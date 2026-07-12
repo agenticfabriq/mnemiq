@@ -41,6 +41,7 @@ while IFS= read -r f; do
     fail=1
   fi
   case "$f" in
+    *.example|*.sample|*.template) : ;;  # example/template files are meant to be committed
     .env|*/.env|.env.*) echo "BLOCKED [env-file]: $f (do not commit env files)"; fail=1 ;;
   esac
 done < <(list_files)
