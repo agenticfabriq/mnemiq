@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Enable with: git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/scripts/repo-guard.sh" --staged

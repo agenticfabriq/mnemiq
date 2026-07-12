@@ -1,0 +1,13 @@
+name: repo-guard
+on:
+  push:
+  pull_request:
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan for proprietary names and secrets
+        run: bash scripts/repo-guard.sh --all
