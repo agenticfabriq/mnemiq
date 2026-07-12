@@ -30,3 +30,12 @@ def test_translate_maps_datetime_and_strips_asc():
     assert "timestamp" in out.lower()
     assert "ASC" not in out
     assert out.count(";") == 2  # each statement terminated
+
+
+def test_translate_drops_keys_without_dangling_comma():
+    out = "\n".join(translate(TSQL))
+    assert "foreign key" not in out.lower()
+    assert "primary key" not in out.lower()
+    import re
+
+    assert not re.search(r",\s*\)", out)  # no dangling comma before a closing paren
