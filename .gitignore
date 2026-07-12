@@ -1,0 +1,16 @@
+# Secrets / env — never commit
+.env
+.env.*
+!.env.example
+
+# Data / build artifacts
+*.duckdb
+*.duckdb.wal
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# OS
+.DS_Store
