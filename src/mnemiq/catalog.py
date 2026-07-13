@@ -4,6 +4,14 @@ from dataclasses import dataclass, field
 
 from mnemiq.adapters.base import SourceAdapter
 
+# Naming convention for identifier columns in the source catalog. Key columns are
+# join candidates, never coded vocabularies -- "policy_identifier = 1" has no meaning.
+KEY_SUFFIXES = ("_identifier", "_id")
+
+
+def is_key_like(column: str) -> bool:
+    return column.endswith(KEY_SUFFIXES)
+
 
 @dataclass
 class ColumnInfo:
