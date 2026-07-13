@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from mnemiq.adapters.base import SourceAdapter
-from mnemiq.catalog import TableInfo, is_key_like
+from mnemiq.catalog import TableInfo, is_key_like, is_sensitive_name
 
 
 @dataclass
@@ -68,11 +68,13 @@ def profile_table(
             distinct_count=distinct_count,
             null_count=row_count - non_null,
         )
-        # A small observed value set is a candidate coded vocabulary; Plan 04 gives the
-        # codes meaning. Key columns are excluded: low distinct-count on a foreign key is
-        # an artifact of sample size, not a vocabulary.
+        # A small observed value set is a candidate coded vocabulary; the semantic pass gives
+        # the codes meaning. Two kinds of column are excluded before we ever read a value:
+        #   - keys: low distinct-count on a foreign key is an artifact of sample size
+        #   - sensitive: harvesting a name column would copy real people into the snapshot
         if (
             not is_key_like(c)
+            and not is_sensitive_name(c)
             and 0 < distinct_count <= code_max_distinct
             and distinct_count < row_count
         ):

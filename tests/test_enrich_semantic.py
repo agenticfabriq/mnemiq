@@ -98,6 +98,35 @@ def test_a_raising_enricher_does_not_sink_the_run():
     assert all(c.description is None for c in out.columns)
 
 
+def test_pii_classification_scrubs_the_harvested_values():
+    # Second line of defense: the column name gave nothing away, so profiling harvested its
+    # values -- but the model recognized them as personal data. Those values ARE the PII.
+    snapshot = Snapshot(
+        version="structural",
+        source_id="acme",
+        created_at="2026-07-13T00:00:00Z",
+        columns=[
+            Column(
+                id="t.handle",
+                object_id="t",
+                name="handle",
+                data_type="text",
+                coded_values=[CodedValue(code="alice99"), CodedValue(code="bob42")],
+            )
+        ],
+    )
+    reply = """{"columns": [{"name": "handle", "description": "The person's login handle.",
+                "semantic_type": "name", "pii_level": "pii",
+                "code_meanings": {"alice99": "the user Alice", "bob42": "the user Bob"}}]}"""
+
+    out = enrich_semantic(snapshot, FakeEnricher({"t": reply}))
+    handle = out.columns[0]
+
+    assert handle.pii_level == "pii"
+    assert handle.description  # we still document it
+    assert handle.coded_values == []  # but we do not carry real people in the snapshot
+
+
 def test_a_successful_table_is_marked_done():
     out = enrich_semantic(_snapshot(), FakeEnricher({"fireclaim": GOOD}))
     job = next(j for j in out.jobs if j.id == "semantic:fireclaim")

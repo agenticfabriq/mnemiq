@@ -35,3 +35,21 @@ def test_live_enrichment_gives_acme_its_meaning():
     assert any(c.semantic_type == "identifier" for c in typed_ids)
 
     assert enriched.version != structural.version
+
+
+def test_live_enrichment_carries_no_personal_data():
+    """The snapshot is a searchable artifact. Real people must not be in it."""
+    adapter = DuckDBPostgresAdapter(os.getenv("MNEMIQ_PG_DSN", _DSN))
+    enriched = enrich_semantic(
+        enrich_structural(adapter, "acme"), LLMEnricher(LLMClient(Settings.from_env()))
+    )
+
+    # ACME's person table holds these names; none may survive into the snapshot
+    blob = enriched.model_dump_json().lower()
+    for name in ("alice", "bob", "mary"):
+        assert name not in blob, f"a real person's name reached the snapshot: {name}"
+
+    # no column classified as personal data may carry its observed values
+    for column in enriched.columns:
+        if column.pii_level in {"pii", "phi"}:
+            assert column.coded_values == [], f"{column.id} carries personal values"

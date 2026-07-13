@@ -49,6 +49,19 @@ def test_profile_table_covers_every_column_and_finds_codes():
     assert all(isinstance(v, tuple) and len(v) == 2 for v in code.top_k)
 
 
+def test_names_are_never_harvested():
+    # person.first_name holds 3 distinct values in the sample -- it *looks* like a coded
+    # vocabulary. Harvesting it would copy real people into the snapshot and into a prompt.
+    adapter = _adapter()
+    stats = {s.column: s for s in profile_table(adapter, _table(adapter, "person"))}
+
+    for column in ("first_name", "last_name", "middle_name", "birth_date"):
+        assert stats[column].top_k == [], f"{column} is personal data, not a vocabulary"
+
+    # the counts are still computed -- we suppress the values, not the profiling
+    assert stats["first_name"].row_count == 29
+
+
 def test_profile_table_skips_keys_and_nulls():
     adapter = _adapter()
     stats = {s.column: s for s in profile_table(adapter, _table(adapter, "policy_amount"))}
