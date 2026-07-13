@@ -6,6 +6,8 @@ from mnemiq.enrichment.pipeline import content_version
 from mnemiq.enrichment.prompts import ColumnFacts
 from mnemiq.enrichment.proposals import ColumnAnnotation
 
+_SENSITIVE = {"pii", "phi"}
+
 
 def _facts(columns: list[Column]) -> list[ColumnFacts]:
     # Only what the snapshot actually knows. The counts live in the source, not here, and a
@@ -22,16 +24,23 @@ def _facts(columns: list[Column]) -> list[ColumnFacts]:
 
 def _annotated(column: Column, annotation: ColumnAnnotation) -> Column:
     """A new Column carrying the annotation. Structural facts win; the LLM only fills blanks."""
-    meanings = annotation.code_meanings
+    if annotation.pii_level in _SENSITIVE:
+        # The model recognized personal data in a column whose name did not give it away.
+        # Its observed values ARE that personal data: drop them rather than carry real people
+        # in the snapshot. The second line of defense -- profiling is the first (catalog.py).
+        coded_values: list[CodedValue] = []
+    else:
+        meanings = annotation.code_meanings
+        coded_values = [
+            CodedValue(code=cv.code, meaning=meanings.get(cv.code)) for cv in column.coded_values
+        ]
+
     return column.model_copy(
         update={
             "description": annotation.description,
             "semantic_type": annotation.semantic_type,
             "pii_level": annotation.pii_level,
-            "coded_values": [
-                CodedValue(code=cv.code, meaning=meanings.get(cv.code))
-                for cv in column.coded_values
-            ],
+            "coded_values": coded_values,
         }
     )
 
