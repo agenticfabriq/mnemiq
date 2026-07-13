@@ -10,11 +10,12 @@ from mnemiq.enrichment.joins import infer_relationships
 from mnemiq.enrichment.profiling import profile_table
 
 
-def _content_version(snapshot: Snapshot) -> str:
+def content_version(snapshot: Snapshot) -> str:
     """Hash what the snapshot asserts, not when it was built.
 
-    Covers the observed codes too, so a shifted vocabulary invalidates downstream
-    caches. Excludes created_at and jobs -- those are run bookkeeping, not content.
+    Covers the observed codes -- and, after semantic enrichment, the descriptions and code
+    meanings -- so a shifted vocabulary invalidates downstream caches. Excludes created_at
+    and jobs: those are run bookkeeping, not content.
     """
     payload = json.dumps(
         {
@@ -95,5 +96,5 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
         relationships=relationships,
         jobs=jobs,
     )
-    snapshot.version = _content_version(snapshot)
+    snapshot.version = content_version(snapshot)
     return snapshot
