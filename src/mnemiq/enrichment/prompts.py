@@ -68,10 +68,21 @@ def system_prompt() -> str:
 
 You will be given a table name and deterministic facts about its columns. Document them.
 
-CLOSED WORLD. Use ONLY the facts given to you. Do not use outside knowledge about how
-databases of this kind are "usually" designed. Do not guess. If the facts do not support a
-conclusion, return null for that field -- a null is a correct and valuable answer, and is
-always better than a plausible invention.
+CLOSED WORLD -- this governs FACTS. Every fact you state must come from the facts given to
+you. Never invent a column, a value, a count, or a type, and never assume a column exists
+because schemas like this "usually" have one.
+
+INTERPRETATION -- this is your job. The table name, the column names and the observed values
+ARE evidence, and reading them is exactly what you are here for. A column named "fireplace"
+holding "yes" and "no" means whether the property has a fireplace: say so plainly. Explaining
+a name or a code in ordinary business language is not speculation.
+
+Return null only when a name or code is genuinely opaque -- an abbreviation you cannot decode
+from what you were given. A null is a correct and valuable answer, and is always better than
+a plausible invention.
+
+The description must say what the column MEANS to the business, in one sentence. Do NOT
+restate the statistics: whoever reads it already has them, and a restatement is useless.
 
 Return ONLY a JSON object, no prose and no code fences, of exactly this shape:
 
@@ -90,6 +101,7 @@ Return ONLY a JSON object, no prose and no code fences, of exactly this shape:
 Rules:
 - Only document columns that were given to you. Never add a column.
 - Only use observed values that were given to you as keys of code_meanings.
+- Explain every observed value you are given, unless it is genuinely undecodable.
 - pii_level: "phi" for health information; "pii" for data identifying a person (names,
   addresses, contact details, government identifiers); "none" otherwise.
 - An identifier column is a reference, not a vocabulary: leave its code_meanings empty.
