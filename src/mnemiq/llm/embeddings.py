@@ -53,6 +53,10 @@ class FakeEmbedder:
         while len(raw) < self._dim * 4:
             raw += hashlib.sha256(f"{counter}:{text}".encode()).digest()
             counter += 1
-        floats = struct.unpack(f"{self._dim}f", raw[: self._dim * 4])
+        # Read the digest as unsigned ints, not floats: a random 32-bit pattern is a valid
+        # float32 only by luck -- most are NaN or Inf, and NaN poisons both the norm and
+        # equality (nan != nan).
+        ints = struct.unpack(f"{self._dim}I", raw[: self._dim * 4])
+        floats = [(i / 0xFFFFFFFF) * 2.0 - 1.0 for i in ints]  # -> [-1, 1]
         norm = math.sqrt(sum(f * f for f in floats)) or 1.0
         return [f / norm for f in floats]
