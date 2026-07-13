@@ -1,4 +1,5 @@
 import os
+import re
 
 import pytest
 
@@ -44,10 +45,11 @@ def test_live_enrichment_carries_no_personal_data():
         enrich_structural(adapter, "acme"), LLMEnricher(LLMClient(Settings.from_env()))
     )
 
-    # ACME's person table holds these names; none may survive into the snapshot
+    # ACME's person table holds these names; none may survive into the snapshot.
+    # Whole words only -- "primary street address" is not a person called Mary.
     blob = enriched.model_dump_json().lower()
     for name in ("alice", "bob", "mary"):
-        assert name not in blob, f"a real person's name reached the snapshot: {name}"
+        assert not re.search(rf"\b{name}\b", blob), f"a real person's name reached the snapshot: {name}"
 
     # no column classified as personal data may carry its observed values
     for column in enriched.columns:
