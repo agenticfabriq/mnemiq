@@ -20,5 +20,13 @@ class DuckDBPostgresAdapter:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def list_columns(self) -> list[tuple[str, str, str]]:
+        rows = self._con.execute(
+            "SELECT table_name, column_name, data_type FROM information_schema.columns "
+            f"WHERE table_catalog = '{self._schema}' AND table_schema = 'public' "
+            "ORDER BY table_name, ordinal_position"
+        ).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
     def execute(self, sql: str) -> list[tuple]:
         return self._con.execute(sql).fetchall()
