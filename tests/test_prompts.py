@@ -57,3 +57,13 @@ def test_prompts_carry_persona_and_closed_world_directive():
     assert "boolean" in system and "phi" in system
 
     assert "t" in user_prompt(render_table_facts("t", []))
+
+
+def test_closed_world_governs_facts_but_not_interpretation():
+    # A directive broad enough to forbid interpreting a column name suppresses the very thing
+    # we want: the model returns null meanings and descriptions that restate the statistics.
+    # Facts are closed; reading names and codes into business language is the job.
+    system = system_prompt()
+    assert "INTERPRETATION" in system
+    assert "not speculation" in system
+    assert "restate the statistics" in system  # descriptions must add meaning, not echo input
