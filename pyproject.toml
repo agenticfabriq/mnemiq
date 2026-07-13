@@ -8,6 +8,7 @@ dependencies = [
   "duckdb>=1.2",
   "psycopg[binary]>=3.2",
   "openai>=1.40",
+  "pydantic>=2",
 ]
 
 [project.optional-dependencies]
