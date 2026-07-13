@@ -7,6 +7,9 @@ from mnemiq.enrichment.prompts import ColumnFacts
 from mnemiq.enrichment.proposals import ColumnAnnotation
 
 _SENSITIVE = {"pii", "phi"}
+# A measurement is not a controlled vocabulary. A small sample makes one look like the other,
+# and "0.7 means the value 0.7" is noise that would compete with real signal in the index.
+_MEASURES = {"ratio", "amount", "count"}
 
 
 def _facts(columns: list[Column]) -> list[ColumnFacts]:
@@ -24,10 +27,11 @@ def _facts(columns: list[Column]) -> list[ColumnFacts]:
 
 def _annotated(column: Column, annotation: ColumnAnnotation) -> Column:
     """A new Column carrying the annotation. Structural facts win; the LLM only fills blanks."""
-    if annotation.pii_level in _SENSITIVE:
-        # The model recognized personal data in a column whose name did not give it away.
-        # Its observed values ARE that personal data: drop them rather than carry real people
-        # in the snapshot. The second line of defense -- profiling is the first (catalog.py).
+    if annotation.pii_level in _SENSITIVE or annotation.semantic_type in _MEASURES:
+        # pii/phi: the model recognized personal data in a column whose name did not give it
+        #   away. Its observed values ARE that personal data -- drop them rather than carry
+        #   real people in the snapshot. Profiling is the first line of defense (catalog.py).
+        # measures: the observed values are samples, not a vocabulary.
         coded_values: list[CodedValue] = []
     else:
         meanings = annotation.code_meanings
