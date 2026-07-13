@@ -8,7 +8,9 @@ class MeasureExpr(BaseModel):
 
 class CodedValue(BaseModel):
     code: str
-    meaning: str
+    # None until semantic enrichment assigns it: structural profiling can observe that a
+    # code exists, but only the semantic pass can say what it means.
+    meaning: str | None = None
 
 
 class JoinKey(BaseModel):

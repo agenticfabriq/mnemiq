@@ -59,13 +59,20 @@
             "type": "string"
           },
           "meaning": {
-            "title": "Meaning",
-            "type": "string"
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Meaning"
           }
         },
         "required": [
-          "code",
-          "meaning"
+          "code"
         ],
         "title": "CodedValue",
         "type": "object"
