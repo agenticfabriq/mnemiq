@@ -12,9 +12,7 @@ def _snap(version="v1"):
         created_at="2026-07-12T00:00:00Z",
         columns=[Column(id="party.name", object_id="party", name="name", data_type="text")],
         relationships=[
-            Relationship(
-                id="claim->party", from_="claim", to="party", cardinality="many_to_one"
-            )
+            Relationship(id="claim->party", from_="claim", to="party", cardinality="many_to_one")
         ],
     )
 
