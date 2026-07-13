@@ -1,0 +1,832 @@
+{
+  "identity_context": {
+    "properties": {
+      "attributes": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "title": "Attributes",
+        "type": "object"
+      },
+      "email": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Email"
+      },
+      "groups": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Groups",
+        "type": "array"
+      },
+      "principal_id": {
+        "title": "Principal Id",
+        "type": "string"
+      },
+      "roles": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Roles",
+        "type": "array"
+      },
+      "tenant_id": {
+        "title": "Tenant Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "tenant_id",
+      "principal_id"
+    ],
+    "title": "IdentityContext",
+    "type": "object"
+  },
+  "snapshot": {
+    "$defs": {
+      "CodedValue": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "meaning": {
+            "title": "Meaning",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "meaning"
+        ],
+        "title": "CodedValue",
+        "type": "object"
+      },
+      "Column": {
+        "properties": {
+          "coded_values": {
+            "items": {
+              "$ref": "#/$defs/CodedValue"
+            },
+            "title": "Coded Values",
+            "type": "array"
+          },
+          "data_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Data Type"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          },
+          "pii_level": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Pii Level"
+          },
+          "semantic_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Semantic Type"
+          }
+        },
+        "required": [
+          "id",
+          "object_id",
+          "name"
+        ],
+        "title": "Column",
+        "type": "object"
+      },
+      "CompatibilityProfile": {
+        "properties": {
+          "lossless_concepts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Lossless Concepts",
+            "type": "array"
+          },
+          "lossy_concepts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Lossy Concepts",
+            "type": "array"
+          },
+          "mapping_status": {
+            "title": "Mapping Status",
+            "type": "string"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Notes",
+            "type": "array"
+          },
+          "source_system": {
+            "title": "Source System",
+            "type": "string"
+          },
+          "source_version": {
+            "title": "Source Version",
+            "type": "string"
+          },
+          "unsupported_concepts": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Unsupported Concepts",
+            "type": "array"
+          }
+        },
+        "required": [
+          "source_system",
+          "source_version",
+          "mapping_status"
+        ],
+        "title": "CompatibilityProfile",
+        "type": "object"
+      },
+      "Definition": {
+        "properties": {
+          "bound_objects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Bound Objects",
+            "type": "array"
+          },
+          "definition": {
+            "title": "Definition",
+            "type": "string"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Depends On",
+            "type": "array"
+          },
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "parents": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Parents",
+            "type": "array"
+          },
+          "term": {
+            "title": "Term",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "term",
+          "domain",
+          "definition"
+        ],
+        "title": "Definition",
+        "type": "object"
+      },
+      "Dimension": {
+        "properties": {
+          "data_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Data Type"
+          },
+          "expr": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expr"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "semantic_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Semantic Type"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "source"
+        ],
+        "title": "Dimension",
+        "type": "object"
+      },
+      "Job": {
+        "properties": {
+          "attempts": {
+            "default": 0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "checkpoints": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Checkpoints",
+            "type": "array"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "max_attempts": {
+            "default": 1,
+            "title": "Max Attempts",
+            "type": "integer"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tenant_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tenant Id"
+          }
+        },
+        "required": [
+          "id",
+          "source_id",
+          "kind",
+          "status"
+        ],
+        "title": "Job",
+        "type": "object"
+      },
+      "JoinKey": {
+        "properties": {
+          "left": {
+            "title": "Left",
+            "type": "string"
+          },
+          "right": {
+            "title": "Right",
+            "type": "string"
+          }
+        },
+        "required": [
+          "left",
+          "right"
+        ],
+        "title": "JoinKey",
+        "type": "object"
+      },
+      "MeasureExpr": {
+        "properties": {
+          "expr": {
+            "title": "Expr",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expr",
+          "source"
+        ],
+        "title": "MeasureExpr",
+        "type": "object"
+      },
+      "Metric": {
+        "properties": {
+          "compatible_dimensions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Compatible Dimensions",
+            "type": "array"
+          },
+          "grain": {
+            "title": "Grain",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "measure": {
+            "$ref": "#/$defs/MeasureExpr"
+          },
+          "owner": {
+            "title": "Owner",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "time_dimension": {
+            "title": "Time Dimension",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "status",
+          "owner",
+          "grain",
+          "measure",
+          "time_dimension"
+        ],
+        "title": "Metric",
+        "type": "object"
+      },
+      "Quality": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          },
+          "observed_value": {
+            "title": "Observed Value",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "threshold": {
+            "title": "Threshold",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "object_id",
+          "name",
+          "status",
+          "threshold",
+          "observed_value"
+        ],
+        "title": "Quality",
+        "type": "object"
+      },
+      "Relationship": {
+        "properties": {
+          "cardinality": {
+            "title": "Cardinality",
+            "type": "string"
+          },
+          "from": {
+            "title": "From",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "join_keys": {
+            "items": {
+              "$ref": "#/$defs/JoinKey"
+            },
+            "title": "Join Keys",
+            "type": "array"
+          },
+          "to": {
+            "title": "To",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "from",
+          "to",
+          "cardinality"
+        ],
+        "title": "Relationship",
+        "type": "object"
+      },
+      "Skill": {
+        "properties": {
+          "approval_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Approval Ref"
+          },
+          "dialect": {
+            "title": "Dialect",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "question": {
+            "title": "Question",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "sql": {
+            "title": "Sql",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "question",
+          "sql",
+          "dialect",
+          "source_id"
+        ],
+        "title": "Skill",
+        "type": "object"
+      },
+      "SourceBinding": {
+        "properties": {
+          "binding_type": {
+            "title": "Binding Type",
+            "type": "string"
+          },
+          "freshness_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Freshness Ref"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          },
+          "source_id": {
+            "title": "Source Id",
+            "type": "string"
+          },
+          "source_object": {
+            "title": "Source Object",
+            "type": "string"
+          },
+          "tenant_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tenant Id"
+          }
+        },
+        "required": [
+          "id",
+          "source_id",
+          "object_id",
+          "source_object",
+          "binding_type"
+        ],
+        "title": "SourceBinding",
+        "type": "object"
+      }
+    },
+    "properties": {
+      "columns": {
+        "items": {
+          "$ref": "#/$defs/Column"
+        },
+        "title": "Columns",
+        "type": "array"
+      },
+      "compatibility_profiles": {
+        "items": {
+          "$ref": "#/$defs/CompatibilityProfile"
+        },
+        "title": "Compatibility Profiles",
+        "type": "array"
+      },
+      "created_at": {
+        "title": "Created At",
+        "type": "string"
+      },
+      "definitions": {
+        "items": {
+          "$ref": "#/$defs/Definition"
+        },
+        "title": "Definitions",
+        "type": "array"
+      },
+      "dimensions": {
+        "items": {
+          "$ref": "#/$defs/Dimension"
+        },
+        "title": "Dimensions",
+        "type": "array"
+      },
+      "jobs": {
+        "items": {
+          "$ref": "#/$defs/Job"
+        },
+        "title": "Jobs",
+        "type": "array"
+      },
+      "metrics": {
+        "items": {
+          "$ref": "#/$defs/Metric"
+        },
+        "title": "Metrics",
+        "type": "array"
+      },
+      "qualities": {
+        "items": {
+          "$ref": "#/$defs/Quality"
+        },
+        "title": "Qualities",
+        "type": "array"
+      },
+      "relationships": {
+        "items": {
+          "$ref": "#/$defs/Relationship"
+        },
+        "title": "Relationships",
+        "type": "array"
+      },
+      "skills": {
+        "items": {
+          "$ref": "#/$defs/Skill"
+        },
+        "title": "Skills",
+        "type": "array"
+      },
+      "source_bindings": {
+        "items": {
+          "$ref": "#/$defs/SourceBinding"
+        },
+        "title": "Source Bindings",
+        "type": "array"
+      },
+      "source_id": {
+        "title": "Source Id",
+        "type": "string"
+      },
+      "version": {
+        "title": "Version",
+        "type": "string"
+      }
+    },
+    "required": [
+      "version",
+      "source_id",
+      "created_at"
+    ],
+    "title": "Snapshot",
+    "type": "object"
+  },
+  "trace": {
+    "$defs": {
+      "IdentityContext": {
+        "properties": {
+          "attributes": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Attributes",
+            "type": "object"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Email"
+          },
+          "groups": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Groups",
+            "type": "array"
+          },
+          "principal_id": {
+            "title": "Principal Id",
+            "type": "string"
+          },
+          "roles": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Roles",
+            "type": "array"
+          },
+          "tenant_id": {
+            "title": "Tenant Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant_id",
+          "principal_id"
+        ],
+        "title": "IdentityContext",
+        "type": "object"
+      }
+    },
+    "properties": {
+      "definitions_used": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Definitions Used",
+        "type": "array"
+      },
+      "enrichment_version": {
+        "title": "Enrichment Version",
+        "type": "string"
+      },
+      "identity": {
+        "$ref": "#/$defs/IdentityContext"
+      },
+      "plan_sql": {
+        "title": "Plan Sql",
+        "type": "string"
+      },
+      "question": {
+        "title": "Question",
+        "type": "string"
+      },
+      "result_shape": {
+        "title": "Result Shape",
+        "type": "string"
+      },
+      "tables_used": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Tables Used",
+        "type": "array"
+      },
+      "target_sql": {
+        "title": "Target Sql",
+        "type": "string"
+      },
+      "timing": {
+        "additionalProperties": {
+          "type": "number"
+        },
+        "title": "Timing",
+        "type": "object"
+      }
+    },
+    "required": [
+      "question",
+      "plan_sql",
+      "target_sql",
+      "result_shape",
+      "timing",
+      "enrichment_version",
+      "identity"
+    ],
+    "title": "Trace",
+    "type": "object"
+  }
+}
