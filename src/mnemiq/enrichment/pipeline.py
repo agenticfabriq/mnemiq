@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 
 from mnemiq.catalog import introspect
 from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding
-from mnemiq.enrichment.joins import infer_relationships
+from mnemiq.enrichment.joins import build_relationships
 from mnemiq.enrichment.profiling import profile_table
 
 
@@ -84,7 +84,7 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
         )
 
     try:
-        relationships = infer_relationships(adapter, catalog)
+        relationships = build_relationships(adapter, catalog)
         status = "done"
     except Exception:
         relationships, status = [], "failed"
