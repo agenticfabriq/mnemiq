@@ -74,3 +74,73 @@ def test_card_is_self_sufficient():
 def test_a_table_with_no_enrichment_still_gets_a_card():
     card = next(c for c in build_cards(_snapshot()) if c.object_id == "party")
     assert "party" in card.text and "name" in card.text
+
+
+def test_an_entirely_null_column_warns_on_the_card():
+    snapshot = Snapshot(
+        version="v1",
+        source_id="acme",
+        created_at="2026-07-14T00:00:00Z",
+        source_bindings=[
+            SourceBinding(
+                id="sb:fireclaim", source_id="acme", object_id="fireclaim",
+                source_object="fireclaim", binding_type="table",
+            )
+        ],
+        columns=[
+            Column(
+                id="fireclaim.claimnumber", object_id="fireclaim", name="claimnumber",
+                data_type="text", description="The number of the claim.",
+                row_count=820, distinct_count=0, null_count=820,
+            ),
+            Column(
+                id="fireclaim.loss_ratio", object_id="fireclaim", name="loss_ratio",
+                data_type="text", row_count=820, distinct_count=98, null_count=0,
+            ),
+        ],
+    )
+    (card,) = build_cards(snapshot)
+
+    claimnumber_line = next(l for l in card.text.splitlines() if "claimnumber" in l)
+    loss_line = next(l for l in card.text.splitlines() if "loss_ratio" in l)
+
+    assert "ENTIRELY NULL" in claimnumber_line  # the warning outranks the description
+    assert "ENTIRELY NULL" not in loss_line
+
+
+def test_an_empty_table_does_not_false_alarm():
+    # 0 rows means "no data yet", not "this column is a trap"
+    snapshot = Snapshot(
+        version="v1",
+        source_id="acme",
+        created_at="2026-07-14T00:00:00Z",
+        source_bindings=[
+            SourceBinding(
+                id="sb:t", source_id="acme", object_id="t",
+                source_object="t", binding_type="table",
+            )
+        ],
+        columns=[
+            Column(id="t.c", object_id="t", name="c", data_type="text",
+                   row_count=0, distinct_count=0, null_count=0),
+        ],
+    )
+    (card,) = build_cards(snapshot)
+    assert "ENTIRELY NULL" not in card.text
+
+
+def test_an_unprofiled_column_does_not_false_alarm():
+    snapshot = Snapshot(
+        version="v1",
+        source_id="acme",
+        created_at="2026-07-14T00:00:00Z",
+        source_bindings=[
+            SourceBinding(
+                id="sb:t", source_id="acme", object_id="t",
+                source_object="t", binding_type="table",
+            )
+        ],
+        columns=[Column(id="t.c", object_id="t", name="c", data_type="text")],
+    )
+    (card,) = build_cards(snapshot)
+    assert "ENTIRELY NULL" not in card.text
