@@ -56,6 +56,9 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
                         CodedValue(code=str(value))
                         for value, _count in (stats[col.name].top_k if col.name in stats else [])
                     ],
+                    row_count=stats[col.name].row_count if col.name in stats else None,
+                    distinct_count=stats[col.name].distinct_count if col.name in stats else None,
+                    null_count=stats[col.name].null_count if col.name in stats else None,
                 )
                 for col in table.columns
             ]

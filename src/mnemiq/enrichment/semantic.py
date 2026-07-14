@@ -13,13 +13,16 @@ _MEASURES = {"ratio", "amount", "count"}
 
 
 def _facts(columns: list[Column]) -> list[ColumnFacts]:
-    # Only what the snapshot actually knows. The counts live in the source, not here, and a
-    # fabricated zero would poison a closed-world prompt.
+    # Only what the snapshot actually knows; absent counts stay absent -- a fabricated
+    # zero would poison a closed-world prompt.
     return [
         ColumnFacts(
             name=c.name,
             data_type=c.data_type or "unknown",
             codes=[cv.code for cv in c.coded_values],
+            row_count=c.row_count,
+            distinct_count=c.distinct_count,
+            null_count=c.null_count,
         )
         for c in columns
     ]

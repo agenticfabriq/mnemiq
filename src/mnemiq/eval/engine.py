@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from mnemiq.agent.budget import Budget
 from mnemiq.agent.loop import Agent, AgentAnswer
@@ -8,7 +8,7 @@ from mnemiq.agent.synthesize import LLMSynthesizer
 from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.config import Settings
-from mnemiq.contract import IdentityContext, Snapshot
+from mnemiq.contract import Definition, IdentityContext, Snapshot
 from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import LLMEmbedder
@@ -33,7 +33,11 @@ class _GrantAll:
 
 
 def build_engine(
-    snapshot: Snapshot, adapter, settings: Settings, store_path: str = ":memory:"
+    snapshot: Snapshot,
+    adapter,
+    settings: Settings,
+    store_path: str = ":memory:",
+    definitions: Sequence[Definition] = (),
 ) -> tuple[Engine, LLMClient]:
     """Retrieval + agent over one snapshot, assembled exactly once.
 
@@ -60,7 +64,7 @@ def build_engine(
     )
 
     def ask(question: str) -> AgentAnswer:
-        packet = retrieve(con, question, IDENTITY, authz, embedder, k=6)
+        packet = retrieve(con, question, IDENTITY, authz, embedder, k=6, definitions=definitions)
         return agent.answer(packet, snapshot, grants, IDENTITY)
 
     return ask, client

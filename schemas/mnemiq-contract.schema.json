@@ -110,6 +110,18 @@
             "default": null,
             "title": "Description"
           },
+          "distinct_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Distinct Count"
+          },
           "id": {
             "title": "Id",
             "type": "string"
@@ -117,6 +129,18 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "null_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Null Count"
           },
           "object_id": {
             "title": "Object Id",
@@ -133,6 +157,18 @@
             ],
             "default": null,
             "title": "Pii Level"
+          },
+          "row_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Row Count"
           },
           "semantic_type": {
             "anyOf": [

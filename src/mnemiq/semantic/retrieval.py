@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import duckdb
 
 from mnemiq.authz.grants import AuthzProvider
-from mnemiq.contract import IdentityContext
+from mnemiq.contract import Definition, IdentityContext
 from mnemiq.llm.embeddings import Embedder
+from mnemiq.semantic.glossary import select_definitions
 
 _RRF_K = 60  # the standard RRF constant (reciprocal-rank blending)
 
@@ -24,7 +26,7 @@ class ContextPacket:
     cards: list[RetrievedCard]
     grant_fingerprint: str
     enrichment_version: str | None
-    definitions: list = field(default_factory=list)  # Plan 06
+    definitions: list[Definition] = field(default_factory=list)
     examples: list = field(default_factory=list)  # Plan 08
 
 
@@ -39,6 +41,7 @@ def retrieve(
     authz: AuthzProvider,
     embedder: Embedder,
     k: int = 5,
+    definitions: Sequence[Definition] = (),
 ) -> ContextPacket:
     """Hybrid retrieval, scoped to the identity's grants *before* anything is ranked.
 
@@ -56,6 +59,8 @@ def retrieve(
     )
     if not grants.objects:
         return packet  # nothing is visible: do not even touch the index
+
+    packet.definitions = select_definitions(question, definitions, grants)
 
     allowed = list(grants.objects)
     placeholders = ", ".join("?" for _ in allowed)
