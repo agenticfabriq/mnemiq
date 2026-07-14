@@ -41,6 +41,12 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]]) -> Refusal |
     referenced = set(alias_to_table.values())
     known_columns = {c for t in referenced for c in visible[t]}
 
+    # A SELECT alias is a name the query invents for an expression, and GROUP BY / ORDER BY /
+    # HAVING may refer to it: `SELECT year(d) AS y, count(*) FROM t GROUP BY y` is ordinary,
+    # correct SQL -- and without this the engine could not answer "count X by year" at all.
+    # It is safe: an alias can only be defined from columns that were themselves checked.
+    known_columns |= {alias.alias for alias in ast.find_all(exp.Alias) if alias.alias}
+
     for column in ast.find_all(exp.Column):
         qualifier = column.table
         if qualifier:

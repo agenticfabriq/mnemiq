@@ -68,6 +68,23 @@ def test_a_column_qualified_by_an_alias_resolves():
     assert _check("SELECT c.nope FROM claim c").code == RefusalCode.UNKNOWN_COLUMN
 
 
+def test_a_group_by_on_a_select_alias_is_valid_sql():
+    # the most natural analytics query there is. GROUP BY / ORDER BY / HAVING may reference a
+    # SELECT alias -- rejecting it would leave the engine unable to answer "count X by year".
+    sql = (
+        "SELECT status AS s, count(*) AS n FROM claim "
+        "GROUP BY s HAVING n > 1 ORDER BY n DESC"
+    )
+    assert _check(sql) is None
+
+
+def test_an_alias_cannot_launder_an_unknown_column():
+    # the alias is fine; the column it is built from is still checked
+    assert _check("SELECT nonexistent AS s FROM claim GROUP BY s").code == (
+        RefusalCode.UNKNOWN_COLUMN
+    )
+
+
 def test_an_unqualified_column_must_exist_in_some_referenced_table():
     assert _check("SELECT premium FROM claim JOIN policy ON TRUE") is None
     assert (

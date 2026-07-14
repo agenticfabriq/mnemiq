@@ -9,6 +9,7 @@ import pytest
 import sqlglot
 from sqlglot import exp
 
+from mnemiq.sql.authz_guard import check_access
 from mnemiq.sql.guard import check_shape
 from mnemiq.sql.verdict import Refusal
 
@@ -38,6 +39,33 @@ def test_the_guard_always_imposes_a_limit(tpcds_queries):
     for nr, query in tpcds_queries:
         ast = check_shape(query, dialect="duckdb")
         assert ast.args.get("limit") is not None, f"q{nr} escaped without a row limit"
+
+
+def test_the_authorization_guard_accepts_every_real_analytic_query(tpcds_queries):
+    """The access guard must not reject valid SQL either -- only unauthorized SQL.
+
+    Given the real TPC-DS schema as the visible schema, all 99 queries must pass. This is
+    what catches false positives like rejecting a GROUP BY on a SELECT alias, which would
+    make the engine unable to answer "count X by year".
+    """
+    con = duckdb.connect()
+    con.execute("INSTALL tpcds; LOAD tpcds; CALL dsdgen(sf=0);")  # schema only, no rows
+    visible: dict[str, set[str]] = {}
+    for table, column in con.execute(
+        "SELECT table_name, column_name FROM information_schema.columns "
+        "WHERE table_schema = 'main'"
+    ).fetchall():
+        visible.setdefault(table, set()).add(column)
+    assert visible, "TPC-DS schema did not materialize"
+
+    rejected = []
+    for nr, query in tpcds_queries:
+        ast = check_shape(query, dialect="duckdb")
+        assert not isinstance(ast, Refusal), f"q{nr} failed the shape guard"
+        refusal = check_access(ast, visible)
+        if refusal is not None:
+            rejected.append((nr, refusal.code, refusal.subject))
+    assert not rejected, f"the access guard rejected authorized analytics SQL: {rejected}"
 
 
 def test_every_query_transpiles_and_keeps_its_tables(tpcds_queries):
