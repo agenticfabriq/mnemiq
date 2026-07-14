@@ -52,7 +52,9 @@ def _preview(table: pa.Table) -> list[dict]:
     ]
 
 
-def run_case(case: EvaluationCase, engine: Engine, adapter) -> CaseResult:
+def run_case(
+    case: EvaluationCase, engine: Engine, adapter, allow_extra_columns: bool = True
+) -> CaseResult:
     """Ask the engine, then check its answer against the gold query's result set."""
     result = CaseResult(case_id=case.id, outcome=Outcome.ERROR, question=case.question,
                         gold_sql=case.gold_sql or "")
@@ -106,5 +108,9 @@ def run_case(case: EvaluationCase, engine: Engine, adapter) -> CaseResult:
     result.engine_rows = _preview(candidate)
     result.engine_row_count = candidate.num_rows
     result.executed = True
-    result.outcome = Outcome.CORRECT if results_match(gold, candidate) else Outcome.WRONG
+    result.outcome = (
+        Outcome.CORRECT
+        if results_match(gold, candidate, allow_extra_columns=allow_extra_columns)
+        else Outcome.WRONG
+    )
     return result
