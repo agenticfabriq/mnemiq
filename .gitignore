@@ -6,6 +6,7 @@
 # Data / build artifacts
 *.duckdb
 *.duckdb.wal
+eval-reports/
 
 # Python
 __pycache__/
