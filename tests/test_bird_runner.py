@@ -134,3 +134,54 @@ def test_run_case_populates_db_id_and_difficulty():
     result = run_case(case, ask, _A())
     assert result.db_id == "shop"
     assert result.difficulty == "moderate"
+
+
+def test_process_db_runs_every_case_once_across_workers():
+    # concurrency plumbing: with >1 worker, every case is processed exactly once and
+    # results come back complete. Fakes stand in for the LLM engine and the DB.
+    from mnemiq.eval.bird_runner import _process_db
+
+    cases = [_case(i, "shop", "simple") for i in range(10)]
+
+    class _FakeClient:
+        total_tokens = 7
+        calls = 1
+
+    class _FakeAdapter:
+        def execute(self, sql):
+            return [(1,)]  # _gold_too_big probe: 1 row, under any cap
+
+        def execute_arrow(self, sql, timeout_s=None):
+            return pa.table({"n": [5]})  # gold and candidate both -> match
+
+    def build_engine_fn():
+        def ask(_q):
+            return AgentAnswer(answer="5", trace=_trace(), deferred=False)
+        return ask, _FakeAdapter(), _FakeClient()
+
+    out, clients = _process_db(cases, build_engine_fn, max_rows_cap=1000, workers=3)
+
+    results = [r for kind, r in out if kind == "result"]
+    assert len(out) == 10
+    assert all(r.outcome is Outcome.CORRECT for r in results)
+    assert {r.case_id for r in results} == {f"bird-{i}" for i in range(10)}
+    assert clients  # at least one per-worker client collected for token totals
+
+
+def test_process_db_sequential_path_matches():
+    from mnemiq.eval.bird_runner import _process_db
+
+    cases = [_case(1, "shop", "simple")]
+
+    class _A:
+        def execute(self, sql):
+            return [(1,)]
+
+        def execute_arrow(self, sql, timeout_s=None):
+            return pa.table({"n": [5]})
+
+    def build():
+        return (lambda _q: AgentAnswer(answer="5", trace=_trace(), deferred=False)), _A(), None
+
+    out, _ = _process_db(cases, build, max_rows_cap=1000, workers=1)
+    assert len(out) == 1 and out[0][0] == "result"
