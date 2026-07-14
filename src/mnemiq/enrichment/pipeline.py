@@ -46,7 +46,7 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
     # (CDSCode, ID) don't match the naming gate. Fail-soft: no catalog FKs -> the gate stands.
     fk_children: dict[str, set[str]] = {}
     try:
-        for from_table, from_col, _to_table, _to_col in adapter.foreign_keys():
+        for from_table, from_col, _to_table, _to_col, _cid in adapter.foreign_keys():
             fk_children.setdefault(from_table, set()).add(from_col)
     except Exception:
         fk_children = {}

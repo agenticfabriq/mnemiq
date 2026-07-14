@@ -147,3 +147,51 @@ def test_declared_fk_table_is_not_also_inferred(tmp_path):
     adapter = _fk_src(tmp_path)
     rels = build_relationships(adapter, introspect(adapter))
     assert sum(1 for r in rels if r.from_ == "child") == 1
+
+
+def test_independent_fks_to_same_parent_are_separate_relationships(tmp_path):
+    # superhero has eye/hair/skin colour_id -> colour, THREE independent FKs, not a composite.
+    path = tmp_path / "fk2.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE colour (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE hero (
+            id INTEGER PRIMARY KEY,
+            eye_id INTEGER REFERENCES colour(id),
+            hair_id INTEGER REFERENCES colour(id)
+        );
+        INSERT INTO colour VALUES (1,'blue'),(2,'red');
+        INSERT INTO hero VALUES (1,1,2);
+        """
+    )
+    con.commit()
+    con.close()
+    adapter = SQLiteAdapter(str(path))
+    rels = [r for r in relationships_from_foreign_keys(adapter, introspect(adapter)) if r.from_ == "hero"]
+
+    assert len(rels) == 2  # not one merged "composite"
+    left_cols = sorted(r.join_keys[0].left for r in rels)
+    assert left_cols == ["eye_id", "hair_id"]
+    assert all(len(r.join_keys) == 1 for r in rels)
+
+
+def test_a_true_composite_fk_is_one_relationship_with_two_keys(tmp_path):
+    path = tmp_path / "fk3.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE parent (a INTEGER, b INTEGER, PRIMARY KEY (a, b));
+        CREATE TABLE child (
+            id INTEGER PRIMARY KEY, pa INTEGER, pb INTEGER,
+            FOREIGN KEY (pa, pb) REFERENCES parent(a, b)
+        );
+        """
+    )
+    con.commit()
+    con.close()
+    adapter = SQLiteAdapter(str(path))
+    rels = [r for r in relationships_from_foreign_keys(adapter, introspect(adapter)) if r.from_ == "child"]
+
+    assert len(rels) == 1
+    assert {(k.left, k.right) for k in rels[0].join_keys} == {("pa", "a"), ("pb", "b")}

@@ -76,14 +76,22 @@ def relationships_from_foreign_keys(adapter, catalog: list[TableInfo]) -> list[R
     """Declared foreign keys as Relationships. The catalog is authoritative -- unlike the
     naming inference, this captures differently-named and non-_id keys."""
     known = {t.name for t in catalog}
-    grouped: dict[tuple[str, str], list[JoinKey]] = {}
-    for from_table, from_col, to_table, to_col in adapter.foreign_keys():
+    # Group by constraint, not by (child, parent): a composite FK's columns share a
+    # constraint id, while independent FKs to the same parent do not -- so eye/hair/skin
+    # -> colour stay three relationships, not one bogus composite.
+    grouped: dict[str, tuple[str, str, list[JoinKey]]] = {}
+    order: list[str] = []
+    for from_table, from_col, to_table, to_col, cid in adapter.foreign_keys():
         if from_table not in known or to_table not in known:
             continue
-        grouped.setdefault((from_table, to_table), []).append(JoinKey(left=from_col, right=to_col))
+        if cid not in grouped:
+            grouped[cid] = (from_table, to_table, [])
+            order.append(cid)
+        grouped[cid][2].append(JoinKey(left=from_col, right=to_col))
 
     rels: list[Relationship] = []
-    for (child, parent), keys in grouped.items():
+    for cid in order:
+        child, parent, keys = grouped[cid]
         cols = "+".join(k.left for k in keys)
         rels.append(
             Relationship(

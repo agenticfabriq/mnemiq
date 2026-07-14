@@ -80,7 +80,8 @@ def test_foreign_keys_reads_declared_constraints(tmp_path):
     con.close()
 
     fks = SQLiteAdapter(str(path)).foreign_keys()
-    assert ("child", "pid", "parent", "id") in fks
+    # (from_table, from_col, to_table, to_col, constraint_id)
+    assert any(fk[:4] == ("child", "pid", "parent", "id") for fk in fks)
 
 
 def test_foreign_keys_empty_when_none_declared(db):

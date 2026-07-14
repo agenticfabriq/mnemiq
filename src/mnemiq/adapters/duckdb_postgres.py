@@ -31,14 +31,16 @@ class DuckDBPostgresAdapter:
         ).fetchall()
         return [(r[0], r[1], r[2]) for r in rows]
 
-    def foreign_keys(self) -> list[tuple[str, str, str, str]]:
-        """Declared FKs from the attached Postgres catalog.
+    def foreign_keys(self) -> list[tuple[str, str, str, str, str]]:
+        """Declared FKs: (from_table, from_col, to_table, to_col, constraint_id).
 
         Run through postgres_query so the information_schema joins execute with real
-        Postgres semantics (not DuckDB's proxy). Any failure -> [] (fall back to inference).
+        Postgres semantics (not DuckDB's proxy). The constraint_name is the id that keeps
+        independent FKs to the same parent distinct. Any failure -> [] (fall back to inference).
         """
         query = (
-            "SELECT kcu.table_name, kcu.column_name, ccu.table_name, ccu.column_name "
+            "SELECT kcu.table_name, kcu.column_name, ccu.table_name, ccu.column_name, "
+            "  tc.constraint_name "
             "FROM information_schema.table_constraints tc "
             "JOIN information_schema.key_column_usage kcu "
             "  ON tc.constraint_name = kcu.constraint_name "
@@ -55,7 +57,7 @@ class DuckDBPostgresAdapter:
             ).fetchall()
         except Exception:
             return []
-        return [(r[0], r[1], r[2], r[3]) for r in rows]
+        return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
     def execute(self, sql: str) -> list[tuple]:
         return self._con.execute(sql).fetchall()
