@@ -70,3 +70,37 @@ def infer_relationships(adapter, catalog: list[TableInfo]) -> list[Relationship]
                     )
                 )
     return rels
+
+
+def relationships_from_foreign_keys(adapter, catalog: list[TableInfo]) -> list[Relationship]:
+    """Declared foreign keys as Relationships. The catalog is authoritative -- unlike the
+    naming inference, this captures differently-named and non-_id keys."""
+    known = {t.name for t in catalog}
+    grouped: dict[tuple[str, str], list[JoinKey]] = {}
+    for from_table, from_col, to_table, to_col in adapter.foreign_keys():
+        if from_table not in known or to_table not in known:
+            continue
+        grouped.setdefault((from_table, to_table), []).append(JoinKey(left=from_col, right=to_col))
+
+    rels: list[Relationship] = []
+    for (child, parent), keys in grouped.items():
+        cols = "+".join(k.left for k in keys)
+        rels.append(
+            Relationship(
+                id=f"{child}.{cols}->{parent}",
+                from_=child,
+                to=parent,
+                cardinality="many_to_one",  # the FK side is the "many"
+                join_keys=keys,
+            )
+        )
+    return rels
+
+
+def build_relationships(adapter, catalog: list[TableInfo]) -> list[Relationship]:
+    """Declared-first, inference-fallback, per child table. A table that declares any FK is
+    described by the catalog; inference runs only for tables the catalog is silent on."""
+    declared = relationships_from_foreign_keys(adapter, catalog)
+    covered = {r.from_ for r in declared}
+    inferred = [r for r in infer_relationships(adapter, catalog) if r.from_ not in covered]
+    return declared + inferred
