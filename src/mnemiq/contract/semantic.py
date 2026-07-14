@@ -94,6 +94,7 @@ class EvaluationCase(BaseModel):
     # the same facts is correct -- a gold string cannot express that (spec 6.9).
     gold_sql: str | None = None
     answerable: bool = True  # False: the right behaviour is to defer, not to answer
+    db_id: str | None = None  # which source this question targets; None = the single/default source
     expected_answer: str | None = None  # human-readable documentation; never graded against
     metric_id: str | None = None
     dimensions: list[str] = Field(default_factory=list)
