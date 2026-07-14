@@ -34,6 +34,16 @@ class SQLiteAdapter:
                 out.append((table, row[1], (row[2] or "unknown")))
         return out
 
+    def foreign_keys(self) -> list[tuple[str, str, str, str]]:
+        """Declared FKs from the catalog: (from_table, from_col, to_table, to_col)."""
+        out: list[tuple[str, str, str, str]] = []
+        for table in self.introspect():
+            # PRAGMA foreign_key_list: (id, seq, table(parent), from(child col), to(parent col), ...)
+            for row in self._con.execute(f'PRAGMA foreign_key_list("{table}")').fetchall():
+                parent, from_col, to_col = row[2], row[3], row[4]
+                out.append((table, from_col, parent, to_col))
+        return out
+
     def execute(self, sql: str) -> list[tuple]:
         return self._con.execute(sql).fetchall()
 
