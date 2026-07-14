@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 from mnemiq.config import Settings
@@ -15,10 +16,11 @@ from mnemiq.eval.golden import load_cases
 from mnemiq.eval.harness import run_case
 from mnemiq.eval.report import Report, summarize
 from mnemiq.llm.client import LLMClient
+from mnemiq.semantic.glossary import load_definitions
 
 
-def _run(snapshot: Snapshot, adapter, settings: Settings, label: str) -> Report:
-    ask, client = build_engine(snapshot, adapter, settings)
+def _run(snapshot: Snapshot, adapter, settings: Settings, label: str, definitions=()) -> Report:
+    ask, client = build_engine(snapshot, adapter, settings, definitions=definitions)
 
     cases = load_cases("evals/acme.json")
     results = []
@@ -42,12 +44,16 @@ def main() -> int:
     adapter = DuckDBPostgresAdapter(settings.pg_dsn)
     ab = "--ab" in sys.argv
 
+    # The glossary applies to BOTH arms: the A/B isolates enrichment, nothing else.
+    glossary_path = Path("glossary/acme.json")
+    definitions = load_definitions(str(glossary_path)) if glossary_path.exists() else []
+
     print("enriching ACME...", flush=True)
     structural = enrich_structural(adapter, "acme")
     enriched = enrich_semantic(structural, LLMEnricher(LLMClient(settings)))
 
     print("\nrunning the golden set (enrichment ON)...", flush=True)
-    on = _run(enriched, adapter, settings, "ENRICHMENT ON")
+    on = _run(enriched, adapter, settings, "ENRICHMENT ON", definitions=definitions)
 
     if not ab:
         return 0
@@ -55,7 +61,9 @@ def main() -> int:
     # The thesis on trial: the same questions, the same model, the same decider -- the only
     # difference is whether the snapshot carries meaning.
     print("\nrunning the golden set (enrichment OFF)...", flush=True)
-    off = _run(structural, adapter, settings, "ENRICHMENT OFF (structural only)")
+    off = _run(
+        structural, adapter, settings, "ENRICHMENT OFF (structural only)", definitions=definitions
+    )
 
     print("\n===== THE SEMANTIC LAYER, IN A NUMBER =====")
     print(f"  accuracy with enrichment:    {on.accuracy:.1%}")

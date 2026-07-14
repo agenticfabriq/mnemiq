@@ -101,8 +101,8 @@ def test_an_entirely_null_column_warns_on_the_card():
     )
     (card,) = build_cards(snapshot)
 
-    claimnumber_line = next(l for l in card.text.splitlines() if "claimnumber" in l)
-    loss_line = next(l for l in card.text.splitlines() if "loss_ratio" in l)
+    claimnumber_line = next(line for line in card.text.splitlines() if "claimnumber" in line)
+    loss_line = next(line for line in card.text.splitlines() if "loss_ratio" in line)
 
     assert "ENTIRELY NULL" in claimnumber_line  # the warning outranks the description
     assert "ENTIRELY NULL" not in loss_line
