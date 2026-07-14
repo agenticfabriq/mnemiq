@@ -55,6 +55,26 @@ def test_evaluation_case_carries_gold_sql_not_a_gold_string():
     assert EvaluationCase.model_validate_json(case.model_dump_json()) == case
 
 
+def test_evaluation_case_carries_a_db_id_for_routing():
+    from mnemiq.contract import EvaluationCase
+
+    case = EvaluationCase(
+        id="bird-1471",
+        question="ratio of EUR to CZK customers?",
+        gold_sql="SELECT 1",
+        db_id="debit_card_specializing",
+        tags=["simple"],
+    )
+    assert case.db_id == "debit_card_specializing"
+    assert EvaluationCase.model_validate_json(case.model_dump_json()) == case
+
+
+def test_db_id_defaults_to_none_for_single_source_evals():
+    from mnemiq.contract import EvaluationCase
+
+    assert EvaluationCase(id="x", question="q").db_id is None
+
+
 def test_a_column_carries_its_profile_counts():
     # Profiling computes these; the eval proved that dropping them at the contract
     # boundary turns an empty column into an invisible trap (COUNT(DISTINCT claimnumber)).

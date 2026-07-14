@@ -102,6 +102,19 @@ def test_extra_columns_cannot_rescue_a_missing_row():
     assert not results_match(gold, candidate)
 
 
+def test_strict_mode_rejects_an_extra_column():
+    gold = _t({"n": [820]})
+    candidate = _t({"n": [820], "extra": ["ctx"]})
+    assert results_match(gold, candidate)  # lenient default: still correct
+    assert not results_match(gold, candidate, allow_extra_columns=False)  # BIRD: wrong
+
+
+def test_strict_mode_still_ignores_row_and_column_order():
+    gold = _t({"k": ["no", "yes"], "n": [128, 692]})
+    candidate = _t({"n": [692, 128], "k": ["yes", "no"]})
+    assert results_match(gold, candidate, allow_extra_columns=False)
+
+
 def test_the_gold_may_never_have_more_columns_than_the_candidate():
     # the tolerance is one-directional: the candidate may add context, never omit facts
     gold = _t({"k": ["yes"], "n": [692]})
