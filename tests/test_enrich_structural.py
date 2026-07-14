@@ -58,3 +58,30 @@ def test_the_snapshot_carries_profile_counts(snap):
     assert claimnumber.row_count == 820
     assert claimnumber.null_count == 820
     assert claimnumber.distinct_count == 0
+
+
+def test_declared_fks_become_relationships(tmp_path):
+    import sqlite3
+
+    from mnemiq.adapters.sqlite import SQLiteAdapter
+    from mnemiq.enrichment.pipeline import enrich_structural
+
+    # `dist` is a differently-named, non-_id key -> naming inference cannot produce it,
+    # so a relationship here proves the DECLARED path populated it.
+    path = tmp_path / "shop.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE district (district_id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE client (id INTEGER PRIMARY KEY, dist INTEGER REFERENCES district(district_id));
+        INSERT INTO district VALUES (1,'NY'),(2,'LA');
+        INSERT INTO client VALUES (1,1),(2,2);
+        """
+    )
+    con.commit()
+    con.close()
+
+    snap = enrich_structural(SQLiteAdapter(str(path)), "shop")
+    rel = next(r for r in snap.relationships if r.from_ == "client")
+    assert rel.to == "district"
+    assert (rel.join_keys[0].left, rel.join_keys[0].right) == ("dist", "district_id")
