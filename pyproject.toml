@@ -10,6 +10,8 @@ dependencies = [
   "openai>=1.40",
   "pydantic>=2",
   "sqlglot>=25",
+  "pyarrow>=17",
+  "cachetools>=5",
 ]
 
 [project.optional-dependencies]
