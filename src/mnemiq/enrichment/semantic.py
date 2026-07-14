@@ -12,9 +12,12 @@ _SENSITIVE = {"pii", "phi"}
 _MEASURES = {"ratio", "amount", "count"}
 
 
-def _facts(columns: list[Column]) -> list[ColumnFacts]:
+def _facts(
+    columns: list[Column], fk_map: dict[tuple[str, str], str] | None = None
+) -> list[ColumnFacts]:
     # Only what the snapshot actually knows; absent counts stay absent -- a fabricated
     # zero would poison a closed-world prompt.
+    fk_map = fk_map or {}
     return [
         ColumnFacts(
             name=c.name,
@@ -23,6 +26,7 @@ def _facts(columns: list[Column]) -> list[ColumnFacts]:
             row_count=c.row_count,
             distinct_count=c.distinct_count,
             null_count=c.null_count,
+            foreign_key=fk_map.get((c.object_id, c.name)),
         )
         for c in columns
     ]
@@ -63,11 +67,17 @@ def enrich_semantic(snapshot: Snapshot, enricher: Enricher) -> Snapshot:
     for column in snapshot.columns:
         by_table.setdefault(column.object_id, []).append(column)
 
+    # (from_table, from_col) -> "to_table.to_col", so the enricher describes FK columns right
+    fk_map: dict[tuple[str, str], str] = {}
+    for rel in snapshot.relationships:
+        for jk in rel.join_keys:
+            fk_map[(rel.from_, jk.left)] = f"{rel.to}.{jk.right}"
+
     annotated: dict[str, Column] = {}
     jobs: list[Job] = []
     for table, columns in by_table.items():
         try:
-            annotation = enricher.annotate(table, _facts(columns))
+            annotation = enricher.annotate(table, _facts(columns, fk_map))
         except Exception:
             annotation = None  # fail-soft: a rate-limit costs us a table, not the run
 
