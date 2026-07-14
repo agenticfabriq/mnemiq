@@ -79,3 +79,31 @@ def test_a_null_matches_a_null():
     nulls = pa.table({"n": pa.array([None], type=pa.int64())})
     assert results_match(nulls, nulls)
     assert not results_match(nulls, _t({"n": [0]}))  # NULL is not zero
+
+
+def test_an_extra_context_column_does_not_make_a_right_answer_wrong():
+    # "which policy is earliest?" answered with the policy number AND its date is not an
+    # error -- the fact asked for is there. Found live: three of four eval "failures" were
+    # right answers carrying one extra column.
+    gold = _t({"policy_number": ["31003000336"]})
+    candidate = _t({"policy_number": ["31003000336"], "effective_date": ["2015-01-01"]})
+    assert results_match(gold, candidate)
+
+
+def test_extra_columns_cannot_rescue_wrong_rows():
+    gold = _t({"n": [820]})
+    candidate = _t({"n": [819], "extra": ["context"]})
+    assert not results_match(gold, candidate)
+
+
+def test_extra_columns_cannot_rescue_a_missing_row():
+    gold = _t({"d": ["2019-01-15", "2019-06-02"]})
+    candidate = _t({"id": [1], "d": ["2019-01-15"]})
+    assert not results_match(gold, candidate)
+
+
+def test_the_gold_may_never_have_more_columns_than_the_candidate():
+    # the tolerance is one-directional: the candidate may add context, never omit facts
+    gold = _t({"k": ["yes"], "n": [692]})
+    candidate = _t({"n": [692]})
+    assert not results_match(gold, candidate)
