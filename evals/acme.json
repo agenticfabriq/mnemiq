@@ -12,7 +12,7 @@
   {"id": "claim-count", "question": "how many claims are there in total?", "gold_sql": "SELECT count(*) AS n FROM claim", "tags": ["aggregate", "single-table"]},
   {"id": "claim-amount-total", "question": "what is the total of all claim amounts?", "gold_sql": "SELECT sum(claim_amount) AS total FROM claim_amount", "tags": ["aggregate", "money"]},
   {"id": "policy-amount-total", "question": "what is the total of all policy amounts?", "gold_sql": "SELECT sum(policy_amount) AS total FROM policy_amount", "tags": ["aggregate", "money"]},
-  {"id": "claims-per-catastrophe", "question": "how many claims are linked to each catastrophe?", "gold_sql": "SELECT catastrophe_identifier, count(*) AS n FROM claim GROUP BY catastrophe_identifier", "tags": ["group-by"]},
+  {"id": "claims-per-catastrophe", "question": "how many claims are linked to each catastrophe, including catastrophes with no claims?", "gold_sql": "SELECT c.catastrophe_identifier, count(cl.claim_identifier) AS n FROM catastrophe c LEFT JOIN claim cl ON cl.catastrophe_identifier = c.catastrophe_identifier GROUP BY c.catastrophe_identifier", "tags": ["group-by", "join"]},
   {"id": "catastrophe-names", "question": "what are the names of the catastrophes?", "gold_sql": "SELECT catastrophe_name FROM catastrophe", "tags": ["projection"]},
   {"id": "policy-count", "question": "how many policies are there?", "gold_sql": "SELECT count(*) AS n FROM policy", "tags": ["aggregate", "single-table"]},
   {"id": "policy-earliest", "question": "which policy number has the earliest effective date?", "gold_sql": "SELECT policy_number FROM policy ORDER BY effective_date LIMIT 1", "tags": ["order-by", "limit"]},
