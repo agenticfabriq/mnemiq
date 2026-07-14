@@ -63,6 +63,32 @@ def test_the_database_is_read_only(db):
         SQLiteAdapter(db).execute("CREATE TABLE evil (x INT)")
 
 
+def test_foreign_keys_reads_declared_constraints(tmp_path):
+    path = tmp_path / "fk.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE child (
+            id INTEGER PRIMARY KEY,
+            pid INTEGER REFERENCES parent(id),
+            note TEXT
+        );
+        """
+    )
+    con.commit()
+    con.close()
+
+    fks = SQLiteAdapter(str(path)).foreign_keys()
+    # (from_table, from_col, to_table, to_col, constraint_id)
+    assert any(fk[:4] == ("child", "pid", "parent", "id") for fk in fks)
+
+
+def test_foreign_keys_empty_when_none_declared(db):
+    # the `db` fixture (customer/order) declares no FKs
+    assert SQLiteAdapter(db).foreign_keys() == []
+
+
 def test_a_runaway_query_is_interrupted(db):
     # a recursive CTE that never stops; the interrupt must end it
     runaway = "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r) SELECT count(*) FROM r"

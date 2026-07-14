@@ -35,6 +35,12 @@ def main() -> int:
         help="checkpoint file; a re-run resumes from it. Delete it to start fresh.",
     )
     p.add_argument("--refresh", action="store_true")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="concurrent questions per database (LLM-latency-bound; try 4-8). Lower if rate-limited.",
+    )
     args = p.parse_args()
 
     settings = Settings.from_env()
@@ -64,6 +70,7 @@ def main() -> int:
         cache_dir=args.cache,
         on_case=progress,
         results_path=args.results,
+        workers=args.workers,
     )
     report = summarize(results, tokens=use["tokens"], llm_calls=use["llm_calls"])
 

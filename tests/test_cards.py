@@ -144,3 +144,18 @@ def test_an_unprofiled_column_does_not_false_alarm():
     )
     (card,) = build_cards(snapshot)
     assert "ENTIRELY NULL" not in card.text
+
+
+def test_a_relationship_with_differing_keys_renders_both_columns():
+    snapshot = Snapshot(
+        version="v1", source_id="s", created_at="2026-07-14T00:00:00Z",
+        source_bindings=[SourceBinding(
+            id="sb:child", source_id="s", object_id="child",
+            source_object="child", binding_type="table")],
+        columns=[Column(id="child.pid", object_id="child", name="pid", data_type="integer")],
+        relationships=[Relationship.model_validate(
+            {"id": "child.pid->parent", "from": "child", "to": "parent",
+             "cardinality": "many_to_one", "join_keys": [{"left": "pid", "right": "id"}]})],
+    )
+    (card,) = build_cards(snapshot)
+    assert "joins parent (many_to_one: pid = id)" in card.text

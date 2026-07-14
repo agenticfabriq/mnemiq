@@ -39,6 +39,7 @@ class ColumnFacts:
     row_count: int | None = None
     distinct_count: int | None = None
     null_count: int | None = None
+    foreign_key: str | None = None  # "to_table.to_column" when this column is a declared FK
 
 
 def render_table_facts(table: str, columns: list[ColumnFacts]) -> str:
@@ -54,6 +55,8 @@ def render_table_facts(table: str, columns: list[ColumnFacts]) -> str:
             stats.append(f"nulls={c.null_count}")
 
         line = f"- {sanitize(c.name)} ({', '.join(stats)})"
+        if c.foreign_key:
+            line += f" FK -> {sanitize(c.foreign_key)}"
         if c.codes:
             observed = ", ".join(sanitize(v, limit=40) for v in c.codes)
             line += f" observed values: [{observed}]"
