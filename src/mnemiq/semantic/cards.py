@@ -43,6 +43,17 @@ def build_cards(snapshot: Snapshot) -> list[SchemaCard]:
             line = "".join(parts)
             if column.description:
                 line += f" {column.description}"
+            if (
+                column.row_count is not None
+                and column.row_count > 0
+                and column.null_count == column.row_count
+            ):
+                # The Plan 08 eval's dominant failure: a confident description of an empty
+                # column reads as an invitation to use it. Outrank the description.
+                line += (
+                    " ENTIRELY NULL in this source: every value is missing;"
+                    " do not count, filter, join or aggregate on this column."
+                )
             if column.coded_values:
                 codes = "; ".join(
                     f"{cv.code} = {cv.meaning}" if cv.meaning else cv.code
