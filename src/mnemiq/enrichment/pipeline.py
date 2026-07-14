@@ -42,9 +42,21 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
     source_bindings: list[SourceBinding] = []
     jobs: list[Job] = []
 
+    # Declared-FK child columns are keys, not coded vocabularies -- even when their names
+    # (CDSCode, ID) don't match the naming gate. Fail-soft: no catalog FKs -> the gate stands.
+    fk_children: dict[str, set[str]] = {}
+    try:
+        for from_table, from_col, _to_table, _to_col in adapter.foreign_keys():
+            fk_children.setdefault(from_table, set()).add(from_col)
+    except Exception:
+        fk_children = {}
+
     for table in catalog:
         try:
-            stats = {s.column: s for s in profile_table(adapter, table)}
+            stats = {
+                s.column: s
+                for s in profile_table(adapter, table, key_columns=fk_children.get(table.name))
+            }
             table_columns = [
                 Column(
                     id=f"{table.name}.{col.name}",

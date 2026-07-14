@@ -72,3 +72,33 @@ def test_profile_table_skips_keys_and_nulls():
 
     # a real coded column still gets harvested, and NULLs are not among its codes
     assert stats["amount_type_code"].top_k == [("Year", 6)]
+
+
+def test_declared_fk_column_is_not_harvested_as_a_vocabulary(tmp_path):
+    import sqlite3
+
+    from mnemiq.adapters.sqlite import SQLiteAdapter
+    from mnemiq.catalog import introspect
+    from mnemiq.enrichment.profiling import profile_table
+
+    path = tmp_path / "p.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE region (code TEXT PRIMARY KEY, name TEXT);
+        CREATE TABLE sale (id INTEGER PRIMARY KEY, rc TEXT);
+        INSERT INTO region VALUES ('N','North'),('S','South');
+        INSERT INTO sale VALUES (1,'N'),(2,'S'),(3,'N');
+        """
+    )
+    con.commit()
+    con.close()
+    adapter = SQLiteAdapter(str(path))
+    sale = next(t for t in introspect(adapter) if t.name == "sale")
+
+    # rc has 2 distinct values in 3 rows -> looks like a vocabulary by name alone
+    without = {s.column: s for s in profile_table(adapter, sale)}
+    assert without["rc"].top_k  # harvested when we don't know it's a key
+
+    with_key = {s.column: s for s in profile_table(adapter, sale, key_columns={"rc"})}
+    assert with_key["rc"].top_k == []  # a declared FK column is a key, not a vocabulary
