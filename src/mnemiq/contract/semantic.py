@@ -22,6 +22,11 @@ class Column(BaseModel):
     description: str | None = None
     pii_level: str | None = None
     coded_values: list[CodedValue] = Field(default_factory=list)
+    # Profile counts. None means "profiling did not run", never zero -- a fabricated
+    # zero would make every unprofiled column look empty.
+    row_count: int | None = None
+    distinct_count: int | None = None
+    null_count: int | None = None
 
 
 class Dimension(BaseModel):
