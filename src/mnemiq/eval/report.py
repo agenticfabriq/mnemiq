@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from mnemiq.eval.harness import CaseResult, Outcome
@@ -60,3 +61,13 @@ def summarize(results: list[CaseResult], tokens: int = 0, llm_calls: int = 0) ->
         attr = counters[result.outcome]
         setattr(report, attr, getattr(report, attr) + 1)
     return report
+
+
+def slice_by(results: list[CaseResult], key: Callable[[CaseResult], str | None]) -> dict[str, Report]:
+    """Sub-reports grouped by a key (database, difficulty). None keys are dropped."""
+    groups: dict[str, list[CaseResult]] = {}
+    for r in results:
+        k = key(r)
+        if k is not None:
+            groups.setdefault(k, []).append(r)
+    return {k: summarize(v) for k, v in sorted(groups.items())}

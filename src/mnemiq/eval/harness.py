@@ -36,6 +36,8 @@ class CaseResult:
     engine_rows: list[dict] | None = field(default=None)
     gold_row_count: int | None = None
     engine_row_count: int | None = None
+    db_id: str | None = None
+    difficulty: str | None = None
     proposed: bool = False
     approved: bool = False
     executed: bool = False
@@ -56,8 +58,16 @@ def run_case(
     case: EvaluationCase, engine: Engine, adapter, allow_extra_columns: bool = True
 ) -> CaseResult:
     """Ask the engine, then check its answer against the gold query's result set."""
-    result = CaseResult(case_id=case.id, outcome=Outcome.ERROR, question=case.question,
-                        gold_sql=case.gold_sql or "")
+    result = CaseResult(
+        case_id=case.id,
+        outcome=Outcome.ERROR,
+        question=case.question,
+        gold_sql=case.gold_sql or "",
+        db_id=case.db_id,
+        difficulty=next(
+            (t for t in case.tags if t in {"simple", "moderate", "challenging"}), None
+        ),
+    )
     started = time.perf_counter()
 
     try:
