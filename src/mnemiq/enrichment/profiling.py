@@ -46,11 +46,13 @@ def profile_table(
     table: TableInfo,
     k: int = 10,
     code_max_distinct: int = 25,
+    key_columns: set[str] | None = None,
 ) -> list[ColumnStats]:
     """One counts query for the whole table; top-k only where it is cheap and useful."""
     cols = [c.name for c in table.columns]
     if not cols:
         return []
+    keys = key_columns or set()
 
     selects = ["count(*)"]
     for c in cols:
@@ -71,9 +73,11 @@ def profile_table(
         # A small observed value set is a candidate coded vocabulary; the semantic pass gives
         # the codes meaning. Two kinds of column are excluded before we ever read a value:
         #   - keys: low distinct-count on a foreign key is an artifact of sample size
+        #     (by name suffix, or declared in the catalog -- key_columns)
         #   - sensitive: harvesting a name column would copy real people into the snapshot
         if (
             not is_key_like(c)
+            and c not in keys
             and not is_sensitive_name(c)
             and 0 < distinct_count <= code_max_distinct
             and distinct_count < row_count
