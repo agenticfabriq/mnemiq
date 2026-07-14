@@ -92,3 +92,58 @@ def test_cross_type_join_keys_compare_as_text():
     ]
     rels = infer_relationships(_DuckAdapter(con), catalog)
     assert any(r.from_ == "child" and r.to == "parent" for r in rels)
+
+
+# --- Plan 11: declared foreign keys ---------------------------------------------------
+import sqlite3  # noqa: E402
+
+from mnemiq.adapters.sqlite import SQLiteAdapter  # noqa: E402
+from mnemiq.catalog import introspect  # noqa: E402
+from mnemiq.enrichment.joins import build_relationships, relationships_from_foreign_keys  # noqa: E402
+
+
+def _fk_src(tmp_path):
+    # parent<-child by DECLARED fk (differently-named key);
+    # widget.gadget_identifier names table `gadget` by CONVENTION but declares no fk
+    path = tmp_path / "j.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(
+        """
+        CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent(id));
+        CREATE TABLE gadget (gadget_identifier INTEGER PRIMARY KEY, label TEXT);
+        CREATE TABLE widget (id INTEGER PRIMARY KEY, gadget_identifier INTEGER);
+        INSERT INTO parent VALUES (1,'a'),(2,'b');
+        INSERT INTO child VALUES (10,1),(11,2);
+        INSERT INTO gadget VALUES (100,'x'),(101,'y');
+        INSERT INTO widget VALUES (1,100),(2,101);
+        """
+    )
+    con.commit()
+    con.close()
+    return SQLiteAdapter(str(path))
+
+
+def test_from_foreign_keys_builds_relationship_with_differing_keys(tmp_path):
+    adapter = _fk_src(tmp_path)
+    rels = relationships_from_foreign_keys(adapter, introspect(adapter))
+
+    child_rel = next(r for r in rels if r.from_ == "child")
+    assert child_rel.to == "parent"
+    assert child_rel.cardinality == "many_to_one"
+    assert (child_rel.join_keys[0].left, child_rel.join_keys[0].right) == ("pid", "id")
+
+
+def test_build_relationships_is_declared_first_with_inference_fallback(tmp_path):
+    adapter = _fk_src(tmp_path)
+    rels = build_relationships(adapter, introspect(adapter))
+    by_from = {r.from_: r for r in rels}
+
+    assert by_from["child"].to == "parent"  # declared
+    assert by_from["widget"].to == "gadget"  # inferred fallback (no declared fk)
+
+
+def test_declared_fk_table_is_not_also_inferred(tmp_path):
+    adapter = _fk_src(tmp_path)
+    rels = build_relationships(adapter, introspect(adapter))
+    assert sum(1 for r in rels if r.from_ == "child") == 1
