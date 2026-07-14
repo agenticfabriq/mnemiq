@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import threading
+
 import duckdb
+import pyarrow as pa
 
 
 class DuckDBPostgresAdapter:
@@ -30,3 +33,19 @@ class DuckDBPostgresAdapter:
 
     def execute(self, sql: str) -> list[tuple]:
         return self._con.execute(sql).fetchall()
+
+    def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
+        """Run a query and return Arrow, cancelling it if it overruns.
+
+        A LIMIT bounds the rows that come back. It does not bound a query that never
+        produces a first row -- only an interrupt does that.
+        """
+        timer = None
+        if timeout_s is not None:
+            timer = threading.Timer(timeout_s, self._con.interrupt)
+            timer.start()
+        try:
+            return self._con.execute(sql).to_arrow_table()
+        finally:
+            if timer is not None:
+                timer.cancel()

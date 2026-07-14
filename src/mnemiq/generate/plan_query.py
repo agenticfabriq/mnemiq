@@ -28,18 +28,21 @@ def plan_query(
     max_attempts: int = 3,
     dialect: str = "duckdb",
     target: str = "postgres",
+    feedback: str | None = None,
 ) -> Outcome:
     """Propose, decide, repair -- and defer rather than guess.
 
     The model proposes; `decide` has the final say. A refusal it can act on comes back as
     feedback. An unauthorized reference does not: retrying it would be inviting the model to
     find another route to data this identity may not have.
+
+    `feedback` seeds the loop -- the agent uses it to hand back what the *database* said, a
+    thing no amount of static analysis could have known.
     """
     visible = visible_schema(snapshot, grants)
     if not packet.cards or not visible:
         return Deferred(reason="No tables are available to answer this question with your access.")
 
-    feedback: str | None = None
     last: Refusal | None = None
 
     for _attempt in range(max_attempts):
