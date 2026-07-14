@@ -39,3 +39,28 @@ def test_relationship_from_alias_round_trips():
 def test_snapshot_aggregates_and_defaults():
     s = Snapshot(version="v1", source_id="acme", created_at="2026-07-12T00:00:00Z")
     assert s.metrics == [] and s.columns == [] and s.relationships == []
+
+
+def test_evaluation_case_carries_gold_sql_not_a_gold_string():
+    from mnemiq.contract import EvaluationCase
+
+    case = EvaluationCase(
+        id="fire-count",
+        question="how many fire claims are there?",
+        gold_sql="SELECT count(*) AS n FROM fireclaim",
+        tags=["aggregate"],
+    )
+    assert case.answerable is True  # the default
+    assert case.expected_answer is None  # documentation only; nothing grades on it
+    assert EvaluationCase.model_validate_json(case.model_dump_json()) == case
+
+
+def test_an_unanswerable_case_has_no_gold_sql():
+    from mnemiq.contract import EvaluationCase
+
+    case = EvaluationCase(
+        id="no-salary",
+        question="what is the average salary of our employees?",
+        answerable=False,
+    )
+    assert case.gold_sql is None  # there is no right query, only a right refusal

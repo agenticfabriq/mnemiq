@@ -85,9 +85,14 @@ class CompatibilityProfile(BaseModel):
 class EvaluationCase(BaseModel):
     id: str
     question: str
-    expected_answer: str
+    # Ground truth is a QUERY, not a string. Result-based grading means any query returning
+    # the same facts is correct -- a gold string cannot express that (spec 6.9).
+    gold_sql: str | None = None
+    answerable: bool = True  # False: the right behaviour is to defer, not to answer
+    expected_answer: str | None = None  # human-readable documentation; never graded against
     metric_id: str | None = None
     dimensions: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
 
 
 class Skill(BaseModel):

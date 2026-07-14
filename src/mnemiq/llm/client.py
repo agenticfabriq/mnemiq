@@ -20,6 +20,14 @@ class LLMClient:
             raise RuntimeError("LLM base_url/api_key not configured (set MNEMIQ_LLM_* env)")
         self._model = settings.llm_model
         self._client = OpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key)
+        # A change that buys 1% accuracy for 3x the tokens is a trade to make on purpose.
+        self.calls = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
 
     def complete(self, system: str, user: str, max_tokens: int = 512) -> str:
         kwargs = {token_param_name(self._model): max_tokens}
@@ -31,4 +39,9 @@ class LLMClient:
             ],
             **kwargs,
         )
+        self.calls += 1
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
+            self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
         return resp.choices[0].message.content or ""
