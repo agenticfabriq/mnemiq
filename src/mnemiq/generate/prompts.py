@@ -34,7 +34,14 @@ Return ONLY a JSON object, no prose and no code fences:
 
 def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
     cards = "\n\n".join(c.card for c in packet.cards) or "(no tables are available to you)"
-    parts = [f"QUESTION: {sanitize(packet.question, limit=500)}", "", "TABLES:", cards]
+    parts = [f"QUESTION: {sanitize(packet.question, limit=500)}"]
+    if packet.definitions:
+        parts += ["", "DEFINITIONS (authoritative business meanings -- follow them exactly):"]
+        parts += [
+            f"- {sanitize(d.term, limit=80)}: {sanitize(d.definition, limit=600)}"
+            for d in packet.definitions
+        ]
+    parts += ["", "TABLES:", cards]
     if feedback:
         parts += [
             "",
