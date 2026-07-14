@@ -34,6 +34,21 @@ class SQLiteAdapter:
                 out.append((table, row[1], (row[2] or "unknown")))
         return out
 
+    def foreign_keys(self) -> list[tuple[str, str, str, str, str]]:
+        """Declared FKs: (from_table, from_col, to_table, to_col, constraint_id).
+
+        The constraint_id groups a composite FK's columns and, crucially, keeps independent
+        FKs to the same parent (eye/hair/skin -> colour) as distinct constraints.
+        """
+        out: list[tuple[str, str, str, str, str]] = []
+        for table in self.introspect():
+            # PRAGMA foreign_key_list: (id, seq, table(parent), from(child col), to(parent col), ...)
+            # `id` is per-constraint (shared by a composite's columns).
+            for row in self._con.execute(f'PRAGMA foreign_key_list("{table}")').fetchall():
+                fk_id, parent, from_col, to_col = row[0], row[2], row[3], row[4]
+                out.append((table, from_col, parent, to_col, f"{table}:{fk_id}"))
+        return out
+
     def execute(self, sql: str) -> list[tuple]:
         return self._con.execute(sql).fetchall()
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 
 from mnemiq.adapters.sqlite import SQLiteAdapter
@@ -106,6 +108,41 @@ def _run_grouped(
     return results
 
 
+def _process_db(cases, build_engine_fn, max_rows_cap: int, workers: int):
+    """Run one database's cases, optionally across worker threads.
+
+    Thread safety: each worker builds its OWN engine on first use (thread-local) -- its own
+    DuckDB store connection, its own SQLite adapter, its own LLM client -- so no non-thread-safe
+    connection is ever shared. The OpenAI HTTP client is concurrency-safe. Results are
+    consumed single-threaded by the caller (ThreadPoolExecutor.map preserves order), so the
+    checkpoint append needs no lock. Returns (list of (kind, payload), per-worker clients).
+    """
+    local = threading.local()
+    clients: list = []
+    clients_lock = threading.Lock()
+
+    def engine():
+        if not hasattr(local, "e"):
+            ask, adapter, client = build_engine_fn()
+            local.e = (ask, adapter)
+            with clients_lock:
+                clients.append(client)
+        return local.e
+
+    def work(case):
+        ask, adapter = engine()
+        if _gold_too_big(adapter, case.gold_sql, max_rows_cap):
+            return ("excluded", case.id)
+        return ("result", run_case(case, ask, adapter, allow_extra_columns=False))
+
+    if workers <= 1:
+        out = [work(case) for case in cases]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            out = list(pool.map(work, cases))
+    return out, clients
+
+
 def _gold_too_big(adapter, gold_sql: str, cap: int) -> bool:
     probe = f"SELECT count(*) FROM (SELECT 1 FROM ({gold_sql}) LIMIT {cap + 1})"
     try:
@@ -123,6 +160,7 @@ def run_bird(
     max_rows_cap: int = 1000,
     on_case: Callable[[int, int, CaseResult], None] | None = None,
     results_path: str | None = None,
+    workers: int = 1,
 ) -> tuple[list[CaseResult], dict]:
     """Run BIRD cases grouped by database. Resumable: with results_path, each result is
     checkpointed as it completes and a re-run skips everything already answered -- a long
@@ -144,25 +182,29 @@ def run_bird(
             continue  # whole DB already done in a prior segment -- no enrichment, no client
 
         snapshot = enrich_bird_db(minidev_dir, db_id, settings, cache_dir=cache_dir)
-        adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
-        ask, client = build_engine(snapshot, adapter, settings)
 
-        for case in remaining:
+        def _build():  # each worker builds its own isolated engine (thread-safe connections)
+            adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
+            ask, client = build_engine(snapshot, adapter, settings)
+            return ask, adapter, client
+
+        out, clients = _process_db(remaining, _build, max_rows_cap, workers)
+
+        # collection is single-threaded here -> checkpoint append needs no lock
+        for kind, payload in out:
             processed += 1
-            if _gold_too_big(adapter, case.gold_sql, max_rows_cap):
-                # the guard caps the candidate at max_rows_cap; a larger gold would force a
-                # false WRONG. Exclude and log -- never silently mark it failed.
-                excluded.append(case.id)
+            if kind == "excluded":
+                excluded.append(payload)
                 continue
-            result = run_case(case, ask, adapter, allow_extra_columns=False)
-            results.append(result)
+            results.append(payload)
             if results_path is not None:
-                _append_result(results_path, result)
+                _append_result(results_path, payload)
             if on_case is not None:
-                on_case(processed, len(cases), result)
+                on_case(processed, len(cases), payload)
 
-        tokens += client.total_tokens
-        calls += client.calls
+        for client in clients:
+            tokens += client.total_tokens
+            calls += client.calls
         if results_path is not None:
             _save_meta(results_path, tokens, calls, excluded)
 

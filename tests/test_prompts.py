@@ -67,3 +67,16 @@ def test_closed_world_governs_facts_but_not_interpretation():
     assert "INTERPRETATION" in system
     assert "not speculation" in system
     assert "restate the statistics" in system  # descriptions must add meaning, not echo input
+
+
+def test_a_foreign_key_column_is_rendered_in_the_facts():
+    from mnemiq.enrichment.prompts import ColumnFacts, render_table_facts
+
+    facts = [
+        ColumnFacts(name="district_id", data_type="integer", foreign_key="district.district_id"),
+        ColumnFacts(name="name", data_type="text"),
+    ]
+    text = render_table_facts("client", facts)
+    assert "FK -> district.district_id" in text
+    name_line = next(line for line in text.splitlines() if line.startswith("- name "))
+    assert "FK" not in name_line

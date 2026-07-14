@@ -70,3 +70,45 @@ def infer_relationships(adapter, catalog: list[TableInfo]) -> list[Relationship]
                     )
                 )
     return rels
+
+
+def relationships_from_foreign_keys(adapter, catalog: list[TableInfo]) -> list[Relationship]:
+    """Declared foreign keys as Relationships. The catalog is authoritative -- unlike the
+    naming inference, this captures differently-named and non-_id keys."""
+    known = {t.name for t in catalog}
+    # Group by constraint, not by (child, parent): a composite FK's columns share a
+    # constraint id, while independent FKs to the same parent do not -- so eye/hair/skin
+    # -> colour stay three relationships, not one bogus composite.
+    grouped: dict[str, tuple[str, str, list[JoinKey]]] = {}
+    order: list[str] = []
+    for from_table, from_col, to_table, to_col, cid in adapter.foreign_keys():
+        if from_table not in known or to_table not in known:
+            continue
+        if cid not in grouped:
+            grouped[cid] = (from_table, to_table, [])
+            order.append(cid)
+        grouped[cid][2].append(JoinKey(left=from_col, right=to_col))
+
+    rels: list[Relationship] = []
+    for cid in order:
+        child, parent, keys = grouped[cid]
+        cols = "+".join(k.left for k in keys)
+        rels.append(
+            Relationship(
+                id=f"{child}.{cols}->{parent}",
+                from_=child,
+                to=parent,
+                cardinality="many_to_one",  # the FK side is the "many"
+                join_keys=keys,
+            )
+        )
+    return rels
+
+
+def build_relationships(adapter, catalog: list[TableInfo]) -> list[Relationship]:
+    """Declared-first, inference-fallback, per child table. A table that declares any FK is
+    described by the catalog; inference runs only for tables the catalog is silent on."""
+    declared = relationships_from_foreign_keys(adapter, catalog)
+    covered = {r.from_ for r in declared}
+    inferred = [r for r in infer_relationships(adapter, catalog) if r.from_ not in covered]
+    return declared + inferred
