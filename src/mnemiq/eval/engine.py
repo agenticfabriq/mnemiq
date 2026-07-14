@@ -1,0 +1,66 @@
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from mnemiq.agent.budget import Budget
+from mnemiq.agent.loop import Agent, AgentAnswer
+from mnemiq.agent.synthesize import LLMSynthesizer
+from mnemiq.authz.grants import GrantSet
+from mnemiq.cache.store import L1Cache, TwoTierCache
+from mnemiq.config import Settings
+from mnemiq.contract import IdentityContext, Snapshot
+from mnemiq.generate.generator import LLMGenerator
+from mnemiq.llm.client import LLMClient
+from mnemiq.llm.embeddings import LLMEmbedder
+from mnemiq.semantic.retrieval import retrieve
+from mnemiq.semantic.store import build_index
+from mnemiq.store.bootstrap import init_store
+
+IDENTITY = IdentityContext(tenant_id="local", principal_id="eval", roles=["analyst"])
+
+Engine = Callable[[str], AgentAnswer]
+
+
+class _GrantAll:
+    """The eval grants every indexed table. Authorization has its own tests; what is on
+    trial here is whether the engine can answer what it IS allowed to see."""
+
+    def __init__(self, grants: GrantSet) -> None:
+        self._grants = grants
+
+    def grants_for(self, _identity: IdentityContext) -> GrantSet:
+        return self._grants
+
+
+def build_engine(
+    snapshot: Snapshot, adapter, settings: Settings, store_path: str = ":memory:"
+) -> tuple[Engine, LLMClient]:
+    """Retrieval + agent over one snapshot, assembled exactly once.
+
+    The script and the live test must measure the SAME engine; assembling it twice, two
+    subtly different ways, is how an eval drifts away from the thing it claims to measure.
+    Returns the ask function and the client whose token counter it shares, so the caller
+    can report what the run cost.
+    """
+    embedder = LLMEmbedder(settings)
+    con = init_store(store_path)
+    build_index(con, snapshot, embedder)
+
+    tables = [r[0] for r in con.execute("SELECT object_id FROM semantic_object").fetchall()]
+    grants = GrantSet(frozenset(tables))
+    authz = _GrantAll(grants)
+
+    client = LLMClient(settings)  # one client, so the token count is the run's true cost
+    agent = Agent(
+        generator=LLMGenerator(client),
+        synthesizer=LLMSynthesizer(client),
+        adapter=adapter,
+        cache=TwoTierCache(L1Cache()),
+        budget=Budget(wall_clock_s=120.0),
+    )
+
+    def ask(question: str) -> AgentAnswer:
+        packet = retrieve(con, question, IDENTITY, authz, embedder, k=6)
+        return agent.answer(packet, snapshot, grants, IDENTITY)
+
+    return ask, client
