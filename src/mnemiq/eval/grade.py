@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from datetime import date, datetime
 from decimal import Decimal
+from itertools import combinations
 
 import pyarrow as pa
 
@@ -63,16 +64,24 @@ def results_match(gold: pa.Table, candidate: pa.Table, rel_tol: float = 1e-2) ->
     formatting. A different query that returns the right answer is correct -- that is the
     whole point of result-based grading (spec 6.9). What must match is the data.
     """
-    if gold.num_columns != candidate.num_columns:
+    # One-directional column tolerance: the candidate may ADD context columns (the date
+    # next to the policy number it was asked for) but may never omit a gold column. Extra
+    # columns cannot rescue wrong rows -- every gold row must still find its match.
+    if gold.num_columns > candidate.num_columns:
         return False
 
-    gold_rows, candidate_rows = _rows(gold), _rows(candidate)
-    if _match_rows(gold_rows, candidate_rows, rel_tol):
-        return True
+    gold_rows = _rows(gold)
+    for keep in combinations(range(candidate.num_columns), gold.num_columns):
+        projected = candidate.select(list(keep))
+        candidate_rows = _rows(projected)
+        if _match_rows(gold_rows, candidate_rows, rel_tol):
+            return True
 
-    # Column order is not meaning: `SELECT k, count(*)` and `SELECT count(*), k` are the same
-    # answer. Retry with each row's values sorted into a canonical order.
-    def sort_cells(rows: list[list[object]]) -> list[list[object]]:
-        return [sorted(row, key=repr) for row in rows]
+        # Column order is not meaning: `SELECT k, count(*)` and `SELECT count(*), k` are
+        # the same answer. Retry with each row's values sorted into a canonical order.
+        def sort_cells(rows: list[list[object]]) -> list[list[object]]:
+            return [sorted(row, key=repr) for row in rows]
 
-    return _match_rows(sort_cells(gold_rows), sort_cells(candidate_rows), rel_tol)
+        if _match_rows(sort_cells(gold_rows), sort_cells(candidate_rows), rel_tol):
+            return True
+    return False
