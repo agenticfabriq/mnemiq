@@ -29,6 +29,11 @@ def main() -> int:
     p.add_argument("--no-evidence", action="store_true")
     p.add_argument("--cache", default="eval-reports/bird-cache")
     p.add_argument("--report")
+    p.add_argument(
+        "--results",
+        default="eval-reports/bird-results.jsonl",
+        help="checkpoint file; a re-run resumes from it. Delete it to start fresh.",
+    )
     p.add_argument("--refresh", action="store_true")
     args = p.parse_args()
 
@@ -52,7 +57,14 @@ def main() -> int:
     def progress(done, total, result):
         print(f"  [{done:3}/{total}] {result.outcome:20} {result.case_id}", flush=True)
 
-    results, use = run_bird(cases, args.minidev, settings, cache_dir=args.cache, on_case=progress)
+    results, use = run_bird(
+        cases,
+        args.minidev,
+        settings,
+        cache_dir=args.cache,
+        on_case=progress,
+        results_path=args.results,
+    )
     report = summarize(results, tokens=use["tokens"], llm_calls=use["llm_calls"])
 
     print("\n===== BIRD mini-dev =====")

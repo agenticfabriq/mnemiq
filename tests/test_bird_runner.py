@@ -97,6 +97,27 @@ def test_enrich_cache_is_model_aware(tmp_path):
     assert len(files) == 2  # two models -> two distinct cache entries
 
 
+def test_results_checkpoint_round_trips(tmp_path):
+    from mnemiq.eval.bird_runner import _append_result, _load_done
+
+    path = str(tmp_path / "results.jsonl")
+    r1 = CaseResult(case_id="bird-1", outcome=Outcome.CORRECT, db_id="shop", difficulty="simple")
+    r2 = CaseResult(case_id="bird-2", outcome=Outcome.WRONG, db_id="shop", difficulty="moderate")
+    _append_result(path, r1)
+    _append_result(path, r2)
+
+    done = _load_done(path)
+    assert set(done) == {"bird-1", "bird-2"}
+    assert done["bird-1"].outcome is Outcome.CORRECT  # reconstructed as the enum, not a string
+    assert done["bird-2"].db_id == "shop"
+
+
+def test_load_done_is_empty_when_no_checkpoint(tmp_path):
+    from mnemiq.eval.bird_runner import _load_done
+
+    assert _load_done(str(tmp_path / "missing.jsonl")) == {}
+
+
 def test_run_case_populates_db_id_and_difficulty():
     # the slices need these on the result; run_case reads them off the case
     from mnemiq.eval.harness import run_case
