@@ -15,4 +15,4 @@ def test_foreign_keys_runs_and_returns_a_list():
     # ACME's DDL did not survive seeding -> no declared FKs; the empty path is the
     # regression-safety case (enrichment falls back to data inference).
     for fk in fks:
-        assert len(fk) == 4 and all(isinstance(x, str) for x in fk)
+        assert len(fk) == 5 and all(isinstance(x, str) for x in fk)
