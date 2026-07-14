@@ -57,21 +57,35 @@ def _match_rows(gold: list[list], candidate: list[list], rel_tol: float) -> bool
     return True
 
 
-def results_match(gold: pa.Table, candidate: pa.Table, rel_tol: float = 1e-2) -> bool:
+def results_match(
+    gold: pa.Table,
+    candidate: pa.Table,
+    rel_tol: float = 1e-2,
+    allow_extra_columns: bool = True,
+) -> bool:
     """Do these two result sets state the same facts?
 
     Not: are they the same query, the same column names, the same row order, or the same
     formatting. A different query that returns the right answer is correct -- that is the
     whole point of result-based grading (spec 6.9). What must match is the data.
+
+    With allow_extra_columns=False the candidate must have exactly the gold's columns
+    (BIRD execution accuracy); by default it may carry extra context columns (ACME's
+    conversational questions -- the date next to the policy number it was asked for).
     """
-    # One-directional column tolerance: the candidate may ADD context columns (the date
-    # next to the policy number it was asked for) but may never omit a gold column. Extra
-    # columns cannot rescue wrong rows -- every gold row must still find its match.
-    if gold.num_columns > candidate.num_columns:
-        return False
+    if allow_extra_columns:
+        # One-directional tolerance: the candidate may ADD context columns but never omit a
+        # gold column. Extra columns cannot rescue wrong rows -- every gold row still matches.
+        if gold.num_columns > candidate.num_columns:
+            return False
+        column_choices = combinations(range(candidate.num_columns), gold.num_columns)
+    else:
+        if gold.num_columns != candidate.num_columns:
+            return False
+        column_choices = [tuple(range(candidate.num_columns))]
 
     gold_rows = _rows(gold)
-    for keep in combinations(range(candidate.num_columns), gold.num_columns):
+    for keep in column_choices:
         projected = candidate.select(list(keep))
         candidate_rows = _rows(projected)
         if _match_rows(gold_rows, candidate_rows, rel_tol):
