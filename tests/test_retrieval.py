@@ -1,5 +1,5 @@
 from mnemiq.authz.grants import DenyAll, GrantSet
-from mnemiq.contract import Column, IdentityContext, Snapshot, SourceBinding
+from mnemiq.contract import Column, Definition, IdentityContext, Snapshot, SourceBinding
 from mnemiq.llm.embeddings import FakeEmbedder
 from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.store import build_index
@@ -103,3 +103,35 @@ def test_k_bounds_the_packet(tmp_path):
         k=1,
     )
     assert len(packet.cards) == 1
+
+
+def test_retrieve_fills_definitions_access_scoped(tmp_path):
+    definition = Definition(
+        id="def-claim", term="claim", domain="claims",
+        definition="A demand for payment under a policy.", bound_objects=["claim"],
+    )
+    con = _con(tmp_path)
+
+    packet = retrieve(
+        con, "how many claims?", _identity(), _StaticAuthz("claim", "policy"),
+        FakeEmbedder(), definitions=[definition],
+    )
+    assert packet.definitions == [definition]
+
+    packet = retrieve(
+        con, "how many claims?", _identity(), _StaticAuthz("policy"),
+        FakeEmbedder(), definitions=[definition],
+    )
+    assert packet.definitions == []  # binds an ungranted table: never shown
+
+
+def test_no_grants_means_no_definitions_either(tmp_path):
+    definition = Definition(
+        id="def-claim", term="claim", domain="claims",
+        definition="A demand for payment under a policy.", bound_objects=["claim"],
+    )
+    packet = retrieve(
+        _con(tmp_path), "how many claims?", _identity(), DenyAll(),
+        FakeEmbedder(), definitions=[definition],
+    )
+    assert packet.definitions == []

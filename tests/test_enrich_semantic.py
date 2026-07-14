@@ -132,3 +132,20 @@ def test_a_successful_table_is_marked_done():
     job = next(j for j in out.jobs if j.id == "semantic:fireclaim")
     assert job.status == "done"
     assert job.kind == "semantic"
+
+
+def test_facts_forward_the_counts_to_the_enricher():
+    from mnemiq.enrichment.semantic import _facts
+
+    columns = [
+        Column(
+            id="t.empty", object_id="t", name="empty",
+            data_type="text", row_count=820, distinct_count=0, null_count=820,
+        ),
+        Column(id="t.unprofiled", object_id="t", name="unprofiled", data_type="text"),
+    ]
+    facts = _facts(columns)
+
+    assert facts[0].row_count == 820 and facts[0].null_count == 820
+    # a fact we do not have is a fact we do not send
+    assert facts[1].row_count is None and facts[1].null_count is None

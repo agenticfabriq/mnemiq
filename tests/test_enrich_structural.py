@@ -48,3 +48,13 @@ def test_pipeline_persists_and_reloads(snap, tmp_path):
 
 def test_pipeline_is_idempotent(snap):
     assert enrich_structural(_adapter(), "acme").version == snap.version
+
+
+def test_the_snapshot_carries_profile_counts(snap):
+    by_id = {c.id: c for c in snap.columns}
+    claimnumber = by_id["fireclaim.claimnumber"]
+
+    # the trap column: 820 rows, every one NULL -- the snapshot must say so
+    assert claimnumber.row_count == 820
+    assert claimnumber.null_count == 820
+    assert claimnumber.distinct_count == 0

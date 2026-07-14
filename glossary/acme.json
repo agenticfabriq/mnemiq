@@ -1,0 +1,9 @@
+[
+  {
+    "id": "def-premium",
+    "term": "premium",
+    "domain": "policy",
+    "definition": "A premium is money paid for an insurance policy. Premium amounts are stored as policy_amount rows: the premium table links each premium to its amount via policy_amount_identifier. To total premiums, join premium to policy_amount on policy_amount_identifier and sum policy_amount.policy_amount. Do not sum policy_amount rows that are not linked through premium, and do not use columns merely named premium on other tables.",
+    "bound_objects": ["premium", "policy_amount"]
+  }
+]

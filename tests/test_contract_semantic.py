@@ -55,6 +55,26 @@ def test_evaluation_case_carries_gold_sql_not_a_gold_string():
     assert EvaluationCase.model_validate_json(case.model_dump_json()) == case
 
 
+def test_a_column_carries_its_profile_counts():
+    # Profiling computes these; the eval proved that dropping them at the contract
+    # boundary turns an empty column into an invisible trap (COUNT(DISTINCT claimnumber)).
+    c = Column(
+        id="fireclaim.claimnumber",
+        object_id="fireclaim",
+        name="claimnumber",
+        row_count=820,
+        distinct_count=0,
+        null_count=820,
+    )
+    assert c.null_count == c.row_count == 820
+    assert Column.model_validate_json(c.model_dump_json()) == c
+
+
+def test_the_counts_default_to_absent_not_zero():
+    c = Column(id="t.c", object_id="t", name="c")
+    assert c.row_count is None and c.distinct_count is None and c.null_count is None
+
+
 def test_an_unanswerable_case_has_no_gold_sql():
     from mnemiq.contract import EvaluationCase
 
