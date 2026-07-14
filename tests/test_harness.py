@@ -88,6 +88,37 @@ def test_a_crash_is_an_error_not_a_wrong_answer():
     assert result.outcome is Outcome.ERROR
 
 
+def test_a_case_result_carries_everything_a_reviewer_needs():
+    # question, gold SQL, our SQL, and BOTH result sets -- without these, analyzing a
+    # failure means re-running queries by hand (which is exactly what Plan 08 required)
+    adapter = _GoldAdapter(candidate=pa.table({"total": [819]}))
+    result = run_case(_case(), lambda q: _answered(), adapter)
+
+    assert result.question == "how many fire claims?"
+    assert result.gold_sql == "GOLD"
+    assert result.sql == "CANDIDATE"
+    assert result.gold_rows == [{"n": 820}]
+    assert result.engine_rows == [{"total": 819}]
+    assert result.gold_row_count == 1 and result.engine_row_count == 1
+
+
+def test_a_deferred_case_still_shows_what_gold_would_have_returned():
+    # a wrong deferral is only reviewable if the report shows the answer that existed
+    result = run_case(_case(), lambda q: _deferred(), _GoldAdapter())
+    assert result.outcome is Outcome.DEFERRED_WRONGLY
+    assert result.gold_rows == [{"n": 820}]
+    assert result.engine_rows is None
+
+
+def test_result_previews_are_capped():
+    big = pa.table({"n": list(range(500))})
+    adapter = _GoldAdapter(candidate=big)
+    result = run_case(_case(), lambda q: _answered(), adapter)
+
+    assert result.engine_row_count == 500  # the true count is kept
+    assert len(result.engine_rows) == 100  # the preview is bounded
+
+
 def test_the_report_separates_wrong_from_error():
     adapter = _GoldAdapter(candidate=pa.table({"total": [819]}))
     results = [
