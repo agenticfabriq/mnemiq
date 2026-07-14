@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-DEFAULT_MODEL = "openai.gpt-5-mini"
+DEFAULT_MODEL = "openai.gpt-5.5"
 DEFAULT_EMBED_MODEL = "openai.text-embedding-3-small"
 
 
