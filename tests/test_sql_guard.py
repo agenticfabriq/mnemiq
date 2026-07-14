@@ -70,6 +70,36 @@ def test_select_star_is_refused():
     assert _refused("SELECT c.* FROM claim c").code == RefusalCode.SELECT_STAR
 
 
+def test_an_inner_star_is_allowed_because_the_output_columns_are_still_explicit():
+    # what must be knowable is the set of columns leaving the engine. An EXISTS discards its
+    # projection, and a star inside a derived table is bounded by the explicit projection
+    # that wraps it. Rejecting these would refuse 22 of the 99 TPC-DS queries.
+    _ok("SELECT a FROM claim WHERE EXISTS (SELECT * FROM policy WHERE policy.a = claim.a)")
+    _ok("SELECT a FROM (SELECT * FROM claim)")
+    _ok("WITH x AS (SELECT * FROM claim) SELECT a FROM x")
+
+
+def test_a_star_over_a_derived_table_is_allowed_its_columns_are_known():
+    # the inner projection is explicit, so the output columns are fully determined
+    _ok("SELECT * FROM (SELECT claim_identifier, status FROM claim)")
+    _ok("WITH x AS (SELECT a FROM claim) SELECT * FROM x")
+
+
+def test_a_star_over_a_base_table_is_refused_even_behind_a_join():
+    # `claim` is a real table: its column set is unbounded, and we would not know what we
+    # are returning -- nor could column-level authorization check it
+    assert _refused("SELECT c.* FROM claim c JOIN (SELECT a FROM policy) x ON TRUE").code == (
+        RefusalCode.SELECT_STAR
+    )
+
+
+def test_a_star_in_a_union_branch_is_still_refused():
+    # every branch of a union returns columns to the caller
+    assert _refused("SELECT a FROM claim UNION SELECT * FROM policy").code == (
+        RefusalCode.SELECT_STAR
+    )
+
+
 def test_count_star_is_not_a_select_star():
     # COUNT(*) contains an exp.Star. A naive find_all(exp.Star) would reject the most common
     # analytics query there is, and the engine could not count anything.
