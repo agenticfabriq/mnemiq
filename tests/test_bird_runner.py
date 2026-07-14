@@ -1,8 +1,12 @@
+import os
+import sqlite3
+
 import pyarrow as pa
 
 from mnemiq.agent.loop import AgentAnswer
+from mnemiq.config import Settings
 from mnemiq.contract import EvaluationCase, IdentityContext, Trace
-from mnemiq.eval.bird_runner import _run_grouped  # the pure routing core, engine injected
+from mnemiq.eval.bird_runner import _run_grouped, enrich_bird_db
 from mnemiq.eval.harness import CaseResult, Outcome
 from mnemiq.eval.report import slice_by
 
@@ -60,6 +64,37 @@ def test_slice_by_difficulty_and_db():
     assert by_diff["moderate"].correct == 1 and by_diff["moderate"].wrong == 1
     by_db = slice_by(results, lambda r: r.db_id)
     assert set(by_db) == {"shop", "bank"}
+
+
+def _tiny_bird(tmp_path):
+    dbdir = tmp_path / "dev_databases" / "toy"
+    dbdir.mkdir(parents=True)
+    con = sqlite3.connect(dbdir / "toy.sqlite")
+    con.executescript("CREATE TABLE t (a INTEGER, b TEXT); INSERT INTO t VALUES (1,'x'),(2,'y');")
+    con.commit()
+    con.close()
+    return str(tmp_path)
+
+
+def _settings(model):
+    return Settings(
+        llm_base_url=None, llm_api_key=None, llm_model=model, pg_dsn=None, acme_data_dir=None
+    )
+
+
+def test_enrich_cache_is_model_aware(tmp_path):
+    # structural-only, so no LLM; the point is the cache key, not the enrichment
+    minidev = _tiny_bird(tmp_path)
+    cache = str(tmp_path / "cache")
+
+    enrich_bird_db(minidev, "toy", _settings("openai.gpt-5.5"), cache_dir=cache, semantic=False)
+    enrich_bird_db(minidev, "toy", _settings("openai.gpt-5-mini"), cache_dir=cache, semantic=False)
+
+    files = os.listdir(cache)
+    # a cache keyed on db_id alone would serve gpt-5-mini's enrichment to a gpt-5.5 run
+    assert any("openai.gpt-5.5" in f for f in files)
+    assert any("openai.gpt-5-mini" in f for f in files)
+    assert len(files) == 2  # two models -> two distinct cache entries
 
 
 def test_run_case_populates_db_id_and_difficulty():

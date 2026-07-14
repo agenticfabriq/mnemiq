@@ -23,8 +23,11 @@ def enrich_bird_db(
     refresh: bool = False,
     semantic: bool = True,
 ) -> Snapshot:
-    """Enrich one BIRD database. Cached to disk: BIRD DBs never change, so db_id is the key."""
-    cache_path = os.path.join(cache_dir, f"{db_id}.json") if cache_dir else None
+    """Enrich one BIRD database. Cached to disk: BIRD DBs never change, so (db_id, model)
+    is the key -- the enriched snapshot depends on the model, so switching models must not
+    silently reuse another model's enrichment."""
+    model_slug = (settings.llm_model or "default").replace("/", "_")
+    cache_path = os.path.join(cache_dir, f"{db_id}__{model_slug}.json") if cache_dir else None
     if cache_path and not refresh and os.path.isfile(cache_path):
         with open(cache_path) as fh:
             return Snapshot.model_validate_json(fh.read())
