@@ -1,0 +1,28 @@
+from __future__ import annotations
+
+from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
+from mnemiq.config import Settings
+from mnemiq.enrichment.enricher import LLMEnricher
+from mnemiq.enrichment.pipeline import enrich_structural
+from mnemiq.enrichment.semantic import enrich_semantic
+from mnemiq.eval.engine import build_engine
+from mnemiq.eval.golden import load_cases
+from mnemiq.eval.harness import run_case
+from mnemiq.eval.report import summarize
+from mnemiq.llm.client import LLMClient
+
+
+def run_acme(settings: Settings, golden: str = "evals/acme.json") -> int:
+    """Run the ACME golden set once (enrichment ON) and print the report."""
+    if not settings.pg_dsn:
+        print("set MNEMIQ_PG_DSN")
+        return 1
+    adapter = DuckDBPostgresAdapter(settings.pg_dsn)
+    snapshot = enrich_semantic(
+        enrich_structural(adapter, settings.source_id), LLMEnricher(LLMClient(settings))
+    )
+    ask, client = build_engine(snapshot, adapter, settings)
+    results = [run_case(c, ask, adapter) for c in load_cases(golden)]
+    report = summarize(results, tokens=client.total_tokens, llm_calls=client.calls)
+    print(report.render())
+    return 0
