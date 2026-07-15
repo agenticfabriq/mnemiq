@@ -38,6 +38,7 @@ class CaseResult:
     engine_row_count: int | None = None
     db_id: str | None = None
     difficulty: str | None = None
+    agreement: float | None = None  # self-consistency: winning-cluster fraction, if any
     proposed: bool = False
     approved: bool = False
     executed: bool = False
@@ -78,6 +79,7 @@ def run_case(
         return result
 
     result.ms = (time.perf_counter() - started) * 1000
+    result.agreement = answer.agreement
 
     gold: pa.Table | None = None
     if case.answerable:
