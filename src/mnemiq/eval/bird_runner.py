@@ -161,6 +161,7 @@ def run_bird(
     on_case: Callable[[int, int, CaseResult], None] | None = None,
     results_path: str | None = None,
     workers: int = 1,
+    candidates: int = 1,
 ) -> tuple[list[CaseResult], dict]:
     """Run BIRD cases grouped by database. Resumable: with results_path, each result is
     checkpointed as it completes and a re-run skips everything already answered -- a long
@@ -185,7 +186,7 @@ def run_bird(
 
         def _build():  # each worker builds its own isolated engine (thread-safe connections)
             adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
-            ask, client = build_engine(snapshot, adapter, settings)
+            ask, client = build_engine(snapshot, adapter, settings, candidates=candidates)
             return ask, adapter, client
 
         out, clients = _process_db(remaining, _build, max_rows_cap, workers)

@@ -38,6 +38,7 @@ def build_engine(
     settings: Settings,
     store_path: str = ":memory:",
     definitions: Sequence[Definition] = (),
+    candidates: int = 1,
 ) -> tuple[Engine, LLMClient]:
     """Retrieval + agent over one snapshot, assembled exactly once.
 
@@ -61,6 +62,7 @@ def build_engine(
         adapter=adapter,
         cache=TwoTierCache(L1Cache()),
         budget=Budget(wall_clock_s=120.0),
+        candidates=candidates,
     )
 
     def ask(question: str) -> AgentAnswer:
