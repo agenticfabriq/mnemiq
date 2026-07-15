@@ -10,6 +10,7 @@ from mnemiq.cache.keys import cache_key
 from mnemiq.cache.store import Cache, from_ipc, to_ipc
 from mnemiq.contract import IdentityContext, Snapshot, Trace
 from mnemiq.execute.render import render_result
+from mnemiq.execute.resultset import cluster
 from mnemiq.execute.runner import ExecutionError, run
 from mnemiq.generate.generator import Generator
 from mnemiq.generate.plan_query import Deferred, plan_query
@@ -23,6 +24,7 @@ class AgentAnswer:
     trace: Trace | None = None
     deferred: bool = False
     cached: bool = False
+    agreement: float | None = None
 
 
 def _shape(row_count: int, column_count: int) -> str:
@@ -44,6 +46,7 @@ class Agent:
         cache: Cache,
         budget: Budget | None = None,
         timeout_s: float = 30.0,
+        candidates: int = 1,
     ) -> None:
         self.generator = generator
         self.synthesizer = synthesizer
@@ -51,6 +54,7 @@ class Agent:
         self.cache = cache
         self.budget = budget or Budget()
         self.timeout_s = timeout_s
+        self.candidates = candidates
 
     def answer(
         self,
@@ -60,6 +64,18 @@ class Agent:
         identity: IdentityContext,
     ) -> AgentAnswer:
         deadline = self.budget.started()
+        if self.candidates <= 1:
+            return self._answer_single(packet, snapshot, grants, identity, deadline)
+        return self._answer_consistent(packet, snapshot, grants, identity, deadline)
+
+    def _answer_single(
+        self,
+        packet: ContextPacket,
+        snapshot: Snapshot,
+        grants: GrantSet,
+        identity: IdentityContext,
+        deadline,
+    ) -> AgentAnswer:
         feedback: str | None = None
         failure: str | None = None
 
@@ -116,6 +132,68 @@ class Agent:
                 f"Last error: {failure}"
             ),
             deferred=True,
+        )
+
+    def _execute(self, approved: Approved, grants: GrantSet, packet: ContextPacket):
+        """Cache-or-run one plan; None on execution error (this candidate just drops out)."""
+        key = cache_key(approved.plan_sql, grants.fingerprint, packet.enrichment_version)
+        hit = self.cache.get(key)
+        if hit is not None:
+            return from_ipc(hit)
+        try:
+            result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
+        except ExecutionError:
+            return None
+        self.cache.put(key, to_ipc(result.table))
+        return result.table
+
+    def _answer_consistent(
+        self,
+        packet: ContextPacket,
+        snapshot: Snapshot,
+        grants: GrantSet,
+        identity: IdentityContext,
+        deadline,
+    ) -> AgentAnswer:
+        # Generate N single-shot candidates and let the deterministic executor vote. Each
+        # is decided independently; a refusal/deferral just drops that candidate.
+        executed: list[tuple[Approved, object]] = []
+        for _ in range(self.candidates):
+            outcome = plan_query(
+                packet,
+                snapshot,
+                grants,
+                self.generator,
+                adapter=self.adapter,
+                target="duckdb",
+                max_attempts=1,
+            )
+            if not isinstance(outcome, Approved):
+                continue
+            table = self._execute(outcome, grants, packet)
+            if table is not None:
+                executed.append((outcome, table))
+
+        if not executed:
+            # no candidate ran -> fall back to the single repairing path (today's floor)
+            return self._answer_single(packet, snapshot, grants, identity, deadline)
+
+        groups = cluster([table for _, table in executed])
+        winner = max(groups, key=len)  # ties -> first (earliest-appearance) cluster
+        approved, table = executed[winner[0]]
+        agreement = len(winner) / len(executed)
+
+        base = self._synthesize(
+            packet, approved, identity, table, deadline, cached=False, forced=deadline.expired
+        )
+        caution = "" if agreement >= 0.5 else " -- treat with caution"
+        note = f" (confidence: {len(winner)}/{len(executed)} candidates agreed{caution}.)"
+        return AgentAnswer(
+            answer=base.answer + note,
+            trace=base.trace,
+            deferred=False,
+            cached=False,
+            agreement=agreement,
         )
 
     def _synthesize(
