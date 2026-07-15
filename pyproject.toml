@@ -17,6 +17,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
 
+[project.scripts]
+mnemiq = "mnemiq.cli:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
