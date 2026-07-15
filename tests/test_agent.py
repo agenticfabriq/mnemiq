@@ -194,3 +194,71 @@ def test_the_timeout_message_reaches_the_repair_loop():
     result = _answer(agent)
     assert result.deferred is True
     assert "timed out" in result.answer.lower()
+
+
+# --- Plan 12: self-consistency (candidate voting) -------------------------------------
+class _VotingAdapter:
+    """Returns a result keyed by a marker in the SQL, so candidates form clusters."""
+
+    def execute(self, sql):  # EXPLAIN inside decide()
+        return []
+
+    def execute_arrow(self, sql, timeout_s=None):
+        u = sql.upper()
+        if "SUM" in u:
+            return pa.table({"n": [5]})
+        if "MAX" in u:
+            return pa.table({"n": [9]})
+        return pa.table({"n": [7]})  # count(*) / plain case
+
+
+def _sql(expr):
+    return f'{{"sql": "SELECT {expr} AS n FROM claim", "reason": "ok"}}'
+
+
+def _vote_agent(replies, candidates, synth="There are 7."):
+    return Agent(
+        generator=FakeGenerator(replies),
+        synthesizer=FakeSynthesizer(synth),
+        adapter=_VotingAdapter(),
+        cache=TwoTierCache(L1Cache()),
+        candidates=candidates,
+    )
+
+
+def test_plurality_result_wins_and_agreement_is_reported():
+    # 3 -> 7, one -> 5 (SUM), one -> 9 (MAX): the 7-cluster (3/5) wins
+    agent = _vote_agent(
+        [_sql("count(*)"), _sql("count(*)"), _sql("count(*)"), _sql("sum(n)"), _sql("max(n)")], 5
+    )
+    ans = _answer(agent)
+    assert not ans.deferred
+    assert ans.agreement == 0.6  # 3 of 5
+    assert "3/5" in ans.answer
+    assert "There are 7." in ans.answer
+
+
+def test_a_tie_breaks_to_the_earliest_cluster():
+    # 5,5,7,7 -> two clusters of 2; the earlier (5-cluster) wins
+    agent = _vote_agent(
+        [_sql("sum(n)"), _sql("sum(n)"), _sql("count(*)"), _sql("count(*)")], 4, synth="five"
+    )
+    ans = _answer(agent)
+    assert ans.agreement == 0.5
+    assert "2/4" in ans.answer
+
+
+def test_falls_back_to_single_repairing_path_when_no_candidate_is_valid():
+    defers = ['{"sql": null, "reason": "cannot"}'] * 3
+    agent = _vote_agent(defers + [_sql("count(*)")], 3, synth="fallback answer")
+    ans = _answer(agent)
+    assert not ans.deferred
+    assert ans.agreement is None  # single-path answer carries no agreement
+    assert "fallback answer" in ans.answer
+
+
+def test_single_candidate_mode_is_unchanged():
+    agent = _vote_agent([_sql("count(*)")], 1, synth="one")
+    ans = _answer(agent)
+    assert ans.agreement is None
+    assert ans.answer == "one"  # no note appended

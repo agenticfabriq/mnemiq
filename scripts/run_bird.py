@@ -41,6 +41,13 @@ def main() -> int:
         default=1,
         help="concurrent questions per database (LLM-latency-bound; try 4-8). Lower if rate-limited.",
     )
+    p.add_argument(
+        "--candidates",
+        type=int,
+        default=1,
+        help="self-consistency: generate N candidates per question and vote (N=5 typical). "
+        "N x generation cost.",
+    )
     args = p.parse_args()
 
     settings = Settings.from_env()
@@ -71,6 +78,7 @@ def main() -> int:
         on_case=progress,
         results_path=args.results,
         workers=args.workers,
+        candidates=args.candidates,
     )
     report = summarize(results, tokens=use["tokens"], llm_calls=use["llm_calls"])
 
