@@ -18,6 +18,7 @@ _ORDER = [
     Outcome.WRONG,
     Outcome.ERROR,
     Outcome.DEFERRED_WRONGLY,
+    Outcome.CORRECT_FACTS,
     Outcome.CORRECT,
     Outcome.DEFERRED_CORRECTLY,
 ]
@@ -26,6 +27,7 @@ _COLORS = {
     Outcome.WRONG: "#c0392b",
     Outcome.ERROR: "#e67e22",
     Outcome.DEFERRED_WRONGLY: "#b7950b",
+    Outcome.CORRECT_FACTS: "#0e7c7b",
     Outcome.CORRECT: "#1e8449",
     Outcome.DEFERRED_CORRECTLY: "#2471a3",
 }
@@ -40,11 +42,13 @@ def _summary(report: Report) -> dict:
     return {
         "total": report.total,
         "correct": report.correct,
+        "correct_facts": report.correct_facts,
         "wrong": report.wrong,
         "deferred_correctly": report.deferred_correctly,
         "deferred_wrongly": report.deferred_wrongly,
         "error": report.error,
         "accuracy": report.accuracy,
+        "strict_accuracy": report.strict_accuracy,
         "llm_calls": report.llm_calls,
         "tokens": report.tokens,
     }
@@ -99,7 +103,7 @@ def write_html(report: Report, path: str, label: str) -> None:
     summary = _summary(report)
     stat_cells = "".join(
         f"<td><b>{summary[k]}</b><br><span class='muted'>{k}</span></td>"
-        for k in ("total", "correct", "wrong", "deferred_wrongly", "deferred_correctly", "error")
+        for k in ("total", "correct", "correct_facts", "wrong", "deferred_wrongly", "deferred_correctly", "error")
     )
     cases = "\n".join(_case_html(r) for r in _sorted(report.results))
     doc = f"""<!doctype html>
@@ -119,7 +123,7 @@ summary {{ cursor: pointer; }}
 </style></head><body>
 <h1>mnemiq eval — {html.escape(label)}</h1>
 <table class="stats"><tr>{stat_cells}</tr></table>
-<p>accuracy <b>{summary["accuracy"]:.1%}</b> (correct / answerable)
+<p>accuracy <b>{summary["accuracy"]:.1%}</b> (got-the-facts) &nbsp;·&nbsp; strict <b>{summary["strict_accuracy"]:.1%}</b>
 &nbsp;·&nbsp; llm calls {summary["llm_calls"]} &nbsp;·&nbsp; tokens {summary["tokens"]}</p>
 {cases}
 </body></html>"""

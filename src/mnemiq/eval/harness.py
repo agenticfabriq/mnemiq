@@ -15,7 +15,10 @@ _PREVIEW_ROWS = 100
 
 
 class Outcome(StrEnum):
-    CORRECT = "correct"
+    CORRECT = "correct"  # exact result-set match (BIRD-strict semantics)
+    CORRECT_FACTS = "correct_facts"  # right data, different shape (e.g. an extra column).
+    # A format difference is NOT a failure -- it is its own category, so strict-EX and
+    # got-the-facts can be reported side by side without re-grading.
     WRONG = "wrong"  # answered, and the answer is not right. The only invisible failure.
     DEFERRED_CORRECTLY = "deferred_correctly"
     DEFERRED_WRONGLY = "deferred_wrongly"
@@ -55,9 +58,7 @@ def _preview(table: pa.Table) -> list[dict]:
     ]
 
 
-def run_case(
-    case: EvaluationCase, engine: Engine, adapter, allow_extra_columns: bool = True
-) -> CaseResult:
+def run_case(case: EvaluationCase, engine: Engine, adapter) -> CaseResult:
     """Ask the engine, then check its answer against the gold query's result set."""
     result = CaseResult(
         case_id=case.id,
@@ -120,9 +121,10 @@ def run_case(
     result.engine_rows = _preview(candidate)
     result.engine_row_count = candidate.num_rows
     result.executed = True
-    result.outcome = (
-        Outcome.CORRECT
-        if results_match(gold, candidate, allow_extra_columns=allow_extra_columns)
-        else Outcome.WRONG
-    )
+    if results_match(gold, candidate, allow_extra_columns=False):
+        result.outcome = Outcome.CORRECT
+    elif results_match(gold, candidate, allow_extra_columns=True):
+        result.outcome = Outcome.CORRECT_FACTS
+    else:
+        result.outcome = Outcome.WRONG
     return result
