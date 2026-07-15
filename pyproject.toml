@@ -12,10 +12,14 @@ dependencies = [
   "sqlglot>=25",
   "pyarrow>=17",
   "cachetools>=5",
+  "mcp>=1.28",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+mnemiq = "mnemiq.cli:main"
 
 [build-system]
 requires = ["hatchling"]
