@@ -16,3 +16,11 @@ def test_default_model():
         llm_base_url=None, llm_api_key=None, llm_model=None, pg_dsn=None, acme_data_dir=None
     )
     assert s.llm_model == "openai.gpt-5.5"
+
+
+def test_source_id_and_store_path_defaults():
+    s = Settings(
+        llm_base_url=None, llm_api_key=None, llm_model=None, pg_dsn=None, acme_data_dir=None
+    )
+    assert s.source_id == "acme"
+    assert s.store_path == "mnemiq.duckdb"

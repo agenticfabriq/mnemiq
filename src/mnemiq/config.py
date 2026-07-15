@@ -16,12 +16,18 @@ class Settings:
     acme_data_dir: str | None
     embed_model: str | None = None
     authz_path: str | None = None
+    source_id: str | None = None
+    store_path: str | None = None
 
     def __post_init__(self) -> None:
         if not self.llm_model:
             self.llm_model = DEFAULT_MODEL
         if not self.embed_model:
             self.embed_model = DEFAULT_EMBED_MODEL
+        if not self.source_id:
+            self.source_id = "acme"
+        if not self.store_path:
+            self.store_path = "mnemiq.duckdb"
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -33,4 +39,6 @@ class Settings:
             acme_data_dir=os.getenv("MNEMIQ_ACME_DATA_DIR"),
             embed_model=os.getenv("MNEMIQ_EMBED_MODEL"),
             authz_path=os.getenv("MNEMIQ_AUTHZ_PATH"),
+            source_id=os.getenv("MNEMIQ_SOURCE_ID"),
+            store_path=os.getenv("MNEMIQ_STORE_PATH"),
         )
