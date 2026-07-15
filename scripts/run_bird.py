@@ -87,12 +87,12 @@ def main() -> int:
     if use["excluded"]:
         print(f"\nexcluded {len(use['excluded'])} cases (gold > row cap): {use['excluded']}")
 
-    print("\nby difficulty:")
+    print("\nby difficulty (strict / got-the-facts):")
     for name, rep in slice_by(results, lambda r: r.difficulty).items():
-        print(f"  {name:12} {rep.accuracy:6.1%}  ({rep.correct}/{rep.answerable})")
-    print("\nby database:")
+        print(f"  {name:12} {rep.strict_accuracy:6.1%} / {rep.accuracy:6.1%}  (n={rep.answerable})")
+    print("\nby database (strict / got-the-facts):")
     for name, rep in slice_by(results, lambda r: r.db_id).items():
-        print(f"  {name:26} {rep.accuracy:6.1%}  ({rep.correct}/{rep.answerable})")
+        print(f"  {name:26} {rep.strict_accuracy:6.1%} / {rep.accuracy:6.1%}  (n={rep.answerable})")
 
     if args.report:
         from pathlib import Path

@@ -119,14 +119,41 @@ def test_result_previews_are_capped():
     assert len(result.engine_rows) == 100  # the preview is bounded
 
 
-def test_run_case_can_grade_strictly():
-    # same engine answer, two grading regimes: an extra column passes lenient, fails strict
+def test_a_format_difference_is_correct_facts_not_wrong():
+    # right data, extra context column: a format difference is NOT a failure -- it gets
+    # its own category so strict-EX and got-the-facts can be reported side by side
     adapter = _GoldAdapter(candidate=pa.table({"n": [820], "extra": ["ctx"]}))
+    result = run_case(_case(), lambda q: _answered(), adapter)
+    assert result.outcome is Outcome.CORRECT_FACTS
+
+
+def test_an_exact_result_is_correct_not_correct_facts():
+    adapter = _GoldAdapter(candidate=pa.table({"total": [820]}))  # names never matter
     assert run_case(_case(), lambda q: _answered(), adapter).outcome is Outcome.CORRECT
-    assert (
-        run_case(_case(), lambda q: _answered(), adapter, allow_extra_columns=False).outcome
-        is Outcome.WRONG
-    )
+
+
+def test_wrong_facts_are_still_wrong_even_with_extra_columns():
+    adapter = _GoldAdapter(candidate=pa.table({"n": [819], "extra": ["ctx"]}))
+    assert run_case(_case(), lambda q: _answered(), adapter).outcome is Outcome.WRONG
+
+
+def test_the_report_shows_strict_and_facts_accuracy_side_by_side():
+    results = [
+        run_case(_case(), lambda q: _answered(), _GoldAdapter(pa.table({"n": [820]}))),
+        run_case(
+            _case(), lambda q: _answered(), _GoldAdapter(pa.table({"n": [820], "x": ["c"]}))
+        ),
+        run_case(_case(), lambda q: _answered(), _GoldAdapter(pa.table({"n": [1]}))),
+    ]
+    report = summarize(results)
+
+    assert report.correct == 1 and report.correct_facts == 1 and report.wrong == 1
+    assert report.strict_accuracy == 1 / 3  # BIRD-comparable
+    assert report.accuracy == 2 / 3  # the product metric: got-the-facts
+
+    rendered = report.render()
+    assert "CORRECT_FACTS" in rendered
+    assert "strict" in rendered.lower()
 
 
 def test_the_report_separates_wrong_from_error():
