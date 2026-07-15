@@ -104,7 +104,7 @@ def _run_grouped(
         for case in db_cases:
             if gold_sql_sentinel is not None:  # test hook: fake adapter keys off a sentinel
                 case = case.model_copy(update={"gold_sql": gold_sql_sentinel})
-            results.append(run_case(case, ask, adapter, allow_extra_columns=False))
+            results.append(run_case(case, ask, adapter))
     return results
 
 
@@ -133,7 +133,7 @@ def _process_db(cases, build_engine_fn, max_rows_cap: int, workers: int):
         ask, adapter = engine()
         if _gold_too_big(adapter, case.gold_sql, max_rows_cap):
             return ("excluded", case.id)
-        return ("result", run_case(case, ask, adapter, allow_extra_columns=False))
+        return ("result", run_case(case, ask, adapter))
 
     if workers <= 1:
         out = [work(case) for case in cases]
