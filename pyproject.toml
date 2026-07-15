@@ -12,6 +12,7 @@ dependencies = [
   "sqlglot>=25",
   "pyarrow>=17",
   "cachetools>=5",
+  "mcp>=1.28",
 ]
 
 [project.optional-dependencies]
