@@ -42,6 +42,8 @@ class CaseResult:
     db_id: str | None = None
     difficulty: str | None = None
     agreement: float | None = None  # self-consistency: winning-cluster fraction, if any
+    judge_engaged: bool | None = None  # selector-judge: consulted on this case?
+    judge_override: bool | None = None  # ...and picked against the majority?
     proposed: bool = False
     approved: bool = False
     executed: bool = False
@@ -81,6 +83,8 @@ def run_case(case: EvaluationCase, engine: Engine, adapter) -> CaseResult:
 
     result.ms = (time.perf_counter() - started) * 1000
     result.agreement = answer.agreement
+    result.judge_engaged = answer.judge_engaged
+    result.judge_override = answer.judge_override
 
     gold: pa.Table | None = None
     if case.answerable:

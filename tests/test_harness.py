@@ -173,3 +173,13 @@ def test_the_report_separates_wrong_from_error():
     rendered = report.render()
     assert "WRONG" in rendered
     assert "1" in rendered
+
+
+def test_judge_telemetry_is_copied_onto_the_case_result():
+    answer = AgentAnswer(
+        answer="820 claims.", trace=_trace(), deferred=False,
+        agreement=0.4, judge_engaged=True, judge_override=True,
+    )
+    result = run_case(_case(), lambda q: answer, _GoldAdapter(pa.table({"n": [820]})))
+    assert result.judge_engaged is True
+    assert result.judge_override is True
