@@ -29,3 +29,27 @@ def test_definitions_render_as_authoritative():
 
 def test_no_definitions_no_block():
     assert "DEFINITIONS" not in user_prompt(_packet())
+
+
+def test_direct_strategy_leaves_the_system_prompt_byte_identical():
+    from mnemiq.generate.prompts import system_prompt
+
+    base = system_prompt()
+    assert system_prompt(strategy=None) == base
+    assert system_prompt(strategy="direct") == base
+
+
+def test_decompose_and_skeleton_strategies_append_their_preamble():
+    from mnemiq.generate.prompts import STRATEGY_PREAMBLES, system_prompt
+
+    base = system_prompt()
+    for name in ("decompose", "skeleton"):
+        prompt = system_prompt(strategy=name)
+        assert prompt.startswith(base)
+        assert STRATEGY_PREAMBLES[name] in prompt
+
+
+def test_an_unknown_strategy_falls_back_to_direct():
+    from mnemiq.generate.prompts import system_prompt
+
+    assert system_prompt(strategy="nonsense") == system_prompt()
