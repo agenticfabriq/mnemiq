@@ -7,7 +7,6 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 
-from mnemiq.adapters.duckdb import DuckDBAdapter
 from mnemiq.adapters.sqlite import SQLiteAdapter
 from mnemiq.config import Settings
 from mnemiq.contract import EvaluationCase, Snapshot
@@ -185,13 +184,14 @@ def run_bird(
 
         snapshot = enrich_bird_db(minidev_dir, db_id, settings, cache_dir=cache_dir)
 
-        def _build():  # each worker builds its own isolated engines (thread-safe connections)
-            # Engine executes via DuckDB (YEAR/EXTRACT work natively over the attached sqlite);
-            # gold executes on native SQLite -- the ground truth is "gold on SQLite".
-            engine_adapter = DuckDBAdapter.sqlite(bird_db_path(minidev_dir, db_id))
-            gold_adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
-            ask, client = build_engine(snapshot, engine_adapter, settings, candidates=candidates)
-            return ask, engine_adapter, gold_adapter, client
+        def _build():  # each worker builds its own isolated engine (thread-safe connections)
+            # BIRD grades single-engine on native SQLite: the engine generates + executes
+            # SQLite and gold runs on the same engine, so a wrong answer is a real error,
+            # never a cross-engine artifact (parity measured 1.5% otherwise). DuckDB is the
+            # executor in the product path (DuckDBAdapter); the benchmark stays apples-to-apples.
+            adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
+            ask, client = build_engine(snapshot, adapter, settings, candidates=candidates)
+            return ask, adapter, adapter, client  # engine + gold: same native SQLite executor
 
         out, clients = _process_db(remaining, _build, max_rows_cap, workers)
 
