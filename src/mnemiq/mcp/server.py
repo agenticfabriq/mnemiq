@@ -13,12 +13,15 @@ from mnemiq.contract import IdentityContext
 from mnemiq.runtime import Runtime, build_runtime
 
 
-def _db_read(runtime: Runtime, identity: IdentityContext, question: str) -> dict:
-    ans = runtime.ask(question, identity)
+def _db_read(
+    runtime: Runtime, identity: IdentityContext, question: str, mode: str | None = None
+) -> dict:
+    ans = runtime.ask(question, identity, mode=mode)
     trace = ans.trace
     return {
         "answer": ans.answer,
         "deferred": ans.deferred,
+        "mode": ans.mode,
         "sql": trace.target_sql if trace else None,  # a deferral never carries a fabricated query
         "trace": (
             {
@@ -50,10 +53,12 @@ def build_mcp(runtime: Runtime, identity: IdentityContext):
     mcp = FastMCP("mnemiq")
 
     @mcp.tool()
-    def db_read(question: str) -> dict:
+    def db_read(question: str, mode: str | None = None) -> dict:
         """Answer a natural-language question over the database (read-only). Returns the
-        answer, the SQL run, and an auditable trace; defers honestly when it cannot answer."""
-        return _db_read(runtime, identity, question)
+        answer, the SQL run, and an auditable trace; defers honestly when it cannot answer.
+        mode: 'instant' (cheapest, no retries), 'thinking' (default, self-repairing), or
+        'deep' (5 candidates + judge + agreement gate -- highest precision, ~6x cost)."""
+        return _db_read(runtime, identity, question, mode=mode)
 
     @mcp.tool()
     def get_schema() -> dict:
