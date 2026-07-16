@@ -9,6 +9,8 @@ import pyarrow as pa
 class DuckDBPostgresAdapter:
     """Query a Postgres source through DuckDB's postgres extension (ATTACH)."""
 
+    dialect = "duckdb"  # DuckDB is the executor (it reads Postgres via the scanner)
+
     def __init__(self, dsn: str, schema: str = "src") -> None:
         self._schema = schema
         self._con = duckdb.connect()

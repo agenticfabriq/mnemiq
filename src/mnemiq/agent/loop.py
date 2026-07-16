@@ -72,6 +72,10 @@ class Agent:
         self.values = values
         self.selector = selector
         self.min_agreement = min_agreement
+        # Transpile the plan (written in duckdb) to whatever the source actually runs.
+        # Default duckdb: the product adapter executes via DuckDB, so it is a no-op there;
+        # a SQLite source gets SQLite instead of failing on un-transpiled DuckDB.
+        self.target_dialect = getattr(adapter, "dialect", "duckdb")
 
     def answer(
         self,
@@ -107,7 +111,7 @@ class Agent:
                 grants,
                 self.generator,
                 adapter=self.adapter,
-                target="duckdb",
+                target=self.target_dialect,
                 feedback=feedback,
                 corrector=self.corrector,
                 values=self.values,
@@ -184,7 +188,7 @@ class Agent:
                 grants,
                 StrategyGenerator(self.generator, STRATEGIES[i % len(STRATEGIES)]),
                 adapter=self.adapter,
-                target="duckdb",
+                target=self.target_dialect,
                 max_attempts=1,
                 corrector=self.corrector,
                 values=self.values,

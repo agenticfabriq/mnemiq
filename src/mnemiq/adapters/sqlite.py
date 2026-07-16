@@ -14,6 +14,8 @@ class SQLiteAdapter:
     is a read plane, and the decider is not the only thing standing between it and a write.
     """
 
+    dialect = "sqlite"  # the engine transpiles its duckdb plan to SQLite before executing
+
     def __init__(self, path: str) -> None:
         # mode=ro rejects every write at the driver; interrupt() is documented safe to call
         # from another thread even though the connection itself is single-threaded.
