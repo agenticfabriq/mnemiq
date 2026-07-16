@@ -20,6 +20,25 @@ def test_an_approved_query_carries_both_dialects_and_its_references():
     assert verdict.columns == ["claim_identifier"]
 
 
+def test_a_value_grounding_miss_is_refused_when_an_index_is_supplied():
+    from tests.test_values_check import IDX  # reuse the fake index
+
+    v = decide(
+        "SELECT Country FROM gasstations WHERE Country = 'CZE'",
+        {"gasstations": {"Country"}},
+        values=IDX,
+    )
+    assert isinstance(v, Refusal) and v.code == RefusalCode.VALUE_GROUNDING
+
+
+def test_without_an_index_the_value_check_is_skipped():
+    v = decide(
+        "SELECT Country FROM gasstations WHERE Country = 'CZE'",
+        {"gasstations": {"Country"}},
+    )
+    assert isinstance(v, Approved)  # values=None -> today's behavior, no value check
+
+
 def test_the_shape_guard_runs_before_the_access_guard():
     # a DROP naming an unauthorized table is refused as a DROP -- we never get far enough to
     # discuss what it names
