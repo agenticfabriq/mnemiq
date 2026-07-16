@@ -309,3 +309,65 @@ def test_agent_passes_its_values_into_plan_query(monkeypatch):
     )
     agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
     assert seen["values"] is sentinel
+
+
+# --- Plan 16: selector-judge + strategy diversity ---------------------------------------
+def test_candidates_cycle_the_three_strategies():
+    from mnemiq.agent.loop import STRATEGIES
+
+    agent = _vote_agent([_sql("count(*)")] * 5, 5)
+    _answer(agent)
+    assert agent.generator.strategies == list(STRATEGIES) + ["direct", "decompose"]
+
+
+def test_unanimous_clusters_never_consult_the_selector():
+    from mnemiq.execute.select import FakeSelector
+
+    selector = FakeSelector([0])
+    agent = _vote_agent([_sql("count(*)")] * 3, 3)
+    agent.selector = selector
+    ans = _answer(agent)
+    assert not ans.deferred
+    assert selector.calls == []  # single cluster: selection is vacuous
+    assert ans.judge_engaged is False
+    assert ans.judge_override is False
+
+
+def test_disagreement_engages_the_selector_and_its_pick_wins():
+    from mnemiq.execute.select import FakeSelector
+
+    # 2x count(*) -> 7, 1x sum -> 5: majority is the 7-cluster (index 0);
+    # the judge overrides to the 5-cluster (index 1)
+    selector = FakeSelector([1])
+    agent = _vote_agent([_sql("count(*)"), _sql("count(*)"), _sql("sum(n)")], 3, synth="five")
+    agent.selector = selector
+    ans = _answer(agent)
+
+    assert len(selector.calls) == 1
+    question, views = selector.calls[0]
+    assert [v.size for v in views] == [2, 1]
+    assert "SELECT" in views[0].sql and "rows" in views[0].preview
+    assert ans.judge_engaged is True
+    assert ans.judge_override is True
+    assert ans.agreement == 1 / 3  # agreement reflects the CHOSEN cluster
+
+
+def test_selector_agreeing_with_majority_is_not_an_override():
+    from mnemiq.execute.select import FakeSelector
+
+    selector = FakeSelector([0])
+    agent = _vote_agent([_sql("count(*)"), _sql("count(*)"), _sql("sum(n)")], 3)
+    agent.selector = selector
+    ans = _answer(agent)
+    assert ans.judge_engaged is True
+    assert ans.judge_override is False
+    assert ans.agreement == 2 / 3
+
+
+def test_without_a_selector_voting_behavior_is_unchanged():
+    agent = _vote_agent(
+        [_sql("count(*)"), _sql("count(*)"), _sql("count(*)"), _sql("sum(n)"), _sql("max(n)")], 5
+    )
+    ans = _answer(agent)
+    assert ans.agreement == 0.6  # exactly Plan 12's pick
+    assert ans.judge_engaged is None  # no selector wired: telemetry stays None
