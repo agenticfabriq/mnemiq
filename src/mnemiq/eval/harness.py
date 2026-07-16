@@ -44,6 +44,7 @@ class CaseResult:
     agreement: float | None = None  # self-consistency: winning-cluster fraction, if any
     judge_engaged: bool | None = None  # selector-judge: consulted on this case?
     judge_override: bool | None = None  # ...and picked against the majority?
+    candidates_executed: int | None = None  # multi-candidate: how many of N ran
     proposed: bool = False
     approved: bool = False
     executed: bool = False
@@ -85,6 +86,7 @@ def run_case(case: EvaluationCase, engine: Engine, adapter) -> CaseResult:
     result.agreement = answer.agreement
     result.judge_engaged = answer.judge_engaged
     result.judge_override = answer.judge_override
+    result.candidates_executed = answer.candidates_executed
 
     gold: pa.Table | None = None
     if case.answerable:
