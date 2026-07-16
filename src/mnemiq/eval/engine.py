@@ -61,7 +61,9 @@ def build_engine(
 
     client = LLMClient(settings)  # one client, so the token count is the run's true cost
     agent = Agent(
-        generator=LLMGenerator(client),
+        # Generate in the source's dialect (BIRD: SQLite), so nothing needs a cross-dialect
+        # transpile the SQLite writer can't do (DuckDB YEAR()/EXTRACT -> strftime).
+        generator=LLMGenerator(client, dialect=getattr(adapter, "dialect", "duckdb")),
         synthesizer=LLMSynthesizer(client),
         adapter=adapter,
         cache=TwoTierCache(L1Cache()),
