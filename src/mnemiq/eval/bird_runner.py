@@ -7,6 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 
+from mnemiq.adapters.duckdb import DuckDBAdapter
 from mnemiq.adapters.sqlite import SQLiteAdapter
 from mnemiq.config import Settings
 from mnemiq.contract import EvaluationCase, Snapshot
@@ -123,17 +124,17 @@ def _process_db(cases, build_engine_fn, max_rows_cap: int, workers: int):
 
     def engine():
         if not hasattr(local, "e"):
-            ask, adapter, client = build_engine_fn()
-            local.e = (ask, adapter)
+            ask, engine_adapter, gold_adapter, client = build_engine_fn()
+            local.e = (ask, engine_adapter, gold_adapter)
             with clients_lock:
                 clients.append(client)
         return local.e
 
     def work(case):
-        ask, adapter = engine()
-        if _gold_too_big(adapter, case.gold_sql, max_rows_cap):
+        ask, engine_adapter, gold_adapter = engine()
+        if _gold_too_big(gold_adapter, case.gold_sql, max_rows_cap):
             return ("excluded", case.id)
-        return ("result", run_case(case, ask, adapter))
+        return ("result", run_case(case, ask, engine_adapter, gold_adapter))
 
     if workers <= 1:
         out = [work(case) for case in cases]
@@ -184,10 +185,13 @@ def run_bird(
 
         snapshot = enrich_bird_db(minidev_dir, db_id, settings, cache_dir=cache_dir)
 
-        def _build():  # each worker builds its own isolated engine (thread-safe connections)
-            adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
-            ask, client = build_engine(snapshot, adapter, settings, candidates=candidates)
-            return ask, adapter, client
+        def _build():  # each worker builds its own isolated engines (thread-safe connections)
+            # Engine executes via DuckDB (YEAR/EXTRACT work natively over the attached sqlite);
+            # gold executes on native SQLite -- the ground truth is "gold on SQLite".
+            engine_adapter = DuckDBAdapter.sqlite(bird_db_path(minidev_dir, db_id))
+            gold_adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
+            ask, client = build_engine(snapshot, engine_adapter, settings, candidates=candidates)
+            return ask, engine_adapter, gold_adapter, client
 
         out, clients = _process_db(remaining, _build, max_rows_cap, workers)
 
