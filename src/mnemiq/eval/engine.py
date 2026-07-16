@@ -9,6 +9,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.config import Settings
 from mnemiq.contract import Definition, IdentityContext, Snapshot
+from mnemiq.execute.select import LLMSelector
 from mnemiq.generate.correct import LLMCorrector
 from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
@@ -68,6 +69,7 @@ def build_engine(
         candidates=candidates,
         corrector=LLMCorrector(client),
         values=ValueIndex(con),
+        selector=LLMSelector(client) if candidates > 1 else None,
     )
 
     def ask(question: str) -> AgentAnswer:

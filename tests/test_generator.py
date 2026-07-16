@@ -92,3 +92,32 @@ def test_the_live_model_defers_when_the_cards_cannot_answer():
     packet = _packet("what is the average salary of our employees?")
     proposal = LLMGenerator(LLMClient(Settings.from_env())).propose(packet)
     assert proposal.sql is None, f"should have deferred, got: {proposal.sql}"
+
+
+def test_strategy_generator_binds_a_strategy_through_the_two_arg_protocol():
+    from mnemiq.generate.generator import FakeGenerator, StrategyGenerator
+
+    packet = _packet()
+    inner = FakeGenerator(['{"sql": "SELECT 1"}'])
+    wrapped = StrategyGenerator(inner, "decompose")
+
+    proposal = wrapped.propose(packet, feedback=None)  # 2-arg call, like plan_query makes
+    assert proposal.sql == "SELECT 1"
+    assert inner.strategies == ["decompose"]
+
+
+def test_llm_generator_puts_the_strategy_preamble_in_the_system_prompt():
+    from mnemiq.generate.generator import LLMGenerator
+    from mnemiq.generate.prompts import STRATEGY_PREAMBLES
+
+    class _Client:
+        def __init__(self):
+            self.seen = {}
+
+        def complete(self, system, user, max_tokens=512):
+            self.seen = {"system": system}
+            return '{"sql": "SELECT 1"}'
+
+    client = _Client()
+    LLMGenerator(client).propose(_packet(), strategy="skeleton")
+    assert STRATEGY_PREAMBLES["skeleton"] in client.seen["system"]

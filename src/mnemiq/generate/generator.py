@@ -47,13 +47,27 @@ class LLMGenerator:
         self._max_tokens = max_tokens
         self._dialect = dialect
 
-    def propose(self, packet: ContextPacket, feedback: str | None = None) -> SqlProposal:
+    def propose(
+        self, packet: ContextPacket, feedback: str | None = None, strategy: str | None = None
+    ) -> SqlProposal:
         raw = self._client.complete(
-            system_prompt(dialect=self._dialect),
+            system_prompt(dialect=self._dialect, strategy=strategy),
             user_prompt(packet, feedback),
             max_tokens=self._max_tokens,
         )
         return _parse(raw)
+
+
+class StrategyGenerator:
+    """Binds one strategy onto a generator, behind the plain two-arg Generator protocol --
+    plan_query never learns strategies exist."""
+
+    def __init__(self, inner, strategy: str) -> None:
+        self._inner = inner
+        self._strategy = strategy
+
+    def propose(self, packet: ContextPacket, feedback: str | None = None) -> SqlProposal:
+        return self._inner.propose(packet, feedback, strategy=self._strategy)
 
 
 class FakeGenerator:
@@ -62,9 +76,13 @@ class FakeGenerator:
     def __init__(self, replies: list[str]) -> None:
         self._replies = list(replies)
         self.calls: list[str | None] = []
+        self.strategies: list[str | None] = []
 
-    def propose(self, packet: ContextPacket, feedback: str | None = None) -> SqlProposal:
+    def propose(
+        self, packet: ContextPacket, feedback: str | None = None, strategy: str | None = None
+    ) -> SqlProposal:
         self.calls.append(feedback)
+        self.strategies.append(strategy)
         if not self._replies:
             return SqlProposal(sql=None, reason="no more scripted replies")
         return _parse(self._replies.pop(0))
