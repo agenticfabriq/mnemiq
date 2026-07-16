@@ -431,6 +431,7 @@ def test_agent_transpiles_to_the_adapters_dialect(monkeypatch):
     captured = {}
 
     def fake_plan_query(packet, snapshot, grants, generator, **kw):
+        captured["dialect"] = kw.get("dialect")
         captured["target"] = kw.get("target")
         return Deferred(reason="stop")
 
@@ -448,6 +449,8 @@ def test_agent_transpiles_to_the_adapters_dialect(monkeypatch):
     agent = _agent(["ignored"], adapter=_SqliteAdapter())
     ans = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
     assert ans.deferred is True
+    # source dialect drives BOTH parsing and execution -- no cross-dialect transpile
+    assert captured["dialect"] == "sqlite"
     assert captured["target"] == "sqlite"
 
 
@@ -458,13 +461,15 @@ def test_agent_defaults_to_duckdb_when_the_adapter_is_silent(monkeypatch):
     captured = {}
 
     def fake_plan_query(packet, snapshot, grants, generator, **kw):
+        captured["dialect"] = kw.get("dialect")
         captured["target"] = kw.get("target")
         return Deferred(reason="stop")
 
     monkeypatch.setattr(loop_mod, "plan_query", fake_plan_query)
     agent = _agent(["ignored"], adapter=_FakeAdapter())  # _FakeAdapter declares no dialect
     agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
-    assert captured["target"] == "duckdb"  # the product default, unchanged
+    assert captured["dialect"] == "duckdb"  # the product default, unchanged
+    assert captured["target"] == "duckdb"
 
 
 def test_real_adapters_declare_their_execution_dialect():
