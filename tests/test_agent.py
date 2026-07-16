@@ -419,3 +419,57 @@ def test_without_min_agreement_fragmentation_still_answers():
 def test_the_single_path_reports_no_candidate_count():
     ans = _answer(_agent(['{"sql": "SELECT n FROM claim"}']))
     assert ans.candidates_executed is None
+
+
+def test_agent_transpiles_to_the_adapters_dialect(monkeypatch):
+    # The bug: target was hardcoded "duckdb", so DuckDB SQL hit non-DuckDB sources
+    # un-transpiled (BIRD's SQLite: "no such function: YEAR"). The Agent must transpile
+    # to the dialect the adapter actually executes.
+    import mnemiq.agent.loop as loop_mod
+    from mnemiq.generate.plan_query import Deferred
+
+    captured = {}
+
+    def fake_plan_query(packet, snapshot, grants, generator, **kw):
+        captured["target"] = kw.get("target")
+        return Deferred(reason="stop")
+
+    monkeypatch.setattr(loop_mod, "plan_query", fake_plan_query)
+
+    class _SqliteAdapter:
+        dialect = "sqlite"
+
+        def execute_arrow(self, sql, timeout_s=None):
+            return _RESULT
+
+        def execute(self, sql):
+            return []
+
+    agent = _agent(["ignored"], adapter=_SqliteAdapter())
+    ans = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+    assert ans.deferred is True
+    assert captured["target"] == "sqlite"
+
+
+def test_agent_defaults_to_duckdb_when_the_adapter_is_silent(monkeypatch):
+    import mnemiq.agent.loop as loop_mod
+    from mnemiq.generate.plan_query import Deferred
+
+    captured = {}
+
+    def fake_plan_query(packet, snapshot, grants, generator, **kw):
+        captured["target"] = kw.get("target")
+        return Deferred(reason="stop")
+
+    monkeypatch.setattr(loop_mod, "plan_query", fake_plan_query)
+    agent = _agent(["ignored"], adapter=_FakeAdapter())  # _FakeAdapter declares no dialect
+    agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+    assert captured["target"] == "duckdb"  # the product default, unchanged
+
+
+def test_real_adapters_declare_their_execution_dialect():
+    from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
+    from mnemiq.adapters.sqlite import SQLiteAdapter
+
+    assert SQLiteAdapter.dialect == "sqlite"
+    assert DuckDBPostgresAdapter.dialect == "duckdb"
