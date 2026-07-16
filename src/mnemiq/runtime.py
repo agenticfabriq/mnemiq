@@ -16,6 +16,7 @@ from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
 from mnemiq.semantic.retrieval import retrieve
+from mnemiq.semantic.values import ValueIndex
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.snapshot_store import current_version, load_snapshot
 
@@ -74,6 +75,7 @@ def build_runtime(settings: Settings) -> Runtime:
         cache=TwoTierCache(L1Cache()),
         budget=Budget(wall_clock_s=120.0),
         corrector=LLMCorrector(client),
+        values=ValueIndex(con),
     )
     return Runtime(
         con=con,

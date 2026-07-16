@@ -15,6 +15,7 @@ from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import LLMEmbedder
 from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.store import build_index
+from mnemiq.semantic.values import ValueIndex, build_value_index
 from mnemiq.store.bootstrap import init_store
 
 IDENTITY = IdentityContext(tenant_id="local", principal_id="eval", roles=["analyst"])
@@ -51,6 +52,7 @@ def build_engine(
     embedder = LLMEmbedder(settings)
     con = init_store(store_path)
     build_index(con, snapshot, embedder)
+    build_value_index(adapter, snapshot, con)
 
     tables = [r[0] for r in con.execute("SELECT object_id FROM semantic_object").fetchall()]
     grants = GrantSet(frozenset(tables))
@@ -65,6 +67,7 @@ def build_engine(
         budget=Budget(wall_clock_s=120.0),
         candidates=candidates,
         corrector=LLMCorrector(client),
+        values=ValueIndex(con),
     )
 
     def ask(question: str) -> AgentAnswer:
