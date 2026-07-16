@@ -5,6 +5,7 @@ from sqlglot import exp
 
 from mnemiq.sql.authz_guard import check_access
 from mnemiq.sql.guard import MAX_ROWS, check_shape
+from mnemiq.sql.lint import lint
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
 
 
@@ -30,6 +31,11 @@ def decide(
     refusal = check_access(shaped, visible)
     if refusal is not None:
         return refusal
+
+    violation = lint(shaped)
+    if violation is not None:
+        # silently-wrong SQL: runs fine, wrong answer. Repairable -- the corrector fixes it.
+        return Refusal(code=RefusalCode.LOGIC_LINT, message=violation.message)
 
     plan_sql = shaped.sql(dialect=dialect)
     target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]

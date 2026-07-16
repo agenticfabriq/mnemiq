@@ -89,3 +89,61 @@ def test_an_empty_packet_defers_without_calling_the_model():
 
     assert isinstance(outcome, Deferred)
     assert generator.calls == []  # no tables, no grants, no reason to spend a token
+
+
+def test_logic_lint_is_corrected_once_and_approved():
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract import Column, Snapshot
+    from mnemiq.generate.correct import FakeCorrector
+    from mnemiq.generate.generator import FakeGenerator
+    from mnemiq.generate.plan_query import plan_query
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+    from mnemiq.sql.verdict import Approved
+
+    snapshot = Snapshot(
+        version="v1", source_id="s", created_at="2026-07-15T00:00:00Z",
+        columns=[
+            Column(id="claim.name", object_id="claim", name="name"),
+            Column(id="claim.score", object_id="claim", name="score"),
+        ],
+    )
+    packet = ContextPacket(
+        question="q", cards=[RetrievedCard(object_id="claim", card="TABLE claim", score=1.0)],
+        grant_fingerprint="fp", enrichment_version="v1",
+    )
+    grants = GrantSet(frozenset({"claim"}))
+    gen = FakeGenerator(['{"sql": "SELECT name FROM claim ORDER BY score LIMIT 1"}'])
+    corrector = FakeCorrector(
+        ["SELECT name FROM claim WHERE score IS NOT NULL ORDER BY score LIMIT 1"]
+    )
+
+    verdict = plan_query(
+        packet, snapshot, grants, gen, adapter=None, target="duckdb", corrector=corrector
+    )
+    assert isinstance(verdict, Approved)
+    assert corrector.calls and "IS NOT NULL" not in corrector.calls[0][0]  # got the flawed SQL
+    # the corrected (null-guarded) form was approved; sqlglot renders it as "NOT score IS NULL"
+    assert "IS NULL" in verdict.plan_sql and "NOT" in verdict.plan_sql
+
+
+def test_without_a_corrector_a_lint_falls_back_to_regenerate_then_defers():
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract import Column, Snapshot
+    from mnemiq.generate.generator import FakeGenerator
+    from mnemiq.generate.plan_query import Deferred, plan_query
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+
+    snapshot = Snapshot(
+        version="v1", source_id="s", created_at="2026-07-15T00:00:00Z",
+        columns=[Column(id="claim.score", object_id="claim", name="score"),
+                 Column(id="claim.name", object_id="claim", name="name")],
+    )
+    packet = ContextPacket(question="q", cards=[RetrievedCard(object_id="claim", card="c", score=1.0)],
+                           grant_fingerprint="fp", enrichment_version="v1")
+    grants = GrantSet(frozenset({"claim"}))
+    gen = FakeGenerator([
+        '{"sql": "SELECT name FROM claim ORDER BY score LIMIT 1"}',
+        '{"sql": "SELECT name FROM claim ORDER BY score LIMIT 1"}',
+    ])
+    out = plan_query(packet, snapshot, grants, gen, adapter=None, target="duckdb", max_attempts=2)
+    assert isinstance(out, Deferred)  # lint fed back, never corrected, ran out of attempts
