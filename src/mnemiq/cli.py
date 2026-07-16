@@ -44,6 +44,7 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.enrichment.pipeline import enrich_structural
     from mnemiq.enrichment.semantic import enrich_semantic
     from mnemiq.llm.client import LLMClient
+    from mnemiq.semantic.values import build_value_index
     from mnemiq.store.bootstrap import init_store
     from mnemiq.store.snapshot_store import save_snapshot
 
@@ -53,8 +54,13 @@ def _cmd_enrich(settings: Settings) -> int:
     adapter = DuckDBPostgresAdapter(settings.pg_dsn)
     snap = enrich_structural(adapter, settings.source_id)
     snap = enrich_semantic(snap, LLMEnricher(LLMClient(settings)))
-    save_snapshot(init_store(settings.store_path), snap)
-    print(f"snapshot {snap.version} ({len(snap.source_bindings)} tables) -> {settings.store_path}")
+    con = init_store(settings.store_path)
+    save_snapshot(con, snap)
+    n_values = build_value_index(adapter, snap, con)
+    print(
+        f"snapshot {snap.version} ({len(snap.source_bindings)} tables, "
+        f"{n_values} indexed values) -> {settings.store_path}"
+    )
     return 0
 
 

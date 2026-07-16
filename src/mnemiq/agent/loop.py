@@ -48,6 +48,7 @@ class Agent:
         timeout_s: float = 30.0,
         candidates: int = 1,
         corrector=None,
+        values=None,
     ) -> None:
         self.generator = generator
         self.synthesizer = synthesizer
@@ -57,6 +58,7 @@ class Agent:
         self.timeout_s = timeout_s
         self.candidates = candidates
         self.corrector = corrector
+        self.values = values
 
     def answer(
         self,
@@ -95,6 +97,7 @@ class Agent:
                 target="duckdb",
                 feedback=feedback,
                 corrector=self.corrector,
+                values=self.values,
             )
             if isinstance(outcome, Deferred):
                 return AgentAnswer(answer=outcome.reason, deferred=True)
@@ -171,6 +174,7 @@ class Agent:
                 target="duckdb",
                 max_attempts=1,
                 corrector=self.corrector,
+                values=self.values,
             )
             if not isinstance(outcome, Approved):
                 continue

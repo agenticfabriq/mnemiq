@@ -286,3 +286,26 @@ def test_agent_passes_its_corrector_into_plan_query(monkeypatch):
     )
     agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
     assert seen["corrector"] is corrector
+
+
+def test_agent_passes_its_values_into_plan_query(monkeypatch):
+    import mnemiq.agent.loop as loop
+    from mnemiq.sql.verdict import Approved
+
+    seen = {}
+
+    def fake_plan_query(packet, snapshot, grants, generator, **kwargs):
+        seen["values"] = kwargs.get("values")
+        return Approved(plan_sql="SELECT 1", target_sql="SELECT 1", tables=[], columns=[])
+
+    monkeypatch.setattr(loop, "plan_query", fake_plan_query)
+    sentinel = object()
+    agent = Agent(
+        generator=FakeGenerator(['{"sql":"SELECT 1"}']),
+        synthesizer=FakeSynthesizer("ok"),
+        adapter=_FakeAdapter(),
+        cache=TwoTierCache(L1Cache()),
+        values=sentinel,
+    )
+    agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+    assert seen["values"] is sentinel
