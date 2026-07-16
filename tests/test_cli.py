@@ -11,8 +11,10 @@ def _fake_settings():
 
 def test_parser_exposes_the_lifecycle_subcommands():
     p = build_parser()
-    args = p.parse_args(["ask", "how many claims?", "--json"])
+    args = p.parse_args(["ask", "how many claims?", "--json", "--mode", "deep"])
     assert args.command == "ask" and args.question == "how many claims?" and args.json is True
+    assert args.mode == "deep"
+    assert p.parse_args(["ask", "q"]).mode is None  # unset -> the router decides
     for cmd in ("enrich", "build", "serve", "eval"):
         assert p.parse_args([cmd]).command == cmd  # each parses with no extra args
 
@@ -22,7 +24,7 @@ def test_ask_prints_answer_and_exits_zero(monkeypatch, capsys):
     from mnemiq.agent.loop import AgentAnswer
 
     class _RT:
-        def ask(self, q, identity):
+        def ask(self, q, identity, mode=None):
             return AgentAnswer(answer="There are 2 claims.", trace=None, deferred=False)
 
     monkeypatch.setattr(cli, "build_runtime", lambda settings: _RT())
@@ -37,7 +39,7 @@ def test_ask_on_a_deferral_still_exits_zero(monkeypatch, capsys):
     from mnemiq.agent.loop import AgentAnswer
 
     class _RT:
-        def ask(self, q, identity):
+        def ask(self, q, identity, mode=None):
             return AgentAnswer(answer="I cannot answer that.", deferred=True)
 
     monkeypatch.setattr(cli, "build_runtime", lambda settings: _RT())
@@ -56,3 +58,27 @@ def test_ask_reports_missing_snapshot_as_nonzero(monkeypatch, capsys):
     monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: _fake_settings()))
     assert main(["ask", "q"]) == 1
     assert "mnemiq enrich" in capsys.readouterr().err
+
+
+def test_ask_rejects_an_unknown_mode_at_the_parser():
+    import pytest
+
+    with pytest.raises(SystemExit):  # argparse choices: fail closed before any work
+        build_parser().parse_args(["ask", "q", "--mode", "fastest"])
+
+
+def test_ask_passes_mode_to_the_runtime_and_reports_it(monkeypatch, capsys):
+    import mnemiq.cli as cli
+    from mnemiq.agent.loop import AgentAnswer
+
+    class _RT:
+        def ask(self, q, identity, mode=None):
+            self.mode = mode
+            return AgentAnswer(answer="ok", mode=mode or "thinking")
+
+    rt = _RT()
+    monkeypatch.setattr(cli, "build_runtime", lambda settings: rt)
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: _fake_settings()))
+    assert main(["ask", "q", "--mode", "instant", "--json"]) == 0
+    assert rt.mode == "instant"
+    assert '"mode": "instant"' in capsys.readouterr().out
