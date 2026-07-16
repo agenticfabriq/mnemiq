@@ -126,6 +126,49 @@ def test_logic_lint_is_corrected_once_and_approved():
     assert "IS NULL" in verdict.plan_sql and "NOT" in verdict.plan_sql
 
 
+def test_value_grounding_is_corrected_once_and_approved():
+    from mnemiq.contract import Column, Snapshot
+    from mnemiq.generate.correct import FakeCorrector
+    from mnemiq.generate.generator import FakeGenerator
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+    from mnemiq.sql.verdict import Approved
+
+    class _FakeIndex:
+        def __init__(self, data):
+            self._data = data
+
+        def has(self, t, c):
+            return (t, c) in self._data
+
+        def contains(self, t, c, v):
+            return v in self._data.get((t, c), set())
+
+        def nearest(self, t, c, v, k=8):
+            return sorted(self._data.get((t, c), set()))[:k]
+
+    snapshot = Snapshot(
+        version="v1", source_id="s", created_at="2026-07-15T00:00:00Z",
+        columns=[Column(id="gasstations.Country", object_id="gasstations", name="Country")],
+    )
+    packet = ContextPacket(
+        question="q",
+        cards=[RetrievedCard(object_id="gasstations", card="TABLE gasstations", score=1.0)],
+        grant_fingerprint="fp", enrichment_version="v1",
+    )
+    grants = GrantSet(frozenset({"gasstations"}))
+    idx = _FakeIndex({("gasstations", "Country"): {"Czech Republic", "Slovakia"}})
+    gen = FakeGenerator(['{"sql": "SELECT Country FROM gasstations WHERE Country = \'CZE\'"}'])
+    corrector = FakeCorrector(["SELECT Country FROM gasstations WHERE Country = 'Czech Republic'"])
+
+    verdict = plan_query(
+        packet, snapshot, grants, gen, adapter=None, target="duckdb",
+        corrector=corrector, values=idx,
+    )
+    assert isinstance(verdict, Approved)
+    assert "CZE" in corrector.calls[0][0]  # the corrector saw the flawed SQL
+    assert "Czech Republic" in verdict.plan_sql  # the corrected literal was approved
+
+
 def test_without_a_corrector_a_lint_falls_back_to_regenerate_then_defers():
     from mnemiq.authz.grants import GrantSet
     from mnemiq.contract import Column, Snapshot
