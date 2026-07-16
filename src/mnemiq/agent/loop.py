@@ -32,6 +32,7 @@ class AgentAnswer:
     agreement: float | None = None
     judge_engaged: bool | None = None  # multi-candidate only: did the judge get consulted?
     judge_override: bool | None = None  # ...and did it pick against the majority?
+    candidates_executed: int | None = None  # multi-candidate only: how many of N ran
 
 
 def _shape(row_count: int, column_count: int) -> str:
@@ -57,6 +58,7 @@ class Agent:
         corrector=None,
         values=None,
         selector=None,
+        min_agreement: float | None = None,
     ) -> None:
         self.generator = generator
         self.synthesizer = synthesizer
@@ -68,6 +70,7 @@ class Agent:
         self.corrector = corrector
         self.values = values
         self.selector = selector
+        self.min_agreement = min_agreement
 
     def answer(
         self,
@@ -206,6 +209,22 @@ class Agent:
         ]
         majority = majority_index(views)
 
+        if self.min_agreement is not None:
+            # Selective answering: fragmentation is a confidence verdict on the QUESTION,
+            # judged before any pick. A reduced set never passes -- unanimity among
+            # survivors is survival bias, not agreement (Plan 12: 4/4, 3/3 -> 11%, 0%).
+            largest = views[majority].size
+            if len(executed) < self.candidates or largest / len(executed) < self.min_agreement:
+                return AgentAnswer(
+                    answer=(
+                        "The candidates disagreed too much to answer confidently "
+                        f"(best agreement {largest} of {self.candidates})."
+                    ),
+                    deferred=True,
+                    agreement=largest / len(executed),
+                    candidates_executed=len(executed),
+                )
+
         judge_engaged = judge_override = None
         if self.selector is not None:
             judge_engaged = not auto_accepted(views)
@@ -231,6 +250,7 @@ class Agent:
             agreement=agreement,
             judge_engaged=judge_engaged,
             judge_override=judge_override,
+            candidates_executed=len(executed),
         )
 
     def _synthesize(
