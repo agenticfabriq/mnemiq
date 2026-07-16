@@ -18,6 +18,10 @@ class Deferred:
 
 Outcome = Approved | Deferred
 
+# Refusals the corrector can fix with one surgical edit: both are silently-wrong SQL that
+# runs fine and answers wrong. A guard (unauthorized table) is never in this set.
+CORRECTABLE = frozenset({RefusalCode.LOGIC_LINT, RefusalCode.VALUE_GROUNDING})
+
 
 def plan_query(
     packet: ContextPacket,
@@ -30,6 +34,7 @@ def plan_query(
     target: str = "postgres",
     feedback: str | None = None,
     corrector=None,
+    values=None,
 ) -> Outcome:
     """Propose, decide, repair -- and defer rather than guess.
 
@@ -53,21 +58,24 @@ def plan_query(
                 reason=proposal.reason or "The model could not answer from these tables."
             )
 
-        verdict = decide(proposal.sql, visible, adapter=adapter, dialect=dialect, target=target)
+        verdict = decide(
+            proposal.sql, visible, adapter=adapter, dialect=dialect, target=target, values=values
+        )
 
         if (
             isinstance(verdict, Refusal)
-            and verdict.code == RefusalCode.LOGIC_LINT
+            and verdict.code in CORRECTABLE
             and corrector is not None
         ):
             # one surgical pass: fix only the flagged problem, then re-decide (which re-runs
-            # shape/access/lint/EXPLAIN, so a bad edit cannot slip through)
+            # shape/access/lint/values/EXPLAIN, so a bad edit cannot slip through)
             verdict = decide(
                 corrector.correct(proposal.sql, verdict.message),
                 visible,
                 adapter=adapter,
                 dialect=dialect,
                 target=target,
+                values=values,
             )
 
         if isinstance(verdict, Approved):

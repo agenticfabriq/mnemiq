@@ -6,6 +6,7 @@ from sqlglot import exp
 from mnemiq.sql.authz_guard import check_access
 from mnemiq.sql.guard import MAX_ROWS, check_shape
 from mnemiq.sql.lint import lint
+from mnemiq.sql.values_check import check_values
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
 
 
@@ -16,6 +17,7 @@ def decide(
     dialect: str = "duckdb",
     target: str = "postgres",
     max_rows: int = MAX_ROWS,
+    values=None,
 ) -> Verdict:
     """The deterministic decider: shape, then access, then proof against the real source.
 
@@ -36,6 +38,13 @@ def decide(
     if violation is not None:
         # silently-wrong SQL: runs fine, wrong answer. Repairable -- the corrector fixes it.
         return Refusal(code=RefusalCode.LOGIC_LINT, message=violation.message)
+
+    if values is not None:
+        # a filter literal that does not exist in its column runs fine and answers wrong --
+        # another silently-wrong class the corrector fixes, given the real values to pick from.
+        grounding = check_values(shaped, visible, values)
+        if grounding is not None:
+            return grounding
 
     plan_sql = shaped.sql(dialect=dialect)
     target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
