@@ -371,3 +371,51 @@ def test_without_a_selector_voting_behavior_is_unchanged():
     ans = _answer(agent)
     assert ans.agreement == 0.6  # exactly Plan 12's pick
     assert ans.judge_engaged is None  # no selector wired: telemetry stays None
+
+
+# --- Plan 17: selective answering (the min_agreement gate) ------------------------------
+def test_fragmented_candidates_defer_and_never_consult_the_judge():
+    from mnemiq.execute.select import FakeSelector
+
+    selector = FakeSelector([0])
+    agent = _vote_agent([_sql("count(*)"), _sql("count(*)"), _sql("sum(n)")], 3)
+    agent.selector = selector
+    agent.min_agreement = 1.0
+    ans = _answer(agent)
+
+    assert ans.deferred is True
+    assert "disagreed" in ans.answer and "2 of 3" in ans.answer
+    assert selector.calls == []  # gate fires before the judge
+    assert ans.agreement == 2 / 3
+    assert ans.candidates_executed == 3
+
+
+def test_full_set_unanimity_passes_the_gate():
+    agent = _vote_agent([_sql("count(*)")] * 3, 3)
+    agent.min_agreement = 1.0
+    ans = _answer(agent)
+    assert ans.deferred is False
+    assert ans.candidates_executed == 3
+
+
+def test_reduced_set_unanimity_is_survival_bias_and_defers():
+    # one candidate defers -> only 2 of 3 executed; they agree, but 2/2 is not 3/3
+    agent = _vote_agent(
+        ['{"sql": null, "reason": "cannot"}', _sql("count(*)"), _sql("count(*)")], 3
+    )
+    agent.min_agreement = 1.0
+    ans = _answer(agent)
+    assert ans.deferred is True
+    assert "2 of 3" in ans.answer
+    assert ans.candidates_executed == 2
+
+
+def test_without_min_agreement_fragmentation_still_answers():
+    agent = _vote_agent([_sql("count(*)"), _sql("count(*)"), _sql("sum(n)")], 3)
+    ans = _answer(agent)
+    assert ans.deferred is False  # min_agreement=None: today's behavior
+
+
+def test_the_single_path_reports_no_candidate_count():
+    ans = _answer(_agent(['{"sql": "SELECT n FROM claim"}']))
+    assert ans.candidates_executed is None

@@ -183,3 +183,11 @@ def test_judge_telemetry_is_copied_onto_the_case_result():
     result = run_case(_case(), lambda q: answer, _GoldAdapter(pa.table({"n": [820]})))
     assert result.judge_engaged is True
     assert result.judge_override is True
+
+
+def test_candidates_executed_is_copied_onto_the_case_result():
+    answer = AgentAnswer(
+        answer="820 claims.", trace=_trace(), deferred=False, candidates_executed=4
+    )
+    result = run_case(_case(), lambda q: answer, _GoldAdapter(pa.table({"n": [820]})))
+    assert result.candidates_executed == 4
