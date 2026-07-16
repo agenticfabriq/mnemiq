@@ -14,6 +14,7 @@ class RefusalCode(StrEnum):
     UNKNOWN_COLUMN = "unknown_column"
     EXPLAIN_FAILED = "explain_failed"
     LOGIC_LINT = "logic_lint"
+    VALUE_GROUNDING = "value_grounding"
 
 
 # A refusal the model can act on is a repair; a refusal it cannot act on is a dead end.
@@ -29,6 +30,7 @@ REPAIRABLE = frozenset(
         RefusalCode.UNKNOWN_COLUMN,
         RefusalCode.EXPLAIN_FAILED,
         RefusalCode.LOGIC_LINT,
+        RefusalCode.VALUE_GROUNDING,
     }
 )
 
