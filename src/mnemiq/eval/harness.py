@@ -61,8 +61,14 @@ def _preview(table: pa.Table) -> list[dict]:
     ]
 
 
-def run_case(case: EvaluationCase, engine: Engine, adapter) -> CaseResult:
-    """Ask the engine, then check its answer against the gold query's result set."""
+def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None) -> CaseResult:
+    """Ask the engine, then check its answer against the gold query's result set.
+
+    `adapter` executes the engine's SQL (the same executor the engine used); `gold_adapter`
+    (defaults to `adapter`) executes the gold SQL. BIRD passes a DuckDB engine adapter and a
+    native-SQLite gold adapter; single-engine callers (ACME) pass one adapter for both.
+    """
+    gold_adapter = gold_adapter or adapter
     result = CaseResult(
         case_id=case.id,
         outcome=Outcome.ERROR,
@@ -91,7 +97,7 @@ def run_case(case: EvaluationCase, engine: Engine, adapter) -> CaseResult:
     gold: pa.Table | None = None
     if case.answerable:
         try:
-            gold = adapter.execute_arrow(case.gold_sql, timeout_s=30)
+            gold = gold_adapter.execute_arrow(case.gold_sql, timeout_s=30)
             result.gold_rows = _preview(gold)
             result.gold_row_count = gold.num_rows
         except Exception:
