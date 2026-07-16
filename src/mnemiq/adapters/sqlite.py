@@ -14,7 +14,8 @@ class SQLiteAdapter:
     is a read plane, and the decider is not the only thing standing between it and a write.
     """
 
-    dialect = "sqlite"  # the engine transpiles its duckdb plan to SQLite before executing
+    dialect = "sqlite"  # only relevant if used as an execution adapter; BIRD executes the
+    # engine's SQL via DuckDBAdapter and uses this adapter for enrichment + native gold.
 
     def __init__(self, path: str) -> None:
         # mode=ro rejects every write at the driver; interrupt() is documented safe to call
