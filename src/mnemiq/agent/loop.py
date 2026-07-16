@@ -47,6 +47,7 @@ class Agent:
         budget: Budget | None = None,
         timeout_s: float = 30.0,
         candidates: int = 1,
+        corrector=None,
     ) -> None:
         self.generator = generator
         self.synthesizer = synthesizer
@@ -55,6 +56,7 @@ class Agent:
         self.budget = budget or Budget()
         self.timeout_s = timeout_s
         self.candidates = candidates
+        self.corrector = corrector
 
     def answer(
         self,
@@ -92,6 +94,7 @@ class Agent:
                 adapter=self.adapter,
                 target="duckdb",
                 feedback=feedback,
+                corrector=self.corrector,
             )
             if isinstance(outcome, Deferred):
                 return AgentAnswer(answer=outcome.reason, deferred=True)
@@ -167,6 +170,7 @@ class Agent:
                 adapter=self.adapter,
                 target="duckdb",
                 max_attempts=1,
+                corrector=self.corrector,
             )
             if not isinstance(outcome, Approved):
                 continue

@@ -29,6 +29,7 @@ def plan_query(
     dialect: str = "duckdb",
     target: str = "postgres",
     feedback: str | None = None,
+    corrector=None,
 ) -> Outcome:
     """Propose, decide, repair -- and defer rather than guess.
 
@@ -53,6 +54,22 @@ def plan_query(
             )
 
         verdict = decide(proposal.sql, visible, adapter=adapter, dialect=dialect, target=target)
+
+        if (
+            isinstance(verdict, Refusal)
+            and verdict.code == RefusalCode.LOGIC_LINT
+            and corrector is not None
+        ):
+            # one surgical pass: fix only the flagged problem, then re-decide (which re-runs
+            # shape/access/lint/EXPLAIN, so a bad edit cannot slip through)
+            verdict = decide(
+                corrector.correct(proposal.sql, verdict.message),
+                visible,
+                adapter=adapter,
+                dialect=dialect,
+                target=target,
+            )
+
         if isinstance(verdict, Approved):
             return verdict
 

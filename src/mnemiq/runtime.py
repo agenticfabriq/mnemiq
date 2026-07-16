@@ -11,6 +11,7 @@ from mnemiq.authz.grants import AuthzProvider, DenyAll, FileAuthzProvider
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext, Snapshot
+from mnemiq.generate.correct import LLMCorrector
 from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
@@ -72,6 +73,7 @@ def build_runtime(settings: Settings) -> Runtime:
         adapter=DuckDBPostgresAdapter(settings.pg_dsn),
         cache=TwoTierCache(L1Cache()),
         budget=Budget(wall_clock_s=120.0),
+        corrector=LLMCorrector(client),
     )
     return Runtime(
         con=con,
