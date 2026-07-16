@@ -68,3 +68,25 @@ def test_a_query_the_snapshot_believes_but_the_source_denies_is_refused():
     assert isinstance(verdict, Refusal)
     assert verdict.code == RefusalCode.EXPLAIN_FAILED
     assert verdict.repairable
+
+
+def test_decide_flags_a_logic_lint_and_refuses():
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.verdict import Refusal, RefusalCode
+
+    visible = {"t": {"name", "score"}}
+    verdict = decide("SELECT name FROM t ORDER BY score LIMIT 1", visible, adapter=None)
+    assert isinstance(verdict, Refusal)
+    assert verdict.code == RefusalCode.LOGIC_LINT
+    assert verdict.repairable
+
+
+def test_decide_approves_the_guarded_form():
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.verdict import Approved
+
+    visible = {"t": {"name", "score"}}
+    verdict = decide(
+        "SELECT name FROM t WHERE score IS NOT NULL ORDER BY score LIMIT 1", visible, adapter=None
+    )
+    assert isinstance(verdict, Approved)
