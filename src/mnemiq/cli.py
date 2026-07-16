@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sys
 
+from mnemiq.agent.modes import MODES
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
 from mnemiq.runtime import SnapshotMissing, build_runtime
@@ -22,6 +23,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--json", action="store_true", help="emit the machine record")
     a.add_argument("--principal", default="local")
     a.add_argument("--roles", default="", help="comma-separated")
+    a.add_argument("--mode", choices=sorted(MODES), default=None,
+                   help="instant (cheapest) | thinking (default) | deep (highest precision)")
 
     sub.add_parser("serve", help="run the MCP server on stdio")
 
@@ -88,7 +91,7 @@ def _cmd_ask(settings: Settings, args) -> int:
     except SnapshotMissing as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    ans = rt.ask(args.question, _identity(args))
+    ans = rt.ask(args.question, _identity(args), mode=args.mode)
     if args.json:
         import json
 
@@ -97,6 +100,7 @@ def _cmd_ask(settings: Settings, args) -> int:
                 {
                     "answer": ans.answer,
                     "deferred": ans.deferred,
+                    "mode": ans.mode,
                     "sql": ans.trace.target_sql if ans.trace else None,
                 },
                 default=str,
