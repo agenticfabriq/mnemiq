@@ -12,10 +12,15 @@ from mnemiq.contract import IdentityContext, Snapshot, Trace
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
 from mnemiq.execute.runner import ExecutionError, run
-from mnemiq.generate.generator import Generator
+from mnemiq.execute.select import ClusterView, auto_accepted, majority_index
+from mnemiq.generate.generator import Generator, StrategyGenerator
 from mnemiq.generate.plan_query import Deferred, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
+
+# Cycled across candidates in multi-candidate mode: engineered disagreement, so the
+# selector has something real to select over (uniform resampling measured 56% unanimous).
+STRATEGIES = ("direct", "decompose", "skeleton")
 
 
 @dataclass
@@ -25,6 +30,8 @@ class AgentAnswer:
     deferred: bool = False
     cached: bool = False
     agreement: float | None = None
+    judge_engaged: bool | None = None  # multi-candidate only: did the judge get consulted?
+    judge_override: bool | None = None  # ...and did it pick against the majority?
 
 
 def _shape(row_count: int, column_count: int) -> str:
@@ -49,6 +56,7 @@ class Agent:
         candidates: int = 1,
         corrector=None,
         values=None,
+        selector=None,
     ) -> None:
         self.generator = generator
         self.synthesizer = synthesizer
@@ -59,6 +67,7 @@ class Agent:
         self.candidates = candidates
         self.corrector = corrector
         self.values = values
+        self.selector = selector
 
     def answer(
         self,
@@ -161,15 +170,15 @@ class Agent:
         identity: IdentityContext,
         deadline,
     ) -> AgentAnswer:
-        # Generate N single-shot candidates and let the deterministic executor vote. Each
+        # Generate N candidates across engineered strategies and let execution vote. Each
         # is decided independently; a refusal/deferral just drops that candidate.
         executed: list[tuple[Approved, object]] = []
-        for _ in range(self.candidates):
+        for i in range(self.candidates):
             outcome = plan_query(
                 packet,
                 snapshot,
                 grants,
-                self.generator,
+                StrategyGenerator(self.generator, STRATEGIES[i % len(STRATEGIES)]),
                 adapter=self.adapter,
                 target="duckdb",
                 max_attempts=1,
@@ -187,7 +196,25 @@ class Agent:
             return self._answer_single(packet, snapshot, grants, identity, deadline)
 
         groups = cluster([table for _, table in executed])
-        winner = max(groups, key=len)  # ties -> first (earliest-appearance) cluster
+        views = [
+            ClusterView(
+                sql=executed[group[0]][0].plan_sql,
+                preview=render_result(executed[group[0]][1], max_rows=5),
+                size=len(group),
+            )
+            for group in groups
+        ]
+        majority = majority_index(views)
+
+        judge_engaged = judge_override = None
+        if self.selector is not None:
+            judge_engaged = not auto_accepted(views)
+            chosen = self.selector.select(packet.question, views) if judge_engaged else majority
+            judge_override = chosen != majority
+        else:
+            chosen = majority  # no selector wired: Plan 12's vote, byte-for-byte
+
+        winner = groups[chosen]
         approved, table = executed[winner[0]]
         agreement = len(winner) / len(executed)
 
@@ -202,6 +229,8 @@ class Agent:
             deferred=False,
             cached=False,
             agreement=agreement,
+            judge_engaged=judge_engaged,
+            judge_override=judge_override,
         )
 
     def _synthesize(

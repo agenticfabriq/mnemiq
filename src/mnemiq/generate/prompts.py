@@ -9,9 +9,28 @@ PERSONA = (
     "when a question cannot be answered from the tables you were given."
 )
 
+# Candidate diversity is engineered, not sampled: three ways of *approaching* the question,
+# so multi-candidate runs disagree where the model's first instinct is wrong. "direct" is
+# deliberately empty -- it must leave the prompt byte-identical to single-shot.
+STRATEGY_PREAMBLES = {
+    "direct": "",
+    "decompose": (
+        "APPROACH: before writing SQL, silently decompose the question -- the result grain "
+        "(one row per what?), the filters, and the aggregation. Then write the query that "
+        "matches that decomposition exactly."
+    ),
+    "skeleton": (
+        "APPROACH: before writing SQL, silently sketch the query skeleton "
+        "(SELECT ... FROM ... JOIN ... WHERE ... GROUP BY ...), decide what fills each slot, "
+        "then write the finished query."
+    ),
+}
 
-def system_prompt(dialect: str = "duckdb", max_rows: int = MAX_ROWS) -> str:
-    return f"""{PERSONA}
+
+def system_prompt(
+    dialect: str = "duckdb", max_rows: int = MAX_ROWS, strategy: str | None = None
+) -> str:
+    base = f"""{PERSONA}
 
 You will be given a question and the schema cards for the ONLY tables you may use.
 Write one {dialect} SELECT query that answers the question.
@@ -30,6 +49,8 @@ far worse than an honest "I cannot answer that from this data".
 Return ONLY a JSON object, no prose and no code fences:
 {{"sql": "<the SELECT, or null>", "reason": "<one sentence>"}}
 """
+    preamble = STRATEGY_PREAMBLES.get(strategy or "direct", "")
+    return f"{base}\n{preamble}\n" if preamble else base
 
 
 def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
