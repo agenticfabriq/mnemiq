@@ -9,6 +9,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.config import Settings
 from mnemiq.contract import Definition, IdentityContext, Snapshot
+from mnemiq.generate.correct import LLMCorrector
 from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import LLMEmbedder
@@ -63,6 +64,7 @@ def build_engine(
         cache=TwoTierCache(L1Cache()),
         budget=Budget(wall_clock_s=120.0),
         candidates=candidates,
+        corrector=LLMCorrector(client),
     )
 
     def ask(question: str) -> AgentAnswer:

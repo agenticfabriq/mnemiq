@@ -262,3 +262,27 @@ def test_single_candidate_mode_is_unchanged():
     ans = _answer(agent)
     assert ans.agreement is None
     assert ans.answer == "one"  # no note appended
+
+
+def test_agent_passes_its_corrector_into_plan_query(monkeypatch):
+    import mnemiq.agent.loop as loop
+    from mnemiq.generate.correct import FakeCorrector
+    from mnemiq.sql.verdict import Approved
+
+    seen = {}
+
+    def fake_plan_query(packet, snapshot, grants, generator, **kwargs):
+        seen["corrector"] = kwargs.get("corrector")
+        return Approved(plan_sql="SELECT 1", target_sql="SELECT 1", tables=[], columns=[])
+
+    monkeypatch.setattr(loop, "plan_query", fake_plan_query)
+    corrector = FakeCorrector([])
+    agent = Agent(
+        generator=FakeGenerator(['{"sql":"SELECT 1"}']),
+        synthesizer=FakeSynthesizer("ok"),
+        adapter=_VotingAdapter(),
+        cache=TwoTierCache(L1Cache()),
+        corrector=corrector,
+    )
+    agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+    assert seen["corrector"] is corrector
