@@ -16,8 +16,10 @@ def _trace():
 class _RT:
     def __init__(self, answer, cards):
         self._answer, self._cards = answer, cards
+        self.mode = "UNSET"
 
-    def ask(self, question, identity):
+    def ask(self, question, identity, mode=None):
+        self.mode = mode
         return self._answer
 
     def schema(self, identity):
@@ -44,3 +46,18 @@ def test_get_schema_returns_the_granted_cards():
     rt = _RT(None, [{"object_id": "claim", "card": "TABLE claim ..."}])
     out = _get_schema(rt, _identity())
     assert out["tables"] == [{"object_id": "claim", "card": "TABLE claim ..."}]
+
+
+def test_db_read_passes_mode_through_and_echoes_it():
+    ans = AgentAnswer(answer="2 claims.", trace=_trace(), deferred=False, mode="deep")
+    rt = _RT(ans, [])
+    out = _db_read(rt, _identity(), "how many claims?", mode="deep")
+    assert rt.mode == "deep"
+    assert out["mode"] == "deep"
+
+
+def test_db_read_defaults_mode_to_none_so_the_router_decides():
+    rt = _RT(AgentAnswer(answer="2 claims.", trace=_trace(), deferred=False, mode="thinking"), [])
+    out = _db_read(rt, _identity(), "how many claims?")
+    assert rt.mode is None
+    assert out["mode"] == "thinking"  # what the router resolved, echoed back

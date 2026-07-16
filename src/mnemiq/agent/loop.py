@@ -33,6 +33,7 @@ class AgentAnswer:
     judge_engaged: bool | None = None  # multi-candidate only: did the judge get consulted?
     judge_override: bool | None = None  # ...and did it pick against the majority?
     candidates_executed: int | None = None  # multi-candidate only: how many of N ran
+    mode: str | None = None  # resolved mode name, stamped by the Runtime (the Agent IS a mode)
 
 
 def _shape(row_count: int, column_count: int) -> str:

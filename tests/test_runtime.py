@@ -60,6 +60,7 @@ def test_schema_is_empty_under_denyall():
 def test_ask_retrieves_scoped_and_delegates_to_the_agent(monkeypatch):
     # ask wires retrieve -> agent.answer; verify with fakes, no store/LLM
     import mnemiq.runtime as rt_mod
+    from mnemiq.agent.loop import AgentAnswer
 
     calls = {}
 
@@ -70,11 +71,60 @@ def test_ask_retrieves_scoped_and_delegates_to_the_agent(monkeypatch):
     class _Agent:
         def answer(self, packet, snapshot, grants, identity):
             calls["answer"] = (packet, snapshot, grants.objects)
-            return "ANSWER"
+            return AgentAnswer(answer="ANSWER")
 
     monkeypatch.setattr(rt_mod, "retrieve", fake_retrieve)
     rt = Runtime(con=None, snapshot="SNAP", adapter=None, agent=_Agent(), embedder=None,
                  authz=_StaticAuthz("claim"), settings=None)
-    assert rt.ask("how many claims?", _identity()) == "ANSWER"
+    got = rt.ask("how many claims?", _identity())
+    assert got.answer == "ANSWER"
+    assert got.mode == "thinking"  # the resolved default, stamped by Runtime
     assert calls["retrieve"] == ("how many claims?", 6)
     assert calls["answer"][0] == "PACKET" and calls["answer"][1] == "SNAP"
+
+
+def test_ask_dispatches_to_the_mode_agent_and_stamps_the_mode(monkeypatch):
+    import mnemiq.runtime as rt_mod
+    from mnemiq.agent.loop import AgentAnswer
+
+    monkeypatch.setattr(rt_mod, "retrieve", lambda *a, **k: "PACKET")
+
+    class _A:
+        def __init__(self, tag):
+            self.tag = tag
+
+        def answer(self, packet, snapshot, grants, identity):
+            return AgentAnswer(answer=self.tag)
+
+    agents = {"instant": _A("i"), "thinking": _A("t"), "deep": _A("d")}
+    rt = Runtime(con=None, snapshot=None, adapter=None, agent=agents["thinking"],
+                 embedder=None, authz=_StaticAuthz("claim"), settings=None, agents=agents)
+    deep = rt.ask("q", _identity(), mode="deep")
+    assert deep.answer == "d" and deep.mode == "deep"
+    default = rt.ask("q", _identity())
+    assert default.answer == "t" and default.mode == "thinking"
+
+
+def test_ask_with_an_unknown_mode_fails_closed_before_any_work(monkeypatch):
+    import mnemiq.runtime as rt_mod
+    from mnemiq.agent.route import UnknownMode
+
+    def _no_retrieve(*a, **k):
+        raise AssertionError("retrieval must not run for an unknown mode")
+
+    monkeypatch.setattr(rt_mod, "retrieve", _no_retrieve)
+    rt = Runtime(con=None, snapshot=None, adapter=None, agent=None, embedder=None,
+                 authz=DenyAll(), settings=None)
+    with pytest.raises(UnknownMode):
+        rt.ask("q", _identity(), mode="fastest")
+
+
+def test_build_runtime_rejects_an_unknown_default_mode(tmp_path):
+    from mnemiq.agent.route import UnknownMode
+
+    s = Settings(
+        llm_base_url=None, llm_api_key=None, llm_model=None, pg_dsn="x", acme_data_dir=None,
+        store_path=str(tmp_path / "empty.duckdb"), default_mode="fastest",
+    )
+    with pytest.raises(UnknownMode):  # validated BEFORE the snapshot check -- boot fails fast
+        build_runtime(s)
