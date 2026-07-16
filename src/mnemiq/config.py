@@ -18,6 +18,7 @@ class Settings:
     authz_path: str | None = None
     source_id: str | None = None
     store_path: str | None = None
+    default_mode: str | None = None
 
     def __post_init__(self) -> None:
         if not self.llm_model:
@@ -41,4 +42,5 @@ class Settings:
             authz_path=os.getenv("MNEMIQ_AUTHZ_PATH"),
             source_id=os.getenv("MNEMIQ_SOURCE_ID"),
             store_path=os.getenv("MNEMIQ_STORE_PATH"),
+            default_mode=os.getenv("MNEMIQ_MODE"),
         )

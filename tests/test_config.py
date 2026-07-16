@@ -24,3 +24,13 @@ def test_source_id_and_store_path_defaults():
     )
     assert s.source_id == "acme"
     assert s.store_path == "mnemiq.duckdb"
+
+
+def test_default_mode_reads_env(monkeypatch):
+    monkeypatch.setenv("MNEMIQ_MODE", "deep")
+    assert Settings.from_env().default_mode == "deep"
+
+
+def test_default_mode_is_none_when_unset(monkeypatch):
+    monkeypatch.delenv("MNEMIQ_MODE", raising=False)
+    assert Settings.from_env().default_mode is None
