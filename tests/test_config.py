@@ -1,4 +1,6 @@
-from mnemiq.config import Settings
+import json
+
+from mnemiq.config import Settings, SourceSpec
 
 
 def test_from_env_reads_vars(monkeypatch):
@@ -44,3 +46,26 @@ def test_write_enabled_from_env(monkeypatch):
 def test_write_enabled_defaults_false(monkeypatch):
     monkeypatch.delenv("MNEMIQ_WRITE_ENABLED", raising=False)
     assert Settings.from_env().write_enabled is False
+
+
+def test_source_specs_synthesizes_single_source_from_pg_dsn():
+    s = Settings(llm_base_url=None, llm_api_key=None, llm_model=None,
+                 pg_dsn="postgres://x", acme_data_dir=None, source_id="acme")
+    specs = s.source_specs()
+    assert specs == [SourceSpec(id="acme", kind="postgres", target="postgres://x",
+                                catalog="src", schema="public")]
+
+
+def test_source_specs_reads_manifest(tmp_path):
+    manifest = tmp_path / "sources.json"
+    manifest.write_text(json.dumps([
+        {"id": "sales", "kind": "postgres", "target": "postgres://p",
+         "catalog": "pg", "schema": "public"},
+        {"id": "ops", "kind": "sqlite", "target": "/tmp/ops.db",
+         "catalog": "ops", "schema": "main"},
+    ]))
+    s = Settings(llm_base_url=None, llm_api_key=None, llm_model=None, pg_dsn=None,
+                 acme_data_dir=None, sources_path=str(manifest))
+    specs = s.source_specs()
+    assert [sp.catalog for sp in specs] == ["pg", "ops"]
+    assert specs[1].kind == "sqlite" and specs[1].schema == "main"
