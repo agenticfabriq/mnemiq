@@ -137,27 +137,49 @@ def test_no_grants_means_no_definitions_either(tmp_path):
     assert packet.definitions == []
 
 
-def test_retrieve_attaches_examples_for_retrieved_tables():
-    from mnemiq.contract import Example
-    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_examples
+def test_attach_facts_inserts_block_after_table_line():
+    from mnemiq.contract import TableFacts
+    from mnemiq.semantic.retrieval import RetrievedCard, _attach_facts
 
-    packet = ContextPacket(question="q", cards=[RetrievedCard(object_id="claim", card="c",
-                            score=1.0)], grant_fingerprint="fp", enrichment_version="v1")
-    examples = [
-        Example(question="q1", sql="s1", tables=["claim"], object_id="claim"),
-        Example(question="q2", sql="s2", tables=["party"], object_id="party"),  # not retrieved
-    ]
-    _attach_examples(packet, examples, cap=5)
-    assert [e.question for e in packet.examples] == ["q1"]
+    card = RetrievedCard(object_id="claim", card="TABLE claim\nCOLUMNS:\n- amount", score=1.0)
+    _attach_facts([card], [TableFacts(object_id="claim", grain="one row per claim")])
+    assert card.card.startswith("TABLE claim\nGRAIN: one row per claim\nCOLUMNS:")
+    # a table with no facts is untouched
+    other = RetrievedCard(object_id="party", card="TABLE party\nCOLUMNS:", score=1.0)
+    _attach_facts([other], [TableFacts(object_id="claim", grain="x")])
+    assert other.card == "TABLE party\nCOLUMNS:"
 
 
-def test_attach_examples_caps_total():
-    from mnemiq.contract import Example
-    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_examples
+def test_retrieve_examples_by_question_similarity_and_access_scope(tmp_path):
+    from mnemiq.contract import Column, Example, Snapshot
+    from mnemiq.llm.embeddings import FakeEmbedder
+    from mnemiq.semantic.retrieval import _retrieve_examples
+    from mnemiq.semantic.store import build_example_index
+    from mnemiq.store.bootstrap import init_store
 
-    packet = ContextPacket(question="q", cards=[RetrievedCard(object_id="claim", card="c",
-                            score=1.0)], grant_fingerprint="fp", enrichment_version="v1")
-    examples = [Example(question=f"q{i}", sql="s", tables=["claim"], object_id="claim")
-                for i in range(9)]
-    _attach_examples(packet, examples, cap=5)
-    assert len(packet.examples) == 5
+    con = init_store(str(tmp_path / "s.duckdb"))
+    snap = Snapshot(
+        version="v1", source_id="acme", created_at="t",
+        columns=[Column(id="claim.n", object_id="claim", name="n")],
+        examples=[
+            Example(question="how many claims?", sql="SELECT count(*) FROM claim",
+                    tables=["claim"], object_id="claim"),
+            Example(question="party secret", sql="SELECT * FROM party", tables=["party"],
+                    object_id="party"),  # outside the grant -> must never surface
+        ],
+    )
+    emb = FakeEmbedder()
+    build_example_index(con, snap, emb)
+    (qvec,) = emb.embed(["how many claims?"])
+    got = _retrieve_examples(con, qvec, allowed={"claim"}, k=5)
+    assert [e.object_id for e in got] == ["claim"]
+
+
+def test_retrieve_examples_no_index_returns_empty(tmp_path):
+    from mnemiq.llm.embeddings import FakeEmbedder
+    from mnemiq.semantic.retrieval import _retrieve_examples
+    from mnemiq.store.bootstrap import init_store
+
+    con = init_store(str(tmp_path / "s.duckdb"))  # no example table built
+    (qvec,) = FakeEmbedder().embed(["q"])
+    assert _retrieve_examples(con, qvec, allowed={"claim"}, k=5) == []

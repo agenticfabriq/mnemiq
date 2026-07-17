@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import duckdb
 
 from mnemiq.authz.grants import AuthzProvider
-from mnemiq.contract import Definition, Example, IdentityContext
+from mnemiq.contract import Definition, Example, IdentityContext, TableFacts
 from mnemiq.llm.embeddings import Embedder
+from mnemiq.semantic.cards import render_facts_block
 from mnemiq.semantic.glossary import select_definitions
 
 _RRF_K = 60  # the standard reciprocal-rank-fusion constant
@@ -34,15 +36,40 @@ def _rank(rows: list[tuple[str, float]]) -> dict[str, int]:
     return {object_id: rank for rank, (object_id, _score) in enumerate(rows, start=1)}
 
 
-def _attach_examples(packet: ContextPacket, examples, cap: int = 5) -> None:
-    """Attach validated examples for the tables actually retrieved (grounds few-shot on the
-    tables in play). Stable order: retrieval rank, then question."""
-    if not examples:
-        return
-    ranked = {c.object_id: i for i, c in enumerate(packet.cards)}
-    hits = [e for e in examples if e.object_id in ranked]
-    hits.sort(key=lambda e: (ranked[e.object_id], e.question))
-    packet.examples = hits[:cap]
+def _attach_facts(cards: list[RetrievedCard], table_facts: Sequence[TableFacts]) -> None:
+    """Insert each retrieved table's structural-facts block right after its TABLE line. Facts
+    live here, NOT in the indexed card, so they never perturb retrieval top-k."""
+    by_id = {tf.object_id: tf for tf in table_facts}
+    for c in cards:
+        tf = by_id.get(c.object_id)
+        block = render_facts_block(tf) if tf else ""
+        if not block:
+            continue
+        head, _, rest = c.card.partition("\n")
+        c.card = f"{head}\n{block}\n{rest}" if rest else f"{head}\n{block}"
+
+
+def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5) -> list[Example]:
+    """Top-k validated examples by QUESTION similarity to the asked question -- on-target
+    few-shot, not per-table. Never surfaces an example touching a table outside the grants."""
+    placeholders = ", ".join("?" for _ in allowed)
+    try:
+        rows = con.execute(
+            "SELECT question, sql, tables, object_id, "
+            f"array_cosine_similarity(embedding, ?::FLOAT[{len(embedding)}]) AS s "
+            f"FROM example WHERE object_id IN ({placeholders}) ORDER BY s DESC LIMIT ?",
+            [embedding, *allowed, k * 3],
+        ).fetchall()
+    except Exception:
+        return []  # no example index built for this store
+    out: list[Example] = []
+    for question, sql, tables_json, object_id, _s in rows:
+        tables = json.loads(tables_json)
+        if set(tables) <= allowed:  # an example must not reveal a forbidden table
+            out.append(Example(question=question, sql=sql, tables=tables, object_id=object_id))
+        if len(out) >= k:
+            break
+    return out
 
 
 def retrieve(
@@ -53,7 +80,7 @@ def retrieve(
     embedder: Embedder,
     k: int = 5,
     definitions: Sequence[Definition] = (),
-    examples: Sequence[Example] = (),
+    table_facts: Sequence[TableFacts] = (),
 ) -> ContextPacket:
     """Hybrid retrieval, scoped to the identity's grants *before* anything is ranked.
 
@@ -128,5 +155,6 @@ def retrieve(
         if object_id in cards
     ]
     packet.enrichment_version = next(iter(cards.values()))[1] if cards else None
-    _attach_examples(packet, examples)
+    _attach_facts(packet.cards, table_facts)
+    packet.examples = _retrieve_examples(con, embedding, set(grants.objects), k=k)
     return packet

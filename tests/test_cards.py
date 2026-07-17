@@ -161,30 +161,33 @@ def test_a_relationship_with_differing_keys_renders_both_columns():
     assert "joins parent (many_to_one: pid = id)" in card.text
 
 
-def test_card_renders_structural_facts_above_columns():
+def test_render_facts_block():
+    from mnemiq.contract import TableFacts
+    from mnemiq.semantic.cards import render_facts_block
+
+    tf = TableFacts(object_id="claim", grain="one row per claim",
+                    gotchas=["amount stored as text; cast first"],
+                    canonical_measures={"total_amount": "sum(amount)"},
+                    default_time_column="created")
+    block = render_facts_block(tf)
+    assert "GRAIN: one row per claim" in block
+    assert "GOTCHAS:" in block and "amount stored as text" in block
+    assert "MEASURES: total_amount = sum(amount)" in block
+    assert "DEFAULT TIME COLUMN: created" in block
+    assert render_facts_block(TableFacts(object_id="x")) == ""  # empty facts -> empty block
+
+
+def test_build_cards_stays_lean_facts_are_not_indexed():
+    # facts must NOT enter build_cards -- the retrieval index is built from these, and facts
+    # in the index perturbed top-k. They attach post-retrieval instead.
     from mnemiq.contract import Column, Snapshot, TableFacts
     from mnemiq.semantic.cards import build_cards
 
     snap = Snapshot(
         version="v1", source_id="acme", created_at="t",
-        columns=[Column(id="claim.amount", object_id="claim", name="amount", data_type="DECIMAL")],
-        table_facts=[TableFacts(object_id="claim", grain="one row per claim",
-                                gotchas=["amount stored as text; cast first"],
-                                canonical_measures={"total_amount": "sum(amount)"},
-                                default_time_column="created")],
+        columns=[Column(id="claim.n", object_id="claim", name="n")],
+        table_facts=[TableFacts(object_id="claim", grain="one row per claim")],
     )
     text = build_cards(snap)[0].text
-    assert text.index("GRAIN: one row per claim") < text.index("COLUMNS:")
-    assert "GOTCHAS:" in text and "amount stored as text" in text
-    assert "MEASURES: total_amount = sum(amount)" in text
-    assert "DEFAULT TIME COLUMN: created" in text
-
-
-def test_card_without_facts_is_unchanged():
-    from mnemiq.contract import Column, Snapshot
-    from mnemiq.semantic.cards import build_cards
-
-    snap = Snapshot(version="v1", source_id="acme", created_at="t",
-                    columns=[Column(id="claim.n", object_id="claim", name="n")])
-    text = build_cards(snap)[0].text
-    assert text.startswith("TABLE claim\nCOLUMNS:")  # no facts blocks
+    assert text.startswith("TABLE claim\nCOLUMNS:")
+    assert "GRAIN" not in text  # facts stay out of the indexed card
