@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 
+from mnemiq.sql.qualify import object_key
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -24,9 +25,9 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]]) -> Refusal |
     # tables, and the aliases that stand for them
     alias_to_table: dict[str, str] = {}
     for table in ast.find_all(exp.Table):
-        name = table.name
-        if name in local:
+        if table.name in local:
             continue
+        name = object_key(table)
         if name not in visible:
             return Refusal(
                 code=RefusalCode.UNAUTHORIZED_TABLE,

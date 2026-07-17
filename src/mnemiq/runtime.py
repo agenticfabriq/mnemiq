@@ -114,20 +114,40 @@ def build_runtime(settings: Settings) -> Runtime:
             f"MNEMIQ_MODE={default_mode!r} names no mode; valid modes: {sorted(MODES)}"
         )
     con = init_store(settings.store_path)
-    version = current_version(con, settings.source_id)
-    if version is None:
-        raise SnapshotMissing(
-            f"no snapshot for source {settings.source_id!r} in {settings.store_path!r} -- "
-            "run `mnemiq enrich` then `mnemiq build` first"
-        )
-    snapshot = load_snapshot(con, version)
-    if not settings.pg_dsn:
-        raise SnapshotMissing("no MNEMIQ_PG_DSN -- the engine needs a source to query")
+    specs = settings.source_specs()
+    if len(specs) > 1:
+        # Federated: ATTACH all sources into one DuckDB; the snapshot is the qualified union,
+        # carrying the catalog->schema registry the decider expands with.
+        from mnemiq.adapters.federated import FederatedAdapter
+        from mnemiq.semantic.federation import merge_snapshots
+
+        pairs = []
+        for spec in specs:
+            v = current_version(con, spec.id)
+            if v is None:
+                raise SnapshotMissing(
+                    f"no snapshot for source {spec.id!r} -- run `mnemiq enrich` then "
+                    "`mnemiq build` first"
+                )
+            pairs.append((spec, load_snapshot(con, v)))
+        snapshot = merge_snapshots(pairs)
+        adapter = FederatedAdapter(specs, read_only=not settings.write_enabled)
+    else:
+        # Single-source fast path -- unchanged from v0.1.
+        version = current_version(con, settings.source_id)
+        if version is None:
+            raise SnapshotMissing(
+                f"no snapshot for source {settings.source_id!r} in {settings.store_path!r} -- "
+                "run `mnemiq enrich` then `mnemiq build` first"
+            )
+        snapshot = load_snapshot(con, version)
+        if not settings.pg_dsn:
+            raise SnapshotMissing("no MNEMIQ_PG_DSN -- the engine needs a source to query")
+        # Read-only attach unless writes are explicitly enabled -- the backstop under db_write.
+        adapter = DuckDBPostgresAdapter(settings.pg_dsn, read_only=not settings.write_enabled)
 
     # Shared components, built once; each mode is a thin Agent over the same instances.
     client = LLMClient(settings)
-    # Read-only attach unless writes are explicitly enabled -- the backstop under db_write.
-    adapter = DuckDBPostgresAdapter(settings.pg_dsn, read_only=not settings.write_enabled)
     # Generate in the dialect the source executes (duckdb here); keeps generation, parsing,
     # and execution on one dialect so no cross-dialect transpile gap can bite.
     generator = LLMGenerator(client, dialect=adapter.dialect)
