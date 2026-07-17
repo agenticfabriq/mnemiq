@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 
 from mnemiq.agent.budget import Budget
@@ -75,8 +76,12 @@ def build_engine(
         selector=LLMSelector(client) if candidates > 1 else None,
     )
 
+    # k=12 measured +2.3 strict / +2.3 facts over k=6 (recall probe: k=12 -> 100% gold-table
+    # coverage; k=6 left 48 cases, mostly big DBs, without their gold table). Tunable per source.
+    k = int(os.getenv("MNEMIQ_RETRIEVAL_K", "12"))
+
     def ask(question: str) -> AgentAnswer:
-        packet = retrieve(con, question, IDENTITY, authz, embedder, k=6,
+        packet = retrieve(con, question, IDENTITY, authz, embedder, k=k,
                           definitions=definitions, table_facts=snapshot.table_facts)
         return agent.answer(packet, snapshot, grants, IDENTITY)
 
