@@ -15,6 +15,8 @@ def test_parser_exposes_the_lifecycle_subcommands():
     assert args.command == "ask" and args.question == "how many claims?" and args.json is True
     assert args.mode == "deep"
     assert p.parse_args(["ask", "q"]).mode is None  # unset -> the router decides
+    w = p.parse_args(["write", "INSERT INTO claim (id) VALUES (1)", "--json"])
+    assert w.command == "write" and w.json is True
     for cmd in ("enrich", "build", "serve", "eval"):
         assert p.parse_args([cmd]).command == cmd  # each parses with no extra args
 
@@ -82,3 +84,17 @@ def test_ask_passes_mode_to_the_runtime_and_reports_it(monkeypatch, capsys):
     assert main(["ask", "q", "--mode", "instant", "--json"]) == 0
     assert rt.mode == "instant"
     assert '"mode": "instant"' in capsys.readouterr().out
+
+
+def test_write_reports_a_refusal_and_exits_zero(monkeypatch, capsys):
+    import mnemiq.cli as cli
+    from mnemiq.runtime import WriteResult
+
+    class _RT:
+        def write(self, sql, identity):
+            return WriteResult(approved=False, refusal="You may not write to 'claim'.")
+
+    monkeypatch.setattr(cli, "build_runtime", lambda settings: _RT())
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: _fake_settings()))
+    assert main(["write", "INSERT INTO claim (id) VALUES (1)"]) == 0  # a refusal is valid
+    assert "may not write" in capsys.readouterr().out
