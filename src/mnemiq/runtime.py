@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -49,7 +50,8 @@ class Runtime:
         name = self.router.route(question, mode)
         agent = (self.agents or {}).get(name, self.agent)
         packet = retrieve(
-            self.con, question, identity, self.authz, self.embedder, k=6,
+            self.con, question, identity, self.authz, self.embedder,
+            k=int(os.getenv("MNEMIQ_RETRIEVAL_K", "12")),
             table_facts=self.snapshot.table_facts if self.snapshot else (),
         )
         grants = self.authz.grants_for(identity)
