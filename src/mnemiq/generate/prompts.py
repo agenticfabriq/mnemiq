@@ -62,6 +62,10 @@ def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
             f"- {sanitize(d.term, limit=80)}: {sanitize(d.definition, limit=600)}"
             for d in packet.definitions
         ]
+    if packet.examples:
+        parts += ["", "WORKED EXAMPLES (verified queries over these tables -- adapt, don't copy blindly):"]
+        for ex in packet.examples:
+            parts += [f"Q: {sanitize(ex.question, limit=300)}", f"SQL: {ex.sql}"]
     parts += ["", "TABLES:", cards]
     if feedback:
         parts += [

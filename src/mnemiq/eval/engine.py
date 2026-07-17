@@ -75,7 +75,8 @@ def build_engine(
     )
 
     def ask(question: str) -> AgentAnswer:
-        packet = retrieve(con, question, IDENTITY, authz, embedder, k=6, definitions=definitions)
+        packet = retrieve(con, question, IDENTITY, authz, embedder, k=6,
+                          definitions=definitions, examples=snapshot.examples)
         return agent.answer(packet, snapshot, grants, IDENTITY)
 
     return ask, client
