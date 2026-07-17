@@ -50,7 +50,7 @@ class Runtime:
         agent = (self.agents or {}).get(name, self.agent)
         packet = retrieve(
             self.con, question, identity, self.authz, self.embedder, k=6,
-            examples=self.snapshot.examples if self.snapshot else (),
+            table_facts=self.snapshot.table_facts if self.snapshot else (),
         )
         grants = self.authz.grants_for(identity)
         answer = agent.answer(packet, self.snapshot, grants, identity)

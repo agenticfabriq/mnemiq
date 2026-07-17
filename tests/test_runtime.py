@@ -65,8 +65,8 @@ def test_ask_retrieves_scoped_and_delegates_to_the_agent(monkeypatch):
 
     calls = {}
 
-    def fake_retrieve(con, question, identity, authz, embedder, k=5, examples=()):
-        calls["retrieve"] = (question, k, list(examples))
+    def fake_retrieve(con, question, identity, authz, embedder, k=5, table_facts=()):
+        calls["retrieve"] = (question, k, list(table_facts))
         return "PACKET"
 
     class _Agent:
