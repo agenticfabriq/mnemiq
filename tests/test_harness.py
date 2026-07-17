@@ -191,3 +191,26 @@ def test_candidates_executed_is_copied_onto_the_case_result():
     )
     result = run_case(_case(), lambda q: answer, _GoldAdapter(pa.table({"n": [820]})))
     assert result.candidates_executed == 4
+
+
+def test_run_case_splits_engine_and_gold_execution():
+    # engine adapter runs only the candidate SQL; gold adapter runs only the gold SQL.
+    # If run_case crossed them, one fake would get the wrong SQL and raise -> ERROR.
+    class _EngineAdapter:
+        def execute_arrow(self, sql, timeout_s=None):
+            assert sql == "CANDIDATE", f"engine adapter got non-candidate SQL: {sql}"
+            return pa.table({"total": [820]})
+
+    class _GoldOnly:
+        def execute_arrow(self, sql, timeout_s=None):
+            assert sql == "GOLD", f"gold adapter got non-gold SQL: {sql}"
+            return pa.table({"n": [820]})
+
+    result = run_case(_case(), lambda q: _answered(), _EngineAdapter(), _GoldOnly())
+    assert result.outcome is Outcome.CORRECT
+
+
+def test_run_case_gold_adapter_defaults_to_the_engine_adapter():
+    adapter = _GoldAdapter(candidate=pa.table({"total": [820]}))  # serves both GOLD and CANDIDATE
+    result = run_case(_case(), lambda q: _answered(), adapter)     # no gold_adapter passed
+    assert result.outcome is Outcome.CORRECT

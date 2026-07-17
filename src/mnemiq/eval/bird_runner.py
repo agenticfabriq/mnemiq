@@ -123,17 +123,17 @@ def _process_db(cases, build_engine_fn, max_rows_cap: int, workers: int):
 
     def engine():
         if not hasattr(local, "e"):
-            ask, adapter, client = build_engine_fn()
-            local.e = (ask, adapter)
+            ask, engine_adapter, gold_adapter, client = build_engine_fn()
+            local.e = (ask, engine_adapter, gold_adapter)
             with clients_lock:
                 clients.append(client)
         return local.e
 
     def work(case):
-        ask, adapter = engine()
-        if _gold_too_big(adapter, case.gold_sql, max_rows_cap):
+        ask, engine_adapter, gold_adapter = engine()
+        if _gold_too_big(gold_adapter, case.gold_sql, max_rows_cap):
             return ("excluded", case.id)
-        return ("result", run_case(case, ask, adapter))
+        return ("result", run_case(case, ask, engine_adapter, gold_adapter))
 
     if workers <= 1:
         out = [work(case) for case in cases]
@@ -185,9 +185,13 @@ def run_bird(
         snapshot = enrich_bird_db(minidev_dir, db_id, settings, cache_dir=cache_dir)
 
         def _build():  # each worker builds its own isolated engine (thread-safe connections)
+            # BIRD grades single-engine on native SQLite: the engine generates + executes
+            # SQLite and gold runs on the same engine, so a wrong answer is a real error,
+            # never a cross-engine artifact (parity measured 1.5% otherwise). DuckDB is the
+            # executor in the product path (DuckDBAdapter); the benchmark stays apples-to-apples.
             adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
             ask, client = build_engine(snapshot, adapter, settings, candidates=candidates)
-            return ask, adapter, client
+            return ask, adapter, adapter, client  # engine + gold: same native SQLite executor
 
         out, clients = _process_db(remaining, _build, max_rows_cap, workers)
 

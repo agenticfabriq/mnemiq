@@ -72,6 +72,11 @@ class Agent:
         self.values = values
         self.selector = selector
         self.min_agreement = min_agreement
+        # The source's SQL dialect: the model writes it, `decide` parses it, the source runs
+        # it. Product adapter is duckdb (transpile is a no-op); a SQLite source is SQLite
+        # end-to-end -- no cross-dialect transpile gap (SQLGlot can't map DuckDB YEAR()/
+        # EXTRACT to SQLite strftime). The generator is constructed with the same dialect.
+        self.dialect = getattr(adapter, "dialect", "duckdb")
 
     def answer(
         self,
@@ -107,7 +112,8 @@ class Agent:
                 grants,
                 self.generator,
                 adapter=self.adapter,
-                target="duckdb",
+                dialect=self.dialect,
+                target=self.dialect,
                 feedback=feedback,
                 corrector=self.corrector,
                 values=self.values,
@@ -184,7 +190,8 @@ class Agent:
                 grants,
                 StrategyGenerator(self.generator, STRATEGIES[i % len(STRATEGIES)]),
                 adapter=self.adapter,
-                target="duckdb",
+                dialect=self.dialect,
+                target=self.dialect,
                 max_attempts=1,
                 corrector=self.corrector,
                 values=self.values,
