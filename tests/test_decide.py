@@ -109,3 +109,40 @@ def test_decide_approves_the_guarded_form():
         "SELECT name FROM t WHERE score IS NOT NULL ORDER BY score LIMIT 1", visible, adapter=None
     )
     assert isinstance(verdict, Approved)
+
+
+def test_decide_with_empty_policy_is_unchanged():
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.policy import AccessPolicy
+    from mnemiq.sql.verdict import Approved
+
+    visible = {"claim": {"id", "amount"}}
+    a = decide("SELECT id, amount FROM claim", visible, dialect="duckdb", target="duckdb")
+    b = decide("SELECT id, amount FROM claim", visible, dialect="duckdb", target="duckdb",
+               policy=AccessPolicy())
+    assert isinstance(a, Approved) and isinstance(b, Approved)
+    assert a.target_sql == b.target_sql
+
+
+def test_decide_injects_row_filter_and_masks():
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.policy import AccessPolicy
+    from mnemiq.sql.verdict import Approved
+
+    visible = {"claim": {"id", "amount", "ssn"}}
+    pol = AccessPolicy(row_filters={"claim": "amount > 0"}, masked={("claim", "ssn")})
+    v = decide("SELECT id, ssn FROM claim", visible, dialect="duckdb", target="duckdb", policy=pol)
+    assert isinstance(v, Approved)
+    low = v.target_sql.lower()
+    assert "amount > 0" in low and "null as ssn" in low
+
+
+def test_decide_refuses_denied_column():
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.policy import AccessPolicy
+    from mnemiq.sql.verdict import Refusal, RefusalCode
+
+    visible = {"claim": {"id", "ssn"}}
+    v = decide("SELECT ssn FROM claim", visible, dialect="duckdb", target="duckdb",
+               policy=AccessPolicy(denied={("claim", "ssn")}))
+    assert isinstance(v, Refusal) and v.code == RefusalCode.UNAUTHORIZED_COLUMN
