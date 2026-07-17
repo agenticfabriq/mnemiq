@@ -44,8 +44,11 @@ def _identity(args) -> IdentityContext:
 def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
     from mnemiq.enrichment.enricher import LLMEnricher
+    from mnemiq.enrichment.examples import LLMExampleGenerator, enrich_examples
+    from mnemiq.enrichment.facts import LLMFactsEnricher, enrich_table_facts
     from mnemiq.enrichment.pipeline import enrich_structural
     from mnemiq.enrichment.semantic import enrich_semantic
+    from mnemiq.eval.bird_runner import _flag
     from mnemiq.llm.client import LLMClient
     from mnemiq.semantic.values import build_value_index
     from mnemiq.store.bootstrap import init_store
@@ -57,6 +60,12 @@ def _cmd_enrich(settings: Settings) -> int:
     adapter = DuckDBPostgresAdapter(settings.pg_dsn)
     snap = enrich_structural(adapter, settings.source_id)
     snap = enrich_semantic(snap, LLMEnricher(LLMClient(settings)))
+    if _flag("MNEMIQ_ENRICH_FACTS"):
+        snap = enrich_table_facts(snap, LLMFactsEnricher(LLMClient(settings)))
+    if _flag("MNEMIQ_ENRICH_EXAMPLES"):
+        snap = enrich_examples(
+            snap, LLMExampleGenerator(LLMClient(settings)), adapter, dialect=adapter.dialect
+        )
     con = init_store(settings.store_path)
     save_snapshot(con, snap)
     n_values = build_value_index(adapter, snap, con)
@@ -69,7 +78,7 @@ def _cmd_enrich(settings: Settings) -> int:
 
 def _cmd_build(settings: Settings) -> int:
     from mnemiq.llm.embeddings import LLMEmbedder
-    from mnemiq.semantic.store import build_index
+    from mnemiq.semantic.store import build_example_index, build_index
     from mnemiq.store.bootstrap import init_store
     from mnemiq.store.snapshot_store import current_version, load_snapshot
 
@@ -80,8 +89,11 @@ def _cmd_build(settings: Settings) -> int:
             f"no snapshot for {settings.source_id!r} -- run `mnemiq enrich` first", file=sys.stderr
         )
         return 1
-    n = build_index(con, load_snapshot(con, version), LLMEmbedder(settings))
-    print(f"indexed {n} cards -> {settings.store_path}")
+    snap = load_snapshot(con, version)
+    embedder = LLMEmbedder(settings)
+    n = build_index(con, snap, embedder)
+    n_ex = build_example_index(con, snap, embedder)
+    print(f"indexed {n} cards, {n_ex} examples -> {settings.store_path}")
     return 0
 
 

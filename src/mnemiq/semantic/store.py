@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import duckdb
 
 from mnemiq.contract import Snapshot
@@ -13,6 +15,17 @@ CREATE TABLE IF NOT EXISTS semantic_object (
   version   TEXT,
   card      TEXT,
   embedding FLOAT[{EMBED_DIM}]
+)
+"""
+
+_EXAMPLE_DDL = f"""
+CREATE TABLE IF NOT EXISTS example (
+  question   TEXT,
+  sql        TEXT,
+  tables     TEXT,
+  object_id  TEXT,
+  source_id  TEXT,
+  embedding  FLOAT[{EMBED_DIM}]
 )
 """
 
@@ -51,6 +64,31 @@ def build_index(con: duckdb.DuckDBPyConnection, snapshot: Snapshot, embedder: Em
         "USING HNSW (embedding) WITH (metric = 'cosine')"
     )
     return len(cards)
+
+
+def build_example_index(
+    con: duckdb.DuckDBPyConnection, snapshot: Snapshot, embedder: Embedder
+) -> int:
+    """Embed each validated example's QUESTION into its own index, so retrieval pulls the
+    examples most similar to the asked question -- not whatever tables happened to rank.
+
+    Kept out of semantic_object so example text never perturbs table retrieval.
+    """
+    con.execute(_EXAMPLE_DDL)
+    con.execute("DELETE FROM example WHERE source_id = ?", [snapshot.source_id])
+    if not snapshot.examples:
+        return 0
+
+    vectors = embedder.embed([e.question for e in snapshot.examples])
+    con.executemany(
+        "INSERT INTO example (question, sql, tables, object_id, source_id, embedding) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            [e.question, e.sql, json.dumps(e.tables), e.object_id, snapshot.source_id, v]
+            for e, v in zip(snapshot.examples, vectors, strict=True)
+        ],
+    )
+    return len(snapshot.examples)
 
 
 def indexed_version(con: duckdb.DuckDBPyConnection, source_id: str) -> str | None:

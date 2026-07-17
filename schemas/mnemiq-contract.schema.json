@@ -350,6 +350,36 @@
         "title": "Dimension",
         "type": "object"
       },
+      "Example": {
+        "properties": {
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          },
+          "question": {
+            "title": "Question",
+            "type": "string"
+          },
+          "sql": {
+            "title": "Sql",
+            "type": "string"
+          },
+          "tables": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tables",
+            "type": "array"
+          }
+        },
+        "required": [
+          "question",
+          "sql",
+          "object_id"
+        ],
+        "title": "Example",
+        "type": "object"
+      },
       "Job": {
         "properties": {
           "attempts": {
@@ -666,6 +696,57 @@
         ],
         "title": "SourceBinding",
         "type": "object"
+      },
+      "TableFacts": {
+        "properties": {
+          "canonical_measures": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Canonical Measures",
+            "type": "object"
+          },
+          "default_time_column": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Default Time Column"
+          },
+          "gotchas": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Gotchas",
+            "type": "array"
+          },
+          "grain": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Grain"
+          },
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id"
+        ],
+        "title": "TableFacts",
+        "type": "object"
       }
     },
     "properties": {
@@ -699,6 +780,13 @@
           "$ref": "#/$defs/Dimension"
         },
         "title": "Dimensions",
+        "type": "array"
+      },
+      "examples": {
+        "items": {
+          "$ref": "#/$defs/Example"
+        },
+        "title": "Examples",
         "type": "array"
       },
       "jobs": {
@@ -746,6 +834,13 @@
       "source_id": {
         "title": "Source Id",
         "type": "string"
+      },
+      "table_facts": {
+        "items": {
+          "$ref": "#/$defs/TableFacts"
+        },
+        "title": "Table Facts",
+        "type": "array"
       },
       "version": {
         "title": "Version",
