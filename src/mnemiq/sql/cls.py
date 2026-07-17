@@ -4,6 +4,7 @@ from sqlglot import exp
 
 from mnemiq.sql.authz_guard import local_cte_names
 from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.qualify import object_key
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -37,8 +38,8 @@ def check_cls(ast: exp.Expression, policy: AccessPolicy) -> Refusal | None:
     # resolve columns against every base table the query references (not just visible ones)
     local = local_cte_names(ast)
     tables = [t for t in ast.find_all(exp.Table) if t.name not in local]
-    referenced = {t.name for t in tables}
-    aliases = {t.alias_or_name: t.name for t in tables}
+    referenced = {object_key(t) for t in tables}
+    aliases = {t.alias_or_name: object_key(t) for t in tables}
 
     for column in ast.find_all(exp.Column):
         cands = _candidate_tables(column, aliases, referenced)
