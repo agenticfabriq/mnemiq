@@ -21,3 +21,10 @@ def test_execute_counts_party():
     a = DuckDBPostgresAdapter(_dsn())
     rows = a.execute("SELECT count(*) FROM party")
     assert rows[0][0] == 30
+
+
+def test_read_only_default_still_attaches_read_only():
+    import pytest
+    a = DuckDBPostgresAdapter(_dsn())  # default read_only=True
+    with pytest.raises(Exception):  # a write against a read-only attach is rejected
+        a.execute("CREATE TABLE src.public._probe_ro (x INT)")
