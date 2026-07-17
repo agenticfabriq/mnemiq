@@ -61,11 +61,12 @@ def test_ask_retrieves_scoped_and_delegates_to_the_agent(monkeypatch):
     # ask wires retrieve -> agent.answer; verify with fakes, no store/LLM
     import mnemiq.runtime as rt_mod
     from mnemiq.agent.loop import AgentAnswer
+    from mnemiq.contract import Snapshot
 
     calls = {}
 
-    def fake_retrieve(con, question, identity, authz, embedder, k=5):
-        calls["retrieve"] = (question, k)
+    def fake_retrieve(con, question, identity, authz, embedder, k=5, table_facts=()):
+        calls["retrieve"] = (question, k, list(table_facts))
         return "PACKET"
 
     class _Agent:
@@ -73,14 +74,15 @@ def test_ask_retrieves_scoped_and_delegates_to_the_agent(monkeypatch):
             calls["answer"] = (packet, snapshot, grants.objects)
             return AgentAnswer(answer="ANSWER")
 
+    snap = Snapshot(version="v1", source_id="acme", created_at="t")
     monkeypatch.setattr(rt_mod, "retrieve", fake_retrieve)
-    rt = Runtime(con=None, snapshot="SNAP", adapter=None, agent=_Agent(), embedder=None,
+    rt = Runtime(con=None, snapshot=snap, adapter=None, agent=_Agent(), embedder=None,
                  authz=_StaticAuthz("claim"), settings=None)
     got = rt.ask("how many claims?", _identity())
     assert got.answer == "ANSWER"
     assert got.mode == "thinking"  # the resolved default, stamped by Runtime
-    assert calls["retrieve"] == ("how many claims?", 6)
-    assert calls["answer"][0] == "PACKET" and calls["answer"][1] == "SNAP"
+    assert calls["retrieve"] == ("how many claims?", 6, [])  # snapshot.examples threaded in
+    assert calls["answer"][0] == "PACKET" and calls["answer"][1] is snap
 
 
 def test_ask_dispatches_to_the_mode_agent_and_stamps_the_mode(monkeypatch):

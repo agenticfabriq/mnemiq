@@ -59,6 +59,21 @@ class Definition(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
 
 
+class TableFacts(BaseModel):
+    object_id: str
+    grain: str | None = None
+    gotchas: list[str] = Field(default_factory=list)
+    canonical_measures: dict[str, str] = Field(default_factory=dict)  # business name -> expr
+    default_time_column: str | None = None
+
+
+class Example(BaseModel):
+    question: str
+    sql: str
+    tables: list[str] = Field(default_factory=list)
+    object_id: str
+
+
 class Relationship(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     id: str
@@ -135,3 +150,5 @@ class Snapshot(BaseModel):
     skills: list[Skill] = Field(default_factory=list)
     jobs: list[Job] = Field(default_factory=list)
     compatibility_profiles: list[CompatibilityProfile] = Field(default_factory=list)
+    table_facts: list[TableFacts] = Field(default_factory=list)
+    examples: list[Example] = Field(default_factory=list)

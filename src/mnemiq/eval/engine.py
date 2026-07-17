@@ -15,7 +15,7 @@ from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import LLMEmbedder
 from mnemiq.semantic.retrieval import retrieve
-from mnemiq.semantic.store import build_index
+from mnemiq.semantic.store import build_example_index, build_index
 from mnemiq.semantic.values import ValueIndex, build_value_index
 from mnemiq.store.bootstrap import init_store
 
@@ -53,6 +53,7 @@ def build_engine(
     embedder = LLMEmbedder(settings)
     con = init_store(store_path)
     build_index(con, snapshot, embedder)
+    build_example_index(con, snapshot, embedder)
     build_value_index(adapter, snapshot, con)
 
     tables = [r[0] for r in con.execute("SELECT object_id FROM semantic_object").fetchall()]
@@ -75,7 +76,8 @@ def build_engine(
     )
 
     def ask(question: str) -> AgentAnswer:
-        packet = retrieve(con, question, IDENTITY, authz, embedder, k=6, definitions=definitions)
+        packet = retrieve(con, question, IDENTITY, authz, embedder, k=6,
+                          definitions=definitions, table_facts=snapshot.table_facts)
         return agent.answer(packet, snapshot, grants, IDENTITY)
 
     return ask, client

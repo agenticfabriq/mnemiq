@@ -53,3 +53,28 @@ def test_an_unknown_strategy_falls_back_to_direct():
     from mnemiq.generate.prompts import system_prompt
 
     assert system_prompt(strategy="nonsense") == system_prompt()
+
+
+def test_user_prompt_renders_examples_when_present():
+    from mnemiq.contract import Example
+    from mnemiq.generate.prompts import user_prompt
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+
+    packet = ContextPacket(
+        question="how many claims?",
+        cards=[RetrievedCard(object_id="claim", card="TABLE claim", score=1.0)],
+        grant_fingerprint="fp", enrichment_version="v1",
+        examples=[Example(question="total?", sql="SELECT count(*) FROM claim",
+                          tables=["claim"], object_id="claim")],
+    )
+    text = user_prompt(packet)
+    assert "WORKED EXAMPLES" in text and "SELECT count(*) FROM claim" in text
+
+
+def test_user_prompt_without_examples_is_unchanged():
+    from mnemiq.generate.prompts import user_prompt
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+
+    packet = ContextPacket(question="q", cards=[RetrievedCard(object_id="c", card="TABLE c",
+                            score=1.0)], grant_fingerprint="fp", enrichment_version="v1")
+    assert "WORKED EXAMPLES" not in user_prompt(packet)

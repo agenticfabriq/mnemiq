@@ -11,6 +11,23 @@ class SchemaCard:
     text: str
 
 
+def render_facts_block(tf) -> str:
+    """The grain/gotchas/measures/time block attached to a card AFTER retrieval. Kept OUT of
+    the retrieval index (build_index embeds the lean card) so facts never perturb top-k."""
+    lines: list[str] = []
+    if tf.grain:
+        lines.append(f"GRAIN: {tf.grain}")
+    if tf.gotchas:
+        lines.append("GOTCHAS:")
+        lines.extend(f"- {g}" for g in tf.gotchas)
+    if tf.canonical_measures:
+        measures = "; ".join(f"{n} = {e}" for n, e in tf.canonical_measures.items())
+        lines.append(f"MEASURES: {measures}")
+    if tf.default_time_column:
+        lines.append(f"DEFAULT TIME COLUMN: {tf.default_time_column}")
+    return "\n".join(lines)
+
+
 def build_cards(snapshot: Snapshot) -> list[SchemaCard]:
     """One self-sufficient card per table: what it is, what it holds, how it joins.
 

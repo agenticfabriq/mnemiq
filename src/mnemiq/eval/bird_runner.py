@@ -11,6 +11,8 @@ from mnemiq.adapters.sqlite import SQLiteAdapter
 from mnemiq.config import Settings
 from mnemiq.contract import EvaluationCase, Snapshot
 from mnemiq.enrichment.enricher import LLMEnricher
+from mnemiq.enrichment.examples import LLMExampleGenerator, enrich_examples
+from mnemiq.enrichment.facts import LLMFactsEnricher, enrich_table_facts
 from mnemiq.enrichment.pipeline import enrich_structural
 from mnemiq.enrichment.semantic import enrich_semantic
 from mnemiq.eval.bird import bird_db_path
@@ -59,6 +61,22 @@ def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str]) 
         json.dump({"tokens": tokens, "llm_calls": calls, "excluded": excluded}, fh)
 
 
+def _flag(name: str) -> bool:
+    # Default OFF: the plan-20 A/B measured both phases as regressions on a strong frontier
+    # model (facts -2.9, facts+examples -8.0 strict). Parked as opt-in plumbing; set the env
+    # var to "1" to enable (e.g. for a weaker/local model that may need the scaffolding).
+    return os.getenv(name, "0") == "1"
+
+
+def _enrich_cache_suffix() -> str:
+    parts = []
+    if _flag("MNEMIQ_ENRICH_FACTS"):
+        parts.append("facts")
+    if _flag("MNEMIQ_ENRICH_EXAMPLES"):
+        parts.append("examples")
+    return f"__{'_'.join(parts)}" if parts else ""
+
+
 def enrich_bird_db(
     minidev_dir: str,
     db_id: str,
@@ -69,9 +87,13 @@ def enrich_bird_db(
 ) -> Snapshot:
     """Enrich one BIRD database. Cached to disk: BIRD DBs never change, so (db_id, model)
     is the key -- the enriched snapshot depends on the model, so switching models must not
-    silently reuse another model's enrichment."""
+    silently reuse another model's enrichment. The facts/examples toggles enter the key too,
+    so an A/B run never reuses another config's enrichment."""
     model_slug = (settings.llm_model or "default").replace("/", "_")
-    cache_path = os.path.join(cache_dir, f"{db_id}__{model_slug}.json") if cache_dir else None
+    cache_path = (
+        os.path.join(cache_dir, f"{db_id}__{model_slug}{_enrich_cache_suffix()}.json")
+        if cache_dir else None
+    )
     if cache_path and not refresh and os.path.isfile(cache_path):
         with open(cache_path) as fh:
             return Snapshot.model_validate_json(fh.read())
@@ -80,6 +102,13 @@ def enrich_bird_db(
     snapshot = enrich_structural(adapter, db_id)
     if semantic:
         snapshot = enrich_semantic(snapshot, LLMEnricher(LLMClient(settings)))
+        if _flag("MNEMIQ_ENRICH_FACTS"):
+            snapshot = enrich_table_facts(snapshot, LLMFactsEnricher(LLMClient(settings)))
+        if _flag("MNEMIQ_ENRICH_EXAMPLES"):
+            snapshot = enrich_examples(
+                snapshot, LLMExampleGenerator(LLMClient(settings)),
+                adapter, dialect=adapter.dialect,
+            )
 
     if cache_path:
         os.makedirs(cache_dir, exist_ok=True)

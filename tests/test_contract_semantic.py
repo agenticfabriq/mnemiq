@@ -104,3 +104,18 @@ def test_an_unanswerable_case_has_no_gold_sql():
         answerable=False,
     )
     assert case.gold_sql is None  # there is no right query, only a right refusal
+
+
+def test_table_facts_and_example_models_default_empty():
+    from mnemiq.contract import Example, Snapshot, TableFacts
+
+    tf = TableFacts(object_id="claim")
+    assert tf.grain is None and tf.gotchas == [] and tf.canonical_measures == {}
+    assert tf.default_time_column is None
+    ex = Example(question="how many?", sql="SELECT count(*) FROM claim", tables=["claim"],
+                 object_id="claim")
+    assert ex.tables == ["claim"]
+    snap = Snapshot(version="v1", source_id="acme", created_at="t",
+                    table_facts=[tf], examples=[ex])
+    assert snap.table_facts[0].object_id == "claim" and snap.examples[0].object_id == "claim"
+    assert Snapshot(version="v1", source_id="acme", created_at="t").table_facts == []
