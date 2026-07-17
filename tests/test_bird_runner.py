@@ -157,7 +157,8 @@ def test_process_db_runs_every_case_once_across_workers():
     def build_engine_fn():
         def ask(_q):
             return AgentAnswer(answer="5", trace=_trace(), deferred=False)
-        return ask, _FakeAdapter(), _FakeClient()
+        adapter = _FakeAdapter()  # one fake serves engine + gold (both return the same table)
+        return ask, adapter, adapter, _FakeClient()
 
     out, clients = _process_db(cases, build_engine_fn, max_rows_cap=1000, workers=3)
 
@@ -181,7 +182,51 @@ def test_process_db_sequential_path_matches():
             return pa.table({"n": [5]})
 
     def build():
-        return (lambda _q: AgentAnswer(answer="5", trace=_trace(), deferred=False)), _A(), None
+        a = _A()  # engine + gold adapter (same fake)
+        return (lambda _q: AgentAnswer(answer="5", trace=_trace(), deferred=False)), a, a, None
 
     out, _ = _process_db(cases, build, max_rows_cap=1000, workers=1)
     assert len(out) == 1 and out[0][0] == "result"
+
+
+def test_process_db_threads_engine_and_gold_adapters():
+    import pyarrow as pa
+
+    from mnemiq.agent.loop import AgentAnswer
+    from mnemiq.contract import EvaluationCase, IdentityContext, Trace
+    from mnemiq.eval.bird_runner import _process_db
+    from mnemiq.eval.harness import Outcome
+
+    def _answer(_q):
+        trace = Trace(question="q", plan_sql="CANDIDATE", target_sql="CANDIDATE",
+                      result_shape="scalar", timing={"total_ms": 1.0}, enrichment_version="v1",
+                      identity=IdentityContext(tenant_id="t", principal_id="u"),
+                      tables_used=["person"])
+        return AgentAnswer(answer="820.", trace=trace, deferred=False)
+
+    class _Engine:  # runs the candidate SQL only
+        def execute(self, sql):
+            return [(0,)]  # _gold_too_big probe -> not too big
+
+        def execute_arrow(self, sql, timeout_s=None):
+            assert sql == "CANDIDATE"
+            return pa.table({"total": [820]})
+
+    class _Gold:  # runs the gold SQL only
+        def execute(self, sql):
+            return [(0,)]
+
+        def execute_arrow(self, sql, timeout_s=None):
+            assert sql == "GOLD"
+            return pa.table({"n": [820]})
+
+    class _Client:
+        total_tokens = 0
+        calls = 0
+
+    case = EvaluationCase(id="c1", question="q", gold_sql="GOLD", answerable=True, db_id="d")
+    out, clients = _process_db(
+        [case], lambda: (_answer, _Engine(), _Gold(), _Client()), max_rows_cap=1000, workers=1
+    )
+    assert [k for k, _ in out] == ["result"]
+    assert out[0][1].outcome is Outcome.CORRECT

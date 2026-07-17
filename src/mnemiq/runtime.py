@@ -85,9 +85,11 @@ def build_runtime(settings: Settings) -> Runtime:
 
     # Shared components, built once; each mode is a thin Agent over the same instances.
     client = LLMClient(settings)
-    generator = LLMGenerator(client)
-    synthesizer = LLMSynthesizer(client)
     adapter = DuckDBPostgresAdapter(settings.pg_dsn)
+    # Generate in the dialect the source executes (duckdb here); keeps generation, parsing,
+    # and execution on one dialect so no cross-dialect transpile gap can bite.
+    generator = LLMGenerator(client, dialect=adapter.dialect)
+    synthesizer = LLMSynthesizer(client)
     cache = TwoTierCache(L1Cache())
     corrector = LLMCorrector(client)
     values = ValueIndex(con)
