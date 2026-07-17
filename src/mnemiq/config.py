@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 
 DEFAULT_MODEL = "openai.gpt-5.5"
 DEFAULT_EMBED_MODEL = "openai.text-embedding-3-small"
+
+
+@dataclass(frozen=True)
+class SourceSpec:
+    id: str
+    kind: str  # "postgres" | "sqlite"
+    target: str  # dsn (postgres) or file path (sqlite)
+    catalog: str  # DuckDB attach alias AND the object_id prefix in a federated store
+    schema: str  # source schema: "public" (postgres) / "main" (sqlite)
 
 
 @dataclass
@@ -16,6 +26,7 @@ class Settings:
     acme_data_dir: str | None
     embed_model: str | None = None
     authz_path: str | None = None
+    sources_path: str | None = None
     source_id: str | None = None
     store_path: str | None = None
     default_mode: str | None = None
@@ -41,8 +52,20 @@ class Settings:
             acme_data_dir=os.getenv("MNEMIQ_ACME_DATA_DIR"),
             embed_model=os.getenv("MNEMIQ_EMBED_MODEL"),
             authz_path=os.getenv("MNEMIQ_AUTHZ_PATH"),
+            sources_path=os.getenv("MNEMIQ_SOURCES_PATH"),
             source_id=os.getenv("MNEMIQ_SOURCE_ID"),
             store_path=os.getenv("MNEMIQ_STORE_PATH"),
             default_mode=os.getenv("MNEMIQ_MODE"),
             write_enabled=os.getenv("MNEMIQ_WRITE_ENABLED") == "1",
         )
+
+    def source_specs(self) -> list["SourceSpec"]:
+        """Resolved source list. A manifest wins; otherwise synthesize the single legacy
+        source from source_id + pg_dsn (today's behavior -> exactly one spec)."""
+        if self.sources_path:
+            with open(self.sources_path) as fh:
+                raw = json.load(fh)
+            return [SourceSpec(id=d["id"], kind=d["kind"], target=d["target"],
+                               catalog=d["catalog"], schema=d["schema"]) for d in raw]
+        return [SourceSpec(id=self.source_id or "acme", kind="postgres",
+                           target=self.pg_dsn or "", catalog="src", schema="public")]

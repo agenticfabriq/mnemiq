@@ -89,6 +89,13 @@ def _cmd_build(settings: Settings) -> int:
     from mnemiq.store.snapshot_store import current_version, load_snapshot
 
     con = init_store(settings.store_path)
+    embedder = LLMEmbedder(settings)
+    if len(settings.source_specs()) > 1:
+        from mnemiq.store.federated_build import build_federated
+
+        n, n_ex = build_federated(settings, con, embedder)
+        print(f"indexed {n} cards, {n_ex} examples (federated) -> {settings.store_path}")
+        return 0
     version = current_version(con, settings.source_id)
     if version is None:
         print(
@@ -96,7 +103,6 @@ def _cmd_build(settings: Settings) -> int:
         )
         return 1
     snap = load_snapshot(con, version)
-    embedder = LLMEmbedder(settings)
     n = build_index(con, snap, embedder)
     n_ex = build_example_index(con, snap, embedder)
     print(f"indexed {n} cards, {n_ex} examples -> {settings.store_path}")

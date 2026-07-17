@@ -48,6 +48,7 @@ def plan_query(
     """
     visible = visible_schema(snapshot, grants)
     policy = build_access_policy(snapshot, grants)
+    registry = getattr(snapshot, "registry", {})  # {} for a plain single-source Snapshot
     if not packet.cards or not visible:
         return Deferred(reason="No tables are available to answer this question with your access.")
 
@@ -62,7 +63,7 @@ def plan_query(
 
         verdict = decide(
             proposal.sql, visible, adapter=adapter, dialect=dialect, target=target,
-            values=values, policy=policy
+            values=values, policy=policy, registry=registry
         )
 
         if (
@@ -80,6 +81,7 @@ def plan_query(
                 target=target,
                 values=values,
                 policy=policy,
+                registry=registry,
             )
 
         if isinstance(verdict, Approved):

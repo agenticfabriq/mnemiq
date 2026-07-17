@@ -8,6 +8,7 @@ from mnemiq.sql.cls import check_cls
 from mnemiq.sql.guard import MAX_ROWS, check_shape
 from mnemiq.sql.lint import lint
 from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.rls import apply_row_and_mask
 from mnemiq.sql.values_check import check_values
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
@@ -22,6 +23,7 @@ def decide(
     max_rows: int = MAX_ROWS,
     values=None,
     policy: AccessPolicy | None = None,
+    registry: dict[str, str] | None = None,
 ) -> Verdict:
     """The deterministic decider: shape, then access, then proof against the real source.
 
@@ -60,6 +62,14 @@ def decide(
         if isinstance(shaped, Refusal):
             return shaped
 
+    # Provenance uses the qualified id and must be read BEFORE expansion rewrites the nodes.
+    cte_names = {cte.alias_or_name for cte in shaped.find_all(exp.CTE)}
+    tables = sorted({object_key(t) for t in shaped.find_all(exp.Table)} - cte_names)
+    columns = sorted({c.name for c in shaped.find_all(exp.Column)})
+
+    # Federation: 'catalog.table' -> 'catalog.schema.table' so DuckDB resolves it. No-op single-source.
+    expand_tables(shaped, registry or {})
+
     plan_sql = shaped.sql(dialect=dialect)
     target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
 
@@ -72,9 +82,5 @@ def decide(
                 code=RefusalCode.EXPLAIN_FAILED,
                 message=f"The source rejected this query: {exc}",
             )
-
-    cte_names = {cte.alias_or_name for cte in shaped.find_all(exp.CTE)}
-    tables = sorted({t.name for t in shaped.find_all(exp.Table)} - cte_names)
-    columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
     return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables, columns=columns)

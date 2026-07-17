@@ -5,6 +5,7 @@ from sqlglot import exp
 
 from mnemiq.sql.authz_guard import local_cte_names
 from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.qualify import object_key
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -57,8 +58,8 @@ def apply_row_and_mask(
                 referenced_masked.add(tbl)
 
     for table_node in list(ast.find_all(exp.Table)):
-        name = table_node.name
-        if name in local or name not in visible:
+        name = object_key(table_node)
+        if table_node.name in local or name not in visible:
             continue
         needs_filter = name in policy.row_filters
         needs_mask = name in referenced_masked
