@@ -81,7 +81,7 @@ def test_ask_retrieves_scoped_and_delegates_to_the_agent(monkeypatch):
     got = rt.ask("how many claims?", _identity())
     assert got.answer == "ANSWER"
     assert got.mode == "thinking"  # the resolved default, stamped by Runtime
-    assert calls["retrieve"] == ("how many claims?", 6, [])  # snapshot.examples threaded in
+    assert calls["retrieve"] == ("how many claims?", 12, [])  # k=12 default; facts threaded in
     assert calls["answer"][0] == "PACKET" and calls["answer"][1] is snap
 
 
