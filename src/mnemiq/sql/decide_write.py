@@ -5,6 +5,8 @@ from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.authz_guard import check_access
+from mnemiq.sql.cls import check_cls
+from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
 
 _WRITE_ROOTS = (exp.Insert, exp.Update, exp.Delete)
@@ -53,9 +55,11 @@ def decide_write(
     adapter=None,
     dialect: str = "duckdb",
     target: str | None = None,
+    policy: AccessPolicy | None = None,
 ) -> ApprovedWrite | Refusal:
     """The deterministic write decider: shape -> table/column authz -> target-writable -> proof."""
     target = target or dialect
+    policy = policy or AccessPolicy()
     shaped = check_write_shape(sql, dialect=dialect)
     if isinstance(shaped, Refusal):
         return shaped
@@ -64,6 +68,11 @@ def decide_write(
     if refusal is not None:
         return refusal
 
+    # A write needs RAW access: a masked column is treated as denied for writes.
+    write_cls = check_cls(shaped, AccessPolicy(denied=policy.denied | policy.masked))
+    if write_cls is not None:
+        return write_cls
+
     tgt = _target_table(shaped)
     if tgt is None or not grants.allows_write(tgt):
         return Refusal(
@@ -71,6 +80,14 @@ def decide_write(
             message=f"You may not write to {tgt!r}.",
             subject=tgt,
         )
+
+    # RLS on writes: constrain an UPDATE/DELETE to the identity's visible rows (INSERT exempt).
+    filt = policy.row_filters.get(tgt)
+    if filt is not None and isinstance(shaped, (exp.Update, exp.Delete)):
+        parsed = sqlglot.parse_one(filt, read=dialect)
+        existing = shaped.args.get("where")
+        combined = exp.and_(existing.this, parsed) if existing is not None else parsed
+        shaped.set("where", exp.Where(this=combined))
 
     plan_sql = shaped.sql(dialect=dialect)
     target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
