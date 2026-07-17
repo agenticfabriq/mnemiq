@@ -159,3 +159,32 @@ def test_a_relationship_with_differing_keys_renders_both_columns():
     )
     (card,) = build_cards(snapshot)
     assert "joins parent (many_to_one: pid = id)" in card.text
+
+
+def test_card_renders_structural_facts_above_columns():
+    from mnemiq.contract import Column, Snapshot, TableFacts
+    from mnemiq.semantic.cards import build_cards
+
+    snap = Snapshot(
+        version="v1", source_id="acme", created_at="t",
+        columns=[Column(id="claim.amount", object_id="claim", name="amount", data_type="DECIMAL")],
+        table_facts=[TableFacts(object_id="claim", grain="one row per claim",
+                                gotchas=["amount stored as text; cast first"],
+                                canonical_measures={"total_amount": "sum(amount)"},
+                                default_time_column="created")],
+    )
+    text = build_cards(snap)[0].text
+    assert text.index("GRAIN: one row per claim") < text.index("COLUMNS:")
+    assert "GOTCHAS:" in text and "amount stored as text" in text
+    assert "MEASURES: total_amount = sum(amount)" in text
+    assert "DEFAULT TIME COLUMN: created" in text
+
+
+def test_card_without_facts_is_unchanged():
+    from mnemiq.contract import Column, Snapshot
+    from mnemiq.semantic.cards import build_cards
+
+    snap = Snapshot(version="v1", source_id="acme", created_at="t",
+                    columns=[Column(id="claim.n", object_id="claim", name="n")])
+    text = build_cards(snap)[0].text
+    assert text.startswith("TABLE claim\nCOLUMNS:")  # no facts blocks
