@@ -35,6 +35,17 @@ def _db_read(
     }
 
 
+def _db_write(runtime: Runtime, identity: IdentityContext, sql: str) -> dict:
+    res = runtime.write(sql, identity)
+    return {
+        "approved": res.approved,
+        "target": res.target,
+        "rows_affected": res.rows_affected,
+        "refusal": res.refusal,
+        "sql": res.target_sql,
+    }
+
+
 def _get_schema(runtime: Runtime, identity: IdentityContext) -> dict:
     return {"tables": runtime.schema(identity)}
 
@@ -59,6 +70,14 @@ def build_mcp(runtime: Runtime, identity: IdentityContext):
         mode: 'instant' (cheapest, no retries), 'thinking' (default, self-repairing), or
         'deep' (5 candidates + judge + agreement gate -- highest precision, ~6x cost)."""
         return _db_read(runtime, identity, question, mode=mode)
+
+    @mcp.tool()
+    def db_write(sql: str) -> dict:
+        """Execute a single INSERT/UPDATE/DELETE (read/write governed separately from db_read).
+        Refused by default: a write runs only when the identity has a write grant AND the
+        deployment enabled writes. DDL and multi-statement input are never executed. Returns
+        {approved, target, rows_affected, refusal, sql}; a governance plane records the result."""
+        return _db_write(runtime, identity, sql)
 
     @mcp.tool()
     def get_schema() -> dict:

@@ -20,12 +20,25 @@ from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
 from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.values import ValueIndex
+from mnemiq.sql.decide_write import decide_write
+from mnemiq.sql.schema import visible_schema
+from mnemiq.sql.verdict import ApprovedWrite
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.snapshot_store import current_version, load_snapshot
 
 
 class SnapshotMissing(RuntimeError):
     """No enriched snapshot in the store -- the source has not been indexed yet."""
+
+
+@dataclass
+class WriteResult:
+    approved: bool
+    target: str | None = None
+    rows_affected: int | None = None
+    refusal: str | None = None
+    plan_sql: str | None = None
+    target_sql: str | None = None
 
 
 @dataclass
@@ -66,6 +79,26 @@ class Runtime:
         allowed = grants.objects
         return [{"object_id": oid, "card": card} for oid, card in rows if oid in allowed]
 
+    def write(self, sql: str, identity: IdentityContext) -> WriteResult:
+        """Governed write: the caller supplies SQL; the decider screens it, then it executes
+        only if a write grant exists AND the source is attached read-write. Two locks."""
+        grants = self.authz.grants_for(identity)
+        visible = visible_schema(self.snapshot, grants) if self.snapshot else {}
+        dialect = getattr(self.adapter, "dialect", "duckdb")
+        verdict = decide_write(sql, visible, grants, adapter=self.adapter, dialect=dialect)
+        if not isinstance(verdict, ApprovedWrite):
+            return WriteResult(approved=False, refusal=verdict.message, target=verdict.subject)
+        try:
+            result = self.adapter.execute(verdict.target_sql)
+        except Exception as exc:  # the read-only attach backstop rejects the write here
+            return WriteResult(approved=False, refusal=f"the source rejected the write: {exc}",
+                               target=verdict.target, plan_sql=verdict.plan_sql,
+                               target_sql=verdict.target_sql)
+        rows = (result[0][0] if result and len(result[0]) == 1
+                and isinstance(result[0][0], int) else None)
+        return WriteResult(approved=True, target=verdict.target, rows_affected=rows,
+                           plan_sql=verdict.plan_sql, target_sql=verdict.target_sql)
+
 
 def _authz(settings: Settings) -> AuthzProvider:
     return FileAuthzProvider(settings.authz_path) if settings.authz_path else DenyAll()
@@ -90,7 +123,8 @@ def build_runtime(settings: Settings) -> Runtime:
 
     # Shared components, built once; each mode is a thin Agent over the same instances.
     client = LLMClient(settings)
-    adapter = DuckDBPostgresAdapter(settings.pg_dsn)
+    # Read-only attach unless writes are explicitly enabled -- the backstop under db_write.
+    adapter = DuckDBPostgresAdapter(settings.pg_dsn, read_only=not settings.write_enabled)
     # Generate in the dialect the source executes (duckdb here); keeps generation, parsing,
     # and execution on one dialect so no cross-dialect transpile gap can bite.
     generator = LLMGenerator(client, dialect=adapter.dialect)

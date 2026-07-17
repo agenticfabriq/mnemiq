@@ -26,6 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--mode", choices=sorted(MODES), default=None,
                    help="instant (cheapest) | thinking (default) | deep (highest precision)")
 
+    w = sub.add_parser("write", help="execute a single INSERT/UPDATE/DELETE (governed)")
+    w.add_argument("sql")
+    w.add_argument("--json", action="store_true", help="emit the WriteResult")
+    w.add_argument("--principal", default="local")
+    w.add_argument("--roles", default="", help="comma-separated")
+
     sub.add_parser("serve", help="run the MCP server on stdio")
 
     e = sub.add_parser("eval", help="run the ACME golden set")
@@ -126,6 +132,25 @@ def _cmd_ask(settings: Settings, args) -> int:
     return 0
 
 
+def _cmd_write(settings: Settings, args) -> int:
+    try:
+        rt = build_runtime(settings)
+    except SnapshotMissing as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    res = rt.write(args.sql, _identity(args))
+    if args.json:
+        import json
+
+        print(json.dumps(vars(res), default=str))
+        return 0
+    if res.approved:
+        print(f"OK: wrote to {res.target} (rows affected: {res.rows_affected})")
+    else:
+        print(f"refused: {res.refusal}")
+    return 0
+
+
 def _cmd_serve(settings: Settings) -> int:
     from mnemiq.mcp.server import serve
 
@@ -142,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_build(settings)
     if args.command == "ask":
         return _cmd_ask(settings, args)
+    if args.command == "write":
+        return _cmd_write(settings, args)
     if args.command == "serve":
         return _cmd_serve(settings)
     if args.command == "eval":
