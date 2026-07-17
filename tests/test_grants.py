@@ -62,3 +62,44 @@ def test_fingerprint_is_stable_and_grant_sensitive():
 
     assert a.fingerprint == b.fingerprint  # identical access -> shared cache entries
     assert a.fingerprint != c.fingerprint  # broader access must never serve narrower
+
+
+def test_grantset_writable_defaults_empty_and_allows_write():
+    from mnemiq.authz.grants import GrantSet
+
+    g = GrantSet(frozenset({"claim"}))
+    assert g.writable == frozenset() and not g.allows_write("claim")
+    gw = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}))
+    assert gw.allows_write("claim") and not gw.allows_write("policy")
+    assert gw.fingerprint == g.fingerprint  # write grant leaves the read-set cache key unchanged
+
+
+def test_file_authz_dict_form_grants_writes_and_write_implies_read(tmp_path):
+    import json
+
+    from mnemiq.authz.grants import FileAuthzProvider
+    from mnemiq.contract import IdentityContext
+
+    policy = tmp_path / "authz.json"
+    policy.write_text(json.dumps({"roles": {
+        "analyst": ["claim"],
+        "writer": {"read": ["policy"], "write": ["claim"]},
+    }}))
+    prov = FileAuthzProvider(str(policy))
+
+    reader = prov.grants_for(IdentityContext(tenant_id="t", principal_id="u", roles=["analyst"]))
+    assert reader.objects == frozenset({"claim"}) and reader.writable == frozenset()
+
+    writer = prov.grants_for(IdentityContext(tenant_id="t", principal_id="u", roles=["writer"]))
+    assert writer.writable == frozenset({"claim"})
+    assert writer.objects == frozenset({"policy", "claim"})  # write implies read
+
+
+def test_file_authz_malformed_denies_both(tmp_path):
+    from mnemiq.authz.grants import FileAuthzProvider
+    from mnemiq.contract import IdentityContext
+
+    p = tmp_path / "bad.json"
+    p.write_text("not json")
+    g = FileAuthzProvider(str(p)).grants_for(IdentityContext(tenant_id="t", principal_id="u"))
+    assert g.objects == frozenset() and g.writable == frozenset()
