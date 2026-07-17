@@ -27,11 +27,25 @@ def build_cards(snapshot: Snapshot) -> list[SchemaCard]:
         line = f"- joins {rel.to} ({rel.cardinality}{': ' + keys if keys else ''})"
         joins.setdefault(rel.from_, []).append(line)
 
+    facts = {f.object_id: f for f in snapshot.table_facts}
     tables = [b.object_id for b in snapshot.source_bindings] or list(columns)
 
     cards: list[SchemaCard] = []
     for table in tables:
-        lines = [f"TABLE {table}", "COLUMNS:"]
+        lines = [f"TABLE {table}"]
+        tf = facts.get(table)
+        if tf is not None:
+            if tf.grain:
+                lines.append(f"GRAIN: {tf.grain}")
+            if tf.gotchas:
+                lines.append("GOTCHAS:")
+                lines.extend(f"- {g}" for g in tf.gotchas)
+            if tf.canonical_measures:
+                measures = "; ".join(f"{n} = {e}" for n, e in tf.canonical_measures.items())
+                lines.append(f"MEASURES: {measures}")
+            if tf.default_time_column:
+                lines.append(f"DEFAULT TIME COLUMN: {tf.default_time_column}")
+        lines.append("COLUMNS:")
         for column in columns.get(table, []):
             parts = [f"- {column.name} ({column.data_type or 'unknown'}"]
             if column.semantic_type:
