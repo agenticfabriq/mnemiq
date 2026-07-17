@@ -6,6 +6,7 @@ from .semantic import (
     Definition,
     Dimension,
     EvaluationCase,
+    Example,
     Job,
     Metric,
     Quality,
@@ -13,6 +14,7 @@ from .semantic import (
     Skill,
     Snapshot,
     SourceBinding,
+    TableFacts,
 )
 from .values import CodedValue, JoinKey, MeasureExpr
 
@@ -29,9 +31,11 @@ __all__ = [
     "Quality",
     "CompatibilityProfile",
     "EvaluationCase",
+    "Example",
     "Skill",
     "Job",
     "Snapshot",
+    "TableFacts",
     "IdentityContext",
     "Trace",
     "export_json_schema",
