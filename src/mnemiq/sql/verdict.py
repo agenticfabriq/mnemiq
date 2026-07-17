@@ -15,6 +15,9 @@ class RefusalCode(StrEnum):
     EXPLAIN_FAILED = "explain_failed"
     LOGIC_LINT = "logic_lint"
     VALUE_GROUNDING = "value_grounding"
+    NOT_A_WRITE = "not_a_write"
+    UNBOUNDED_WRITE = "unbounded_write"
+    UNAUTHORIZED_WRITE = "unauthorized_write"
 
 
 # A refusal the model can act on is a repair; a refusal it cannot act on is a dead end.
@@ -52,6 +55,14 @@ class Approved:
     target_sql: str  # what will actually run on the source
     tables: list[str] = field(default_factory=list)
     columns: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ApprovedWrite:
+    plan_sql: str
+    target_sql: str
+    target: str  # the mutated table
+    tables: list[str] = field(default_factory=list)  # all referenced tables
 
 
 Verdict = Approved | Refusal
