@@ -58,3 +58,22 @@ def test_explain_failure_is_surfaced():
     v = decide_write("INSERT INTO claim (id) VALUES (1)", _VISIBLE, _grants(),
                      adapter=_BadAdapter(), dialect="duckdb")
     assert isinstance(v, Refusal) and v.code == RefusalCode.EXPLAIN_FAILED
+
+
+def test_write_refuses_a_restricted_column():
+    from mnemiq.sql.policy import AccessPolicy
+    pol = AccessPolicy(masked={("claim", "ssn")})
+    v = decide_write("UPDATE claim SET ssn = 'x' WHERE id = 1", {"claim": {"id", "ssn", "amount"}},
+                     _grants(), adapter=_OkAdapter(), dialect="duckdb", policy=pol)
+    assert isinstance(v, Refusal) and v.code in {
+        RefusalCode.UNAUTHORIZED_COLUMN, RefusalCode.MASKED_COLUMN_IN_PREDICATE,
+    }
+
+
+def test_write_injects_row_filter_into_update():
+    from mnemiq.sql.policy import AccessPolicy
+    from mnemiq.sql.verdict import ApprovedWrite
+    pol = AccessPolicy(row_filters={"claim": "region = 'US'"})
+    v = decide_write("UPDATE claim SET amount = 0 WHERE id = 1", {"claim": {"id", "amount", "region"}},
+                     _grants(), adapter=_OkAdapter(), dialect="duckdb", policy=pol)
+    assert isinstance(v, ApprovedWrite) and "region = 'US'" in v.target_sql

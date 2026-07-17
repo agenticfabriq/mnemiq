@@ -21,6 +21,7 @@ from mnemiq.llm.embeddings import Embedder, LLMEmbedder
 from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.values import ValueIndex
 from mnemiq.sql.decide_write import decide_write
+from mnemiq.sql.policy import AccessPolicy, build_access_policy
 from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import ApprovedWrite
 from mnemiq.store.bootstrap import init_store
@@ -84,8 +85,10 @@ class Runtime:
         only if a write grant exists AND the source is attached read-write. Two locks."""
         grants = self.authz.grants_for(identity)
         visible = visible_schema(self.snapshot, grants) if self.snapshot else {}
+        policy = build_access_policy(self.snapshot, grants) if self.snapshot else AccessPolicy()
         dialect = getattr(self.adapter, "dialect", "duckdb")
-        verdict = decide_write(sql, visible, grants, adapter=self.adapter, dialect=dialect)
+        verdict = decide_write(sql, visible, grants, adapter=self.adapter, dialect=dialect,
+                               policy=policy)
         if not isinstance(verdict, ApprovedWrite):
             return WriteResult(approved=False, refusal=verdict.message, target=verdict.subject)
         try:
