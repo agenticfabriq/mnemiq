@@ -7,6 +7,7 @@ from mnemiq.contract import Snapshot
 from mnemiq.generate.generator import Generator
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.decide import decide
+from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 
@@ -46,6 +47,7 @@ def plan_query(
     thing no amount of static analysis could have known.
     """
     visible = visible_schema(snapshot, grants)
+    policy = build_access_policy(snapshot, grants)
     if not packet.cards or not visible:
         return Deferred(reason="No tables are available to answer this question with your access.")
 
@@ -59,7 +61,8 @@ def plan_query(
             )
 
         verdict = decide(
-            proposal.sql, visible, adapter=adapter, dialect=dialect, target=target, values=values
+            proposal.sql, visible, adapter=adapter, dialect=dialect, target=target,
+            values=values, policy=policy
         )
 
         if (
@@ -76,6 +79,7 @@ def plan_query(
                 dialect=dialect,
                 target=target,
                 values=values,
+                policy=policy,
             )
 
         if isinstance(verdict, Approved):
