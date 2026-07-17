@@ -62,7 +62,10 @@ def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str]) 
 
 
 def _flag(name: str) -> bool:
-    return os.getenv(name, "1") != "0"  # default ON
+    # Default OFF: the plan-20 A/B measured both phases as regressions on a strong frontier
+    # model (facts -2.9, facts+examples -8.0 strict). Parked as opt-in plumbing; set the env
+    # var to "1" to enable (e.g. for a weaker/local model that may need the scaffolding).
+    return os.getenv(name, "0") == "1"
 
 
 def _enrich_cache_suffix() -> str:
