@@ -2,9 +2,10 @@ import sqlglot
 
 from mnemiq.sql.authz_guard import check_access
 from mnemiq.sql.cls import check_cls
+from mnemiq.sql.decide import decide
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.rls import apply_row_and_mask
-from mnemiq.sql.verdict import RefusalCode
+from mnemiq.sql.verdict import Approved, RefusalCode
 
 
 def _ast(sql):
@@ -36,3 +37,20 @@ def test_rls_wraps_qualified_table():
     out = apply_row_and_mask(_ast("SELECT id FROM pg.person"), policy, visible, dialect="duckdb")
     low = out.sql(dialect="duckdb").lower()
     assert "id > 0" in low and "from pg.person" in low  # filter applied at the (still-qualified) source
+
+
+def test_decide_expands_qualified_table_for_execution():
+    visible = {"pg.person": {"id", "last_name"}}
+    v = decide("SELECT id FROM pg.person", visible, dialect="duckdb", target="duckdb",
+               registry={"pg": "public"})
+    assert isinstance(v, Approved)
+    assert "pg.public.person" in v.target_sql
+    assert v.tables == ["pg.person"]  # provenance keeps the qualified id
+
+
+def test_decide_single_source_unchanged():
+    visible = {"person": {"id"}}
+    v = decide("SELECT id FROM person", visible, dialect="duckdb", target="duckdb")
+    assert isinstance(v, Approved)
+    assert v.target_sql.strip().lower().startswith("select") and "person" in v.target_sql
+    assert v.tables == ["person"]
