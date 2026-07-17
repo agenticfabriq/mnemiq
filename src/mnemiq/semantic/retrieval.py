@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 import duckdb
 
 from mnemiq.authz.grants import AuthzProvider
-from mnemiq.contract import Definition, IdentityContext
+from mnemiq.contract import Definition, Example, IdentityContext
 from mnemiq.llm.embeddings import Embedder
 from mnemiq.semantic.glossary import select_definitions
 
@@ -27,11 +27,22 @@ class ContextPacket:
     grant_fingerprint: str
     enrichment_version: str | None
     definitions: list[Definition] = field(default_factory=list)
-    examples: list = field(default_factory=list)  # Plan 08
+    examples: list[Example] = field(default_factory=list)  # Plan 08 seam; filled by retrieve()
 
 
 def _rank(rows: list[tuple[str, float]]) -> dict[str, int]:
     return {object_id: rank for rank, (object_id, _score) in enumerate(rows, start=1)}
+
+
+def _attach_examples(packet: ContextPacket, examples, cap: int = 5) -> None:
+    """Attach validated examples for the tables actually retrieved (grounds few-shot on the
+    tables in play). Stable order: retrieval rank, then question."""
+    if not examples:
+        return
+    ranked = {c.object_id: i for i, c in enumerate(packet.cards)}
+    hits = [e for e in examples if e.object_id in ranked]
+    hits.sort(key=lambda e: (ranked[e.object_id], e.question))
+    packet.examples = hits[:cap]
 
 
 def retrieve(
@@ -42,6 +53,7 @@ def retrieve(
     embedder: Embedder,
     k: int = 5,
     definitions: Sequence[Definition] = (),
+    examples: Sequence[Example] = (),
 ) -> ContextPacket:
     """Hybrid retrieval, scoped to the identity's grants *before* anything is ranked.
 
@@ -116,4 +128,5 @@ def retrieve(
         if object_id in cards
     ]
     packet.enrichment_version = next(iter(cards.values()))[1] if cards else None
+    _attach_examples(packet, examples)
     return packet

@@ -135,3 +135,29 @@ def test_no_grants_means_no_definitions_either(tmp_path):
         FakeEmbedder(), definitions=[definition],
     )
     assert packet.definitions == []
+
+
+def test_retrieve_attaches_examples_for_retrieved_tables():
+    from mnemiq.contract import Example
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_examples
+
+    packet = ContextPacket(question="q", cards=[RetrievedCard(object_id="claim", card="c",
+                            score=1.0)], grant_fingerprint="fp", enrichment_version="v1")
+    examples = [
+        Example(question="q1", sql="s1", tables=["claim"], object_id="claim"),
+        Example(question="q2", sql="s2", tables=["party"], object_id="party"),  # not retrieved
+    ]
+    _attach_examples(packet, examples, cap=5)
+    assert [e.question for e in packet.examples] == ["q1"]
+
+
+def test_attach_examples_caps_total():
+    from mnemiq.contract import Example
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_examples
+
+    packet = ContextPacket(question="q", cards=[RetrievedCard(object_id="claim", card="c",
+                            score=1.0)], grant_fingerprint="fp", enrichment_version="v1")
+    examples = [Example(question=f"q{i}", sql="s", tables=["claim"], object_id="claim")
+                for i in range(9)]
+    _attach_examples(packet, examples, cap=5)
+    assert len(packet.examples) == 5
