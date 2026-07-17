@@ -35,4 +35,4 @@ def test_duckdb_postgres_adapter_is_a_thin_compat_subclass():
     assert issubclass(DuckDBPostgresAdapter, DuckDBAdapter)
     assert DuckDBPostgresAdapter.dialect == "duckdb"
     params = list(inspect.signature(DuckDBPostgresAdapter.__init__).parameters)
-    assert params == ["self", "dsn", "schema"]  # unchanged ctor
+    assert params == ["self", "dsn", "schema", "read_only"]  # + read_only for the write path

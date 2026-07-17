@@ -41,24 +41,27 @@ class DuckDBAdapter:
         catalog: str,
         table_schema: str,
         fk_via_postgres: bool,
+        read_only: bool = True,
     ) -> None:
         self._catalog = catalog
         self._table_schema = table_schema
         self._fk_via_postgres = fk_via_postgres
         self._con = duckdb.connect()
         self._con.execute(f"INSTALL {extension}; LOAD {extension};")
-        self._con.execute(f"ATTACH '{attach_target}' AS {catalog} (TYPE {attach_type}, READ_ONLY)")
+        # READ_ONLY unless a write is explicitly enabled -- the backstop under the write path.
+        clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
+        self._con.execute(f"ATTACH '{attach_target}' AS {catalog} {clause}")
         self._con.execute(f"USE {catalog}.{table_schema}")
 
     @classmethod
-    def postgres(cls, dsn: str, schema: str = "src") -> "DuckDBAdapter":
+    def postgres(cls, dsn: str, schema: str = "src", read_only: bool = True) -> "DuckDBAdapter":
         return cls(attach_target=dsn, attach_type="POSTGRES", extension="postgres",
-                   catalog=schema, table_schema="public", fk_via_postgres=True)
+                   catalog=schema, table_schema="public", fk_via_postgres=True, read_only=read_only)
 
     @classmethod
-    def sqlite(cls, path: str, schema: str = "s") -> "DuckDBAdapter":
+    def sqlite(cls, path: str, schema: str = "s", read_only: bool = True) -> "DuckDBAdapter":
         return cls(attach_target=path, attach_type="SQLITE", extension="sqlite",
-                   catalog=schema, table_schema="main", fk_via_postgres=False)
+                   catalog=schema, table_schema="main", fk_via_postgres=False, read_only=read_only)
 
     def introspect(self) -> list[str]:
         rows = self._con.execute(
@@ -115,6 +118,7 @@ class DuckDBPostgresAdapter(DuckDBAdapter):
     Preserved as a thin subclass so existing imports and call sites are unchanged.
     """
 
-    def __init__(self, dsn: str, schema: str = "src") -> None:
+    def __init__(self, dsn: str, schema: str = "src", read_only: bool = True) -> None:
         super().__init__(attach_target=dsn, attach_type="POSTGRES", extension="postgres",
-                         catalog=schema, table_schema="public", fk_via_postgres=True)
+                         catalog=schema, table_schema="public", fk_via_postgres=True,
+                         read_only=read_only)

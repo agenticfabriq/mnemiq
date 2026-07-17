@@ -34,3 +34,13 @@ def test_default_mode_reads_env(monkeypatch):
 def test_default_mode_is_none_when_unset(monkeypatch):
     monkeypatch.delenv("MNEMIQ_MODE", raising=False)
     assert Settings.from_env().default_mode is None
+
+
+def test_write_enabled_from_env(monkeypatch):
+    monkeypatch.setenv("MNEMIQ_WRITE_ENABLED", "1")
+    assert Settings.from_env().write_enabled is True
+
+
+def test_write_enabled_defaults_false(monkeypatch):
+    monkeypatch.delenv("MNEMIQ_WRITE_ENABLED", raising=False)
+    assert Settings.from_env().write_enabled is False
