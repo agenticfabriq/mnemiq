@@ -18,6 +18,9 @@ class RefusalCode(StrEnum):
     NOT_A_WRITE = "not_a_write"
     UNBOUNDED_WRITE = "unbounded_write"
     UNAUTHORIZED_WRITE = "unauthorized_write"
+    UNAUTHORIZED_COLUMN = "unauthorized_column"
+    MASKED_COLUMN_IN_PREDICATE = "masked_column_in_predicate"
+    INVALID_ROW_FILTER = "invalid_row_filter"
 
 
 # A refusal the model can act on is a repair; a refusal it cannot act on is a dead end.

@@ -4,8 +4,11 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.sql.authz_guard import check_access
+from mnemiq.sql.cls import check_cls
 from mnemiq.sql.guard import MAX_ROWS, check_shape
 from mnemiq.sql.lint import lint
+from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.rls import apply_row_and_mask
 from mnemiq.sql.values_check import check_values
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
 
@@ -18,6 +21,7 @@ def decide(
     target: str = "postgres",
     max_rows: int = MAX_ROWS,
     values=None,
+    policy: AccessPolicy | None = None,
 ) -> Verdict:
     """The deterministic decider: shape, then access, then proof against the real source.
 
@@ -26,6 +30,7 @@ def decide(
     permission error is not the control: by the time it fires, we have already confirmed to
     the model that the table exists.
     """
+    policy = policy or AccessPolicy()
     shaped = check_shape(sql, dialect=dialect, max_rows=max_rows)
     if isinstance(shaped, Refusal):
         return shaped
@@ -33,6 +38,10 @@ def decide(
     refusal = check_access(shaped, visible)
     if refusal is not None:
         return refusal
+
+    cls = check_cls(shaped, policy)  # column deny / mask-in-predicate
+    if cls is not None:
+        return cls
 
     violation = lint(shaped)
     if violation is not None:
@@ -45,6 +54,11 @@ def decide(
         grounding = check_values(shaped, visible, values)
         if grounding is not None:
             return grounding
+
+    if not policy.empty:  # RLS + source-side mask rewrite (filtered/masked tables -> derived)
+        shaped = apply_row_and_mask(shaped, policy, visible, dialect=dialect)
+        if isinstance(shaped, Refusal):
+            return shaped
 
     plan_sql = shaped.sql(dialect=dialect)
     target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
