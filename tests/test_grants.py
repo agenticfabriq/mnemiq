@@ -103,3 +103,39 @@ def test_file_authz_malformed_denies_both(tmp_path):
     p.write_text("not json")
     g = FileAuthzProvider(str(p)).grants_for(IdentityContext(tenant_id="t", principal_id="u"))
     assert g.objects == frozenset() and g.writable == frozenset()
+
+
+def test_fingerprint_reflects_the_full_policy():
+    from mnemiq.authz.grants import GrantSet
+
+    base = GrantSet(frozenset({"claim"}))
+    filtered = GrantSet(frozenset({"claim"}), row_filters={"claim": "region = 'US'"})
+    cleared = GrantSet(frozenset({"claim"}), pii_clearance=frozenset({"pii"}))
+    masked = GrantSet(frozenset({"claim"}), pii_mask=frozenset({"pii"}))
+    fps = {base.fingerprint, filtered.fingerprint, cleared.fingerprint, masked.fingerprint}
+    assert len(fps) == 4  # every policy dimension changes the authorization boundary
+    assert filtered.fingerprint == GrantSet(frozenset({"claim"}),
+                                            row_filters={"claim": "region = 'US'"}).fingerprint
+    assert hash(filtered) == hash(GrantSet(frozenset({"claim"})))  # dict excluded from hash
+
+
+def test_file_authz_dict_form_parses_rls_cls(tmp_path):
+    import json
+
+    from mnemiq.authz.grants import FileAuthzProvider
+    from mnemiq.contract import IdentityContext
+
+    policy = tmp_path / "authz.json"
+    policy.write_text(json.dumps({"roles": {
+        "us": {"read": ["claim"], "row_filters": {"claim": "region = 'US'"},
+               "pii_clearance": ["pii"], "pii_mask": ["phi"]},
+        "eu": {"read": ["claim"], "row_filters": {"claim": "region = 'EU'"}},
+    }}))
+    prov = FileAuthzProvider(str(policy))
+
+    g = prov.grants_for(IdentityContext(tenant_id="t", principal_id="u", roles=["us"]))
+    assert g.row_filters == {"claim": "region = 'US'"}
+    assert g.pii_clearance == frozenset({"pii"}) and g.pii_mask == frozenset({"phi"})
+
+    both = prov.grants_for(IdentityContext(tenant_id="t", principal_id="u", roles=["us", "eu"]))
+    assert both.row_filters["claim"] == "(region = 'US') OR (region = 'EU')"  # OR-combined

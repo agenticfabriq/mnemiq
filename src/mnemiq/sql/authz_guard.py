@@ -5,10 +5,10 @@ from sqlglot import exp
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
-def _cte_names(ast: exp.Expression) -> set[str]:
+def local_cte_names(ast: exp.Expression) -> set[str]:
     # A CTE alias is reported as a Table by find_all(). It is a name the query defines for
     # itself, not an object in the source -- authorizing it would be a category error, and
-    # rejecting it would break every valid WITH clause.
+    # rejecting it would break every valid WITH clause. Shared with the CLS/RLS passes.
     return {cte.alias_or_name for cte in ast.find_all(exp.CTE)}
 
 
@@ -19,7 +19,7 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]]) -> Refusal |
     table. It can still *name* one -- `users`, `employees`, `salaries` are in every schema it
     was trained on. This is the lock that makes naming it useless.
     """
-    local = _cte_names(ast)
+    local = local_cte_names(ast)
 
     # tables, and the aliases that stand for them
     alias_to_table: dict[str, str] = {}
