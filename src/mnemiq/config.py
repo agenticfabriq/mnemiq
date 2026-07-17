@@ -19,6 +19,7 @@ class Settings:
     source_id: str | None = None
     store_path: str | None = None
     default_mode: str | None = None
+    write_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not self.llm_model:
@@ -43,4 +44,5 @@ class Settings:
             source_id=os.getenv("MNEMIQ_SOURCE_ID"),
             store_path=os.getenv("MNEMIQ_STORE_PATH"),
             default_mode=os.getenv("MNEMIQ_MODE"),
+            write_enabled=os.getenv("MNEMIQ_WRITE_ENABLED") == "1",
         )

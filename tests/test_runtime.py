@@ -130,3 +130,47 @@ def test_build_runtime_rejects_an_unknown_default_mode(tmp_path):
     )
     with pytest.raises(UnknownMode):  # validated BEFORE the snapshot check -- boot fails fast
         build_runtime(s)
+
+
+class _WriteAuthz:
+    def __init__(self, *tables):
+        self._g = GrantSet(frozenset(tables), writable=frozenset(tables))
+
+    def grants_for(self, _identity):
+        return self._g
+
+
+def test_write_refuses_under_denyall():
+    from mnemiq.contract import Snapshot
+    from mnemiq.runtime import Runtime
+
+    snap = Snapshot(version="v1", source_id="acme", created_at="t")
+    rt = Runtime(con=None, snapshot=snap, adapter=None, agent=None, embedder=None,
+                 authz=DenyAll(), settings=None)
+    res = rt.write("INSERT INTO claim (id) VALUES (1)", _identity())
+    assert res.approved is False and res.refusal
+
+
+def test_write_executes_on_approval():
+    from mnemiq.contract import Column, Snapshot
+    from mnemiq.runtime import Runtime
+
+    snap = Snapshot(version="v1", source_id="acme", created_at="t",
+                    columns=[Column(id="claim.id", object_id="claim", name="id")])
+
+    class _RWAdapter:
+        dialect = "duckdb"
+
+        def __init__(self):
+            self.ran = []
+
+        def execute(self, sql):
+            self.ran.append(sql)
+            return [] if sql.startswith("EXPLAIN") else [(1,)]
+
+    adapter = _RWAdapter()
+    rt = Runtime(con=None, snapshot=snap, adapter=adapter, agent=None, embedder=None,
+                 authz=_WriteAuthz("claim"), settings=None)  # write grant on claim
+    res = rt.write("INSERT INTO claim (id) VALUES (1)", _identity())
+    assert res.approved is True and res.target == "claim" and res.rows_affected == 1
+    assert any(not s.startswith("EXPLAIN") for s in adapter.ran)  # the write actually ran

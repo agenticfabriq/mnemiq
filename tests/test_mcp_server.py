@@ -61,3 +61,30 @@ def test_db_read_defaults_mode_to_none_so_the_router_decides():
     out = _db_read(rt, _identity(), "how many claims?")
     assert rt.mode is None
     assert out["mode"] == "thinking"  # what the router resolved, echoed back
+
+
+def test_db_write_refused_by_default():
+    from mnemiq.mcp.server import _db_write
+    from mnemiq.runtime import WriteResult
+
+    class _RT:
+        def write(self, sql, identity):
+            return WriteResult(approved=False, refusal="You may not write to 'claim'.",
+                               target="claim")
+
+    out = _db_write(_RT(), _identity(), "INSERT INTO claim (id) VALUES (1)")
+    assert out["approved"] is False and "may not write" in out["refusal"]
+    assert out["rows_affected"] is None
+
+
+def test_db_write_reports_rows_on_approval():
+    from mnemiq.mcp.server import _db_write
+    from mnemiq.runtime import WriteResult
+
+    class _RT:
+        def write(self, sql, identity):
+            return WriteResult(approved=True, target="claim", rows_affected=1,
+                               target_sql="INSERT INTO claim ...")
+
+    out = _db_write(_RT(), _identity(), "INSERT INTO claim (id) VALUES (1)")
+    assert out["approved"] is True and out["target"] == "claim" and out["rows_affected"] == 1

@@ -11,9 +11,13 @@ from mnemiq.contract import IdentityContext
 @dataclass(frozen=True)
 class GrantSet:
     objects: frozenset[str]
+    writable: frozenset[str] = frozenset()  # a writable object is always readable (in objects)
 
     def allows(self, object_id: str) -> bool:
         return object_id in self.objects
+
+    def allows_write(self, object_id: str) -> bool:
+        return object_id in self.writable
 
     @property
     def fingerprint(self) -> str:
@@ -61,8 +65,13 @@ class FileAuthzProvider:
             return EMPTY
 
         objects: set[str] = set()
+        writable: set[str] = set()
         for principal_role in [*identity.roles, *identity.groups]:
             granted = roles.get(principal_role)
-            if isinstance(granted, list):
+            if isinstance(granted, list):  # list form: read-only (backward compatible)
                 objects.update(str(o) for o in granted)
-        return GrantSet(frozenset(objects))
+            elif isinstance(granted, dict):  # dict form: explicit read + write
+                objects.update(str(o) for o in granted.get("read", []))
+                writable.update(str(o) for o in granted.get("write", []))
+        objects |= writable  # a writable table is always readable (the decider requires it)
+        return GrantSet(frozenset(objects), frozenset(writable))
