@@ -32,6 +32,13 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--principal", default="local")
     w.add_argument("--roles", default="", help="comma-separated")
 
+    f = sub.add_parser("feedback", help="record a fixed failure as a golden case + example")
+    f.add_argument("--question", required=True)
+    f.add_argument("--sql", required=True)
+    f.add_argument("--tables", default="", help="comma-separated")
+    f.add_argument("--golden", default="evals/acme.json")
+    f.add_argument("--examples", default="evals/captured_examples.json")
+
     sub.add_parser("serve", help="run the MCP server on stdio")
 
     e = sub.add_parser("eval", help="run the ACME golden set")
@@ -170,6 +177,15 @@ def _cmd_write(settings: Settings, args) -> int:
     return 0
 
 
+def _cmd_feedback(args) -> int:
+    from mnemiq.feedback.capture import capture_fix
+
+    tables = [t for t in args.tables.split(",") if t]
+    cid = capture_fix(args.question, args.sql, tables, "acme", args.golden, args.examples)
+    print(f"captured {cid} -> {args.golden}, {args.examples}")
+    return 0
+
+
 def _cmd_serve(settings: Settings) -> int:
     from mnemiq.mcp.server import serve
 
@@ -188,6 +204,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_ask(settings, args)
     if args.command == "write":
         return _cmd_write(settings, args)
+    if args.command == "feedback":
+        return _cmd_feedback(args)
     if args.command == "serve":
         return _cmd_serve(settings)
     if args.command == "eval":
