@@ -36,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     e = sub.add_parser("eval", help="run the ACME golden set")
     e.add_argument("--golden", default="evals/acme.json")
+    e.add_argument("--gate", action="store_true", help="exit non-zero on accuracy regression")
+    e.add_argument("--record", action="store_true", help="record this run in the accuracy trend")
     return p
 
 
@@ -191,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "eval":
         from mnemiq.eval.run import run_acme
 
-        return run_acme(settings, golden=args.golden)
+        return run_acme(settings, golden=args.golden, gate=args.gate, record=args.record)
     return 2
 
 

@@ -12,8 +12,12 @@ from mnemiq.eval.report import summarize
 from mnemiq.llm.client import LLMClient
 
 
-def run_acme(settings: Settings, golden: str = "evals/acme.json") -> int:
-    """Run the ACME golden set once (enrichment ON) and print the report."""
+def run_acme(settings: Settings, golden: str = "evals/acme.json",
+             gate: bool = False, record: bool = False) -> int:
+    """Run the ACME golden set once (enrichment ON) and print the report.
+
+    --record appends the run to the accuracy trend; --gate additionally fails (exit 1) when
+    accuracy regressed beyond tolerance versus the last recorded run (the evaluation loop)."""
     if not settings.pg_dsn:
         print("set MNEMIQ_PG_DSN")
         return 1
@@ -25,4 +29,15 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json") -> int:
     results = [run_case(c, ask, adapter) for c in load_cases(golden)]
     report = summarize(results, tokens=client.total_tokens, llm_calls=client.calls)
     print(report.render())
+
+    from mnemiq.eval.trend import check_regression, last_run, record_run
+
+    previous = last_run(settings.control_dsn, settings.source_id, path="evals/trend.json")
+    if record or gate:
+        record_run(settings.control_dsn, settings.source_id, report, path="evals/trend.json")
+    if gate:
+        msg = check_regression(report, previous)
+        if msg:
+            print(f"GATE FAILED: {msg}")
+            return 1
     return 0
