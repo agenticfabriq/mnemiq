@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--examples", default="evals/captured_examples.json")
 
     sub.add_parser("serve", help="run the MCP server on stdio")
+    sub.add_parser("metrics", help="print observability SLOs from the answer log")
 
     e = sub.add_parser("eval", help="run the ACME golden set")
     e.add_argument("--golden", default="evals/acme.json")
@@ -214,6 +215,16 @@ def _cmd_feedback(args) -> int:
     return 0
 
 
+def _cmd_metrics(settings: Settings) -> int:
+    from mnemiq.observability.metrics import NullSink, PostgresSink, aggregate
+
+    sink = PostgresSink(settings.control_dsn) if settings.control_dsn else NullSink()
+    m = aggregate(sink.recent(settings.source_id, 1000))
+    print(f"answers={m.answers} deferral_rate={m.deferral_rate:.1%} "
+          f"cache_hit_rate={m.cache_hit_rate:.1%} p50={m.p50_ms:.0f}ms p95={m.p95_ms:.0f}ms")
+    return 0
+
+
 def _cmd_serve(settings: Settings) -> int:
     from mnemiq.mcp.server import serve
 
@@ -236,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_write(settings, args)
     if args.command == "feedback":
         return _cmd_feedback(args)
+    if args.command == "metrics":
+        return _cmd_metrics(settings)
     if args.command == "serve":
         return _cmd_serve(settings)
     if args.command == "eval":
