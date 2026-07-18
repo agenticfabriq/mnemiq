@@ -41,6 +41,12 @@ def load_snapshot(con: duckdb.DuckDBPyConnection, version: str) -> Snapshot:
     return Snapshot.model_validate_json(row[0])
 
 
+def has_snapshot(con: duckdb.DuckDBPyConnection, version: str) -> bool:
+    _ensure(con)
+    row = con.execute("SELECT 1 FROM snapshot WHERE version = ? LIMIT 1", [version]).fetchone()
+    return row is not None
+
+
 def current_version(con: duckdb.DuckDBPyConnection, source_id: str) -> str | None:
     _ensure(con)
     row = con.execute(
