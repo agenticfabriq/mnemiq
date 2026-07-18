@@ -17,6 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("enrich", help="profile + describe the source; save a snapshot")
     sub.add_parser("build", help="index the current snapshot for retrieval")
+    sub.add_parser(
+        "refresh", help="re-crawl the source; re-enrich + publish if the catalog changed"
+    )
 
     a = sub.add_parser("ask", help="ask a question in natural language")
     a.add_argument("question")
@@ -32,10 +35,20 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--principal", default="local")
     w.add_argument("--roles", default="", help="comma-separated")
 
+    f = sub.add_parser("feedback", help="record a fixed failure as a golden case + example")
+    f.add_argument("--question", required=True)
+    f.add_argument("--sql", required=True)
+    f.add_argument("--tables", default="", help="comma-separated")
+    f.add_argument("--golden", default="evals/acme.json")
+    f.add_argument("--examples", default="evals/captured_examples.json")
+
     sub.add_parser("serve", help="run the MCP server on stdio")
+    sub.add_parser("metrics", help="print observability SLOs from the answer log")
 
     e = sub.add_parser("eval", help="run the ACME golden set")
     e.add_argument("--golden", default="evals/acme.json")
+    e.add_argument("--gate", action="store_true", help="exit non-zero on accuracy regression")
+    e.add_argument("--record", action="store_true", help="record this run in the accuracy trend")
     return p
 
 
@@ -120,6 +133,31 @@ def _cmd_build(settings: Settings) -> int:
     return 0
 
 
+def _cmd_refresh(settings: Settings) -> int:
+    from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
+    from mnemiq.enrichment.refresh import catalog_diff
+    from mnemiq.store.bootstrap import init_store
+    from mnemiq.store.snapshot_store import current_version, load_snapshot
+
+    if not settings.pg_dsn:
+        print("set MNEMIQ_PG_DSN", file=sys.stderr)
+        return 1
+    con = init_store(settings.store_path)
+    version = current_version(con, settings.source_id)
+    if version is None:
+        print("no snapshot -- run `mnemiq enrich` first", file=sys.stderr)
+        return 1
+    diff = catalog_diff(DuckDBPostgresAdapter(settings.pg_dsn), load_snapshot(con, version))
+    print(f"added={diff.added} changed={diff.changed} dropped={diff.dropped}")
+    if not diff.has_changes:
+        print("catalog unchanged -- nothing to refresh")
+        return 0
+    rc = _cmd_enrich(settings)
+    if rc == 0:
+        rc = _cmd_build(settings)  # build publishes the new version when a control DSN is set
+    return rc
+
+
 def _cmd_ask(settings: Settings, args) -> int:
     try:
         rt = build_runtime(settings)
@@ -168,6 +206,25 @@ def _cmd_write(settings: Settings, args) -> int:
     return 0
 
 
+def _cmd_feedback(args) -> int:
+    from mnemiq.feedback.capture import capture_fix
+
+    tables = [t for t in args.tables.split(",") if t]
+    cid = capture_fix(args.question, args.sql, tables, "acme", args.golden, args.examples)
+    print(f"captured {cid} -> {args.golden}, {args.examples}")
+    return 0
+
+
+def _cmd_metrics(settings: Settings) -> int:
+    from mnemiq.observability.metrics import NullSink, PostgresSink, aggregate
+
+    sink = PostgresSink(settings.control_dsn) if settings.control_dsn else NullSink()
+    m = aggregate(sink.recent(settings.source_id, 1000))
+    print(f"answers={m.answers} deferral_rate={m.deferral_rate:.1%} "
+          f"cache_hit_rate={m.cache_hit_rate:.1%} p50={m.p50_ms:.0f}ms p95={m.p95_ms:.0f}ms")
+    return 0
+
+
 def _cmd_serve(settings: Settings) -> int:
     from mnemiq.mcp.server import serve
 
@@ -182,16 +239,22 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_enrich(settings)
     if args.command == "build":
         return _cmd_build(settings)
+    if args.command == "refresh":
+        return _cmd_refresh(settings)
     if args.command == "ask":
         return _cmd_ask(settings, args)
     if args.command == "write":
         return _cmd_write(settings, args)
+    if args.command == "feedback":
+        return _cmd_feedback(args)
+    if args.command == "metrics":
+        return _cmd_metrics(settings)
     if args.command == "serve":
         return _cmd_serve(settings)
     if args.command == "eval":
         from mnemiq.eval.run import run_acme
 
-        return run_acme(settings, golden=args.golden)
+        return run_acme(settings, golden=args.golden, gate=args.gate, record=args.record)
     return 2
 
 
