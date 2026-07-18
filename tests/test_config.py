@@ -56,6 +56,16 @@ def test_source_specs_synthesizes_single_source_from_pg_dsn():
                                 catalog="src", schema="public")]
 
 
+def test_control_dsn_from_env(monkeypatch):
+    monkeypatch.setenv("MNEMIQ_CONTROL_DSN", "postgresql://ctl")
+    assert Settings.from_env().control_dsn == "postgresql://ctl"
+
+
+def test_control_dsn_defaults_none(monkeypatch):
+    monkeypatch.delenv("MNEMIQ_CONTROL_DSN", raising=False)
+    assert Settings.from_env().control_dsn is None
+
+
 def test_source_specs_reads_manifest(tmp_path):
     manifest = tmp_path / "sources.json"
     manifest.write_text(json.dumps([

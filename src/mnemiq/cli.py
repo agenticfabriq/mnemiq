@@ -95,6 +95,13 @@ def _cmd_build(settings: Settings) -> int:
 
         n, n_ex = build_federated(settings, con, embedder)
         print(f"indexed {n} cards, {n_ex} examples (federated) -> {settings.store_path}")
+        if settings.control_dsn:
+            from mnemiq.store.control import publish_version
+
+            for spec in settings.source_specs():
+                v = current_version(con, spec.id)
+                if v is not None:
+                    publish_version(settings.control_dsn, spec.id, v)
         return 0
     version = current_version(con, settings.source_id)
     if version is None:
@@ -106,6 +113,10 @@ def _cmd_build(settings: Settings) -> int:
     n = build_index(con, snap, embedder)
     n_ex = build_example_index(con, snap, embedder)
     print(f"indexed {n} cards, {n_ex} examples -> {settings.store_path}")
+    if settings.control_dsn:
+        from mnemiq.store.control import publish_version
+
+        publish_version(settings.control_dsn, settings.source_id, version)
     return 0
 
 

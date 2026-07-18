@@ -25,7 +25,8 @@ from mnemiq.sql.policy import AccessPolicy, build_access_policy
 from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import ApprovedWrite
 from mnemiq.store.bootstrap import init_store
-from mnemiq.store.snapshot_store import current_version, load_snapshot
+from mnemiq.store.control import resolve_version
+from mnemiq.store.snapshot_store import load_snapshot
 
 
 class SnapshotMissing(RuntimeError):
@@ -56,10 +57,22 @@ class Runtime:
     settings: Settings | None
     agents: dict[str, Agent] | None = None  # one per mode; None = single-agent (tests)
     router: Router = field(default_factory=StaticRouter)
+    loaded_versions: dict[str, str] = field(default_factory=dict)
+
+    def reload_if_stale(self) -> None:
+        """Hot-swap the in-memory snapshot when the shared version pointer has advanced to a
+        version this replica already has locally. No-op without a control DSN."""
+        if not self.settings or not self.settings.control_dsn:
+            return
+        snapshot, versions = load_current_snapshot(self.settings, self.con)
+        if versions != self.loaded_versions:
+            self.snapshot = snapshot
+            self.loaded_versions = versions
 
     def ask(
         self, question: str, identity: IdentityContext, mode: str | None = None
     ) -> AgentAnswer:
+        self.reload_if_stale()
         # Route first: an unknown mode fails before any retrieval or LLM work.
         name = self.router.route(question, mode)
         agent = (self.agents or {}).get(name, self.agent)
@@ -107,6 +120,36 @@ def _authz(settings: Settings) -> AuthzProvider:
     return FileAuthzProvider(settings.authz_path) if settings.authz_path else DenyAll()
 
 
+def load_current_snapshot(settings: Settings, con) -> tuple[Snapshot, dict[str, str]]:
+    """Resolve the current version per source (shared pointer when a control DSN is set, else
+    local) and load the snapshot -- merged across sources when federated."""
+    specs = settings.source_specs()
+    versions: dict[str, str] = {}
+    if len(specs) > 1:
+        from mnemiq.semantic.federation import merge_snapshots
+
+        pairs = []
+        for spec in specs:
+            v = resolve_version(con, settings.control_dsn, spec.id)
+            if v is None:
+                raise SnapshotMissing(
+                    f"no snapshot for source {spec.id!r} -- run `mnemiq enrich` then "
+                    "`mnemiq build` first"
+                )
+            versions[spec.id] = v
+            pairs.append((spec, load_snapshot(con, v)))
+        return merge_snapshots(pairs), versions
+    sid = settings.source_id
+    v = resolve_version(con, settings.control_dsn, sid)
+    if v is None:
+        raise SnapshotMissing(
+            f"no snapshot for source {settings.source_id!r} in {settings.store_path!r} -- "
+            "run `mnemiq enrich` then `mnemiq build` first"
+        )
+    versions[sid] = v
+    return load_snapshot(con, v), versions
+
+
 def build_runtime(settings: Settings) -> Runtime:
     default_mode = settings.default_mode or DEFAULT_MODE
     if default_mode not in MODES:
@@ -114,33 +157,17 @@ def build_runtime(settings: Settings) -> Runtime:
             f"MNEMIQ_MODE={default_mode!r} names no mode; valid modes: {sorted(MODES)}"
         )
     con = init_store(settings.store_path)
+    # Current version per source (shared pointer when a control DSN is set, else local) + snapshot.
+    snapshot, loaded_versions = load_current_snapshot(settings, con)
     specs = settings.source_specs()
     if len(specs) > 1:
         # Federated: ATTACH all sources into one DuckDB; the snapshot is the qualified union,
         # carrying the catalog->schema registry the decider expands with.
         from mnemiq.adapters.federated import FederatedAdapter
-        from mnemiq.semantic.federation import merge_snapshots
 
-        pairs = []
-        for spec in specs:
-            v = current_version(con, spec.id)
-            if v is None:
-                raise SnapshotMissing(
-                    f"no snapshot for source {spec.id!r} -- run `mnemiq enrich` then "
-                    "`mnemiq build` first"
-                )
-            pairs.append((spec, load_snapshot(con, v)))
-        snapshot = merge_snapshots(pairs)
         adapter = FederatedAdapter(specs, read_only=not settings.write_enabled)
     else:
         # Single-source fast path -- unchanged from v0.1.
-        version = current_version(con, settings.source_id)
-        if version is None:
-            raise SnapshotMissing(
-                f"no snapshot for source {settings.source_id!r} in {settings.store_path!r} -- "
-                "run `mnemiq enrich` then `mnemiq build` first"
-            )
-        snapshot = load_snapshot(con, version)
         if not settings.pg_dsn:
             raise SnapshotMissing("no MNEMIQ_PG_DSN -- the engine needs a source to query")
         # Read-only attach unless writes are explicitly enabled -- the backstop under db_write.
@@ -152,7 +179,13 @@ def build_runtime(settings: Settings) -> Runtime:
     # and execution on one dialect so no cross-dialect transpile gap can bite.
     generator = LLMGenerator(client, dialect=adapter.dialect)
     synthesizer = LLMSynthesizer(client)
-    cache = TwoTierCache(L1Cache())
+    # Live L2 (cross-replica) when a control Postgres is configured; L1-only otherwise (today).
+    if settings.control_dsn:
+        from mnemiq.cache.postgres import PostgresCache
+
+        cache = TwoTierCache(L1Cache(), PostgresCache(settings.control_dsn))
+    else:
+        cache = TwoTierCache(L1Cache())
     corrector = LLMCorrector(client)
     values = ValueIndex(con)
     selector = LLMSelector(client)
@@ -179,4 +212,5 @@ def build_runtime(settings: Settings) -> Runtime:
         settings=settings,
         agents=agents,
         router=StaticRouter(default=default_mode),
+        loaded_versions=loaded_versions,
     )

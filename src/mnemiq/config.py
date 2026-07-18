@@ -27,6 +27,7 @@ class Settings:
     embed_model: str | None = None
     authz_path: str | None = None
     sources_path: str | None = None
+    control_dsn: str | None = None
     source_id: str | None = None
     store_path: str | None = None
     default_mode: str | None = None
@@ -53,6 +54,7 @@ class Settings:
             embed_model=os.getenv("MNEMIQ_EMBED_MODEL"),
             authz_path=os.getenv("MNEMIQ_AUTHZ_PATH"),
             sources_path=os.getenv("MNEMIQ_SOURCES_PATH"),
+            control_dsn=os.getenv("MNEMIQ_CONTROL_DSN"),
             source_id=os.getenv("MNEMIQ_SOURCE_ID"),
             store_path=os.getenv("MNEMIQ_STORE_PATH"),
             default_mode=os.getenv("MNEMIQ_MODE"),
