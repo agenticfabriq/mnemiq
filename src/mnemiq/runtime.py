@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -58,6 +59,7 @@ class Runtime:
     agents: dict[str, Agent] | None = None  # one per mode; None = single-agent (tests)
     router: Router = field(default_factory=StaticRouter)
     loaded_versions: dict[str, str] = field(default_factory=dict)
+    sink: Any = None  # observability sink; None = NullSink (no record written)
 
     def reload_if_stale(self) -> None:
         """Hot-swap the in-memory snapshot when the shared version pointer has advanced to a
@@ -73,6 +75,7 @@ class Runtime:
         self, question: str, identity: IdentityContext, mode: str | None = None
     ) -> AgentAnswer:
         self.reload_if_stale()
+        started = time.perf_counter()
         # Route first: an unknown mode fails before any retrieval or LLM work.
         name = self.router.route(question, mode)
         agent = (self.agents or {}).get(name, self.agent)
@@ -84,6 +87,14 @@ class Runtime:
         grants = self.authz.grants_for(identity)
         answer = agent.answer(packet, self.snapshot, grants, identity)
         answer.mode = name
+        if self.sink is not None:  # observability loop: one fail-soft record per answer
+            from mnemiq.observability.metrics import AnswerRecord
+
+            self.sink.record(
+                self.settings.source_id if self.settings else "unknown",
+                AnswerRecord(deferred=answer.deferred, cached=answer.cached,
+                             total_ms=(time.perf_counter() - started) * 1000, mode=name),
+            )
         return answer
 
     def schema(self, identity: IdentityContext) -> list[dict]:
@@ -179,13 +190,19 @@ def build_runtime(settings: Settings) -> Runtime:
     # and execution on one dialect so no cross-dialect transpile gap can bite.
     generator = LLMGenerator(client, dialect=adapter.dialect)
     synthesizer = LLMSynthesizer(client)
-    # Live L2 (cross-replica) when a control Postgres is configured; L1-only otherwise (today).
+    # Live L2 (cross-replica) + observability sink when a control Postgres is configured;
+    # L1-only + no-op sink otherwise (today, byte-for-byte).
     if settings.control_dsn:
         from mnemiq.cache.postgres import PostgresCache
+        from mnemiq.observability.metrics import PostgresSink
 
         cache = TwoTierCache(L1Cache(), PostgresCache(settings.control_dsn))
+        sink = PostgresSink(settings.control_dsn)
     else:
+        from mnemiq.observability.metrics import NullSink
+
         cache = TwoTierCache(L1Cache())
+        sink = NullSink()
     corrector = LLMCorrector(client)
     values = ValueIndex(con)
     selector = LLMSelector(client)
@@ -213,4 +230,5 @@ def build_runtime(settings: Settings) -> Runtime:
         agents=agents,
         router=StaticRouter(default=default_mode),
         loaded_versions=loaded_versions,
+        sink=sink,
     )
