@@ -17,6 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("enrich", help="profile + describe the source; save a snapshot")
     sub.add_parser("build", help="index the current snapshot for retrieval")
+    sub.add_parser(
+        "refresh", help="re-crawl the source; re-enrich + publish if the catalog changed"
+    )
 
     a = sub.add_parser("ask", help="ask a question in natural language")
     a.add_argument("question")
@@ -129,6 +132,31 @@ def _cmd_build(settings: Settings) -> int:
     return 0
 
 
+def _cmd_refresh(settings: Settings) -> int:
+    from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
+    from mnemiq.enrichment.refresh import catalog_diff
+    from mnemiq.store.bootstrap import init_store
+    from mnemiq.store.snapshot_store import current_version, load_snapshot
+
+    if not settings.pg_dsn:
+        print("set MNEMIQ_PG_DSN", file=sys.stderr)
+        return 1
+    con = init_store(settings.store_path)
+    version = current_version(con, settings.source_id)
+    if version is None:
+        print("no snapshot -- run `mnemiq enrich` first", file=sys.stderr)
+        return 1
+    diff = catalog_diff(DuckDBPostgresAdapter(settings.pg_dsn), load_snapshot(con, version))
+    print(f"added={diff.added} changed={diff.changed} dropped={diff.dropped}")
+    if not diff.has_changes:
+        print("catalog unchanged -- nothing to refresh")
+        return 0
+    rc = _cmd_enrich(settings)
+    if rc == 0:
+        rc = _cmd_build(settings)  # build publishes the new version when a control DSN is set
+    return rc
+
+
 def _cmd_ask(settings: Settings, args) -> int:
     try:
         rt = build_runtime(settings)
@@ -200,6 +228,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_enrich(settings)
     if args.command == "build":
         return _cmd_build(settings)
+    if args.command == "refresh":
+        return _cmd_refresh(settings)
     if args.command == "ask":
         return _cmd_ask(settings, args)
     if args.command == "write":
