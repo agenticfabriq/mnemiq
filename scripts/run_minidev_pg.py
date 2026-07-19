@@ -13,6 +13,8 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import os
 import sys
 import urllib.parse as up
 
@@ -51,6 +53,17 @@ def main() -> int:
         return 1
     pg_dsn = args.pg_dsn or _bird_dsn(settings.pg_dsn)
 
+    # Enrichment can run on a different (e.g. hosted) model than generation, to hold the
+    # semantic layer constant while only generation varies. Defaults to the generation model.
+    enrich_settings = settings
+    if os.getenv("MNEMIQ_ENRICH_BASE_URL"):
+        enrich_settings = dataclasses.replace(
+            settings,
+            llm_base_url=os.environ["MNEMIQ_ENRICH_BASE_URL"],
+            llm_api_key=os.getenv("MNEMIQ_ENRICH_API_KEY", settings.llm_api_key),
+            llm_model=os.getenv("MNEMIQ_ENRICH_MODEL", settings.llm_model),
+        )
+
     cases = load_bird(
         args.minidev,
         dialect="postgresql",
@@ -60,13 +73,15 @@ def main() -> int:
         with_evidence=not args.no_evidence,
     )
     print(f"loaded {len(cases)} mini-dev PG cases across {len({c.db_id for c in cases})} databases "
-          f"| generation model: {settings.llm_model}", flush=True)
+          f"| generation: {settings.llm_model} | enrichment: {enrich_settings.llm_model} "
+          f"| embeddings: {settings.embed_endpoint()[0]}", flush=True)
 
     def progress(done, total, result):
         print(f"  [{done:3}/{total}] {result.outcome:20} {result.case_id}", flush=True)
 
     results, use = run_minidev_pg(
         cases, args.minidev, pg_dsn, settings,
+        enrich_settings=enrich_settings,
         cache_dir=args.cache, on_case=progress, results_path=args.results,
         workers=args.workers, candidates=args.candidates,
     )
