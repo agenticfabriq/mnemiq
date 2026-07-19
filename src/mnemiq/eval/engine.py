@@ -58,7 +58,11 @@ def build_engine(
     build_value_index(adapter, snapshot, con)
 
     tables = [r[0] for r in con.execute("SELECT object_id FROM semantic_object").fetchall()]
-    grants = GrantSet(frozenset(tables))
+    # Grade SQL capability with FULL data access: clear every PII level the enrichment tagged,
+    # so CLS does not refuse legitimate columns (e.g. CustomerID). Governance/RLS/CLS have their
+    # own tests; a benchmark that denied enrichment-tagged PII would under-count every attempt.
+    levels = frozenset(c.pii_level for c in snapshot.columns if c.pii_level and c.pii_level != "none")
+    grants = GrantSet(frozenset(tables), pii_clearance=levels)
     authz = _GrantAll(grants)
 
     client = LLMClient(settings)  # one client, so the token count is the run's true cost
