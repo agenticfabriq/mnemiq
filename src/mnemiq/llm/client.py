@@ -29,8 +29,11 @@ class LLMClient:
     def total_tokens(self) -> int:
         return self.prompt_tokens + self.completion_tokens
 
-    def complete(self, system: str, user: str, max_tokens: int = 512) -> str:
+    def complete(self, system: str, user: str, max_tokens: int = 512,
+                 extra_body: dict | None = None) -> str:
         kwargs = {token_param_name(self._model): max_tokens}
+        if extra_body:  # e.g. vLLM guided decoding (guided_json / guided_grammar)
+            kwargs["extra_body"] = extra_body
         resp = self._client.chat.completions.create(
             model=self._model,
             messages=[

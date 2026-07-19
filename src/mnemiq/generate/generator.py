@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from typing import Protocol
@@ -9,6 +10,21 @@ from mnemiq.generate.prompts import system_prompt, user_prompt
 from mnemiq.semantic.retrieval import ContextPacket
 
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
+
+# Constrained decoding (MNEMIQ_GUIDED_SQL=1): force the reply to be a JSON object with a NON-EMPTY
+# sql string, so an over-deferring local model literally cannot return {"sql": null}. Requires a
+# guided-decoding backend (vLLM guided_json). No effect against endpoints that ignore extra_body.
+_GUIDED_SQL_SCHEMA = {
+    "type": "object",
+    "properties": {"sql": {"type": "string", "minLength": 1}, "reason": {"type": "string"}},
+    "required": ["sql"],
+}
+
+
+def _guided_extra_body() -> dict | None:
+    if os.getenv("MNEMIQ_GUIDED_SQL", "0") == "1":
+        return {"guided_json": _GUIDED_SQL_SCHEMA}
+    return None
 
 
 @dataclass
@@ -50,10 +66,12 @@ class LLMGenerator:
     def propose(
         self, packet: ContextPacket, feedback: str | None = None, strategy: str | None = None
     ) -> SqlProposal:
+        extra = _guided_extra_body()
         raw = self._client.complete(
             system_prompt(dialect=self._dialect, strategy=strategy),
             user_prompt(packet, feedback),
             max_tokens=self._max_tokens,
+            **({"extra_body": extra} if extra else {}),
         )
         return _parse(raw)
 
