@@ -56,6 +56,18 @@ def test_source_specs_synthesizes_single_source_from_pg_dsn():
                                 catalog="src", schema="public")]
 
 
+def test_embed_endpoint_defaults_to_chat():
+    s = Settings(llm_base_url="http://chat", llm_api_key="ck", llm_model=None, pg_dsn=None,
+                 acme_data_dir=None)
+    assert s.embed_endpoint() == ("http://chat", "ck")
+
+
+def test_embed_endpoint_split_overrides_chat():
+    s = Settings(llm_base_url="http://local-vllm", llm_api_key="x", llm_model=None, pg_dsn=None,
+                 acme_data_dir=None, embed_base_url="http://hosted", embed_api_key="hk")
+    assert s.embed_endpoint() == ("http://hosted", "hk")  # generation local, embeddings hosted
+
+
 def test_control_dsn_from_env(monkeypatch):
     monkeypatch.setenv("MNEMIQ_CONTROL_DSN", "postgresql://ctl")
     assert Settings.from_env().control_dsn == "postgresql://ctl"

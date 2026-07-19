@@ -25,6 +25,8 @@ class Settings:
     pg_dsn: str | None
     acme_data_dir: str | None
     embed_model: str | None = None
+    embed_base_url: str | None = None
+    embed_api_key: str | None = None
     authz_path: str | None = None
     sources_path: str | None = None
     control_dsn: str | None = None
@@ -52,6 +54,8 @@ class Settings:
             pg_dsn=os.getenv("MNEMIQ_PG_DSN"),
             acme_data_dir=os.getenv("MNEMIQ_ACME_DATA_DIR"),
             embed_model=os.getenv("MNEMIQ_EMBED_MODEL"),
+            embed_base_url=os.getenv("MNEMIQ_EMBED_BASE_URL"),
+            embed_api_key=os.getenv("MNEMIQ_EMBED_API_KEY"),
             authz_path=os.getenv("MNEMIQ_AUTHZ_PATH"),
             sources_path=os.getenv("MNEMIQ_SOURCES_PATH"),
             control_dsn=os.getenv("MNEMIQ_CONTROL_DSN"),
@@ -60,6 +64,12 @@ class Settings:
             default_mode=os.getenv("MNEMIQ_MODE"),
             write_enabled=os.getenv("MNEMIQ_WRITE_ENABLED") == "1",
         )
+
+    def embed_endpoint(self) -> tuple[str | None, str | None]:
+        """The endpoint embeddings use. Defaults to the chat endpoint, so today is unchanged;
+        set MNEMIQ_EMBED_BASE_URL/KEY to hold embeddings on a separate (e.g. hosted) endpoint
+        while chat/generation points at a local model."""
+        return (self.embed_base_url or self.llm_base_url, self.embed_api_key or self.llm_api_key)
 
     def source_specs(self) -> list["SourceSpec"]:
         """Resolved source list. A manifest wins; otherwise synthesize the single legacy
