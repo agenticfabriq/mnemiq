@@ -1,8 +1,26 @@
 from __future__ import annotations
 
+import os
+
 from mnemiq.enrichment.prompts import sanitize
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.guard import MAX_ROWS
+
+# Default defer-don't-guess block (byte-for-byte with the original prompt).
+_DEFER_DEFAULT = (
+    'DEFERRING IS A CORRECT ANSWER. If the cards cannot answer the question, return\n'
+    '{"sql": null, "reason": "<what is missing>"}. A confident query over the wrong tables is\n'
+    'far worse than an honest "I cannot answer that from this data".'
+)
+# Assertive variant (MNEMIQ_ASSERTIVE_SQL=1): for weaker/local models that over-defer -- attempt
+# when the tables are present; defer ONLY when a required table is genuinely absent.
+_DEFER_ASSERTIVE = (
+    "ATTEMPT EVERY QUESTION whose tables are on the cards. If the tables you need ARE present,\n"
+    'you MUST write your best {dialect} SELECT -- even if the question is complex or you are\n'
+    "unsure; a reasonable attempt is expected and far better than giving up.\n"
+    'Return {{"sql": null, "reason": "<the missing table>"}} ONLY when a table you genuinely need\n'
+    "is absent from the cards. Do NOT return null merely because the question is hard."
+)
 
 PERSONA = (
     "You are a careful analytics engineer. You write correct SQL, and you say so plainly "
@@ -30,6 +48,11 @@ STRATEGY_PREAMBLES = {
 def system_prompt(
     dialect: str = "duckdb", max_rows: int = MAX_ROWS, strategy: str | None = None
 ) -> str:
+    defer = (
+        _DEFER_ASSERTIVE.format(dialect=dialect)
+        if os.getenv("MNEMIQ_ASSERTIVE_SQL", "0") == "1"
+        else _DEFER_DEFAULT
+    )
     base = f"""{PERSONA}
 
 You will be given a question and the schema cards for the ONLY tables you may use.
@@ -42,9 +65,7 @@ HARD RULES -- a query that breaks one of these is rejected before it runs:
 - List explicit columns. Never SELECT * from a table.
 - Keep the result small (a LIMIT of at most {max_rows} is enforced regardless).
 
-DEFERRING IS A CORRECT ANSWER. If the cards cannot answer the question, return
-{{"sql": null, "reason": "<what is missing>"}}. A confident query over the wrong tables is
-far worse than an honest "I cannot answer that from this data".
+{defer}
 
 Return ONLY a JSON object, no prose and no code fences:
 {{"sql": "<the SELECT, or null>", "reason": "<one sentence>"}}
