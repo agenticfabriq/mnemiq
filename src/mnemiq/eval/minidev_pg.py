@@ -33,6 +33,7 @@ def run_minidev_pg(
     pg_dsn: str,
     settings: Settings,
     *,
+    enrich_settings: Settings | None = None,
     cache_dir: str | None = None,
     max_rows_cap: int = 1000,
     on_case: Callable[[int, int, CaseResult], None] | None = None,
@@ -42,7 +43,12 @@ def run_minidev_pg(
 ) -> tuple[list[CaseResult], dict]:
     """Grouped-by-db, resumable mini-dev PG run. Enrichment is per-db (cached, from the SQLite
     dev_databases -- dialect-agnostic); execution is against `bird_dev` (pg_dsn) via DuckDB;
-    gold runs on native Postgres."""
+    gold runs on native Postgres.
+
+    `enrich_settings` (default `settings`) lets enrichment run on a *different* model than
+    generation -- e.g. hold the semantic layer constant on a hosted model while only generation
+    varies across a local-model ladder. Embeddings follow `settings.embed_endpoint()`."""
+    enrich_settings = enrich_settings or settings
     by_db: dict[str, list[EvaluationCase]] = {}
     for case in cases:
         by_db.setdefault(case.db_id, []).append(case)
@@ -59,7 +65,7 @@ def run_minidev_pg(
         if not remaining:
             continue
 
-        snapshot = enrich_bird_db(minidev_dir, db_id, settings, cache_dir=cache_dir)
+        snapshot = enrich_bird_db(minidev_dir, db_id, enrich_settings, cache_dir=cache_dir)
 
         def _build(snapshot=snapshot):  # bind the current db's snapshot; own connections per worker
             engine_adapter = DuckDBAdapter.postgres(pg_dsn, read_only=True)  # engine SQL -> bird_dev
