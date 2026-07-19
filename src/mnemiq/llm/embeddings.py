@@ -18,11 +18,13 @@ class Embedder(Protocol):
 
 class LLMEmbedder:
     def __init__(self, settings: Settings, batch_size: int = 64) -> None:
-        if not settings.llm_base_url or not settings.llm_api_key:
-            raise RuntimeError("LLM base_url/api_key not configured (set MNEMIQ_LLM_* env)")
+        base_url, api_key = settings.embed_endpoint()
+        if not base_url or not api_key:
+            raise RuntimeError("embed base_url/api_key not configured (set MNEMIQ_LLM_* or "
+                               "MNEMIQ_EMBED_* env)")
         self._model = settings.embed_model
         self._batch_size = batch_size
-        self._client = OpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key)
+        self._client = OpenAI(base_url=base_url, api_key=api_key)
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         vectors: list[list[float]] = []
