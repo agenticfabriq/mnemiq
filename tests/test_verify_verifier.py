@@ -19,9 +19,17 @@ def test_sanity_short_circuits_before_grounding():
     assert v.defer and v.layer == "sanity"
 
 
-def test_grounding_fires_when_sanity_passes():
-    v = Verifier().verify(_packet("total for 'SME'"), _approved("SELECT SUM(x) FROM t"), pa.table({"s": [10]}))
+def test_grounding_fires_when_enabled_and_sanity_passes():
+    # grounding is off by default (measured EX cost); enable it explicitly
+    v = Verifier(grounding=True).verify(
+        _packet("total for 'SME'"), _approved("SELECT SUM(x) FROM t"), pa.table({"s": [10]})
+    )
     assert v.defer and v.layer == "grounding"
+
+
+def test_grounding_off_by_default():
+    v = Verifier().verify(_packet("total for 'SME'"), _approved("SELECT SUM(x) FROM t"), pa.table({"s": [10]}))
+    assert not v.defer and v.layer == "pass"
 
 
 def test_clean_result_passes():

@@ -34,3 +34,23 @@ def test_question_without_salient_literals_passes():
     p = _packet("how many customers are there?")
     a = _approved("SELECT COUNT(*) FROM customers")
     assert grounding_check(p, a) is None
+
+
+def test_case_insensitive_match_passes():
+    # question says "discount"; SQL uses 'Discount' -> grounded
+    p = _packet('how many "discount" stations?')
+    a = _approved("SELECT COUNT(*) FROM gasstations WHERE Segment = 'Discount'")
+    assert grounding_check(p, a) is None
+
+
+def test_possessive_apostrophe_is_not_a_quoted_value():
+    # "Sanders's" must not be parsed as a quoted literal 's'
+    p = _packet("What's Angela Sanders's major?")
+    a = _approved("SELECT major_name FROM member JOIN major WHERE first_name = 'Angela'")
+    assert grounding_check(p, a) is None
+
+
+def test_reformatted_date_is_not_flagged():
+    p = _packet("what segment at '2012/8/23'?")
+    a = _approved("SELECT Segment FROM customers WHERE Date = '2012-08-23'")
+    assert grounding_check(p, a) is None
