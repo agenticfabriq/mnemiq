@@ -34,6 +34,14 @@ class Settings:
     store_path: str | None = None
     default_mode: str | None = None
     write_enabled: bool = False
+    verify: bool = False
+    verify_threshold: float = 0.5
+    verify_sanity: bool = True
+    verify_grounding: bool = False  # measured EX cost > sanity; opt-in dial (see plan-27 M1)
+    verify_judge: bool = False
+    verify_base_url: str | None = None
+    verify_model: str | None = None
+    verify_api_key: str | None = None
 
     def __post_init__(self) -> None:
         if not self.llm_model:
@@ -63,6 +71,14 @@ class Settings:
             store_path=os.getenv("MNEMIQ_STORE_PATH"),
             default_mode=os.getenv("MNEMIQ_MODE"),
             write_enabled=os.getenv("MNEMIQ_WRITE_ENABLED") == "1",
+            verify=os.getenv("MNEMIQ_VERIFY") == "1",
+            verify_threshold=float(os.getenv("MNEMIQ_VERIFY_THRESHOLD", "0.5")),
+            verify_sanity=os.getenv("MNEMIQ_VERIFY_SANITY", "1") == "1",
+            verify_grounding=os.getenv("MNEMIQ_VERIFY_GROUNDING", "0") == "1",
+            verify_judge=os.getenv("MNEMIQ_VERIFY_JUDGE", "0") == "1",
+            verify_base_url=os.getenv("MNEMIQ_VERIFY_BASE_URL"),
+            verify_model=os.getenv("MNEMIQ_VERIFY_MODEL"),
+            verify_api_key=os.getenv("MNEMIQ_VERIFY_API_KEY"),
         )
 
     def embed_endpoint(self) -> tuple[str | None, str | None]:
@@ -70,6 +86,11 @@ class Settings:
         set MNEMIQ_EMBED_BASE_URL/KEY to hold embeddings on a separate (e.g. hosted) endpoint
         while chat/generation points at a local model."""
         return (self.embed_base_url or self.llm_base_url, self.embed_api_key or self.llm_api_key)
+
+    def verify_endpoint(self) -> tuple[str | None, str | None]:
+        """The endpoint the verifier's judge uses. Defaults to the chat endpoint; set
+        MNEMIQ_VERIFY_BASE_URL/KEY to run the judge on a separate (e.g. local) model."""
+        return (self.verify_base_url or self.llm_base_url, self.verify_api_key or self.llm_api_key)
 
     def source_specs(self) -> list["SourceSpec"]:
         """Resolved source list. A manifest wins; otherwise synthesize the single legacy
