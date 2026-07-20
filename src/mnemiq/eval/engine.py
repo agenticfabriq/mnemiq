@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 from collections.abc import Callable, Sequence
 
@@ -19,6 +20,8 @@ from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.store import build_example_index, build_index
 from mnemiq.semantic.values import ValueIndex, build_value_index
 from mnemiq.store.bootstrap import init_store
+from mnemiq.verify.judge import SemanticJudge
+from mnemiq.verify.verifier import Verifier
 
 IDENTITY = IdentityContext(tenant_id="local", principal_id="eval", roles=["analyst"])
 
@@ -43,6 +46,7 @@ def build_engine(
     store_path: str = ":memory:",
     definitions: Sequence[Definition] = (),
     candidates: int = 1,
+    verify: bool = False,
 ) -> tuple[Engine, LLMClient]:
     """Retrieval + agent over one snapshot, assembled exactly once.
 
@@ -66,6 +70,18 @@ def build_engine(
     authz = _GrantAll(grants)
 
     client = LLMClient(settings)  # one client, so the token count is the run's true cost
+
+    verifier = None
+    if verify or settings.verify:
+        judge = None
+        if settings.verify_judge:
+            base, key = settings.verify_endpoint()
+            judge = SemanticJudge(LLMClient(dataclasses.replace(
+                settings, llm_base_url=base, llm_api_key=key,
+                llm_model=settings.verify_model or settings.llm_model)))
+        verifier = Verifier(threshold=settings.verify_threshold, sanity=settings.verify_sanity,
+                            grounding=settings.verify_grounding, judge=judge)
+
     agent = Agent(
         # Generate in the source's dialect (BIRD: SQLite), so nothing needs a cross-dialect
         # transpile the SQLite writer can't do (DuckDB YEAR()/EXTRACT -> strftime).
@@ -78,6 +94,7 @@ def build_engine(
         corrector=LLMCorrector(client),
         values=ValueIndex(con),
         selector=LLMSelector(client) if candidates > 1 else None,
+        verifier=verifier,
     )
 
     # k=12 measured +2.3 strict / +2.3 facts over k=6 (recall probe: k=12 -> 100% gold-table
