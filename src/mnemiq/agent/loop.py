@@ -60,6 +60,7 @@ class Agent:
         values=None,
         selector=None,
         min_agreement: float | None = None,
+        verifier=None,
     ) -> None:
         self.generator = generator
         self.synthesizer = synthesizer
@@ -72,6 +73,7 @@ class Agent:
         self.values = values
         self.selector = selector
         self.min_agreement = min_agreement
+        self.verifier = verifier
         # The source's SQL dialect: the model writes it, `decide` parses it, the source runs
         # it. Product adapter is duckdb (transpile is a no-op); a SQLite source is SQLite
         # end-to-end -- no cross-dialect transpile gap (SQLGlot can't map DuckDB YEAR()/
@@ -126,8 +128,12 @@ class Agent:
 
             hit = self.cache.get(key)
             if hit is not None:
+                table = from_ipc(hit)
+                blocked = self._verified(packet, approved, table)
+                if blocked is not None:
+                    return blocked
                 return self._synthesize(
-                    packet, approved, identity, from_ipc(hit), deadline, cached=True, forced=False
+                    packet, approved, identity, table, deadline, cached=True, forced=False
                 )
 
             try:
@@ -140,6 +146,9 @@ class Agent:
                 continue
 
             self.cache.put(key, to_ipc(result.table))
+            blocked = self._verified(packet, approved, result.table)
+            if blocked is not None:
+                return blocked
             return self._synthesize(
                 packet,
                 approved,
@@ -245,6 +254,10 @@ class Agent:
         approved, table = executed[winner[0]]
         agreement = len(winner) / len(executed)
 
+        blocked = self._verified(packet, approved, table)
+        if blocked is not None:
+            return blocked
+
         base = self._synthesize(
             packet, approved, identity, table, deadline, cached=False, forced=deadline.expired
         )
@@ -260,6 +273,17 @@ class Agent:
             judge_override=judge_override,
             candidates_executed=len(executed),
         )
+
+    def _verified(self, packet: ContextPacket, approved: Approved, table) -> AgentAnswer | None:
+        """None if the answer clears the verifier (or none is wired), else a deferral. This is the
+        correctness gate: the decider guards validity, the verifier guards likely-correctness, and
+        both end in the same defer-don't-guess path."""
+        if self.verifier is None:
+            return None
+        verdict = self.verifier.verify(packet, approved, table)
+        if verdict.defer:
+            return AgentAnswer(answer=verdict.reason, deferred=True)
+        return None
 
     def _synthesize(
         self,
