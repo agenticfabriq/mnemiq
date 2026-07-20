@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import functools
+import hashlib
+import json
 import os
 
 from mnemiq.config import Settings
@@ -29,6 +31,28 @@ from mnemiq.verify.judge import SemanticJudge
 from mnemiq.verify.verifier import Verifier
 
 _THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+
+class _CachingJudge:
+    """Wrap a judge with a persistent per-case score cache so a wall-clock kill mid-sweep doesn't
+    re-pay for hosted calls -- a re-run resumes. Keyed on (question, sql, model)."""
+
+    def __init__(self, judge, path: str, model: str) -> None:
+        self._judge = judge
+        self._path = path
+        self._model = model
+        self._cache: dict[str, float] = {}
+        if os.path.exists(path):
+            self._cache = json.load(open(path))
+
+    def score(self, question: str, schema: str, sql: str, preview: str) -> float:
+        key = hashlib.sha1(f"{self._model}\x00{question}\x00{sql}".encode()).hexdigest()
+        if key in self._cache:
+            return self._cache[key]
+        s = self._judge.score(question, schema, sql, preview)
+        self._cache[key] = s
+        json.dump(self._cache, open(self._path, "w"))
+        return s
 
 
 def _line(o: dict) -> str:
@@ -61,7 +85,8 @@ def main() -> int:
     key = os.getenv("MNEMIQ_VERIFY_API_KEY") or settings.llm_api_key
     model = os.getenv("MNEMIQ_VERIFY_MODEL") or settings.llm_model
     client = LLMClient(dataclasses.replace(settings, llm_base_url=base, llm_api_key=key, llm_model=model))
-    judge = SemanticJudge(client)
+    tag = "".join(ch if ch.isalnum() else "_" for ch in model)
+    judge = _CachingJudge(SemanticJudge(client), f"{args.run}.judgecache.{tag}.json", model)
 
     @functools.lru_cache(maxsize=None)
     def cards_for(db_id: str) -> str:
