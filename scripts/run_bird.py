@@ -9,6 +9,7 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 
 from mnemiq.config import Settings
@@ -17,7 +18,8 @@ from mnemiq.eval.bird import load_bird
 from mnemiq.eval.bird_runner import run_bird
 from mnemiq.eval.report import slice_by, summarize
 
-_DEFAULT_DIR = "/Users/user/src/dataset/bird-minidev/MINIDEV"
+_DEFAULT_DIR = os.environ.get(
+    "MNEMIQ_MINIDEV_DIR", os.path.expanduser("~/src/dataset/bird-minidev/MINIDEV"))
 
 
 def main() -> int:

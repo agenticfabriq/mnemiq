@@ -23,7 +23,8 @@ from mnemiq.eval.bird import load_bird
 from mnemiq.eval.minidev_pg import run_minidev_pg
 from mnemiq.eval.report import slice_by, summarize
 
-_DEFAULT_DIR = "/Users/user/src/dataset/bird-minidev/MINIDEV"
+_DEFAULT_DIR = os.environ.get(
+    "MNEMIQ_MINIDEV_DIR", os.path.expanduser("~/src/dataset/bird-minidev/MINIDEV"))
 
 
 def _bird_dsn(base_dsn: str, db: str = "bird_dev") -> str:

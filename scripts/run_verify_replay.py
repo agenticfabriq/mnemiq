@@ -66,7 +66,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("run")
     p.add_argument("--judge", action="store_true")
-    p.add_argument("--minidev", default="/Users/user/src/dataset/bird-minidev/MINIDEV")
+    p.add_argument("--minidev", default=os.environ.get(
+        "MNEMIQ_MINIDEV_DIR", os.path.expanduser("~/src/dataset/bird-minidev/MINIDEV")))
     p.add_argument("--cache", default="eval-reports/minidev-pg-cache")
     args = p.parse_args()
 

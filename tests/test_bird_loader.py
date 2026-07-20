@@ -5,7 +5,8 @@ import pytest
 
 from mnemiq.eval.bird import bird_db_path, load_bird
 
-_REAL = "/Users/user/src/dataset/bird-minidev/MINIDEV"
+_REAL = os.environ.get(
+    "MNEMIQ_MINIDEV_DIR", os.path.expanduser("~/src/dataset/bird-minidev/MINIDEV"))
 
 
 @pytest.fixture
