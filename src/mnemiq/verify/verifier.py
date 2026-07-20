@@ -15,10 +15,14 @@ def _cards_text(packet: ContextPacket) -> str:
 class Verifier:
     """Cascade: deterministic sanity -> grounding -> optional LLM judge. An enabled deterministic
     layer that fires is a hard defer and short-circuits. The judge produces a graded confidence;
-    defer when it falls below `threshold`. `judge=None` -> deterministic-only."""
+    defer when it falls below `threshold`. `judge=None` -> deterministic-only.
+
+    Grounding is OFF by default: measured on saved runs it caught 28 wrong but lost 16 correct
+    (a real EX cost), where sanity caught 31 wrong for only 2 lost. Grounding is a dial position
+    (safety-first) and a soft signal the judge subsumes -- not a free default."""
 
     def __init__(self, *, threshold: float = 0.5, sanity: bool = True,
-                 grounding: bool = True, judge=None) -> None:
+                 grounding: bool = False, judge=None) -> None:
         self.threshold = threshold
         self.sanity = sanity
         self.grounding = grounding
