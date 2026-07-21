@@ -13,7 +13,8 @@ def test_registry_has_exactly_the_three_modes():
 
 
 def test_thinking_is_todays_product_bundle():
-    # Guards the zero-behavior-change claim: these are build_runtime's pre-plan-18 values.
+    # These are build_runtime's pre-plan-18 knob values; `thinking` now ALSO carries the
+    # sanity verify net (verifier-productionization) -- a deliberate, documented safety add.
     m = MODES["thinking"]
     assert (m.candidates, m.corrector, m.judge, m.min_agreement) == (1, True, False, None)
     assert (m.budget_s, m.max_attempts) == (120.0, 3)
@@ -51,3 +52,27 @@ def test_build_agent_wires_knobs_per_mode():
     assert instant.corrector is None and instant.selector is None
     assert instant.budget.max_attempts == 1
     assert instant.values is vals  # value grounding stays wired in EVERY mode
+
+
+def test_modes_carry_verify_levels():
+    # sanity (free deterministic net) everywhere; the LLM judge only in deep.
+    assert MODES["instant"].verify == "sanity"
+    assert MODES["thinking"].verify == "sanity"
+    assert MODES["deep"].verify == "full"
+
+
+def test_build_agent_wires_verifier():
+    sentinel = object()
+    agent = build_agent(
+        MODES["deep"], generator=None, synthesizer=None, adapter=None,
+        cache=None, corrector=None, values=None, selector=None, verifier=sentinel,
+    )
+    assert agent.verifier is sentinel
+
+
+def test_build_agent_verifier_defaults_none():
+    agent = build_agent(
+        MODES["instant"], generator=None, synthesizer=None, adapter=None,
+        cache=None, corrector=None, values=None, selector=None,
+    )
+    assert agent.verifier is None
