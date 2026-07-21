@@ -9,6 +9,7 @@ dependencies = [
   "psycopg[binary]>=3.2",
   "openai>=1.40",
   "pydantic>=2",
+  "pydantic-settings>=2",
   "sqlglot>=25",
   "pyarrow>=17",
   "cachetools>=5",
