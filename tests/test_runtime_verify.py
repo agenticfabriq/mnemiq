@@ -51,3 +51,34 @@ def test_build_verifier_layers():
     assert sanity_only is not None and sanity_only.judge is None
     full = _build_verifier("full", threshold=0.5, grounding=False, judge=judge)
     assert full is not None and full.judge is judge
+
+
+def _base_settings(**over):
+    s = Settings(llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d",
+                 acme_data_dir="a")
+    return dataclasses.replace(s, **over)
+
+
+def test_mode_verifiers_default_policy():
+    from mnemiq.runtime import _build_mode_verifiers
+
+    vs, judge_calls = _build_mode_verifiers(_base_settings(), client=object())
+    assert vs["instant"].judge is None          # sanity only
+    assert vs["thinking"].judge is None          # sanity only
+    assert vs["deep"].judge is not None          # sanity + judge
+    assert judge_calls == 1                       # judge built exactly once (shared)
+
+
+def test_mode_verifiers_force_off():
+    from mnemiq.runtime import _build_mode_verifiers
+
+    vs, _ = _build_mode_verifiers(_base_settings(verify_override="0"), client=object())
+    assert vs["instant"] is None and vs["thinking"] is None and vs["deep"] is None
+
+
+def test_mode_verifiers_force_full():
+    from mnemiq.runtime import _build_mode_verifiers
+
+    vs, judge_calls = _build_mode_verifiers(_base_settings(verify_override="1"), client=object())
+    assert vs["instant"].judge is not None and vs["thinking"].judge is not None
+    assert judge_calls == 1
