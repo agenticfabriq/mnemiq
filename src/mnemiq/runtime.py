@@ -28,6 +28,8 @@ from mnemiq.sql.verdict import ApprovedWrite
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.control import resolve_version
 from mnemiq.store.snapshot_store import load_snapshot
+from mnemiq.verify.judge import SemanticJudge
+from mnemiq.verify.verifier import Verifier
 
 
 class SnapshotMissing(RuntimeError):
@@ -129,6 +131,24 @@ class Runtime:
 
 def _authz(settings: Settings) -> AuthzProvider:
     return FileAuthzProvider(settings.authz_path) if settings.authz_path else DenyAll()
+
+
+def _resolve_verify_level(mode_verify: str, override: str | None) -> str:
+    """Apply the MNEMIQ_VERIFY override to a mode's default verify level.
+    "0" forces off (byte-for-byte escape hatch); "1" forces full; unset keeps the mode default."""
+    if override == "0":
+        return "off"
+    if override == "1":
+        return "full"
+    return mode_verify
+
+
+def _build_verifier(level: str, *, threshold: float, grounding: bool, judge):
+    """None when off; else a Verifier with sanity always on and the judge only at 'full'."""
+    if level == "off":
+        return None
+    return Verifier(threshold=threshold, sanity=True, grounding=grounding,
+                    judge=judge if level == "full" else None)
 
 
 def load_current_snapshot(settings: Settings, con) -> tuple[Snapshot, dict[str, str]]:
