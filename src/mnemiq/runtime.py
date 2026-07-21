@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
-import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -84,7 +82,7 @@ class Runtime:
         agent = (self.agents or {}).get(name, self.agent)
         packet = retrieve(
             self.con, question, identity, self.authz, self.embedder,
-            k=int(os.getenv("MNEMIQ_RETRIEVAL_K", "12")),
+            k=self.settings.retrieval_k if self.settings else 12,
             table_facts=self.snapshot.table_facts if self.snapshot else (),
         )
         grants = self.authz.grants_for(identity)
@@ -163,9 +161,9 @@ def _build_mode_verifiers(settings: Settings, *, client):
     if any(lvl == "full" for lvl in levels.values()):
         base, key = settings.verify_endpoint()
         if settings.verify_base_url or settings.verify_model or settings.verify_api_key:
-            judge_client = LLMClient(dataclasses.replace(
-                settings, llm_base_url=base, llm_api_key=key,
-                llm_model=settings.verify_model or settings.llm_model))
+            judge_client = LLMClient(settings.model_copy(update={
+                "llm_base_url": base, "llm_api_key": key,
+                "llm_model": settings.verify_model or settings.llm_model}))
         else:
             judge_client = client  # self-judge: reuse the generation client
         judge = SemanticJudge(judge_client)
@@ -235,7 +233,8 @@ def build_runtime(settings: Settings) -> Runtime:
     client = LLMClient(settings)
     # Generate in the dialect the source executes (duckdb here); keeps generation, parsing,
     # and execution on one dialect so no cross-dialect transpile gap can bite.
-    generator = LLMGenerator(client, dialect=adapter.dialect)
+    generator = LLMGenerator(client, dialect=adapter.dialect,
+                             guided_sql=settings.guided_sql, assertive=settings.assertive_sql)
     synthesizer = LLMSynthesizer(client)
     # Live L2 (cross-replica) + observability sink when a control Postgres is configured;
     # L1-only + no-op sink otherwise (today, byte-for-byte).

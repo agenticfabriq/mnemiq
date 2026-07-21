@@ -82,3 +82,11 @@ def test_mode_verifiers_force_full():
     vs, judge_calls = _build_mode_verifiers(_base_settings(verify_override="1"), client=object())
     assert vs["instant"].judge is not None and vs["thinking"].judge is not None
     assert judge_calls == 1
+
+
+def test_mode_verifiers_judge_endpoint_override():
+    # verify_model set -> judge client built via settings.model_copy (the ex-dataclasses.replace path)
+    from mnemiq.runtime import _build_mode_verifiers
+
+    vs, jc = _build_mode_verifiers(_base_settings(verify_model="judge-model"), client=object())
+    assert vs["deep"].judge is not None and jc == 1

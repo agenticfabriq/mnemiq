@@ -85,7 +85,7 @@ def main() -> int:
     base = os.getenv("MNEMIQ_VERIFY_BASE_URL") or settings.llm_base_url
     key = os.getenv("MNEMIQ_VERIFY_API_KEY") or settings.llm_api_key
     model = os.getenv("MNEMIQ_VERIFY_MODEL") or settings.llm_model
-    client = LLMClient(dataclasses.replace(settings, llm_base_url=base, llm_api_key=key, llm_model=model))
+    client = LLMClient(settings.model_copy(update={"llm_base_url": base, "llm_api_key": key, "llm_model": model}))
     tag = "".join(ch if ch.isalnum() else "_" for ch in model)
     judge = _CachingJudge(SemanticJudge(client), f"{args.run}.judgecache.{tag}.json", model)
 

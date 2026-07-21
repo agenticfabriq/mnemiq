@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import dataclasses
-import os
 from collections.abc import Callable, Sequence
 
 from mnemiq.agent.budget import Budget
@@ -76,16 +74,17 @@ def build_engine(
         judge = None
         if settings.verify_judge:
             base, key = settings.verify_endpoint()
-            judge = SemanticJudge(LLMClient(dataclasses.replace(
-                settings, llm_base_url=base, llm_api_key=key,
-                llm_model=settings.verify_model or settings.llm_model)))
+            judge = SemanticJudge(LLMClient(settings.model_copy(update={
+                "llm_base_url": base, "llm_api_key": key,
+                "llm_model": settings.verify_model or settings.llm_model})))
         verifier = Verifier(threshold=settings.verify_threshold, sanity=settings.verify_sanity,
                             grounding=settings.verify_grounding, judge=judge)
 
     agent = Agent(
         # Generate in the source's dialect (BIRD: SQLite), so nothing needs a cross-dialect
         # transpile the SQLite writer can't do (DuckDB YEAR()/EXTRACT -> strftime).
-        generator=LLMGenerator(client, dialect=getattr(adapter, "dialect", "duckdb")),
+        generator=LLMGenerator(client, dialect=getattr(adapter, "dialect", "duckdb"),
+                               guided_sql=settings.guided_sql, assertive=settings.assertive_sql),
         synthesizer=LLMSynthesizer(client),
         adapter=adapter,
         cache=TwoTierCache(L1Cache()),
@@ -99,7 +98,7 @@ def build_engine(
 
     # k=12 measured +2.3 strict / +2.3 facts over k=6 (recall probe: k=12 -> 100% gold-table
     # coverage; k=6 left 48 cases, mostly big DBs, without their gold table). Tunable per source.
-    k = int(os.getenv("MNEMIQ_RETRIEVAL_K", "12"))
+    k = settings.retrieval_k
 
     def ask(question: str) -> AgentAnswer:
         packet = retrieve(con, question, IDENTITY, authz, embedder, k=k,

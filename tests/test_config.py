@@ -1,8 +1,24 @@
 import json
+import pathlib
 
 import pytest
 
 from mnemiq.config import Settings, SourceSpec
+
+
+def _src_files_reading(var: str) -> list[str]:
+    """Engine source files (other than config.py) that still READ `var` from the environment —
+    i.e. a line mentioning the var AND os.getenv/os.environ (comments mentioning it are fine)."""
+    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "mnemiq"
+    hits = []
+    for p in root.rglob("*.py"):
+        if p.name == "config.py":
+            continue
+        for line in p.read_text().splitlines():
+            if var in line and ("getenv" in line or "environ" in line):
+                hits.append(p.name)
+                break
+    return hits
 
 
 def test_from_env_reads_vars(monkeypatch):
@@ -160,3 +176,17 @@ def test_env_example_lists_every_field_without_secrets():
     for line in text.splitlines():
         if line.startswith("MNEMIQ_") and ("API_KEY" in line or "DSN" in line):
             assert line.split("#")[0].strip().endswith("=")  # secret value blank
+
+
+def test_no_adhoc_retrieval_k_reads():
+    assert _src_files_reading("MNEMIQ_RETRIEVAL_K") == []
+
+
+def test_no_adhoc_identity_reads():
+    for var in ("MNEMIQ_PRINCIPAL", "MNEMIQ_ROLES", "MNEMIQ_TENANT"):
+        assert _src_files_reading(var) == [], var
+
+
+def test_no_adhoc_generation_flag_reads():
+    for var in ("MNEMIQ_GUIDED_SQL", "MNEMIQ_ASSERTIVE_SQL"):
+        assert _src_files_reading(var) == [], var
