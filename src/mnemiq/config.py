@@ -35,6 +35,7 @@ class Settings:
     default_mode: str | None = None
     write_enabled: bool = False
     verify: bool = False
+    verify_override: str | None = None  # raw MNEMIQ_VERIFY: None=mode defaults, "0"=force off, "1"=force full
     verify_threshold: float = 0.5
     verify_sanity: bool = True
     verify_grounding: bool = False  # measured EX cost > sanity; opt-in dial (see plan-27 M1)
@@ -72,6 +73,7 @@ class Settings:
             default_mode=os.getenv("MNEMIQ_MODE"),
             write_enabled=os.getenv("MNEMIQ_WRITE_ENABLED") == "1",
             verify=os.getenv("MNEMIQ_VERIFY") == "1",
+            verify_override=os.getenv("MNEMIQ_VERIFY"),
             verify_threshold=float(os.getenv("MNEMIQ_VERIFY_THRESHOLD", "0.5")),
             verify_sanity=os.getenv("MNEMIQ_VERIFY_SANITY", "1") == "1",
             verify_grounding=os.getenv("MNEMIQ_VERIFY_GROUNDING", "0") == "1",
