@@ -77,13 +77,8 @@ class Settings(BaseSettings):
             self.store_path = "mnemiq.duckdb"
         return self
 
-    @model_validator(mode="after")
-    def _check_mode(self) -> "Settings":
-        if self.default_mode is not None:
-            from mnemiq.agent.modes import MODES  # lazy: avoid an import cycle at module load
-            if self.default_mode not in MODES:
-                raise ValueError(f"MNEMIQ_MODE={self.default_mode!r} invalid; valid: {sorted(MODES)}")
-        return self
+    # NB: default_mode is validated at boot by build_runtime (raising UnknownMode with the valid
+    # set) -- its established contract. We don't duplicate it here.
 
     @property
     def verify(self) -> bool:  # eval back-compat: MNEMIQ_VERIFY=1 means "verify on"
