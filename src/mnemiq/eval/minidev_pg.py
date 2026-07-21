@@ -40,6 +40,7 @@ def run_minidev_pg(
     results_path: str | None = None,
     workers: int = 1,
     candidates: int = 1,
+    semantic: bool = True,
 ) -> tuple[list[CaseResult], dict]:
     """Grouped-by-db, resumable mini-dev PG run. Enrichment is per-db (cached, from the SQLite
     dev_databases -- dialect-agnostic); execution is against `bird_dev` (pg_dsn) via DuckDB;
@@ -65,7 +66,9 @@ def run_minidev_pg(
         if not remaining:
             continue
 
-        snapshot = enrich_bird_db(minidev_dir, db_id, enrich_settings, cache_dir=cache_dir)
+        snapshot = enrich_bird_db(
+            minidev_dir, db_id, enrich_settings, cache_dir=cache_dir, semantic=semantic
+        )
 
         def _build(snapshot=snapshot):  # bind the current db's snapshot; own connections per worker
             engine_adapter = DuckDBAdapter.postgres(pg_dsn, read_only=True)  # engine SQL -> bird_dev
