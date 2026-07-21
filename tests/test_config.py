@@ -134,14 +134,11 @@ def test_verify_tristate(monkeypatch):
     assert Settings.from_env().verify is True
 
 
-def test_validation_rejects_bad_values(monkeypatch):
-    monkeypatch.setenv("MNEMIQ_VERIFY_THRESHOLD", "2.0")   # > 1.0
+def test_validation_rejects_bad_threshold(monkeypatch):
+    monkeypatch.setenv("MNEMIQ_VERIFY_THRESHOLD", "2.0")   # > 1.0 -> pydantic range error
     with pytest.raises(Exception):
         Settings.from_env()
-    monkeypatch.delenv("MNEMIQ_VERIFY_THRESHOLD", raising=False)
-    monkeypatch.setenv("MNEMIQ_MODE", "bogus")             # not a mode
-    with pytest.raises(Exception):
-        Settings.from_env()
+    # NB: a bad MNEMIQ_MODE is rejected at boot by build_runtime (UnknownMode), not here.
 
 
 def test_folded_fields_read_their_env(monkeypatch):
