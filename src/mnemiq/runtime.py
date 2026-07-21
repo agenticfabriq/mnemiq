@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 import time
 from dataclasses import dataclass, field
@@ -28,6 +29,8 @@ from mnemiq.sql.verdict import ApprovedWrite
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.control import resolve_version
 from mnemiq.store.snapshot_store import load_snapshot
+from mnemiq.verify.judge import SemanticJudge
+from mnemiq.verify.verifier import Verifier
 
 
 class SnapshotMissing(RuntimeError):
@@ -131,6 +134,50 @@ def _authz(settings: Settings) -> AuthzProvider:
     return FileAuthzProvider(settings.authz_path) if settings.authz_path else DenyAll()
 
 
+def _resolve_verify_level(mode_verify: str, override: str | None) -> str:
+    """Apply the MNEMIQ_VERIFY override to a mode's default verify level.
+    "0" forces off (byte-for-byte escape hatch); "1" forces full; unset keeps the mode default."""
+    if override == "0":
+        return "off"
+    if override == "1":
+        return "full"
+    return mode_verify
+
+
+def _build_verifier(level: str, *, threshold: float, grounding: bool, judge):
+    """None when off; else a Verifier with sanity always on and the judge only at 'full'."""
+    if level == "off":
+        return None
+    return Verifier(threshold=threshold, sanity=True, grounding=grounding,
+                    judge=judge if level == "full" else None)
+
+
+def _build_mode_verifiers(settings: Settings, *, client):
+    """Return ({mode_name: Verifier|None}, judge_build_count). The judge is built at most once
+    (self-judge on the local model, unless MNEMIQ_VERIFY_* points elsewhere) and shared across
+    every mode that needs it."""
+    override = settings.verify_override
+    levels = {name: _resolve_verify_level(m.verify, override) for name, m in MODES.items()}
+    judge = None
+    judge_calls = 0
+    if any(lvl == "full" for lvl in levels.values()):
+        base, key = settings.verify_endpoint()
+        if settings.verify_base_url or settings.verify_model or settings.verify_api_key:
+            judge_client = LLMClient(dataclasses.replace(
+                settings, llm_base_url=base, llm_api_key=key,
+                llm_model=settings.verify_model or settings.llm_model))
+        else:
+            judge_client = client  # self-judge: reuse the generation client
+        judge = SemanticJudge(judge_client)
+        judge_calls = 1
+    verifiers = {
+        name: _build_verifier(levels[name], threshold=settings.verify_threshold,
+                              grounding=settings.verify_grounding, judge=judge)
+        for name in MODES
+    }
+    return verifiers, judge_calls
+
+
 def load_current_snapshot(settings: Settings, con) -> tuple[Snapshot, dict[str, str]]:
     """Resolve the current version per source (shared pointer when a control DSN is set, else
     local) and load the snapshot -- merged across sources when federated."""
@@ -206,6 +253,9 @@ def build_runtime(settings: Settings) -> Runtime:
     corrector = LLMCorrector(client)
     values = ValueIndex(con)
     selector = LLMSelector(client)
+    # Per-mode result verifier: sanity (free) in every mode, judge in `deep`; the judge is
+    # built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
+    verifiers, _ = _build_mode_verifiers(settings, client=client)
     agents = {
         name: build_agent(
             mode,
@@ -216,6 +266,7 @@ def build_runtime(settings: Settings) -> Runtime:
             corrector=corrector,
             values=values,
             selector=selector,
+            verifier=verifiers[name],
         )
         for name, mode in MODES.items()
     }
