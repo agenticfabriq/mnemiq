@@ -190,3 +190,11 @@ def test_no_adhoc_identity_reads():
 def test_no_adhoc_generation_flag_reads():
     for var in ("MNEMIQ_GUIDED_SQL", "MNEMIQ_ASSERTIVE_SQL"):
         assert _src_files_reading(var) == [], var
+
+
+def test_cli_config_prints_template(capsys):
+    from mnemiq.cli import main
+    rc = main(["config", "example"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "MNEMIQ_LLM_BASE_URL=" in out and "MNEMIQ_RETRIEVAL_K=12" in out
