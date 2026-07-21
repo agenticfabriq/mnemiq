@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import os
-
 from mnemiq.enrichment.prompts import sanitize
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.guard import MAX_ROWS
@@ -46,11 +44,12 @@ STRATEGY_PREAMBLES = {
 
 
 def system_prompt(
-    dialect: str = "duckdb", max_rows: int = MAX_ROWS, strategy: str | None = None
+    dialect: str = "duckdb", max_rows: int = MAX_ROWS, strategy: str | None = None,
+    assertive: bool = False,
 ) -> str:
     defer = (
         _DEFER_ASSERTIVE.format(dialect=dialect)
-        if os.getenv("MNEMIQ_ASSERTIVE_SQL", "0") == "1"
+        if assertive
         else _DEFER_DEFAULT
     )
     base = f"""{PERSONA}

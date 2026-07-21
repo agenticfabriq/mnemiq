@@ -6,7 +6,6 @@ injects a JWT-derived identity. The boundary is IdentityContext + AuthzProvider 
 
 from __future__ import annotations
 
-import os
 
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
@@ -50,11 +49,12 @@ def _get_schema(runtime: Runtime, identity: IdentityContext) -> dict:
     return {"tables": runtime.schema(identity)}
 
 
-def _identity_from_env() -> IdentityContext:
+def _identity_from_settings(settings: Settings | None) -> IdentityContext:
+    """Standalone (no-AF) identity from config. AF replaces this with a JWT-carried identity."""
     return IdentityContext(
-        tenant_id=os.getenv("MNEMIQ_TENANT", "local"),
-        principal_id=os.getenv("MNEMIQ_PRINCIPAL", "local"),
-        roles=[r for r in os.getenv("MNEMIQ_ROLES", "").split(",") if r],
+        tenant_id=(settings.tenant if settings else None) or "local",
+        principal_id=(settings.principal if settings else None) or "local",
+        roles=[r for r in ((settings.roles if settings else "") or "").split(",") if r],
     )
 
 
@@ -89,5 +89,5 @@ def build_mcp(runtime: Runtime, identity: IdentityContext):
 
 def serve(settings: Settings) -> None:
     runtime = build_runtime(settings)
-    identity = _identity_from_env()
+    identity = _identity_from_settings(settings)
     build_mcp(runtime, identity).run()  # stdio
