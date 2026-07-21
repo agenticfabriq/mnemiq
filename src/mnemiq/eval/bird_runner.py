@@ -61,18 +61,14 @@ def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str]) 
         json.dump({"tokens": tokens, "llm_calls": calls, "excluded": excluded}, fh)
 
 
-def _flag(name: str) -> bool:
-    # Default OFF: the plan-20 A/B measured both phases as regressions on a strong frontier
-    # model (facts -2.9, facts+examples -8.0 strict). Parked as opt-in plumbing; set the env
-    # var to "1" to enable (e.g. for a weaker/local model that may need the scaffolding).
-    return os.getenv(name, "0") == "1"
-
-
-def _enrich_cache_suffix() -> str:
+# Facts/examples default OFF (settings.enrich_facts/enrich_examples): the plan-20 A/B measured both
+# phases as regressions on a strong frontier model (facts -2.9, facts+examples -8.0 strict). Parked
+# as opt-in plumbing; set MNEMIQ_ENRICH_FACTS/EXAMPLES=1 (a weaker/local model may need scaffolding).
+def _enrich_cache_suffix(settings: Settings) -> str:
     parts = []
-    if _flag("MNEMIQ_ENRICH_FACTS"):
+    if settings.enrich_facts:
         parts.append("facts")
-    if _flag("MNEMIQ_ENRICH_EXAMPLES"):
+    if settings.enrich_examples:
         parts.append("examples")
     return f"__{'_'.join(parts)}" if parts else ""
 
@@ -91,7 +87,7 @@ def enrich_bird_db(
     so an A/B run never reuses another config's enrichment."""
     model_slug = (settings.llm_model or "default").replace("/", "_")
     cache_path = (
-        os.path.join(cache_dir, f"{db_id}__{model_slug}{_enrich_cache_suffix()}.json")
+        os.path.join(cache_dir, f"{db_id}__{model_slug}{_enrich_cache_suffix(settings)}.json")
         if cache_dir else None
     )
     if cache_path and not refresh and os.path.isfile(cache_path):
@@ -102,9 +98,9 @@ def enrich_bird_db(
     snapshot = enrich_structural(adapter, db_id)
     if semantic:
         snapshot = enrich_semantic(snapshot, LLMEnricher(LLMClient(settings)))
-        if _flag("MNEMIQ_ENRICH_FACTS"):
+        if settings.enrich_facts:
             snapshot = enrich_table_facts(snapshot, LLMFactsEnricher(LLMClient(settings)))
-        if _flag("MNEMIQ_ENRICH_EXAMPLES"):
+        if settings.enrich_examples:
             snapshot = enrich_examples(
                 snapshot, LLMExampleGenerator(LLMClient(settings)),
                 adapter, dialect=adapter.dialect,
