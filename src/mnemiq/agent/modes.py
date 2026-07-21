@@ -49,6 +49,7 @@ def build_agent(
     corrector,
     values,
     selector,
+    verifier=None,
 ) -> Agent:
     """One thin Agent per mode over SHARED components (safe: they hold no per-call state)."""
     return Agent(
@@ -62,4 +63,5 @@ def build_agent(
         values=values,
         selector=selector if mode.judge else None,
         min_agreement=mode.min_agreement,
+        verifier=verifier,
     )

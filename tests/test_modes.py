@@ -59,3 +59,20 @@ def test_modes_carry_verify_levels():
     assert MODES["instant"].verify == "sanity"
     assert MODES["thinking"].verify == "sanity"
     assert MODES["deep"].verify == "full"
+
+
+def test_build_agent_wires_verifier():
+    sentinel = object()
+    agent = build_agent(
+        MODES["deep"], generator=None, synthesizer=None, adapter=None,
+        cache=None, corrector=None, values=None, selector=None, verifier=sentinel,
+    )
+    assert agent.verifier is sentinel
+
+
+def test_build_agent_verifier_defaults_none():
+    agent = build_agent(
+        MODES["instant"], generator=None, synthesizer=None, adapter=None,
+        cache=None, corrector=None, values=None, selector=None,
+    )
+    assert agent.verifier is None
