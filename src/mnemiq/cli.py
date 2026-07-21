@@ -69,7 +69,6 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.enrichment.facts import LLMFactsEnricher, enrich_table_facts
     from mnemiq.enrichment.pipeline import enrich_structural
     from mnemiq.enrichment.semantic import enrich_semantic
-    from mnemiq.eval.bird_runner import _flag
     from mnemiq.llm.client import LLMClient
     from mnemiq.semantic.values import build_value_index
     from mnemiq.store.bootstrap import init_store
@@ -81,9 +80,9 @@ def _cmd_enrich(settings: Settings) -> int:
     adapter = DuckDBPostgresAdapter(settings.pg_dsn)
     snap = enrich_structural(adapter, settings.source_id)
     snap = enrich_semantic(snap, LLMEnricher(LLMClient(settings)))
-    if _flag("MNEMIQ_ENRICH_FACTS"):
+    if settings.enrich_facts:
         snap = enrich_table_facts(snap, LLMFactsEnricher(LLMClient(settings)))
-    if _flag("MNEMIQ_ENRICH_EXAMPLES"):
+    if settings.enrich_examples:
         snap = enrich_examples(
             snap, LLMExampleGenerator(LLMClient(settings)), adapter, dialect=adapter.dialect
         )

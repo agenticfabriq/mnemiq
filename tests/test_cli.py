@@ -98,3 +98,13 @@ def test_write_reports_a_refusal_and_exits_zero(monkeypatch, capsys):
     monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: _fake_settings()))
     assert main(["write", "INSERT INTO claim (id) VALUES (1)"]) == 0  # a refusal is valid
     assert "may not write" in capsys.readouterr().out
+
+
+def test_cmd_enrich_lazy_imports_resolve(capsys):
+    # Regression (plan-29): _cmd_enrich's import block runs BEFORE the pg_dsn check, so a
+    # no-DSN Settings still exercises every lazy import. Folding bird_runner._flag into
+    # settings.enrich_facts/examples broke `import _flag` here until enrich was updated.
+    from mnemiq.cli import _cmd_enrich
+    from mnemiq.config import Settings
+    assert _cmd_enrich(Settings()) == 1  # no pg_dsn -> 1, but only after imports resolve
+    assert "MNEMIQ_PG_DSN" in capsys.readouterr().err
