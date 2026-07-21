@@ -21,17 +21,20 @@ class Mode:
     min_agreement: float | None
     budget_s: float
     max_attempts: int
+    verify: str = "sanity"  # result-verifier level: "off" | "sanity" | "full" (sanity+judge)
 
 
+# Verify levels: sanity (deterministic empty/null net) in every mode; the LLM judge only
+# in `deep`. MNEMIQ_VERIFY=0 forces off (byte-for-byte); =1 forces full everywhere.
 MODES: dict[str, Mode] = {
     "instant": Mode("instant", candidates=1, corrector=False, judge=False,
-                    min_agreement=None, budget_s=30.0, max_attempts=1),
+                    min_agreement=None, budget_s=30.0, max_attempts=1, verify="sanity"),
     "thinking": Mode("thinking", candidates=1, corrector=True, judge=False,
-                     min_agreement=None, budget_s=120.0, max_attempts=3),
+                     min_agreement=None, budget_s=120.0, max_attempts=3, verify="sanity"),
     # 0.6 keeps ~85% coverage at +3.8 precision (plan 17 offline table); the gate's
     # full-set rule turns a dropped candidate into an honest deferral.
     "deep": Mode("deep", candidates=5, corrector=True, judge=True,
-                 min_agreement=0.6, budget_s=300.0, max_attempts=3),
+                 min_agreement=0.6, budget_s=300.0, max_attempts=3, verify="full"),
 }
 DEFAULT_MODE = "thinking"
 
