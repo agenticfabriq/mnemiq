@@ -185,7 +185,8 @@ def test_no_adhoc_identity_reads():
 
 
 def test_no_adhoc_generation_flag_reads():
-    for var in ("MNEMIQ_GUIDED_SQL", "MNEMIQ_ASSERTIVE_SQL"):
+    for var in ("MNEMIQ_GUIDED_SQL", "MNEMIQ_ASSERTIVE_SQL",
+                "MNEMIQ_ENRICH_FACTS", "MNEMIQ_ENRICH_EXAMPLES"):
         assert _src_files_reading(var) == [], var
 
 
