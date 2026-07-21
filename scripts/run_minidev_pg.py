@@ -46,6 +46,10 @@ def main() -> int:
                    help="checkpoint file; a re-run resumes from it. Delete it to start fresh.")
     p.add_argument("--workers", type=int, default=1)
     p.add_argument("--candidates", type=int, default=1)
+    p.add_argument("--no-semantic", action="store_true",
+                   help="structural-only enrichment (skip the LLM semantic layer) — the "
+                        "enrichment OFF arm of an A/B. Use a SEPARATE --cache so it does not "
+                        "reuse enriched snapshots.")
     args = p.parse_args()
 
     settings = Settings.from_env()
@@ -85,6 +89,7 @@ def main() -> int:
         enrich_settings=enrich_settings,
         cache_dir=args.cache, on_case=progress, results_path=args.results,
         workers=args.workers, candidates=args.candidates,
+        semantic=not args.no_semantic,
     )
     report = summarize(results, tokens=use["tokens"], llm_calls=use["llm_calls"])
 
