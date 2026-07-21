@@ -233,13 +233,14 @@ def test_process_db_threads_engine_and_gold_adapters():
 
 
 def test_enrich_bird_db_cache_key_reflects_phase_toggles(monkeypatch):
+    from mnemiq.config import Settings
     from mnemiq.eval.bird_runner import _enrich_cache_suffix
 
     monkeypatch.setenv("MNEMIQ_ENRICH_FACTS", "1")
     monkeypatch.setenv("MNEMIQ_ENRICH_EXAMPLES", "0")
-    assert _enrich_cache_suffix() == "__facts"
+    assert _enrich_cache_suffix(Settings.from_env()) == "__facts"
     monkeypatch.setenv("MNEMIQ_ENRICH_EXAMPLES", "1")
-    assert _enrich_cache_suffix() == "__facts_examples"
+    assert _enrich_cache_suffix(Settings.from_env()) == "__facts_examples"
     monkeypatch.setenv("MNEMIQ_ENRICH_FACTS", "0")
     monkeypatch.setenv("MNEMIQ_ENRICH_EXAMPLES", "0")
-    assert _enrich_cache_suffix() == ""
+    assert _enrich_cache_suffix(Settings.from_env()) == ""
