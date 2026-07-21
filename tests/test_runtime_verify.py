@@ -56,7 +56,7 @@ def test_build_verifier_layers():
 def _base_settings(**over):
     s = Settings(llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d",
                  acme_data_dir="a")
-    return dataclasses.replace(s, **over)
+    return s.model_copy(update=over)  # pydantic model (was dataclasses.replace)
 
 
 def test_mode_verifiers_default_policy():
