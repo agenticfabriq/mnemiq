@@ -56,7 +56,7 @@ def test_build_verifier_layers():
 def _base_settings(**over):
     s = Settings(llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d",
                  acme_data_dir="a")
-    return dataclasses.replace(s, **over)
+    return s.model_copy(update=over)  # pydantic model (was dataclasses.replace)
 
 
 def test_mode_verifiers_default_policy():
@@ -82,3 +82,11 @@ def test_mode_verifiers_force_full():
     vs, judge_calls = _build_mode_verifiers(_base_settings(verify_override="1"), client=object())
     assert vs["instant"].judge is not None and vs["thinking"].judge is not None
     assert judge_calls == 1
+
+
+def test_mode_verifiers_judge_endpoint_override():
+    # verify_model set -> judge client built via settings.model_copy (the ex-dataclasses.replace path)
+    from mnemiq.runtime import _build_mode_verifiers
+
+    vs, jc = _build_mode_verifiers(_base_settings(verify_model="judge-model"), client=object())
+    assert vs["deep"].judge is not None and jc == 1

@@ -42,6 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--golden", default="evals/acme.json")
     f.add_argument("--examples", default="evals/captured_examples.json")
 
+    c = sub.add_parser("config", help="print a .env.example template (all knobs, defaults, docs)")
+    c.add_argument("action", nargs="?", choices=["example"], default="example")
     sub.add_parser("serve", help="run the MCP server on stdio")
     sub.add_parser("metrics", help="print observability SLOs from the answer log")
 
@@ -234,6 +236,9 @@ def _cmd_serve(settings: Settings) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "config":  # before from_env(): a template needs no valid config
+        print(Settings.env_example(), end="")
+        return 0
     settings = Settings.from_env()
     if args.command == "enrich":
         return _cmd_enrich(settings)

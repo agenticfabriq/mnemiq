@@ -1,6 +1,24 @@
 import json
+import pathlib
+
+import pytest
 
 from mnemiq.config import Settings, SourceSpec
+
+
+def _src_files_reading(var: str) -> list[str]:
+    """Engine source files (other than config.py) that still READ `var` from the environment —
+    i.e. a line mentioning the var AND os.getenv/os.environ (comments mentioning it are fine)."""
+    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "mnemiq"
+    hits = []
+    for p in root.rglob("*.py"):
+        if p.name == "config.py":
+            continue
+        for line in p.read_text().splitlines():
+            if var in line and ("getenv" in line or "environ" in line):
+                hits.append(p.name)
+                break
+    return hits
 
 
 def test_from_env_reads_vars(monkeypatch):
@@ -91,3 +109,90 @@ def test_source_specs_reads_manifest(tmp_path):
     specs = s.source_specs()
     assert [sp.catalog for sp in specs] == ["pg", "ops"]
     assert specs[1].kind == "sqlite" and specs[1].schema == "main"
+
+
+# --- pydantic-settings migration (2026-07-21) ---
+
+
+def test_env_prefix_maps_existing_names(monkeypatch):
+    monkeypatch.setenv("MNEMIQ_VERIFY_THRESHOLD", "0.3")
+    monkeypatch.setenv("MNEMIQ_MODE", "deep")
+    s = Settings.from_env()
+    assert s.verify_threshold == 0.3        # coerced to float
+    assert s.default_mode == "deep"
+
+
+def test_verify_tristate(monkeypatch):
+    monkeypatch.delenv("MNEMIQ_VERIFY", raising=False)
+    assert Settings.from_env().verify_override is None
+    assert Settings.from_env().verify is False
+    monkeypatch.setenv("MNEMIQ_VERIFY", "0")
+    assert Settings.from_env().verify_override == "0"
+    assert Settings.from_env().verify is False
+    monkeypatch.setenv("MNEMIQ_VERIFY", "1")
+    assert Settings.from_env().verify_override == "1"
+    assert Settings.from_env().verify is True
+
+
+def test_validation_rejects_bad_threshold(monkeypatch):
+    monkeypatch.setenv("MNEMIQ_VERIFY_THRESHOLD", "2.0")   # > 1.0 -> pydantic range error
+    with pytest.raises(Exception):
+        Settings.from_env()
+    # NB: a bad MNEMIQ_MODE is rejected at boot by build_runtime (UnknownMode), not here.
+
+
+def test_folded_fields_read_their_env(monkeypatch):
+    monkeypatch.setenv("MNEMIQ_GUIDED_SQL", "1")
+    monkeypatch.setenv("MNEMIQ_ASSERTIVE_SQL", "1")
+    monkeypatch.setenv("MNEMIQ_RETRIEVAL_K", "6")
+    monkeypatch.setenv("MNEMIQ_PRINCIPAL", "alice")
+    monkeypatch.setenv("MNEMIQ_ROLES", "analyst,admin")
+    monkeypatch.setenv("MNEMIQ_TENANT", "acme")
+    s = Settings.from_env()
+    assert s.guided_sql is True and s.assertive_sql is True
+    assert s.retrieval_k == 6
+    assert s.principal == "alice" and s.tenant == "acme"
+    assert s.roles == "analyst,admin"
+
+
+def test_folded_field_defaults(monkeypatch):
+    for v in ("MNEMIQ_GUIDED_SQL", "MNEMIQ_ASSERTIVE_SQL", "MNEMIQ_RETRIEVAL_K"):
+        monkeypatch.delenv(v, raising=False)
+    s = Settings.from_env()
+    assert s.guided_sql is False and s.assertive_sql is False
+    assert s.retrieval_k == 12   # shipped default
+
+
+def test_env_example_lists_every_field_without_secrets():
+    text = Settings.env_example()
+    assert "MNEMIQ_LLM_BASE_URL=" in text
+    assert "MNEMIQ_VERIFY_THRESHOLD=0.5" in text
+    assert "MNEMIQ_RETRIEVAL_K=12" in text
+    assert "MNEMIQ_VERIFY=" in text            # the tri-state alias, not MNEMIQ_VERIFY_OVERRIDE
+    assert "MNEMIQ_VERIFY_OVERRIDE" not in text
+    for line in text.splitlines():
+        if line.startswith("MNEMIQ_") and ("API_KEY" in line or "DSN" in line):
+            assert line.split("#")[0].strip().endswith("=")  # secret value blank
+
+
+def test_no_adhoc_retrieval_k_reads():
+    assert _src_files_reading("MNEMIQ_RETRIEVAL_K") == []
+
+
+def test_no_adhoc_identity_reads():
+    for var in ("MNEMIQ_PRINCIPAL", "MNEMIQ_ROLES", "MNEMIQ_TENANT"):
+        assert _src_files_reading(var) == [], var
+
+
+def test_no_adhoc_generation_flag_reads():
+    for var in ("MNEMIQ_GUIDED_SQL", "MNEMIQ_ASSERTIVE_SQL",
+                "MNEMIQ_ENRICH_FACTS", "MNEMIQ_ENRICH_EXAMPLES"):
+        assert _src_files_reading(var) == [], var
+
+
+def test_cli_config_prints_template(capsys):
+    from mnemiq.cli import main
+    rc = main(["config", "example"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "MNEMIQ_LLM_BASE_URL=" in out and "MNEMIQ_RETRIEVAL_K=12" in out

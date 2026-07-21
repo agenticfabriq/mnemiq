@@ -62,12 +62,11 @@ def main() -> int:
     # semantic layer constant while only generation varies. Defaults to the generation model.
     enrich_settings = settings
     if os.getenv("MNEMIQ_ENRICH_BASE_URL"):
-        enrich_settings = dataclasses.replace(
-            settings,
-            llm_base_url=os.environ["MNEMIQ_ENRICH_BASE_URL"],
-            llm_api_key=os.getenv("MNEMIQ_ENRICH_API_KEY", settings.llm_api_key),
-            llm_model=os.getenv("MNEMIQ_ENRICH_MODEL", settings.llm_model),
-        )
+        enrich_settings = settings.model_copy(update={
+            "llm_base_url": os.environ["MNEMIQ_ENRICH_BASE_URL"],
+            "llm_api_key": os.getenv("MNEMIQ_ENRICH_API_KEY", settings.llm_api_key),
+            "llm_model": os.getenv("MNEMIQ_ENRICH_MODEL", settings.llm_model),
+        })
 
     cases = load_bird(
         args.minidev,
