@@ -33,7 +33,9 @@ def _facts(
 
 
 def _annotated(column: Column, annotation: ColumnAnnotation) -> Column:
-    """A new Column carrying the annotation. Structural facts win; the LLM only fills blanks."""
+    """A new Column carrying the annotation. Grounded coded_values win; the LLM only adds
+    description/semantic_type/pii_level -- it no longer proposes code meanings (those are
+    grounded from data or the operator dictionary in ground_codes, or left bare)."""
     if annotation.pii_level in _SENSITIVE or annotation.semantic_type in _MEASURES:
         # pii/phi: the model recognized personal data in a column whose name did not give it
         #   away. Its observed values ARE that personal data -- drop them rather than carry
@@ -41,10 +43,8 @@ def _annotated(column: Column, annotation: ColumnAnnotation) -> Column:
         # measures: the observed values are samples, not a vocabulary.
         coded_values: list[CodedValue] = []
     else:
-        meanings = annotation.code_meanings
-        coded_values = [
-            CodedValue(code=cv.code, meaning=meanings.get(cv.code)) for cv in column.coded_values
-        ]
+        # Preserve grounded meanings + provenance; annotation.code_meanings is ignored.
+        coded_values = column.coded_values
 
     return column.model_copy(
         update={

@@ -42,10 +42,10 @@ def test_annotations_land_on_the_columns():
     assert fireplace.description == "Whether the property has a fireplace."
     assert fireplace.semantic_type == "boolean"
     assert fireplace.pii_level == "none"
-    assert {cv.code: cv.meaning for cv in fireplace.coded_values} == {
-        "yes": "has a fireplace",
-        "no": "has no fireplace",
-    }
+    # The LLM annotates the column (description/type/pii) but no longer invents code meanings:
+    # ungrounded codes stay bare (grounded-or-bare). The codes themselves are preserved.
+    assert {cv.code for cv in fireplace.coded_values} == {"yes", "no"}
+    assert all(cv.meaning is None for cv in fireplace.coded_values)
 
     claim = next(c for c in out.columns if c.name == "claim_identifier")
     assert claim.semantic_type == "identifier"
@@ -149,3 +149,33 @@ def test_facts_forward_the_counts_to_the_enricher():
     assert facts[0].row_count == 820 and facts[0].null_count == 820
     # a fact we do not have is a fact we do not send
     assert facts[1].row_count is None and facts[1].null_count is None
+
+
+def test_grounded_meanings_survive_the_llm_pass(tmp_path):
+    import json
+    import sqlite3
+
+    from mnemiq.adapters.sqlite import SQLiteAdapter
+    from mnemiq.enrichment.grounding import ground_codes
+    from mnemiq.enrichment.pipeline import enrich_structural
+
+    path = tmp_path / "t.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT, status_name TEXT);"
+        "INSERT INTO t VALUES (1,'A','Active'),(2,'A','Active'),(3,'B','Blocked');"
+    )
+    con.commit()
+    con.close()
+
+    adapter = SQLiteAdapter(str(path))
+    snap = ground_codes(adapter, enrich_structural(adapter, "t"))
+    # the LLM tries to (re)assign code meanings AND a description
+    reply = json.dumps({"columns": [{"name": "status", "description": "row status",
+                                     "code_meanings": {"A": "Apple", "B": "Banana"}}]})
+    out = enrich_semantic(snap, FakeEnricher({"t": reply}))
+
+    status = next(c for c in out.columns if c.id == "t.status")
+    meanings = {cv.code: (cv.meaning, cv.source) for cv in status.coded_values}
+    assert meanings["A"] == ("Active", "correlated")   # grounded value kept, NOT "Apple"
+    assert status.description == "row status"           # description still applied

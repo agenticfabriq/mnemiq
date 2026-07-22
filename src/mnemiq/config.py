@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     assertive_sql: bool = Field(default=False, description="assertive prompt: attempt an answer instead of deferring")
     enrich_facts: bool = Field(default=False, description="eval: table-facts enrichment phase (plan-20, default off)")
     enrich_examples: bool = Field(default=False, description="eval: verified-example enrichment phase (plan-20, default off)")
+    dictionary_path: str | None = Field(default=None, description="operator code data-dictionary JSON path (grounds code meanings)")
     retrieval_k: int = Field(default=12, ge=1, description="schema cards retrieved into the generation packet")
     principal: str | None = Field(default=None, description="MCP standalone identity: principal id")
     roles: str | None = Field(default=None, description="MCP standalone identity: comma-separated roles")
