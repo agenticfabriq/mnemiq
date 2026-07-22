@@ -89,10 +89,17 @@ def _cmd_enrich(settings: Settings) -> int:
     con = init_store(settings.store_path)
     save_snapshot(con, snap)
     n_values = build_value_index(adapter, snap, con)
+    failed = [j.id.removeprefix("profile:") for j in snap.jobs
+              if j.kind == "profile" and j.status == "failed"]
     print(
         f"snapshot {snap.version} ({len(snap.source_bindings)} tables, "
         f"{n_values} indexed values) -> {settings.store_path}"
     )
+    if failed:
+        # Never report a silent partial success: a whole class of tables failing (e.g. a missing
+        # driver dep for a column type) would otherwise look like a healthy run.
+        print(f"WARNING: {len(failed)} table(s) FAILED to profile and were EXCLUDED -- the semantic "
+              f"model is INCOMPLETE: {', '.join(sorted(failed))}", file=sys.stderr)
     return 0
 
 

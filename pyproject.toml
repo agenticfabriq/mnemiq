@@ -10,6 +10,7 @@ dependencies = [
   "openai>=1.40",
   "pydantic>=2",
   "pydantic-settings>=2",
+  "pytz",  # DuckDB needs it to profile Postgres timestamptz columns (else profiling throws)
   "sqlglot>=25",
   "pyarrow>=17",
   "cachetools>=5",

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import UTC, datetime
+
+logger = logging.getLogger(__name__)
 
 from mnemiq.catalog import introspect
 from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding
@@ -75,9 +78,13 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
                 for col in table.columns
             ]
             status = "done"
-        except Exception:
+        except Exception as exc:
             # fail-soft: one bad table never sinks the run. It contributes nothing --
-            # a half-profiled table would silently poison the version hash.
+            # a half-profiled table would silently poison the version hash. But do NOT swallow
+            # it silently: log loudly so a systematic failure (e.g. a missing driver dep that
+            # sinks EVERY table of a given column type) is visible, not a quiet 93% data loss.
+            logger.warning("profile failed for table %r; EXCLUDED from the model: %s",
+                           table.name, exc)
             table_columns, status = [], "failed"
 
         if status == "done":
