@@ -77,8 +77,13 @@ def _cmd_enrich(settings: Settings) -> int:
     if not settings.pg_dsn:
         print("set MNEMIQ_PG_DSN", file=sys.stderr)
         return 1
+    from mnemiq.enrichment.dictionary import load_dictionary
+    from mnemiq.enrichment.grounding import ground_codes
+
     adapter = DuckDBPostgresAdapter(settings.pg_dsn)
     snap = enrich_structural(adapter, settings.source_id)
+    _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
+    snap = ground_codes(adapter, snap, _dict)
     snap = enrich_semantic(snap, LLMEnricher(LLMClient(settings)))
     if settings.enrich_facts:
         snap = enrich_table_facts(snap, LLMFactsEnricher(LLMClient(settings)))

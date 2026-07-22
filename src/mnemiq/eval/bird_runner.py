@@ -70,6 +70,11 @@ def _enrich_cache_suffix(settings: Settings) -> str:
         parts.append("facts")
     if settings.enrich_examples:
         parts.append("examples")
+    if settings.dictionary_path:
+        # a dictionary changes grounded meanings -> must not reuse a no-dict (or other-dict)
+        # snapshot. Content edits to the same path still need --refresh (as grounding itself does).
+        import hashlib
+        parts.append("dict" + hashlib.sha256(settings.dictionary_path.encode()).hexdigest()[:6])
     return f"__{'_'.join(parts)}" if parts else ""
 
 
@@ -94,8 +99,13 @@ def enrich_bird_db(
         with open(cache_path) as fh:
             return Snapshot.model_validate_json(fh.read())
 
+    from mnemiq.enrichment.dictionary import load_dictionary
+    from mnemiq.enrichment.grounding import ground_codes
+
     adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
     snapshot = enrich_structural(adapter, db_id)
+    _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
+    snapshot = ground_codes(adapter, snapshot, _dict)
     if semantic:
         snapshot = enrich_semantic(snapshot, LLMEnricher(LLMClient(settings)))
         if settings.enrich_facts:
