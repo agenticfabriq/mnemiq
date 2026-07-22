@@ -196,3 +196,13 @@ def test_cli_config_prints_template(capsys):
     out = capsys.readouterr().out
     assert rc == 0
     assert "MNEMIQ_LLM_BASE_URL=" in out and "MNEMIQ_RETRIEVAL_K=12" in out
+
+
+def test_dictionary_path_reads_env(monkeypatch):
+    monkeypatch.setenv("MNEMIQ_DICTIONARY_PATH", "/tmp/dict.json")
+    assert Settings().dictionary_path == "/tmp/dict.json"
+
+
+def test_dictionary_path_defaults_none(monkeypatch):
+    monkeypatch.delenv("MNEMIQ_DICTIONARY_PATH", raising=False)
+    assert Settings().dictionary_path is None
