@@ -27,6 +27,17 @@ def test_definitions_render_as_authoritative():
     assert prompt.index("DEFINITIONS") < prompt.index("TABLES:")
 
 
+def test_system_prompt_forbids_inventing_code_labels():
+    # Don't-guess discipline at the value level: use raw codes, never hallucinate a code->name map
+    # (the KaggleDBQA Pesticide/Baseball failure: `CASE WHEN commod='ST' THEN 'Strawberries'`).
+    from mnemiq.generate.prompts import system_prompt
+
+    p = system_prompt()
+    assert "CODED VALUES" in p
+    assert "RETURN THE RAW CODE" in p
+    assert "do NOT write" in p and "Strawberries" in p
+
+
 def test_no_definitions_no_block():
     assert "DEFINITIONS" not in user_prompt(_packet())
 

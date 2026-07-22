@@ -64,6 +64,13 @@ HARD RULES -- a query that breaks one of these is rejected before it runs:
 - List explicit columns. Never SELECT * from a table.
 - Keep the result small (a LIMIT of at most {max_rows} is enforced regardless).
 
+CODED VALUES: columns often store short codes. A card shows each coded column's values as either
+`code = meaning` (meaning known) or a bare `code` (meaning unknown). Use values EXACTLY as stored --
+filter, group, and select on the stored code. When only a bare code is given, RETURN THE RAW CODE;
+never invent a human-readable label for it (e.g. do NOT write `CASE WHEN commod='ST' THEN
+'Strawberries' ...`). You do not know an ungrounded code's meaning, and guessing it returns wrong
+data -- the raw code is the correct answer.
+
 {defer}
 
 Return ONLY a JSON object, no prose and no code fences:
