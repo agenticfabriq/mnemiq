@@ -4,6 +4,7 @@ import logging
 
 from mnemiq.catalog import is_key_like
 from mnemiq.contract import CodedValue, Snapshot
+from mnemiq.enrichment.pipeline import content_version
 
 logger = logging.getLogger(__name__)
 
@@ -138,3 +139,47 @@ def apply_dictionary(snapshot: Snapshot, dictionary) -> Snapshot:
             "description": entry.description or col.description,
         }))
     return snapshot.model_copy(update={"columns": new_cols}, deep=True)
+
+
+def _safe(fn, adapter, snapshot) -> dict[str, dict[str, str]]:
+    try:
+        return fn(adapter, snapshot)
+    except Exception as exc:
+        logger.warning("%s failed; skipped: %s", getattr(fn, "__name__", fn), exc)
+        return {}
+
+
+def ground_codes(adapter, snapshot: Snapshot, dictionary=None) -> Snapshot:
+    """Fill CodedValue.meaning from data (correlated < lookup) then the operator dictionary."""
+    corr = _safe(ground_from_correlated, adapter, snapshot)
+    look = _safe(ground_from_lookup, adapter, snapshot)
+
+    # column_id -> {code: (meaning, source)} with lookup overriding correlated
+    merged: dict[str, dict[str, tuple[str, str]]] = {}
+    for col_id, m in corr.items():
+        merged.setdefault(col_id, {}).update({k: (v, "correlated") for k, v in m.items()})
+    for col_id, m in look.items():
+        merged.setdefault(col_id, {}).update({k: (v, "lookup") for k, v in m.items()})
+
+    new_cols = []
+    for col in snapshot.columns:
+        grounded = merged.get(col.id)
+        if not grounded:
+            new_cols.append(col)
+            continue
+        existing = {cv.code: cv for cv in col.coded_values}
+        codes = list(existing) + [c for c in grounded if c not in existing]  # preserve order
+        coded = []
+        for code in codes:
+            if code in grounded:
+                meaning, source = grounded[code]
+                coded.append(CodedValue(code=code, meaning=meaning, source=source))
+            else:
+                coded.append(existing[code])
+        new_cols.append(col.model_copy(update={"coded_values": coded}))
+
+    grounded_snap = snapshot.model_copy(update={"columns": new_cols}, deep=True)
+    if dictionary is not None:
+        grounded_snap = apply_dictionary(grounded_snap, dictionary)
+    grounded_snap.version = content_version(grounded_snap)
+    return grounded_snap
