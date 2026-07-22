@@ -21,10 +21,14 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
     if not settings.pg_dsn:
         print("set MNEMIQ_PG_DSN")
         return 1
+    from mnemiq.enrichment.dictionary import load_dictionary
+    from mnemiq.enrichment.grounding import ground_codes
+
     adapter = DuckDBPostgresAdapter(settings.pg_dsn)
-    snapshot = enrich_semantic(
-        enrich_structural(adapter, settings.source_id), LLMEnricher(LLMClient(settings))
-    )
+    _snap = enrich_structural(adapter, settings.source_id)
+    _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
+    _snap = ground_codes(adapter, _snap, _dict)
+    snapshot = enrich_semantic(_snap, LLMEnricher(LLMClient(settings)))
     ask, client = build_engine(snapshot, adapter, settings)
     results = [run_case(c, ask, adapter) for c in load_cases(golden)]
     report = summarize(results, tokens=client.total_tokens, llm_calls=client.calls)
