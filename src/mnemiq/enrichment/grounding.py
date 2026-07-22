@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 
 from mnemiq.catalog import is_key_like
-from mnemiq.contract import Snapshot
+from mnemiq.contract import CodedValue, Snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -112,3 +112,29 @@ def ground_from_lookup(adapter, snapshot: Snapshot) -> dict[str, dict[str, str]]
             if mapping:
                 out[child.id] = mapping
     return out
+
+
+def apply_dictionary(snapshot: Snapshot, dictionary) -> Snapshot:
+    """Overlay operator meanings + column descriptions. Highest precedence. Not re-versioned."""
+    entries = dictionary.columns
+    known = {c.id for c in snapshot.columns}
+    for col_id in entries:
+        if col_id not in known:
+            logger.warning("dictionary column %r not in schema; skipped", col_id)
+
+    new_cols = []
+    for col in snapshot.columns:
+        entry = entries.get(col.id)
+        if entry is None:
+            new_cols.append(col)
+            continue
+        coded = [
+            CodedValue(code=cv.code, meaning=entry.codes[cv.code], source="dictionary")
+            if cv.code in entry.codes else cv
+            for cv in col.coded_values
+        ]
+        new_cols.append(col.model_copy(update={
+            "coded_values": coded,
+            "description": entry.description or col.description,
+        }))
+    return snapshot.model_copy(update={"columns": new_cols}, deep=True)
