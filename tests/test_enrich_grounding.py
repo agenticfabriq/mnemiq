@@ -76,3 +76,40 @@ def test_lookup_skips_dimension_without_a_label_column(tmp_path):
     """)
     snap = enrich_structural(adapter, "shop")
     assert ground_from_lookup(adapter, snap).get("fact.dim_id") in (None, {})
+
+
+def test_ground_codes_precedence_dictionary_over_lookup(tmp_path):
+    from mnemiq.enrichment.dictionary import ColumnEntry, DataDictionary
+    from mnemiq.enrichment.grounding import ground_codes
+
+    adapter = _sqlite(tmp_path, "film", """
+        CREATE TABLE language (language_id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE film (film_id INTEGER PRIMARY KEY, title TEXT,
+                           language_id INTEGER REFERENCES language(language_id));
+        INSERT INTO language VALUES (1,'English'),(2,'Italian');
+        INSERT INTO film VALUES (1,'A',1),(2,'B',2);
+    """)
+    snap = enrich_structural(adapter, "film")
+    d = DataDictionary(columns={"film.language_id": ColumnEntry(codes={"1": "Anglais"})})
+    out = ground_codes(adapter, snap, d)
+
+    lang = next(c for c in out.columns if c.id == "film.language_id")
+    meanings = {cv.code: (cv.meaning, cv.source) for cv in lang.coded_values}
+    assert meanings["1"] == ("Anglais", "dictionary")   # dictionary wins over lookup
+    assert meanings["2"] == ("Italian", "lookup")        # lookup fills the rest
+    assert out.version != snap.version                    # re-versioned
+
+
+def test_ground_codes_survives_a_failing_source(tmp_path, monkeypatch):
+    from mnemiq.enrichment import grounding
+
+    adapter = _sqlite(tmp_path, "t", """
+        CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT, status_name TEXT);
+        INSERT INTO t VALUES (1,'A','Active'),(2,'A','Active'),(3,'B','Blocked');
+    """)
+    snap = enrich_structural(adapter, "t")
+    monkeypatch.setattr(grounding, "ground_from_lookup",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = grounding.ground_codes(adapter, snap)  # must not raise
+    status = next(c for c in out.columns if c.id == "t.status")
+    assert {cv.code: cv.meaning for cv in status.coded_values} == {"A": "Active", "B": "Blocked"}
