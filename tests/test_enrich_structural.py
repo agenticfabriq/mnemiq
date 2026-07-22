@@ -85,3 +85,39 @@ def test_declared_fks_become_relationships(tmp_path):
     rel = next(r for r in snap.relationships if r.from_ == "client")
     assert rel.to == "district"
     assert (rel.join_keys[0].left, rel.join_keys[0].right) == ("dist", "district_id")
+
+
+def test_profile_failure_excludes_table_but_loudly(tmp_path, monkeypatch, caplog):
+    """A table whose profiling throws is excluded (fail-soft) BUT recorded as a failed job and
+    logged -- never a silent partial success (the Pagila real-DB bug: pytz-less timestamptz
+    profiling silently dropped 14/15 tables while reporting success)."""
+    import logging
+    import sqlite3
+
+    from mnemiq.adapters.sqlite import SQLiteAdapter
+    from mnemiq.enrichment import pipeline
+
+    path = tmp_path / "shop.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(
+        "CREATE TABLE good (id INTEGER PRIMARY KEY, name TEXT);"
+        "CREATE TABLE bad (id INTEGER PRIMARY KEY, ts TEXT);"
+    )
+    con.commit()
+    con.close()
+
+    real = pipeline.profile_table
+
+    def flaky(adapter, table, key_columns=None):
+        if table.name == "bad":
+            raise RuntimeError("simulated driver failure")
+        return real(adapter, table, key_columns=key_columns)
+
+    monkeypatch.setattr(pipeline, "profile_table", flaky)
+    with caplog.at_level(logging.WARNING):
+        snap = pipeline.enrich_structural(SQLiteAdapter(str(path)), "shop")
+
+    names = {b.object_id for b in snap.source_bindings}
+    assert "good" in names and "bad" not in names                      # excluded, run survives
+    assert [j.id for j in snap.jobs if j.status == "failed"] == ["profile:bad"]  # recorded
+    assert any("bad" in r.message and "EXCLUDED" in r.message for r in caplog.records)  # loud
