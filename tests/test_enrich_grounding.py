@@ -113,3 +113,33 @@ def test_ground_codes_survives_a_failing_source(tmp_path, monkeypatch):
     out = grounding.ground_codes(adapter, snap)  # must not raise
     status = next(c for c in out.columns if c.id == "t.status")
     assert {cv.code: cv.meaning for cv in status.coded_values} == {"A": "Active", "B": "Blocked"}
+
+
+def test_end_to_end_card_shows_grounded_and_dictionary_meanings(tmp_path):
+    import json
+
+    from mnemiq.enrichment.dictionary import load_dictionary
+    from mnemiq.enrichment.enricher import FakeEnricher
+    from mnemiq.enrichment.grounding import ground_codes
+    from mnemiq.enrichment.semantic import enrich_semantic
+    from mnemiq.semantic.cards import build_cards
+
+    # 3 rows so `status` has distinct(2) < row_count(3) and is harvested as a code vocabulary.
+    adapter = _sqlite(tmp_path, "shop", """
+        CREATE TABLE language (language_id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE film (film_id INTEGER PRIMARY KEY, title TEXT, status TEXT,
+                           status_name TEXT, language_id INTEGER REFERENCES language(language_id));
+        INSERT INTO language VALUES (1,'English'),(2,'Italian');
+        INSERT INTO film VALUES (1,'A','L','Live',1),(2,'B','A','Archived',2),(3,'C','L','Live',1);
+    """)
+    dpath = tmp_path / "d.json"
+    dpath.write_text(json.dumps({"columns": {"film.language_id": {"codes": {"2": "Italiano"}}}}))
+
+    snap = enrich_structural(adapter, "shop")
+    snap = ground_codes(adapter, snap, load_dictionary(str(dpath)))
+    snap = enrich_semantic(snap, FakeEnricher({}))  # no LLM meanings
+    cards = {c.object_id: c.text for c in build_cards(snap)}
+
+    assert "L = Live" in cards["film"]        # correlated (status -> status_name)
+    assert "1 = English" in cards["film"]     # lookup (language_id -> language.name)
+    assert "2 = Italiano" in cards["film"]    # dictionary overrides lookup
