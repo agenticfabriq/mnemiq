@@ -9,3 +9,8 @@ def test_measure_expr_round_trip():
 def test_coded_value_and_join_key():
     assert CodedValue(code="S", meaning="suspended").meaning == "suspended"
     assert JoinKey(left="a.id", right="b.a_id").left == "a.id"
+
+
+def test_coded_value_source_defaults_none_and_accepts_provenance():
+    assert CodedValue(code="A").source is None
+    assert CodedValue(code="A", meaning="detect", source="lookup").source == "lookup"
