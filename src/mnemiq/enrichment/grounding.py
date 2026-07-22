@@ -69,3 +69,46 @@ def ground_from_correlated(adapter, snapshot: Snapshot) -> dict[str, dict[str, s
             if mapping:
                 out[col.id] = mapping
     return out
+
+
+_CODE_MAX_DISTINCT = 25  # keep parity with profiling.profile_table
+
+
+def ground_from_lookup(adapter, snapshot: Snapshot) -> dict[str, dict[str, str]]:
+    """Ground a low-cardinality FK child column from its dimension table's label column.
+
+    Independent of the structural code-harvest: FK children are excluded from harvesting
+    (they are keys), so this is where dimension codes (film.language_id -> language.name)
+    actually get grounded.
+    """
+    by_id = {(c.object_id, c.name): c for c in snapshot.columns}
+    by_table = _columns_by_table(snapshot)
+    out: dict[str, dict[str, str]] = {}
+
+    for rel in snapshot.relationships:
+        for jk in rel.join_keys:
+            child = by_id.get((rel.from_, jk.left))
+            if child is None or not child.distinct_count:
+                continue
+            if not (0 < child.distinct_count <= _CODE_MAX_DISTINCT):
+                continue
+            labels = [
+                c.name for c in by_table.get(rel.to, [])
+                if _label_like(c.name) and c.name != jk.right and not is_key_like(c.name)
+            ]
+            if len(labels) != 1:
+                continue  # no clear label, or ambiguous -> skip
+            label = labels[0]
+            try:
+                pairs = adapter.execute(
+                    f'SELECT DISTINCT u."{jk.right}", u."{label}" '
+                    f'FROM "{rel.from_}" t JOIN "{rel.to}" u ON t."{jk.left}" = u."{jk.right}" '
+                    f'WHERE t."{jk.left}" IS NOT NULL'
+                )
+            except Exception as exc:
+                logger.warning("lookup grounding failed for %s.%s: %s", rel.from_, jk.left, exc)
+                continue
+            mapping = {str(code): str(lbl) for code, lbl in pairs if str(lbl) != ""}
+            if mapping:
+                out[child.id] = mapping
+    return out
