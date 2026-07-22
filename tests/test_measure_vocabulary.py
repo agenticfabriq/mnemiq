@@ -41,10 +41,11 @@ def test_measures_carry_no_coded_values():
 
 
 def test_real_vocabularies_survive():
+    # A real vocabulary is kept (unlike a measure, which is dropped) -- but the LLM no longer
+    # invents code meanings, so ungrounded codes survive bare (grounded-or-bare).
     out = enrich_semantic(
         _snapshot("status"), FakeEnricher({"fireclaim": _reply("status", "code")})
     )
-    assert {cv.code: cv.meaning for cv in out.columns[0].coded_values} == {
-        "0.7": "the value 0.7",
-        "0.8": "the value 0.8",
-    }
+    coded = out.columns[0].coded_values
+    assert {cv.code for cv in coded} == {"0.7", "0.8"}   # the vocabulary survives
+    assert all(cv.meaning is None for cv in coded)        # LLM no longer assigns meanings
