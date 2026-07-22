@@ -47,3 +47,32 @@ def test_correlated_skips_when_ambiguous(tmp_path):
     """)
     snap = enrich_structural(adapter, "t")
     assert ground_from_correlated(adapter, snap).get("t.status") in (None, {})
+
+
+def test_lookup_grounds_fk_child_from_dimension_label(tmp_path):
+    from mnemiq.enrichment.grounding import ground_from_lookup
+
+    adapter = _sqlite(tmp_path, "film", """
+        CREATE TABLE language (language_id INTEGER PRIMARY KEY, name TEXT);
+        CREATE TABLE film (film_id INTEGER PRIMARY KEY, title TEXT,
+                           language_id INTEGER REFERENCES language(language_id));
+        INSERT INTO language VALUES (1,'English'),(2,'Italian');
+        INSERT INTO film VALUES (1,'A',1),(2,'B',2),(3,'C',1);
+    """)
+    snap = enrich_structural(adapter, "film")
+    grounded = ground_from_lookup(adapter, snap)
+    # language_id is a key (no harvested coded_values) yet gets grounded from the dim label
+    assert grounded["film.language_id"] == {"1": "English", "2": "Italian"}
+
+
+def test_lookup_skips_dimension_without_a_label_column(tmp_path):
+    from mnemiq.enrichment.grounding import ground_from_lookup
+
+    adapter = _sqlite(tmp_path, "shop", """
+        CREATE TABLE dim (dim_id INTEGER PRIMARY KEY, qty INTEGER);
+        CREATE TABLE fact (id INTEGER PRIMARY KEY, dim_id INTEGER REFERENCES dim(dim_id));
+        INSERT INTO dim VALUES (1,10),(2,20);
+        INSERT INTO fact VALUES (1,1),(2,2);
+    """)
+    snap = enrich_structural(adapter, "shop")
+    assert ground_from_lookup(adapter, snap).get("fact.dim_id") in (None, {})
