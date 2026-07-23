@@ -1,0 +1,27 @@
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix ex:   <http://example.org/vocab#> .
+
+ex:ColourScheme a skos:ConceptScheme ;
+    skos:prefLabel "Colour Codes" ;
+    skos:definition "A controlled vocabulary of colour codes used in sample records." .
+
+ex:Red a skos:Concept ;
+    skos:inScheme ex:ColourScheme ;
+    skos:notation "R" ;
+    skos:prefLabel "Red" ;
+    skos:altLabel "Crimson" ;
+    skos:definition "The colour red." .
+
+ex:Green a skos:Concept ;
+    skos:inScheme ex:ColourScheme ;
+    skos:notation "G" ;
+    skos:prefLabel "Green" .
+
+ex:Blue a skos:Concept ;
+    skos:inScheme ex:ColourScheme ;
+    skos:notation "B" ;
+    skos:prefLabel "Blue" .
+
+ex:Unnotated a skos:Concept ;
+    skos:inScheme ex:ColourScheme ;
+    skos:prefLabel "No Code Here" .
