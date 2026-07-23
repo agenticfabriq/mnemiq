@@ -135,11 +135,19 @@ def _cmd_enrich(settings: Settings) -> int:
     con = init_store(settings.store_path)
     save_snapshot(con, snap)
     n_values = build_value_index(adapter, snap, con)
+    n_concepts = 0
+    if _onto is not None:
+        from mnemiq.semantic.ontology_index import build_ontology_index
+
+        # Persist alongside the value index so ask-time reads the store, not the records file.
+        n_concepts = build_ontology_index(_onto, snap, con)
     failed = [j.id.removeprefix("profile:") for j in snap.jobs
               if j.kind == "profile" and j.status == "failed"]
     print(
         f"snapshot {snap.version} ({len(snap.source_bindings)} tables, "
-        f"{n_values} indexed values) -> {settings.store_path}"
+        f"{n_values} indexed values"
+        + (f", {n_concepts} indexed concepts" if n_concepts else "")
+        + f") -> {settings.store_path}"
     )
     if failed:
         # Never report a silent partial success: a whole class of tables failing (e.g. a missing

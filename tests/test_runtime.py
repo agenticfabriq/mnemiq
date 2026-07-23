@@ -65,7 +65,7 @@ def test_ask_retrieves_scoped_and_delegates_to_the_agent(monkeypatch):
 
     calls = {}
 
-    def fake_retrieve(con, question, identity, authz, embedder, k=5, table_facts=()):
+    def fake_retrieve(con, question, identity, authz, embedder, k=5, table_facts=(), **kwargs):
         calls["retrieve"] = (question, k, list(table_facts))
         return "PACKET"
 
@@ -174,3 +174,46 @@ def test_write_executes_on_approval():
     res = rt.write("INSERT INTO claim (id) VALUES (1)", _identity())
     assert res.approved is True and res.target == "claim" and res.rows_affected == 1
     assert any(not s.startswith("EXPLAIN") for s in adapter.ran)  # the write actually ran
+
+
+def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
+    """Regression: question-time code resolution and the glossary reached eval's build_engine
+    but NOT the product path, so `mnemiq ask` and the MCP server saw neither. The absence of a
+    test over Runtime.ask is exactly why that gap survived review."""
+    import mnemiq.runtime as rt_mod
+    from mnemiq.agent.loop import AgentAnswer
+    from mnemiq.contract import CodeScheme, Column, Definition, Snapshot
+
+    seen = {}
+
+    def fake_retrieve(con, question, identity, authz, embedder, k=5, table_facts=(),
+                      definitions=(), columns=(), ontology_index=None):
+        seen["definitions"] = list(definitions)
+        seen["columns"] = [c.id for c in columns]
+        seen["ontology_index"] = ontology_index
+        from mnemiq.semantic.retrieval import ContextPacket
+
+        return ContextPacket(question=question, cards=[], grant_fingerprint="f",
+                             enrichment_version=None)
+
+    monkeypatch.setattr(rt_mod, "retrieve", fake_retrieve)
+
+    class _Agent:
+        def answer(self, packet, snapshot, grants, identity):
+            return AgentAnswer(answer="ANSWER")
+
+    snap = Snapshot(
+        version="v", source_id="s", created_at="t",
+        columns=[Column(id="patient.icd10_cd", object_id="patient", name="icd10_cd",
+                        code_scheme=CodeScheme(id="urn:icd10", label="ICD-10-CM"))],
+        definitions=[Definition(id="d1", term="ICD-10-CM", domain="ontology",
+                                definition="A diagnosis coding system.")],
+    )
+    sentinel = object()
+    rt = Runtime(con=None, snapshot=snap, adapter=None, agent=_Agent(), embedder=None,
+                 authz=_StaticAuthz("patient"), settings=None, ontology=sentinel)
+    rt.ask("how many with type 2 diabetes", _identity())
+
+    assert seen["ontology_index"] is sentinel        # the index reaches retrieval
+    assert seen["columns"] == ["patient.icd10_cd"]   # bound columns are visible to it
+    assert [d.term for d in seen["definitions"]] == ["ICD-10-CM"]  # glossary seam fed
