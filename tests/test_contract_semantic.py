@@ -119,3 +119,14 @@ def test_table_facts_and_example_models_default_empty():
                     table_facts=[tf], examples=[ex])
     assert snap.table_facts[0].object_id == "claim" and snap.examples[0].object_id == "claim"
     assert Snapshot(version="v1", source_id="acme", created_at="t").table_facts == []
+
+
+def test_column_code_scheme_defaults_none_and_accepts_a_scheme():
+    from mnemiq.contract import CodeScheme, Column
+
+    assert Column(id="t.c", object_id="t", name="c").code_scheme is None
+    col = Column(
+        id="patient.icd10_cd", object_id="patient", name="icd10_cd",
+        code_scheme=CodeScheme(id="urn:example:icd10", label="ICD-10-CM"),
+    )
+    assert col.code_scheme.label == "ICD-10-CM"
