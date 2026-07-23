@@ -1,0 +1,21 @@
+@prefix owl:  <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix ex:   <http://example.org/shapes#> .
+
+ex:Shape a owl:Class ;
+    rdfs:label "Shape Codes" .
+
+ex:Circle a owl:Class ;
+    rdfs:subClassOf ex:Shape ;
+    skos:notation "CIR" ;
+    rdfs:label "Circle" .
+
+ex:Square a owl:Class ;
+    rdfs:subClassOf ex:Shape ;
+    skos:notation "SQR" ;
+    rdfs:label "Square" .
+
+ex:Glossary a owl:Class ;
+    rdfs:label "Sample Batch" ;
+    skos:definition "A group of samples processed together on one day." .
