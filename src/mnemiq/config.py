@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     enrich_facts: bool = Field(default=False, description="eval: table-facts enrichment phase (plan-20, default off)")
     enrich_examples: bool = Field(default=False, description="eval: verified-example enrichment phase (plan-20, default off)")
     dictionary_path: str | None = Field(default=None, description="operator code data-dictionary JSON path (grounds code meanings)")
+    ontology_records_path: str | None = Field(default=None, description="ontology records JSON path (binds code schemes, grounds bare codes)")
     retrieval_k: int = Field(default=12, ge=1, description="schema cards retrieved into the generation packet")
     principal: str | None = Field(default=None, description="MCP standalone identity: principal id")
     roles: str | None = Field(default=None, description="MCP standalone identity: comma-separated roles")

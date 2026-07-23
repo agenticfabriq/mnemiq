@@ -59,6 +59,18 @@ def build_engine(
     build_example_index(con, snapshot, embedder)
     build_value_index(adapter, snapshot, con)
 
+    ontology_index = None
+    if settings.ontology_records_path:
+        from mnemiq.ontology.records import load_records
+        from mnemiq.semantic.ontology_index import OntologyIndex, build_ontology_index
+
+        build_ontology_index(load_records(settings.ontology_records_path), snapshot, con)
+        ontology_index = OntologyIndex(con)
+
+    # The glossary channel has been wired-but-unfed since Plan 08: Snapshot.definitions was
+    # never read at runtime. Ontology definitions are the first producer that makes it matter.
+    definitions = definitions or snapshot.definitions
+
     tables = [r[0] for r in con.execute("SELECT object_id FROM semantic_object").fetchall()]
     # Grade SQL capability with FULL data access: clear every PII level the enrichment tagged,
     # so CLS does not refuse legitimate columns (e.g. CustomerID). Governance/RLS/CLS have their
@@ -102,7 +114,8 @@ def build_engine(
 
     def ask(question: str) -> AgentAnswer:
         packet = retrieve(con, question, IDENTITY, authz, embedder, k=k,
-                          definitions=definitions, table_facts=snapshot.table_facts)
+                          definitions=definitions, table_facts=snapshot.table_facts,
+                          columns=snapshot.columns, ontology_index=ontology_index)
         return agent.answer(packet, snapshot, grants, IDENTITY)
 
     return ask, client

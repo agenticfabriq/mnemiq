@@ -52,6 +52,25 @@
   },
   "snapshot": {
     "$defs": {
+      "CodeScheme": {
+        "description": "The code system a column's values are drawn from (ICD-10, NAICS, ...). Set by the\nontology binder from observed values, never by the LLM.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "CodeScheme",
+        "type": "object"
+      },
       "CodedValue": {
         "properties": {
           "code": {
@@ -91,6 +110,17 @@
       },
       "Column": {
         "properties": {
+          "code_scheme": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CodeScheme"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
           "coded_values": {
             "items": {
               "$ref": "#/$defs/CodedValue"

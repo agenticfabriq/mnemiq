@@ -75,6 +75,14 @@ def _enrich_cache_suffix(settings: Settings) -> str:
         # snapshot. Content edits to the same path still need --refresh (as grounding itself does).
         import hashlib
         parts.append("dict" + hashlib.sha256(settings.dictionary_path.encode()).hexdigest()[:6])
+    if settings.ontology_records_path:
+        # ontology bindings change grounded meanings AND which columns carry a scheme -> a
+        # no-ontology snapshot must never be reused. Content edits still need --refresh.
+        import hashlib
+
+        parts.append(
+            "onto" + hashlib.sha256(settings.ontology_records_path.encode()).hexdigest()[:6]
+        )
     return f"__{'_'.join(parts)}" if parts else ""
 
 
@@ -101,11 +109,13 @@ def enrich_bird_db(
 
     from mnemiq.enrichment.dictionary import load_dictionary
     from mnemiq.enrichment.grounding import ground_codes
+    from mnemiq.ontology.records import load_records
 
     adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
     snapshot = enrich_structural(adapter, db_id)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
-    snapshot = ground_codes(adapter, snapshot, _dict)
+    _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
+    snapshot = ground_codes(adapter, snapshot, _dict, _onto)
     if semantic:
         snapshot = enrich_semantic(snapshot, LLMEnricher(LLMClient(settings)))
         if settings.enrich_facts:

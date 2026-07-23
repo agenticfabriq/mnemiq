@@ -13,6 +13,13 @@ class SourceBinding(BaseModel):
     freshness_ref: str | None = None
 
 
+class CodeScheme(BaseModel):
+    """The code system a column's values are drawn from (ICD-10, NAICS, ...). Set by the
+    ontology binder from observed values, never by the LLM."""
+    id: str
+    label: str
+
+
 class Column(BaseModel):
     id: str
     object_id: str
@@ -22,6 +29,7 @@ class Column(BaseModel):
     description: str | None = None
     pii_level: str | None = None
     coded_values: list[CodedValue] = Field(default_factory=list)
+    code_scheme: CodeScheme | None = None
     # Profile counts. None means "profiling did not run", never zero -- a fabricated
     # zero would make every unprofiled column look empty.
     row_count: int | None = None

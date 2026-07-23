@@ -115,6 +115,32 @@ def ground_from_lookup(adapter, snapshot: Snapshot) -> dict[str, dict[str, str]]
     return out
 
 
+def ontology_meanings(snapshot: Snapshot, records) -> dict[str, dict[str, str]]:
+    """notation -> pref_label for bound columns' harvested codes.
+
+    Takes no adapter: binding already did the database work, so this is a pure lookup. Only
+    columns that actually harvested a vocabulary can be filled -- a large code system arrives
+    with no coded_values at all, and is served by the concept index at question time instead.
+    """
+    by_scheme = {
+        s.id: {c.notation.strip().casefold(): c.pref_label for c in s.concepts}
+        for s in records.schemes
+    }
+    out: dict[str, dict[str, str]] = {}
+    for col in snapshot.columns:
+        if col.code_scheme is None or not col.coded_values:
+            continue
+        table = by_scheme.get(col.code_scheme.id, {})
+        mapping = {
+            cv.code: table[cv.code.strip().casefold()]
+            for cv in col.coded_values
+            if cv.code.strip().casefold() in table
+        }
+        if mapping:
+            out[col.id] = mapping
+    return out
+
+
 def apply_dictionary(snapshot: Snapshot, dictionary) -> Snapshot:
     """Overlay operator meanings + column descriptions. Highest precedence. Not re-versioned."""
     entries = dictionary.columns
@@ -149,13 +175,30 @@ def _safe(fn, adapter, snapshot) -> dict[str, dict[str, str]]:
         return {}
 
 
-def ground_codes(adapter, snapshot: Snapshot, dictionary=None) -> Snapshot:
-    """Fill CodedValue.meaning from data (correlated < lookup) then the operator dictionary."""
+def ground_codes(adapter, snapshot: Snapshot, dictionary=None, ontology=None) -> Snapshot:
+    """Fill CodedValue.meaning: ontology < correlated < lookup < operator dictionary.
+
+    Ontology is the floor, not a competitor: an external standard describes the world, while a
+    correlated/lookup label describes THIS database, so the database wins wherever it speaks.
+    Seeding the merge map first and letting the in-DB sources overwrite IS that precedence.
+    """
+    onto: dict[str, dict[str, str]] = {}
+    if ontology is not None:
+        from mnemiq.ontology.binder import bind_schemes
+
+        snapshot = bind_schemes(adapter, snapshot, ontology)
+        try:
+            onto = ontology_meanings(snapshot, ontology)
+        except Exception as exc:
+            logger.warning("ontology grounding failed; skipped: %s", exc)
+
     corr = _safe(ground_from_correlated, adapter, snapshot)
     look = _safe(ground_from_lookup, adapter, snapshot)
 
-    # column_id -> {code: (meaning, source)} with lookup overriding correlated
+    # column_id -> {code: (meaning, source)}; later sources overwrite earlier ones
     merged: dict[str, dict[str, tuple[str, str]]] = {}
+    for col_id, m in onto.items():
+        merged.setdefault(col_id, {}).update({k: (v, "ontology") for k, v in m.items()})
     for col_id, m in corr.items():
         merged.setdefault(col_id, {}).update({k: (v, "correlated") for k, v in m.items()})
     for col_id, m in look.items():

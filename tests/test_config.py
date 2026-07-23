@@ -206,3 +206,12 @@ def test_dictionary_path_reads_env(monkeypatch):
 def test_dictionary_path_defaults_none(monkeypatch):
     monkeypatch.delenv("MNEMIQ_DICTIONARY_PATH", raising=False)
     assert Settings().dictionary_path is None
+
+
+def test_ontology_records_path_defaults_none(monkeypatch):
+    from mnemiq.config import Settings
+
+    monkeypatch.delenv("MNEMIQ_ONTOLOGY_RECORDS_PATH", raising=False)
+    assert Settings().ontology_records_path is None
+    monkeypatch.setenv("MNEMIQ_ONTOLOGY_RECORDS_PATH", "/x/records.json")
+    assert Settings().ontology_records_path == "/x/records.json"
