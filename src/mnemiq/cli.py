@@ -44,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("config", help="print a .env.example template (all knobs, defaults, docs)")
     c.add_argument("action", nargs="?", choices=["example"], default="example")
+    d = sub.add_parser("digest-ontology", help="TTL/SKOS/OWL -> ontology records JSON")
+    d.add_argument("--ttl", action="append", required=True,
+                   help="a .ttl file or a directory of them; repeatable")
+    d.add_argument("--out", required=True, help="output records JSON path")
+
     sub.add_parser("serve", help="run the MCP server on stdio")
     sub.add_parser("metrics", help="print observability SLOs from the answer log")
 
@@ -60,6 +65,40 @@ def _identity(args) -> IdentityContext:
         principal_id=getattr(args, "principal", "local"),
         roles=[r for r in getattr(args, "roles", "").split(",") if r],
     )
+
+
+def _cmd_digest_ontology(args) -> int:
+    import glob
+    import os
+
+    from mnemiq.ontology.digest import digest_ontology  # lazy: the only rdflib importer
+
+    paths: list[str] = []
+    for entry in args.ttl:
+        if os.path.isdir(entry):
+            paths.extend(sorted(glob.glob(os.path.join(entry, "**", "*.ttl"), recursive=True)))
+        else:
+            paths.append(entry)
+    if not paths:
+        print("no .ttl files found", file=sys.stderr)
+        return 1
+
+    try:
+        records = digest_ontology(paths)
+    except ImportError:
+        print("digest-ontology needs the ontology extra: pip install 'mnemiq[ontology]'",
+              file=sys.stderr)
+        return 1
+
+    with open(args.out, "w", encoding="utf-8") as fh:
+        fh.write(records.model_dump_json(indent=2))
+        fh.write("\n")
+    print(
+        f"digested {len(paths)} file(s): {len(records.schemes)} scheme(s), "
+        f"{sum(len(s.concepts) for s in records.schemes)} concept(s), "
+        f"{len(records.definitions)} definition(s) -> {args.out}"
+    )
+    return 0
 
 
 def _cmd_enrich(settings: Settings) -> int:
@@ -250,6 +289,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "config":  # before from_env(): a template needs no valid config
         print(Settings.env_example(), end="")
         return 0
+    if args.command == "digest-ontology":  # likewise: TTL in, JSON out -- no source needed
+        return _cmd_digest_ontology(args)
     settings = Settings.from_env()
     if args.command == "enrich":
         return _cmd_enrich(settings)
