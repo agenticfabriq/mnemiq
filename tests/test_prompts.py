@@ -80,3 +80,17 @@ def test_a_foreign_key_column_is_rendered_in_the_facts():
     assert "FK -> district.district_id" in text
     name_line = next(line for line in text.splitlines() if line.startswith("- name "))
     assert "FK" not in name_line
+
+
+def test_user_prompt_renders_code_vocabulary_block():
+    from mnemiq.generate.prompts import user_prompt
+    from mnemiq.semantic.retrieval import ContextPacket, ResolvedConcept
+
+    packet = ContextPacket(question="how many with type 2 diabetes", cards=[],
+                           grant_fingerprint="f", enrichment_version="v")
+    packet.concepts = [
+        ResolvedConcept("patient.icd10_cd", "ICD-10-CM", "E11", "Type 2 diabetes mellitus")]
+    text = user_prompt(packet)
+    assert "CODE VOCABULARY" in text
+    assert "patient.icd10_cd uses ICD-10-CM" in text
+    assert "E11 = Type 2 diabetes mellitus" in text

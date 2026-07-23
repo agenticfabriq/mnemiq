@@ -143,3 +143,63 @@ def test_end_to_end_card_shows_grounded_and_dictionary_meanings(tmp_path):
     assert "L = Live" in cards["film"]        # correlated (status -> status_name)
     assert "1 = English" in cards["film"]     # lookup (language_id -> language.name)
     assert "2 = Italiano" in cards["film"]    # dictionary overrides lookup
+
+
+def _colour_db(tmp_path, name="onto"):
+    import sqlite3
+
+    from mnemiq.adapters.sqlite import SQLiteAdapter
+    from mnemiq.enrichment.pipeline import enrich_structural
+
+    path = tmp_path / f"{name}.sqlite"
+    con = sqlite3.connect(path)
+    # duplicates on purpose: profiling harvests coded_values only when distinct < row_count,
+    # so a one-row-per-code table would land in the large-code-system regime instead
+    con.executescript("""
+        CREATE TABLE sample (sample_pk INTEGER PRIMARY KEY, colour_code TEXT);
+        INSERT INTO sample VALUES (1,'R'),(2,'G'),(3,'B'),(4,'Y'),(5,'P'),
+                                  (6,'R'),(7,'G'),(8,'B');
+    """)
+    con.commit()
+    con.close()
+    adapter = SQLiteAdapter(str(path))
+    return adapter, enrich_structural(adapter, "p")
+
+
+def _colour_records(labels):
+    from mnemiq.ontology.records import Concept, ConceptScheme, OntologyRecords
+
+    return OntologyRecords(schemes=[ConceptScheme(
+        id="urn:colour", label="Colour Codes",
+        concepts=[Concept(id=f"c{n}", notation=n, pref_label=lbl) for n, lbl in labels.items()],
+    )])
+
+
+def test_ontology_fills_bare_codes(tmp_path):
+    from mnemiq.enrichment.grounding import ground_codes
+
+    adapter, snap = _colour_db(tmp_path)
+    records = _colour_records(
+        {"R": "Red", "G": "Green", "B": "Blue", "Y": "Yellow", "P": "Purple"})
+
+    out = ground_codes(adapter, snap, ontology=records)
+    col = next(c for c in out.columns if c.name == "colour_code")
+    meanings = {cv.code: (cv.meaning, cv.source) for cv in col.coded_values}
+    assert meanings["R"] == ("Red", "ontology")
+    assert col.code_scheme.label == "Colour Codes"
+
+
+def test_dictionary_still_outranks_ontology(tmp_path):
+    from mnemiq.enrichment.dictionary import ColumnEntry, DataDictionary
+    from mnemiq.enrichment.grounding import ground_codes
+
+    adapter, snap = _colour_db(tmp_path, "dict")
+    records = _colour_records({n: f"Onto {n}" for n in ("R", "G", "B", "Y", "P")})
+    dictionary = DataDictionary(columns={
+        "sample.colour_code": ColumnEntry(codes={"R": "Operator Red"})})
+
+    out = ground_codes(adapter, snap, dictionary=dictionary, ontology=records)
+    col = next(c for c in out.columns if c.name == "colour_code")
+    meanings = {cv.code: (cv.meaning, cv.source) for cv in col.coded_values}
+    assert meanings["R"] == ("Operator Red", "dictionary")
+    assert meanings["G"] == ("Onto G", "ontology")

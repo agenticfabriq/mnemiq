@@ -19,6 +19,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
+ontology = [
+    "rdflib>=7",
+]
 
 [project.scripts]
 mnemiq = "mnemiq.cli:main"

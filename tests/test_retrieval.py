@@ -183,3 +183,35 @@ def test_retrieve_examples_no_index_returns_empty(tmp_path):
     con = init_store(str(tmp_path / "s.duckdb"))  # no example table built
     (qvec,) = FakeEmbedder().embed(["q"])
     assert _retrieve_examples(con, qvec, allowed={"claim"}, k=5) == []
+
+
+def test_resolve_concepts_covers_only_bound_columns_on_shown_cards():
+    import duckdb
+
+    from mnemiq.contract import CodeScheme, Column
+    from mnemiq.semantic.ontology_index import OntologyIndex
+    from mnemiq.semantic.retrieval import ResolvedConcept, _resolve_concepts
+
+    con = duckdb.connect(":memory:")
+    con.execute("""
+        CREATE TABLE ontology_concept (source_id TEXT, scheme_id TEXT, notation TEXT,
+                                       label TEXT, definition TEXT)
+    """)
+    con.execute("INSERT INTO ontology_concept VALUES "
+                "('s','urn:icd10','E11','Type 2 diabetes mellitus',''),"
+                "('s','urn:icd10','I10','Essential hypertension','')")
+
+    columns = [
+        Column(id="patient.icd10_cd", object_id="patient", name="icd10_cd",
+               code_scheme=CodeScheme(id="urn:icd10", label="ICD-10-CM")),
+        Column(id="hidden.icd10_cd", object_id="hidden", name="icd10_cd",
+               code_scheme=CodeScheme(id="urn:icd10", label="ICD-10-CM")),
+        Column(id="patient.x", object_id="patient", name="x"),
+    ]
+    got = _resolve_concepts("how many with type 2 diabetes", columns, {"patient"},
+                            OntologyIndex(con))
+
+    assert ResolvedConcept("patient.icd10_cd", "ICD-10-CM", "E11",
+                           "Type 2 diabetes mellitus") in got
+    # a column on a table that was not retrieved is never resolved
+    assert all(c.column_id == "patient.icd10_cd" for c in got)
