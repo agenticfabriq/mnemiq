@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 CONTAINMENT_MIN = 0.95   # tolerates residual dirt after sentinel forgiveness
 MIN_DISTINCT = 4         # three or fewer values match a scheme by coincidence too easily
 SAMPLE_LIMIT = 1000      # bounds the large-code-system probe
-AFFINITY_MIN = 0.30      # trigram floor; see textmatch.name_affinity for why two surface forms
+AFFINITY_MIN = 0.50      # overlap-coefficient floor; see textmatch.name_affinity
 
 # Junk that appears in essentially every real coded column. Forgiven from containment so a
 # sparsely-populated standard-code column still binds. Extensible per deployment.
