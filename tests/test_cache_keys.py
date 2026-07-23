@@ -33,3 +33,13 @@ def test_re_enrichment_invalidates_everything():
     old = cache_key("SELECT a FROM claim", "fp-analyst", "v1")
     new = cache_key("SELECT a FROM claim", "fp-analyst", "v2")
     assert old != new  # stale answers expire by construction, not by someone noticing
+
+
+def test_enrich_cache_suffix_separates_ontology_runs():
+    from mnemiq.config import Settings
+    from mnemiq.eval.bird_runner import _enrich_cache_suffix
+
+    plain = _enrich_cache_suffix(Settings())
+    onto = _enrich_cache_suffix(Settings(ontology_records_path="/x/a.json"))
+    other = _enrich_cache_suffix(Settings(ontology_records_path="/x/b.json"))
+    assert plain != onto and onto != other

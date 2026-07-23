@@ -118,11 +118,13 @@ def _cmd_enrich(settings: Settings) -> int:
         return 1
     from mnemiq.enrichment.dictionary import load_dictionary
     from mnemiq.enrichment.grounding import ground_codes
+    from mnemiq.ontology.records import load_records
 
     adapter = DuckDBPostgresAdapter(settings.pg_dsn)
     snap = enrich_structural(adapter, settings.source_id)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
-    snap = ground_codes(adapter, snap, _dict)
+    _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
+    snap = ground_codes(adapter, snap, _dict, _onto)
     snap = enrich_semantic(snap, LLMEnricher(LLMClient(settings)))
     if settings.enrich_facts:
         snap = enrich_table_facts(snap, LLMFactsEnricher(LLMClient(settings)))
