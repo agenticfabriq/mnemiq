@@ -108,3 +108,17 @@ def test_cmd_enrich_lazy_imports_resolve(capsys):
     from mnemiq.config import Settings
     assert _cmd_enrich(Settings()) == 1  # no pg_dsn -> 1, but only after imports resolve
     assert "MNEMIQ_PG_DSN" in capsys.readouterr().err
+
+
+def test_digest_ontology_writes_records(tmp_path):
+    import json
+
+    from mnemiq.cli import main
+
+    out = tmp_path / "records.json"
+    rc = main(["digest-ontology", "--ttl", "tests/fixtures/ontology/skos_scheme.ttl",
+               "--out", str(out)])
+    assert rc == 0
+    payload = json.loads(out.read_text())
+    assert payload["version"]
+    assert any(s["label"] == "Colour Codes" for s in payload["schemes"])
