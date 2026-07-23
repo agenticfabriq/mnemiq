@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import duckdb
 
 from mnemiq.authz.grants import AuthzProvider
-from mnemiq.contract import Definition, Example, IdentityContext, TableFacts
+from mnemiq.contract import Column, Definition, Example, IdentityContext, TableFacts
 from mnemiq.llm.embeddings import Embedder
 from mnemiq.semantic.cards import render_facts_block
 from mnemiq.semantic.glossary import select_definitions
@@ -22,6 +22,15 @@ class RetrievedCard:
     score: float
 
 
+@dataclass(frozen=True)
+class ResolvedConcept:
+    """A candidate code for the asked question, on a scheme-bound column."""
+    column_id: str
+    scheme_label: str
+    notation: str
+    label: str
+
+
 @dataclass
 class ContextPacket:
     question: str
@@ -29,6 +38,7 @@ class ContextPacket:
     grant_fingerprint: str
     enrichment_version: str | None
     definitions: list[Definition] = field(default_factory=list)
+    concepts: list[ResolvedConcept] = field(default_factory=list)
     examples: list[Example] = field(default_factory=list)  # Plan 08 seam; filled by retrieve()
 
 
@@ -72,6 +82,26 @@ def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5) -> list[Ex
     return out
 
 
+_CONCEPT_CAP = 15  # total across all columns: a prompt block, not a data dump
+
+
+def _resolve_concepts(question, columns, shown: set[str], index) -> list[ResolvedConcept]:
+    """Candidate codes for the question, for scheme-bound columns on RETRIEVED tables only.
+
+    Grant safety is inherited, not re-implemented: `shown` comes from cards that were already
+    scoped to the identity's grants before anything was ranked.
+    """
+    out: list[ResolvedConcept] = []
+    for column in columns:
+        if column.object_id not in shown or column.code_scheme is None:
+            continue
+        for notation, label in index.nearest(column.code_scheme.id, question):
+            out.append(ResolvedConcept(column.id, column.code_scheme.label, notation, label))
+            if len(out) >= _CONCEPT_CAP:
+                return out
+    return out
+
+
 def retrieve(
     con: duckdb.DuckDBPyConnection,
     question: str,
@@ -81,6 +111,8 @@ def retrieve(
     k: int = 5,
     definitions: Sequence[Definition] = (),
     table_facts: Sequence[TableFacts] = (),
+    columns: Sequence[Column] = (),
+    ontology_index=None,
 ) -> ContextPacket:
     """Hybrid retrieval, scoped to the identity's grants *before* anything is ranked.
 
@@ -157,4 +189,8 @@ def retrieve(
     packet.enrichment_version = next(iter(cards.values()))[1] if cards else None
     _attach_facts(packet.cards, table_facts)
     packet.examples = _retrieve_examples(con, embedding, set(grants.objects), k=k)
+    if ontology_index is not None and packet.cards:
+        packet.concepts = _resolve_concepts(
+            question, columns, {c.object_id for c in packet.cards}, ontology_index
+        )
     return packet
