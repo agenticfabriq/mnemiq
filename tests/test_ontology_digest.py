@@ -8,7 +8,8 @@ def test_digest_reads_a_skos_concept_scheme():
     scheme = next(s for s in records.schemes if s.label == "Colour Codes")
     by_notation = {c.notation: c for c in scheme.concepts}
 
-    assert set(by_notation) == {"R", "G", "B"}  # the un-notated concept cannot ground a code
+    # the un-notated concept cannot ground a code, so it is not a member of the scheme
+    assert set(by_notation) == {"R", "G", "B", "Y", "P"}
     assert by_notation["R"].pref_label == "Red"
     assert by_notation["R"].alt_labels == ["Crimson"]
     assert by_notation["R"].definition == "The colour red."

@@ -22,6 +22,16 @@ ex:Blue a skos:Concept ;
     skos:notation "B" ;
     skos:prefLabel "Blue" .
 
+ex:Yellow a skos:Concept ;
+    skos:inScheme ex:ColourScheme ;
+    skos:notation "Y" ;
+    skos:prefLabel "Yellow" .
+
+ex:Purple a skos:Concept ;
+    skos:inScheme ex:ColourScheme ;
+    skos:notation "P" ;
+    skos:prefLabel "Purple" .
+
 ex:Unnotated a skos:Concept ;
     skos:inScheme ex:ColourScheme ;
     skos:prefLabel "No Code Here" .
