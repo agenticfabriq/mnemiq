@@ -140,17 +140,19 @@ def bind_schemes(adapter, snapshot: Snapshot, records: OntologyRecords,
         for c in snapshot.columns
     ]
 
-    # Narrow ontology definitions to the tables their scheme bound to, so grant filtering
-    # applies. An unbound definition stays global -- correct for a public standard, and the
-    # reason select_definitions treats an empty bound_objects as "visible to everyone".
-    tables_by_scheme: dict[str, list[str]] = {}
-    for column in columns:
-        if column.code_scheme:
-            tables_by_scheme.setdefault(column.code_scheme.id, []).append(column.object_id)
-    definitions = list(snapshot.definitions)
-    for definition in records.definitions:
-        scheme_id = definition.id.removeprefix("ontology:scheme:")
-        objects = sorted(set(tables_by_scheme.get(scheme_id, [])))
-        definitions.append(definition.model_copy(update={"bound_objects": objects}))
+    # Ontology definitions stay UNBOUND, i.e. visible to every identity.
+    #
+    # Binding them to the tables that use the scheme was backwards. select_definitions requires
+    # ALL bound objects to be granted, so the more widely a scheme was used the FEWER identities
+    # could see what it means -- on Pagila the MPAA definition bound to `film` plus two views
+    # over it, and an analyst granted only `film` was shown the coded column and denied the
+    # definition of the very scheme named on its card.
+    #
+    # That rule protects against a definition whose TEXT names tables ("join premium to
+    # policy_amount on ..."), which leaks their existence. A scheme definition describes the
+    # scheme, not the tables, and names none of them, so it discloses nothing. Correct for a
+    # public standard; a proprietary taxonomy needs a public/proprietary marker in the record
+    # format, which SP2 will add when the format is revised for certified records.
+    definitions = list(snapshot.definitions) + list(records.definitions)
 
     return snapshot.model_copy(update={"columns": columns, "definitions": definitions}, deep=True)
