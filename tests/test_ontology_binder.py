@@ -120,20 +120,29 @@ def test_explicit_binding_bypasses_every_gate(tmp_path):
     assert next(c for c in out.columns if c.name == "zzz").code_scheme.id == "urn:colour"
 
 
-def test_bound_definitions_are_narrowed_to_the_bound_table(tmp_path):
+def test_ontology_definitions_stay_unbound_and_therefore_visible(tmp_path):
+    """Regression: binding a scheme definition to every table using the scheme was backwards.
+    select_definitions requires ALL bound objects to be granted, so the more widely a scheme was
+    used the FEWER identities could see what it means -- on Pagila the MPAA definition bound to
+    film plus two views, and an analyst granted only `film` saw nothing. A scheme definition
+    describes the scheme, not the tables, and its text names no table, so it discloses nothing.
+    A proprietary taxonomy needs a public/proprietary marker in the format instead (SP2)."""
+    from mnemiq.authz.grants import GrantSet
     from mnemiq.contract import Definition
     from mnemiq.ontology.binder import bind_schemes
+    from mnemiq.semantic.glossary import select_definitions
 
     codes = ["R", "G", "B", "Y", "P"]
     adapter, snap = _snapshot(tmp_path, "defs", _table("colour_code", codes))
     records = OntologyRecords(
         schemes=[_scheme("urn:colour", "Colour Codes", codes)],
         definitions=[Definition(id="ontology:scheme:urn:colour", term="Colour Codes",
-                                domain="ontology", definition="A vocabulary of colours."),
-                     Definition(id="ontology:term:urn:other", term="Sample Batch",
-                                domain="ontology", definition="A group of samples.")],
+                                domain="ontology", definition="A vocabulary of colours.")],
     )
     out = bind_schemes(adapter, snap, records)
-    by_term = {d.term: d for d in out.definitions}
-    assert by_term["Colour Codes"].bound_objects == ["sample"]  # grant filtering now applies
-    assert by_term["Sample Batch"].bound_objects == []          # unbound stays global
+    assert next(d for d in out.definitions if d.term == "Colour Codes").bound_objects == []
+
+    # and it survives grant filtering for an identity holding only one of the scheme's tables
+    selected = select_definitions("what is the Colour Codes scheme", out.definitions,
+                                  GrantSet(frozenset({"sample"})))
+    assert [d.term for d in selected] == ["Colour Codes"]
