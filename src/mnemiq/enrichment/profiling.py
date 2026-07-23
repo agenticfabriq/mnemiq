@@ -82,6 +82,9 @@ def profile_table(
             and 0 < distinct_count <= code_max_distinct
             and distinct_count < row_count
         ):
-            s.top_k = _top_k(adapter, table.name, c, k)
+            # Harvest the WHOLE vocabulary, not a top-k slice: the column already qualifies as a
+            # code set (<= code_max_distinct distinct), so a rare code must not be dropped -- else a
+            # dictionary can never ground it and the model never sees it. Bounded by the cap.
+            s.top_k = _top_k(adapter, table.name, c, code_max_distinct)
         stats.append(s)
     return stats
