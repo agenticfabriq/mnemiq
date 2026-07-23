@@ -191,3 +191,17 @@ def test_build_cards_stays_lean_facts_are_not_indexed():
     text = build_cards(snap)[0].text
     assert text.startswith("TABLE claim\nCOLUMNS:")
     assert "GRAIN" not in text  # facts stay out of the indexed card
+
+
+def test_card_names_the_code_scheme():
+    from mnemiq.contract import CodeScheme, CodedValue, Column, Snapshot
+    from mnemiq.semantic.cards import build_cards
+
+    snap = Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="patient.icd10_cd", object_id="patient", name="icd10_cd", data_type="text",
+               code_scheme=CodeScheme(id="urn:icd10", label="ICD-10-CM"),
+               coded_values=[CodedValue(code="E11", meaning="Type 2 diabetes", source="ontology")]),
+    ])
+    card = build_cards(snap)[0].text
+    assert "ICD-10-CM" in card
+    assert "E11 = Type 2 diabetes" in card

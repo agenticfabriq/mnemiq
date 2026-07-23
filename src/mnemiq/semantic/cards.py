@@ -77,6 +77,8 @@ def build_cards(snapshot: Snapshot) -> list[SchemaCard]:
                     for cv in column.coded_values
                 )
                 line += f" Values: {codes}"
+            if column.code_scheme:
+                line += f" Codes from {column.code_scheme.label}."
             lines.append(line)
 
         if table in joins:
