@@ -89,6 +89,15 @@ def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
             f"- {sanitize(d.term, limit=80)}: {sanitize(d.definition, limit=600)}"
             for d in packet.definitions
         ]
+    if packet.concepts:
+        parts += ["", "CODE VOCABULARY (candidate codes for this question -- filter on the CODE, never the label):"]
+        grouped: dict[tuple[str, str], list[str]] = {}
+        for concept in packet.concepts:
+            grouped.setdefault((concept.column_id, concept.scheme_label), []).append(
+                f"{concept.notation} = {sanitize(concept.label, limit=120)}"
+            )
+        for (column_id, scheme), items in grouped.items():
+            parts.append(f"- {column_id} uses {scheme}. Candidates: {'; '.join(items)}")
     if packet.examples:
         parts += ["", "WORKED EXAMPLES (verified queries over these tables -- adapt, don't copy blindly):"]
         for ex in packet.examples:
