@@ -102,3 +102,28 @@ def test_declared_fk_column_is_not_harvested_as_a_vocabulary(tmp_path):
 
     with_key = {s.column: s for s in profile_table(adapter, sale, key_columns={"rc"})}
     assert with_key["rc"].top_k == []  # a declared FK column is a key, not a vocabulary
+
+
+def test_coded_column_harvests_all_distinct_up_to_the_cap(tmp_path):
+    # A coded column with 12 distinct values (> the old top-10 slice) must surface ALL of them:
+    # it already qualifies as a vocabulary (<= code_max_distinct), so a rare code must not be
+    # dropped -- else a dictionary can never ground it and the model never sees it.
+    import sqlite3
+
+    from mnemiq.adapters.sqlite import SQLiteAdapter
+    from mnemiq.catalog import introspect
+    from mnemiq.enrichment.profiling import profile_table
+
+    codes = list("abcdefghijkl")  # 12 distinct
+    rows = [(i + 1, c) for i, c in enumerate(codes)] + [(13, "a"), (14, "b")]  # distinct 12 < rows 14
+    path = tmp_path / "t.sqlite"
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, kind TEXT)")
+    con.executemany("INSERT INTO t VALUES (?, ?)", rows)
+    con.commit()
+    con.close()
+
+    adapter = SQLiteAdapter(str(path))
+    t = next(x for x in introspect(adapter) if x.name == "t")
+    stats = {s.column: s for s in profile_table(adapter, t)}
+    assert {v for v, _ in stats["kind"].top_k} == set(codes)  # all 12, not just the top 10
