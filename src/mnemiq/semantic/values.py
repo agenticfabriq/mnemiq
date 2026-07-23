@@ -4,6 +4,7 @@ import duckdb
 
 from mnemiq.catalog import is_key_like, is_sensitive_name
 from mnemiq.contract import Snapshot
+from mnemiq.semantic.textmatch import similarity
 
 # Personal-data levels the semantic pass assigns -- never indexed. Mirrors
 # enrichment.semantic._SENSITIVE; the deterministic first line is is_sensitive_name.
@@ -80,19 +81,6 @@ def build_value_index(
     return len(rows)
 
 
-def _trigrams(text: str) -> set[str]:
-    padded = f"  {text.lower()} "
-    return {padded[i : i + 3] for i in range(len(padded) - 2)}
-
-
-def _similarity(a: str, b: str) -> float:
-    ta, tb = _trigrams(a), _trigrams(b)
-    if not ta or not tb:
-        return 0.0
-    union = len(ta | tb)
-    return len(ta & tb) / union if union else 0.0
-
-
 class ValueIndex:
     """Read side of the value index. Resilient to a store built before value grounding: the
     table is ensured on construction, so an un-indexed store simply answers 'not indexed'."""
@@ -128,7 +116,7 @@ class ValueIndex:
     def nearest(self, object_id: str, column: str, literal: str, k: int = 8) -> list[str]:
         ranked = sorted(
             self._values(object_id, column),
-            key=lambda v: _similarity(literal, v),
+            key=lambda v: similarity(literal, v),
             reverse=True,
         )
         return ranked[:k]  # returns all when the column has <= k values
