@@ -1,6 +1,7 @@
 from .schema import export_json_schema, write_schema
 from .seams import IdentityContext, Trace
 from .semantic import (
+    CodeScheme,
     Column,
     CompatibilityProfile,
     Definition,
@@ -22,6 +23,7 @@ __all__ = [
     "CodedValue",
     "JoinKey",
     "MeasureExpr",
+    "CodeScheme",
     "SourceBinding",
     "Column",
     "Dimension",
