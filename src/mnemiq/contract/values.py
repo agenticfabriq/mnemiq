@@ -11,7 +11,7 @@ class CodedValue(BaseModel):
     # None until semantic enrichment assigns it: structural profiling can observe that a
     # code exists, but only the semantic pass can say what it means.
     meaning: str | None = None
-    # Provenance of `meaning`: "correlated" | "lookup" | "dictionary" | None (ungrounded).
+    # Provenance of `meaning`: "ontology" | "correlated" | "lookup" | "dictionary" | None.
     source: str | None = None
 
 
