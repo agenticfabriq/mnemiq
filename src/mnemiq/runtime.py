@@ -19,6 +19,7 @@ from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
 from mnemiq.semantic.retrieval import retrieve
+from mnemiq.semantic.ontology_index import OntologyIndex
 from mnemiq.semantic.values import ValueIndex
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy, build_access_policy
@@ -61,6 +62,7 @@ class Runtime:
     router: Router = field(default_factory=StaticRouter)
     loaded_versions: dict[str, str] = field(default_factory=dict)
     sink: Any = None  # observability sink; None = NullSink (no record written)
+    ontology: Any = None  # OntologyIndex reader; None = no question-time code resolution
 
     def reload_if_stale(self) -> None:
         """Hot-swap the in-memory snapshot when the shared version pointer has advanced to a
@@ -84,6 +86,11 @@ class Runtime:
             self.con, question, identity, self.authz, self.embedder,
             k=self.settings.retrieval_k if self.settings else 12,
             table_facts=self.snapshot.table_facts if self.snapshot else (),
+            # Definitions ride with the snapshot: the glossary channel had no runtime producer
+            # until the ontology digest, so this stayed unfed from Plan 08 until SP1.
+            definitions=self.snapshot.definitions if self.snapshot else (),
+            columns=self.snapshot.columns if self.snapshot else (),
+            ontology_index=self.ontology,
         )
         grants = self.authz.grants_for(identity)
         answer = agent.answer(packet, self.snapshot, grants, identity)
@@ -251,6 +258,9 @@ def build_runtime(settings: Settings) -> Runtime:
         sink = NullSink()
     corrector = LLMCorrector(client)
     values = ValueIndex(con)
+    # Built at enrich time and persisted, exactly like the value index -- so ask-time needs the
+    # store, not the records file. An unindexed store simply resolves nothing.
+    ontology = OntologyIndex(con)
     selector = LLMSelector(client)
     # Per-mode result verifier: sanity (free) in every mode, judge in `deep`; the judge is
     # built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
@@ -281,4 +291,5 @@ def build_runtime(settings: Settings) -> Runtime:
         router=StaticRouter(default=default_mode),
         loaded_versions=loaded_versions,
         sink=sink,
+        ontology=ontology,
     )
