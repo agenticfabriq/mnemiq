@@ -215,3 +215,12 @@ def test_ontology_records_path_defaults_none(monkeypatch):
     assert Settings().ontology_records_path is None
     monkeypatch.setenv("MNEMIQ_ONTOLOGY_RECORDS_PATH", "/x/records.json")
     assert Settings().ontology_records_path == "/x/records.json"
+
+
+def test_verity_config_defaults_none(monkeypatch):
+    from mnemiq.config import Settings
+
+    monkeypatch.delenv("MNEMIQ_VERITY_RECORDS_URL", raising=False)
+    assert Settings().verity_records_url is None
+    monkeypatch.setenv("MNEMIQ_VERITY_RECORDS_URL", "https://verity.example/api/semantic/records")
+    assert Settings().verity_records_url.endswith("/api/semantic/records")

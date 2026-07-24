@@ -54,6 +54,8 @@ class Settings(BaseSettings):
     enrich_examples: bool = Field(default=False, description="eval: verified-example enrichment phase (plan-20, default off)")
     dictionary_path: str | None = Field(default=None, description="operator code data-dictionary JSON path (grounds code meanings)")
     ontology_records_path: str | None = Field(default=None, description="ontology records JSON path (binds code schemes, grounds bare codes)")
+    verity_records_url: str | None = Field(default=None, description="Verity GET /api/semantic/records endpoint (governed certified records)")
+    verity_token: str | None = Field(default=None, description="bearer token for the Verity records endpoint; tenant is derived from it")
     retrieval_k: int = Field(default=12, ge=1, description="schema cards retrieved into the generation packet")
     principal: str | None = Field(default=None, description="MCP standalone identity: principal id")
     roles: str | None = Field(default=None, description="MCP standalone identity: comma-separated roles")
