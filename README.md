@@ -67,6 +67,12 @@ source → enrichment (profiling + LLM descriptions + foreign keys + glossary)
        → execution → synthesis → trace
 ```
 
+## Grounding code columns
+
+Short codes like `E11` or `NC-17` mean nothing on their own. mnemiq grounds them from the data
+itself, from a standard code system (an ontology in TTL/SKOS/OWL), or from a hand-written operator
+dictionary — always **grounded-or-bare**, never guessed. See [docs/grounding.md](docs/grounding.md).
+
 ## Open core
 
 The engine is Apache-2.0 and stands alone. Two commercial planes build on it and are **not**
