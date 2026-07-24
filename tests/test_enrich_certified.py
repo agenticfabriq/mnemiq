@@ -1,0 +1,57 @@
+from mnemiq.contract import (
+    CertifiedRecord, CodedValue, CodeScheme, Column, Definition, RecordEnvelope, Snapshot,
+)
+
+
+def _env(object_type, object_id):
+    return RecordEnvelope(object_type=object_type, object_id=object_id,
+                          version="v1", source_system="pg")
+
+
+def _local_snapshot():
+    # a locally-profiled column: has structure (data_type/stats), no meaning yet
+    return Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="orders.status", object_id="orders", name="status", data_type="text",
+               distinct_count=3, row_count=100,
+               coded_values=[CodedValue(code="N"), CodedValue(code="S")])])
+
+
+def test_column_merge_takes_meaning_from_cert_and_structure_from_local():
+    from mnemiq.enrichment.certified import apply_certified
+
+    cert_col = Column(id="orders.status", object_id="orders", name="status",
+                      description="Order status.", semantic_type="category",
+                      coded_values=[CodedValue(code="N", meaning="New"),
+                                    CodedValue(code="S", meaning="Shipped")],
+                      code_scheme=CodeScheme(id="urn:status", label="Order Status"))
+    out = apply_certified(_local_snapshot(),
+                          [CertifiedRecord(envelope=_env("column", "orders.status"), payload=cert_col)])
+    col = next(c for c in out.columns if c.id == "orders.status")
+
+    # meaning from cert
+    assert col.description == "Order status."
+    assert col.code_scheme.label == "Order Status"
+    assert {cv.code: cv.meaning for cv in col.coded_values} == {"N": "New", "S": "Shipped"}
+    assert all(cv.source == "certified" for cv in col.coded_values)
+    # structure stays local
+    assert col.data_type == "text"
+    assert col.distinct_count == 3 and col.row_count == 100
+
+
+def test_standalone_definition_record_is_added():
+    from mnemiq.enrichment.certified import apply_certified
+
+    d = Definition(id="def-status", term="status", domain="ops", definition="fulfilment state")
+    out = apply_certified(_local_snapshot(),
+                          [CertifiedRecord(envelope=_env("definition", "def-status"), payload=d)])
+    assert [x.term for x in out.definitions] == ["status"]
+
+
+def test_cert_for_a_column_not_in_the_db_is_skipped():
+    from mnemiq.enrichment.certified import apply_certified
+
+    ghost = Column(id="orders.ghost", object_id="orders", name="ghost", description="nope")
+    out = apply_certified(_local_snapshot(),
+                          [CertifiedRecord(envelope=_env("column", "orders.ghost"), payload=ghost)])
+    assert not any(c.id == "orders.ghost" for c in out.columns)  # stale cert, not grounded
+    assert next(c for c in out.columns if c.id == "orders.status").description is None
