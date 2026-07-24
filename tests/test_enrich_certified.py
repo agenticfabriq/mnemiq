@@ -55,3 +55,55 @@ def test_cert_for_a_column_not_in_the_db_is_skipped():
                           [CertifiedRecord(envelope=_env("column", "orders.ghost"), payload=ghost)])
     assert not any(c.id == "orders.ghost" for c in out.columns)  # stale cert, not grounded
     assert next(c for c in out.columns if c.id == "orders.status").description is None
+
+
+def _record_json():
+    return {
+        "envelope": {"object_type": "column", "object_id": "orders.status",
+                     "version": "v1", "source_system": "pg"},
+        "payload": {"id": "orders.status", "object_id": "orders", "name": "status",
+                    "description": "Order status."},
+    }
+
+
+def test_fetch_parses_records(monkeypatch):
+    import io
+    import json as _json
+
+    from mnemiq.config import Settings
+    from mnemiq.enrichment import certified as mod
+
+    class _Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    def fake_urlopen(req, timeout=0):
+        return _Resp(_json.dumps({"records": [_record_json(),
+                                              {"envelope": {}, "payload": {}}]}).encode())
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    records = mod.fetch_certified_records(
+        Settings(verity_records_url="https://v/api/semantic/records", verity_token="t"))
+    assert len(records) == 1  # the malformed second item is skipped, not fatal
+    assert records[0].payload.description == "Order status."
+
+
+def test_fetch_is_fail_soft_on_network_error(monkeypatch):
+    import urllib.error
+
+    from mnemiq.config import Settings
+    from mnemiq.enrichment import certified as mod
+
+    def boom(req, timeout=0):
+        raise urllib.error.URLError("verity down")
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", boom)
+    assert mod.fetch_certified_records(
+        Settings(verity_records_url="https://v/api/semantic/records")) == []
+
+
+def test_fetch_returns_empty_when_unconfigured():
+    from mnemiq.config import Settings
+    from mnemiq.enrichment.certified import fetch_certified_records
+
+    assert fetch_certified_records(Settings()) == []

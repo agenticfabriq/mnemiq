@@ -19,6 +19,30 @@ _STANDALONE = {
 }
 
 
+def fetch_certified_records(settings) -> list[CertifiedRecord]:
+    """Pull certified records from Verity. Fail-soft: any network/decode error degrades to
+    local-only enrichment (mnemiq is never bricked by a Verity outage)."""
+    url = getattr(settings, "verity_records_url", None)
+    if not url:
+        return []
+    token = getattr(settings, "verity_token", None) or ""
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read())
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        logger.warning("verity records unreachable; enriching local-only: %s", exc)
+        return []
+
+    out: list[CertifiedRecord] = []
+    for item in payload.get("records", []):
+        try:
+            out.append(CertifiedRecord.model_validate(item))
+        except Exception as exc:  # one malformed record must not sink the batch
+            logger.warning("skipping malformed certified record: %s", exc)
+    return out
+
+
 def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snapshot:
     """Overlay certified MEANING onto locally-profiled STRUCTURE.
 
