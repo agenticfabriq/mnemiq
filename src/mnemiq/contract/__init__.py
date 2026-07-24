@@ -18,7 +18,7 @@ from .semantic import (
     TableFacts,
 )
 from .values import CodedValue, JoinKey, MeasureExpr
-from .records import Provenance, RecordEnvelope
+from .records import CertifiedRecord, Provenance, RecordEnvelope
 
 __all__ = [
     "CodedValue",
@@ -45,4 +45,5 @@ __all__ = [
     "write_schema",
     "Provenance",
     "RecordEnvelope",
+    "CertifiedRecord",
 ]
