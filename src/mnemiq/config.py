@@ -9,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_MODEL = "openai.gpt-5.5"
 DEFAULT_EMBED_MODEL = "openai.text-embedding-3-small"
 
-_SECRET_HINTS = ("api_key", "dsn", "password")  # fields whose value is never printed in .env.example
+_SECRET_HINTS = ("api_key", "dsn", "password", "secret")  # fields whose value is never printed in .env.example
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,9 @@ class Settings(BaseSettings):
     dictionary_path: str | None = Field(default=None, description="operator code data-dictionary JSON path (grounds code meanings)")
     ontology_records_path: str | None = Field(default=None, description="ontology records JSON path (binds code schemes, grounds bare codes)")
     verity_records_url: str | None = Field(default=None, description="Verity GET /api/semantic/records endpoint (governed certified records)")
-    verity_token: str | None = Field(default=None, description="bearer token for the Verity records endpoint; tenant is derived from it")
+    verity_token_url: str | None = Field(default=None, description="Verity POST /api/auth/token endpoint (OAuth2 client-credentials grant)")
+    verity_client_id: str | None = Field(default=None, description="Verity service client id (created in the workbench API Credentials page)")
+    verity_client_secret: str | None = Field(default=None, description="Verity service client secret; presented only to the token endpoint, never to the records endpoint")
     retrieval_k: int = Field(default=12, ge=1, description="schema cards retrieved into the generation packet")
     principal: str | None = Field(default=None, description="MCP standalone identity: principal id")
     roles: str | None = Field(default=None, description="MCP standalone identity: comma-separated roles")

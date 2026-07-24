@@ -220,7 +220,36 @@ def test_ontology_records_path_defaults_none(monkeypatch):
 def test_verity_config_defaults_none(monkeypatch):
     from mnemiq.config import Settings
 
-    monkeypatch.delenv("MNEMIQ_VERITY_RECORDS_URL", raising=False)
-    assert Settings().verity_records_url is None
+    for var in ("MNEMIQ_VERITY_RECORDS_URL", "MNEMIQ_VERITY_TOKEN_URL",
+                "MNEMIQ_VERITY_CLIENT_ID", "MNEMIQ_VERITY_CLIENT_SECRET"):
+        monkeypatch.delenv(var, raising=False)
+    s = Settings()
+    assert s.verity_records_url is None
+    assert s.verity_token_url is None
+    assert s.verity_client_id is None
+    assert s.verity_client_secret is None
+
     monkeypatch.setenv("MNEMIQ_VERITY_RECORDS_URL", "https://verity.example/api/semantic/records")
-    assert Settings().verity_records_url.endswith("/api/semantic/records")
+    monkeypatch.setenv("MNEMIQ_VERITY_TOKEN_URL", "https://verity.example/api/auth/token")
+    monkeypatch.setenv("MNEMIQ_VERITY_CLIENT_ID", "cid_abc123")
+    monkeypatch.setenv("MNEMIQ_VERITY_CLIENT_SECRET", "s3cret")
+    s = Settings()
+    assert s.verity_records_url.endswith("/api/semantic/records")
+    assert s.verity_token_url.endswith("/api/auth/token")
+    assert s.verity_client_id == "cid_abc123"
+    assert s.verity_client_secret == "s3cret"
+
+
+def test_static_verity_token_is_gone_and_the_secret_is_never_printed():
+    # The static bearer never authenticated (Verity's extractor ignored `Authorization`);
+    # slice 3 replaces it with the client-credentials exchange.
+    from mnemiq.config import Settings
+
+    assert not hasattr(Settings(), "verity_token")
+    text = Settings.env_example()
+    assert "MNEMIQ_VERITY_TOKEN=" not in text          # the old field, not TOKEN_URL
+    assert "MNEMIQ_VERITY_TOKEN_URL=" in text
+    assert "MNEMIQ_VERITY_CLIENT_ID=" in text
+    for line in text.splitlines():
+        if line.startswith("MNEMIQ_VERITY_CLIENT_SECRET"):
+            assert line.split("#")[0].strip().endswith("=")  # secret value blank
