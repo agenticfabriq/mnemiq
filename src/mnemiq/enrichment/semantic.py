@@ -56,7 +56,9 @@ def _annotated(column: Column, annotation: ColumnAnnotation) -> Column:
     )
 
 
-def enrich_semantic(snapshot: Snapshot, enricher: Enricher) -> Snapshot:
+def enrich_semantic(
+    snapshot: Snapshot, enricher: Enricher, protected: frozenset[str] = frozenset()
+) -> Snapshot:
     """The only LLM phase: give the structural facts their business meaning.
 
     The enricher proposes; this function decides. Annotations are merged onto a *copy* of the
@@ -94,6 +96,8 @@ def enrich_semantic(snapshot: Snapshot, enricher: Enricher) -> Snapshot:
 
         by_name = {a.name: a for a in annotation.columns}
         for column in columns:
+            if column.id in protected:
+                continue  # certified meaning is authoritative; the LLM never clobbers it
             if column.name in by_name:
                 annotated[column.id] = _annotated(column, by_name[column.name])
         jobs.append(
