@@ -107,3 +107,32 @@ def test_fetch_returns_empty_when_unconfigured():
     from mnemiq.enrichment.certified import fetch_certified_records
 
     assert fetch_certified_records(Settings()) == []
+
+
+def test_flow_certified_over_local_but_dictionary_over_certified():
+    """The precedence blend end to end: local grounding fills a code, certified overrides it,
+    the operator dictionary overrides certified."""
+    from mnemiq.contract import (
+        CertifiedRecord, CodedValue, Column, RecordEnvelope, Snapshot,
+    )
+    from mnemiq.enrichment.certified import apply_certified
+    from mnemiq.enrichment.dictionary import ColumnEntry, DataDictionary
+    from mnemiq.enrichment.grounding import apply_dictionary
+
+    snap = Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="orders.status", object_id="orders", name="status", data_type="text",
+               coded_values=[CodedValue(code="N", meaning="local-new", source="lookup")])])
+
+    cert = Column(id="orders.status", object_id="orders", name="status",
+                  coded_values=[CodedValue(code="N", meaning="cert-new")])
+    snap = apply_certified(
+        snap, [CertifiedRecord(envelope=RecordEnvelope(
+            object_type="column", object_id="orders.status", version="v", source_system="pg"),
+            payload=cert)])
+    assert snap.columns[0].coded_values[0].meaning == "cert-new"      # certified beat lookup
+    assert snap.columns[0].coded_values[0].source == "certified"
+
+    snap = apply_dictionary(snap, DataDictionary(columns={
+        "orders.status": ColumnEntry(codes={"N": "dict-new"})}))
+    assert snap.columns[0].coded_values[0].meaning == "dict-new"      # dictionary beat certified
+    assert snap.columns[0].coded_values[0].source == "dictionary"
