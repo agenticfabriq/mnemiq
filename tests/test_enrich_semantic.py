@@ -179,3 +179,23 @@ def test_grounded_meanings_survive_the_llm_pass(tmp_path):
     meanings = {cv.code: (cv.meaning, cv.source) for cv in status.coded_values}
     assert meanings["A"] == ("Active", "correlated")   # grounded value kept, NOT "Apple"
     assert status.description == "row status"           # description still applied
+
+
+def test_enrich_semantic_does_not_overwrite_a_protected_column():
+    from mnemiq.contract import Column, Snapshot
+    from mnemiq.enrichment.enricher import FakeEnricher
+    from mnemiq.enrichment.semantic import enrich_semantic
+
+    snap = Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="orders.status", object_id="orders", name="status", data_type="text",
+               description="CERTIFIED status."),
+        Column(id="orders.note", object_id="orders", name="note", data_type="text"),
+    ])
+    # the fake LLM would describe both columns
+    replies = {"orders": '{"columns":[{"name":"status","description":"LLM status"},'
+                         '{"name":"note","description":"LLM note"}]}'}
+    out = enrich_semantic(snap, FakeEnricher(replies), protected=frozenset({"orders.status"}))
+
+    by_id = {c.id: c for c in out.columns}
+    assert by_id["orders.status"].description == "CERTIFIED status."  # protected -> unchanged
+    assert by_id["orders.note"].description == "LLM note"             # unprotected -> annotated
