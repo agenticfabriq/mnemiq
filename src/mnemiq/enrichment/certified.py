@@ -6,6 +6,7 @@ import urllib.error
 import urllib.request
 
 from mnemiq.contract import CertifiedRecord, CodedValue, Snapshot
+from mnemiq.enrichment.verity_auth import access_token
 
 logger = logging.getLogger(__name__)
 
@@ -21,18 +22,13 @@ _STANDALONE = {
 
 
 def fetch_certified_records(settings) -> list[CertifiedRecord]:
-    """Pull certified records from Verity. Fail-soft: any network/decode error degrades to
-    local-only enrichment (mnemiq is never bricked by a Verity outage)."""
+    """Pull certified records from Verity. Fail-soft: any auth/network/decode error degrades to
+    local-only enrichment (mnemiq is never bricked by a Verity outage or a revoked credential)."""
     url = getattr(settings, "verity_records_url", None)
     if not url:
         return []
-    token = getattr(settings, "verity_token", None) or ""
-    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read())
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        logger.warning("verity records unreachable; enriching local-only: %s", exc)
+    payload = _get_records(settings, url)
+    if payload is None:
         return []
 
     out: list[CertifiedRecord] = []
@@ -42,6 +38,32 @@ def fetch_certified_records(settings) -> list[CertifiedRecord]:
         except Exception as exc:  # one malformed record must not sink the batch
             logger.warning("skipping malformed certified record: %s", exc)
     return out
+
+
+def _get_records(settings, url: str) -> dict | None:
+    """GET the records with a Bearer token, refreshing once on 401.
+
+    A 401 is the expected answer when the cached token expired server-side or the credential
+    was revoked, so it earns exactly one forced refresh + retry -- never a loop. Returns None
+    when the pull could not be completed.
+    """
+    for force_refresh in (False, True):
+        token = access_token(settings, force_refresh=force_refresh)
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        request = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                return json.loads(response.read())
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401 and token is not None and not force_refresh:
+                logger.info("verity rejected the token (401); refreshing once")
+                continue
+            logger.warning("verity records unreachable; enriching local-only: %s", exc)
+            return None
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            logger.warning("verity records unreachable; enriching local-only: %s", exc)
+            return None
+    return None
 
 
 def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snapshot:

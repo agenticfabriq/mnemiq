@@ -78,26 +78,138 @@ def _record_json():
     }
 
 
-def test_fetch_parses_records(monkeypatch):
+def test_fetch_parses_records_and_presents_the_bearer_token(monkeypatch):
     import io
     import json as _json
 
     from mnemiq.config import Settings
     from mnemiq.enrichment import certified as mod
+    from mnemiq.enrichment import verity_auth
 
     class _Resp(io.BytesIO):
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
+    verity_auth.reset_token_cache()
+    seen: list = []
+
     def fake_urlopen(req, timeout=0):
+        seen.append(req)
+        if req.full_url.endswith("/api/auth/token"):
+            return _Resp(_json.dumps({"access_token": "tok-1", "expires_in": 600}).encode())
         return _Resp(_json.dumps({"records": [_record_json(),
                                               {"envelope": {}, "payload": {}}]}).encode())
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
-    records = mod.fetch_certified_records(
-        Settings(verity_records_url="https://v/api/semantic/records", verity_token="t"))
+    records = mod.fetch_certified_records(Settings(
+        verity_records_url="https://v/api/semantic/records",
+        verity_token_url="https://v/api/auth/token",
+        verity_client_id="cid_abc123",
+        verity_client_secret="s3cret"))
+
     assert len(records) == 1  # the malformed second item is skipped, not fatal
     assert records[0].payload.description == "Order status."
+    records_request = seen[-1]
+    assert records_request.get_header("Authorization") == "Bearer tok-1"
+
+
+def test_fetch_sends_no_authorization_header_when_unconfigured(monkeypatch):
+    import io
+    import json as _json
+
+    from mnemiq.config import Settings
+    from mnemiq.enrichment import certified as mod
+    from mnemiq.enrichment import verity_auth
+
+    class _Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    verity_auth.reset_token_cache()
+    seen: list = []
+
+    def fake_urlopen(req, timeout=0):
+        seen.append(req)
+        return _Resp(_json.dumps({"records": [_record_json()]}).encode())
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    records = mod.fetch_certified_records(
+        Settings(verity_records_url="https://v/api/semantic/records"))
+
+    assert len(records) == 1
+    assert len(seen) == 1, "no token exchange without client credentials"
+    assert seen[0].get_header("Authorization") is None
+
+
+def test_fetch_refreshes_the_token_once_on_401(monkeypatch):
+    import io
+    import json as _json
+    import urllib.error
+
+    from mnemiq.config import Settings
+    from mnemiq.enrichment import certified as mod
+    from mnemiq.enrichment import verity_auth
+
+    class _Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    verity_auth.reset_token_cache()
+    minted: list = []
+    record_attempts: list = []
+
+    def fake_urlopen(req, timeout=0):
+        if req.full_url.endswith("/api/auth/token"):
+            minted.append(req)
+            return _Resp(_json.dumps(
+                {"access_token": f"tok-{len(minted)}", "expires_in": 600}).encode())
+        record_attempts.append(req.get_header("Authorization"))
+        if len(record_attempts) == 1:  # the cached token was revoked/expired server-side
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+        return _Resp(_json.dumps({"records": [_record_json()]}).encode())
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    records = mod.fetch_certified_records(Settings(
+        verity_records_url="https://v/api/semantic/records",
+        verity_token_url="https://v/api/auth/token",
+        verity_client_id="cid_abc123",
+        verity_client_secret="s3cret"))
+
+    assert len(records) == 1, "the retry after refresh must succeed"
+    assert record_attempts == ["Bearer tok-1", "Bearer tok-2"]
+    assert len(minted) == 2, "exactly one refresh"
+
+
+def test_fetch_gives_up_after_one_refresh_when_401_persists(monkeypatch):
+    import io
+    import json as _json
+    import urllib.error
+
+    from mnemiq.config import Settings
+    from mnemiq.enrichment import certified as mod
+    from mnemiq.enrichment import verity_auth
+
+    class _Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    verity_auth.reset_token_cache()
+    record_attempts: list = []
+
+    def fake_urlopen(req, timeout=0):
+        if req.full_url.endswith("/api/auth/token"):
+            return _Resp(_json.dumps({"access_token": "tok", "expires_in": 600}).encode())
+        record_attempts.append(req)
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    # A revoked credential 401s forever: degrade to local-only rather than loop.
+    assert mod.fetch_certified_records(Settings(
+        verity_records_url="https://v/api/semantic/records",
+        verity_token_url="https://v/api/auth/token",
+        verity_client_id="cid_abc123",
+        verity_client_secret="s3cret")) == []
+    assert len(record_attempts) == 2
 
 
 def test_fetch_is_fail_soft_on_network_error(monkeypatch):
