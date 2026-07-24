@@ -1,4 +1,717 @@
 {
+  "certified_record": {
+    "$defs": {
+      "CodeScheme": {
+        "description": "The code system a column's values are drawn from (ICD-10, NAICS, ...). Set by the\nontology binder from observed values, never by the LLM.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "CodeScheme",
+        "type": "object"
+      },
+      "CodedValue": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "meaning": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Meaning"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Source"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "title": "CodedValue",
+        "type": "object"
+      },
+      "Column": {
+        "properties": {
+          "code_scheme": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CodeScheme"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "coded_values": {
+            "items": {
+              "$ref": "#/$defs/CodedValue"
+            },
+            "title": "Coded Values",
+            "type": "array"
+          },
+          "data_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Data Type"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Description"
+          },
+          "distinct_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Distinct Count"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "null_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Null Count"
+          },
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          },
+          "pii_level": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Pii Level"
+          },
+          "row_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Row Count"
+          },
+          "semantic_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Semantic Type"
+          }
+        },
+        "required": [
+          "id",
+          "object_id",
+          "name"
+        ],
+        "title": "Column",
+        "type": "object"
+      },
+      "Concept": {
+        "description": "One member of a code system. `notation` is the ONLY join key to stored data -- every\nmatch downstream compares stored values against it, never against a label.",
+        "properties": {
+          "alt_labels": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Alt Labels",
+            "type": "array"
+          },
+          "broader": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Broader",
+            "type": "array"
+          },
+          "definition": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Definition"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "notation": {
+            "title": "Notation",
+            "type": "string"
+          },
+          "pref_label": {
+            "title": "Pref Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "notation",
+          "pref_label"
+        ],
+        "title": "Concept",
+        "type": "object"
+      },
+      "ConceptScheme": {
+        "properties": {
+          "concepts": {
+            "items": {
+              "$ref": "#/$defs/Concept"
+            },
+            "title": "Concepts",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "ConceptScheme",
+        "type": "object"
+      },
+      "Definition": {
+        "properties": {
+          "bound_objects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Bound Objects",
+            "type": "array"
+          },
+          "definition": {
+            "title": "Definition",
+            "type": "string"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Depends On",
+            "type": "array"
+          },
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "parents": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Parents",
+            "type": "array"
+          },
+          "term": {
+            "title": "Term",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "term",
+          "domain",
+          "definition"
+        ],
+        "title": "Definition",
+        "type": "object"
+      },
+      "Dimension": {
+        "properties": {
+          "data_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Data Type"
+          },
+          "expr": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Expr"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "semantic_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Semantic Type"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "source"
+        ],
+        "title": "Dimension",
+        "type": "object"
+      },
+      "Example": {
+        "properties": {
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          },
+          "question": {
+            "title": "Question",
+            "type": "string"
+          },
+          "sql": {
+            "title": "Sql",
+            "type": "string"
+          },
+          "tables": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tables",
+            "type": "array"
+          }
+        },
+        "required": [
+          "question",
+          "sql",
+          "object_id"
+        ],
+        "title": "Example",
+        "type": "object"
+      },
+      "JoinKey": {
+        "properties": {
+          "left": {
+            "title": "Left",
+            "type": "string"
+          },
+          "right": {
+            "title": "Right",
+            "type": "string"
+          }
+        },
+        "required": [
+          "left",
+          "right"
+        ],
+        "title": "JoinKey",
+        "type": "object"
+      },
+      "MeasureExpr": {
+        "properties": {
+          "expr": {
+            "title": "Expr",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expr",
+          "source"
+        ],
+        "title": "MeasureExpr",
+        "type": "object"
+      },
+      "Metric": {
+        "properties": {
+          "compatible_dimensions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Compatible Dimensions",
+            "type": "array"
+          },
+          "grain": {
+            "title": "Grain",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "measure": {
+            "$ref": "#/$defs/MeasureExpr"
+          },
+          "owner": {
+            "title": "Owner",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "time_dimension": {
+            "title": "Time Dimension",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "status",
+          "owner",
+          "grain",
+          "measure",
+          "time_dimension"
+        ],
+        "title": "Metric",
+        "type": "object"
+      },
+      "Provenance": {
+        "description": "A portable trust marker: who vouched for a record and when. Optional -- unset on the\nlocal/open path, filled by the governed producer. Deliberately holds no governance\nmachinery; `evidence_ref` is an opaque pointer, never the evidence content.",
+        "properties": {
+          "certified_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Certified At"
+          },
+          "certifier": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Certifier"
+          },
+          "evidence_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Evidence Ref"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "Provenance",
+        "type": "object"
+      },
+      "RecordEnvelope": {
+        "description": "The thin wrapper around a per-object payload. `version` is a content hash of the payload\n(supplied by the producer); `provenance` is None until a governed producer sets it.",
+        "properties": {
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          },
+          "object_type": {
+            "title": "Object Type",
+            "type": "string"
+          },
+          "provenance": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/Provenance"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "source_system": {
+            "title": "Source System",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_type",
+          "object_id",
+          "version",
+          "source_system"
+        ],
+        "title": "RecordEnvelope",
+        "type": "object"
+      },
+      "Relationship": {
+        "properties": {
+          "cardinality": {
+            "title": "Cardinality",
+            "type": "string"
+          },
+          "from": {
+            "title": "From",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "join_keys": {
+            "items": {
+              "$ref": "#/$defs/JoinKey"
+            },
+            "title": "Join Keys",
+            "type": "array"
+          },
+          "to": {
+            "title": "To",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "from",
+          "to",
+          "cardinality"
+        ],
+        "title": "Relationship",
+        "type": "object"
+      },
+      "TableFacts": {
+        "properties": {
+          "canonical_measures": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Canonical Measures",
+            "type": "object"
+          },
+          "default_time_column": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Default Time Column"
+          },
+          "gotchas": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Gotchas",
+            "type": "array"
+          },
+          "grain": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Grain"
+          },
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id"
+        ],
+        "title": "TableFacts",
+        "type": "object"
+      }
+    },
+    "description": "One certifiable object plus its envelope. `object_type` in the envelope discriminates the\npayload; the payload is a reused domain type, never a parallel record type.",
+    "properties": {
+      "envelope": {
+        "$ref": "#/$defs/RecordEnvelope"
+      },
+      "payload": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/Column"
+          },
+          {
+            "$ref": "#/$defs/Definition"
+          },
+          {
+            "$ref": "#/$defs/Metric"
+          },
+          {
+            "$ref": "#/$defs/Dimension"
+          },
+          {
+            "$ref": "#/$defs/Relationship"
+          },
+          {
+            "$ref": "#/$defs/ConceptScheme"
+          },
+          {
+            "$ref": "#/$defs/TableFacts"
+          },
+          {
+            "$ref": "#/$defs/Example"
+          }
+        ],
+        "title": "Payload"
+      }
+    },
+    "required": [
+      "envelope",
+      "payload"
+    ],
+    "title": "CertifiedRecord",
+    "type": "object"
+  },
+  "format_version": "1.0.0",
   "identity_context": {
     "properties": {
       "attributes": {
@@ -48,6 +761,177 @@
       "principal_id"
     ],
     "title": "IdentityContext",
+    "type": "object"
+  },
+  "ontology_records": {
+    "$defs": {
+      "Concept": {
+        "description": "One member of a code system. `notation` is the ONLY join key to stored data -- every\nmatch downstream compares stored values against it, never against a label.",
+        "properties": {
+          "alt_labels": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Alt Labels",
+            "type": "array"
+          },
+          "broader": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Broader",
+            "type": "array"
+          },
+          "definition": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Definition"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "notation": {
+            "title": "Notation",
+            "type": "string"
+          },
+          "pref_label": {
+            "title": "Pref Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "notation",
+          "pref_label"
+        ],
+        "title": "Concept",
+        "type": "object"
+      },
+      "ConceptScheme": {
+        "properties": {
+          "concepts": {
+            "items": {
+              "$ref": "#/$defs/Concept"
+            },
+            "title": "Concepts",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Description"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "ConceptScheme",
+        "type": "object"
+      },
+      "Definition": {
+        "properties": {
+          "bound_objects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Bound Objects",
+            "type": "array"
+          },
+          "definition": {
+            "title": "Definition",
+            "type": "string"
+          },
+          "depends_on": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Depends On",
+            "type": "array"
+          },
+          "domain": {
+            "title": "Domain",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "parents": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Parents",
+            "type": "array"
+          },
+          "term": {
+            "title": "Term",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "term",
+          "domain",
+          "definition"
+        ],
+        "title": "Definition",
+        "type": "object"
+      }
+    },
+    "description": "The portable artifact. Two producers -- mnemiq's lean digest and the governed plane --\nemit this same shape; the engine cannot tell them apart, which is the point.\n\n`bindings` carries EXPLICIT operator bindings only. Auto-binding needs observed values and\ntherefore cannot happen at digest time; it runs at enrich time (see binder.py).",
+    "properties": {
+      "bindings": {
+        "additionalProperties": {
+          "type": "string"
+        },
+        "title": "Bindings",
+        "type": "object"
+      },
+      "definitions": {
+        "items": {
+          "$ref": "#/$defs/Definition"
+        },
+        "title": "Definitions",
+        "type": "array"
+      },
+      "schemes": {
+        "items": {
+          "$ref": "#/$defs/ConceptScheme"
+        },
+        "title": "Schemes",
+        "type": "array"
+      },
+      "version": {
+        "default": "",
+        "title": "Version",
+        "type": "string"
+      }
+    },
+    "title": "OntologyRecords",
     "type": "object"
   },
   "snapshot": {
