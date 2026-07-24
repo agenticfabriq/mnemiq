@@ -5,7 +5,7 @@ import json
 
 from pydantic import BaseModel, Field, ValidationError
 
-from mnemiq.contract import Definition
+from mnemiq.contract.semantic import Definition
 
 
 class Concept(BaseModel):
