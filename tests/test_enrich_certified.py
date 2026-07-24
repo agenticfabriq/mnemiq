@@ -47,6 +47,18 @@ def test_standalone_definition_record_is_added():
     assert [x.term for x in out.definitions] == ["status"]
 
 
+def test_standalone_dimension_record_is_routed_into_snapshot():
+    from mnemiq.enrichment.certified import apply_certified
+    from mnemiq.contract import Dimension
+
+    dim = Dimension(id="dim-region", label="Region", source="orders.region")
+    out = apply_certified(
+        _local_snapshot(),
+        [CertifiedRecord(envelope=_env("dimension", "dim-region"), payload=dim)],
+    )
+    assert any(d.id == "dim-region" for d in out.dimensions)
+
+
 def test_cert_for_a_column_not_in_the_db_is_skipped():
     from mnemiq.enrichment.certified import apply_certified
 
