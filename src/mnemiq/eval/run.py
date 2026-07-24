@@ -21,16 +21,27 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
     if not settings.pg_dsn:
         print("set MNEMIQ_PG_DSN")
         return 1
+    from mnemiq.enrichment.certified import apply_certified, fetch_certified_records
     from mnemiq.enrichment.dictionary import load_dictionary
-    from mnemiq.enrichment.grounding import ground_codes
+    from mnemiq.enrichment.grounding import apply_dictionary, ground_codes
+    from mnemiq.enrichment.pipeline import content_version
     from mnemiq.ontology.records import load_records
 
     adapter = DuckDBPostgresAdapter(settings.pg_dsn)
     _snap = enrich_structural(adapter, settings.source_id)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
-    _snap = ground_codes(adapter, _snap, _dict, _onto)
-    snapshot = enrich_semantic(_snap, LLMEnricher(LLMClient(settings)))
+    _certified = fetch_certified_records(settings)
+    # precedence: ontology < correlated < lookup < certified < dictionary
+    _snap = ground_codes(adapter, _snap, dictionary=None, ontology=_onto)
+    _snap = apply_certified(_snap, _certified)
+    _protected = frozenset(r.envelope.object_id for r in _certified
+                           if r.envelope.object_type == "column")
+    _snap = enrich_semantic(_snap, LLMEnricher(LLMClient(settings)), protected=_protected)
+    if _dict:
+        _snap = apply_dictionary(_snap, _dict)
+        _snap.version = content_version(_snap)
+    snapshot = _snap
     ask, client = build_engine(snapshot, adapter, settings)
     results = [run_case(c, ask, adapter) for c in load_cases(golden)]
     report = summarize(results, tokens=client.total_tokens, llm_calls=client.calls)

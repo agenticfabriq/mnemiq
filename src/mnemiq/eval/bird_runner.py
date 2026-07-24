@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -64,7 +65,7 @@ def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str]) 
 # Facts/examples default OFF (settings.enrich_facts/enrich_examples): the plan-20 A/B measured both
 # phases as regressions on a strong frontier model (facts -2.9, facts+examples -8.0 strict). Parked
 # as opt-in plumbing; set MNEMIQ_ENRICH_FACTS/EXAMPLES=1 (a weaker/local model may need scaffolding).
-def _enrich_cache_suffix(settings: Settings) -> str:
+def _enrich_cache_suffix(settings: Settings, certified_digest: str = "") -> str:
     parts = []
     if settings.enrich_facts:
         parts.append("facts")
@@ -83,6 +84,9 @@ def _enrich_cache_suffix(settings: Settings) -> str:
         parts.append(
             "onto" + hashlib.sha256(settings.ontology_records_path.encode()).hexdigest()[:6]
         )
+    if certified_digest:
+        # a changed set of certified records must not reuse a snapshot built from another set
+        parts.append("cert" + certified_digest[:6])
     return f"__{'_'.join(parts)}" if parts else ""
 
 
@@ -98,9 +102,17 @@ def enrich_bird_db(
     is the key -- the enriched snapshot depends on the model, so switching models must not
     silently reuse another model's enrichment. The facts/examples toggles enter the key too,
     so an A/B run never reuses another config's enrichment."""
+    from mnemiq.enrichment.certified import apply_certified, fetch_certified_records
+
+    _certified = fetch_certified_records(settings)
+    _cert_digest = hashlib.sha256(
+        "".join(sorted(r.envelope.version for r in _certified)).encode()
+    ).hexdigest() if _certified else ""
+
     model_slug = (settings.llm_model or "default").replace("/", "_")
     cache_path = (
-        os.path.join(cache_dir, f"{db_id}__{model_slug}{_enrich_cache_suffix(settings)}.json")
+        os.path.join(cache_dir,
+                     f"{db_id}__{model_slug}{_enrich_cache_suffix(settings, _cert_digest)}.json")
         if cache_dir else None
     )
     if cache_path and not refresh and os.path.isfile(cache_path):
@@ -108,16 +120,21 @@ def enrich_bird_db(
             return Snapshot.model_validate_json(fh.read())
 
     from mnemiq.enrichment.dictionary import load_dictionary
-    from mnemiq.enrichment.grounding import ground_codes
+    from mnemiq.enrichment.grounding import apply_dictionary, ground_codes
+    from mnemiq.enrichment.pipeline import content_version
     from mnemiq.ontology.records import load_records
 
     adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
     snapshot = enrich_structural(adapter, db_id)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
-    snapshot = ground_codes(adapter, snapshot, _dict, _onto)
+    # precedence: ontology < correlated < lookup < certified < dictionary
+    snapshot = ground_codes(adapter, snapshot, dictionary=None, ontology=_onto)
+    snapshot = apply_certified(snapshot, _certified)
     if semantic:
-        snapshot = enrich_semantic(snapshot, LLMEnricher(LLMClient(settings)))
+        _protected = frozenset(r.envelope.object_id for r in _certified
+                               if r.envelope.object_type == "column")
+        snapshot = enrich_semantic(snapshot, LLMEnricher(LLMClient(settings)), protected=_protected)
         if settings.enrich_facts:
             snapshot = enrich_table_facts(snapshot, LLMFactsEnricher(LLMClient(settings)))
         if settings.enrich_examples:
@@ -125,6 +142,10 @@ def enrich_bird_db(
                 snapshot, LLMExampleGenerator(LLMClient(settings)),
                 adapter, dialect=adapter.dialect,
             )
+
+    if _dict:
+        snapshot = apply_dictionary(snapshot, _dict)  # the operator's final override
+        snapshot.version = content_version(snapshot)  # re-version: dict landed after enrich_semantic
 
     if cache_path:
         os.makedirs(cache_dir, exist_ok=True)
