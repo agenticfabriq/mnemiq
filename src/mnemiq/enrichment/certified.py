@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 _STANDALONE = {
     "definition": "definitions",
     "metric": "metrics",
+    "dimension": "dimensions",
     "relationship": "relationships",
     "table_facts": "table_facts",
     "example": "examples",
