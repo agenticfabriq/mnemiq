@@ -43,3 +43,12 @@ def test_enrich_cache_suffix_separates_ontology_runs():
     onto = _enrich_cache_suffix(Settings(ontology_records_path="/x/a.json"))
     other = _enrich_cache_suffix(Settings(ontology_records_path="/x/b.json"))
     assert plain != onto and onto != other
+
+
+def test_enrich_cache_suffix_separates_certified_record_sets():
+    from mnemiq.config import Settings
+    from mnemiq.eval.bird_runner import _enrich_cache_suffix
+
+    s = Settings(verity_records_url="https://v/api/semantic/records")
+    assert _enrich_cache_suffix(s, certified_digest="") == _enrich_cache_suffix(s)
+    assert _enrich_cache_suffix(s, certified_digest="aaa") != _enrich_cache_suffix(s, certified_digest="bbb")

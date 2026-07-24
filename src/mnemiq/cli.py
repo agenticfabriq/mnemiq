@@ -116,16 +116,27 @@ def _cmd_enrich(settings: Settings) -> int:
     if not settings.pg_dsn:
         print("set MNEMIQ_PG_DSN", file=sys.stderr)
         return 1
+    from mnemiq.enrichment.certified import apply_certified, fetch_certified_records
     from mnemiq.enrichment.dictionary import load_dictionary
-    from mnemiq.enrichment.grounding import ground_codes
+    from mnemiq.enrichment.grounding import apply_dictionary, ground_codes
+    from mnemiq.enrichment.pipeline import content_version
     from mnemiq.ontology.records import load_records
 
     adapter = DuckDBPostgresAdapter(settings.pg_dsn)
     snap = enrich_structural(adapter, settings.source_id)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
-    snap = ground_codes(adapter, snap, _dict, _onto)
-    snap = enrich_semantic(snap, LLMEnricher(LLMClient(settings)))
+    _certified = fetch_certified_records(settings)
+
+    # precedence: ontology < correlated < lookup < certified < dictionary
+    snap = ground_codes(adapter, snap, dictionary=None, ontology=_onto)  # local grounding, no dict yet
+    snap = apply_certified(snap, _certified)
+    _protected = frozenset(r.envelope.object_id for r in _certified
+                           if r.envelope.object_type == "column")
+    snap = enrich_semantic(snap, LLMEnricher(LLMClient(settings)), protected=_protected)
+    if _dict:
+        snap = apply_dictionary(snap, _dict)         # the operator's final override
+        snap.version = content_version(snap)          # re-version: dict landed after enrich_semantic
     if settings.enrich_facts:
         snap = enrich_table_facts(snap, LLMFactsEnricher(LLMClient(settings)))
     if settings.enrich_examples:
