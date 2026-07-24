@@ -18,6 +18,7 @@ from .semantic import (
     TableFacts,
 )
 from .values import CodedValue, JoinKey, MeasureExpr
+from .records import Provenance, RecordEnvelope
 
 __all__ = [
     "CodedValue",
@@ -42,4 +43,6 @@ __all__ = [
     "Trace",
     "export_json_schema",
     "write_schema",
+    "Provenance",
+    "RecordEnvelope",
 ]
