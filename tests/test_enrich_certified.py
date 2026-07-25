@@ -260,3 +260,45 @@ def test_flow_certified_over_local_but_dictionary_over_certified():
         "orders.status": ColumnEntry(codes={"N": "dict-new"})}))
     assert snap.columns[0].coded_values[0].meaning == "dict-new"      # dictionary beat certified
     assert snap.columns[0].coded_values[0].source == "dictionary"
+
+
+def test_certified_concept_schemes_are_reconstructed():
+    from mnemiq.enrichment.certified import certified_concept_schemes
+
+    rec = CertifiedRecord.model_validate({
+        "envelope": {"object_type": "concept_scheme", "object_id": "mpaa", "version": "v1",
+                     "source_system": "ontology:mpaa"},
+        "payload": {"id": "mpaa", "label": "MPAA rating", "description": "Film ratings.",
+                    "concepts": [{"id": "mpaa:R", "notation": "R", "pref_label": "Restricted"}]},
+    })
+    # a non-scheme record must be ignored by the extractor
+    other = CertifiedRecord.model_validate({
+        "envelope": {"object_type": "definition", "object_id": "d1", "version": "v1",
+                     "source_system": "ontology:mpaa"},
+        "payload": {"id": "d1", "term": "t", "domain": "ontology", "definition": "d"},
+    })
+    schemes = certified_concept_schemes([rec, other])
+    assert [s.id for s in schemes] == ["mpaa"]
+    assert schemes[0].concepts[0].notation == "R"
+
+
+def test_certified_public_definition_visible_and_nonpublic_unbound_hidden():
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.enrichment.certified import apply_certified
+    from mnemiq.semantic.glossary import select_definitions
+
+    def _def_record(public):
+        return CertifiedRecord.model_validate({
+            "envelope": {"object_type": "definition", "object_id": "d1", "version": "v1",
+                         "source_system": "ontology:mpaa"},
+            "payload": {"id": "d1", "term": "MPAA rating", "domain": "ontology",
+                        "definition": "MPAA film ratings.", "public": public,
+                        "bound_objects": [], "parents": [], "depends_on": []},
+        })
+
+    # a public certified definition is visible to a caller holding no grants (item 1)
+    snap = apply_certified(Snapshot(version="v", source_id="s", created_at="t"), [_def_record(True)])
+    assert select_definitions("what is the MPAA rating?", snap.definitions, GrantSet(frozenset()))
+    # the same definition without `public`, unbound, is visible to no one (fail-closed)
+    snap = apply_certified(Snapshot(version="v", source_id="s", created_at="t"), [_def_record(False)])
+    assert select_definitions("what is the MPAA rating?", snap.definitions, GrantSet(frozenset())) == []

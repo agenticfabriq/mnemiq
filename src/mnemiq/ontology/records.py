@@ -46,6 +46,22 @@ def records_version(records: OntologyRecords) -> str:
     return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
+def merge_records(local, certified_schemes):
+    """Union local-digest schemes with governed (Verity-certified) schemes by scheme id; certified
+    wins on a collision -- the governed source outranks the local digest, matching the
+    certified > ontology precedence. Local definitions and explicit bindings are preserved."""
+    by_id = {s.id: s for s in (local.schemes if local else [])}
+    for scheme in certified_schemes:
+        by_id[scheme.id] = scheme  # certified overrides local on id collision
+    records = OntologyRecords(
+        schemes=sorted(by_id.values(), key=lambda s: s.id),
+        definitions=list(local.definitions) if local else [],
+        bindings=dict(local.bindings) if local else {},
+    )
+    records.version = records_version(records)
+    return records
+
+
 def load_records(path: str) -> OntologyRecords:
     """Parse an ontology records artifact (JSON). Raises ValueError on malformed input."""
     try:

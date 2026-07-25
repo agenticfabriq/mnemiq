@@ -19,18 +19,23 @@ def content_version(snapshot: Snapshot) -> str:
     Covers the observed codes -- and, after semantic enrichment, the descriptions and code
     meanings -- so a shifted vocabulary invalidates downstream caches. Excludes created_at
     and jobs: those are run bookkeeping, not content.
+
+    The ontology vocabulary lives outside the columns (a column carries only its scheme id/label
+    via `code_scheme`, never the concepts), so `ontology_version` -- the merged local+certified
+    OntologyRecords version -- is folded in too, when present. That closes the gap where a changed
+    governed scheme (an edited concept label, an added code) that does not rebind any column would
+    otherwise reuse a stale enrichment. Included only when set, so non-ontology snapshots keep the
+    exact same version they had before this field existed.
     """
-    payload = json.dumps(
-        {
-            "source_id": snapshot.source_id,
-            "columns": [c.model_dump(by_alias=True) for c in snapshot.columns],
-            "relationships": [r.model_dump(by_alias=True) for r in snapshot.relationships],
-            "source_bindings": [b.model_dump(by_alias=True) for b in snapshot.source_bindings],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
+    body: dict = {
+        "source_id": snapshot.source_id,
+        "columns": [c.model_dump(by_alias=True) for c in snapshot.columns],
+        "relationships": [r.model_dump(by_alias=True) for r in snapshot.relationships],
+        "source_bindings": [b.model_dump(by_alias=True) for b in snapshot.source_bindings],
+    }
+    if snapshot.ontology_version:
+        body["ontology_version"] = snapshot.ontology_version
+    payload = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
