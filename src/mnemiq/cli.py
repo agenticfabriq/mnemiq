@@ -119,17 +119,23 @@ def _cmd_enrich(settings: Settings) -> int:
     if not settings.pg_dsn:
         print("set MNEMIQ_PG_DSN", file=sys.stderr)
         return 1
-    from mnemiq.enrichment.certified import apply_certified, fetch_certified_records
+    from mnemiq.enrichment.certified import (
+        apply_certified, certified_concept_schemes, fetch_certified_records,
+    )
     from mnemiq.enrichment.dictionary import load_dictionary
     from mnemiq.enrichment.grounding import apply_dictionary, ground_codes
     from mnemiq.enrichment.pipeline import content_version
-    from mnemiq.ontology.records import load_records
+    from mnemiq.ontology.records import load_records, merge_records
 
     adapter = DuckDBPostgresAdapter(settings.pg_dsn)
     snap = enrich_structural(adapter, settings.source_id)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
     _certified = fetch_certified_records(settings)
+    # Governed concept schemes join the local digest before binding + indexing; certified wins.
+    _cert_schemes = certified_concept_schemes(_certified)
+    if _cert_schemes:
+        _onto = merge_records(_onto, _cert_schemes)
 
     # precedence: ontology < correlated < lookup < certified < dictionary
     snap = ground_codes(adapter, snap, dictionary=None, ontology=_onto)  # local grounding, no dict yet
