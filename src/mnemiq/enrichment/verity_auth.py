@@ -4,6 +4,7 @@ import json
 import logging
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 logger = logging.getLogger(__name__)
@@ -50,13 +51,16 @@ def access_token(settings, *, force_refresh: bool = False) -> str | None:
         if cached is not None and cached[1] > time.time():
             return cached[0]
 
-    body = json.dumps({
+    # Keycloak's token endpoint is standard OAuth2: a form-urlencoded body, not JSON. The client
+    # secret rides in the body (client_secret_post); it is never logged (see the except below).
+    body = urllib.parse.urlencode({
         "grant_type": "client_credentials",
         "client_id": client_id,
         "client_secret": client_secret,
     }).encode()
     request = urllib.request.Request(
-        token_url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        token_url, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             payload = json.loads(response.read())
