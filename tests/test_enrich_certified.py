@@ -260,3 +260,23 @@ def test_flow_certified_over_local_but_dictionary_over_certified():
         "orders.status": ColumnEntry(codes={"N": "dict-new"})}))
     assert snap.columns[0].coded_values[0].meaning == "dict-new"      # dictionary beat certified
     assert snap.columns[0].coded_values[0].source == "dictionary"
+
+
+def test_certified_concept_schemes_are_reconstructed():
+    from mnemiq.enrichment.certified import certified_concept_schemes
+
+    rec = CertifiedRecord.model_validate({
+        "envelope": {"object_type": "concept_scheme", "object_id": "mpaa", "version": "v1",
+                     "source_system": "ontology:mpaa"},
+        "payload": {"id": "mpaa", "label": "MPAA rating", "description": "Film ratings.",
+                    "concepts": [{"id": "mpaa:R", "notation": "R", "pref_label": "Restricted"}]},
+    })
+    # a non-scheme record must be ignored by the extractor
+    other = CertifiedRecord.model_validate({
+        "envelope": {"object_type": "definition", "object_id": "d1", "version": "v1",
+                     "source_system": "ontology:mpaa"},
+        "payload": {"id": "d1", "term": "t", "domain": "ontology", "definition": "d"},
+    })
+    schemes = certified_concept_schemes([rec, other])
+    assert [s.id for s in schemes] == ["mpaa"]
+    assert schemes[0].concepts[0].notation == "R"

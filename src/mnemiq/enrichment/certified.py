@@ -7,6 +7,7 @@ import urllib.request
 
 from mnemiq.contract import CertifiedRecord, CodedValue, Snapshot
 from mnemiq.enrichment.verity_auth import access_token
+from mnemiq.ontology.records import ConceptScheme
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,18 @@ def _get_records(settings, url: str) -> dict | None:
             logger.warning("verity records unreachable; enriching local-only: %s", exc)
             return None
     return None
+
+
+def certified_concept_schemes(records: list[CertifiedRecord]) -> list[ConceptScheme]:
+    """The certified `concept_scheme` records as ConceptScheme objects. The records pull already
+    resolved each payload to its typed form, so this is a typed filter; non-scheme records are
+    ignored (definitions flow via apply_certified). Never raises -- fail-soft like the rest of the pull."""
+    return [
+        record.payload
+        for record in records
+        if record.envelope.object_type == "concept_scheme"
+        and isinstance(record.payload, ConceptScheme)
+    ]
 
 
 def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snapshot:
