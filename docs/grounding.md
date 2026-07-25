@@ -76,6 +76,15 @@ A concept with no `skos:notation` cannot ground a code (there is nothing to matc
 dropped from the scheme. The output `records.json` is a portable artifact; you can inspect or edit
 it by hand.
 
+**Public vs. confidential definitions (`--public`).** Definition visibility is *fail-closed*. By
+default the definitions a digest produces are shown to a caller only when they are *bound* to a
+table that caller is granted. Pass `--public` when the vocabulary is a public standard whose text
+names no table of yours — MPAA ratings, ICD-10, NAICS — to mark its definitions visible to every
+identity. Omit it for a confidential internal taxonomy: an unmarked, unbound definition is visible
+to **no one**, so a private vocabulary can never leak by being shipped unbound. (Migration: records
+digested before this flag existed carry no marker and default to non-public; re-run the digest with
+`--public` to restore a standard vocabulary's definitions.)
+
 ### 3. Enrich with the records
 
 ```
