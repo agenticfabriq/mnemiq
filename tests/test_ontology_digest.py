@@ -34,3 +34,14 @@ def test_digest_emits_one_definition_per_scheme_plus_non_member_classes():
     assert "Sample Batch" in terms   # a class with a definition, member of no scheme
     assert "Red" not in terms        # scheme MEMBERS never become Definitions
     assert all(d.bound_objects == [] for d in records.definitions)  # binding happens later
+
+
+def test_definitions_are_nonpublic_by_default_and_public_when_declared():
+    from mnemiq.ontology.digest import digest_ontology
+
+    # Fail-closed: without --public the produced definitions are not globally visible.
+    default = digest_ontology([f"{FIXTURES}/skos_scheme.ttl"])
+    assert default.definitions and all(d.public is False for d in default.definitions)
+
+    declared = digest_ontology([f"{FIXTURES}/skos_scheme.ttl"], public=True)
+    assert declared.definitions and all(d.public is True for d in declared.definitions)

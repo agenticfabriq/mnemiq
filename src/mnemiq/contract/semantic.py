@@ -62,6 +62,11 @@ class Definition(BaseModel):
     term: str
     domain: str
     definition: str
+    # Fail-closed visibility. A definition is shown only if it is `public` (a standard whose text
+    # names no table -- MPAA, ICD-10) OR it is bound to objects the identity is granted. An unbound,
+    # non-public definition (a confidential internal taxonomy) is therefore visible to no one, rather
+    # than to everyone as `all([]) == True` would otherwise imply.
+    public: bool = False
     bound_objects: list[str] = Field(default_factory=list)
     parents: list[str] = Field(default_factory=list)
     depends_on: list[str] = Field(default_factory=list)

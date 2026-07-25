@@ -48,6 +48,9 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--ttl", action="append", required=True,
                    help="a .ttl file or a directory of them; repeatable")
     d.add_argument("--out", required=True, help="output records JSON path")
+    d.add_argument("--public", action="store_true",
+                   help="mark these definitions as a public standard (visible to every identity); "
+                        "omit for a confidential taxonomy, which stays hidden unless bound+granted")
 
     sub.add_parser("serve", help="run the MCP server on stdio")
     sub.add_parser("metrics", help="print observability SLOs from the answer log")
@@ -84,7 +87,7 @@ def _cmd_digest_ontology(args) -> int:
         return 1
 
     try:
-        records = digest_ontology(paths)
+        records = digest_ontology(paths, public=args.public)
     except ImportError:
         print("digest-ontology needs the ontology extra: pip install 'mnemiq[ontology]'",
               file=sys.stderr)

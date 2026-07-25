@@ -51,11 +51,15 @@ def _concept(graph, subject) -> Concept | None:
     )
 
 
-def digest_ontology(paths: Sequence[str]) -> OntologyRecords:
+def digest_ontology(paths: Sequence[str], public: bool = False) -> OntologyRecords:
     """Deterministic TTL/SKOS/OWL -> records. No LLM, no network, no inference.
 
     Two shapes are recognised: an explicit skos:ConceptScheme whose members declare
     skos:inScheme, and (fallback) an owl:Class whose rdfs:subClassOf children carry notations.
+
+    `public` marks the produced definitions as a public standard (visible to every identity).
+    It defaults False -- fail-closed -- so a confidential taxonomy is not globally visible unless
+    the operator declares the ontology public (`mnemiq digest-ontology --public`).
     """
     from rdflib import RDF, Graph, URIRef  # lazy: rdflib is the optional `ontology` extra
 
@@ -112,6 +116,7 @@ def digest_ontology(paths: Sequence[str]) -> OntologyRecords:
                 term=scheme.label,
                 domain="ontology",
                 definition=scheme.description,
+                public=public,
             ))
     scheme_ids = {s.id for s in schemes}
     for subject in graph.subjects(RDF.type, URIRef(OWL + "Class")):
@@ -125,6 +130,7 @@ def digest_ontology(paths: Sequence[str]) -> OntologyRecords:
                 term=_label(graph, subject),
                 domain="ontology",
                 definition=text,
+                public=public,
             ))
 
     records = OntologyRecords(

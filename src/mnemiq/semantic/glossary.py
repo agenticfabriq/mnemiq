@@ -29,10 +29,18 @@ def select_definitions(
 
     A definition binding any ungranted table is never shown: it would leak that the
     table exists, and it would steer the model into SQL the decider must reject.
+
+    Visibility is fail-closed: a definition is shown only if it is `public` (a standard whose
+    text names no table) or it is bound to objects the identity is granted. An unbound,
+    non-public definition -- a confidential internal taxonomy -- is visible to no one.
     """
     selected = []
     for definition in definitions:
-        if not all(grants.allows(obj) for obj in definition.bound_objects):
+        visible = definition.public or (
+            bool(definition.bound_objects)
+            and all(grants.allows(obj) for obj in definition.bound_objects)
+        )
+        if not visible:
             continue
         if _term_pattern(definition.term).search(question):
             selected.append(definition)

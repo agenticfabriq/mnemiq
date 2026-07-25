@@ -156,13 +156,39 @@ def test_explicit_binding_bypasses_every_gate(tmp_path):
     assert next(c for c in out.columns if c.name == "zzz").code_scheme.id == "urn:colour"
 
 
-def test_ontology_definitions_stay_unbound_and_therefore_visible(tmp_path):
-    """Regression: binding a scheme definition to every table using the scheme was backwards.
-    select_definitions requires ALL bound objects to be granted, so the more widely a scheme was
-    used the FEWER identities could see what it means -- on Pagila the MPAA definition bound to
-    film plus two views, and an analyst granted only `film` saw nothing. A scheme definition
-    describes the scheme, not the tables, and its text names no table, so it discloses nothing.
-    A proprietary taxonomy needs a public/proprietary marker in the format instead (SP2)."""
+def test_public_scheme_definitions_stay_unbound_and_visible(tmp_path):
+    """The binder must NOT bind a scheme definition to every table using the scheme. That was
+    backwards: select_definitions requires ALL bound objects to be granted, so the more widely a
+    scheme was used the FEWER identities could see what it means -- on Pagila the MPAA definition
+    bound to film plus two views, and an analyst granted only `film` saw nothing. A scheme
+    definition describes the scheme, not the tables. It stays unbound; the `public` marker (SP2) is
+    what makes a standard visible to everyone, while a non-public taxonomy stays hidden (fail-closed)."""
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract import Definition
+    from mnemiq.ontology.binder import bind_schemes
+    from mnemiq.semantic.glossary import select_definitions
+
+    codes = ["R", "G", "B", "Y", "P"]
+    adapter, snap = _snapshot(tmp_path, "defs", _table("colour_code", codes))
+    records = OntologyRecords(
+        schemes=[_scheme("urn:colour", "Colour Codes", codes)],
+        definitions=[Definition(id="ontology:scheme:urn:colour", term="Colour Codes",
+                                domain="ontology", definition="A vocabulary of colours.",
+                                public=True)],
+    )
+    out = bind_schemes(adapter, snap, records)
+    assert next(d for d in out.definitions if d.term == "Colour Codes").bound_objects == []
+
+    # public + unbound survives grant filtering for an identity holding only one of the tables
+    selected = select_definitions("what is the Colour Codes scheme", out.definitions,
+                                  GrantSet(frozenset({"sample"})))
+    assert [d.term for d in selected] == ["Colour Codes"]
+
+
+def test_nonpublic_unbound_scheme_definition_is_hidden(tmp_path):
+    """Fail-closed complement: the same scheme definition WITHOUT `public` (a confidential
+    taxonomy) is unbound and therefore visible to no one -- it does not leak by being shipped
+    unbound, which is the SP1 behavior SP2 corrects."""
     from mnemiq.authz.grants import GrantSet
     from mnemiq.contract import Definition
     from mnemiq.ontology.binder import bind_schemes
@@ -176,9 +202,6 @@ def test_ontology_definitions_stay_unbound_and_therefore_visible(tmp_path):
                                 domain="ontology", definition="A vocabulary of colours.")],
     )
     out = bind_schemes(adapter, snap, records)
-    assert next(d for d in out.definitions if d.term == "Colour Codes").bound_objects == []
-
-    # and it survives grant filtering for an identity holding only one of the scheme's tables
     selected = select_definitions("what is the Colour Codes scheme", out.definitions,
-                                  GrantSet(frozenset({"sample"})))
-    assert [d.term for d in selected] == ["Colour Codes"]
+                                  GrantSet(frozenset({"colour_code"})))
+    assert selected == []
