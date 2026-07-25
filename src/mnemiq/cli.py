@@ -136,6 +136,13 @@ def _cmd_enrich(settings: Settings) -> int:
     _cert_schemes = certified_concept_schemes(_certified)
     if _cert_schemes:
         _onto = merge_records(_onto, _cert_schemes)
+    if _onto is not None:
+        # Fold the (local + certified) ontology version into the snapshot identity BEFORE the
+        # pipeline finalizes snap.version, so a changed governed scheme -- even one that edits a
+        # concept label without rebinding any column -- invalidates this cached enrichment (the
+        # store key is snap.version). code_scheme carries only the scheme id/label, so the columns
+        # alone would not reflect it.
+        snap = snap.model_copy(update={"ontology_version": _onto.version})
 
     # precedence: ontology < correlated < lookup < certified < dictionary
     snap = ground_codes(adapter, snap, dictionary=None, ontology=_onto)  # local grounding, no dict yet
