@@ -230,12 +230,14 @@ def test_verity_config_defaults_none(monkeypatch):
     assert s.verity_client_secret is None
 
     monkeypatch.setenv("MNEMIQ_VERITY_RECORDS_URL", "https://verity.example/api/semantic/records")
-    monkeypatch.setenv("MNEMIQ_VERITY_TOKEN_URL", "https://verity.example/api/auth/token")
+    monkeypatch.setenv(
+        "MNEMIQ_VERITY_TOKEN_URL",
+        "https://keycloak.example/realms/verity/protocol/openid-connect/token")
     monkeypatch.setenv("MNEMIQ_VERITY_CLIENT_ID", "cid_abc123")
     monkeypatch.setenv("MNEMIQ_VERITY_CLIENT_SECRET", "s3cret")
     s = Settings()
     assert s.verity_records_url.endswith("/api/semantic/records")
-    assert s.verity_token_url.endswith("/api/auth/token")
+    assert s.verity_token_url.endswith("/protocol/openid-connect/token")
     assert s.verity_client_id == "cid_abc123"
     assert s.verity_client_secret == "s3cret"
 
