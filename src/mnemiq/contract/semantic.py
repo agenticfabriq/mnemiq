@@ -153,6 +153,11 @@ class Snapshot(BaseModel):
     version: str
     source_id: str
     created_at: str
+    # The version of the OntologyRecords this snapshot was enriched against (local digest merged
+    # with governed/certified schemes). Folded into `content_version` so a shifted ontology
+    # vocabulary invalidates the enrichment even when it does not alter any column's `code_scheme`
+    # (which carries only the scheme id/label, never concept content). Empty = no ontology.
+    ontology_version: str = ""
     columns: list[Column] = Field(default_factory=list)
     dimensions: list[Dimension] = Field(default_factory=list)
     metrics: list[Metric] = Field(default_factory=list)

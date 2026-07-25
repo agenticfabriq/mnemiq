@@ -1744,6 +1744,11 @@
         "title": "Metrics",
         "type": "array"
       },
+      "ontology_version": {
+        "default": "",
+        "title": "Ontology Version",
+        "type": "string"
+      },
       "qualities": {
         "items": {
           "$ref": "#/$defs/Quality"
