@@ -304,6 +304,11 @@
             "title": "Parents",
             "type": "array"
           },
+          "public": {
+            "default": false,
+            "title": "Public",
+            "type": "boolean"
+          },
           "term": {
             "title": "Term",
             "type": "string"
@@ -711,7 +716,7 @@
     "title": "CertifiedRecord",
     "type": "object"
   },
-  "format_version": "1.0.0",
+  "format_version": "1.1.0",
   "identity_context": {
     "properties": {
       "attributes": {
@@ -886,6 +891,11 @@
             },
             "title": "Parents",
             "type": "array"
+          },
+          "public": {
+            "default": false,
+            "title": "Public",
+            "type": "boolean"
           },
           "term": {
             "title": "Term",
@@ -1202,6 +1212,11 @@
             },
             "title": "Parents",
             "type": "array"
+          },
+          "public": {
+            "default": false,
+            "title": "Public",
+            "type": "boolean"
           },
           "term": {
             "title": "Term",
