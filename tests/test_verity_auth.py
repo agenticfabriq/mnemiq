@@ -1,6 +1,7 @@
 import io
 import json
 import urllib.error
+import urllib.parse
 
 from mnemiq.config import Settings
 from mnemiq.enrichment import verity_auth
@@ -13,7 +14,7 @@ class _Resp(io.BytesIO):
 
 def _configured(**overrides) -> Settings:
     base = dict(verity_records_url="https://v/api/semantic/records",
-                verity_token_url="https://v/api/auth/token",
+                verity_token_url="https://kc/realms/verity/protocol/openid-connect/token",
                 verity_client_id="cid_abc123",
                 verity_client_secret="s3cret")
     base.update(overrides)
@@ -38,12 +39,14 @@ def test_access_token_posts_client_credentials_and_returns_the_token(monkeypatch
 
     assert len(calls) == 1
     request = calls[0]
-    assert request.full_url == "https://v/api/auth/token"
+    assert request.full_url == "https://kc/realms/verity/protocol/openid-connect/token"
     assert request.get_method() == "POST"
-    body = json.loads(request.data)
-    assert body["client_id"] == "cid_abc123"
-    assert body["client_secret"] == "s3cret"
-    assert body["grant_type"] == "client_credentials"
+    # Keycloak's token endpoint requires a form-encoded body, not JSON.
+    assert request.get_header("Content-type") == "application/x-www-form-urlencoded"
+    form = urllib.parse.parse_qs(request.data.decode())
+    assert form["client_id"] == ["cid_abc123"]
+    assert form["client_secret"] == ["s3cret"]
+    assert form["grant_type"] == ["client_credentials"]
 
 
 def test_access_token_is_cached_until_it_nears_expiry(monkeypatch):
@@ -97,7 +100,8 @@ def test_access_token_is_fail_soft_on_token_endpoint_failure(monkeypatch):
     verity_auth.reset_token_cache()
 
     def boom(req, timeout=0):
-        raise urllib.error.HTTPError("https://v/api/auth/token", 401, "Unauthorized", {}, None)
+        raise urllib.error.HTTPError(
+            "https://kc/realms/verity/protocol/openid-connect/token", 401, "Unauthorized", {}, None)
 
     monkeypatch.setattr(verity_auth.urllib.request, "urlopen", boom)
     assert verity_auth.access_token(_configured()) is None
