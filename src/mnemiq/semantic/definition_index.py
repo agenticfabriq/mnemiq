@@ -91,3 +91,24 @@ class DefinitionIndex:
             return []
         return [(term, text, float(score)) for term, text, score in rows if score is not None
                 and float(score) >= floor]
+
+
+class DefinitionRetriever:
+    """Enrich-time grounding: turn a table + its columns into a REFERENCE block of nearby certified
+    meaning. The query is deterministic structure (table name + column names)."""
+
+    def __init__(self, index: DefinitionIndex, embedder, k: int = 5, floor: float = -1.0) -> None:
+        # floor=-1.0 admits everything: grounding surfaces the top-k nearest reference (bounded by
+        # k, advisory "use when they clearly apply"), rather than dropping all of it when the
+        # nearest match sits below an arbitrary positive threshold. A tuned floor is a later knob.
+        self._index = index
+        self._embedder = embedder
+        self._k = k
+        self._floor = floor
+
+    def grounding_for(self, table: str, columns) -> str:
+        from mnemiq.enrichment.prompts import render_grounding_block
+
+        query = " ".join([table, *(c.name for c in columns)])
+        items = self._index.nearest(query, self._embedder, k=self._k, floor=self._floor)
+        return render_grounding_block(items)
