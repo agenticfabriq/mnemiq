@@ -16,7 +16,7 @@ def _allowed(facts: list[ColumnFacts]) -> dict[str, set[str]]:
 
 
 class Enricher(Protocol):
-    def annotate(self, table: str, facts: list[ColumnFacts]) -> TableAnnotation: ...
+    def annotate(self, table: str, facts: list[ColumnFacts], grounding: str = "") -> TableAnnotation: ...
 
 
 class LLMEnricher:
@@ -28,12 +28,12 @@ class LLMEnricher:
         self._client = client
         self._max_tokens = max_tokens
 
-    def annotate(self, table: str, facts: list[ColumnFacts]) -> TableAnnotation:
+    def annotate(self, table: str, facts: list[ColumnFacts], grounding: str = "") -> TableAnnotation:
         if not facts:
             return TableAnnotation(table=table)
 
         system = system_prompt()
-        user = user_prompt(render_table_facts(table, facts))
+        user = user_prompt(render_table_facts(table, facts), grounding)
         allowed = _allowed(facts)
 
         for _attempt in range(2):  # one bounded retry; models drop the channel occasionally
@@ -50,7 +50,9 @@ class FakeEnricher:
     def __init__(self, replies: dict[str, str] | None = None) -> None:
         self._replies = replies or {}
         self.calls: list[str] = []
+        self.grounding_calls: dict[str, str] = {}
 
-    def annotate(self, table: str, facts: list[ColumnFacts]) -> TableAnnotation:
+    def annotate(self, table: str, facts: list[ColumnFacts], grounding: str = "") -> TableAnnotation:
         self.calls.append(table)
+        self.grounding_calls[table] = grounding
         return parse_annotation(self._replies.get(table, ""), table, _allowed(facts))

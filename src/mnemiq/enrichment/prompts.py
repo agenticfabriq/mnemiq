@@ -64,6 +64,23 @@ def render_table_facts(table: str, columns: list[ColumnFacts]) -> str:
     return "\n".join(lines)
 
 
+def render_grounding_block(items: list[tuple[str, str, float]]) -> str:
+    """A demarcated REFERENCE block of certified meaning that MAY relate to the columns. Empty when
+    there is nothing to ground with, so the no-RAG prompt is byte-identical to before."""
+    if not items:
+        return ""
+    lines = [
+        "REFERENCE -- certified business definitions that may relate to these columns. Use them to",
+        "interpret a name or a code when they clearly apply. They are reference material, NOT facts",
+        "about these columns: never assert a definition's content as a fact about a column it does",
+        "not match, and never invent a column or a value from them.",
+        "",
+    ]
+    for term, text, _score in items:
+        lines.append(f"- {sanitize(term, limit=80)}: {sanitize(text, limit=300)}")
+    return "\n".join(lines)
+
+
 def system_prompt() -> str:
     types = ", ".join(SEMANTIC_TYPES)
     levels = ", ".join(PII_LEVELS)
@@ -111,5 +128,7 @@ Rules:
 """
 
 
-def user_prompt(facts_block: str) -> str:
+def user_prompt(facts_block: str, grounding_block: str = "") -> str:
+    if grounding_block:
+        return f"{grounding_block}\n\n{facts_block}\n\nDocument these columns as JSON."
     return f"{facts_block}\n\nDocument these columns as JSON."
