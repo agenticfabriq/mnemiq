@@ -57,7 +57,8 @@ def _annotated(column: Column, annotation: ColumnAnnotation) -> Column:
 
 
 def enrich_semantic(
-    snapshot: Snapshot, enricher: Enricher, protected: frozenset[str] = frozenset()
+    snapshot: Snapshot, enricher: Enricher, protected: frozenset[str] = frozenset(),
+    retriever=None,
 ) -> Snapshot:
     """The only LLM phase: give the structural facts their business meaning.
 
@@ -78,8 +79,14 @@ def enrich_semantic(
     annotated: dict[str, Column] = {}
     jobs: list[Job] = []
     for table, columns in by_table.items():
+        grounding = ""
+        if retriever is not None:
+            try:
+                grounding = retriever.grounding_for(table, columns)
+            except Exception:
+                grounding = ""  # degrade-to-local: grounding is optional, never fatal
         try:
-            annotation = enricher.annotate(table, _facts(columns, fk_map))
+            annotation = enricher.annotate(table, _facts(columns, fk_map), grounding)
         except Exception:
             annotation = None  # fail-soft: a rate-limit costs us a table, not the run
 

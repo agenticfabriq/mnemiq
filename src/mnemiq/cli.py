@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 
 from mnemiq.agent.modes import MODES
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
 from mnemiq.runtime import SnapshotMissing, build_runtime
+
+logger = logging.getLogger(__name__)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -149,7 +152,26 @@ def _cmd_enrich(settings: Settings) -> int:
     snap = apply_certified(snap, _certified)
     _protected = frozenset(r.envelope.object_id for r in _certified
                            if r.envelope.object_type == "column")
-    snap = enrich_semantic(snap, LLMEnricher(LLMClient(settings)), protected=_protected)
+    retriever = None
+    if _onto is not None:
+        try:
+            import duckdb
+
+            from mnemiq.llm.embeddings import LLMEmbedder
+            from mnemiq.semantic.definition_index import (
+                DefinitionIndex, DefinitionRetriever, build_definition_index,
+            )
+
+            embedder = LLMEmbedder(settings)  # raises if no embed endpoint configured
+            gcon = duckdb.connect()  # ephemeral: grounding is enrich-time only, not persisted
+            build_definition_index(_onto, snap, gcon, embedder,
+                                   max_concepts=settings.definition_index_max_concepts)
+            retriever = DefinitionRetriever(DefinitionIndex(gcon), embedder)
+        except Exception as exc:  # degrade-to-local: no embedder / no corpus -> no grounding
+            logger.warning("enrich grounding disabled: %s", exc)
+            retriever = None
+    snap = enrich_semantic(snap, LLMEnricher(LLMClient(settings)), protected=_protected,
+                           retriever=retriever)
     if _dict:
         snap = apply_dictionary(snap, _dict)         # the operator's final override
         snap.version = content_version(snap)          # re-version: dict landed after enrich_semantic
@@ -168,6 +190,24 @@ def _cmd_enrich(settings: Settings) -> int:
 
         # Persist alongside the value index so ask-time reads the store, not the records file.
         n_concepts = build_ontology_index(_onto, snap, con)
+    if _onto is not None:
+        try:
+            import json
+            import os
+
+            from mnemiq.ontology.binder import binding_suggestions_document, suggest_bindings
+
+            suggestions = suggest_bindings(adapter, snap, _onto)
+            path = settings.binding_suggestions_path
+            if path is None and settings.store_path:
+                path = os.path.join(os.path.dirname(settings.store_path) or ".",
+                                    "binding-suggestions.json")
+            if path:
+                with open(path, "w") as fh:
+                    json.dump(binding_suggestions_document(snap.source_id, suggestions), fh, indent=2)
+                print(f"{len(suggestions)} binding suggestion(s) -> {path}")
+        except Exception as exc:  # never fail an enrich run over an advisory artifact
+            logger.warning("binding suggestions skipped: %s", exc)
     failed = [j.id.removeprefix("profile:") for j in snap.jobs
               if j.kind == "profile" and j.status == "failed"]
     print(
