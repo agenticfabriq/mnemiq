@@ -186,3 +186,24 @@ Grounding is computed at `enrich` time and cached with the snapshot. Editing the
 the dictionary and re-running `enrich` re-grounds from scratch. Under the eval/benchmark cache, the
 records and dictionary paths are folded into the snapshot cache key, so switching files never reuses
 a stale snapshot; editing a file in place still needs `--refresh` (as grounding always does).
+
+## RAG-during-enrichment (SP5b)
+
+At enrich time mnemiq uses the certified meaning it already holds locally in two ways, both proposals-only
+and fail-soft (if no embedding endpoint is configured, or Verity is unreachable, enrichment runs exactly as
+before):
+
+- **Description grounding.** For each table, mnemiq retrieves the most relevant certified definitions (and
+  in-scale concept text) and adds them to the enrichment prompt as a demarcated REFERENCE block, so the
+  model interprets a column against certified meaning instead of its own priors. Retrieval is semantic
+  (embeddings); the model's output is still screened by the closed-world validator. Configure the embedding
+  endpoint with `MNEMIQ_EMBED_BASE_URL` / `MNEMIQ_EMBED_API_KEY` (defaults to the chat endpoint). The
+  per-scheme concept cap is `MNEMIQ_DEFINITION_INDEX_MAX_CONCEPTS` (default 500).
+
+- **Binding suggestions.** For columns the precision-first binder declines to auto-bind (a near-miss on
+  containment/affinity, or an ambiguous match against two schemes), mnemiq writes a reviewable
+  `binding-suggestions.json` (beside the store, or `MNEMIQ_BINDING_SUGGESTIONS_PATH`). Each entry carries the
+  column, candidate scheme, and the evidence (containment, matched, affinity, unmatched, reason). To accept a
+  suggestion, add `"<column_id>": "<scheme_id>"` to the `bindings` map of your ontology records
+  (`MNEMIQ_ONTOLOGY_RECORDS_PATH`); it then binds on the next `mnemiq enrich` via the explicit-binding path.
+  Suggestions never change a binding on their own.

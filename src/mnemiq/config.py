@@ -59,6 +59,10 @@ class Settings(BaseSettings):
     verity_client_id: str | None = Field(default=None, description="Verity service client id (created in the workbench API Credentials page)")
     verity_client_secret: str | None = Field(default=None, description="Verity service client secret; presented only to the token endpoint, never to the records endpoint")
     retrieval_k: int = Field(default=12, ge=1, description="schema cards retrieved into the generation packet")
+    definition_index_max_concepts: int = Field(default=500, ge=0,
+        description="per-scheme concept cap for the enrich-time definition-grounding index")
+    binding_suggestions_path: str | None = Field(default=None,
+        description="where enrich writes ontology binding-suggestions (defaults beside the store)")
     principal: str | None = Field(default=None, description="MCP standalone identity: principal id")
     roles: str | None = Field(default=None, description="MCP standalone identity: comma-separated roles")
     tenant: str | None = Field(default=None, description="MCP standalone identity: tenant id")
