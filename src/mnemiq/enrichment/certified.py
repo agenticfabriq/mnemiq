@@ -36,13 +36,14 @@ def fetch_certified_records(settings) -> list[CertifiedRecord]:
 
     watermark_path = _watermark_path(settings)
     since = _read_watermark(watermark_path, url)
+    page_size = getattr(settings, "verity_page_size", 500)
 
     out: list[CertifiedRecord] = []
     cursor: str | None = None
     latest_watermark: str | None = None
     fully_drained = False
     for _ in range(_MAX_PAGES):
-        payload = _get_records(settings, _page_url(url, since, cursor))
+        payload = _get_records(settings, _page_url(url, since, cursor, page_size))
         if payload is None:
             break  # a page failed -> keep what we have; do NOT advance the watermark
         for item in payload.get("records", []):
@@ -62,14 +63,16 @@ def fetch_certified_records(settings) -> list[CertifiedRecord]:
     return out
 
 
-def _page_url(url: str, since: str | None, cursor: str | None) -> str:
+def _page_url(url: str, since: str | None, cursor: str | None, limit: int | None = None) -> str:
     from urllib.parse import urlencode
 
-    params = {}
+    params: dict[str, object] = {}
     if since:
         params["since"] = since
     if cursor:
         params["cursor"] = cursor
+    if limit and limit > 0:
+        params["limit"] = limit
     if not params:
         return url
     separator = "&" if "?" in url else "?"
