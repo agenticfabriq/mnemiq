@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 
@@ -22,23 +23,91 @@ _STANDALONE = {
 }
 
 
+_MAX_PAGES = 10000  # a guard against a misbehaving server; real corpora are far smaller
+
+
 def fetch_certified_records(settings) -> list[CertifiedRecord]:
-    """Pull certified records from Verity. Fail-soft: any auth/network/decode error degrades to
-    local-only enrichment (mnemiq is never bricked by a Verity outage or a revoked credential)."""
+    """Pull certified records from Verity, paginating (`next_cursor`) and syncing incrementally
+    (`since` watermark). Fail-soft: any auth/network/decode error degrades to local-only enrichment
+    (mnemiq is never bricked by a Verity outage or a revoked credential)."""
     url = getattr(settings, "verity_records_url", None)
     if not url:
         return []
-    payload = _get_records(settings, url)
-    if payload is None:
-        return []
+
+    watermark_path = _watermark_path(settings)
+    since = _read_watermark(watermark_path, url)
 
     out: list[CertifiedRecord] = []
-    for item in payload.get("records", []):
-        try:
-            out.append(CertifiedRecord.model_validate(item))
-        except Exception as exc:  # one malformed record must not sink the batch
-            logger.warning("skipping malformed certified record: %s", exc)
+    cursor: str | None = None
+    latest_watermark: str | None = None
+    fully_drained = False
+    for _ in range(_MAX_PAGES):
+        payload = _get_records(settings, _page_url(url, since, cursor))
+        if payload is None:
+            break  # a page failed -> keep what we have; do NOT advance the watermark
+        for item in payload.get("records", []):
+            try:
+                out.append(CertifiedRecord.model_validate(item))
+            except Exception as exc:  # one malformed record must not sink the batch
+                logger.warning("skipping malformed certified record: %s", exc)
+        if payload.get("watermark"):
+            latest_watermark = payload["watermark"]
+        cursor = payload.get("next_cursor")
+        if not cursor:
+            fully_drained = True
+            break
+
+    if fully_drained and latest_watermark and watermark_path:
+        _write_watermark(watermark_path, url, latest_watermark)
     return out
+
+
+def _page_url(url: str, since: str | None, cursor: str | None) -> str:
+    from urllib.parse import urlencode
+
+    params = {}
+    if since:
+        params["since"] = since
+    if cursor:
+        params["cursor"] = cursor
+    if not params:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}{urlencode(params)}"
+
+
+def _watermark_path(settings) -> str | None:
+    path = getattr(settings, "verity_watermark_path", None)
+    if path:
+        return path
+    store = getattr(settings, "store_path", None)
+    if store:
+        return os.path.join(os.path.dirname(store) or ".", "verity-watermark.json")
+    return None
+
+
+def _read_watermark(path: str | None, url: str) -> str | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path) as handle:
+            return json.load(handle).get(url)
+    except Exception as exc:  # a corrupt/unreadable sidecar just means a full pull
+        logger.warning("verity watermark unreadable; full pull: %s", exc)
+        return None
+
+
+def _write_watermark(path: str, url: str, watermark: str) -> None:
+    try:
+        data: dict = {}
+        if os.path.exists(path):
+            with open(path) as handle:
+                data = json.load(handle)
+        data[url] = watermark
+        with open(path, "w") as handle:
+            json.dump(data, handle)
+    except Exception as exc:  # unwritable -> next sync is non-incremental, never fatal
+        logger.warning("verity watermark unwritable; next sync non-incremental: %s", exc)
 
 
 def _get_records(settings, url: str) -> dict | None:
