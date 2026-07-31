@@ -21,6 +21,9 @@ class RefusalCode(StrEnum):
     UNAUTHORIZED_COLUMN = "unauthorized_column"
     MASKED_COLUMN_IN_PREDICATE = "masked_column_in_predicate"
     INVALID_ROW_FILTER = "invalid_row_filter"
+    # Deployment-level, not grant-level: this deployment does not do writes at all. Distinct from
+    # UNAUTHORIZED_WRITE, which is a statement about THIS identity's grants (M3).
+    WRITES_DISABLED = "writes_disabled"
 
 
 # A refusal the model can act on is a repair; a refusal it cannot act on is a dead end.
