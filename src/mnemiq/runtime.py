@@ -8,19 +8,15 @@ from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 from mnemiq.agent.loop import Agent, AgentAnswer
 from mnemiq.agent.modes import DEFAULT_MODE, MODES, build_agent
 from mnemiq.agent.route import Router, StaticRouter, UnknownMode
-from mnemiq.agent.synthesize import LLMSynthesizer
+from mnemiq.assembly import build_components
 from mnemiq.authz.grants import AuthzProvider, DenyAll, FileAuthzProvider
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext, Snapshot
-from mnemiq.execute.select import LLMSelector
-from mnemiq.generate.correct import LLMCorrector
-from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
 from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.ontology_index import OntologyIndex
-from mnemiq.semantic.values import ValueIndex
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy, build_access_policy
 from mnemiq.sql.schema import visible_schema
@@ -237,12 +233,7 @@ def build_runtime(settings: Settings) -> Runtime:
         adapter = DuckDBPostgresAdapter(settings.pg_dsn, read_only=not settings.write_enabled)
 
     # Shared components, built once; each mode is a thin Agent over the same instances.
-    client = LLMClient(settings)
-    # Generate in the dialect the source executes (duckdb here); keeps generation, parsing,
-    # and execution on one dialect so no cross-dialect transpile gap can bite.
-    generator = LLMGenerator(client, dialect=adapter.dialect,
-                             guided_sql=settings.guided_sql, assertive=settings.assertive_sql)
-    synthesizer = LLMSynthesizer(client)
+    kit = build_components(settings, adapter, con)
     # Live L2 (cross-replica) + observability sink when a control Postgres is configured;
     # L1-only + no-op sink otherwise (today, byte-for-byte).
     if settings.control_dsn:
@@ -256,25 +247,22 @@ def build_runtime(settings: Settings) -> Runtime:
 
         cache = TwoTierCache(L1Cache())
         sink = NullSink()
-    corrector = LLMCorrector(client)
-    values = ValueIndex(con)
     # Built at enrich time and persisted, exactly like the value index -- so ask-time needs the
     # store, not the records file. An unindexed store simply resolves nothing.
     ontology = OntologyIndex(con)
-    selector = LLMSelector(client)
     # Per-mode result verifier: sanity (free) in every mode, judge in `deep`; the judge is
     # built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
-    verifiers, _ = _build_mode_verifiers(settings, client=client)
+    verifiers, _ = _build_mode_verifiers(settings, client=kit.client)
     agents = {
         name: build_agent(
             mode,
-            generator=generator,
-            synthesizer=synthesizer,
+            generator=kit.generator,
+            synthesizer=kit.synthesizer,
             adapter=adapter,
             cache=cache,
-            corrector=corrector,
-            values=values,
-            selector=selector,
+            corrector=kit.corrector,
+            values=kit.values,
+            selector=kit.selector,
             verifier=verifiers[name],
         )
         for name, mode in MODES.items()
