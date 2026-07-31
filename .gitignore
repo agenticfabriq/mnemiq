@@ -13,5 +13,13 @@ __pycache__/
 *.pyc
 .venv/
 
+# Linked git worktrees kept inside the repo. Each is a second checkout of this same
+# repository, so leaving it untracked puts it in every `git status` and one careless
+# `git add` away from a bogus gitlink.
+.worktrees/
+
+# Editor
+.vscode/
+
 # OS
 .DS_Store
