@@ -136,7 +136,12 @@ class Runtime:
         policy = build_access_policy(self.snapshot, grants) if self.snapshot else AccessPolicy()
         dialect = getattr(self.adapter, "dialect", "duckdb")
         verdict = decide_write(sql, visible, grants, adapter=self.adapter, dialect=dialect,
-                               policy=policy)
+                               policy=policy,
+                               # M3: the deployment switch reaches the decider, so a disabled
+                               # deployment refuses in our vocabulary instead of letting the
+                               # read-only attachment raise and calling that a refusal.
+                               writes_enabled=bool(
+                                   self.settings and self.settings.write_enabled))
         if not isinstance(verdict, ApprovedWrite):
             return WriteResult(approved=False, refusal=verdict.message, target=verdict.subject)
         try:

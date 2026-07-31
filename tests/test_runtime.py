@@ -169,8 +169,16 @@ def test_write_executes_on_approval():
             return [] if sql.startswith("EXPLAIN") else [(1,)]
 
     adapter = _RWAdapter()
+
+    class _WritesEnabled:
+        # M3: the deployment switch now reaches the decider and defaults CLOSED, so a test that
+        # exercises the execution path has to say which deployment it is testing. `settings=None`
+        # used to mean "unconfigured", which quietly meant "writes allowed".
+        write_enabled = True
+        source_id = "acme"
+
     rt = Runtime(con=None, snapshot=snap, adapter=adapter, agent=None, embedder=None,
-                 authz=_WriteAuthz("claim"), settings=None)  # write grant on claim
+                 authz=_WriteAuthz("claim"), settings=_WritesEnabled())  # write grant on claim
     res = rt.write("INSERT INTO claim (id) VALUES (1)", _identity())
     assert res.approved is True and res.target == "claim" and res.rows_affected == 1
     assert any(not s.startswith("EXPLAIN") for s in adapter.ran)  # the write actually ran

@@ -56,9 +56,34 @@ def decide_write(
     dialect: str = "duckdb",
     target: str | None = None,
     policy: AccessPolicy | None = None,
+    writes_enabled: bool = False,
 ) -> ApprovedWrite | Refusal:
-    """The deterministic write decider: shape -> table/column authz -> target-writable -> proof."""
+    """The deterministic write decider: deployment switch -> shape -> table/column authz ->
+    target-writable -> proof.
+
+    `writes_enabled` is the deployment-level switch (`settings.write_enabled`). **It defaults to
+    False on purpose.** A security parameter whose default is permissive means any caller that
+    forgets it fails open; defaulting to disabled means forgetting fails closed. That is surprising
+    for a library API and correct for a decider.
+
+    M3: this switch reached only the adapter (`read_only=not write_enabled`), never a decider. So a
+    deployment with writes off still APPROVED the write, executed it, and reported a refusal built
+    from whatever the read-only attachment raised -- the database as the control, which is the
+    principle this project defines itself against.
+    """
     target = target or dialect
+    if not writes_enabled:
+        # First, before shape or authz: if the deployment does not do writes, nothing about this
+        # particular statement matters, and an EXPLAIN against a read-only source is work done to
+        # reach a foregone conclusion.
+        return Refusal(
+            code=RefusalCode.WRITES_DISABLED,
+            message=(
+                "This deployment has writes disabled, so no write can be approved. This is a "
+                "deployment setting, not a limit on your grants."
+            ),
+            subject=None,
+        )
     policy = policy or AccessPolicy()
     shaped = check_write_shape(sql, dialect=dialect)
     if isinstance(shaped, Refusal):
