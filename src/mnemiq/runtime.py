@@ -18,6 +18,7 @@ from mnemiq.llm.embeddings import Embedder, LLMEmbedder
 from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.ontology_index import OntologyIndex
 from mnemiq.sql.decide_write import decide_write
+from mnemiq.semantic.cards import build_cards
 from mnemiq.sql.policy import AccessPolicy, build_access_policy
 from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import ApprovedWrite
@@ -87,6 +88,8 @@ class Runtime:
             definitions=self.snapshot.definitions if self.snapshot else (),
             columns=self.snapshot.columns if self.snapshot else (),
             ontology_index=self.ontology,
+            # M4: lets retrieve re-render each card against this identity's column policy.
+            snapshot=self.snapshot,
         )
         grants = self.authz.grants_for(identity)
         answer = agent.answer(packet, self.snapshot, grants, identity)
@@ -103,11 +106,27 @@ class Runtime:
         return answer
 
     def schema(self, identity: IdentityContext) -> list[dict]:
-        """The tables/cards this identity may see -- access-scoped, so metadata never leaks."""
+        """The tables and cards this identity may see, scoped by TABLE and by COLUMN.
+
+        M4: this filtered on `oid in grants.objects` alone -- table level -- while promising that
+        metadata never leaks. The stored card is rendered once at enrich time from the whole
+        snapshot, so a granted table's card listed every column including denied ones, with their
+        pii_level and their harvested coded values. The card is re-rendered per identity now; the
+        stored one stays identity-independent because it is what gets embedded and indexed.
+        """
         grants = self.authz.grants_for(identity)
         rows = self.con.execute("SELECT object_id, card FROM semantic_object").fetchall()
         allowed = grants.objects
-        return [{"object_id": oid, "card": card} for oid, card in rows if oid in allowed]
+        visible = [(oid, card) for oid, card in rows if oid in allowed]
+        if self.snapshot is None:
+            return [{"object_id": oid, "card": card} for oid, card in visible]
+        scoped = {
+            card.object_id: card.text
+            for card in build_cards(self.snapshot, policy=build_access_policy(self.snapshot, grants))
+        }
+        return [
+            {"object_id": oid, "card": scoped.get(oid, card)} for oid, card in visible
+        ]
 
     def write(self, sql: str, identity: IdentityContext) -> WriteResult:
         """Governed write: the caller supplies SQL; the decider screens it, then it executes
