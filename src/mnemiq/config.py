@@ -137,3 +137,14 @@ class Settings(BaseSettings):
             desc = info.description or ""
             lines.append(f"{env}={default}  # {desc}".rstrip())
         return "\n".join(lines) + "\n"
+
+
+def identity_from_settings(settings: "Settings | None"):
+    """Standalone (no-AF) identity from config. AF replaces this with a JWT-carried identity."""
+    from mnemiq.contract import IdentityContext
+
+    return IdentityContext(
+        tenant_id=(settings.tenant if settings else None) or "local",
+        principal_id=(settings.principal if settings else None) or "local",
+        roles=[r for r in ((settings.roles if settings else "") or "").split(",") if r],
+    )
