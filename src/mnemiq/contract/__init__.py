@@ -1,5 +1,5 @@
 from .schema import export_json_schema, write_schema
-from .seams import IdentityContext, Trace
+from .seams import DeferralReason, IdentityContext, Trace
 from .semantic import (
     CodeScheme,
     Column,
@@ -21,6 +21,7 @@ from .values import CodedValue, JoinKey, MeasureExpr
 from .records import CertifiedRecord, Provenance, RecordEnvelope
 
 __all__ = [
+    "DeferralReason",
     "CodedValue",
     "JoinKey",
     "MeasureExpr",

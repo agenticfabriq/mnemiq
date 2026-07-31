@@ -166,7 +166,10 @@ def test_the_budget_bounds_repair_attempts():
     )
     result = _answer(agent)
 
-    assert result.deferred is True
+    # M6: the source rejecting every attempt is a FAILURE, not the engine deferring. What this
+    # test exists to pin -- that the loop is bounded and then honest -- is unchanged.
+    assert result.failed is True
+    assert result.deferred is False
     assert len(adapter.queries) == 2  # bounded, then honest
     assert "typo" in result.answer or "could not" in result.answer.lower()
 
@@ -192,7 +195,7 @@ def test_the_timeout_message_reaches_the_repair_loop():
         ['{"sql": "SELECT n FROM claim"}'] * 3, adapter=_Slow(), budget=Budget(max_attempts=2)
     )
     result = _answer(agent)
-    assert result.deferred is True
+    assert result.failed is True  # M6: a timeout is the source failing us, not us abstaining
     assert "timed out" in result.answer.lower()
 
 

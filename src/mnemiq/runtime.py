@@ -101,7 +101,8 @@ class Runtime:
             self.sink.record(
                 self.settings.source_id if self.settings else "unknown",
                 AnswerRecord(deferred=answer.deferred, cached=answer.cached,
-                             total_ms=(time.perf_counter() - started) * 1000, mode=name),
+                             total_ms=(time.perf_counter() - started) * 1000, mode=name,
+                             failed=answer.failed, reason_code=answer.reason_code),
             )
         return answer
 
