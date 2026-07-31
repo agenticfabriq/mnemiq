@@ -8,7 +8,7 @@ from mnemiq.agent.trace import build_trace
 from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.keys import cache_key
 from mnemiq.cache.store import Cache, from_ipc, to_ipc
-from mnemiq.contract import IdentityContext, Snapshot, Trace
+from mnemiq.contract import DeferralReason, IdentityContext, Snapshot, Trace
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
 from mnemiq.execute.runner import ExecutionError, run
@@ -28,6 +28,11 @@ class AgentAnswer:
     answer: str
     trace: Trace | None = None
     deferred: bool = False
+    # A deferral is a decision we made; a failure is something that happened to us. Collapsing
+    # them let a source outage raise the deferral rate -- the one number the product claim rests
+    # on -- and the eval harness graded it "safe: gave up on an answerable question" (M6).
+    failed: bool = False
+    reason_code: DeferralReason | None = None
     cached: bool = False
     agreement: float | None = None
     judge_engaged: bool | None = None  # multi-candidate only: did the judge get consulted?
@@ -121,7 +126,8 @@ class Agent:
                 values=self.values,
             )
             if isinstance(outcome, Deferred):
-                return AgentAnswer(answer=outcome.reason, deferred=True)
+                return AgentAnswer(answer=outcome.reason, deferred=True,
+                                   reason_code=outcome.code)
 
             approved: Approved = outcome
             key = cache_key(approved.plan_sql, grants.fingerprint, packet.enrichment_version)
@@ -160,12 +166,15 @@ class Agent:
                 execute_ms=result.elapsed_ms,
             )
 
+        # NOT a deferral. We did not decline to answer -- the source refused to serve us, and
+        # counting that as abstention is what let an outage look like the engine working (M6).
         return AgentAnswer(
             answer=(
                 "Could not answer this question: the database rejected every attempt. "
                 f"Last error: {failure}"
             ),
-            deferred=True,
+            failed=True,
+            reason_code=DeferralReason.EXECUTION_FAILED,
         )
 
     def _execute(self, approved: Approved, grants: GrantSet, packet: ContextPacket):
@@ -238,6 +247,7 @@ class Agent:
                         f"(best agreement {largest} of {self.candidates})."
                     ),
                     deferred=True,
+                    reason_code=DeferralReason.DISAGREEMENT,
                     agreement=largest / len(executed),
                     candidates_executed=len(executed),
                 )
@@ -282,7 +292,8 @@ class Agent:
             return None
         verdict = self.verifier.verify(packet, approved, table)
         if verdict.defer:
-            return AgentAnswer(answer=verdict.reason, deferred=True)
+            return AgentAnswer(answer=verdict.reason, deferred=True,
+                               reason_code=DeferralReason.VERIFICATION)
         return None
 
     def _synthesize(

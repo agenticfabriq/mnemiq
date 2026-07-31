@@ -103,6 +103,14 @@ def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None) -
         except Exception:
             gold = None  # a gold failure never changes the outcome; the preview just stays empty
 
+    if answer.failed:
+        # The source refused to serve us. That is an ERROR, not the engine abstaining -- grading
+        # it DEFERRED_WRONGLY reported an outage as "safe: gave up on an answerable question"
+        # and inflated every deferral rate we have measured (register M6).
+        result.outcome = Outcome.ERROR
+        result.answer = answer.answer
+        return result
+
     if answer.deferred:
         # Refusing a question the data cannot answer is the behaviour we built the decider
         # for. Refusing one it *can* answer is a failure -- but a safe one: the user knows.

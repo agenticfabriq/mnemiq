@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from mnemiq.contract import IdentityContext
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -17,6 +20,10 @@ class GrantSet:
     row_filters: dict[str, str] = field(default_factory=dict, compare=False)
     pii_clearance: frozenset[str] = frozenset()  # pii_levels seen RAW
     pii_mask: frozenset[str] = frozenset()  # pii_levels seen MASKED (else denied)
+    # False when the policy could not be READ, as opposed to a policy that legitimately grants
+    # nothing. Both deny everything -- the difference is that one is an outage an operator must be
+    # told about, and before this they were the same empty set (register M2).
+    available: bool = True
 
     def allows(self, object_id: str) -> bool:
         return object_id in self.objects
@@ -30,6 +37,10 @@ class GrantSet:
         so it hashes the FULL policy. Two identities with identical readable tables but different
         row filters / PII clearance / mask get different cache keys; a result computed under one
         policy can never be served under a narrower one (the Plan 07 cache key).
+
+        `available` is deliberately excluded: it describes whether we could READ the policy, not
+        what the policy grants. Including it would repartition the cache during an outage, which
+        is a second failure on top of the first.
         """
         parts = [
             "R:" + "|".join(sorted(self.objects)),
@@ -41,6 +52,8 @@ class GrantSet:
 
 
 EMPTY = GrantSet(frozenset())
+# Denies exactly as much as EMPTY. It exists so the engine can say *why* nothing is granted.
+UNAVAILABLE = GrantSet(frozenset(), available=False)
 
 
 class AuthzProvider(Protocol):
@@ -71,8 +84,14 @@ class FileAuthzProvider:
             with open(self._path) as fh:
                 policy = json.load(fh)
             roles = policy["roles"]
-        except (OSError, json.JSONDecodeError, KeyError, TypeError):
-            return EMPTY
+        except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+            # Fail closed AND loudly, which is what the docstring above has always promised. It
+            # used to return EMPTY silently, so a typo'd path denied everything and looked
+            # identical to a policy that grants nothing -- and the deferral it produced was
+            # counted as the engine abstaining correctly (register M2).
+            logger.error("authorization policy %s could not be read (%s); denying everything",
+                         self._path, exc)
+            return UNAVAILABLE
 
         objects: set[str] = set()
         writable: set[str] = set()

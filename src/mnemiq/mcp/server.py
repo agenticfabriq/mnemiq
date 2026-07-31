@@ -20,6 +20,10 @@ def _db_read(
     return {
         "answer": ans.answer,
         "deferred": ans.deferred,
+        # A governing agent has to choose between requesting a grant, rephrasing, and paging an
+        # operator. Before this it got one boolean and a sentence for all three (register M6).
+        "failed": ans.failed,
+        "reason_code": str(ans.reason_code) if ans.reason_code else None,
         "mode": ans.mode,
         "sql": trace.target_sql if trace else None,  # a deferral never carries a fabricated query
         "trace": (

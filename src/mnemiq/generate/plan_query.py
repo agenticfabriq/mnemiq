@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from mnemiq.authz.grants import GrantSet
-from mnemiq.contract import Snapshot
+from mnemiq.contract import DeferralReason, Snapshot
 from mnemiq.generate.generator import Generator
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.decide import decide
@@ -15,6 +15,9 @@ from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 @dataclass
 class Deferred:
     reason: str
+    # What the caller should do next. `reason` is prose for a human; this is for a machine
+    # (register M6).
+    code: DeferralReason = DeferralReason.UNANSWERABLE
 
 
 Outcome = Approved | Deferred
@@ -50,7 +53,16 @@ def plan_query(
     policy = build_access_policy(snapshot, grants)
     registry = getattr(snapshot, "registry", {})  # {} for a plain single-source Snapshot
     if not packet.cards or not visible:
-        return Deferred(reason="No tables are available to answer this question with your access.")
+        if not grants.available:
+            # The policy could not be READ. Denying everything is correct; saying "your access"
+            # is not -- this is an outage, and it needs an operator, not a rephrase (M2).
+            return Deferred(
+                reason=("The authorization policy could not be read, so no access could be "
+                        "resolved. This is a configuration fault, not a limit on your account."),
+                code=DeferralReason.POLICY_UNAVAILABLE,
+            )
+        return Deferred(reason="No tables are available to answer this question with your access.",
+                        code=DeferralReason.NO_TABLES)
 
     last: Refusal | None = None
 
@@ -58,7 +70,8 @@ def plan_query(
         proposal = generator.propose(packet, feedback)
         if proposal.sql is None:
             return Deferred(
-                reason=proposal.reason or "The model could not answer from these tables."
+                reason=proposal.reason or "The model could not answer from these tables.",
+                code=DeferralReason.UNANSWERABLE,
             )
 
         verdict = decide(
@@ -93,7 +106,8 @@ def plan_query(
                 reason=(
                     f"Answering this would require access to {verdict.subject!r}, "
                     "which you do not have."
-                )
+                ),
+                code=DeferralReason.AUTHORIZATION,
             )
 
         last = verdict
@@ -101,5 +115,6 @@ def plan_query(
 
     reason = last.message if last else "The query could not be made valid."
     return Deferred(
-        reason=f"Could not produce a valid query after {max_attempts} attempts. {reason}"
+        reason=f"Could not produce a valid query after {max_attempts} attempts. {reason}",
+        code=DeferralReason.INVALID_QUERY,
     )
