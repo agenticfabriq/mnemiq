@@ -23,6 +23,23 @@ from mnemiq.sql.verdict import Approved
 STRATEGIES = ("direct", "decompose", "skeleton")
 
 
+@dataclass(frozen=True)
+class ResultPreview:
+    """A bounded slice of the executed result, for display -- never re-executed."""
+
+    columns: list[str]
+    rows: list[list[object]]
+    row_count: int  # true count, not the capped length
+    truncated: bool
+
+
+def result_preview(table, cap: int) -> ResultPreview:
+    cols = [str(c) for c in table.column_names]
+    raw = table.slice(0, cap).to_pylist()
+    return ResultPreview(columns=cols, rows=[[r[c] for c in cols] for r in raw],
+                         row_count=table.num_rows, truncated=table.num_rows > cap)
+
+
 @dataclass
 class AgentAnswer:
     answer: str
@@ -34,6 +51,7 @@ class AgentAnswer:
     judge_override: bool | None = None  # ...and did it pick against the majority?
     candidates_executed: int | None = None  # multi-candidate only: how many of N ran
     mode: str | None = None  # resolved mode name, stamped by the Runtime (the Agent IS a mode)
+    preview: ResultPreview | None = None  # None on every deferral path -- never fabricated
 
 
 def _shape(row_count: int, column_count: int) -> str:
@@ -61,6 +79,7 @@ class Agent:
         selector=None,
         min_agreement: float | None = None,
         verifier=None,
+        preview_rows: int = 100,
     ) -> None:
         self.generator = generator
         self.synthesizer = synthesizer
@@ -74,6 +93,7 @@ class Agent:
         self.selector = selector
         self.min_agreement = min_agreement
         self.verifier = verifier
+        self.preview_rows = preview_rows
         # The source's SQL dialect: the model writes it, `decide` parses it, the source runs
         # it. Product adapter is duckdb (transpile is a no-op); a SQLite source is SQLite
         # end-to-end -- no cross-dialect transpile gap (SQLGlot can't map DuckDB YEAR()/
@@ -272,6 +292,7 @@ class Agent:
             judge_engaged=judge_engaged,
             judge_override=judge_override,
             candidates_executed=len(executed),
+            preview=base.preview,
         )
 
     def _verified(self, packet: ContextPacket, approved: Approved, table) -> AgentAnswer | None:
@@ -307,4 +328,5 @@ class Agent:
             timing={"execute_ms": execute_ms, "total_ms": deadline.elapsed_ms},
             result_shape=_shape(table.num_rows, table.num_columns),
         )
-        return AgentAnswer(answer=answer, trace=trace, deferred=False, cached=cached)
+        return AgentAnswer(answer=answer, trace=trace, deferred=False, cached=cached,
+                           preview=result_preview(table, self.preview_rows))
