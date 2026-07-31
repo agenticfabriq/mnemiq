@@ -53,7 +53,9 @@ def decide(
     if values is not None:
         # a filter literal that does not exist in its column runs fine and answers wrong --
         # another silently-wrong class the corrector fixes, given the real values to pick from.
-        grounding = check_values(shaped, visible, values)
+        # M5: the index is unfiltered and this runs before the RLS rewrite below, so the
+        # refusal must know which tables this identity only sees a slice of.
+        grounding = check_values(shaped, visible, values, row_filtered=set(policy.row_filters))
         if grounding is not None:
             return grounding
 

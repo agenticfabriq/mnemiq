@@ -187,10 +187,14 @@ def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
     seen = {}
 
     def fake_retrieve(con, question, identity, authz, embedder, k=5, table_facts=(),
-                      definitions=(), columns=(), ontology_index=None):
+                      definitions=(), columns=(), ontology_index=None, snapshot=None):
         seen["definitions"] = list(definitions)
         seen["columns"] = [c.id for c in columns]
         seen["ontology_index"] = ontology_index
+        # M4 added a fourth thing that has to reach the product path: without the snapshot,
+        # retrieve cannot re-render a card against the caller's column policy and silently
+        # serves the unscoped one. That is the same gap this test was written for.
+        seen["snapshot"] = snapshot
         from mnemiq.semantic.retrieval import ContextPacket
 
         return ContextPacket(question=question, cards=[], grant_fingerprint="f",
@@ -215,5 +219,6 @@ def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
     rt.ask("how many with type 2 diabetes", _identity())
 
     assert seen["ontology_index"] is sentinel        # the index reaches retrieval
+    assert seen["snapshot"] is snap                 # ...and so does the snapshot (M4)
     assert seen["columns"] == ["patient.icd10_cd"]   # bound columns are visible to it
     assert [d.term for d in seen["definitions"]] == ["ICD-10-CM"]  # glossary seam fed

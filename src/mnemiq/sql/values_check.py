@@ -13,13 +13,25 @@ def _column_and_string(a: exp.Expression, b: exp.Expression) -> tuple[exp.Column
     return None
 
 
-def check_values(ast: exp.Expression, visible: dict[str, set[str]], values) -> Refusal | None:
+def check_values(
+    ast: exp.Expression,
+    visible: dict[str, set[str]],
+    values,
+    row_filtered: set[str] | None = None,
+) -> Refusal | None:
     """Flag an equality/IN filter whose string literal does not exist in its indexed column.
 
     Fires only where the column resolves unambiguously to an indexed base column -- a bounded,
     non-key, non-PII string column whose full value set we hold. Anything we cannot resolve or
     have not indexed is skipped: the check never guesses, so a 'not found' is genuine.
+
+    `row_filtered` names the tables this identity sees through a row filter. **The value index is
+    built once per source with no predicate** (`semantic/values.py`), and this check runs BEFORE the
+    RLS rewrite -- so listing the real values of a row-filtered table let an identity enumerate rows
+    it cannot read, without executing anything (M5). For those tables the refusal still fires and
+    still names the wrong literal; it just stops quoting the data, and says why.
     """
+    row_filtered = row_filtered or set()
     cte = {c.alias_or_name for c in ast.find_all(exp.CTE)}
     alias_to_table: dict[str, str] = {}
     for table in ast.find_all(exp.Table):
@@ -40,6 +52,15 @@ def check_values(ast: exp.Expression, visible: dict[str, set[str]], values) -> R
             return None
         if values.contains(table, column.name, literal):
             return None
+        if table in row_filtered:
+            return Refusal(
+                code=RefusalCode.VALUE_GROUNDING,
+                message=(
+                    f"the value {literal!r} does not appear in {table}.{column.name}. "
+                    "The valid values are not listed because your access to this table is "
+                    "row-filtered and the value index is not."
+                ),
+            )
         near = values.nearest(table, column.name, literal)
         return Refusal(
             code=RefusalCode.VALUE_GROUNDING,

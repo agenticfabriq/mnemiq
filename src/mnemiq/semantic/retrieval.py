@@ -113,6 +113,7 @@ def retrieve(
     table_facts: Sequence[TableFacts] = (),
     columns: Sequence[Column] = (),
     ontology_index=None,
+    snapshot=None,
 ) -> ContextPacket:
     """Hybrid retrieval, scoped to the identity's grants *before* anything is ranked.
 
@@ -120,6 +121,13 @@ def retrieve(
     never returned: the model cannot be tempted by a table it was never shown, and no packet
     can disclose that the table exists. Metadata is itself confidential -- a table named
     `layoff_plans` discloses by its mere existence.
+
+    **That was true of tables and false of columns until M4.** The stored card is rendered once at
+    enrich time from the whole snapshot, so a granted table's card carried every column, its
+    pii_level and its harvested coded values. Given `snapshot`, the cards are re-rendered against
+    the identity's column policy before they go in the packet. Ranking still runs on the stored,
+    identity-independent card -- an index per grant set is combinatorial, and ranking is not a
+    channel: nothing about a hidden column reaches the caller.
     """
     grants = authz.grants_for(identity)
     packet = ContextPacket(
@@ -181,8 +189,21 @@ def retrieve(
     ).fetchall()
     cards = {object_id: (card, version) for object_id, card, version in rows}
 
+    scoped: dict[str, str] = {}
+    if snapshot is not None:
+        from mnemiq.semantic.cards import build_cards
+        from mnemiq.sql.policy import build_access_policy
+
+        scoped = {
+            card.object_id: card.text
+            for card in build_cards(snapshot, policy=build_access_policy(snapshot, grants))
+        }
     packet.cards = [
-        RetrievedCard(object_id=object_id, card=cards[object_id][0], score=score)
+        RetrievedCard(
+            object_id=object_id,
+            card=scoped.get(object_id, cards[object_id][0]),
+            score=score,
+        )
         for object_id, score in top
         if object_id in cards
     ]
