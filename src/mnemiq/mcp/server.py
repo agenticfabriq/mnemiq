@@ -26,6 +26,12 @@ def _db_read(
         "reason_code": str(ans.reason_code) if ans.reason_code else None,
         "mode": ans.mode,
         "sql": trace.target_sql if trace else None,  # a deferral never carries a fabricated query
+        "preview": (
+            {"columns": ans.preview.columns, "rows": ans.preview.rows,
+             "row_count": ans.preview.row_count, "truncated": ans.preview.truncated}
+            if ans.preview
+            else None
+        ),
         "trace": (
             {
                 "tables_used": trace.tables_used,
@@ -54,12 +60,9 @@ def _get_schema(runtime: Runtime, identity: IdentityContext) -> dict:
 
 
 def _identity_from_settings(settings: Settings | None) -> IdentityContext:
-    """Standalone (no-AF) identity from config. AF replaces this with a JWT-carried identity."""
-    return IdentityContext(
-        tenant_id=(settings.tenant if settings else None) or "local",
-        principal_id=(settings.principal if settings else None) or "local",
-        roles=[r for r in ((settings.roles if settings else "") or "").split(",") if r],
-    )
+    from mnemiq.config import identity_from_settings
+
+    return identity_from_settings(settings)
 
 
 def build_mcp(runtime: Runtime, identity: IdentityContext):

@@ -55,7 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="mark these definitions as a public standard (visible to every identity); "
                         "omit for a confidential taxonomy, which stays hidden unless bound+granted")
 
-    sub.add_parser("serve", help="run the MCP server on stdio")
+    s = sub.add_parser("serve", help="run the MCP server on stdio, or the HTTP API with --http")
+    s.add_argument("--http", action="store_true", help="serve the HTTP API (needs mnemiq[server])")
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8080)
     sub.add_parser("metrics", help="print observability SLOs from the answer log")
 
     e = sub.add_parser("eval", help="run the ACME golden set")
@@ -384,6 +387,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "metrics":
         return _cmd_metrics(settings)
     if args.command == "serve":
+        if args.http:
+            from mnemiq.server.app import serve_http
+
+            return serve_http(settings, host=args.host, port=args.port) or 0
         return _cmd_serve(settings)
     if args.command == "eval":
         from mnemiq.eval.run import run_acme
