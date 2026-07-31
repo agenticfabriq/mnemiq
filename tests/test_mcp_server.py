@@ -35,6 +35,21 @@ def test_db_read_returns_answer_sql_trace_and_not_deferred():
     assert out["trace"]["tables_used"] == ["claim"]
 
 
+def test_db_read_carries_the_bounded_preview():
+    from mnemiq.agent.loop import ResultPreview
+
+    p = ResultPreview(columns=["n"], rows=[[2]], row_count=1, truncated=False)
+    rt = _RT(AgentAnswer(answer="2 claims.", trace=_trace(), preview=p), [])
+    out = _db_read(rt, _identity(), "how many claims?")
+    assert out["preview"] == {"columns": ["n"], "rows": [[2]], "row_count": 1,
+                              "truncated": False}
+
+
+def test_db_read_preview_is_none_on_deferral():
+    rt = _RT(AgentAnswer(answer="No table holds salary.", deferred=True), [])
+    assert _db_read(rt, _identity(), "avg salary?")["preview"] is None
+
+
 def test_db_read_passes_a_deferral_through_honestly():
     rt = _RT(AgentAnswer(answer="No table holds salary.", deferred=True), [])
     out = _db_read(rt, _identity(), "avg salary?")

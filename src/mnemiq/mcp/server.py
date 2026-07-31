@@ -22,6 +22,12 @@ def _db_read(
         "deferred": ans.deferred,
         "mode": ans.mode,
         "sql": trace.target_sql if trace else None,  # a deferral never carries a fabricated query
+        "preview": (
+            {"columns": ans.preview.columns, "rows": ans.preview.rows,
+             "row_count": ans.preview.row_count, "truncated": ans.preview.truncated}
+            if ans.preview
+            else None
+        ),
         "trace": (
             {
                 "tables_used": trace.tables_used,
