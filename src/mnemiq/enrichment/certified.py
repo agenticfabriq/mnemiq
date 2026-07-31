@@ -6,9 +6,10 @@ import os
 import urllib.error
 import urllib.request
 
-from mnemiq.contract import CertifiedRecord, CodedValue, Snapshot
+from mnemiq.contract import CertifiedRecord, CodedValue, Job, Snapshot
 from mnemiq.enrichment.verity_auth import access_token
 from mnemiq.ontology.records import ConceptScheme
+from mnemiq.semantic.values import SENSITIVE_PII
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,22 @@ def certified_concept_schemes(records: list[CertifiedRecord]) -> list[ConceptSch
     ]
 
 
+def _is_attested(record: CertifiedRecord) -> bool:
+    """Is this record's certification claim backed by someone?
+
+    `Provenance.status` is a producer-supplied string and `certifier` is optional, so a record can
+    assert certification with nobody attesting it -- which is exactly what Verity published for every
+    draft-certified record before its D56 fix. That is fine for meaning; it is not fine for a field
+    that gates whether we harvest a column's values (register M1).
+    """
+    provenance = record.envelope.provenance
+    return (
+        provenance is not None
+        and provenance.status == "certified"
+        and bool(provenance.certifier)
+    )
+
+
 def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snapshot:
     """Overlay certified MEANING onto locally-profiled STRUCTURE.
 
@@ -158,11 +175,22 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
     from the certified record; its structure (data_type, row/distinct/null counts) stays local.
     Standalone objects (definition/metric/...) are appended to their lists. A certified column
     with no local counterpart is dropped -- mnemiq grounds what is physically in the DB.
+
+    **`pii_level` is trusted only from an attested record (M1).** An unattested one may still supply
+    description, semantic_type, coded_values and code_scheme, and may still *raise* sensitivity --
+    it simply cannot move a column OUT of `SENSITIVE_PII`, because that is the set
+    `semantic.values._qualifies` gates value harvesting on. The rule is set membership against that
+    same set rather than an ordering over the level strings, so the check and the gate cannot drift.
     """
     by_type: dict[str, list] = {}
+    attested: dict[str, bool] = {}
     for rec in records:
         by_type.setdefault(rec.envelope.object_type, []).append(rec.payload)
+        if rec.envelope.object_type == "column":
+            # Last writer wins, matching the payload dict below.
+            attested[rec.envelope.object_id] = _is_attested(rec)
 
+    refused_downgrades: list[str] = []
     certified_cols = {c.id: c for c in by_type.get("column", [])}
     known = {c.id for c in snapshot.columns}
     for col_id in certified_cols:
@@ -177,15 +205,41 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
             continue
         coded = [CodedValue(code=cv.code, meaning=cv.meaning, source="certified")
                  for cv in cert.coded_values]
+        pii_level = cert.pii_level
+        if (
+            not attested.get(col.id, False)
+            and col.pii_level in SENSITIVE_PII
+            and pii_level not in SENSITIVE_PII
+        ):
+            logger.warning(
+                "refusing to lower pii_level on %r from %r to %r: the certified record names no "
+                "certifier, and this field gates value harvesting",
+                col.id, col.pii_level, pii_level,
+            )
+            refused_downgrades.append(col.id)
+            pii_level = col.pii_level
         new_cols.append(col.model_copy(update={
             "description": cert.description,
             "semantic_type": cert.semantic_type,
-            "pii_level": cert.pii_level,
+            "pii_level": pii_level,
             "coded_values": coded,
             "code_scheme": cert.code_scheme,
         }))
 
     updates: dict = {"columns": new_cols}
+    if refused_downgrades:
+        # `snapshot.jobs` is this codebase's structured run record, so a security-relevant refusal
+        # goes there rather than living only in a log line nobody reads (register M2's lesson).
+        updates["jobs"] = [
+            *snapshot.jobs,
+            Job(
+                id="certified:pii_downgrade_refused",
+                source_id=snapshot.source_id,
+                kind="certified_pii_downgrade_refused",
+                status="refused",
+                checkpoints=sorted(refused_downgrades),
+            ),
+        ]
     for object_type, attr in _STANDALONE.items():
         payloads = by_type.get(object_type, [])
         if payloads:

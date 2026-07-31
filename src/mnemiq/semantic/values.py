@@ -8,7 +8,10 @@ from mnemiq.semantic.textmatch import similarity
 
 # Personal-data levels the semantic pass assigns -- never indexed. Mirrors
 # enrichment.semantic._SENSITIVE; the deterministic first line is is_sensitive_name.
-_SENSITIVE_PII = {"pii", "phi"}
+# The levels that keep a column out of the value index. Public because `enrichment.certified` gates
+# on the same set when deciding whether an unattested record may lower a level (M1) -- one set, so
+# the trust check and the harvesting gate cannot drift apart.
+SENSITIVE_PII = frozenset({"pii", "phi"})
 
 # Physical column names avoid `column`/`value`, which are reserved words in DuckDB.
 _DDL = """
@@ -39,7 +42,7 @@ def _qualifies(column, max_distinct: int) -> bool:
         and _is_string_type(column.data_type)
         and not is_key_like(column.name)
         and not is_sensitive_name(column.name)
-        and column.pii_level not in _SENSITIVE_PII
+        and column.pii_level not in SENSITIVE_PII
     )
 
 
