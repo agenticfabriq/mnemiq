@@ -1,6 +1,6 @@
 import pyarrow as pa
 
-from mnemiq.agent.loop import AgentAnswer, ResultPreview, result_preview
+from mnemiq.agent.loop import AgentAnswer, result_preview
 
 
 def test_preview_caps_rows_and_flags_truncation():

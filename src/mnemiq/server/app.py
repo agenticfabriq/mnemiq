@@ -46,3 +46,23 @@ def build_app(runtime, identity, heartbeat_s: float = 15.0) -> FastAPI:
         return {"tables": runtime.schema(identity)}
 
     return app
+
+
+def _run_uvicorn(app, host: str, port: int) -> None:  # seam for tests
+    import uvicorn
+
+    uvicorn.run(app, host=host, port=port)
+
+
+def serve_http(settings, host: str, port: int) -> None:
+    try:
+        import uvicorn  # noqa: F401  -- fail before building a runtime
+    except ImportError as exc:
+        raise SystemExit(
+            "the HTTP server needs the server extra: uv sync --extra server"
+        ) from exc
+    from mnemiq.config import identity_from_settings
+    from mnemiq.runtime import build_runtime
+
+    runtime = build_runtime(settings)
+    _run_uvicorn(build_app(runtime, identity_from_settings(settings)), host=host, port=port)
