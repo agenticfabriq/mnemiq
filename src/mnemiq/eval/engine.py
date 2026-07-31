@@ -4,19 +4,16 @@ from collections.abc import Callable, Sequence
 
 from mnemiq.agent.budget import Budget
 from mnemiq.agent.loop import Agent, AgentAnswer
-from mnemiq.agent.synthesize import LLMSynthesizer
+from mnemiq.assembly import build_components
 from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.config import Settings
 from mnemiq.contract import Definition, IdentityContext, Snapshot
-from mnemiq.execute.select import LLMSelector
-from mnemiq.generate.correct import LLMCorrector
-from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import LLMEmbedder
 from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.store import build_example_index, build_index
-from mnemiq.semantic.values import ValueIndex, build_value_index
+from mnemiq.semantic.values import build_value_index
 from mnemiq.store.bootstrap import init_store
 from mnemiq.verify.judge import SemanticJudge
 from mnemiq.verify.verifier import Verifier
@@ -87,7 +84,8 @@ def build_engine(
     grants = GrantSet(frozenset(tables), pii_clearance=levels)
     authz = _GrantAll(grants)
 
-    client = LLMClient(settings)  # one client, so the token count is the run's true cost
+    kit = build_components(settings, adapter, con)
+    client = kit.client  # one client, so the token count is the run's true cost
 
     verifier = None
     if verify or settings.verify:
@@ -100,19 +98,18 @@ def build_engine(
         verifier = Verifier(threshold=settings.verify_threshold, sanity=settings.verify_sanity,
                             grounding=settings.verify_grounding, judge=judge)
 
+    # The kit generates in the source's dialect (BIRD: SQLite), so nothing needs a
+    # cross-dialect transpile the SQLite writer can't do (DuckDB YEAR()/EXTRACT -> strftime).
     agent = Agent(
-        # Generate in the source's dialect (BIRD: SQLite), so nothing needs a cross-dialect
-        # transpile the SQLite writer can't do (DuckDB YEAR()/EXTRACT -> strftime).
-        generator=LLMGenerator(client, dialect=getattr(adapter, "dialect", "duckdb"),
-                               guided_sql=settings.guided_sql, assertive=settings.assertive_sql),
-        synthesizer=LLMSynthesizer(client),
+        generator=kit.generator,
+        synthesizer=kit.synthesizer,
         adapter=adapter,
         cache=TwoTierCache(L1Cache()),
         budget=Budget(wall_clock_s=120.0),
         candidates=candidates,
-        corrector=LLMCorrector(client),
-        values=ValueIndex(con),
-        selector=LLMSelector(client) if candidates > 1 else None,
+        corrector=kit.corrector,
+        values=kit.values,
+        selector=kit.selector if candidates > 1 else None,
         verifier=verifier,
     )
 
