@@ -84,3 +84,73 @@ def test_the_field_is_spelled_the_way_mcp_spells_it():
                                      reason_code=DeferralReason.NO_TABLES))
 
     assert "reason_code" in out and "deferral_reason" not in out
+
+
+# =============================================================================================
+# CROSS-THREAD GUARD -- read this before adding a field to AgentAnswer.
+#
+# M14 happened because two threads were both correct: the engine thread gave AgentAnswer
+# `failed` and `reason_code`, and the server thread's serializer -- written days earlier against
+# an engine that had neither -- kept emitting the fields it knew about. Nobody was wrong, and a
+# source outage went out looking like a successful answer for a day.
+#
+# Worktrees isolate code, not contracts, and the two threads do not share session memory. So the
+# seam is enforced here instead of by anyone remembering: add a field to AgentAnswer and this
+# test fails until you either put it on the wire or say out loud why it stays off.
+# =============================================================================================
+
+import dataclasses
+
+# Fields that reach the wire under other names, and the keys they become. `trace` is exploded
+# rather than nested because the wire is flat by design (ui-eval-unify §5).
+_EXPLODED: dict[str, tuple[str, ...]] = {
+    "trace": ("sql", "tables_used", "enrichment_version", "timing"),
+}
+
+# Fields deliberately kept off the wire. Empty today: everything AgentAnswer carries is something
+# a caller can act on. Add here ONLY with a reason -- an entry is a decision, not a shortcut.
+_WITHHELD: dict[str, str] = {}
+
+
+def test_every_agentanswer_field_reaches_the_wire_or_is_explicitly_withheld():
+    payload = answer_payload(
+        AgentAnswer(answer="x", trace=_trace(), preview=None)
+    )
+
+    missing = []
+    for field in dataclasses.fields(AgentAnswer):
+        name = field.name
+        if name in _WITHHELD:
+            continue
+        if name in _EXPLODED:
+            absent = [key for key in _EXPLODED[name] if key not in payload]
+            if absent:
+                missing.append(f"{name} -> {absent} (declared exploded, but those keys are absent)")
+            continue
+        if name not in payload:
+            missing.append(name)
+
+    assert not missing, (
+        f"AgentAnswer fields that reach no caller: {missing}.\n"
+        "Add them to answer_payload (it is the shared serializer for /v1/ask and the SSE CUSTOM "
+        "event, so one edit covers both), or add them to _EXPLODED if they arrive under another "
+        "name, or to _WITHHELD with a reason. Do not delete this assertion -- it exists because "
+        "M14 shipped a failure that looked like a success for a day."
+    )
+
+
+def test_the_guard_notices_a_field_that_stops_being_serialized():
+    # A guard that cannot fail is the register's pattern 6. This proves this one can, by asking
+    # it about a field the payload genuinely does not have.
+    payload = answer_payload(AgentAnswer(answer="x"))
+
+    assert "not_a_real_field" not in payload
+    assert "reason_code" in payload, "and that it is looking at the real payload"
+
+
+def test_exploded_and_withheld_name_only_real_fields():
+    # Otherwise a renamed field leaves a stale exemption behind that silently excuses its
+    # replacement -- the register's own hand-maintained-mirror failure, inside the guard.
+    known = {f.name for f in dataclasses.fields(AgentAnswer)}
+    stale = (set(_EXPLODED) | set(_WITHHELD)) - known
+    assert not stale, f"exemptions for fields that no longer exist: {sorted(stale)}"
