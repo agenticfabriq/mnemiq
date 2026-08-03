@@ -73,12 +73,14 @@ def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None) -
     (defaults to `adapter`) executes the gold SQL. BIRD passes a DuckDB engine adapter and a
     native-Postgres gold adapter; single-engine callers (ACME) pass one adapter for both.
 
-    When those two are different engines, a candidate is also checked against the
-    gold's engine. A dialect difference is otherwise scored as a correctness
-    difference: `SELECT ... WHERE YEAR(d) = 1997` runs in DuckDB and raises
-    `function year(date) does not exist` in Postgres, and grading it CORRECT
-    credits an answer that cannot be run against the database the benchmark is
-    about. Measured on minidev-pg: 405 such cases across 34 runs.
+    When those two are different engines, the candidate is also probed against
+    the gold's engine and the result recorded in `portable_to_gold_engine`. It
+    does not change the outcome: `SELECT ... WHERE YEAR(d) = 1997` runs in
+    DuckDB and raises `function year(date) does not exist` in Postgres, which
+    says the SQL is not portable, not that the answer is wrong. `Report`
+    excludes unportable answers from BIRD-comparable accuracy and keeps them in
+    got-the-facts. Measured on minidev-pg: 405 otherwise-CORRECT and 67
+    otherwise-CORRECT_FACTS across 34 runs.
     """
     gold_adapter = gold_adapter or adapter
     result = CaseResult(
@@ -155,16 +157,19 @@ def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None) -
     result.executed = True
 
     if gold_adapter is not adapter:
+        # Recorded, not scored. Whether the SQL also runs on the gold's engine is
+        # a fact about portability, not about whether the agent found the answer,
+        # and the two metrics want different answers to it: BIRD-comparable
+        # accuracy runs both sides in one engine, so it must exclude these;
+        # got-the-facts is about our executor, which answered. Folding it into
+        # WRONG lost both distinctions at once -- and WRONG is, by this file's
+        # own reckoning, the only failure a user cannot see.
         try:
             gold_adapter.execute_arrow(result.sql, timeout_s=30)
             result.portable_to_gold_engine = True
         except Exception as exc:
-            # Our executor answered; the benchmark's own engine cannot run it.
-            # That is a real product answer and not a valid answer here.
             result.portable_to_gold_engine = False
             result.dialect_error = str(exc)
-            result.outcome = Outcome.WRONG
-            return result
 
     if results_match(gold, candidate, allow_extra_columns=False):
         result.outcome = Outcome.CORRECT

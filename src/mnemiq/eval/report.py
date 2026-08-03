@@ -15,6 +15,10 @@ class Report:
     deferred_correctly: int = 0
     deferred_wrongly: int = 0
     error: int = 0
+    # Answers our executor ran and the gold's engine cannot. Not a wrong answer:
+    # excluded from the BIRD-comparable number, kept in the product metric.
+    unportable: int = 0
+    unportable_exact: int = 0
     tokens: int = 0
     llm_calls: int = 0
     results: list[CaseResult] = field(default_factory=list)
@@ -25,13 +29,25 @@ class Report:
 
     @property
     def accuracy(self) -> float:
-        """The product metric: got-the-facts over questions the data can answer."""
+        """The product metric: got-the-facts over questions the data can answer.
+
+        Portability does not enter here. Our executor is the one that ran the
+        query, and it answered; whether the same SQL would also run on the
+        benchmark's engine is a different question from whether the agent found
+        the facts.
+        """
         return (self.correct + self.correct_facts) / self.answerable if self.answerable else 0.0
 
     @property
     def strict_accuracy(self) -> float:
-        """Exact result-set match only (BIRD-comparable execution accuracy)."""
-        return self.correct / self.answerable if self.answerable else 0.0
+        """Exact result-set match, BIRD-comparable -- so portability counts.
+
+        BIRD's protocol executes candidate and gold in one engine. An answer the
+        gold's engine cannot run has no comparable result set, so counting it
+        here would make the number incomparable to the thing it is named after.
+        """
+        exact = self.correct - self.unportable_exact
+        return exact / self.answerable if self.answerable else 0.0
 
     def render(self) -> str:
         lines = [
@@ -43,6 +59,8 @@ class Report:
             f"  DEFERRED_WRONGLY   {self.deferred_wrongly}   (safe: gave up on an answerable question)",
             f"  DEFERRED_CORRECTLY {self.deferred_correctly}   (success: refused the unanswerable)",
             f"  ERROR              {self.error}",
+            f"  unportable         {self.unportable}   ({self.unportable_exact} of them exact -- "
+            f"ran here, not on the gold's engine)",
             "",
             f"accuracy         {self.accuracy:.1%}  (got-the-facts / answerable -- the product metric)",
             f"strict accuracy  {self.strict_accuracy:.1%}  (exact match / answerable -- BIRD-comparable)",
@@ -69,6 +87,10 @@ def summarize(results: list[CaseResult], tokens: int = 0, llm_calls: int = 0) ->
     for result in results:
         attr = counters[result.outcome]
         setattr(report, attr, getattr(report, attr) + 1)
+        if result.portable_to_gold_engine is False:
+            report.unportable += 1
+            if result.outcome is Outcome.CORRECT:
+                report.unportable_exact += 1
     return report
 
 

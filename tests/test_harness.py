@@ -213,13 +213,12 @@ def test_run_case_splits_engine_and_gold_execution():
     assert result.portable_to_gold_engine is True
 
 
-def test_a_candidate_the_gold_engine_cannot_run_is_not_correct():
-    """A dialect difference must not be scored as a correctness difference.
+def _unportable_result():
+    """A candidate our executor runs and the gold's engine rejects.
 
     `WHERE YEAR(d) = 1997` runs in DuckDB and raises `function year(date) does
-    not exist` in Postgres. Crediting it CORRECT credits an answer that cannot
-    be run against the database the benchmark is about. 405 such cases were
-    measured across 34 minidev-pg runs.
+    not exist` in Postgres. 405 otherwise-CORRECT and 67 otherwise-CORRECT_FACTS
+    cases across 34 minidev-pg runs are this.
     """
 
     class _EngineAdapter:
@@ -232,11 +231,37 @@ def test_a_candidate_the_gold_engine_cannot_run_is_not_correct():
                 return pa.table({"n": [820]})
             raise Exception("function year(date) does not exist")
 
-    result = run_case(_case(), lambda q: _answered(), _EngineAdapter(), _GoldSide())
+    return run_case(_case(), lambda q: _answered(), _EngineAdapter(), _GoldSide())
 
-    assert result.outcome is Outcome.WRONG
+
+def test_an_unportable_answer_is_recorded_as_such_not_as_wrong():
+    """WRONG is, by this module's own reckoning, the only failure a user cannot see.
+
+    Folding "the gold's engine cannot run this" into it would lose both the fact
+    that our executor answered and the fact that the SQL is not portable.
+    """
+    result = _unportable_result()
+
+    assert result.outcome is Outcome.CORRECT
     assert result.portable_to_gold_engine is False
     assert "year(date)" in result.dialect_error
+
+
+def test_an_unportable_answer_leaves_the_bird_comparable_number():
+    """BIRD executes candidate and gold in one engine, so this has no place in it."""
+    report = summarize([_unportable_result()])
+
+    assert report.unportable == 1
+    assert report.unportable_exact == 1
+    assert report.strict_accuracy == 0.0
+
+
+def test_an_unportable_answer_still_got_the_facts():
+    """Our executor ran the query and it returned the right rows. That is the
+    product metric, and portability is a different question from it."""
+    report = summarize([_unportable_result()])
+
+    assert report.accuracy == 1.0
 
 
 def test_a_single_engine_run_is_not_asked_about_portability():
