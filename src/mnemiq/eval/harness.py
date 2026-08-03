@@ -48,6 +48,11 @@ class CaseResult:
     proposed: bool = False
     approved: bool = False
     executed: bool = False
+    # Set only when gold and candidate run on different engines. False means the
+    # candidate SQL does not execute on the engine the gold is written for, so
+    # the answer is real for our executor and not an answer to this benchmark.
+    portable_to_gold_engine: bool | None = None
+    dialect_error: str | None = None
     ms: float = 0.0
 
 
@@ -66,7 +71,14 @@ def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None) -
 
     `adapter` executes the engine's SQL (the same executor the engine used); `gold_adapter`
     (defaults to `adapter`) executes the gold SQL. BIRD passes a DuckDB engine adapter and a
-    native-SQLite gold adapter; single-engine callers (ACME) pass one adapter for both.
+    native-Postgres gold adapter; single-engine callers (ACME) pass one adapter for both.
+
+    When those two are different engines, a candidate is also checked against the
+    gold's engine. A dialect difference is otherwise scored as a correctness
+    difference: `SELECT ... WHERE YEAR(d) = 1997` runs in DuckDB and raises
+    `function year(date) does not exist` in Postgres, and grading it CORRECT
+    credits an answer that cannot be run against the database the benchmark is
+    about. Measured on minidev-pg: 405 such cases across 34 runs.
     """
     gold_adapter = gold_adapter or adapter
     result = CaseResult(
@@ -141,6 +153,19 @@ def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None) -
     result.engine_rows = _preview(candidate)
     result.engine_row_count = candidate.num_rows
     result.executed = True
+
+    if gold_adapter is not adapter:
+        try:
+            gold_adapter.execute_arrow(result.sql, timeout_s=30)
+            result.portable_to_gold_engine = True
+        except Exception as exc:
+            # Our executor answered; the benchmark's own engine cannot run it.
+            # That is a real product answer and not a valid answer here.
+            result.portable_to_gold_engine = False
+            result.dialect_error = str(exc)
+            result.outcome = Outcome.WRONG
+            return result
+
     if results_match(gold, candidate, allow_extra_columns=False):
         result.outcome = Outcome.CORRECT
     elif results_match(gold, candidate, allow_extra_columns=True):

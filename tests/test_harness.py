@@ -194,20 +194,59 @@ def test_candidates_executed_is_copied_onto_the_case_result():
 
 
 def test_run_case_splits_engine_and_gold_execution():
-    # engine adapter runs only the candidate SQL; gold adapter runs only the gold SQL.
-    # If run_case crossed them, one fake would get the wrong SQL and raise -> ERROR.
+    # The engine adapter sees only the candidate SQL. The gold adapter sees the
+    # gold, and also the candidate -- that second call is the portability check.
     class _EngineAdapter:
         def execute_arrow(self, sql, timeout_s=None):
             assert sql == "CANDIDATE", f"engine adapter got non-candidate SQL: {sql}"
             return pa.table({"total": [820]})
 
-    class _GoldOnly:
+    class _GoldSide:
         def execute_arrow(self, sql, timeout_s=None):
-            assert sql == "GOLD", f"gold adapter got non-gold SQL: {sql}"
-            return pa.table({"n": [820]})
+            if sql == "GOLD":
+                return pa.table({"n": [820]})
+            assert sql == "CANDIDATE", f"gold adapter got unexpected SQL: {sql}"
+            return pa.table({"total": [820]})
 
-    result = run_case(_case(), lambda q: _answered(), _EngineAdapter(), _GoldOnly())
+    result = run_case(_case(), lambda q: _answered(), _EngineAdapter(), _GoldSide())
     assert result.outcome is Outcome.CORRECT
+    assert result.portable_to_gold_engine is True
+
+
+def test_a_candidate_the_gold_engine_cannot_run_is_not_correct():
+    """A dialect difference must not be scored as a correctness difference.
+
+    `WHERE YEAR(d) = 1997` runs in DuckDB and raises `function year(date) does
+    not exist` in Postgres. Crediting it CORRECT credits an answer that cannot
+    be run against the database the benchmark is about. 405 such cases were
+    measured across 34 minidev-pg runs.
+    """
+
+    class _EngineAdapter:
+        def execute_arrow(self, sql, timeout_s=None):
+            return pa.table({"total": [820]})  # our executor is happy
+
+    class _GoldSide:
+        def execute_arrow(self, sql, timeout_s=None):
+            if sql == "GOLD":
+                return pa.table({"n": [820]})
+            raise Exception("function year(date) does not exist")
+
+    result = run_case(_case(), lambda q: _answered(), _EngineAdapter(), _GoldSide())
+
+    assert result.outcome is Outcome.WRONG
+    assert result.portable_to_gold_engine is False
+    assert "year(date)" in result.dialect_error
+
+
+def test_a_single_engine_run_is_not_asked_about_portability():
+    """ACME runs one engine for both sides; there is no second dialect to check."""
+    adapter = _GoldAdapter(candidate=pa.table({"total": [820]}))
+
+    result = run_case(_case(), lambda q: _answered(), adapter)
+
+    assert result.outcome is Outcome.CORRECT
+    assert result.portable_to_gold_engine is None
 
 
 def test_run_case_gold_adapter_defaults_to_the_engine_adapter():

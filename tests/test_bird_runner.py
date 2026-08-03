@@ -212,13 +212,15 @@ def test_process_db_threads_engine_and_gold_adapters():
             assert sql == "CANDIDATE"
             return pa.table({"total": [820]})
 
-    class _Gold:  # runs the gold SQL only
+    class _Gold:  # runs the gold SQL, and the candidate for the portability check
         def execute(self, sql):
             return [(0,)]
 
         def execute_arrow(self, sql, timeout_s=None):
-            assert sql == "GOLD"
-            return pa.table({"n": [820]})
+            if sql == "GOLD":
+                return pa.table({"n": [820]})
+            assert sql == "CANDIDATE"
+            return pa.table({"total": [820]})
 
     class _Client:
         total_tokens = 0
@@ -230,6 +232,7 @@ def test_process_db_threads_engine_and_gold_adapters():
     )
     assert [k for k, _ in out] == ["result"]
     assert out[0][1].outcome is Outcome.CORRECT
+    assert out[0][1].portable_to_gold_engine is True
 
 
 def test_enrich_bird_db_cache_key_reflects_phase_toggles(monkeypatch):
