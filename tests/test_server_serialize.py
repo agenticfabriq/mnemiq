@@ -1,5 +1,7 @@
+import dataclasses
+
 from mnemiq.agent.loop import AgentAnswer, ResultPreview
-from mnemiq.contract import IdentityContext, Trace
+from mnemiq.contract import DeferralReason, IdentityContext, Trace
 from mnemiq.server.serialize import answer_payload
 
 
@@ -33,8 +35,6 @@ def test_deferral_payload_has_no_sql_no_preview():
 # went out as `deferred: false` with no `failed` key, so at the product surface an outage was
 # indistinguishable from a successful answer -- strictly worse than the conflation M6 removed.
 # ---------------------------------------------------------------------------------------------
-
-from mnemiq.contract import DeferralReason
 
 
 def test_a_failed_answer_is_distinguishable_from_an_answer():
@@ -98,8 +98,6 @@ def test_the_field_is_spelled_the_way_mcp_spells_it():
 # seam is enforced here instead of by anyone remembering: add a field to AgentAnswer and this
 # test fails until you either put it on the wire or say out loud why it stays off.
 # =============================================================================================
-
-import dataclasses
 
 # Fields that reach the wire under other names, and the keys they become. `trace` is exploded
 # rather than nested because the wire is flat by design (ui-eval-unify §5).

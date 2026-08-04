@@ -6,6 +6,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
-      - run: uv sync --extra dev
+      # `ontology` carries rdflib, which tests/test_ontology_digest.py imports at
+      # collection time; without it those tests error rather than skip.
+      - run: uv sync --extra dev --extra ontology
       - run: uv run ruff check .
       - run: uv run pytest -m "not integration and not live_llm" -v
+
+  workbench:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: workbench
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: workbench/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build

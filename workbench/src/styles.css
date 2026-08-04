@@ -1,0 +1,178 @@
+@import "tailwindcss";
+
+/*
+ * A reading instrument over a governed ledger.
+ *
+ * Monospace is the protagonist: every label, identifier, figure, table cell and
+ * statement is set in it. The proportional face appears only for answer prose, so
+ * the one human sentence on screen stands out against the chrome around it.
+ *
+ * Two hues are reserved and never decorative. `brass` means the engine declined;
+ * `crimson` means the source failed. Keeping them apart is the whole point --
+ * collapsing a refusal into a failure is the defect the engine fixed underneath,
+ * and the surface must not put it back. An answered turn carries no hue at all.
+ */
+
+@layer base {
+  :root {
+    --paper: #f2f3f5;
+    --surface: #fbfbfc;
+    --sunken: #e9ebee;
+    --ink: #12161a;
+    --graphite: #5a626b;
+    --rule: #d7dbe0;
+    --brass: #8a6212;
+    --brass-wash: #f6efdd;
+    --crimson: #9c3a34;
+    --crimson-wash: #f8e9e7;
+  }
+
+  /* Follow the system unless the reader has overridden it. */
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --paper: #101418;
+      --surface: #171c21;
+      --sunken: #0b0e11;
+      --ink: #e8eaec;
+      --graphite: #8b939c;
+      --rule: #2a3138;
+      --brass: #d2a03c;
+      --brass-wash: #2a2114;
+      --crimson: #d9756c;
+      --crimson-wash: #2b1917;
+    }
+  }
+
+  [data-theme="dark"] {
+    --paper: #101418;
+    --surface: #171c21;
+    --sunken: #0b0e11;
+    --ink: #e8eaec;
+    --graphite: #8b939c;
+    --rule: #2a3138;
+    --brass: #d2a03c;
+    --brass-wash: #2a2114;
+    --crimson: #d9756c;
+    --crimson-wash: #2b1917;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--font-mono);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* Figures line up in tables and in the verdict stripe. */
+  table,
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--brass);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@theme {
+  --color-paper: var(--paper);
+  --color-surface: var(--surface);
+  --color-sunken: var(--sunken);
+  --color-ink: var(--ink);
+  --color-graphite: var(--graphite);
+  --color-rule: var(--rule);
+  --color-brass: var(--brass);
+  --color-brass-wash: var(--brass-wash);
+  --color-crimson: var(--crimson);
+  --color-crimson-wash: var(--crimson-wash);
+
+  --font-mono:
+    ui-monospace, "SF Mono", SFMono-Regular, "JetBrains Mono", Menlo, Consolas,
+    monospace;
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    sans-serif;
+}
+
+/* The chrome voice: small, tracked, upper. For words WE choose. */
+@utility label {
+  font-size: 10px;
+  line-height: 1.4;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--graphite);
+}
+
+/*
+ * The same voice for text the ENGINE chose -- column names, table names, mode names,
+ * version hashes. Never case-transformed: in a SQL tool an identifier is data, and
+ * `CLAIM_COUNT` is a different string from `claim_count`.
+ */
+@utility meta {
+  font-size: 10px;
+  line-height: 1.4;
+  letter-spacing: 0.06em;
+  color: var(--graphite);
+}
+
+/* Answer prose -- the only proportional type in the interface. */
+@utility prose-answer {
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.65;
+  color: var(--ink);
+
+  & p {
+    margin-block: 0.5rem;
+  }
+  & p:first-child {
+    margin-block-start: 0;
+  }
+  & p:last-child {
+    margin-block-end: 0;
+  }
+  & ul,
+  & ol {
+    margin-block: 0.5rem;
+    padding-inline-start: 1.25rem;
+  }
+  & ul {
+    list-style: disc;
+  }
+  & ol {
+    list-style: decimal;
+  }
+  & li {
+    margin-block: 0.15rem;
+  }
+  & strong {
+    font-weight: 600;
+  }
+  & code {
+    font-family: var(--font-mono);
+    font-size: 0.9em;
+    background: var(--sunken);
+    padding: 0.1em 0.3em;
+    border-radius: 2px;
+  }
+  & a {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+}

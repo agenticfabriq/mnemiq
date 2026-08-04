@@ -8,6 +8,12 @@
 *.duckdb.wal
 eval-reports/
 
+# The workbench bundle. Built by `pnpm build` in workbench/, it lands inside the
+# Python package so a wheel picks it up -- the repo carries the source, not the bundle.
+src/mnemiq/server/static/
+workbench/node_modules/
+workbench/dist/
+
 # Python
 __pycache__/
 *.pyc

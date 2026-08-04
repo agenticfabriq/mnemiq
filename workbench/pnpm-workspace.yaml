@@ -1,0 +1,14 @@
+# esbuild ships prebuilt platform binaries via a postinstall script; vite cannot
+# build without it. Every other dependency stays script-free.
+allowBuilds:
+  esbuild: true
+
+# assistant-ui is pinned exactly and moves fast (three releases in the 24h before
+# this was written), so these are exempt from the release-age gate deliberately.
+minimumReleaseAgeExclude:
+  - '@assistant-ui/core@0.3.5'
+  - '@assistant-ui/react@0.15.4'
+  - '@assistant-ui/store@0.3.3'
+  - assistant-cloud@0.1.38
+  - assistant-stream@0.3.33
+  - safe-content-frame@0.0.26

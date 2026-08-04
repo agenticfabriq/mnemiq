@@ -49,6 +49,19 @@ uv run mnemiq ask "how many claims are there?"
 Access is fail-closed: set `MNEMIQ_AUTHZ_PATH` to a policy file granting objects to roles, and
 pass `--roles analyst`. Without a policy, the engine grants nothing and defers.
 
+## Use it from a browser (workbench)
+
+```
+cd workbench && pnpm install && pnpm build
+uv run mnemiq serve --http     # http://127.0.0.1:8080
+```
+
+One process serves both the workbench and the HTTP API — `POST /v1/ask` (JSON),
+`POST /v1/chat` (SSE, [AG-UI](https://github.com/ag-ui-protocol/ag-ui) event
+vocabulary), `GET /v1/schema`. Every answer shows the SQL that produced it and the
+tables it read; a question the data cannot support comes back as a stated reason,
+not a guess. See [`workbench/README.md`](workbench/README.md).
+
 ## Use it from an AI agent (MCP)
 
 `uv run mnemiq serve` exposes two read-only, access-scoped tools over stdio — `db_read(question)`
