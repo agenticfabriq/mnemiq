@@ -1,13 +1,15 @@
 /**
- * The provenance of one answer.
+ * The provenance of one answer, and where its time went.
  *
- * Deliberately not a step list with per-step timings: the engine emits `execute_ms`
- * and `total_ms` and nothing finer, so a breakdown into planning/generation phases
- * would be invented. This shows what was actually measured.
+ * The phase breakdown comes from the step events, not from the trace: the engine
+ * records one total and the execution time, so this list is the only place the split
+ * exists. It is also usually a surprise -- writing the SQL dominates, and running it
+ * is noise.
  */
 
-import type { AnswerPayload } from "../lib/types";
+import type { AnswerPayload, Step } from "../lib/types";
 import { duration } from "../lib/verdict";
+import { Steps } from "./Steps";
 
 function Row({ term, children }: { term: string; children: React.ReactNode }) {
   return (
@@ -18,11 +20,19 @@ function Row({ term, children }: { term: string; children: React.ReactNode }) {
   );
 }
 
-export function RunDetails({ answer }: { answer: AnswerPayload }) {
+export function RunDetails({
+  answer,
+  steps = [],
+}: {
+  answer: AnswerPayload;
+  steps?: Step[];
+}) {
   const execute = duration(answer.timing?.["execute_ms"]);
   const total = duration(answer.timing?.["total_ms"]);
   const tables = answer.tables_used ?? [];
-  if (tables.length === 0 && !total && !answer.enrichment_version) return null;
+  if (tables.length === 0 && !total && !answer.enrichment_version && steps.length === 0) {
+    return null;
+  }
 
   return (
     <details className="border border-rule">
@@ -30,6 +40,11 @@ export function RunDetails({ answer }: { answer: AnswerPayload }) {
         Run details
       </summary>
       <dl className="border-t border-rule px-2.5 py-1.5">
+        {steps.length > 0 && (
+          <Row term="Phases">
+            <Steps steps={steps} />
+          </Row>
+        )}
         {tables.length > 0 && (
           <Row term="Tables read">
             <span className="break-all">{tables.join(", ")}</span>

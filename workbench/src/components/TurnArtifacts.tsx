@@ -11,7 +11,9 @@ import { useEffect, useState } from "react";
 import type { DataMessagePartProps } from "@assistant-ui/react";
 
 import type { Turn } from "../lib/store";
+import type { Step } from "../lib/types";
 import { duration } from "../lib/verdict";
+import { Steps } from "./Steps";
 import { Badges } from "./Badges";
 import { DeferralCard } from "./DeferralCard";
 import { ResultTable } from "./ResultTable";
@@ -19,11 +21,11 @@ import { RunDetails } from "./RunDetails";
 import { SqlBlock } from "./SqlBlock";
 
 /**
- * The engine answers in one shot -- there are no tokens to stream -- so the only
- * honest progress signal is how long it has been working. Deep mode can run for
- * minutes; a bare spinner would say nothing about that.
+ * The engine answers in one shot -- there are no tokens to stream -- so progress is
+ * the phases it reports plus how long it has been going. Deep mode runs for minutes;
+ * a bare spinner would say nothing about that.
  */
-function Working() {
+function Working({ steps }: { steps: Step[] }) {
   const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
     const started = Date.now();
@@ -32,13 +34,10 @@ function Working() {
   }, []);
 
   return (
-    <p className="meta tabular flex items-center gap-2" role="status">
-      <span
-        className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-brass"
-        aria-hidden="true"
-      />
-      Working… {duration(elapsed)}
-    </p>
+    <div className="flex flex-col gap-1.5">
+      <Steps steps={steps} live />
+      <p className="meta tabular">Working… {duration(elapsed)}</p>
+    </div>
   );
 }
 
@@ -58,8 +57,9 @@ export function TurnArtifacts({ data }: DataMessagePartProps<Turn>) {
   }
 
   const answer = turn.answer;
+  const steps = turn.steps ?? [];
   if (!answer) {
-    return turn.status === "running" ? <Working /> : null;
+    return turn.status === "running" ? <Working steps={steps} /> : null;
   }
 
   const refused = answer.deferred || answer.failed;
@@ -70,7 +70,7 @@ export function TurnArtifacts({ data }: DataMessagePartProps<Turn>) {
       {answer.sql && <SqlBlock sql={answer.sql} />}
       {answer.preview && <ResultTable preview={answer.preview} />}
       <Badges answer={answer} />
-      <RunDetails answer={answer} />
+      <RunDetails answer={answer} steps={steps} />
     </div>
   );
 }

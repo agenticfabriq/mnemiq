@@ -15,6 +15,7 @@ from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext, Snapshot
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
+from mnemiq.progress import Emit, Stage, step
 from mnemiq.semantic.retrieval import retrieve
 from mnemiq.semantic.ontology_index import OntologyIndex
 from mnemiq.sql.decide_write import decide_write
@@ -72,27 +73,32 @@ class Runtime:
             self.loaded_versions = versions
 
     def ask(
-        self, question: str, identity: IdentityContext, mode: str | None = None
+        self,
+        question: str,
+        identity: IdentityContext,
+        mode: str | None = None,
+        emit: Emit | None = None,
     ) -> AgentAnswer:
         self.reload_if_stale()
         started = time.perf_counter()
         # Route first: an unknown mode fails before any retrieval or LLM work.
         name = self.router.route(question, mode)
         agent = (self.agents or {}).get(name, self.agent)
-        packet = retrieve(
-            self.con, question, identity, self.authz, self.embedder,
-            k=self.settings.retrieval_k if self.settings else 12,
-            table_facts=self.snapshot.table_facts if self.snapshot else (),
-            # Definitions ride with the snapshot: the glossary channel had no runtime producer
-            # until the ontology digest, so this stayed unfed from Plan 08 until SP1.
-            definitions=self.snapshot.definitions if self.snapshot else (),
-            columns=self.snapshot.columns if self.snapshot else (),
-            ontology_index=self.ontology,
-            # M4: lets retrieve re-render each card against this identity's column policy.
-            snapshot=self.snapshot,
-        )
+        with step(emit, Stage.RETRIEVE, mode=name):
+            packet = retrieve(
+                self.con, question, identity, self.authz, self.embedder,
+                k=self.settings.retrieval_k if self.settings else 12,
+                table_facts=self.snapshot.table_facts if self.snapshot else (),
+                # Definitions ride with the snapshot: the glossary channel had no runtime
+                # producer until the ontology digest, so this stayed unfed from Plan 08 until SP1.
+                definitions=self.snapshot.definitions if self.snapshot else (),
+                columns=self.snapshot.columns if self.snapshot else (),
+                ontology_index=self.ontology,
+                # M4: lets retrieve re-render each card against this identity's column policy.
+                snapshot=self.snapshot,
+            )
         grants = self.authz.grants_for(identity)
-        answer = agent.answer(packet, self.snapshot, grants, identity)
+        answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
         answer.mode = name
         if self.sink is not None:  # observability loop: one fail-soft record per answer
             from mnemiq.observability.metrics import AnswerRecord

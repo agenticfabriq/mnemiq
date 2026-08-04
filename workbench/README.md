@@ -45,19 +45,29 @@ reload without inventing a server-side store. Two consequences worth knowing: it
 is per browser rather than per principal, and it is **not** an audit record of
 what the engine was asked — the engine's own answer log is.
 
-## Streaming, honestly
+## Streaming: stages, not tokens
 
-The SSE transport is real, but there is nothing to stream yet. `LLMClient.complete`
-is a blocking call, `LLMSynthesizer.answer` returns a finished string, and
-`Runtime.ask` returns a finished `AgentAnswer` — so `/v1/chat` emits one
-`TEXT_MESSAGE_CONTENT` frame carrying the whole answer, between keep-alives.
+The engine streams **progress**, not text. `/v1/chat` emits `STEP_STARTED` /
+`STEP_FINISHED` frames as the answer moves through its phases, then delivers the
+finished answer in a single `TEXT_MESSAGE_CONTENT`.
 
-The UI therefore shows elapsed time while it waits rather than a spinner that
-implies progress it cannot see. Token streaming would mean threading a streaming
-call through `llm/client.py`, `agent/synthesize.py` and the agent loop, whose
-`ask() -> AgentAnswer` seam the eval harness and MCP both depend on. Stage-level
-progress events (retrieved → generated → executing → synthesising) would be the
-cheaper half and need only an optional callback on that seam.
+That split is deliberate and measured. Timing a real request against a live store:
+SQL generation took 63% of the wall clock, correction 17%, **synthesis 11%** and
+execution 0.07%. Token-streaming the synthesis would animate that last 11% and
+reveal about a hundred characters — and a deep-mode run that defers never
+synthesises at all, so it would show nothing. Stages cover the whole wait.
+
+The mechanism is one `asyncio.Queue` per request. The engine is synchronous and
+runs on a worker thread; it reports progress through a plain synchronous `emit`
+callback (`mnemiq/progress.py`) whose body only schedules a thread-safe put. The
+queue is then the single ordering point for everything the client sees, and the
+completion itself is queued as a sentinel — so a step emitted before the answer
+can never arrive after it. If token deltas are ever wanted, they become a second
+producer on the same queue rather than a new mechanism.
+
+Every step carries a `stepId` on both halves. Matching a finish to its start by
+name would break the moment two steps of the same name overlap, which is exactly
+what deep mode's candidates would do if they were ever run concurrently.
 
 ## How it fits together
 

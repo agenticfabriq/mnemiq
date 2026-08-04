@@ -9,7 +9,7 @@
  * so identity here is a correctness-adjacent performance contract, not a nicety.
  */
 
-import type { AguiEvent, AnswerPayload } from "./types";
+import type { AguiEvent, AnswerPayload, Step } from "./types";
 
 export type TurnStatus = "running" | "complete" | "error";
 
@@ -19,6 +19,8 @@ export type Turn = {
   text: string;
   /** Present once the CUSTOM frame lands; absent on a stream that errored early. */
   answer?: AnswerPayload;
+  /** The phases this answer passed through, in the order the engine reported them. */
+  steps?: Step[];
   error?: string;
   status: TurnStatus;
 };
@@ -32,6 +34,22 @@ const nextId = (prefix: string) =>
 
 export function userTurn(text: string): Turn {
   return { id: nextId("u"), role: "user", text, status: "complete" };
+}
+
+function startedStep(event: AguiEvent): Step | null {
+  const e = event as { stepId?: unknown; stepName?: unknown; attempt?: unknown;
+    index?: unknown; of?: unknown };
+  const id = String(e.stepId ?? "");
+  const name = String(e.stepName ?? "");
+  if (!id || !name) return null;
+  return {
+    id,
+    name,
+    status: "running",
+    ...(typeof e.attempt === "number" && { attempt: e.attempt }),
+    ...(typeof e.index === "number" && { index: e.index }),
+    ...(typeof e.of === "number" && { of: e.of }),
+  };
 }
 
 /** Replace the last assistant turn, if there is one; otherwise leave the list alone. */
@@ -65,6 +83,26 @@ export function reduce(turns: Turn[], event: AguiEvent): Turn[] {
       const delta = "delta" in event ? String(event.delta ?? "") : "";
       if (!delta) return turns;
       return patchLast(turns, (t) => ({ ...t, text: t.text + delta }));
+    }
+
+    case "STEP_STARTED": {
+      const step = startedStep(event);
+      if (!step) return turns;
+      return patchLast(turns, (t) => ({ ...t, steps: [...(t.steps ?? []), step] }));
+    }
+
+    case "STEP_FINISHED": {
+      const id = String((event as { stepId?: unknown }).stepId ?? "");
+      if (!id) return turns;
+      const ms = (event as { durationMs?: number }).durationMs;
+      const failed = (event as { ok?: boolean }).ok === false;
+      return patchLast(turns, (t) => {
+        const at = (t.steps ?? []).findIndex((s) => s.id === id);
+        if (at < 0) return t;
+        const steps = t.steps!.slice();
+        steps[at] = { ...steps[at]!, status: failed ? "failed" : "done", ...(ms !== undefined && { ms }) };
+        return { ...t, steps };
+      });
     }
 
     case "CUSTOM": {

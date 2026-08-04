@@ -15,7 +15,7 @@ class _RT:
         self._answer, self._cards, self._raises = answer, list(cards), raises
         self.asked = None
 
-    def ask(self, question, identity, mode=None):
+    def ask(self, question, identity, mode=None, emit=None):
         if self._raises:
             raise self._raises
         self.asked = (question, identity.principal_id, mode)

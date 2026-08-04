@@ -50,9 +50,29 @@ export type AnswerPayload = {
   preview: ResultPreview | null;
 };
 
+/**
+ * One phase of an answer. `id` is what a finish is matched to its start by -- matching
+ * on name would break as soon as two steps of the same name overlap.
+ */
+export type Step = {
+  id: string;
+  name: string;
+  status: "running" | "done" | "failed";
+  ms?: number;
+  /** plan: which repair attempt. candidate: which of N. `of` is the total for either. */
+  attempt?: number;
+  index?: number;
+  of?: number;
+};
+
 /** The AG-UI frames /v1/chat emits. Unlisted types are ignored, not errors. */
 export type AguiEvent =
   | { type: "RUN_STARTED"; runId: string }
+  // Stage-specific extras (attempt/index/of) ride along untyped and are read
+  // defensively, so a new field on the engine side cannot break an older client.
+  | { type: "STEP_STARTED"; stepName: string; stepId: string }
+  | { type: "STEP_FINISHED"; stepName: string; stepId: string; durationMs?: number;
+      ok?: boolean }
   | { type: "TEXT_MESSAGE_START"; messageId: string; role: string }
   | { type: "TEXT_MESSAGE_CONTENT"; messageId: string; delta: string }
   | { type: "TEXT_MESSAGE_END"; messageId: string }

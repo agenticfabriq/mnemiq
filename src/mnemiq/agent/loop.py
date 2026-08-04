@@ -9,6 +9,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.keys import cache_key
 from mnemiq.cache.store import Cache, from_ipc, to_ipc
 from mnemiq.contract import DeferralReason, IdentityContext, Snapshot, Trace
+from mnemiq.progress import Emit, Stage, step
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
 from mnemiq.execute.runner import ExecutionError, run
@@ -111,11 +112,12 @@ class Agent:
         snapshot: Snapshot,
         grants: GrantSet,
         identity: IdentityContext,
+        emit: Emit | None = None,
     ) -> AgentAnswer:
         deadline = self.budget.started()
         if self.candidates <= 1:
-            return self._answer_single(packet, snapshot, grants, identity, deadline)
-        return self._answer_consistent(packet, snapshot, grants, identity, deadline)
+            return self._answer_single(packet, snapshot, grants, identity, deadline, emit)
+        return self._answer_consistent(packet, snapshot, grants, identity, deadline, emit)
 
     def _answer_single(
         self,
@@ -124,6 +126,7 @@ class Agent:
         grants: GrantSet,
         identity: IdentityContext,
         deadline,
+        emit: Emit | None = None,
     ) -> AgentAnswer:
         feedback: str | None = None
         failure: str | None = None
@@ -133,18 +136,19 @@ class Agent:
             # *decider* rejects (a star, a bad column) -- never disable that by capping it to
             # one attempt. This outer loop repairs what the *database* rejects, which is a
             # thing no amount of static analysis could have known.
-            outcome = plan_query(
-                packet,
-                snapshot,
-                grants,
-                self.generator,
-                adapter=self.adapter,
-                dialect=self.dialect,
-                target=self.dialect,
-                feedback=feedback,
-                corrector=self.corrector,
-                values=self.values,
-            )
+            with step(emit, Stage.PLAN, attempt=_attempt + 1, of=self.budget.max_attempts):
+                outcome = plan_query(
+                    packet,
+                    snapshot,
+                    grants,
+                    self.generator,
+                    adapter=self.adapter,
+                    dialect=self.dialect,
+                    target=self.dialect,
+                    feedback=feedback,
+                    corrector=self.corrector,
+                    values=self.values,
+                )
             if isinstance(outcome, Deferred):
                 return AgentAnswer(answer=outcome.reason, deferred=True,
                                    reason_code=outcome.code)
@@ -155,15 +159,18 @@ class Agent:
             hit = self.cache.get(key)
             if hit is not None:
                 table = from_ipc(hit)
-                blocked = self._verified(packet, approved, table)
+                with step(emit, Stage.VERIFY, cached=True):
+                    blocked = self._verified(packet, approved, table)
                 if blocked is not None:
                     return blocked
                 return self._synthesize(
-                    packet, approved, identity, table, deadline, cached=True, forced=False
+                    packet, approved, identity, table, deadline, cached=True, forced=False,
+                    emit=emit,
                 )
 
             try:
-                result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
+                with step(emit, Stage.EXECUTE):
+                    result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
             except ExecutionError as exc:
                 # The database is the one authority that cannot be wrong about itself: its
                 # complaint is the cheapest accuracy lever we have. Feed it back and retry.
@@ -172,7 +179,8 @@ class Agent:
                 continue
 
             self.cache.put(key, to_ipc(result.table))
-            blocked = self._verified(packet, approved, result.table)
+            with step(emit, Stage.VERIFY):
+                blocked = self._verified(packet, approved, result.table)
             if blocked is not None:
                 return blocked
             return self._synthesize(
@@ -184,6 +192,7 @@ class Agent:
                 cached=False,
                 forced=deadline.expired,
                 execute_ms=result.elapsed_ms,
+                emit=emit,
             )
 
         # NOT a deferral. We did not decline to answer -- the source refused to serve us, and
@@ -217,32 +226,34 @@ class Agent:
         grants: GrantSet,
         identity: IdentityContext,
         deadline,
+        emit: Emit | None = None,
     ) -> AgentAnswer:
         # Generate N candidates across engineered strategies and let execution vote. Each
         # is decided independently; a refusal/deferral just drops that candidate.
         executed: list[tuple[Approved, object]] = []
         for i in range(self.candidates):
-            outcome = plan_query(
-                packet,
-                snapshot,
-                grants,
-                StrategyGenerator(self.generator, STRATEGIES[i % len(STRATEGIES)]),
-                adapter=self.adapter,
-                dialect=self.dialect,
-                target=self.dialect,
-                max_attempts=1,
-                corrector=self.corrector,
-                values=self.values,
-            )
-            if not isinstance(outcome, Approved):
-                continue
-            table = self._execute(outcome, grants, packet)
+            with step(emit, Stage.CANDIDATE, index=i + 1, of=self.candidates):
+                outcome = plan_query(
+                    packet,
+                    snapshot,
+                    grants,
+                    StrategyGenerator(self.generator, STRATEGIES[i % len(STRATEGIES)]),
+                    adapter=self.adapter,
+                    dialect=self.dialect,
+                    target=self.dialect,
+                    max_attempts=1,
+                    corrector=self.corrector,
+                    values=self.values,
+                )
+                if not isinstance(outcome, Approved):
+                    continue
+                table = self._execute(outcome, grants, packet)
             if table is not None:
                 executed.append((outcome, table))
 
         if not executed:
             # no candidate ran -> fall back to the single repairing path (today's floor)
-            return self._answer_single(packet, snapshot, grants, identity, deadline)
+            return self._answer_single(packet, snapshot, grants, identity, deadline, emit)
 
         groups = cluster([table for _, table in executed])
         views = [
@@ -284,12 +295,14 @@ class Agent:
         approved, table = executed[winner[0]]
         agreement = len(winner) / len(executed)
 
-        blocked = self._verified(packet, approved, table)
+        with step(emit, Stage.VERIFY):
+            blocked = self._verified(packet, approved, table)
         if blocked is not None:
             return blocked
 
         base = self._synthesize(
-            packet, approved, identity, table, deadline, cached=False, forced=deadline.expired
+            packet, approved, identity, table, deadline, cached=False,
+            forced=deadline.expired, emit=emit,
         )
         caution = "" if agreement >= 0.5 else " -- treat with caution"
         note = f" (confidence: {len(winner)}/{len(executed)} candidates agreed{caution}.)"
@@ -327,10 +340,12 @@ class Agent:
         cached: bool,
         forced: bool,
         execute_ms: float = 0.0,
+        emit: Emit | None = None,
     ) -> AgentAnswer:
-        answer = self.synthesizer.answer(
-            packet.question, approved.plan_sql, render_result(table), forced=forced
-        )
+        with step(emit, Stage.SYNTHESIZE, forced=forced):
+            answer = self.synthesizer.answer(
+                packet.question, approved.plan_sql, render_result(table), forced=forced
+            )
         trace = build_trace(
             question=packet.question,
             approved=approved,
