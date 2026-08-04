@@ -10,4 +10,6 @@ jobs:
         with:
           fetch-depth: 0
       - name: Scan for proprietary names and secrets
+        env:
+          REPO_GUARD_NAME_PATTERNS: ${{ secrets.REPO_GUARD_NAME_PATTERNS }}
         run: bash scripts/repo-guard.sh --all
