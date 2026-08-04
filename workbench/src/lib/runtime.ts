@@ -5,9 +5,13 @@
  * MessagePrimitive.Parts dispatches by name to our renderer. The alternative --
  * bindExternalStoreMessage / getExternalStoreMessages -- is marked deprecated at
  * 0.15.4 and its generic is caller-asserted rather than checked.
+ *
+ * Threads are ours too. assistant-ui's external-store thread-list adapter is
+ * deprecated at this version, and switching threads is just handing the runtime a
+ * different messages array -- not worth taking a churning API for.
  */
 
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   useExternalStoreRuntime,
   type AppendMessage,
@@ -16,6 +20,7 @@ import {
 
 import { streamChat } from "./transport";
 import { isRunning, reduce, userTurn, type Turn } from "./store";
+import { emptyThread, isBlank, load, save, titleFor, type Thread } from "./threads";
 import { DEFAULT_MODE, type Mode } from "./types";
 
 export const TURN_PART = "mnemiq.turn";
@@ -52,23 +57,77 @@ function convertMessage(turn: Turn): ThreadMessageLike {
 }
 
 export function useWorkbench() {
-  const [turns, setTurns] = useState<Turn[]>([]);
+  const restored = useMemo(() => {
+    const stored = load();
+    return stored.length ? stored : [emptyThread()];
+  }, []);
+
+  const [threads, setThreads] = useState<Thread[]>(restored);
+  const [activeId, setActiveId] = useState<string>(restored[0]!.id);
   const [mode, setMode] = useState<Mode>(DEFAULT_MODE);
-  // The composer reads the mode at send time, so a mid-run change never retargets
-  // the run already in flight.
+
+  // Read at send time so switching thread or mode mid-run never retargets a run
+  // already in flight.
   const modeRef = useRef(mode);
   modeRef.current = mode;
+  const activeRef = useRef(activeId);
+  activeRef.current = activeId;
+  const threadsRef = useRef(threads);
+  threadsRef.current = threads;
 
-  const ask = useCallback(async (question: string) => {
-    setTurns((current) => [...current, userTurn(question)]);
-    for await (const event of streamChat(question, modeRef.current)) {
-      setTurns((current) => reduce(current, event));
+  useEffect(() => {
+    save(threads);
+  }, [threads]);
+
+  const active = threads.find((t) => t.id === activeId) ?? threads[0]!;
+
+  const updateTurns = useCallback(
+    (threadId: string, update: (turns: Turn[]) => Turn[]) => {
+      setThreads((current) =>
+        current.map((thread) => {
+          if (thread.id !== threadId) return thread;
+          const turns = update(thread.turns);
+          if (turns === thread.turns) return thread;
+          const next = { ...thread, turns };
+          return { ...next, title: titleFor(next) };
+        }),
+      );
+    },
+    [],
+  );
+
+  const ask = useCallback(
+    async (question: string) => {
+      const threadId = activeRef.current;
+      updateTurns(threadId, (current) => [...current, userTurn(question)]);
+      for await (const event of streamChat(question, modeRef.current)) {
+        updateTurns(threadId, (current) => reduce(current, event));
+      }
+    },
+    [updateTurns],
+  );
+
+  const newChat = useCallback(() => {
+    const blank = threadsRef.current.find(isBlank);
+    if (blank) {
+      setActiveId(blank.id);
+      return;
     }
+    const thread = emptyThread();
+    setThreads((current) => [thread, ...current]);
+    setActiveId(thread.id);
+  }, []);
+
+  const deleteThread = useCallback((id: string) => {
+    const remaining = threadsRef.current.filter((thread) => thread.id !== id);
+    const next = remaining.length > 0 ? remaining : [emptyThread()];
+    setThreads(next);
+    if (id === activeRef.current) setActiveId(next[0]!.id);
   }, []);
 
   const runtime = useExternalStoreRuntime<Turn>({
-    messages: turns,
-    isRunning: isRunning(turns),
+    messages: active.turns,
+    isRunning: isRunning(active.turns),
     convertMessage,
     onNew: async (message: AppendMessage) => {
       const question = textOf(message).trim();
@@ -76,5 +135,15 @@ export function useWorkbench() {
     },
   });
 
-  return { runtime, mode, setMode, ask, turns };
+  return {
+    runtime,
+    mode,
+    setMode,
+    ask,
+    threads,
+    activeId: active.id,
+    selectThread: setActiveId,
+    newChat,
+    deleteThread,
+  };
 }

@@ -25,8 +25,10 @@ export type Turn = {
 
 export const ANSWER_EVENT = "mnemiq.answer";
 
-let seq = 0;
-const nextId = (prefix: string) => `${prefix}-${++seq}`;
+// Ids must not collide with ids restored from a previous session, so they cannot be
+// a counter that restarts at zero on reload.
+const nextId = (prefix: string) =>
+  `${prefix}-${globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2)}`;
 
 export function userTurn(text: string): Turn {
   return { id: nextId("u"), role: "user", text, status: "complete" };

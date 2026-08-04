@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
 
+import { HistoryPanel } from "./components/HistoryPanel";
 import { ModeSelector } from "./components/ModeSelector";
-import { ScopePanel } from "./components/ScopePanel";
+import { ScopePanel, useSchema } from "./components/ScopePanel";
 import { Thread } from "./components/Thread";
 import { useWorkbench } from "./lib/runtime";
 
 type Theme = "system" | "light" | "dark";
+
+const SCOPE_KEY = "mnemiq.scope-open.v1";
 
 function ThemeToggle() {
   const [theme, setTheme] = useState<Theme>("system");
@@ -31,7 +34,16 @@ function ThemeToggle() {
 }
 
 export default function App() {
-  const { runtime, mode, setMode, ask } = useWorkbench();
+  const { runtime, mode, setMode, ask, threads, activeId, selectThread, newChat, deleteThread } =
+    useWorkbench();
+  const tables = useSchema();
+
+  const [scopeOpen, setScopeOpen] = useState<boolean>(
+    () => globalThis.localStorage?.getItem(SCOPE_KEY) !== "0",
+  );
+  useEffect(() => {
+    globalThis.localStorage?.setItem(SCOPE_KEY, scopeOpen ? "1" : "0");
+  }, [scopeOpen]);
 
   return (
     <AssistantRuntimeProvider runtime={runtime}>
@@ -41,15 +53,32 @@ export default function App() {
           <span className="label hidden md:inline">workbench</span>
           <div className="ml-auto flex items-center gap-3">
             <ModeSelector mode={mode} onChange={setMode} />
+            <button
+              type="button"
+              onClick={() => setScopeOpen((open) => !open)}
+              aria-pressed={scopeOpen}
+              className={`label hidden border px-2 py-1 lg:inline-block ${
+                scopeOpen ? "border-rule text-ink" : "border-rule hover:text-ink"
+              }`}
+            >
+              {tables === null ? "Tables" : `${tables.length} tables`}
+            </button>
             <ThemeToggle />
           </div>
         </header>
 
         <div className="flex min-h-0 flex-1">
-          <ScopePanel />
+          <HistoryPanel
+            threads={threads}
+            activeId={activeId}
+            onSelect={selectThread}
+            onNew={newChat}
+            onDelete={deleteThread}
+          />
           <main className="min-w-0 flex-1">
             <Thread onPick={ask} />
           </main>
+          {scopeOpen && <ScopePanel tables={tables} onHide={() => setScopeOpen(false)} />}
         </div>
       </div>
     </AssistantRuntimeProvider>

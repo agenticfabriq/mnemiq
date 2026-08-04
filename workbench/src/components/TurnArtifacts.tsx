@@ -7,14 +7,40 @@
  * explains what to do about it.
  */
 
+import { useEffect, useState } from "react";
 import type { DataMessagePartProps } from "@assistant-ui/react";
 
 import type { Turn } from "../lib/store";
+import { duration } from "../lib/verdict";
 import { Badges } from "./Badges";
 import { DeferralCard } from "./DeferralCard";
 import { ResultTable } from "./ResultTable";
 import { RunDetails } from "./RunDetails";
 import { SqlBlock } from "./SqlBlock";
+
+/**
+ * The engine answers in one shot -- there are no tokens to stream -- so the only
+ * honest progress signal is how long it has been working. Deep mode can run for
+ * minutes; a bare spinner would say nothing about that.
+ */
+function Working() {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const started = Date.now();
+    const timer = globalThis.setInterval(() => setElapsed(Date.now() - started), 250);
+    return () => globalThis.clearInterval(timer);
+  }, []);
+
+  return (
+    <p className="meta tabular flex items-center gap-2" role="status">
+      <span
+        className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-brass"
+        aria-hidden="true"
+      />
+      Working… {duration(elapsed)}
+    </p>
+  );
+}
 
 export function TurnArtifacts({ data }: DataMessagePartProps<Turn>) {
   const turn = data;
@@ -33,11 +59,7 @@ export function TurnArtifacts({ data }: DataMessagePartProps<Turn>) {
 
   const answer = turn.answer;
   if (!answer) {
-    return turn.status === "running" ? (
-      <p className="label" role="status">
-        Working…
-      </p>
-    ) : null;
+    return turn.status === "running" ? <Working /> : null;
   }
 
   const refused = answer.deferred || answer.failed;

@@ -35,6 +35,30 @@ pnpm test        # vitest
 pnpm typecheck   # tsc --noEmit
 ```
 
+## Layout
+
+History on the left, transcript in the middle, the tables in scope on the right
+(hidable — the toggle sits in the header, and the choice is remembered).
+
+History lives in this browser's `localStorage`, which is what makes it survive a
+reload without inventing a server-side store. Two consequences worth knowing: it
+is per browser rather than per principal, and it is **not** an audit record of
+what the engine was asked — the engine's own answer log is.
+
+## Streaming, honestly
+
+The SSE transport is real, but there is nothing to stream yet. `LLMClient.complete`
+is a blocking call, `LLMSynthesizer.answer` returns a finished string, and
+`Runtime.ask` returns a finished `AgentAnswer` — so `/v1/chat` emits one
+`TEXT_MESSAGE_CONTENT` frame carrying the whole answer, between keep-alives.
+
+The UI therefore shows elapsed time while it waits rather than a spinner that
+implies progress it cannot see. Token streaming would mean threading a streaming
+call through `llm/client.py`, `agent/synthesize.py` and the agent loop, whose
+`ask() -> AgentAnswer` seam the eval harness and MCP both depend on. Stage-level
+progress events (retrieved → generated → executing → synthesising) would be the
+cheaper half and need only an optional callback on that seam.
+
 ## How it fits together
 
 ```
