@@ -10,6 +10,7 @@
 import { useState } from "react";
 
 import { chartSpecFor, whyNoChart } from "../lib/chartspec";
+import { downloadCsv } from "../lib/csv";
 import type { ResultPreview } from "../lib/types";
 import { ResultChart } from "./ResultChart";
 import { ResultTable } from "./ResultTable";
@@ -42,6 +43,19 @@ export function ResultView({ preview }: { preview: ResultPreview }) {
             </button>
           ))}
         </div>
+        <button
+          type="button"
+          onClick={() => downloadCsv(preview)}
+          title={
+            preview.truncated
+              ? `Downloads the ${preview.rows.length} rows shown, not all ${preview.row_count}`
+              : `Downloads all ${preview.row_count} rows`
+          }
+          className="label border border-rule px-2 py-1 hover:border-brass hover:text-brass"
+        >
+          {preview.truncated ? `CSV (${preview.rows.length} shown)` : "CSV"}
+        </button>
+
         {!spec && <span className="meta">{whyNoChart(preview)}</span>}
 
         {/* One measure at a time -- see chartoption.ts for why there is no second axis. */}
