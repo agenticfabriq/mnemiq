@@ -63,14 +63,20 @@ def _system_with_markdown(row_count: int | None = None) -> str:
 def test_markdown_is_off_unless_asked_for():
     # Every other consumer of the answer -- MCP, the eval harness, beacon's SUT -- reads
     # plain text, so this cannot be on by default.
-    assert "You may use markdown" not in _system_for(3)
+    assert "Use markdown when the answer has structure" not in _system_for(3)
 
 
 def test_markdown_permission_is_added_when_configured():
-    assert "You may use markdown" in _system_with_markdown()
+    assert "Use markdown when the answer has structure" in _system_with_markdown()
 
 
 def test_markdown_never_licenses_restating_the_table():
     system = _system_with_markdown(LIST_LIMIT + 1)
-    assert "Never restate the result table" in system
+    assert "a small markdown table IS the answer" in system
     assert "Do NOT list its rows back" in system, "the summarise rule still applies"
+
+
+def test_the_plain_opener_is_dropped_when_markdown_is_on():
+    # "one or two plain sentences" outranked the markdown permission that followed it.
+    assert "one or two plain sentences" in _system_for(3)
+    assert "one or two plain sentences" not in _system_with_markdown(3)

@@ -12,8 +12,16 @@ _PERSONA = (
     "and you never invent a number."
 )
 
-_RULES = """Answer the question from the rows below, in one or two plain sentences.
+# The opening line is the strongest instruction in the prompt, so it -- not a permission
+# appended after it -- is what decides whether structure is allowed. "One or two plain
+# sentences" followed by "you may use markdown" is a contradiction, and the firm half won:
+# asked to compare two measures across three regions it produced a 278-character run-on.
+_OPEN_PLAIN = "Answer the question from the rows below, in one or two plain sentences."
+_OPEN_MARKDOWN = (
+    "Answer the question from the rows below, as briefly as it can be answered well."
+)
 
+_RULES = """
 - Use ONLY the values in the result. Never estimate, extrapolate, or add outside knowledge.
 - If the result is empty, say plainly that no rows matched -- that is a real answer.
 - If the rows are truncated, say that your answer covers only the rows shown.
@@ -35,10 +43,10 @@ the table in prose is not, and it is where a long answer starts inventing detail
 # plain text unless something is there to render it.
 _MARKDOWN = """
 
-You may use markdown when the answer genuinely has structure: a short list, or a small
-table when comparing values across a few named things. Never for a single figure or a
-one-sentence answer -- a sentence is not a list. Never restate the result table as a
-markdown table."""
+Use markdown when the answer has structure. When you are giving more than one figure for
+each of several named things, a small markdown table IS the answer -- write one, rather
+than a sentence with semicolons in it. A short bulleted list works when there is one
+figure each. For a single figure, write the sentence: a sentence is not a list."""
 
 _FORCED = "\n\nYou are out of budget. Answer from the data you already have. Do not ask for more."
 
@@ -56,7 +64,8 @@ class LLMSynthesizer:
 
     def answer(self, question: str, sql: str, rendered: str, forced: bool = False,
                row_count: int | None = None) -> str:
-        system = f"{_PERSONA}\n\n{_RULES}"
+        opener = _OPEN_MARKDOWN if self._markdown else _OPEN_PLAIN
+        system = f"{_PERSONA}\n\n{opener}\n{_RULES}"
         if self._markdown:
             system += _MARKDOWN
         if row_count is not None and row_count > LIST_LIMIT:
