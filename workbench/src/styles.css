@@ -25,6 +25,23 @@
     --brass-wash: #f6efdd;
     --crimson: #9c3a34;
     --crimson-wash: #f8e9e7;
+
+    /*
+     * Chart series. A separate scale from brass/crimson on purpose: those two are
+     * reserved for what the engine decided, and a status hue must never come back
+     * as "series 4". Validated against this surface for lightness band, chroma
+     * floor, CVD separation and normal-vision separation; four slots fall under
+     * 3:1 contrast here, which the always-present table view and direct labels are
+     * the required relief for.
+     */
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --series-4: #eda100;
+    --series-5: #e87ba4;
+    --series-6: #008300;
+    --series-7: #4a3aa7;
+    --series-8: #e34948;
   }
 
   /* Follow the system unless the reader has overridden it. */
@@ -40,6 +57,16 @@
       --brass-wash: #2a2114;
       --crimson: #d9756c;
       --crimson-wash: #2b1917;
+
+      /* Dark is stepped for the dark surface, not a flip of the light set. */
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --series-4: #c98500;
+      --series-5: #d55181;
+      --series-6: #008300;
+      --series-7: #9085e9;
+      --series-8: #e34948;
     }
   }
 
@@ -54,6 +81,16 @@
     --brass-wash: #2a2114;
     --crimson: #d9756c;
     --crimson-wash: #2b1917;
+
+    /* Dark is stepped for the dark surface, not a flip of the light set. */
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+    --series-7: #9085e9;
+    --series-8: #e34948;
   }
 
   html,

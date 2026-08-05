@@ -16,7 +16,7 @@ import { duration } from "../lib/verdict";
 import { Steps } from "./Steps";
 import { Badges } from "./Badges";
 import { DeferralCard } from "./DeferralCard";
-import { ResultTable } from "./ResultTable";
+import { ResultView } from "./ResultView";
 import { RunDetails } from "./RunDetails";
 import { SqlBlock } from "./SqlBlock";
 
@@ -68,7 +68,7 @@ export function TurnArtifacts({ data }: DataMessagePartProps<Turn>) {
     <div className="flex flex-col gap-2.5">
       {refused && <DeferralCard answer={answer} />}
       {answer.sql && <SqlBlock sql={answer.sql} />}
-      {answer.preview && <ResultTable preview={answer.preview} />}
+      {answer.preview && <ResultView preview={answer.preview} />}
       <Badges answer={answer} />
       <RunDetails answer={answer} steps={steps} />
     </div>

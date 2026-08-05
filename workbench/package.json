@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@assistant-ui/react": "0.15.4",
+    "echarts": "6.1.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-markdown": "^10.1.0",
