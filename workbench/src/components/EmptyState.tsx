@@ -1,5 +1,7 @@
 /** An empty screen is an invitation to act, so it hands over questions to try. */
 
+import { Mark } from "./Mark";
+
 // One aggregate, one grouping, and one the engine should decline -- a refusal is as
 // much a demonstration of the engine as an answer is.
 const STARTERS = [
@@ -12,6 +14,7 @@ export function EmptyState({ onPick }: { onPick: (question: string) => void }) {
   return (
     <section className="flex flex-col gap-4 py-6">
       <div>
+        <Mark size={30} className="mb-3 text-graphite" />
         <h2 className="text-[15px] font-medium">Ask a question about your data.</h2>
         <p className="mt-1.5 max-w-lg text-[12px] text-graphite">
           Answers arrive with the SQL that produced them. When the data cannot support

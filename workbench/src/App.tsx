@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { AssistantRuntimeProvider } from "@assistant-ui/react";
 
 import { HistoryPanel } from "./components/HistoryPanel";
+import { Mark } from "./components/Mark";
 import { ModeSelector } from "./components/ModeSelector";
 import { ScopePanel, useSchema } from "./components/ScopePanel";
 import { Thread } from "./components/Thread";
@@ -49,7 +50,10 @@ export default function App() {
     <AssistantRuntimeProvider runtime={runtime}>
       <div className="flex h-full flex-col">
         <header className="flex items-center gap-4 border-b border-rule bg-surface px-5 py-2.5">
-          <span className="text-[14px] font-medium tracking-tight">mnemiq</span>
+          <span className="flex items-center gap-2">
+            <Mark size={18} />
+            <span className="text-[14px] font-medium tracking-tight">mnemiq</span>
+          </span>
           <span className="label hidden md:inline">workbench</span>
           <div className="ml-auto flex items-center gap-3">
             <ModeSelector mode={mode} onChange={setMode} />
