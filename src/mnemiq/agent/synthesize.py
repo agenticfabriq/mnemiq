@@ -30,6 +30,16 @@ two sentences saying what the result covers and what stands out in it: the large
 smallest, a pattern, an outlier. Naming one or two rows as examples is fine. Reproducing
 the table in prose is not, and it is where a long answer starts inventing detail."""
 
+# Off by default: a one-line answer wrapped in markdown reads worse than the sentence,
+# and every consumer of /v1/ask -- MCP clients, the eval harness, beacon's SUT -- gets
+# plain text unless something is there to render it.
+_MARKDOWN = """
+
+You may use markdown when the answer genuinely has structure: a short list, or a small
+table when comparing values across a few named things. Never for a single figure or a
+one-sentence answer -- a sentence is not a list. Never restate the result table as a
+markdown table."""
+
 _FORCED = "\n\nYou are out of budget. Answer from the data you already have. Do not ask for more."
 
 
@@ -39,13 +49,16 @@ class Synthesizer(Protocol):
 
 
 class LLMSynthesizer:
-    def __init__(self, client, max_tokens: int = 1000) -> None:
+    def __init__(self, client, max_tokens: int = 1000, markdown: bool = False) -> None:
         self._client = client
         self._max_tokens = max_tokens
+        self._markdown = markdown
 
     def answer(self, question: str, sql: str, rendered: str, forced: bool = False,
                row_count: int | None = None) -> str:
         system = f"{_PERSONA}\n\n{_RULES}"
+        if self._markdown:
+            system += _MARKDOWN
         if row_count is not None and row_count > LIST_LIMIT:
             system += _SUMMARISE
         if forced:

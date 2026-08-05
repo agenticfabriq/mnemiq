@@ -51,3 +51,26 @@ def test_the_budget_notice_still_applies_on_top():
     system = _system_for(LIST_LIMIT + 1, forced=True)
     assert "Do NOT list its rows back" in system
     assert "out of budget" in system
+
+
+def _system_with_markdown(row_count: int | None = None) -> str:
+    client = _Recorder()
+    LLMSynthesizer(client, markdown=True).answer("q", "SELECT 1", "n\n1\n(1 rows)",
+                                                 row_count=row_count)
+    return client.system
+
+
+def test_markdown_is_off_unless_asked_for():
+    # Every other consumer of the answer -- MCP, the eval harness, beacon's SUT -- reads
+    # plain text, so this cannot be on by default.
+    assert "You may use markdown" not in _system_for(3)
+
+
+def test_markdown_permission_is_added_when_configured():
+    assert "You may use markdown" in _system_with_markdown()
+
+
+def test_markdown_never_licenses_restating_the_table():
+    system = _system_with_markdown(LIST_LIMIT + 1)
+    assert "Never restate the result table" in system
+    assert "Do NOT list its rows back" in system, "the summarise rule still applies"

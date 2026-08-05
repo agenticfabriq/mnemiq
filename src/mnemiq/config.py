@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     # --- behavior levers / MCP standalone identity ---
     guided_sql: bool = Field(default=False, description="constrained decoding: force non-empty sql (vLLM guided_json)")
     assertive_sql: bool = Field(default=False, description="assertive prompt: attempt an answer instead of deferring")
+    answer_markdown: bool = Field(default=False, description="let the answer use markdown (lists, tables) when the result has structure")
     enrich_facts: bool = Field(default=False, description="eval: table-facts enrichment phase (plan-20, default off)")
     enrich_examples: bool = Field(default=False, description="eval: verified-example enrichment phase (plan-20, default off)")
     dictionary_path: str | None = Field(default=None, description="operator code data-dictionary JSON path (grounds code meanings)")
