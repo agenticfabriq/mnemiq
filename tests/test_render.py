@@ -34,3 +34,34 @@ def test_an_empty_result_is_stated_plainly():
 def test_nulls_render_as_null_not_none():
     table = pa.table({"n": pa.array([None, 1], type=pa.int64())})
     assert "NULL" in render_result(table)
+
+
+def test_a_shortened_cell_is_declared_not_just_marked():
+    # The model read a bare `…` as evidence and reported rows truncated when only cells
+    # were. Row truncation was always announced; cell truncation was not.
+    t = pa.table({"detail": ["x" * 400]})
+    out = render_result(t)
+
+    assert "…" in out
+    assert "shortened for this prompt" in out
+    assert "(1 rows)" in out, "the row count must still be honest"
+
+
+def test_nothing_is_declared_when_nothing_was_shortened():
+    out = render_result(pa.table({"n": [1, 2]}))
+    assert "shortened" not in out
+    assert "…" not in out
+
+
+def test_ordinary_values_are_no_longer_cut():
+    # 120 halved schema/description columns; a policy number or a sentence must survive.
+    value = "a claim description of the kind an adjuster writes, " * 3
+    assert len(value) < 240
+    assert value in render_result(pa.table({"note": [value]}))
+
+
+def test_both_bounds_are_declared_together():
+    rows = ["y" * 400] * 60
+    out = render_result(pa.table({"detail": rows}), max_rows=50)
+    assert "showing 50 of 60 rows (truncated)" in out
+    assert "shortened for this prompt" in out
