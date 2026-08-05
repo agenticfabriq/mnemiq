@@ -1,10 +1,11 @@
 /**
- * The mnemiq mark: a Q inside brackets.
+ * The mnemiq mark: a q inside brackets.
  *
  * The letter is the house (Agentic Fabriq, whose products share it); the brackets are
  * this product -- scope closing on what an identity may see, which is the engine's job.
- * Squared and mitred like everything else here; the tail is the one diagonal in the
- * system, which is what makes it a Q rather than a box.
+ * Lowercase to match the wordmark and the rest of the type system, and squared like
+ * everything else here: the bowl is drawn as one stroke whose right side keeps going to
+ * become the descender, so the letter is a single continuous path.
  *
  * Strokes are `currentColor`, so it takes the ink of whatever it sits in and needs no
  * light and dark variants. `public/favicon.svg` carries the same geometry with explicit
@@ -27,8 +28,7 @@ export function Mark({ size = 20, className }: { size?: number; className?: stri
       strokeLinejoin="miter"
     >
       <path d="M10 4H4v24h6M22 4h6v24h-6" />
-      <rect x="11.6" y="9.6" width="9" height="10.6" />
-      <path d="M17 17.4l5.2 5.6" />
+      <path d="M19.4 19.6h-8V9.4h8v16.4" />
     </svg>
   );
 }
