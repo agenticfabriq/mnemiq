@@ -1,9 +1,11 @@
 /** An empty screen is an invitation to act, so it hands over questions to try. */
 
+// One aggregate, one grouping, and one the engine should decline -- a refusal is as
+// much a demonstration of the engine as an answer is.
 const STARTERS = [
-  "How many claims are there?",
-  "List every fire claim with its identifier and amount",
+  "Which region has the highest total claim amount?",
   "How many claims are there by status?",
+  "List five policyholders by name with their policy number",
 ];
 
 export function EmptyState({ onPick }: { onPick: (question: string) => void }) {
