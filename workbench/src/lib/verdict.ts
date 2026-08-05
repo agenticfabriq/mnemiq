@@ -60,6 +60,10 @@ export const REASONS: Record<DeferralReason, { title: string; next: string }> = 
     title: "The source rejected every attempt",
     next: "Page an operator. This is a source failure, not a refusal.",
   },
+  model_unavailable: {
+    title: "The model provider did not respond",
+    next: "An outage, not a judgement about your data. Try again.",
+  },
 };
 
 /** 412 ms / 8.5 s / 2 m 04 s -- always legible, never more precision than is useful. */

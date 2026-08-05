@@ -9,6 +9,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.keys import cache_key
 from mnemiq.cache.store import Cache, from_ipc, to_ipc
 from mnemiq.contract import DeferralReason, IdentityContext, Snapshot, Trace
+from mnemiq.llm.client import ModelUnavailable
 from mnemiq.progress import Emit, Stage, step
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
@@ -115,9 +116,22 @@ class Agent:
         emit: Emit | None = None,
     ) -> AgentAnswer:
         deadline = self.budget.started()
-        if self.candidates <= 1:
-            return self._answer_single(packet, snapshot, grants, identity, deadline, emit)
-        return self._answer_consistent(packet, snapshot, grants, identity, deadline, emit)
+        try:
+            if self.candidates <= 1:
+                return self._answer_single(packet, snapshot, grants, identity, deadline, emit)
+            return self._answer_consistent(packet, snapshot, grants, identity, deadline, emit)
+        except ModelUnavailable:
+            # Symmetry with the source-outage path: something happened TO us, so it is a
+            # stated failure the caller can act on, never a deferral and never a traceback
+            # out of the transport. `failed` is what keeps it out of the deferral rate (M6).
+            return AgentAnswer(
+                answer=(
+                    "Could not answer this question: the model provider did not respond. "
+                    "This is an outage, not a judgement about your data -- try again."
+                ),
+                failed=True,
+                reason_code=DeferralReason.MODEL_UNAVAILABLE,
+            )
 
     def _answer_single(
         self,

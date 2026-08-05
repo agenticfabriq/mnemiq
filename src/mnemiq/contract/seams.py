@@ -22,6 +22,7 @@ class DeferralReason(StrEnum):
     VERIFICATION = "verification"  # we answered, then the verifier declined to stand behind it
     DISAGREEMENT = "disagreement"  # candidates diverged too much to pick one
     EXECUTION_FAILED = "execution_failed"  # the source rejected every attempt -- NOT a deferral
+    MODEL_UNAVAILABLE = "model_unavailable"  # the model provider did not answer -- NOT a deferral
 
 
 class IdentityContext(BaseModel):

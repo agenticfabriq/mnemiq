@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import re
 
-from openai import OpenAI
+from openai import APIError, OpenAI
 
 from mnemiq.config import Settings
 
 _GPT5 = re.compile(r"(^|\.)gpt-5")
+
+
+class ModelUnavailable(RuntimeError):
+    """The model provider did not answer -- outage, timeout, rate limit, bad gateway.
+
+    Its own type so the agent can end in a stated failure instead of a traceback, and so
+    the SDK's exception classes stop at this module. This is the model-side twin of the
+    source refusing to serve us: something that happened TO us, never a decision we made.
+    """
 
 
 def token_param_name(model: str) -> str:
@@ -34,14 +43,17 @@ class LLMClient:
         kwargs = {token_param_name(self._model): max_tokens}
         if extra_body:  # e.g. vLLM guided decoding (guided_json / guided_grammar)
             kwargs["extra_body"] = extra_body
-        resp = self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            **kwargs,
-        )
+        try:
+            resp = self._client.chat.completions.create(
+                model=self._model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                **kwargs,
+            )
+        except APIError as exc:
+            raise ModelUnavailable(str(exc)) from exc
         self.calls += 1
         usage = getattr(resp, "usage", None)
         if usage is not None:
