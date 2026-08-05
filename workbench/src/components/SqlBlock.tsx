@@ -39,7 +39,9 @@ export function SqlBlock({ sql }: { sql: string }) {
         )}
       </div>
       {open && (
-        <pre className="overflow-x-auto px-2.5 py-2 text-[12px] leading-relaxed">
+        // Wrap rather than scroll: a statement is read, not scrubbed sideways, and a
+        // horizontal scrollbar hides the tail of exactly the thing on trial here.
+        <pre className="px-2.5 py-2 text-[12px] leading-relaxed break-words whitespace-pre-wrap">
           <code>{sql}</code>
         </pre>
       )}
