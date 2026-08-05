@@ -358,7 +358,8 @@ class Agent:
     ) -> AgentAnswer:
         with step(emit, Stage.SYNTHESIZE, forced=forced):
             answer = self.synthesizer.answer(
-                packet.question, approved.plan_sql, render_result(table), forced=forced
+                packet.question, approved.plan_sql, render_result(table), forced=forced,
+                row_count=table.num_rows,
             )
         trace = build_trace(
             question=packet.question,
