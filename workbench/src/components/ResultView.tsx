@@ -17,9 +17,13 @@ import { ResultTable } from "./ResultTable";
 
 export function ResultView({ preview }: { preview: ResultPreview }) {
   const spec = chartSpecFor(preview);
-  const [view, setView] = useState<"table" | "chart">("table");
+  // Chart first when there is one. The answer above already states the figures -- in a
+  // formatted table when the engine is emitting markdown -- so opening on the raw table
+  // is a third copy of the same numbers. The shape is the thing it does not already say.
+  const [chosen, setChosen] = useState<"table" | "chart" | null>(null);
   const [measure, setMeasure] = useState<string | null>(null);
-  const showing = spec ? view : "table";
+  const showing = spec ? (chosen ?? "chart") : "table";
+  const setView = setChosen;
   const shown = measure && spec?.valueColumns.includes(measure) ? measure : spec?.valueColumns[0];
 
   return (
