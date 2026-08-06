@@ -195,6 +195,12 @@ def run_case_csv(
     result.engine_rows = _preview(candidate)
     result.engine_row_count = candidate.num_rows
     result.executed = True
+    # Portability is decided, not skipped. BIRD has two engines and must check by running
+    # the SQL on the gold's; here the benchmark's own SQLite file IS the executor, so a
+    # query that ran has already run on the gold engine and there is nothing to re-check.
+    # Keyed on the adapter rather than hardcoded: run this through a DuckDB attachment and
+    # the claim stops being free, and the flag must go back to being earned.
+    result.portable_to_gold_engine = getattr(adapter, "dialect", None) == "sqlite"
     result.outcome = grade_alternatives(candidate, alternatives)
     return result
 

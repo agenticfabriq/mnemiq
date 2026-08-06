@@ -117,6 +117,8 @@ def _trace(sql: str) -> Trace:
 
 
 class _Adapter:
+    dialect = "sqlite"
+
     def __init__(self, table: pa.Table):
         self._table = table
 
@@ -150,6 +152,37 @@ def test_an_engine_failure_is_an_error_never_a_deferral():
     result = run_case_csv(_case(), engine, _Adapter(pa.table({"n": [3]})),
                           [pa.table({"n": [3]})])
     assert result.outcome == Outcome.ERROR
+
+
+def test_running_on_the_benchmarks_own_sqlite_is_portable_by_construction():
+    # Left as None this reads "unverified", and a leaderboard-comparable column shows n/a
+    # for a run that is comparable -- understating it exactly where it matters most.
+    engine = lambda q: AgentAnswer(answer="3", trace=_trace("SELECT 3"))  # noqa: E731
+    result = run_case_csv(_case(), engine, _Adapter(pa.table({"n": [3]})),
+                          [pa.table({"n": [3]})])
+
+    assert result.portable_to_gold_engine is True
+
+
+def test_another_executor_does_not_inherit_that_claim():
+    # Run this path through a DuckDB attachment and the SQL is no longer known to run on
+    # the benchmark's engine; the flag has to be earned again, not assumed.
+    class _Attached(_Adapter):
+        dialect = "duckdb"
+
+    engine = lambda q: AgentAnswer(answer="3", trace=_trace("SELECT 3"))  # noqa: E731
+    result = run_case_csv(_case(), engine, _Attached(pa.table({"n": [3]})),
+                          [pa.table({"n": [3]})])
+
+    assert result.portable_to_gold_engine is False
+
+
+def test_a_case_that_never_executed_claims_nothing():
+    engine = lambda q: AgentAnswer(answer="cannot", deferred=True)  # noqa: E731
+    result = run_case_csv(_case(), engine, _Adapter(pa.table({"n": [3]})),
+                          [pa.table({"n": [3]})])
+
+    assert result.portable_to_gold_engine is None, "a declined case ran no SQL to be portable"
 
 
 def test_a_case_with_no_published_gold_is_an_error_not_a_silent_pass():
