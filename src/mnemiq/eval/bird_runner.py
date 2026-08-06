@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -57,9 +58,51 @@ def _load_meta(results_path: str) -> tuple[int, int, list[str]]:
     return m.get("tokens", 0), m.get("llm_calls", 0), m.get("excluded", [])
 
 
+def source_rev() -> str:
+    """The mnemiq revision that produced a run, for a consumer's provenance record.
+
+    A results file says what the engine answered and how this runner graded it, and
+    "how this runner graded it" is a moving target -- the grading rules changed twice
+    in one day. Without a revision, a consumer importing the file can record the script
+    path and nothing that actually pins the behaviour.
+
+    Fail-soft, and honest when uncertain: an eval run must never die for want of a
+    version string, and a bare rev that hides uncommitted changes is worse than no rev,
+    because it looks precise. A dirty tree is marked as such.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+
+    def git(*args: str) -> str | None:
+        try:
+            done = subprocess.run(  # noqa: S603 -- fixed argv, no shell
+                ["git", "-C", here, *args], capture_output=True, text=True, timeout=5
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    rev = git("rev-parse", "--short", "HEAD")
+    if rev is None:  # not a checkout: an installed wheel still has a version
+        try:
+            from importlib.metadata import version
+
+            return f"mnemiq {version('mnemiq')}"
+        except Exception:  # noqa: BLE001 -- provenance is never worth failing a run for
+            return ""
+    return f"{rev}-dirty" if git("status", "--porcelain") else rev
+
+
 def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str]) -> None:
     with open(_meta_path(results_path), "w") as fh:
-        json.dump({"tokens": tokens, "llm_calls": calls, "excluded": excluded}, fh)
+        json.dump(
+            {
+                "tokens": tokens,
+                "llm_calls": calls,
+                "excluded": excluded,
+                "source_rev": source_rev(),
+            },
+            fh,
+        )
 
 
 # Facts/examples default OFF (settings.enrich_facts/enrich_examples): the plan-20 A/B measured both
