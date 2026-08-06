@@ -120,3 +120,65 @@ def test_the_gold_may_never_have_more_columns_than_the_candidate():
     gold = _t({"k": ["yes"], "n": [692]})
     candidate = _t({"n": [692]})
     assert not results_match(gold, candidate)
+
+
+def test_got_facts_accepts_a_rounding_of_the_same_quantity():
+    # 66.62 for 66.6230 is the same quantity printed shorter -- the fact is there.
+    gold = pa.table({"rate": [66.6230]})
+    candidate = pa.table({"rate": [66.62]})
+
+    assert results_match(gold, candidate, allow_extra_columns=True)
+
+
+def test_exact_match_does_not_accept_that_rounding():
+    # Exact match claims the result sets are the SAME; presentation leniency belongs to
+    # the second metric, or the strict number stops meaning what BIRD reports.
+    gold = pa.table({"rate": [66.6230]})
+    candidate = pa.table({"rate": [66.62]})
+
+    assert not results_match(gold, candidate, allow_extra_columns=False)
+
+
+def test_a_rounding_is_read_in_either_direction():
+    assert results_match(pa.table({"r": [52.63]}), pa.table({"r": [52.6]}),
+                         allow_extra_columns=True)
+    assert results_match(pa.table({"r": [52.6]}), pa.table({"r": [52.63]}),
+                         allow_extra_columns=True)
+
+
+def test_rounding_a_small_quantity_to_zero_is_not_a_fact():
+    # 0.0 for 0.196 collapses the quantity to nothing; that answer lost the fact, so
+    # rounding to zero places is presentation only above magnitude one.
+    assert not results_match(pa.table({"r": [0.196]}), pa.table({"r": [0.0]}),
+                             allow_extra_columns=True)
+    assert results_match(pa.table({"r": [52.63]}), pa.table({"r": [53.0]}),
+                         allow_extra_columns=True)
+
+
+def test_a_different_quantity_nearby_is_still_wrong():
+    # The reason this is a rounding rule and not a wider band: 1038.15 is not 1039.32
+    # printed differently, it is a different number, and a percentage would admit it.
+    assert not results_match(pa.table({"n": [1039.324324]}),
+                             pa.table({"n": [1038.150684931507]}),
+                             allow_extra_columns=True)
+
+
+def test_counts_stay_exact_under_the_tolerant_reading_too():
+    assert not results_match(pa.table({"n": [819]}), pa.table({"n": [820]}),
+                             allow_extra_columns=True)
+
+
+def test_either_rounding_convention_is_still_a_rounding():
+    # 38.125 to two places is 38.12 under banker's rounding and 38.13 under half-up.
+    # Both are the same quantity printed shorter; which convention the engine used is
+    # not the candidate's answer. (Spider local023 was failing on exactly this pair.)
+    gold = pa.table({"avg": [38.125]})
+
+    assert results_match(gold, pa.table({"avg": [38.13]}), allow_extra_columns=True)
+    assert results_match(gold, pa.table({"avg": [38.12]}), allow_extra_columns=True)
+
+
+def test_a_neighbouring_value_is_not_rescued_by_either_convention():
+    # 6.47 is not 6.48 rounded any way at any place -- it is a different average.
+    assert not results_match(pa.table({"r": [6.48]}), pa.table({"r": [6.47]}),
+                             allow_extra_columns=True)

@@ -4,7 +4,13 @@ from itertools import combinations
 
 import pyarrow as pa
 
-from mnemiq.execute.resultset import _match_rows, _rows, normalize
+from mnemiq.execute.resultset import (
+    _match_rows,
+    _rows,
+    facts_cells_match,
+    grade_cells_match,
+    normalize,
+)
 
 # normalize is re-exported: harness.py imports it from here. _rows/_match_rows back
 # results_match below; the shared definitions live in the engine's resultset module.
@@ -14,7 +20,6 @@ __all__ = ["normalize", "results_match"]
 def results_match(
     gold: pa.Table,
     candidate: pa.Table,
-    rel_tol: float = 1e-2,
     allow_extra_columns: bool = True,
 ) -> bool:
     """Do these two result sets state the same facts?
@@ -26,7 +31,19 @@ def results_match(
     With allow_extra_columns=False the candidate must have exactly the gold's columns
     (BIRD execution accuracy); by default it may carry extra context columns (ACME's
     conversational questions -- the date next to the policy number it was asked for).
+
+    This flag is really which of the two metrics is being asked for, so it also selects
+    the cell reading. Got-facts means "the information gold wants, with extra columns or
+    different formatting", and a value printed to fewer decimals is formatting, so the
+    tolerant reading accepts a rounding either way (facts_cells_match) while the strict
+    one does not. The rule is beacon's, ported rather than reinvented: one definition
+    graded two ways is how the same column comes to mean different things per benchmark.
+
+    The numeric bounds are beacon's too (grade_cells_match), replacing a 1e-2 band that
+    was doing the rounding rule's job badly: 1% called 1038.15 and 1039.32 the same
+    answer while still needing luck on a genuine rounding.
     """
+    cell_match = facts_cells_match if allow_extra_columns else grade_cells_match
     if allow_extra_columns:
         # One-directional tolerance: the candidate may ADD context columns but never omit a
         # gold column. Extra columns cannot rescue wrong rows -- every gold row still matches.
@@ -42,7 +59,7 @@ def results_match(
     for keep in column_choices:
         projected = candidate.select(list(keep))
         candidate_rows = _rows(projected)
-        if _match_rows(gold_rows, candidate_rows, rel_tol):
+        if _match_rows(gold_rows, candidate_rows, 0.0, cell_match):
             return True
 
         # Column order is not meaning: `SELECT k, count(*)` and `SELECT count(*), k` are
@@ -50,6 +67,6 @@ def results_match(
         def sort_cells(rows: list[list[object]]) -> list[list[object]]:
             return [sorted(row, key=repr) for row in rows]
 
-        if _match_rows(sort_cells(gold_rows), sort_cells(candidate_rows), rel_tol):
+        if _match_rows(sort_cells(gold_rows), sort_cells(candidate_rows), 0.0, cell_match):
             return True
     return False
