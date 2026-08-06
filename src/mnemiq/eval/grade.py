@@ -16,6 +16,11 @@ from mnemiq.execute.resultset import (
 # results_match below; the shared definitions live in the engine's resultset module.
 __all__ = ["normalize", "results_match"]
 
+# The definitions these two readings implement are the grading contract agreed with
+# beacon on 2026-08-07: beacon `docs/grading.md`. That document is the agreement; this
+# file is one of its two implementations. Change the meaning there, not here -- two
+# implementations restating a definition is how they come to disagree.
+
 
 def results_match(
     gold: pa.Table,
@@ -62,8 +67,15 @@ def results_match(
         if _match_rows(gold_rows, candidate_rows, 0.0, cell_match):
             return True
 
-        # Column order is not meaning: `SELECT k, count(*)` and `SELECT count(*), k` are
-        # the same answer. Retry with each row's values sorted into a canonical order.
+        # Column order is presentation, so got-facts retries with each row's cells sorted
+        # into a canonical order -- `SELECT k, count(*)` and `SELECT count(*), k` carry
+        # the same information. Exact match does NOT: BIRD's evaluator compares row
+        # tuples position-wise, so the strict number has to stay the one the leaderboard
+        # publishes. This retry running on both readings is what made mnemiq's own BIRD
+        # "correct" slightly generous against the published metric.
+        if not allow_extra_columns:
+            continue
+
         def sort_cells(rows: list[list[object]]) -> list[list[object]]:
             return [sorted(row, key=repr) for row in rows]
 

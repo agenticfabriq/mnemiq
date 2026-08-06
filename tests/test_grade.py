@@ -109,10 +109,19 @@ def test_strict_mode_rejects_an_extra_column():
     assert not results_match(gold, candidate, allow_extra_columns=False)  # BIRD: wrong
 
 
-def test_strict_mode_still_ignores_row_and_column_order():
+def test_strict_mode_ignores_row_order_but_not_column_order():
+    # This used to assert that strict ignored BOTH, which made mnemiq's BIRD "correct"
+    # generous against the published metric: BIRD's evaluator compares row tuples
+    # position-wise. Row order stays tolerated; column order moved to got-facts only.
+    # See beacon docs/grading.md, "exact".
     gold = _t({"k": ["no", "yes"], "n": [128, 692]})
-    candidate = _t({"n": [692, 128], "k": ["yes", "no"]})
-    assert results_match(gold, candidate, allow_extra_columns=False)
+
+    rows_reordered = _t({"k": ["yes", "no"], "n": [692, 128]})
+    assert results_match(gold, rows_reordered, allow_extra_columns=False)
+
+    columns_reordered = _t({"n": [692, 128], "k": ["yes", "no"]})
+    assert not results_match(gold, columns_reordered, allow_extra_columns=False)
+    assert results_match(gold, columns_reordered, allow_extra_columns=True)
 
 
 def test_the_gold_may_never_have_more_columns_than_the_candidate():
@@ -182,3 +191,27 @@ def test_a_neighbouring_value_is_not_rescued_by_either_convention():
     # 6.47 is not 6.48 rounded any way at any place -- it is a different average.
     assert not results_match(pa.table({"r": [6.48]}), pa.table({"r": [6.47]}),
                              allow_extra_columns=True)
+
+
+def test_column_order_is_tolerated_by_got_facts():
+    # SELECT k, count(*) and SELECT count(*), k carry the same information.
+    gold = pa.table({"k": ["a", "b"], "n": [1, 2]})
+    swapped = pa.table({"n": [1, 2], "k": ["a", "b"]})
+
+    assert results_match(gold, swapped, allow_extra_columns=True)
+
+
+def test_column_order_is_part_of_exact_match():
+    # BIRD's evaluator compares row tuples position-wise, so the strict number has to
+    # stay the one the leaderboard publishes. beacon docs/grading.md, "exact".
+    gold = pa.table({"k": ["a", "b"], "n": [1, 2]})
+    swapped = pa.table({"n": [1, 2], "k": ["a", "b"]})
+
+    assert not results_match(gold, swapped, allow_extra_columns=False)
+
+
+def test_exact_match_still_ignores_row_order():
+    # Row order is a separate question from column order, and stays tolerated here.
+    gold = pa.table({"n": [1, 2]})
+
+    assert results_match(gold, pa.table({"n": [2, 1]}), allow_extra_columns=False)
