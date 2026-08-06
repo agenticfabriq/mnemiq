@@ -40,6 +40,26 @@ class AskBody(BaseModel):
     history: list[HistoryTurn] | None = None
 
 
+class _Workbench(StaticFiles):
+    """Serves the built bundle with the two cache lifetimes it actually has.
+
+    Vite content-hashes everything under `assets/`, so those URLs are immutable and
+    may be kept forever. `index.html` is the one file whose name never changes, and
+    it is what names the current hashes -- cached, it pins the browser to whatever
+    bundle it was built against, and a rebuild silently changes nothing. It must be
+    revalidated on every load; `no-cache` means "ask first", not "do not store", so
+    an unchanged build still answers 304.
+    """
+
+    def file_response(self, full_path, stat_result, scope, status_code=200):
+        response = super().file_response(full_path, stat_result, scope, status_code)
+        immutable = "/assets/" in scope.get("path", "")
+        response.headers["cache-control"] = (
+            "public, max-age=31536000, immutable" if immutable else "no-cache"
+        )
+        return response
+
+
 def build_app(
     runtime, identity, heartbeat_s: float = 15.0, static_dir: Path | None = None
 ) -> FastAPI:
@@ -74,7 +94,7 @@ def build_app(
     # Mounted last, so it can only claim paths no API route above already answered.
     built = static_dir if static_dir is not None else STATIC_DIR
     if (built / "index.html").is_file():
-        app.mount("/", StaticFiles(directory=built, html=True), name="workbench")
+        app.mount("/", _Workbench(directory=built, html=True), name="workbench")
     else:
 
         @app.get("/", response_class=HTMLResponse)
