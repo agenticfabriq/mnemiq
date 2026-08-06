@@ -34,6 +34,29 @@ class IdentityContext(BaseModel):
     attributes: dict[str, str] = Field(default_factory=dict)
 
 
+class HistoryTurn(BaseModel):
+    """One prior turn of a conversation, carried forward as structure, not prose.
+
+    A follow-up like "and how many claims does it have?" needs an antecedent for "it",
+    and the previous SQL does not contain one -- `ORDER BY total DESC LIMIT 1` computes
+    the top region without naming it. So the answer's RESULT is what resolves the
+    pronoun, and a few rows of it ride along beside the query that produced them.
+
+    `grant_fingerprint` is the authorization boundary this turn was answered under. A
+    turn is replayed only to the same boundary: otherwise a privileged turn's values
+    (a person's name, a masked column) could steer a query asked by an identity that
+    may not see them, and the new answer would disclose through the filter what the
+    policy withheld from the column.
+    """
+
+    question: str
+    sql: str = ""  # the query that ran -- what was actually asked of the data
+    tables_used: list[str] = Field(default_factory=list)
+    columns: list[str] = Field(default_factory=list)
+    rows: list[list[object]] = Field(default_factory=list)  # bounded; the antecedent
+    grant_fingerprint: str = ""
+
+
 class Trace(BaseModel):
     question: str
     plan_sql: str

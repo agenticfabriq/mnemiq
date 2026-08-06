@@ -26,7 +26,7 @@ class _RT:
         self._answer, self._raises, self._stages = answer, raises, list(stages)
         self._delay = delay_s
 
-    def ask(self, question, identity, mode=None, emit=None):
+    def ask(self, question, identity, mode=None, emit=None, history=None):
         for stage in self._stages:
             with step(emit, stage):
                 time.sleep(self._delay)
@@ -84,7 +84,7 @@ def test_a_step_that_raised_says_so():
 
 def test_extra_step_fields_survive_to_the_client():
     class _Deep:
-        def ask(self, question, identity, mode=None, emit=None):
+        def ask(self, question, identity, mode=None, emit=None, history=None):
             with step(emit, Stage.CANDIDATE, index=3, of=5):
                 pass
             return AgentAnswer(answer="x")

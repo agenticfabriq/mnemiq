@@ -16,7 +16,7 @@ class _RT:
     def __init__(self, answer=None, raises=None, delay_s=0.0):
         self._answer, self._raises, self._delay = answer, raises, delay_s
 
-    def ask(self, question, identity, mode=None, emit=None):
+    def ask(self, question, identity, mode=None, emit=None, history=None):
         time.sleep(self._delay)
         if self._raises:
             raise self._raises

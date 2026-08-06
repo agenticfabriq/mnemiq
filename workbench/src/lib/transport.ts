@@ -4,17 +4,18 @@
  */
 
 import { readSse } from "./sse";
-import type { AguiEvent, Mode, SchemaTable } from "./types";
+import type { AguiEvent, HistoryTurn, Mode, SchemaTable } from "./types";
 
 export async function* streamChat(
   question: string,
   mode: Mode,
+  history: HistoryTurn[] = [],
   signal?: AbortSignal,
 ): AsyncGenerator<AguiEvent> {
   const response = await fetch("/v1/chat", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ question, mode }),
+    body: JSON.stringify({ question, mode, history }),
     signal,
   });
 

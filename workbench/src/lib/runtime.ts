@@ -18,6 +18,7 @@ import {
   type ThreadMessageLike,
 } from "@assistant-ui/react";
 
+import { historyFrom } from "./history";
 import { streamChat } from "./transport";
 import { isRunning, reduce, userTurn, type Turn } from "./store";
 import { emptyThread, isBlank, load, save, titleFor, type Thread } from "./threads";
@@ -99,8 +100,11 @@ export function useWorkbench() {
   const ask = useCallback(
     async (question: string) => {
       const threadId = activeRef.current;
+      // Read before the user turn is appended: the history is what came BEFORE this ask.
+      const before = threadsRef.current.find((t) => t.id === threadId)?.turns ?? [];
+      const history = historyFrom(before);
       updateTurns(threadId, (current) => [...current, userTurn(question)]);
-      for await (const event of streamChat(question, modeRef.current)) {
+      for await (const event of streamChat(question, modeRef.current, history)) {
         updateTurns(threadId, (current) => reduce(current, event));
       }
     },

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
+from mnemiq.agent.history import scope_history
 from mnemiq.agent.loop import Agent, AgentAnswer
 from mnemiq.agent.modes import DEFAULT_MODE, MODES, build_agent
 from mnemiq.agent.route import Router, StaticRouter, UnknownMode
@@ -12,7 +13,7 @@ from mnemiq.assembly import build_components
 from mnemiq.authz.grants import AuthzProvider, DenyAll, FileAuthzProvider
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.config import Settings
-from mnemiq.contract import IdentityContext, Snapshot
+from mnemiq.contract import HistoryTurn, IdentityContext, Snapshot
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
 from mnemiq.progress import Emit, Stage, step
@@ -78,6 +79,7 @@ class Runtime:
         identity: IdentityContext,
         mode: str | None = None,
         emit: Emit | None = None,
+        history: list[HistoryTurn] | None = None,
     ) -> AgentAnswer:
         self.reload_if_stale()
         started = time.perf_counter()
@@ -98,8 +100,11 @@ class Runtime:
                 snapshot=self.snapshot,
             )
         grants = self.authz.grants_for(identity)
+        # Scoped against THIS identity's boundary, never the one that produced the turn.
+        packet.history = scope_history(history, grants.fingerprint)
         answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
         answer.mode = name
+        answer.grant_fingerprint = grants.fingerprint
         if self.sink is not None:  # observability loop: one fail-soft record per answer
             from mnemiq.observability.metrics import AnswerRecord
 

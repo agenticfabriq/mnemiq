@@ -62,12 +62,14 @@ def test_ask_retrieves_scoped_and_delegates_to_the_agent(monkeypatch):
     import mnemiq.runtime as rt_mod
     from mnemiq.agent.loop import AgentAnswer
     from mnemiq.contract import Snapshot
+    from mnemiq.semantic.retrieval import ContextPacket
 
     calls = {}
 
     def fake_retrieve(con, question, identity, authz, embedder, k=5, table_facts=(), **kwargs):
         calls["retrieve"] = (question, k, list(table_facts))
-        return "PACKET"
+        return ContextPacket(question=question, cards=[], grant_fingerprint="fp",
+                             enrichment_version="v1")
 
     class _Agent:
         def answer(self, packet, snapshot, grants, identity, emit=None):
@@ -82,14 +84,21 @@ def test_ask_retrieves_scoped_and_delegates_to_the_agent(monkeypatch):
     assert got.answer == "ANSWER"
     assert got.mode == "thinking"  # the resolved default, stamped by Runtime
     assert calls["retrieve"] == ("how many claims?", 12, [])  # k=12 default; facts threaded in
-    assert calls["answer"][0] == "PACKET" and calls["answer"][1] is snap
+    assert calls["answer"][0].question == "how many claims?"
+    assert calls["answer"][1] is snap
 
 
 def test_ask_dispatches_to_the_mode_agent_and_stamps_the_mode(monkeypatch):
     import mnemiq.runtime as rt_mod
     from mnemiq.agent.loop import AgentAnswer
 
-    monkeypatch.setattr(rt_mod, "retrieve", lambda *a, **k: "PACKET")
+    from mnemiq.semantic.retrieval import ContextPacket
+
+    monkeypatch.setattr(
+        rt_mod, "retrieve",
+        lambda *a, **k: ContextPacket(question="q", cards=[], grant_fingerprint="fp",
+                                      enrichment_version="v1"),
+    )
 
     class _A:
         def __init__(self, tag):

@@ -33,6 +33,17 @@ export type ResultPreview = {
   truncated: boolean;
 };
 
+/** One prior turn, echoed back so a follow-up can resolve against it. */
+export type HistoryTurn = {
+  question: string;
+  sql: string;
+  tables_used: string[];
+  columns: string[];
+  rows: Cell[][];
+  /** The authorization boundary the engine answered under; it re-checks this. */
+  grant_fingerprint: string;
+};
+
 export type AnswerPayload = {
   answer: string;
   deferred: boolean;
@@ -49,6 +60,7 @@ export type AnswerPayload = {
   enrichment_version: string | null;
   timing: Record<string, number> | null;
   preview: ResultPreview | null;
+  grant_fingerprint?: string;
 };
 
 /**

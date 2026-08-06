@@ -45,7 +45,7 @@ def step_frame(event: dict) -> dict:
 
 
 async def chat_stream(runtime, identity, question: str, mode: str | None,
-                      heartbeat_s: float = 15.0):
+                      heartbeat_s: float = 15.0, history=None):
     run_id, msg_id = uuid4().hex, uuid4().hex
     yield frame({"type": "RUN_STARTED", "runId": run_id})
 
@@ -57,7 +57,7 @@ async def chat_stream(runtime, identity, question: str, mode: str | None,
         loop.call_soon_threadsafe(queue.put_nowait, event)
 
     fut = loop.run_in_executor(
-        None, lambda: runtime.ask(question, identity, mode=mode, emit=emit)
+        None, lambda: runtime.ask(question, identity, mode=mode, emit=emit, history=history)
     )
     fut.add_done_callback(lambda _: queue.put_nowait(_DONE))
 

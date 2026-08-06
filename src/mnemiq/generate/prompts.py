@@ -102,6 +102,24 @@ def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
         parts += ["", "WORKED EXAMPLES (verified queries over these tables -- adapt, don't copy blindly):"]
         for ex in packet.examples:
             parts += [f"Q: {sanitize(ex.question, limit=300)}", f"SQL: {ex.sql}"]
+    if packet.history:
+        # Prior turns, oldest first. The rows are what a pronoun resolves against: the
+        # previous SQL computed "the top region" without ever naming it.
+        parts += [
+            "",
+            "EARLIER IN THIS CONVERSATION (resolve references like \"it\" against these "
+            "results; the current QUESTION is still the one to answer):",
+        ]
+        for turn in packet.history:
+            parts.append(f"Q: {sanitize(turn.question, limit=300)}")
+            if turn.sql:
+                parts.append(f"SQL: {turn.sql}")
+            if turn.columns and turn.rows:
+                parts.append("RESULT: " + " | ".join(sanitize(c, limit=60) for c in turn.columns))
+                for row in turn.rows:
+                    parts.append(
+                        "        " + " | ".join(sanitize(str(v), limit=60) for v in row)
+                    )
     parts += ["", "TABLES:", cards]
     if feedback:
         parts += [

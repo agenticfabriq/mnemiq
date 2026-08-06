@@ -19,6 +19,7 @@ def answer_payload(ans: AgentAnswer) -> dict:
         "failed": ans.failed,
         "reason_code": str(ans.reason_code) if ans.reason_code else None,
         "mode": ans.mode,
+        "grant_fingerprint": ans.grant_fingerprint,
         "cached": ans.cached,
         "agreement": ans.agreement,
         "judge_engaged": ans.judge_engaged,

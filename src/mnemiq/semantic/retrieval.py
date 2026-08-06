@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import duckdb
 
 from mnemiq.authz.grants import AuthzProvider
-from mnemiq.contract import Column, Definition, Example, IdentityContext, TableFacts
+from mnemiq.contract import Column, Definition, Example, HistoryTurn, IdentityContext, TableFacts
 from mnemiq.llm.embeddings import Embedder
 from mnemiq.semantic.cards import render_facts_block
 from mnemiq.semantic.glossary import select_definitions
@@ -40,6 +40,8 @@ class ContextPacket:
     definitions: list[Definition] = field(default_factory=list)
     concepts: list[ResolvedConcept] = field(default_factory=list)
     examples: list[Example] = field(default_factory=list)  # Plan 08 seam; filled by retrieve()
+    # Prior turns, already scoped to this identity's authorization boundary by the caller.
+    history: list[HistoryTurn] = field(default_factory=list)
 
 
 def _rank(rows: list[tuple[str, float]]) -> dict[str, int]:

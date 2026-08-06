@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from mnemiq.agent.route import UnknownMode
+from mnemiq.contract import HistoryTurn
 from mnemiq.server.serialize import answer_payload
 from mnemiq.server.sse import chat_stream
 
@@ -33,6 +34,10 @@ _UNBUILT = """<!doctype html><meta charset="utf-8"><title>mnemiq</title>
 class AskBody(BaseModel):
     question: str
     mode: str | None = None
+    # Prior turns the caller wants this question read against. Untrusted: the engine
+    # replays only those whose grant_fingerprint matches the CURRENT identity's
+    # boundary, so echoing another identity's turn buys nothing (agent/history.py).
+    history: list[HistoryTurn] | None = None
 
 
 def build_app(
@@ -47,14 +52,17 @@ def build_app(
     @app.post("/v1/ask")
     def ask(body: AskBody) -> dict:
         try:
-            return answer_payload(runtime.ask(body.question, identity, mode=body.mode))
+            return answer_payload(
+                runtime.ask(body.question, identity, mode=body.mode, history=body.history)
+            )
         except UnknownMode as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/v1/chat")
     def chat(body: AskBody) -> StreamingResponse:
         return StreamingResponse(
-            chat_stream(runtime, identity, body.question, body.mode, heartbeat_s=heartbeat_s),
+            chat_stream(runtime, identity, body.question, body.mode,
+                        heartbeat_s=heartbeat_s, history=body.history),
             media_type="text/event-stream",
             headers={"cache-control": "no-cache", "x-accel-buffering": "no"},
         )

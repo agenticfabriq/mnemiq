@@ -59,6 +59,9 @@ class AgentAnswer:
     candidates_executed: int | None = None  # multi-candidate only: how many of N ran
     mode: str | None = None  # resolved mode name, stamped by the Runtime (the Agent IS a mode)
     preview: ResultPreview | None = None  # None on every deferral path -- never fabricated
+    # The authorization boundary this answer was computed under. A client echoes it back
+    # with the turn; the engine replays a turn only to the same boundary (history.py).
+    grant_fingerprint: str = ""
 
 
 def _shape(row_count: int, column_count: int) -> str:
