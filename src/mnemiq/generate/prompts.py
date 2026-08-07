@@ -89,6 +89,23 @@ def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
             f"- {sanitize(d.term, limit=80)}: {sanitize(d.definition, limit=600)}"
             for d in packet.definitions
         ]
+    if packet.metrics:
+        # The EXPRESSION is the payload. A section naming "Settled Payment Volume" without saying
+        # how it is computed tells the model a phrase it already had; the certified SQL is the part
+        # a schema cannot supply.
+        parts += ["", "CERTIFIED MEASURES (the authoritative way to compute these -- follow the expression exactly):"]
+        parts += [
+            f"- {sanitize(m.label, limit=80)} ({sanitize(m.id, limit=80)}) over {sanitize(m.measure.source, limit=80)}"
+            f": {sanitize(m.measure.expr, limit=600)}"
+            for m in packet.metrics
+        ]
+    if packet.dimensions:
+        parts += ["", "CERTIFIED DIMENSIONS (the agreed way to slice these tables):"]
+        parts += [
+            f"- {sanitize(d.label, limit=80)} = {sanitize(d.expr or d.id, limit=200)}"
+            f" on {sanitize(d.source, limit=80)}"
+            for d in packet.dimensions
+        ]
     if packet.concepts:
         parts += ["", "CODE VOCABULARY (candidate codes for this question -- filter on the CODE, never the label):"]
         grouped: dict[tuple[str, str], list[str]] = {}
