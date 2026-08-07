@@ -47,7 +47,10 @@ class DuckDBAdapter:
         self._table_schema = table_schema
         self._fk_via_postgres = fk_via_postgres
         self._con = duckdb.connect()
-        self._con.execute(f"INSTALL {extension}; LOAD {extension};")
+        # A DuckDB file needs no extension: the engine already speaks its own format. INSTALLing a
+        # nonexistent "duckdb" extension would fail, so the empty string means "nothing to load".
+        if extension:
+            self._con.execute(f"INSTALL {extension}; LOAD {extension};")
         # READ_ONLY unless a write is explicitly enabled -- the backstop under the write path.
         clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
         self._con.execute(f"ATTACH '{attach_target}' AS {catalog} {clause}")
@@ -57,6 +60,18 @@ class DuckDBAdapter:
     def postgres(cls, dsn: str, schema: str = "src", read_only: bool = True) -> "DuckDBAdapter":
         return cls(attach_target=dsn, attach_type="POSTGRES", extension="postgres",
                    catalog=schema, table_schema="public", fk_via_postgres=True, read_only=read_only)
+
+    @classmethod
+    def duckdb(cls, path: str, schema: str = "d", read_only: bool = True) -> "DuckDBAdapter":
+        """A DuckDB file as the source.
+
+        The class calls itself the universal executor and could attach Postgres and SQLite and not
+        DuckDB, so a warehouse that IS DuckDB had no adapter at all. `main` is DuckDB's default
+        schema, and no extension is needed to read its own format.
+        """
+        return cls(attach_target=path, attach_type="DUCKDB", extension="",
+                   catalog=schema, table_schema="main", fk_via_postgres=False,
+                   read_only=read_only)
 
     @classmethod
     def sqlite(cls, path: str, schema: str = "s", read_only: bool = True) -> "DuckDBAdapter":
