@@ -23,7 +23,10 @@ def _term_pattern(term: str) -> re.Pattern[str]:
 
 
 def select_definitions(
-    question: str, definitions: Sequence[Definition], grants: GrantSet
+    question: str,
+    definitions: Sequence[Definition],
+    grants: GrantSet,
+    table_ids: Sequence[str] = (),
 ) -> list[Definition]:
     """The definitions this question needs AND this identity may see.
 
@@ -33,7 +36,20 @@ def select_definitions(
     Visibility is fail-closed: a definition is shown only if it is `public` (a standard whose
     text names no table) or it is bound to objects the identity is granted. An unbound,
     non-public definition -- a confidential internal taxonomy -- is visible to no one.
+
+    **Two selection rules, because there are two kinds of definition.** A definition BOUND to a
+    table rides with it: if the table is in the retrieved context, the definition is offered
+    whatever the question said. A policy governing a table -- "the business date is this column,
+    not the other five" -- matters most precisely when the asker did not know to ask for it, and
+    drafting the fs corpus measured the cost of the other rule: three of five policy definitions
+    matched no realistic question, so under term-matching alone they could never be retrieved
+    however true they were.
+
+    An UNBOUND definition keeps the term-match rule. A public standard belongs to no table, so it
+    has no table to ride with, and matching the asker's words is the right rule for something
+    looked up by name.
     """
+    in_context = set(table_ids)
     selected = []
     for definition in definitions:
         visible = definition.public or (
@@ -42,6 +58,7 @@ def select_definitions(
         )
         if not visible:
             continue
-        if _term_pattern(definition.term).search(question):
+        rides_with_a_table = any(obj in in_context for obj in definition.bound_objects)
+        if rides_with_a_table or _term_pattern(definition.term).search(question):
             selected.append(definition)
     return selected

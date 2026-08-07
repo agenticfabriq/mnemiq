@@ -95,3 +95,49 @@ def test_a_multi_word_term_matches_as_a_phrase():
     grants = _grants("fireclaim")
     assert select_definitions("average loss ratios by year", [loss], grants)
     assert not select_definitions("ratio of losses", [loss], grants)  # order matters
+
+
+def _payment_date_policy() -> Definition:
+    """A policy definition: it rules on a table, and it matters most when the asker does not know
+    to ask for it. Nobody types "payment date" when they ask "how many payments last quarter"."""
+    return Definition(
+        id="fspay:policy:payment_date",
+        term="payment date",
+        domain="fs_payments",
+        definition="The business date is payment_transaction_date_time, not the other five.",
+        bound_objects=["payment_transaction"],
+    )
+
+
+def test_a_bound_definition_rides_with_its_table():
+    """Term-matching is right for a standard looked up by name and wrong for a policy that governs
+    a table. Measured on the fs corpus: three of five policy definitions match no realistic
+    question, so under term-matching alone they could never be retrieved however true they are."""
+    grants = GrantSet(objects=frozenset({"payment_transaction"}))
+
+    selected = select_definitions(
+        "how many payments last quarter", [_payment_date_policy()], grants,
+        table_ids=["payment_transaction"],
+    )
+
+    assert [d.term for d in selected] == ["payment date"]
+
+
+def test_a_bound_definition_stays_with_its_table():
+    # Non-vacuity: riding with a table must mean THAT table, not every question.
+    grants = GrantSet(objects=frozenset({"payment_transaction", "refund"}))
+
+    selected = select_definitions(
+        "how many refunds", [_payment_date_policy()], grants, table_ids=["refund"]
+    )
+
+    assert selected == []
+
+
+def test_an_unbound_standard_still_needs_its_term():
+    """A public standard belongs to no table, so it has no table to ride with. It keeps the
+    term-match rule, which is the right one for something looked up by name."""
+    grants = GrantSet(objects=frozenset({"patient"}))
+
+    assert select_definitions("what is an MPAA rating", [_standard()], grants, table_ids=["patient"])
+    assert select_definitions("how many patients", [_standard()], grants, table_ids=["patient"]) == []

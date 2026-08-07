@@ -149,7 +149,6 @@ def retrieve(
     if not grants.objects:
         return packet  # nothing is visible: do not even touch the index
 
-    packet.definitions = select_definitions(question, definitions, grants)
 
     allowed = list(grants.objects)
     placeholders = ", ".join("?" for _ in allowed)
@@ -222,6 +221,9 @@ def retrieve(
     # After the cards are chosen, because a certified measure rides with its table -- see
     # `semantic.measures` for why that rule differs from the glossary's word-matching one.
     table_ids = [c.object_id for c in packet.cards]
+    # After the cards, not before: a bound definition rides with its table, so which tables were
+    # retrieved has to be known first. It used to be selected before anything was ranked.
+    packet.definitions = select_definitions(question, definitions, grants, table_ids)
     packet.metrics = select_metrics(table_ids, metrics, grants)
     packet.dimensions = select_dimensions(table_ids, dimensions, grants)
     packet.examples = _retrieve_examples(con, embedding, set(grants.objects), k=k)
