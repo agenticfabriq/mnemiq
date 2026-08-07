@@ -49,6 +49,7 @@ from mnemiq.eval.bird_runner import (
 from mnemiq.eval.engine import build_engine
 from mnemiq.eval.grade import results_match
 from mnemiq.eval.harness import CaseResult, Engine, Outcome, _preview
+from mnemiq.llm.client import ModelUnavailable
 
 
 def _repo_dir(spider2_dir: str) -> str:
@@ -109,6 +110,17 @@ def load_spider2_local(
             if limit is not None and len(cases) >= limit:
                 break
     return cases
+
+
+# A dead endpoint answers every remaining case identically and instantly. Left alone, a
+# run "finishes" as a full-length file of nothing -- which is worse than crashing, because
+# it looks like data. Measured: one such run wrote 101 rows before anyone noticed.
+MAX_CONSECUTIVE_OUTAGES = 5
+
+
+def _is_outage(result: CaseResult) -> bool:
+    """An engine-side outage, as distinct from a case the engine genuinely could not do."""
+    return result.outcome is Outcome.ERROR and "provider did not respond" in (result.answer or "")
 
 
 def gold_alternatives(spider2_dir: str, instance_id: str) -> list[pa.Table]:
@@ -244,6 +256,7 @@ def run_spider2(
     tokens, calls, excluded = _load_meta(results_path) if results_path else (0, 0, [])
     results: list[CaseResult] = list(done.values())
     processed = len(done)
+    _outages = 0
 
     for db_id, db_cases in sorted(by_db.items()):
         remaining = [c for c in db_cases if c.id not in done]
@@ -283,6 +296,13 @@ def run_spider2(
                 _append_result(results_path, result)
             if on_case is not None:
                 on_case(processed, len(cases), result)
+            _outages = _outages + 1 if _is_outage(result) else 0
+            if _outages >= MAX_CONSECUTIVE_OUTAGES:
+                raise ModelUnavailable(
+                    f"{_outages} consecutive cases got no answer from the model provider; "
+                    f"stopping after {processed} of {len(cases)}. The results file holds the "
+                    "cases that did run -- delete the outage rows and re-run to resume."
+                )
 
         for client in clients:
             tokens += client.total_tokens

@@ -8,7 +8,7 @@ import pyarrow as pa
 
 from mnemiq.agent.loop import AgentAnswer
 from mnemiq.contract import IdentityContext, Trace
-from mnemiq.eval.harness import Outcome
+from mnemiq.eval.harness import CaseResult, Outcome
 from mnemiq.eval.spider2 import (
     gold_alternatives,
     grade_alternatives,
@@ -190,3 +190,27 @@ def test_a_case_with_no_published_gold_is_an_error_not_a_silent_pass():
     result = run_case_csv(_case(), engine, _Adapter(pa.table({"n": [3]})), [])
     assert result.outcome == Outcome.ERROR
     assert "no gold result" in result.answer
+
+
+def test_a_dead_provider_stops_the_run_instead_of_filling_the_file():
+    # A dead endpoint answers every remaining case identically and instantly, so a run
+    # "finishes" as a full-length file of nothing -- which is worse than crashing,
+    # because it looks like data. One such run wrote 101 rows before anyone noticed.
+    from mnemiq.eval.spider2 import MAX_CONSECUTIVE_OUTAGES, _is_outage
+
+    outage = CaseResult(case_id="c", outcome=Outcome.ERROR, question="q", db_id="d",
+                        answer="Could not answer this question: the model provider did "
+                               "not respond. This is an outage, not a judgement.")
+    assert _is_outage(outage)
+    assert MAX_CONSECUTIVE_OUTAGES < 10, "the guard has to fire long before a run completes"
+
+
+def test_a_case_the_engine_genuinely_failed_is_not_an_outage():
+    # Only the provider-unreachable state should trip the guard. A crashed case, or a
+    # query the source rejected, is a real result and must not stop the run.
+    from mnemiq.eval.spider2 import _is_outage
+
+    assert not _is_outage(CaseResult(case_id="c", outcome=Outcome.ERROR, question="q",
+                                     db_id="d", answer="no such column: widget.frob"))
+    assert not _is_outage(CaseResult(case_id="c", outcome=Outcome.WRONG, question="q",
+                                     db_id="d", answer="the model provider did not respond"))
