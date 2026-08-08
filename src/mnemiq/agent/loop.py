@@ -123,14 +123,22 @@ class Agent:
             if self.candidates <= 1:
                 return self._answer_single(packet, snapshot, grants, identity, deadline, emit)
             return self._answer_consistent(packet, snapshot, grants, identity, deadline, emit)
-        except ModelUnavailable:
+        except ModelUnavailable as exc:
             # Symmetry with the source-outage path: something happened TO us, so it is a
             # stated failure the caller can act on, never a deferral and never a traceback
             # out of the transport. `failed` is what keeps it out of the deferral rate (M6).
+            #
+            # The provider's own words ride along. This message used to assert an outage
+            # and drop the cause, so a misconfigured model name, a context-length refusal
+            # and a dead endpoint were indistinguishable in a results file -- three very
+            # different problems wearing one sentence. Diagnosing a 30-case failure took
+            # twenty minutes for want of the string that was already in hand.
+            detail = str(exc).strip()
             return AgentAnswer(
                 answer=(
                     "Could not answer this question: the model provider did not respond. "
                     "This is an outage, not a judgement about your data -- try again."
+                    + (f" The provider said: {detail[:300]}" if detail else "")
                 ),
                 failed=True,
                 reason_code=DeferralReason.MODEL_UNAVAILABLE,

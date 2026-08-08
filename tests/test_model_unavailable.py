@@ -92,3 +92,18 @@ def test_a_real_bug_still_raises():
     agent.generator = _Broken()
     with pytest.raises(ValueError):
         _ask(agent)
+
+
+def test_the_providers_own_words_survive_into_the_answer():
+    """A results file has to say WHICH failure happened.
+
+    This message used to assert an outage and discard the cause, so a misconfigured
+    model name, a context-length refusal and a dead endpoint all read identically.
+    Diagnosing a 30-case failure took twenty minutes for want of a string that was
+    already in hand.
+    """
+    answer = _ask(_agent())
+
+    assert answer.failed
+    assert "500" in answer.answer, "the provider's status has to reach the results file"
+    assert "outage, not a judgement" in answer.answer, "the plain-language framing stays"
