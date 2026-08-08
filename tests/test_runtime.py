@@ -199,13 +199,22 @@ def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
     test over Runtime.ask is exactly why that gap survived review."""
     import mnemiq.runtime as rt_mod
     from mnemiq.agent.loop import AgentAnswer
-    from mnemiq.contract import CodeScheme, Column, Definition, Snapshot
+    from mnemiq.contract import (
+        CodeScheme, Column, Definition, Dimension, MeasureExpr, Metric, Snapshot,
+    )
 
     seen = {}
 
     def fake_retrieve(con, question, identity, authz, embedder, k=5, table_facts=(),
-                      definitions=(), columns=(), ontology_index=None, snapshot=None):
+                      definitions=(), metrics=(), dimensions=(), columns=(), ontology_index=None,
+                      snapshot=None):
         seen["definitions"] = list(definitions)
+        # Certified metrics and dimensions were the next pair to reach the snapshot and stop
+        # there -- five of the fs corpus's records, carrying the certified SQL for settled, gross
+        # and net volume, appended by `apply_certified` and read by nothing. Same gap this test
+        # was written for, one generation later.
+        seen["metrics"] = [m.id for m in metrics]
+        seen["dimensions"] = [d.id for d in dimensions]
         seen["columns"] = [c.id for c in columns]
         seen["ontology_index"] = ontology_index
         # M4 added a fourth thing that has to reach the product path: without the snapshot,
@@ -229,6 +238,11 @@ def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
                         code_scheme=CodeScheme(id="urn:icd10", label="ICD-10-CM"))],
         definitions=[Definition(id="d1", term="ICD-10-CM", domain="ontology",
                                 definition="A diagnosis coding system.")],
+        metrics=[Metric(id="patient_count", label="Patient Count", status="certified", owner="o",
+                        grain="day",
+                        measure=MeasureExpr(expr="count(distinct patient_id)", source="patient"),
+                        time_dimension="day")],
+        dimensions=[Dimension(id="patient.icd10_cd", label="Diagnosis", source="patient")],
     )
     sentinel = object()
     rt = Runtime(con=None, snapshot=snap, adapter=None, agent=_Agent(), embedder=None,
@@ -239,3 +253,5 @@ def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
     assert seen["snapshot"] is snap                 # ...and so does the snapshot (M4)
     assert seen["columns"] == ["patient.icd10_cd"]   # bound columns are visible to it
     assert [d.term for d in seen["definitions"]] == ["ICD-10-CM"]  # glossary seam fed
+    assert seen["metrics"] == ["patient_count"]      # ...and the certified measures
+    assert seen["dimensions"] == ["patient.icd10_cd"]

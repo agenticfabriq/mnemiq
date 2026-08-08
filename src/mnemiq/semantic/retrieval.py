@@ -7,10 +7,14 @@ from dataclasses import dataclass, field
 import duckdb
 
 from mnemiq.authz.grants import AuthzProvider
-from mnemiq.contract import Column, Definition, Example, HistoryTurn, IdentityContext, TableFacts
+from mnemiq.contract import (
+    Column, Definition, Dimension, Example, HistoryTurn, IdentityContext, Metric,
+    TableFacts,
+)
 from mnemiq.llm.embeddings import Embedder
 from mnemiq.semantic.cards import render_facts_block
 from mnemiq.semantic.glossary import select_definitions
+from mnemiq.semantic.measures import select_dimensions, select_metrics
 
 _RRF_K = 60  # the standard RRF constant (reciprocal-rank blending)
 
@@ -38,6 +42,11 @@ class ContextPacket:
     grant_fingerprint: str
     enrichment_version: str | None
     definitions: list[Definition] = field(default_factory=list)
+    # Certified metrics and dimensions over the tables in `cards`. They rode in the snapshot and
+    # were read by nothing until this; see `semantic.measures` for why they are selected by table
+    # rather than by the words of the question.
+    metrics: list[Metric] = field(default_factory=list)
+    dimensions: list[Dimension] = field(default_factory=list)
     concepts: list[ResolvedConcept] = field(default_factory=list)
     examples: list[Example] = field(default_factory=list)  # Plan 08 seam; filled by retrieve()
     # Prior turns, already scoped to this identity's authorization boundary by the caller.
@@ -112,6 +121,8 @@ def retrieve(
     embedder: Embedder,
     k: int = 5,
     definitions: Sequence[Definition] = (),
+    metrics: Sequence[Metric] = (),
+    dimensions: Sequence[Dimension] = (),
     table_facts: Sequence[TableFacts] = (),
     columns: Sequence[Column] = (),
     ontology_index=None,
@@ -141,7 +152,6 @@ def retrieve(
     if not grants.objects:
         return packet  # nothing is visible: do not even touch the index
 
-    packet.definitions = select_definitions(question, definitions, grants)
 
     allowed = list(grants.objects)
     placeholders = ", ".join("?" for _ in allowed)
@@ -211,6 +221,14 @@ def retrieve(
     ]
     packet.enrichment_version = next(iter(cards.values()))[1] if cards else None
     _attach_facts(packet.cards, table_facts)
+    # After the cards are chosen, because a certified measure rides with its table -- see
+    # `semantic.measures` for why that rule differs from the glossary's word-matching one.
+    table_ids = [c.object_id for c in packet.cards]
+    # After the cards, not before: a bound definition rides with its table, so which tables were
+    # retrieved has to be known first. It used to be selected before anything was ranked.
+    packet.definitions = select_definitions(question, definitions, grants, table_ids)
+    packet.metrics = select_metrics(table_ids, metrics, grants)
+    packet.dimensions = select_dimensions(table_ids, dimensions, grants)
     packet.examples = _retrieve_examples(con, embedding, set(grants.objects), k=k)
     if ontology_index is not None and packet.cards:
         packet.concepts = _resolve_concepts(

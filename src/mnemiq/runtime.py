@@ -94,6 +94,12 @@ class Runtime:
                 # Definitions ride with the snapshot: the glossary channel had no runtime
                 # producer until the ontology digest, so this stayed unfed from Plan 08 until SP1.
                 definitions=self.snapshot.definitions if self.snapshot else (),
+                # Certified metrics and dimensions were appended to the snapshot by
+                # `apply_certified` and passed to nothing -- five of the fs corpus's twenty-eight
+                # records reaching the model not at all, and the five carrying the most explicit
+                # meaning.
+                metrics=self.snapshot.metrics if self.snapshot else (),
+                dimensions=self.snapshot.dimensions if self.snapshot else (),
                 columns=self.snapshot.columns if self.snapshot else (),
                 ontology_index=self.ontology,
                 # M4: lets retrieve re-render each card against this identity's column policy.
