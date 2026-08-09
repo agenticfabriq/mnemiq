@@ -946,6 +946,30 @@
   },
   "snapshot": {
     "$defs": {
+      "CertifiedRef": {
+        "description": "Which certified version supplied a piece of meaning in this snapshot.\n\nM24: `apply_certified` applied `rec.payload` and dropped `rec.envelope`, so mnemiq carried the\nCONTENT of a certified record and could not say which VERSION produced it -- and an emitted\ntrace could therefore never name what it relied on. Verity D131 is the mirror: it kept the\nreference at ingest and threw it away.\n\nDeliberately a list of typed refs rather than a `{object_id: version}` dict. `object_id` does\nnot identify a record -- `loss_ratio` is legitimately both the metric and the glossary\ndefinition (Verity D124 was exactly that mistake) -- and this shape is already the wire type\nthe trace carries, so it crosses without translation.",
+        "properties": {
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          },
+          "object_type": {
+            "title": "Object Type",
+            "type": "string"
+          },
+          "version_hash": {
+            "title": "Version Hash",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_type",
+          "object_id",
+          "version_hash"
+        ],
+        "title": "CertifiedRef",
+        "type": "object"
+      },
       "CodeScheme": {
         "description": "The code system a column's values are drawn from (ICD-10, NAICS, ...). Set by the\nontology binder from observed values, never by the LLM.",
         "properties": {
@@ -1691,6 +1715,13 @@
       }
     },
     "properties": {
+      "certified_refs": {
+        "items": {
+          "$ref": "#/$defs/CertifiedRef"
+        },
+        "title": "Certified Refs",
+        "type": "array"
+      },
       "columns": {
         "items": {
           "$ref": "#/$defs/Column"

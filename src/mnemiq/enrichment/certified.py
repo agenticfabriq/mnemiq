@@ -8,6 +8,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 from mnemiq.contract import CertifiedRecord, CodedValue, Job, Snapshot
+from mnemiq.contract.semantic import CertifiedRef
 from mnemiq.enrichment.verity_auth import access_token
 from mnemiq.ontology.records import ConceptScheme
 from mnemiq.semantic.values import SENSITIVE_PII
@@ -368,5 +369,24 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
         payloads = by_type.get(object_type, [])
         if payloads:
             updates[attr] = [*getattr(snapshot, attr), *payloads]
+
+    # M24: keep WHICH certified version supplied each piece of meaning. The envelope was in hand
+    # the whole time and was dropped here, so mnemiq carried certified content it could not
+    # attribute -- and an emitted trace could never name what the answer relied on, leaving
+    # Verity's D131 reader with no producer. Keyed on (object_type, object_id) because `object_id`
+    # alone does not identify a record: `loss_ratio` is legitimately both a metric and a glossary
+    # definition, which is the mistake D124 was.
+    refs = {
+        (rec.envelope.object_type, rec.envelope.object_id): CertifiedRef(
+            object_type=rec.envelope.object_type,
+            object_id=rec.envelope.object_id,
+            version_hash=rec.envelope.version,
+        )
+        for rec in records
+    }
+    if refs or snapshot.certified_refs:
+        existing = {(r.object_type, r.object_id): r for r in snapshot.certified_refs}
+        existing.update(refs)
+        updates["certified_refs"] = [existing[key] for key in sorted(existing)]
 
     return snapshot.model_copy(update=updates, deep=True)

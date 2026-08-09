@@ -149,6 +149,25 @@ class Job(BaseModel):
     max_attempts: int = 1
 
 
+class CertifiedRef(BaseModel):
+    """Which certified version supplied a piece of meaning in this snapshot.
+
+    M24: `apply_certified` applied `rec.payload` and dropped `rec.envelope`, so mnemiq carried the
+    CONTENT of a certified record and could not say which VERSION produced it -- and an emitted
+    trace could therefore never name what it relied on. Verity D131 is the mirror: it kept the
+    reference at ingest and threw it away.
+
+    Deliberately a list of typed refs rather than a `{object_id: version}` dict. `object_id` does
+    not identify a record -- `loss_ratio` is legitimately both the metric and the glossary
+    definition (Verity D124 was exactly that mistake) -- and this shape is already the wire type
+    the trace carries, so it crosses without translation.
+    """
+
+    object_type: str
+    object_id: str
+    version_hash: str
+
+
 class Snapshot(BaseModel):
     version: str
     source_id: str
@@ -170,3 +189,7 @@ class Snapshot(BaseModel):
     compatibility_profiles: list[CompatibilityProfile] = Field(default_factory=list)
     table_facts: list[TableFacts] = Field(default_factory=list)
     examples: list[Example] = Field(default_factory=list)
+    # PROVENANCE, not content: which certified versions supplied the meaning above. Deliberately
+    # absent from `content_version`'s body, so two snapshots asserting the same meaning from
+    # different record versions still share a cache entry (M24).
+    certified_refs: list[CertifiedRef] = Field(default_factory=list)
