@@ -239,3 +239,38 @@ def test_a_deferral_sends_the_enum_and_not_the_message(monkeypatch):
 
     assert body["resolved_intent"]["reason_code"] == "no_certified_meaning"
     assert "BusinessEntityID" not in json.dumps(body), "the deferral prose is opt-in, not always-on"
+
+
+# --- M26: the emitter had no caller ------------------------------------------------------------
+#
+# The sink existed, `Runtime.trace_sink` existed, eight tests passed, and `build_runtime` never
+# constructed one -- so every answer in production would have emitted nothing while the suite
+# stayed green. Seventh instance in two days of a seam wired at one end, and I committed it in the
+# slice that was about that species.
+#
+# Testing the SINK cannot catch this. The assertion has to be that the runtime HAS one.
+
+def test_build_runtime_constructs_an_emitter_when_verity_is_configured(monkeypatch, tmp_path):
+    # The assertion is that the field is WIRED from settings, not merely present on the dataclass.
+    import inspect
+
+    import mnemiq.runtime as rt
+
+    source = inspect.getsource(rt.build_runtime)
+    assert "trace_sink=trace_sink" in source, (
+        "build_runtime does not pass trace_sink to Runtime -- the emitter has no caller and every "
+        "answer emits nothing while its own tests pass"
+    )
+    assert "VerityTraceSink" in source, "build_runtime never constructs the emitter"
+
+
+def test_the_emitter_is_off_unless_a_url_is_configured():
+    """Byte-for-byte unchanged when Verity is not configured -- the emitter is opt-in."""
+    import inspect
+
+    import mnemiq.runtime as rt
+
+    source = inspect.getsource(rt.build_runtime)
+    assert "if settings.verity_traces_url:" in source, (
+        "the emitter must be gated on configuration, not constructed unconditionally"
+    )

@@ -321,6 +321,16 @@ def build_runtime(settings: Settings) -> Runtime:
 
         cache = TwoTierCache(L1Cache())
         sink = NullSink()
+    # M26: the emitter shipped with NO CALLER. `Runtime.trace_sink` existed, the sink existed, its
+    # tests passed, and nothing here ever constructed one -- so every answer in production emitted
+    # nothing while a full suite stayed green. That is the seventh instance in two days of a seam
+    # wired at one end, committed in the slice that was about that species. It is also why this
+    # branch exists rather than a docstring saying the emitter is "available".
+    trace_sink = None
+    if settings.verity_traces_url:
+        from mnemiq.observability.trace_sink import VerityTraceSink
+
+        trace_sink = VerityTraceSink(settings)
     # Built at enrich time and persisted, exactly like the value index -- so ask-time needs the
     # store, not the records file. An unindexed store simply resolves nothing.
     ontology = OntologyIndex(con)
@@ -353,5 +363,6 @@ def build_runtime(settings: Settings) -> Runtime:
         router=StaticRouter(default=default_mode),
         loaded_versions=loaded_versions,
         sink=sink,
+        trace_sink=trace_sink,
         ontology=ontology,
     )
