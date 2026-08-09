@@ -316,3 +316,47 @@ def test_a_seed_is_sent_only_when_configured():
 
     assert "seed" not in sent(), "unset means the provider's own default, not a chosen one"
     assert sent(llm_seed=1234)["seed"] == 1234
+
+
+HAND_WRITTEN_MARKER = "# --- not generated:"
+
+
+def test_the_tracked_env_example_matches_the_renderer():
+    """The COMMITTED file, not the renderer's output.
+
+    The old test asserted against `Settings.env_example()` and passed while the tracked
+    file still said `MNEMIQ_RETRIEVAL_K=12` -- it proved the code could render the right
+    template, never that the repo contained one. The file says "Copy to .env", and a
+    sourced 12 overrides the measured default of 24, so the documented setup path
+    silently undid the change. Thirteen other settings were missing too.
+
+    Only the generated PREFIX is compared: everything past the marker is hand-written
+    (REPO_GUARD_NAME_PATTERNS is CI configuration, not a Settings field) and regenerating
+    blindly deletes it -- which disarms the guard keeping proprietary names out of a
+    public repo.
+    """
+    from mnemiq.config import Settings
+
+    tracked = (pathlib.Path(__file__).resolve().parents[1] / ".env.example").read_text()
+    generated_prefix = tracked.split(HAND_WRITTEN_MARKER)[0].rstrip("\n") + "\n"
+
+    assert generated_prefix == Settings.env_example(), (
+        "the tracked .env.example has drifted; regenerate it with "
+        "`Settings.env_example()` and keep everything below the marker"
+    )
+
+
+def test_the_hand_written_tail_survives():
+    tracked = (pathlib.Path(__file__).resolve().parents[1] / ".env.example").read_text()
+
+    assert HAND_WRITTEN_MARKER in tracked, "the boundary marker is what protects the tail"
+    assert "REPO_GUARD_NAME_PATTERNS=" in tracked
+    assert "REPO_GUARD_NAME_PATTERNS" not in Settings_env_example_fields(), (
+        "if it ever becomes a Settings field, delete this test rather than have two sources"
+    )
+
+
+def Settings_env_example_fields() -> str:
+    from mnemiq.config import Settings
+
+    return Settings.env_example()
