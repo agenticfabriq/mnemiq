@@ -28,6 +28,7 @@ class LLMClient:
         if not settings.llm_base_url or not settings.llm_api_key:
             raise RuntimeError("LLM base_url/api_key not configured (set MNEMIQ_LLM_* env)")
         self._model = settings.llm_model
+        self._seed = settings.llm_seed
         self._client = OpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key)
         # A change that buys 1% accuracy for 3x the tokens is a trade to make on purpose.
         self.calls = 0
@@ -41,6 +42,13 @@ class LLMClient:
     def complete(self, system: str, user: str, max_tokens: int = 512,
                  extra_body: dict | None = None) -> str:
         kwargs = {token_param_name(self._model): max_tokens}
+        if self._seed is not None:
+            # Reproducibility, not determinism-at-any-cost. Safe with multi-candidate
+            # generation and with the repair loop because BOTH vary the prompt -- candidates
+            # by engineered strategy, retries by appended feedback -- rather than relying on
+            # sampling noise. A future candidate strategy that resamples the same prompt
+            # would need to vary this per call, or it would produce N identical candidates.
+            kwargs["seed"] = self._seed
         if extra_body:  # e.g. constrained decoding (response_format json_schema)
             kwargs["extra_body"] = extra_body
         try:

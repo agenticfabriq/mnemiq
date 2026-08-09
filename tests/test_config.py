@@ -290,3 +290,29 @@ def test_the_retrieval_k_default_is_written_once():
     src = (pathlib.Path(__file__).resolve().parents[1] / "src" / "mnemiq" / "runtime.py").read_text()
     assert "DEFAULT_RETRIEVAL_K" in src
     assert not re.search(r"retrieval_k if self\.settings else \d", src)
+
+
+def test_a_seed_is_sent_only_when_configured():
+    """Reproducibility on demand: unset by default, forwarded when set.
+
+    Measuring whether a config change helped needs a noise band, and getting one cost a
+    whole extra 135-case run because nothing was seeded. Temperature is locked at 1 on
+    the endpoint we ship against -- it rejects 0 -- so the seed is the only determinism
+    lever available.
+    """
+    from unittest.mock import MagicMock
+
+    from mnemiq.config import Settings
+    from mnemiq.llm.client import LLMClient
+
+    def sent(**overrides):
+        s = Settings(llm_base_url="http://x", llm_api_key="k", llm_model="m", **overrides)
+        c = LLMClient(s)
+        c._client = MagicMock()
+        c._client.chat.completions.create.return_value = MagicMock(
+            choices=[MagicMock(message=MagicMock(content="ok"))], usage=None)
+        c.complete("sys", "user")
+        return c._client.chat.completions.create.call_args.kwargs
+
+    assert "seed" not in sent(), "unset means the provider's own default, not a chosen one"
+    assert sent(llm_seed=1234)["seed"] == 1234
