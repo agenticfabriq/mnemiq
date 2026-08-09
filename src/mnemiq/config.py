@@ -65,7 +65,7 @@ class Settings(BaseSettings):
     verity_token_url: str | None = Field(default=None, description="Keycloak POST .../realms/<realm>/protocol/openid-connect/token endpoint (OAuth2 client-credentials grant)")
     verity_client_id: str | None = Field(default=None, description="Verity service client id (created in the workbench API Credentials page)")
     verity_client_secret: str | None = Field(default=None, description="Verity service client secret; presented only to the token endpoint, never to the records endpoint")
-    llm_seed: int | None = Field(default=None, description="sampling seed sent to the provider; unset = provider default (set it to make an eval reproducible)")
+    llm_seed: int | None = Field(default=None, description="sampling seed forwarded to the provider; honoured by vLLM, IGNORED by the hosted endpoint (accepted, no system_fingerprint, output still varies) -- so it buys reproducibility on the local path only")
     retrieval_k: int = Field(default=DEFAULT_RETRIEVAL_K, ge=1, description="schema cards retrieved into the generation packet")
     definition_index_max_concepts: int = Field(default=500, ge=0,
         description="per-scheme concept cap for the enrich-time definition-grounding index")

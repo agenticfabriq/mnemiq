@@ -293,12 +293,17 @@ def test_the_retrieval_k_default_is_written_once():
 
 
 def test_a_seed_is_sent_only_when_configured():
-    """Reproducibility on demand: unset by default, forwarded when set.
+    """Forwarded when set, absent when not -- which is all this can promise.
 
-    Measuring whether a config change helped needs a noise band, and getting one cost a
-    whole extra 135-case run because nothing was seeded. Temperature is locked at 1 on
-    the endpoint we ship against -- it rejects 0 -- so the seed is the only determinism
-    lever available.
+    Written to make evals reproducible, then measured and found not to deliver that on
+    the endpoint we ship against: it accepts `seed`, returns no `system_fingerprint`,
+    and two identical seeded SQL requests still produced different queries. OpenAI ties
+    seed determinism to that fingerprint and this proxy does not participate. vLLM does
+    honour it, so the setting earns its place on the local path only.
+
+    The test asserts the plumbing, which is the part we control. It deliberately does
+    NOT assert determinism, because that would be asserting a provider's behaviour we
+    have measured to be absent.
     """
     from unittest.mock import MagicMock
 
