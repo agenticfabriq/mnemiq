@@ -48,7 +48,7 @@ class Settings(BaseSettings):
                                      description="default answer mode: instant|thinking|deep")
     write_enabled: bool = Field(default=False, description="attach the source read-write (governed writes)")
     # --- behavior levers / MCP standalone identity ---
-    guided_sql: bool = Field(default=False, description="constrained decoding: force non-empty sql (vLLM guided_json)")
+    guided_sql: bool = Field(default=False, description="constrained decoding: force non-empty sql (response_format json_schema; works on vLLM and OpenAI-compatible endpoints)")
     assertive_sql: bool = Field(default=False, description="assertive prompt: attempt an answer instead of deferring")
     answer_markdown: bool = Field(default=False, description="let the answer use markdown (lists, tables) when the result has structure")
     enrich_facts: bool = Field(default=False, description="eval: table-facts enrichment phase (plan-20, default off)")

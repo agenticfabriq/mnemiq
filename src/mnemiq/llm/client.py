@@ -41,7 +41,7 @@ class LLMClient:
     def complete(self, system: str, user: str, max_tokens: int = 512,
                  extra_body: dict | None = None) -> str:
         kwargs = {token_param_name(self._model): max_tokens}
-        if extra_body:  # e.g. vLLM guided decoding (guided_json / guided_grammar)
+        if extra_body:  # e.g. constrained decoding (response_format json_schema)
             kwargs["extra_body"] = extra_body
         try:
             resp = self._client.chat.completions.create(
