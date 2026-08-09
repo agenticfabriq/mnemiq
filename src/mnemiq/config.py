@@ -8,6 +8,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEFAULT_MODEL = "openai.gpt-5.5"
 DEFAULT_EMBED_MODEL = "openai.text-embedding-3-small"
+# Measured on the full Spider 2.0-lite sweep against a variance control; see
+# tests/test_config.py::test_the_retrieval_k_default_is_the_measured_one.
+DEFAULT_RETRIEVAL_K = 24
 
 _SECRET_HINTS = ("api_key", "dsn", "password", "secret")  # fields whose value is never printed in .env.example
 
@@ -62,7 +65,7 @@ class Settings(BaseSettings):
     verity_token_url: str | None = Field(default=None, description="Keycloak POST .../realms/<realm>/protocol/openid-connect/token endpoint (OAuth2 client-credentials grant)")
     verity_client_id: str | None = Field(default=None, description="Verity service client id (created in the workbench API Credentials page)")
     verity_client_secret: str | None = Field(default=None, description="Verity service client secret; presented only to the token endpoint, never to the records endpoint")
-    retrieval_k: int = Field(default=12, ge=1, description="schema cards retrieved into the generation packet")
+    retrieval_k: int = Field(default=DEFAULT_RETRIEVAL_K, ge=1, description="schema cards retrieved into the generation packet")
     definition_index_max_concepts: int = Field(default=500, ge=0,
         description="per-scheme concept cap for the enrich-time definition-grounding index")
     binding_suggestions_path: str | None = Field(default=None,

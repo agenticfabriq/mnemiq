@@ -160,14 +160,14 @@ def test_folded_field_defaults(monkeypatch):
         monkeypatch.delenv(v, raising=False)
     s = Settings.from_env()
     assert s.guided_sql is False and s.assertive_sql is False
-    assert s.retrieval_k == 12   # shipped default
+    assert s.retrieval_k == 24   # shipped default (raised from 12; see config.py)
 
 
 def test_env_example_lists_every_field_without_secrets():
     text = Settings.env_example()
     assert "MNEMIQ_LLM_BASE_URL=" in text
     assert "MNEMIQ_VERIFY_THRESHOLD=0.5" in text
-    assert "MNEMIQ_RETRIEVAL_K=12" in text
+    assert "MNEMIQ_RETRIEVAL_K=24" in text
     assert "MNEMIQ_VERIFY=" in text            # the tri-state alias, not MNEMIQ_VERIFY_OVERRIDE
     assert "MNEMIQ_VERIFY_OVERRIDE" not in text
     for line in text.splitlines():
@@ -195,7 +195,7 @@ def test_cli_config_prints_template(capsys):
     rc = main(["config", "example"])
     out = capsys.readouterr().out
     assert rc == 0
-    assert "MNEMIQ_LLM_BASE_URL=" in out and "MNEMIQ_RETRIEVAL_K=12" in out
+    assert "MNEMIQ_LLM_BASE_URL=" in out and "MNEMIQ_RETRIEVAL_K=24" in out
 
 
 def test_dictionary_path_reads_env(monkeypatch):
@@ -255,3 +255,38 @@ def test_static_verity_token_is_gone_and_the_secret_is_never_printed():
     for line in text.splitlines():
         if line.startswith("MNEMIQ_VERITY_CLIENT_SECRET"):
             assert line.split("#")[0].strip().endswith("=")  # secret value blank
+
+
+def test_the_retrieval_k_default_is_the_measured_one():
+    """24, not 12, and the number is measured rather than chosen.
+
+    Full Spider 2.0-lite sweep, 127 cases gradeable in every arm, against a variance
+    control (k=12 run twice, same config, to size run-to-run noise):
+
+        k=12 twice   facts 53.5% / 55.9%   -> noise band 2.4 pts
+        k=24         facts 60.6%           -> +5.9 vs the k=12 mean
+        k=36         facts 56.7%           -> +2.0, inside the noise band
+
+    Deferral is the firmer half: 8.7% / 6.3% at k=12 against 3.1% at k=24, and the
+    mechanism was verified case by case -- the engine had been refusing on columns it
+    was never shown. Strict match is unaffected and narrow schemas lose nothing.
+
+    More is not monotonically better: k=36 buys nothing over k=12 and costs on wrong.
+    """
+    from mnemiq.config import Settings
+
+    assert Settings().retrieval_k == 24
+
+
+def test_the_retrieval_k_default_is_written_once():
+    """The runtime must not restate the default as a literal.
+
+    It did: `k=self.settings.retrieval_k if self.settings else 12`. When the measured
+    default moved to 24 that copy kept answering 12, and only a test caught it. A second
+    copy of a number is a second thing to forget.
+    """
+    import re
+
+    src = (pathlib.Path(__file__).resolve().parents[1] / "src" / "mnemiq" / "runtime.py").read_text()
+    assert "DEFAULT_RETRIEVAL_K" in src
+    assert not re.search(r"retrieval_k if self\.settings else \d", src)

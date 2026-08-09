@@ -12,7 +12,7 @@ from mnemiq.agent.route import Router, StaticRouter, UnknownMode
 from mnemiq.assembly import build_components
 from mnemiq.authz.grants import AuthzProvider, DenyAll, FileAuthzProvider
 from mnemiq.cache.store import L1Cache, TwoTierCache
-from mnemiq.config import Settings
+from mnemiq.config import DEFAULT_RETRIEVAL_K, Settings
 from mnemiq.contract import HistoryTurn, IdentityContext, Snapshot
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
@@ -89,7 +89,10 @@ class Runtime:
         with step(emit, Stage.RETRIEVE, mode=name):
             packet = retrieve(
                 self.con, question, identity, self.authz, self.embedder,
-                k=self.settings.retrieval_k if self.settings else 12,
+                # The default lives on the Settings field, not here. It was written out as a
+                # literal 12 and silently kept the old value when the measured default moved
+                # to 24 -- a second copy of a number is a second thing to forget.
+                k=self.settings.retrieval_k if self.settings else DEFAULT_RETRIEVAL_K,
                 table_facts=self.snapshot.table_facts if self.snapshot else (),
                 # Definitions ride with the snapshot: the glossary channel had no runtime
                 # producer until the ontology digest, so this stayed unfed from Plan 08 until SP1.
