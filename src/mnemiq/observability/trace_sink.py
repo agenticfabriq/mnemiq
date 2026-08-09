@@ -1,0 +1,305 @@
+"""Emit one governed trace per answer to Verity.
+
+Verity's five trace tables were empty and its CAPTURE/OBSERVE screens starved: the ingest path
+validates, dedupes, enqueues and grades, and had never received a row because nothing sent one.
+This is the sender.
+
+**The payload is a disclosure decision, not plumbing.** An answer carries result rows, prose that
+restates values, SQL embedding literals from the question, the question itself, and the identity of
+whoever asked. So the request is built FROM THE TIER TABLE below rather than from the event: a field
+nobody classified cannot ship, because "the event carries it" is what code does when nobody decided.
+Adding a field to `IdentityContext` therefore ships it OFF until someone puts it in a tier.
+
+**The boundary is enforced here, before the request leaves.** Not by Verity discarding on receipt --
+filtering at the receiver means the bytes already crossed the wire, already sat in a log, already
+existed on a second machine. "We do not store it" and "we do not send it" are different claims and
+only the second survives a security review.
+
+Two placements are load-bearing and both were learned the hard way:
+
+* the answer goes in an **`answer_text` artifact**, never the top-level `answer` field. That is what
+  every Verity grader reads (`artifact_payload(trace, "answer_text")`) AND what Verity redacts for
+  identities without reviewer/admin/operator. Gradeable and protected are the same place (D132).
+* `semantic_refs` names what the PACKET selected, not what the snapshot held. `certified_refs` is
+  snapshot-scoped and retrieval takes a subset per question, so shipping the snapshot's list would
+  report what was *available* as what was *used* -- and Verity's D131 reader would republish that as
+  fact.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any
+
+from mnemiq.enrichment.verity_auth import access_token
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AnswerEvent:
+    """One answered question, as the runtime saw it.
+
+    Everything the emitter may send is reachable from here -- and every field of it appears in
+    exactly one tier in `_build_trace`, which is what makes the tier table binding rather than
+    advisory.
+    """
+
+    source_id: str
+    question: str
+    identity: Any
+    answer: Any
+    elapsed_ms: float
+    packet: Any = None  # the retrieval packet, for what the answer actually USED
+    events: list[dict] = field(default_factory=list)
+
+
+class TraceSink:
+    """A sink for whole answers, beside (not instead of) the metrics sink.
+
+    Two jobs, two seams: `ObservabilitySink` is a counter that wants six scalars fast; this batches,
+    crosses a network to another product, tolerates latency and may retry. Fusing them would make
+    every future trace field justify itself to a counter.
+    """
+
+    def record_answer(self, event: AnswerEvent) -> None:  # pragma: no cover - protocol
+        raise NotImplementedError
+
+
+def _sha256(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+
+
+class VerityTraceSink(TraceSink):
+    """Post one trace per answer, fail-soft, with the tier table as the only source of payload."""
+
+    def __init__(self, settings: Any) -> None:
+        self._settings = settings
+        self.dropped = 0  # M18's lesson: a fail-soft that produces nothing must still be countable
+
+    # -- tier gates ------------------------------------------------------------------------------
+    def _send_text(self) -> bool:
+        """Question text, SQL, answer prose, deferral message -- all carry literals."""
+        return bool(getattr(self._settings, "verity_trace_send_text", False))
+
+    def _send_identity_detail(self) -> bool:
+        """email / roles / groups / attributes. None is needed for audit; all are free riders, and
+        `attributes` is an open dict a DEPLOYMENT fills, so what travels is whatever some future
+        integrator stapled to an identity."""
+        return bool(getattr(self._settings, "verity_trace_send_identity_detail", False))
+
+    def _send_rows(self) -> bool:
+        """Result rows. The deepest tier: this is the customer's data, not a description of it."""
+        return bool(getattr(self._settings, "verity_trace_send_rows", False))
+
+    # -- payload ---------------------------------------------------------------------------------
+    def _semantic_refs(self, event: AnswerEvent) -> list[dict]:
+        """The certified versions THIS ANSWER used: the packet's selection ∩ the snapshot's refs."""
+        packet = event.packet
+        snapshot_refs = getattr(event, "certified_refs", None) or []
+        if packet is None or not snapshot_refs:
+            return []
+        selected: set[tuple[str, str]] = set()
+        for object_type, attr in (
+            ("definition", "definitions"),
+            ("metric", "metrics"),
+            ("dimension", "dimensions"),
+        ):
+            for obj in getattr(packet, attr, []) or []:
+                object_id = getattr(obj, "id", None)
+                if object_id:
+                    selected.add((object_type, str(object_id)))
+        return [
+            {
+                "object_type": ref.object_type,
+                "object_id": ref.object_id,
+                "version_hash": ref.version_hash,
+            }
+            for ref in snapshot_refs
+            if (ref.object_type, ref.object_id) in selected
+        ]
+
+    def _build_trace(self, event: AnswerEvent) -> dict:
+        answer = event.answer
+        identity = event.identity
+        trace = getattr(answer, "trace", None)
+
+        # ---- ALWAYS: no field here restates a value from the customer's database ---------------
+        record: dict[str, Any] = {
+            "trace_id": _sha256(f"{identity.tenant_id}|{event.source_id}|{id(answer)}")[7:39],
+            "tenant_id": identity.tenant_id,
+            "source_id": event.source_id,
+            "source_system": "mnemiq",
+            "agent": {"system": "mnemiq", "name": event.source_id, "version": _version()},
+            "identity": {
+                # A person-identifier, and labelled as one. It earns the always tier by the test
+                # applied to semantic_refs: an audit store that cannot say WHO asked answers
+                # nothing. `roles` is NOT here -- grant_fingerprint already carries the
+                # authorization boundary, so roles duplicate a fact already present while
+                # disclosing group membership on their own.
+                "principal_id": identity.principal_id,
+                "roles": [],
+                "groups": [],
+            },
+            "question": {
+                # A correlation key, NOT a privacy measure: questions are low-entropy and
+                # enumerable, so a hash confirms a guess. Labelled rather than salted, because a
+                # weak mitigation invites the misplaced trust an honest label does not.
+                "text": "",
+                "hash": _sha256(event.question),
+            },
+            "resolved_intent": {
+                "mode": getattr(answer, "mode", None),
+                "deferred": bool(getattr(answer, "deferred", False)),
+                "failed": bool(getattr(answer, "failed", False)),
+                # The ENUM, never the message: the message is free text carrying schema and values,
+                # and now the provider's own error string too.
+                "reason_code": _reason_code(answer),
+                "enrichment_version": getattr(trace, "enrichment_version", None),
+                "candidates_executed": getattr(answer, "candidates_executed", None),
+                "judge_engaged": getattr(answer, "judge_engaged", None),
+                "agreement": getattr(answer, "agreement", None),
+                "cached": getattr(answer, "cached", None),
+            },
+            # Stage names and durations. Metadata by construction, and what Live Traces renders.
+            "events": [_to_trace_event(e, i) for i, e in enumerate(event.events)],
+            "artifacts": [],
+            "semantic_refs": self._semantic_refs(event),
+            "policy_decisions": [],
+            "collector_metadata": {
+                "elapsed_ms": round(event.elapsed_ms, 3),
+                # A hash of the policy, not the policy. Two answers to one question under different
+                # grants are different events and must not be indistinguishable in the store.
+                "grant_fingerprint": getattr(answer, "grant_fingerprint", None),
+            },
+            "captured_at": _now(),
+            "idempotency_key": "",
+        }
+        record["idempotency_key"] = f"{record['trace_id']}-v1"
+
+        # ---- OPT-IN: text that restates or embeds values --------------------------------------
+        if self._send_text():
+            record["question"]["text"] = event.question
+            record["executed_sql"] = getattr(trace, "target_sql", None) or None
+            answer_text = str(getattr(answer, "answer", "") or "")
+            if answer_text:
+                record["artifacts"].append({
+                    "artifact_id": f"{record['trace_id']}-answer",
+                    "kind": "answer_text",
+                    "sha256": _sha256(answer_text),
+                    "redaction_state": "redacted",
+                    "payload": {"answer": answer_text},
+                })
+
+        if self._send_identity_detail():
+            record["identity"].update({
+                "email": getattr(identity, "email", None),
+                "roles": list(getattr(identity, "roles", []) or []),
+                "groups": list(getattr(identity, "groups", []) or []),
+            })
+            attributes = dict(getattr(identity, "attributes", {}) or {})
+            if attributes:
+                record["collector_metadata"]["identity_attributes"] = attributes
+
+        # ---- DEEPEST OPT-IN: the customer's rows ----------------------------------------------
+        if self._send_rows():
+            preview = getattr(answer, "preview", None)
+            if preview is not None:
+                record["artifacts"].append({
+                    "artifact_id": f"{record['trace_id']}-rows",
+                    "kind": "result_sample",
+                    "sha256": _sha256(json.dumps(preview.rows, default=str, sort_keys=True)),
+                    "redaction_state": "redacted",
+                    "payload": {
+                        "columns": list(preview.columns),
+                        "rows": preview.rows,
+                        "row_count": preview.row_count,
+                        "truncated": preview.truncated,
+                    },
+                })
+        return record
+
+    # -- transport -------------------------------------------------------------------------------
+    def record_answer(self, event: AnswerEvent) -> None:
+        url = getattr(self._settings, "verity_traces_url", None)
+        if not url:
+            return
+        try:
+            body = json.dumps({"traces": [self._build_trace(event)]}).encode()
+        except Exception as exc:  # a payload we cannot build is a drop, not a raised answer
+            self.dropped += 1
+            logger.warning("verity trace not built; answer unaffected: %s", exc)
+            return
+        token = access_token(self._settings)
+        headers = {"content-type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10):
+                return
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            # Never raises into Runtime.ask: a Verity outage cannot stop mnemiq answering. But M18
+            # is the cautionary tale -- a fail-soft that silently produced nothing looked exactly
+            # like "no certified records", so the drop is counted and named.
+            self.dropped += 1
+            logger.warning("verity trace dropped (%d total); answer unaffected: %s",
+                           self.dropped, exc)
+
+
+# mnemiq's `Stage` and Verity's `TraceEventKindV1` are two vocabularies for the same idea, and they
+# do not line up. Verity's `kind` is a CLOSED enum, so this is a real mapping rather than a rename --
+# and it is LOSSY at exactly one point worth naming: mnemiq's VERIFY is a distinct phase (the
+# verifier is a product claim, not an implementation detail) and Verity has no variant for it, so it
+# arrives as a model call. The true stage always rides in `payload.stage`, so nothing is lost even
+# where `kind` approximates; a `Verify` variant on Verity's side would let `kind` stop approximating.
+_STAGE_TO_KIND = {
+    "retrieve": "semantic_lookup",
+    "plan": "sql_compile",
+    "candidate": "model_call",
+    "execute": "sql_execute",
+    "verify": "model_call",  # lossy, see above
+    "synthesize": "answer",
+}
+
+
+def _to_trace_event(raw: dict, index: int) -> dict:
+    stage = str(raw.get("stage") or "")
+    kind = _STAGE_TO_KIND.get(stage, "tool_call")
+    if raw.get("ok") is False:
+        kind = "error"
+    return {
+        "event_id": f"{index}-{stage or 'stage'}",
+        "kind": kind,
+        "occurred_at": str(raw.get("at") or _now()),
+        "duration_ms": int(raw["ms"]) if isinstance(raw.get("ms"), (int, float)) else None,
+        # The stage mnemiq actually ran, kept whatever `kind` had to approximate to.
+        "payload": {"stage": stage, "ok": raw.get("ok")},
+    }
+
+
+def _reason_code(answer: Any) -> str | None:
+    reason = getattr(answer, "reason_code", None)
+    if reason is None:
+        return None
+    return getattr(reason, "value", None) or str(reason)
+
+
+def _version() -> str:
+    try:
+        from mnemiq import __version__
+
+        return str(__version__)
+    except Exception:
+        return "unknown"
+
+
+def _now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

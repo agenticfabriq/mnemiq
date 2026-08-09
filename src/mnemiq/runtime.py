@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,6 +31,9 @@ from mnemiq.store.control import resolve_version
 from mnemiq.store.snapshot_store import load_snapshot
 from mnemiq.verify.judge import SemanticJudge
 from mnemiq.verify.verifier import Verifier
+
+
+logger = logging.getLogger(__name__)
 
 
 class SnapshotMissing(RuntimeError):
@@ -61,6 +66,10 @@ class Runtime:
     router: Router = field(default_factory=StaticRouter)
     loaded_versions: dict[str, str] = field(default_factory=dict)
     sink: Any = None  # observability sink; None = NullSink (no record written)
+    # A SECOND seam beside `sink`, not a widening of it. The metrics sink is a counter that wants
+    # six scalars fast; this one batches, crosses a network to another product and may retry.
+    # None = emit nothing, and the engine is byte-for-byte unchanged.
+    trace_sink: Any = None
     ontology: Any = None  # OntologyIndex reader; None = no question-time code resolution
 
     def reload_if_stale(self) -> None:
@@ -111,6 +120,29 @@ class Runtime:
         answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
         answer.mode = name
         answer.grant_fingerprint = grants.fingerprint
+        if self.trace_sink is not None:
+            # One governed trace per answer. Fail-soft by the same contract as the metrics sink --
+            # a Verity outage cannot stop mnemiq answering -- and the payload is built from the
+            # tier table inside the emitter, never from this event, so a field nobody classified
+            # cannot ship.
+            from mnemiq.observability.trace_sink import AnswerEvent
+
+            event = AnswerEvent(
+                source_id=self.settings.source_id if self.settings else "unknown",
+                question=packet.question,
+                identity=identity,
+                answer=answer,
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+                packet=packet,
+            )
+            # What the SNAPSHOT holds; the emitter intersects it with what the PACKET selected, so
+            # the trace names what the answer USED rather than what was available to it.
+            event.certified_refs = self.snapshot.certified_refs if self.snapshot else []
+            try:
+                self.trace_sink.record_answer(event)
+            except Exception as exc:  # never into the caller's answer
+                logger.warning("trace emit failed; answer unaffected: %s", exc)
+
         if self.sink is not None:  # observability loop: one fail-soft record per answer
             from mnemiq.observability.metrics import AnswerRecord
 

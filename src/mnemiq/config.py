@@ -59,6 +59,12 @@ class Settings(BaseSettings):
     verity_watermark_path: str | None = Field(default=None, description="path to the Verity /open incremental-sync watermark sidecar JSON (defaults beside the store)")
     verity_page_size: int = Field(default=500, ge=0, description="Verity /open page size sent as ?limit= (0 = unbounded full dump)")
     verity_full_resync_after_secs: int = Field(default=86400, ge=0, description="how stale the locally merged certified set may get before it is re-pulled in full; a withdrawal is invisible to an incremental delta, so this window is the only thing that removes one locally (0 = always full)")
+    verity_traces_url: str | None = Field(default=None, description="Verity POST /api/traces/batch endpoint; unset = emit nothing (the engine is unchanged)")
+    # The disclosure tiers. Default-closed, and enforced in the EMITTER rather than by Verity
+    # discarding on receipt: filtering at the receiver means the bytes already crossed the wire.
+    verity_trace_send_text: bool = Field(default=False, description="opt-in: send question text, executed SQL, the answer prose and the deferral MESSAGE (all carry literals from the question and values from the database)")
+    verity_trace_send_identity_detail: bool = Field(default=False, description="opt-in: send email, roles, groups and attributes; none is needed for audit and `attributes` is an open dict a deployment fills")
+    verity_trace_send_rows: bool = Field(default=False, description="deepest opt-in: send result rows -- the customer's data itself, not a description of it")
     verity_token_url: str | None = Field(default=None, description="Keycloak POST .../realms/<realm>/protocol/openid-connect/token endpoint (OAuth2 client-credentials grant)")
     verity_client_id: str | None = Field(default=None, description="Verity service client id (created in the workbench API Credentials page)")
     verity_client_secret: str | None = Field(default=None, description="Verity service client secret; presented only to the token endpoint, never to the records endpoint")
