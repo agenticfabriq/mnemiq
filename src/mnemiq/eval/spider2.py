@@ -178,6 +178,8 @@ def run_case_csv(
 
     result.agreement = answer.agreement
     result.judge_engaged = answer.judge_engaged
+    result.verify_confidence = answer.verify_confidence
+    result.verify_layer = answer.verify_layer
     result.judge_override = answer.judge_override
     result.candidates_executed = answer.candidates_executed
 

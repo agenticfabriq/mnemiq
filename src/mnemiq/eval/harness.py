@@ -43,6 +43,11 @@ class CaseResult:
     difficulty: str | None = None
     agreement: float | None = None  # self-consistency: winning-cluster fraction, if any
     judge_engaged: bool | None = None  # selector-judge: consulted on this case?
+    # The RESULT verifier's read -- recorded on passes as well as refusals, because the only
+    # question worth asking of a judge is whether it scores wrong answers below right ones,
+    # and the passes are half that comparison.
+    verify_confidence: float | None = None
+    verify_layer: str | None = None
     judge_override: bool | None = None  # ...and picked against the majority?
     candidates_executed: int | None = None  # multi-candidate: how many of N ran
     proposed: bool = False
@@ -105,6 +110,8 @@ def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None) -
     result.ms = (time.perf_counter() - started) * 1000
     result.agreement = answer.agreement
     result.judge_engaged = answer.judge_engaged
+    result.verify_confidence = answer.verify_confidence
+    result.verify_layer = answer.verify_layer
     result.judge_override = answer.judge_override
     result.candidates_executed = answer.candidates_executed
 

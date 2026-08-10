@@ -107,7 +107,16 @@ _EXPLODED: dict[str, tuple[str, ...]] = {
 
 # Fields deliberately kept off the wire. Empty today: everything AgentAnswer carries is something
 # a caller can act on. Add here ONLY with a reason -- an entry is a decision, not a shortcut.
-_WITHHELD: dict[str, str] = {}
+_WITHHELD: dict[str, str] = {
+    # Engine telemetry, added so an eval can ask whether the verifier's score RANKS wrong
+    # answers below right ones. Deliberately not on the wire: a bare "0.62" beside an answer
+    # reads to a user as a probability the answer is correct, which is not what it is and not
+    # something we have shown it to be -- measured once, the judge caught 4 and killed 4.
+    # Surfacing it is a UI decision with its own argument, not a side effect of measuring.
+    "verify_confidence": "engine telemetry; a raw score beside an answer would read as an "
+                         "accuracy claim we have not earned",
+    "verify_layer": "engine telemetry; meaningless to a user without the confidence",
+}
 
 
 def test_every_agentanswer_field_reaches_the_wire_or_is_explicitly_withheld():
