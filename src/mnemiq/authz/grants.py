@@ -79,6 +79,18 @@ class FileAuthzProvider:
     def __init__(self, path: str) -> None:
         self._path = path
 
+    def policy_roles(self) -> list[str]:
+        """The roles this policy declares, for advisory checks at boot.
+
+        Optional on the provider protocol: a control-plane provider need not enumerate, and
+        callers treat its absence as "cannot check" rather than "nothing to check".
+        """
+        try:
+            with open(self._path) as fh:
+                return sorted(json.load(fh)["roles"])
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
+            return []
+
     def grants_for(self, identity: IdentityContext) -> GrantSet:
         try:
             with open(self._path) as fh:
