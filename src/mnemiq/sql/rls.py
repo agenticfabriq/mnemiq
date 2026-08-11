@@ -3,9 +3,9 @@ from __future__ import annotations
 import sqlglot
 from sqlglot import exp
 
-from mnemiq.sql.authz_guard import local_cte_names
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import object_key
+from mnemiq.sql.scope import base_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -46,7 +46,6 @@ def apply_row_and_mask(
     if not policy.row_filters and not policy.masked:
         return ast
 
-    local = local_cte_names(ast)
     masked_by_table: dict[str, set[str]] = {}
     for tbl, col in policy.masked:
         masked_by_table.setdefault(tbl, set()).add(col)
@@ -57,9 +56,10 @@ def apply_row_and_mask(
             if column.name in cols:
                 referenced_masked.add(tbl)
 
-    for table_node in list(ast.find_all(exp.Table)):
+    # Resolved before the loop mutates the tree: `replace` invalidates the scope it was read from.
+    for table_node in base_tables(ast):
         name = object_key(table_node)
-        if table_node.name in local or name not in visible:
+        if name not in visible:
             continue
         needs_filter = name in policy.row_filters
         needs_mask = name in referenced_masked
