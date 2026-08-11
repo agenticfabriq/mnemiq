@@ -34,6 +34,41 @@ class _GrantAll:
         return self._grants
 
 
+class RunCost:
+    """Usage summed across every client an engine uses -- not just the generator's.
+
+    `build_engine` returned `kit.client` under the comment "one client, so the token count is
+    the run's true cost". That was true until a judge was configured, and then false: the judge
+    runs on its OWN client, so its calls landed on a counter nobody read. The claim in the
+    comment is exactly the kind that stops people checking.
+
+    Measured, which is how it surfaced: a judge arm reported 324 calls against its control's
+    350 -- FEWER, while adding an LLM call per answered case. The drop was fewer synthesis
+    calls from extra deferrals; roughly a hundred judge calls were simply invisible.
+
+    Exposes the reader interface the four runners already use, so none of them change.
+    """
+
+    def __init__(self, *clients) -> None:
+        self._clients = [c for c in clients if c is not None]
+
+    @property
+    def calls(self) -> int:
+        return sum(c.calls for c in self._clients)
+
+    @property
+    def prompt_tokens(self) -> int:
+        return sum(c.prompt_tokens for c in self._clients)
+
+    @property
+    def completion_tokens(self) -> int:
+        return sum(c.completion_tokens for c in self._clients)
+
+    @property
+    def total_tokens(self) -> int:
+        return sum(c.total_tokens for c in self._clients)
+
+
 def build_engine(
     snapshot: Snapshot,
     adapter,
@@ -85,18 +120,25 @@ def build_engine(
     authz = _GrantAll(grants)
 
     kit = build_components(settings, adapter, con)
-    client = kit.client  # one client, so the token count is the run's true cost
 
     verifier = None
+    judge_client = None
     if verify or settings.verify:
         judge = None
         if settings.verify_judge:
             base, key = settings.verify_endpoint()
-            judge = SemanticJudge(LLMClient(settings.model_copy(update={
+            # Its own client on purpose: the judge may point at a different endpoint and model
+            # (verify_base_url / verify_model). That is why its cost has to be summed, not
+            # assumed to land on the generator's counter.
+            judge_client = LLMClient(settings.model_copy(update={
                 "llm_base_url": base, "llm_api_key": key,
-                "llm_model": settings.verify_model or settings.llm_model})))
+                "llm_model": settings.verify_model or settings.llm_model}))
+            judge = SemanticJudge(judge_client)
         verifier = Verifier(threshold=settings.verify_threshold, sanity=settings.verify_sanity,
                             grounding=settings.verify_grounding, judge=judge)
+
+    # Every client the engine actually uses, so "the run's cost" is the run's cost.
+    client = RunCost(kit.client, judge_client)
 
     # The kit generates in the source's dialect (BIRD: SQLite), so nothing needs a
     # cross-dialect transpile the SQLite writer can't do (DuckDB YEAR()/EXTRACT -> strftime).

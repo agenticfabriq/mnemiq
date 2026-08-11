@@ -14,7 +14,7 @@ from mnemiq.agent.route import Router, StaticRouter, UnknownMode
 from mnemiq.assembly import build_components
 from mnemiq.authz.grants import AuthzProvider, DenyAll, FileAuthzProvider
 from mnemiq.cache.store import L1Cache, TwoTierCache
-from mnemiq.config import Settings
+from mnemiq.config import DEFAULT_RETRIEVAL_K, Settings
 from mnemiq.contract import HistoryTurn, IdentityContext, Snapshot
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
@@ -98,7 +98,10 @@ class Runtime:
         with step(emit, Stage.RETRIEVE, mode=name):
             packet = retrieve(
                 self.con, question, identity, self.authz, self.embedder,
-                k=self.settings.retrieval_k if self.settings else 12,
+                # The default lives on the Settings field, not here. It was written out as a
+                # literal 12 and silently kept the old value when the measured default moved
+                # to 24 -- a second copy of a number is a second thing to forget.
+                k=self.settings.retrieval_k if self.settings else DEFAULT_RETRIEVAL_K,
                 table_facts=self.snapshot.table_facts if self.snapshot else (),
                 # Definitions ride with the snapshot: the glossary channel had no runtime
                 # producer until the ontology digest, so this stayed unfed from Plan 08 until SP1.
@@ -207,6 +210,27 @@ class Runtime:
 
 def _authz(settings: Settings) -> AuthzProvider:
     return FileAuthzProvider(settings.authz_path) if settings.authz_path else DenyAll()
+
+
+def _warn_row_filter_coverage(authz: AuthzProvider, snapshot: Snapshot | None) -> None:
+    """Say, at boot, which granted tables a row filter fails to reach.
+
+    A policy declares filters table by table, so a tenancy axis is only as tight as the
+    author's enumeration of everything hanging off it -- and nothing downstream complains,
+    because the engine is faithfully applying what it was given. Advisory: it reports, it
+    never refuses. The operator's policy is the operator's.
+    """
+    from mnemiq.authz.coverage import warn_unfiltered_dependents
+    from mnemiq.contract import IdentityContext
+
+    roles = getattr(authz, "policy_roles", None)
+    if snapshot is None or roles is None:
+        return  # a provider that cannot enumerate roles is not a provider with no holes
+    for role in roles():
+        grants = authz.grants_for(
+            IdentityContext(tenant_id="boot", principal_id="boot", roles=[role])
+        )
+        warn_unfiltered_dependents(grants, snapshot.relationships, role=role)
 
 
 def _resolve_verify_level(mode_verify: str, override: str | None) -> str:
@@ -351,13 +375,15 @@ def build_runtime(settings: Settings) -> Runtime:
         )
         for name, mode in MODES.items()
     }
+    _boot_authz = _authz(settings)
+    _warn_row_filter_coverage(_boot_authz, snapshot)
     return Runtime(
         con=con,
         snapshot=snapshot,
         adapter=adapter,
         agent=agents[default_mode],
         embedder=LLMEmbedder(settings),
-        authz=_authz(settings),
+        authz=_boot_authz,
         settings=settings,
         agents=agents,
         router=StaticRouter(default=default_mode),

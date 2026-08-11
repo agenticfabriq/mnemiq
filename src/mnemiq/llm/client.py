@@ -28,6 +28,7 @@ class LLMClient:
         if not settings.llm_base_url or not settings.llm_api_key:
             raise RuntimeError("LLM base_url/api_key not configured (set MNEMIQ_LLM_* env)")
         self._model = settings.llm_model
+        self._seed = settings.llm_seed
         self._client = OpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key)
         # A change that buys 1% accuracy for 3x the tokens is a trade to make on purpose.
         self.calls = 0
@@ -41,7 +42,20 @@ class LLMClient:
     def complete(self, system: str, user: str, max_tokens: int = 512,
                  extra_body: dict | None = None) -> str:
         kwargs = {token_param_name(self._model): max_tokens}
-        if extra_body:  # e.g. vLLM guided decoding (guided_json / guided_grammar)
+        if self._seed is not None:
+            # Forwarded, not guaranteed. MEASURED: vLLM honours it; the hosted endpoint accepts
+            # it, returns no system_fingerprint, and still varies its output -- two identical
+            # seeded SQL requests produced different queries. OpenAI ties seed determinism to
+            # that fingerprint, and this proxy does not participate. So this buys
+            # reproducibility on the local path and nothing on the frontier one; do not build
+            # an experiment design that assumes it.
+            #
+            # Safe with multi-candidate generation and the repair loop regardless, because
+            # BOTH vary the prompt -- candidates by engineered strategy, retries by appended
+            # feedback -- rather than relying on sampling noise. A future strategy that
+            # resamples the same prompt would need to vary this per call.
+            kwargs["seed"] = self._seed
+        if extra_body:  # e.g. constrained decoding (response_format json_schema)
             kwargs["extra_body"] = extra_body
         try:
             resp = self._client.chat.completions.create(

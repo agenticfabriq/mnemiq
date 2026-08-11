@@ -62,6 +62,25 @@ class AgentAnswer:
     # The authorization boundary this answer was computed under. A client echoes it back
     # with the turn; the engine replays a turn only to the same boundary (history.py).
     grant_fingerprint: str = ""
+    # The verifier's read, kept on the PASS path as well as the defer path. Without the
+    # passes there is no way to ask the only question that matters about a judge -- does it
+    # score wrong answers below right ones -- so a threshold can only be tuned by running the
+    # whole suite again. Measured once with these dropped: caught 4, killed 4, missed 37.
+    verify_confidence: float | None = None
+    verify_layer: str | None = None  # "sanity" | "grounding" | "judge" | "pass"
+
+
+def _stamp(answer: AgentAnswer, verdict) -> AgentAnswer:
+    """Carry the verifier's read onto an answer that PASSED it.
+
+    A confidence recorded only when the verifier refuses is a sample of one tail. Ranking is
+    the only property of a judge that matters -- does it score wrong answers below right ones
+    -- and that is unanswerable without the scores it gave to the answers it let through.
+    """
+    if verdict is not None:
+        answer.verify_confidence = verdict.confidence
+        answer.verify_layer = verdict.layer
+    return answer
 
 
 def _shape(row_count: int, column_count: int) -> str:
@@ -185,13 +204,13 @@ class Agent:
             if hit is not None:
                 table = from_ipc(hit)
                 with step(emit, Stage.VERIFY, cached=True):
-                    blocked = self._verified(packet, approved, table)
+                    blocked, verdict = self._verified(packet, approved, table)
                 if blocked is not None:
                     return blocked
-                return self._synthesize(
+                return _stamp(self._synthesize(
                     packet, approved, identity, table, deadline, cached=True, forced=False,
                     emit=emit,
-                )
+                ), verdict)
 
             try:
                 with step(emit, Stage.EXECUTE):
@@ -205,10 +224,10 @@ class Agent:
 
             self.cache.put(key, to_ipc(result.table))
             with step(emit, Stage.VERIFY):
-                blocked = self._verified(packet, approved, result.table)
+                blocked, verdict = self._verified(packet, approved, result.table)
             if blocked is not None:
                 return blocked
-            return self._synthesize(
+            return _stamp(self._synthesize(
                 packet,
                 approved,
                 identity,
@@ -218,7 +237,7 @@ class Agent:
                 forced=deadline.expired,
                 execute_ms=result.elapsed_ms,
                 emit=emit,
-            )
+            ), verdict)
 
         # NOT a deferral. We did not decline to answer -- the source refused to serve us, and
         # counting that as abstention is what let an outage look like the engine working (M6).
@@ -321,14 +340,14 @@ class Agent:
         agreement = len(winner) / len(executed)
 
         with step(emit, Stage.VERIFY):
-            blocked = self._verified(packet, approved, table)
+            blocked, verdict = self._verified(packet, approved, table)
         if blocked is not None:
             return blocked
 
-        base = self._synthesize(
+        base = _stamp(self._synthesize(
             packet, approved, identity, table, deadline, cached=False,
             forced=deadline.expired, emit=emit,
-        )
+        ), verdict)
         caution = "" if agreement >= 0.5 else " -- treat with caution"
         note = f" (confidence: {len(winner)}/{len(executed)} candidates agreed{caution}.)"
         return AgentAnswer(
@@ -341,19 +360,29 @@ class Agent:
             judge_override=judge_override,
             candidates_executed=len(executed),
             preview=base.preview,
+            # Carried from `base`: this branch rebuilds the answer to append the agreement
+            # note, and a field added to AgentAnswer is silently dropped here unless copied.
+            verify_confidence=base.verify_confidence,
+            verify_layer=base.verify_layer,
         )
 
-    def _verified(self, packet: ContextPacket, approved: Approved, table) -> AgentAnswer | None:
-        """None if the answer clears the verifier (or none is wired), else a deferral. This is the
-        correctness gate: the decider guards validity, the verifier guards likely-correctness, and
-        both end in the same defer-don't-guess path."""
+    def _verified(self, packet: ContextPacket, approved: Approved, table):
+        """The verifier's read, or None when none is wired. Returns (deferral, verdict).
+
+        The correctness gate: the decider guards validity, the verifier guards
+        likely-correctness, and both end in the same defer-don't-guess path. The verdict comes
+        back even when it passes, because a confidence recorded only on refusals cannot answer
+        whether the judge ranks wrong answers below right ones.
+        """
         if self.verifier is None:
-            return None
+            return None, None
         verdict = self.verifier.verify(packet, approved, table)
         if verdict.defer:
             return AgentAnswer(answer=verdict.reason, deferred=True,
-                               reason_code=DeferralReason.VERIFICATION)
-        return None
+                               reason_code=DeferralReason.VERIFICATION,
+                               verify_confidence=verdict.confidence,
+                               verify_layer=verdict.layer), verdict
+        return None, verdict
 
     def _synthesize(
         self,

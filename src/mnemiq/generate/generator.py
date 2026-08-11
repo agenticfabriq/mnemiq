@@ -11,8 +11,9 @@ from mnemiq.semantic.retrieval import ContextPacket
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
 
 # Constrained decoding (MNEMIQ_GUIDED_SQL=1): force the reply to be a JSON object with a NON-EMPTY
-# sql string, so an over-deferring local model literally cannot return {"sql": null}. Requires a
-# guided-decoding backend (vLLM guided_json). No effect against endpoints that ignore extra_body.
+# sql string, so an over-deferring model literally cannot return {"sql": null}. Measured worth: on
+# Qwen-14B this turned a 100% deferral rate into real attempts, because the model was fencing its
+# JSON in ```json blocks and the parser saw no SQL.
 _GUIDED_SQL_SCHEMA = {
     "type": "object",
     "properties": {"sql": {"type": "string", "minLength": 1}, "reason": {"type": "string"}},
@@ -21,9 +22,29 @@ _GUIDED_SQL_SCHEMA = {
 
 
 def _guided_extra_body(guided_sql: bool) -> dict | None:
-    if guided_sql:
-        return {"guided_json": _GUIDED_SQL_SCHEMA}
-    return None
+    """The request field that constrains the reply to `_GUIDED_SQL_SCHEMA`.
+
+    `response_format`, not vLLM's `guided_json`. Both were measured against both backends:
+    guided_json is a vLLM extension and the OpenAI-compatible endpoint rejects it outright
+    with `Unknown parameter` -- a 400, so the request FAILS rather than degrading. This flag
+    was therefore not merely inert on the frontier model, it was unusable, and the comment
+    here used to claim such endpoints would "ignore" it.
+
+    `strict` is deliberately omitted. Strict mode additionally requires
+    `additionalProperties: false` and every property in `required`, which `reason` (optional
+    by design) violates -- sending it is another 400. Without strict the schema is honoured
+    by vLLM's structured-output engine and is best-effort on the provider side, so the
+    non-empty guarantee is firm where it was always needed and advisory where the model
+    was not deferring anyway.
+    """
+    if not guided_sql:
+        return None
+    return {
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": "sql_proposal", "schema": _GUIDED_SQL_SCHEMA},
+        }
+    }
 
 
 @dataclass
