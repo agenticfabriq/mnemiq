@@ -21,6 +21,10 @@ class RefusalCode(StrEnum):
     UNAUTHORIZED_COLUMN = "unauthorized_column"
     MASKED_COLUMN_IN_PREDICATE = "masked_column_in_predicate"
     INVALID_ROW_FILTER = "invalid_row_filter"
+    # A granted view whose body this engine cannot resolve, while a policy is active. Refusing
+    # is the floor the full fix keeps as its error branch: an unresolvable view is one whose
+    # base tables' filters cannot be applied, and answering from it anyway is M27 (M27).
+    UNRESOLVABLE_VIEW = "unresolvable_view"
     # Deployment-level, not grant-level: this deployment does not do writes at all. Distinct from
     # UNAUTHORIZED_WRITE, which is a statement about THIS identity's grants (M3).
     WRITES_DISABLED = "writes_disabled"

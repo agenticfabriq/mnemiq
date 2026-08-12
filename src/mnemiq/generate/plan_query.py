@@ -52,6 +52,10 @@ def plan_query(
     visible = visible_schema(snapshot, grants)
     policy = build_access_policy(snapshot, grants)
     registry = getattr(snapshot, "registry", {})  # {} for a plain single-source Snapshot
+    # A view's body is what makes a filter on its base tables reach anything (M27). It comes
+    # from the snapshot rather than from the source at ask time: it is versioned content, and
+    # a body that drifted from the one the policy was reasoned about is a governance change.
+    views = {v.object_id: v for v in snapshot.views}
     if not packet.cards or not visible:
         if not grants.available:
             # The policy could not be READ. Denying everything is correct; saying "your access"
@@ -76,7 +80,7 @@ def plan_query(
 
         verdict = decide(
             proposal.sql, visible, adapter=adapter, dialect=dialect, target=target,
-            values=values, policy=policy, registry=registry
+            values=values, policy=policy, registry=registry, views=views
         )
 
         corrected = False
@@ -96,6 +100,7 @@ def plan_query(
                 values=values,
                 policy=policy,
                 registry=registry,
+                views=views,
             )
             # Only when the repair is what carried it: a correction that still refuses is not
             # a corrected plan, it is a failed one, and reporting it would overstate the work.
