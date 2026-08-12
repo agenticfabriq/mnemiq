@@ -136,3 +136,20 @@ def gate_outcome(report: Report, previous: RunRecord | None,
         return ("no baseline is recorded for this source, so this run was not compared against "
                 "anything -- record one with `mnemiq eval --record`, then gate against it")
     return check_regression(report, previous)
+
+
+def should_record(record: bool, gate: bool, gate_failed: bool) -> bool:
+    """Whether this run belongs in the trend.
+
+    `--gate` used to imply recording, and it recorded BEFORE comparing. Armed, that is a
+    ratchet rather than a gate: a regression fails one build, becomes the baseline, and every
+    run after it passes against the lower number. One red build and then green forever, which
+    is indistinguishable from the sixteen-point drift that was actually observed (M34).
+
+    So a gate is a reader. Writing is `--record`'s job, and when both are asked for, a run
+    that failed the gate is not written -- a number we just rejected must not become the one
+    we measure against.
+    """
+    if not record:
+        return False
+    return not (gate and gate_failed)

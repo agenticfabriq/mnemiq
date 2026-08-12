@@ -92,3 +92,34 @@ def test_a_genuinely_absent_baseline_is_not_an_outage(tmp_path):
     from mnemiq.eval.trend import last_run
 
     assert last_run(None, "acme", path=str(tmp_path / "absent.json")) is None
+
+
+def test_a_regressed_run_must_not_become_the_new_baseline():
+    """The defect that would have survived arming the gate. `--gate` recorded the run before
+    comparing it, so a regression failed once and then WAS the baseline -- one red build, then
+    green forever, while the number kept sliding. A ratchet, not a gate."""
+    from mnemiq.eval.trend import RunRecord, should_record
+
+    previous = RunRecord(source_id="acme", run_at="", accuracy=0.96, strict_accuracy=0.84,
+                         total=30, correct=29, correct_facts=0, wrong=1, deferred_wrongly=0,
+                         error=0)
+    regressed = _report(24, 30)  # 0.80 against a 0.96 baseline
+    assert should_record(record=True, gate=True, gate_failed=True) is False
+    assert should_record(record=True, gate=True, gate_failed=False) is True
+    from mnemiq.eval.trend import gate_outcome
+    assert gate_outcome(regressed, previous) is not None  # it did fail, as it must
+
+
+def test_recording_without_gating_always_writes():
+    """`--record` alone is how a baseline gets established in the first place."""
+    from mnemiq.eval.trend import should_record
+
+    assert should_record(record=True, gate=False, gate_failed=False) is True
+
+
+def test_gating_alone_never_writes():
+    """A gate is a reader. Writing was what let it move its own goalposts."""
+    from mnemiq.eval.trend import should_record
+
+    assert should_record(record=False, gate=True, gate_failed=False) is False
+    assert should_record(record=False, gate=True, gate_failed=True) is False

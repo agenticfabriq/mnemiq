@@ -56,7 +56,9 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
     report = summarize(results, tokens=client.total_tokens, llm_calls=client.calls)
     print(report.render())
 
-    from mnemiq.eval.trend import TrendUnavailable, gate_outcome, last_run, record_run
+    from mnemiq.eval.trend import (
+        TrendUnavailable, gate_outcome, last_run, record_run, should_record,
+    )
 
     store_error: str | None = None
     previous = None
@@ -64,12 +66,15 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
         previous = last_run(settings.control_dsn, settings.source_id, path=TREND_PATH)
     except TrendUnavailable as exc:
         store_error = str(exc)
-    if record or gate:
+    # Compare BEFORE writing. `--gate` used to imply a write, and wrote first, so a regression
+    # became the baseline it had just been rejected against -- one red build, then green
+    # forever (M34).
+    msg = gate_outcome(report, previous, store_error=store_error) if gate else None
+    if should_record(record=record, gate=gate, gate_failed=msg is not None):
         record_run(settings.control_dsn, settings.source_id, report, path=TREND_PATH)
     if gate:
         # A gate that cannot compare FAILS. It used to pass, and passed for as long as no
-        # baseline existed -- which was always, because nothing had ever written one (M34).
-        msg = gate_outcome(report, previous, store_error=store_error)
+        # baseline existed -- which was always, because nothing had ever written one.
         if msg:
             print(f"GATE FAILED: {msg}")
             return 1
