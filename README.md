@@ -12,8 +12,11 @@ engine says so instead of inventing a number.
 
 ## Why trust it
 
-- **It never invents an answer.** Across every evaluation run, zero questions the data could not
-  answer were answered anyway — they were deferred, with an explanation.
+- **It refuses rather than guesses.** When the data cannot answer a question, the engine states the
+  reason instead of inventing a number — every unanswerable ACME case, and 26 of 30 results on an
+  adversarial refusal set built to tempt it. The residual is instructive: the case it answers is
+  *"the lifetime value of our average customer"*, where a plausible-looking derivation exists over
+  the columns and the business definition does not. Refusal is measured here, not asserted.
 - **Two independent locks on access.** The model is never *shown* a table the caller may not see
   (access-scoped retrieval), and the decider re-checks every referenced object against grants
   before anything runs. The database's own permission error is never the control.
@@ -26,14 +29,26 @@ engine says so instead of inventing a number.
 Measured, not asserted. Grading is result-based: a different query that returns the right facts
 passes; the harness reports both exact-match and got-the-facts accuracy.
 
-| corpus | accuracy |
-|---|---|
-| ACME (in-domain, 30 cases) | 100% |
-| BIRD mini-dev (500 questions, 11 unseen schemas) | 40.5% exact-match · 52.2% got-the-facts |
+| corpus | exact-match | got-the-facts |
+|---|---|---|
+| ACME (in-domain, 30 cases) | 84.0% | 96.0% |
+| BIRD mini-dev (487 answerable, 11 unseen schemas) | 49.5% | 62.1% |
+| Spider 2.0-lite (135 questions, 30 schemas) | 36.5% | 58.5% |
 
-The single-shot engine is competitive with strong frontier one-shot baselines on BIRD
-(GPT-4o 34%, Claude 3.7 41%). The distance to leaderboard pipelines is added machinery —
-candidate selection, verification — which is on the roadmap, not a difference in the core.
+Those are three different questions, not three attempts at one. ACME is in-domain — one enriched
+schema with a golden set, the regime a real deployment is in. BIRD and Spider are **cold start**:
+unseen schemas, no glossary, no examples. Spider 2.0 is the hard one by design — real
+data-application schemas, often more than a thousand columns.
+
+On BIRD the single-shot engine sits in the range of BIRD's own reported single-shot baselines
+(GPT-4o 34.4, Claude 3.7 41.1, o3-mini 42.6). The distance to leaderboard pipelines is added
+machinery — candidate selection, verification — and task-specific fine-tuning, not a difference
+in the core.
+
+**On local models, the honest result:** a 24 GB Qwen2.5-Coder-14B with constrained decoding reaches
+50.7% got-the-facts on BIRD — close to frontier — and **6.8% on Spider 2.0-lite**, where the same
+frontier configuration holds at 58.5%. Local capability is far more schema-dependent than the BIRD
+number alone suggests. Measure on your own schema before committing an architecture to it.
 
 ## Quickstart
 
@@ -95,6 +110,9 @@ capability lives in the open core.
 
 ## Status
 
-v0.1: the full read path, evaluated on ACME and BIRD. Roadmap: cross-source federation, tiered
-modes, the governed write plane, multi-replica deployment, local models, and the self-maintaining
-loops.
+v0.1: the full read path — enrichment, retrieval, the decider, execution, trace — evaluated on
+ACME, BIRD mini-dev and Spider 2.0-lite, with a local-model program alongside. Tiered modes
+(`instant` / `thinking` / `deep`), row- and column-level security, the governed write path,
+cross-source federation and multi-replica deployment are built and wired behind the same
+interfaces. Next: additional source adapters, the self-maintaining loops, and hardening the write
+plane against a production source.
