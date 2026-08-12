@@ -161,3 +161,23 @@ def test_exploded_and_withheld_name_only_real_fields():
     known = {f.name for f in dataclasses.fields(AgentAnswer)}
     stale = (set(_EXPLODED) | set(_WITHHELD)) - known
     assert not stale, f"exemptions for fields that no longer exist: {sorted(stale)}"
+
+
+def test_the_wire_carries_what_the_mode_actually_spent():
+    """M33: `instant` and `thinking` run identical code whenever the first SQL is approved,
+    so without these two the mode control is unfalsifiable from the outside."""
+    from mnemiq.agent.loop import AgentAnswer
+    from mnemiq.server.serialize import answer_payload
+
+    body = answer_payload(AgentAnswer(answer="7.", mode="thinking", attempts=2, corrected=True))
+    assert body["attempts"] == 2
+    assert body["corrected"] is True
+
+
+def test_an_answer_that_never_planned_reports_neither_rather_than_zero():
+    """A deferral did no attempts; saying `0` would claim it measured something."""
+    from mnemiq.agent.loop import AgentAnswer
+    from mnemiq.server.serialize import answer_payload
+
+    body = answer_payload(AgentAnswer(answer="No.", deferred=True))
+    assert body["attempts"] is None and body["corrected"] is None

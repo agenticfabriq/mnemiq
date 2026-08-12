@@ -25,6 +25,10 @@ def answer_payload(ans: AgentAnswer) -> dict:
         "judge_engaged": ans.judge_engaged,
         "judge_override": ans.judge_override,
         "candidates_executed": ans.candidates_executed,
+        # M33: what the mode actually spent. Without these, `instant` and `thinking` are
+        # indistinguishable on a question that succeeds first time -- which is most of them.
+        "attempts": ans.attempts,
+        "corrected": ans.corrected,
         "sql": t.target_sql if t else None,
         "tables_used": list(t.tables_used) if t else None,
         "enrichment_version": t.enrichment_version if t else None,

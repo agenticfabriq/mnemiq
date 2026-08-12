@@ -8,7 +8,7 @@
  */
 
 import type { AnswerPayload, Step } from "../lib/types";
-import { duration } from "../lib/verdict";
+import { duration, effort as describeEffort } from "../lib/verdict";
 import { Steps } from "./Steps";
 
 function Row({ term, children }: { term: string; children: React.ReactNode }) {
@@ -29,8 +29,15 @@ export function RunDetails({
 }) {
   const execute = duration(answer.timing?.["execute_ms"]);
   const total = duration(answer.timing?.["total_ms"]);
+  const effort = describeEffort(answer);
   const tables = answer.tables_used ?? [];
-  if (tables.length === 0 && !total && !answer.enrichment_version && steps.length === 0) {
+  if (
+    tables.length === 0 &&
+    !total &&
+    !effort &&
+    !answer.enrichment_version &&
+    steps.length === 0
+  ) {
     return null;
   }
 
@@ -56,6 +63,11 @@ export function RunDetails({
               {total}
               {execute && <span className="text-graphite"> · {execute} in the source</span>}
             </span>
+          </Row>
+        )}
+        {effort && (
+          <Row term="Effort">
+            <span className="tabular">{effort}</span>
           </Row>
         )}
         {answer.enrichment_version && (

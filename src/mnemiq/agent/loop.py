@@ -57,6 +57,13 @@ class AgentAnswer:
     judge_engaged: bool | None = None  # multi-candidate only: did the judge get consulted?
     judge_override: bool | None = None  # ...and did it pick against the majority?
     candidates_executed: int | None = None  # multi-candidate only: how many of N ran
+    # What the mode actually spent. `instant` and `thinking` differ only in the corrector and
+    # the retry ceiling, and both are invisible on a question that succeeds first time -- so the
+    # control read as inert when it was working exactly as designed (M33). `attempts` counts the
+    # OUTER loop, which repairs what the database rejected; `corrected` is the inner surgical
+    # pass, which repairs what the decider rejected. Two different judges, two different numbers.
+    attempts: int | None = None
+    corrected: bool | None = None
     mode: str | None = None  # resolved mode name, stamped by the Runtime (the Agent IS a mode)
     preview: ResultPreview | None = None  # None on every deferral path -- never fabricated
     # The authorization boundary this answer was computed under. A client echoes it back
@@ -209,7 +216,7 @@ class Agent:
                     return blocked
                 return _stamp(self._synthesize(
                     packet, approved, identity, table, deadline, cached=True, forced=False,
-                    emit=emit,
+                    emit=emit, attempts=_attempt + 1,
                 ), verdict)
 
             try:
@@ -237,6 +244,7 @@ class Agent:
                 forced=deadline.expired,
                 execute_ms=result.elapsed_ms,
                 emit=emit,
+                attempts=_attempt + 1,
             ), verdict)
 
         # NOT a deferral. We did not decline to answer -- the source refused to serve us, and
@@ -395,6 +403,7 @@ class Agent:
         forced: bool,
         execute_ms: float = 0.0,
         emit: Emit | None = None,
+        attempts: int | None = None,
     ) -> AgentAnswer:
         with step(emit, Stage.SYNTHESIZE, forced=forced):
             answer = self.synthesizer.answer(
@@ -410,4 +419,5 @@ class Agent:
             result_shape=_shape(table.num_rows, table.num_columns),
         )
         return AgentAnswer(answer=answer, trace=trace, deferred=False, cached=cached,
-                           preview=result_preview(table, self.preview_rows))
+                           preview=result_preview(table, self.preview_rows),
+                           attempts=attempts, corrected=approved.corrected)

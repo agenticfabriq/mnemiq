@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import DeferralReason, Snapshot
@@ -79,6 +79,7 @@ def plan_query(
             values=values, policy=policy, registry=registry
         )
 
+        corrected = False
         if (
             isinstance(verdict, Refusal)
             and verdict.code in CORRECTABLE
@@ -96,9 +97,12 @@ def plan_query(
                 policy=policy,
                 registry=registry,
             )
+            # Only when the repair is what carried it: a correction that still refuses is not
+            # a corrected plan, it is a failed one, and reporting it would overstate the work.
+            corrected = isinstance(verdict, Approved)
 
         if isinstance(verdict, Approved):
-            return verdict
+            return replace(verdict, corrected=corrected)
 
         if verdict.code == RefusalCode.UNAUTHORIZED_TABLE:
             # Do not retry. A guard that can be retried is a puzzle, not a guard.
