@@ -9,15 +9,58 @@ from mnemiq.sql.scope import base_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
-def _validate_filter(filt: str, cols: set[str], dialect: str) -> exp.Expression | None:
-    """Parse a row filter and confirm it references only columns of the table; else None."""
+def _validate_filter(
+    filt: str,
+    cols: set[str],
+    dialect: str,
+    policy_schema: dict[str, set[str]] | None = None,
+) -> exp.Expression | None:
+    """Parse a row filter and confirm it can only speak about what it is entitled to; else None.
+
+    Two scopes, two rules. **Outside** a subquery the predicate is a WHERE on one table and may
+    name only that table's own columns -- nothing else is in scope there. **Inside** a subquery
+    it may name any table in `policy_schema`, the policy author's visibility.
+
+    M28: the single rule was the outer one, applied everywhere, which made child-table tenancy
+    structurally inexpressible -- `payment` has no `store_id`, so the only way to say "payments
+    belonging to this store's customers" is to reach through `customer`, and that was refused.
+    The shipped pagila policy did exactly that, so the two tables the coverage warning told the
+    author to filter became unqueryable instead.
+
+    The subquery is resolved against the POLICY's visibility and never the caller's, because
+    the policy is what defines the caller's boundary and resolving it through that boundary is
+    circular -- and because an entitlements table, the standard shape for this, is one no
+    caller is ever granted. Without a `policy_schema` a subquery cannot be checked at all, so
+    it is refused: an unvalidatable filter must not become a filter that silently does nothing.
+    """
     try:
         expr = sqlglot.parse_one(filt, read=dialect)
     except Exception:
         return None
+    if not isinstance(expr, exp.Condition):
+        return None  # a statement, not a predicate -- `DELETE FROM t` is not a row filter
+
+    nested = list(expr.find_all(exp.Select))
+    inner: set[int] = {id(node) for select in nested for node in select.walk()}
+
     for column in expr.find_all(exp.Column):
-        if column.name not in cols:
+        if id(column) not in inner and column.name not in cols:
             return None
+
+    if not nested:
+        return expr
+    if not policy_schema:
+        return None
+
+    for select in nested:
+        referenced = {table.name for table in select.find_all(exp.Table)}
+        if not referenced or not referenced <= set(policy_schema):
+            return None
+        # Unqualified inside a subquery -> resolve against every table it reads, fail-closed.
+        known = {c for t in referenced for c in policy_schema[t]}
+        for column in select.find_all(exp.Column):
+            if column.name not in known:
+                return None
     return expr
 
 
@@ -67,7 +110,9 @@ def apply_row_and_mask(
             continue
         filt: exp.Expression | None = None
         if needs_filter:
-            filt = _validate_filter(policy.row_filters[name], visible[name], dialect)
+            filt = _validate_filter(
+                policy.row_filters[name], visible[name], dialect, policy.policy_schema
+            )
             if filt is None:
                 return Refusal(
                     code=RefusalCode.INVALID_ROW_FILTER,
