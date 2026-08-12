@@ -17,6 +17,15 @@ _DDL = (
 )
 
 
+class TrendUnavailable(RuntimeError):
+    """The trend store could not be READ. Distinct from "no baseline yet", and the distinction
+    is the finding: `last_run` swallowed every exception into the same `None` that means a
+    first run, so a misconfigured control DSN disarmed the gate exactly like a missing file --
+    and the Postgres path is the one that looks configured. One is an outage an operator must
+    fix, the other is Tuesday. M2 and M6 removed this same collapse elsewhere (M34).
+    """
+
+
 @dataclass
 class RunRecord:
     source_id: str
@@ -87,8 +96,11 @@ def last_run(control_dsn: str | None, source_id: str,
             with open(path) as fh:
                 rows = [r for r in json.load(fh) if r["source_id"] == source_id]
             return RunRecord(**rows[-1]) if rows else None
-    except Exception:
-        return None
+    except Exception as exc:
+        # Raise rather than return None. Returning None here is how the gate came to pass
+        # forever: it is the same value that means "first run", so a broken store read as a
+        # clean slate and `--gate` waved every run through.
+        raise TrendUnavailable(str(exc)) from exc
     return None
 
 
@@ -101,3 +113,26 @@ def check_regression(report: Report, previous: RunRecord | None,
         return (f"accuracy regressed: {report.accuracy:.1%} < previous "
                 f"{previous.accuracy:.1%} - {tolerance:.0%} tolerance")
     return None
+
+
+def gate_outcome(report: Report, previous: RunRecord | None,
+                 store_error: str | None = None) -> str | None:
+    """The reason `--gate` should fail, or None to pass.
+
+    `check_regression` answers one question -- did accuracy drop? -- and answering "no" when
+    there is nothing to compare is correct at that level. The GATE's question is different:
+    *did this run get checked?* Reading an absent comparison as a pass is what made the
+    mechanism unfailable, and it held while a published 100% drifted sixteen points with CI
+    green throughout (M34).
+
+    So a gate that could not compare FAILS, and says which of the two reasons applies. That is
+    the same default `writes_enabled` took in M3: forgetting must fail closed, and a check
+    that silently does nothing is the thing this project defines itself against.
+    """
+    if store_error is not None:
+        return (f"the accuracy trend could not be read ({store_error}), so this run was not "
+                "compared against anything")
+    if previous is None:
+        return ("no baseline is recorded for this source, so this run was not compared against "
+                "anything -- record one with `mnemiq eval --record`, then gate against it")
+    return check_regression(report, previous)

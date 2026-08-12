@@ -12,12 +12,21 @@ from mnemiq.eval.report import summarize
 from mnemiq.llm.client import LLMClient
 
 
+# One spelling, read and written from the same constant. Two string literals is how a reader
+# and a writer come to disagree about where the baseline lives.
+TREND_PATH = "evals/trend.json"
+
+
 def run_acme(settings: Settings, golden: str = "evals/acme.json",
              gate: bool = False, record: bool = False) -> int:
     """Run the ACME golden set once (enrichment ON) and print the report.
 
     --record appends the run to the accuracy trend; --gate additionally fails (exit 1) when
-    accuracy regressed beyond tolerance versus the last recorded run (the evaluation loop)."""
+    accuracy regressed beyond tolerance versus the last recorded run (the evaluation loop).
+
+    --gate also fails when it could not compare at all -- no baseline, or a trend store it
+    could not read. Both used to pass, so the gate could not fail and did not, while the
+    number it was guarding drifted sixteen points (M34)."""
     if not settings.pg_dsn:
         print("set MNEMIQ_PG_DSN")
         return 1
@@ -47,14 +56,22 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
     report = summarize(results, tokens=client.total_tokens, llm_calls=client.calls)
     print(report.render())
 
-    from mnemiq.eval.trend import check_regression, last_run, record_run
+    from mnemiq.eval.trend import TrendUnavailable, gate_outcome, last_run, record_run
 
-    previous = last_run(settings.control_dsn, settings.source_id, path="evals/trend.json")
+    store_error: str | None = None
+    previous = None
+    try:
+        previous = last_run(settings.control_dsn, settings.source_id, path=TREND_PATH)
+    except TrendUnavailable as exc:
+        store_error = str(exc)
     if record or gate:
-        record_run(settings.control_dsn, settings.source_id, report, path="evals/trend.json")
+        record_run(settings.control_dsn, settings.source_id, report, path=TREND_PATH)
     if gate:
-        msg = check_regression(report, previous)
+        # A gate that cannot compare FAILS. It used to pass, and passed for as long as no
+        # baseline existed -- which was always, because nothing had ever written one (M34).
+        msg = gate_outcome(report, previous, store_error=store_error)
         if msg:
             print(f"GATE FAILED: {msg}")
             return 1
+        print("GATE PASSED: compared against the last recorded run")
     return 0
