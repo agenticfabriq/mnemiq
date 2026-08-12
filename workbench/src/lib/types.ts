@@ -55,6 +55,10 @@ export type AnswerPayload = {
   judge_engaged: boolean | null;
   judge_override: boolean | null;
   candidates_executed: number | null;
+  /** What the mode spent: outer attempts (the database rejected the SQL) and whether the
+   *  corrector's surgical pass carried it (the decider rejected it). Two different judges. */
+  attempts: number | null;
+  corrected: boolean | null;
   sql: string | null;
   tables_used: string[] | null;
   enrichment_version: string | null;

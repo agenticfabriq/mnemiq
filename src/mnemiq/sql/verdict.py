@@ -61,6 +61,11 @@ class Approved:
     target_sql: str  # what will actually run on the source
     tables: list[str] = field(default_factory=list)
     columns: list[str] = field(default_factory=list)
+    # Set by `plan_query`, never by `decide` -- the decider does not repair, it only rules.
+    # It rides here because it is a fact about THIS plan: the SQL that was approved is not the
+    # SQL the model first proposed. Without it the corrector is the one mode difference nobody
+    # can observe (M33).
+    corrected: bool = False
 
 
 @dataclass

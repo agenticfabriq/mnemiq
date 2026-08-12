@@ -77,3 +77,26 @@ export function duration(ms: number | undefined): string | null {
 
 export const plural = (n: number, one: string, many = `${one}s`) =>
   `${n} ${n === 1 ? one : many}`;
+
+/**
+ * What the mode spent, in words -- "1 attempt · no repair needed".
+ *
+ * `instant` and `thinking` run identical code whenever the first SQL is approved: the
+ * corrector fires only on a decider refusal, and attempts 2 and 3 only after the database
+ * rejects one. So the control looked inert on most questions while working exactly as
+ * designed. This line is the difference, stated (M33).
+ *
+ * Null when the engine reported neither -- a deferral, a failure, or an older payload. An
+ * absent number is not a zero.
+ */
+export function effort(answer: {
+  attempts: number | null;
+  corrected: boolean | null;
+}): string | null {
+  const parts: string[] = [];
+  if (answer.attempts !== null) parts.push(plural(answer.attempts, "attempt"));
+  if (answer.corrected !== null) {
+    parts.push(answer.corrected ? "SQL corrected once" : "no repair needed");
+  }
+  return parts.length > 0 ? parts.join(" · ") : null;
+}

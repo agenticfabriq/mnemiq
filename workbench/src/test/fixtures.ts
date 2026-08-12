@@ -17,6 +17,8 @@ export const SCALAR_ANSWER: AnswerPayload = {
   "judge_engaged": null,
   "judge_override": null,
   "candidates_executed": null,
+  "attempts": 1,
+  "corrected": false,
   "sql": "SELECT COUNT(claim_identifier) AS claim_count FROM claim LIMIT 1000",
   "tables_used": [
     "claim"
@@ -52,6 +54,8 @@ export const TABLE_ANSWER: AnswerPayload = {
   "judge_engaged": null,
   "judge_override": null,
   "candidates_executed": null,
+  "attempts": 1,
+  "corrected": false,
   "sql": "SELECT c.claim_identifier, ca.claim_amount FROM claim AS c LEFT JOIN claim_amount AS ca ON ca.claim_identifier = c.claim_identifier WHERE c.catastrophe_identifier = 4 AND NOT c.claim_identifier IS NULL ORDER BY c.claim_identifier, ca.claim_amount_identifier LIMIT 1000",
   "tables_used": [
     "claim",
@@ -118,6 +122,8 @@ export const DEFERRAL: AnswerPayload = {
   "judge_engaged": null,
   "judge_override": null,
   "candidates_executed": null,
+  "attempts": null,
+  "corrected": null,
   "sql": null,
   "tables_used": null,
   "enrichment_version": null,

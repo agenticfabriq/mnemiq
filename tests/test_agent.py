@@ -481,3 +481,21 @@ def test_real_adapters_declare_their_execution_dialect():
 
     assert SQLiteAdapter.dialect == "sqlite"
     assert DuckDBPostgresAdapter.dialect == "duckdb"
+
+
+def test_an_answer_reports_the_attempt_that_produced_it():
+    """M33: the outer loop repairs what the DATABASE rejected, and `instant` caps it at one
+    while `thinking` allows three -- a difference nothing on the answer used to record."""
+    adapter = _FakeAdapter(errors=1)
+    agent = _agent(
+        ['{"sql": "SELECT n FROM claim"}', '{"sql": "SELECT n FROM claim"}'], adapter=adapter
+    )
+    result = _answer(agent)
+    assert result.deferred is False
+    assert result.attempts == 2, "the first attempt failed in the source; the second answered"
+
+
+def test_a_first_time_answer_says_one_attempt_and_no_repair():
+    result = _answer(_agent(['{"sql": "SELECT n FROM claim"}']))
+    assert result.attempts == 1
+    assert result.corrected is False

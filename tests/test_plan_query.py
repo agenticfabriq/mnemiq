@@ -190,3 +190,50 @@ def test_without_a_corrector_a_lint_falls_back_to_regenerate_then_defers():
     ])
     out = plan_query(packet, snapshot, grants, gen, adapter=None, target="duckdb", max_attempts=2)
     assert isinstance(out, Deferred)  # lint fed back, never corrected, ran out of attempts
+
+
+
+# --- M33: the corrector is the one mode difference nobody could observe ---------
+
+
+def test_a_plan_that_needed_no_repair_says_so():
+    """`thinking` differs from `instant` by the corrector and almost nothing else, so an
+    answer that cannot say whether it fired cannot show the mode doing its work."""
+    outcome, _ = _plan(['{"sql": "SELECT claim_identifier FROM claim"}'])
+    assert isinstance(outcome, Approved) and outcome.corrected is False
+
+
+def test_a_plan_the_corrector_carried_records_it():
+    """An ORDER BY with a LIMIT and no NOT NULL guard is a lint refusal -- silently-wrong SQL
+    that runs fine and answers wrong, which is exactly what the corrector exists for."""
+
+    class _Corrector:
+        def correct(self, sql, message):
+            return "SELECT status FROM claim WHERE NOT status IS NULL ORDER BY status"
+
+    outcome, _ = _plan(
+        ['{"sql": "SELECT status FROM claim ORDER BY status"}'], corrector=_Corrector()
+    )
+    assert isinstance(outcome, Approved)
+    assert outcome.corrected is True
+
+
+def test_a_correction_that_still_refuses_is_not_reported_as_corrected():
+    """Reporting it would overstate the work: a failed repair is not a repaired plan."""
+
+    class _Useless:
+        def correct(self, sql, message):
+            return "SELECT status FROM claim ORDER BY status"  # the same lint violation
+
+    outcome, _ = _plan(
+        ['{"sql": "SELECT status FROM claim ORDER BY status"}'] * 3, corrector=_Useless()
+    )
+    assert isinstance(outcome, Deferred)
+
+
+def test_decide_never_sets_corrected_because_the_decider_does_not_repair():
+    from mnemiq.sql.decide import decide
+
+    verdict = decide("SELECT claim_identifier FROM claim", {"claim": {"claim_identifier"}},
+                     dialect="duckdb", target="duckdb")
+    assert isinstance(verdict, Approved) and verdict.corrected is False
