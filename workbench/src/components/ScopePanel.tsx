@@ -8,21 +8,25 @@
 
 import { useEffect, useState } from "react";
 
-import { fetchSchema } from "../lib/transport";
+import { fetchScope, type Scope } from "../lib/transport";
 import type { SchemaTable } from "../lib/types";
 
-export function useSchema() {
-  const [tables, setTables] = useState<SchemaTable[] | null>(null);
+const NOTHING: Scope = { tables: [], starters: [] };
+
+/** One fetch for both, because the engine scopes them together (M32). `null` means the
+ *  answer has not arrived yet, which the panel renders differently from an empty scope. */
+export function useScope() {
+  const [scope, setScope] = useState<Scope | null>(null);
   useEffect(() => {
     let live = true;
-    fetchSchema()
-      .then((rows) => live && setTables(rows))
-      .catch(() => live && setTables([]));
+    fetchScope()
+      .then((next) => live && setScope(next))
+      .catch(() => live && setScope(NOTHING));
     return () => {
       live = false;
     };
   }, []);
-  return tables;
+  return scope;
 }
 
 export function ScopePanel({

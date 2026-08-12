@@ -2,15 +2,22 @@
 
 import { Mark } from "./Mark";
 
-// One aggregate, one grouping, and one the engine should decline -- a refusal is as
-// much a demonstration of the engine as an answer is.
-const STARTERS = [
-  "Which region has the highest total claim amount?",
-  "How many claims are there by status?",
-  "List five policyholders by name with their policy number",
-];
-
-export function EmptyState({ onPick }: { onPick: (question: string) => void }) {
+/**
+ * The questions come from the engine, composed from the source this deployment is actually
+ * connected to and scoped to what the asker may see. They used to be three hardcoded
+ * questions about claims and policyholders, so every other source opened by inviting you to
+ * ask about a database that was not there (M32).
+ *
+ * None is a valid answer. A source with nothing worth offering gets the invitation and no
+ * buttons -- quieter than three confident questions about the wrong data.
+ */
+export function EmptyState({
+  starters,
+  onPick,
+}: {
+  starters: string[];
+  onPick: (question: string) => void;
+}) {
   return (
     <section className="flex flex-col gap-4 py-6">
       <div>
@@ -23,7 +30,7 @@ export function EmptyState({ onPick }: { onPick: (question: string) => void }) {
       </div>
 
       <ul className="flex flex-col items-start gap-1.5">
-        {STARTERS.map((question) => (
+        {starters.map((question) => (
           <li key={question}>
             <button
               type="button"

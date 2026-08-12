@@ -4,7 +4,7 @@ import { AssistantRuntimeProvider } from "@assistant-ui/react";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { Mark } from "./components/Mark";
 import { ModeSelector } from "./components/ModeSelector";
-import { ScopePanel, useSchema } from "./components/ScopePanel";
+import { ScopePanel, useScope } from "./components/ScopePanel";
 import { Thread } from "./components/Thread";
 import { useWorkbench } from "./lib/runtime";
 
@@ -37,7 +37,7 @@ function ThemeToggle() {
 export default function App() {
   const { runtime, mode, setMode, ask, threads, activeId, selectThread, newChat, deleteThread } =
     useWorkbench();
-  const tables = useSchema();
+  const scope = useScope();
 
   const [scopeOpen, setScopeOpen] = useState<boolean>(
     () => globalThis.localStorage?.getItem(SCOPE_KEY) !== "0",
@@ -65,7 +65,7 @@ export default function App() {
                 scopeOpen ? "border-rule text-ink" : "border-rule hover:text-ink"
               }`}
             >
-              {tables === null ? "Tables" : `${tables.length} tables`}
+              {scope === null ? "Tables" : `${scope.tables.length} tables`}
             </button>
             <ThemeToggle />
           </div>
@@ -80,9 +80,9 @@ export default function App() {
             onDelete={deleteThread}
           />
           <main className="min-w-0 flex-1">
-            <Thread onPick={ask} />
+            <Thread starters={scope?.starters ?? []} onPick={ask} />
           </main>
-          {scopeOpen && <ScopePanel tables={tables} onHide={() => setScopeOpen(false)} />}
+          {scopeOpen && <ScopePanel tables={scope?.tables ?? null} onHide={() => setScopeOpen(false)} />}
         </div>
       </div>
     </AssistantRuntimeProvider>
