@@ -59,15 +59,26 @@ def decide(
         if grounding is not None:
             return grounding
 
+    # Provenance is read from the query as ASKED, before either rewrite touches it.
+    #
+    # It must precede `expand_tables`, which rewrites the identifiers. It must also precede the
+    # RLS rewrite, for a reason that only appeared once filters could reach through another
+    # table (M28): the injected predicate reads whatever the POLICY names, so reporting the
+    # rewritten tree would tell the caller which tables their own policy consults -- an
+    # entitlements table being the standard shape, and one no caller is granted. What the
+    # engine reads on the policy's behalf is not the caller's lineage. The audit trace is the
+    # channel for that, and it is not this one.
+    #
+    # The same move corrects `columns`: the derived table projects every visible column of a
+    # filtered table, so reading it afterwards reported columns the query never mentioned.
+    cte_names = {cte.alias_or_name for cte in shaped.find_all(exp.CTE)}
+    tables = sorted({object_key(t) for t in shaped.find_all(exp.Table)} - cte_names)
+    columns = sorted({c.name for c in shaped.find_all(exp.Column)})
+
     if not policy.empty:  # RLS + source-side mask rewrite (filtered/masked tables -> derived)
         shaped = apply_row_and_mask(shaped, policy, visible, dialect=dialect)
         if isinstance(shaped, Refusal):
             return shaped
-
-    # Provenance uses the qualified id and must be read BEFORE expansion rewrites the nodes.
-    cte_names = {cte.alias_or_name for cte in shaped.find_all(exp.CTE)}
-    tables = sorted({object_key(t) for t in shaped.find_all(exp.Table)} - cte_names)
-    columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
     # Federation: 'catalog.table' -> 'catalog.schema.table' so DuckDB resolves it. No-op single-source.
     expand_tables(shaped, registry or {})
