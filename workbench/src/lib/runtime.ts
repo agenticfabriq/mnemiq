@@ -22,7 +22,8 @@ import { historyFrom } from "./history";
 import { streamChat } from "./transport";
 import { isRunning, reduce, userTurn, type Turn } from "./store";
 import { emptyThread, isBlank, load, save, titleFor, type Thread } from "./threads";
-import { DEFAULT_MODE, type Mode } from "./types";
+import { loadMode, saveMode } from "./mode";
+import { type Mode } from "./types";
 
 export const TURN_PART = "mnemiq.turn";
 
@@ -65,7 +66,9 @@ export function useWorkbench() {
 
   const [threads, setThreads] = useState<Thread[]>(restored);
   const [activeId, setActiveId] = useState<string>(restored[0]!.id);
-  const [mode, setMode] = useState<Mode>(DEFAULT_MODE);
+  // Restored, not defaulted: mode is what a question costs, and a reload that quietly
+  // moves a reader from `deep` back to `thinking` changes the answer they get next.
+  const [mode, setMode] = useState<Mode>(loadMode);
 
   // Read at send time so switching thread or mode mid-run never retargets a run
   // already in flight.
@@ -75,6 +78,10 @@ export function useWorkbench() {
   activeRef.current = activeId;
   const threadsRef = useRef(threads);
   threadsRef.current = threads;
+
+  useEffect(() => {
+    saveMode(mode);
+  }, [mode]);
 
   useEffect(() => {
     save(threads);
