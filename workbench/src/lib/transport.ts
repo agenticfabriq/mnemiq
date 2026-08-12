@@ -38,9 +38,11 @@ export async function* streamChat(
   }
 }
 
-export async function fetchSchema(): Promise<SchemaTable[]> {
+export type Scope = { tables: SchemaTable[]; starters: string[] };
+
+export async function fetchScope(): Promise<Scope> {
   const response = await fetch("/v1/schema");
-  if (!response.ok) return [];
-  const body = (await response.json()) as { tables?: SchemaTable[] };
-  return body.tables ?? [];
+  if (!response.ok) return { tables: [], starters: [] };
+  const body = (await response.json()) as { tables?: SchemaTable[]; starters?: string[] };
+  return { tables: body.tables ?? [], starters: body.starters ?? [] };
 }

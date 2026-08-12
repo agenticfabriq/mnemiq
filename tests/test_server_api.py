@@ -11,8 +11,9 @@ def _identity():
 
 
 class _RT:
-    def __init__(self, answer=None, cards=(), raises=None):
+    def __init__(self, answer=None, cards=(), raises=None, starters=()):
         self._answer, self._cards, self._raises = answer, list(cards), raises
+        self._starters = list(starters)
         self.asked = None
 
     def ask(self, question, identity, mode=None, emit=None, history=None):
@@ -21,8 +22,8 @@ class _RT:
         self.asked = (question, identity.principal_id, mode)
         return self._answer
 
-    def schema(self, identity):
-        return self._cards
+    def scope(self, identity):
+        return {"tables": self._cards, "starters": self._starters}
 
 
 def _client(rt):
@@ -54,4 +55,16 @@ def test_schema_and_healthz():
     rt = _RT(cards=[{"object_id": "claim", "card": "..."}])
     c = _client(rt)
     assert c.get("/healthz").json() == {"ok": True}
-    assert c.get("/v1/schema").json() == {"tables": [{"object_id": "claim", "card": "..."}]}
+    assert c.get("/v1/schema").json() == {
+        "tables": [{"object_id": "claim", "card": "..."}],
+        "starters": [],
+    }
+
+
+def test_the_opening_questions_ride_on_the_schema_response():
+    """M32: they are access-scoped alongside the cards, so they travel with them rather than
+    on an endpoint of their own that could answer to a different grant resolution."""
+    rt = _RT(cards=[{"object_id": "payment", "card": "..."}],
+             starters=["What is the total amount in payment?"])
+    body = _client(rt).get("/v1/schema").json()
+    assert body["starters"] == ["What is the total amount in payment?"]

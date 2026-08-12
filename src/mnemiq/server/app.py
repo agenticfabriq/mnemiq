@@ -89,7 +89,9 @@ def build_app(
 
     @app.get("/v1/schema")
     def schema() -> dict:
-        return {"tables": runtime.schema(identity)}
+        # `scope` rather than `schema`: the opening screen's starters are access-scoped from the
+        # same grant resolution as the cards, so the two cannot disagree (M32).
+        return runtime.scope(identity)
 
     # Mounted last, so it can only claim paths no API route above already answered.
     built = static_dir if static_dir is not None else STATIC_DIR

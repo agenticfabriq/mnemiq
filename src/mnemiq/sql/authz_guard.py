@@ -3,14 +3,8 @@ from __future__ import annotations
 from sqlglot import exp
 
 from mnemiq.sql.qualify import object_key
+from mnemiq.sql.scope import base_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
-
-
-def local_cte_names(ast: exp.Expression) -> set[str]:
-    # A CTE alias is reported as a Table by find_all(). It is a name the query defines for
-    # itself, not an object in the source -- authorizing it would be a category error, and
-    # rejecting it would break every valid WITH clause. Shared with the CLS/RLS passes.
-    return {cte.alias_or_name for cte in ast.find_all(exp.CTE)}
 
 
 def check_access(ast: exp.Expression, visible: dict[str, set[str]]) -> Refusal | None:
@@ -20,13 +14,11 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]]) -> Refusal |
     table. It can still *name* one -- `users`, `employees`, `salaries` are in every schema it
     was trained on. This is the lock that makes naming it useless.
     """
-    local = local_cte_names(ast)
-
-    # tables, and the aliases that stand for them
+    # tables, and the aliases that stand for them. `base_tables` -- not `find_all` minus a flat
+    # set of CTE names -- because a reference inside a CTE body naming that same CTE reads the
+    # base table, and skipping it let an ungranted table through (M31).
     alias_to_table: dict[str, str] = {}
-    for table in ast.find_all(exp.Table):
-        if table.name in local:
-            continue
+    for table in base_tables(ast):
         name = object_key(table)
         if name not in visible:
             return Refusal(
@@ -51,8 +43,8 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]]) -> Refusal |
     for column in ast.find_all(exp.Column):
         qualifier = column.table
         if qualifier:
-            if qualifier in local:
-                continue  # a column of a CTE: its source columns were checked at the source
+            # A CTE alias is absent from `alias_to_table` and falls through below: its source
+            # columns were checked where the CTE read them.
             table = alias_to_table.get(qualifier)
             if table is None:
                 continue  # qualifier belongs to a CTE or a subquery alias

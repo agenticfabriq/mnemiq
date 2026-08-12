@@ -17,8 +17,8 @@ class _RT:
     def ask(self, *a, **k):  # never reached; these tests only touch static files
         raise AssertionError("static request should not reach the engine")
 
-    def schema(self, _identity):
-        return [{"object_id": "claim", "card": "claim(claim_id)"}]
+    def scope(self, _identity):
+        return {"tables": [{"object_id": "claim", "card": "claim(claim_id)"}], "starters": []}
 
 
 def _client(tmp_path):

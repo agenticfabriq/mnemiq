@@ -13,8 +13,8 @@ def _identity():
 
 
 class _RT:
-    def schema(self, identity):
-        return [{"object_id": "claim", "card": "..."}]
+    def scope(self, identity):
+        return {"tables": [{"object_id": "claim", "card": "..."}], "starters": []}
 
 
 def _built(tmp_path):
@@ -61,4 +61,7 @@ def test_defaults_to_the_instruction_when_that_directory_is_empty(tmp_path, monk
 def test_the_mount_never_shadows_the_api(tmp_path):
     c = TestClient(build_app(_RT(), _identity(), static_dir=_built(tmp_path)))
     assert c.get("/healthz").json() == {"ok": True}
-    assert c.get("/v1/schema").json() == {"tables": [{"object_id": "claim", "card": "..."}]}
+    assert c.get("/v1/schema").json() == {
+        "tables": [{"object_id": "claim", "card": "..."}],
+        "starters": [],
+    }

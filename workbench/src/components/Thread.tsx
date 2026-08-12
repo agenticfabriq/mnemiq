@@ -50,13 +50,19 @@ function AssistantTurn() {
   );
 }
 
-export function Thread({ onPick }: { onPick: (question: string) => void }) {
+export function Thread({
+  starters,
+  onPick,
+}: {
+  starters: string[];
+  onPick: (question: string) => void;
+}) {
   return (
     <ThreadPrimitive.Root className="flex h-full flex-col">
       <ThreadPrimitive.Viewport className="flex-1 overflow-y-auto">
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-5 px-5 py-6">
           <AuiIf condition={(s) => s.thread.isEmpty}>
-            <EmptyState onPick={onPick} />
+            <EmptyState starters={starters} onPick={onPick} />
           </AuiIf>
           <ThreadPrimitive.Messages>
             {({ message }) => (message.role === "user" ? <UserTurn /> : <AssistantTurn />)}
