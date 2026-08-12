@@ -22,6 +22,15 @@ _PG_FK_QUERY = (
 )
 
 
+# Views for a Postgres source, for the same reason as the FK query: DuckDB's proxy reports
+# every attached-Postgres view as a BASE TABLE, so asking it finds nothing at all.
+_PG_VIEW_QUERY = (
+    "SELECT c.relname, pg_get_viewdef(c.oid, true) "
+    "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE c.relkind = 'v' AND n.nspname = 'public' ORDER BY c.relname"
+)
+
+
 class DuckDBAdapter:
     """DuckDB as the universal executor: ATTACH a source and read it via DuckDB's scanner.
 
@@ -109,6 +118,36 @@ class DuckDBAdapter:
         except Exception:
             return []
         return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
+
+    def view_definitions(self) -> list[tuple[str, str, str]]:
+        """(view, body, dialect) for every view in the source. Any failure -> [].
+
+        **DuckDB's `information_schema` cannot answer this for an attached Postgres**: it
+        reports every view as `BASE TABLE`, so the obvious discovery path finds no views at all
+        and the governance that depends on knowing one silently does nothing. Measured on
+        Pagila -- 7 views, 0 reported. So a Postgres source is asked through `postgres_query`,
+        exactly as declared FKs already are, and the body comes back as Postgres SQL.
+
+        A native DuckDB file answers correctly from `duckdb_views()`. A SQLite source attached
+        through DuckDB's scanner exposes neither, and returns [] -- the same posture as
+        `foreign_keys`, and the reason `SQLiteAdapter` answers for itself.
+        """
+        if self._fk_via_postgres:  # the source is Postgres, reached through the attachment
+            try:
+                rows = self._con.execute(
+                    f"SELECT * FROM postgres_query('{self._catalog}', $q${_PG_VIEW_QUERY}$q$)"
+                ).fetchall()
+            except Exception:
+                return []
+            return [(r[0], r[1], "postgres") for r in rows]
+        try:
+            rows = self._con.execute(
+                "SELECT view_name, sql FROM duckdb_views() WHERE NOT internal "
+                f"AND schema_name = '{self._table_schema}' ORDER BY view_name"
+            ).fetchall()
+        except Exception:
+            return []
+        return [(r[0], r[1], "duckdb") for r in rows]
 
     def execute(self, sql: str) -> list[tuple]:
         return self._con.execute(sql).fetchall()

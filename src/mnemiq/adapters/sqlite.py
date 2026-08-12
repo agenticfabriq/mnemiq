@@ -29,6 +29,16 @@ class SQLiteAdapter:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def view_definitions(self) -> list[tuple[str, str, str]]:
+        """SQLite stores the whole `CREATE VIEW ... AS ...` statement, not the bare body; the
+        parser normalises that, because string-stripping the prefix is a second SQL dialect
+        implemented in `str.partition`."""
+        rows = self._con.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'view' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+        return [(r[0], r[1], "sqlite") for r in rows if r[1]]
+
     def list_columns(self) -> list[tuple[str, str, str]]:
         out: list[tuple[str, str, str]] = []
         for table in self.introspect():
