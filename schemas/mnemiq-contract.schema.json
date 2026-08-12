@@ -1712,6 +1712,30 @@
         ],
         "title": "TableFacts",
         "type": "object"
+      },
+      "ViewDefinition": {
+        "description": "A view's body, as the source states it.\n\nStructural, not semantic: discovery reports it, no LLM touches it. It exists because a\nview is the one object a governed engine cannot reason about from its columns alone --\nthe rows it returns are defined by SQL held in the source, and until that SQL is in the\nsnapshot a granted view over a filtered table returns unfiltered rows (M27).\n\n`dialect` is the SOURCE's, not the executor's: `pg_get_viewdef` returns Postgres even when\nthe adapter that fetched it executes DuckDB, and parsing it as anything else silently\nmangles casts and quoting.",
+        "properties": {
+          "definition": {
+            "title": "Definition",
+            "type": "string"
+          },
+          "dialect": {
+            "title": "Dialect",
+            "type": "string"
+          },
+          "object_id": {
+            "title": "Object Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "object_id",
+          "definition",
+          "dialect"
+        ],
+        "title": "ViewDefinition",
+        "type": "object"
       }
     },
     "properties": {
@@ -1822,6 +1846,13 @@
       "version": {
         "title": "Version",
         "type": "string"
+      },
+      "views": {
+        "items": {
+          "$ref": "#/$defs/ViewDefinition"
+        },
+        "title": "Views",
+        "type": "array"
       }
     },
     "required": [

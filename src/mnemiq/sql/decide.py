@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlglot
 from sqlglot import exp
 
+from mnemiq.contract import ViewDefinition
 from mnemiq.sql.authz_guard import check_access
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.guard import MAX_ROWS, check_shape
@@ -11,6 +12,7 @@ from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.rls import apply_row_and_mask
 from mnemiq.sql.values_check import check_values
+from mnemiq.sql.views import inline_views
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
 
 
@@ -24,6 +26,7 @@ def decide(
     values=None,
     policy: AccessPolicy | None = None,
     registry: dict[str, str] | None = None,
+    views: dict[str, ViewDefinition] | None = None,
 ) -> Verdict:
     """The deterministic decider: shape, then access, then proof against the real source.
 
@@ -75,8 +78,27 @@ def decide(
     tables = sorted({object_key(t) for t in shaped.find_all(exp.Table)} - cte_names)
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
-    if not policy.empty:  # RLS + source-side mask rewrite (filtered/masked tables -> derived)
-        shaped = apply_row_and_mask(shaped, policy, visible, dialect=dialect)
+    if not policy.empty:
+        # Views resolve to their base tables FIRST, so the rewrite below lands the filter at
+        # the leaves rather than on a view's output -- which for an aggregating view is not a
+        # weaker fix but an impossible one, the tenancy column having been grouped away (M27).
+        #
+        # Gated on an active policy for the same reason the rest of this is: an ungoverned
+        # deployment gains nothing from the rewrite and should not pay its risk.
+        expanded = inline_views(shaped, views or {}, policy.policy_schema)
+        if isinstance(expanded, Refusal):
+            return expanded
+        shaped = expanded.ast
+
+        # RLS + source-side mask rewrite (filtered/masked tables -> derived). `visible` is
+        # widened by exactly the base tables inlining introduced: they are absent from the
+        # caller's map, and without them the rewriter skips them and the view returns
+        # unfiltered rows -- M27 surviving its own fix. A row filter's subquery is also absent
+        # from `visible` and must NOT be filtered; it is excluded because it is injected after
+        # this scan, and now also because it is not in `introduced`.
+        shaped = apply_row_and_mask(
+            shaped, policy, {**visible, **expanded.introduced}, dialect=dialect
+        )
         if isinstance(shaped, Refusal):
             return shaped
 

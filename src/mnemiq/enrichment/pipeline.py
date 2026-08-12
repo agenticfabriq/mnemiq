@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 logger = logging.getLogger(__name__)
 
 from mnemiq.catalog import introspect
-from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding
+from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding, ViewDefinition
 from mnemiq.enrichment.joins import build_relationships
 from mnemiq.enrichment.profiling import profile_table
 
@@ -33,6 +33,10 @@ def content_version(snapshot: Snapshot) -> str:
         "relationships": [r.model_dump(by_alias=True) for r in snapshot.relationships],
         "source_bindings": [b.model_dump(by_alias=True) for b in snapshot.source_bindings],
     }
+    # Included only when present, so every snapshot taken before views were discovered keeps
+    # the exact version it had -- the same rule `ontology_version` follows.
+    if snapshot.views:
+        body["views"] = [v.model_dump(by_alias=True) for v in snapshot.views]
     if snapshot.ontology_version:
         body["ontology_version"] = snapshot.ontology_version
     payload = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
@@ -114,11 +118,26 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
         relationships, status = [], "failed"
     jobs.append(Job(id="infer:relationships", source_id=source_id, kind="join", status=status))
 
+    # A view is the one object the snapshot cannot describe from its columns: the rows it
+    # returns are defined by SQL the source holds. Fail-soft like the FK read -- a source that
+    # will not answer leaves `views` empty, and an empty list means "none known", which the
+    # governance layer must treat as "cannot reason about", never as "there are none" (M27).
+    try:
+        views = [
+            ViewDefinition(object_id=name, definition=body, dialect=dialect)
+            for name, body, dialect in adapter.view_definitions()
+        ]
+        status = "done"
+    except Exception:
+        views, status = [], "failed"
+    jobs.append(Job(id="discover:views", source_id=source_id, kind="discover", status=status))
+
     snapshot = Snapshot(
         version="",
         source_id=source_id,
         created_at=datetime.now(UTC).isoformat(),
         columns=columns,
+        views=views,
         source_bindings=source_bindings,
         relationships=relationships,
         jobs=jobs,

@@ -14,6 +14,7 @@ from .semantic import (
     Relationship,
     Skill,
     Snapshot,
+    ViewDefinition,
     SourceBinding,
     TableFacts,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "Skill",
     "Job",
     "Snapshot",
+    "ViewDefinition",
     "TableFacts",
     "IdentityContext",
     "Trace",

@@ -37,6 +37,24 @@ class Column(BaseModel):
     null_count: int | None = None
 
 
+class ViewDefinition(BaseModel):
+    """A view's body, as the source states it.
+
+    Structural, not semantic: discovery reports it, no LLM touches it. It exists because a
+    view is the one object a governed engine cannot reason about from its columns alone --
+    the rows it returns are defined by SQL held in the source, and until that SQL is in the
+    snapshot a granted view over a filtered table returns unfiltered rows (M27).
+
+    `dialect` is the SOURCE's, not the executor's: `pg_get_viewdef` returns Postgres even when
+    the adapter that fetched it executes DuckDB, and parsing it as anything else silently
+    mangles casts and quoting.
+    """
+
+    object_id: str
+    definition: str
+    dialect: str
+
+
 class Dimension(BaseModel):
     id: str
     label: str
@@ -178,6 +196,10 @@ class Snapshot(BaseModel):
     # (which carries only the scheme id/label, never concept content). Empty = no ontology.
     ontology_version: str = ""
     columns: list[Column] = Field(default_factory=list)
+    # Structural, and part of what the snapshot ASSERTS about the source: change a view's body
+    # and the rows it returns change, so this is folded into `content_version` alongside the
+    # columns rather than treated as bookkeeping.
+    views: list[ViewDefinition] = Field(default_factory=list)
     dimensions: list[Dimension] = Field(default_factory=list)
     metrics: list[Metric] = Field(default_factory=list)
     definitions: list[Definition] = Field(default_factory=list)
