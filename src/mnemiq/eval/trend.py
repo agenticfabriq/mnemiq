@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
 from dataclasses import asdict, dataclass
 
 from mnemiq.eval.report import Report
@@ -52,8 +53,15 @@ def _to_record(source_id: str, run_at: str, report: Report) -> RunRecord:
 def record_run(control_dsn: str | None, source_id: str, report: Report,
                path: str | None = None, run_at: str = "") -> None:
     """Append a run to the trend. Postgres when a control DSN is set, else a local JSON.
-    Fail-soft: a trend-write error never fails the eval run."""
-    rec = _to_record(source_id, run_at, report)
+    Fail-soft: a trend-write error never fails the eval run.
+
+    `run_at` defaults to NOW, not to the empty string it used to. Every production caller
+    omits it, so Postgres held rows whose ordering key was identical and `last_run`'s
+    `ORDER BY run_at DESC LIMIT 1` returned an arbitrary historical row -- the gate comparing
+    against whichever one the planner happened to pick. The JSON backend was unaffected only
+    because it takes `rows[-1]` and never looks at the field.
+    """
+    rec = _to_record(source_id, run_at or datetime.now(UTC).isoformat(), report)
     try:
         if control_dsn:
             import psycopg

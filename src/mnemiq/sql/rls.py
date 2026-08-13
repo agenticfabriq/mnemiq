@@ -53,11 +53,17 @@ def _validate_filter(
         return None
 
     for select in nested:
-        referenced = {table.name for table in select.find_all(exp.Table)}
+        # `object_key`, not `.name`: dropping the qualifier accepted
+        # `private.entitlement` for a key of `entitlement`, and rejected the only
+        # spelling a federated key (`pg.entitlement`) can be written in.
+        referenced = {object_key(table) for table in select.find_all(exp.Table)}
         if not referenced or not referenced <= set(policy_schema):
             return None
         # Unqualified inside a subquery -> resolve against every table it reads, fail-closed.
-        known = {c for t in referenced for c in policy_schema[t]}
+        # `cols` is included because a subquery may correlate back to the row being
+        # filtered. Every node under a nested SELECT was treated as inner, so the EXISTS
+        # spelling of a predicate the IN spelling already allowed was refused.
+        known = cols | {c for t in referenced for c in policy_schema[t]}
         for column in select.find_all(exp.Column):
             if column.name not in known:
                 return None
@@ -81,11 +87,22 @@ def _derived_table(
 
 
 def apply_row_and_mask(
-    ast: exp.Expression, policy: AccessPolicy, visible: dict[str, set[str]], dialect: str = "duckdb"
+    ast: exp.Expression,
+    policy: AccessPolicy,
+    visible: dict[str, set[str]],
+    dialect: str = "duckdb",
+    only: set[int] | None = None,
 ) -> exp.Expression | Refusal:
     """Wrap each base table that has a row filter or a referenced masked column in a derived
     table that applies the filter and NULLs masked columns AT THE SOURCE. Returns the rewritten
-    AST, or a Refusal for a policy-invalid filter."""
+    AST, or a Refusal for a policy-invalid filter.
+
+    `only` restricts the rewrite to specific table NODES rather than table names. The decider
+    runs this twice -- once over the objects the caller named, once over the bases that
+    inlining a view introduced -- and a caller may reference one of those bases directly as
+    well. Without node identity the second pass would wrap the first pass's output again,
+    nesting a filter inside an identical copy of itself.
+    """
     if not policy.row_filters and not policy.masked:
         return ast
 
@@ -101,6 +118,8 @@ def apply_row_and_mask(
 
     # Resolved before the loop mutates the tree: `replace` invalidates the scope it was read from.
     for table_node in base_tables(ast):
+        if only is not None and id(table_node) not in only:
+            continue
         name = object_key(table_node)
         if name not in visible:
             continue

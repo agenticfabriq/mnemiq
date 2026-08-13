@@ -30,8 +30,11 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     denied: set[tuple[str, str]] = set()
     masked: set[tuple[str, str]] = set()
     for c in snapshot.columns:
-        if not grants.allows(c.object_id):
-            continue  # not readable -> check_access handles it, not CLS
+        # Deliberately NOT skipped when the object is ungranted. A caller granted only a view
+        # never has a grant on the tables behind it, and after inlining those tables are what
+        # the query reads -- so dropping their dispositions here silently unmasked them. The
+        # entries are inert for a table the query cannot reach: `check_access` refuses a direct
+        # reference before CLS runs, and the rewrite only wraps nodes that are present.
         level = c.pii_level
         if not level or level == "none" or level in grants.pii_clearance:
             continue  # raw
@@ -39,7 +42,10 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
             masked.add((c.object_id, c.name))
         else:
             denied.add((c.object_id, c.name))
-    row_filters = {t: f for t, f in grants.row_filters.items() if grants.allows(t)}
+    # Same reasoning as the dispositions above: a view-only grant carries no grant on the base
+    # the filter names, and requiring one made the filter vanish exactly when it was needed.
+    # A filter for a table the query never reaches is never applied.
+    row_filters = dict(grants.row_filters)
     policy_schema: dict[str, set[str]] = {}
     for c in snapshot.columns:
         policy_schema.setdefault(c.object_id, set()).add(c.name)

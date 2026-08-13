@@ -3,6 +3,8 @@ from __future__ import annotations
 from sqlglot import exp
 from sqlglot.optimizer.scope import build_scope
 
+from mnemiq.sql.qualify import object_key
+
 
 def base_tables(ast: exp.Expression) -> list[exp.Table]:
     """Every `exp.Table` node that reads a real object in the source.
@@ -36,4 +38,40 @@ def base_tables(ast: exp.Expression) -> list[exp.Table]:
         for table in scope.tables:
             if isinstance(scope.sources.get(table.alias_or_name), exp.Table):
                 out.append(table)
+    return out
+
+
+def column_tables(ast: exp.Expression) -> dict[int, str]:
+    """`id(column node)` -> the base table its qualifier names **in that column's own scope**.
+
+    Absent when the qualifier names a CTE or a derived table, and absent for every column when
+    the scopes cannot be resolved -- callers must fall back to their fail-closed behaviour
+    rather than treat a missing entry as "no table".
+
+    M31 made `base_tables` scope-aware and stopped there. Both consumers went on building ONE
+    alias->table dictionary across every scope, so in
+
+        SELECT q.secret FROM inner_t q UNION ALL SELECT q.secret FROM outer_t q
+
+    the second `q` overwrote the first and a denied column was resolved against the permitted
+    table. The resolver was right; the map that consumed it was still flat.
+    """
+    try:
+        root = build_scope(ast)
+    except Exception:
+        root = None
+    if root is None:
+        return {}
+
+    out: dict[int, str] = {}
+    for scope in root.traverse():
+        local = {
+            name: object_key(source)
+            for name, source in scope.sources.items()
+            if isinstance(source, exp.Table)
+        }
+        for column in getattr(scope, "columns", ()):
+            table = local.get(column.table)
+            if column.table and table is not None:
+                out[id(column)] = table
     return out

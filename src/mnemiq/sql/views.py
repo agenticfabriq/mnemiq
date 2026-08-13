@@ -30,6 +30,10 @@ class Inlined:
 
     ast: exp.Expression
     introduced: dict[str, set[str]]
+    # The identity of the nodes inlining ADDED. The caller may also reference one of these
+    # tables directly, and that reference was already rewritten on its own terms; wrapping it a
+    # second time would nest one filter inside an identical copy of itself.
+    nodes: set[int]
 
 
 def _body(view: ViewDefinition) -> exp.Expression | None:
@@ -73,10 +77,11 @@ def inline_views(
     an alternative to it.
     """
     introduced: dict[str, set[str]] = {}
-    refusal = _expand(ast, views, schema, introduced, (), 0)
+    nodes: set[int] = set()
+    refusal = _expand(ast, views, schema, introduced, nodes, (), 0)
     if refusal is not None:
         return refusal
-    return Inlined(ast=ast, introduced=introduced)
+    return Inlined(ast=ast, introduced=introduced, nodes=nodes)
 
 
 def _expand(
@@ -84,6 +89,7 @@ def _expand(
     views: dict[str, ViewDefinition],
     schema: dict[str, set[str]],
     introduced: dict[str, set[str]],
+    nodes: set[int],
     stack: tuple[str, ...],
     depth: int,
 ) -> Refusal | None:
@@ -117,13 +123,14 @@ def _expand(
                 ),
                 subject=name,
             )
-        nested = _expand(body, views, schema, introduced, (*stack, name), depth + 1)
+        nested = _expand(body, views, schema, introduced, nodes, (*stack, name), depth + 1)
         if nested is not None:
             return nested
         for inner in base_tables(body):
             inner_name = object_key(inner)
             if inner_name not in views and inner_name in schema:
                 introduced.setdefault(inner_name, set()).update(schema[inner_name])
+                nodes.add(id(inner))
         node.replace(
             exp.Subquery(this=body, alias=exp.TableAlias(this=exp.to_identifier(node.alias_or_name)))
         )

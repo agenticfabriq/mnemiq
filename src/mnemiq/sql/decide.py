@@ -79,28 +79,35 @@ def decide(
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
     if not policy.empty:
-        # Views resolve to their base tables FIRST, so the rewrite below lands the filter at
-        # the leaves rather than on a view's output -- which for an aggregating view is not a
-        # weaker fix but an impossible one, the tenancy column having been grouped away (M27).
+        # Two passes, because inlining REMOVES the object a view-keyed policy is attached to.
         #
-        # Gated on an active policy for the same reason the rest of this is: an ungoverned
-        # deployment gains nothing from the rewrite and should not pay its risk.
+        # First the objects the caller actually named. A view granted on its own carries its
+        # own filters and masks -- `customer_list.email` is masked, `customer_list: sid = 1`
+        # filters -- and both are expressible on the view's output. Inlining first threw the
+        # node away and the policy with it, which is how a masked column came back in the
+        # clear (Codex review, 2026-08-12).
+        shaped = apply_row_and_mask(shaped, policy, visible, dialect=dialect)
+        if isinstance(shaped, Refusal):
+            return shaped
+
+        # Then resolve views to their bases, so a filter on a base lands at the leaves rather
+        # than on a view's output -- which for an aggregating view is not a weaker fix but an
+        # impossible one, the tenancy column having been grouped away (M27).
         expanded = inline_views(shaped, views or {}, policy.policy_schema)
         if isinstance(expanded, Refusal):
             return expanded
         shaped = expanded.ast
 
-        # RLS + source-side mask rewrite (filtered/masked tables -> derived). `visible` is
-        # widened by exactly the base tables inlining introduced: they are absent from the
-        # caller's map, and without them the rewriter skips them and the view returns
-        # unfiltered rows -- M27 surviving its own fix. A row filter's subquery is also absent
-        # from `visible` and must NOT be filtered; it is excluded because it is injected after
-        # this scan, and now also because it is not in `introduced`.
-        shaped = apply_row_and_mask(
-            shaped, policy, {**visible, **expanded.introduced}, dialect=dialect
-        )
-        if isinstance(shaped, Refusal):
-            return shaped
+        # Finally the bases inlining introduced. Restricted to the NODES it added: a caller may
+        # also name one of those tables directly, and that reference was already rewritten in
+        # the first pass. A row filter's own subquery (M28) is excluded for free -- it is
+        # injected during a pass, never scanned by one.
+        if expanded.nodes:
+            shaped = apply_row_and_mask(
+                shaped, policy, expanded.introduced, dialect=dialect, only=expanded.nodes
+            )
+            if isinstance(shaped, Refusal):
+                return shaped
 
     # Federation: 'catalog.table' -> 'catalog.schema.table' so DuckDB resolves it. No-op single-source.
     expand_tables(shaped, registry or {})
