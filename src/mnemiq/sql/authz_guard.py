@@ -47,7 +47,20 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]]) -> Refusal |
             # Resolved per scope, not from one flat map: an alias can name two different
             # tables in one statement, and keeping only the last let a column be checked
             # against the wrong one (Codex review, 2026-08-12).
-            table = resolved.get(id(column), alias_to_table.get(qualifier))
+            if resolved is None:
+                # Unreadable scopes: fall back to the rule for an unqualified column rather
+                # than to the flat map that was the defect. Same guarantee, no worse.
+                if column.name not in known_columns:
+                    return Refusal(
+                        code=RefusalCode.UNKNOWN_COLUMN,
+                        message=(
+                            f"No table in this query has a column {column.name!r}. "
+                            "Use only the columns listed on the schema cards."
+                        ),
+                        subject=column.name,
+                    )
+                continue
+            table = resolved.get(id(column))
             if table is None:
                 continue  # qualifier belongs to a CTE or a subquery alias
             if column.name not in visible[table]:

@@ -243,3 +243,39 @@ def test_but_a_genuinely_correlated_unqualified_reference_still_works():
         "EXISTS (SELECT 1 FROM entitlement e WHERE e.customer_id = payer_id)",
         {"payer_id"}, D, {"entitlement": {"customer_id"}})
     assert got is not None
+
+
+# --- third pass: the resolver's own failure must not be permission ---------------
+
+
+def _break_scope(monkeypatch):
+    """Force `build_scope` to raise. No naturally-parsed shape was found that does this in the
+    installed sqlglot, which is the point: the fallback is the part nobody exercises, and it
+    was the part that let a denied column through."""
+    import mnemiq.sql.scope as scope_mod
+
+    def explode(_ast):
+        raise RuntimeError("scopes unresolvable")
+
+    monkeypatch.setattr(scope_mod, "build_scope", explode)
+
+
+def test_a_denied_column_is_refused_when_the_scopes_cannot_be_resolved(monkeypatch):
+    _break_scope(monkeypatch)
+    v = plan("SELECT q.secret FROM inner_t q UNION ALL SELECT q.id FROM (SELECT id FROM outer_t) q",
+             TWO, AccessPolicy(denied={("inner_t", "secret")}))
+    assert isinstance(v, Refusal), "an unresolvable statement returned a denied column"
+
+
+def test_a_masked_column_is_still_masked_when_the_scopes_cannot_be_resolved(monkeypatch):
+    _break_scope(monkeypatch)
+    v = plan("SELECT q.secret FROM inner_t q", TWO, AccessPolicy(masked={("inner_t", "secret")}))
+    assert isinstance(v, Refusal) or "NULL AS secret" in v.plan_sql
+
+
+def test_an_unresolvable_statement_that_touches_nothing_sensitive_still_runs(monkeypatch):
+    """Fail-closed on the policy, not fail-closed on everything: an unresolvable statement is
+    not itself a reason to refuse."""
+    _break_scope(monkeypatch)
+    v = plan("SELECT o.id FROM outer_t o", TWO, AccessPolicy(denied={("inner_t", "secret")}))
+    assert isinstance(v, Approved), v

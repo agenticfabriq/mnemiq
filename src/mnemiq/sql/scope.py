@@ -41,12 +41,18 @@ def base_tables(ast: exp.Expression) -> list[exp.Table]:
     return out
 
 
-def column_tables(ast: exp.Expression) -> dict[int, str]:
-    """`id(column node)` -> the base table its qualifier names **in that column's own scope**.
+def column_tables(ast: exp.Expression) -> dict[int, str] | None:
+    """`id(column node)` -> the base table its qualifier names **in that column's own scope**,
+    or **None** when the scopes could not be resolved at all.
 
-    Absent when the qualifier names a CTE or a derived table, and absent for every column when
-    the scopes cannot be resolved -- callers must fall back to their fail-closed behaviour
-    rather than treat a missing entry as "no table".
+    None and `{}` are different answers and the difference is the finding. An empty map used to
+    mean both "resolved, and no column resolves to a base table" and "the resolver failed", so
+    a failure was read as the former: `cls` concluded a denied column belonged to no table and
+    let it through. That is the same collapse as M2's outage-versus-empty-policy and M34's
+    missing-versus-unreadable baseline -- an absence and a failure wearing one value.
+
+    A missing entry within a returned map still means only "this qualifier names a CTE or a
+    derived table".
 
     M31 made `base_tables` scope-aware and stopped there. Both consumers went on building ONE
     alias->table dictionary across every scope, so in
@@ -61,7 +67,7 @@ def column_tables(ast: exp.Expression) -> dict[int, str]:
     except Exception:
         root = None
     if root is None:
-        return {}
+        return None
 
     out: dict[int, str] = {}
     for scope in root.traverse():

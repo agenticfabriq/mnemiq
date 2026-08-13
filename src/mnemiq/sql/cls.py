@@ -9,7 +9,7 @@ from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
 def _candidate_tables(
-    column: exp.Column, resolved: dict[int, str], referenced: set[str], aliased: set[str]
+    column: exp.Column, resolved: dict[int, str] | None, referenced: set[str], aliased: set[str]
 ) -> set[str]:
     """The base table(s) a column could belong to.
 
@@ -20,7 +20,10 @@ def _candidate_tables(
     Unqualified -> every referenced base table, fail-closed. An alias the resolver could not
     place is treated the same way rather than as "no table": unresolvable is not permission.
     """
-    if not column.table:
+    if not column.table or resolved is None:
+        # `resolved is None` -> the scopes could not be read, so nothing here is known to be a
+        # local alias. Every referenced base table is a candidate; an unreadable statement is
+        # not an argument for permission.
         return referenced
     table = resolved.get(id(column))
     if table is not None:
