@@ -17,6 +17,15 @@ _DDL = (
 )
 
 
+class TrendUnavailable(RuntimeError):
+    """The trend store could not be READ. Distinct from "no baseline yet", and the distinction
+    is the finding: `last_run` swallowed every exception into the same `None` that means a
+    first run, so a misconfigured control DSN disarmed the gate exactly like a missing file --
+    and the Postgres path is the one that looks configured. One is an outage an operator must
+    fix, the other is Tuesday. M2 and M6 removed this same collapse elsewhere (M34).
+    """
+
+
 @dataclass
 class RunRecord:
     source_id: str
@@ -87,17 +96,81 @@ def last_run(control_dsn: str | None, source_id: str,
             with open(path) as fh:
                 rows = [r for r in json.load(fh) if r["source_id"] == source_id]
             return RunRecord(**rows[-1]) if rows else None
-    except Exception:
-        return None
+    except Exception as exc:
+        # Raise rather than return None. Returning None here is how the gate came to pass
+        # forever: it is the same value that means "first run", so a broken store read as a
+        # clean slate and `--gate` waved every run through.
+        raise TrendUnavailable(str(exc)) from exc
     return None
 
 
 def check_regression(report: Report, previous: RunRecord | None,
                      tolerance: float = 0.02) -> str | None:
-    """A message if accuracy dropped more than tolerance below the previous run, else None."""
+    """A message if accuracy dropped more than tolerance below the previous run, else None.
+
+    **`tolerance` is a proxy for zero, not a tuned band.** Read it before changing it.
+
+    Accuracy is got-the-facts over ANSWERABLE cases, and ACME has 25 of those, so the metric
+    moves in steps of 1/25 = **4 percentage points**. A 2% tolerance is finer than one case,
+    which means it does not permit a small drift -- it permits nothing. The gate fires the
+    moment a single answerable case regresses, and every value below 0.04 behaves identically.
+
+    So there is no threshold to calibrate here, only a choice between two behaviours: anything
+    under 0.04 is "no case may regress", and 0.04-0.079 is "one case may regress". On 25 cases
+    the second is most of the drift worth catching, so **widening this is not the right answer
+    to a flapping gate** -- find out which case moved instead.
+
+    The likeliest source of a flap is not the model: `run_acme` re-enriches all 51 tables every
+    run, so two runs compare engines over independently regenerated snapshots. If the nightly
+    reddens on a night nothing changed, pin the snapshot rather than loosen this.
+
+    Not calibrated against a deliberate same-config control, but not unevidenced either: two
+    independent runs (2026-08-11 and 2026-08-12) produced identical counts -- 21/3/1/5 -- and
+    failed on the same case. The nightly is now the standing variance experiment, at no cost.
+    """
     if previous is None:
         return None
     if report.accuracy < previous.accuracy - tolerance:
         return (f"accuracy regressed: {report.accuracy:.1%} < previous "
                 f"{previous.accuracy:.1%} - {tolerance:.0%} tolerance")
     return None
+
+
+def gate_outcome(report: Report, previous: RunRecord | None,
+                 store_error: str | None = None) -> str | None:
+    """The reason `--gate` should fail, or None to pass.
+
+    `check_regression` answers one question -- did accuracy drop? -- and answering "no" when
+    there is nothing to compare is correct at that level. The GATE's question is different:
+    *did this run get checked?* Reading an absent comparison as a pass is what made the
+    mechanism unfailable, and it held while a published 100% drifted sixteen points with CI
+    green throughout (M34).
+
+    So a gate that could not compare FAILS, and says which of the two reasons applies. That is
+    the same default `writes_enabled` took in M3: forgetting must fail closed, and a check
+    that silently does nothing is the thing this project defines itself against.
+    """
+    if store_error is not None:
+        return (f"the accuracy trend could not be read ({store_error}), so this run was not "
+                "compared against anything")
+    if previous is None:
+        return ("no baseline is recorded for this source, so this run was not compared against "
+                "anything -- record one with `mnemiq eval --record`, then gate against it")
+    return check_regression(report, previous)
+
+
+def should_record(record: bool, gate: bool, gate_failed: bool) -> bool:
+    """Whether this run belongs in the trend.
+
+    `--gate` used to imply recording, and it recorded BEFORE comparing. Armed, that is a
+    ratchet rather than a gate: a regression fails one build, becomes the baseline, and every
+    run after it passes against the lower number. One red build and then green forever, which
+    is indistinguishable from the sixteen-point drift that was actually observed (M34).
+
+    So a gate is a reader. Writing is `--record`'s job, and when both are asked for, a run
+    that failed the gate is not written -- a number we just rejected must not become the one
+    we measure against.
+    """
+    if not record:
+        return False
+    return not (gate and gate_failed)

@@ -1,0 +1,1 @@
+[{"source_id": "acme", "run_at": "", "accuracy": 0.96, "strict_accuracy": 0.84, "total": 30, "correct": 21, "correct_facts": 3, "wrong": 1, "deferred_wrongly": 0, "error": 0}]

@@ -68,7 +68,18 @@ def source_rev() -> str:
 
     Fail-soft, and honest when uncertain: an eval run must never die for want of a
     version string, and a bare rev that hides uncommitted changes is worse than no rev,
-    because it looks precise. A dirty tree is marked as such.
+    because it looks precise. A tree with MODIFIED TRACKED FILES is marked as such.
+
+    Untracked files deliberately do not count, and the distinction is not pedantry. This
+    marked `-dirty` on any porcelain output, so three orphan scratch files in the checkout
+    stamped every artifact produced there as unreproducible -- including the Spider2 k=24 run,
+    whose code was in fact exactly its commit. A flag that fires when nothing is wrong is a
+    flag nobody reads when something is, which is M19's lesson about a guard that cries wolf.
+
+    The signal is not discarded, because an untracked file can be something a run READ -- an
+    authz policy or a golden set sitting beside the code. It moves to `untracked_files` in the
+    meta, where it says what it means instead of impersonating a modified tree. Two states,
+    two fields: collapsing them is the defect M2, M6 and M34 all turned out to be.
     """
     here = os.path.dirname(os.path.abspath(__file__))
 
@@ -89,7 +100,21 @@ def source_rev() -> str:
             return f"mnemiq {version('mnemiq')}"
         except Exception:  # noqa: BLE001 -- provenance is never worth failing a run for
             return ""
-    return f"{rev}-dirty" if git("status", "--porcelain") else rev
+    return f"{rev}-dirty" if git("status", "--porcelain", "--untracked-files=no") else rev
+
+
+def untracked_count() -> int:
+    """How many untracked files sat beside the code. Provenance, not a warning: a consumer
+    comparing two artifacts can see whether the working directory differed at all."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        done = subprocess.run(  # noqa: S603 -- fixed argv, no shell
+            ["git", "-C", here, "ls-files", "--others", "--exclude-standard"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    return len([ln for ln in done.stdout.splitlines() if ln.strip()]) if done.returncode == 0 else 0
 
 
 def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str]) -> None:
@@ -100,6 +125,7 @@ def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str]) 
                 "llm_calls": calls,
                 "excluded": excluded,
                 "source_rev": source_rev(),
+                "untracked_files": untracked_count(),
             },
             fh,
         )

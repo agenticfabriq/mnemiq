@@ -1,0 +1,58 @@
+# The accuracy gate. Separate from `ci` on purpose, and scheduled rather than per-PR.
+#
+# Why not per-PR, which is the stronger thing to want: GitHub does not expose secrets to
+# workflows triggered from a fork, and this repo is public. A per-PR gate would therefore pass
+# vacuously for exactly the contributors it most needs to check -- a fail-open created by CI
+# topology rather than by code, which is the same shape as the finding this job exists to close
+# (M34). The eval also needs a live model endpoint, and one Spider2 run logged 10 provider
+# outages in 270 calls; a gate that goes red for an outage is a gate people learn to route
+# around, which is how repo-guard's over-matching became a problem (M19).
+#
+# So: it runs nightly on the default branch and on demand, and a regression is caught within a
+# day rather than blocked at merge. That trade is deliberate and is the weaker half of it.
+name: eval-nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+# One at a time. Two concurrent runs would compare against a baseline the other is mid-way
+# through reasoning about.
+concurrency:
+  group: eval-nightly
+  cancel-in-progress: false
+
+jobs:
+  acme:
+    runs-on: ubuntu-latest
+    # The full run enriches 51 tables before it asks 30 questions.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --extra dev --extra ontology
+
+      # `--gate`, never `--record`. The nightly is a READER: it compares and fails, and it
+      # never writes the baseline. A job that recorded its own result would restore the ratchet
+      # removed in the code -- a regression fails once, becomes the baseline, and passes
+      # forever after. Accepting a new accuracy level is a human commit of evals/trend.json,
+      # reviewed like any other change to what we claim.
+      #
+      # It also fails when it CANNOT compare: no baseline, or a trend store it could not read.
+      # Both used to pass, which is why nothing noticed a published number drifting 16 points.
+      - name: Gate ACME accuracy against the recorded baseline
+        env:
+          MNEMIQ_PG_DSN: ${{ secrets.MNEMIQ_ACME_PG_DSN }}
+          MNEMIQ_SOURCE_ID: acme
+          MNEMIQ_LLM_BASE_URL: ${{ secrets.MNEMIQ_LLM_BASE_URL }}
+          MNEMIQ_LLM_API_KEY: ${{ secrets.MNEMIQ_LLM_API_KEY }}
+          MNEMIQ_LLM_MODEL: ${{ secrets.MNEMIQ_LLM_MODEL }}
+        # `set -o pipefail` is load-bearing, not hygiene. Actions runs `bash -e` without it, so
+        # a pipeline reports the exit status of its LAST command -- `tee` -- and a failing gate
+        # would be reported as a passing step. That is this finding's own failure mode, one
+        # layer out, and it nearly shipped in the change that made the gate able to fail.
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run mnemiq eval --gate | tee -a "$GITHUB_STEP_SUMMARY"
