@@ -30,6 +30,11 @@ class Inlined:
 
     ast: exp.Expression
     introduced: dict[str, set[str]]
+    # For each column a view PUBLISHES, the base columns it is derived from. Keyed by the
+    # output name because that is what the caller can actually read: a body that merely
+    # mentions a restricted column in a projection nobody selects discloses nothing, and
+    # refusing on that would make any view naming a restricted column unusable.
+    exposes: dict[str, set[tuple[str, str]]]
     # The identity of the nodes inlining ADDED. The caller may also reference one of these
     # tables directly, and that reference was already rewritten on its own terms; wrapping it a
     # second time would nest one filter inside an identical copy of itself.
@@ -93,10 +98,43 @@ def inline_views(
     """
     introduced: dict[str, set[str]] = {}
     nodes: set[int] = set()
-    refusal = _expand(ast, views, schema, introduced, nodes, (), 0, protect or set())
+    exposes: dict[str, set[tuple[str, str]]] = {}
+    refusal = _expand(ast, views, schema, introduced, nodes, exposes, (), 0, protect or set())
     if refusal is not None:
         return refusal
-    return Inlined(ast=ast, introduced=introduced, nodes=nodes)
+    return Inlined(ast=ast, introduced=introduced, nodes=nodes, exposes=exposes)
+
+
+def _exposes(body: exp.Expression) -> dict[str, set[tuple[str, str]]]:
+    """Output column name -> the base (table, column) pairs it is derived from.
+
+    A view body is self-contained, so a column in it cannot be a correlated reference to the
+    caller's query and can be attributed here -- which the general resolver refuses to do for
+    an unqualified column, correctly, because anywhere else it might be. With one source in
+    scope the attribution is exact; with several it over-attributes, which is the direction to
+    be wrong in.
+    """
+    out: dict[str, set[tuple[str, str]]] = {}
+    if not isinstance(body, exp.Select):
+        return out
+    sources = {
+        table.alias_or_name: object_key(table) for table in base_tables(body)
+    }
+    if not sources:
+        return out
+    for projection in body.expressions:
+        published = projection.alias_or_name
+        if not published:
+            continue
+        derived = out.setdefault(published, set())
+        for column in projection.find_all(exp.Column):
+            if column.table:
+                owner = sources.get(column.table)
+                if owner:
+                    derived.add((owner, column.name))
+            else:
+                derived.update((owner, column.name) for owner in sources.values())
+    return out
 
 
 def _expand(
@@ -105,6 +143,7 @@ def _expand(
     schema: dict[str, set[str]],
     introduced: dict[str, set[str]],
     nodes: set[int],
+    exposes: dict[str, set[tuple[str, str]]],
     stack: tuple[str, ...],
     depth: int,
     protect: set[int],
@@ -143,10 +182,12 @@ def _expand(
                 ),
                 subject=name,
             )
-        nested = _expand(body, views, schema, introduced, nodes, (*stack, name),
+        nested = _expand(body, views, schema, introduced, nodes, exposes, (*stack, name),
                          depth + 1, protect)
         if nested is not None:
             return nested
+        for published, derived in _exposes(body).items():
+            exposes.setdefault(published, set()).update(derived)
         for inner in base_tables(body):
             inner_name = object_key(inner)
             if inner_name not in views and inner_name in schema:

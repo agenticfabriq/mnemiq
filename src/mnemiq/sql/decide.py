@@ -102,6 +102,32 @@ def decide(
             return expanded
         shaped = expanded.ast
 
+        # A DENIED column is not readable through a view either. `check_cls` ran before
+        # inlining, when the body was still one opaque node, and the rewrite below only knows
+        # how to NULL a masked column -- so a denied base column came back raw through a
+        # granted view. Masks were fixed here and denials were not, because nothing asked what
+        # ELSE keys on the object inlining removes.
+        #
+        # Scoped to columns that resolve to an INTRODUCED table: re-running check_cls over the
+        # whole tree would fire on the rewriter's own projections, which list every visible
+        # column of a filtered table including denied ones.
+        # Only what the CALLER reads. `columns` was taken from the query as asked, so a body
+        # that merely mentions a restricted column in a projection nobody selected is not a
+        # disclosure -- refusing on that would make any view naming one unusable.
+        exposed = {
+            pair
+            for published in columns
+            for pair in expanded.exposes.get(published, ())
+        }
+        denied_read = exposed & policy.denied
+        if denied_read:
+            name = sorted(denied_read)[0][1]
+            return Refusal(
+                code=RefusalCode.UNAUTHORIZED_COLUMN,
+                message=f"You may not read the column {name!r}.",
+                subject=name,
+            )
+
         # Finally the bases inlining introduced. Restricted to the NODES it added: a caller may
         # also name one of those tables directly, and that reference was already rewritten in
         # the first pass. A row filter's own subquery (M28) is excluded for free -- it is

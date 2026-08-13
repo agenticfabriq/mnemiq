@@ -175,18 +175,58 @@ def test_a_recorded_run_is_stamped_so_the_latest_can_be_found(tmp_path):
 
 def test_a_caller_no_policy_applies_to_is_not_put_through_the_rewrite():
     """Keeping dispositions for ungranted tables (F3's fix) made `policy.empty` false for
-    everyone, so a caller with nothing enforceable started being inlined -- and an unparseable
-    view then refused a query that used to work."""
+    everyone, so a caller with nothing enforceable started being inlined. Reachability is the
+    rule -- and here the view's body PARSES, so reachability can be computed and correctly
+    finds nothing applicable."""
     snap = Snapshot(
         version="v1", source_id="s", created_at="t",
         columns=[Column(id="v.id", object_id="v", name="id"),
+                 Column(id="harmless.id", object_id="harmless", name="id"),
                  Column(id="secret.ssn", object_id="secret", name="ssn", pii_level="pii")],
-        views=[ViewDefinition(object_id="v", dialect=D, definition="SELECT FROM WHERE ((")],
+        views=[ViewDefinition(object_id="v", dialect=D, definition="SELECT id FROM harmless")],
     )
     g = GrantSet(frozenset({"v"}))          # `secret` is nothing to do with this caller
     pol, vis = build_access_policy(snap, g), visible_schema(snap, g)
+    assert pol.empty, "an unrelated PII column made this caller's policy non-empty"
     v = plan("SELECT id FROM v", vis, pol, {x.object_id: x for x in snap.views})
-    assert isinstance(v, Approved), f"an unrelated PII column refused this caller: {v}"
+    assert isinstance(v, Approved), v
+    assert "FROM v" in v.plan_sql, "a caller with nothing enforceable was still rewritten"
+
+
+def test_but_an_UNPARSEABLE_view_keeps_the_policy_live_so_the_inliner_can_refuse():
+    """The other half, and the one the first repair got backwards. If the body cannot be read
+    we cannot say which tables it touches, so we cannot say the policy is irrelevant -- and
+    concluding it was left the policy empty, skipped the rewrite, and approved the view
+    unfiltered. The inliner never got the chance to refuse it."""
+    snap = Snapshot(
+        version="v1", source_id="s", created_at="t",
+        columns=[Column(id="v.id", object_id="v", name="id"),
+                 Column(id="base.id", object_id="base", name="id"),
+                 Column(id="base.tenant_id", object_id="base", name="tenant_id")],
+        views=[ViewDefinition(object_id="v", dialect=D, definition="SELECT FROM WHERE ((")],
+    )
+    g = GrantSet(frozenset({"v"}), row_filters={"base": "tenant_id = 1"})
+    pol, vis = build_access_policy(snap, g), visible_schema(snap, g)
+    v = plan("SELECT id FROM v", vis, pol, {x.object_id: x for x in snap.views})
+    assert isinstance(v, Refusal), f"an unreadable view was approved unfiltered: {v}"
+
+
+def test_a_qualified_view_base_is_reached_with_the_same_key_the_inliner_uses():
+    """`_reachable` compared bare names while the inliner resolves `object_key`, so `pg.base`
+    was never reached, its filter was dropped, and the view read unfiltered."""
+    snap = Snapshot(
+        version="v1", source_id="s", created_at="t",
+        columns=[Column(id="v.id", object_id="v", name="id"),
+                 Column(id="pg.base.id", object_id="pg.base", name="id"),
+                 Column(id="pg.base.tenant_id", object_id="pg.base", name="tenant_id")],
+        views=[ViewDefinition(object_id="v", dialect=D, definition="SELECT id FROM pg.base")],
+    )
+    g = GrantSet(frozenset({"v"}), row_filters={"pg.base": "tenant_id = 1"})
+    pol, vis = build_access_policy(snap, g), visible_schema(snap, g)
+    assert "pg.base" in pol.row_filters, "the qualified base was never reached"
+    v = plan("SELECT id FROM v", vis, pol, {x.object_id: x for x in snap.views})
+    assert isinstance(v, Approved), v
+    assert "tenant_id = 1" in v.plan_sql, "the qualified base's filter never landed"
 
 
 def test_a_policys_own_subquery_is_not_inlined_and_not_filtered():
@@ -279,3 +319,34 @@ def test_an_unresolvable_statement_that_touches_nothing_sensitive_still_runs(mon
     _break_scope(monkeypatch)
     v = plan("SELECT o.id FROM outer_t o", TWO, AccessPolicy(denied={("inner_t", "secret")}))
     assert isinstance(v, Approved), v
+
+
+def test_a_denied_base_column_is_not_readable_through_a_granted_view():
+    """Masks were carried across inlining and denials were not -- nothing asked what ELSE keys
+    on the object that inlining removes."""
+    snap = Snapshot(
+        version="v1", source_id="s", created_at="t",
+        columns=[Column(id="v.email", object_id="v", name="email"),
+                 Column(id="base.email", object_id="base", name="email", pii_level="pii")],
+        views=[ViewDefinition(object_id="v", dialect=D, definition="SELECT email FROM base")],
+    )
+    g = GrantSet(frozenset({"v"}))          # no clearance -> base.email is DENIED
+    pol, vis = build_access_policy(snap, g), visible_schema(snap, g)
+    assert ("base", "email") in pol.denied
+    v = plan("SELECT email FROM v", vis, pol, {x.object_id: x for x in snap.views})
+    assert isinstance(v, Refusal), f"a denied column was read through a view: {getattr(v,'plan_sql',v)}"
+
+
+def test_a_view_over_a_column_that_is_merely_masked_still_answers():
+    """Denial refuses; masking does not. The distinction must survive the same path."""
+    snap = Snapshot(
+        version="v1", source_id="s", created_at="t",
+        columns=[Column(id="v.email", object_id="v", name="email"),
+                 Column(id="base.email", object_id="base", name="email", pii_level="pii")],
+        views=[ViewDefinition(object_id="v", dialect=D, definition="SELECT email FROM base")],
+    )
+    g = GrantSet(frozenset({"v"}), pii_mask=frozenset({"pii"}))
+    pol, vis = build_access_policy(snap, g), visible_schema(snap, g)
+    v = plan("SELECT email FROM v", vis, pol, {x.object_id: x for x in snap.views})
+    assert isinstance(v, Approved), v
+    assert "NULL AS email" in v.plan_sql

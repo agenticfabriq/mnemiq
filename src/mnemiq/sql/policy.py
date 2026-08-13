@@ -39,7 +39,10 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
     import sqlglot
     from sqlglot import exp
 
+    from mnemiq.sql.qualify import object_key
+
     bodies = {v.object_id: v for v in snapshot.views}
+    every = {c.object_id for c in snapshot.columns}
     reachable, frontier = set(grants.objects), list(grants.objects)
     while frontier:
         view = bodies.get(frontier.pop())
@@ -48,11 +51,19 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
         try:
             parsed = sqlglot.parse_one(view.definition, read=view.dialect)
         except Exception:
-            continue  # unresolvable: `inline_views` refuses it, and refusing needs no policy
+            # We cannot see what this view reads, so we cannot say the policy is irrelevant.
+            # Returning what we have left the policy EMPTY, which skipped the rewrite entirely
+            # and approved the view unfiltered -- `inline_views` never got the chance to refuse
+            # it. Everything is reachable instead: the policy stays live and the inliner does
+            # its job.
+            return every | reachable
         for table in parsed.find_all(exp.Table):
-            if table.name not in reachable:
-                reachable.add(table.name)
-                frontier.append(table.name)
+            # `object_key`, the same spelling the inliner resolves with. A bare `.name` here
+            # never reached `pg.base`, so its filter was dropped and the view read unfiltered.
+            key = object_key(table)
+            if key not in reachable:
+                reachable.add(key)
+                frontier.append(key)
     return reachable
 
 

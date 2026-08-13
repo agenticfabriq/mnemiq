@@ -5,14 +5,13 @@ from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables
+from mnemiq.sql.scope import base_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
-def _full_key(table: exp.Table) -> str:
-    """Every qualifier the reference carries, in order. `object_key` is the object-id form and
-    deliberately drops the catalog; validation cannot afford to."""
-    return ".".join(p for p in (table.text("catalog"), table.text("db"), table.name) if p)
+# The stand-in for the table a filter is attached to, so the predicate can be validated as the
+# query it becomes. Chosen to be unspellable in SQL a policy author would write.
+_SUBJECT = "__mnemiq_filtered__"
 
 
 def _validate_filter(
@@ -46,41 +45,40 @@ def _validate_filter(
     if not isinstance(expr, exp.Condition):
         return None  # a statement, not a predicate -- `DELETE FROM t` is not a row filter
 
-    nested = list(expr.find_all(exp.Select))
-    inner: set[int] = {id(node) for select in nested for node in select.walk()}
-
-    for column in expr.find_all(exp.Column):
-        if id(column) not in inner and column.name not in cols:
-            return None
-
-    if not nested:
-        return expr
-    if not policy_schema:
+    # Validate the predicate as the query it will become, so the ONE scope-aware resolver
+    # answers "which table does this column belong to" here as well.
+    #
+    # This used to build its own alias map with a descendant-wide `find_all`, so a nested
+    # `FROM other e` overwrote an outer `FROM entitlement e` and an invalid column was checked
+    # against the wrong table. That is the third place a flat alias map has been a bypass --
+    # `check_access`, `check_cls`, and here. There is now one resolver and no local maps.
+    schema = dict(policy_schema or {})
+    schema[_SUBJECT] = set(cols)
+    try:
+        wrapped = sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {filt}", read=dialect)
+    except Exception:
         return None
+    resolved = column_tables(wrapped)
+    if resolved is None:
+        return None  # scopes unreadable -> the filter cannot be validated, so it is refused
 
-    for select in nested:
-        # The FULL qualification, not `object_key`, which keeps `db.table` and drops the
-        # catalog -- so `other.public.entitlement` and `public.entitlement` reduced to the
-        # same key and a filter could read another catalog's table. Policy keys never carry
-        # three parts, so a three-part reference now matches nothing and is refused.
-        referenced = {_full_key(table) for table in select.find_all(exp.Table)}
-        if not referenced or not referenced <= set(policy_schema):
-            return None
-        # Qualified -> it must belong to the table its alias names. Unqualified -> it may be
-        # the subquery's own or a correlated reference to the filtered row, so both sets are
-        # allowed. Unioning the names for BOTH cases (the first repair of this) let
-        # `e.payer_id` pass because the OUTER table had a `payer_id`.
-        aliases = {t.alias_or_name: _full_key(t) for t in select.find_all(exp.Table)}
-        inner_cols = {c for t in referenced for c in policy_schema[t]}
-        for column in select.find_all(exp.Column):
-            owner = aliases.get(column.table) if column.table else None
-            if owner is not None:
-                if column.name not in policy_schema.get(owner, set()):
-                    return None
-            elif column.table:
-                return None  # qualified by something this subquery does not read
-            elif column.name not in inner_cols | cols:
+    for table in base_tables(wrapped):
+        key = object_key(table)
+        if key != _SUBJECT and key not in schema:
+            return None  # a table the policy author has not got
+
+    for column in wrapped.find_all(exp.Column):
+        owner = resolved.get(id(column))
+        if owner is None:
+            if column.table:
+                return None  # qualified by something no scope here defines
+            # Unqualified: the subquery's own tables, or a correlated reference to the row
+            # being filtered. Fail-closed across both rather than resolving ambiguity.
+            reachable = {c for t in base_tables(wrapped) for c in schema.get(object_key(t), ())}
+            if column.name not in reachable:
                 return None
+        elif column.name not in schema.get(owner, set()):
+            return None
     return expr
 
 
