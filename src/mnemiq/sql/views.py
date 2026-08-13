@@ -52,10 +52,25 @@ def _body(view: ViewDefinition) -> exp.Expression | None:
     return parsed if isinstance(parsed, exp.Query) else None
 
 
+def _protected(node: exp.Expression, protect: set[int]) -> bool:
+    """Is this node inside a predicate the policy injected? Walked by ancestry rather than by
+    name, because the policy's subquery and the caller's own reference can name the same view
+    in one statement and must be treated oppositely."""
+    if not protect:
+        return False
+    current: exp.Expression | None = node
+    while current is not None:
+        if id(current) in protect:
+            return True
+        current = current.parent
+    return False
+
+
 def inline_views(
     ast: exp.Expression,
     views: dict[str, ViewDefinition],
     schema: dict[str, set[str]],
+    protect: set[int] | None = None,
 ) -> Inlined | Refusal:
     """Replace every reference to a governed view with the SQL it stands for.
 
@@ -78,7 +93,7 @@ def inline_views(
     """
     introduced: dict[str, set[str]] = {}
     nodes: set[int] = set()
-    refusal = _expand(ast, views, schema, introduced, nodes, (), 0)
+    refusal = _expand(ast, views, schema, introduced, nodes, (), 0, protect or set())
     if refusal is not None:
         return refusal
     return Inlined(ast=ast, introduced=introduced, nodes=nodes)
@@ -92,11 +107,16 @@ def _expand(
     nodes: set[int],
     stack: tuple[str, ...],
     depth: int,
+    protect: set[int],
 ) -> Refusal | None:
     for node in base_tables(ast):
         name = object_key(node)
         view = views.get(name)
         if view is None:
+            continue
+        if _protected(node, protect):
+            # A view the POLICY named. It reads with the policy author's reach, so it is left
+            # exactly as written -- not inlined, and therefore never filtered.
             continue
         if name in stack:
             return Refusal(
@@ -123,7 +143,8 @@ def _expand(
                 ),
                 subject=name,
             )
-        nested = _expand(body, views, schema, introduced, nodes, (*stack, name), depth + 1)
+        nested = _expand(body, views, schema, introduced, nodes, (*stack, name),
+                         depth + 1, protect)
         if nested is not None:
             return nested
         for inner in base_tables(body):

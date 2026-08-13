@@ -86,14 +86,18 @@ def decide(
         # filters -- and both are expressible on the view's output. Inlining first threw the
         # node away and the policy with it, which is how a masked column came back in the
         # clear (Codex review, 2026-08-12).
-        shaped = apply_row_and_mask(shaped, policy, visible, dialect=dialect)
+        injected: set[int] = set()
+        shaped = apply_row_and_mask(
+            shaped, policy, visible, dialect=dialect, injected=injected
+        )
         if isinstance(shaped, Refusal):
             return shaped
 
         # Then resolve views to their bases, so a filter on a base lands at the leaves rather
         # than on a view's output -- which for an aggregating view is not a weaker fix but an
         # impossible one, the tenancy column having been grouped away (M27).
-        expanded = inline_views(shaped, views or {}, policy.policy_schema)
+        expanded = inline_views(shaped, views or {}, policy.policy_schema,
+                                protect=injected)
         if isinstance(expanded, Refusal):
             return expanded
         shaped = expanded.ast

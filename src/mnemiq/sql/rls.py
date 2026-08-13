@@ -9,6 +9,12 @@ from mnemiq.sql.scope import base_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
+def _full_key(table: exp.Table) -> str:
+    """Every qualifier the reference carries, in order. `object_key` is the object-id form and
+    deliberately drops the catalog; validation cannot afford to."""
+    return ".".join(p for p in (table.text("catalog"), table.text("db"), table.name) if p)
+
+
 def _validate_filter(
     filt: str,
     cols: set[str],
@@ -53,19 +59,27 @@ def _validate_filter(
         return None
 
     for select in nested:
-        # `object_key`, not `.name`: dropping the qualifier accepted
-        # `private.entitlement` for a key of `entitlement`, and rejected the only
-        # spelling a federated key (`pg.entitlement`) can be written in.
-        referenced = {object_key(table) for table in select.find_all(exp.Table)}
+        # The FULL qualification, not `object_key`, which keeps `db.table` and drops the
+        # catalog -- so `other.public.entitlement` and `public.entitlement` reduced to the
+        # same key and a filter could read another catalog's table. Policy keys never carry
+        # three parts, so a three-part reference now matches nothing and is refused.
+        referenced = {_full_key(table) for table in select.find_all(exp.Table)}
         if not referenced or not referenced <= set(policy_schema):
             return None
-        # Unqualified inside a subquery -> resolve against every table it reads, fail-closed.
-        # `cols` is included because a subquery may correlate back to the row being
-        # filtered. Every node under a nested SELECT was treated as inner, so the EXISTS
-        # spelling of a predicate the IN spelling already allowed was refused.
-        known = cols | {c for t in referenced for c in policy_schema[t]}
+        # Qualified -> it must belong to the table its alias names. Unqualified -> it may be
+        # the subquery's own or a correlated reference to the filtered row, so both sets are
+        # allowed. Unioning the names for BOTH cases (the first repair of this) let
+        # `e.payer_id` pass because the OUTER table had a `payer_id`.
+        aliases = {t.alias_or_name: _full_key(t) for t in select.find_all(exp.Table)}
+        inner_cols = {c for t in referenced for c in policy_schema[t]}
         for column in select.find_all(exp.Column):
-            if column.name not in known:
+            owner = aliases.get(column.table) if column.table else None
+            if owner is not None:
+                if column.name not in policy_schema.get(owner, set()):
+                    return None
+            elif column.table:
+                return None  # qualified by something this subquery does not read
+            elif column.name not in inner_cols | cols:
                 return None
     return expr
 
@@ -92,10 +106,17 @@ def apply_row_and_mask(
     visible: dict[str, set[str]],
     dialect: str = "duckdb",
     only: set[int] | None = None,
+    injected: set[int] | None = None,
 ) -> exp.Expression | Refusal:
     """Wrap each base table that has a row filter or a referenced masked column in a derived
     table that applies the filter and NULLs masked columns AT THE SOURCE. Returns the rewritten
     AST, or a Refusal for a policy-invalid filter.
+
+    `injected`, when given, is filled with the id of every node in the predicates this call
+    INSERTS. Those nodes belong to the policy, not to the caller: nothing downstream may inline
+    a view named inside one, and nothing may filter what such a view resolves to. Without that
+    record, the caller's own filter was applied inside their policy's subquery -- the exact
+    inversion of the rule the subquery exists to honour (M28).
 
     `only` restricts the rewrite to specific table NODES rather than table names. The decider
     runs this twice -- once over the objects the caller named, once over the bases that
@@ -141,5 +162,11 @@ def apply_row_and_mask(
         derived = _derived_table(
             name, table_node.alias_or_name, visible[name], masked_by_table.get(name, set()), filt
         )
+        if injected is not None and filt is not None:
+            # Read off the DERIVED tree, not off `filt`: sqlglot may copy a node into place,
+            # and an id taken before insertion can belong to nothing.
+            where = derived.this.args.get("where")
+            if where is not None:
+                injected.update(id(node) for node in where.walk())
         table_node.replace(derived)
     return ast

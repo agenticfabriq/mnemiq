@@ -168,3 +168,78 @@ def test_a_recorded_run_is_stamped_so_the_latest_can_be_found(tmp_path):
     record_run(None, "acme", Report(total=10, correct=9, wrong=1), path=path)
     rec = last_run(None, "acme", path=path)
     assert rec.run_at, "a run with no timestamp cannot be ordered against another"
+
+
+# --- second pass: what the fix itself broke or left half-done --------------------
+
+
+def test_a_caller_no_policy_applies_to_is_not_put_through_the_rewrite():
+    """Keeping dispositions for ungranted tables (F3's fix) made `policy.empty` false for
+    everyone, so a caller with nothing enforceable started being inlined -- and an unparseable
+    view then refused a query that used to work."""
+    snap = Snapshot(
+        version="v1", source_id="s", created_at="t",
+        columns=[Column(id="v.id", object_id="v", name="id"),
+                 Column(id="secret.ssn", object_id="secret", name="ssn", pii_level="pii")],
+        views=[ViewDefinition(object_id="v", dialect=D, definition="SELECT FROM WHERE ((")],
+    )
+    g = GrantSet(frozenset({"v"}))          # `secret` is nothing to do with this caller
+    pol, vis = build_access_policy(snap, g), visible_schema(snap, g)
+    v = plan("SELECT id FROM v", vis, pol, {x.object_id: x for x in snap.views})
+    assert isinstance(v, Approved), f"an unrelated PII column refused this caller: {v}"
+
+
+def test_a_policys_own_subquery_is_not_inlined_and_not_filtered():
+    """The two-visibility rule, broken by the fix that restored it elsewhere. A view named
+    INSIDE a row filter belongs to the policy, so it reads with the policy author's reach --
+    inlining it and then applying the caller's filter to its bases is the caller's reach."""
+    snap = Snapshot(
+        version="v1", source_id="s", created_at="t",
+        columns=[Column(id="payment.payment_id", object_id="payment", name="payment_id"),
+                 Column(id="payment.customer_id", object_id="payment", name="customer_id"),
+                 Column(id="customer.customer_id", object_id="customer", name="customer_id"),
+                 Column(id="customer.store_id", object_id="customer", name="store_id"),
+                 Column(id="customer_view.customer_id", object_id="customer_view",
+                        name="customer_id")],
+        views=[ViewDefinition(object_id="customer_view", dialect=D,
+                              definition="SELECT customer_id FROM customer")],
+    )
+    # The view is granted TOO, so `customer` is reachable and its filter survives the policy
+    # builder. Without that this passes for the wrong reason -- the filter is dropped and there
+    # is nothing left to leak, which is the unreachable-fixture trap that hid the original bug.
+    g = GrantSet(frozenset({"payment", "customer_view"}), row_filters={
+        "payment": "customer_id IN (SELECT customer_id FROM customer_view)",
+        "customer": "store_id = 1"})
+    pol, vis = build_access_policy(snap, g), visible_schema(snap, g)
+    v = plan("SELECT payment_id FROM payment", vis, pol,
+             {x.object_id: x for x in snap.views})
+    assert isinstance(v, Approved), v
+    assert "customer" in pol.row_filters, "the fixture no longer exercises the interaction"
+    assert "store_id = 1" not in v.plan_sql, (
+        "the caller's filter reached inside the policy's own subquery"
+    )
+
+
+def test_a_three_part_name_cannot_borrow_another_catalogs_key():
+    """`object_key` keeps `db.table` and drops the catalog, so two catalogs collide."""
+    got = _validate_filter(
+        "customer_id IN (SELECT customer_id FROM other.public.entitlement)",
+        {"customer_id"}, D, {"public.entitlement": {"customer_id"}})
+    assert got is None, "a filter reached a table in a different catalog"
+
+
+def test_a_qualified_inner_column_must_belong_to_the_table_it_names():
+    """Correlation was allowed by unioning the outer table's column NAMES into the inner
+    check, so an inner column qualified to a table that has no such column passed for
+    sharing a name with one the outer table does have."""
+    got = _validate_filter(
+        "EXISTS (SELECT 1 FROM entitlement e WHERE e.payer_id = payer_id)",
+        {"payer_id"}, D, {"entitlement": {"customer_id"}})
+    assert got is None, "e.payer_id was accepted though entitlement has no payer_id"
+
+
+def test_but_a_genuinely_correlated_unqualified_reference_still_works():
+    got = _validate_filter(
+        "EXISTS (SELECT 1 FROM entitlement e WHERE e.customer_id = payer_id)",
+        {"payer_id"}, D, {"entitlement": {"customer_id"}})
+    assert got is not None

@@ -18,22 +18,18 @@ def test_build_access_policy_from_pii_and_clearance():
     pol = build_access_policy(_snap(), grants)
     assert pol.denied == set()                       # pii cleared, phi masked -> none denied
     assert pol.masked == {("claim", "dx")}           # phi -> masked
-    # `party` is NOT readable and its filter is kept anyway. It used to be dropped, which was
-    # right while an ungranted table could never appear in a query -- and wrong the moment a
-    # granted VIEW could be inlined into one. A caller granted only a view has no grant on the
-    # tables behind it, so requiring one deleted the filter exactly when it mattered. Inert
-    # otherwise: a direct reference is refused before CLS runs.
-    assert pol.row_filters == {"claim": "region='US'", "party": "1=1"}
+    # `party` is dropped -- not for being ungranted, but for being UNREACHABLE. A caller
+    # granted only a view has no grant on the tables behind it, and after inlining those are
+    # what the query reads, so the rule is reachability (grants + the bases of granted views).
+    # Here `claim` is not a view, so reachable == granted and the outcome is unchanged.
+    assert pol.row_filters == {"claim": "region='US'"}
     assert not pol.empty
 
 
 def test_no_clearance_denies_all_pii():
     grants = GrantSet(frozenset({"claim"}))  # no clearance, no mask
     pol = build_access_policy(_snap(), grants)
-    # Same rule for dispositions: `party.x` is carried even though `party` is not granted,
-    # because after a view is inlined the query reads it.
-    assert pol.denied == {("claim", "ssn"), ("claim", "dx"), ("party", "x")}
-    assert pol.masked == set()
+    assert pol.denied == {("claim", "ssn"), ("claim", "dx")} and pol.masked == set()
 
 
 def test_empty_policy():
