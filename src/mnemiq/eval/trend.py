@@ -106,7 +106,28 @@ def last_run(control_dsn: str | None, source_id: str,
 
 def check_regression(report: Report, previous: RunRecord | None,
                      tolerance: float = 0.02) -> str | None:
-    """A message if accuracy dropped more than tolerance below the previous run, else None."""
+    """A message if accuracy dropped more than tolerance below the previous run, else None.
+
+    **`tolerance` is a proxy for zero, not a tuned band.** Read it before changing it.
+
+    Accuracy is got-the-facts over ANSWERABLE cases, and ACME has 25 of those, so the metric
+    moves in steps of 1/25 = **4 percentage points**. A 2% tolerance is finer than one case,
+    which means it does not permit a small drift -- it permits nothing. The gate fires the
+    moment a single answerable case regresses, and every value below 0.04 behaves identically.
+
+    So there is no threshold to calibrate here, only a choice between two behaviours: anything
+    under 0.04 is "no case may regress", and 0.04-0.079 is "one case may regress". On 25 cases
+    the second is most of the drift worth catching, so **widening this is not the right answer
+    to a flapping gate** -- find out which case moved instead.
+
+    The likeliest source of a flap is not the model: `run_acme` re-enriches all 51 tables every
+    run, so two runs compare engines over independently regenerated snapshots. If the nightly
+    reddens on a night nothing changed, pin the snapshot rather than loosen this.
+
+    Not calibrated against a deliberate same-config control, but not unevidenced either: two
+    independent runs (2026-08-11 and 2026-08-12) produced identical counts -- 21/3/1/5 -- and
+    failed on the same case. The nightly is now the standing variance experiment, at no cost.
+    """
     if previous is None:
         return None
     if report.accuracy < previous.accuracy - tolerance:
