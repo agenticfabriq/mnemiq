@@ -70,12 +70,8 @@ def _unrecognised_source(body: exp.Expression) -> str | None:
     for source in sources:
         if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
             continue
-        if isinstance(source, exp.Subquery):
-            # Anything: a function inside is caught by the node-type scan above wherever it
-            # sits, and a named table inside is collected by the raw walk. Requiring a Query
-            # here bought no safety once those two hold, and refused parenthesised joins and
-            # pivots over named tables that the source executes happily.
-            continue
+        if isinstance(source, exp.Subquery) and isinstance(source.this, exp.Query):
+            continue  # a real subquery: its own FROM/JOIN nodes are enumerated by this walk
         return type(source).__name__
     return None
 
@@ -211,7 +207,13 @@ def _walk(
         # boundary -- and it closes every unknown-object spelling at once rather than the file
         # literal specifically.
         if known:
-            recognised = _spellings(known) | _spellings(set(views))
+            # A CTE alias is a name the BODY defines; the source is not expected to know it.
+            # Counting it as an unknown object refused every ordinary CTE view -- five of eight
+            # new refusals in the review's matrix were legitimate SQL. This weakens nothing:
+            # `_mentions` still collects the alias, so a CTE named after a filtered table still
+            # trips the filtered check below.
+            local = {cte.alias_or_name for cte in body.find_all(exp.CTE)}
+            recognised = _spellings(known) | _spellings(set(views)) | _spellings(local)
             # BOTH sides normalised. Widening only the known set still rejected `public.film`
             # against a snapshot that keys it `film`: a name is known when ANY of its spellings
             # matches any recognised one, not when its exact text appears.
