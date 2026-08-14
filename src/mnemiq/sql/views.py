@@ -5,7 +5,6 @@ from sqlglot import exp
 
 from mnemiq.contract import ViewDefinition
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 # A view nested deeper than this is either a cycle the stack missed or a schema nobody should
@@ -27,6 +26,47 @@ def _body(view: ViewDefinition) -> exp.Expression | None:
     if isinstance(parsed, exp.Create):
         parsed = parsed.expression
     return parsed if isinstance(parsed, exp.Query) else None
+
+
+def _unrecognised_source(body: exp.Expression) -> str | None:
+    """The name of a source shape this engine does not model, or None if all are plain.
+
+    A **whitelist**, and that is the whole design. The previous rule enumerated dangerous
+    shapes -- a table-valued function, then laterals -- and each round of review found another
+    it had not thought of, because an unlisted shape PASSED. Here an unlisted shape refuses:
+    every source must be a named table or a subquery over one, and anything else (LATERAL,
+    UNNEST, a function call, a table literal, whatever a future dialect adds) lands in the
+    refuse branch without anyone having to notice it first.
+
+    That inversion is the same one `writes_enabled` took in M3. Forgetting must fail closed.
+    """
+    # Found by node type, not by args key. The first version read `args["from"]`, which this
+    # sqlglot spells `from_`, so it enumerated NOTHING -- and a whitelist that finds no sources
+    # approves everything. It was failing open in exactly the way it exists to prevent, and only
+    # the function tests caught it. Node types do not get renamed out from under a lookup.
+    sources = [node.this for node in body.find_all(exp.From)]
+    sources += [join.this for join in body.find_all(exp.Join)]
+    for source in sources:
+        if isinstance(source, exp.Table) and source.name:
+            continue
+        if isinstance(source, exp.Subquery):
+            continue  # its own FROM/JOIN nodes are enumerated by the same walk
+        return type(source).__name__
+    return None
+
+
+def _mentions(body: exp.Expression) -> set[str]:
+    """Every table name the body mentions, in both spellings, from the RAW tree.
+
+    Deliberately not `base_tables`. That resolves scopes to tell a CTE reference from a base
+    table, which is right for authorization and wrong here: scope resolution can only ever
+    return FEWER names, and it dropped the read inside a lateral. Over-inclusion costs a
+    spurious refusal on a CTE that shares a filtered table's name; under-inclusion cost the
+    control. Both spellings because a body may say `public.customer` where the snapshot's
+    object-id is `customer`.
+    """
+    tables = list(body.find_all(exp.Table))
+    return {object_key(t) for t in tables} | {t.name for t in tables if t.name}
 
 
 def check_views(
@@ -68,9 +108,11 @@ def _walk(
     stack: tuple[str, ...],
     depth: int,
 ) -> Refusal | None:
-    for node in base_tables(ast):
+    for node in ast.find_all(exp.Table):
         name = object_key(node)
-        view = views.get(name)
+        view = views.get(name) or views.get(node.name)
+        if view is not None and name not in views:
+            name = node.name  # a body may qualify a view the snapshot keys bare
         if view is None:
             continue
         if name in stack:
@@ -98,27 +140,17 @@ def _walk(
                 ),
                 subject=name,
             )
-        sources = base_tables(body)
-        if any(not t.name for t in sources):
-            # A table-valued function -- `query_table('customer')`, `read_csv(...)` -- parses to
-            # a table node with an EMPTY name, so it matches nothing and the body looks like it
-            # reads nothing. It is the one shape that defeats "which tables does this body
-            # mention", because the name it reads exists only at execution. A source this
-            # engine cannot bind to an object is refused while a policy is active.
+        unrecognised = _unrecognised_source(body)
+        if unrecognised is not None:
             return Refusal(
                 code=RefusalCode.UNRESOLVABLE_VIEW,
                 message=(
-                    f"{name!r} reads through a function rather than a named table, so this "
-                    "engine cannot tell which tables it touches."
+                    f"{name!r} reads through a {unrecognised.lower()} rather than a named "
+                    "table, so this engine cannot tell which tables it touches."
                 ),
                 subject=name,
             )
-        # Both spellings. Snapshot object-ids are bare names for a single source while a body
-        # may say `public.customer`; comparing one form to the other dropped the match, and a
-        # missed match here means NOT refusing.
-        reached = sorted(
-            {object_key(t) for t in sources} & filtered | {t.name for t in sources} & filtered
-        )
+        reached = sorted(_mentions(body) & filtered)
         if reached:
             return Refusal(
                 code=RefusalCode.UNGOVERNED_VIEW,

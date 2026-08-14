@@ -53,9 +53,8 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
         except Exception:
             # We cannot see what this view reads, so we cannot say the policy is irrelevant.
             # Returning what we have left the policy EMPTY, which skipped the rewrite entirely
-            # and approved the view unfiltered -- `inline_views` never got the chance to refuse
-            # it. Everything is reachable instead: the policy stays live and the inliner does
-            # its job.
+            # and approved the view unfiltered -- `check_views` never got the chance to refuse
+            # it. Everything is reachable instead, so the policy stays live and the floor runs.
             return every | reachable
         for table in parsed.find_all(exp.Table):
             # `object_key`, the same spelling the inliner resolves with. A bare `.name` here

@@ -138,3 +138,52 @@ def test_a_schema_qualified_base_is_still_recognised_as_the_filtered_table():
     policy = AccessPolicy(row_filters={"customer": "store_id = 1"}, policy_schema=SCHEMA)
     verdict = plan("SELECT a FROM v", view("SELECT customer_id AS a FROM public.customer"), policy)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW
+
+
+# --- the inversion: an unrecognised shape refuses without being listed -----------
+
+
+@pytest.mark.parametrize(
+    "dialect,body",
+    [
+        ("postgres", "SELECT * FROM film f, LATERAL (VALUES ((SELECT max(store_id) FROM customer))) AS v(x)"),
+        ("duckdb", "SELECT * FROM film f, LATERAL (SELECT * FROM query_table('customer')) t"),
+        ("postgres", "SELECT * FROM ROWS FROM (generate_series(1,2))"),
+        ("postgres", "SELECT * FROM XMLTABLE('/a' PASSING x COLUMNS c text)"),
+        ("duckdb", "SELECT * FROM read_parquet('customer.parquet')"),
+        ("sqlite", "SELECT * FROM json_each('[]')"),
+    ],
+    ids=["lateral-values", "lateral-function", "rows-from", "xmltable", "read_parquet", "json_each"],
+)
+def test_a_source_shape_this_engine_does_not_model_is_refused(dialect, body):
+    """None of these is enumerated anywhere in the engine. They refuse because the rule is a
+    whitelist -- every source must be a named table or a subquery over one -- so a shape nobody
+    thought of lands in the refuse branch instead of the allow branch. The two lateral cases
+    are the ones that defeated the previous rule by hiding a filtered read from scope
+    resolution."""
+    views = {"v": ViewDefinition(object_id="v", dialect=dialect, definition=body)}
+    verdict = decide("SELECT a FROM v", GRANTED, dialect=dialect, target=dialect,
+                     policy=FILTERED, views=views)
+    assert isinstance(verdict, Refusal), f"an unmodelled source was allowed: {verdict}"
+
+
+def test_the_ordinary_shapes_still_pass_the_whitelist():
+    """The whitelist has to admit real views or it is just an outage."""
+    for body in ("SELECT customer_id AS a FROM public.film",
+                 "SELECT f.film_id AS a FROM film f JOIN film g ON f.film_id = g.film_id",
+                 "SELECT a FROM (SELECT film_id AS a FROM film) inner_q",
+                 "SELECT film_id AS a FROM film UNION ALL SELECT film_id AS a FROM film"):
+        verdict = plan("SELECT a FROM v", view(body), FILTERED)
+        assert isinstance(verdict, Approved), f"{body!r} was refused: {verdict}"
+
+
+def test_a_view_qualified_in_the_body_is_still_recognised_as_a_view():
+    """Nested-view lookup was keyed on `object_key` only, so a body saying `public.inner_v`
+    never recursed and the inner view's filtered base went unseen."""
+    views = {
+        "v": ViewDefinition(object_id="v", dialect=D, definition="SELECT a FROM public.inner_v"),
+        "inner_v": ViewDefinition(object_id="inner_v", dialect=D,
+                                  definition="SELECT customer_id AS a FROM customer"),
+    }
+    verdict = plan("SELECT a FROM v", views, FILTERED)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW

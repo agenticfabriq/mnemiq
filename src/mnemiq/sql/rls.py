@@ -110,24 +110,11 @@ def apply_row_and_mask(
     policy: AccessPolicy,
     visible: dict[str, set[str]],
     dialect: str = "duckdb",
-    only: set[int] | None = None,
-    injected: set[int] | None = None,
 ) -> exp.Expression | Refusal:
     """Wrap each base table that has a row filter or a referenced masked column in a derived
     table that applies the filter and NULLs masked columns AT THE SOURCE. Returns the rewritten
     AST, or a Refusal for a policy-invalid filter.
 
-    `injected`, when given, is filled with the id of every node in the predicates this call
-    INSERTS. Those nodes belong to the policy, not to the caller: nothing downstream may inline
-    a view named inside one, and nothing may filter what such a view resolves to. Without that
-    record, the caller's own filter was applied inside their policy's subquery -- the exact
-    inversion of the rule the subquery exists to honour (M28).
-
-    `only` restricts the rewrite to specific table NODES rather than table names. The decider
-    runs this twice -- once over the objects the caller named, once over the bases that
-    inlining a view introduced -- and a caller may reference one of those bases directly as
-    well. Without node identity the second pass would wrap the first pass's output again,
-    nesting a filter inside an identical copy of itself.
     """
     if not policy.row_filters and not policy.masked:
         return ast
@@ -144,8 +131,6 @@ def apply_row_and_mask(
 
     # Resolved before the loop mutates the tree: `replace` invalidates the scope it was read from.
     for table_node in base_tables(ast):
-        if only is not None and id(table_node) not in only:
-            continue
         name = object_key(table_node)
         if name not in visible:
             continue
@@ -167,11 +152,5 @@ def apply_row_and_mask(
         derived = _derived_table(
             name, table_node.alias_or_name, visible[name], masked_by_table.get(name, set()), filt
         )
-        if injected is not None and filt is not None:
-            # Read off the DERIVED tree, not off `filt`: sqlglot may copy a node into place,
-            # and an id taken before insertion can belong to nothing.
-            where = derived.this.args.get("where")
-            if where is not None:
-                injected.update(id(node) for node in where.walk())
         table_node.replace(derived)
     return ast
