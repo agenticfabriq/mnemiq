@@ -7,13 +7,30 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-from mnemiq.contract import CertifiedRecord, CodedValue, Job, Snapshot
+from mnemiq.contract import PII_LEVELS, CertifiedRecord, CodedValue, Job, Snapshot
 from mnemiq.contract.semantic import CertifiedRef
 from mnemiq.enrichment.verity_auth import access_token
 from mnemiq.ontology.records import ConceptScheme
 from mnemiq.semantic.values import SENSITIVE_PII
 
 logger = logging.getLogger(__name__)
+
+# What an unrecognised `pii_level` is treated as (M41). `pii` over `phi` is a deliberate choice,
+# not an ordering: both keep the column out of the value index, and claiming health data we were
+# never told about would be a second wrong assertion on top of the one being corrected.
+#
+# Written as a literal and CHECKED, rather than derived. The first version read
+# `sorted(SENSITIVE_PII)[0]`, which looks defensive and is not: it selects by spelling, so it
+# happened to give "pii" only because of the alphabet, would pick wrongly if a third level were
+# added, and raises IndexError on an empty set. A guard whose correctness is a coincidence of
+# sort order is the shape this register keeps finding. The check below fails at import if the
+# constant ever falls out of either set it has to belong to.
+_MOST_SENSITIVE = "pii"
+if _MOST_SENSITIVE not in SENSITIVE_PII or _MOST_SENSITIVE not in PII_LEVELS:
+    raise RuntimeError(
+        f"the fallback pii_level {_MOST_SENSITIVE!r} must be both a real level {PII_LEVELS} and "
+        f"one the value-index gate treats as sensitive {sorted(SENSITIVE_PII)}"
+    )
 
 # object_type -> Snapshot list attribute, for standalone (non-column) records
 _STANDALONE = {
@@ -316,6 +333,7 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
             attested[rec.envelope.object_id] = _is_attested(rec)
 
     refused_downgrades: list[str] = []
+    unrecognised_levels: list[str] = []
     certified_cols = {c.id: c for c in by_type.get("column", [])}
     known = {c.id for c in snapshot.columns}
     for col_id in certified_cols:
@@ -331,6 +349,20 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
         coded = [CodedValue(code=cv.code, meaning=cv.meaning, source="certified")
                  for cv in cert.coded_values]
         pii_level = cert.pii_level
+        # M41. `Column.pii_level` is `str | None` and this is the one producer that does not clamp
+        # to the vocabulary (enrichment parses through `_in_vocabulary`), so an unrecognised value
+        # used to land on the column -- and `_qualifies` gates harvesting on
+        # `pii_level not in SENSITIVE_PII`, which anything unrecognised passes. That fails OPEN:
+        # "personal", "sensitive", a typo'd "pii " all read as sensitive to a human and as
+        # harvestable to the code. The value is recorded here and SUBSTITUTED BELOW, after M1.
+        unrecognised = pii_level is not None and pii_level not in PII_LEVELS
+        if unrecognised:
+            logger.warning(
+                "unrecognised pii_level %r on %r (not one of %s) -- an unrecognised level must "
+                "not be read as non-sensitive",
+                pii_level, col.id, "/".join(PII_LEVELS),
+            )
+            unrecognised_levels.append(col.id)
         if (
             not attested.get(col.id, False)
             and col.pii_level in SENSITIVE_PII
@@ -343,6 +375,17 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
             )
             refused_downgrades.append(col.id)
             pii_level = col.pii_level
+        elif unrecognised:
+            # Substituting BEFORE the check above inverted the check's own predicate and was a
+            # REGRESSION, caught in review: `"personal" not in SENSITIVE_PII` refuses, but the
+            # substituted `"pii"` does not, so an UNATTESTED record could walk a column phi -> pii.
+            # The harvest gate cannot see that (both are sensitive) and authorization can:
+            # `pii_clearance` grants on the exact level, so a pii-cleared, non-phi-cleared role
+            # then read a phi column raw. M1 therefore judges what the record actually SAID, and
+            # the substitution only applies where M1 let the value through. Refusing the whole
+            # record was rejected for M1's stated reason: the danger is one field, and dropping
+            # meaning over it degrades enrichment.
+            pii_level = _MOST_SENSITIVE
         new_cols.append(col.model_copy(update={
             "description": cert.description,
             "semantic_type": cert.semantic_type,
@@ -352,19 +395,36 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
         }))
 
     updates: dict = {"columns": new_cols}
+    # `snapshot.jobs` is this codebase's structured run record, so a security-relevant refusal goes
+    # there rather than living only in a log line nobody reads (register M2's lesson). Accumulated
+    # into ONE list rather than assigned per condition: two `updates["jobs"] = [*snapshot.jobs, ...]`
+    # statements each rebuild from the original, so whichever ran second dropped the other's job
+    # while both still logged -- the record gone, the logs reassuring. The two kinds are distinct
+    # facts and both must survive: one is "the record was not trusted to lower this", the other is
+    # "the record said something this field has no meaning for".
+    new_jobs: list[Job] = []
+    if unrecognised_levels:
+        new_jobs.append(
+            Job(
+                id="certified:pii_level_unrecognised",
+                source_id=snapshot.source_id,
+                kind="certified_pii_level_unrecognised",
+                status="refused",
+                checkpoints=sorted(unrecognised_levels),
+            )
+        )
     if refused_downgrades:
-        # `snapshot.jobs` is this codebase's structured run record, so a security-relevant refusal
-        # goes there rather than living only in a log line nobody reads (register M2's lesson).
-        updates["jobs"] = [
-            *snapshot.jobs,
+        new_jobs.append(
             Job(
                 id="certified:pii_downgrade_refused",
                 source_id=snapshot.source_id,
                 kind="certified_pii_downgrade_refused",
                 status="refused",
                 checkpoints=sorted(refused_downgrades),
-            ),
-        ]
+            )
+        )
+    if new_jobs:
+        updates["jobs"] = [*snapshot.jobs, *new_jobs]
     for object_type, attr in _STANDALONE.items():
         payloads = by_type.get(object_type, [])
         if payloads:
