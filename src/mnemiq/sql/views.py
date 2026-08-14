@@ -98,7 +98,27 @@ def _walk(
                 ),
                 subject=name,
             )
-        reached = sorted({object_key(t) for t in base_tables(body)} & filtered)
+        sources = base_tables(body)
+        if any(not t.name for t in sources):
+            # A table-valued function -- `query_table('customer')`, `read_csv(...)` -- parses to
+            # a table node with an EMPTY name, so it matches nothing and the body looks like it
+            # reads nothing. It is the one shape that defeats "which tables does this body
+            # mention", because the name it reads exists only at execution. A source this
+            # engine cannot bind to an object is refused while a policy is active.
+            return Refusal(
+                code=RefusalCode.UNRESOLVABLE_VIEW,
+                message=(
+                    f"{name!r} reads through a function rather than a named table, so this "
+                    "engine cannot tell which tables it touches."
+                ),
+                subject=name,
+            )
+        # Both spellings. Snapshot object-ids are bare names for a single source while a body
+        # may say `public.customer`; comparing one form to the other dropped the match, and a
+        # missed match here means NOT refusing.
+        reached = sorted(
+            {object_key(t) for t in sources} & filtered | {t.name for t in sources} & filtered
+        )
         if reached:
             return Refusal(
                 code=RefusalCode.UNGOVERNED_VIEW,

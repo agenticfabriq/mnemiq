@@ -106,3 +106,35 @@ def test_the_refusal_names_the_table_and_says_what_to_do_instead():
 def test_the_caller_is_told_they_read_the_view():
     verdict = plan("SELECT a FROM v", view("SELECT film_id AS a FROM film"), FILTERED)
     assert verdict.tables == ["v"]
+
+
+# --- the structural claim, attacked ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "SELECT * FROM query_table('customer')",
+        "SELECT * FROM read_csv('customer.csv')",
+        "SELECT * FROM generate_series(1, 10)",
+    ],
+    ids=["query_table", "read_csv", "generate_series"],
+)
+def test_a_body_reading_through_a_function_is_refused(body):
+    """The one shape that defeats "which tables does this body mention": a table-valued
+    function parses to a table node with an EMPTY name, so it matches nothing and the body
+    appears to read nothing at all. `query_table('customer')` reads a filtered table by a name
+    only the database resolves. A source this engine cannot bind to an object is refused while
+    a policy is active -- the unbound-source rule, which the floor needs to be a floor."""
+    verdict = plan("SELECT a FROM v", view(body), FILTERED)
+    assert isinstance(verdict, Refusal), f"a function source escaped the floor: {verdict}"
+    assert verdict.code is RefusalCode.UNRESOLVABLE_VIEW
+
+
+def test_a_schema_qualified_base_is_still_recognised_as_the_filtered_table():
+    """Snapshot object-ids are bare names for a single source, but a body may spell the same
+    table `public.customer`. Deriving one key and comparing it to the other dropped the filter
+    from the policy entirely, so the floor had nothing left to match on."""
+    policy = AccessPolicy(row_filters={"customer": "store_id = 1"}, policy_schema=SCHEMA)
+    verdict = plan("SELECT a FROM v", view("SELECT customer_id AS a FROM public.customer"), policy)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW

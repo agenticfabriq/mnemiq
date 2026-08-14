@@ -60,10 +60,13 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
         for table in parsed.find_all(exp.Table):
             # `object_key`, the same spelling the inliner resolves with. A bare `.name` here
             # never reached `pg.base`, so its filter was dropped and the view read unfiltered.
-            key = object_key(table)
-            if key not in reachable:
-                reachable.add(key)
-                frontier.append(key)
+            # Both spellings, for the same reason the floor matches both: a body may write
+            # `public.base` where the snapshot's object-id is `base`, and reaching neither
+            # dropped the filter before anything could apply it.
+            for key in {object_key(table), table.name}:
+                if key and key not in reachable:
+                    reachable.add(key)
+                    frontier.append(key)
     return reachable
 
 
