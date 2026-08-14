@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlglot import exp
 
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables
+from mnemiq.sql.scope import base_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -18,6 +18,7 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]]) -> Refusal |
     # set of CTE names -- because a reference inside a CTE body naming that same CTE reads the
     # base table, and skipping it let an ungranted table through (M31).
     alias_to_table: dict[str, str] = {}
+    resolved = column_tables(ast)
     for table in base_tables(ast):
         name = object_key(table)
         if name not in visible:
@@ -43,9 +44,23 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]]) -> Refusal |
     for column in ast.find_all(exp.Column):
         qualifier = column.table
         if qualifier:
-            # A CTE alias is absent from `alias_to_table` and falls through below: its source
-            # columns were checked where the CTE read them.
-            table = alias_to_table.get(qualifier)
+            # Resolved per scope, not from one flat map: an alias can name two different
+            # tables in one statement, and keeping only the last let a column be checked
+            # against the wrong one (Codex review, 2026-08-12).
+            if resolved is None:
+                # Unreadable scopes: fall back to the rule for an unqualified column rather
+                # than to the flat map that was the defect. Same guarantee, no worse.
+                if column.name not in known_columns:
+                    return Refusal(
+                        code=RefusalCode.UNKNOWN_COLUMN,
+                        message=(
+                            f"No table in this query has a column {column.name!r}. "
+                            "Use only the columns listed on the schema cards."
+                        ),
+                        subject=column.name,
+                    )
+                continue
+            table = resolved.get(id(column))
             if table is None:
                 continue  # qualifier belongs to a CTE or a subquery alias
             if column.name not in visible[table]:

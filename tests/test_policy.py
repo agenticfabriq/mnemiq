@@ -18,7 +18,11 @@ def test_build_access_policy_from_pii_and_clearance():
     pol = build_access_policy(_snap(), grants)
     assert pol.denied == set()                       # pii cleared, phi masked -> none denied
     assert pol.masked == {("claim", "dx")}           # phi -> masked
-    assert pol.row_filters == {"claim": "region='US'"}  # party filtered out (not readable)
+    # `party` is dropped -- not for being ungranted, but for being UNREACHABLE. A caller
+    # granted only a view has no grant on the tables behind it, and after inlining those are
+    # what the query reads, so the rule is reachability (grants + the bases of granted views).
+    # Here `claim` is not a view, so reachable == granted and the outcome is unchanged.
+    assert pol.row_filters == {"claim": "region='US'"}
     assert not pol.empty
 
 

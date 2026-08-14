@@ -5,8 +5,13 @@ from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables
+from mnemiq.sql.scope import base_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
+
+
+# The stand-in for the table a filter is attached to, so the predicate can be validated as the
+# query it becomes. Chosen to be unspellable in SQL a policy author would write.
+_SUBJECT = "__mnemiq_filtered__"
 
 
 def _validate_filter(
@@ -40,27 +45,47 @@ def _validate_filter(
     if not isinstance(expr, exp.Condition):
         return None  # a statement, not a predicate -- `DELETE FROM t` is not a row filter
 
-    nested = list(expr.find_all(exp.Select))
-    inner: set[int] = {id(node) for select in nested for node in select.walk()}
-
-    for column in expr.find_all(exp.Column):
-        if id(column) not in inner and column.name not in cols:
-            return None
-
-    if not nested:
-        return expr
-    if not policy_schema:
+    # Validate the predicate as the query it will become, so the ONE scope-aware resolver
+    # answers "which table does this column belong to" here as well.
+    #
+    # This used to build its own alias map with a descendant-wide `find_all`, so a nested
+    # `FROM other e` overwrote an outer `FROM entitlement e` and an invalid column was checked
+    # against the wrong table. That is the third place a flat alias map has been a bypass --
+    # `check_access`, `check_cls`, and here. There is now one resolver and no local maps.
+    if _SUBJECT in filt:
+        # The stand-in is a real identifier at execution time and is exempt from the table
+        # check below, so a filter naming it would read whatever table happens to carry that
+        # name. Unspellable by convention is not unspellable.
         return None
+    schema = dict(policy_schema or {})
+    schema[_SUBJECT] = set(cols)
+    try:
+        wrapped = sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {filt}", read=dialect)
+    except Exception:
+        return None
+    resolved = column_tables(wrapped)
+    if resolved is None:
+        return None  # scopes unreadable -> the filter cannot be validated, so it is refused
 
-    for select in nested:
-        referenced = {table.name for table in select.find_all(exp.Table)}
-        if not referenced or not referenced <= set(policy_schema):
-            return None
-        # Unqualified inside a subquery -> resolve against every table it reads, fail-closed.
-        known = {c for t in referenced for c in policy_schema[t]}
-        for column in select.find_all(exp.Column):
-            if column.name not in known:
+    for table in base_tables(wrapped):
+        if any("." in part for part in (table.text("catalog"), table.text("db"), table.name)):
+            return None  # `"pg.entitlement"` is not `pg.entitlement`, and a dotted key cannot
+        key = object_key(table)
+        if key != _SUBJECT and key not in schema:
+            return None  # a table the policy author has not got
+
+    for column in wrapped.find_all(exp.Column):
+        owner = resolved.get(id(column))
+        if owner is None:
+            if column.table:
+                return None  # qualified by something no scope here defines
+            # Unqualified: the subquery's own tables, or a correlated reference to the row
+            # being filtered. Fail-closed across both rather than resolving ambiguity.
+            reachable = {c for t in base_tables(wrapped) for c in schema.get(object_key(t), ())}
+            if column.name not in reachable:
                 return None
+        elif column.name not in schema.get(owner, set()):
+            return None
     return expr
 
 
@@ -81,11 +106,16 @@ def _derived_table(
 
 
 def apply_row_and_mask(
-    ast: exp.Expression, policy: AccessPolicy, visible: dict[str, set[str]], dialect: str = "duckdb"
+    ast: exp.Expression,
+    policy: AccessPolicy,
+    visible: dict[str, set[str]],
+    dialect: str = "duckdb",
 ) -> exp.Expression | Refusal:
     """Wrap each base table that has a row filter or a referenced masked column in a derived
     table that applies the filter and NULLs masked columns AT THE SOURCE. Returns the rewritten
-    AST, or a Refusal for a policy-invalid filter."""
+    AST, or a Refusal for a policy-invalid filter.
+
+    """
     if not policy.row_filters and not policy.masked:
         return ast
 

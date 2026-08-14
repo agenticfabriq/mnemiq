@@ -25,13 +25,58 @@ class AccessPolicy:
         return not self.row_filters and not self.denied and not self.masked
 
 
+def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
+    """Objects this caller's query can end up reading: what they are granted, plus the bases
+    behind any granted view, transitively.
+
+    Not the same as "granted". A view-only grant carries no grant on the tables behind it, and
+    after inlining those are what the query reads -- so scoping dispositions to grants alone
+    deleted the policy exactly where it was needed. Scoping to *everything* instead was the
+    over-correction: it made `policy.empty` false for every caller in a deployment that had any
+    policy at all, so a caller with nothing enforceable was put through a rewrite that could
+    refuse them over a view they had every right to read.
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    from mnemiq.sql.qualify import object_key
+
+    bodies = {v.object_id: v for v in snapshot.views}
+    every = {c.object_id for c in snapshot.columns}
+    reachable, frontier = set(grants.objects), list(grants.objects)
+    while frontier:
+        view = bodies.get(frontier.pop())
+        if view is None:
+            continue
+        try:
+            parsed = sqlglot.parse_one(view.definition, read=view.dialect)
+        except Exception:
+            # We cannot see what this view reads, so we cannot say the policy is irrelevant.
+            # Returning what we have left the policy EMPTY, which skipped the rewrite entirely
+            # and approved the view unfiltered -- `check_views` never got the chance to refuse
+            # it. Everything is reachable instead, so the policy stays live and the floor runs.
+            return every | reachable
+        for table in parsed.find_all(exp.Table):
+            # `object_key`, the same spelling the inliner resolves with. A bare `.name` here
+            # never reached `pg.base`, so its filter was dropped and the view read unfiltered.
+            # Both spellings, for the same reason the floor matches both: a body may write
+            # `public.base` where the snapshot's object-id is `base`, and reaching neither
+            # dropped the filter before anything could apply it.
+            for key in {object_key(table), table.name}:
+                if key and key not in reachable:
+                    reachable.add(key)
+                    frontier.append(key)
+    return reachable
+
+
 def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     """Resolve per-column dispositions from pii_level + clearance, and readable row filters."""
+    reachable = _reachable(snapshot, grants)
     denied: set[tuple[str, str]] = set()
     masked: set[tuple[str, str]] = set()
     for c in snapshot.columns:
-        if not grants.allows(c.object_id):
-            continue  # not readable -> check_access handles it, not CLS
+        if c.object_id not in reachable:
+            continue  # not reachable even through a view -> nothing here can ever apply
         level = c.pii_level
         if not level or level == "none" or level in grants.pii_clearance:
             continue  # raw
@@ -39,7 +84,8 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
             masked.add((c.object_id, c.name))
         else:
             denied.add((c.object_id, c.name))
-    row_filters = {t: f for t, f in grants.row_filters.items() if grants.allows(t)}
+    # Reachable, not granted -- same reasoning as the dispositions above.
+    row_filters = {t: f for t, f in grants.row_filters.items() if t in reachable}
     policy_schema: dict[str, set[str]] = {}
     for c in snapshot.columns:
         policy_schema.setdefault(c.object_id, set()).add(c.name)
