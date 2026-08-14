@@ -285,14 +285,43 @@ def test_the_known_object_rule_closes_every_unknown_spelling_not_just_files():
     [
         "SELECT 1 AS a FROM (film JOIN film g ON film.film_id = g.film_id) q",
         "SELECT * FROM (PIVOT film ON title USING count(film_id)) p",
+        "SELECT * FROM ((VALUES (hidden()))) v(x)",
     ],
-    ids=["parenthesised-named-join", "pivot-over-named-table"],
+    ids=["parenthesised-named-join", "pivot-over-named-table", "values-over-function"],
 )
-def test_shapes_the_source_executes_are_no_longer_refused_for_being_containers(body):
-    """Requiring a Subquery to hold a Query bought nothing once functions are caught by node
-    type wherever they sit and named tables are collected by the raw walk -- it only refused
-    idioms DuckDB runs happily."""
+def test_a_subquery_must_hold_a_query_even_though_that_refuses_working_sql(body):
+    """The deliberate trade, and I made it the wrong way round once.
+
+    Allowing a Subquery to hold anything was measured as removing the floor's material
+    over-refusal -- parenthesised joins and pivots over named tables, which the source runs
+    happily. It also opened an EXECUTABLE escape: `((VALUES (hidden())))` produces no
+    `exp.Table` at all, so the node-type scan has nothing to scan and the raw walk has nothing
+    to collect. A scalar macro reading a governed table was built as a view and returned its
+    rows, in DuckDB and in SQLite both.
+
+    So the first two shapes refuse for the third one's sake. That is the cost, it is
+    availability rather than safety, and it is written down here rather than discovered again:
+    reducing over-refusal is not worth a hole, and a cost measurement is not a safety argument.
+    """
     views = {"v": ViewDefinition(object_id="v", dialect="duckdb", definition=body)}
     verdict = decide("SELECT a FROM v", GRANTED, dialect="duckdb", target="duckdb",
                      policy=FILTERED, views=views)
+    assert isinstance(verdict, Refusal), verdict
+
+
+def test_an_ordinary_cte_view_is_not_refused_for_naming_something_the_source_lacks():
+    """A CTE alias is a name the BODY defines. Counting it as an unknown object refused every
+    ordinary CTE view -- five of eight new refusals in the review's matrix were legitimate SQL."""
+    verdict = plan("SELECT a FROM v",
+                   view("WITH recent AS (SELECT film_id AS a FROM film) SELECT a FROM recent"),
+                   FILTERED)
     assert isinstance(verdict, Approved), verdict
+
+
+def test_but_a_cte_named_after_a_filtered_table_still_refuses():
+    """Exempting CTE aliases from the KNOWN check weakens nothing: `_mentions` still collects
+    the alias, so the filtered check still trips."""
+    verdict = plan("SELECT a FROM v",
+                   view("WITH customer AS (SELECT film_id AS a FROM film) SELECT a FROM customer"),
+                   FILTERED)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW
