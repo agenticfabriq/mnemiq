@@ -14,21 +14,17 @@ def object_key(table: exp.Table) -> str:
     read a different catalog's table; snapshot object-ids never carry three parts, so a
     three-part reference now matches nothing and is refused.
 
-    An identifier containing a literal dot cannot be spelled unambiguously in a dotted key --
-    the single quoted identifier `"pg.entitlement"` would otherwise equal `pg.entitlement`, and
-    they are different tables. Those get a key that cannot match any object-id, which refuses
-    them: a pathological name is not worth a matching rule that can be gamed.
+A quoted identifier containing a literal dot is ambiguous against a dotted key --
+    `"pg.entitlement"` reads the same as `pg.entitlement`. It is left ambiguous here rather
+    than made unmatchable: a discovered table genuinely named `sales.2026` has that string as
+    its object-id, and refusing it would make a real table unqueryable to spare a hypothetical
+    one. Row-filter validation, where the collision was exploitable, refuses dotted
+    identifiers itself.
 
     This was three functions (`object_key`, `_full_key`, and a bare `.name`) that disagreed,
     and every disagreement between them was a bypass.
     """
-    parts = [p for p in (table.text("catalog"), table.text("db"), table.name) if p]
-    if any("." in p for p in parts):
-        # Prefixed, not merely joined: `"\x00".join(["pg.entitlement"])` is the string back
-        # again, so a SINGLE quoted identifier containing a dot would have sailed through the
-        # guard meant to stop it.
-        return "\x00" + "\x00".join(parts)
-    return ".".join(parts)
+    return ".".join(p for p in (table.text("catalog"), table.text("db"), table.name) if p)
 
 
 def expand_tables(ast: exp.Expression, registry: dict[str, str]) -> None:

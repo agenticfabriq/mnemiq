@@ -16,7 +16,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.policy import AccessPolicy, build_access_policy
 from mnemiq.sql.rls import _validate_filter
 from mnemiq.sql.schema import visible_schema
-from mnemiq.sql.verdict import Approved, Refusal
+from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 
 D = "postgres"
 
@@ -84,40 +84,6 @@ def _through_the_real_builder(grants: GrantSet):
     snap = _snapshot()
     return (visible_schema(snap, grants), build_access_policy(snap, grants),
             {v.object_id: v for v in snap.views})
-
-
-def test_a_view_only_grant_is_filtered_when_the_filter_names_the_base():
-    grants = GrantSet(frozenset({"customer_list"}), row_filters={"customer": "store_id = 1"})
-    visible, policy, views = _through_the_real_builder(grants)
-    v = plan("SELECT id FROM customer_list", visible, policy, views)
-    assert isinstance(v, Approved), v
-    assert "store_id = 1" in v.plan_sql, "the base filter never reached the inlined body"
-
-
-def test_a_view_only_grant_is_filtered_when_the_filter_names_the_view():
-    """The filter's column is in the view's OUTPUT, so it can be applied there -- but inlining
-    removed the node it was keyed to before the rewrite ran."""
-    grants = GrantSet(frozenset({"customer_list"}), row_filters={"customer_list": "sid = 1"})
-    visible, policy, views = _through_the_real_builder(grants)
-    v = plan("SELECT id FROM customer_list", visible, policy, views)
-    assert isinstance(v, Approved), v
-    assert "sid = 1" in v.plan_sql, "the view-keyed filter was silently unused"
-
-
-def test_a_mask_keyed_to_a_view_column_survives_inlining():
-    grants = GrantSet(frozenset({"customer_list"}), pii_mask=frozenset({"pii"}))
-    visible, policy, views = _through_the_real_builder(grants)
-    assert ("customer_list", "email") in policy.masked  # the real builder keys it to the view
-    v = plan("SELECT email FROM customer_list", visible, policy, views)
-    assert isinstance(v, Approved), v
-    assert "NULL AS email" in v.plan_sql, "inlining dropped the mask"
-
-
-def test_the_caller_still_only_learns_they_read_the_view():
-    grants = GrantSet(frozenset({"customer_list"}), row_filters={"customer": "store_id = 1"})
-    visible, policy, views = _through_the_real_builder(grants)
-    v = plan("SELECT id FROM customer_list", visible, policy, views)
-    assert v.tables == ["customer_list"]
 
 
 # --- F4: qualification dropped when validating a subquery ------------------------
@@ -211,55 +177,6 @@ def test_but_an_UNPARSEABLE_view_keeps_the_policy_live_so_the_inliner_can_refuse
     assert isinstance(v, Refusal), f"an unreadable view was approved unfiltered: {v}"
 
 
-def test_a_qualified_view_base_is_reached_with_the_same_key_the_inliner_uses():
-    """`_reachable` compared bare names while the inliner resolves `object_key`, so `pg.base`
-    was never reached, its filter was dropped, and the view read unfiltered."""
-    snap = Snapshot(
-        version="v1", source_id="s", created_at="t",
-        columns=[Column(id="v.id", object_id="v", name="id"),
-                 Column(id="pg.base.id", object_id="pg.base", name="id"),
-                 Column(id="pg.base.tenant_id", object_id="pg.base", name="tenant_id")],
-        views=[ViewDefinition(object_id="v", dialect=D, definition="SELECT id FROM pg.base")],
-    )
-    g = GrantSet(frozenset({"v"}), row_filters={"pg.base": "tenant_id = 1"})
-    pol, vis = build_access_policy(snap, g), visible_schema(snap, g)
-    assert "pg.base" in pol.row_filters, "the qualified base was never reached"
-    v = plan("SELECT id FROM v", vis, pol, {x.object_id: x for x in snap.views})
-    assert isinstance(v, Approved), v
-    assert "tenant_id = 1" in v.plan_sql, "the qualified base's filter never landed"
-
-
-def test_a_policys_own_subquery_is_not_inlined_and_not_filtered():
-    """The two-visibility rule, broken by the fix that restored it elsewhere. A view named
-    INSIDE a row filter belongs to the policy, so it reads with the policy author's reach --
-    inlining it and then applying the caller's filter to its bases is the caller's reach."""
-    snap = Snapshot(
-        version="v1", source_id="s", created_at="t",
-        columns=[Column(id="payment.payment_id", object_id="payment", name="payment_id"),
-                 Column(id="payment.customer_id", object_id="payment", name="customer_id"),
-                 Column(id="customer.customer_id", object_id="customer", name="customer_id"),
-                 Column(id="customer.store_id", object_id="customer", name="store_id"),
-                 Column(id="customer_view.customer_id", object_id="customer_view",
-                        name="customer_id")],
-        views=[ViewDefinition(object_id="customer_view", dialect=D,
-                              definition="SELECT customer_id FROM customer")],
-    )
-    # The view is granted TOO, so `customer` is reachable and its filter survives the policy
-    # builder. Without that this passes for the wrong reason -- the filter is dropped and there
-    # is nothing left to leak, which is the unreachable-fixture trap that hid the original bug.
-    g = GrantSet(frozenset({"payment", "customer_view"}), row_filters={
-        "payment": "customer_id IN (SELECT customer_id FROM customer_view)",
-        "customer": "store_id = 1"})
-    pol, vis = build_access_policy(snap, g), visible_schema(snap, g)
-    v = plan("SELECT payment_id FROM payment", vis, pol,
-             {x.object_id: x for x in snap.views})
-    assert isinstance(v, Approved), v
-    assert "customer" in pol.row_filters, "the fixture no longer exercises the interaction"
-    assert "store_id = 1" not in v.plan_sql, (
-        "the caller's filter reached inside the policy's own subquery"
-    )
-
-
 def test_a_three_part_name_cannot_borrow_another_catalogs_key():
     """`object_key` keeps `db.table` and drops the catalog, so two catalogs collide."""
     got = _validate_filter(
@@ -321,32 +238,48 @@ def test_an_unresolvable_statement_that_touches_nothing_sensitive_still_runs(mon
     assert isinstance(v, Approved), v
 
 
-def test_a_denied_base_column_is_not_readable_through_a_granted_view():
-    """Masks were carried across inlining and denials were not -- nothing asked what ELSE keys
-    on the object that inlining removes."""
+# --- what the floor keeps, and what it openly does not ---------------------------
+
+
+def test_a_view_column_is_governed_at_the_view_by_its_own_classification():
+    """Why the floor need not trigger on column dispositions: enrichment classifies a view's
+    OWN columns, so CLS governs them without reading the body. Pagila's `customer_list.phone`
+    carries its own pii_level."""
     snap = Snapshot(
         version="v1", source_id="s", created_at="t",
-        columns=[Column(id="v.email", object_id="v", name="email"),
+        columns=[Column(id="v.email", object_id="v", name="email", pii_level="pii"),
                  Column(id="base.email", object_id="base", name="email", pii_level="pii")],
         views=[ViewDefinition(object_id="v", dialect=D, definition="SELECT email FROM base")],
     )
-    g = GrantSet(frozenset({"v"}))          # no clearance -> base.email is DENIED
+    g = GrantSet(frozenset({"v"}))            # no clearance -> v.email is DENIED at the view
     pol, vis = build_access_policy(snap, g), visible_schema(snap, g)
-    assert ("base", "email") in pol.denied
     v = plan("SELECT email FROM v", vis, pol, {x.object_id: x for x in snap.views})
-    assert isinstance(v, Refusal), f"a denied column was read through a view: {getattr(v,'plan_sql',v)}"
+    assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_COLUMN
 
 
-def test_a_view_over_a_column_that_is_merely_masked_still_answers():
-    """Denial refuses; masking does not. The distinction must survive the same path."""
+def test_an_unclassified_view_column_over_a_classified_base_is_the_known_gap():
+    """Stated as a test so it cannot be forgotten. If enrichment tags a base column and MISSES
+    the view column derived from it, the floor does not catch it -- the floor reads row filters,
+    not lineage. That is an enrichment gap, and closing it properly is the column-lineage work
+    this feature was reverted for."""
     snap = Snapshot(
         version="v1", source_id="s", created_at="t",
-        columns=[Column(id="v.email", object_id="v", name="email"),
+        columns=[Column(id="v.email", object_id="v", name="email"),          # NOT classified
                  Column(id="base.email", object_id="base", name="email", pii_level="pii")],
         views=[ViewDefinition(object_id="v", dialect=D, definition="SELECT email FROM base")],
     )
-    g = GrantSet(frozenset({"v"}), pii_mask=frozenset({"pii"}))
+    g = GrantSet(frozenset({"v"}))
     pol, vis = build_access_policy(snap, g), visible_schema(snap, g)
     v = plan("SELECT email FROM v", vis, pol, {x.object_id: x for x in snap.views})
-    assert isinstance(v, Approved), v
-    assert "NULL AS email" in v.plan_sql
+    assert isinstance(v, Approved), "if this now refuses, the gap closed and the note is stale"
+
+
+def test_a_filter_may_not_name_the_synthetic_subject_table():
+    """`__mnemiq_filtered__` stands in for the filtered table while a predicate is validated.
+    It is a real identifier at execution time and was exempt from the table check, so a filter
+    naming it read whatever table carried that name. Unspellable by convention is not
+    unspellable."""
+    got = _validate_filter(
+        "EXISTS (SELECT 1 FROM __mnemiq_filtered__ s WHERE s.customer_id = customer_id)",
+        {"customer_id"}, D, {"entitlement": {"customer_id"}})
+    assert got is None

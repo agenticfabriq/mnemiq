@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import sqlglot
 from sqlglot import exp
 
@@ -10,35 +8,9 @@ from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import base_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
-# A view whose body reaches this deep is either a cycle the stack missed or a schema nobody
-# should be governing by inlining. Refusing beats emitting SQL of unbounded size.
+# A view nested deeper than this is either a cycle the stack missed or a schema nobody should
+# be governing by reading definitions. Refusing beats walking forever.
 MAX_DEPTH = 8
-
-
-@dataclass(frozen=True)
-class Inlined:
-    """The rewritten tree, and the base tables the rewrite brought into it.
-
-    `introduced` is the point of the type. Once a view's body is inlined, the query reads
-    tables the caller never named and that are absent from their `visible` map -- and those
-    tables MUST still receive the caller's row filters and column masks, or the view is exactly
-    the bypass M27 describes. Returning the set explicitly is deliberate: a row filter's own
-    subquery (M28) is also absent from `visible` and must NOT be filtered, and telling the two
-    apart by evaluation order alone is a security property resting on the order of two
-    statements. Named, it rests on a name.
-    """
-
-    ast: exp.Expression
-    introduced: dict[str, set[str]]
-    # For each column a view PUBLISHES, the base columns it is derived from. Keyed by the
-    # output name because that is what the caller can actually read: a body that merely
-    # mentions a restricted column in a projection nobody selects discloses nothing, and
-    # refusing on that would make any view naming a restricted column unusable.
-    exposes: dict[str, set[tuple[str, str]]]
-    # The identity of the nodes inlining ADDED. The caller may also reference one of these
-    # tables directly, and that reference was already rewritten on its own terms; wrapping it a
-    # second time would nest one filter inside an identical copy of itself.
-    nodes: set[int]
 
 
 def _body(view: ViewDefinition) -> exp.Expression | None:
@@ -57,105 +29,49 @@ def _body(view: ViewDefinition) -> exp.Expression | None:
     return parsed if isinstance(parsed, exp.Query) else None
 
 
-def _protected(node: exp.Expression, protect: set[int]) -> bool:
-    """Is this node inside a predicate the policy injected? Walked by ancestry rather than by
-    name, because the policy's subquery and the caller's own reference can name the same view
-    in one statement and must be treated oppositely."""
-    if not protect:
-        return False
-    current: exp.Expression | None = node
-    while current is not None:
-        if id(current) in protect:
-            return True
-        current = current.parent
-    return False
-
-
-def inline_views(
-    ast: exp.Expression,
-    views: dict[str, ViewDefinition],
-    schema: dict[str, set[str]],
-    protect: set[int] | None = None,
-) -> Inlined | Refusal:
-    """Replace every reference to a governed view with the SQL it stands for.
+def check_views(
+    ast: exp.Expression, views: dict[str, ViewDefinition], filtered: set[str]
+) -> Refusal | None:
+    """Refuse a granted view that reads a row-filtered table, and one this engine cannot read.
 
     M27: a view's rows are defined by SQL held in the source, so a filter on its base table
-    reaches nothing -- the decider refused the base table correctly and the repair loop used
-    that refusal as a signpost to the same data through the view. Wrapping the view's *output*
-    cannot fix it either: `sales_by_film_category` aggregates the tenancy column away entirely,
-    so there is nothing left to filter on. The body has to be inlined and the filter has to
-    land at the leaves, before the GROUP BY.
+    reaches nothing -- the decider refused the base table correctly, and the repair loop used
+    that refusal as a signpost to the same rows through the view.
 
-    Inlining also dissolves two problems that looked separate. A renamed column needs no
-    mapping -- `customer_list` exposes `store_id` as `sid`, and the filter goes on
-    `customer.store_id` inside, where it still has its own name. And the base tables come from
-    parsing the body, so the dependency data needs no catalog privileges: the obvious source,
-    `information_schema.view_table_usage`, returns nothing at all to a non-owner.
+    **This is the floor, not the fix.** The fix is to inline the body so the filter lands at
+    the leaves, and it was built, merged, and taken back out. Applying a policy *through* a
+    view needs column-level lineage, and a lineage model that does not understand `SELECT *`,
+    `UNION`, aggregates or transitive renames fails OPEN on every shape it misses -- four
+    review rounds found bypasses in ordinary view definitions, the last of them in
+    `SELECT * FROM base`.
 
-    Fails closed on a body that will not parse, a view nested deeper than `MAX_DEPTH`, and a
-    cycle -- which is the option this replaced, kept as this one's error branch rather than as
-    an alternative to it.
+    The floor asks a question with no unmodelled shapes: *which tables does this body mention*.
+    `find_all` answers that for every spelling of SQL -- a star mentions its tables, a union
+    mentions both sides' -- and a body that will not parse is refused outright. There is no
+    shape that yields FEWER tables than the body reads, so every way this can be wrong points
+    at refusing.
+
+    Only row filters trigger it. Column dispositions need not, because enrichment classifies a
+    view's own columns independently -- `customer_list.phone` carries its own `pii_level` -- so
+    CLS already governs them at the view. Including them was measured on Pagila: all seven
+    views refuse for all three roles, including one with no row filters at all.
     """
-    introduced: dict[str, set[str]] = {}
-    nodes: set[int] = set()
-    exposes: dict[str, set[tuple[str, str]]] = {}
-    refusal = _expand(ast, views, schema, introduced, nodes, exposes, (), 0, protect or set())
-    if refusal is not None:
-        return refusal
-    return Inlined(ast=ast, introduced=introduced, nodes=nodes, exposes=exposes)
+    if not filtered:
+        return None
+    return _walk(ast, views, filtered, (), 0)
 
 
-def _exposes(body: exp.Expression) -> dict[str, set[tuple[str, str]]]:
-    """Output column name -> the base (table, column) pairs it is derived from.
-
-    A view body is self-contained, so a column in it cannot be a correlated reference to the
-    caller's query and can be attributed here -- which the general resolver refuses to do for
-    an unqualified column, correctly, because anywhere else it might be. With one source in
-    scope the attribution is exact; with several it over-attributes, which is the direction to
-    be wrong in.
-    """
-    out: dict[str, set[tuple[str, str]]] = {}
-    if not isinstance(body, exp.Select):
-        return out
-    sources = {
-        table.alias_or_name: object_key(table) for table in base_tables(body)
-    }
-    if not sources:
-        return out
-    for projection in body.expressions:
-        published = projection.alias_or_name
-        if not published:
-            continue
-        derived = out.setdefault(published, set())
-        for column in projection.find_all(exp.Column):
-            if column.table:
-                owner = sources.get(column.table)
-                if owner:
-                    derived.add((owner, column.name))
-            else:
-                derived.update((owner, column.name) for owner in sources.values())
-    return out
-
-
-def _expand(
+def _walk(
     ast: exp.Expression,
     views: dict[str, ViewDefinition],
-    schema: dict[str, set[str]],
-    introduced: dict[str, set[str]],
-    nodes: set[int],
-    exposes: dict[str, set[tuple[str, str]]],
+    filtered: set[str],
     stack: tuple[str, ...],
     depth: int,
-    protect: set[int],
 ) -> Refusal | None:
     for node in base_tables(ast):
         name = object_key(node)
         view = views.get(name)
         if view is None:
-            continue
-        if _protected(node, protect):
-            # A view the POLICY named. It reads with the policy author's reach, so it is left
-            # exactly as written -- not inlined, and therefore never filtered.
             continue
         if name in stack:
             return Refusal(
@@ -177,23 +93,22 @@ def _expand(
             return Refusal(
                 code=RefusalCode.UNRESOLVABLE_VIEW,
                 message=(
-                    f"{name!r} is a view whose definition this engine cannot read, so the "
-                    "access policy on the tables behind it cannot be applied."
+                    f"{name!r} is a view whose definition this engine cannot read, so it "
+                    "cannot confirm the row policy on the tables behind it."
                 ),
                 subject=name,
             )
-        nested = _expand(body, views, schema, introduced, nodes, exposes, (*stack, name),
-                         depth + 1, protect)
+        reached = sorted({object_key(t) for t in base_tables(body)} & filtered)
+        if reached:
+            return Refusal(
+                code=RefusalCode.UNGOVERNED_VIEW,
+                message=(
+                    f"{name!r} reads {reached[0]!r}, which is row-filtered for you, and this "
+                    "engine cannot apply that filter through a view. Query the table directly."
+                ),
+                subject=name,
+            )
+        nested = _walk(body, views, filtered, (*stack, name), depth + 1)
         if nested is not None:
             return nested
-        for published, derived in _exposes(body).items():
-            exposes.setdefault(published, set()).update(derived)
-        for inner in base_tables(body):
-            inner_name = object_key(inner)
-            if inner_name not in views and inner_name in schema:
-                introduced.setdefault(inner_name, set()).update(schema[inner_name])
-                nodes.add(id(inner))
-        node.replace(
-            exp.Subquery(this=body, alias=exp.TableAlias(this=exp.to_identifier(node.alias_or_name)))
-        )
     return None

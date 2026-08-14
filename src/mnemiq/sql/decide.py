@@ -12,7 +12,7 @@ from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.rls import apply_row_and_mask
 from mnemiq.sql.values_check import check_values
-from mnemiq.sql.views import inline_views
+from mnemiq.sql.views import check_views
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
 
 
@@ -48,6 +48,12 @@ def decide(
     if cls is not None:
         return cls
 
+    # A row filter cannot be applied through a view, so a view that reads a filtered table is
+    # declined rather than answered past. The floor, deliberately -- see `check_views` (M27).
+    ungoverned = check_views(shaped, views or {}, set(policy.row_filters))
+    if ungoverned is not None:
+        return ungoverned
+
     violation = lint(shaped)
     if violation is not None:
         # silently-wrong SQL: runs fine, wrong answer. Repairable -- the corrector fixes it.
@@ -79,65 +85,9 @@ def decide(
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
     if not policy.empty:
-        # Two passes, because inlining REMOVES the object a view-keyed policy is attached to.
-        #
-        # First the objects the caller actually named. A view granted on its own carries its
-        # own filters and masks -- `customer_list.email` is masked, `customer_list: sid = 1`
-        # filters -- and both are expressible on the view's output. Inlining first threw the
-        # node away and the policy with it, which is how a masked column came back in the
-        # clear (Codex review, 2026-08-12).
-        injected: set[int] = set()
-        shaped = apply_row_and_mask(
-            shaped, policy, visible, dialect=dialect, injected=injected
-        )
+        shaped = apply_row_and_mask(shaped, policy, visible, dialect=dialect)
         if isinstance(shaped, Refusal):
             return shaped
-
-        # Then resolve views to their bases, so a filter on a base lands at the leaves rather
-        # than on a view's output -- which for an aggregating view is not a weaker fix but an
-        # impossible one, the tenancy column having been grouped away (M27).
-        expanded = inline_views(shaped, views or {}, policy.policy_schema,
-                                protect=injected)
-        if isinstance(expanded, Refusal):
-            return expanded
-        shaped = expanded.ast
-
-        # A DENIED column is not readable through a view either. `check_cls` ran before
-        # inlining, when the body was still one opaque node, and the rewrite below only knows
-        # how to NULL a masked column -- so a denied base column came back raw through a
-        # granted view. Masks were fixed here and denials were not, because nothing asked what
-        # ELSE keys on the object inlining removes.
-        #
-        # Scoped to columns that resolve to an INTRODUCED table: re-running check_cls over the
-        # whole tree would fire on the rewriter's own projections, which list every visible
-        # column of a filtered table including denied ones.
-        # Only what the CALLER reads. `columns` was taken from the query as asked, so a body
-        # that merely mentions a restricted column in a projection nobody selected is not a
-        # disclosure -- refusing on that would make any view naming one unusable.
-        exposed = {
-            pair
-            for published in columns
-            for pair in expanded.exposes.get(published, ())
-        }
-        denied_read = exposed & policy.denied
-        if denied_read:
-            name = sorted(denied_read)[0][1]
-            return Refusal(
-                code=RefusalCode.UNAUTHORIZED_COLUMN,
-                message=f"You may not read the column {name!r}.",
-                subject=name,
-            )
-
-        # Finally the bases inlining introduced. Restricted to the NODES it added: a caller may
-        # also name one of those tables directly, and that reference was already rewritten in
-        # the first pass. A row filter's own subquery (M28) is excluded for free -- it is
-        # injected during a pass, never scanned by one.
-        if expanded.nodes:
-            shaped = apply_row_and_mask(
-                shaped, policy, expanded.introduced, dialect=dialect, only=expanded.nodes
-            )
-            if isinstance(shaped, Refusal):
-                return shaped
 
     # Federation: 'catalog.table' -> 'catalog.schema.table' so DuckDB resolves it. No-op single-source.
     expand_tables(shaped, registry or {})

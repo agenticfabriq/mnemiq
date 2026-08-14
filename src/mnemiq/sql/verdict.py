@@ -25,6 +25,10 @@ class RefusalCode(StrEnum):
     # is the floor the full fix keeps as its error branch: an unresolvable view is one whose
     # base tables' filters cannot be applied, and answering from it anyway is M27 (M27).
     UNRESOLVABLE_VIEW = "unresolvable_view"
+    # A granted view that reads a row-filtered table. The engine cannot apply the filter
+    # through a view, so it declines rather than answer past it -- distinct from
+    # UNRESOLVABLE_VIEW, which is a view it could not read at all (M27).
+    UNGOVERNED_VIEW = "ungoverned_view"
     # Deployment-level, not grant-level: this deployment does not do writes at all. Distinct from
     # UNAUTHORIZED_WRITE, which is a statement about THIS identity's grants (M3).
     WRITES_DISABLED = "writes_disabled"

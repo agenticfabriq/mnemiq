@@ -52,6 +52,11 @@ def _validate_filter(
     # `FROM other e` overwrote an outer `FROM entitlement e` and an invalid column was checked
     # against the wrong table. That is the third place a flat alias map has been a bypass --
     # `check_access`, `check_cls`, and here. There is now one resolver and no local maps.
+    if _SUBJECT in filt:
+        # The stand-in is a real identifier at execution time and is exempt from the table
+        # check below, so a filter naming it would read whatever table happens to carry that
+        # name. Unspellable by convention is not unspellable.
+        return None
     schema = dict(policy_schema or {})
     schema[_SUBJECT] = set(cols)
     try:
@@ -63,6 +68,8 @@ def _validate_filter(
         return None  # scopes unreadable -> the filter cannot be validated, so it is refused
 
     for table in base_tables(wrapped):
+        if any("." in part for part in (table.text("catalog"), table.text("db"), table.name)):
+            return None  # `"pg.entitlement"` is not `pg.entitlement`, and a dotted key cannot
         key = object_key(table)
         if key != _SUBJECT and key not in schema:
             return None  # a table the policy author has not got
