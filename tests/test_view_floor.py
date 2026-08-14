@@ -259,3 +259,40 @@ def test_a_function_source_cannot_hide_behind_nested_containers(body):
     verdict = decide("SELECT a FROM v", GRANTED, dialect="duckdb", target="duckdb",
                      policy=FILTERED, views=views)
     assert isinstance(verdict, Refusal), f"a function hid behind parentheses: {verdict}"
+
+
+def test_a_body_may_only_read_objects_the_snapshot_knows():
+    """A caller writing `SELECT a FROM 'customer.csv'` is already refused UNAUTHORIZED_TABLE --
+    the name is not in `visible`. A view body was never held to that, so a view could reach a
+    file the caller could not. That is M27's shape again: the view reaching past the caller's
+    own boundary."""
+    verdict = decide("SELECT a FROM v", GRANTED, dialect="duckdb", target="duckdb",
+                     policy=FILTERED,
+                     views={"v": ViewDefinition(object_id="v", dialect="duckdb",
+                                                definition="SELECT a FROM 'customer.csv'")})
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW
+
+
+def test_the_known_object_rule_closes_every_unknown_spelling_not_just_files():
+    verdict = decide("SELECT a FROM v", GRANTED, dialect=D, target=D, policy=FILTERED,
+                     views={"v": ViewDefinition(object_id="v", dialect=D,
+                                                definition="SELECT a FROM nowhere_at_all")})
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "SELECT 1 AS a FROM (film JOIN film g ON film.film_id = g.film_id) q",
+        "SELECT * FROM (PIVOT film ON title USING count(film_id)) p",
+    ],
+    ids=["parenthesised-named-join", "pivot-over-named-table"],
+)
+def test_shapes_the_source_executes_are_no_longer_refused_for_being_containers(body):
+    """Requiring a Subquery to hold a Query bought nothing once functions are caught by node
+    type wherever they sit and named tables are collected by the raw walk -- it only refused
+    idioms DuckDB runs happily."""
+    views = {"v": ViewDefinition(object_id="v", dialect="duckdb", definition=body)}
+    verdict = decide("SELECT a FROM v", GRANTED, dialect="duckdb", target="duckdb",
+                     policy=FILTERED, views=views)
+    assert isinstance(verdict, Approved), verdict

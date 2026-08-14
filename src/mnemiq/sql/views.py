@@ -70,10 +70,29 @@ def _unrecognised_source(body: exp.Expression) -> str | None:
     for source in sources:
         if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
             continue
-        if isinstance(source, exp.Subquery) and isinstance(source.this, exp.Query):
-            continue  # a real subquery: its own FROM/JOIN nodes are enumerated by this walk
-        return type(source.this if isinstance(source, exp.Subquery) else source).__name__
+        if isinstance(source, exp.Subquery):
+            # Anything: a function inside is caught by the node-type scan above wherever it
+            # sits, and a named table inside is collected by the raw walk. Requiring a Query
+            # here bought no safety once those two hold, and refused parenthesised joins and
+            # pivots over named tables that the source executes happily.
+            continue
+        return type(source).__name__
     return None
+
+
+def _spellings(names: set[str]) -> set[str]:
+    """Every spelling a name might be written in: itself, folded, and its bare last segment.
+
+    One function for both comparisons -- what a body MENTIONS and what the source KNOWS -- 
+    because when only the filtered set was widened, the known-object check refused every
+    qualified reference it should have accepted. Two sets compared against each other must be
+    normalised the same way or the comparison is between two different vocabularies.
+    """
+    out: set[str] = set()
+    for name in names:
+        bare = name.rsplit(".", 1)[-1]
+        out |= {name, name.lower(), bare, bare.lower()}
+    return out
 
 
 def _mentions(body: exp.Expression) -> set[str]:
@@ -88,14 +107,17 @@ def _mentions(body: exp.Expression) -> set[str]:
     """
     tables = list(body.find_all(exp.Table))
     names = {object_key(t) for t in tables} | {t.name for t in tables if t.name}
-    # Folded, because unquoted identifiers are case-insensitive in all three engines and
-    # `PUBLIC.CUSTOMER` was not matching a filtered `customer`. Folding here can only ADD
+    # Folded and bare-segmented, because unquoted identifiers are case-insensitive in all three
+    # engines and a body may qualify what the snapshot keys bare. Widening here can only ADD
     # matches, and every added match is a refusal.
-    return names | {n.lower() for n in names}
+    return _spellings(names)
 
 
 def check_views(
-    ast: exp.Expression, views: dict[str, ViewDefinition], filtered: set[str]
+    ast: exp.Expression,
+    views: dict[str, ViewDefinition],
+    filtered: set[str],
+    known: set[str] | None = None,
 ) -> Refusal | None:
     """Refuse a granted view that reads a row-filtered table, and one this engine cannot read.
 
@@ -123,13 +145,14 @@ def check_views(
     """
     if not filtered:
         return None
-    return _walk(ast, views, filtered, (), 0)
+    return _walk(ast, views, filtered, known or set(), (), 0)
 
 
 def _walk(
     ast: exp.Expression,
     views: dict[str, ViewDefinition],
     filtered: set[str],
+    known: set[str],
     stack: tuple[str, ...],
     depth: int,
 ) -> Refusal | None:
@@ -181,6 +204,31 @@ def _walk(
         wanted = {f for f in filtered} | {f.lower() for f in filtered} \
             | {f.rsplit(".", 1)[-1] for f in filtered} \
             | {f.rsplit(".", 1)[-1].lower() for f in filtered}
+        # A body may only read objects the snapshot knows. A caller writing
+        # `SELECT a FROM 'customer.csv'` is already refused UNAUTHORIZED_TABLE because the name
+        # is not in `visible`; a view body was never held to that, so a view could reach a file
+        # the caller could not. That is M27's shape -- the view reaching past the caller's own
+        # boundary -- and it closes every unknown-object spelling at once rather than the file
+        # literal specifically.
+        if known:
+            recognised = _spellings(known) | _spellings(set(views))
+            # BOTH sides normalised. Widening only the known set still rejected `public.film`
+            # against a snapshot that keys it `film`: a name is known when ANY of its spellings
+            # matches any recognised one, not when its exact text appears.
+            unknown = sorted(
+                object_key(x)
+                for x in body.find_all(exp.Table)
+                if not (_spellings({object_key(x)}) & recognised)
+            )
+            if unknown:
+                return Refusal(
+                    code=RefusalCode.UNRESOLVABLE_VIEW,
+                    message=(
+                        f"{name!r} reads {unknown[0]!r}, which is not an object in this source, "
+                        "so this engine cannot tell what policy applies to it."
+                    ),
+                    subject=name,
+                )
         reached = sorted(_mentions(body) & wanted)
         if reached:
             return Refusal(
@@ -191,7 +239,7 @@ def _walk(
                 ),
                 subject=name,
             )
-        nested = _walk(body, views, filtered, (*stack, name), depth + 1)
+        nested = _walk(body, views, filtered, known, (*stack, name), depth + 1)
         if nested is not None:
             return nested
     return None
