@@ -2,6 +2,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .values import CodedValue, JoinKey, MeasureExpr
 
+# The closed vocabulary of `Column.pii_level`. Lives here, beside the field, so the producer
+# (enrichment) and the consumers (the value-index gate, and the authz clearance check) read
+# one set and cannot drift -- `pii_clearance`/`pii_mask` are sets drawn from these same levels,
+# so a clearance value outside this set clears nothing (M40).
+PII_LEVELS: tuple[str, ...] = ("none", "pii", "phi")
+
 
 class SourceBinding(BaseModel):
     id: str

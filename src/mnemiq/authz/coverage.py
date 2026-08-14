@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 
 from mnemiq.authz.grants import GrantSet
+from mnemiq.contract import PII_LEVELS
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,37 @@ def unfiltered_dependents(grants: GrantSet, relationships) -> list[tuple[str, st
                     seen.add(parent)
                     stack.append(parent)
     return sorted(set(found))
+
+
+def unknown_pii_levels(grants: GrantSet) -> list[str]:
+    """The `pii_clearance`/`pii_mask` values that are not PII levels, sorted.
+
+    Clearance/mask are sets drawn from `PII_LEVELS`, and a column is read raw iff its level is in
+    `pii_clearance`. The sensitive columns an operator means to reach are classified `pii`/`phi`,
+    so a value outside the vocabulary -- a `low`/`medium`/`high` clearance scale, say -- can clear
+    none of them: it denies rather than leaks, but silently (M40). (Nothing enforces `PII_LEVELS`
+    on `Column.pii_level` itself; a producer that wrote an off-vocabulary level is a separate gap.)
+    """
+    return sorted((grants.pii_clearance | grants.pii_mask) - set(PII_LEVELS))
+
+
+def warn_unknown_pii_levels(grants: GrantSet, role: str = "") -> None:
+    """Log a clearance/mask value that names no PII level, fail-soft. A warning, never a
+    refusal -- the policy is the operator's, but a grant that grants nothing must be visible."""
+    try:
+        unknown = unknown_pii_levels(grants)
+    except Exception:  # noqa: BLE001 -- an advisory check must never stop a boot
+        logger.debug("pii-level vocabulary check failed", exc_info=True)
+        return
+    if not unknown:
+        return
+    who = f" for role '{role}'" if role else ""
+    logger.warning(
+        "pii-level vocabulary%s: pii_clearance/pii_mask names %s, which is not a PII level "
+        "(%s) -- the sensitive columns it was meant to reach are classified pii/phi, and a value "
+        "outside that set clears none of them, so they stay denied",
+        who, ", ".join(unknown), "/".join(PII_LEVELS),
+    )
 
 
 def warn_unfiltered_dependents(grants: GrantSet, relationships, role: str = "") -> None:
