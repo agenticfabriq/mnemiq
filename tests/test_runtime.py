@@ -1,9 +1,11 @@
+import logging
+
 import pytest
 
 from mnemiq.authz.grants import DenyAll, GrantSet
 from mnemiq.config import Settings
-from mnemiq.contract import IdentityContext
-from mnemiq.runtime import Runtime, SnapshotMissing, build_runtime
+from mnemiq.contract import IdentityContext, JoinKey, Relationship, Snapshot
+from mnemiq.runtime import Runtime, SnapshotMissing, _warn_policy_advisories, build_runtime
 
 
 def _identity():
@@ -26,6 +28,55 @@ class _StaticAuthz:
 
     def grants_for(self, _identity):
         return self._g
+
+
+class _RoledAuthz:
+    """Enumerates one role (like FileAuthzProvider) and returns a fixed grant for it, so the
+    boot advisory has a role to walk."""
+
+    def __init__(self, role, grant):
+        self._role, self._grant = role, grant
+
+    def policy_roles(self):
+        return [self._role]
+
+    def grants_for(self, _identity):
+        return self._grant
+
+
+def _snapshot_with(relationships):
+    return Snapshot(version="v1", source_id="s", created_at="2026-01-01T00:00:00Z",
+                    relationships=relationships)
+
+
+def test_boot_advisory_warns_about_an_off_vocabulary_clearance_without_a_snapshot(caplog):
+    # The wiring restructure must run the clearance check even when no snapshot is available:
+    # a clearance value's validity does not depend on the snapshot.
+    authz = _RoledAuthz(
+        "hq_analyst", GrantSet(frozenset({"customer"}), pii_clearance=frozenset({"high"}))
+    )
+
+    with caplog.at_level(logging.WARNING):
+        _warn_policy_advisories(authz, None)
+
+    assert "hq_analyst" in caplog.text and "high" in caplog.text
+
+
+def test_boot_advisory_still_reports_row_filter_holes_when_a_snapshot_is_present(caplog):
+    # And the row-filter advisory the restructure sits beside must keep firing when it can.
+    authz = _RoledAuthz(
+        "store1", GrantSet(frozenset({"customer", "payment"}),
+                           row_filters={"customer": "store_id = 1"})
+    )
+    snap = _snapshot_with([
+        Relationship(id="payment->customer", **{"from": "payment"}, to="customer",
+                     cardinality="many_to_one", join_keys=[JoinKey(left="k", right="k")]),
+    ])
+
+    with caplog.at_level(logging.WARNING):
+        _warn_policy_advisories(authz, snap)
+
+    assert "payment" in caplog.text  # the unfiltered dependent is still named
 
 
 class _Con:

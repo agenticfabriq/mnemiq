@@ -229,25 +229,29 @@ def _authz(settings: Settings) -> AuthzProvider:
     return FileAuthzProvider(settings.authz_path) if settings.authz_path else DenyAll()
 
 
-def _warn_row_filter_coverage(authz: AuthzProvider, snapshot: Snapshot | None) -> None:
-    """Say, at boot, which granted tables a row filter fails to reach.
+def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> None:
+    """Say, at boot, the two ways a policy silently grants less than its author meant:
 
-    A policy declares filters table by table, so a tenancy axis is only as tight as the
-    author's enumeration of everything hanging off it -- and nothing downstream complains,
-    because the engine is faithfully applying what it was given. Advisory: it reports, it
-    never refuses. The operator's policy is the operator's.
+    a row filter that fails to reach every table hanging off its tenancy axis, and a
+    `pii_clearance`/`pii_mask` value that names no PII level and so clears nothing (M40).
+    Both faithfully apply what the policy said, so nothing downstream complains. Advisory:
+    it reports, it never refuses. The operator's policy is the operator's.
     """
-    from mnemiq.authz.coverage import warn_unfiltered_dependents
+    from mnemiq.authz.coverage import warn_unfiltered_dependents, warn_unknown_pii_levels
     from mnemiq.contract import IdentityContext
 
     roles = getattr(authz, "policy_roles", None)
-    if snapshot is None or roles is None:
+    if roles is None:
         return  # a provider that cannot enumerate roles is not a provider with no holes
     for role in roles():
         grants = authz.grants_for(
             IdentityContext(tenant_id="boot", principal_id="boot", roles=[role])
         )
-        warn_unfiltered_dependents(grants, snapshot.relationships, role=role)
+        # A clearance value outside the PII vocabulary is inert whatever the snapshot holds,
+        # so it is warned about even when no snapshot is available to check filter coverage.
+        warn_unknown_pii_levels(grants, role=role)
+        if snapshot is not None:
+            warn_unfiltered_dependents(grants, snapshot.relationships, role=role)
 
 
 def _resolve_verify_level(mode_verify: str, override: str | None) -> str:
@@ -393,7 +397,7 @@ def build_runtime(settings: Settings) -> Runtime:
         for name, mode in MODES.items()
     }
     _boot_authz = _authz(settings)
-    _warn_row_filter_coverage(_boot_authz, snapshot)
+    _warn_policy_advisories(_boot_authz, snapshot)
     return Runtime(
         con=con,
         snapshot=snapshot,

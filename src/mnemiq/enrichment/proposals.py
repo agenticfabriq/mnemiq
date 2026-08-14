@@ -5,6 +5,11 @@ import re
 
 from pydantic import BaseModel, Field
 
+# The pii_level vocabulary is owned by the contract, beside the field it validates; imported
+# here (and re-exported for prompts.py) so the enrichment prompt and the authz clearance check
+# read one set (M40).
+from mnemiq.contract import PII_LEVELS
+
 SEMANTIC_TYPES: tuple[str, ...] = (
     "identifier",
     "code",
@@ -21,8 +26,6 @@ SEMANTIC_TYPES: tuple[str, ...] = (
     "free_text",
     "other",
 )
-
-PII_LEVELS: tuple[str, ...] = ("none", "pii", "phi")
 
 _MAX_DESCRIPTION = 400
 _MAX_MEANING = 200

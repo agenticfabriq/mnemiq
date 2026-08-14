@@ -6,7 +6,13 @@ their own 33,689.74, so the other store's revenue by subtraction, without naming
 touching a filtered table. The engine was correct; the policy was incomplete and nothing said so.
 """
 
-from mnemiq.authz.coverage import unfiltered_dependents
+import logging
+
+from mnemiq.authz.coverage import (
+    unfiltered_dependents,
+    unknown_pii_levels,
+    warn_unknown_pii_levels,
+)
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import JoinKey, Relationship
 
@@ -68,3 +74,61 @@ def test_many_to_many_does_not_imply_ownership():
     g = grants({"customer", "payment"}, {"customer": "store_id = 1"})
 
     assert unfiltered_dependents(g, [rel("payment", "customer", "many_to_many")]) == []
+
+
+# --- PII-clearance vocabulary (M40) -----------------------------------------
+# A column's pii_level is only ever none/pii/phi. A `pii_clearance` or `pii_mask` value
+# outside that set matches no column and silently grants nothing -- so an author who reaches
+# for a low/medium/high scale gets a clearance that clears nothing, with no feedback. The
+# engine is right to deny (fail-closed), but the misconfiguration must be visible.
+
+
+def cls_grants(clearance=(), mask=()):
+    return GrantSet(
+        frozenset({"customer"}),
+        pii_clearance=frozenset(clearance),
+        pii_mask=frozenset(mask),
+    )
+
+
+def test_a_clearance_value_outside_the_pii_vocabulary_is_reported():
+    g = cls_grants(clearance={"low", "medium", "high"})
+
+    assert unknown_pii_levels(g) == ["high", "low", "medium"]
+
+
+def test_the_real_pii_levels_are_not_reported():
+    g = cls_grants(clearance={"pii", "phi"}, mask={"pii"})
+
+    assert unknown_pii_levels(g) == []
+
+
+def test_none_in_a_clearance_is_a_no_op_not_an_error():
+    # 'none' is a valid level -- clearing it is pointless but not a misconfiguration.
+    g = cls_grants(clearance={"none", "pii"})
+
+    assert unknown_pii_levels(g) == []
+
+
+def test_an_unknown_mask_value_is_reported_too():
+    g = cls_grants(mask={"secret"})
+
+    assert unknown_pii_levels(g) == ["secret"]
+
+
+def test_warn_names_the_role_and_the_unknown_values(caplog):
+    g = cls_grants(clearance={"high"})
+
+    with caplog.at_level(logging.WARNING):
+        warn_unknown_pii_levels(g, role="hq_analyst")
+
+    assert "hq_analyst" in caplog.text and "high" in caplog.text
+
+
+def test_warn_is_silent_for_a_valid_policy(caplog):
+    g = cls_grants(clearance={"pii", "phi"}, mask={"pii"})
+
+    with caplog.at_level(logging.WARNING):
+        warn_unknown_pii_levels(g, role="hq_analyst")
+
+    assert caplog.records == []

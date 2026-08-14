@@ -1,6 +1,7 @@
 from .schema import export_json_schema, write_schema
 from .seams import DeferralReason, HistoryTurn, IdentityContext, Trace
 from .semantic import (
+    PII_LEVELS,
     CodeScheme,
     Column,
     CompatibilityProfile,
@@ -50,4 +51,5 @@ __all__ = [
     "Provenance",
     "RecordEnvelope",
     "CertifiedRecord",
+    "PII_LEVELS",
 ]
