@@ -46,12 +46,22 @@ def _unrecognised_source(body: exp.Expression) -> str | None:
     # the function tests caught it. Node types do not get renamed out from under a lookup.
     sources = [node.this for node in body.find_all(exp.From)]
     sources += [join.this for join in body.find_all(exp.Join)]
+    # Two conditions, and the second is the one round seven needed. A `Subquery` is allowed on
+    # the assumption its inner sources reappear as From/Join nodes -- but sqlglot represents a
+    # parenthesised join as `Subquery(Table-with-joins)` and a pivot as `Subquery(Pivot)`, and
+    # in both the ROOT source is in neither position. `FROM (query_table('customer') JOIN film)`
+    # therefore enumerated only `film`, and the real table name lives inside a string literal
+    # where nothing can read it. DuckDB executes both shapes.
+    #
+    # A table source is checked on `.this` being an Identifier rather than on having a name: a
+    # function call parses as `Table(Anonymous)`, which is what an empty name was standing in
+    # for, and the type is the fact while the empty name was a symptom of it.
     for source in sources:
-        if isinstance(source, exp.Table) and source.name:
+        if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
             continue
-        if isinstance(source, exp.Subquery):
-            continue  # its own FROM/JOIN nodes are enumerated by the same walk
-        return type(source).__name__
+        if isinstance(source, exp.Subquery) and isinstance(source.this, exp.Query):
+            continue  # a real subquery: its own FROM/JOIN nodes are enumerated by this walk
+        return type(source.this if isinstance(source, exp.Subquery) else source).__name__
     return None
 
 
@@ -66,7 +76,11 @@ def _mentions(body: exp.Expression) -> set[str]:
     object-id is `customer`.
     """
     tables = list(body.find_all(exp.Table))
-    return {object_key(t) for t in tables} | {t.name for t in tables if t.name}
+    names = {object_key(t) for t in tables} | {t.name for t in tables if t.name}
+    # Folded, because unquoted identifiers are case-insensitive in all three engines and
+    # `PUBLIC.CUSTOMER` was not matching a filtered `customer`. Folding here can only ADD
+    # matches, and every added match is a refusal.
+    return names | {n.lower() for n in names}
 
 
 def check_views(
@@ -150,7 +164,13 @@ def _walk(
                 ),
                 subject=name,
             )
-        reached = sorted(_mentions(body) & filtered)
+        # The filtered set is widened the same way and by its bare last segment, so a body
+        # saying `customer` still matches a filter keyed `public.customer`. Both directions,
+        # because a miss here means not refusing.
+        wanted = {f for f in filtered} | {f.lower() for f in filtered} \
+            | {f.rsplit(".", 1)[-1] for f in filtered} \
+            | {f.rsplit(".", 1)[-1].lower() for f in filtered}
+        reached = sorted(_mentions(body) & wanted)
         if reached:
             return Refusal(
                 code=RefusalCode.UNGOVERNED_VIEW,

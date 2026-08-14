@@ -187,3 +187,51 @@ def test_a_view_qualified_in_the_body_is_still_recognised_as_a_view():
     }
     verdict = plan("SELECT a FROM v", views, FILTERED)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW
+
+
+# --- round seven: a subquery's own root is a source too ---------------------------
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # sqlglot renders a parenthesised join as Subquery(Table-with-joins) and a pivot as
+        # Subquery(Pivot). In both the ROOT source sits in neither a From nor a Join, so it was
+        # never enumerated -- and the real table name lives inside a string literal where
+        # nothing can read it. DuckDB executes both.
+        "SELECT 1 AS a FROM (query_table('customer') JOIN film ON true) q",
+        "SELECT * FROM (PIVOT query_table('customer') ON c USING sum(x)) p",
+    ],
+    ids=["parenthesised-join-over-function", "pivot-over-function"],
+)
+def test_a_subquerys_own_root_source_is_checked_too(body):
+    views = {"v": ViewDefinition(object_id="v", dialect="duckdb", definition=body)}
+    verdict = decide("SELECT a FROM v", GRANTED, dialect="duckdb", target="duckdb",
+                     policy=FILTERED, views=views)
+    assert isinstance(verdict, Refusal), f"a hidden dynamic source was allowed: {verdict}"
+
+
+def test_a_function_source_is_recognised_by_node_type_not_by_an_empty_name():
+    """`query_table(...)` parses as `Table(Anonymous)`. The empty name was a symptom; the node
+    type is the fact, and checking the fact does not depend on the symptom holding."""
+    from mnemiq.sql.views import _unrecognised_source
+    import sqlglot
+
+    body = sqlglot.parse_one("SELECT * FROM query_table('customer')", read="duckdb")
+    assert _unrecognised_source(body) is not None
+
+
+def test_a_case_varying_reference_still_matches_a_filtered_table():
+    """Unquoted identifiers fold in all three engines, so `PUBLIC.CUSTOMER` is `customer`."""
+    verdict = plan("SELECT a FROM v",
+                   view("SELECT customer_id AS a FROM PUBLIC.CUSTOMER"), FILTERED)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW
+
+
+def test_a_bare_reference_matches_a_filter_keyed_with_a_qualifier():
+    """The other direction of the two-spelling match: filter keyed `public.customer`, body
+    saying `customer`. A miss here means not refusing."""
+    policy = AccessPolicy(row_filters={"public.customer": "store_id = 1"},
+                          policy_schema={"public.customer": {"customer_id", "store_id"}})
+    verdict = plan("SELECT a FROM v", view("SELECT customer_id AS a FROM customer"), policy)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW
