@@ -44,6 +44,17 @@ def _unrecognised_source(body: exp.Expression) -> str | None:
     # sqlglot spells `from_`, so it enumerated NOTHING -- and a whitelist that finds no sources
     # approves everything. It was failing open in exactly the way it exists to prevent, and only
     # the function tests caught it. Node types do not get renamed out from under a lookup.
+    # FIRST, and position-independent: a table node whose `.this` is not an Identifier is a
+    # function wearing a table's clothes, wherever it sits. Checking source POSITIONS caught
+    # `Subquery(Table)` and `Subquery(Pivot)` and still missed `((query_table('customer')))`,
+    # because a Subquery inside a Subquery satisfies the Query test while its root is in no
+    # From or Join slot. Containers nest arbitrarily; the node type does not move.
+    for table in body.find_all(exp.Table):
+        if not isinstance(table.this, exp.Identifier):
+            return type(table.this).__name__
+
+    # SECOND, by position, for sources that are not Table nodes at all -- LATERAL, UNNEST,
+    # VALUES. The two checks are independent on purpose: neither subsumes the other.
     sources = [node.this for node in body.find_all(exp.From)]
     sources += [join.this for join in body.find_all(exp.Join)]
     # Two conditions, and the second is the one round seven needed. A `Subquery` is allowed on

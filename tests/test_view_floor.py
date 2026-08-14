@@ -235,3 +235,27 @@ def test_a_bare_reference_matches_a_filter_keyed_with_a_qualifier():
                           policy_schema={"public.customer": {"customer_id", "store_id"}})
     verdict = plan("SELECT a FROM v", view("SELECT customer_id AS a FROM customer"), policy)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "SELECT * FROM ((query_table('customer'))) q",
+        "SELECT * FROM (((( query_table('customer') )))) q",
+        "SELECT * FROM (SELECT * FROM ((query_table('customer'))) i) o",
+        "WITH c AS (SELECT * FROM ((query_table('customer')))) SELECT * FROM c",
+    ],
+    ids=["double-paren", "quadruple-paren", "nested-in-derived", "nested-in-cte"],
+)
+def test_a_function_source_cannot_hide_behind_nested_containers(body):
+    """Checking source POSITIONS caught `Subquery(Table)` and `Subquery(Pivot)` and still
+    missed a Subquery inside a Subquery -- that satisfies the Query test while its root sits in
+    no From or Join slot. Containers nest arbitrarily; the node type does not move, so the
+    check is on the node type and not on where it sits.
+
+    Found by the Verity lane asking whether anything else in the model treats a CONTAINER as
+    not-a-source -- the same class, a different node type."""
+    views = {"v": ViewDefinition(object_id="v", dialect="duckdb", definition=body)}
+    verdict = decide("SELECT a FROM v", GRANTED, dialect="duckdb", target="duckdb",
+                     policy=FILTERED, views=views)
+    assert isinstance(verdict, Refusal), f"a function hid behind parentheses: {verdict}"
