@@ -188,3 +188,65 @@ def test_the_write_decider_has_no_second_rls_implementation():
         )
     # And the wrap itself is constructed in exactly one place.
     assert inspect.getsource(rls_module).count("def _derived_table") == 1
+
+
+# -- the class, not the instance ------------------------------------------------------------------
+
+# M39's sharpest lesson is that fixing an instance is not fixing a class. The finding named two
+# shapes (INSERT..SELECT, UPDATE..IN-subquery); the guard has to hold for every way a write can
+# read. Each of these was run against the fix and each binds -- including the shapes that read a
+# governed table from somewhere other than a FROM clause.
+_EVERY_READ_SHAPE = [
+    ("subquery_in_set", "UPDATE scratch SET amount = (SELECT max(amount) FROM claim) WHERE id = 1"),
+    ("subquery_in_values",
+     "INSERT INTO scratch (id, amount) VALUES (1, (SELECT max(amount) FROM claim))"),
+    ("correlated_exists", "UPDATE scratch SET amount = 0 "
+                          "WHERE EXISTS (SELECT 1 FROM claim WHERE claim.id = scratch.id)"),
+    ("union_source", "INSERT INTO scratch (id, amount) "
+                     "SELECT id, amount FROM claim UNION ALL SELECT id, amount FROM claim"),
+    ("nested_cte", "INSERT INTO scratch (id, amount) WITH a AS (SELECT id, amount FROM claim), "
+                   "b AS (SELECT id, amount FROM a) SELECT id, amount FROM b"),
+    ("recursive_cte", "INSERT INTO scratch (id, amount) WITH RECURSIVE r AS "
+                      "(SELECT id, amount FROM claim UNION ALL SELECT id, amount FROM r WHERE id > 0) "
+                      "SELECT id, amount FROM r"),
+    # M31's shape: a CTE named after the governed table. The reference inside the CTE's own body
+    # reads the real table and must be wrapped; the outer reference is the CTE and must not be.
+    ("cte_shadowing_the_name", "INSERT INTO scratch (id, amount) "
+                               "WITH claim AS (SELECT id, amount FROM claim) SELECT id, amount FROM claim"),
+    ("lateral_join", "INSERT INTO scratch (id, amount) SELECT s.id, c.amount FROM scratch s, "
+                     "LATERAL (SELECT amount FROM claim WHERE claim.id = s.id) c"),
+    ("scalar_in_where", "DELETE FROM scratch WHERE amount > (SELECT avg(amount) FROM claim)"),
+    ("returning", "DELETE FROM scratch WHERE id = 1 RETURNING (SELECT max(amount) FROM claim)"),
+    ("on_conflict_do_update", "INSERT INTO scratch (id, amount) VALUES (1, 2) "
+                              "ON CONFLICT (id) DO UPDATE SET amount = (SELECT max(amount) FROM claim)"),
+    ("window_function",
+     "INSERT INTO scratch (id, amount) SELECT id, row_number() OVER (ORDER BY amount) FROM claim"),
+    ("join", "INSERT INTO scratch (id, amount) SELECT c.id, c.amount FROM claim c "
+             "JOIN scratch s ON s.id = c.id"),
+    ("self_join_aliased", "INSERT INTO scratch (id, amount) SELECT a.id, b.amount FROM claim a "
+                          "JOIN claim b ON a.id = b.id"),
+]
+
+
+@pytest.mark.parametrize("label,sql", _EVERY_READ_SHAPE, ids=[c[0] for c in _EVERY_READ_SHAPE])
+def test_no_write_shape_reads_a_governed_table_unfiltered(label, sql):
+    verdict = _write(sql)
+    assert isinstance(verdict, ApprovedWrite), f"{label}: {verdict}"
+    assert "region = 'west'" in verdict.plan_sql, (
+        f"{label}: reads `claim` with no row filter -- {verdict.plan_sql}"
+    )
+
+
+@pytest.mark.parametrize("existing_where", ["id = 1 OR id = 2", "id = 1 OR 1 = 1"])
+@pytest.mark.parametrize("filt", ["region = 'west'", "region = 'west' OR region = 'north'"])
+def test_the_target_conjunction_binds_tighter_than_an_existing_or(existing_where, filt):
+    """`WHERE a OR b AND filt` is not `WHERE (a OR b) AND filt`. The conjunction must parenthesise
+    both sides or an OR in either half swallows the filter -- the oldest bypass in the genre."""
+    verdict = _write(f"UPDATE claim SET amount = 0 WHERE {existing_where}", _policy(filt))
+    assert isinstance(verdict, ApprovedWrite)
+
+    con = _con()
+    con.execute(verdict.target_sql)
+    touched = {r[0] for r in con.execute("SELECT id FROM claim WHERE amount = 0").fetchall()}
+    in_filter = {r[0] for r in con.execute(f"SELECT id FROM claim WHERE {filt}").fetchall()}
+    assert touched <= in_filter, f"mutated rows outside the filter: {touched - in_filter}"
