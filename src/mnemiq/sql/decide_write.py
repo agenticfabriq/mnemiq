@@ -7,19 +7,27 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.authz_guard import check_access
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.rls import apply_row_filters_to_write
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
 
 _WRITE_ROOTS = (exp.Insert, exp.Update, exp.Delete)
 
 
-def _target_table(ast: exp.Expression) -> str | None:
+def _target_node(ast: exp.Expression) -> exp.Table | None:
+    """The table node being written, as a NODE. RLS needs the identity, not the name: the target
+    is the one table a write must not wrap in a derived table, and the same name can appear
+    elsewhere in the statement as an ordinary read that must be."""
     this = ast.this
     if isinstance(this, exp.Schema):  # INSERT INTO t (cols)
         this = this.this
     if isinstance(this, exp.Table):
-        return this.name
-    found = ast.find(exp.Table)
-    return found.name if found else None
+        return this
+    return ast.find(exp.Table)
+
+
+def _target_table(ast: exp.Expression) -> str | None:
+    node = _target_node(ast)
+    return node.name if node is not None else None
 
 
 def check_write_shape(sql: str, dialect: str = "duckdb") -> exp.Expression | Refusal:
@@ -52,10 +60,11 @@ def decide_write(
     sql: str,
     visible: dict[str, set[str]],
     grants: GrantSet,
+    *,
+    policy: AccessPolicy,
     adapter=None,
     dialect: str = "duckdb",
     target: str | None = None,
-    policy: AccessPolicy | None = None,
     writes_enabled: bool = False,
 ) -> ApprovedWrite | Refusal:
     """The deterministic write decider: deployment switch -> shape -> table/column authz ->
@@ -70,6 +79,14 @@ def decide_write(
     deployment with writes off still APPROVED the write, executed it, and reported a refusal built
     from whatever the read-only attachment raised -- the database as the control, which is the
     principle this project defines itself against.
+
+    `policy` is **required**, by the same argument one paragraph up. It used to default to `None`
+    and become an empty `AccessPolicy` -- a security parameter with a permissive default, in the
+    signature whose sibling parameter is documented as fail-closed for exactly that reason. Empty
+    is a legitimate value (a deployment with no policy, and `Runtime.write` passes it when there
+    is no snapshot), which is precisely why it must be *stated*: "no policy supplied" and "a
+    policy that restricts nothing" are the same denial and different facts, and collapsing them is
+    M2's finding and the peer lane's M45.
     """
     target = target or dialect
     if not writes_enabled:
@@ -84,7 +101,6 @@ def decide_write(
             ),
             subject=None,
         )
-    policy = policy or AccessPolicy()
     shaped = check_write_shape(sql, dialect=dialect)
     if isinstance(shaped, Refusal):
         return shaped
@@ -106,13 +122,15 @@ def decide_write(
             subject=tgt,
         )
 
-    # RLS on writes: constrain an UPDATE/DELETE to the identity's visible rows (INSERT exempt).
-    filt = policy.row_filters.get(tgt)
-    if filt is not None and isinstance(shaped, (exp.Update, exp.Delete)):
-        parsed = sqlglot.parse_one(filt, read=dialect)
-        existing = shaped.args.get("where")
-        combined = exp.and_(existing.this, parsed) if existing is not None else parsed
-        shaped.set("where", exp.Where(this=combined))
+    # RLS: the read path's implementation, not a second copy of it. This block used to filter
+    # only the table being WRITTEN -- so every table a write READ was ungoverned (M30), and the
+    # filter was spliced in without validation (M7). Both are one defect: there were two
+    # implementations and the second was wrong. `apply_row_filters_to_write` wraps the reads and
+    # conjoins the target, using the same `_validate_filter` the read decider uses.
+    governed = apply_row_filters_to_write(shaped, policy, visible, _target_node(shaped), dialect)
+    if isinstance(governed, Refusal):
+        return governed
+    shaped = governed
 
     plan_sql = shaped.sql(dialect=dialect)
     target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]

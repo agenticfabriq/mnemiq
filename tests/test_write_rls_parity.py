@@ -164,11 +164,27 @@ def test_the_governed_write_moves_only_in_filter_rows(label, sql):
 
 def test_the_write_decider_has_no_second_rls_implementation():
     """M7's actual remedy. Leaving the inline copy correct-looking beside `apply_row_and_mask` is
-    how the two came to disagree; M31's fix DELETED the superseded helper for the same reason."""
+    how the two came to disagree; M31's fix DELETED the superseded helper for the same reason.
+
+    Asserted as a property rather than as a symbol name: the write decider must build no filter
+    of its own, and `rls.py` must remain the only module that constructs the wrap.
+    """
     import inspect
 
-    from mnemiq.sql import decide_write as module
+    from mnemiq.sql import decide_write as write_module
+    from mnemiq.sql import rls as rls_module
 
-    src = inspect.getsource(module)
-    assert "apply_row_and_mask" in src, "the write path must call the one RLS implementation"
-    assert "exp.Where(this=combined)" not in src, "the inline RLS rewrite is still there"
+    # Comments stripped: the assertion is about what the module DOES. The first version of this
+    # test matched the prose of the comment explaining the fix, which is a test of the changelog.
+    write_src = "\n".join(
+        line for line in inspect.getsource(write_module).splitlines()
+        if not line.strip().startswith("#")
+    )
+    assert "mnemiq.sql.rls" in write_src, "the write path must route through the RLS module"
+    for built_here in ("exp.Where(this=", "_validate_filter", "row_filters.get"):
+        assert built_here not in write_src, (
+            f"the write decider builds its own filter ({built_here!r}) -- that is the second "
+            "implementation M7 filed"
+        )
+    # And the wrap itself is constructed in exactly one place.
+    assert inspect.getsource(rls_module).count("def _derived_table") == 1
