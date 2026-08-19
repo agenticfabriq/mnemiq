@@ -250,3 +250,30 @@ def test_the_target_conjunction_binds_tighter_than_an_existing_or(existing_where
     touched = {r[0] for r in con.execute("SELECT id FROM claim WHERE amount = 0").fetchall()}
     in_filter = {r[0] for r in con.execute(f"SELECT id FROM claim WHERE {filt}").fetchall()}
     assert touched <= in_filter, f"mutated rows outside the filter: {touched - in_filter}"
+
+
+# -- the residual, recorded as a tripwire rather than as prose --------------------------------------
+
+
+@pytest.mark.xfail(strict=True, reason="M48 (v1 lane): a statement-level WITH parks its CTEs in the "
+                                       "write root's `with_` arg, outside where build_scope roots "
+                                       "itself, so base_tables returns [] and every guard sees an "
+                                       "empty statement. Fixed by `_unscoped_ctes` in scope.py; when "
+                                       "that lands this xpasses and strict=True forces the flip.")
+@pytest.mark.parametrize("sql", [
+    "WITH x AS (SELECT id, amount FROM claim) "
+    "INSERT INTO scratch (id, amount) SELECT id, amount FROM x",
+    "WITH x AS (SELECT id FROM claim) UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM x)",
+    "WITH x AS (SELECT id FROM claim) DELETE FROM scratch WHERE id IN (SELECT id FROM x)",
+])
+def test_a_statement_level_with_is_still_invisible_to_the_rewrite(sql):
+    """M30 is closed for every shape above and open for this one.
+
+    The 14-shape sweep has a CTE case and still missed this: it spells the WITH *inside* the
+    INSERT, which sqlglot parses into the projection where `build_scope` can see it. A leading
+    WITH parses somewhere else entirely. Shapes generated from one spelling read as covering the
+    class -- which is how a sweep can be exhaustive and blind at once.
+    """
+    verdict = _write(sql)
+    assert isinstance(verdict, ApprovedWrite)
+    assert "region = 'west'" in verdict.plan_sql
