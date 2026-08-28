@@ -369,29 +369,37 @@ _ENTITLED = "id IN (SELECT id FROM entitlement WHERE who = 'u')"
 # first said UPDATE and DELETE exercise the conjoin by being UPDATE and DELETE (the shape alone
 # is not enough), the second said the filter's table decides it (not enough either -- an INSERT
 # whose TARGET is filtered still takes neither branch, because `apply_row_filters_to_write`
-# returns on `not isinstance(ast, (exp.Update, exp.Delete))` before it ever reads `row_filters`,
-# and that exemption is deliberate: an INSERT does not read its target).
+# returns on `not isinstance(ast, (exp.Update, exp.Delete))` before it reads the filter FOR THE
+# TARGET, and that exemption is deliberate: an INSERT does not read its target. It has already
+# read `row_filters` by then -- `apply_row_and_mask` runs first and consults them to wrap the
+# READS, which is what filters `claim` in the insert case below. The early return skips the
+# target's own predicate, not row filtering.)
 #
-# `rendering` is asserted so the two branches are told apart. Without it both cases pass on
-# `"entitlement" in plan_sql`, which any construct naming the table satisfies -- only deleting
-# the branch outright would fail.
+# `rendering` and `absent` are asserted so the two branches are told apart in both directions.
+# `"entitlement" in plan_sql` alone is satisfied by any construct naming the table, and even
+# `") AS claim"` only proves a derived table named `claim` EXISTS, not that the predicate is
+# inside it -- a rewrite that wrapped `claim` unfiltered and conjoined ITS predicate onto the
+# target's WHERE would filter `scratch`'s rows by `claim`'s policy, the wrong table entirely, and
+# still satisfy both. Pinning the predicate's position is what distinguishes them.
 _PROVENANCE_SHAPES = [
     ("insert", "INSERT INTO scratch (id, amount) SELECT id, amount FROM claim",
-     {"claim": _ENTITLED}, ["claim", "scratch"], ") AS claim"),
-    ("update", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
-     {"claim": _ENTITLED}, ["claim", "scratch"], ") AS claim"),
-    ("delete", "DELETE FROM scratch WHERE id IN (SELECT id FROM claim)",
-     {"claim": _ENTITLED}, ["claim", "scratch"], ") AS claim"),
-    ("update_target_filtered", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
-     {"scratch": _ENTITLED}, ["claim", "scratch"],
+     {"claim": _ENTITLED}, ["claim", "scratch"], f"WHERE {_ENTITLED}) AS claim",
      f"AND {_ENTITLED}"),
+    ("update", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
+     {"claim": _ENTITLED}, ["claim", "scratch"], f"WHERE {_ENTITLED}) AS claim",
+     f"AND {_ENTITLED}"),
+    ("delete", "DELETE FROM scratch WHERE id IN (SELECT id FROM claim)",
+     {"claim": _ENTITLED}, ["claim", "scratch"], f"WHERE {_ENTITLED}) AS claim",
+     f"AND {_ENTITLED}"),
+    ("update_target_filtered", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
+     {"scratch": _ENTITLED}, ["claim", "scratch"], f"AND {_ENTITLED}", ") AS claim"),
 ]
 
 
-@pytest.mark.parametrize("label,sql,filters,expected,rendering", _PROVENANCE_SHAPES,
+@pytest.mark.parametrize("label,sql,filters,expected,rendering,absent", _PROVENANCE_SHAPES,
                          ids=[p[0] for p in _PROVENANCE_SHAPES])
 def test_write_provenance_does_not_disclose_the_caller_s_own_policy(label, sql, filters, expected,
-                                                                    rendering):
+                                                                    rendering, absent):
     """`tables` is read from the statement as ASKED, not from the rewritten tree.
 
     M28 on the write path. A row filter may reach through another table -- the only way to express
@@ -419,3 +427,4 @@ def test_write_provenance_does_not_disclose_the_caller_s_own_policy(label, sql, 
     # through the branch this case exists to reach, not merely somewhere in the statement.
     assert "entitlement" in verdict.plan_sql
     assert rendering in verdict.plan_sql
+    assert absent not in verdict.plan_sql
