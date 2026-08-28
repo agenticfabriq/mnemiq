@@ -204,9 +204,10 @@ def decide_write(
         )
 
     # Ordered AFTER the grant check, and that ordering is the finding. Mirroring `decide`
-    # (access -> CLS -> views) is wrong on this path for the reason that keeps recurring here: a
-    # write's TARGET is not a base table, so `check_access` never covers it, and `check_views`
-    # walked it anyway. `INSERT INTO hidden_view ...` then refused UNGOVERNED_VIEW naming the
+    # (access -> CLS -> views) is wrong on this path for the reason that keeps recurring here: an
+    # INSERT's target is not a base table, so `check_access` never covers it, and `check_views`
+    # walked it anyway. (An UPDATE/DELETE target IS a base table and `check_access` refuses it
+    # already -- the asymmetry is INSERT's alone, as `_target_table` says above.) `INSERT INTO hidden_view ...` then refused UNGOVERNED_VIEW naming the
     # view AND its row-filtered base -- three facts about objects the caller holds no grant on,
     # and distinguishable from the plain-target refusal, so a probe rather than one leaked bit.
     #

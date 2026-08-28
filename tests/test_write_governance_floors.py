@@ -469,6 +469,17 @@ def test_an_ungranted_target_refuses_before_the_view_floor_can_describe_it():
     assert verdict.code is RefusalCode.UNAUTHORIZED_WRITE, "authorize the target before inspecting it"
     assert "claim" not in verdict.message, "the refusal must not name the view's base table"
 
+    # The property is that the two refusals are INDISTINGUISHABLE, and asserting only the first
+    # row does not pin it: a later change that makes UNAUTHORIZED_WRITE say something different
+    # for an object that exists reopens the probe with this test still green.
+    nonexistent = decide_write("INSERT INTO nonesuch (id, amount) SELECT id, amount FROM scratch",
+                               visible, grants, adapter=_OkAdapter(), policy=policy, views=views,
+                               writes_enabled=True)
+    assert isinstance(nonexistent, Refusal)
+    assert nonexistent.code is verdict.code
+    assert verdict.message.replace("hidden_view", "X") == nonexistent.message.replace("nonesuch", "X"), (
+        "an ungranted object that EXISTS must be indistinguishable from one that does not")
+
 
 def test_a_granted_view_target_still_meets_the_view_floor():
     """The control: moving authorization first must not disable the floor for granted objects."""
