@@ -360,18 +360,28 @@ def test_the_with_floor_is_not_keyed_on_a_sqlglot_arg_name():
     assert not _has_unscoped_with(inside), "the governed spelling must not be swept up"
 
 
+_ENTITLED = "id IN (SELECT id FROM entitlement WHERE who = 'u')"
+
+# The last case filters the TARGET, and it is the only one that enters the conjoined-WHERE branch
+# of `apply_row_filters_to_write`. The first three filter `claim`, a read SOURCE, so all three
+# take the derived-table branch -- which is what the first version of this comment got wrong: it
+# claimed UPDATE and DELETE exercised the conjoin simply by being UPDATE and DELETE. The branch
+# is chosen by WHICH table the filter names, not by the statement's shape.
 _PROVENANCE_SHAPES = [
     ("insert", "INSERT INTO scratch (id, amount) SELECT id, amount FROM claim",
-     ["claim", "scratch"]),
+     {"claim": _ENTITLED}, ["claim", "scratch"]),
     ("update", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
-     ["claim", "scratch"]),
-    ("delete", "DELETE FROM scratch WHERE id IN (SELECT id FROM claim)", ["claim", "scratch"]),
+     {"claim": _ENTITLED}, ["claim", "scratch"]),
+    ("delete", "DELETE FROM scratch WHERE id IN (SELECT id FROM claim)",
+     {"claim": _ENTITLED}, ["claim", "scratch"]),
+    ("update_target_filtered", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
+     {"scratch": _ENTITLED}, ["claim", "scratch"]),
 ]
 
 
-@pytest.mark.parametrize("label,sql,expected", _PROVENANCE_SHAPES,
+@pytest.mark.parametrize("label,sql,filters,expected", _PROVENANCE_SHAPES,
                          ids=[p[0] for p in _PROVENANCE_SHAPES])
-def test_write_provenance_does_not_disclose_the_caller_s_own_policy(label, sql, expected):
+def test_write_provenance_does_not_disclose_the_caller_s_own_policy(label, sql, filters, expected):
     """`tables` is read from the statement as ASKED, not from the rewritten tree.
 
     M28 on the write path. A row filter may reach through another table -- the only way to express
@@ -385,7 +395,7 @@ def test_write_provenance_does_not_disclose_the_caller_s_own_policy(label, sql, 
     """
     visible = {"claim": {"id", "amount"}, "scratch": {"id", "amount"}}
     policy = AccessPolicy(
-        row_filters={"claim": "id IN (SELECT id FROM entitlement WHERE who = 'u')"},
+        row_filters=filters,
         policy_schema={**{k: set(v) for k, v in visible.items()},
                        "entitlement": {"id", "who"}},
     )
@@ -395,7 +405,5 @@ def test_write_provenance_does_not_disclose_the_caller_s_own_policy(label, sql, 
     assert isinstance(verdict, ApprovedWrite)
     assert verdict.tables == expected
     assert "entitlement" not in verdict.tables
-    # The filter still binds -- provenance is narrowed, not the governance. UPDATE/DELETE reach
-    # this through the conjoined-WHERE branch of `apply_row_filters_to_write` rather than the
-    # derived-table one, which is why all three shapes are pinned rather than the INSERT alone.
+    # The filter still binds -- provenance is narrowed, not the governance.
     assert "entitlement" in verdict.plan_sql
