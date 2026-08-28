@@ -393,9 +393,11 @@ _PROVENANCE_SHAPES = [
      f"AND {_ENTITLED}"),
     ("update_target_filtered", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
      # Anchored past the subquery's closing paren, so it pins the predicate onto the TARGET's
-     # WHERE. Bare `AND <predicate>` also matched it conjoined onto the inner `SELECT ... FROM
-     # claim`, which would filter the read by the target's policy -- the wrong table, and the
-     # exact mirror of the mistake the derived-table cases are anchored against.
+     # WHERE rather than merely somewhere in the statement -- a strictly stronger substring, and
+     # the same position property the three cases above assert. No counterexample is claimed for
+     # it: this statement's inner select has no WHERE, and `exp.and_` renders an injected
+     # predicate there as `WHERE ...`, not `AND ...`, so the bare form did not admit the inner
+     # conjunction an earlier version of this comment said it did.
      {"scratch": _ENTITLED}, ["claim", "scratch"], f"FROM claim) AND {_ENTITLED}", ") AS claim"),
 ]
 
