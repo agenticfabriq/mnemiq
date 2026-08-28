@@ -220,6 +220,7 @@ def test_one_source_that_could_not_report_views_makes_the_union_unavailable():
 def test_an_unreadable_inventory_defers_before_the_first_model_call():
     """The refusal fires ahead of the AST walk, so every attempt would propose, be refused
     identically, and feed the same unfixable message back. Knowable before spending anything."""
+    from mnemiq.contract import DeferralReason
     from mnemiq.generate.plan_query import plan_query
     from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
 
@@ -234,4 +235,4 @@ def test_an_unreadable_inventory_defers_before_the_first_model_call():
                              grant_fingerprint="f", enrichment_version=None),
         snapshot=snapshot, grants=VIEW_ONLY_GRANT, generator=ExplodingGenerator(),
     )
-    assert getattr(result, "code", None) is not None
+    assert result.code is DeferralReason.POLICY_UNAVAILABLE, result
