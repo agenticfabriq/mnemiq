@@ -347,6 +347,31 @@ def test_a_filter_keyed_in_another_case_is_not_dropped_from_the_policy():
     assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
 
 
+@pytest.mark.parametrize("snapshot_key", ["claim", "Claim", "CLAIM"])
+@pytest.mark.parametrize("body_ref", ["claim", "Claim", "CLAIM"])
+def test_the_pii_policy_reaches_through_a_view_in_every_case_combination(snapshot_key, body_ref):
+    """BOTH directions. The first version of this test fixed only snapshot-lowercase against a
+    body in another case, because the fold was added to the spellings `_reachable` GENERATES.
+    The reverse -- a snapshot keyed `Claim` with a body writing `claim` -- still failed open,
+    since the `columns` loop compared exactly. Measured: `denied == []` for a column marked
+    `direct`, so a direct-PII column was readable through a granted view.
+
+    The two comparisons in `build_access_policy` ask the same question. One was folded and the
+    one three lines above it was not, in the commit that named this pattern.
+    """
+    snapshot = Snapshot(
+        version="v", source_id="s", created_at="t",
+        columns=[_col(snapshot_key, "id"),
+                 Column(id=f"{snapshot_key}.ssn", object_id=snapshot_key, name="ssn",
+                        data_type="text", pii_level="direct"),
+                 _col("claim_v", "id")],
+        views=[ViewDefinition(object_id="claim_v",
+                              definition=f"SELECT id, ssn FROM {body_ref}", dialect="duckdb")],
+        jobs=_done())
+    policy = build_access_policy(snapshot, GrantSet(objects=frozenset({"claim_v"})))
+    assert (snapshot_key, "ssn") in policy.denied
+
+
 def test_a_view_body_spelling_its_base_in_another_case_still_carries_the_pii_policy():
     """The case-fold in `_reachable` is load-bearing on the COLUMN path, not the filter path --
     `build_access_policy`'s own fold covers the latter, which is why deleting this one left every
@@ -436,5 +461,49 @@ def test_a_nested_view_over_nothing_filtered_is_still_approved():
     snapshot = _nested_case_snapshot("CLAIM_V")
     v = decide("SELECT id FROM claim_v2", {"claim_v2": {"id"}},
                policy=build_access_policy(snapshot, GrantSet(objects=frozenset({"claim_v2"}))),
+               views=inventory_for(snapshot))
+    assert getattr(v, "code", None) is None, v
+
+
+# -- the class, rather than the cells --------------------------------------------------------
+#
+# Five rounds of review each found one more case combination that failed open, and each fix was
+# written for the cell in front of it. The filter path has THREE independent spellings -- the
+# filter's key, the snapshot's object_id, and the view body's reference -- and nothing was
+# checking their product. This is what should have been written after the first one.
+
+@pytest.mark.parametrize("filter_key", ["claim", "Claim", "CLAIM"])
+@pytest.mark.parametrize("snapshot_key", ["claim", "Claim", "CLAIM"])
+@pytest.mark.parametrize("body_ref", ["claim", "Claim", "CLAIM"])
+def test_a_row_filter_reaches_through_a_view_however_the_three_names_are_spelled(
+    filter_key, snapshot_key, body_ref
+):
+    """27 combinations of filter key x snapshot key x body reference. Unquoted identifiers are
+    case-insensitive in all three engines, so every one of these describes the same objects and
+    every one must refuse."""
+    snapshot = Snapshot(
+        version="v", source_id="s", created_at="t",
+        columns=[_col(snapshot_key, "id"), _col(snapshot_key, "region"), _col("claim_v", "id")],
+        views=[ViewDefinition(object_id="claim_v",
+                              definition=f"SELECT id, region FROM {body_ref}", dialect="duckdb")],
+        jobs=_done())
+    grants = GrantSet(objects=frozenset({"claim_v"}),
+                      row_filters={filter_key: "region = 'west'"})
+    v = decide("SELECT id FROM claim_v", {"claim_v": {"id"}},
+               policy=build_access_policy(snapshot, grants), views=inventory_for(snapshot))
+    assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
+
+
+def test_the_same_matrix_with_nothing_filtered_stays_approved():
+    """The control for all 27: case folding must widen what the policy REACHES, never turn an
+    ungoverned view into a refusal on its own."""
+    snapshot = Snapshot(
+        version="v", source_id="s", created_at="t",
+        columns=[_col("CLAIM", "id"), _col("CLAIM", "region"), _col("claim_v", "id")],
+        views=[ViewDefinition(object_id="claim_v", definition="SELECT id, region FROM Claim",
+                              dialect="duckdb")],
+        jobs=_done())
+    v = decide("SELECT id FROM claim_v", {"claim_v": {"id"}},
+               policy=build_access_policy(snapshot, GrantSet(objects=frozenset({"claim_v"}))),
                views=inventory_for(snapshot))
     assert getattr(v, "code", None) is None, v

@@ -113,8 +113,16 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     reachable = _reachable(snapshot, grants)
     denied: set[tuple[str, str]] = set()
     masked: set[tuple[str, str]] = set()
+    # One folded view of `reachable`, shared by BOTH comparisons below. They ask the same
+    # question -- is this object within the policy's reach -- and the column one was left exact
+    # while the filter one was folded, in the same function, in the commit that named this exact
+    # pattern. Measured: a snapshot keying `Claim` with a view body writing `FROM claim` gave
+    # `denied == []` for a column marked `pii_level='direct'`, so a direct-PII column was
+    # readable through a granted view. The other direction already worked, which is what made it
+    # look finished.
+    folded = {r.lower() for r in reachable}
     for c in snapshot.columns:
-        if c.object_id not in reachable:
+        if c.object_id not in reachable and c.object_id.lower() not in folded:
             continue  # not reachable even through a view -> nothing here can ever apply
         level = c.pii_level
         if not level or level == "none" or level in grants.pii_clearance:
@@ -134,7 +142,6 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     # A NARROW case fix, deliberately not the object-id normalisation M50 asks for. Normalising
     # ids once at the policy boundary is a design decision with three directions to reconcile,
     # and it does not belong inside a bypass fix.
-    folded = {r.lower() for r in reachable}
     row_filters = {t: f for t, f in grants.row_filters.items()
                    if t in reachable or t.lower() in folded}
     policy_schema: dict[str, set[str]] = {}
