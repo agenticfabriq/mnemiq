@@ -331,7 +331,8 @@ def test_the_with_floor_is_not_keyed_on_a_sqlglot_arg_name():
     fires, and the statement is approved with no guard having run -- failing OPEN, silently,
     on a dependency bump rather than on a code change.
 
-    This re-parks the node under the older key to assert the detector never reads the name.
+    This pops whichever key this sqlglot uses and re-parks under the other one, so the detector
+    is asked about a spelling it was not given on either version.
     `views.py` carries the same lesson from the same cause: a whitelist that read `args["from"]`
     where that sqlglot said `from_` enumerated no sources and approved everything.
     """
@@ -359,7 +360,18 @@ def test_the_with_floor_is_not_keyed_on_a_sqlglot_arg_name():
     assert not _has_unscoped_with(inside), "the governed spelling must not be swept up"
 
 
-def test_write_provenance_does_not_disclose_the_caller_s_own_policy():
+_PROVENANCE_SHAPES = [
+    ("insert", "INSERT INTO scratch (id, amount) SELECT id, amount FROM claim",
+     ["claim", "scratch"]),
+    ("update", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
+     ["claim", "scratch"]),
+    ("delete", "DELETE FROM scratch WHERE id IN (SELECT id FROM claim)", ["claim", "scratch"]),
+]
+
+
+@pytest.mark.parametrize("label,sql,expected", _PROVENANCE_SHAPES,
+                         ids=[p[0] for p in _PROVENANCE_SHAPES])
+def test_write_provenance_does_not_disclose_the_caller_s_own_policy(label, sql, expected):
     """`tables` is read from the statement as ASKED, not from the rewritten tree.
 
     M28 on the write path. A row filter may reach through another table -- the only way to express
@@ -377,11 +389,13 @@ def test_write_provenance_does_not_disclose_the_caller_s_own_policy():
         policy_schema={**{k: set(v) for k, v in visible.items()},
                        "entitlement": {"id", "who"}},
     )
-    verdict = decide_write("INSERT INTO scratch (id, amount) SELECT id, amount FROM claim",
-                           visible, GrantSet(frozenset(visible), writable=frozenset({"scratch"})),
+    verdict = decide_write(sql, visible,
+                           GrantSet(frozenset(visible), writable=frozenset({"scratch"})),
                            adapter=_OkAdapter(), policy=policy, writes_enabled=True)
     assert isinstance(verdict, ApprovedWrite)
-    assert verdict.tables == ["claim", "scratch"]
+    assert verdict.tables == expected
     assert "entitlement" not in verdict.tables
-    # The filter still binds -- provenance is narrowed, not the governance.
+    # The filter still binds -- provenance is narrowed, not the governance. UPDATE/DELETE reach
+    # this through the conjoined-WHERE branch of `apply_row_filters_to_write` rather than the
+    # derived-table one, which is why all three shapes are pinned rather than the INSERT alone.
     assert "entitlement" in verdict.plan_sql
