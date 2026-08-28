@@ -109,11 +109,23 @@ def test_the_write_target_is_recorded_even_though_nothing_reads_it():
     assert _write_tables("INSERT INTO scratch SELECT id, id FROM orders") == ["orders", "scratch"]
 
 
-def test_an_update_target_reaches_the_record_only_through_the_union():
-    """The previous version of this test asserted the target is "recorded once and not twice",
-    which a set union can never violate -- it could not fail. What is actually load-bearing, and
-    surprising, is that `base_tables` does not contain the target at all here: the scope resolves,
-    the target is in no `scope.sources`, and only the union puts it back."""
+def test_an_update_target_is_a_read_the_resolver_now_names():
+    """This test has had three premises, and the churn is the point.
+
+    v1 asserted the target is "recorded once and not twice" -- a set union cannot violate that,
+    so it could not fail. v2 asserted `base_tables` does NOT contain the target and only the
+    union puts it back, which was true and was the DEFECT: a target absent from the read set is
+    a target no guard checks. Modelling it in the resolver closed three findings at once, so the
+    honest assertion is now the opposite of v2's."""
     sql = "UPDATE scratch SET customer_id = 0 WHERE id IN (SELECT id FROM orders)"
+    assert {t.name for t in base_tables(sqlglot.parse_one(sql, read="duckdb"))} == {"orders", "scratch"}
+    assert _write_tables(sql) == ["orders", "scratch"]
+
+
+def test_a_plain_insert_target_still_reaches_the_record_only_through_the_union():
+    """The union is not redundant after the resolver change. A plain INSERT genuinely does not
+    read its target, so `_target_read` returns None and `base_tables` correctly omits it -- while
+    the audit record must still name what the write touched."""
+    sql = "INSERT INTO scratch SELECT id, id FROM orders"
     assert {t.name for t in base_tables(sqlglot.parse_one(sql, read="duckdb"))} == {"orders"}
     assert _write_tables(sql) == ["orders", "scratch"]

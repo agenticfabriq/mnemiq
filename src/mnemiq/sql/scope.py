@@ -42,6 +42,42 @@ def _unscoped_ctes(ast: exp.Expression, root) -> bool:
     return False
 
 
+def _target_read(ast: exp.Expression) -> exp.Table | None:
+    """The table a WRITE reads through its own TARGET position, or None if it reads none.
+
+    `build_scope` models the query a statement runs, not the object it mutates, so a write
+    target is in no `scope.sources` and every guard built on `base_tables` was blind to it.
+    Measured before this: `UPDATE claim SET amount = 0 WHERE ssn = '1' AND id IN (SELECT id FROM
+    other)` resolved to ['other'] alone, so a DENIED column on `claim` was checked against
+    `other` and the write was approved carrying it -- while the same statement without the
+    subquery was refused, because `build_scope` fails there and the `find_all` fallback put the
+    target back. The guard was doing its job only when the resolver gave up.
+
+    Which shapes READ their target is the whole question, and it is not the verb:
+
+      UPDATE   yes -- it reads the rows it is about to change
+      DELETE   yes -- same, through its WHERE
+      INSERT   no -- the target is written and never read
+      INSERT ... ON CONFLICT DO UPDATE   YES: the SET clause reads the existing row
+
+    That last row is why this is a predicate and not `isinstance(ast, (Update, Delete))`. An
+    upsert is an INSERT by node type and a read of its target in fact, and it was approved
+    against a target the caller could not see, whose column was denied.
+    """
+    if isinstance(ast, (exp.Update, exp.Delete)):
+        node = ast.this
+    elif isinstance(ast, exp.Insert):
+        conflict = ast.args.get("conflict")
+        if conflict is None or not conflict.args.get("expressions"):
+            return None  # no ON CONFLICT, or DO NOTHING: nothing reads the target
+        node = ast.this
+    else:
+        return None
+    if isinstance(node, exp.Schema):  # INSERT INTO t (cols)
+        node = node.this
+    return node if isinstance(node, exp.Table) else None
+
+
 def base_tables(ast: exp.Expression) -> list[exp.Table]:
     """Every `exp.Table` node that reads a real object in the source.
 
@@ -74,6 +110,11 @@ def base_tables(ast: exp.Expression) -> list[exp.Table]:
         for table in scope.tables:
             if isinstance(scope.sources.get(table.alias_or_name), exp.Table):
                 out.append(table)
+    # The write target, which no scope names. Added here rather than in each guard so the three
+    # of them keep sharing one premise -- the M31 lesson, and the reason M48 sits in this file.
+    target = _target_read(ast)
+    if target is not None and not any(t is target for t in out):
+        out.append(target)
     return out
 
 
@@ -116,4 +157,16 @@ def column_tables(ast: exp.Expression) -> dict[int, str] | None:
             table = local.get(column.table)
             if column.table and table is not None:
                 out[id(column)] = table
+
+    # Columns qualified by the write target resolve to it. `ON CONFLICT DO UPDATE SET amount =
+    # scratch.amount + 1` reads `scratch.amount` from a table in no scope, so without this the
+    # map has no entry and `check_cls` falls back to the referenced set -- checking a denied
+    # column against the wrong table. Only fills entries the scope walk did not, so a real
+    # source or CTE of the same name keeps its scoped answer.
+    target = _target_read(ast)
+    if target is not None:
+        key = object_key(target)
+        for column in ast.find_all(exp.Column):
+            if column.table == target.alias_or_name and id(column) not in out:
+                out[id(column)] = key
     return out

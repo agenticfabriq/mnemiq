@@ -219,10 +219,12 @@ def test_the_floor_never_fires_on_a_read(sql):
     assert column_tables(ast) is not None
 
 
-# -- the residual these floors do NOT cover, as tripwires rather than as prose ------------------
+# -- what the floors did NOT cover, now closed by modelling the target in the resolver ---------
 #
-# A known residual is a strict xfail, not a sentence: prose cannot fail. Both were found by the
-# review gate measuring claims I had written into the comments above and never run.
+# These landed as strict xfails first, because a known residual must be able to fail. All three
+# shared ONE root -- `base_tables` did not model the write target -- and closing it in the
+# resolver turned every one of them green at once, which is the argument for fixing a shared
+# premise rather than each guard. The markers came off when the tripwires fired.
 #
 # Three reachable defects, kept apart because they fail through different guards.
 #
@@ -248,13 +250,6 @@ def test_a_denied_column_on_the_target_is_refused_when_the_resolver_gives_up():
     assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_COLUMN
 
 
-@pytest.mark.xfail(strict=True, reason="An UPDATE/DELETE target is absent from `base_tables` "
-                                       "whenever `build_scope` SUCCEEDS, because the target is "
-                                       "not among `scope.sources`. `check_cls` builds its "
-                                       "`referenced` set from `base_tables`, so a denied column "
-                                       "ON THE TARGET can never match and the write is approved "
-                                       "with it. Also disproves `_target_table`'s docstring, "
-                                       "which M50's fix relies on.")
 @pytest.mark.parametrize("sql", [
     "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
     "DELETE FROM scratch WHERE amount = 0 AND id IN (SELECT id FROM claim)",
@@ -264,15 +259,6 @@ def test_a_denied_column_on_the_target_is_refused_when_the_resolver_succeeds(sql
     assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_COLUMN
 
 
-@pytest.mark.xfail(strict=True, reason="`ON CONFLICT DO UPDATE` READS its target, so the premise "
-                                       "that an INSERT target is written and never read -- which "
-                                       "is why `base_tables` may omit it -- does not hold for an "
-                                       "upsert. `column_tables` cannot resolve `scratch.amount` "
-                                       "when `scratch` is not in `scope.sources`, so "
-                                       "`_candidate_tables` falls through to `referenced` and "
-                                       "evaluates `scratch.amount` against `claim` -- the wrong "
-                                       "table, not a skipped column. Root cause is `base_tables` "
-                                       "omitting the target, not a missing branch in check_cls.")
 def test_an_upsert_may_not_read_a_denied_column_on_its_target():
     v = _upsert_verdict("INSERT INTO scratch (id, amount) SELECT id, amount FROM claim "
                         "ON CONFLICT (id) DO UPDATE SET amount = scratch.amount + 1")
@@ -314,14 +300,6 @@ def test_check_access_does_run_for_this_statement_shape():
     assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_TABLE
 
 
-@pytest.mark.xfail(strict=True, reason="A write whose read set resolves EMPTY skips table "
-                                       "authorization entirely: `base_tables` is [] because the "
-                                       "subquery names no table and an UPDATE target is in no "
-                                       "`scope.sources`, so `check_access` early-outs on "
-                                       "`if not alias_to_table`. Independent of the snapshot -- "
-                                       "approved identically for an empty one, one omitting the "
-                                       "target, and one describing it. `grants.allows_write` is "
-                                       "the only guard the statement meets. Snapshot-independent: approved identically whether the snapshot omits the target or describes it -- the describing case is the control below, where approval is CORRECT and must survive the fix.")
 @pytest.mark.parametrize("visible", _TARGET_UNDESCRIBED, ids=["no-snapshot", "omits-target"])
 def test_a_write_with_an_empty_read_set_is_still_authorized_against_the_snapshot(visible):
     v = _shape_verdict("UPDATE scratch SET amount = 0 WHERE id IN (SELECT 1)", visible)
@@ -337,3 +315,32 @@ def test_a_write_whose_target_the_snapshot_describes_stays_approved():
     v = _shape_verdict("UPDATE scratch SET amount = 0 WHERE id IN (SELECT 1)",
                        {"scratch": {"id", "amount"}})
     assert not isinstance(v, Refusal), v
+
+
+# Modelling the target in `base_tables` closes the bypass; modelling its COLUMNS in
+# `column_tables` is what stops the fix from over-refusing. Without the second half a qualified
+# reference to an ALLOWED column on the target falls back to the referenced set and is matched
+# against the wrong table -- measured: `scratch.amount` refused because `claim.amount` is denied.
+# A guard that refuses legitimate writes is not a safer guard, it is a broken one.
+
+_BOTH_VISIBLE = {"claim": {"id", "amount"}, "scratch": {"id", "amount"}}
+_BOTH_GRANTS = GrantSet(objects=frozenset(_BOTH_VISIBLE), writable=frozenset({"scratch"}))
+_QUALIFIED = "UPDATE scratch SET id = 0 WHERE scratch.amount > 5 AND id IN (SELECT id FROM claim)"
+
+
+def _denied_verdict(denied):
+    return decide_write(_QUALIFIED, _BOTH_VISIBLE, _BOTH_GRANTS, adapter=None, dialect="duckdb",
+                        policy=AccessPolicy(denied=denied), views={}, writes_enabled=True)
+
+
+def test_a_qualified_allowed_column_on_the_target_is_not_refused_by_a_denial_elsewhere():
+    """The false-positive half. `scratch.amount` is readable; `claim.amount` is denied; the
+    statement names both tables. The qualifier has to resolve to the target."""
+    assert not isinstance(_denied_verdict({("claim", "amount")}), Refusal)
+
+
+def test_a_qualified_denied_column_on_the_target_is_still_refused():
+    """The true-positive control, so the test above cannot be satisfied by giving up on the
+    target's columns altogether -- which is what the resolver did before this."""
+    v = _denied_verdict({("scratch", "amount")})
+    assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_COLUMN
