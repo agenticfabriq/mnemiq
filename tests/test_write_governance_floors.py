@@ -305,3 +305,33 @@ def test_runtime_write_supplies_the_view_snapshot_to_the_decider():
     # only UNGOVERNED_VIEW produces. `"view" in refusal` was not that: "claim_view" contains
     # "view", so it passed just as happily on UNRESOLVABLE_VIEW.
     assert "cannot apply that filter through a view" in (res.refusal or "")
+
+
+def test_the_with_floor_is_not_keyed_on_a_sqlglot_arg_name():
+    """The floor must survive the arg being spelled differently, because it is.
+
+    `pyproject.toml` declares `sqlglot>=25`; the pinned 30.12.0 calls this arg `with_` and
+    25.34.1 calls it `with`. A lookup by name returns None on the other spelling, the floor never
+    fires, and the statement is approved with no guard having run -- failing OPEN, silently,
+    on a dependency bump rather than on a code change.
+
+    This re-parks the node under the older key to assert the detector never reads the name.
+    `views.py` carries the same lesson from the same cause: a whitelist that read `args["from"]`
+    where that sqlglot said `from_` enumerated no sources and approved everything.
+    """
+    import sqlglot
+
+    from mnemiq.sql.decide_write import _has_unscoped_with
+
+    ast = sqlglot.parse_one("WITH x AS (SELECT id FROM claim) "
+                            "INSERT INTO scratch (id) SELECT id FROM x", read="duckdb")
+    assert _has_unscoped_with(ast), "control: the current spelling must be detected"
+
+    node = ast.args.pop("with_")
+    assert node is not None
+    ast.args["with"] = node  # the spelling sqlglot 25.x uses, inside the declared range
+    assert _has_unscoped_with(ast), "the floor must not depend on the arg's NAME"
+
+    inside = sqlglot.parse_one("INSERT INTO scratch (id) WITH x AS (SELECT id FROM claim) "
+                               "SELECT id FROM x", read="duckdb")
+    assert not _has_unscoped_with(inside), "the governed spelling must not be swept up"

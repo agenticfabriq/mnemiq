@@ -16,6 +16,31 @@ from mnemiq.sql.views import check_views
 _WRITE_ROOTS = (exp.Insert, exp.Update, exp.Delete)
 
 
+def _has_unscoped_with(ast: exp.Expression) -> bool:
+    """Is a WITH attached directly to the write root, rather than inside the query it wraps?
+
+    Asked STRUCTURALLY -- "is any direct child a `With` node" -- and deliberately not by looking
+    up an arg by name. The first version read `ast.args["with_"]`, which is this sqlglot's
+    spelling; `pyproject.toml` declares `sqlglot>=25` and 25.34.1 spells the same arg `with`, so
+    a name-keyed lookup silently returns None across most of the supported range and the floor
+    never fires. A guard that finds nothing approves everything.
+
+    This repo has already paid for that lesson once: `views.py` records a whitelist that read
+    `args["from"]` where that sqlglot said `from_`, enumerated no sources, and therefore approved
+    every shape. Node TYPES are stable across versions in a way arg NAMES are not.
+
+    The CTE spelled inside the statement (`INSERT INTO t (cols) WITH x AS (...) SELECT ...`)
+    lives under the projection, not under the root, so it is correctly not matched here: it is
+    inside the scope `build_scope` roots at, and every guard already sees it.
+    """
+    for value in ast.args.values():
+        if isinstance(value, exp.With):
+            return True
+        if isinstance(value, list) and any(isinstance(v, exp.With) for v in value):
+            return True
+    return False
+
+
 def _target_node(ast: exp.Expression) -> exp.Table | None:
     """The table node being written, as a NODE, or None if this engine cannot name exactly one.
 
@@ -65,7 +90,7 @@ def check_write_shape(sql: str, dialect: str = "duckdb") -> exp.Expression | Ref
             message="Return exactly one statement. Multiple statements are never executed.",
         )
     ast = statements[0]
-    if isinstance(ast, _WRITE_ROOTS) and ast.args.get("with_") is not None:
+    if isinstance(ast, _WRITE_ROOTS) and _has_unscoped_with(ast):
         # A LEADING `WITH` parks its CTEs in the write root's `with_` arg, outside where
         # `build_scope` roots itself -- so `base_tables` returns [] and every guard sees an empty
         # statement. Not "the filter is missing": no guard runs. Measured, each against the plain
@@ -201,5 +226,8 @@ def decide_write(
             )
 
     cte_names = {c.alias_or_name for c in shaped.find_all(exp.CTE)}
-    tables = sorted({t.name for t in shaped.find_all(exp.Table)} - cte_names)
+    # `object_key`, matching the read path and the target resolution above. Built from `.name`
+    # this reported `INSERT INTO scratch SELECT ... FROM pg.claim` as having touched `claim` --
+    # a third spelling of the one question, inside the function fixing the other two.
+    tables = sorted({object_key(t) for t in shaped.find_all(exp.Table)} - cte_names)
     return ApprovedWrite(plan_sql=plan_sql, target_sql=target_sql, target=tgt, tables=tables)
