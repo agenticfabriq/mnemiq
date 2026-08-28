@@ -14,6 +14,7 @@ M40/M41, M45, `column_tables`, the provenance flag, M48 and M49.
 """
 from __future__ import annotations
 
+import pytest
 import sqlglot
 
 from mnemiq.contract.semantic import Job, Snapshot, ViewDefinition
@@ -377,3 +378,63 @@ def test_the_same_body_in_matching_case_is_the_control():
         views=[VIEW_OVER_CLAIM], jobs=_done())
     policy = build_access_policy(snapshot, GrantSet(objects=frozenset({"claim_v"})))
     assert policy.denied == set()
+
+
+# -- the nested lookup was case-sensitive, on BOTH paths ---------------------------------------
+#
+# Found by Codex's stop-time review, after the catalog fix. `_walk` resolved a body's table ref
+# by exact string match while `_spellings` two screens down folds deliberately, because unquoted
+# identifiers are case-insensitive in all three engines. So a body writing `FROM CLAIM_V` against
+# an inventory keyed `claim_v` missed, the nested view was never walked, and its row-filtered
+# base was never reached. Pre-existing on the single-source path too -- not federation's bug.
+
+def _nested_case_snapshot(inner_ref):
+    return Snapshot(
+        version="v", source_id="s", created_at="t",
+        columns=[_col("claim", "id"), _col("claim", "region"), _col("claim_v", "id"),
+                 _col("claim_v2", "id")],
+        views=[VIEW_OVER_CLAIM,
+               ViewDefinition(object_id="claim_v2", definition=f"SELECT id FROM {inner_ref}",
+                              dialect="duckdb")],
+        jobs=_done())
+
+
+@pytest.mark.parametrize("inner_ref", ["claim_v", "CLAIM_V", "Claim_V"])
+def test_a_nested_view_is_found_however_its_body_spells_it(inner_ref):
+    snapshot = _nested_case_snapshot(inner_ref)
+    grants = GrantSet(objects=frozenset({"claim_v2"}), row_filters={"claim": "region = 'west'"})
+    v = decide("SELECT id FROM claim_v2", {"claim_v2": {"id"}},
+               policy=build_access_policy(snapshot, grants), views=inventory_for(snapshot))
+    assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
+
+
+@pytest.mark.parametrize("inner_ref", ["claim_v", "CLAIM_V"])
+@pytest.mark.parametrize("catalog", ["pg", "PG"])
+def test_the_federated_nested_view_folds_case_too(inner_ref, catalog):
+    """Both fallbacks compose: the catalog prefix AND the case fold have to apply together.
+
+    `catalog` is parametrized because the first version of this fold lowercased only the table
+    half of the candidate while the comparison folds the whole key, so any alias carrying an
+    uppercase letter made the fallback dead code -- `pg` refused and `PG` approved, on the
+    identical statement. `SourceSpec.catalog` is a free-form DuckDB attach alias and nothing
+    normalises it, so an uppercase one is a configuration choice, not a corner case.
+    """
+    from mnemiq.config import SourceSpec
+    from mnemiq.semantic.federation import merge_snapshots
+    spec = SourceSpec(id="s", kind="postgres", target="d", catalog=catalog, schema="public")
+    fed = merge_snapshots([(spec, _nested_case_snapshot(inner_ref))])
+    grants = GrantSet(objects=frozenset({f"{catalog}.claim_v2"}),
+                      row_filters={f"{catalog}.claim": "region = 'west'"})
+    v = decide(f"SELECT id FROM {catalog}.claim_v2", {f"{catalog}.claim_v2": {"id"}},
+               policy=build_access_policy(fed, grants), views=inventory_for(fed))
+    assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
+
+
+def test_a_nested_view_over_nothing_filtered_is_still_approved():
+    """The blast-radius control: folding the lookup must not turn every nested view into a
+    refusal. Same snapshot, no row filters, so nothing can be reached around."""
+    snapshot = _nested_case_snapshot("CLAIM_V")
+    v = decide("SELECT id FROM claim_v2", {"claim_v2": {"id"}},
+               policy=build_access_policy(snapshot, GrantSet(objects=frozenset({"claim_v2"}))),
+               views=inventory_for(snapshot))
+    assert getattr(v, "code", None) is None, v

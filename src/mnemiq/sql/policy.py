@@ -59,8 +59,16 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
         # standard shape.
         return every | reachable
     bodies = dict(inventory)
+    # Folded index, for the reason `_walk` folds its own lookup: this one resolves the SAME
+    # question -- which view does this name refer to -- and answered it case-sensitively, so the
+    # two disagreed. Measured: a nested body reading `FROM CLAIM_V` under catalog `PG` never
+    # descended into `PG.claim_v`, `PG.claim` never became reachable, and its row filter was
+    # dropped from the policy. Catalog `pg` worked only because the generated spellings happened
+    # to match the key's case; the alias is free-form and nothing normalises it.
+    folded_bodies = {k.lower(): v for k, v in bodies.items()}
     while frontier:
-        view = bodies.get(frontier.pop())
+        candidate = frontier.pop()
+        view = bodies.get(candidate) or folded_bodies.get(candidate.lower())
         if view is None:
             continue
         try:

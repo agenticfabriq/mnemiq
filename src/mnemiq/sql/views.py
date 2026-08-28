@@ -241,6 +241,30 @@ def _walk(
                     view, name = views[candidate], candidate
                     break
         if view is None:
+            # Case-insensitive fallback, tried LAST so an exact match always wins. Unquoted
+            # identifiers are case-insensitive in all three engines -- `_spellings` two screens
+            # down folds for exactly this reason -- but this lookup did not. Measured: a body
+            # writing `FROM CLAIM_V` against an inventory keyed `claim_v` missed, the nested view
+            # was never walked, and its row-filtered base was never reached. APPROVED on the
+            # single-source path as well as the federated one, so this is not federation's bug.
+            #
+            # `sorted` so a source holding two keys differing only in case resolves the same way
+            # every run. Such a source cannot exist unambiguously under those same engine rules,
+            # but a deterministic wrong answer is debuggable and a arbitrary one is not.
+            # `.lower()` on the WHOLE candidate, catalog included. Lowercasing only the table
+            # half left the prefix in its original case while the comparison below folds the real
+            # key in full, so any catalog alias carrying an uppercase letter made this fallback
+            # dead code. `SourceSpec.catalog` is a free-form DuckDB attach alias and nothing in
+            # `merge_snapshots` or `qualify_object_id` normalises it. Measured: catalog `pg`
+            # refused and catalog `PG` approved, on the identical statement.
+            wanted = {object_key(node).lower(), node.name.lower()}
+            if catalog:
+                wanted |= {f"{catalog}.{w}".lower() for w in tuple(wanted)}
+            for key in sorted(views):
+                if key.lower() in wanted:
+                    view, name = views[key], key
+                    break
+        if view is None:
             continue
         if name in stack:
             return Refusal(
