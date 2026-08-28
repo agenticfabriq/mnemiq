@@ -1,16 +1,23 @@
 """`verdict.tables` is not a log line -- it is the ACL that decides which worked examples a
 caller may see (`_retrieve_examples`, *"an example must not reveal a forbidden table"*).
 
+NOT RETROACTIVE: `tables` enters the snapshot at enrich time and `build_example_index` copies it
+verbatim, so a store enriched before this fix keeps the flat-subtraction value and keeps showing
+the leaky example. Re-indexing does not clear it -- the examples phase has to run again.
+
 Both deciders built it as `find_all(exp.Table)` minus a flat set of CTE aliases: the exact
 construct M31 filed and `base_tables()` was written to replace, still standing in the consumer
 M31 did not reach, because it was not a guard at the time and is one now (M49).
 """
 from __future__ import annotations
 
+import sqlglot
+
 from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.decide import decide
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.scope import base_tables
 from mnemiq.sql.verdict import Refusal
 
 VISIBLE = {
@@ -102,9 +109,11 @@ def test_the_write_target_is_recorded_even_though_nothing_reads_it():
     assert _write_tables("INSERT INTO scratch SELECT id, id FROM orders") == ["orders", "scratch"]
 
 
-def test_an_update_target_is_recorded_once_and_not_twice():
-    """The other half of the asymmetry: an UPDATE target IS read, so it is already in the read
-    set, and the union must not turn that into a duplicate."""
-    tables = _write_tables("UPDATE scratch SET customer_id = 0 WHERE id IN "
-                           "(SELECT id FROM orders)")
-    assert tables == ["orders", "scratch"]
+def test_an_update_target_reaches_the_record_only_through_the_union():
+    """The previous version of this test asserted the target is "recorded once and not twice",
+    which a set union can never violate -- it could not fail. What is actually load-bearing, and
+    surprising, is that `base_tables` does not contain the target at all here: the scope resolves,
+    the target is in no `scope.sources`, and only the union puts it back."""
+    sql = "UPDATE scratch SET customer_id = 0 WHERE id IN (SELECT id FROM orders)"
+    assert {t.name for t in base_tables(sqlglot.parse_one(sql, read="duckdb"))} == {"orders"}
+    assert _write_tables(sql) == ["orders", "scratch"]

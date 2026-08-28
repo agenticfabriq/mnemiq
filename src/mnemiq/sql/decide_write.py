@@ -223,6 +223,28 @@ def decide_write(
     # ACL `_retrieve_examples` filters on, so a CTE named after a governed table deletes that
     # table from the list and an example whose SQL names it is then shown to a caller who may not
     # read it. Same resolver as the three guards, so the premise cannot drift apart again.
+    #
+    # The target is unioned in rather than left to the resolver, and the reason is NOT the verb.
+    # Measured: `base_tables` is ['orders'] for both `UPDATE scratch ... WHERE id IN (SELECT id
+    # FROM orders)` and its DELETE equivalent -- the target NODE is absent from every write shape
+    # whose scope resolves, so the union is what records it, not a top-up for INSERT. An earlier
+    # draft claimed the UPDATE/DELETE target was already in the read set "because the statement
+    # reads it to find its rows"; the review gate measured that and it is false. Gating the union
+    # on `isinstance(shaped, exp.Insert)` would silently drop the target.
+    #
+    # The target's NAME can still arrive without the union, when the statement happens to read the
+    # target elsewhere -- `UPDATE scratch ... WHERE id IN (SELECT id FROM scratch)` resolves to
+    # ['scratch']. A second draft of this comment said "present only when `build_scope` fails",
+    # and that shape falsifies it. The union is unconditional, so the code was never affected;
+    # the claim was.
+    #
+    # That absence is a defect in its own right, not a quirk to route around: strict xfails in
+    # tests/test_cte_shadowing.py pin what it costs, the worst being a denied column ON THE
+    # TARGET evaluated against the wrong table. This union fixes the RECORD, not the guard.
+    #
+    # On the write path this field has no consumer today -- examples are recorded from `decide`
+    # alone and `Runtime.write` discards it -- so this half is consistency with the read decider
+    # and a correct audit record for when one arrives, not the closing of a live leak.
     tables = sorted({object_key(t) for t in base_tables(shaped)} | {tgt})
 
     # RLS: the read path's implementation, not a second copy of it. This block used to filter
