@@ -227,6 +227,22 @@ def test_an_insert_into_a_bare_granted_target_still_works():
     assert verdict.target == "scratch"
 
 
+def test_the_reported_tables_are_spelled_as_the_snapshot_spells_them():
+    """`ApprovedWrite.tables` is built from `object_key`, like the read path's equivalent.
+
+    Built from `.name` it reported this statement as having touched `claim` -- the same
+    qualifier-dropping the target resolution above was fixed for, in the same function. Nothing
+    in `src/` reads this field today, which is exactly why it needs a test: an unobserved field
+    reverts silently, and the revert surfaces the first time write provenance is consumed.
+    """
+    visible = {"pg.claim": {"id", "amount"}, "scratch": {"id", "amount"}}
+    verdict = decide_write("INSERT INTO scratch (id, amount) SELECT id, amount FROM pg.claim",
+                           visible, GrantSet(frozenset(visible), writable=frozenset({"scratch"})),
+                           adapter=_OkAdapter(), policy=AccessPolicy(), writes_enabled=True)
+    assert isinstance(verdict, ApprovedWrite)
+    assert verdict.tables == ["pg.claim", "scratch"]
+
+
 def test_a_multi_target_delete_is_refused_rather_than_guessed_at():
     """`DELETE s FROM t JOIN s` puts the deleted table in `args['tables']` while `this` is `t`,
     so the resolver authorized `t` and the statement deletes from `s`. DuckDB happens to reject
@@ -327,7 +343,9 @@ def test_the_with_floor_is_not_keyed_on_a_sqlglot_arg_name():
                             "INSERT INTO scratch (id) SELECT id FROM x", read="duckdb")
     assert _has_unscoped_with(ast), "control: the current spelling must be detected"
 
-    node = ast.args.pop("with_")
+    # Popped by either spelling -- keyed on one name, this test raises KeyError on the very
+    # version it defends against, which is the defect it exists to catch, one level up.
+    node = ast.args.pop("with_", None) or ast.args.pop("with", None)
     assert node is not None
     ast.args["with"] = node  # the spelling sqlglot 25.x uses, inside the declared range
     assert _has_unscoped_with(ast), "the floor must not depend on the arg's NAME"
