@@ -361,7 +361,7 @@ def test_every_target_of_a_multi_target_delete_is_a_read():
     assert {t.name for t in base_tables(ast)} == {"a", "b", "c"}
 
 
-_MT_VISIBLE = {"a": {"id", "x", "z"}, "b": {"id", "y", "z"}}
+_MT_VISIBLE = {"a": {"id", "x", "z"}, "b": {"id", "x", "y", "z"}}
 _MT_GRANTS = GrantSet(objects=frozenset(_MT_VISIBLE), writable=frozenset({"a"}))
 
 
@@ -373,12 +373,21 @@ def _mt(sql):
 @pytest.mark.parametrize("sql", [
     "UPDATE a, b SET a.x = 1, b.y = 2 WHERE a.id = b.id",       # two tables assigned
     "UPDATE a JOIN b ON a.id = b.id SET b.y = 1 WHERE b.z = 5",  # one, and not the resolved target
+    "UPDATE a JOIN b ON a.id = b.id SET x = 1 WHERE b.z = 5",  # unqualified: MySQL resolves
+                                                               # it to whichever join owns `x`
+    "UPDATE a JOIN b ON a.id = b.id SET (a.x, b.y) = (1, 2) WHERE b.z = 5",  # row-value tuple
 ])
 def test_an_update_this_engine_cannot_name_one_target_for_is_refused(sql):
     """`UPDATE a, b SET ...` parses with `b` on `a`'s own `joins`, not in a `tables` arg -- that
     arg is DELETE-only -- so the ambiguity guard never saw it. Measured before: APPROVED with
     target='a' while `b.y` is written and `b` was never checked for a write grant. The second
-    shape is the same hole reached differently: a join whose SET assigns the OTHER table."""
+    shape is the same hole reached differently: a join whose SET assigns the OTHER table.
+
+    The last two are the discriminator's own blind spots, found by the gate on the commit that
+    added it: an UNQUALIFIED `SET x = 1` and a row-value `SET (a.x, b.y) = (...)` both leave the
+    assigned-table set empty, so a rule that only counts qualified assignments never fires. Bare
+    columns are unambiguous against a single-table UPDATE and not against a joined one, so they
+    are refused only when the target joins."""
     v = _mt(sql)
     assert isinstance(v, Refusal) and v.code is RefusalCode.AMBIGUOUS_WRITE_TARGET
 

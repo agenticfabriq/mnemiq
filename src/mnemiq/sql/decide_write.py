@@ -86,15 +86,26 @@ def _target_table(ast: exp.Expression) -> str | None:
         # that used it: sqlglot parses `UPDATE a JOIN b ON ... SET a.x = b.y` identically, and
         # that statement assigns only `a.x` and is perfectly legitimate. What separates them is
         # what the SET clause ASSIGNS to, so that is what this reads.
-        assigned = set()
+        assigned, unattributable = set(), False
         for assignment in ast.args.get("expressions") or []:
             lhs = assignment.this if isinstance(assignment, exp.EQ) else assignment
             if isinstance(lhs, exp.Column) and lhs.table:
                 assigned.add(lhs.table)
-        # More than one table assigned, or exactly one that is not the resolved target: either
-        # way this engine cannot name the single object being written, and an authorization
-        # decision must not be made against a guess.
+            else:
+                # An UNQUALIFIED column, or a row-value `SET (a.x, b.y) = (...)` tuple. Against a
+                # single-table UPDATE that is unambiguous. Against a joined one it is not: MySQL
+                # resolves a bare `SET x = 1` to whichever joined table owns `x`, so `UPDATE a
+                # JOIN b ... SET x = 1` can write `b.x` while this resolves the target as `a`.
+                # We cannot attribute it without a schema, so it counts as unattributable rather
+                # than as an assignment to the target.
+                unattributable = True
+        # Refuse when the statement joins and anything is unattributable, when more than one
+        # table is assigned, or when the one assigned table is not the resolved target. Each is
+        # the same condition: this engine cannot name the single object being written, and an
+        # authorization decision must not be made against a guess.
         if len(assigned) > 1 or (assigned and node.alias_or_name not in assigned):
+            return None
+        if unattributable and node.args.get("joins"):
             return None
     return object_key(node) if node is not None else None
 
