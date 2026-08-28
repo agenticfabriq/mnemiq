@@ -344,3 +344,18 @@ def test_a_qualified_denied_column_on_the_target_is_still_refused():
     target's columns altogether -- which is what the resolver did before this."""
     v = _denied_verdict({("scratch", "amount")})
     assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_COLUMN
+
+
+def test_every_target_of_a_multi_target_delete_is_a_read():
+    """`DELETE a, b FROM ...` puts its targets in `tables` and leaves a JOIN in `this`, so
+    reading `this` alone names one target and drops the rest -- `b` was missing, and neither
+    its visibility nor its columns were ever checked.
+
+    `decide_write` refuses this shape as AMBIGUOUS_WRITE_TARGET, so the resolver's gap is inert
+    today. It is closed anyway: a resolver whose correctness depends on a guard downstream of
+    it is the defect this whole change is about, and `base_tables` is consumed by three guards
+    that do not all sit behind that refusal.
+    """
+    ast = sqlglot.parse_one("DELETE a, b FROM a JOIN b ON a.id = b.id WHERE a.x IN "
+                            "(SELECT x FROM c)", read="mysql")
+    assert {t.name for t in base_tables(ast)} == {"a", "b", "c"}

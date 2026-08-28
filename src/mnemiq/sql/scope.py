@@ -42,7 +42,7 @@ def _unscoped_ctes(ast: exp.Expression, root) -> bool:
     return False
 
 
-def _target_read(ast: exp.Expression) -> exp.Table | None:
+def _target_reads(ast: exp.Expression) -> list[exp.Table]:
     """The table a WRITE reads through its own TARGET position, or None if it reads none.
 
     `build_scope` models the query a statement runs, not the object it mutates, so a write
@@ -65,17 +65,27 @@ def _target_read(ast: exp.Expression) -> exp.Table | None:
     against a target the caller could not see, whose column was denied.
     """
     if isinstance(ast, (exp.Update, exp.Delete)):
-        node = ast.this
+        # A multi-target DELETE puts its targets in `tables` and leaves a JOIN in `this`, so
+        # reading `this` alone names ONE of them and drops the rest. `_target_node` in
+        # `decide_write` already guards this and refuses AMBIGUOUS_WRITE_TARGET -- but a
+        # resolver whose correctness depends on a guard downstream of it is the bug this
+        # whole change is about, so it is handled here too. All targets, not a pick.
+        targets = ast.args.get("tables")
+        nodes = list(targets) if targets else [ast.this]
     elif isinstance(ast, exp.Insert):
         conflict = ast.args.get("conflict")
         if conflict is None or not conflict.args.get("expressions"):
-            return None  # no ON CONFLICT, or DO NOTHING: nothing reads the target
-        node = ast.this
+            return []  # no ON CONFLICT, or DO NOTHING: nothing reads the target
+        nodes = [ast.this]
     else:
-        return None
-    if isinstance(node, exp.Schema):  # INSERT INTO t (cols)
-        node = node.this
-    return node if isinstance(node, exp.Table) else None
+        return []
+    out: list[exp.Table] = []
+    for node in nodes:
+        if isinstance(node, exp.Schema):  # INSERT INTO t (cols)
+            node = node.this
+        if isinstance(node, exp.Table):
+            out.append(node)
+    return out
 
 
 def base_tables(ast: exp.Expression) -> list[exp.Table]:
@@ -112,9 +122,9 @@ def base_tables(ast: exp.Expression) -> list[exp.Table]:
                 out.append(table)
     # The write target, which no scope names. Added here rather than in each guard so the three
     # of them keep sharing one premise -- the M31 lesson, and the reason M48 sits in this file.
-    target = _target_read(ast)
-    if target is not None and not any(t is target for t in out):
-        out.append(target)
+    for target in _target_reads(ast):
+        if not any(t is target for t in out):
+            out.append(target)
     return out
 
 
@@ -163,8 +173,7 @@ def column_tables(ast: exp.Expression) -> dict[int, str] | None:
     # map has no entry and `check_cls` falls back to the referenced set -- checking a denied
     # column against the wrong table. Only fills entries the scope walk did not, so a real
     # source or CTE of the same name keeps its scoped answer.
-    target = _target_read(ast)
-    if target is not None:
+    for target in _target_reads(ast):
         key = object_key(target)
         for column in ast.find_all(exp.Column):
             if column.table == target.alias_or_name and id(column) not in out:
