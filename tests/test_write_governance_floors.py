@@ -394,10 +394,12 @@ _PROVENANCE_SHAPES = [
     ("update_target_filtered", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
      # Anchored past the subquery's closing paren, so it pins the predicate onto the TARGET's
      # WHERE rather than merely somewhere in the statement -- a strictly stronger substring, and
-     # the same position property the three cases above assert. No counterexample is claimed for
-     # it: this statement's inner select has no WHERE, and `exp.and_` renders an injected
-     # predicate there as `WHERE ...`, not `AND ...`, so the bare form did not admit the inner
-     # conjunction an earlier version of this comment said it did.
+     # the same KIND of position property the three cases above assert, which pin the predicate
+     # inside the derived table instead. No counterexample is claimed for it: this statement's
+     # inner select has no WHERE, and the conjoin is reached only when one already exists (`...
+     # if existing is not None else predicate`), so a predicate injected there renders as a bare
+     # `WHERE ...`. The bare form did not admit the inner conjunction an earlier version of this
+     # comment said it did.
      {"scratch": _ENTITLED}, ["claim", "scratch"], f"FROM claim) AND {_ENTITLED}", ") AS claim"),
 ]
 
