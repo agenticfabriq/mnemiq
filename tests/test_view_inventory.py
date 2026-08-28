@@ -236,3 +236,47 @@ def test_an_unreadable_inventory_defers_before_the_first_model_call():
         snapshot=snapshot, grants=VIEW_ONLY_GRANT, generator=ExplodingGenerator(),
     )
     assert result.code is DeferralReason.POLICY_UNAVAILABLE, result
+
+
+# -- the federated spelling gap, found by Codex's stop-time review -------------------------------
+#
+# `merge_snapshots` qualifies a view's object_id (`claim_v` -> `pg.claim_v`) and leaves its BODY
+# exactly as the source wrote it (`SELECT id, region FROM claim`). `_reachable` parses that body,
+# reaches `claim`, never reaches `pg.claim`, and drops the federated filter from the policy as
+# irrelevant -- so `check_views` sees an empty `filtered` and its early-out approves the read.
+#
+# Third time a narrowing in `_reachable` has silently disarmed the guard downstream of it, after
+# the unparseable-body case it already handles and the unavailable-inventory case above.
+
+def _federated():
+    from mnemiq.config import SourceSpec
+    from mnemiq.semantic.federation import merge_snapshots
+    snap = Snapshot(
+        version="v", source_id="s", created_at="t",
+        columns=[_col("claim", "id"), _col("claim", "region"), _col("claim_v", "id")],
+        views=[VIEW_OVER_CLAIM], jobs=_done())
+    spec = SourceSpec(id="s", kind="postgres", target="d", catalog="pg", schema="public")
+    return merge_snapshots([(spec, snap)])
+
+
+def test_a_federated_view_only_grant_does_not_bypass_the_row_filter():
+    """Measured before the fix: row_filters={} and APPROVED -- every row of `claim` returned
+    unfiltered through a granted view, while the identical single-source shapes refused."""
+    fed = _federated()
+    grants = GrantSet(objects=frozenset({"pg.claim_v"}),
+                      row_filters={"pg.claim": "region = 'west'"})
+    policy = build_access_policy(fed, grants)
+    assert dict(policy.row_filters) == {"pg.claim": "region = 'west'"}
+    v = decide("SELECT id FROM pg.claim_v", {"pg.claim_v": {"id"}},
+               policy=policy, views=inventory_for(fed))
+    assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
+
+
+def test_a_federated_caller_with_no_row_filters_is_still_approved():
+    """The blast-radius control: widening the spellings `_reachable` tries must not make a
+    policy-free federated caller suddenly refusable."""
+    fed = _federated()
+    v = decide("SELECT id FROM pg.claim_v", {"pg.claim_v": {"id"}},
+               policy=build_access_policy(fed, GrantSet(objects=frozenset({"pg.claim_v"}))),
+               views=inventory_for(fed))
+    assert not isinstance(v, type(None)) and getattr(v, "code", None) is None, v
