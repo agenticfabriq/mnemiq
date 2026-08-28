@@ -392,7 +392,11 @@ _PROVENANCE_SHAPES = [
      {"claim": _ENTITLED}, ["claim", "scratch"], f"WHERE {_ENTITLED}) AS claim",
      f"AND {_ENTITLED}"),
     ("update_target_filtered", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
-     {"scratch": _ENTITLED}, ["claim", "scratch"], f"AND {_ENTITLED}", ") AS claim"),
+     # Anchored past the subquery's closing paren, so it pins the predicate onto the TARGET's
+     # WHERE. Bare `AND <predicate>` also matched it conjoined onto the inner `SELECT ... FROM
+     # claim`, which would filter the read by the target's policy -- the wrong table, and the
+     # exact mirror of the mistake the derived-table cases are anchored against.
+     {"scratch": _ENTITLED}, ["claim", "scratch"], f"FROM claim) AND {_ENTITLED}", ") AS claim"),
 ]
 
 
