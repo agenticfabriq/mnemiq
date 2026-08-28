@@ -12,6 +12,7 @@ principle the project defines itself against.
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.decide_write import decide_write
+from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
 
 _VISIBLE = {"claim": {"id", "amount"}}
@@ -31,7 +32,8 @@ class _ExplodingAdapter:
 
 def test_a_deployment_with_writes_disabled_refuses_before_touching_the_source():
     verdict = decide_write(
-        _SQL, _VISIBLE, _grants(), adapter=_ExplodingAdapter(), writes_enabled=False
+        _SQL, _VISIBLE, _grants(), adapter=_ExplodingAdapter(), writes_enabled=False,
+        policy=AccessPolicy(),
     )
 
     assert isinstance(verdict, Refusal)
@@ -41,7 +43,8 @@ def test_a_deployment_with_writes_disabled_refuses_before_touching_the_source():
 def test_the_refusal_does_not_claim_the_identity_lacks_a_grant():
     # D43's distinction: saying "governance said no" when governance was never consulted.
     verdict = decide_write(
-        _SQL, _VISIBLE, _grants(), adapter=_ExplodingAdapter(), writes_enabled=False
+        _SQL, _VISIBLE, _grants(), adapter=_ExplodingAdapter(), writes_enabled=False,
+        policy=AccessPolicy(),
     )
 
     assert verdict.code != RefusalCode.UNAUTHORIZED_WRITE
@@ -52,7 +55,7 @@ def test_the_refusal_does_not_claim_the_identity_lacks_a_grant():
 
 def test_omitting_the_switch_fails_closed():
     # A security parameter whose default is permissive means forgetting it fails OPEN.
-    verdict = decide_write(_SQL, _VISIBLE, _grants(), adapter=_ExplodingAdapter())
+    verdict = decide_write(_SQL, _VISIBLE, _grants(), adapter=_ExplodingAdapter(), policy=AccessPolicy())
 
     assert isinstance(verdict, Refusal)
     assert verdict.code == RefusalCode.WRITES_DISABLED
@@ -65,7 +68,7 @@ def test_writes_enabled_is_unchanged():
 
     verdict = decide_write(
         _SQL, _VISIBLE, _grants(), adapter=_OkAdapter(), writes_enabled=True
-    )
+    , policy=AccessPolicy())
 
     assert isinstance(verdict, ApprovedWrite), getattr(verdict, "message", verdict)
 

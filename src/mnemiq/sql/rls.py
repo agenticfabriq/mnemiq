@@ -110,11 +110,19 @@ def apply_row_and_mask(
     policy: AccessPolicy,
     visible: dict[str, set[str]],
     dialect: str = "duckdb",
+    exclude: exp.Expression | None = None,
 ) -> exp.Expression | Refusal:
     """Wrap each base table that has a row filter or a referenced masked column in a derived
     table that applies the filter and NULLs masked columns AT THE SOURCE. Returns the rewritten
     AST, or a Refusal for a policy-invalid filter.
 
+    `exclude` skips ONE node, by identity. It exists for the target of an UPDATE/DELETE, which is
+    the single position where a derived table is not SQL -- there is nothing to mutate through
+    `UPDATE (SELECT ...) AS claim`. That target is filtered by conjunction instead, in
+    `apply_row_filters_to_write`, which is equivalent there because the target's rows ARE the rows
+    being mutated. By identity and never by name: `UPDATE claim ... WHERE id IN (SELECT id FROM
+    claim ...)` is two nodes with one name that need opposite treatment, and matching on the name
+    would skip both -- the flat-name-set bypass M31 and the view rounds each paid for once.
     """
     if not policy.row_filters and not policy.masked:
         return ast
@@ -131,6 +139,8 @@ def apply_row_and_mask(
 
     # Resolved before the loop mutates the tree: `replace` invalidates the scope it was read from.
     for table_node in base_tables(ast):
+        if exclude is not None and table_node is exclude:
+            continue
         name = object_key(table_node)
         if name not in visible:
             continue
@@ -153,4 +163,55 @@ def apply_row_and_mask(
             name, table_node.alias_or_name, visible[name], masked_by_table.get(name, set()), filt
         )
         table_node.replace(derived)
+    return ast
+
+
+def apply_row_filters_to_write(
+    ast: exp.Expression,
+    policy: AccessPolicy,
+    visible: dict[str, set[str]],
+    target: exp.Expression | None,
+    dialect: str = "duckdb",
+) -> exp.Expression | Refusal:
+    """Govern a write with the read path's RLS. Returns the rewritten AST, or a Refusal.
+
+    M7 filed "two implementations with different semantics" and M30 measured what the second one
+    permitted. The measurements, on `2af9443`: the write path bound a filter only to the table
+    being *written*, so every table a write *read* was unfiltered -- `INSERT INTO scratch SELECT
+    id, amount FROM claim` copied governed rows into an ungoverned table, where a later plain
+    SELECT returns them forever. One approved write turned a filtered table into an unfiltered
+    copy. And it parsed the filter with a bare `parse_one` rather than validating it, so a policy
+    naming an arbitrary table was spliced in unchecked, a non-predicate became `WHERE id = 1 AND
+    DELETE FROM claim`, and a typo raised `ParseError` out of the decider instead of refusing.
+
+    So this is not a new implementation; it is the split that lets there be only one. Reads are
+    wrapped by `apply_row_and_mask` unchanged. The UPDATE/DELETE target is conjoined, because it
+    cannot be wrapped -- and it is conjoined with a predicate that went through the SAME
+    `_validate_filter`, which is what closes the validation half rather than patching its five
+    symptoms one at a time.
+
+    An INSERT target is exempt and stays exempt: an INSERT does not read its target, and filtering
+    rows on the way IN is not what a row filter means.
+    """
+    rewritten = apply_row_and_mask(ast, policy, visible, dialect=dialect, exclude=target)
+    if isinstance(rewritten, Refusal):
+        return rewritten
+    ast = rewritten
+
+    if not isinstance(ast, (exp.Update, exp.Delete)) or not isinstance(target, exp.Table):
+        return ast
+    name = object_key(target)
+    filt = policy.row_filters.get(name)
+    if filt is None:
+        return ast
+    predicate = _validate_filter(filt, visible.get(name, set()), dialect, policy.policy_schema)
+    if predicate is None:
+        return Refusal(
+            code=RefusalCode.INVALID_ROW_FILTER,
+            message=f"The row-access policy for {name!r} is not a valid predicate.",
+            subject=name,
+        )
+    existing = ast.args.get("where")
+    combined = exp.and_(existing.this, predicate) if existing is not None else predicate
+    ast.set("where", exp.Where(this=combined))
     return ast

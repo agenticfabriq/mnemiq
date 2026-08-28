@@ -204,8 +204,12 @@ class Runtime:
         visible = visible_schema(self.snapshot, grants) if self.snapshot else {}
         policy = build_access_policy(self.snapshot, grants) if self.snapshot else AccessPolicy()
         dialect = getattr(self.adapter, "dialect", "duckdb")
+        # The same map the read path builds in `plan_query`. Without it the write decider's view
+        # floor is a parameter nobody passes -- the whole control, satisfied in tests and absent
+        # in production.
+        views = {v.object_id: v for v in self.snapshot.views} if self.snapshot else {}
         verdict = decide_write(sql, visible, grants, adapter=self.adapter, dialect=dialect,
-                               policy=policy,
+                               policy=policy, views=views,
                                # M3: the deployment switch reaches the decider, so a disabled
                                # deployment refuses in our vocabulary instead of letting the
                                # read-only attachment raise and calling that a refusal.
