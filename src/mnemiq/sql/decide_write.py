@@ -4,30 +4,53 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
+from mnemiq.contract import ViewDefinition
 from mnemiq.sql.authz_guard import check_access
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.qualify import object_key
 from mnemiq.sql.rls import apply_row_filters_to_write
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
+from mnemiq.sql.views import check_views
 
 _WRITE_ROOTS = (exp.Insert, exp.Update, exp.Delete)
 
 
 def _target_node(ast: exp.Expression) -> exp.Table | None:
-    """The table node being written, as a NODE. RLS needs the identity, not the name: the target
-    is the one table a write must not wrap in a derived table, and the same name can appear
-    elsewhere in the statement as an ordinary read that must be."""
+    """The table node being written, as a NODE, or None if this engine cannot name exactly one.
+
+    RLS needs the identity, not the name: the target is the one table a write must not wrap in a
+    derived table, and the same name can appear elsewhere in the statement as an ordinary read
+    that must be.
+
+    None means REFUSE, never "guess". This used to fall back to `ast.find(exp.Table)` -- the
+    first table in the tree -- which is a source for any shape whose target is not `this`.
+    Measured: `DELETE s FROM t JOIN s` resolved to `t`, so the grant was checked against a table
+    the statement only reads while `s`, the one it deletes from, was never authorized at all.
+    sqlglot puts the deleted tables in `args["tables"]` for that shape. DuckDB happens to reject
+    the syntax, so the EXPLAIN proof caught it downstream -- an authorization decision rescued by
+    a parser error is not a control, and the next dialect need not oblige.
+    """
+    if ast.args.get("tables"):  # multi-target DELETE: the deleted table is not `this`
+        return None
     this = ast.this
     if isinstance(this, exp.Schema):  # INSERT INTO t (cols)
         this = this.this
-    if isinstance(this, exp.Table):
-        return this
-    return ast.find(exp.Table)
+    return this if isinstance(this, exp.Table) else None
 
 
 def _target_table(ast: exp.Expression) -> str | None:
+    """The target's object-id, spelled the way the snapshot spells one.
+
+    `object_key`, not `.name`. Reading `.name` dropped every qualifier before the write grant was
+    checked, so `UPDATE pg.claim` was authorized against a grant on bare `claim` and then executed
+    against `pg.claim` -- and the RLS half of this same change already used `object_key`, so one
+    change asked the same question two ways. An INSERT is the shape with no backstop: an
+    UPDATE/DELETE target is also a base table and `check_access` refuses it when it is not
+    visible, but an INSERT target is not a base table and no guard before this one sees it.
+    """
     node = _target_node(ast)
-    return node.name if node is not None else None
+    return object_key(node) if node is not None else None
 
 
 def check_write_shape(sql: str, dialect: str = "duckdb") -> exp.Expression | Refusal:
@@ -42,6 +65,23 @@ def check_write_shape(sql: str, dialect: str = "duckdb") -> exp.Expression | Ref
             message="Return exactly one statement. Multiple statements are never executed.",
         )
     ast = statements[0]
+    if isinstance(ast, _WRITE_ROOTS) and ast.args.get("with_") is not None:
+        # A LEADING `WITH` parks its CTEs in the write root's `with_` arg, outside where
+        # `build_scope` roots itself -- so `base_tables` returns [] and every guard sees an empty
+        # statement. Not "the filter is missing": no guard runs. Measured, each against the plain
+        # spelling as a control: a read of a table with NO grant was approved and executed, and so
+        # was a reference to a column that does not exist.
+        #
+        # Refused by shape, which is a question with no unmodelled cases -- either the arg is set
+        # or it is not. Modelling the scope instead is M48's job in the v1 lane; until it lands,
+        # a shape this engine cannot see into is declined rather than approved blind. The same
+        # CTE spelled INSIDE the INSERT parses into the projection, where `build_scope` sees it,
+        # and stays approved and governed.
+        return Refusal(
+            code=RefusalCode.UNSCOPED_CTE,
+            message=("Put the WITH clause inside the statement rather than before it, or inline "
+                     "it: a leading WITH is not visible to this engine's policy checks."),
+        )
     if not isinstance(ast, _WRITE_ROOTS):
         return Refusal(
             code=RefusalCode.NOT_A_WRITE,
@@ -65,6 +105,7 @@ def decide_write(
     adapter=None,
     dialect: str = "duckdb",
     target: str | None = None,
+    views: dict[str, ViewDefinition] | None = None,
     writes_enabled: bool = False,
 ) -> ApprovedWrite | Refusal:
     """The deterministic write decider: deployment switch -> shape -> table/column authz ->
@@ -114,8 +155,24 @@ def decide_write(
     if write_cls is not None:
         return write_cls
 
+    # A row filter cannot be applied through a view, so a write that READS one is declined
+    # exactly as a read of it is. The rewrite below cannot see through a view either, so without
+    # this a filter on the view's base table reached nothing: measured, an INSERT selecting from
+    # a governed view was approved and copied every row into an ungoverned table, where a later
+    # plain SELECT returns them forever. The read decider has had this floor since M27; the write
+    # decider had no `views` parameter at all, so it could not have run it even in principle.
+    ungoverned = check_views(shaped, views or {}, set(policy.row_filters),
+                             known=set(policy.policy_schema))
+    if ungoverned is not None:
+        return ungoverned
+
     tgt = _target_table(shaped)
-    if tgt is None or not grants.allows_write(tgt):
+    if tgt is None:
+        return Refusal(
+            code=RefusalCode.AMBIGUOUS_WRITE_TARGET,
+            message="This engine cannot tell which single table this statement writes to.",
+        )
+    if not grants.allows_write(tgt):
         return Refusal(
             code=RefusalCode.UNAUTHORIZED_WRITE,
             message=f"You may not write to {tgt!r}.",

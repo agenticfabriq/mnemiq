@@ -220,9 +220,7 @@ def test_the_write_decider_constructs_no_row_filter_of_its_own():
 
     Kept anyway, because the specific regression it blocks is the specific one that happened:
     someone editing the write decider adds "just one" filter back where the old copy lived. It is
-    the third version of this test. The first asserted a symbol name, which the better design
-    does not satisfy; the second matched the prose of the comment explaining the fix, which is a
-    test of the changelog.
+    the third version of this test -- see the comment below for the two it replaces.
     """
     import inspect
 

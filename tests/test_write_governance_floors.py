@@ -163,9 +163,11 @@ def test_the_same_cte_spelled_inside_the_insert_is_approved_and_governed():
 # same question. This is M50's root (no single object-id normalisation) in its worst direction:
 # not a filter silently dropped, but a write authorized against an object it does not touch.
 
-# `s` is visible on purpose. With it absent, `check_access` refuses UNAUTHORIZED_TABLE before
-# the target resolver is reached, and the multi-target test below would pass without the floor
-# existing -- green for a reason that has nothing to do with what it claims to prove.
+# `s` is visible on purpose. With it absent, `check_access` refuses UNAUTHORIZED_TABLE before the
+# target resolver is ever reached, so the multi-target test below would be RED for a reason that
+# has nothing to do with the floor -- passing its `isinstance(verdict, Refusal)` line on the
+# wrong refusal and failing the next one. Not a false green; a test that cannot observe its
+# subject in either direction, which is the same defect the runtime-write case had.
 _Q_VISIBLE = {"claim": {"id", "amount"}, "pg.claim": {"id", "amount"}, "s": {"id"}}
 _Q_POLICY = AccessPolicy(policy_schema={k: set(v) for k, v in _Q_VISIBLE.items()})
 

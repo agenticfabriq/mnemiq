@@ -32,6 +32,14 @@ class RefusalCode(StrEnum):
     # Deployment-level, not grant-level: this deployment does not do writes at all. Distinct from
     # UNAUTHORIZED_WRITE, which is a statement about THIS identity's grants (M3).
     WRITES_DISABLED = "writes_disabled"
+    # A write whose CTEs sit outside the scope every guard walks, so the guards see an empty
+    # statement and approve it ungoverned. Refused by shape rather than modelled, the same way
+    # UNGOVERNED_VIEW refuses rather than reaching through a view.
+    UNSCOPED_CTE = "unscoped_cte"
+    # A write whose target this engine cannot resolve to exactly one table. An authorization
+    # decision must not be made against a guess: the previous fallback picked the first table in
+    # the tree, which for a multi-target DELETE is a SOURCE.
+    AMBIGUOUS_WRITE_TARGET = "ambiguous_write_target"
 
 
 # A refusal the model can act on is a repair; a refusal it cannot act on is a dead end.
