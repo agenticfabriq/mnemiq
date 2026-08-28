@@ -180,6 +180,16 @@ def decide_write(
     if write_cls is not None:
         return write_cls
 
+    # Provenance is read from the statement as ASKED, before the rewrite touches it -- the same
+    # ordering, and the same reason, as the read path. The RLS predicate reads whatever the POLICY
+    # names, so reporting the rewritten tree tells the caller which tables their own policy
+    # consults; an entitlements table is the standard shape and one no caller is granted (M28).
+    # Computed here, above the rewrite, rather than at the return: measured below the rewrite it
+    # answered `['claim', 'entitlement', 'scratch']` for a caller granted neither `entitlement`
+    # nor sight of it. What the engine reads on the policy's behalf is not the caller's lineage.
+    cte_names = {c.alias_or_name for c in shaped.find_all(exp.CTE)}
+    tables = sorted({object_key(t) for t in shaped.find_all(exp.Table)} - cte_names)
+
     # A row filter cannot be applied through a view, so a write that READS one is declined
     # exactly as a read of it is. The rewrite below cannot see through a view either, so without
     # this a filter on the view's base table reached nothing: measured, an INSERT selecting from
@@ -225,9 +235,4 @@ def decide_write(
                 message=f"The source rejected this query: {exc}",
             )
 
-    cte_names = {c.alias_or_name for c in shaped.find_all(exp.CTE)}
-    # `object_key`, matching the read path and the target resolution above. Built from `.name`
-    # this reported `INSERT INTO scratch SELECT ... FROM pg.claim` as having touched `claim` --
-    # a third spelling of the one question, inside the function fixing the other two.
-    tables = sorted({object_key(t) for t in shaped.find_all(exp.Table)} - cte_names)
     return ApprovedWrite(plan_sql=plan_sql, target_sql=target_sql, target=tgt, tables=tables)

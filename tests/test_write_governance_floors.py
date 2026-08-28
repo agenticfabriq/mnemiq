@@ -343,13 +343,45 @@ def test_the_with_floor_is_not_keyed_on_a_sqlglot_arg_name():
                             "INSERT INTO scratch (id) SELECT id FROM x", read="duckdb")
     assert _has_unscoped_with(ast), "control: the current spelling must be detected"
 
-    # Popped by either spelling -- keyed on one name, this test raises KeyError on the very
-    # version it defends against, which is the defect it exists to catch, one level up.
-    node = ast.args.pop("with_", None) or ast.args.pop("with", None)
+    # Popped by whichever spelling this sqlglot uses, and re-parked under the OTHER one. Keyed
+    # on a constant, this test raises KeyError on the version it defends against; re-parking
+    # under a constant is worse -- on 25.x it would pop and restore the same key, re-running the
+    # control above and passing a detector regressed to `args.get("with")`. The defect this test
+    # exists to catch, twice, one level up in the test itself.
+    popped = "with_" if "with_" in ast.args else "with"
+    node = ast.args.pop(popped)
     assert node is not None
-    ast.args["with"] = node  # the spelling sqlglot 25.x uses, inside the declared range
+    ast.args["with" if popped == "with_" else "with_"] = node
     assert _has_unscoped_with(ast), "the floor must not depend on the arg's NAME"
 
     inside = sqlglot.parse_one("INSERT INTO scratch (id) WITH x AS (SELECT id FROM claim) "
                                "SELECT id FROM x", read="duckdb")
     assert not _has_unscoped_with(inside), "the governed spelling must not be swept up"
+
+
+def test_write_provenance_does_not_disclose_the_caller_s_own_policy():
+    """`tables` is read from the statement as ASKED, not from the rewritten tree.
+
+    M28 on the write path. A row filter may reach through another table -- the only way to express
+    child-table tenancy -- and the injected predicate names whatever the POLICY names. Reporting
+    the rewrite therefore tells the caller which tables their policy consults, and an entitlements
+    table is both the standard shape and one no caller is ever granted.
+
+    Measured before the fix: this returned `['claim', 'entitlement', 'scratch']` to a caller who
+    holds no grant on `entitlement` and cannot see it in their schema. The read path has computed
+    this above its rewrite since M28; the write path computed it below.
+    """
+    visible = {"claim": {"id", "amount"}, "scratch": {"id", "amount"}}
+    policy = AccessPolicy(
+        row_filters={"claim": "id IN (SELECT id FROM entitlement WHERE who = 'u')"},
+        policy_schema={**{k: set(v) for k, v in visible.items()},
+                       "entitlement": {"id", "who"}},
+    )
+    verdict = decide_write("INSERT INTO scratch (id, amount) SELECT id, amount FROM claim",
+                           visible, GrantSet(frozenset(visible), writable=frozenset({"scratch"})),
+                           adapter=_OkAdapter(), policy=policy, writes_enabled=True)
+    assert isinstance(verdict, ApprovedWrite)
+    assert verdict.tables == ["claim", "scratch"]
+    assert "entitlement" not in verdict.tables
+    # The filter still binds -- provenance is narrowed, not the governance.
+    assert "entitlement" in verdict.plan_sql
