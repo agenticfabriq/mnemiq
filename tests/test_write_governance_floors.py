@@ -495,3 +495,33 @@ def test_a_granted_view_target_still_meets_the_view_floor():
                            writes_enabled=True)
     assert isinstance(verdict, Refusal)
     assert verdict.code is RefusalCode.UNGOVERNED_VIEW
+
+
+@pytest.mark.xfail(strict=True, reason="M50's residual, and specifically the exact-spelling "
+                                       "floor's own: `object_key` joins identifier parts without "
+                                       "preserving quoting, so the dotted NAME '\"pg.claim\"' -- "
+                                       "one literal identifier -- and the schema-qualified "
+                                       "'pg.claim' produce the same key. Measured: a grant meant "
+                                       "for the first authorized a mutation of the second, which "
+                                       "set it to 0 while the first kept its value. Closing it "
+                                       "needs structured identifier parts plus the deployment's "
+                                       "catalog/schema, which is the normalisation M50 asks for "
+                                       "and not another floor keyed on a string.")
+def test_a_quoted_dotted_name_is_a_different_object_from_a_schema_qualified_one():
+    """Filed as a tripwire rather than a sentence, per this project's own convention 8: prose in
+    a register cannot fail, so the fix lands quietly and the row drifts to closed.
+
+    Asserted on the resolved target rather than on a verdict, because the collision is upstream of
+    authorization -- with grants keyed by string there is no way to *express* a grant on one of
+    these two objects and not the other, which is the finding.
+    """
+    import sqlglot
+
+    from mnemiq.sql.decide_write import _target_table
+
+    dotted_name = _target_table(sqlglot.parse_one('UPDATE "pg.claim" SET amount = 0 WHERE id = 1',
+                                                  read="duckdb"))
+    qualified = _target_table(sqlglot.parse_one("UPDATE pg.claim SET amount = 0 WHERE id = 1",
+                                                read="duckdb"))
+    assert dotted_name != qualified, (
+        f"two distinct physical objects share one grant key: {dotted_name!r}")
