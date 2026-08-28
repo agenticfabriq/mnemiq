@@ -162,12 +162,67 @@ def test_the_governed_write_moves_only_in_filter_rows(label, sql):
 # -- one implementation ---------------------------------------------------------------------------
 
 
-def test_the_write_decider_has_no_second_rls_implementation():
-    """M7's actual remedy. Leaving the inline copy correct-looking beside `apply_row_and_mask` is
-    how the two came to disagree; M31's fix DELETED the superseded helper for the same reason.
+_RENDERINGS = [
+    ("filter", "SELECT id, amount FROM claim", _policy()),
+    # A filter that reaches through another table (M28's shape) renders a derived table over a
+    # subquery, and resolves that subquery against `policy_schema` rather than the caller's
+    # scope -- a materially different rendering from the plain predicate above.
+    #
+    # There is deliberately no masked case: a write needs RAW access, so `decide_write` treats a
+    # masked column as denied and refuses before any rewrite happens. The mask half of
+    # `apply_row_and_mask` is unreachable from the write path by design, which is why the
+    # equality here is over row filters only.
+    ("subquery_filter", "SELECT id, amount FROM claim",
+     AccessPolicy(row_filters={"claim": "id IN (SELECT id FROM entitlement)"},
+                  policy_schema={**_SCHEMA, "entitlement": {"id"}})),
+    ("two_references", "SELECT a.id, b.amount FROM claim AS a JOIN claim AS b ON a.id = b.id",
+     _policy()),
+    ("no_policy", "SELECT id, amount FROM claim", AccessPolicy()),
+]
 
-    Asserted as a property rather than as a symbol name: the write decider must build no filter
-    of its own, and `rls.py` must remain the only module that constructs the wrap.
+
+@pytest.mark.parametrize("label,select_sql,policy", _RENDERINGS, ids=[r[0] for r in _RENDERINGS])
+def test_the_write_path_rewrites_a_read_exactly_as_the_read_path_does(label, select_sql, policy):
+    """The security invariant behind M7, asserted as an equality between the two paths' OUTPUT.
+
+    This is what the source-placement guard below was pretending to be. An INSERT's SELECT is a
+    read, so the write path's rendering of it must equal `apply_row_and_mask`'s character for
+    character -- across a plain filter, a filter that reaches through another table, two
+    references to one filtered table, and no policy at all.
+
+    Scope, stated because the previous version of this docstring overran it: four renderings are
+    evidence about four renderings. A second implementation that agreed on all four and diverged
+    on a fifth would pass here, and the 14 shapes below are what make that narrow. What this
+    forecloses is the cheap way the duplicate came back the first time -- something that renders
+    *nearly* the same.
+    """
+    read = sqlglot.parse_one(select_sql, read="duckdb")
+    governed_read = apply_row_and_mask(read, policy, _VISIBLE, dialect="duckdb")
+    assert not isinstance(governed_read, Refusal)
+
+    verdict = _write(f"INSERT INTO scratch (id, amount) {select_sql}", policy)
+    assert isinstance(verdict, ApprovedWrite)
+    assert verdict.plan_sql == (
+        "INSERT INTO scratch (id, amount) " + governed_read.sql(dialect="duckdb")
+    )
+
+
+def test_the_write_decider_constructs_no_row_filter_of_its_own():
+    """An ARCHITECTURAL guard on source placement -- not a security invariant, and it must not be
+    read as one. The invariant is the equality above and the 14 shapes below.
+
+    What it actually asserts: the three constructs that made up the deleted inline copy do not
+    reappear in `decide_write.py`. It cannot see a second implementation moved to another module,
+    spelled through an alias, or written with different AST calls -- and `rls.py` legitimately
+    contains all three today, inside `apply_row_filters_to_write`. So the honest claim is that
+    the duplicate has been RELOCATED to sit beside the original and share its validator, which is
+    what stops them drifting; the claim is not that the strings are gone from the codebase.
+
+    Kept anyway, because the specific regression it blocks is the specific one that happened:
+    someone editing the write decider adds "just one" filter back where the old copy lived. It is
+    the third version of this test. The first asserted a symbol name, which the better design
+    does not satisfy; the second matched the prose of the comment explaining the fix, which is a
+    test of the changelog.
     """
     import inspect
 
@@ -255,11 +310,15 @@ def test_the_target_conjunction_binds_tighter_than_an_existing_or(existing_where
 # -- the residual, recorded as a tripwire rather than as prose --------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="M48 (v1 lane): a statement-level WITH parks its CTEs in the "
-                                       "write root's `with_` arg, outside where build_scope roots "
-                                       "itself, so base_tables returns [] and every guard sees an "
-                                       "empty statement. Fixed by `_unscoped_ctes` in scope.py; when "
-                                       "that lands this xpasses and strict=True forces the flip.")
+@pytest.mark.xfail(strict=True, reason="M30's residual: a statement-level WITH parks its CTEs in "
+                                       "the write root's `with_` arg, outside where build_scope "
+                                       "roots itself, so every guard sees an empty statement. This "
+                                       "asserts the GOVERNED outcome, so it xpasses only when the "
+                                       "shape is scope-resolved (M48's `_unscoped_ctes`) and "
+                                       "nothing stands in its place. It does NOT distinguish "
+                                       "'approved ungoverned' from 'refused' -- both leave it "
+                                       "xfailing, which is why test_write_governance_floors.py "
+                                       "asserts the disposition directly.")
 @pytest.mark.parametrize("sql", [
     "WITH x AS (SELECT id, amount FROM claim) "
     "INSERT INTO scratch (id, amount) SELECT id, amount FROM x",
@@ -273,6 +332,13 @@ def test_a_statement_level_with_is_still_invisible_to_the_rewrite(sql):
     INSERT, which sqlglot parses into the projection where `build_scope` can see it. A leading
     WITH parses somewhere else entirely. Shapes generated from one spelling read as covering the
     class -- which is how a sweep can be exhaustive and blind at once.
+
+    What this tripwire pinned when it was written was too narrow, and that is the more useful
+    lesson: it asserts an RLS predicate on a table that IS granted, so it recorded a missing
+    filter. Measured later, the same shape approved a read of a table with no grant at all and a
+    reference to a column that does not exist -- the guards were not filtering less, they were
+    not running. A tripwire built from the symptom you noticed pins the symptom you noticed.
+    `test_write_governance_floors.py` carries the authorization dimensions.
     """
     verdict = _write(sql)
     assert isinstance(verdict, ApprovedWrite)

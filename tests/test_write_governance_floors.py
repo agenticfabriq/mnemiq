@@ -163,7 +163,10 @@ def test_the_same_cte_spelled_inside_the_insert_is_approved_and_governed():
 # same question. This is M50's root (no single object-id normalisation) in its worst direction:
 # not a filter silently dropped, but a write authorized against an object it does not touch.
 
-_Q_VISIBLE = {"claim": {"id", "amount"}, "pg.claim": {"id", "amount"}}
+# `s` is visible on purpose. With it absent, `check_access` refuses UNAUTHORIZED_TABLE before
+# the target resolver is reached, and the multi-target test below would pass without the floor
+# existing -- green for a reason that has nothing to do with what it claims to prove.
+_Q_VISIBLE = {"claim": {"id", "amount"}, "pg.claim": {"id", "amount"}, "s": {"id"}}
 _Q_POLICY = AccessPolicy(policy_schema={k: set(v) for k, v in _Q_VISIBLE.items()})
 
 
@@ -193,6 +196,35 @@ def test_a_qualified_grant_authorizes_the_qualified_target():
     assert verdict.target == "pg.claim"
 
 
+def test_an_insert_into_an_unknown_qualified_target_is_refused():
+    """The shape with NO backstop, and the reason floor 3 cannot be pinned on UPDATE alone.
+
+    An UPDATE/DELETE target is also a base table, so `check_access` refuses it when it is not
+    visible. An INSERT target is not a base table and no guard before the grant check ever sees
+    it: measured, `INSERT INTO pg.claim ... SELECT ... FROM claim` under `visible={'claim'}` and
+    `writable={'claim'}` was APPROVED as `target='claim'` -- a write into an object the identity
+    holds no grant on and that is not in the snapshot's visible set at all.
+    """
+    visible = {"claim": {"id", "amount"}}
+    verdict = decide_write("INSERT INTO pg.claim (id, amount) SELECT id, amount FROM claim",
+                           visible, GrantSet(frozenset(visible), writable=frozenset({"claim"})),
+                           adapter=_OkAdapter(),
+                           policy=AccessPolicy(policy_schema={"claim": {"id", "amount"}}),
+                           writes_enabled=True)
+    assert isinstance(verdict, Refusal)
+    assert verdict.code is RefusalCode.UNAUTHORIZED_WRITE
+    assert verdict.subject == "pg.claim"
+
+
+def test_an_insert_into_a_bare_granted_target_still_works():
+    visible = {"claim": {"id", "amount"}, "scratch": {"id", "amount"}}
+    verdict = decide_write("INSERT INTO scratch (id, amount) SELECT id, amount FROM claim",
+                           visible, GrantSet(frozenset(visible), writable=frozenset({"scratch"})),
+                           adapter=_OkAdapter(), policy=AccessPolicy(), writes_enabled=True)
+    assert isinstance(verdict, ApprovedWrite)
+    assert verdict.target == "scratch"
+
+
 def test_a_multi_target_delete_is_refused_rather_than_guessed_at():
     """`DELETE s FROM t JOIN s` puts the deleted table in `args['tables']` while `this` is `t`,
     so the resolver authorized `t` and the statement deletes from `s`. DuckDB happens to reject
@@ -218,3 +250,56 @@ def test_no_floor_blocks_an_ordinary_governed_write_end_to_end():
     con.execute("CREATE TABLE scratch (id INT, amount INT)")
     con.execute(verdict.plan_sql)
     assert con.execute("SELECT id FROM scratch ORDER BY id").fetchall() == [(1,)]
+
+
+# -- the floors reach production, not just the decider ---------------------------------------------
+
+
+def test_runtime_write_supplies_the_view_snapshot_to_the_decider():
+    """Floor 1 can be satisfied entirely while the gap it measured stays open in production.
+
+    `Runtime.write` is the only production caller of `decide_write`, it holds `self.snapshot`,
+    and it passed no views -- the read path builds the same map one line away in `plan_query`
+    (`views = {v.object_id: v for v in snapshot.views}`). A parameter nobody passes is not a
+    control, so this test drives the write through the Runtime rather than the decider.
+    """
+    from mnemiq.contract import Column, IdentityContext, Snapshot
+    from mnemiq.runtime import Runtime
+
+    snap = Snapshot(
+        version="v1", source_id="acme", created_at="t",
+        columns=[Column(id="claim_view.id", object_id="claim_view", name="id"),
+                 # `claim` must be a known object or `check_views` refuses UNRESOLVABLE_VIEW
+                 # -- snapshot incompleteness, not the row-filter floor this test is about.
+                 Column(id="claim.id", object_id="claim", name="id"),
+                 Column(id="claim.region", object_id="claim", name="region"),
+                 Column(id="scratch.id", object_id="scratch", name="id")],
+        views=[ViewDefinition(object_id="claim_view", definition="SELECT * FROM claim",
+                              dialect="duckdb")],
+    )
+
+    class _Authz:
+        def grants_for(self, _identity):
+            return GrantSet(frozenset({"claim_view", "scratch"}),
+                            writable=frozenset({"scratch"}),
+                            row_filters={"claim": "region = 'west'"})
+
+    class _Adapter:
+        dialect = "duckdb"
+
+        def execute(self, sql):
+            return [] if sql.startswith("EXPLAIN") else [(1,)]
+
+    class _WritesEnabled:
+        write_enabled = True
+        source_id = "acme"
+
+    rt = Runtime(con=None, snapshot=snap, adapter=_Adapter(), agent=None, embedder=None,
+                 authz=_Authz(), settings=_WritesEnabled())
+    res = rt.write("INSERT INTO scratch (id) SELECT id FROM claim_view",
+                   IdentityContext(tenant_id="t", principal_id="u", roles=["analyst"]))
+    assert res.approved is False
+    # `WriteResult` carries no refusal code, so the assertion has to be on the message that
+    # only UNGOVERNED_VIEW produces. `"view" in refusal` was not that: "claim_view" contains
+    # "view", so it passed just as happily on UNRESOLVABLE_VIEW.
+    assert "cannot apply that filter through a view" in (res.refusal or "")
