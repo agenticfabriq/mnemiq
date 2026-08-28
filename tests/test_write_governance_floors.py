@@ -1,0 +1,220 @@
+"""The write path's governance is the READ path's governance, or it is not parity.
+
+M30 + M7 unified the RLS *rewrite* and stopped there, and an adversarial review found the gap
+that framing left: a read is governed by the rewrite AND by the floors around it, and the write
+path had none of the floors. Three shapes walked straight through a write that a read refuses.
+
+Each floor here is the same design as `check_views` (M27): refuse the shape that cannot be
+governed, rather than model it and fail open on the shapes the model misses. Each is removable
+the day the thing it stands in for is resolved, and each is paired with a control proving it
+refuses the ungovernable shape rather than the whole feature.
+"""
+
+import duckdb
+import pytest
+
+from mnemiq.authz.grants import GrantSet
+from mnemiq.contract.semantic import ViewDefinition
+from mnemiq.sql.decide import decide
+from mnemiq.sql.decide_write import decide_write
+from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
+
+
+class _OkAdapter:
+    def execute(self, sql):
+        return []
+
+
+# -- floor 1: a write reads through a governed view --------------------------------------------
+
+# Measured before the fix, with the read path as the control:
+#   read  via decide       REFUSED(UNGOVERNED_VIEW)
+#   write via decide_write APPROVED  -> executed -> copied [(1,), (2,), (3,)], west-only is [(1,)]
+# `decide_write` had no `views` parameter at all, so `check_views` could not run on a write even
+# in principle. The RLS rewrite cannot see through a view, so a filter on the view's BASE table
+# reached nothing and the rows landed, durably, in an ungoverned table.
+
+_V_VISIBLE = {"claim_view": {"id", "amount", "region"}, "scratch": {"id", "amount"}}
+_V_SCHEMA = {"claim": {"id", "amount", "region"}, **{k: set(v) for k, v in _V_VISIBLE.items()}}
+_VIEWS = {"claim_view": ViewDefinition(object_id="claim_view",
+                                       definition="SELECT * FROM claim", dialect="duckdb")}
+
+
+def _v_policy(filtered: bool = True) -> AccessPolicy:
+    return AccessPolicy(row_filters={"claim": "region = 'west'"} if filtered else {},
+                        policy_schema=_V_SCHEMA)
+
+
+def _v_grants() -> GrantSet:
+    return GrantSet(frozenset(_V_VISIBLE), writable=frozenset({"scratch"}))
+
+
+_VIEW_READERS = [
+    ("insert", "INSERT INTO scratch (id, amount) SELECT id, amount FROM claim_view"),
+    ("update", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim_view)"),
+    ("delete", "DELETE FROM scratch WHERE id IN (SELECT id FROM claim_view)"),
+]
+
+
+@pytest.mark.parametrize("label,sql", _VIEW_READERS, ids=[c[0] for c in _VIEW_READERS])
+def test_a_write_reading_a_governed_view_is_refused_as_a_read_is(label, sql):
+    verdict = decide_write(sql, _V_VISIBLE, _v_grants(), adapter=_OkAdapter(),
+                           policy=_v_policy(), views=_VIEWS, writes_enabled=True)
+    assert isinstance(verdict, Refusal)
+    assert verdict.code is RefusalCode.UNGOVERNED_VIEW
+
+
+def test_the_read_path_refuses_the_same_view_the_write_path_now_does():
+    """The control that makes the floor a PARITY claim rather than a write-path opinion."""
+    read = decide("SELECT id, amount FROM claim_view", _V_VISIBLE, adapter=_OkAdapter(),
+                  dialect="duckdb", target="duckdb", policy=_v_policy(), views=_VIEWS)
+    assert isinstance(read, Refusal)
+    assert read.code is RefusalCode.UNGOVERNED_VIEW
+
+
+@pytest.mark.parametrize("label,sql", _VIEW_READERS, ids=[c[0] for c in _VIEW_READERS])
+def test_an_unfiltered_view_is_still_writable(label, sql):
+    """The floor refuses views over FILTERED tables, not views. Without this control the fix
+    above is indistinguishable from banning views from the write path entirely."""
+    verdict = decide_write(sql, _V_VISIBLE, _v_grants(), adapter=_OkAdapter(),
+                           policy=_v_policy(filtered=False), views=_VIEWS, writes_enabled=True)
+    assert isinstance(verdict, ApprovedWrite)
+
+
+def test_a_write_with_no_view_snapshot_is_unaffected():
+    """Every existing caller passes no views; the floor must be inert for them."""
+    verdict = decide_write("INSERT INTO scratch (id, amount) SELECT id, amount FROM scratch",
+                           _V_VISIBLE, _v_grants(), adapter=_OkAdapter(),
+                           policy=_v_policy(), writes_enabled=True)
+    assert isinstance(verdict, ApprovedWrite)
+
+
+# -- floor 2: a statement-level WITH is invisible to every guard ---------------------------------
+
+# sqlglot parks a LEADING `WITH` in the write root's `with_` arg, outside where `build_scope`
+# roots itself -- so `base_tables` returns [] and each guard sees an empty statement. The M30
+# xfails pinned only the RLS symptom, on a table that was granted. Measured, with the plain
+# spellings as controls:
+#   plain read of ungranted table  REFUSED(UNAUTHORIZED_TABLE)  |  leading WITH  APPROVED
+#   plain unknown column           REFUSED(UNKNOWN_COLUMN)      |  leading WITH  APPROVED
+#   -> executed, copying [(7, 700), (8, 800)] out of a table with no grant at all.
+# So the residual was never only "the filter is missing"; it was "no guard runs". A floor is the
+# honest response to that: refuse the spelling until its CTEs are inside the scope the guards
+# walk. The equivalent INSERT-internal spelling stays approved and stays governed, which is what
+# makes this a floor and not a ban on CTEs.
+
+_W_VISIBLE = {"claim": {"id", "amount", "region"}, "scratch": {"id", "amount"}}
+_W_SCHEMA = {k: set(v) for k, v in _W_VISIBLE.items()}
+
+
+def _w_write(sql: str, visible=None, grants=None):
+    visible = _W_VISIBLE if visible is None else visible
+    grants = grants or GrantSet(frozenset(visible), writable=frozenset({"claim", "scratch"}))
+    return decide_write(sql, visible, grants, adapter=_OkAdapter(), dialect="duckdb",
+                        policy=AccessPolicy(row_filters={"claim": "region = 'west'"},
+                                            policy_schema=_W_SCHEMA),
+                        writes_enabled=True)
+
+
+_LEADING_WITH = [
+    "WITH x AS (SELECT id, amount FROM claim) "
+    "INSERT INTO scratch (id, amount) SELECT id, amount FROM x",
+    "WITH x AS (SELECT id FROM claim) UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM x)",
+    "WITH x AS (SELECT id FROM claim) DELETE FROM scratch WHERE id IN (SELECT id FROM x)",
+]
+
+
+@pytest.mark.parametrize("sql", _LEADING_WITH)
+def test_a_statement_level_with_is_refused_rather_than_approved_ungoverned(sql):
+    verdict = _w_write(sql)
+    assert isinstance(verdict, Refusal)
+    assert verdict.code is RefusalCode.UNSCOPED_CTE
+
+
+def test_the_floor_covers_the_authorization_dimension_not_only_the_filter():
+    """The dimension the M30 xfails did not pin, and the one that made this critical: behind a
+    leading WITH the identity read a table it holds no grant on whatsoever."""
+    visible = {"scratch": {"id", "amount"}}  # `secret` is neither visible nor granted
+    grants = GrantSet(frozenset(visible), writable=frozenset({"scratch"}))
+    verdict = _w_write("WITH x AS (SELECT id, amount FROM secret) "
+                       "INSERT INTO scratch (id, amount) SELECT id, amount FROM x",
+                       visible=visible, grants=grants)
+    assert isinstance(verdict, Refusal)
+
+
+def test_the_same_cte_spelled_inside_the_insert_is_approved_and_governed():
+    """The control that keeps this a floor rather than a ban: sqlglot parses this spelling into
+    the projection, where `build_scope` sees it, so every guard runs and the filter binds."""
+    verdict = _w_write("INSERT INTO scratch (id, amount) "
+                       "WITH c AS (SELECT id, amount FROM claim) SELECT id, amount FROM c")
+    assert isinstance(verdict, ApprovedWrite)
+    assert "region = 'west'" in verdict.plan_sql
+
+
+# -- floor 3: the target is resolved by exact spelling, or refused -------------------------------
+
+# Measured: with `pg.claim` and `claim` both readable and only bare `claim` writable,
+#   UPDATE claim    (control) APPROVED target='claim'
+#   UPDATE pg.claim           APPROVED target='claim'   <- authorized against a DIFFERENT object
+#   UPDATE other    (control) REFUSED(UNAUTHORIZED_WRITE)
+# and executing it set pg.claim to 0 while bare claim kept 999. The grant check read `node.name`
+# while the RLS half of the same change read `object_key` -- one change, two spellings of the
+# same question. This is M50's root (no single object-id normalisation) in its worst direction:
+# not a filter silently dropped, but a write authorized against an object it does not touch.
+
+_Q_VISIBLE = {"claim": {"id", "amount"}, "pg.claim": {"id", "amount"}}
+_Q_POLICY = AccessPolicy(policy_schema={k: set(v) for k, v in _Q_VISIBLE.items()})
+
+
+def _q_write(sql: str, writable: set[str]):
+    return decide_write(sql, _Q_VISIBLE, GrantSet(frozenset(_Q_VISIBLE),
+                                                  writable=frozenset(writable)),
+                        adapter=_OkAdapter(), policy=_Q_POLICY, writes_enabled=True)
+
+
+def test_a_qualified_target_is_not_authorized_by_a_bare_grant():
+    verdict = _q_write("UPDATE pg.claim SET amount = 0 WHERE id = 1", {"claim"})
+    assert isinstance(verdict, Refusal)
+    assert verdict.code is RefusalCode.UNAUTHORIZED_WRITE
+    assert verdict.subject == "pg.claim", "the refusal must name the object actually written"
+
+
+def test_a_bare_target_is_still_authorized_by_a_bare_grant():
+    verdict = _q_write("UPDATE claim SET amount = 0 WHERE id = 1", {"claim"})
+    assert isinstance(verdict, ApprovedWrite)
+    assert verdict.target == "claim"
+
+
+def test_a_qualified_grant_authorizes_the_qualified_target():
+    """Exact spelling in BOTH directions -- otherwise the floor reads as 'qualifiers refuse'."""
+    verdict = _q_write("UPDATE pg.claim SET amount = 0 WHERE id = 1", {"pg.claim"})
+    assert isinstance(verdict, ApprovedWrite)
+    assert verdict.target == "pg.claim"
+
+
+def test_a_multi_target_delete_is_refused_rather_than_guessed_at():
+    """`DELETE s FROM t JOIN s` puts the deleted table in `args['tables']` while `this` is `t`,
+    so the resolver authorized `t` and the statement deletes from `s`. DuckDB happens to reject
+    the syntax, so the EXPLAIN proof caught it -- a wrong authorization decision saved by a
+    downstream parser error is not a control, and the next dialect need not oblige."""
+    verdict = _q_write("DELETE s FROM claim JOIN s ON claim.id = s.id WHERE claim.id = 1",
+                       {"claim", "s"})
+    assert isinstance(verdict, Refusal)
+    assert verdict.code is RefusalCode.AMBIGUOUS_WRITE_TARGET
+
+
+# -- the floors hold against a real database ------------------------------------------------------
+
+
+def test_no_floor_blocks_an_ordinary_governed_write_end_to_end():
+    """One executed control for the whole file: the ordinary shape still runs, and still lands
+    only filtered rows. Three refusals prove nothing if the feature stopped working."""
+    verdict = _w_write("INSERT INTO scratch (id, amount) SELECT id, amount FROM claim")
+    assert isinstance(verdict, ApprovedWrite)
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INT, amount INT, region TEXT)")
+    con.execute("INSERT INTO claim VALUES (1,10,'west'),(2,20,'east'),(3,30,'east')")
+    con.execute("CREATE TABLE scratch (id INT, amount INT)")
+    con.execute(verdict.plan_sql)
+    assert con.execute("SELECT id FROM scratch ORDER BY id").fetchall() == [(1,)]
