@@ -436,3 +436,51 @@ def test_write_provenance_does_not_disclose_the_caller_s_own_policy(label, sql, 
     assert "entitlement" in verdict.plan_sql
     assert rendering in verdict.plan_sql
     assert absent not in verdict.plan_sql
+
+
+def test_an_ungranted_target_refuses_before_the_view_floor_can_describe_it():
+    """Authorization runs before inspection, or the refusal becomes a discovery probe.
+
+    The floors were ordered to mirror `decide` -- access, CLS, views -- and that ordering is
+    wrong here for the reason that keeps recurring on this path: a write's TARGET is not a base
+    table, so `check_access` never covers it, and `check_views` walked it anyway. Measured before
+    the fix, with an ungranted plain target as the control:
+
+      INSERT INTO hidden_view  REFUSED(UNGOVERNED_VIEW) "'hidden_view' reads 'claim', which is
+                               row-filtered for you"
+      INSERT INTO nonesuch     REFUSED(UNAUTHORIZED_WRITE)
+
+    Three facts about objects the caller holds no grant on, from a refusal: that `hidden_view`
+    exists, that it reads `claim`, and that `claim` is row-filtered for them. Distinguishable
+    from the plain-target refusal, so it is a probe, not a leak of one bit.
+    """
+    visible = {"scratch": {"id", "amount"}}  # hidden_view is NOT granted
+    policy = AccessPolicy(row_filters={"claim": "region = 'west'"},
+                          policy_schema={"claim": {"id", "amount", "region"},
+                                         "hidden_view": {"id", "amount"},
+                                         "scratch": {"id", "amount"}})
+    views = {"hidden_view": ViewDefinition(object_id="hidden_view",
+                                           definition="SELECT * FROM claim", dialect="duckdb")}
+    grants = GrantSet(frozenset(visible), writable=frozenset({"scratch"}))
+    verdict = decide_write("INSERT INTO hidden_view (id, amount) SELECT id, amount FROM scratch",
+                           visible, grants, adapter=_OkAdapter(), policy=policy, views=views,
+                           writes_enabled=True)
+    assert isinstance(verdict, Refusal)
+    assert verdict.code is RefusalCode.UNAUTHORIZED_WRITE, "authorize the target before inspecting it"
+    assert "claim" not in verdict.message, "the refusal must not name the view's base table"
+
+
+def test_a_granted_view_target_still_meets_the_view_floor():
+    """The control: moving authorization first must not disable the floor for granted objects."""
+    visible = {"claim_view": {"id", "amount"}, "scratch": {"id", "amount"}}
+    policy = AccessPolicy(row_filters={"claim": "region = 'west'"},
+                          policy_schema={"claim": {"id", "amount", "region"},
+                                         **{k: set(v) for k, v in visible.items()}})
+    views = {"claim_view": ViewDefinition(object_id="claim_view",
+                                          definition="SELECT * FROM claim", dialect="duckdb")}
+    grants = GrantSet(frozenset(visible), writable=frozenset({"claim_view", "scratch"}))
+    verdict = decide_write("INSERT INTO claim_view (id, amount) SELECT id, amount FROM scratch",
+                           visible, grants, adapter=_OkAdapter(), policy=policy, views=views,
+                           writes_enabled=True)
+    assert isinstance(verdict, Refusal)
+    assert verdict.code is RefusalCode.UNGOVERNED_VIEW

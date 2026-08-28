@@ -190,17 +190,6 @@ def decide_write(
     cte_names = {c.alias_or_name for c in shaped.find_all(exp.CTE)}
     tables = sorted({object_key(t) for t in shaped.find_all(exp.Table)} - cte_names)
 
-    # A row filter cannot be applied through a view, so a write that READS one is declined
-    # exactly as a read of it is. The rewrite below cannot see through a view either, so without
-    # this a filter on the view's base table reached nothing: measured, an INSERT selecting from
-    # a governed view was approved and copied every row into an ungoverned table, where a later
-    # plain SELECT returns them forever. The read decider has had this floor since M27; the write
-    # decider had no `views` parameter at all, so it could not have run it even in principle.
-    ungoverned = check_views(shaped, views or {}, set(policy.row_filters),
-                             known=set(policy.policy_schema))
-    if ungoverned is not None:
-        return ungoverned
-
     tgt = _target_table(shaped)
     if tgt is None:
         return Refusal(
@@ -213,6 +202,24 @@ def decide_write(
             message=f"You may not write to {tgt!r}.",
             subject=tgt,
         )
+
+    # Ordered AFTER the grant check, and that ordering is the finding. Mirroring `decide`
+    # (access -> CLS -> views) is wrong on this path for the reason that keeps recurring here: a
+    # write's TARGET is not a base table, so `check_access` never covers it, and `check_views`
+    # walked it anyway. `INSERT INTO hidden_view ...` then refused UNGOVERNED_VIEW naming the
+    # view AND its row-filtered base -- three facts about objects the caller holds no grant on,
+    # and distinguishable from the plain-target refusal, so a probe rather than one leaked bit.
+    #
+    # A row filter cannot be applied through a view, so a write that READS one is declined
+    # exactly as a read of it is. The rewrite below cannot see through a view either, so without
+    # this a filter on the view's base table reached nothing: measured, an INSERT selecting from
+    # a governed view was approved and copied every row into an ungoverned table, where a later
+    # plain SELECT returns them forever. The read decider has had this floor since M27; the write
+    # decider had no `views` parameter at all, so it could not have run it even in principle.
+    ungoverned = check_views(shaped, views or {}, set(policy.row_filters),
+                             known=set(policy.policy_schema))
+    if ungoverned is not None:
+        return ungoverned
 
     # RLS: the read path's implementation, not a second copy of it. This block used to filter
     # only the table being WRITTEN -- so every table a write READ was ungoverned (M30), and the
