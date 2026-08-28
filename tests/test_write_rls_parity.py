@@ -311,12 +311,20 @@ def test_the_target_conjunction_binds_tighter_than_an_existing_or(existing_where
 @pytest.mark.xfail(strict=True, reason="M30's residual: a statement-level WITH parks its CTEs in "
                                        "the write root's `with_` arg, outside where build_scope "
                                        "roots itself, so every guard sees an empty statement. This "
-                                       "asserts the GOVERNED outcome, so it xpasses only when the "
-                                       "shape is scope-resolved (M48's `_unscoped_ctes`) and "
-                                       "nothing stands in its place. It does NOT distinguish "
-                                       "'approved ungoverned' from 'refused' -- both leave it "
-                                       "xfailing, which is why test_write_governance_floors.py "
-                                       "asserts the disposition directly.")
+                                       "asserts the GOVERNED outcome, and nothing on either "
+                                       "lane produces it: the shape is REFUSED by the "
+                                       "UNSCOPED_CTE floor, and M48's `_unscoped_ctes` refuses "
+                                       "it too rather than governing it -- measured on that "
+                                       "branch, `base_tables` returns ['claim','scratch','x'] "
+                                       "and `check_access` gives UNAUTHORIZED_TABLE on the CTE's "
+                                       "own alias, because declaring the scope unresolvable "
+                                       "falls back to `find_all(exp.Table)`. Governing this "
+                                       "needs `build_scope` to descend into the write root's "
+                                       "`with_`, which nobody has built. So this xpasses only "
+                                       "when that exists; it does NOT distinguish 'approved "
+                                       "ungoverned' from 'refused', which is why "
+                                       "test_write_governance_floors.py asserts the disposition "
+                                       "directly.")
 @pytest.mark.parametrize("sql", [
     "WITH x AS (SELECT id, amount FROM claim) "
     "INSERT INTO scratch (id, amount) SELECT id, amount FROM x",
