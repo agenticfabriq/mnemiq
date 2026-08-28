@@ -124,7 +124,7 @@ def test_an_update_target_is_a_read_the_resolver_now_names():
 
 def test_a_plain_insert_target_still_reaches_the_record_only_through_the_union():
     """The union is not redundant after the resolver change. A plain INSERT genuinely does not
-    read its target, so `_target_read` returns None and `base_tables` correctly omits it -- while
+    read its target, so `_target_reads` returns [] and `base_tables` correctly omits it -- while
     the audit record must still name what the write touched."""
     sql = "INSERT INTO scratch SELECT id, id FROM orders"
     assert {t.name for t in base_tables(sqlglot.parse_one(sql, read="duckdb"))} == {"orders"}

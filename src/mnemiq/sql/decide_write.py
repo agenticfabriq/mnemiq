@@ -76,6 +76,26 @@ def _target_table(ast: exp.Expression) -> str | None:
     visible, but an INSERT target is not a base table and no guard before this one sees it.
     """
     node = _target_node(ast)
+    if node is not None and isinstance(ast, exp.Update):
+        # A MySQL-style multi-table UPDATE -- `UPDATE a, b SET a.x = 1, b.y = 2` -- parses with
+        # `b` hanging off `a`'s OWN `joins`, not in a `tables` arg (that arg is DELETE-only), so
+        # the guard above never sees it. Measured before this: APPROVED with target='a' while
+        # `b.y` was written and `b` was never checked for a write grant.
+        #
+        # The presence of `joins` CANNOT be the test, and the review gate blocked the version
+        # that used it: sqlglot parses `UPDATE a JOIN b ON ... SET a.x = b.y` identically, and
+        # that statement assigns only `a.x` and is perfectly legitimate. What separates them is
+        # what the SET clause ASSIGNS to, so that is what this reads.
+        assigned = set()
+        for assignment in ast.args.get("expressions") or []:
+            lhs = assignment.this if isinstance(assignment, exp.EQ) else assignment
+            if isinstance(lhs, exp.Column) and lhs.table:
+                assigned.add(lhs.table)
+        # More than one table assigned, or exactly one that is not the resolved target: either
+        # way this engine cannot name the single object being written, and an authorization
+        # decision must not be made against a guess.
+        if len(assigned) > 1 or (assigned and node.alias_or_name not in assigned):
+            return None
     return object_key(node) if node is not None else None
 
 
@@ -226,7 +246,7 @@ def decide_write(
     #
     # The target is unioned in because a PLAIN INSERT does not read it, so `base_tables`
     # correctly omits it while the audit record must still name it. Every other write shape now
-    # arrives with the target already in the read set: `_target_read` models an UPDATE/DELETE
+    # arrives with the target already in the read set: `_target_reads` models an UPDATE/DELETE
     # target, and an upsert's, as the reads they are. Earlier drafts of this comment claimed the
     # asymmetry ran the other way, then that the target was absent from every resolving shape --
     # both measured false, and the second was describing a defect rather than a design.

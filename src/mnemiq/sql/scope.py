@@ -43,7 +43,7 @@ def _unscoped_ctes(ast: exp.Expression, root) -> bool:
 
 
 def _target_reads(ast: exp.Expression) -> list[exp.Table]:
-    """The table a WRITE reads through its own TARGET position, or None if it reads none.
+    """Every table a WRITE reads through its own TARGET position; empty when it reads none.
 
     `build_scope` models the query a statement runs, not the object it mutates, so a write
     target is in no `scope.sources` and every guard built on `base_tables` was blind to it.

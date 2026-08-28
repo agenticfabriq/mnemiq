@@ -359,3 +359,48 @@ def test_every_target_of_a_multi_target_delete_is_a_read():
     ast = sqlglot.parse_one("DELETE a, b FROM a JOIN b ON a.id = b.id WHERE a.x IN "
                             "(SELECT x FROM c)", read="mysql")
     assert {t.name for t in base_tables(ast)} == {"a", "b", "c"}
+
+
+_MT_VISIBLE = {"a": {"id", "x", "z"}, "b": {"id", "y", "z"}}
+_MT_GRANTS = GrantSet(objects=frozenset(_MT_VISIBLE), writable=frozenset({"a"}))
+
+
+def _mt(sql):
+    return decide_write(sql, _MT_VISIBLE, _MT_GRANTS, adapter=None, dialect="mysql",
+                        target="mysql", policy=AccessPolicy(), views={}, writes_enabled=True)
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE a, b SET a.x = 1, b.y = 2 WHERE a.id = b.id",       # two tables assigned
+    "UPDATE a JOIN b ON a.id = b.id SET b.y = 1 WHERE b.z = 5",  # one, and not the resolved target
+])
+def test_an_update_this_engine_cannot_name_one_target_for_is_refused(sql):
+    """`UPDATE a, b SET ...` parses with `b` on `a`'s own `joins`, not in a `tables` arg -- that
+    arg is DELETE-only -- so the ambiguity guard never saw it. Measured before: APPROVED with
+    target='a' while `b.y` is written and `b` was never checked for a write grant. The second
+    shape is the same hole reached differently: a join whose SET assigns the OTHER table."""
+    v = _mt(sql)
+    assert isinstance(v, Refusal) and v.code is RefusalCode.AMBIGUOUS_WRITE_TARGET
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE a JOIN b ON a.id = b.id SET a.x = b.y WHERE b.z = 5",  # legitimate single target
+    "UPDATE a SET x = 1 WHERE id = 2",                             # unqualified assignment
+])
+def test_an_update_that_names_one_target_is_still_approved(sql):
+    """The controls, and they are why the first version of this guard was blocked. It keyed on
+    the presence of `joins`, and sqlglot parses a single-target JOIN update identically to the
+    multi-target comma form -- so it refused a statement assigning only `a.x`. What separates
+    them is what the SET clause ASSIGNS to, not what the target joins against."""
+    assert not isinstance(_mt(sql), Refusal)
+
+
+def test_an_ordinary_update_with_a_from_clause_is_still_approved():
+    """A Postgres-style `UPDATE ... FROM` puts the other table in `from` rather than on the
+    target's joins, so it must keep working under either discriminator."""
+    visible = {"a": {"id", "x"}, "b": {"id", "y"}}
+    v = decide_write("UPDATE a SET x = b.y FROM b WHERE a.id = b.id", visible,
+                     GrantSet(objects=frozenset(visible), writable=frozenset({"a"})),
+                     adapter=None, dialect="postgres", target="postgres",
+                     policy=AccessPolicy(), views={}, writes_enabled=True)
+    assert not isinstance(v, Refusal), v
