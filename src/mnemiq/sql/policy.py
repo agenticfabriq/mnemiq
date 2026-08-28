@@ -89,6 +89,10 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
             spellings = {object_key(table), table.name}
             if catalog:
                 spellings |= {f"{catalog}.{k}" for k in spellings if k}
+            # Folded spellings widen what is REACHABLE. They do not by themselves fix a filter
+            # keyed in another case -- that comparison is below, and this comment claimed the
+            # fix before measuring it.
+            spellings |= {k.lower() for k in spellings if k}
             for key in spellings:
                 if key and key not in reachable:
                     reachable.add(key)
@@ -112,7 +116,19 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
         else:
             denied.add((c.object_id, c.name))
     # Reachable, not granted -- same reasoning as the dispositions above.
-    row_filters = {t: f for t, f in grants.row_filters.items() if t in reachable}
+    # Compared case-INSENSITIVELY, for the reason `views._spellings` folds: unquoted identifiers
+    # are case-insensitive in all three engines. This narrowing runs FIRST, so a filter it drops
+    # over a case mismatch never reaches the guard that would have folded it. Measured: a snapshot
+    # keyed `Claim`, a view body writing `FROM claim`, and `row_filters={'Claim': ...}` yielded
+    # `row_filters={}` and an APPROVED read of every row -- while handing `check_views` that same
+    # filter directly refuses. Fourth instance of a narrowing here disarming the guard below it.
+    #
+    # A NARROW case fix, deliberately not the object-id normalisation M50 asks for. Normalising
+    # ids once at the policy boundary is a design decision with three directions to reconcile,
+    # and it does not belong inside a bypass fix.
+    folded = {r.lower() for r in reachable}
+    row_filters = {t: f for t, f in grants.row_filters.items()
+                   if t in reachable or t.lower() in folded}
     policy_schema: dict[str, set[str]] = {}
     for c in snapshot.columns:
         policy_schema.setdefault(c.object_id, set()).add(c.name)

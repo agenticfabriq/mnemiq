@@ -280,3 +280,100 @@ def test_a_federated_caller_with_no_row_filters_is_still_approved():
                policy=build_access_policy(fed, GrantSet(objects=frozenset({"pg.claim_v"}))),
                views=inventory_for(fed))
     assert not isinstance(v, type(None)) and getattr(v, "code", None) is None, v
+
+
+# -- two more of the same class, found by the gate on the commit that fixed the first ----------
+#
+# The catalog fix moved the failure a layer deeper rather than closing it, and made it REACHABLE:
+# before that fix `_walk` never ran on a federated view-only grant at all, because the filter was
+# already gone. Now it runs, and a NESTED federated view resolves to nothing.
+
+def _nested_federated():
+    from mnemiq.config import SourceSpec
+    from mnemiq.semantic.federation import merge_snapshots
+    snap = Snapshot(
+        version="v", source_id="s", created_at="t",
+        columns=[_col("claim", "id"), _col("claim", "region"), _col("claim_v", "id"),
+                 _col("claim_v2", "id")],
+        views=[VIEW_OVER_CLAIM,
+               ViewDefinition(object_id="claim_v2", definition="SELECT id FROM claim_v",
+                              dialect="duckdb")],
+        jobs=_done())
+    spec = SourceSpec(id="s", kind="postgres", target="d", catalog="pg", schema="public")
+    return merge_snapshots([(spec, snap)])
+
+
+def test_a_nested_federated_view_is_resolved_in_its_own_catalog():
+    """A federated body is written in the SOURCE's naming, so `claim_v2` reads `claim_v` where
+    the merged inventory keys it `pg.claim_v`. Measured before: APPROVED, every row of
+    `pg.claim`, while the byte-identical single-source shape refused."""
+    fed = _nested_federated()
+    grants = GrantSet(objects=frozenset({"pg.claim_v2"}),
+                      row_filters={"pg.claim": "region = 'west'"})
+    v = decide("SELECT id FROM pg.claim_v2", {"pg.claim_v2": {"id"}},
+               policy=build_access_policy(fed, grants), views=inventory_for(fed))
+    assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
+
+
+def test_the_write_door_refuses_the_federated_view_identically():
+    """This file's own convention: M46 is what happens when the two doors disagree about a view,
+    so both are asserted rather than trusting that a shared `build_access_policy` covers it."""
+    from mnemiq.sql.decide_write import decide_write
+    fed = _nested_federated()
+    grants = GrantSet(objects=frozenset({"pg.claim_v2", "pg.scratch"}),
+                      writable=frozenset({"pg.scratch"}),
+                      row_filters={"pg.claim": "region = 'west'"})
+    v = decide_write("INSERT INTO pg.scratch SELECT id FROM pg.claim_v2",
+                     {"pg.claim_v2": {"id"}, "pg.scratch": {"id"}}, grants, adapter=None,
+                     dialect="duckdb", policy=build_access_policy(fed, grants),
+                     views=inventory_for(fed), writes_enabled=True)
+    assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
+
+
+def test_a_filter_keyed_in_another_case_is_not_dropped_from_the_policy():
+    """`_reachable` narrows FIRST, so a filter it drops over a case mismatch never reaches the
+    guard that would have folded it. Unquoted identifiers are case-insensitive in all three
+    engines, which is why `views._spellings` folds -- this comparison did not."""
+    snapshot = Snapshot(
+        version="v", source_id="s", created_at="t",
+        columns=[_col("Claim", "id"), _col("Claim", "region"), _col("claim_v", "id")],
+        views=[VIEW_OVER_CLAIM], jobs=_done())
+    grants = GrantSet(objects=frozenset({"claim_v"}), row_filters={"Claim": "region = 'west'"})
+    policy = build_access_policy(snapshot, grants)
+    assert dict(policy.row_filters) == {"Claim": "region = 'west'"}
+    v = decide("SELECT id FROM claim_v", {"claim_v": {"id"}},
+               policy=policy, views=inventory_for(snapshot))
+    assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
+
+
+def test_a_view_body_spelling_its_base_in_another_case_still_carries_the_pii_policy():
+    """The case-fold in `_reachable` is load-bearing on the COLUMN path, not the filter path --
+    `build_access_policy`'s own fold covers the latter, which is why deleting this one left every
+    test green. The `columns` loop compares `c.object_id not in reachable` exactly, so a body
+    writing `FROM CLAIM` against a snapshot keyed `claim` made the base table unreachable and its
+    dispositions were never applied.
+
+    Measured without the fold: `policy.denied == []` for a column marked `direct` -- a direct-PII
+    column left readable through a granted view.
+    """
+    snapshot = Snapshot(
+        version="v", source_id="s", created_at="t",
+        columns=[_col("claim", "id"),
+                 Column(id="claim.ssn", object_id="claim", name="ssn", data_type="text",
+                        pii_level="direct"),
+                 _col("claim_v", "id")],
+        views=[ViewDefinition(object_id="claim_v", definition="SELECT id, ssn FROM CLAIM",
+                              dialect="duckdb")],
+        jobs=_done())
+    policy = build_access_policy(snapshot, GrantSet(objects=frozenset({"claim_v"})))
+    assert ("claim", "ssn") in policy.denied
+
+
+def test_the_same_body_in_matching_case_is_the_control():
+    """So the test above cannot pass on a policy builder that denies everything it sees."""
+    snapshot = Snapshot(
+        version="v", source_id="s", created_at="t",
+        columns=[_col("claim", "id"), _col("claim", "ssn"), _col("claim_v", "id")],
+        views=[VIEW_OVER_CLAIM], jobs=_done())
+    policy = build_access_policy(snapshot, GrantSet(objects=frozenset({"claim_v"})))
+    assert policy.denied == set()

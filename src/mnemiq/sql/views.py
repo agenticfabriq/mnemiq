@@ -212,7 +212,7 @@ def check_views(
                 "reachable; this is not a limit on your grants."
             ),
         )
-    return _walk(ast, views, filtered, known or set(), (), 0)
+    return _walk(ast, views, filtered, known or set(), (), 0, "")
 
 
 def _walk(
@@ -222,12 +222,24 @@ def _walk(
     known: set[str],
     stack: tuple[str, ...],
     depth: int,
+    catalog: str,
 ) -> Refusal | None:
     for node in ast.find_all(exp.Table):
         name = object_key(node)
         view = views.get(name) or views.get(node.name)
         if view is not None and name not in views:
             name = node.name  # a body may qualify a view the snapshot keys bare
+        if view is None and catalog:
+            # A FEDERATED view body is written in the SOURCE's own naming, so a NESTED view
+            # reads `claim_v` where the merged inventory keys it `pg.claim_v`, and the lookup
+            # above misses. Measured: `pg.claim_v2` over `pg.claim_v` over a filtered
+            # `pg.claim` was APPROVED while the byte-identical single-source shape refused.
+            # Resolved in the ENCLOSING view's catalog only, never globally, so two catalogs
+            # holding a view of the same name cannot resolve to each other's.
+            for candidate in (f"{catalog}.{object_key(node)}", f"{catalog}.{node.name}"):
+                if candidate in views:
+                    view, name = views[candidate], candidate
+                    break
         if view is None:
             continue
         if name in stack:
@@ -312,7 +324,10 @@ def _walk(
                 ),
                 subject=name,
             )
-        nested = _walk(body, views, filtered, known, (*stack, name), depth + 1)
+        # The body's own catalog carries into it: a view two levels down is still written in
+        # the source's naming, not the federation's.
+        nested = _walk(body, views, filtered, known, (*stack, name), depth + 1,
+                       name.rsplit(".", 1)[0] if "." in name else catalog)
         if nested is not None:
             return nested
     return None
