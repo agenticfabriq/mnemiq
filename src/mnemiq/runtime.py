@@ -24,6 +24,7 @@ from mnemiq.semantic.ontology_index import OntologyIndex
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.semantic.cards import build_cards
 from mnemiq.semantic.starters import compose_starters
+from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import AccessPolicy, build_access_policy
 from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import ApprovedWrite
@@ -207,7 +208,7 @@ class Runtime:
         # The same map the read path builds in `plan_query`. Without it the write decider's view
         # floor is a parameter nobody passes -- the whole control, satisfied in tests and absent
         # in production.
-        views = {v.object_id: v for v in self.snapshot.views} if self.snapshot else {}
+        views = inventory_for(self.snapshot)
         verdict = decide_write(sql, visible, grants, adapter=self.adapter, dialect=dialect,
                                policy=policy, views=views,
                                # M3: the deployment switch reaches the decider, so a disabled

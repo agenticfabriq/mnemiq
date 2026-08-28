@@ -109,6 +109,66 @@ def _mentions(body: exp.Expression) -> set[str]:
     return _spellings(names)
 
 
+class ViewInventory(dict):
+    """The views a source reports, plus whether the source could be ASKED.
+
+    A plain `{}` asserts "this source has no views". A failed discovery produces the SAME empty
+    mapping and means "we do not know what views exist" -- and the governance layer must not read
+    the second as the first. Measured before this existed: with `row_filters={'claim'}` and a view
+    `claim_v` over it, `check_views` REFUSED `ungoverned_view` when discovery succeeded and
+    APPROVED when discovery failed, from the identical call.
+
+    The producer already knew. `enrichment/pipeline.py` records `discover:views` with
+    `status='failed'` under a comment saying an empty list "must be treated as 'cannot reason
+    about', never as 'there are none'". Nothing read it -- the tenth instance in this codebase of
+    an absence and a failure sharing one value.
+
+    Modelled on `authz/grants.py`'s EMPTY and UNAVAILABLE, which deny identically and exist so the
+    engine can say WHY. Kept as a dict subclass so every existing caller that passes a plain
+    mapping keeps meaning what it meant: a bare dict asserts it is complete, and only a caller
+    that knows otherwise says so.
+    """
+
+    def __init__(self, mapping=None, available: bool = True) -> None:
+        super().__init__(mapping or {})
+        self.available = available
+
+
+# Denies exactly as much as it must, and says why. Distinct from `ViewInventory({})`, which is a
+# source that answered and reported no views.
+VIEWS_UNAVAILABLE = ViewInventory(available=False)
+
+
+def inventory_for(snapshot) -> ViewInventory:
+    """The view inventory a snapshot supports, and whether it could be built at all.
+
+    ONE place answers this, because two would drift: the read path builds its inventory in
+    `plan_query` and the write path in `Runtime.write`, and M46 is what happens when the two
+    doors disagree about a view.
+
+    No snapshot at all is UNAVAILABLE, not empty. `Runtime` substitutes `{}` there, which reads
+    as "this source has no views" -- an engine holding no schema cannot assert that.
+
+    A snapshot whose `discover:views` job FAILED is unavailable: the source was asked and did not
+    answer. `enrichment/pipeline.py` has recorded that status all along, under a comment saying an
+    empty list "must be treated as 'cannot reason about', never as 'there are none'". Nothing read
+    it until now.
+
+    Deliberate residual: a snapshot carrying no `discover:views` job at all is treated as
+    AVAILABLE. The producer always emits one, so absence means a hand-built snapshot rather than a
+    failed read, and the stricter rule -- demand a `done` job -- would refuse every such snapshot
+    on a question about provenance rather than about views. Named here so the choice is visible
+    instead of implicit; a test pins it.
+    """
+    if snapshot is None:
+        return VIEWS_UNAVAILABLE
+    failed = any(
+        getattr(j, "id", None) == "discover:views" and getattr(j, "status", None) == "failed"
+        for j in getattr(snapshot, "jobs", ()) or ()
+    )
+    return ViewInventory({v.object_id: v for v in snapshot.views}, available=not failed)
+
+
 def check_views(
     ast: exp.Expression,
     views: dict[str, ViewDefinition],
@@ -140,7 +200,18 @@ def check_views(
     views refuse for all three roles, including one with no row filters at all.
     """
     if not filtered:
+        # No row filters: there is nothing a view could carry the caller around, so an unknown
+        # inventory costs nothing either. This early-out is what keeps the refusal below narrow.
         return None
+    if not getattr(views, "available", True):
+        return Refusal(
+            code=RefusalCode.VIEW_INVENTORY_UNAVAILABLE,
+            message=(
+                "This source could not report its views, so this engine cannot confirm that "
+                "nothing in this query reads around a row filter. Retry once the source is "
+                "reachable; this is not a limit on your grants."
+            ),
+        )
     return _walk(ast, views, filtered, known or set(), (), 0)
 
 

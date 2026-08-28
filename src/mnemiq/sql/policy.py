@@ -41,9 +41,24 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
 
     from mnemiq.sql.qualify import object_key
 
-    bodies = {v.object_id: v for v in snapshot.views}
+    from mnemiq.sql.views import inventory_for
+
+    inventory = inventory_for(snapshot)
     every = {c.object_id for c in snapshot.columns}
     reachable, frontier = set(grants.objects), list(grants.objects)
+    if not inventory.available:
+        # Same reason as the unparseable body below, and the same answer. We cannot see what any
+        # view reads, so we cannot say the policy is irrelevant to this caller.
+        #
+        # This is load-bearing for M52 and was found by the review gate blocking that commit.
+        # Narrowing here empties `row_filters`, and `check_views` early-outs on `if not filtered`
+        # BEFORE it can refuse an unavailable inventory -- so the guard added for M52 was bypassed
+        # by the very failure it exists for, one file upstream. Measured: a view-only grant plus a
+        # failed `discover:views` job returned Approved on `SELECT ... FROM claim_v`, every row of
+        # the filtered base table, unfiltered. The docstring above calls a view-only grant the
+        # standard shape.
+        return every | reachable
+    bodies = dict(inventory)
     while frontier:
         view = bodies.get(frontier.pop())
         if view is None:

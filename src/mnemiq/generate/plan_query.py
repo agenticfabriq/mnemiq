@@ -7,6 +7,7 @@ from mnemiq.contract import DeferralReason, Snapshot
 from mnemiq.generate.generator import Generator
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.decide import decide
+from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
@@ -55,7 +56,19 @@ def plan_query(
     # A view's body is what makes a filter on its base tables reach anything (M27). It comes
     # from the snapshot rather than from the source at ask time: it is versioned content, and
     # a body that drifted from the one the policy was reasoned about is a governance change.
-    views = {v.object_id: v for v in snapshot.views}
+    views = inventory_for(snapshot)
+    if not views.available and policy.row_filters:
+        # Knowable before the first `generator.propose`, and unfixable by rephrasing: the refusal
+        # fires ahead of the AST walk, so all `max_attempts` iterations would propose, be refused
+        # identically, and feed the same message back to the model. Same shape as the
+        # `grants.available` fast-path below, and the same reason -- an outage needs an operator,
+        # not a retry.
+        return Deferred(
+            reason=("This source could not report its views, so the engine cannot confirm that "
+                    "a query does not read around a row filter. This is a configuration or "
+                    "connectivity fault, not a limit on your access."),
+            code=DeferralReason.POLICY_UNAVAILABLE,
+        )
     if not packet.cards or not visible:
         if not grants.available:
             # The policy could not be READ. Denying everything is correct; saying "your access"
