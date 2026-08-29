@@ -28,6 +28,7 @@ def merge_snapshots(pairs: list[tuple[SourceSpec, Snapshot]]) -> FederatedSnapsh
     table refs inside examples) are prefixed with each source's catalog so nothing collides in
     a single shared index."""
     columns, table_facts, examples, bindings, definitions = [], [], [], [], []
+    views, jobs = [], []
     for spec, snap in pairs:
         cat = spec.catalog
         for c in snap.columns:
@@ -48,11 +49,20 @@ def merge_snapshots(pairs: list[tuple[SourceSpec, Snapshot]]) -> FederatedSnapsh
         for d in snap.definitions:
             definitions.append(d.model_copy(update={
                 "bound_objects": [qualify_object_id(cat, o) for o in d.bound_objects]}))
+        # Views and the jobs that produced them. Dropped until now, which had two costs: the M27
+        # view floor could not fire on ANY federated deployment, because `snapshot.views` was
+        # always empty there; and `inventory_for` then read that empty list as "this source has
+        # no views" rather than "nobody asked", so M52's guard was inert too. One source that
+        # could not report its views makes the merged inventory unavailable -- the union is only
+        # as knowable as its least knowable member.
+        for v in snap.views:
+            views.append(v.model_copy(update={"object_id": qualify_object_id(cat, v.object_id)}))
+        jobs.extend(snap.jobs)
     return FederatedSnapshot(
         version=_composite_version(pairs),
         source_id="federated",
         created_at=max((snap.created_at for _, snap in pairs), default="t"),
         columns=columns, table_facts=table_facts, examples=examples,
-        source_bindings=bindings, definitions=definitions,
+        source_bindings=bindings, definitions=definitions, views=views, jobs=jobs,
         registry={spec.catalog: spec.schema for spec, _ in pairs},
     )

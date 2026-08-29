@@ -14,9 +14,14 @@ it is a disguise for.
 from __future__ import annotations
 
 import pytest
+import sqlglot
 
 from mnemiq.sql.decide import decide
+from mnemiq.sql.verdict import Refusal
+from mnemiq.sql.decide_write import decide_write
+from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.scope import base_tables, column_tables
 from mnemiq.sql.verdict import Approved, RefusalCode
 
 DIALECT = "postgres"
@@ -138,3 +143,273 @@ def test_a_derived_table_sharing_the_name_was_already_correct():
         policy=FILTER,
     )
     assert isinstance(v, Approved) and "store_id = 1" in v.plan_sql
+
+
+# -- M48: the same blind spot one layer down, in the resolver the three guards share -------------
+#
+# A write root parks its CTEs in its own WITH arg, outside the query `build_scope` roots itself
+# at, so every guard saw an empty statement and approved it ungoverned. `check_write_shape`
+# refuses this shape outright now (UNSCOPED_CTE), so these assert the FLOOR underneath that
+# refusal: one guard's decision must not be the only thing standing between a write and an
+# unresolved scope, because `base_tables` is the premise all three of them share.
+#
+# `build_scope` is `traverse_scope(...)[-1]`, and traverse_scope DOES visit the write root's
+# CTEs -- taking only the last scope is what discards them. Measured, all three shapes below:
+# traverse_scope recovers {claim, x} and the write target `scratch` appears in NO scope. For
+# the INSERT that is correct, because an INSERT target is written and never read. For the
+# UPDATE and DELETE it is not: those read the target to find their rows. So swapping the call
+# site governs the reads and silently drops the target on two shapes of three -- the floor is
+# not one call away.
+
+_WRITE_WITH_LEADING_CTE = [
+    "WITH x AS (SELECT id, amount FROM claim) "
+    "INSERT INTO scratch (id, amount) SELECT id, amount FROM x",
+    "WITH x AS (SELECT id FROM claim) UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM x)",
+    "WITH x AS (SELECT id FROM claim) DELETE FROM scratch WHERE id IN (SELECT id FROM x)",
+]
+
+
+@pytest.mark.parametrize("sql", _WRITE_WITH_LEADING_CTE)
+def test_the_resolver_over_reports_rather_than_answering_empty(sql):
+    """`[]` would mean "this statement reads no real object", and `check_access` acts on that:
+    its `if not alias_to_table: return None` early-out is justified by "their sources were
+    checked above", and above, nothing was. Over-reporting refuses the statement on `x`, which
+    is the direction to fail in -- so this floor DECLINES, it does not govern."""
+    ast = sqlglot.parse_one(sql, read="duckdb")
+    assert {t.name for t in base_tables(ast)} == {"claim", "scratch", "x"}
+    assert column_tables(ast) is None
+
+
+@pytest.mark.parametrize("sql", _WRITE_WITH_LEADING_CTE)
+def test_the_resolver_floor_is_not_keyed_on_a_sqlglot_arg_name(sql):
+    """`pyproject` declares `sqlglot>=25`. 25.x spells this arg `with` where 30.x spells it
+    `with_`, so a name-keyed lookup returns None across much of the declared range and fails
+    OPEN exactly where it must fail closed. Simulated by re-keying the node the parser produced:
+    the floor is structural, so the spelling cannot reach it."""
+    ast = sqlglot.parse_one(sql, read="duckdb")
+    node = ast.args.pop("with_", None) or ast.args.pop("with", None)
+    assert node is not None, "the parser produced neither spelling -- the fixture is inert"
+    for spelling in ("with", "with_"):
+        probe = ast.copy()
+        probe.args[spelling] = node
+        assert {t.name for t in base_tables(probe)} == {"claim", "scratch", "x"}, spelling
+
+
+def test_the_same_cte_spelled_inside_the_insert_is_still_resolved():
+    """The control that keeps this a floor and not a ban: this spelling parses into the
+    projection, where `build_scope` sees it, and the resolver reads it exactly."""
+    ast = sqlglot.parse_one(
+        "INSERT INTO scratch (id, amount) "
+        "WITH c AS (SELECT id, amount FROM claim) SELECT id, amount FROM c", read="duckdb")
+    assert {t.name for t in base_tables(ast)} == {"claim"}
+    assert column_tables(ast) is not None
+
+
+@pytest.mark.parametrize("sql", [
+    "WITH x AS (SELECT id FROM claim) SELECT id FROM x",
+    "WITH claim AS (SELECT id FROM claim) SELECT id FROM claim",
+    "SELECT * FROM (WITH y AS (SELECT id FROM claim) SELECT id FROM y) AS z",
+])
+def test_the_floor_never_fires_on_a_read(sql):
+    """A read's WITH is always owned by the query `build_scope` roots at, so this is a
+    write-root mechanism. Asserted because M49's ACL was claimed to depend on it and does not --
+    the coupling was latent, and a test is what keeps that answer true."""
+    ast = sqlglot.parse_one(sql, read="duckdb")
+    assert {t.name for t in base_tables(ast)} == {"claim"}
+    assert column_tables(ast) is not None
+
+
+# -- what the floors did NOT cover, now closed by modelling the target in the resolver ---------
+#
+# These landed as strict xfails first, because a known residual must be able to fail. All three
+# shared ONE root -- `base_tables` did not model the write target -- and closing it in the
+# resolver turned every one of them green at once, which is the argument for fixing a shared
+# premise rather than each guard. The markers came off when the tripwires fired.
+#
+# Three reachable defects, kept apart because they fail through different guards.
+#
+# `strict=True` is what catches a decider that starts refusing everything: an XPASS becomes a
+# failure. A control asserting a REFUSAL guards the opposite direction only when the thing it
+# refuses is specific -- which is why the controls below pin a refusal CODE, not just a refusal.
+
+_UPSERT_VISIBLE = {"claim": {"id", "amount"}, "scratch": {"id", "amount"}}
+_UPSERT_GRANTS = GrantSet(objects=frozenset(_UPSERT_VISIBLE), writable=frozenset({"scratch"}))
+_DENY_AMOUNT = AccessPolicy(denied={("scratch", "amount")})
+
+
+def _upsert_verdict(sql, policy=_DENY_AMOUNT):
+    return decide_write(sql, _UPSERT_VISIBLE, _UPSERT_GRANTS, adapter=None, dialect="duckdb",
+                        policy=policy, views={}, writes_enabled=True)
+
+
+def test_a_denied_column_on_the_target_is_refused_when_the_resolver_gives_up():
+    """The control, and the reason the residual is invisible: `build_scope` returns None for
+    this shape, so `base_tables` takes the `find_all` fallback, `scratch` lands in the read set
+    and `check_cls` refuses. Every refusal below is this fallback, never a check on the target."""
+    v = _upsert_verdict("UPDATE scratch SET amount = 0 WHERE id = 1")
+    assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_COLUMN
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
+    "DELETE FROM scratch WHERE amount = 0 AND id IN (SELECT id FROM claim)",
+])
+def test_a_denied_column_on_the_target_is_refused_when_the_resolver_succeeds(sql):
+    v = _upsert_verdict(sql)
+    assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_COLUMN
+
+
+def test_an_upsert_may_not_read_a_denied_column_on_its_target():
+    v = _upsert_verdict("INSERT INTO scratch (id, amount) SELECT id, amount FROM claim "
+                        "ON CONFLICT (id) DO UPDATE SET amount = scratch.amount + 1")
+    assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_COLUMN
+
+
+def test_an_ordinary_governed_upsert_is_still_approved():
+    """Guards the refuse-everything direction: nothing is denied, so this upsert must go
+    through. `strict=True` on the xfails above does the same job from the other side."""
+    v = _upsert_verdict("INSERT INTO scratch (id, amount) SELECT id, amount FROM claim "
+                        "ON CONFLICT (id) DO UPDATE SET amount = scratch.amount + 1",
+                        policy=AccessPolicy())
+    assert not isinstance(v, Refusal)
+
+
+# The third defect, and it is a statement SHAPE rather than a missing snapshot. An earlier draft
+# blamed `Runtime.write` passing `{}`; measured, the approval does not depend on `visible` at all.
+# `UPDATE scratch SET amount = 0 WHERE id IN (SELECT 1)` resolves to an EMPTY read set -- the
+# subquery names no table and the target is in no `scope.sources` -- so `check_access` takes its
+# `if not alias_to_table` early-out and no guard evaluates the target under any snapshot.
+
+# Only snapshots that do NOT describe the target: refusing is the correct fixed verdict
+# there. A snapshot that DOES describe it must stay approved, which is the control below.
+_TARGET_UNDESCRIBED = [{}, {"claim": {"id"}}]
+_SCRATCH_GRANTS = GrantSet(objects=frozenset({"scratch"}), writable=frozenset({"scratch"}))
+
+
+def _shape_verdict(sql, visible):
+    return decide_write(sql, visible, _SCRATCH_GRANTS, adapter=None, dialect="duckdb",
+                        policy=AccessPolicy(), views={}, writes_enabled=True)
+
+
+def test_check_access_does_run_for_this_statement_shape():
+    """The discriminating control. Same shape, but the subquery names a table the caller cannot
+    read, so `base_tables` is non-empty and the early-out is not taken. Without this, the xfail
+    below cannot tell 'the guard ran and passed' from 'the guard never ran'."""
+    v = _shape_verdict("UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM secret)",
+                       {"scratch": {"id", "amount"}})
+    assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_TABLE
+
+
+@pytest.mark.parametrize("visible", _TARGET_UNDESCRIBED, ids=["no-snapshot", "omits-target"])
+def test_a_write_with_an_empty_read_set_is_still_authorized_against_the_snapshot(visible):
+    v = _shape_verdict("UPDATE scratch SET amount = 0 WHERE id IN (SELECT 1)", visible)
+    assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_TABLE
+
+
+def test_a_write_whose_target_the_snapshot_describes_stays_approved():
+    """The positive control for the empty-read-set shape, and the reason the xfail above is not
+    parametrized over this snapshot: here the caller is fully entitled -- target readable,
+    writable, both columns real -- so approval is the CORRECT verdict and must survive any fix
+    to the residual. Without this, closing the residual by refusing the shape outright would
+    look like success."""
+    v = _shape_verdict("UPDATE scratch SET amount = 0 WHERE id IN (SELECT 1)",
+                       {"scratch": {"id", "amount"}})
+    assert not isinstance(v, Refusal), v
+
+
+# Modelling the target in `base_tables` closes the bypass; modelling its COLUMNS in
+# `column_tables` is what stops the fix from over-refusing. Without the second half a qualified
+# reference to an ALLOWED column on the target falls back to the referenced set and is matched
+# against the wrong table -- measured: `scratch.amount` refused because `claim.amount` is denied.
+# A guard that refuses legitimate writes is not a safer guard, it is a broken one.
+
+_BOTH_VISIBLE = {"claim": {"id", "amount"}, "scratch": {"id", "amount"}}
+_BOTH_GRANTS = GrantSet(objects=frozenset(_BOTH_VISIBLE), writable=frozenset({"scratch"}))
+_QUALIFIED = "UPDATE scratch SET id = 0 WHERE scratch.amount > 5 AND id IN (SELECT id FROM claim)"
+
+
+def _denied_verdict(denied):
+    return decide_write(_QUALIFIED, _BOTH_VISIBLE, _BOTH_GRANTS, adapter=None, dialect="duckdb",
+                        policy=AccessPolicy(denied=denied), views={}, writes_enabled=True)
+
+
+def test_a_qualified_allowed_column_on_the_target_is_not_refused_by_a_denial_elsewhere():
+    """The false-positive half. `scratch.amount` is readable; `claim.amount` is denied; the
+    statement names both tables. The qualifier has to resolve to the target."""
+    assert not isinstance(_denied_verdict({("claim", "amount")}), Refusal)
+
+
+def test_a_qualified_denied_column_on_the_target_is_still_refused():
+    """The true-positive control, so the test above cannot be satisfied by giving up on the
+    target's columns altogether -- which is what the resolver did before this."""
+    v = _denied_verdict({("scratch", "amount")})
+    assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_COLUMN
+
+
+def test_every_target_of_a_multi_target_delete_is_a_read():
+    """`DELETE a, b FROM ...` puts its targets in `tables` and leaves a JOIN in `this`, so
+    reading `this` alone names one target and drops the rest -- `b` was missing, and neither
+    its visibility nor its columns were ever checked.
+
+    `decide_write` refuses this shape as AMBIGUOUS_WRITE_TARGET, so the resolver's gap is inert
+    today. It is closed anyway: a resolver whose correctness depends on a guard downstream of
+    it is the defect this whole change is about, and `base_tables` is consumed by three guards
+    that do not all sit behind that refusal.
+    """
+    ast = sqlglot.parse_one("DELETE a, b FROM a JOIN b ON a.id = b.id WHERE a.x IN "
+                            "(SELECT x FROM c)", read="mysql")
+    assert {t.name for t in base_tables(ast)} == {"a", "b", "c"}
+
+
+_MT_VISIBLE = {"a": {"id", "x", "z"}, "b": {"id", "x", "y", "z"}}
+_MT_GRANTS = GrantSet(objects=frozenset(_MT_VISIBLE), writable=frozenset({"a"}))
+
+
+def _mt(sql):
+    return decide_write(sql, _MT_VISIBLE, _MT_GRANTS, adapter=None, dialect="mysql",
+                        target="mysql", policy=AccessPolicy(), views={}, writes_enabled=True)
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE a, b SET a.x = 1, b.y = 2 WHERE a.id = b.id",       # two tables assigned
+    "UPDATE a JOIN b ON a.id = b.id SET b.y = 1 WHERE b.z = 5",  # one, and not the resolved target
+    "UPDATE a JOIN b ON a.id = b.id SET x = 1 WHERE b.z = 5",  # unqualified: MySQL resolves
+                                                               # it to whichever join owns `x`
+    "UPDATE a JOIN b ON a.id = b.id SET (a.x, b.y) = (1, 2) WHERE b.z = 5",  # row-value tuple
+])
+def test_an_update_this_engine_cannot_name_one_target_for_is_refused(sql):
+    """`UPDATE a, b SET ...` parses with `b` on `a`'s own `joins`, not in a `tables` arg -- that
+    arg is DELETE-only -- so the ambiguity guard never saw it. Measured before: APPROVED with
+    target='a' while `b.y` is written and `b` was never checked for a write grant. The second
+    shape is the same hole reached differently: a join whose SET assigns the OTHER table.
+
+    The last two are the discriminator's own blind spots, found by the gate on the commit that
+    added it: an UNQUALIFIED `SET x = 1` and a row-value `SET (a.x, b.y) = (...)` both leave the
+    assigned-table set empty, so a rule that only counts qualified assignments never fires. Bare
+    columns are unambiguous against a single-table UPDATE and not against a joined one, so they
+    are refused only when the target joins."""
+    v = _mt(sql)
+    assert isinstance(v, Refusal) and v.code is RefusalCode.AMBIGUOUS_WRITE_TARGET
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE a JOIN b ON a.id = b.id SET a.x = b.y WHERE b.z = 5",  # legitimate single target
+    "UPDATE a SET x = 1 WHERE id = 2",                             # unqualified assignment
+])
+def test_an_update_that_names_one_target_is_still_approved(sql):
+    """The controls, and they are why the first version of this guard was blocked. It keyed on
+    the presence of `joins`, and sqlglot parses a single-target JOIN update identically to the
+    multi-target comma form -- so it refused a statement assigning only `a.x`. What separates
+    them is what the SET clause ASSIGNS to, not what the target joins against."""
+    assert not isinstance(_mt(sql), Refusal)
+
+
+def test_an_ordinary_update_with_a_from_clause_is_still_approved():
+    """A Postgres-style `UPDATE ... FROM` puts the other table in `from` rather than on the
+    target's joins, so it must keep working under either discriminator."""
+    visible = {"a": {"id", "x"}, "b": {"id", "y"}}
+    v = decide_write("UPDATE a SET x = b.y FROM b WHERE a.id = b.id", visible,
+                     GrantSet(objects=frozenset(visible), writable=frozenset({"a"})),
+                     adapter=None, dialect="postgres", target="postgres",
+                     policy=AccessPolicy(), views={}, writes_enabled=True)
+    assert not isinstance(v, Refusal), v

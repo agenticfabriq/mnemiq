@@ -120,7 +120,19 @@ class DuckDBAdapter:
         return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
     def view_definitions(self) -> list[tuple[str, str, str]]:
-        """(view, body, dialect) for every view in the source. Any failure -> [].
+        """(view, body, dialect) for every view in the source. A failure RAISES.
+
+        It used to return `[]` on any failure, and that single choice defeated the whole
+        availability signal above it: `enrichment/pipeline.py` wraps this call in a `try/except`
+        precisely so a source that will not answer records `discover:views` as `failed`, and it
+        could never fire because the exception was eaten here. The job said `done`, the snapshot
+        carried an empty `views`, and `inventory_for` reported a COMPLETE inventory of nothing --
+        so a granted view over a filtered table was absent from it, its base filter was narrowed
+        away, and the read was approved unfiltered. `SQLiteAdapter.view_definitions` never
+        swallowed, which is why the test pinning that contract stayed green.
+
+        An empty list still means "this source reports no views" and is answered honestly by a
+        query that succeeds with no rows. What it must never mean again is "nobody could ask".
 
         **DuckDB's `information_schema` cannot answer this for an attached Postgres**: it
         reports every view as `BASE TABLE`, so the obvious discovery path finds no views at all
@@ -137,16 +149,16 @@ class DuckDBAdapter:
                 rows = self._con.execute(
                     f"SELECT * FROM postgres_query('{self._catalog}', $q${_PG_VIEW_QUERY}$q$)"
                 ).fetchall()
-            except Exception:
-                return []
+            except Exception as exc:  # the caller records `discover:views` failed
+                raise RuntimeError(f"could not read view definitions from Postgres: {exc}") from exc
             return [(r[0], r[1], "postgres") for r in rows]
         try:
             rows = self._con.execute(
                 "SELECT view_name, sql FROM duckdb_views() WHERE NOT internal "
                 f"AND schema_name = '{self._table_schema}' ORDER BY view_name"
             ).fetchall()
-        except Exception:
-            return []
+        except Exception as exc:  # the caller records `discover:views` failed
+            raise RuntimeError(f"could not read view definitions from DuckDB: {exc}") from exc
         return [(r[0], r[1], "duckdb") for r in rows]
 
     def execute(self, sql: str) -> list[tuple]:

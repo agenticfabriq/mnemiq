@@ -10,6 +10,7 @@ from mnemiq.sql.guard import MAX_ROWS, check_shape
 from mnemiq.sql.lint import lint
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import expand_tables, object_key
+from mnemiq.sql.scope import base_tables
 from mnemiq.sql.rls import apply_row_and_mask
 from mnemiq.sql.values_check import check_values
 from mnemiq.sql.views import check_views
@@ -50,7 +51,7 @@ def decide(
 
     # A row filter cannot be applied through a view, so a view that reads a filtered table is
     # declined rather than answered past. The floor, deliberately -- see `check_views` (M27).
-    ungoverned = check_views(shaped, views or {}, set(policy.row_filters),
+    ungoverned = check_views(shaped, {} if views is None else views, set(policy.row_filters),
                              known=set(policy.policy_schema))
     if ungoverned is not None:
         return ungoverned
@@ -81,8 +82,13 @@ def decide(
     #
     # The same move corrects `columns`: the derived table projects every visible column of a
     # filtered table, so reading it afterwards reported columns the query never mentioned.
-    cte_names = {cte.alias_or_name for cte in shaped.find_all(exp.CTE)}
-    tables = sorted({object_key(t) for t in shaped.find_all(exp.Table)} - cte_names)
+    #
+    # `base_tables`, not `find_all` minus a flat set of CTE aliases (M49). That construct is the
+    # one M31 filed and this field kept, because it reads like a log line and is not: it is the
+    # ACL `_retrieve_examples` filters on, so a CTE named after a governed table deletes that
+    # table from the list and an example whose SQL names it is then shown to a caller who may not
+    # read it. Same resolver as the three guards, so the premise cannot drift apart again.
+    tables = sorted({object_key(t) for t in base_tables(shaped)})
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
     if not policy.empty:

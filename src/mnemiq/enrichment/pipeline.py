@@ -37,6 +37,18 @@ def content_version(snapshot: Snapshot) -> str:
     # the exact version it had -- the same rule `ontology_version` follows.
     if snapshot.views:
         body["views"] = [v.model_dump(by_alias=True) for v in snapshot.views]
+    # The `discover:views` STATUS, though `jobs` as a whole is excluded above. It stopped being
+    # bookkeeping when `inventory_for` began reading it: it now decides whether a granted view is
+    # governed or refused, and a governance input that does not move the version does not reach a
+    # running replica. Measured, a source with no views: `done` and `failed` hash IDENTICALLY, so
+    # `reload_if_stale` never swaps between them. Both directions bite -- a replica keeps
+    # `available=True` after discovery starts failing, and worse, one holding `failed` keeps
+    # refusing every view query after the operator repairs the source, because the repaired
+    # snapshot hashes the same. Only this one status, and only when set, so a snapshot that
+    # predates the job keeps the exact version it had.
+    discovery = next((j.status for j in snapshot.jobs if j.id == "discover:views"), None)
+    if discovery is not None:
+        body["views_discovery"] = discovery
     if snapshot.ontology_version:
         body["ontology_version"] = snapshot.ontology_version
     payload = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)

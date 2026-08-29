@@ -9,6 +9,7 @@ from mnemiq.sql.authz_guard import check_access
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import object_key
+from mnemiq.sql.scope import base_tables
 from mnemiq.sql.rls import apply_row_filters_to_write
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import check_views
@@ -75,6 +76,37 @@ def _target_table(ast: exp.Expression) -> str | None:
     visible, but an INSERT target is not a base table and no guard before this one sees it.
     """
     node = _target_node(ast)
+    if node is not None and isinstance(ast, exp.Update):
+        # A MySQL-style multi-table UPDATE -- `UPDATE a, b SET a.x = 1, b.y = 2` -- parses with
+        # `b` hanging off `a`'s OWN `joins`, not in a `tables` arg (that arg is DELETE-only), so
+        # the guard above never sees it. Measured before this: APPROVED with target='a' while
+        # `b.y` was written and `b` was never checked for a write grant.
+        #
+        # The presence of `joins` CANNOT be the test, and the review gate blocked the version
+        # that used it: sqlglot parses `UPDATE a JOIN b ON ... SET a.x = b.y` identically, and
+        # that statement assigns only `a.x` and is perfectly legitimate. What separates them is
+        # what the SET clause ASSIGNS to, so that is what this reads.
+        assigned, unattributable = set(), False
+        for assignment in ast.args.get("expressions") or []:
+            lhs = assignment.this if isinstance(assignment, exp.EQ) else assignment
+            if isinstance(lhs, exp.Column) and lhs.table:
+                assigned.add(lhs.table)
+            else:
+                # An UNQUALIFIED column, or a row-value `SET (a.x, b.y) = (...)` tuple. Against a
+                # single-table UPDATE that is unambiguous. Against a joined one it is not: MySQL
+                # resolves a bare `SET x = 1` to whichever joined table owns `x`, so `UPDATE a
+                # JOIN b ... SET x = 1` can write `b.x` while this resolves the target as `a`.
+                # We cannot attribute it without a schema, so it counts as unattributable rather
+                # than as an assignment to the target.
+                unattributable = True
+        # Refuse when the statement joins and anything is unattributable, when more than one
+        # table is assigned, or when the one assigned table is not the resolved target. Each is
+        # the same condition: this engine cannot name the single object being written, and an
+        # authorization decision must not be made against a guess.
+        if len(assigned) > 1 or (assigned and node.alias_or_name not in assigned):
+            return None
+        if unattributable and node.args.get("joins"):
+            return None
     return object_key(node) if node is not None else None
 
 
@@ -180,15 +212,6 @@ def decide_write(
     if write_cls is not None:
         return write_cls
 
-    # Provenance is read from the statement as ASKED, before the rewrite touches it -- the same
-    # ordering, and the same reason, as the read path. The RLS predicate reads whatever the POLICY
-    # names, so reporting the rewritten tree tells the caller which tables their own policy
-    # consults; an entitlements table is the standard shape and one no caller is granted (M28).
-    # Computed here, above the rewrite, rather than at the return: measured below the rewrite it
-    # answered `['claim', 'entitlement', 'scratch']` for a caller granted neither `entitlement`
-    # nor sight of it. What the engine reads on the policy's behalf is not the caller's lineage.
-    cte_names = {c.alias_or_name for c in shaped.find_all(exp.CTE)}
-    tables = sorted({object_key(t) for t in shaped.find_all(exp.Table)} - cte_names)
 
     tgt = _target_table(shaped)
     if tgt is None:
@@ -204,12 +227,11 @@ def decide_write(
         )
 
     # Ordered AFTER the grant check, and that ordering is the finding. Mirroring `decide`
-    # (access -> CLS -> views) is wrong on this path for the reason that keeps recurring here: an
-    # INSERT's target is not a base table, so `check_access` never covers it, and `check_views`
-    # walked it anyway. (An UPDATE/DELETE target IS a base table and `check_access` refuses it
-    # already -- the asymmetry is INSERT's alone, as `_target_table` says above.) `INSERT INTO hidden_view ...` then refused UNGOVERNED_VIEW naming the
-    # view AND its row-filtered base -- three facts about objects the caller holds no grant on,
-    # and distinguishable from the plain-target refusal, so a probe rather than one leaked bit.
+    # (access -> CLS -> views) is wrong on this path: an INSERT's target is not a base table, so
+    # `check_access` never covers it, and `check_views` walked it anyway. `INSERT INTO
+    # hidden_view ...` then refused UNGOVERNED_VIEW naming the view AND its row-filtered base --
+    # three facts about objects the caller holds no grant on, and distinguishable from the
+    # plain-target refusal, so a probe rather than one leaked bit.
     #
     # A row filter cannot be applied through a view, so a write that READS one is declined
     # exactly as a read of it is. The rewrite below cannot see through a view either, so without
@@ -217,10 +239,29 @@ def decide_write(
     # a governed view was approved and copied every row into an ungoverned table, where a later
     # plain SELECT returns them forever. The read decider has had this floor since M27; the write
     # decider had no `views` parameter at all, so it could not have run it even in principle.
-    ungoverned = check_views(shaped, views or {}, set(policy.row_filters),
+    ungoverned = check_views(shaped, {} if views is None else views, set(policy.row_filters),
                              known=set(policy.policy_schema))
     if ungoverned is not None:
         return ungoverned
+
+    # Provenance is read from the statement as ASKED, before the rewrite touches it -- the same
+    # ordering, and the same reason, as the read path. The RLS predicate reads whatever the POLICY
+    # names, so reporting the rewritten tree tells the caller which tables their own policy
+    # consults; an entitlements table is the standard shape and one no caller is granted (M28).
+    #
+    # `base_tables`, not `find_all` minus a flat set of CTE aliases (M49). That construct is the
+    # one M31 filed and this field kept, because it reads like a log line and is not: it is the
+    # ACL `_retrieve_examples` filters on, so a CTE named after a governed table deletes that
+    # table from the list and an example whose SQL names it is then shown to a caller who may not
+    # read it. Same resolver as the three guards, so the premise cannot drift apart again.
+    #
+    # The target is unioned in because a PLAIN INSERT does not read it, so `base_tables`
+    # correctly omits it while the audit record must still name it. Every other write shape now
+    # arrives with the target already in the read set: `_target_reads` models an UPDATE/DELETE
+    # target, and an upsert's, as the reads they are. Earlier drafts of this comment claimed the
+    # asymmetry ran the other way, then that the target was absent from every resolving shape --
+    # both measured false, and the second was describing a defect rather than a design.
+    tables = sorted({object_key(t) for t in base_tables(shaped)} | {tgt})
 
     # RLS: the read path's implementation, not a second copy of it. This block used to filter
     # only the table being WRITTEN -- so every table a write READ was ungoverned (M30), and the

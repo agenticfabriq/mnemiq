@@ -12,7 +12,7 @@ import sqlite3
 import pytest
 
 from mnemiq.adapters.sqlite import SQLiteAdapter
-from mnemiq.contract import Snapshot, ViewDefinition
+from mnemiq.contract import Job, Snapshot, ViewDefinition
 from mnemiq.enrichment.pipeline import content_version, enrich_structural
 
 
@@ -89,3 +89,54 @@ def test_changing_a_view_body_changes_the_content_version():
 def test_a_snapshot_with_no_views_keeps_the_version_it_had_before_views_existed():
     """The `ontology_version` rule: an absent field must not re-version every old snapshot."""
     assert content_version(_snap()) == content_version(_snap(views=[]))
+
+
+def _discovery(status):
+    return _snap(jobs=[Job(id="discover:views", source_id="s", kind="discover", status=status)])
+
+
+def test_a_failed_discovery_changes_the_content_version():
+    """`jobs` is excluded from the hash as run bookkeeping, and this one status stopped being
+    bookkeeping when `inventory_for` began reading it: it decides whether a granted view is
+    governed or refused.
+
+    Measured before this, on a source with no views, `done` and `failed` hashed IDENTICALLY --
+    so `reload_if_stale` compares equal versions and never swaps. Both directions bite. A replica
+    keeps `available=True` after discovery starts failing; and worse, one holding `failed` keeps
+    refusing every view query after the operator repairs the source, because the repaired
+    snapshot hashes the same. A refusal nothing but a process restart can clear.
+    """
+    assert content_version(_discovery("done")) != content_version(_discovery("failed"))
+
+
+def test_a_snapshot_with_no_discovery_job_keeps_the_version_it_had():
+    """Same `included only when present` contract as `views` and `ontology_version` above: a
+    snapshot predating the job must not re-version, or every legacy store churns on upgrade."""
+    assert content_version(_snap()) == content_version(_snap(jobs=[]))
+
+
+def test_an_unrelated_job_does_not_change_the_version():
+    """The control, and the reason this folds in ONE status rather than `jobs` wholesale: an
+    ordinary job's status is still bookkeeping and must not re-version the snapshot."""
+    other = _snap(jobs=[Job(id="profile:columns", source_id="s", kind="profile", status="failed")])
+    assert content_version(_snap()) == content_version(other)
+
+
+def test_the_adapter_raises_rather_than_reporting_no_views(source):
+    """The root cause under all of it. `DuckDBAdapter.view_definitions` caught every exception
+    and returned `[]` -- its docstring said "Any failure -> []" -- so the exception never reached
+    the `try/except` in `enrich_structural` that exists to record `failed`, the job said `done`,
+    and the availability signal faithfully reported a COMPLETE inventory of nothing.
+
+    Pinned on the DuckDB adapter specifically: `SQLiteAdapter` never swallowed, which is why
+    `test_a_source_that_will_not_answer_fails_soft_and_says_so` above stayed green while the
+    adapter most deployments use did the opposite.
+    """
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+
+    adapter = DuckDBAdapter.sqlite(str(source))
+    adapter._table_schema = "no_such_schema_at_all"
+    adapter._con.execute("DROP VIEW IF EXISTS nothing")  # connection is live; the query will not be
+    adapter._con.close()  # force the catalog read to fail the way a dead source does
+    with pytest.raises(Exception):
+        adapter.view_definitions()

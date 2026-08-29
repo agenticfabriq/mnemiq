@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
+from mnemiq.sql.qualify import names_one_object
 
 
 @dataclass
@@ -24,6 +25,54 @@ class AccessPolicy:
     def empty(self) -> bool:
         return not self.row_filters and not self.denied and not self.masked
 
+    # ONE normalisation of an object id, here, rather than at each enforcement site. Every guard
+    # used to compare the SNAPSHOT's spelling against the spelling the QUERY resolved to, with an
+    # exact match, so a source keying `CLAIM` against a query saying `claim` slipped all three:
+    # measured, a `direct` PII column APPROVED and a row filter APPROVED UNFILTERED, on a plain
+    # table read with no view involved. Unquoted identifiers are case-insensitive in all three
+    # engines, so those spell the same object.
+    #
+    # A narrower answer than M50 asks for -- it folds case, not schema qualification -- and
+    # deliberately so: the keys STAY as the snapshot wrote them, so `verdict.tables`, refusal
+    # subjects and every existing caller keep reporting the source's own names. What changes is
+    # only how a lookup is answered.
+
+    # NO CACHE. The first version memoised on `(len(denied), len(masked), len(row_filters))`,
+    # which the review gate broke in one line: swap one denied pair for another and the
+    # cardinality is unchanged, so `denies` keeps answering about the pair that is gone. No
+    # caller mutates these in place today, but they are plain mutable set/dict sitting directly
+    # under three authorization methods, and a stale authorization answer is silent and wrong.
+    # These sets hold a handful of entries; folding per call costs nothing worth this risk.
+
+    def denies(self, table: str, column: str) -> bool:
+        return any(names_one_object(table, [t]) and c.lower() == column.lower()
+                   for t, c in self.denied)
+
+    def masks(self, table: str, column: str) -> bool:
+        return any(names_one_object(table, [t]) and c.lower() == column.lower()
+                   for t, c in self.masked)
+
+    def row_filter_for(self, table: str) -> str | None:
+        """Every filter naming this table, whatever its spelling, OR-combined.
+
+        NOT "the exact match, else a folded one". That made the applied policy depend on how the
+        CALLER spelled the table: measured, one identity whose `row_filters` held both `claim` and
+        `CLAIM` got a different predicate from `FROM claim` than from `FROM CLAIM`. A caller
+        choosing its own row policy by changing case is the defect, and picking a winner in any
+        order still leaves them choosing.
+
+        OR is the right combinator because it is the one `grants.py` uses to merge per-role
+        filters -- more roles mean more visible rows. `grants_for` now folds when it merges, so
+        duplicates should not reach here at all; this is the second line of defence for a policy
+        built by hand or by a provider that does not fold.
+        """
+        matches = [f for t, f in self.row_filters.items() if names_one_object(table, [t])]
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        return " OR ".join(f"({m})" for m in matches)
+
 
 def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
     """Objects this caller's query can end up reading: what they are granted, plus the bases
@@ -41,11 +90,42 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
 
     from mnemiq.sql.qualify import object_key
 
-    bodies = {v.object_id: v for v in snapshot.views}
+    from mnemiq.sql.views import inventory_for
+
+    inventory = inventory_for(snapshot)
     every = {c.object_id for c in snapshot.columns}
     reachable, frontier = set(grants.objects), list(grants.objects)
+    if not inventory.available:
+        # EVERY filtered table stays reachable, not just the ones the snapshot has columns for.
+        # `every` is built from `snapshot.columns`, so a filtered base table whose PROFILING
+        # failed is absent from it -- and then the filter is dropped, `check_views` early-outs on
+        # `if not filtered`, and the unavailable inventory is never even consulted. Measured: with
+        # `claim` profiled the read is REFUSED view_inventory_unavailable; with `claim` missing
+        # from the columns it is APPROVED, unfiltered. Two degraded signals cancelling into an
+        # approval. Fifth instance of a narrowing here disarming the guard below it, which is why
+        # the filter KEYS are now part of the floor rather than something the floor looks up.
+        # Same reason as the unparseable body below, and the same answer. We cannot see what any
+        # view reads, so we cannot say the policy is irrelevant to this caller.
+        #
+        # This is load-bearing for M52 and was found by the review gate blocking that commit.
+        # Narrowing here empties `row_filters`, and `check_views` early-outs on `if not filtered`
+        # BEFORE it can refuse an unavailable inventory -- so the guard added for M52 was bypassed
+        # by the very failure it exists for, one file upstream. Measured: a view-only grant plus a
+        # failed `discover:views` job returned Approved on `SELECT ... FROM claim_v`, every row of
+        # the filtered base table, unfiltered. The docstring above calls a view-only grant the
+        # standard shape.
+        return every | reachable | set(grants.row_filters)
+    bodies = dict(inventory)
+    # Folded index, for the reason `_walk` folds its own lookup: this one resolves the SAME
+    # question -- which view does this name refer to -- and answered it case-sensitively, so the
+    # two disagreed. Measured: a nested body reading `FROM CLAIM_V` under catalog `PG` never
+    # descended into `PG.claim_v`, `PG.claim` never became reachable, and its row filter was
+    # dropped from the policy. Catalog `pg` worked only because the generated spellings happened
+    # to match the key's case; the alias is free-form and nothing normalises it.
+    folded_bodies = {k.lower(): v for k, v in bodies.items()}
     while frontier:
-        view = bodies.get(frontier.pop())
+        candidate = frontier.pop()
+        view = bodies.get(candidate) or folded_bodies.get(candidate.lower())
         if view is None:
             continue
         try:
@@ -55,14 +135,37 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
             # Returning what we have left the policy EMPTY, which skipped the rewrite entirely
             # and approved the view unfiltered -- `check_views` never got the chance to refuse
             # it. Everything is reachable instead, so the policy stays live and the floor runs.
-            return every | reachable
+            # Including the filter keys, for the same reason as the unavailable exit above and
+            # by the same rule: a filter KEY names a table the policy explicitly governs, and
+            # `every` is built from `snapshot.columns`, so a filtered base table whose PROFILING
+            # failed is not in it. The first fix here covered only the unavailable branch and
+            # Codex's stop-time review found this one still open — measured, an unparseable body
+            # plus failed profiling returned APPROVED where the control with columns present
+            # refuses `unresolvable_view`. Two exits, one meaning.
+            return every | reachable | set(grants.row_filters)
+        # A FEDERATED view's object_id is catalog-qualified but its BODY is not:
+        # `merge_snapshots` rewrites `claim_v` -> `pg.claim_v` and leaves `SELECT ... FROM claim`
+        # exactly as the source wrote it. So a body table has to be tried in the view's OWN
+        # catalog as well, or a filter keyed `pg.claim` is never reached and is dropped from the
+        # policy as irrelevant. Measured before this: a view-only grant on `pg.claim_v` with
+        # `row_filters={'pg.claim': ...}` yielded `row_filters={}` and APPROVED the read,
+        # returning every row of `claim` unfiltered -- while the identical single-source shapes
+        # refused. Third time a narrowing here has silently disarmed the guard downstream of it.
+        catalog = view.object_id.rsplit(".", 1)[0] if "." in view.object_id else ""
         for table in parsed.find_all(exp.Table):
             # `object_key`, the same spelling the inliner resolves with. A bare `.name` here
             # never reached `pg.base`, so its filter was dropped and the view read unfiltered.
             # Both spellings, for the same reason the floor matches both: a body may write
             # `public.base` where the snapshot's object-id is `base`, and reaching neither
             # dropped the filter before anything could apply it.
-            for key in {object_key(table), table.name}:
+            spellings = {object_key(table), table.name}
+            if catalog:
+                spellings |= {f"{catalog}.{k}" for k in spellings if k}
+            # Folded spellings widen what is REACHABLE. They do not by themselves fix a filter
+            # keyed in another case -- that comparison is below, and this comment claimed the
+            # fix before measuring it.
+            spellings |= {k.lower() for k in spellings if k}
+            for key in spellings:
                 if key and key not in reachable:
                     reachable.add(key)
                     frontier.append(key)
@@ -74,8 +177,16 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     reachable = _reachable(snapshot, grants)
     denied: set[tuple[str, str]] = set()
     masked: set[tuple[str, str]] = set()
+    # One folded view of `reachable`, shared by BOTH comparisons below. They ask the same
+    # question -- is this object within the policy's reach -- and the column one was left exact
+    # while the filter one was folded, in the same function, in the commit that named this exact
+    # pattern. Measured: a snapshot keying `Claim` with a view body writing `FROM claim` gave
+    # `denied == []` for a column marked `pii_level='direct'`, so a direct-PII column was
+    # readable through a granted view. The other direction already worked, which is what made it
+    # look finished.
+    folded = {r.lower() for r in reachable}
     for c in snapshot.columns:
-        if c.object_id not in reachable:
+        if c.object_id not in reachable and c.object_id.lower() not in folded:
             continue  # not reachable even through a view -> nothing here can ever apply
         level = c.pii_level
         if not level or level == "none" or level in grants.pii_clearance:
@@ -85,7 +196,18 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
         else:
             denied.add((c.object_id, c.name))
     # Reachable, not granted -- same reasoning as the dispositions above.
-    row_filters = {t: f for t, f in grants.row_filters.items() if t in reachable}
+    # Compared case-INSENSITIVELY, for the reason `views._spellings` folds: unquoted identifiers
+    # are case-insensitive in all three engines. This narrowing runs FIRST, so a filter it drops
+    # over a case mismatch never reaches the guard that would have folded it. Measured: a snapshot
+    # keyed `Claim`, a view body writing `FROM claim`, and `row_filters={'Claim': ...}` yielded
+    # `row_filters={}` and an APPROVED read of every row -- while handing `check_views` that same
+    # filter directly refuses. Fourth instance of a narrowing here disarming the guard below it.
+    #
+    # A NARROW case fix, deliberately not the object-id normalisation M50 asks for. Normalising
+    # ids once at the policy boundary is a design decision with three directions to reconcile,
+    # and it does not belong inside a bypass fix.
+    row_filters = {t: f for t, f in grants.row_filters.items()
+                   if t in reachable or t.lower() in folded}
     policy_schema: dict[str, set[str]] = {}
     for c in snapshot.columns:
         policy_schema.setdefault(c.object_id, set()).add(c.name)

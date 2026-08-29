@@ -28,6 +28,10 @@ class RefusalCode(StrEnum):
     # A granted view that reads a row-filtered table. The engine cannot apply the filter
     # through a view, so it declines rather than answer past it -- distinct from
     # UNRESOLVABLE_VIEW, which is a view it could not read at all (M27).
+    # The source could not be asked what views it has, so the engine cannot confirm that a name
+    # in the query is not a view reading around a row filter. Distinct from UNGOVERNED_VIEW,
+    # which names a view it CAN see: this one reports a gap in what it knows, not in the policy.
+    VIEW_INVENTORY_UNAVAILABLE = "view_inventory_unavailable"
     UNGOVERNED_VIEW = "ungoverned_view"
     # Deployment-level, not grant-level: this deployment does not do writes at all. Distinct from
     # UNAUTHORIZED_WRITE, which is a statement about THIS identity's grants (M3).

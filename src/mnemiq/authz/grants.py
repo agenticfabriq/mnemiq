@@ -120,8 +120,16 @@ class FileAuthzProvider:
                 clearance.update(str(x) for x in granted.get("pii_clearance", []))
                 mask.update(str(x) for x in granted.get("pii_mask", []))
                 for table, filt in (granted.get("row_filters") or {}).items():
-                    if table in row_filters:  # more roles = more visible rows: OR-combine
-                        row_filters[table] = f"({row_filters[table]}) OR ({filt})"
+                    # Matched case-INSENSITIVELY. Unquoted identifiers are case-insensitive in
+                    # all three engines, so two roles naming one table in different cases are two
+                    # grants on the SAME table and must OR-combine like any other pair -- which is
+                    # what the comment below has always said and the exact `in` never did.
+                    # Measured before this: `claim` and `CLAIM` stayed separate keys and the
+                    # QUERY's spelling then chose which role's predicate applied, `FROM claim`
+                    # getting one and `FROM CLAIM` the other, from one policy and one identity.
+                    existing = next((k for k in row_filters if k.lower() == table.lower()), None)
+                    if existing is not None:  # more roles = more visible rows: OR-combine
+                        row_filters[existing] = f"({row_filters[existing]}) OR ({filt})"
                     else:
                         row_filters[table] = str(filt)
         objects |= writable  # a writable table is always readable (the decider requires it)

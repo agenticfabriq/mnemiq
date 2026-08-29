@@ -109,6 +109,66 @@ def _mentions(body: exp.Expression) -> set[str]:
     return _spellings(names)
 
 
+class ViewInventory(dict):
+    """The views a source reports, plus whether the source could be ASKED.
+
+    A plain `{}` asserts "this source has no views". A failed discovery produces the SAME empty
+    mapping and means "we do not know what views exist" -- and the governance layer must not read
+    the second as the first. Measured before this existed: with `row_filters={'claim'}` and a view
+    `claim_v` over it, `check_views` REFUSED `ungoverned_view` when discovery succeeded and
+    APPROVED when discovery failed, from the identical call.
+
+    The producer already knew. `enrichment/pipeline.py` records `discover:views` with
+    `status='failed'` under a comment saying an empty list "must be treated as 'cannot reason
+    about', never as 'there are none'". Nothing read it -- the tenth instance in this codebase of
+    an absence and a failure sharing one value.
+
+    Modelled on `authz/grants.py`'s EMPTY and UNAVAILABLE, which deny identically and exist so the
+    engine can say WHY. Kept as a dict subclass so every existing caller that passes a plain
+    mapping keeps meaning what it meant: a bare dict asserts it is complete, and only a caller
+    that knows otherwise says so.
+    """
+
+    def __init__(self, mapping=None, available: bool = True) -> None:
+        super().__init__(mapping or {})
+        self.available = available
+
+
+# Denies exactly as much as it must, and says why. Distinct from `ViewInventory({})`, which is a
+# source that answered and reported no views.
+VIEWS_UNAVAILABLE = ViewInventory(available=False)
+
+
+def inventory_for(snapshot) -> ViewInventory:
+    """The view inventory a snapshot supports, and whether it could be built at all.
+
+    ONE place answers this, because two would drift: the read path builds its inventory in
+    `plan_query` and the write path in `Runtime.write`, and M46 is what happens when the two
+    doors disagree about a view.
+
+    No snapshot at all is UNAVAILABLE, not empty. `Runtime` substitutes `{}` there, which reads
+    as "this source has no views" -- an engine holding no schema cannot assert that.
+
+    A snapshot whose `discover:views` job FAILED is unavailable: the source was asked and did not
+    answer. `enrichment/pipeline.py` has recorded that status all along, under a comment saying an
+    empty list "must be treated as 'cannot reason about', never as 'there are none'". Nothing read
+    it until now.
+
+    Deliberate residual: a snapshot carrying no `discover:views` job at all is treated as
+    AVAILABLE. The producer always emits one, so absence means a hand-built snapshot rather than a
+    failed read, and the stricter rule -- demand a `done` job -- would refuse every such snapshot
+    on a question about provenance rather than about views. Named here so the choice is visible
+    instead of implicit; a test pins it.
+    """
+    if snapshot is None:
+        return VIEWS_UNAVAILABLE
+    failed = any(
+        getattr(j, "id", None) == "discover:views" and getattr(j, "status", None) == "failed"
+        for j in getattr(snapshot, "jobs", ()) or ()
+    )
+    return ViewInventory({v.object_id: v for v in snapshot.views}, available=not failed)
+
+
 def check_views(
     ast: exp.Expression,
     views: dict[str, ViewDefinition],
@@ -140,8 +200,19 @@ def check_views(
     views refuse for all three roles, including one with no row filters at all.
     """
     if not filtered:
+        # No row filters: there is nothing a view could carry the caller around, so an unknown
+        # inventory costs nothing either. This early-out is what keeps the refusal below narrow.
         return None
-    return _walk(ast, views, filtered, known or set(), (), 0)
+    if not getattr(views, "available", True):
+        return Refusal(
+            code=RefusalCode.VIEW_INVENTORY_UNAVAILABLE,
+            message=(
+                "This source could not report its views, so this engine cannot confirm that "
+                "nothing in this query reads around a row filter. Retry once the source is "
+                "reachable; this is not a limit on your grants."
+            ),
+        )
+    return _walk(ast, views, filtered, known or set(), (), 0, "")
 
 
 def _walk(
@@ -151,12 +222,48 @@ def _walk(
     known: set[str],
     stack: tuple[str, ...],
     depth: int,
+    catalog: str,
 ) -> Refusal | None:
     for node in ast.find_all(exp.Table):
         name = object_key(node)
         view = views.get(name) or views.get(node.name)
         if view is not None and name not in views:
             name = node.name  # a body may qualify a view the snapshot keys bare
+        if view is None and catalog:
+            # A FEDERATED view body is written in the SOURCE's own naming, so a NESTED view
+            # reads `claim_v` where the merged inventory keys it `pg.claim_v`, and the lookup
+            # above misses. Measured: `pg.claim_v2` over `pg.claim_v` over a filtered
+            # `pg.claim` was APPROVED while the byte-identical single-source shape refused.
+            # Resolved in the ENCLOSING view's catalog only, never globally, so two catalogs
+            # holding a view of the same name cannot resolve to each other's.
+            for candidate in (f"{catalog}.{object_key(node)}", f"{catalog}.{node.name}"):
+                if candidate in views:
+                    view, name = views[candidate], candidate
+                    break
+        if view is None:
+            # Case-insensitive fallback, tried LAST so an exact match always wins. Unquoted
+            # identifiers are case-insensitive in all three engines -- `_spellings` two screens
+            # down folds for exactly this reason -- but this lookup did not. Measured: a body
+            # writing `FROM CLAIM_V` against an inventory keyed `claim_v` missed, the nested view
+            # was never walked, and its row-filtered base was never reached. APPROVED on the
+            # single-source path as well as the federated one, so this is not federation's bug.
+            #
+            # `sorted` so a source holding two keys differing only in case resolves the same way
+            # every run. Such a source cannot exist unambiguously under those same engine rules,
+            # but a deterministic wrong answer is debuggable and a arbitrary one is not.
+            # `.lower()` on the WHOLE candidate, catalog included. Lowercasing only the table
+            # half left the prefix in its original case while the comparison below folds the real
+            # key in full, so any catalog alias carrying an uppercase letter made this fallback
+            # dead code. `SourceSpec.catalog` is a free-form DuckDB attach alias and nothing in
+            # `merge_snapshots` or `qualify_object_id` normalises it. Measured: catalog `pg`
+            # refused and catalog `PG` approved, on the identical statement.
+            wanted = {object_key(node).lower(), node.name.lower()}
+            if catalog:
+                wanted |= {f"{catalog}.{w}".lower() for w in tuple(wanted)}
+            for key in sorted(views):
+                if key.lower() in wanted:
+                    view, name = views[key], key
+                    break
         if view is None:
             continue
         if name in stack:
@@ -241,7 +348,10 @@ def _walk(
                 ),
                 subject=name,
             )
-        nested = _walk(body, views, filtered, known, (*stack, name), depth + 1)
+        # The body's own catalog carries into it: a view two levels down is still written in
+        # the source's naming, not the federation's.
+        nested = _walk(body, views, filtered, known, (*stack, name), depth + 1,
+                       name.rsplit(".", 1)[0] if "." in name else catalog)
         if nested is not None:
             return nested
     return None
