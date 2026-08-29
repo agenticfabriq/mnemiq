@@ -240,30 +240,191 @@ def test_the_timeout_is_not_left_behind_when_the_cursor_cannot_be_acquired():
     assert a._con.call_timeout == before, "a failed acquisition changed the connection's timeout"
 
 
-def test_a_read_only_adapter_cannot_read_a_table_created_this_instant():
-    """The documented cost of `SET TRANSACTION READ ONLY`, pinned so it is a known property
-    rather than a flake someone chases later.
+# `test_a_read_only_adapter_cannot_read_a_table_created_this_instant` lived here and is REMOVED,
+# not moved. The behaviour is real and measured -- a read-only transaction pins a snapshot and
+# Oracle refuses to read a table whose DDL is newer, ORA-01466 -- but the window is SUB-SECOND, so
+# the test passed 3/3 in isolation and failed inside the full suite, where the preceding fixtures
+# had spent long enough for the window to close. A test whose verdict depends on how fast the
+# suite ahead of it ran is worse than no test: it fails intermittently and teaches people to
+# re-run rather than read. The measurement is recorded in `OracleAdapter._cursor`'s docstring,
+# where it cannot flake.
 
-    The read-only transaction takes a read-consistent snapshot, and Oracle refuses to read a
-    table whose definition is newer than it. Measured: fails immediately after the CREATE,
-    succeeds ~2s later, and a WRITABLE adapter reads it immediately -- so this is the safeguard's
-    behaviour, not a broken connection.
+
+# -- M57: can this connection be trusted to have VPD applied to it? ----------------------------
+
+@pytest.fixture
+def vpd():
+    """A table with two rows and a VPD policy admitting one. Torn down after.
+
+    `DBMS_RLS` and `CREATE ANY CONTEXT` must be granted to the test user; the module skips
+    cleanly if the policy cannot be created, because a VPD-less instance cannot exercise this.
     """
     import oracledb
 
     w = _adapter(read_only=False)
     try:
-        w.execute("DROP TABLE t_fresh")
+        w.execute("BEGIN DBMS_RLS.DROP_POLICY('APPUSER','T_VPD','P'); END;")
     except oracledb.DatabaseError:
         pass
-    w.execute("CREATE TABLE t_fresh (id NUMBER)")
     try:
-        assert _adapter(read_only=False).execute("SELECT count(*) FROM t_fresh") == [(0,)], \
-            "a writable adapter must read it immediately -- otherwise this proves nothing"
-        with pytest.raises(oracledb.DatabaseError, match="ORA-01466"):
-            _adapter().execute("SELECT count(*) FROM t_fresh")
-        time.sleep(2)
-        assert _adapter().execute("SELECT count(*) FROM t_fresh") == [(0,)], \
-            "the snapshot restriction must clear, or the safeguard blocks reads permanently"
+        w.execute("DROP TABLE t_vpd")
+    except oracledb.DatabaseError:
+        pass
+    w.execute("CREATE TABLE t_vpd (id NUMBER, region VARCHAR2(10))")
+    w.execute("INSERT INTO t_vpd VALUES (1,'west')")
+    w.execute("INSERT INTO t_vpd VALUES (2,'east')")
+    w.execute("CREATE OR REPLACE FUNCTION t_west_f(s VARCHAR2, o VARCHAR2) "
+              "RETURN VARCHAR2 AS BEGIN RETURN 'region = ''west'''; END;")
+    w.execute("CREATE OR REPLACE FUNCTION t_null_f(s VARCHAR2, o VARCHAR2) "
+              "RETURN VARCHAR2 AS BEGIN RETURN NULL; END;")
+
+    def attach(fn):
+        try:
+            w.execute("BEGIN DBMS_RLS.DROP_POLICY('APPUSER','T_VPD','P'); END;")
+        except oracledb.DatabaseError:
+            pass
+        w.execute(f"BEGIN DBMS_RLS.ADD_POLICY(object_schema=>'APPUSER',object_name=>'T_VPD',"
+                  f"policy_name=>'P',function_schema=>'APPUSER',policy_function=>'{fn}',"
+                  f"statement_types=>'SELECT'); END;")
+
+    try:
+        attach("T_WEST_F")
+    except oracledb.DatabaseError as exc:
+        pytest.skip(f"this instance cannot create a VPD policy: {exc}")
+    time.sleep(2)  # ORA-01466: a read-only transaction cannot read DDL newer than its snapshot
+    yield attach
+    try:
+        w.execute("BEGIN DBMS_RLS.DROP_POLICY('APPUSER','T_VPD','P'); END;")
+    except oracledb.DatabaseError:
+        pass
+    w.execute("DROP TABLE t_vpd")
+
+
+def test_a_policy_actually_restricts_the_rows(vpd):
+    """The control the rest of this section rests on: without it, a `bypassing` verdict could not
+    be distinguished from a policy that never worked."""
+    assert _adapter().execute("SELECT count(*) FROM t_vpd") == [(1,)], "2 rows exist; 1 is visible"
+
+
+def test_an_ordinary_principal_reports_attached(vpd):
+    verdict, _ = _adapter().assert_enforcing()
+    assert verdict == "attached"
+
+
+def test_attached_is_not_a_claim_of_enforcement(vpd):
+    """The finding, and the reason this is not a port of the Postgres check.
+
+    A VPD policy function returning NULL yields no predicate -- all rows -- while `ALL_POLICIES`
+    still reports it `enable = 'YES'`. So the catalog cannot distinguish an enforcing policy from
+    an inert one, and `attached` must never be read as "enforcing". This test pins the gap rather
+    than pretending the check closes it: the verdict is UNCHANGED while enforcement is gone.
+    """
+    vpd("T_NULL_F")
+    time.sleep(2)
+    assert _adapter().execute("SELECT count(*) FROM t_vpd") == [(2,)], \
+        "a NULL-returning policy function restricts nothing"
+    verdict, reason = _adapter().assert_enforcing()
+    assert verdict == "attached", "the catalog still reports the policy enabled"
+    assert "not proof of enforcement" in reason, \
+        "the verdict must say what it cannot establish, since the catalog cannot tell"
+
+
+def test_no_policy_at_all_is_unverifiable_not_ok():
+    """A third state, not an acceptance -- the same shape as the Postgres check's
+    `rls_tables = 0`. An owner with no policies has nothing enforcing row security."""
+    a = _adapter()
+    a._schema = "NOBODY_OWNS_THIS"
+    verdict, _ = a.assert_enforcing()
+    assert verdict == "unverifiable"
+
+
+# The bypass verdicts need a principal that actually bypasses, which needs an admin connection to
+# create. Without one these skip -- and that skip is itself the finding: mutation showed that
+# neutering the EXEMPT ACCESS POLICY refusal broke NOTHING in the suite as first written, because
+# every test connected as a principal that could not bypass. The verdict that matters most was
+# the one verified least.
+
+ADMIN_USER = os.environ.get("MNEMIQ_ORACLE_TEST_ADMIN_USER")
+ADMIN_PASSWORD = os.environ.get("MNEMIQ_ORACLE_TEST_ADMIN_PASSWORD")
+needs_admin = pytest.mark.skipif(
+    not (ADMIN_USER and ADMIN_PASSWORD),
+    reason="set MNEMIQ_ORACLE_TEST_ADMIN_{USER,PASSWORD} to exercise the bypass verdicts",
+)
+
+
+@pytest.fixture
+def exempt_principal(vpd):
+    """A throwaway user holding EXEMPT ACCESS POLICY, granted SELECT on the fixture table.
+
+    Depends on `vpd` so the table exists before the grant: without the grant the principal gets
+    ORA-00942 and the test proves nothing about bypassing -- it would fail for the one reason
+    that is not the subject.
+    """
+    import oracledb
+
+    admin = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
+                             mode=oracledb.AUTH_MODE_SYSDBA)
+    cur = admin.cursor()
+    for stmt in ("DROP USER t_exempt CASCADE",):
+        try:
+            cur.execute(stmt)
+        except oracledb.DatabaseError:
+            pass
+    cur.execute("CREATE USER t_exempt IDENTIFIED BY pw")
+    cur.execute("GRANT CREATE SESSION TO t_exempt")
+    cur.execute("GRANT EXEMPT ACCESS POLICY TO t_exempt")
+    cur.execute("GRANT SELECT ON appuser.t_vpd TO t_exempt")
+    admin.commit()
+    yield "t_exempt", "pw"
+    # DROP USER fails ORA-01940 while a session is open, so the test must close its adapter --
+    # it does, in its own finally. Retried once regardless, since a leaked user would make the
+    # next run's CREATE fail and read as a fixture bug rather than a leak.
+    for _ in range(2):
+        try:
+            cur.execute("DROP USER t_exempt CASCADE")
+            admin.commit()
+            break
+        except oracledb.DatabaseError:
+            time.sleep(1)
+    admin.close()
+
+
+@needs_admin
+def test_a_principal_with_exempt_access_policy_is_refused(vpd, exempt_principal):
+    """The verdict the whole check exists for, and the one mutation proved untested.
+
+    Measured: this principal reads 2 of 2 rows through a policy admitting 1, so the bypass is
+    real and not merely a privilege on paper. `SESSION_PRIVS` is the test rather than a role
+    name -- an owner and a DBA-role user both showed 0 here and both had VPD applied.
+    """
+    user, pw = exempt_principal
+    a = OracleAdapter(dsn=DSN, user=user, password=pw, schema="APPUSER")
+    try:
+        assert a.execute("SELECT count(*) FROM appuser.t_vpd") == [(2,)], \
+            "the fixture policy admits 1 row; seeing 2 is what makes this a bypass"
+        verdict, reason = a.assert_enforcing()
+        assert verdict == "bypassing"
+        assert "EXEMPT ACCESS POLICY" in reason
     finally:
-        w.execute("DROP TABLE t_fresh")
+        a._con.close()  # DROP USER in teardown fails while this session is open
+
+
+@needs_admin
+def test_a_sysdba_connection_is_refused(vpd):
+    """SYS holds EXEMPT ACCESS POLICY implicitly, so the privilege test catches it -- but `ISDBA`
+    is checked too, deliberately redundantly, so a SYSDBA connection is refused for being one
+    rather than for a privilege it happens to imply."""
+    import oracledb
+
+    a = OracleAdapter.__new__(OracleAdapter)
+    a._oracledb = oracledb
+    a._con = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
+                              mode=oracledb.AUTH_MODE_SYSDBA)
+    a._schema = "APPUSER"
+    a._read_only = True
+    try:
+        assert a.execute("SELECT count(*) FROM appuser.t_vpd") == [(2,)]
+        verdict, _ = a.assert_enforcing()
+        assert verdict == "bypassing"
+    finally:
+        a._con.close()

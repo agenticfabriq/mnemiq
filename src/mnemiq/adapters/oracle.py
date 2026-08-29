@@ -32,9 +32,8 @@ class OracleAdapter:
         restriction -- fail-open with no privilege involved anywhere
 
     That last one has no Postgres analogue: every Postgres bypass is privilege-shaped, so a check
-    ported from that shape would not look for it. `assert_enforcing` below is deliberately NOT
-    written yet for that reason -- it needs measuring against a live instance, and guessing at it
-    is how the Postgres version needed four drafts, each missing the next.
+    ported from that shape would not look for it. `assert_enforcing` is written against measured
+    behaviour rather than that shape -- see its docstring for what it can and cannot establish.
     """
 
     dialect = "oracle"
@@ -261,6 +260,72 @@ class OracleAdapter:
         columns = list(zip(*rows)) if rows else [() for _ in names]
         arrays = [pa.array(list(col)) for col in columns]
         return pa.Table.from_arrays(arrays, names=names)
+
+
+    # -- governance ---------------------------------------------------------------------------
+
+    def assert_enforcing(self) -> tuple[str, str]:
+        """Can this CONNECTION be trusted to have VPD applied to it? -> (verdict, reason).
+
+        M57. Under the 2026-08-29 decision the database enforces row security, which makes the
+        connecting principal the single point of failure: a connection privileged enough to bypass
+        VPD means nothing enforces, silently, and no adapter previously inspected this at all.
+
+        Three verdicts, and the third is the point:
+
+          `bypassing`    -- measured to bypass. Refuse.
+          `unverifiable` -- no policy is attached to anything this connection can see, so there is
+                            nothing to enforce and nothing to confirm.
+          `attached`     -- policies exist and this principal holds no bypass privilege. **This is
+                            NOT a guarantee of enforcement**, and the name says so deliberately.
+
+        Why `attached` is the strongest honest answer, and the reason this is not a port of the
+        Postgres check: **a VPD policy function that returns NULL yields no predicate.** Measured
+        on 23ai -- 2 of 2 rows returned, no privilege involved anywhere -- while `ALL_POLICIES`
+        still reports that policy `enable = 'YES'`. Returning `''` behaves identically. So a
+        catalog enumeration sees a healthy, attached, enabled policy that restricts nothing, and
+        the obvious implementation -- count the policies, call it enforcing -- is wrong in a way
+        that looks right. Establishing enforcement would mean executing the policy function, which
+        is arbitrary PL/SQL belonging to the deployment, not to us.
+
+        The privilege test is `SESSION_PRIVS`, not a role name. Measured across five principals:
+        `EXEMPT ACCESS POLICY` present is EXACTLY the set that bypassed -- an explicit grantee and
+        `SYS`, which holds it implicitly -- while the schema OWNER and a `DBA`-role user both had
+        VPD APPLIED and both showed 0. So the Postgres intuitions do not transfer in either
+        direction: Oracle's owner does not bypass where Postgres's does, and Oracle's DBA does not
+        bypass despite documentation that reads as though it might.
+
+        **A SYSDBA connection is caught by the same privilege test, and is not checked
+        separately.** An earlier draft added an `ISDBA` branch as belt-and-braces; mutation showed
+        removing it broke nothing, and probing showed why: any `AS SYSDBA` connection becomes
+        `SESSION_USER = SYS` and holds EXEMPT ACCESS POLICY implicitly, so the privilege test
+        always fires first -- including for a non-SYS user granted SYSDBA, measured as
+        `exempt=1 isdba=TRUE session_user=SYS`. The branch was unreachable. An unreachable branch
+        in a security check is worse than no branch: it reads as protection, no test can cover it,
+        and it rots unnoticed. The FACT is kept here; the dead code is not.
+        """
+        row = self._rows(
+            "SELECT (SELECT count(*) FROM session_privs "
+            "         WHERE privilege = 'EXEMPT ACCESS POLICY') AS exempt, "
+            "       (SELECT count(*) FROM all_policies "
+            "         WHERE object_owner = :owner AND enable = 'YES') AS policies "
+            "FROM dual",
+            owner=self._schema,
+        )[0]
+        exempt, policies = int(row[0]), int(row[1])
+
+        if exempt:
+            return ("bypassing", "this principal holds EXEMPT ACCESS POLICY, which exempts it "
+                                 "from every VPD policy in the database. A SYSDBA connection "
+                                 "reaches this branch too: it holds the privilege implicitly")
+        if policies == 0:
+            return ("unverifiable", f"no enabled VPD policy is attached to any object owned by "
+                                    f"{self._schema} that this connection can see, so there is "
+                                    f"nothing enforcing row security here")
+        return ("attached", f"{policies} enabled VPD polic{'y' if policies == 1 else 'ies'} on "
+                            f"{self._schema}, and this principal holds no bypass privilege. This "
+                            f"is not proof of enforcement: a policy function returning NULL is "
+                            f"reported enabled and restricts nothing.")
 
 
 def _is_timeout(exc: Exception) -> bool:
