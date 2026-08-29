@@ -326,7 +326,7 @@ def test_attached_is_not_a_claim_of_enforcement(vpd, inert_fn):
     vpd(inert_fn)
     time.sleep(2)
     assert _adapter().execute("SELECT count(*) FROM t_vpd") == [(2,)], \
-        "a NULL-returning policy function restricts nothing"
+        f"{inert_fn} restricts nothing: an inert policy function yields no predicate"
     verdict, reason = _adapter().assert_enforcing()
     assert verdict == "attached", "the catalog still reports the policy enabled"
     assert "not proof of enforcement" in reason, \
