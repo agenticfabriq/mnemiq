@@ -17,7 +17,10 @@ from __future__ import annotations
 import pytest
 import sqlglot
 
-from mnemiq.contract.semantic import Job, Snapshot, ViewDefinition
+from mnemiq.authz.grants import GrantSet
+from mnemiq.contract.semantic import Column, Job, Snapshot, ViewDefinition
+from mnemiq.sql.decide import decide
+from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.verdict import RefusalCode
 from mnemiq.sql.views import VIEWS_UNAVAILABLE, ViewInventory, check_views, inventory_for
 
@@ -124,12 +127,6 @@ def test_the_write_decider_refuses_it_identically():
 # table's row filter out of `policy.row_filters` -- and `check_views` early-outs on
 # `if not filtered` BEFORE it can refuse an unavailable inventory. The guard added here was
 # bypassed by the very failure it exists for, one file upstream.
-
-from mnemiq.authz.grants import GrantSet
-from mnemiq.contract.semantic import Column
-from mnemiq.sql.decide import decide
-from mnemiq.sql.policy import build_access_policy
-
 
 def _col(obj, name):
     return Column(id=f"{obj}.{name}", object_id=obj, name=name, data_type="text")
