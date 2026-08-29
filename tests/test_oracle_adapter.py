@@ -519,3 +519,60 @@ def test_a_policy_that_does_not_apply_to_select_is_not_counted_as_governing(vpd)
         f"an UPDATE-only policy must contribute NOTHING to SELECT coverage, leaving zero governed "
         f"tables; got {verdict} -- {reason}"
     )
+
+
+@needs_admin
+def test_full_coverage_reports_attached(vpd):
+    """The terminal branch, `governed == tables`, which shipped untested when coverage went
+    per-table: the test that used to reach `attached` was replaced by the `partial` one and
+    nothing drove the schema into full coverage.
+
+    It needs a schema where EVERY visible table is governed, which the shared fixture schema is
+    not -- so this builds a throwaway owner with exactly one table and one SELECT policy. That is
+    also the honest boundary: `attached` means what it says only when nothing is left out.
+    """
+    import oracledb
+
+    admin = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
+                             mode=oracledb.AUTH_MODE_SYSDBA)
+    cur = admin.cursor()
+    try:
+        cur.execute("DROP USER t_full CASCADE")
+    except oracledb.DatabaseError:
+        pass
+    cur.execute("CREATE USER t_full IDENTIFIED BY pw QUOTA UNLIMITED ON users")
+    cur.execute("GRANT CREATE SESSION, CREATE TABLE, CREATE PROCEDURE TO t_full")
+    cur.execute("GRANT EXECUTE ON DBMS_RLS TO t_full")
+    admin.commit()
+
+    owner = OracleAdapter(dsn=DSN, user="t_full", password="pw", read_only=False)
+    try:
+        owner.execute("CREATE TABLE only_t (id NUMBER, region VARCHAR2(10))")
+        owner.execute("INSERT INTO only_t VALUES (1,'west')")
+        owner.execute("INSERT INTO only_t VALUES (2,'east')")
+        owner.execute("CREATE OR REPLACE FUNCTION f_west(s VARCHAR2, o VARCHAR2) "
+                      "RETURN VARCHAR2 AS BEGIN RETURN 'region = ''west'''; END;")
+        owner.execute("BEGIN DBMS_RLS.ADD_POLICY(object_schema=>'T_FULL',object_name=>'ONLY_T',"
+                      "policy_name=>'P',function_schema=>'T_FULL',policy_function=>'F_WEST',"
+                      "statement_types=>'SELECT'); END;")
+        time.sleep(2)
+
+        reader = OracleAdapter(dsn=DSN, user="t_full", password="pw")
+        assert reader.execute("SELECT count(*) FROM only_t") == [(1,)], \
+            "the policy must actually restrict, or `attached` would be meaningless here"
+        verdict, reason = reader.assert_enforcing()
+        assert verdict == "attached", reason
+        assert "all 1 visible tables" in reason
+        assert "not proof of enforcement" in reason.lower(), \
+            "even full coverage must disclaim: an inert policy function is reported enabled"
+        reader._con.close()
+    finally:
+        owner._con.close()
+        for _ in range(3):
+            try:
+                cur.execute("DROP USER t_full CASCADE")
+                admin.commit()
+                break
+            except oracledb.DatabaseError:
+                time.sleep(1)
+        admin.close()
