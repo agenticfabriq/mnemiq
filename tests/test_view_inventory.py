@@ -564,3 +564,46 @@ def test_a_caller_with_no_row_filters_is_unaffected_by_the_widening():
                policy=build_access_policy(snapshot, GrantSet(objects=frozenset({"claim_v"}))),
                views=inventory_for(snapshot))
     assert getattr(v, "code", None) is None, v
+
+
+# The SAME fail-open, one exit over. `_reachable` has two degraded exits — the inventory is
+# unavailable, and a view body will not parse — and both must keep the filter keys. The first fix
+# covered only the unavailable one; Codex's stop-time review found the unparseable one still open.
+
+_UNPARSEABLE = ViewDefinition(object_id="claim_v", definition="SELECT ((( FROM", dialect="duckdb")
+_DISCOVERY_DONE = [Job(id="discover:views", source_id="s", kind="discover", status="done")]
+
+
+def _unparseable_snapshot(with_base_columns):
+    cols = [_col("claim_v", "id")]
+    if with_base_columns:
+        cols = [_col("claim", "id"), _col("claim", "region")] + cols
+    return Snapshot(version="v", source_id="s", created_at="t", columns=cols,
+                    views=[_UNPARSEABLE], jobs=_DISCOVERY_DONE)
+
+
+def test_an_unparseable_view_body_and_failed_profiling_do_not_cancel_into_an_approval():
+    """Measured before the fix: APPROVED, where the control with columns present refuses
+    `unresolvable_view`. Discovery SUCCEEDED here — this exit is reached by a body the engine
+    cannot read, not by an inventory it could not load, which is why the earlier fix missed it."""
+    snapshot = _unparseable_snapshot(with_base_columns=False)
+    v = decide("SELECT id FROM claim_v", {"claim_v": {"id"}},
+               policy=build_access_policy(snapshot, _VIEW_ONLY), views=inventory_for(snapshot))
+    assert getattr(v, "code", None) is RefusalCode.UNRESOLVABLE_VIEW, v
+
+
+def test_the_unparseable_body_with_profiling_intact_is_the_control():
+    snapshot = _unparseable_snapshot(with_base_columns=True)
+    v = decide("SELECT id FROM claim_v", {"claim_v": {"id"}},
+               policy=build_access_policy(snapshot, _VIEW_ONLY), views=inventory_for(snapshot))
+    assert getattr(v, "code", None) is RefusalCode.UNRESOLVABLE_VIEW, v
+
+
+def test_an_unparseable_body_does_not_refuse_a_caller_with_no_row_filters():
+    """Blast radius, for this exit too: a body the engine cannot read is only a problem for a
+    caller who has something the view could carry them around."""
+    snapshot = _unparseable_snapshot(with_base_columns=False)
+    v = decide("SELECT id FROM claim_v", {"claim_v": {"id"}},
+               policy=build_access_policy(snapshot, GrantSet(objects=frozenset({"claim_v"}))),
+               views=inventory_for(snapshot))
+    assert getattr(v, "code", None) is None, v

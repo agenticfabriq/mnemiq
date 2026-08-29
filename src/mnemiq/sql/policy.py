@@ -135,7 +135,14 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
             # Returning what we have left the policy EMPTY, which skipped the rewrite entirely
             # and approved the view unfiltered -- `check_views` never got the chance to refuse
             # it. Everything is reachable instead, so the policy stays live and the floor runs.
-            return every | reachable
+            # Including the filter keys, for the same reason as the unavailable exit above and
+            # by the same rule: a filter KEY names a table the policy explicitly governs, and
+            # `every` is built from `snapshot.columns`, so a filtered base table whose PROFILING
+            # failed is not in it. The first fix here covered only the unavailable branch and
+            # Codex's stop-time review found this one still open — measured, an unparseable body
+            # plus failed profiling returned APPROVED where the control with columns present
+            # refuses `unresolvable_view`. Two exits, one meaning.
+            return every | reachable | set(grants.row_filters)
         # A FEDERATED view's object_id is catalog-qualified but its BODY is not:
         # `merge_snapshots` rewrites `claim_v` -> `pg.claim_v` and leaves `SELECT ... FROM claim`
         # exactly as the source wrote it. So a body table has to be tried in the view's OWN
