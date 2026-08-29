@@ -334,3 +334,28 @@ def test_a_views_reach_into_a_different_qualified_object_is_not_accounted_for():
     assert lineage.completeness == INCOMPLETE, (
         "a bare-vs-qualified match must count as unresolved, never as accounted for")
     assert "pg.claim_v" in lineage.unresolved
+
+
+def test_the_fourth_spelling_resolves_like_the_other_three():
+    """The membership test used `spellings` (four forms) and retrieval was hand-rolled with three,
+    omitting `bare.lower()`. So `public.CLAIM_VIEW` matched, failed to retrieve, and fell into the
+    cannot-parse branch — UNKNOWN where the other three spellings give INCOMPLETE. Conservative,
+    and still two ways of asking one question, which is the drift the fix claimed to close."""
+    views = [ViewDefinition(object_id="claim_view", definition="SELECT * FROM claim",
+                            dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT id FROM public.CLAIM_VIEW"), ["public.CLAIM_VIEW"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == INCOMPLETE
+
+
+def test_a_cte_inside_a_view_body_is_not_reach():
+    """A local alias names nothing outside the body. Counting it reported INCOMPLETE for a view
+    whose only real base was already in the list — so `base_tables` rather than `find_all`, which
+    is M31/M49's lesson applied one consumer later."""
+    views = [ViewDefinition(object_id="claim_view",
+                            definition="WITH c AS (SELECT * FROM claim) SELECT * FROM c",
+                            dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT v.id FROM claim_view v JOIN claim c ON c.id = v.id"),
+                          ["claim_view", "claim"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == COMPLETE, "the body's only real base is already accounted for"

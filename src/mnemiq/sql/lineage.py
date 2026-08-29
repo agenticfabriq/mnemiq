@@ -69,6 +69,7 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
     from sqlglot import exp
 
     from mnemiq.sql.qualify import object_key
+    from mnemiq.sql.scope import base_tables
     from mnemiq.sql.views import body_of, spellings
 
     tables = list(tables)
@@ -103,12 +104,22 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
     for name in tables:
         if not (spellings({name}) & view_keys):
             continue
-        view = views.get(name) or views.get(name.rsplit(".", 1)[-1]) or views.get(name.lower())
+        # Every spelling `spellings` generates, not three of the four. The hand-rolled version
+        # omitted `bare.lower()`, so `public.CLAIM_VIEW` matched the membership test and then
+        # failed to retrieve -- landing in the cannot-parse branch and reporting UNKNOWN where
+        # the other three spellings report INCOMPLETE. Conservative in outcome and still exactly
+        # the drift this was meant to close: two ways of asking one question.
+        view = next((views[k] for k in spellings({name}) if k in views), None)
         parsed = body_of(view) if view is not None else None
         if parsed is None:
             unclassified.append(name)  # a view we cannot PARSE: unclear, not demonstrated
             continue
-        reaches = {object_key(t) for t in parsed.find_all(exp.Table)}
+        # `base_tables`, not `find_all`: a CTE alias inside the body is not a real read, and
+        # counting one reported INCOMPLETE for a view whose only true base was already in the
+        # list. That is M31/M49's lesson -- the scope-aware resolver exists so that three guards
+        # stopped asking "is this name a real table" three different ways -- applied one consumer
+        # later, in a function that had reached for `find_all` anyway.
+        reaches = {object_key(t) for t in base_tables(parsed)}
         if any(r.lower() not in resolved for r in reaches):
             reaching_views.append(name)
 
