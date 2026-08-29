@@ -67,8 +67,9 @@ def schema():
     w.execute("INSERT INTO t_claim VALUES (1, 1, 100)")
     w.execute("CREATE VIEW t_claim_v AS SELECT id, amount FROM t_claim")
     # There is deliberately NO sleep here, and its absence is load-bearing. A read-only
-    # transaction pins a snapshot and Oracle refuses to read a table whose DDL is newer than it
-    # (ORA-01466), so this fixture used to sleep 2s before yielding -- which meant every read test
+    # transaction pins a snapshot and Oracle refuses to read an object whose definition changed
+    # just BEFORE that transaction began (ORA-01466), so this fixture used to sleep 2s before
+    # yielding -- which meant every read test
     # below ran against a schema old enough to dodge the race, and the adapter's behaviour inside
     # the window went untested by anything. `_with_cursor` retries it now, so the fixture hands
     # over tables created microseconds ago and every read test is also a test of that retry.
@@ -243,7 +244,9 @@ def test_the_timeout_is_not_left_behind_when_the_cursor_cannot_be_acquired():
 
 # `test_a_read_only_adapter_cannot_read_a_table_created_this_instant` lived here and is REMOVED,
 # not moved. The behaviour is real and measured -- a read-only transaction pins a snapshot and
-# Oracle refuses to read a table whose DDL is newer, ORA-01466 -- but the window is SUB-SECOND, so
+# Oracle refuses to read an object whose definition changed just before it began, ORA-01466 (NOT
+# "DDL newer than the snapshot": that phrasing was retracted, see `_cursor`) -- and the window is
+# SUB-SECOND, so
 # the test passed 3/3 in isolation and failed inside the full suite, where the preceding fixtures
 # had spent long enough for the window to close. A test whose verdict depends on how fast the
 # suite ahead of it ran is worse than no test: it fails intermittently and teaches people to
