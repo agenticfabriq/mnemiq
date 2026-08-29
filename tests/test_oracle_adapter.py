@@ -372,6 +372,45 @@ needs_admin = pytest.mark.skipif(
 )
 
 
+
+def _drop_user(cur, username):
+    """Drop a throwaway test user, or RAISE saying what is left behind.
+
+    ONE implementation, because there were two and the second silently reacquired the flaw the
+    first had just been hardened against: a teardown that gives up quietly leaves a standing
+    privilege behind while reporting success. These users hold EXEMPT ACCESS POLICY or own
+    governed tables, so a leak is not untidiness.
+
+    `DROP USER` raises ORA-01940 while any session is open, so the sessions are killed on the
+    second attempt rather than waited out -- a test that failed before closing its own connection
+    would otherwise leak deterministically.
+    """
+    import oracledb
+
+    last = None
+    for attempt in range(3):
+        try:
+            cur.execute(f"DROP USER {username} CASCADE")
+            cur.connection.commit()
+            return
+        except oracledb.DatabaseError as exc:
+            last = exc
+            if attempt == 1:
+                for sid, serial in cur.execute(
+                    "SELECT sid, serial# FROM v$session WHERE username = :u",
+                    u=username.upper(),
+                ).fetchall():
+                    try:
+                        cur.execute(f"ALTER SYSTEM KILL SESSION '{sid},{serial}' IMMEDIATE")
+                    except oracledb.DatabaseError:
+                        pass
+            time.sleep(1)
+    raise AssertionError(
+        f"FAILED TO DROP the test user {username}, which this suite grants privileges to. "
+        f"Remove it by hand: DROP USER {username} CASCADE. Underlying error: {last}"
+    )
+
+
 @pytest.fixture
 def exempt_principal(vpd):
     """A throwaway user holding EXEMPT ACCESS POLICY, granted SELECT on the fixture table.
@@ -396,40 +435,8 @@ def exempt_principal(vpd):
     cur.execute("GRANT SELECT ON appuser.t_vpd TO t_exempt")
     admin.commit()
     yield "t_exempt", "pw"
-    # This user holds EXEMPT ACCESS POLICY -- it bypasses every VPD policy in the database -- so
-    # a teardown that fails QUIETLY leaves a standing bypass behind. The first version swallowed
-    # the error after two attempts and closed the connection, which is the shape this whole
-    # session has been about: a cleanup that reports success it did not achieve.
-    #
-    # DROP USER raises ORA-01940 while a session is open, and the test closes its adapter in its
-    # own finally, so the retries cover ordering rather than excusing failure. If it still will
-    # not drop, kill the sessions and try once more; if THAT fails, raise -- loudly, naming what
-    # is left behind and how to remove it.
-    last = None
-    for attempt in range(3):
-        try:
-            cur.execute("DROP USER t_exempt CASCADE")
-            admin.commit()
-            last = None
-            break
-        except oracledb.DatabaseError as exc:
-            last = exc
-            if attempt == 1:  # still held: terminate whatever is holding it, then retry
-                for sid, serial in cur.execute(
-                    "SELECT sid, serial# FROM v$session WHERE username = 'T_EXEMPT'"
-                ).fetchall():
-                    try:
-                        cur.execute(f"ALTER SYSTEM KILL SESSION '{sid},{serial}' IMMEDIATE")
-                    except oracledb.DatabaseError:
-                        pass
-            time.sleep(1)
     try:
-        if last is not None:
-            raise AssertionError(
-                "FAILED TO DROP the test user T_EXEMPT, which holds EXEMPT ACCESS POLICY and "
-                f"therefore bypasses every VPD policy in this database. Remove it by hand: "
-                f"DROP USER t_exempt CASCADE. Underlying error: {last}"
-            )
+        _drop_user(cur, "t_exempt")
     finally:
         admin.close()
 
@@ -522,7 +529,7 @@ def test_a_policy_that_does_not_apply_to_select_is_not_counted_as_governing(vpd)
 
 
 @needs_admin
-def test_full_coverage_reports_attached(vpd):
+def test_full_coverage_reports_attached():
     """The terminal branch, `governed == tables`, which shipped untested when coverage went
     per-table: the test that used to reach `attached` was replaced by the `partial` one and
     nothing drove the schema into full coverage.
@@ -530,6 +537,10 @@ def test_full_coverage_reports_attached(vpd):
     It needs a schema where EVERY visible table is governed, which the shared fixture schema is
     not -- so this builds a throwaway owner with exactly one table and one SELECT policy. That is
     also the honest boundary: `attached` means what it says only when nothing is left out.
+
+    It does NOT take the `vpd` fixture. An earlier version declared it and never used it: the
+    coverage query filters `all_tables WHERE owner = :owner`, so APPUSER's state cannot reach
+    this schema. That coupling bought nothing and inherited `vpd`'s ability to skip.
     """
     import oracledb
 
@@ -568,11 +579,7 @@ def test_full_coverage_reports_attached(vpd):
         reader._con.close()
     finally:
         owner._con.close()
-        for _ in range(3):
-            try:
-                cur.execute("DROP USER t_full CASCADE")
-                admin.commit()
-                break
-            except oracledb.DatabaseError:
-                time.sleep(1)
-        admin.close()
+        try:
+            _drop_user(cur, "t_full")
+        finally:
+            admin.close()
