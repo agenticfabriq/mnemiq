@@ -66,12 +66,13 @@ def schema():
     w.execute("INSERT INTO t_region VALUES (1, 'west')")
     w.execute("INSERT INTO t_claim VALUES (1, 1, 100)")
     w.execute("CREATE VIEW t_claim_v AS SELECT id, amount FROM t_claim")
-    # A read-only transaction pins a snapshot, and Oracle refuses to read a table whose DDL is
-    # newer than it: ORA-01466, measured to clear after ~1s. The read-only adapter under test
-    # would otherwise fail on every read for reasons that have nothing to do with what is being
-    # tested. This is the fixture paying a documented cost of the safeguard, not hiding it --
-    # `test_a_read_only_adapter_cannot_read_a_table_created_this_instant` pins the behaviour.
-    time.sleep(2)
+    # There is deliberately NO sleep here, and its absence is load-bearing. A read-only
+    # transaction pins a snapshot and Oracle refuses to read a table whose DDL is newer than it
+    # (ORA-01466), so this fixture used to sleep 2s before yielding -- which meant every read test
+    # below ran against a schema old enough to dodge the race, and the adapter's behaviour inside
+    # the window went untested by anything. `_with_cursor` retries it now, so the fixture hands
+    # over tables created microseconds ago and every read test is also a test of that retry.
+    # (The comment here previously pointed at a test that had been deleted for flakiness.)
     yield
     for stmt in ("DROP VIEW t_claim_v", "DROP TABLE t_claim CASCADE CONSTRAINTS",
                  "DROP TABLE t_region CASCADE CONSTRAINTS"):
@@ -608,3 +609,34 @@ def test_full_coverage_reports_attached():
             _drop_user(cur, "t_full")
         finally:
             admin.close()
+
+
+def test_a_table_created_this_instant_is_readable_through_the_read_only_adapter():
+    """The property the ORA-01466 retry exists for, asserted where it can be asserted honestly.
+
+    An end-to-end enrich against a schema created moments earlier had EVERY table fail to profile,
+    and the pipeline's fail-soft handler excluded each one and returned a snapshot reporting
+    success with zero columns. "Provision the schema, then enrich" is what a migration pipeline
+    does, so the window is reachable in production, not just in a test.
+
+    This asserts the READ SUCCEEDS, never that the race fired. The inverse test -- that an
+    unretried read fails inside the window -- was written once and deleted: the window is
+    sub-second, so its verdict depended on how long the preceding tests took. The retry's own
+    branches are covered deterministically in test_oracle_ddl_race.py with a synthetic ORA-01466.
+    """
+    import oracledb
+
+    w = _adapter(read_only=False)
+    try:
+        w.execute("DROP TABLE t_fresh")
+    except oracledb.DatabaseError:
+        pass
+    w.execute("CREATE TABLE t_fresh (id NUMBER)")
+    w.execute("INSERT INTO t_fresh VALUES (7)")
+    try:
+        assert _adapter().execute("SELECT id FROM t_fresh") == [(7,)]
+    finally:
+        try:
+            w.execute("DROP TABLE t_fresh")
+        except oracledb.DatabaseError:
+            pass

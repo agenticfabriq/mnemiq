@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pyarrow as pa
@@ -87,14 +88,11 @@ class OracleAdapter:
         transaction, hence the rollback: without it the statement raises ORA-01453 whenever a
         transaction is already open.
 
-        **Known cost, measured: a read-only transaction cannot read a table whose definition
-        changed in the same second** -- ORA-01466, "table definition has changed", because
-        `SET TRANSACTION READ ONLY` pins a read-consistent snapshot and DDL newer than it is
-        unreadable. Measured: the same read fails immediately after a CREATE, succeeds two seconds
-        later, and succeeds immediately through a writable adapter. It is a real edge for
-        "provision the schema then enrich at once", and it is accepted rather than retried around:
-        a retry loop inside a safeguard is how a safeguard quietly stops being one, and the
-        alternative -- no read-only enforcement at all -- is the thing M3 exists about.
+        **A read-only transaction cannot read a table whose definition changed a moment ago** --
+        ORA-01466, "table definition has changed", because `SET TRANSACTION READ ONLY` pins a
+        read-consistent snapshot and DDL newer than it is unreadable. `_with_cursor` retries it;
+        the reasoning is there, and an earlier version of this docstring argued the opposite on a
+        mechanism that does not hold.
         """
         if self._read_only:
             self._con.rollback()
@@ -103,13 +101,56 @@ class OracleAdapter:
             return cur
         return self._con.cursor()
 
+    # Measured against a live 23ai instance: a read of a table fails with ORA-01466 0.1s after
+    # its CREATE and succeeds at 1.0s, while a control read on the SAME connection at the same
+    # moment with no read-only transaction succeeds -- so the refusal comes from the safeguard's
+    # pinned snapshot, not from the table. The window is sub-second; these bounds cover it with
+    # room and still give up rather than loop.
+    _DDL_RACE_BACKOFF = (0.25, 0.75, 1.5)
+
+    def _with_cursor(self, work):
+        """Run `work(cursor)` on a fresh cursor, retrying the ORA-01466 DDL race.
+
+        **This does not weaken the read-only safeguard, and the distinction is the whole reason
+        the retry is here.** Every attempt goes through `_cursor()`, which re-issues
+        `SET TRANSACTION READ ONLY`; the retry does not fall back to a writable transaction or
+        drop the mode to get the read through. All it obtains is a NEWER read-consistent snapshot,
+        one whose SCN is past the DDL. An earlier version of this adapter refused to retry on the
+        grounds that "a retry loop inside a safeguard is how a safeguard quietly stops being one".
+        That is true of a retry that relaxes the safeguard and false of one that re-enters it, and
+        the argument was made against a mechanism this retry does not use.
+
+        What changed the call was not the argument but a measurement. An end-to-end enrich against
+        a schema created moments earlier had EVERY table fail to profile, and the pipeline's
+        fail-soft handler excluded each one and returned a snapshot reporting success with zero
+        columns -- an engine that had connected to Oracle and knew nothing about it. "Provision the
+        schema, then enrich" is not an exotic sequence; it is what a migration pipeline does.
+
+        Bounded, and it re-raises rather than looping: a persistent ORA-01466 means the definition
+        keeps changing under us, which is a real condition the caller must see and not a race to
+        wait out.
+        """
+        last: Exception | None = None
+        for pause in (0.0, *self._DDL_RACE_BACKOFF):
+            if pause:
+                time.sleep(pause)
+            cur = self._cursor()
+            try:
+                return work(cur)
+            except self._oracledb.DatabaseError as exc:
+                if not (self._read_only and _is_ddl_race(exc)):
+                    raise
+                last = exc
+            finally:
+                cur.close()
+        raise last
+
     def _rows(self, sql: str, **binds: Any) -> list[tuple]:
-        cur = self._cursor()
-        try:
+        def _fetch(cur):
             cur.execute(sql, **binds)
             return cur.fetchall()
-        finally:
-            cur.close()
+
+        return self._with_cursor(_fetch)
 
     def introspect(self) -> list[str]:
         return [
@@ -205,8 +246,7 @@ class OracleAdapter:
         Under `read_only` there is nothing to commit: the transaction is read-only by
         construction, and committing would end it.
         """
-        cur = self._cursor()
-        try:
+        def _run(cur):
             cur.execute(sql)
             if cur.description is not None:
                 rows = cur.fetchall()
@@ -220,8 +260,10 @@ class OracleAdapter:
             if not self._read_only:
                 self._con.commit()
             return rows
-        finally:
-            cur.close()
+
+        # Retried only under read_only, where the DDL race lives; a write is never re-executed by
+        # `_with_cursor`, which is what makes retrying safe to apply on this shared method.
+        return self._with_cursor(_run)
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
         """Run a query and return Arrow, bounding it by the driver's own call timeout.
@@ -231,20 +273,30 @@ class OracleAdapter:
         adapters use -- is not equivalent here, because it races the fetch rather than the call.
         The timeout is restored afterwards so one bounded query cannot silently bound the next.
         """
-        # The cursor is acquired BEFORE the timeout is set, and the timeout is set INSIDE the
-        # try. Both matter. `_cursor()` issues its own `SET TRANSACTION READ ONLY` round trip, so
-        # setting the timeout first would bound the safeguard's own setup; and if `_cursor()`
-        # raised between the mutation and the `try`, the `finally` would never run and the
-        # tightened value would leak to every later call on this adapter-lifetime connection --
-        # exactly what this docstring says it prevents.
-        cur = self._cursor()
+        # Two orderings matter here and both are preserved by running the query inside `_fetch`.
+        # The timeout must be set only once a cursor is in hand, because `_cursor()` issues its
+        # own `SET TRANSACTION READ ONLY` round trip and a tight timeout would otherwise bound the
+        # safeguard's setup rather than the query. And it must be restored on every path,
+        # including one where `_cursor()` itself raises -- a tightened value that leaks would
+        # silently bound every later call on this adapter-lifetime connection.
         previous = self._con.call_timeout
-        try:
+
+        def _fetch(cur):
+            # The timeout is set with the cursor already in hand, and restored before this
+            # returns, so it bounds the QUERY and never `_cursor()`'s own SET TRANSACTION round
+            # trip -- on the first attempt and on every retry alike. Restoring here rather than
+            # only in the outer `finally` is what keeps a retry's setup unbounded.
             if timeout_s is not None:
                 self._con.call_timeout = int(timeout_s * 1000)
-            cur.execute(sql)
-            names = [d[0] for d in cur.description] if cur.description else []
-            rows = cur.fetchall()
+            try:
+                cur.execute(sql)
+                names = [d[0] for d in cur.description] if cur.description else []
+                return names, cur.fetchall()
+            finally:
+                self._con.call_timeout = previous
+
+        try:
+            names, rows = self._with_cursor(_fetch)
         except self._oracledb.DatabaseError as exc:
             # DPY-4011/ORA-03156 surface a cancelled call; report it as a timeout rather than
             # letting a driver code reach the caller as an opaque source error.
@@ -252,7 +304,7 @@ class OracleAdapter:
                 raise RuntimeError(f"query timed out after {timeout_s}s") from exc
             raise
         finally:
-            cur.close()
+            # Belt and braces: `_cursor()` can raise before `_fetch` is ever entered.
             self._con.call_timeout = previous
 
         # Column-major, by position, so duplicate output names survive -- a dict would collapse
@@ -347,6 +399,11 @@ class OracleAdapter:
         return ("attached", f"all {tables} visible tables owned by {self._schema} carry an "
                             f"enabled SELECT policy and this principal holds no bypass "
                             f"privilege. {caveat}")
+
+
+def _is_ddl_race(exc: Exception) -> bool:
+    """ORA-01466: this read-only transaction's snapshot is older than the table's definition."""
+    return "ora-01466" in str(exc).lower()
 
 
 def _is_timeout(exc: Exception) -> bool:
