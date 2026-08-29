@@ -384,7 +384,28 @@ def _drop_user(cur, username):
     `DROP USER` raises ORA-01940 while any session is open, so the sessions are killed on the
     second attempt rather than waited out -- a test that failed before closing its own connection
     would otherwise leak deterministically.
+
+    **It warns rather than raises when another exception is already propagating**, and the two
+    call sites reach that safely by different routes -- which is worth stating, because the
+    obvious reading is wrong.
+
+    From a plain `try/finally` inside a test body, a raise REPLACES the exception that brought us
+    in: the real failure survives only as a chained `__context__`. `sys.exc_info()` is populated
+    there, so the guard fires and the leak degrades to a warning. Verified.
+
+    From a generator FIXTURE teardown, `sys.exc_info()` is `(None, None, None)` even when the
+    test failed -- verified against this repo's pytest -- so the guard does NOT fire and this
+    raises. That is correct, and not by luck: pytest reports a teardown error SEPARATELY from the
+    test failure, so a double failure prints both `FAILED ... THE REAL TEST FAILURE` and
+    `ERROR at teardown ... FAILED TO DROP`. Nothing is masked, and the leak keeps its own line.
+
+    So the guard is load-bearing at one site and inert at the other, deliberately. A review found
+    the inert half and predicted masking; the masking does not happen, but the reasoning in this
+    docstring did not survive contact with either fact and has been rewritten to the measurements.
     """
+    import sys
+    import warnings
+
     import oracledb
 
     last = None
@@ -405,10 +426,14 @@ def _drop_user(cur, username):
                     except oracledb.DatabaseError:
                         pass
             time.sleep(1)
-    raise AssertionError(
+    message = (
         f"FAILED TO DROP the test user {username}, which this suite grants privileges to. "
         f"Remove it by hand: DROP USER {username} CASCADE. Underlying error: {last}"
     )
+    if sys.exc_info()[0] is not None:  # something else is already failing; do not mask it
+        warnings.warn(message, stacklevel=2)
+        return
+    raise AssertionError(message)
 
 
 @pytest.fixture
