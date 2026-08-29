@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 
+from mnemiq.sql.qualify import names_one_object
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -52,7 +53,14 @@ def check_values(
             return None
         if values.contains(table, column.name, literal):
             return None
-        if table in row_filtered:
+        # FOLDED, and folding is safe here for the reason it is not safe for the filter
+        # lookup itself: this set decides whether to WITHHOLD, so matching more of it discloses
+        # less. Measured before this, with `row_filters` keyed `CLAIM` against a snapshot keyed
+        # `claim` -- a pairing the policy fold now BINDS -- `check_values` answered "the real
+        # values include: west, east", naming a value from rows the caller cannot read. The
+        # exact-keyed control withheld it. So the fold that made the filter reach the query left
+        # this branch still believing the table was unfiltered, and turned M5 back on.
+        if names_one_object(table, row_filtered):
             return Refusal(
                 code=RefusalCode.VALUE_GROUNDING,
                 message=(

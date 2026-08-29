@@ -38,3 +38,26 @@ def expand_tables(ast: exp.Expression, registry: dict[str, str]) -> None:
         if db in registry and not table.args.get("catalog"):
             table.set("catalog", exp.to_identifier(db))
             table.set("db", exp.to_identifier(registry[db]))
+
+
+def names_one_object(name: str, candidates) -> bool:
+    """Whether `name` and any of `candidates` are the same object id, ignoring case.
+
+    Used by `AccessPolicy.denies` / `.masks` / `.row_filter_for` and by `check_values`, which
+    each carried their own copy of this rule until a review gate pointed out that adding a third
+    was the M30 shape -- two implementations of a control diverging exactly where nobody was
+    looking -- in a branch whose commit messages were about that shape.
+
+    NOT yet every site. `views.py` still answers the same question independently, in `_spellings`
+    and in two inline comparisons, because it widens a set of spellings in both directions rather
+    than answering yes/no about one name. Left alone deliberately, and named here so the next
+    reader knows it was considered rather than missed -- an earlier draft of this docstring
+    claimed the consolidation was complete, and it is not.
+
+    Case only. Unquoted identifiers are case-insensitive in all three engines; a QUOTED one is
+    case-sensitive in Postgres, and nothing here can tell them apart because quoting is discarded
+    before any caller reaches this. That is M55, and it is open -- when it is settled, this is the
+    single function that has to learn about it.
+    """
+    folded = name.lower()
+    return any(c.lower() == folded for c in candidates)

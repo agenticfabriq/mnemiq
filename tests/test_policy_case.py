@@ -1,10 +1,11 @@
 """Object ids are compared case-insensitively in the deciders' policy lookups.
 
-NOT at literally every enforcement point: `values_check` still compares
-`table in row_filtered` exactly. That one is not a live disclosure -- `ValueIndex` runs its own
-exact-case `WHERE object_id = ?`, so a case mismatch makes the whole grounding check silently
-no-op rather than leak -- but it does mean value grounding goes inert on a case-mismatched query,
-and it is left alone here rather than claimed closed.
+`values_check` folds too, and that claim in this docstring was wrong twice before it was right.
+It first said the check was outside the fold and "left alone"; then that a case mismatch made it
+"silently no-op rather than leak". Measured: it does neither. With a filter keyed `CLAIM` against
+a snapshot keyed `claim` -- a pairing the fold BINDS -- the grounding refusal listed `east`, a
+value from rows the caller cannot read. It fires, and it discloses. Folded now, which is safe
+here because this set decides whether to WITHHOLD.
 
 Found by Codex's stop-time review, which said the PII bypass "remains exploitable" after a fix
 whose test asserted only that `policy.denied` CONTAINED the entry. It did. Nothing asserted that
@@ -27,6 +28,7 @@ from __future__ import annotations
 import itertools
 
 import pytest
+import sqlglot
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract.semantic import Column, Job, Snapshot
@@ -310,3 +312,46 @@ def test_two_roles_on_the_same_spelling_still_or_combine():
         os.unlink(path)
     combined = grants.row_filters["claim"]
     assert "tenant_id = 1" in combined and "tenant_id = 2" in combined and "OR" in combined
+
+
+# -- the disclosure the fold turned back on ----------------------------------------------------
+#
+# `decide` hands `check_values` `row_filtered=set(policy.row_filters)` -- the raw KEYS -- and it
+# compared `table in row_filtered` exactly. The policy fold made a filter keyed `CLAIM` BIND to a
+# snapshot keyed `claim`, while this branch still believed that table was unfiltered, so the
+# grounding refusal listed real values from rows the caller cannot read. M5, back on, reachable
+# only because the fold works.
+#
+# Folding here is safe for the reason folding the filter LOOKUP is not: this set decides whether
+# to WITHHOLD, so matching more of it discloses less.
+
+class _StubValueIndex:
+    """`claim.region` is indexed and holds west + east."""
+
+    def has(self, object_id, column):
+        return (object_id, column) == ("claim", "region")
+
+    def contains(self, object_id, column, literal):
+        return literal in {"west", "east"}
+
+    def nearest(self, object_id, column, literal, k=8):
+        return ["west", "east"]
+
+
+@pytest.mark.parametrize("filter_key", ["claim", "Claim", "CLAIM"])
+def test_value_grounding_withholds_whatever_case_the_filter_is_keyed_in(filter_key):
+    from mnemiq.sql.values_check import check_values
+    ast = sqlglot.parse_one("SELECT id FROM claim WHERE region = 'nope'", read="duckdb")
+    r = check_values(ast, {"claim": {"id", "region"}}, _StubValueIndex(),
+                     row_filtered={filter_key})
+    assert isinstance(r, Refusal), r
+    assert "east" not in r.message and "west" not in r.message, r.message
+
+
+def test_value_grounding_still_names_values_when_nothing_is_filtered():
+    """The control. Withholding is for a caller who sees a slice; a caller who sees the whole
+    table should be told which values are real, which is the whole point of the check."""
+    from mnemiq.sql.values_check import check_values
+    ast = sqlglot.parse_one("SELECT id FROM claim WHERE region = 'nope'", read="duckdb")
+    r = check_values(ast, {"claim": {"id", "region"}}, _StubValueIndex(), row_filtered=set())
+    assert isinstance(r, Refusal) and "west" in r.message, r

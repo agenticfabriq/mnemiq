@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
+from mnemiq.sql.qualify import names_one_object
 
 
 @dataclass
@@ -44,12 +45,12 @@ class AccessPolicy:
     # These sets hold a handful of entries; folding per call costs nothing worth this risk.
 
     def denies(self, table: str, column: str) -> bool:
-        needle = (table.lower(), column.lower())
-        return any((t.lower(), c.lower()) == needle for t, c in self.denied)
+        return any(names_one_object(table, [t]) and c.lower() == column.lower()
+                   for t, c in self.denied)
 
     def masks(self, table: str, column: str) -> bool:
-        needle = (table.lower(), column.lower())
-        return any((t.lower(), c.lower()) == needle for t, c in self.masked)
+        return any(names_one_object(table, [t]) and c.lower() == column.lower()
+                   for t, c in self.masked)
 
     def row_filter_for(self, table: str) -> str | None:
         """Every filter naming this table, whatever its spelling, OR-combined.
@@ -65,8 +66,7 @@ class AccessPolicy:
         duplicates should not reach here at all; this is the second line of defence for a policy
         built by hand or by a provider that does not fold.
         """
-        folded = table.lower()
-        matches = [f for t, f in self.row_filters.items() if t.lower() == folded]
+        matches = [f for t, f in self.row_filters.items() if names_one_object(table, [t])]
         if not matches:
             return None
         if len(matches) == 1:
