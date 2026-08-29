@@ -276,8 +276,19 @@ class OracleAdapter:
           `bypassing`    -- measured to bypass. Refuse.
           `unverifiable` -- no policy is attached to anything this connection can see, so there is
                             nothing to enforce and nothing to confirm.
-          `attached`     -- policies exist and this principal holds no bypass privilege. **This is
-                            NOT a guarantee of enforcement**, and the name says so deliberately.
+          `partial`      -- some tables carry a policy and some do not. NOT an acceptance: the
+                            ungoverned ones are ungoverned.
+          `attached`     -- every table this connection can see carries an enabled policy, and
+                            this principal holds no bypass privilege. **Still NOT a guarantee of
+                            enforcement**, and the name says so deliberately.
+
+        `partial` exists because counting policies per SCHEMA is a false positive. Measured: with
+        a policy on one table and none on the table actually queried, a schema-level count
+        reported `attached` while that query returned every row. That is the same flaw the
+        Postgres check documents as `rls_tables` counting enabled-ness rather than coverage --
+        which this adapter carried across without carrying the caveat, until a review asked.
+        Coverage is per TABLE and the counts are in the reason string, because "3 of 47 governed"
+        is the fact an operator needs and a single verdict word cannot hold it.
 
         Why `attached` is the strongest honest answer, and the reason this is not a port of the
         Postgres check: **a VPD policy function that returns NULL yields no predicate.** Measured
@@ -307,25 +318,35 @@ class OracleAdapter:
         row = self._rows(
             "SELECT (SELECT count(*) FROM session_privs "
             "         WHERE privilege = 'EXEMPT ACCESS POLICY') AS exempt, "
-            "       (SELECT count(*) FROM all_policies "
-            "         WHERE object_owner = :owner AND enable = 'YES') AS policies "
+            "       (SELECT count(*) FROM all_tables WHERE owner = :owner) AS tables, "
+            "       (SELECT count(DISTINCT p.object_name) FROM all_policies p "
+            "         JOIN all_tables t ON t.owner = p.object_owner "
+            "                          AND t.table_name = p.object_name "
+            "         WHERE p.object_owner = :owner AND p.enable = 'YES' "
+            "           AND p.sel = 'YES') AS governed "
             "FROM dual",
             owner=self._schema,
         )[0]
-        exempt, policies = int(row[0]), int(row[1])
+        exempt, tables, governed = int(row[0]), int(row[1]), int(row[2])
 
         if exempt:
             return ("bypassing", "this principal holds EXEMPT ACCESS POLICY, which exempts it "
                                  "from every VPD policy in the database. A SYSDBA connection "
                                  "reaches this branch too: it holds the privilege implicitly")
-        if policies == 0:
-            return ("unverifiable", f"no enabled VPD policy is attached to any object owned by "
-                                    f"{self._schema} that this connection can see, so there is "
-                                    f"nothing enforcing row security here")
-        return ("attached", f"{policies} enabled VPD polic{'y' if policies == 1 else 'ies'} on "
-                            f"{self._schema}, and this principal holds no bypass privilege. This "
-                            f"is not proof of enforcement: a policy function returning NULL is "
-                            f"reported enabled and restricts nothing.")
+        caveat = ("Not proof of enforcement in any case: a policy function returning NULL, or "
+                  "'', is reported enabled and restricts nothing.")
+        if governed == 0:
+            return ("unverifiable", f"no table owned by {self._schema} that this connection can "
+                                    f"see carries an enabled VPD policy on SELECT "
+                                    f"({tables} table(s) visible), so nothing is enforcing row "
+                                    f"security here")
+        if governed < tables:
+            return ("partial", f"{governed} of {tables} tables owned by {self._schema} carry an "
+                               f"enabled SELECT policy; the other {tables - governed} are "
+                               f"ungoverned. {caveat}")
+        return ("attached", f"all {tables} visible tables owned by {self._schema} carry an "
+                            f"enabled SELECT policy and this principal holds no bypass "
+                            f"privilege. {caveat}")
 
 
 def _is_timeout(exc: Exception) -> bool:

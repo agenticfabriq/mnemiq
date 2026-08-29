@@ -308,9 +308,18 @@ def test_a_policy_actually_restricts_the_rows(vpd):
     assert _adapter().execute("SELECT count(*) FROM t_vpd") == [(1,)], "2 rows exist; 1 is visible"
 
 
-def test_an_ordinary_principal_reports_attached(vpd):
-    verdict, _ = _adapter().assert_enforcing()
-    assert verdict == "attached"
+def test_partial_coverage_is_not_reported_as_attached(vpd):
+    """The fixture schema has several tables and a policy on one, which is the ordinary state of
+    a schema mid-rollout -- and the honest verdict is `partial`, not `attached`.
+
+    A schema-level policy COUNT reported `attached` here while the tables without a policy
+    returned every row: measured, a policy on one table and none on the queried one gave
+    `attached` for a query that was completely ungoverned. Coverage is per table now, and the
+    reason string carries the numbers because "1 of 4 governed" is what an operator acts on.
+    """
+    verdict, reason = _adapter().assert_enforcing()
+    assert verdict == "partial", "some tables are governed and some are not"
+    assert "ungoverned" in reason
 
 
 @pytest.mark.parametrize("inert_fn", ["T_NULL_F", "T_EMPTY_F"])
@@ -323,13 +332,20 @@ def test_attached_is_not_a_claim_of_enforcement(vpd, inert_fn):
     an inert one, and `attached` must never be read as "enforcing". This test pins the gap rather
     than pretending the check closes it: the verdict is UNCHANGED while enforcement is gone.
     """
+    enforcing_verdict, _ = _adapter().assert_enforcing()
+    assert _adapter().execute("SELECT count(*) FROM t_vpd") == [(1,)], "the policy restricts"
+
     vpd(inert_fn)
     time.sleep(2)
     assert _adapter().execute("SELECT count(*) FROM t_vpd") == [(2,)], \
         f"{inert_fn} restricts nothing: an inert policy function yields no predicate"
-    verdict, reason = _adapter().assert_enforcing()
-    assert verdict == "attached", "the catalog still reports the policy enabled"
-    assert "not proof of enforcement" in reason, \
+
+    inert_verdict, reason = _adapter().assert_enforcing()
+    assert inert_verdict == enforcing_verdict, (
+        "the verdict is IDENTICAL while enforcement is gone -- that is the finding. The catalog "
+        "reports the inert policy enabled, so enumerating it cannot tell the two apart"
+    )
+    assert "not proof of enforcement" in reason.lower(), \
         "the verdict must say what it cannot establish, since the catalog cannot tell"
 
 
@@ -380,17 +396,42 @@ def exempt_principal(vpd):
     cur.execute("GRANT SELECT ON appuser.t_vpd TO t_exempt")
     admin.commit()
     yield "t_exempt", "pw"
-    # DROP USER fails ORA-01940 while a session is open, so the test must close its adapter --
-    # it does, in its own finally. Retried once regardless, since a leaked user would make the
-    # next run's CREATE fail and read as a fixture bug rather than a leak.
-    for _ in range(2):
+    # This user holds EXEMPT ACCESS POLICY -- it bypasses every VPD policy in the database -- so
+    # a teardown that fails QUIETLY leaves a standing bypass behind. The first version swallowed
+    # the error after two attempts and closed the connection, which is the shape this whole
+    # session has been about: a cleanup that reports success it did not achieve.
+    #
+    # DROP USER raises ORA-01940 while a session is open, and the test closes its adapter in its
+    # own finally, so the retries cover ordering rather than excusing failure. If it still will
+    # not drop, kill the sessions and try once more; if THAT fails, raise -- loudly, naming what
+    # is left behind and how to remove it.
+    last = None
+    for attempt in range(3):
         try:
             cur.execute("DROP USER t_exempt CASCADE")
             admin.commit()
+            last = None
             break
-        except oracledb.DatabaseError:
+        except oracledb.DatabaseError as exc:
+            last = exc
+            if attempt == 1:  # still held: terminate whatever is holding it, then retry
+                for sid, serial in cur.execute(
+                    "SELECT sid, serial# FROM v$session WHERE username = 'T_EXEMPT'"
+                ).fetchall():
+                    try:
+                        cur.execute(f"ALTER SYSTEM KILL SESSION '{sid},{serial}' IMMEDIATE")
+                    except oracledb.DatabaseError:
+                        pass
             time.sleep(1)
-    admin.close()
+    try:
+        if last is not None:
+            raise AssertionError(
+                "FAILED TO DROP the test user T_EXEMPT, which holds EXEMPT ACCESS POLICY and "
+                f"therefore bypasses every VPD policy in this database. Remove it by hand: "
+                f"DROP USER t_exempt CASCADE. Underlying error: {last}"
+            )
+    finally:
+        admin.close()
 
 
 @needs_admin
@@ -436,3 +477,45 @@ def test_a_sysdba_connection_is_refused(vpd):
         assert verdict == "bypassing"
     finally:
         a._con.close()
+
+
+def test_a_policy_that_does_not_apply_to_select_is_not_counted_as_governing(vpd):
+    """`ALL_POLICIES.SEL` is the filter, and mutation showed it was the untested one.
+
+    A VPD policy can be attached for UPDATE or DELETE only -- `sel = 'NO'` -- and it restricts no
+    SELECT whatsoever. Counting it as governing would report a table as covered while every read
+    returns every row: the same false positive as counting policies per schema, one column over.
+
+    Oracle quirk worth knowing: `statement_types => 'INSERT'` and any combination containing
+    INSERT is rejected with ORA-28104, while 'UPDATE', 'DELETE' and 'UPDATE,DELETE' are accepted.
+    So this shape is reachable, which is why the filter is not dead code the way the removed
+    `ISDBA` branch was.
+    """
+    import oracledb
+
+    w = _adapter(read_only=False)
+    try:
+        w.execute("BEGIN DBMS_RLS.DROP_POLICY('APPUSER','T_VPD','P'); END;")
+    except oracledb.DatabaseError:
+        pass
+    w.execute("BEGIN DBMS_RLS.ADD_POLICY(object_schema=>'APPUSER',object_name=>'T_VPD',"
+              "policy_name=>'P',function_schema=>'APPUSER',policy_function=>'T_WEST_F',"
+              "statement_types=>'UPDATE'); END;")
+    time.sleep(2)
+
+    a = _adapter()
+    assert a.execute("SELECT count(*) FROM t_vpd") == [(2,)], \
+        "an UPDATE-only policy restricts no SELECT -- both rows are visible"
+    sel = a.execute("SELECT sel FROM all_policies WHERE object_name = 'T_VPD'")[0][0]
+    assert sel == "NO", "the fixture must produce a non-SELECT policy, or this proves nothing"
+
+    verdict, reason = a.assert_enforcing()
+    # EXACTLY `unverifiable`, not `in (unverifiable, partial)`. The first version accepted both
+    # and mutation proved it worthless: with the filter this policy counts 0 governed tables, and
+    # WITHOUT it 1 -- but the schema has other ungoverned tables either way, so both land on
+    # `partial` and an `in` assertion passes with the filter removed. The count is the only thing
+    # that discriminates, so the count is what this asserts.
+    assert verdict == "unverifiable", (
+        f"an UPDATE-only policy must contribute NOTHING to SELECT coverage, leaving zero governed "
+        f"tables; got {verdict} -- {reason}"
+    )
