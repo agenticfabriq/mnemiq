@@ -60,13 +60,13 @@ def check_cls(ast: exp.Expression, policy: AccessPolicy) -> Refusal | None:
     for column in ast.find_all(exp.Column):
         cands = _candidate_tables(column, resolved, referenced, aliased)
         name = column.name
-        if any((t, name) in policy.denied for t in cands):
+        if any(policy.denies(t, name) for t in cands):
             return Refusal(
                 code=RefusalCode.UNAUTHORIZED_COLUMN,
                 message=f"You may not read the column {name!r}.",
                 subject=name,
             )
-        if any((t, name) in policy.masked for t in cands) and not _is_bare_projection(column):
+        if any(policy.masks(t, name) for t in cands) and not _is_bare_projection(column):
             return Refusal(
                 code=RefusalCode.MASKED_COLUMN_IN_PREDICATE,
                 message=(

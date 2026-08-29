@@ -94,8 +94,11 @@ def _derived_table(
 ) -> exp.Subquery:
     """(SELECT <cols, masked->NULL AS c> FROM table [WHERE filt]) AS alias."""
     projections: list[exp.Expression] = []
+    # Folded on both sides: `cols` carries the snapshot's column spelling and `masked_cols` the
+    # policy's, and a mask that matches the table but not the column name nulls nothing.
+    folded_masked = {m.lower() for m in masked_cols}
     for c in sorted(cols):
-        if c in masked_cols:
+        if c.lower() in folded_masked:
             projections.append(exp.alias_(exp.null(), c))
         else:
             projections.append(exp.column(c))
@@ -127,14 +130,16 @@ def apply_row_and_mask(
     if not policy.row_filters and not policy.masked:
         return ast
 
+    # Folded on BOTH sides: the table keys come from the snapshot and `name` below comes from the
+    # query, and comparing them exactly is what let `CLAIM` and `claim` name different objects.
     masked_by_table: dict[str, set[str]] = {}
     for tbl, col in policy.masked:
-        masked_by_table.setdefault(tbl, set()).add(col)
+        masked_by_table.setdefault(tbl.lower(), set()).add(col.lower())
 
     referenced_masked: set[str] = set()
     for column in ast.find_all(exp.Column):
         for tbl, cols in masked_by_table.items():
-            if column.name in cols:
+            if column.name.lower() in cols:
                 referenced_masked.add(tbl)
 
     # Resolved before the loop mutates the tree: `replace` invalidates the scope it was read from.
@@ -144,14 +149,14 @@ def apply_row_and_mask(
         name = object_key(table_node)
         if name not in visible:
             continue
-        needs_filter = name in policy.row_filters
-        needs_mask = name in referenced_masked
+        needs_filter = policy.row_filter_for(name) is not None
+        needs_mask = name.lower() in referenced_masked
         if not (needs_filter or needs_mask):
             continue
         filt: exp.Expression | None = None
         if needs_filter:
             filt = _validate_filter(
-                policy.row_filters[name], visible[name], dialect, policy.policy_schema
+                policy.row_filter_for(name), visible[name], dialect, policy.policy_schema
             )
             if filt is None:
                 return Refusal(
@@ -160,7 +165,12 @@ def apply_row_and_mask(
                     subject=name,
                 )
         derived = _derived_table(
-            name, table_node.alias_or_name, visible[name], masked_by_table.get(name, set()), filt
+            name, table_node.alias_or_name, visible[name],
+            # `.lower()`: this dict is keyed folded and `name` is the QUERY's spelling.
+            # Missing it left `needs_mask` correctly true while the column set handed to
+            # the projection was EMPTY, so the masked column was emitted as its real
+            # value instead of NULL -- the mask silently doing nothing.
+            masked_by_table.get(name.lower(), set()), filt
         )
         table_node.replace(derived)
     return ast
@@ -201,7 +211,7 @@ def apply_row_filters_to_write(
     if not isinstance(ast, (exp.Update, exp.Delete)) or not isinstance(target, exp.Table):
         return ast
     name = object_key(target)
-    filt = policy.row_filters.get(name)
+    filt = policy.row_filter_for(name)
     if filt is None:
         return ast
     predicate = _validate_filter(filt, visible.get(name, set()), dialect, policy.policy_schema)

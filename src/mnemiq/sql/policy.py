@@ -24,6 +24,49 @@ class AccessPolicy:
     def empty(self) -> bool:
         return not self.row_filters and not self.denied and not self.masked
 
+    # ONE normalisation of an object id, here, rather than at each enforcement site. Every guard
+    # used to compare the SNAPSHOT's spelling against the spelling the QUERY resolved to, with an
+    # exact match, so a source keying `CLAIM` against a query saying `claim` slipped all three:
+    # measured, a `direct` PII column APPROVED and a row filter APPROVED UNFILTERED, on a plain
+    # table read with no view involved. Unquoted identifiers are case-insensitive in all three
+    # engines, so those spell the same object.
+    #
+    # A narrower answer than M50 asks for -- it folds case, not schema qualification -- and
+    # deliberately so: the keys STAY as the snapshot wrote them, so `verdict.tables`, refusal
+    # subjects and every existing caller keep reporting the source's own names. What changes is
+    # only how a lookup is answered.
+
+    # NO CACHE. The first version memoised on `(len(denied), len(masked), len(row_filters))`,
+    # which the review gate broke in one line: swap one denied pair for another and the
+    # cardinality is unchanged, so `denies` keeps answering about the pair that is gone. No
+    # caller mutates these in place today, but they are plain mutable set/dict sitting directly
+    # under three authorization methods, and a stale authorization answer is silent and wrong.
+    # These sets hold a handful of entries; folding per call costs nothing worth this risk.
+
+    def denies(self, table: str, column: str) -> bool:
+        needle = (table.lower(), column.lower())
+        return any((t.lower(), c.lower()) == needle for t, c in self.denied)
+
+    def masks(self, table: str, column: str) -> bool:
+        needle = (table.lower(), column.lower())
+        return any((t.lower(), c.lower()) == needle for t, c in self.masked)
+
+    def row_filter_for(self, table: str) -> str | None:
+        # EXACT first, fold second. `grants.py` merges per-role filters with a case-sensitive
+        # `if table in row_filters`, so two roles naming one table in different cases land as two
+        # distinct keys rather than being OR-combined. The old `row_filters.get(name)` then picked
+        # the one matching the query's own spelling; a fold-only scan would pick whichever came
+        # first in insertion order and silently apply a different role's predicate. Folding is
+        # here to stop a filter being MISSED, not to change which one governs when both exist.
+        exact = self.row_filters.get(table)
+        if exact is not None:
+            return exact
+        folded = table.lower()
+        for t, f in self.row_filters.items():
+            if t.lower() == folded:
+                return f
+        return None
+
 
 def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
     """Objects this caller's query can end up reading: what they are granted, plus the bases
