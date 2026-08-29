@@ -277,6 +277,8 @@ def vpd():
               "RETURN VARCHAR2 AS BEGIN RETURN 'region = ''west'''; END;")
     w.execute("CREATE OR REPLACE FUNCTION t_null_f(s VARCHAR2, o VARCHAR2) "
               "RETURN VARCHAR2 AS BEGIN RETURN NULL; END;")
+    w.execute("CREATE OR REPLACE FUNCTION t_empty_f(s VARCHAR2, o VARCHAR2) "
+              "RETURN VARCHAR2 AS BEGIN RETURN ''; END;")
 
     def attach(fn):
         try:
@@ -311,15 +313,17 @@ def test_an_ordinary_principal_reports_attached(vpd):
     assert verdict == "attached"
 
 
-def test_attached_is_not_a_claim_of_enforcement(vpd):
+@pytest.mark.parametrize("inert_fn", ["T_NULL_F", "T_EMPTY_F"])
+def test_attached_is_not_a_claim_of_enforcement(vpd, inert_fn):
     """The finding, and the reason this is not a port of the Postgres check.
 
-    A VPD policy function returning NULL yields no predicate -- all rows -- while `ALL_POLICIES`
-    still reports it `enable = 'YES'`. So the catalog cannot distinguish an enforcing policy from
+    A VPD policy function returning NULL -- or `''`, which is why both are parametrised rather
+    than one measured and the other asserted in prose -- yields no predicate, all rows, while
+    `ALL_POLICIES` still reports it `enable = 'YES'`. So the catalog cannot distinguish an enforcing policy from
     an inert one, and `attached` must never be read as "enforcing". This test pins the gap rather
     than pretending the check closes it: the verdict is UNCHANGED while enforcement is gone.
     """
-    vpd("T_NULL_F")
+    vpd(inert_fn)
     time.sleep(2)
     assert _adapter().execute("SELECT count(*) FROM t_vpd") == [(2,)], \
         "a NULL-returning policy function restricts nothing"
@@ -411,9 +415,13 @@ def test_a_principal_with_exempt_access_policy_is_refused(vpd, exempt_principal)
 
 @needs_admin
 def test_a_sysdba_connection_is_refused(vpd):
-    """SYS holds EXEMPT ACCESS POLICY implicitly, so the privilege test catches it -- but `ISDBA`
-    is checked too, deliberately redundantly, so a SYSDBA connection is refused for being one
-    rather than for a privilege it happens to imply."""
+    """SYS holds EXEMPT ACCESS POLICY implicitly, so the ONE privilege test catches it.
+
+    There is no separate ISDBA check: an earlier draft had one, mutation showed removing it broke
+    nothing, and probing showed the branch was unreachable -- every `AS SYSDBA` connection becomes
+    `SESSION_USER = SYS` and holds the privilege. This test exists because that reasoning is only
+    as good as the case that exercises it.
+    """
     import oracledb
 
     a = OracleAdapter.__new__(OracleAdapter)
