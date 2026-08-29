@@ -228,3 +228,85 @@ def test_a_masked_column_in_a_bare_projection_is_still_allowed():
     v = decide("SELECT ssn FROM CLAIM", {"CLAIM": {"id", "ssn"}},
                policy=AccessPolicy(masked={("claim", "ssn")}))
     assert not isinstance(v, Refusal), v
+
+
+# -- the residual this branch does NOT close, as a tripwire rather than prose -------------------
+#
+# Folding decides "same table" from the identifier's TYPED case, and that is not what decides it
+# in the engine. Postgres folds an UNQUOTED identifier to lowercase however it was typed and is
+# case-sensitive only for a QUOTED one, so `FROM Claim` and `FROM claim` are the same table
+# unless quoted -- and `object_key` (sql/qualify.py) discards quoting before any guard sees it,
+# while `_derived_table` re-emits the wrapped FROM unquoted regardless. Nothing at the decision
+# knows which case it is in.
+#
+# Both directions were tried on this branch and both were worse:
+#
+#   always fold          two roles naming two case-distinct tables merge into one OR'd filter,
+#                        so a caller granted tenant 1 also matches tenant 2 rows. THIS IS HEAD.
+#   fold unless the      drops the filter entirely for an unquoted `FROM Claim`, which Postgres
+#   snapshot holds both  executes against the filtered lowercase `claim` -- and returns a denied
+#                        `direct` PII column unmasked. Measured, discarded, worse.
+#
+# HEAD keeps the over-broad one because it fails toward MORE governance on the common unquoted
+# path, which is the only path an LLM-generated query takes. The narrow one leaked there.
+#
+# Closing this needs quoting carried from the parse through `object_key` to the policy lookup,
+# which is a design change to the decider's object identity, not a comparison fix. That is M50's
+# question and it is open.
+
+
+@pytest.mark.xfail(strict=True, reason="Two case-distinct tables share one folded policy: two "
+                                       "roles granting `claim` and `Claim` merge into a single "
+                                       "OR'd filter, so a caller granted tenant 1 on one table "
+                                       "also matches the other's rows. Fixing it needs quoting "
+                                       "preserved to the policy lookup (M50); every fix tried "
+                                       "without it leaked worse on the unquoted path.")
+def test_a_grant_on_one_table_does_not_widen_a_filter_on_a_case_variant_one():
+    import json
+    import os
+    import tempfile
+
+    from mnemiq.authz.grants import FileAuthzProvider
+    from mnemiq.contract import IdentityContext
+
+    roles = {"roles": {"a": {"read": ["claim"], "row_filters": {"claim": "tenant_id = 1"}},
+                       "b": {"read": ["Claim"], "row_filters": {"Claim": "tenant_id = 2"}}}}
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.write(fd, json.dumps(roles).encode())
+    os.close(fd)
+    try:
+        grants = FileAuthzProvider(path).grants_for(
+            IdentityContext(subject="u", tenant_id="t", principal_id="p", roles=["a", "b"]))
+    finally:
+        os.unlink(path)
+    snapshot = Snapshot(version="v", source_id="s", created_at="t", views=[], jobs=JOBS,
+                        columns=[_col("claim", "id"), _col("claim", "tenant_id"),
+                                 _col("Claim", "id"), _col("Claim", "tenant_id")])
+    v = decide("SELECT id FROM claim", {"claim": {"id", "tenant_id"}},
+               policy=build_access_policy(snapshot, grants))
+    assert "tenant_id = 2" not in v.plan_sql, v.plan_sql
+
+
+def test_two_roles_on_the_same_spelling_still_or_combine():
+    """The passing control, and the reason the xfail above is not simply 'stop OR-combining'.
+    When both roles name the table identically it IS one table, and more roles must mean more
+    visible rows -- the behaviour `grants_for`'s own comment describes."""
+    import json
+    import os
+    import tempfile
+
+    from mnemiq.authz.grants import FileAuthzProvider
+    from mnemiq.contract import IdentityContext
+
+    roles = {"roles": {"a": {"read": ["claim"], "row_filters": {"claim": "tenant_id = 1"}},
+                       "b": {"read": ["claim"], "row_filters": {"claim": "tenant_id = 2"}}}}
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.write(fd, json.dumps(roles).encode())
+    os.close(fd)
+    try:
+        grants = FileAuthzProvider(path).grants_for(
+            IdentityContext(subject="u", tenant_id="t", principal_id="p", roles=["a", "b"]))
+    finally:
+        os.unlink(path)
+    combined = grants.row_filters["claim"]
+    assert "tenant_id = 1" in combined and "tenant_id = 2" in combined and "OR" in combined
