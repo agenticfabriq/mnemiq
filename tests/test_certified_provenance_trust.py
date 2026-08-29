@@ -14,7 +14,7 @@ import logging
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import PII_LEVELS, Column, Snapshot
-from mnemiq.contract.records import CertifiedRecord, Provenance, RecordEnvelope
+from mnemiq.contract.records import CertifiedRecord, Provenance
 from mnemiq.enrichment.certified import apply_certified
 from mnemiq.semantic.values import _qualifies
 from mnemiq.sql.policy import build_access_policy

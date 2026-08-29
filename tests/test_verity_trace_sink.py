@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 
-import pytest
 
 from mnemiq.contract.seams import IdentityContext
 from mnemiq.contract.semantic import CertifiedRef
