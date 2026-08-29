@@ -12,7 +12,7 @@ from mnemiq.sql.verdict import Refusal, RefusalCode
 MAX_DEPTH = 8
 
 
-def _body(view: ViewDefinition) -> exp.Expression | None:
+def body_of(view: ViewDefinition) -> exp.Expression | None:
     """The SELECT a view stands for, whichever way its source spells it.
 
     Postgres hands back a bare SELECT; DuckDB and SQLite hand back the whole
@@ -76,7 +76,7 @@ def _unrecognised_source(body: exp.Expression) -> str | None:
     return None
 
 
-def _spellings(names: set[str]) -> set[str]:
+def spellings(names: set[str]) -> set[str]:
     """Every spelling a name might be written in: itself, folded, and its bare last segment.
 
     One function for both comparisons -- what a body MENTIONS and what the source KNOWS -- 
@@ -106,7 +106,7 @@ def _mentions(body: exp.Expression) -> set[str]:
     # Folded and bare-segmented, because unquoted identifiers are case-insensitive in all three
     # engines and a body may qualify what the snapshot keys bare. Widening here can only ADD
     # matches, and every added match is a refusal.
-    return _spellings(names)
+    return spellings(names)
 
 
 class ViewInventory(dict):
@@ -292,7 +292,7 @@ def _walk(
                 message=f"The view {name!r} nests deeper than this engine will resolve.",
                 subject=name,
             )
-        body = _body(view)
+        body = body_of(view)
         if body is None:
             return Refusal(
                 code=RefusalCode.UNRESOLVABLE_VIEW,
@@ -331,14 +331,14 @@ def _walk(
             # `_mentions` still collects the alias, so a CTE named after a filtered table still
             # trips the filtered check below.
             local = {cte.alias_or_name for cte in body.find_all(exp.CTE)}
-            recognised = _spellings(known) | _spellings(set(views)) | _spellings(local)
+            recognised = spellings(known) | spellings(set(views)) | spellings(local)
             # BOTH sides normalised. Widening only the known set still rejected `public.film`
             # against a snapshot that keys it `film`: a name is known when ANY of its spellings
             # matches any recognised one, not when its exact text appears.
             unknown = sorted(
                 object_key(x)
                 for x in body.find_all(exp.Table)
-                if not (_spellings({object_key(x)}) & recognised)
+                if not (spellings({object_key(x)}) & recognised)
             )
             if unknown:
                 return Refusal(

@@ -37,11 +37,19 @@ UNKNOWN = "unknown"
 
 @dataclass(frozen=True)
 class Lineage:
-    """The objects an answer read, plus whether that list can be relied on."""
+    """The objects an answer read, plus whether that list can be relied on.
+
+    `unresolved` and `reasons` are separate because they are different NAMESPACES. The first
+    holds object ids and function names -- things in the caller's world. The second holds this
+    engine's own reason codes. Mixed into one array they ship to the audit store
+    indistinguishable, so a consumer rendering objects would show `scope-unresolved` as a table
+    and one filtering for reason codes would match a real object named after one.
+    """
 
     tables: list[str] = field(default_factory=list)
     completeness: str = UNKNOWN
-    unresolved: list[str] = field(default_factory=list)
+    unresolved: list[str] = field(default_factory=list)  # object ids and function names
+    reasons: list[str] = field(default_factory=list)  # this engine's codes, never a caller's name
 
 
 # Functions this engine treats as reaching nothing past their arguments, for the small set that
@@ -60,35 +68,72 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
     """
     from sqlglot import exp
 
+    from mnemiq.sql.qualify import object_key
+    from mnemiq.sql.views import body_of, spellings
+
     tables = list(tables)
-    unresolved: list[str] = []
-    unknown_reasons: list[str] = []
+    # Two lists, because the two states are decided by different evidence: a view whose body we
+    # READ and whose reach we can point at, versus a function whose body we cannot see at all.
+    reaching_views: list[str] = []
+    unclassified: list[str] = []
+    reasons: list[str] = []
+    # Case-folded ONLY, and deliberately NOT `spellings`. The two comparisons in this function
+    # have opposite polarity, which is the trap: widening the VIEW lookup adds matches and every
+    # added match is an INCOMPLETE, so `spellings` is safe there for the reason `views.py` gives
+    # ("every added match is a refusal"). Widening the REACH comparison adds matches and every
+    # added match is a claim of COMPLETENESS. Using one helper for both dropped every qualifier on
+    # both sides, so a view reaching `pg.claim` counted as accounted-for against a list naming
+    # `mysql.claim` -- the audit record affirmatively asserting a read was resolved when it was
+    # not, which is `object_key`'s own documented hazard re-done inside the artifact meant to
+    # prevent exactly that assertion.
+    resolved = {t.lower() for t in tables}
 
-    # Demonstrable reach: a view's body names tables this list does not.
+    # DEMONSTRABLE reach: a view whose body names an object this list does not.
+    #
+    # Membership alone is not demonstration, and saying so was this module's first bug: a view
+    # defined `SELECT 1 AS x` reaches nothing, and `FROM claim_view JOIN claim` may name every
+    # base the body reads. The body is in the snapshot, so the engine can actually look -- and
+    # the docstring above claimed it did before it did.
+    #
+    # Spellings via the shared helper, not `name in views`: `check_views` resolves `CLAIM_VIEW`
+    # and `public.claim_view` to a keyed `claim_view`, and a marker that did not would report
+    # COMPLETE on a statement the guard recognised as reading a view. Two normalisations of one
+    # question drift, which is M7.
+    view_keys = spellings(set(views))
     for name in tables:
-        if name in views:
-            unresolved.append(name)
+        if not (spellings({name}) & view_keys):
+            continue
+        view = views.get(name) or views.get(name.rsplit(".", 1)[-1]) or views.get(name.lower())
+        parsed = body_of(view) if view is not None else None
+        if parsed is None:
+            unclassified.append(name)  # a view we cannot PARSE: unclear, not demonstrated
+            continue
+        reaches = {object_key(t) for t in parsed.find_all(exp.Table)}
+        if any(r.lower() not in resolved for r in reaches):
+            reaching_views.append(name)
 
-    # Unclassifiable reach: a function whose body this engine cannot see.
+    # UNCLASSIFIABLE reach: a function whose body this engine cannot see.
     for node in ast.find_all(exp.Anonymous):
         name = (node.name or "").lower()
-        if name and name not in _PURE and name not in unknown_reasons:
-            unknown_reasons.append(name)
+        if name and name not in _PURE and name not in unclassified:
+            unclassified.append(name)
 
-    # Unestablished at all: the inventory could not be read, was never asked for, or the table
-    # list itself may be wrong because the scope did not resolve.
     if not getattr(views, "available", True):
-        unknown_reasons.append("view-inventory-unavailable")
+        reasons.append("view-inventory-unavailable")
     elif not getattr(views, "asked", False):
         # Default FALSE, not True: a caller that passed a bare mapping has established nothing
         # about views, and an audit record must not read "nobody asked" as "asked and found none".
-        unknown_reasons.append("view-inventory-never-asked")
+        reasons.append("view-inventory-never-asked")
     if not scope_resolved:
-        unknown_reasons.append("scope-unresolved")
+        reasons.append("scope-unresolved")
 
-    if unresolved:
-        return Lineage(tables=tables, completeness=INCOMPLETE,
-                       unresolved=unresolved + unknown_reasons)
-    if unknown_reasons:
-        return Lineage(tables=tables, completeness=UNKNOWN, unresolved=unknown_reasons)
-    return Lineage(tables=tables, completeness=COMPLETE, unresolved=[])
+    unresolved = reaching_views + unclassified
+    if reaching_views:
+        # A gap the engine can point at outranks one it merely suspects: naming the view is more
+        # use to an auditor than recording that something was unclear. The unclear reach is still
+        # carried, not dropped.
+        return Lineage(tables=tables, completeness=INCOMPLETE, unresolved=unresolved,
+                       reasons=reasons)
+    if unresolved or reasons:
+        return Lineage(tables=tables, completeness=UNKNOWN, unresolved=unresolved, reasons=reasons)
+    return Lineage(tables=tables, completeness=COMPLETE)

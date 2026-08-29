@@ -1934,8 +1934,20 @@
       },
       "lineage_completeness": {
         "default": "unknown",
+        "enum": [
+          "complete",
+          "incomplete",
+          "unknown"
+        ],
         "title": "Lineage Completeness",
         "type": "string"
+      },
+      "lineage_reasons": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Lineage Reasons",
+        "type": "array"
       },
       "lineage_unresolved": {
         "items": {

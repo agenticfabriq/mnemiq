@@ -31,5 +31,6 @@ def build_trace(
         # rather than asserting completeness it never established.
         lineage_completeness=getattr(approved.lineage, "completeness", "unknown"),
         lineage_unresolved=list(getattr(approved.lineage, "unresolved", []) or []),
+        lineage_reasons=list(getattr(approved.lineage, "reasons", []) or []),
         definitions_used=[],  # the glossary lands in Plan 08
     )

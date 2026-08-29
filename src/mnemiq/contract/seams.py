@@ -1,5 +1,7 @@
 from enum import StrEnum
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -68,6 +70,10 @@ class Trace(BaseModel):
     tables_used: list[str] = Field(default_factory=list)
     # M56: whether `tables_used` is the whole story. `complete` | `incomplete` | `unknown`, and
     # `unknown` by default because a Trace built without one has not established completeness.
-    lineage_completeness: str = "unknown"
+    lineage_completeness: Literal["complete", "incomplete", "unknown"] = "unknown"
+    # Object ids and function names -- the caller's vocabulary.
     lineage_unresolved: list[str] = Field(default_factory=list)
+    # This engine's reason codes. A separate field because a consumer rendering `unresolved` as
+    # objects would otherwise show `scope-unresolved` as a table name.
+    lineage_reasons: list[str] = Field(default_factory=list)
     definitions_used: list[str] = Field(default_factory=list)

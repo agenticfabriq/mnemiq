@@ -271,3 +271,66 @@ def test_the_decider_puts_the_marker_on_the_verdict():
     assert verdict.lineage.completeness == UNKNOWN, (
         "no views were passed, so the inventory was never asked — cannot confirm")
     assert verdict.tables == ["claim"]
+
+
+# -- the spellings the guard resolves, the marker must resolve too --------------------------------
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT id FROM claim_view",
+    "SELECT id FROM CLAIM_VIEW",
+    "SELECT id FROM public.claim_view",
+])
+def test_a_view_is_recognised_in_every_spelling_check_views_recognises(sql):
+    """`check_views` folds case and falls back to the bare segment, so it refuses UNGOVERNED_VIEW
+    on all three. A marker using exact-string `name in views` reported COMPLETE on the last two —
+    the audit record asserting "every read was resolved" about a statement that read a view, which
+    is the one claim this artifact exists to prevent. Both sides now share `spellings`."""
+    views = [ViewDefinition(object_id="claim_view", definition="SELECT * FROM claim",
+                            dialect="duckdb")]
+    lineage = lineage_for(_ast(sql), [sql.split()[-1]],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == INCOMPLETE
+
+
+def test_a_view_that_reaches_nothing_new_is_not_a_gap():
+    """INCOMPLETE means reach was DEMONSTRATED, and membership is not demonstration. A view whose
+    body names only tables already in the list adds nothing to account for — the first version of
+    this module reported INCOMPLETE on it, and on a view defined `SELECT 1 AS x` that reaches
+    nothing at all."""
+    views = [ViewDefinition(object_id="claim_view", definition="SELECT * FROM claim",
+                            dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT v.id FROM claim_view v JOIN claim c ON c.id = v.id"),
+                          ["claim_view", "claim"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == COMPLETE, "the body's reach is already in the list"
+
+
+def test_object_names_and_engine_reason_codes_do_not_share_a_list():
+    """They ship to the audit store and into the published contract. Mixed, a consumer rendering
+    `unresolved` as objects shows `scope-unresolved` as a table name, and one filtering for reason
+    codes matches a real object named after one."""
+    lineage = lineage_for(_ast("SELECT all_ssns() AS x"), [], inventory_for(_snapshot()))
+    assert "all_ssns" in lineage.unresolved
+    assert "view-inventory-never-asked" in lineage.reasons
+    assert not any(r in lineage.unresolved for r in lineage.reasons)
+
+
+def test_a_views_reach_into_a_different_qualified_object_is_not_accounted_for():
+    """The two comparisons in `lineage_for` have OPPOSITE polarity, and using one widening helper
+    for both was a regression that made COMPLETE reachable for a view when it never had been.
+
+    Measured on the broken version: inventory `{"pg.claim_v": SELECT * FROM claim}`, statement
+    reading `pg.claim_v` joined to `mysql.claim`, tables `["pg.claim_v", "mysql.claim"]` →
+    `complete`, while the view actually reads `pg.claim`, which the list never names. Widening the
+    view LOOKUP adds refusals and is safe; widening the REACH comparison adds claims of
+    completeness and is not. `object_key` exists for this hazard and the fix is to respect it.
+    """
+    views = [ViewDefinition(object_id="pg.claim_v", definition="SELECT * FROM claim",
+                            dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT id FROM pg.claim_v JOIN mysql.claim USING (id)"),
+                          ["pg.claim_v", "mysql.claim"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == INCOMPLETE, (
+        "a bare-vs-qualified match must count as unresolved, never as accounted for")
+    assert "pg.claim_v" in lineage.unresolved

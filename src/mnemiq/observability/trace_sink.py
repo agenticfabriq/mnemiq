@@ -178,6 +178,7 @@ class VerityTraceSink(TraceSink):
                 "tables": list(getattr(trace, "tables_used", []) or []),
                 "completeness": getattr(trace, "lineage_completeness", "unknown") or "unknown",
                 "unresolved": list(getattr(trace, "lineage_unresolved", []) or []),
+                "reasons": list(getattr(trace, "lineage_reasons", []) or []),
             },
             "semantic_refs": self._semantic_refs(event),
             "policy_decisions": [],
