@@ -96,6 +96,14 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
     every = {c.object_id for c in snapshot.columns}
     reachable, frontier = set(grants.objects), list(grants.objects)
     if not inventory.available:
+        # EVERY filtered table stays reachable, not just the ones the snapshot has columns for.
+        # `every` is built from `snapshot.columns`, so a filtered base table whose PROFILING
+        # failed is absent from it -- and then the filter is dropped, `check_views` early-outs on
+        # `if not filtered`, and the unavailable inventory is never even consulted. Measured: with
+        # `claim` profiled the read is REFUSED view_inventory_unavailable; with `claim` missing
+        # from the columns it is APPROVED, unfiltered. Two degraded signals cancelling into an
+        # approval. Fifth instance of a narrowing here disarming the guard below it, which is why
+        # the filter KEYS are now part of the floor rather than something the floor looks up.
         # Same reason as the unparseable body below, and the same answer. We cannot see what any
         # view reads, so we cannot say the policy is irrelevant to this caller.
         #
@@ -106,7 +114,7 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
         # failed `discover:views` job returned Approved on `SELECT ... FROM claim_v`, every row of
         # the filtered base table, unfiltered. The docstring above calls a view-only grant the
         # standard shape.
-        return every | reachable
+        return every | reachable | set(grants.row_filters)
     bodies = dict(inventory)
     # Folded index, for the reason `_walk` folds its own lookup: this one resolves the SAME
     # question -- which view does this name refer to -- and answered it case-sensitively, so the

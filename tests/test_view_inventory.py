@@ -504,3 +504,63 @@ def test_the_same_matrix_with_nothing_filtered_stays_approved():
                policy=build_access_policy(snapshot, GrantSet(objects=frozenset({"claim_v"}))),
                views=inventory_for(snapshot))
     assert getattr(v, "code", None) is None, v
+
+
+# -- two degraded signals must not cancel into an approval --------------------------------------
+#
+# Found by Codex on the branch. `_reachable`'s unavailable branch returns `every | reachable`,
+# and `every` is built from `snapshot.columns` — so a filtered base table whose PROFILING failed
+# is absent from it. The filter is then dropped, and `check_views` early-outs on `if not filtered`
+# BEFORE it can refuse on availability. Two degraded signals cancelling into an approved,
+# unfiltered read.
+#
+# Every other fixture in this file puts the filtered table in `columns`, so `every` already
+# contained it and the union member added for this is invisible to them. That is why this case
+# needs its own test rather than being assumed covered.
+
+_DISCOVERY_FAILED = [Job(id="discover:views", source_id="s", kind="discover", status="failed")]
+_VIEW_ONLY = GrantSet(objects=frozenset({"claim_v"}), row_filters={"claim": "region = 'west'"})
+
+
+def _degraded(with_base_columns):
+    cols = [_col("claim_v", "id")]
+    if with_base_columns:
+        cols = [_col("claim", "id"), _col("claim", "region")] + cols
+    return Snapshot(version="v", source_id="s", created_at="t", columns=cols, views=[],
+                    jobs=_DISCOVERY_FAILED)
+
+
+def test_a_filtered_table_missing_from_the_snapshot_still_reaches_the_policy():
+    """The unit of it: profiling failed, so `claim` has no columns — and its filter must survive
+    anyway, because a filter key names a table the policy explicitly governs."""
+    policy = build_access_policy(_degraded(with_base_columns=False), _VIEW_ONLY)
+    assert dict(policy.row_filters) == {"claim": "region = 'west'"}
+
+
+def test_failed_profiling_and_failed_discovery_do_not_cancel_into_an_approval():
+    """End to end. Measured before the fix: columns present → REFUSED
+    view_inventory_unavailable; columns absent → APPROVED, `SELECT id FROM claim_v LIMIT 1000`,
+    every row of a filtered table through a granted view."""
+    snapshot = _degraded(with_base_columns=False)
+    v = decide("SELECT id FROM claim_v", {"claim_v": {"id"}},
+               policy=build_access_policy(snapshot, _VIEW_ONLY), views=inventory_for(snapshot))
+    assert getattr(v, "code", None) is RefusalCode.VIEW_INVENTORY_UNAVAILABLE, v
+
+
+def test_the_same_shape_with_profiling_intact_is_the_control():
+    """So the test above cannot pass on a decider that has simply started refusing everything —
+    this is the path that already worked, and it must still refuse for the SAME reason."""
+    snapshot = _degraded(with_base_columns=True)
+    v = decide("SELECT id FROM claim_v", {"claim_v": {"id"}},
+               policy=build_access_policy(snapshot, _VIEW_ONLY), views=inventory_for(snapshot))
+    assert getattr(v, "code", None) is RefusalCode.VIEW_INVENTORY_UNAVAILABLE, v
+
+
+def test_a_caller_with_no_row_filters_is_unaffected_by_the_widening():
+    """The blast radius. Keeping filter keys reachable must not make a policy-free caller
+    refusable — `_reachable`'s own docstring records that over-correction as a past mistake."""
+    snapshot = _degraded(with_base_columns=False)
+    v = decide("SELECT id FROM claim_v", {"claim_v": {"id"}},
+               policy=build_access_policy(snapshot, GrantSet(objects=frozenset({"claim_v"}))),
+               views=inventory_for(snapshot))
+    assert getattr(v, "code", None) is None, v
