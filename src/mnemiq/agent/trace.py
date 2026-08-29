@@ -26,5 +26,10 @@ def build_trace(
         enrichment_version=enrichment_version or "unknown",
         identity=identity,
         tables_used=list(approved.tables),
+        # M56: the marker travels with the list from the decider to the audit store. Defaults
+        # carry "unknown", so a path that forgets to thread it records that it cannot confirm
+        # rather than asserting completeness it never established.
+        lineage_completeness=getattr(approved.lineage, "completeness", "unknown"),
+        lineage_unresolved=list(getattr(approved.lineage, "unresolved", []) or []),
         definitions_used=[],  # the glossary lands in Plan 08
     )

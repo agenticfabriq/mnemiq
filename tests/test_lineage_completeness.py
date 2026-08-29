@@ -44,13 +44,19 @@ def test_an_ordinary_read_is_complete():
 # -- source 1: a function reaches where lineage cannot follow ------------------------------------
 
 
-def test_a_function_call_makes_lineage_incomplete_and_is_named():
+def test_a_function_call_makes_lineage_unknown_and_is_named():
     """M43's shape. Verified live: `SELECT all_ssns() AS x` is APPROVED, returns both SSNs, and
     reports `tables=[]` — against a `FROM person` control that refuses UNAUTHORIZED_TABLE. The
-    marker is what stops that `[]` being recorded as "nothing was read"."""
+    marker is what stops that `[]` being recorded as "nothing was read".
+
+    UNKNOWN rather than INCOMPLETE, and the distinction is the point: the engine does not KNOW
+    that `all_ssns()` reads anything, only that it cannot rule it out. A view earns INCOMPLETE
+    because its body is in the snapshot and the reach can be demonstrated. Asserting INCOMPLETE
+    here — as the first draft of this test did — would claim knowledge the engine does not have.
+    """
     lineage = lineage_for(_ast("SELECT all_ssns() AS x"), [],
                           inventory_for(_snapshot(jobs=[_DISCOVERED])))
-    assert lineage.completeness == INCOMPLETE
+    assert lineage.completeness == UNKNOWN
     assert "all_ssns" in lineage.unresolved
     assert lineage.tables == []
 
@@ -59,9 +65,28 @@ def test_a_function_over_a_read_table_still_reports_the_table():
     """Incomplete does not mean empty: what WAS resolved is still the audit record's best evidence."""
     lineage = lineage_for(_ast("SELECT id FROM claim WHERE all_ssns() IS NOT NULL"), ["claim"],
                           inventory_for(_snapshot(jobs=[_DISCOVERED])))
-    assert lineage.completeness == INCOMPLETE
+    assert lineage.completeness == UNKNOWN
     assert lineage.tables == ["claim"]
     assert "all_ssns" in lineage.unresolved
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT id FROM claim WHERE created_at < now()",
+    "SELECT age(created_at) FROM claim",
+    "SELECT current_timestamp FROM claim",
+])
+def test_a_pure_builtin_that_sqlglot_leaves_anonymous_does_not_poison_the_marker(sql):
+    """The degeneracy control, and it is not hypothetical. Measured: of eighteen ordinary
+    expressions only `now()` and `age()` parse to `Anonymous` — `coalesce`, `round`, `substr`,
+    `md5`, `date_trunc`, `extract`, `random`, `uuid` and `string_agg` are all typed. So a rule
+    that reads every `Anonymous` as unresolved reports UNKNOWN on `WHERE created_at < now()`,
+    which is most real queries, and the marker stops meaning anything.
+
+    `_PURE` is the whitelist that prevents it. It is deliberately short, because an unlisted
+    function stays unresolved — the `views.py` pattern, where an unlisted shape must not pass.
+    """
+    lineage = lineage_for(_ast(sql), ["claim"], inventory_for(_snapshot(jobs=[_DISCOVERED])))
+    assert lineage.completeness == COMPLETE, f"{sql} must not poison the marker"
 
 
 def test_an_aggregate_is_not_an_unresolved_function():
@@ -85,6 +110,20 @@ def test_reading_a_view_makes_lineage_incomplete():
                           inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
     assert lineage.completeness == INCOMPLETE
     assert "claim_view" in lineage.unresolved
+
+
+def test_a_demonstrable_gap_outranks_an_unclear_one():
+    """A statement that reads a view AND calls an unclassifiable function is INCOMPLETE, not
+    UNKNOWN: naming the view is more use to an auditor than recording that something was unclear,
+    and UNKNOWN must not mask a gap the engine can actually point at."""
+    views = [ViewDefinition(object_id="claim_view", definition="SELECT * FROM claim",
+                            dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT id FROM claim_view WHERE all_ssns() IS NOT NULL"),
+                          ["claim_view"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == INCOMPLETE
+    assert "claim_view" in lineage.unresolved
+    assert "all_ssns" in lineage.unresolved, "the unclear reach is still recorded, not dropped"
 
 
 # -- sources 3 and 4: we cannot tell whether a name is a view -------------------------------------
@@ -185,3 +224,50 @@ def test_the_trace_never_carries_a_bare_table_list():
     assert lineage is not None
     assert "tables" in lineage and "completeness" in lineage, (
         "tables and completeness ship together or not at all")
+
+
+def test_real_lineage_survives_the_journey_to_the_trace():
+    """The three tests above are satisfied by the fixture's Trace, which carries no lineage and so
+    records UNKNOWN — correct behaviour, and a weak assertion: they would pass on an emitter that
+    never threads the real thing. This one puts a populated Trace in and asserts it comes out."""
+    import sys
+
+    sys.path.insert(0, "tests")
+    from test_verity_trace_sink import _Answer, _Settings, _event
+
+    from mnemiq.observability.trace_sink import VerityTraceSink
+
+    class _TraceWithLineage:
+        target_sql = "SELECT id FROM claim_view"
+        enrichment_version = "v7"
+        tables_used = ["claim_view"]
+        lineage_completeness = INCOMPLETE
+        lineage_unresolved = ["claim_view"]
+
+    answer = _Answer()
+    answer.trace = _TraceWithLineage()
+    record = VerityTraceSink(_Settings())._build_trace(_event(answer=answer))
+
+    assert record["lineage"]["tables"] == ["claim_view"]
+    assert record["lineage"]["completeness"] == INCOMPLETE
+    assert record["lineage"]["unresolved"] == ["claim_view"]
+
+
+def test_the_decider_puts_the_marker_on_the_verdict():
+    """The other end of the same thread: `decide` computes lineage where it computes `tables`, so
+    the two cannot be produced by different code paths and disagree — which is M7's shape."""
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.policy import AccessPolicy
+    from mnemiq.sql.verdict import Approved
+
+    class _Ok:
+        def execute(self, sql):
+            return []
+
+    verdict = decide("SELECT id FROM claim", {"claim": {"id"}}, adapter=_Ok(),
+                     dialect="duckdb", target="duckdb", policy=AccessPolicy())
+    assert isinstance(verdict, Approved)
+    assert verdict.lineage is not None
+    assert verdict.lineage.completeness == UNKNOWN, (
+        "no views were passed, so the inventory was never asked — cannot confirm")
+    assert verdict.tables == ["claim"]

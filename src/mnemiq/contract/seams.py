@@ -66,4 +66,8 @@ class Trace(BaseModel):
     enrichment_version: str
     identity: IdentityContext
     tables_used: list[str] = Field(default_factory=list)
+    # M56: whether `tables_used` is the whole story. `complete` | `incomplete` | `unknown`, and
+    # `unknown` by default because a Trace built without one has not established completeness.
+    lineage_completeness: str = "unknown"
+    lineage_unresolved: list[str] = Field(default_factory=list)
     definitions_used: list[str] = Field(default_factory=list)

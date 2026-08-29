@@ -1932,6 +1932,18 @@
       "identity": {
         "$ref": "#/$defs/IdentityContext"
       },
+      "lineage_completeness": {
+        "default": "unknown",
+        "title": "Lineage Completeness",
+        "type": "string"
+      },
+      "lineage_unresolved": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Lineage Unresolved",
+        "type": "array"
+      },
       "plan_sql": {
         "title": "Plan Sql",
         "type": "string"

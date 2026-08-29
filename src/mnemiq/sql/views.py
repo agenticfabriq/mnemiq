@@ -129,14 +129,21 @@ class ViewInventory(dict):
     that knows otherwise says so.
     """
 
-    def __init__(self, mapping=None, available: bool = True) -> None:
+    def __init__(self, mapping=None, available: bool = True, asked: bool = True) -> None:
         super().__init__(mapping or {})
         self.available = available
+        # Whether the source was ASKED at all, which `available` cannot carry: a snapshot with a
+        # `done` job holding no views and a snapshot with no job at all are both available with an
+        # empty mapping, and nothing could tell them apart. `check_views` deliberately treats both
+        # as answerable -- refusing a query because a hand-built snapshot lacks a job would be
+        # harsh. An AUDIT RECORD is stricter, because saying "cannot confirm" costs nothing where
+        # refusing costs an answer. Same fact, different response, so it needs its own field.
+        self.asked = asked
 
 
 # Denies exactly as much as it must, and says why. Distinct from `ViewInventory({})`, which is a
 # source that answered and reported no views.
-VIEWS_UNAVAILABLE = ViewInventory(available=False)
+VIEWS_UNAVAILABLE = ViewInventory(available=False, asked=False)
 
 
 def inventory_for(snapshot) -> ViewInventory:
@@ -154,8 +161,8 @@ def inventory_for(snapshot) -> ViewInventory:
     empty list "must be treated as 'cannot reason about', never as 'there are none'". Nothing read
     it until now.
 
-    Deliberate residual: a snapshot carrying no `discover:views` job at all is treated as
-    AVAILABLE. The producer always emits one, so absence means a hand-built snapshot rather than a
+    A snapshot carrying no `discover:views` job at all is still treated as AVAILABLE, and now
+    also records `asked=False` so a consumer that wants the stricter reading can have it. The producer always emits one, so absence means a hand-built snapshot rather than a
     failed read, and the stricter rule -- demand a `done` job -- would refuse every such snapshot
     on a question about provenance rather than about views. Named here so the choice is visible
     instead of implicit; a test pins it.
@@ -166,7 +173,11 @@ def inventory_for(snapshot) -> ViewInventory:
         getattr(j, "id", None) == "discover:views" and getattr(j, "status", None) == "failed"
         for j in getattr(snapshot, "jobs", ()) or ()
     )
-    return ViewInventory({v.object_id: v for v in snapshot.views}, available=not failed)
+    asked = any(
+        getattr(j, "id", None) == "discover:views" for j in getattr(snapshot, "jobs", ()) or ()
+    )
+    return ViewInventory({v.object_id: v for v in snapshot.views}, available=not failed,
+                         asked=asked)
 
 
 def check_views(

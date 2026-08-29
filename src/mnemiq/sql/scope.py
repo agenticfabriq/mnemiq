@@ -88,6 +88,28 @@ def _target_reads(ast: exp.Expression) -> list[exp.Table]:
     return out
 
 
+def _root_scope(ast: exp.Expression):
+    """The resolved root scope, or None. ONE place builds it, because `base_tables` and
+    `scope_resolved` must never disagree about whether resolution succeeded -- that is M7's shape,
+    two implementations of one question."""
+    try:
+        return build_scope(ast)
+    except Exception:
+        return None
+
+
+def scope_resolved(ast: exp.Expression) -> bool:
+    """Did the scope resolve, so that `base_tables` is a resolved answer rather than a fallback?
+
+    When it did not, `base_tables` returns `find_all(exp.Table)` -- CTE aliases included -- which
+    OVER-reports. That is the right direction for a guard, because an over-reported name is not in
+    `visible` and the query is refused. It is the wrong direction for an audit record, which would
+    name an object the query never read. So the record needs to know, and the guard does not.
+    """
+    ast_root = _root_scope(ast)
+    return ast_root is not None and not _unscoped_ctes(ast, ast_root)
+
+
 def base_tables(ast: exp.Expression) -> list[exp.Table]:
     """Every `exp.Table` node that reads a real object in the source.
 
@@ -104,10 +126,7 @@ def base_tables(ast: exp.Expression) -> list[exp.Table]:
     deliberately the single answer to "is this node a real read", because three copies of a
     scope rule is how they came to disagree in the first place.
     """
-    try:
-        root = build_scope(ast)
-    except Exception:
-        root = None
+    root = _root_scope(ast)
     if root is None or _unscoped_ctes(ast, root):
         # Unresolvable scopes mean we cannot say which names are local, so every table node
         # is treated as a real read. That over-reports -- a CTE reference will not be in
@@ -149,10 +168,7 @@ def column_tables(ast: exp.Expression) -> dict[int, str] | None:
     the second `q` overwrote the first and a denied column was resolved against the permitted
     table. The resolver was right; the map that consumed it was still flat.
     """
-    try:
-        root = build_scope(ast)
-    except Exception:
-        root = None
+    root = _root_scope(ast)
     if root is None or _unscoped_ctes(ast, root):
         return None
 
