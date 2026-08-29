@@ -294,7 +294,12 @@ def vpd():
         attach("T_WEST_F")
     except oracledb.DatabaseError as exc:
         pytest.skip(f"this instance cannot create a VPD policy: {exc}")
-    time.sleep(2)  # ORA-01466: a read-only transaction cannot read DDL newer than its snapshot
+    # No sleep. There was a `time.sleep(2)` here for ORA-01466, and it was load-bearing: measured,
+    # DBMS_RLS.ADD_POLICY followed by an immediate UNRETRIED read hit the race 12 times out of 12.
+    # `_with_cursor` covers it now, so every VPD test below reads through a policy attached
+    # microseconds earlier and is therefore also a live test of that retry. Three more sleeps of
+    # the same kind were removed with this one; a review asked why one was going and three were
+    # staying, and the honest answer was that all four should go.
     yield attach
     try:
         w.execute("BEGIN DBMS_RLS.DROP_POLICY('APPUSER','T_VPD','P'); END;")
@@ -337,7 +342,6 @@ def test_attached_is_not_a_claim_of_enforcement(vpd, inert_fn):
     assert _adapter().execute("SELECT count(*) FROM t_vpd") == [(1,)], "the policy restricts"
 
     vpd(inert_fn)
-    time.sleep(2)
     assert _adapter().execute("SELECT count(*) FROM t_vpd") == [(2,)], \
         f"{inert_fn} restricts nothing: an inert policy function yields no predicate"
 
@@ -534,7 +538,6 @@ def test_a_policy_that_does_not_apply_to_select_is_not_counted_as_governing(vpd)
     w.execute("BEGIN DBMS_RLS.ADD_POLICY(object_schema=>'APPUSER',object_name=>'T_VPD',"
               "policy_name=>'P',function_schema=>'APPUSER',policy_function=>'T_WEST_F',"
               "statement_types=>'UPDATE'); END;")
-    time.sleep(2)
 
     a = _adapter()
     assert a.execute("SELECT count(*) FROM t_vpd") == [(2,)], \
@@ -592,7 +595,6 @@ def test_full_coverage_reports_attached():
         owner.execute("BEGIN DBMS_RLS.ADD_POLICY(object_schema=>'T_FULL',object_name=>'ONLY_T',"
                       "policy_name=>'P',function_schema=>'T_FULL',policy_function=>'F_WEST',"
                       "statement_types=>'SELECT'); END;")
-        time.sleep(2)
 
         reader = OracleAdapter(dsn=DSN, user="t_full", password="pw")
         assert reader.execute("SELECT count(*) FROM only_t") == [(1,)], \
@@ -640,3 +642,36 @@ def test_a_table_created_this_instant_is_readable_through_the_read_only_adapter(
             w.execute("DROP TABLE t_fresh")
         except oracledb.DatabaseError:
             pass
+
+
+def test_the_real_drivers_ora_01466_is_recognised_by_the_retrys_predicate(vpd):
+    """Ties the synthetic tests to the real driver: same error, same recogniser.
+
+    `test_oracle_ddl_race.py` drives every retry branch with a fake exception, which proves the
+    logic and NOT that the driver raises what the fake imitates. DBMS_RLS.ADD_POLICY followed by
+    an immediate read provokes the real thing reliably -- 12/12 when measured -- so this re-attaches
+    the policy and then reads through `_cursor()` directly, bypassing the retry, to inspect what
+    comes back.
+
+    It takes the `vpd` fixture rather than building its own policy. The first version of this test
+    did the latter, and T_VPD did not exist at that point, so ADD_POLICY failed and the test
+    reported a benign-looking SKIP on every run -- proving nothing while appearing to have had its
+    chance. The fixture already skips cleanly on a VPD-less instance, which is the difference
+    between "this instance cannot" and "the window did not open".
+    """
+    import oracledb
+
+    from mnemiq.adapters.oracle import _is_ddl_race
+
+    vpd("T_WEST_F")  # re-attach: the read below must land in the window this opens
+    cur = _adapter()._cursor()  # deliberately NOT _with_cursor: we want the raw failure
+    try:
+        cur.execute("SELECT count(*) FROM t_vpd")
+        cur.fetchall()
+        pytest.skip("the DDL race did not fire on this run; nothing to inspect")
+    except oracledb.DatabaseError as exc:
+        assert _is_ddl_race(exc), f"the retry would not have recognised this: {exc}"
+        assert exc.args[0].full_code == "ORA-01466"
+        assert exc.args[0].code == 1466
+    finally:
+        cur.close()

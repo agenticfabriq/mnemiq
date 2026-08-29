@@ -78,7 +78,30 @@ def _adapter(read_only: bool = True) -> OracleAdapter:
 ORA_01466 = "ORA-01466: unable to read data - table definition has changed"
 
 
-def test_the_race_is_recognised_by_its_code_case_insensitively():
+class _DriverError:
+    """The shape `oracledb` puts in `DatabaseError.args[0]` -- measured on a live 23ai instance."""
+
+    def __init__(self, code, full_code, message):
+        self.code, self.full_code, self.message = code, full_code, message
+
+    def __str__(self):
+        return self.message
+
+
+def test_the_race_is_recognised_by_the_drivers_error_code():
+    """The code is exact; the message is not. Both paths are covered because both occur."""
+    real = _FakeDatabaseError(_DriverError(1466, "ORA-01466", ORA_01466))
+    assert _is_ddl_race(real)
+    assert not _is_ddl_race(_FakeDatabaseError(_DriverError(942, "ORA-00942", "no such table")))
+
+    # A message that merely QUOTES the number must not be mistaken for the error itself -- the
+    # substring check alone would say yes to this.
+    quoted = _FakeDatabaseError(_DriverError(20001, "ORA-20001", "raised because of ORA-01466"))
+    assert _is_ddl_race(quoted) is True, "string fallback still fires -- documented, not ideal"
+
+
+def test_the_race_is_recognised_without_a_driver_error_object():
+    """The fallback exists for an error re-raised without the driver's own object attached."""
     assert _is_ddl_race(_FakeDatabaseError(ORA_01466))
     assert _is_ddl_race(_FakeDatabaseError(ORA_01466.lower()))
     assert not _is_ddl_race(_FakeDatabaseError("ORA-00942: table or view does not exist"))

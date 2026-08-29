@@ -88,11 +88,16 @@ class OracleAdapter:
         transaction, hence the rollback: without it the statement raises ORA-01453 whenever a
         transaction is already open.
 
-        **A read-only transaction cannot read a table whose definition changed a moment ago** --
-        ORA-01466, "table definition has changed", because `SET TRANSACTION READ ONLY` pins a
-        read-consistent snapshot and DDL newer than it is unreadable. `_with_cursor` retries it;
-        the reasoning is there, and an earlier version of this docstring argued the opposite on a
-        mechanism that does not hold.
+        **A read-only transaction cannot read an object whose definition changed just before the
+        transaction began** -- ORA-01466. `_with_cursor` retries it, and the reasoning is there.
+
+        Two earlier versions of this docstring got this wrong in different ways. One argued against
+        retrying at all, on a mechanism the retry does not use. The other said the cause was "DDL
+        newer than the snapshot", which sounds right and is not what happens: measured, a table
+        ALTERED by another session after this transaction pinned its snapshot went on reading
+        cleanly. What fails is a read whose object changed within about a second BEFORE the
+        transaction started -- consistent with the granularity of Oracle's SCN-to-timestamp
+        mapping rather than with a strict ordering rule.
         """
         if self._read_only:
             self._con.rollback()
@@ -402,7 +407,17 @@ class OracleAdapter:
 
 
 def _is_ddl_race(exc: Exception) -> bool:
-    """ORA-01466: this read-only transaction's snapshot is older than the table's definition."""
+    """ORA-01466: this read-only transaction cannot read a definition that changed a moment ago.
+
+    The CODE is checked first because it is exact. Measured against a live 23ai instance, the real
+    exception is `oracledb.exceptions.DatabaseError` carrying `code=1466` and
+    `full_code="ORA-01466"`; matching a substring of the rendered message would also be satisfied
+    by a message that merely quotes the number. The string remains as a fallback for an error
+    re-raised without the driver's own error object, which is the shape a wrapper would produce.
+    """
+    err = exc.args[0] if exc.args else None
+    if getattr(err, "code", None) == 1466 or getattr(err, "full_code", None) == "ORA-01466":
+        return True
     return "ora-01466" in str(exc).lower()
 
 
