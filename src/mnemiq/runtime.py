@@ -6,7 +6,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 from mnemiq.agent.history import scope_history
 from mnemiq.agent.loop import Agent, AgentAnswer
 from mnemiq.agent.modes import DEFAULT_MODE, MODES, build_agent
@@ -322,11 +321,17 @@ def load_current_snapshot(settings: Settings, con) -> tuple[Snapshot, dict[str, 
             versions[spec.id] = v
             pairs.append((spec, load_snapshot(con, v)))
         return merge_snapshots(pairs), versions
-    sid = settings.source_id
+    # specs[0].id, not settings.source_id. Every multi-source branch above already keys on
+    # spec.id; the single-source ones keyed on settings.source_id, which defaults to "acme" and is
+    # never reconciled with a manifest's id. `enrich` writes the snapshot under the spec's id, so
+    # a one-entry manifest naming anything else stored a snapshot that build, refresh and ask then
+    # looked for under "acme" and never found -- "run `mnemiq enrich` first", forever, after a
+    # successful enrich. Without a manifest the two are the same value, so this is a no-op there.
+    sid = specs[0].id
     v = resolve_version(con, settings.control_dsn, sid)
     if v is None:
         raise SnapshotMissing(
-            f"no snapshot for source {settings.source_id!r} in {settings.store_path!r} -- "
+            f"no snapshot for source {sid!r} in {settings.store_path!r} -- "
             "run `mnemiq enrich` then `mnemiq build` first"
         )
     versions[sid] = v
@@ -350,11 +355,22 @@ def build_runtime(settings: Settings) -> Runtime:
 
         adapter = FederatedAdapter(specs, read_only=not settings.write_enabled)
     else:
-        # Single-source fast path -- unchanged from v0.1.
-        if not settings.pg_dsn:
-            raise SnapshotMissing("no MNEMIQ_PG_DSN -- the engine needs a source to query")
+        # Single source: dispatch on the SPEC, not on pg_dsn. This branch used to read
+        # `settings.pg_dsn` directly, which meant a one-entry manifest was resolved into a spec
+        # and then thrown away -- two sources were honoured and one was not. `adapter_for` is
+        # shared with the enrich and refresh commands so the three doors cannot drift apart.
         # Read-only attach unless writes are explicitly enabled -- the backstop under db_write.
-        adapter = DuckDBPostgresAdapter(settings.pg_dsn, read_only=not settings.write_enabled)
+        from mnemiq.adapters.resolve import SourceUnconfigured, UnknownSourceKind, adapter_for
+
+        try:
+            adapter = adapter_for(specs[0], settings, read_only=not settings.write_enabled)
+        except (SourceUnconfigured, UnknownSourceKind) as exc:
+            # Preserves the established contract: a source the engine cannot connect to raises
+            # SnapshotMissing, now with a message that names what is actually missing. The
+            # unknown-kind case is translated too because `mnemiq ask` and `mnemiq write` catch
+            # SnapshotMissing and print it -- a typo in a manifest should be a sentence, not a
+            # traceback, on every door.
+            raise SnapshotMissing(str(exc)) from exc
 
     # Shared components, built once; each mode is a thin Agent over the same instances.
     kit = build_components(settings, adapter, con)

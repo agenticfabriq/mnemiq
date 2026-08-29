@@ -40,7 +40,7 @@ packages = ["src/mnemiq"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = [".", "src"]
-markers = ["integration: needs Postgres", "live_llm: needs a live LLM endpoint"]
+markers = ["integration: needs a live database (Postgres, or Oracle via MNEMIQ_ORACLE_TEST_DSN)", "live_llm: needs a live LLM endpoint"]
 
 [tool.ruff]
 line-length = 100
