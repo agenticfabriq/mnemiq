@@ -168,14 +168,49 @@ def test_a_row_filter_binds_on_the_write_path_however_the_table_is_spelled(query
     assert "region = 'west'" in v.plan_sql, v.plan_sql
 
 
-def test_an_exact_case_row_filter_wins_over_a_folded_one():
-    """`grants.py` merges per-role filters case-sensitively, so two roles naming one table in
-    different cases produce two keys rather than one OR-combined predicate. Folding exists to
-    stop a filter being MISSED; it must not change which predicate governs when both exist."""
-    policy = AccessPolicy(row_filters={"CLAIM": "region = 'east'", "claim": "region = 'west'"})
-    assert policy.row_filter_for("claim") == "region = 'west'"
-    assert policy.row_filter_for("CLAIM") == "region = 'east'"
-    assert policy.row_filter_for("Claim") in {"region = 'east'", "region = 'west'"}
+def test_the_applied_row_policy_does_not_depend_on_how_the_caller_spells_the_table():
+    """The defect this replaces an earlier assertion for. That one asserted an exact-case key
+    WINS over a folded one -- which means a caller picks its own row policy by changing case.
+    Measured on that version, one identity, one policy holding both `claim` and `CLAIM`:
+
+      SELECT id FROM claim  -> WHERE region = 'west'
+      SELECT id FROM CLAIM  -> WHERE region = 'east'
+
+    Picking a winner in any order still leaves the caller choosing. Both apply now, OR-combined,
+    which is the combinator `grants.py` already uses for per-role filters."""
+    policy = AccessPolicy(row_filters={"claim": "region = 'west'", "CLAIM": "region = 'east'"})
+    plans = {}
+    for q in CASES:
+        v = decide(f"SELECT id FROM {q}", {q: {"id", "region"}}, policy=policy)
+        assert "west" in v.plan_sql and "east" in v.plan_sql, (q, v.plan_sql)
+        plans[q] = v.plan_sql.replace(q, "T")
+    assert len(set(plans.values())) == 1, plans
+
+
+def test_two_roles_naming_one_table_in_different_cases_or_combine_at_the_merge():
+    """The root, in `grants_for`. Its own comment says "more roles = more visible rows:
+    OR-combine", and the exact `in` check never did that across cases -- so the two grants stayed
+    separate keys and the query's spelling chose between them."""
+    import json
+    import os
+    import tempfile
+
+    from mnemiq.authz.grants import FileAuthzProvider
+    from mnemiq.contract import IdentityContext
+
+    policy = {"roles": {"a": {"read": ["claim"], "row_filters": {"claim": "region = 'west'"}},
+                        "b": {"read": ["claim"], "row_filters": {"CLAIM": "region = 'east'"}}}}
+    fd, path = tempfile.mkstemp(suffix=".json")
+    os.write(fd, json.dumps(policy).encode())
+    os.close(fd)
+    try:
+        grants = FileAuthzProvider(path).grants_for(
+            IdentityContext(subject="u", tenant_id="t", principal_id="p", roles=["a", "b"]))
+    finally:
+        os.unlink(path)
+    assert len(grants.row_filters) == 1, dict(grants.row_filters)
+    combined = next(iter(grants.row_filters.values()))
+    assert "west" in combined and "east" in combined and "OR" in combined, combined
 
 
 @pytest.mark.parametrize("query_case", CASES)

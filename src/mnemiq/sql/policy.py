@@ -52,20 +52,26 @@ class AccessPolicy:
         return any((t.lower(), c.lower()) == needle for t, c in self.masked)
 
     def row_filter_for(self, table: str) -> str | None:
-        # EXACT first, fold second. `grants.py` merges per-role filters with a case-sensitive
-        # `if table in row_filters`, so two roles naming one table in different cases land as two
-        # distinct keys rather than being OR-combined. The old `row_filters.get(name)` then picked
-        # the one matching the query's own spelling; a fold-only scan would pick whichever came
-        # first in insertion order and silently apply a different role's predicate. Folding is
-        # here to stop a filter being MISSED, not to change which one governs when both exist.
-        exact = self.row_filters.get(table)
-        if exact is not None:
-            return exact
+        """Every filter naming this table, whatever its spelling, OR-combined.
+
+        NOT "the exact match, else a folded one". That made the applied policy depend on how the
+        CALLER spelled the table: measured, one identity whose `row_filters` held both `claim` and
+        `CLAIM` got a different predicate from `FROM claim` than from `FROM CLAIM`. A caller
+        choosing its own row policy by changing case is the defect, and picking a winner in any
+        order still leaves them choosing.
+
+        OR is the right combinator because it is the one `grants.py` uses to merge per-role
+        filters -- more roles mean more visible rows. `grants_for` now folds when it merges, so
+        duplicates should not reach here at all; this is the second line of defence for a policy
+        built by hand or by a provider that does not fold.
+        """
         folded = table.lower()
-        for t, f in self.row_filters.items():
-            if t.lower() == folded:
-                return f
-        return None
+        matches = [f for t, f in self.row_filters.items() if t.lower() == folded]
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        return " OR ".join(f"({m})" for m in matches)
 
 
 def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
