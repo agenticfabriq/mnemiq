@@ -1007,10 +1007,18 @@ def test_assert_read_only_tracks_every_route_by_which_a_principal_can_write():
       granted through a ROLE -- `USER_TAB_PRIVS` shows no role-granted privilege, 0 rows even
         unfiltered, and the principal could insert.
       granted to PUBLIC -- invisible to every source the check read, and the principal could insert.
-      SELECT only -- **the control, and the one that matters most.** A verdict that cannot reach
-        `constrained` is a warning nobody reads, and one version could not: it counted a PUBLIC
+      SELECT only -- the control, which must NOT say `gate_only`. One version counted a PUBLIC
         INSERT held by a table in the RECYCLE BIN, so a principal with no write ability anywhere
-        was told it had one. `BIN$%` is excluded for that reason.
+        was told it had one; `BIN$%` is excluded for that reason. A check that can only ever return
+        one verdict reports nothing.
+
+    The control asserts `unverifiable`, not `constrained`, and the difference is the last finding
+    in this sequence: **auditing the caller cannot establish read-onlyness at all.** A view
+    resolves its references with the VIEW OWNER's rights, so a principal holding SELECT on one
+    view -- no EXECUTE, no DML, owning nothing -- reaches a function inside it and writes. Measured
+    in `test_a_definer_rights_view_writes_for_a_principal_with_only_select`. `constrained` was
+    removed rather than fixed, because no principal that would legitimately be the read plane can
+    reach it.
     """
     import oracledb
 
@@ -1052,14 +1060,15 @@ def test_assert_read_only_tracks_every_route_by_which_a_principal_can_write():
 
         assert verdict("p_exec") == "gate_only", "EXECUTE alone is enough to write"
         assert verdict("p_role") == "gate_only", "role-granted DML must be seen"
-        assert verdict("p_none") == "constrained", (
-            "a SELECT-only principal must be reachable, or the verdict is inert"
+        assert verdict("p_none") == "unverifiable", (
+            "no write privilege found, and the schema's code is not visible to this principal, so "
+            "the honest answer is that a write path cannot be ruled out"
         )
 
         owner.execute(f"GRANT INSERT ON {USER}.t_route TO PUBLIC")
         assert verdict("p_none") == "gate_only", "a grant to PUBLIC is usable by everyone"
         owner.execute(f"REVOKE INSERT ON {USER}.t_route FROM PUBLIC")
-        assert verdict("p_none") == "constrained", "and it flips back when the grant goes"
+        assert verdict("p_none") == "unverifiable", "and it flips back when the grant goes"
 
         # The recycle-bin case, asserted rather than only described. A review pointed out that this
         # docstring called it the control while nothing here dropped a granted table -- a claim of
@@ -1080,10 +1089,10 @@ def test_assert_read_only_tracks_every_route_by_which_a_principal_can_write():
         if not orphaned:
             pytest.skip("recyclebin is off on this instance, so DROP purged the grant outright "
                         "and there is no BIN$ row for the filter to exclude")
-        assert verdict("p_none") == "constrained", (
+        assert verdict("p_none") == "unverifiable", (
             "a grant held by a table in the recycle bin is not write ability -- counting it made a "
-            "SELECT-only principal report gate_only, and a verdict that cannot reach constrained "
-            "is a warning nobody reads"
+            "SELECT-only principal report gate_only, and a verdict that can only ever say "
+            "gate_only is a warning nobody reads"
         )
     finally:
         for a in made:
@@ -1097,6 +1106,71 @@ def test_assert_read_only_tracks_every_route_by_which_a_principal_can_write():
         cur.close()
         admin.close()
         for stmt in ("DROP FUNCTION f_route", "DROP TABLE t_route", "DROP TABLE t_dropped",
+                     "PURGE RECYCLEBIN"):
+            try:
+                owner.execute(stmt)
+            except oracledb.DatabaseError:
+                pass
+
+
+@needs_admin
+def test_a_definer_rights_view_writes_for_a_principal_with_only_select():
+    """The measurement that removed the `constrained` verdict.
+
+    A view resolves its references with the VIEW OWNER's rights, so a function inside it runs as
+    the owner and the caller needs no privilege on the function at all. This principal holds SELECT
+    on one view and nothing else -- verified here, not assumed -- and reading that view inserts a
+    row. Auditing the CALLER therefore cannot establish that a source is unwritable, which is why
+    `assert_read_only` has no verdict that says so.
+
+    The adapter's statement gate does not help: `SELECT n FROM v_def` is a read by every syntactic
+    measure, and the SQL names no function.
+    """
+    import oracledb
+
+    owner = _adapter(read_only=False)
+    admin = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
+                             mode=oracledb.AUTH_MODE_SYSDBA)
+    cur = admin.cursor()
+    _drop_user(cur, "v_reader")
+    probe = None
+    try:
+        for stmt in ("DROP VIEW v_def", "DROP FUNCTION f_def", "DROP TABLE v_target"):
+            try:
+                owner.execute(stmt)
+            except oracledb.DatabaseError:
+                pass
+        owner.execute("CREATE TABLE v_target (id NUMBER)")
+        owner.execute("CREATE OR REPLACE FUNCTION f_def RETURN NUMBER AS "
+                      "  PRAGMA AUTONOMOUS_TRANSACTION; "
+                      "BEGIN INSERT INTO v_target VALUES (1); COMMIT; RETURN 1; END;")
+        owner.execute("CREATE VIEW v_def AS SELECT f_def AS n FROM dual")
+        cur.execute("CREATE USER v_reader IDENTIFIED BY pw")
+        cur.execute("GRANT CREATE SESSION TO v_reader")
+        owner.execute(f"GRANT SELECT ON {USER}.v_def TO v_reader")
+
+        probe = OracleAdapter(dsn=DSN, user="v_reader", password="pw", schema=USER)
+        assert probe.execute(
+            "SELECT count(*) FROM all_tab_privs WHERE grantee = 'V_READER' "
+            "AND privilege != 'SELECT'"
+        ) == [(0,)], "precondition: this principal holds SELECT and nothing else"
+        assert owner.execute("SELECT count(*) FROM v_target") == [(0,)]
+
+        assert probe.execute(f"SELECT n FROM {USER}.v_def") == [(1,)]  # the gate allows a SELECT
+
+        assert owner.execute("SELECT count(*) FROM v_target") == [(1,)], (
+            "a principal with only SELECT on a view caused a write; if this stops being true, "
+            "read `assert_read_only` before relaxing anything -- the likeliest cause is the "
+            "fixture losing a grant, not Oracle changing how views resolve references"
+        )
+        assert probe.assert_read_only()[0] == "unverifiable"
+    finally:
+        if probe is not None:
+            probe._con.close()
+        _drop_user(cur, "v_reader")
+        cur.close()
+        admin.close()
+        for stmt in ("DROP VIEW v_def", "DROP FUNCTION f_def", "DROP TABLE v_target",
                      "PURGE RECYCLEBIN"):
             try:
                 owner.execute(stmt)

@@ -469,6 +469,12 @@ class OracleAdapter:
         `read_only` is one bug away from not holding, and the fix is a deployment one -- connect
         the read plane as a principal with SELECT and nothing else.
 
+        Two verdicts, `gate_only` and `unverifiable`, and the absence of a third is the finding:
+        auditing the CALLER cannot establish read-onlyness at all, because a view resolves its
+        references with the VIEW OWNER's rights. Measured -- a principal holding SELECT on one view
+        and nothing else read it and a row was inserted, holding no EXECUTE, no DML and owning
+        nothing.
+
         Reports; never refuses. Refusing here would break every deployment that reads as its own
         schema owner, which is most of them, over a risk that requires hostile PL/SQL to realise.
         """
@@ -525,13 +531,40 @@ class OracleAdapter:
                 f"holds {granted} write-shaped object privilege(s) there ({direct} direct, "
                 f"{via_role} through a role, {public} granted to PUBLIC -- INSERT/UPDATE/DELETE/"
                 f"ALTER, and EXECUTE, which is enough on its own), and holds {sysprivs} "
-                "write-shaped system privilege(s). Direct "
-                "writes are refused by this adapter, but a SELECT that reaches an "
-                "AUTONOMOUS_TRANSACTION function -- possibly through a view, where the statement "
-                "text names nothing -- is not something any statement check can see. Connect the "
-                "read plane as a principal holding SELECT and nothing else"))
-        return ("constrained", "this connection holds no write privilege, so read-only does not "
-                               "rest on statement inspection alone")
+                "write-shaped system privilege(s). Direct writes are refused by this adapter, but "
+                "a SELECT that reaches an AUTONOMOUS_TRANSACTION function -- possibly through a "
+                "view, where the statement text names nothing -- is not something any statement "
+                "check can see. Connect the read plane as a principal holding SELECT and nothing "
+                "else"))
+
+        # No write-shaped privilege found. That is NOT "cannot write", and there is no further
+        # query that would make it one -- which is the whole result, arrived at by deleting two
+        # attempts rather than by reasoning.
+        #
+        # Measured: a principal holding SELECT on ONE VIEW and nothing else -- no EXECUTE, no DML,
+        # owning nothing -- read that view and a row was inserted, because a view resolves its
+        # references with the VIEW OWNER's rights and the function inside ran as the owner. So
+        # auditing the CALLER cannot establish read-onlyness at any level of thoroughness.
+        #
+        # Two verdicts were tried here and both were removed as UNREACHABLE, each verified against
+        # a live instance rather than argued:
+        #
+        #   `constrained` ("no write path exists") -- needs the schema's source to prove absence,
+        #   and `ALL_SOURCE` shows a non-owner nothing. DBA_SOURCE shows it but needs SELECT ANY
+        #   DICTIONARY, the privilege this method's own advice says not to grant.
+        #
+        #   `gate_only` by CODE ("the schema declares AUTONOMOUS_TRANSACTION") -- same wall from
+        #   the other side. Every principal that can see the source is already `gate_only` by
+        #   privilege above: the owner (owns tables), an EXECUTE holder (EXECUTE is write-shaped).
+        #   Enumerated over four principal shapes and none reached it. I added that branch in the
+        #   same commit that deleted `constrained` for being unreachable.
+        return ("unverifiable", (
+            f"no write-shaped privilege on {self._schema} was found for this connection, which is "
+            "not the same as none existing. A view resolves its references with the VIEW OWNER's "
+            "rights, so SELECT on one view is enough to reach a subprogram that writes in its own "
+            "transaction -- measured, a principal holding exactly that caused a row to be "
+            "inserted. This is the expected verdict for a correctly minimal read principal: the "
+            "engine reports what it checked, and read-onlyness is the database's to enforce"))
 
     def assert_enforcing(self) -> tuple[str, str]:
         """Can this CONNECTION be trusted to have VPD applied to it? -> (verdict, reason).

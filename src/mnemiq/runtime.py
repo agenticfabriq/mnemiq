@@ -283,8 +283,12 @@ def _warn_source_enforcement(adapter) -> None:
     Any adapter that grows either method is picked up here without further wiring, which is the
     property whose absence produced the finding.
     """
+    # `assert_read_only` has NO clean verdict, and that is deliberate rather than an omission: it
+    # returns `gate_only` or `unverifiable`, because auditing the caller cannot establish that a
+    # source is unwritable -- a view resolves references with the VIEW OWNER's rights. `writable`
+    # means the question does not apply, which is the only quiet case.
     for name, label, clean in (("assert_enforcing", "source enforcement", "attached"),
-                               ("assert_read_only", "read-only basis", "constrained")):
+                               ("assert_read_only", "read-only basis", None)):
         assess = getattr(adapter, name, None)
         if assess is None:
             continue
