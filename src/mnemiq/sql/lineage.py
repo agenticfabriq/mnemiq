@@ -155,12 +155,25 @@ def _functions_in(ast) -> tuple[list[str], bool]:
             continue
         parent = node.parent
         qualified = isinstance(parent, exp.Dot) and parent.expression is node
-        if not qualified and name in _PURE:
-            continue
 
+        # Quoting is read FIRST, before the builtin exemption. `"NOW"()` is case-sensitive in
+        # Postgres, so it cannot be the builtin `now` -- it is a source function -- and skipping
+        # on the folded name let it inherit an exemption it could not have earned. That is the
+        # `public.now()` inheritance the previous pass fixed structurally, re-arriving in the one
+        # spelling the new provenance signal would have caught had it been consulted first.
+        #
+        # LIMIT, stated rather than claimed closed: sqlglot types `"NOW"()` as `CurrentTimestamp`
+        # and discards the quoting before this function sees a node, so that spelling cannot be
+        # NAMED here at all. The marker is still right -- any call downgrades COMPLETE, so it
+        # reports UNKNOWN with the reason -- but the audit record does not name the suspect, and
+        # recovering it would need the raw text rather than the tree. A limit of the parser, not
+        # of the rule.
         identifier = node.args.get("this")
         if getattr(identifier, "quoted", False):
             _add(out, "unnameable-function")
+            continue
+
+        if not qualified and name in _PURE:
             continue
 
         label = name
@@ -291,8 +304,10 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
                 # correct and the rename bought nothing, since the collected keys were only ever
                 # read for truthiness.
                 reaches_past_the_list = True
-        for fn in _functions_in(parsed)[0]:
+        body_fns, body_saw_call = _functions_in(parsed)
+        for fn in body_fns:
             _add(unclassified, fn)
+        saw_any_call = saw_any_call or body_saw_call
         if reaches_past_the_list:
             _add(reaching_views, name)
 

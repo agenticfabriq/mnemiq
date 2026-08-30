@@ -763,3 +763,40 @@ def test_a_view_that_reaches_no_object_at_all_is_still_complete():
                           inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
     assert lineage.completeness == COMPLETE
     assert lineage.unresolved == [] and lineage.reasons == []
+
+
+def test_a_view_body_that_calls_a_function_also_loses_complete():
+    """The any-call downgrade was wired at ONE of its two call sites: the view-body loop took
+    `_functions_in(parsed)[0]` and dropped the flag, so a view defined `SELECT log(1) AS x` still
+    yielded COMPLETE. The class declared closed, surviving one level down — the same shape as
+    applying the source whitelist to bodies and not to the statement, which a previous commit
+    fixed and whose message I then used against its predecessor. Inverted, two commits later."""
+    views = [ViewDefinition(object_id="v", definition="SELECT log(1) AS x", dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT x FROM v"), ["v"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == UNKNOWN
+    assert "unconfirmed-function-identity" in lineage.reasons
+
+
+def test_a_quoted_callable_is_tokened_even_when_its_name_is_identifier_shaped():
+    """The quoted branch had NO test that could fail. Both existing quoted-name cases carry names
+    that fail `_IDENTIFIER` on their own, so both still passed with the branch deleted — coverage
+    that proves the grammar, not the provenance. This payload passes the grammar, so only reading
+    the quoting can stop it, on a default-on disclosure surface."""
+    from mnemiq.sql.lineage import _functions_in
+
+    names, saw_call = _functions_in(
+        _ast('SELECT "sk_live_abc123"() FROM claim'))
+    assert names == ["unnameable-function"], "an identifier-shaped quoted payload was admitted"
+    assert saw_call is True
+
+
+def test_an_unquoted_function_name_is_still_named_and_that_is_the_feature():
+    """Recorded so the ledger is honest. `sk_live_abc123()` unquoted is reported verbatim, and no
+    guard can change that: naming a genuinely unresolved callable is the artifact's purpose, and a
+    function's name is an object id. The quoted branch closes a SPELLING, not the shape — a secret
+    chosen as an unquoted identifier is indistinguishable from a real function name, and treating
+    it as sensitive would mean naming nothing."""
+    from mnemiq.sql.lineage import _functions_in
+
+    assert _functions_in(_ast("SELECT sk_live_abc123() FROM claim"))[0] == ["sk_live_abc123"]
