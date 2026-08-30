@@ -713,3 +713,32 @@ def test_traces_and_metrics_are_attributed_to_the_manifest_source_not_the_settin
     assert rt._source_id() == "acme"
     rt.settings = None
     assert rt._source_id() == "unknown"
+
+
+def test_the_metrics_command_reads_the_id_answers_were_written_under(monkeypatch, tmp_path, capsys):
+    """Write and read must agree, and they did not.
+
+    `Runtime._source_id` records answers under the SNAPSHOT's id; `mnemiq metrics` asked for
+    `settings.source_id`. With a one-entry manifest naming `warehouse`, every answer was written
+    under `warehouse` and this command asked for `acme` -- so the view was EMPTY rather than wrong,
+    which is the harder kind to notice. Fixing the write side and leaving the read is the same
+    half-correction that produced the bug.
+    """
+    from mnemiq.cli import _cmd_metrics
+
+    asked: list = []
+
+    class _Sink:
+        def recent(self, source_id, n):
+            asked.append(source_id)
+            return []
+
+    monkeypatch.setattr("mnemiq.observability.metrics.NullSink", lambda: _Sink())
+    manifest = tmp_path / "sources.json"
+    manifest.write_text(json.dumps([{"id": "warehouse", "kind": "duckdb", "target": "/w.duckdb",
+                                     "catalog": "w", "schema": "main"}]))
+    s = _settings(sources_path=str(manifest))
+    assert s.source_id == "acme", "precondition: the setting differs from the manifest"
+    _cmd_metrics(s)
+    capsys.readouterr()
+    assert asked == ["warehouse"], f"metrics asked for {asked}, not the id answers are recorded under"
