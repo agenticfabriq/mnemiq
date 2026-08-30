@@ -796,3 +796,56 @@ def test_metrics_still_prints_when_there_is_no_store_to_ask(monkeypatch, tmp_pat
                                   store_path=str(tmp_path / "absent.duckdb"))) == 0
     capsys.readouterr()
     assert asked == ["acme"]
+
+
+def test_an_unreadable_store_says_the_source_id_is_a_guess(monkeypatch, tmp_path, capsys):
+    """The fallback IS the key the two source-id bugs were about, so reaching it silently
+    resurrects them by another route.
+
+    Measured before this: an unreadable store made the command ask for `acme` while answers were
+    recorded under `warehouse`, print nothing to stderr, and exit 0. The operator sees an empty
+    view and cannot tell whether no answers were recorded or the wrong question was asked --
+    absence and failure sharing one signal, which is M59 stated for a CLI.
+    """
+    from mnemiq.cli import _cmd_metrics
+
+    asked: list = []
+
+    class _Sink:
+        def recent(self, sid, n):
+            asked.append(sid)
+            return []
+
+    monkeypatch.setattr("mnemiq.observability.metrics.NullSink", lambda: _Sink())
+    manifest = tmp_path / "sources.json"
+    manifest.write_text(json.dumps([{"id": "warehouse", "kind": "duckdb", "target": "/w.duckdb",
+                                     "catalog": "w", "schema": "main"}]))
+    broken = tmp_path / "not-a-store.duckdb"
+    broken.write_text("garbage")
+
+    rc = _cmd_metrics(_settings(sources_path=str(manifest), source_id="acme",
+                                store_path=str(broken)))
+    err = capsys.readouterr().err
+    assert rc == 0, "a metrics view must still print"
+    assert asked == ["acme"], "it can only fall back to the setting"
+    assert "could not read the snapshot" in err, "it must say WHY the id is a guess"
+    assert "may not be the id answers were recorded under" in err, "and what that costs the reader"
+    assert "not an absence of answers" in err, "and that an empty result may be the guess"
+
+
+def test_no_snapshot_yet_is_quiet_because_nothing_has_been_recorded_either(
+    monkeypatch, tmp_path, capsys
+):
+    """A store that opens and holds no snapshot is not a failure: nothing was enriched, so nothing
+    was recorded, and an empty view is the honest answer. Warning here would cry wolf on every
+    fresh install -- the distinction the branch above exists to make."""
+    from mnemiq.cli import _cmd_metrics
+
+    class _Sink:
+        def recent(self, sid, n):
+            return []
+
+    monkeypatch.setattr("mnemiq.observability.metrics.NullSink", lambda: _Sink())
+    _cmd_metrics(_settings(pg_dsn="postgresql://h/db", source_id="acme",
+                           store_path=str(tmp_path / "fresh.duckdb")))
+    assert "may not be the id" not in capsys.readouterr().err
