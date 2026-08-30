@@ -173,9 +173,33 @@ def inventory_for(snapshot) -> ViewInventory:
         getattr(j, "id", None) == "discover:views" and getattr(j, "status", None) == "failed"
         for j in getattr(snapshot, "jobs", ()) or ()
     )
-    asked = any(
-        getattr(j, "id", None) == "discover:views" for j in getattr(snapshot, "jobs", ()) or ()
-    )
+    # COVERAGE, not existence. `any(...)` let one source's completed discovery vouch for every
+    # source in a merged snapshot: a federated snapshot where one catalog was discovered and a
+    # legacy one never was reported asked=True, so a query of the undiscovered catalog's view came
+    # back COMPLETE. That defeats the never-asked distinction exactly where federation makes it
+    # matter -- and it is this file's own lesson, since `merge_snapshots` dropped views and jobs
+    # entirely until recently and produced the same silence one layer down.
+    #
+    # `registry` is catalog -> schema and exists only on a FederatedSnapshot, so its size is the
+    # number of sources merged. A single-source snapshot has none and needs one job.
+    discovery_jobs = {
+        getattr(j, "source_id", None)
+        for j in getattr(snapshot, "jobs", ()) or ()
+        if getattr(j, "id", None) == "discover:views"
+    }
+    sources_needed = max(1, len(getattr(snapshot, "registry", {}) or {}))
+    # A CARDINALITY comparison, and its limit is stated because it cannot be closed here:
+    # `registry` is keyed by `SourceSpec.catalog` while a job carries `SourceSpec.id`, and nothing
+    # requires spec ids to be distinct. Two catalogs attached over one source id therefore collapse
+    # to one discovered id and this reports asked=False permanently, so a fully-discovered
+    # federation answers UNKNOWN with `view-inventory-never-asked`.
+    #
+    # Left that way deliberately. The two sets are not correspondable from a merged snapshot -- the
+    # catalog->source mapping lives in the pairs `merge_snapshots` consumed and does not survive
+    # into the result -- so the choice is between a conservative wrong answer and a confident one.
+    # For a value whose whole job is saying whether completeness can be CONFIRMED, "cannot confirm"
+    # is the correct direction to be wrong in.
+    asked = len(discovery_jobs) >= sources_needed
     return ViewInventory({v.object_id: v for v in snapshot.views}, available=not failed,
                          asked=asked)
 

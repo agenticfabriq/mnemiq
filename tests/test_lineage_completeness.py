@@ -359,3 +359,153 @@ def test_a_cte_inside_a_view_body_is_not_reach():
                           ["claim_view", "claim"],
                           inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
     assert lineage.completeness == COMPLETE, "the body's only real base is already accounted for"
+
+
+# -- the seven findings a second model found, one test each ---------------------------------------
+
+
+def test_a_function_inside_a_view_body_is_reach_the_body_scan_must_see():
+    """Checking a view's body only for base TABLES reported a view of `SELECT all_ssns()` as fully
+    accounted for. The reach is one level down, not absent — so the function scan runs on the body
+    as well as on the caller's statement."""
+    views = [ViewDefinition(object_id="secret_view", definition="SELECT all_ssns() AS ssn",
+                            dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT ssn FROM secret_view"), ["secret_view"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == UNKNOWN
+    assert "all_ssns" in lineage.unresolved
+
+
+def test_a_qualified_call_does_not_inherit_a_builtins_exemption():
+    """`public.now()` parses to an `Anonymous` whose `name` is the bare leaf `now`, so matching
+    `_PURE` on the leaf let a schema-qualified callable — a UDF named `now` in any schema — inherit
+    the builtin's exemption. A qualified call has an `exp.Dot` parent, which is the structural form
+    of "this is not the builtin you whitelisted", and the qualifier is kept in `unresolved` so the
+    record names what it could not account for rather than a leaf matching several things."""
+    lineage = lineage_for(_ast("SELECT public.now() AS x FROM claim"), ["claim"],
+                          inventory_for(_snapshot(jobs=[_DISCOVERED])))
+    assert lineage.completeness == UNKNOWN
+    assert "public.now" in lineage.unresolved  # qualifier kept, arguments never
+
+
+def test_a_quoted_identifier_that_matches_only_when_folded_is_unknown():
+    """Quoting MAY decide identity and this function cannot tell whether it does. In Postgres a
+    quoted identifier is case-sensitive, so `"Claim"` and `claim` are two objects; DuckDB folds
+    them to one — measured in this repo's venv — and `qualify.py` states the rule correctly scoped
+    as "case-sensitive in Postgres". `lineage_for` takes no dialect.
+
+    So this is UNKNOWN, not INCOMPLETE. Folding both was the first version and asserted the wrong
+    one; an earlier draft of this very test asserted INCOMPLETE, which is equally wrong on DuckDB,
+    the repo's own default engine. The honest claim is that identity is engine-dependent here.
+    """
+    views = [ViewDefinition(object_id="v", definition='SELECT id FROM "Claim"', dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT id FROM v JOIN claim USING (id)"), ["v", "claim"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == UNKNOWN
+    assert any(u.startswith("case-ambiguous:") for u in lineage.unresolved)
+
+
+def test_a_quoted_qualifier_decides_identity_as_much_as_a_quoted_leaf():
+    """`object_key` composes catalog/db/name, so inspecting only the leaf's `quoted` flag folded a
+    quoted mixed-case QUALIFIER — `"Public".claim` against `public.claim` read COMPLETE."""
+    views = [ViewDefinition(object_id="v", definition='SELECT id FROM "Public".claim',
+                            dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT id FROM v"), ["v", "public.claim"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == UNKNOWN
+
+
+def test_a_function_label_never_carries_its_arguments():
+    """`unresolved` ships in the emitter's ALWAYS tier, so a label rendered from the whole call
+    expression posts question and database literals to an external audit store on a deployment
+    running the default `verity_trace_send_text=False`. Measured before the fix:
+    `["public.mask(ssn, 'sk-live-abc123')"]`. An identifier is an object id; a rendered call is
+    question text, and the tier table is what keeps those apart."""
+    for sql in ("SELECT public.mask(ssn, 'sk-live-abc123') FROM claim",
+                # The sibling spelling. The first fix stripped arguments where the call is the
+                # Dot's EXPRESSION and left them where it is the Dot's `this`, so `mask(...).tag`
+                # still rendered the whole call -- one leak fixed by reasoning about one shape.
+                "SELECT mask(ssn, 'sk-live-abc123').tag FROM claim"):
+        lineage = lineage_for(_ast(sql), ["claim"], inventory_for(_snapshot(jobs=[_DISCOVERED])))
+        assert not any("sk-live" in u for u in lineage.unresolved), f"secret in ALWAYS tier: {sql}"
+        assert not any("(" in u or "'" in u for u in lineage.unresolved), sql
+
+
+def test_a_field_access_on_a_builtin_is_not_a_qualified_call():
+    """`isinstance(parent, exp.Dot)` matched both sides of the dot, so `now().y` read as a
+    qualified callable and lost its `_PURE` exemption. Qualified means the call is the Dot's
+    EXPRESSION -- `schema.func()` -- not its `this`."""
+    lineage = lineage_for(_ast("SELECT now().y FROM claim"), ["claim"],
+                          inventory_for(_snapshot(jobs=[_DISCOVERED])))
+    assert lineage.completeness == COMPLETE
+
+
+def test_a_table_valued_function_is_unclassified_not_a_demonstrated_gap():
+    """`object_key` returns "" for `generate_series`/`unnest` because there is no identifier to
+    key, and treating that as an unaccounted OBJECT reported INCOMPLETE for a view that reaches no
+    object at all. It is reach we cannot classify, which is UNKNOWN."""
+    views = [ViewDefinition(object_id="g", definition="SELECT * FROM generate_series(1, 10)",
+                            dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT * FROM g"), ["g"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == UNKNOWN
+    assert any("generate_series" in u for u in lineage.unresolved)
+
+
+def test_one_sources_discovery_does_not_vouch_for_a_federated_snapshot():
+    """`any(...)` let a single completed `discover:views` job mark a merged snapshot as asked, so a
+    query of a catalog that was never discovered came back COMPLETE — defeating the never-asked
+    distinction exactly where federation makes it matter."""
+    from mnemiq.semantic.federation import FederatedSnapshot
+
+    def _job(source):
+        return Job(id="discover:views", source_id=source, kind="discover", status="done")
+
+    registry = {"a": "schema_a", "legacy": "schema_legacy"}
+    partial = FederatedSnapshot(version="v1", source_id="f", created_at="t",
+                                jobs=[_job("a")], registry=registry)
+    assert inventory_for(partial).asked is False, "one catalog discovered, one never asked"
+
+    full = FederatedSnapshot(version="v1", source_id="f", created_at="t",
+                             jobs=[_job("a"), _job("legacy")], registry=registry)
+    assert inventory_for(full).asked is True
+
+
+def test_the_public_serializers_never_ship_a_bare_table_list():
+    """The HTTP and MCP projections emitted `tables_used` and none of the marker fields, so a trace
+    with `tables_used=[]` and `completeness='unknown'` reached clients as an empty list — the exact
+    misleading artifact this branch exists to make impossible, on the two surfaces a customer
+    actually reads."""
+    from mnemiq.agent.loop import AgentAnswer
+    from mnemiq.agent.trace import Trace
+    from mnemiq.contract import IdentityContext
+    from mnemiq.server.serialize import answer_payload
+
+    trace = Trace(question="q", plan_sql="SELECT all_ssns()", target_sql="SELECT all_ssns()",
+                  result_shape="scalar", timing={}, enrichment_version="v7",
+                  identity=IdentityContext(tenant_id="t", principal_id="p", roles=[]),
+                  tables_used=[], lineage_completeness=UNKNOWN,
+                  lineage_unresolved=["all_ssns"], lineage_reasons=[])
+    payload = answer_payload(AgentAnswer(answer="x", trace=trace))
+
+    # Asserted on the PAYLOAD, not on module source text. The first version grepped
+    # `inspect.getsource` for the word "lineage", which survives dropping "completeness" from the
+    # emitted dict or making its value unconditionally None -- it tested that a word appears in a
+    # file, while claiming to test that a list and its marker cannot separate.
+    assert payload["lineage"]["completeness"] == UNKNOWN
+    assert payload["lineage"]["unresolved"] == ["all_ssns"]
+    assert payload["tables_used"] == [], "the bare list is still there, and now it is qualified"
+
+    # BOTH surfaces. The previous version asserted only the HTTP payload while its name and the
+    # commit message claimed "the two surfaces a customer actually reads" -- so dropping
+    # `completeness` from the MCP dict kept the suite green, which is the degradation this test
+    # exists to catch, surviving on one of the two.
+    from mnemiq.mcp.server import _db_read
+
+    class _Runtime:
+        def ask(self, question, identity, mode=None):
+            return AgentAnswer(answer="x", trace=trace)
+
+    mcp = _db_read(_Runtime(), IdentityContext(tenant_id="t", principal_id="p", roles=[]), "q")
+    assert mcp["trace"]["lineage"]["completeness"] == UNKNOWN
+    assert mcp["trace"]["lineage"]["unresolved"] == ["all_ssns"]

@@ -31,6 +31,15 @@ def answer_payload(ans: AgentAnswer) -> dict:
         "corrected": ans.corrected,
         "sql": t.target_sql if t else None,
         "tables_used": list(t.tables_used) if t else None,
+        # M56: the list never ships without the marker. A bare `tables_used` is the misleading
+        # artifact this engine now refuses to produce -- `[]` reads as "nothing was read" where
+        # the truth may be "read through a function we could not classify". Emitting the list
+        # here and the marker only in the Verity trace would have recreated it on the two
+        # surfaces a customer actually reads.
+        "lineage": ({"tables": list(t.tables_used),
+                     "completeness": t.lineage_completeness,
+                     "unresolved": list(t.lineage_unresolved),
+                     "reasons": list(t.lineage_reasons)} if t else None),
         "enrichment_version": t.enrichment_version if t else None,
         "timing": t.timing if t else None,
         "preview": ({"columns": p.columns, "rows": p.rows, "row_count": p.row_count,
