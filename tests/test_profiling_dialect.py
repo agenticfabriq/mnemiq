@@ -195,3 +195,112 @@ def test_the_stem_matches_case_insensitively_and_keeps_the_sources_case(column, 
     from mnemiq.enrichment.joins import _stem
 
     assert _stem(column) == stem
+
+
+class _BatchFails(_Recorder):
+    """A source that refuses one column, whatever the batched query asks for.
+
+    Modelled on a real Oracle user-defined object type: `count(DISTINCT addr)` raises ORA-22950 --
+    a DIFFERENT code from the ORA-22849 the LOB types give -- while `count(addr)` succeeds.
+    """
+
+    def execute(self, sql):
+        self.sql.append(sql)
+        if '"ADDR"' in sql and "count(DISTINCT" in sql:
+            raise RuntimeError("ORA-22950: cannot order objects without MAP or ORDER method")
+        if sql.lstrip().upper().startswith("SELECT COUNT(*) FROM"):
+            return [(3,)]
+        if "count(*)" in sql and "GROUP BY" not in sql:
+            return [tuple([3] + [2, 3] * sql.count("count(DISTINCT"))]
+        if "count(DISTINCT" in sql:
+            return [(2, 3)]
+        return [("open", 2), ("shut", 1)]
+
+
+def test_one_unlistable_column_does_not_erase_the_columns_beside_it():
+    """The denylist can never be complete, so it cannot be the guarantee.
+
+    A user-defined object type reports its OWN name as its data type -- `ADDR_T` -- so no list of
+    type names can enumerate it. Measured on a live instance: the batched counts query fails and,
+    before this fallback, took every column of the table with it, including a plain NUMBER.
+    """
+    a = _BatchFails(dialect="oracle")
+    stats = {s.column: s for s in profile_table(
+        a, _table(("ID", "NUMBER"), ("STATUS", "VARCHAR2"), ("ADDR", "ADDR_T")))}
+
+    assert stats["ID"].distinct_count == 2, "a countable column must still be measured"
+    assert stats["STATUS"].distinct_count == 2
+    assert stats["ADDR"].distinct_count is None, "the one that cannot count reports unknown"
+    assert stats["ADDR"].null_count is None
+    assert all(s.row_count == 3 for s in stats.values())
+
+
+def test_the_fallback_only_runs_when_the_batch_fails():
+    """It costs one query per column, so it must not become the normal path."""
+    a = _Recorder(dialect="oracle")
+    profile_table(a, _table(("ID", "NUMBER"), ("STATUS", "VARCHAR2")))
+    batched = [q for q in a.sql if q.count("count(DISTINCT") > 1]
+    per_column = [q for q in a.sql if q.count("count(DISTINCT") == 1 and "GROUP BY" not in q]
+    assert len(batched) == 1 and per_column == [], "the happy path is still one query"
+
+
+def test_an_unmeasured_column_is_never_treated_as_a_vocabulary():
+    """`0 < distinct_count` raises on None, and a column with unknown counts is not a candidate
+    coded vocabulary in any case -- nothing was observed to harvest."""
+    a = _BatchFails(dialect="oracle")
+    addr = {s.column: s for s in profile_table(
+        a, _table(("ID", "NUMBER"), ("ADDR", "ADDR_T")))}["ADDR"]
+    assert addr.top_k == []
+
+
+def test_a_broken_column_is_logged_and_a_known_unsupported_one_is_not(caplog):
+    """Both produce `distinct_count=None`, so without a log they are the same signal.
+
+    A type named in `_UNAGGREGATABLE` is skipped before any query is issued -- nothing went wrong,
+    and a warning there would fire on every LOB column of every enrich. A column that reached the
+    database and FAILED is unplanned by definition: a permission, a driver fault, or a bug here.
+    A line always means the second. That distinction is the whole point of the fix this sits in,
+    and I had reproduced the collapse inside it.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        profile_table(_Recorder(dialect="oracle"), _table(("ID", "NUMBER"), ("BODY", "CLOB")))
+    assert caplog.text == "", "a known-unsupported type is skipped, not failed"
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        profile_table(_BatchFails(dialect="oracle"), _table(("ID", "NUMBER"), ("ADDR", "ADDR_T")))
+    assert "ADDR" in caplog.text and "ORA-22950" in caplog.text
+    assert "batched profile" in caplog.text, "and the fallback itself is announced"
+
+
+def test_a_failure_that_takes_every_column_is_still_a_failed_table():
+    """The fallback must not convert a systemic failure into a successful-looking empty table.
+
+    `enrich_structural` marks a table `done` whenever `profile_table` returns, so swallowing every
+    column's failure would make `profile_outcome` report `complete` over a model that measured
+    nothing -- M59's bug class, one call frame below where it was closed. A cause that takes out
+    every column is systemic, not typed: a permission, a driver fault, temp space exhausted by the
+    sort a DISTINCT needs. Before the fallback existed such an exception propagated and the table
+    was marked failed; it still must.
+    """
+    class _AllDistinctFail(_Recorder):
+        def execute(self, sql):
+            self.sql.append(sql)
+            if "count(DISTINCT" in sql:
+                raise RuntimeError("ORA-01652: unable to extend temp segment")
+            if sql.lstrip().upper().startswith("SELECT COUNT(*) FROM"):
+                return [(3,)]
+            return [("x", 1)]
+
+    with pytest.raises(RuntimeError, match="ORA-01652"):
+        profile_table(_AllDistinctFail(dialect="oracle"), _table(("A", "NUMBER"), ("B", "NUMBER")))
+
+
+def test_a_partial_failure_is_still_carried_rather_than_raised():
+    """The distinction the re-raise turns on: SOME columns measured means the cause was the column,
+    not the session, and the table is worth keeping."""
+    stats = {s.column: s for s in profile_table(
+        _BatchFails(dialect="oracle"), _table(("ID", "NUMBER"), ("ADDR", "ADDR_T")))}
+    assert stats["ID"].distinct_count == 2 and stats["ADDR"].distinct_count is None
