@@ -25,6 +25,20 @@ _UNAGGREGATABLE: dict[str, frozenset[str]] = {
 }
 
 
+# An expression that forces a REAL per-row DISTINCT without naming any user column, used to ask
+# whether this session can sort at all. `count(DISTINCT 1)` is a constant the optimiser may fold
+# away, which would make the probe answer yes on a session that cannot actually sort; ROWNUM
+# varies per row -- measured, it returns one per row on a 3-row table -- so it exercises the
+# machinery a temp-space failure would break.
+#
+# A dialect with NO entry here gets no probe and the conservative answer, not a weak probe. The
+# first version defaulted to `count(DISTINCT 1)`, and a constant is foldable: on DuckDB -- this
+# project's primary adapter -- a session that could not sort at all still answered "yes", so the
+# systemic failure this whole branch exists to catch was reintroduced everywhere except Oracle.
+# Refining behaviour only where the question can actually be asked is the point.
+_DISTINCT_PROBE: dict[str, str] = {"oracle": "ROWNUM"}
+
+
 def _unaggregatable(adapter: SourceAdapter) -> frozenset[str]:
     return _UNAGGREGATABLE.get(getattr(adapter, "dialect", ""), frozenset())
 
@@ -160,19 +174,38 @@ def profile_table(
                     logger.warning("column %r.%r could not be counted and is carried with unknown "
                                    "stats: %s", table.name, c, col_exc)
                     measured[c] = (None, None)
-            if all(v == (None, None) for v in measured.values()):
-                # NOT a per-column quirk. Carrying unknowns for every column would report a table
-                # that measured NOTHING as `done`, and `enrich_structural` marks a table done
-                # whenever this returns -- so `profile_outcome` would say `complete` over a model
-                # that measured nothing. That is M59's bug class, one call frame below where it was
-                # closed this morning, and the codebase already paid for it once as the Pagila
+            probe = _DISTINCT_PROBE.get(getattr(adapter, "dialect", ""))
+            sortable = False
+            if probe is not None and all(v == (None, None) for v in measured.values()):
+                try:
+                    adapter.execute(f'SELECT count(DISTINCT {probe}) FROM "{table.name}"')
+                    sortable = True
+                except Exception:
+                    sortable = False
+            if not sortable and all(v == (None, None) for v in measured.values()):
+                # The session cannot DISTINCT at all, so this is systemic -- a permission, a
+                # driver fault, temp space exhausted by the sort. Carrying unknowns for every
+                # column would report a table that measured NOTHING as `done`, and
+                # `enrich_structural` marks a table done whenever this returns, so
+                # `profile_outcome` would say `complete` over a model that measured nothing. That
+                # is M59's bug class, and the codebase already paid for it once as the Pagila
                 # timestamptz failure that dropped 14 of 15 tables while reporting success.
-                #
-                # A cause that takes out EVERY column is systemic, not typed: a permission, a
-                # driver fault, temp space exhausted by the sort a DISTINCT needs. Re-raising
-                # restores exactly the pre-fallback behaviour for that case -- the pipeline marks
-                # the table failed and the outcome reports it.
+                # Re-raising restores the pre-fallback behaviour exactly.
                 raise
+            # The session CAN sort, so every failure here was the column's own. This is asked
+            # rather than inferred from "all of them failed", which was wrong for a table of ONE
+            # column: measured, a single CLOB was carried with unknown stats while a single
+            # user-defined `ADDR_T` -- the identical situation -- was re-raised and the table
+            # excluded, purely because the first type is on `_UNAGGREGATABLE` and the second
+            # cannot be. That made the list load-bearing again, which is what the fallback exists
+            # to stop.
+            if all(v == (None, None) for v in measured.values()):
+                # Gated, because it was not. It fired whenever the probe succeeded and claimed
+                # "no column could be counted ... all N carried" on a table where one column had
+                # measured perfectly well -- false on both counts, and contradicting the comment
+                # directly above it, which reasons about the partial case.
+                logger.warning("no column of %r could be counted, though the session can sort; "
+                               "all %d carried with unknown stats", table.name, len(measured))
     else:
         # Every column is unaggregatable, so there is nothing to count them WITH; the row count
         # still is, and it is what tells a reader the table is not empty.
