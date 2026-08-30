@@ -400,7 +400,7 @@ def _cmd_feedback(args) -> int:
 
 def _cmd_metrics(settings: Settings) -> int:
     from mnemiq.observability.metrics import NullSink, PostgresSink, aggregate
-    from mnemiq.runtime import load_current_snapshot
+    from mnemiq.runtime import SnapshotMissing, load_current_snapshot
     from mnemiq.store.bootstrap import init_store
 
     sink = PostgresSink(settings.control_dsn) if settings.control_dsn else NullSink()
@@ -417,11 +417,20 @@ def _cmd_metrics(settings: Settings) -> int:
     try:
         con = init_store(settings.store_path)
         source_id = load_current_snapshot(settings, con)[0].source_id
-    except Exception:
-        # No snapshot, no store, or an unreadable one: nothing has been recorded yet, so report
-        # what was asked for. Broad on purpose -- a metrics view must not fail to print because
-        # the store is missing.
+    except SnapshotMissing:
+        # Nothing enriched yet, so nothing has been RECORDED either -- an empty view is the honest
+        # answer and needs no warning. `settings.source_id` is as good a label as any here.
         source_id = settings.source_id or "unknown"
+    except Exception as exc:
+        # Anything else means the id is a GUESS, and the guess is `settings.source_id` -- which is
+        # exactly the key the two bugs above were about. Falling back to it silently resurrects
+        # them by another route: the operator sees an empty view and cannot tell whether no answers
+        # were recorded or the wrong question was asked. Absence and failure must not share one
+        # signal, which is M59 stated for a CLI instead of a snapshot.
+        source_id = settings.source_id or "unknown"
+        print(f"warning: could not read the snapshot to resolve the source id ({exc}); showing "
+              f"metrics for {source_id!r}, which may not be the id answers were recorded under. "
+              "An empty result below may be that, not an absence of answers", file=sys.stderr)
     m = aggregate(sink.recent(source_id, 1000))
     print(f"answers={m.answers} deferral_rate={m.deferral_rate:.1%} "
           f"cache_hit_rate={m.cache_hit_rate:.1%} p50={m.p50_ms:.0f}ms p95={m.p95_ms:.0f}ms")
