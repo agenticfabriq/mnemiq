@@ -469,6 +469,12 @@ class OracleAdapter:
         `read_only` is one bug away from not holding, and the fix is a deployment one -- connect
         the read plane as a principal with SELECT and nothing else.
 
+        Two verdicts, `gate_only` and `unverifiable`, and the absence of a third is the finding:
+        auditing the CALLER cannot establish read-onlyness at all, because a view resolves its
+        references with the VIEW OWNER's rights. Measured -- a principal holding SELECT on one view
+        and nothing else read it and a row was inserted, holding no EXECUTE, no DML and owning
+        nothing.
+
         Reports; never refuses. Refusing here would break every deployment that reads as its own
         schema owner, which is most of them, over a risk that requires hostile PL/SQL to realise.
         """
@@ -525,13 +531,54 @@ class OracleAdapter:
                 f"holds {granted} write-shaped object privilege(s) there ({direct} direct, "
                 f"{via_role} through a role, {public} granted to PUBLIC -- INSERT/UPDATE/DELETE/"
                 f"ALTER, and EXECUTE, which is enough on its own), and holds {sysprivs} "
-                "write-shaped system privilege(s). Direct "
-                "writes are refused by this adapter, but a SELECT that reaches an "
-                "AUTONOMOUS_TRANSACTION function -- possibly through a view, where the statement "
-                "text names nothing -- is not something any statement check can see. Connect the "
-                "read plane as a principal holding SELECT and nothing else"))
-        return ("constrained", "this connection holds no write privilege, so read-only does not "
-                               "rest on statement inspection alone")
+                "write-shaped system privilege(s). Direct writes are refused by this adapter, but "
+                "a SELECT that reaches an AUTONOMOUS_TRANSACTION function -- possibly through a "
+                "view, where the statement text names nothing -- is not something any statement "
+                "check can see. Connect the read plane as a principal holding SELECT and nothing "
+                "else"))
+
+        # No write-shaped privilege. That is NOT the same as "cannot cause a write", and the
+        # difference is measured: a principal holding SELECT on a VIEW and nothing else -- no
+        # EXECUTE, no DML, owning nothing -- read that view and a row was inserted. A view resolves
+        # its references with the VIEW OWNER's rights, so the function inside ran as the owner and
+        # the caller needed no privilege on it at all. Auditing the CALLER can therefore never
+        # establish read-onlyness; the hazard lives in the schema's own code.
+        #
+        # So the absence of writing code has to be shown, not assumed -- and the source may not be
+        # readable. Measured: the owner sees 15 lines of `ALL_SOURCE` for this schema and one
+        # AUTONOMOUS_TRANSACTION hit, while a SELECT-only principal sees **zero lines** and
+        # therefore zero hits. Reading that zero as "no writing code" is the absence/failure
+        # collapse this codebase keeps closing, so the two are separate verdicts.
+        lines, autonomous = self._rows(
+            "SELECT (SELECT count(*) FROM all_source WHERE owner = :owner) AS lines, "
+            "       (SELECT count(*) FROM all_source WHERE owner = :owner "
+            "         AND UPPER(text) LIKE '%AUTONOMOUS\\_TRANSACTION%' ESCAPE '\\') AS autonomous "
+            "FROM dual", owner=self._schema
+        )[0]
+        if autonomous:
+            return ("gate_only", (
+                f"this connection holds no write privilege on {self._schema}, but the schema "
+                f"contains {autonomous} subprogram(s) declaring PRAGMA AUTONOMOUS_TRANSACTION. "
+                "Such a subprogram writes in its own transaction, and reaching it needs no "
+                "privilege on it -- a view resolves references with the VIEW OWNER's rights, so "
+                "SELECT on the view is enough. Read-only cannot be established by privilege here"))
+        # There is deliberately NO "constrained" verdict, and it was removed rather than never
+        # written: an earlier version returned one and it could not be reached by any principal
+        # that would legitimately BE the read plane. Measured -- `ALL_SOURCE` shows a non-owner
+        # zero lines of another schema's code, `DBA_SOURCE` shows 14 but needs SELECT ANY
+        # DICTIONARY (the privilege this very method tells operators not to grant), and the one
+        # non-owner who does see source is a holder of EXECUTE, which is write-shaped and lands in
+        # `gate_only` above. So "no write path exists" is not establishable from here, and a
+        # verdict asserting it would have been a branch that shipped unreachable -- the shape this
+        # adapter already deleted an ISDBA check for.
+        return ("unverifiable", (
+            f"this connection holds no write privilege on {self._schema}, and {lines} line(s) of "
+            "that schema's source are visible to it, so subprograms that write in their own "
+            "transaction cannot be ruled out. Reaching one needs no privilege on it: a view "
+            "resolves references with the VIEW OWNER's rights, so SELECT on a view is enough -- "
+            "measured, a principal holding SELECT on one view and nothing else caused a row to be "
+            "inserted. This is the expected verdict for a correctly minimal read principal, and it "
+            "reports what cannot be seen rather than reading an unreadable catalog as empty"))
 
     def assert_enforcing(self) -> tuple[str, str]:
         """Can this CONNECTION be trusted to have VPD applied to it? -> (verdict, reason).
