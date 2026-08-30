@@ -29,3 +29,27 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# Credential material. A wallet is the credential: an auto-login `cwallet.sso` needs no password,
+# so possessing the file is sufficient to connect. One was found sitting untracked and unignored
+# in this root -- never committed, but only a convention stood between it and `git add -A`.
+#
+# This rule is a BACKSTOP, not the fix. A wallet belongs outside the repo entirely, with
+# `TNS_ADMIN` pointed at it: an ignored file still gets archived, grepped, copied into a
+# worktree and caught in a screenshot. An ignore rule stops exactly one mistake.
+Wallet_*.zip
+*wallet*.zip
+cwallet.sso
+ewallet.p12
+ewallet.pem
+keystore.jks
+truststore.jks
+tnsnames.ora
+sqlnet.ora
+ojdbc.properties
+
+# Tests that write their resolved authz policy to the repo root rather than a tmpdir. The write
+# is the defect; this keeps it from becoming a commit while it stands.
+/acme_authz.json
+/acme_syn_authz.json
+/pagila_authz.json

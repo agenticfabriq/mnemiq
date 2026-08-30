@@ -16,7 +16,6 @@ is MNEMIQ_VERIFY_BASE_URL/MODEL/API_KEY (hosted gpt-5.5 ceiling) or falls back t
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import functools
 import hashlib
 import json

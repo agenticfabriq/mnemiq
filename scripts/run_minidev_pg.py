@@ -13,7 +13,6 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import os
 import sys
 import urllib.parse as up
