@@ -1068,6 +1068,18 @@ def test_assert_read_only_tracks_every_route_by_which_a_principal_can_write():
         owner.execute(f"GRANT INSERT ON {USER}.t_dropped TO PUBLIC")
         assert verdict("p_none") == "gate_only", "precondition: the live grant is counted"
         owner.execute("DROP TABLE t_dropped")  # NOT purged: it keeps its grants as BIN$...
+        # The precondition, asserted rather than assumed. With `recyclebin=off` the DROP purges
+        # immediately, the PUBLIC grant vanishes outright, and the assertion below then passes for
+        # a reason that has nothing to do with the filter it is testing -- a test proving nothing
+        # while reporting success, which is the same shape as the benign-looking SKIP this file
+        # already records once. A review asked for this and was right to.
+        orphaned = owner.execute(
+            f"SELECT count(*) FROM all_tab_privs WHERE table_schema = '{USER.upper()}' "
+            "AND privilege = 'INSERT' AND grantee = 'PUBLIC' AND table_name LIKE 'BIN$%'"
+        )[0][0]
+        if not orphaned:
+            pytest.skip("recyclebin is off on this instance, so DROP purged the grant outright "
+                        "and there is no BIN$ row for the filter to exclude")
         assert verdict("p_none") == "constrained", (
             "a grant held by a table in the recycle bin is not write ability -- counting it made a "
             "SELECT-only principal report gate_only, and a verdict that cannot reach constrained "
