@@ -399,10 +399,21 @@ def _cmd_feedback(args) -> int:
 
 
 def _cmd_metrics(settings: Settings) -> int:
+    from mnemiq.adapters.resolve import SourceUnconfigured, source_spec
     from mnemiq.observability.metrics import NullSink, PostgresSink, aggregate
 
     sink = PostgresSink(settings.control_dsn) if settings.control_dsn else NullSink()
-    m = aggregate(sink.recent(settings.source_id, 1000))
+    # The id answers were RECORDED under, which `Runtime._source_id` takes from the snapshot. This
+    # read `settings.source_id` while the write side moved to the resolved id, so with a one-entry
+    # manifest naming `warehouse` every answer was written under `warehouse` and this command asked
+    # for `acme` and found nothing -- a metrics view that is empty rather than wrong, which is the
+    # harder kind to notice. Fixing the write and leaving the read is the same half-correction this
+    # lane keeps making.
+    try:
+        source_id = source_spec(settings).id
+    except SourceUnconfigured:
+        source_id = settings.source_id or "unknown"  # nothing configured: report what was asked for
+    m = aggregate(sink.recent(source_id, 1000))
     print(f"answers={m.answers} deferral_rate={m.deferral_rate:.1%} "
           f"cache_hit_rate={m.cache_hit_rate:.1%} p50={m.p50_ms:.0f}ms p95={m.p95_ms:.0f}ms")
     return 0
