@@ -436,3 +436,15 @@ def test_a_dialect_with_no_known_codes_treats_every_failure_as_systemic():
         a.dialect = dialect
         with pytest.raises(_OraError):
             profile_table(a, _table(("A", "T")))
+
+
+def test_the_all_unknown_log_describes_what_was_actually_checked(caplog):
+    """It said "though the session can sort" after the sort probe had been deleted -- telling an
+    operator something was verified that never ran. What is actually checked is that every
+    failure carried a known column-type error code, so that is what it says."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        profile_table(_fails_with(lambda: _OraError(22849, "type")), _table(("A", "T")))
+    assert "can sort" not in caplog.text
+    assert "known column-type error" in caplog.text
