@@ -399,20 +399,29 @@ def _cmd_feedback(args) -> int:
 
 
 def _cmd_metrics(settings: Settings) -> int:
-    from mnemiq.adapters.resolve import SourceUnconfigured, source_spec
     from mnemiq.observability.metrics import NullSink, PostgresSink, aggregate
+    from mnemiq.runtime import load_current_snapshot
+    from mnemiq.store.bootstrap import init_store
 
     sink = PostgresSink(settings.control_dsn) if settings.control_dsn else NullSink()
-    # The id answers were RECORDED under, which `Runtime._source_id` takes from the snapshot. This
-    # read `settings.source_id` while the write side moved to the resolved id, so with a one-entry
-    # manifest naming `warehouse` every answer was written under `warehouse` and this command asked
-    # for `acme` and found nothing -- a metrics view that is empty rather than wrong, which is the
-    # harder kind to notice. Fixing the write and leaving the read is the same half-correction this
-    # lane keeps making.
+    # The id answers were RECORDED under, taken from the SAME call the runtime takes it from.
+    # `Runtime._source_id` reads the loaded snapshot's id, so this loads the snapshot rather than
+    # re-deriving the rule -- agreement by construction instead of by my restating it correctly.
+    #
+    # Two versions of restating it were wrong. `settings.source_id` missed a one-entry manifest, so
+    # answers written under `warehouse` were read under `acme`. `source_spec(settings).id` fixed
+    # that and broke FEDERATION: a merged snapshot is recorded under `federated`, while
+    # `source_spec` answers a different question -- which single source a one-source command acts
+    # on -- and returned a member id like `pg`. Both produced an EMPTY metrics view rather than a
+    # wrong one, which is the harder kind to see.
     try:
-        source_id = source_spec(settings).id
-    except SourceUnconfigured:
-        source_id = settings.source_id or "unknown"  # nothing configured: report what was asked for
+        con = init_store(settings.store_path)
+        source_id = load_current_snapshot(settings, con)[0].source_id
+    except Exception:
+        # No snapshot, no store, or an unreadable one: nothing has been recorded yet, so report
+        # what was asked for. Broad on purpose -- a metrics view must not fail to print because
+        # the store is missing.
+        source_id = settings.source_id or "unknown"
     m = aggregate(sink.recent(source_id, 1000))
     print(f"answers={m.answers} deferral_rate={m.deferral_rate:.1%} "
           f"cache_hit_rate={m.cache_hit_rate:.1%} p50={m.p50_ms:.0f}ms p95={m.p95_ms:.0f}ms")

@@ -715,30 +715,84 @@ def test_traces_and_metrics_are_attributed_to_the_manifest_source_not_the_settin
     assert rt._source_id() == "unknown"
 
 
-def test_the_metrics_command_reads_the_id_answers_were_written_under(monkeypatch, tmp_path, capsys):
-    """Write and read must agree, and they did not.
+def _metrics_asks_for(monkeypatch, tmp_path, capsys, specs, snapshot_ids, source_id="acme"):
+    """Run `mnemiq metrics` against a store holding one snapshot per id, and report what it queried.
 
-    `Runtime._source_id` records answers under the SNAPSHOT's id; `mnemiq metrics` asked for
-    `settings.source_id`. With a one-entry manifest naming `warehouse`, every answer was written
-    under `warehouse` and this command asked for `acme` -- so the view was EMPTY rather than wrong,
-    which is the harder kind to notice. Fixing the write side and leaving the read is the same
-    half-correction that produced the bug.
+    Federation needs a snapshot PER SOURCE -- `load_current_snapshot` resolves a version for each
+    spec and merges them, and the merged result is what carries `federated`. Saving a single
+    pre-merged snapshot is not the shape the runtime ever sees.
     """
+    from mnemiq.cli import _cmd_metrics
+    from mnemiq.contract.semantic import Snapshot
+    from mnemiq.store.bootstrap import init_store
+    from mnemiq.store.snapshot_store import save_snapshot
+
+    store = tmp_path / "s.duckdb"
+    con = init_store(str(store))
+    for i, sid in enumerate(snapshot_ids):
+        save_snapshot(con, Snapshot(version=f"v{i}", source_id=sid, created_at="t"))
+    con.close()
+    manifest = tmp_path / "sources.json"
+    manifest.write_text(json.dumps(specs))
+
+    asked: list = []
+
+    class _Sink:
+        def recent(self, sid, n):
+            asked.append(sid)
+            return []
+
+    monkeypatch.setattr("mnemiq.observability.metrics.NullSink", lambda: _Sink())
+    _cmd_metrics(_settings(sources_path=str(manifest), source_id=source_id,
+                           store_path=str(store)))
+    capsys.readouterr()
+    return asked
+
+
+def test_metrics_reads_the_id_a_single_source_manifest_is_recorded_under(
+    monkeypatch, tmp_path, capsys
+):
+    """`Runtime._source_id` records under the SNAPSHOT's id. Reading `settings.source_id` meant
+    answers written under `warehouse` were queried as `acme` -- an EMPTY view, not a wrong one."""
+    asked = _metrics_asks_for(
+        monkeypatch, tmp_path, capsys,
+        [{"id": "warehouse", "kind": "duckdb", "target": "/w.duckdb", "catalog": "w",
+          "schema": "main"}],
+        snapshot_ids=["warehouse"])
+    assert asked == ["warehouse"]
+
+
+def test_metrics_reads_the_federated_id_and_not_a_member_of_the_federation(
+    monkeypatch, tmp_path, capsys
+):
+    """The second wrong answer, and why this now derives the id from `load_current_snapshot`
+    instead of restating the rule.
+
+    A merged snapshot is recorded under `federated`. `source_spec(settings).id` -- my first fix --
+    answers a DIFFERENT question, which single source a one-source command acts on, and returned a
+    member id like `pg`. Both wrong answers produced an empty view rather than a wrong one.
+    """
+    asked = _metrics_asks_for(
+        monkeypatch, tmp_path, capsys,
+        [{"id": "pg", "kind": "postgres", "target": "t", "catalog": "a", "schema": "public"},
+         {"id": "lite", "kind": "sqlite", "target": "t", "catalog": "b", "schema": "main"}],
+        snapshot_ids=["pg", "lite"], source_id="pg")
+    assert asked == ["federated"], f"asked {asked}, but the runtime records under 'federated'"
+
+
+def test_metrics_still_prints_when_there_is_no_store_to_ask(monkeypatch, tmp_path, capsys):
+    """A metrics view must not fail to print because nothing has been enriched yet."""
     from mnemiq.cli import _cmd_metrics
 
     asked: list = []
 
     class _Sink:
-        def recent(self, source_id, n):
-            asked.append(source_id)
+        def recent(self, sid, n):
+            asked.append(sid)
             return []
 
     monkeypatch.setattr("mnemiq.observability.metrics.NullSink", lambda: _Sink())
-    manifest = tmp_path / "sources.json"
-    manifest.write_text(json.dumps([{"id": "warehouse", "kind": "duckdb", "target": "/w.duckdb",
-                                     "catalog": "w", "schema": "main"}]))
-    s = _settings(sources_path=str(manifest))
-    assert s.source_id == "acme", "precondition: the setting differs from the manifest"
-    _cmd_metrics(s)
+    assert _cmd_metrics(_settings(pg_dsn="postgresql://h/db", source_id="acme",
+                                  store_path=str(tmp_path / "absent.duckdb"))) == 0
     capsys.readouterr()
-    assert asked == ["warehouse"], f"metrics asked for {asked}, not the id answers are recorded under"
+    assert asked == ["acme"]
