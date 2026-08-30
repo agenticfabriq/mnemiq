@@ -47,15 +47,31 @@ _UNAGGREGATABLE: dict[str, frozenset[str]] = {
 # bounding syntax is dialect-specific, so the whole statement belongs to the dialect. An entry
 # without the placeholder is refused at import rather than probing the wrong table silently:
 # `str.format` ignores an unused keyword, so a malformed entry would run and answer
-# confidently about a table nobody asked about. A comment cannot stop that; the assert can.
+# confidently about a table nobody asked about. A comment cannot stop that; the check below can.
 _DISTINCT_PROBE: dict[str, str] = {
     "oracle": 'SELECT count(DISTINCT ROWNUM) FROM (SELECT 1 FROM "{table}" FETCH FIRST 100 ROWS ONLY)',
 }
 
+# The same question without the bound, asked ONLY when the bounded answer is "yes" and every
+# column still failed. Bounding fixed a probe that could fail the table it diagnosed; it also
+# shrank the probe's footprint far below the batched query's, so a genuine temp-space exhaustion
+# could pass on 100 rows while the real full-table sort cannot -- and the table would then be
+# carried as `done` with everything unknown, which is the M59 class this branch exists to stop.
+#
+# So the cheap probe runs first and settles the common cases, and this one settles only the
+# ambiguous one. It can still fail on a huge all-unmeasurable table, and that is the deliberate
+# trade: a table reported FAILED is visible and an operator sees it, while a systemically failed
+# table reported `done` is a wrong model nobody is told about.
+_DISTINCT_PROBE_FULL: dict[str, str] = {
+    "oracle": 'SELECT count(DISTINCT ROWNUM) FROM "{table}"',
+}
 
-assert all("{table}" in q for q in _DISTINCT_PROBE.values()), (
-    "every _DISTINCT_PROBE entry must be a SQL template containing {table}"
-)
+
+if not all("{table}" in q
+           for d in (_DISTINCT_PROBE, _DISTINCT_PROBE_FULL) for q in d.values()):
+    # Raised, not asserted: `python -O` strips asserts, and a guard that a standard invocation
+    # mode removes is not a guard. Pointed out by review of the version that used one.
+    raise ValueError("every probe template must contain {table}")
 
 
 def _unaggregatable(adapter: SourceAdapter) -> frozenset[str]:
@@ -195,13 +211,32 @@ def profile_table(
                     measured[c] = (None, None)
             probe = _DISTINCT_PROBE.get(getattr(adapter, "dialect", ""))
             sortable = False
+            deciding: Exception | None = None
             if probe is not None and all(v == (None, None) for v in measured.values()):
                 try:
                     adapter.execute(probe.format(table=table.name))
                     sortable = True
                 except Exception:
                     sortable = False
+                full = _DISTINCT_PROBE_FULL.get(getattr(adapter, "dialect", ""))
+                if sortable and full is not None:
+                    # Ambiguous: nothing measured, yet a 100-row dedup succeeded. Ask at full size
+                    # before concluding the columns were at fault.
+                    try:
+                        adapter.execute(full.format(table=table.name))
+                    except Exception as full_exc:
+                        logger.warning("%r sorts at 100 rows but not at full size; treating as "
+                                       "systemic rather than per-column", table.name)
+                        sortable = False
+                        # The exception that DECIDED this, not the one that started the fallback.
+                        # A bare `raise` below would re-raise the batched failure -- so a table
+                        # whose batch died on ORA-22950 (a column type) and whose full sort died on
+                        # ORA-01652 (capacity) would report the column error, misattributing a
+                        # systemic failure to a type problem for whoever reads it.
+                        deciding = full_exc
             if not sortable and all(v == (None, None) for v in measured.values()):
+                if deciding is not None:
+                    raise deciding
                 # The session cannot DISTINCT at all, so this is systemic -- a permission, a
                 # driver fault, temp space exhausted by the sort. Carrying unknowns for every
                 # column would report a table that measured NOTHING as `done`, and
