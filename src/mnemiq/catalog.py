@@ -10,7 +10,19 @@ KEY_SUFFIXES = ("_identifier", "_id")
 
 
 def is_key_like(column: str) -> bool:
-    return column.endswith(KEY_SUFFIXES)
+    """Case-INSENSITIVE, because identifier case is a property of the source, not of the name.
+
+    This compared raw case and so returned False for every column of an Oracle source, which folds
+    unquoted identifiers to upper: `PARTY_ID` did not end with `_id`. The consequence is measured,
+    not theoretical -- against a real Oracle schema, 11 ID-named columns had their values harvested
+    into the snapshot as candidate coded vocabularies, among them UUIDs and owner identifiers like
+    `ada-1785989224128-4`. Keys are join candidates, never vocabularies, and identifiers are
+    exactly what should not be copied into a searchable artifact that can reach a prompt.
+
+    `is_sensitive_name` below was already case-insensitive. The asymmetry is the tell: case was
+    considered for the PII guard and not for this one.
+    """
+    return column.lower().endswith(KEY_SUFFIXES)
 
 
 # Columns whose *values* are personal data. Their contents must never be harvested into the
