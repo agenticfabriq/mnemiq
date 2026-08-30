@@ -283,12 +283,22 @@ def _warn_source_enforcement(adapter) -> None:
     Any adapter that grows either method is picked up here without further wiring, which is the
     property whose absence produced the finding.
     """
-    # `assert_read_only` has NO clean verdict, and that is deliberate rather than an omission: it
-    # returns `gate_only` or `unverifiable`, because auditing the caller cannot establish that a
-    # source is unwritable -- a view resolves references with the VIEW OWNER's rights. `writable`
-    # means the question does not apply, which is the only quiet case.
-    for name, label, clean in (("assert_enforcing", "source enforcement", "attached"),
-                               ("assert_read_only", "read-only basis", None)):
+    # The level tracks whether the operator can DO anything, not how bad the verdict sounds, and
+    # the same word means different things to the two methods.
+    #
+    #   `assert_enforcing` unverifiable -> WARNING. No VPD policy is enforcing row security on the
+    #   objects this connection can see. That is actionable: attach one.
+    #
+    #   `assert_read_only` unverifiable -> INFO. No write-shaped privilege was found, which is the
+    #   BEST achievable state -- there is no third verdict saying more, because auditing the caller
+    #   cannot establish read-onlyness at all. Warning here fired on every boot of every correctly
+    #   configured read-only deployment, with nothing for the operator to change. That is the
+    #   failure this adapter had already named one commit earlier while scoping PUBLIC grants --
+    #   "a warning that is always on is a warning nobody reads" -- and then reproduced in the log
+    #   level rather than the query.
+    for name, label, quiet in (("assert_enforcing", "source enforcement", {"attached"}),
+                               ("assert_read_only", "read-only basis",
+                                {"unverifiable", "writable"})):
         assess = getattr(adapter, name, None)
         if assess is None:
             continue
@@ -297,7 +307,7 @@ def _warn_source_enforcement(adapter) -> None:
         except Exception as exc:  # a source that will not answer must not stop the engine booting
             logger.warning("could not assess %s: %s", label, exc)
             continue
-        if verdict in (clean, "writable"):
+        if verdict in quiet:
             logger.info("%s: %s -- %s", label, verdict, detail)
         else:
             logger.warning("%s: %s -- %s", label, verdict, detail)
