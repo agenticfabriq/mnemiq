@@ -800,3 +800,44 @@ def test_an_unquoted_function_name_is_still_named_and_that_is_the_feature():
     from mnemiq.sql.lineage import _functions_in
 
     assert _functions_in(_ast("SELECT sk_live_abc123() FROM claim"))[0] == ["sk_live_abc123"]
+
+
+@pytest.mark.parametrize("seed", ["1", "2", "3", "4", "5"])
+def test_case_distinct_views_never_certify_by_hash_order(seed):
+    """`spellings` returns a SET, so `next(...)` chose a view by hash iteration order. With
+    distinct Postgres views `"V"` and `v`, a query bound to `"V"` — whose body reads `secret` —
+    returned COMPLETE on three of five PYTHONHASHSEED values by inspecting `v`'s constant body.
+
+    Non-deterministic false certification is the worst variant of this class: a test can pass and
+    the deployment still be wrong. Several spellings reaching the SAME view is fine; several
+    reaching different ones is exactly where identity would have to be resolved and cannot be, so
+    the lookup refuses to choose.
+
+    Parametrized over seeds because a single run cannot observe the defect — the subprocess is the
+    only way to vary hash ordering, and asserting once would have been an assertion about luck.
+    """
+    import json
+    import subprocess
+    import sys
+    import textwrap
+
+    program = textwrap.dedent('''
+        import sqlglot
+        from mnemiq.contract.semantic import Job, Snapshot, ViewDefinition
+        from mnemiq.sql.lineage import lineage_for
+        from mnemiq.sql.views import inventory_for
+        import json
+        D = Job(id="discover:views", source_id="s", kind="discover", status="done")
+        views = [ViewDefinition(object_id="V", definition="SELECT id FROM secret",
+                                dialect="duckdb"),
+                 ViewDefinition(object_id="v", definition="SELECT 1 AS id", dialect="duckdb")]
+        snap = Snapshot(version="v1", source_id="s", created_at="t", views=views, jobs=[D])
+        lin = lineage_for(sqlglot.parse_one(\'SELECT id FROM "V"\', read="postgres"), ["V"],
+                          inventory_for(snap))
+        print(json.dumps({"c": lin.completeness, "u": lin.unresolved}))
+    ''')
+    out = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
+                         env={"PYTHONHASHSEED": seed, "PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+    result = json.loads(out.stdout.strip().splitlines()[-1])
+    assert result["c"] != COMPLETE, f"certified by hash order at seed {seed}"
+    assert any(u.startswith("ambiguous-view:") for u in result["u"])

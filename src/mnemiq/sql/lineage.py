@@ -37,7 +37,8 @@ _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$#]*")
 
 # The classifications this engine may prefix a label with. A CLOSED set, because anything else in
 # front of a colon is part of a caller-derived name and must face the grammar.
-_ENGINE_PREFIXES = frozenset({"unconfirmed-identity", "table-function", "unmodelled-source"})
+_ENGINE_PREFIXES = frozenset({"unconfirmed-identity", "table-function", "unmodelled-source",
+                              "ambiguous-view"})
 
 COMPLETE = "complete"
 INCOMPLETE = "incomplete"
@@ -245,7 +246,21 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
         # failed to retrieve -- landing in the cannot-parse branch and reporting UNKNOWN where
         # the other three spellings report INCOMPLETE. Conservative in outcome and still exactly
         # the drift this was meant to close: two ways of asking one question.
-        view = next((views[k] for k in spellings({name}) if k in views), None)
+        # Every candidate, and REFUSE TO CHOOSE if more than one distinct view matches. `spellings`
+        # returns a set, so `next(...)` picked by hash order: with distinct Postgres views `"V"`
+        # and `v`, the same query bound to `"V"` returned COMPLETE on three of five PYTHONHASHSEED
+        # values by inspecting `v`'s constant body, and INCOMPLETE on the other two. A lexical
+        # proxy choosing identity, one last time -- and non-deterministically, which is the worst
+        # variant: it certifies a false audit record on some runs and not others, so a test can
+        # pass and the deployment be wrong.
+        #
+        # Several spellings reaching the SAME view is fine; several reaching different ones is
+        # exactly where identity would have to be resolved and cannot be.
+        candidates = {id(views[k]): views[k] for k in spellings({name}) if k in views}
+        if len(candidates) > 1:
+            _add(unclassified, f"ambiguous-view:{name}")
+            continue
+        view = next(iter(candidates.values()), None)
         parsed = body_of(view) if view is not None else None
         if parsed is None:
             _add(unclassified, name)  # a view we cannot PARSE: unclear, not demonstrated
