@@ -319,6 +319,17 @@ def _cmd_ask(settings: Settings, args) -> int:
                     "deferred": ans.deferred,
                     "mode": ans.mode,
                     "sql": ans.trace.target_sql if ans.trace else None,
+                    # The FOURTH surface. Human CLI, HTTP and MCP were each fixed in turn while
+                    # the commit message counted them wrong every time -- "the two surfaces",
+                    # then three. A machine consumer reading `--json` got answer/deferred/mode/sql
+                    # and no audit artifact at all, which is a worse version of the bare list: not
+                    # a misleading marker but no marker and no tables either.
+                    "tables_used": list(ans.trace.tables_used) if ans.trace else None,
+                    "lineage": ({"tables": list(ans.trace.tables_used),
+                                 "completeness": ans.trace.lineage_completeness,
+                                 "unresolved": list(ans.trace.lineage_unresolved),
+                                 "reasons": list(ans.trace.lineage_reasons)}
+                                if ans.trace else None),
                 },
                 default=str,
             )

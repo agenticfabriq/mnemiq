@@ -584,3 +584,48 @@ def test_the_cli_never_prints_a_table_list_without_its_marker():
 
     src = inspect.getsource(cli._cmd_ask if hasattr(cli, "_cmd_ask") else cli)
     assert "lineage_completeness" in src, "the CLI prints the list; it must print the marker"
+
+
+def test_a_direct_unmodelled_source_is_not_reported_complete():
+    """The whitelist was applied to view BODIES and not to the caller's own statement.
+    `SELECT x FROM LATERAL (VALUES ((SELECT max(store_id) FROM customer)))` yields
+    `base_tables == []` while scope resolution reports SUCCESS — so the empty list looked settled
+    and the marker said COMPLETE over a read of `customer` it never named.
+
+    Note this is also an AUTHORIZATION bypass and that half is NOT fixed here: `check_access`
+    reads the same empty `base_tables`, so `decide` approves the statement with `customer` absent
+    from `visible`. Pre-existing, same family as M43, filed rather than fixed — the marker's job
+    is to stop the audit record from calling it accounted for.
+    """
+    lineage = lineage_for(sqlglot.parse_one(
+        "SELECT x FROM LATERAL (VALUES ((SELECT max(store_id) FROM customer))) AS lv(x)",
+        read="postgres"), [], inventory_for(_snapshot(jobs=[_DISCOVERED])))
+    assert lineage.completeness == UNKNOWN
+    assert any(u.startswith("unmodelled-source:") for u in lineage.unresolved)
+
+
+def test_a_label_must_match_an_identifier_not_merely_avoid_five_characters():
+    """`_safe_label` rejected a character blocklist, so `"DOB 1990-01-01"()` passed: sqlglot strips
+    the delimiters and the name arrives with spaces and hyphens but no bracket or quote.
+    Blocklisting is the pattern `views.py` documents as unfixable — an unlisted shape passes —
+    which I had quoted approvingly two commits before writing one."""
+    from mnemiq.sql.lineage import _unclassified_functions
+
+    assert _unclassified_functions(
+        sqlglot.parse_one('SELECT "DOB 1990-01-01"() FROM claim', read="postgres")
+    ) == ["unnameable-function"]
+    # ...and an ordinary name still survives, or the guard would be a blanket.
+    assert _unclassified_functions(
+        sqlglot.parse_one("SELECT all_ssns() FROM claim", read="duckdb")) == ["all_ssns"]
+
+
+def test_the_cli_json_surface_carries_lineage_too():
+    """The fourth surface. A machine consumer reading `--json` got answer/deferred/mode/sql and no
+    audit artifact at all — worse than a bare list, since there was neither marker nor tables."""
+    import inspect
+
+    from mnemiq import cli
+
+    src = inspect.getsource(cli._cmd_ask)
+    json_block = src[src.index("if args.json"):src.index("print(ans.answer)")]
+    assert '"lineage"' in json_block and '"tables_used"' in json_block

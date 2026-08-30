@@ -28,7 +28,12 @@ when a function inventory exists, which is the same shape as the view inventory 
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+
+# What an unquoted SQL identifier may look like, applied per dot-separated segment. Deliberately
+# narrow: a name that needed quoting to be legal is a name this label cannot carry safely.
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$#]*")
 
 COMPLETE = "complete"
 INCOMPLETE = "incomplete"
@@ -69,13 +74,17 @@ def _safe_label(label: str, fallback: str) -> str:
     the previous guard sanitised the composed label while falling back to that same unchecked
     name. Each was found by someone thinking of a shape.
 
-    So this is the single place a label is admitted, and it fails closed: anything holding a
-    bracket or a quote is not an identifier, and if the fallback is no better the value is
-    replaced by a token rather than trusted. An auditor learns that a function could not be
-    accounted for; they do not learn what was inside it.
+    A GRAMMAR, not a blocklist. The first version rejected five characters, which let
+    `"DOB 1990-01-01"()` through: sqlglot strips the delimiters, so the name arrives as
+    `DOB 1990-01-01` -- spaces and hyphens, no bracket, no quote. Blocklisting is the pattern
+    `views.py` documents as unfixable ("each round of review found another it had not thought
+    of, because an unlisted shape PASSED"), which I quoted approvingly two commits before
+    writing one. So a label must MATCH what an identifier is, segment by segment, and anything
+    else becomes a token. An auditor learns that a function could not be accounted for; they do
+    not learn what was inside it.
     """
     for candidate in (label, fallback):
-        if candidate and not any(ch in candidate for ch in "('\"`"):
+        if candidate and all(_IDENTIFIER.fullmatch(part) for part in candidate.split(".")):
             return candidate
     return "unnameable-function"
 
@@ -233,6 +242,16 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
                 unclassified.append(fn)
         if gap:
             reaching_views.append(name)
+
+    # The caller's OWN statement gets the whitelist too, not just the bodies it reads through.
+    # `SELECT x FROM LATERAL (VALUES ((SELECT max(store_id) FROM customer)))` yields
+    # `base_tables == []` while scope resolution reports SUCCESS, so the list is empty and looked
+    # settled -- COMPLETE over a read of `customer` the record never named. Applying the check to
+    # bodies and not to the statement was the same blind spot one level out.
+    if unrecognised_source(ast) is not None:
+        label = f"unmodelled-source:{unrecognised_source(ast)}".lower()
+        if label not in unclassified:
+            unclassified.append(label)
 
     # UNCLASSIFIABLE reach: a function whose body this engine cannot see.
     for fn in _unclassified_functions(ast):
