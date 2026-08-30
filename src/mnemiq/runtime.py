@@ -6,7 +6,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 from mnemiq.agent.history import scope_history
 from mnemiq.agent.loop import Agent, AgentAnswer
 from mnemiq.agent.modes import DEFAULT_MODE, MODES, build_agent
@@ -259,6 +258,39 @@ def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> 
             warn_unfiltered_dependents(grants, snapshot.relationships, role=role)
 
 
+def _warn_source_enforcement(adapter) -> None:
+    """Say, at boot, whether the SOURCE is actually enforcing row security -- when it can tell.
+
+    `OracleAdapter.assert_enforcing` was written, tested against a live instance across four
+    verdicts, and **called by nothing outside its own tests**. That is the shape **M26** is about:
+    a seam wired at one end, with a green suite, reporting nothing in production. Found by an
+    adversarial review of the lane that built it, not by the lane.
+
+    **It warns; it does not refuse**, and that is a decision rather than caution. Under the
+    2026-08-29 direction the ENGINE still enforces RLS/CLS -- delegation to the database is v2 --
+    so a `bypassing` connection today is one where mnemiq's own filters are still in force and
+    refusing to boot would take a working deployment down over a control that is not yet load
+    bearing. **When delegation lands, this must become fail-closed**, which is exactly what
+    **M57** is open for; the value of wiring it now is that the verdict is visible from the first
+    Oracle deployment rather than from the one after the trust boundary moves.
+
+    Any adapter that grows an `assert_enforcing` is picked up here without further wiring, which is
+    the property whose absence produced the finding.
+    """
+    assess = getattr(adapter, "assert_enforcing", None)
+    if assess is None:
+        return
+    try:
+        verdict, detail = assess()
+    except Exception as exc:  # a source that will not answer must not stop the engine booting
+        logger.warning("could not assess source enforcement: %s", exc)
+        return
+    if verdict == "attached":
+        logger.info("source enforcement: %s -- %s", verdict, detail)
+    else:
+        logger.warning("source enforcement: %s -- %s", verdict, detail)
+
+
 def _resolve_verify_level(mode_verify: str, override: str | None) -> str:
     """Apply the MNEMIQ_VERIFY override to a mode's default verify level.
     "0" forces off (byte-for-byte escape hatch); "1" forces full; unset keeps the mode default."""
@@ -322,11 +354,17 @@ def load_current_snapshot(settings: Settings, con) -> tuple[Snapshot, dict[str, 
             versions[spec.id] = v
             pairs.append((spec, load_snapshot(con, v)))
         return merge_snapshots(pairs), versions
-    sid = settings.source_id
+    # specs[0].id, not settings.source_id. Every multi-source branch above already keys on
+    # spec.id; the single-source ones keyed on settings.source_id, which defaults to "acme" and is
+    # never reconciled with a manifest's id. `enrich` writes the snapshot under the spec's id, so
+    # a one-entry manifest naming anything else stored a snapshot that build, refresh and ask then
+    # looked for under "acme" and never found -- "run `mnemiq enrich` first", forever, after a
+    # successful enrich. Without a manifest the two are the same value, so this is a no-op there.
+    sid = specs[0].id
     v = resolve_version(con, settings.control_dsn, sid)
     if v is None:
         raise SnapshotMissing(
-            f"no snapshot for source {settings.source_id!r} in {settings.store_path!r} -- "
+            f"no snapshot for source {sid!r} in {settings.store_path!r} -- "
             "run `mnemiq enrich` then `mnemiq build` first"
         )
     versions[sid] = v
@@ -350,11 +388,22 @@ def build_runtime(settings: Settings) -> Runtime:
 
         adapter = FederatedAdapter(specs, read_only=not settings.write_enabled)
     else:
-        # Single-source fast path -- unchanged from v0.1.
-        if not settings.pg_dsn:
-            raise SnapshotMissing("no MNEMIQ_PG_DSN -- the engine needs a source to query")
+        # Single source: dispatch on the SPEC, not on pg_dsn. This branch used to read
+        # `settings.pg_dsn` directly, which meant a one-entry manifest was resolved into a spec
+        # and then thrown away -- two sources were honoured and one was not. `adapter_for` is
+        # shared with the enrich and refresh commands so the three doors cannot drift apart.
         # Read-only attach unless writes are explicitly enabled -- the backstop under db_write.
-        adapter = DuckDBPostgresAdapter(settings.pg_dsn, read_only=not settings.write_enabled)
+        from mnemiq.adapters.resolve import SourceUnconfigured, UnknownSourceKind, adapter_for
+
+        try:
+            adapter = adapter_for(specs[0], settings, read_only=not settings.write_enabled)
+        except (SourceUnconfigured, UnknownSourceKind) as exc:
+            # Preserves the established contract: a source the engine cannot connect to raises
+            # SnapshotMissing, now with a message that names what is actually missing. The
+            # unknown-kind case is translated too because `mnemiq ask` and `mnemiq write` catch
+            # SnapshotMissing and print it -- a typo in a manifest should be a sentence, not a
+            # traceback, on every door.
+            raise SnapshotMissing(str(exc)) from exc
 
     # Shared components, built once; each mode is a thin Agent over the same instances.
     kit = build_components(settings, adapter, con)
@@ -403,6 +452,7 @@ def build_runtime(settings: Settings) -> Runtime:
     }
     _boot_authz = _authz(settings)
     _warn_policy_advisories(_boot_authz, snapshot)
+    _warn_source_enforcement(adapter)
     return Runtime(
         con=con,
         snapshot=snapshot,

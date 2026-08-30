@@ -18,8 +18,8 @@ _SECRET_HINTS = ("api_key", "dsn", "password", "secret")  # fields whose value i
 @dataclass(frozen=True)
 class SourceSpec:
     id: str
-    kind: str  # "postgres" | "sqlite"
-    target: str  # dsn (postgres) or file path (sqlite)
+    kind: str  # one of adapters.resolve.KINDS: "postgres" | "sqlite" | "duckdb" | "oracle"
+    target: str  # dsn (postgres), file path (sqlite/duckdb), Easy Connect or TNS alias (oracle)
     catalog: str  # DuckDB attach alias AND the object_id prefix in a federated store
     schema: str  # source schema: "public" (postgres) / "main" (sqlite)
 
@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     llm_api_key: str | None = Field(default=None, description="chat/generation API key")
     llm_model: str | None = Field(default=None, description="chat/generation model id")
     pg_dsn: str | None = Field(default=None, description="source Postgres DSN")
+    oracle_user: str | None = Field(default=None, description="source Oracle user (Easy Connect carries no credentials)")
+    oracle_password: str | None = Field(default=None, description="source Oracle password")
     acme_data_dir: str | None = Field(default=None, description="ACME golden dataset dir (tests)")
     embed_model: str | None = Field(default=None, description="embedding model id")
     embed_base_url: str | None = Field(default=None, description="embedding endpoint (defaults to chat)")
