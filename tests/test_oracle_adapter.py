@@ -1060,6 +1060,19 @@ def test_assert_read_only_tracks_every_route_by_which_a_principal_can_write():
         assert verdict("p_none") == "gate_only", "a grant to PUBLIC is usable by everyone"
         owner.execute(f"REVOKE INSERT ON {USER}.t_route FROM PUBLIC")
         assert verdict("p_none") == "constrained", "and it flips back when the grant goes"
+
+        # The recycle-bin case, asserted rather than only described. A review pointed out that this
+        # docstring called it the control while nothing here dropped a granted table -- a claim of
+        # coverage the test did not have, which is the failure this file keeps finding elsewhere.
+        owner.execute("CREATE TABLE t_dropped (id NUMBER)")
+        owner.execute(f"GRANT INSERT ON {USER}.t_dropped TO PUBLIC")
+        assert verdict("p_none") == "gate_only", "precondition: the live grant is counted"
+        owner.execute("DROP TABLE t_dropped")  # NOT purged: it keeps its grants as BIN$...
+        assert verdict("p_none") == "constrained", (
+            "a grant held by a table in the recycle bin is not write ability -- counting it made a "
+            "SELECT-only principal report gate_only, and a verdict that cannot reach constrained "
+            "is a warning nobody reads"
+        )
     finally:
         for a in made:
             a._con.close()
@@ -1071,7 +1084,8 @@ def test_assert_read_only_tracks_every_route_by_which_a_principal_can_write():
             pass
         cur.close()
         admin.close()
-        for stmt in ("DROP FUNCTION f_route", "DROP TABLE t_route", "PURGE RECYCLEBIN"):
+        for stmt in ("DROP FUNCTION f_route", "DROP TABLE t_route", "DROP TABLE t_dropped",
+                     "PURGE RECYCLEBIN"):
             try:
                 owner.execute(stmt)
             except oracledb.DatabaseError:
