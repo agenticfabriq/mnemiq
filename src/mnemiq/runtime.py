@@ -274,21 +274,43 @@ def _warn_source_enforcement(adapter) -> None:
     **M57** is open for; the value of wiring it now is that the verdict is visible from the first
     Oracle deployment rather than from the one after the trust boundary moves.
 
-    Any adapter that grows an `assert_enforcing` is picked up here without further wiring, which is
-    the property whose absence produced the finding.
+    It reports on two questions, both optional and both skipped by an adapter that cannot answer:
+    whether the SOURCE is enforcing row security, and whether `read_only` rests on this adapter's
+    statement gate alone. The second exists because that gate provably cannot see a write reached
+    through an `AUTONOMOUS_TRANSACTION` function, and a view can hide the call so the statement
+    text names nothing -- so the reachable question is whether the connection could write at all.
+
+    Any adapter that grows either method is picked up here without further wiring, which is the
+    property whose absence produced the finding.
     """
-    assess = getattr(adapter, "assert_enforcing", None)
-    if assess is None:
-        return
-    try:
-        verdict, detail = assess()
-    except Exception as exc:  # a source that will not answer must not stop the engine booting
-        logger.warning("could not assess source enforcement: %s", exc)
-        return
-    if verdict == "attached":
-        logger.info("source enforcement: %s -- %s", verdict, detail)
-    else:
-        logger.warning("source enforcement: %s -- %s", verdict, detail)
+    # The level tracks whether the operator can DO anything, not how bad the verdict sounds, and
+    # the same word means different things to the two methods.
+    #
+    #   `assert_enforcing` unverifiable -> WARNING. No VPD policy is enforcing row security on the
+    #   objects this connection can see. That is actionable: attach one.
+    #
+    #   `assert_read_only` unverifiable -> INFO. No write-shaped privilege was found, which is the
+    #   BEST achievable state -- there is no third verdict saying more, because auditing the caller
+    #   cannot establish read-onlyness at all. Warning here fired on every boot of every correctly
+    #   configured read-only deployment, with nothing for the operator to change. That is the
+    #   failure this adapter had already named one commit earlier while scoping PUBLIC grants --
+    #   "a warning that is always on is a warning nobody reads" -- and then reproduced in the log
+    #   level rather than the query.
+    for name, label, quiet in (("assert_enforcing", "source enforcement", {"attached"}),
+                               ("assert_read_only", "read-only basis",
+                                {"unverifiable", "writable"})):
+        assess = getattr(adapter, name, None)
+        if assess is None:
+            continue
+        try:
+            verdict, detail = assess()
+        except Exception as exc:  # a source that will not answer must not stop the engine booting
+            logger.warning("could not assess %s: %s", label, exc)
+            continue
+        if verdict in quiet:
+            logger.info("%s: %s -- %s", label, verdict, detail)
+        else:
+            logger.warning("%s: %s -- %s", label, verdict, detail)
 
 
 def _resolve_verify_level(mode_verify: str, override: str | None) -> str:

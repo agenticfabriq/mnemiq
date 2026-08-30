@@ -297,6 +297,26 @@ def test_an_adapter_that_can_assess_enforcement_is_asked_at_boot(caplog):
     assert "bypassing" in caplog.text and "EXEMPT ACCESS POLICY" in caplog.text
 
 
+def test_both_advisories_are_reported_and_a_clean_read_only_basis_does_not_warn(caplog):
+    """The seam carries two questions now. The second exists because the statement gate provably
+    cannot see a write reached through an AUTONOMOUS_TRANSACTION function behind a view."""
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Both:
+        def assert_enforcing(self):
+            return "attached", "every visible table carries an enabled SELECT policy"
+
+        def assert_read_only(self):
+            return "gate_only", "this read-only connection CAN write: it owns 3 table(s)"
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Both())
+    assert "gate_only" in caplog.text and "CAN write" in caplog.text
+    assert "attached" not in caplog.text, "a clean enforcement verdict must not warn"
+
+
 def test_a_source_that_is_enforcing_does_not_warn(caplog):
     import logging
 
@@ -335,3 +355,49 @@ def test_a_source_that_will_not_answer_does_not_stop_the_engine_booting(caplog):
     with caplog.at_level(logging.WARNING):
         _warn_source_enforcement(_Broken())  # must not raise
     assert "could not assess" in caplog.text and "ORA-00942" in caplog.text
+
+
+def test_a_correctly_configured_read_only_deployment_boots_quiet(caplog):
+    """The best achievable state must not warn, or the warning means nothing.
+
+    `assert_read_only` has no verdict better than `unverifiable` — auditing the caller cannot
+    establish read-onlyness at all — so warning on it fired at every boot of every correctly
+    configured deployment, with nothing for the operator to change. The level tracks whether
+    something can be DONE: `gate_only` can (narrow the principal), `unverifiable` cannot.
+
+    Note the same word is not quiet for the other method: `assert_enforcing` returning
+    `unverifiable` means no VPD policy is enforcing row security, which IS actionable.
+    """
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Correct:
+        def assert_enforcing(self):
+            return "attached", "every visible table carries an enabled SELECT policy"
+
+        def assert_read_only(self):
+            return "unverifiable", "no write-shaped privilege was found"
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Correct())
+    assert caplog.text == "", "a deployment with nothing left to fix must boot silently"
+
+
+def test_the_same_verdict_word_warns_for_one_method_and_not_the_other(caplog):
+    """`unverifiable` is the ceiling for read-only basis and a real gap for enforcement."""
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _NoPolicies:
+        def assert_enforcing(self):
+            return "unverifiable", "no enabled VPD policy on any visible table"
+
+        def assert_read_only(self):
+            return "unverifiable", "no write-shaped privilege was found"
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_NoPolicies())
+    assert "source enforcement" in caplog.text
+    assert "read-only basis" not in caplog.text
