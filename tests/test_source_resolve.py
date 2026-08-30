@@ -887,3 +887,30 @@ def test_a_missing_snapshot_warns_when_the_metrics_are_REMOTE(monkeypatch, tmp_p
     assert asked == ["acme"], "it can only fall back to the setting"
     assert "no local snapshot" in err
     assert "may not be the id answers were recorded under" in err
+
+
+def test_the_one_deployment_that_closes_the_hole_is_not_the_one_that_warns(caplog):
+    """`constrained` is the STRONGEST read-only verdict, so it must not page anybody.
+
+    The quiet set is what an operator can do nothing further about, which is why `unverifiable`
+    was demoted to INFO. `constrained` means the database is open READ ONLY and refuses every
+    write from every principal -- the single deployment that closes M66's PL/SQL hole and the
+    parse-time write with it. Adding the verdict without adding it here made that deployment the
+    one warned at every boot: the always-on warning M66 spent five rounds removing, recreated for
+    the good case by adding the good case.
+    """
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _ReadOnlyDatabase:
+        def assert_enforcing(self):
+            return "attached", "every visible table carries an enabled SELECT policy"
+
+        def assert_read_only(self):
+            return "constrained", "this database is open READ ONLY, so it refuses every write"
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_ReadOnlyDatabase())
+    assert caplog.text == "", (
+        "the best-configured deployment there is warned at boot: " + caplog.text)
