@@ -382,3 +382,30 @@ def test_the_all_unknown_warning_does_not_fire_on_a_partial_failure(caplog):
     assert stats["ID"].distinct_count == 2, "precondition: this is a PARTIAL failure"
     assert "no column of" not in caplog.text
     assert "ADDR" in caplog.text, "the column that did fail is still named"
+
+
+def test_the_probe_is_bounded_so_it_cannot_fail_the_table_it_is_diagnosing():
+    """A diagnostic must not be more expensive than the thing it diagnoses.
+
+    The first version ran `count(DISTINCT ROWNUM)` over the WHOLE table -- a full access plus a
+    dedup of every row, which is exactly the operation most likely to fail under the resource
+    pressure the probe exists to detect. On a large table it could turn a benign per-column failure
+    into an excluded table by failing itself. Measured on 200k rows: 0.0185s unbounded, 0.0011s
+    bounded, and the bounded plan still carries a HASH GROUP BY, so it still does the work.
+    """
+    class _OneBad(_Recorder):
+        def execute(self, sql):
+            self.sql.append(sql)
+            if "count(DISTINCT" in sql and '"ADDR"' in sql:
+                raise RuntimeError("ORA-22950: cannot order objects")
+            if "ROWNUM" in sql:
+                return [(3,)]
+            if sql.lstrip().upper().startswith("SELECT COUNT(*) FROM"):
+                return [(3,)]
+            return [(3, 2, 3)]
+
+    a = _OneBad(dialect="oracle")
+    profile_table(a, _table(("ADDR", "ADDR_T")))
+    probe = next(q for q in a.sql if "ROWNUM" in q)
+    assert "FETCH FIRST" in probe, "the probe must be bounded, not a full-table dedup"
+    assert "HASH" not in probe  # sanity: this is the SQL, not a plan

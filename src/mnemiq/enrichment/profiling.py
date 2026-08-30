@@ -25,18 +25,37 @@ _UNAGGREGATABLE: dict[str, frozenset[str]] = {
 }
 
 
-# An expression that forces a REAL per-row DISTINCT without naming any user column, used to ask
-# whether this session can sort at all. `count(DISTINCT 1)` is a constant the optimiser may fold
-# away, which would make the probe answer yes on a session that cannot actually sort; ROWNUM
-# varies per row -- measured, it returns one per row on a 3-row table -- so it exercises the
-# machinery a temp-space failure would break.
+# Asks whether this session can perform a DISTINCT at all, without naming any user column.
 #
-# A dialect with NO entry here gets no probe and the conservative answer, not a weak probe. The
-# first version defaulted to `count(DISTINCT 1)`, and a constant is foldable: on DuckDB -- this
-# project's primary adapter -- a session that could not sort at all still answered "yes", so the
-# systemic failure this whole branch exists to catch was reintroduced everywhere except Oracle.
-# Refining behaviour only where the question can actually be asked is the point.
-_DISTINCT_PROBE: dict[str, str] = {"oracle": "ROWNUM"}
+# BOUNDED, and that is the point rather than an optimisation. The first version ran
+# `count(DISTINCT ROWNUM)` over the WHOLE table -- a full access plus a dedup of every row, which
+# is precisely the operation most likely to fail under the resource pressure the probe exists to
+# detect. On a large table it could turn a benign per-column failure into an excluded table by
+# failing itself. A diagnostic must not be more expensive than the thing it diagnoses. Measured on
+# 200k rows: 0.0185s unbounded, 0.0011s bounded, and the bounded plan still carries a HASH GROUP BY
+# (with a COUNT STOPKEY above it), so it still exercises the machinery.
+#
+# ROWNUM rather than a constant, and that is measured too: `count(DISTINCT 1)` runs in 0.0020s
+# against a table where a real column's DISTINCT takes 0.0081s -- it is folded away, so it would
+# answer "yes, this session can sort" for a session that cannot. ROWNUM varies per row and costs
+# more than the real column, so it is doing the work.
+#
+# A dialect with NO entry gets no probe and the conservative answer, never a weak one. The first
+# version defaulted to that foldable constant, so on DuckDB -- this project's primary adapter -- a
+# session that could not sort still answered yes and a systemic failure landed as `done`.
+# Each value is a SQL TEMPLATE carrying a `{table}` placeholder, not a bare expression -- the
+# bounding syntax is dialect-specific, so the whole statement belongs to the dialect. An entry
+# without the placeholder is refused at import rather than probing the wrong table silently:
+# `str.format` ignores an unused keyword, so a malformed entry would run and answer
+# confidently about a table nobody asked about. A comment cannot stop that; the assert can.
+_DISTINCT_PROBE: dict[str, str] = {
+    "oracle": 'SELECT count(DISTINCT ROWNUM) FROM (SELECT 1 FROM "{table}" FETCH FIRST 100 ROWS ONLY)',
+}
+
+
+assert all("{table}" in q for q in _DISTINCT_PROBE.values()), (
+    "every _DISTINCT_PROBE entry must be a SQL template containing {table}"
+)
 
 
 def _unaggregatable(adapter: SourceAdapter) -> frozenset[str]:
@@ -178,7 +197,7 @@ def profile_table(
             sortable = False
             if probe is not None and all(v == (None, None) for v in measured.values()):
                 try:
-                    adapter.execute(f'SELECT count(DISTINCT {probe}) FROM "{table.name}"')
+                    adapter.execute(probe.format(table=table.name))
                     sortable = True
                 except Exception:
                     sortable = False
