@@ -124,6 +124,28 @@ class OracleAdapter:
         self._lock = threading.RLock()
         self._schema = (schema or user).upper()
         self._read_only = read_only
+        if self._schema != user.upper():
+            # Discovery filters the data dictionary by OWNER, but the SQL this adapter generates
+            # -- profiling, the proof seam, the planner's approved statement -- names tables
+            # UNQUALIFIED, and Oracle resolves an unqualified name against the CONNECTING user.
+            # So `user=READER, schema=APP` discovered APP's tables and then failed every read with
+            # ORA-00942 on "READER"."ORDERS". Measured: discovery saw ORDERS, enrich produced 0
+            # tables and outcome `unread`.
+            #
+            # That is precisely the least-privilege deployment this adapter's own advice tells
+            # operators to adopt -- a principal holding SELECT on someone else's schema -- so the
+            # recommended configuration was the one that did not work.
+            #
+            # CURRENT_SCHEMA changes NAME RESOLUTION only; it grants nothing, so the reader still
+            # needs its SELECT. Issued on the raw cursor at construction, before any read-only
+            # transaction exists, and never through `execute` -- the read-only gate refuses ALTER,
+            # correctly, and this is the adapter configuring itself rather than running a caller's
+            # statement.
+            cur = self._con.cursor()
+            try:
+                cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{self._schema}"')
+            finally:
+                cur.close()
 
     @classmethod
     def over(cls, connection, oracledb_module, schema: str, read_only: bool = True) -> "OracleAdapter":
