@@ -92,6 +92,15 @@ class OracleAdapter:
         # Only pass what was configured: `oracledb.connect` treats an explicit `config_dir=None`
         # differently from an absent one in some releases, and a plain TCP connection must not
         # start depending on TLS arguments it never had.
+        if wallet_password and not config_dir:
+            # Passing a wallet password with nowhere to look for a wallet reached the driver
+            # silently. Named variables, like the missing-credential path in `adapters.resolve`,
+            # because the operator's next action is to set one of them.
+            raise ValueError(
+                "MNEMIQ_ORACLE_WALLET_PASSWORD is set but MNEMIQ_ORACLE_CONFIG_DIR is not, so "
+                "there is no directory to find a wallet in. Set the config directory, or unset "
+                "the wallet password if this target does not use TLS"
+            )
         extra: dict[str, Any] = {}
         if config_dir:
             extra["config_dir"] = config_dir

@@ -588,3 +588,70 @@ def test_an_advisory_that_raised_is_not_diagnosed_as_a_changed_verdict():
     assert "could not assess" in out and "ORA-00942" in out
     assert "produced no verdict" in out
     assert "the verdict changed" not in out
+
+
+# -- what actually reaches the driver ------------------------------------------------------------
+#
+# These live HERE, not in tests/test_oracle_adapter.py, and that placement is the point. They need
+# no database -- they mock `oracledb` outright -- but that module is gated on
+# MNEMIQ_ORACLE_TEST_DSN and skips wholesale without a live instance, so the sole regression guard
+# for "a plain connection acquires no TLS arguments" was inert in every ordinary CI run. A review
+# caught it by collecting the file and seeing `0 items / 1 skipped`.
+
+
+class _RecordingOracledb:
+    """Stands in for the driver so the CONNECT ARGUMENTS can be asserted."""
+
+    DatabaseError = Exception
+    seen: dict = {}
+
+    @classmethod
+    def connect(cls, **kwargs):
+        cls.seen = dict(kwargs)
+        return _RecordingConnection()
+
+
+class _RecordingConnection:
+    def cursor(self):
+        raise AssertionError("no statement should run during construction")
+
+
+@pytest.fixture
+def driver(monkeypatch):
+    import sys
+
+    _RecordingOracledb.seen = {}
+    monkeypatch.setitem(sys.modules, "oracledb", _RecordingOracledb)
+    return _RecordingOracledb
+
+
+def test_a_plain_connection_passes_no_tls_arguments(driver):
+    """Asserted on the CALL, not on a successful connection: a connection that works says nothing
+    about which keywords reached the driver, and `oracledb.connect` treats an explicit
+    `config_dir=None` differently from an absent one in some releases."""
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    OracleAdapter(dsn="h:1521/S", user="u", password="p")
+    assert set(driver.seen) == {"user", "password", "dsn"}, f"unexpected: {sorted(driver.seen)}"
+
+
+def test_a_configured_directory_reaches_the_driver_as_both_config_and_wallet_location(driver):
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    OracleAdapter(dsn="alias", user="u", password="p", config_dir="/w", wallet_password="wp")
+    assert driver.seen["config_dir"] == "/w"
+    assert driver.seen["wallet_location"] == "/w", "thin mode reads the PEM from the wallet location"
+    assert driver.seen["wallet_password"] == "wp"
+
+
+def test_a_wallet_password_without_a_directory_is_refused_by_name(driver):
+    """Sending a wallet password with nowhere to find a wallet is a misconfiguration, and it was
+    passed to the driver silently. Named the way the missing-credential path names its variables,
+    because the operator's next move is to set one."""
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    with pytest.raises(ValueError) as exc:
+        OracleAdapter(dsn="h:1521/S", user="u", password="p", wallet_password="wp")
+    assert "MNEMIQ_ORACLE_CONFIG_DIR" in str(exc.value)
+    assert "MNEMIQ_ORACLE_WALLET_PASSWORD" in str(exc.value)
+    assert driver.seen == {}, "it must refuse before opening a connection"
