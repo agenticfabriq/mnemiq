@@ -463,7 +463,9 @@ class OracleAdapter:
 
         So the honest question at boot is not "is the gate on" but **"could this connection write
         if something got past the gate"**, and that is answerable: a principal that owns the schema
-        can always write it, and object or ANY-table grants do the same. When the answer is yes,
+        can always write it, and object or ANY-table grants do the same -- **including grants that
+        arrive through a ROLE, which `user_tab_privs` does not show at all**. When the answer is
+        yes,
         `read_only` is one bug away from not holding, and the fix is a deployment one -- connect
         the read plane as a principal with SELECT and nothing else.
 
@@ -472,22 +474,35 @@ class OracleAdapter:
         """
         if not self._read_only:
             return ("writable", "this adapter is not read-only, so the question does not apply")
-        owned, granted, sysprivs = self._rows(
+        # Object privileges are read TWICE, from two dictionary views, because they arrive by two
+        # routes and neither view shows the other's. Measured on a principal owning nothing, with
+        # INSERT/UPDATE/DELETE granted to a ROLE it holds: `user_tab_privs` returned 0 -- not
+        # merely 0 for `grantee = SESSION_USER`, but 0 rows at all -- while
+        # `role_tab_privs` joined to `session_roles` returned 3, and the principal could in fact
+        # insert. `session_privs` DOES resolve role membership, so a single query mixing the two
+        # had one half role-aware and the other not. Role-granted DML is the standard enterprise
+        # shape, so this was the likeliest deployment to be told, wrongly, that it was constrained.
+        owned, direct, via_role, sysprivs = self._rows(
             "SELECT (SELECT count(*) FROM all_tables "
             "         WHERE owner = SYS_CONTEXT('USERENV','SESSION_USER')) AS owned, "
             "       (SELECT count(*) FROM user_tab_privs "
             "         WHERE grantee = SYS_CONTEXT('USERENV','SESSION_USER') "
-            "           AND privilege IN ('INSERT','UPDATE','DELETE')) AS granted, "
+            "           AND privilege IN ('INSERT','UPDATE','DELETE')) AS direct, "
+            "       (SELECT count(*) FROM role_tab_privs "
+            "         WHERE role IN (SELECT role FROM session_roles) "
+            "           AND privilege IN ('INSERT','UPDATE','DELETE')) AS via_role, "
             "       (SELECT count(*) FROM session_privs WHERE privilege IN "
             "         ('INSERT ANY TABLE','UPDATE ANY TABLE','DELETE ANY TABLE', "
             "          'CREATE ANY TABLE','DROP ANY TABLE','CREATE TABLE', "
             "          'CREATE PROCEDURE','CREATE ANY PROCEDURE')) AS sysprivs "
             "FROM dual"
         )[0]
+        granted = direct + via_role
         if owned or granted or sysprivs:
             return ("gate_only", (
                 f"this read-only connection CAN write: it owns {owned} table(s), holds DML grants "
-                f"on {granted}, and holds {sysprivs} write-shaped system privilege(s). Direct "
+                f"on {granted} ({direct} direct, {via_role} through a role), and holds "
+                f"{sysprivs} write-shaped system privilege(s). Direct "
                 "writes are refused by this adapter, but a SELECT that reaches an "
                 "AUTONOMOUS_TRANSACTION function -- possibly through a view, where the statement "
                 "text names nothing -- is not something any statement check can see. Connect the "

@@ -421,7 +421,9 @@ def _drop_user(cur, username):
 
     `DROP USER` raises ORA-01940 while any session is open, so the sessions are killed on the
     second attempt rather than waited out -- a test that failed before closing its own connection
-    would otherwise leak deterministically.
+    would otherwise leak deterministically. ORA-01918, "user does not exist", is treated as
+    SUCCESS: the postcondition is that no such user remains, and one that was never created meets
+    it. That also makes this callable as a pre-test clean slate, not only as a teardown.
 
     **It warns rather than raises when another exception is already propagating**, and the two
     call sites reach that safely by different routes -- which is worth stating, because the
@@ -453,6 +455,13 @@ def _drop_user(cur, username):
             cur.connection.commit()
             return
         except oracledb.DatabaseError as exc:
+            # ORA-01918, "user does not exist", is SUCCESS. This function's postcondition is that
+            # no such user is left behind, and a user that was never created satisfies it. Raising
+            # here made the helper usable only in teardown, so a test that also wanted a clean
+            # slate BEFORE creating its user could not call it -- and one did, passing on the run
+            # where a previous run had leaked and failing on the run where it had not.
+            if "ORA-01918" in str(exc):
+                return
             last = exc
             if attempt == 1:
                 for sid, serial in cur.execute(
@@ -903,3 +912,66 @@ def test_assert_read_only_says_the_gate_is_the_only_basis_when_the_principal_can
 def test_assert_read_only_does_not_answer_for_a_writable_adapter():
     verdict, _ = _adapter(read_only=False).assert_read_only()
     assert verdict == "writable"
+
+
+@needs_admin
+def test_assert_read_only_sees_dml_granted_through_a_role():
+    """Role-granted DML is invisible to `user_tab_privs`, and it is the enterprise-standard shape.
+
+    Measured on a principal owning nothing, holding INSERT/UPDATE/DELETE through a role:
+    `user_tab_privs` returned **0 rows at all** -- not merely zero for `grantee = SESSION_USER` --
+    while `role_tab_privs` joined to `session_roles` returned 3, and the principal could in fact
+    insert. `session_privs` resolves roles, so the original single query had one half role-aware
+    and the other not, and would have reported `constrained` for a connection that can write.
+
+    A review found this. The half that was wrong is the half that reads object privileges, which
+    is the half that matters for a read plane.
+    """
+    import oracledb
+
+    owner = _adapter(read_only=False)
+    for stmt in ("DROP TABLE role_target",):
+        try:
+            owner.execute(stmt)
+        except oracledb.DatabaseError:
+            pass
+    owner.execute("CREATE TABLE role_target (id NUMBER)")
+
+    admin = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
+                             mode=oracledb.AUTH_MODE_SYSDBA)
+    cur = admin.cursor()
+    try:
+        cur.execute("DROP ROLE writer_role")
+    except oracledb.DatabaseError:
+        pass
+    _drop_user(cur, "role_probe")
+    probe = None
+    try:
+        cur.execute("CREATE USER role_probe IDENTIFIED BY pw")
+        cur.execute("GRANT CREATE SESSION TO role_probe")
+        cur.execute("CREATE ROLE writer_role")
+        cur.execute(f"GRANT INSERT, UPDATE, DELETE ON {USER}.role_target TO writer_role")
+        cur.execute("GRANT writer_role TO role_probe")
+
+        probe = OracleAdapter(dsn=DSN, user="role_probe", password="pw", schema=USER)
+        verdict, detail = probe.assert_read_only()
+        assert verdict == "gate_only", (
+            "a principal that can write through a role must not be reported constrained"
+        )
+        assert "0 direct, 3 through a role" in detail, (
+            "the two routes are counted separately so an operator can see which one applies"
+        )
+    finally:
+        if probe is not None:
+            probe._con.close()
+        try:
+            cur.execute("DROP ROLE writer_role")
+        except oracledb.DatabaseError:
+            pass
+        _drop_user(cur, "role_probe")
+        cur.close()
+        admin.close()
+        try:
+            owner.execute("DROP TABLE role_target")
+        except oracledb.DatabaseError:
+            pass
