@@ -512,3 +512,34 @@ def test_a_misspelled_acknowledgement_says_so_instead_of_doing_nothing_quietly()
         "acknowledging a verdict that did not occur is legitimate -- the state may have improved -- "
         "so it is reported, not warned about"
     )
+
+
+def test_an_ack_carried_to_an_adapter_that_cannot_answer_says_which_cause():
+    """The third reason an acknowledgement goes unused, and the one that misleads.
+
+    Only `OracleAdapter` implements `assert_read_only`/`assert_enforcing`. An operator who carries
+    `MNEMIQ_ACK_ADVISORIES` from an Oracle deployment to a Postgres one is neither stale nor
+    misspelled -- the check never ran -- and telling them "the verdict changed" sends them to look
+    at a verdict that was never produced.
+    """
+    import io
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _CannotAnswer:
+        """Every adapter but Oracle."""
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    lg = logging.getLogger("mnemiq.runtime")
+    lg.addHandler(handler)
+    previous, lg.level = lg.level, logging.INFO
+    try:
+        _warn_source_enforcement(_CannotAnswer(), frozenset({"read-only-basis:unverifiable"}))
+    finally:
+        lg.removeHandler(handler)
+        lg.level = previous
+    out = stream.getvalue()
+    assert "does not report" in out
+    assert "the verdict changed" not in out, "that diagnosis would send them to the wrong place"

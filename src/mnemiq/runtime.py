@@ -319,11 +319,13 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
             logger.warning("MNEMIQ_ACK_ADVISORIES: %r names no advisory; known: %s. "
                            "It acknowledges nothing", entry, ", ".join(sorted(known)))
     matched: set[str] = set()
+    assessed: set[str] = set()
 
     for name, label, quiet in advisories:
         assess = getattr(adapter, name, None)
         if assess is None:
-            continue
+            continue  # this adapter cannot answer; only OracleAdapter implements either today
+        assessed.add(label.replace(" ", "-").lower())
         try:
             verdict, detail = assess()
         except Exception as exc:  # a source that will not answer must not stop the engine booting
@@ -345,8 +347,19 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
         else:
             logger.warning("%s: %s -- %s", label, verdict, detail)
 
+    # Three reasons an acknowledgement goes unused, and the message names the right one. The third
+    # is the one a review caught: only `OracleAdapter` implements either method, so an ack carried
+    # from an Oracle deployment to a Postgres one is neither stale nor misspelled -- the check
+    # never ran. Telling that operator "the verdict changed" sends them to look at a verdict that
+    # was never produced.
     for entry in sorted(acknowledged - matched):
-        if entry.split(":", 1)[0] in known:
+        advisory = entry.split(":", 1)[0]
+        if advisory not in known:
+            continue  # already warned about above, as an advisory that does not exist
+        if advisory not in assessed:
+            logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply -- this source does not report "
+                        "%r at all, so nothing was acknowledged", entry, advisory)
+        else:
             logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply this boot -- either the verdict "
                         "changed, or the verdict half is misspelled", entry)
 
