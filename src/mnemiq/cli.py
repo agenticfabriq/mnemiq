@@ -135,10 +135,29 @@ def _cmd_enrich(settings: Settings) -> int:
     )
     from mnemiq.enrichment.dictionary import load_dictionary
     from mnemiq.enrichment.grounding import apply_dictionary, ground_codes
-    from mnemiq.enrichment.pipeline import content_version
+    from mnemiq.enrichment.pipeline import content_version, profile_outcome
     from mnemiq.ontology.records import load_records, merge_records
 
     snap = enrich_structural(adapter, spec.id)
+    # Read what the profile jobs say BEFORE spending LLM calls on the result or saving it. M59,
+    # as corrected: the statuses were already read and REPORTED by the WARNING at the tail of this
+    # function, which pre-dates this check. What nobody did was ACT on them -- the run exited 0 and
+    # saved the snapshot whatever they said, so a run in which every table failed persisted a
+    # zero-column model and the engine then answered "I don't know about any tables" when the truth
+    # was "I could not read them".
+    outcome, detail = profile_outcome(snap)
+    if outcome in ("unread", "empty"):
+        # Both mean the snapshot describes NOTHING, and saving one is the harm: the next `build`
+        # and `ask` would read a model of a database nobody could read and answer "I don't know
+        # about any tables". `empty` is here for the reason a review gave -- a schema name that
+        # matches nothing yields no tables to introspect, so no profile jobs, and it looked
+        # identical to a genuinely empty source. The message separates the causes; the exit does
+        # not, because neither produces a snapshot worth keeping.
+        print(f"enrich failed: {detail}", file=sys.stderr)
+        return 1
+    # `partial` is NOT reported here: the tail of this function already prints
+    # "N table(s) FAILED to profile and were EXCLUDED -- the semantic model is INCOMPLETE",
+    # and it did so before this change. Saying it twice in one run is worse than saying it once.
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
     _certified = fetch_certified_records(settings)
