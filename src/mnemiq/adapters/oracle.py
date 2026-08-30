@@ -42,8 +42,30 @@ class OracleAdapter:
     dialect = "oracle"
 
     def __init__(self, dsn: str, user: str, password: str, schema: str | None = None,
-                 read_only: bool = True) -> None:
+                 read_only: bool = True, config_dir: str | None = None,
+                 wallet_password: str | None = None) -> None:
         """`dsn` is an Easy Connect string or a TNS alias, e.g. `host:1521/FREEPDB1`.
+
+        `config_dir` is a directory holding `tnsnames.ora` (and, for a TLS target, the wallet).
+        It serves TWO deployments with one mechanism, which is why it is not called `wallet_dir`:
+
+          ON-PREM, the common case and the one Qcell runs. `tnsnames.ora` maps an alias to a
+          descriptor, so `dsn` becomes the alias and the connection details live in the file the
+          DBA already maintains. No wallet, no TLS, nothing else changes.
+
+          AUTONOMOUS / TLS, where the same directory also carries the wallet. `wallet_password`
+          decrypts `ewallet.pem`, which is the file THIN mode reads -- measured on a real ADB
+          wallet, that PEM's first line declares an ENCRYPTED private key, so a password is
+          required and is NOT optional the way `cwallet.sso` would suggest. `cwallet.sso` is the
+          auto-login file and thick mode only; this adapter is thin by design (see the class
+          docstring), so it cannot use it.
+
+          (The PEM header is described rather than quoted: the repo guard flags that literal as a
+          secret, correctly -- a scanner that learns to ignore key headers in docstrings is a
+          scanner nobody trusts.)
+
+        Both are `None` by default and nothing is passed to the driver when they are, so the plain
+        `host:port/service` path is byte-for-byte what it was.
 
         `read_only` defaults to True and is the same control every other production adapter
         carries -- `runtime.build_runtime` passes `read_only=not settings.write_enabled`, and
@@ -67,7 +89,16 @@ class OracleAdapter:
             ) from exc
 
         self._oracledb = oracledb
-        self._con = oracledb.connect(user=user, password=password, dsn=dsn)
+        # Only pass what was configured: `oracledb.connect` treats an explicit `config_dir=None`
+        # differently from an absent one in some releases, and a plain TCP connection must not
+        # start depending on TLS arguments it never had.
+        extra: dict[str, Any] = {}
+        if config_dir:
+            extra["config_dir"] = config_dir
+            extra["wallet_location"] = config_dir  # the PEM lives beside tnsnames.ora in an ADB zip
+        if wallet_password:
+            extra["wallet_password"] = wallet_password
+        self._con = oracledb.connect(user=user, password=password, dsn=dsn, **extra)
         # ONE connection, shared by every caller, and `python-oracledb` in thin mode does not make
         # a connection safe for concurrent use. This adapter also mutates CONNECTION-wide state per
         # statement -- `rollback()` then `SET TRANSACTION READ ONLY` in `_cursor`, and

@@ -98,7 +98,19 @@ def test_oracle_takes_credentials_from_settings_and_the_descriptor_from_the_spec
     assert resolve.adapter_for(spec, s, read_only=False).kwargs == {
         "dsn": "db.example.com:1521/PDB1", "user": "app", "password": "pw",
         "schema": "APP", "read_only": False,
+        # None unless configured: the plain TCP path must not acquire TLS arguments it never had
+        "config_dir": None, "wallet_password": None,
     }
+
+
+def test_oracle_carries_a_config_dir_and_wallet_password_when_they_are_set(recorded):
+    """One directory serves on-prem TNS aliases and Autonomous mTLS, so it reaches the adapter
+    from settings the same way the credentials do."""
+    s = _settings(oracle_user="app", oracle_password="pw",
+                  oracle_config_dir="/etc/oracle/wallet", oracle_wallet_password="wp")
+    kwargs = resolve.adapter_for(_spec(kind="oracle", target="alias"), s).kwargs
+    assert kwargs["config_dir"] == "/etc/oracle/wallet"
+    assert kwargs["wallet_password"] == "wp"
 
 
 @pytest.mark.parametrize("cfg, missing", [

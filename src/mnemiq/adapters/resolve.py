@@ -28,7 +28,11 @@ fragment and `/` ends the netloc, so a password containing either would parse in
 a wrong user with no error at all. Each database keeps its own native format, and Oracle's
 credentials travel in `MNEMIQ_ORACLE_USER` / `MNEMIQ_ORACLE_PASSWORD`.
 
-The consequence, stated rather than hidden: **v1 supports one Oracle source**, because one pair of
+`MNEMIQ_ORACLE_CONFIG_DIR` joins them for a `tnsnames.ora` directory -- on-prem alias resolution
+and Autonomous mTLS are the same mechanism -- with `MNEMIQ_ORACLE_WALLET_PASSWORD` when the
+wallet's PEM is encrypted, which an Autonomous wallet's is.
+
+The consequence, stated rather than hidden: **v1 supports one Oracle source**, because one set of
 env vars can only describe one. A second would need per-source credential references, which is a
 manifest-format change and not a v1 requirement.
 """
@@ -108,7 +112,9 @@ def adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only
                 "Connect descriptor carries no credentials, so they are configured separately"
             )
         return OracleAdapter(dsn=spec.target, user=user, password=password,
-                             schema=spec.schema or None, read_only=read_only)
+                             schema=spec.schema or None, read_only=read_only,
+                             config_dir=(settings.oracle_config_dir if settings else None),
+                             wallet_password=(settings.oracle_wallet_password if settings else None))
 
     attach_type, extension, default_schema, fk_via_postgres = _ATTACH[spec.kind]
     return DuckDBAdapter(

@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     pg_dsn: str | None = Field(default=None, description="source Postgres DSN")
     oracle_user: str | None = Field(default=None, description="source Oracle user (Easy Connect carries no credentials)")
     oracle_password: str | None = Field(default=None, description="source Oracle password")
+    oracle_config_dir: str | None = Field(default=None, description="directory holding tnsnames.ora and, for a TLS target, the wallet; on-prem TNS aliases and Autonomous mTLS both use it")
+    oracle_wallet_password: str | None = Field(default=None, description="password for the wallet's ewallet.pem (thin mode cannot use cwallet.sso)")
     ack_advisories: str | None = Field(default=None, description="boot advisories to log at INFO instead of WARNING, comma-separated as <advisory>:<verdict> (e.g. read-only-basis:unverifiable); a CHANGED verdict still warns")
     acme_data_dir: str | None = Field(default=None, description="ACME golden dataset dir (tests)")
     embed_model: str | None = Field(default=None, description="embedding model id")
