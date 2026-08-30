@@ -1182,3 +1182,38 @@ def test_a_definer_rights_view_writes_for_a_principal_with_only_select():
                 owner.execute(stmt)
             except oracledb.DatabaseError:
                 pass
+
+
+def test_a_tns_alias_resolves_through_the_config_dir(tmp_path):
+    """The on-prem mechanism, and the same one Autonomous uses for mTLS.
+
+    Qcell runs Oracle on-prem, where a DBA maintains `tnsnames.ora` and applications connect by
+    ALIAS rather than by host and port. `config_dir` points the driver at that directory. The
+    Autonomous case adds a wallet to the same directory and a password for its PEM; the alias
+    machinery is identical, which is why this is not called `wallet_dir`.
+
+    The third assertion is the control. Without it, a passing alias connection proves nothing --
+    the driver could have fallen back to interpreting `mnemiq_local` as a host, or the test could
+    be reaching the database by some path other than the file.
+    """
+    import oracledb
+
+    host, _, service = DSN.partition("/")
+    hostname, _, port = host.partition(":")
+    (tmp_path / "tnsnames.ora").write_text(
+        f"mnemiq_alias = (DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST={hostname})"
+        f"(PORT={port or 1521}))(CONNECT_DATA=(SERVICE_NAME={service})))\n"
+    )
+
+    aliased = OracleAdapter(dsn="mnemiq_alias", user=USER, password=PASSWORD,
+                            config_dir=str(tmp_path))
+    try:
+        assert aliased.execute("SELECT 1 FROM dual") == [(1,)]
+        assert aliased.introspect() == _adapter().introspect(), (
+            "the alias must reach the same database as the Easy Connect path"
+        )
+    finally:
+        aliased._con.close()
+
+    with pytest.raises(oracledb.DatabaseError, match="DPY-4027"):
+        OracleAdapter(dsn="mnemiq_alias", user=USER, password=PASSWORD)
