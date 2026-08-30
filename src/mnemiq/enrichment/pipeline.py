@@ -60,8 +60,13 @@ def profile_outcome(snapshot: Snapshot) -> tuple[str, str]:
 
     `enrich_structural` is fail-soft per table: one that will not profile is logged and EXCLUDED,
     so a single bad table never sinks a run. That is right, and it records the outcome honestly as
-    `Job(id="profile:<table>", status="failed")` -- **the truth has always been in the snapshot and
-    nothing read it** (M59). When every table failed, the run returned a snapshot with zero columns
+    `Job(id="profile:<table>", status="failed")`.
+
+    **M59 was overstated when filed, and the correction sharpens it.** I wrote that nothing read
+    those statuses; `_cmd_enrich` already ended with a WARNING naming the excluded tables, and had
+    before this. What no one did was ACT on them -- the run exited 0 and saved the snapshot
+    whatever they said. So the all-failed case printed "the semantic model is INCOMPLETE", which
+    is a wild understatement for "describes nothing", and then persisted it. When every table failed, the run returned a snapshot with zero columns
     and exited 0, and the engine then answered "I don't know about any tables" when the truth was
     "I could not read them". Measured on Oracle, where a read-only transaction refused every table
     at once (M60); reachable on any adapter, and by a second route -- a manifest naming a schema
@@ -69,7 +74,8 @@ def profile_outcome(snapshot: Snapshot) -> tuple[str, str]:
 
     FOUR outcomes, not a threshold. A bare count would collapse the two that matter most:
 
-      empty     no profile job at all -- the source has no tables. A real, sayable state.
+      empty     no profile job at all -- an empty source, OR a schema name matching nothing,
+                which introspects to zero tables and so never reaches a profile at all.
       complete  every table profiled.
       partial   some failed. The model is smaller than the database and the caller should know.
       unread    at least one table, and EVERY one failed. The snapshot describes nothing, and it

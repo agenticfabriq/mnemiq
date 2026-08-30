@@ -30,7 +30,10 @@ def test_every_table_failing_is_unread_not_empty():
 
 
 def test_a_source_with_no_tables_is_empty_and_distinct_from_unread():
-    """A real state, and the one a threshold would collapse `unread` into: both have zero columns."""
+    """Distinct from `unread` in the DIAGNOSIS -- could not read, versus nothing was there -- but
+    both are refused, because neither produces a snapshot worth keeping. A schema name matching
+    nothing introspects to zero tables and so never reaches a profile at all, which is how it
+    reaches this state without a single failure recorded."""
     assert profile_outcome(_snap())[0] == "empty"
 
 
@@ -91,3 +94,53 @@ def test_enrich_refuses_to_save_a_snapshot_that_describes_nothing(monkeypatch, t
     err = capsys.readouterr().err
     assert "enrich failed" in err
     assert "NOT evidence that the source is empty" in err
+
+
+@pytest.mark.parametrize("statuses, why", [
+    ((), "no tables at all -- empty source or a schema matching nothing"),
+    (("failed",), "one table and it could not be read"),
+])
+def test_enrich_refuses_and_saves_nothing_for_every_describes_nothing_outcome(
+    monkeypatch, tmp_path, capsys, statuses, why
+):
+    """Both refusing outcomes are wired, not just the one the finding was filed about.
+
+    A review pointed out that only `unread` had an end-to-end test, so a wiring mistake in the
+    other branch would not have been caught -- and `empty` was, at that moment, still exiting 0.
+    """
+    from mnemiq.cli import _cmd_enrich
+    from mnemiq.config import Settings
+
+    saved: list = []
+    monkeypatch.setattr("mnemiq.enrichment.pipeline.enrich_structural",
+                        lambda adapter, source_id: _snap(*statuses))
+    monkeypatch.setattr("mnemiq.store.snapshot_store.save_snapshot",
+                        lambda *a, **k: saved.append(a))
+    monkeypatch.setattr("mnemiq.adapters.resolve.adapter_for", lambda *a, **k: object())
+
+    settings = Settings(llm_base_url=None, llm_api_key=None, llm_model=None, acme_data_dir=None,
+                        pg_dsn="postgresql://h/db", store_path=str(tmp_path / "s.duckdb"))
+    assert _cmd_enrich(settings) == 1, why
+    assert saved == [], "a snapshot that describes nothing must not be persisted"
+    assert "enrich failed" in capsys.readouterr().err
+
+
+def test_a_partial_run_is_reported_once_not_twice(monkeypatch, tmp_path, capsys):
+    """`_cmd_enrich` already ended with a WARNING naming the excluded tables, before this change.
+    Adding a second report of the same fact at the top would have said it twice in one run -- which
+    is also the evidence that M59's "nothing read it" was overstated."""
+    from mnemiq.cli import _cmd_enrich
+    from mnemiq.config import Settings
+
+    monkeypatch.setattr("mnemiq.enrichment.pipeline.enrich_structural",
+                        lambda adapter, source_id: _snap("done", "failed"))
+    monkeypatch.setattr("mnemiq.adapters.resolve.adapter_for", lambda *a, **k: object())
+    settings = Settings(llm_base_url=None, llm_api_key=None, llm_model=None, acme_data_dir=None,
+                        pg_dsn="postgresql://h/db", store_path=str(tmp_path / "s.duckdb"))
+    try:
+        _cmd_enrich(settings)
+    except Exception:
+        pass  # the run goes on to real work this test does not stand up; the count is the point
+    err = capsys.readouterr().err
+    assert err.count("FAILED to profile") <= 1, "one run, one report of the same fact"
+    assert "enrich incomplete" not in err, "the early branch must not duplicate the tail warning"
