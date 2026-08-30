@@ -923,7 +923,13 @@ def test_assert_read_only_says_the_gate_is_the_only_basis_when_the_principal_can
     verdict, detail = _adapter().assert_read_only()
     assert verdict == "gate_only"
     assert "CAN write" in detail and "AUTONOMOUS_TRANSACTION" in detail
-    assert "SELECT and nothing else" in detail, "it must name the deployment fix"
+    # It must name the narrowing AND refuse to call it sufficient. The earlier version of this
+    # assertion required the string "SELECT and nothing else" and called it "the deployment fix" --
+    # encoding, in a test, the premise that a SELECT-only principal cannot cause a write. Measured
+    # false: one holding SELECT on a single view inserted a row.
+    assert "Narrowing this principal to SELECT" in detail
+    assert "does NOT make the connection unable to cause one" in detail
+    assert "DATABASE's to enforce" in detail
 
 
 def test_assert_read_only_does_not_answer_for_a_writable_adapter():

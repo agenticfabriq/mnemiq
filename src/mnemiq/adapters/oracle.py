@@ -466,8 +466,11 @@ class OracleAdapter:
         can always write it, and object or ANY-table grants do the same -- **including grants that
         arrive through a ROLE, which `user_tab_privs` does not show at all**. When the answer is
         yes,
-        `read_only` is one bug away from not holding, and the fix is a deployment one -- connect
-        the read plane as a principal with SELECT and nothing else.
+        `read_only` is one bug away from not holding, and narrowing the principal is the deployment
+        response -- **though it is a reduction, not a fix, and this docstring said otherwise until
+        it was measured.** A principal holding SELECT on one view and nothing else caused a row to
+        be inserted, because a view resolves its references with the VIEW OWNER's rights. Dropping
+        to SELECT removes every DIRECT write; it does not make the connection unable to cause one.
 
         Two verdicts, `gate_only` and `unverifiable`, and the absence of a third is the finding:
         auditing the CALLER cannot establish read-onlyness at all, because a view resolves its
@@ -534,8 +537,11 @@ class OracleAdapter:
                 "write-shaped system privilege(s). Direct writes are refused by this adapter, but "
                 "a SELECT that reaches an AUTONOMOUS_TRANSACTION function -- possibly through a "
                 "view, where the statement text names nothing -- is not something any statement "
-                "check can see. Connect the read plane as a principal holding SELECT and nothing "
-                "else"))
+                "check can see. Narrowing this principal to SELECT removes every direct write "
+                "and is worth doing, but it does NOT make the connection unable to cause one: "
+                "measured, SELECT on a single view was enough, because a view resolves its "
+                "references with the VIEW OWNER's rights. Read-only here is the DATABASE's to "
+                "enforce"))
 
         # No write-shaped privilege found. That is NOT "cannot write", and there is no further
         # query that would make it one -- which is the whole result, arrived at by deleting two
