@@ -1217,3 +1217,60 @@ def test_a_tns_alias_resolves_through_the_config_dir(tmp_path):
 
     with pytest.raises(oracledb.DatabaseError, match="DPY-4027"):
         OracleAdapter(dsn="mnemiq_alias", user=USER, password=PASSWORD)
+
+
+@needs_admin
+def test_a_reader_on_another_owners_schema_can_actually_read_it():
+    """The least-privilege deployment this adapter's own advice recommends, and it did not work.
+
+    Discovery filters the data dictionary by OWNER, but the SQL this adapter generates names tables
+    UNQUALIFIED and Oracle resolves an unqualified name against the CONNECTING user. Measured with
+    `user=READER, schema=APPUSER`: `introspect()` returned ORDERS, every read failed ORA-00942 on
+    `"READER"."ORDERS"`, and `enrich_structural` produced 0 tables with outcome `unread`. So a
+    principal holding SELECT on someone else's schema -- exactly what M66 tells operators to build
+    -- could discover a schema it could not then query.
+
+    `CURRENT_SCHEMA` changes name resolution only and grants nothing, so the reader still needs its
+    SELECT; this asserts it reads, enriches, and passes the decider's proof seam.
+    """
+    import oracledb
+
+    from mnemiq.enrichment.pipeline import enrich_structural, profile_outcome
+    from mnemiq.sql.prove import prove
+
+    owner = _adapter(read_only=False)
+    admin = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
+                             mode=oracledb.AUTH_MODE_SYSDBA)
+    cur = admin.cursor()
+    _drop_user(cur, "x_reader")
+    probe = None
+    try:
+        try:
+            owner.execute("DROP TABLE x_orders")
+        except oracledb.DatabaseError:
+            pass
+        owner.execute("CREATE TABLE x_orders (id NUMBER, status VARCHAR2(8))")
+        owner.execute("INSERT INTO x_orders VALUES (1, 'open')")
+        cur.execute("CREATE USER x_reader IDENTIFIED BY pw")
+        cur.execute("GRANT CREATE SESSION TO x_reader")
+        owner.execute(f"GRANT SELECT ON {USER}.x_orders TO x_reader")
+
+        probe = OracleAdapter(dsn=DSN, user="x_reader", password="pw", schema=USER)
+        assert "X_ORDERS" in probe.introspect(), "precondition: discovery sees the owner's table"
+        assert probe.execute('SELECT count(*) FROM "X_ORDERS"') == [(1,)], (
+            "an UNQUALIFIED read must resolve against the configured owner, not the connecting user"
+        )
+        snap = enrich_structural(probe, "cross_owner")
+        assert profile_outcome(snap)[0] != "unread"
+        assert any(c.object_id == "X_ORDERS" for c in snap.columns)
+        assert prove(probe, 'SELECT count(*) FROM "X_ORDERS"') is None
+    finally:
+        if probe is not None:
+            probe._con.close()
+        _drop_user(cur, "x_reader")
+        cur.close()
+        admin.close()
+        try:
+            owner.execute("DROP TABLE x_orders")
+        except oracledb.DatabaseError:
+            pass

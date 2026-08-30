@@ -690,3 +690,26 @@ def test_build_runtime_renders_it_the_same_way_as_any_other_misconfiguration(mon
                   oracle_user="app", oracle_password="pw", oracle_wallet_password="wp")
     with pytest.raises(SnapshotMissing, match="MNEMIQ_ORACLE_CONFIG_DIR"):
         build_runtime(s)
+
+
+def test_traces_and_metrics_are_attributed_to_the_manifest_source_not_the_setting():
+    """The resolver's claim is that a manifest id survives end to end. It survived as far as the
+    snapshot and stopped: `load_current_snapshot` keys on `specs[0].id`, while the answer trace and
+    the metrics record both still used `settings.source_id` -- so a one-entry manifest naming
+    `warehouse` answered over `warehouse` and recorded every answer under `acme`.
+
+    Attribution is not a cosmetic label. A trace is evidence about WHICH source answered.
+    """
+    from mnemiq.contract.semantic import Snapshot
+    from mnemiq.runtime import Runtime
+
+    rt = object.__new__(Runtime)
+    rt.snapshot = Snapshot(version="v1", source_id="warehouse", created_at="t")
+    rt.settings = _settings(source_id="acme")
+    assert rt._source_id() == "warehouse"
+
+    # and it degrades the way the old code did when there is no snapshot to ask
+    rt.snapshot = None
+    assert rt._source_id() == "acme"
+    rt.settings = None
+    assert rt._source_id() == "unknown"

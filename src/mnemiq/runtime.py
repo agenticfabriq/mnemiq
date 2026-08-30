@@ -83,6 +83,22 @@ class Runtime:
             self.snapshot = snapshot
             self.loaded_versions = versions
 
+    def _source_id(self) -> str:
+        """The id this runtime is actually answering FOR.
+
+        The SNAPSHOT's, not `settings.source_id`. `load_current_snapshot` keys on `specs[0].id`, so
+        a one-entry manifest naming `warehouse` loads and answers over `warehouse` while
+        `settings.source_id` is still its default `acme` -- and every audit trace and metric was
+        recorded under `acme`. The resolver's whole point is that the manifest id survives end to
+        end, and it survived as far as the snapshot and then stopped.
+
+        Attribution is the part that matters: a trace is evidence about WHICH source answered, and
+        a wrong id there is not a cosmetic label, it is the audit record naming the wrong database.
+        """
+        if self.snapshot is not None and self.snapshot.source_id:
+            return self.snapshot.source_id
+        return (self.settings.source_id if self.settings else None) or "unknown"
+
     def ask(
         self,
         question: str,
@@ -132,7 +148,7 @@ class Runtime:
             from mnemiq.observability.trace_sink import AnswerEvent
 
             event = AnswerEvent(
-                source_id=self.settings.source_id if self.settings else "unknown",
+                source_id=self._source_id(),
                 question=packet.question,
                 identity=identity,
                 answer=answer,
@@ -151,7 +167,7 @@ class Runtime:
             from mnemiq.observability.metrics import AnswerRecord
 
             self.sink.record(
-                self.settings.source_id if self.settings else "unknown",
+                self._source_id(),
                 AnswerRecord(deferred=answer.deferred, cached=answer.cached,
                              total_ms=(time.perf_counter() - started) * 1000, mode=name,
                              failed=answer.failed, reason_code=answer.reason_code),
