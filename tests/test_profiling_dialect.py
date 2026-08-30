@@ -304,3 +304,81 @@ def test_a_partial_failure_is_still_carried_rather_than_raised():
     stats = {s.column: s for s in profile_table(
         _BatchFails(dialect="oracle"), _table(("ID", "NUMBER"), ("ADDR", "ADDR_T")))}
     assert stats["ID"].distinct_count == 2 and stats["ADDR"].distinct_count is None
+
+
+@pytest.mark.parametrize("data_type", ["CLOB", "ADDR_T"])
+def test_a_single_uncountable_column_is_treated_the_same_whether_or_not_it_is_listed(data_type):
+    """The denylist must not decide whether a table survives.
+
+    Measured before this: a single CLOB was carried with unknown stats while a single
+    user-defined `ADDR_T` -- the identical situation -- was re-raised and the table excluded, for
+    no reason but that one type is nameable and the other is not. "All columns failed" is a bad
+    proxy for "systemic" when the table has ONE column, because there the two are the same fact.
+    """
+    class _OneBadColumn(_Recorder):
+        def execute(self, sql):
+            self.sql.append(sql)
+            if "count(DISTINCT" in sql and '"ADDR"' in sql:
+                raise RuntimeError("ORA-22950: cannot order objects")
+            if "count(DISTINCT ROWNUM)" in sql:
+                return [(3,)]
+            if sql.lstrip().upper().startswith("SELECT COUNT(*) FROM"):
+                return [(3,)]
+            return [(3, 2, 3)]
+
+    stats = profile_table(_OneBadColumn(dialect="oracle"), _table(("ADDR", data_type)))
+    assert [(s.column, s.distinct_count, s.row_count) for s in stats] == [("ADDR", None, 3)]
+
+
+def test_the_probe_is_what_separates_systemic_from_column_specific():
+    """Asked, not inferred. The probe uses ROWNUM on Oracle because it varies per row and so
+    exercises the sort a temp-space failure would break; `count(DISTINCT 1)` is a constant the
+    optimiser may fold, which would answer yes on a session that cannot actually sort."""
+    class _CannotSort(_Recorder):
+        def execute(self, sql):
+            self.sql.append(sql)
+            if "count(DISTINCT" in sql:
+                raise RuntimeError("ORA-01652: unable to extend temp segment")
+            return [(3,)]
+
+    a = _CannotSort(dialect="oracle")
+    with pytest.raises(RuntimeError, match="ORA-01652"):
+        profile_table(a, _table(("ADDR", "ADDR_T")))
+    assert any("count(DISTINCT ROWNUM)" in q for q in a.sql), "the probe must actually be asked"
+
+
+def test_a_dialect_without_a_probe_keeps_the_conservative_answer():
+    """No probe means no refinement, not a weak probe.
+
+    The first version defaulted to `count(DISTINCT 1)`, and a constant is foldable -- so on DuckDB,
+    this project's primary adapter, a session that could not sort at all still answered "yes" and
+    the table came back `done` with every column unknown. That is the systemic-failure-looks-like-
+    success bug reintroduced for every dialect except Oracle, by the very commit meant to fix it.
+    """
+    class _CannotSort(_Recorder):
+        def execute(self, sql):
+            self.sql.append(sql)
+            if "count(DISTINCT" in sql:
+                raise RuntimeError("out of temporary space")
+            return [(3,)]
+
+    for dialect in ("duckdb", "postgres", "sqlite"):
+        a = _CannotSort(dialect=dialect)
+        with pytest.raises(RuntimeError, match="temporary space"):
+            profile_table(a, _table(("A", "INTEGER"), ("B", "INTEGER")))
+        assert not any("count(DISTINCT 1)" in q for q in a.sql), (
+            f"{dialect}: a foldable constant must not be used as the probe"
+        )
+
+
+def test_the_all_unknown_warning_does_not_fire_on_a_partial_failure(caplog):
+    """It claimed "no column could be counted ... all N carried" on a table where one column had
+    measured perfectly well -- false on both counts, and contradicting the comment above it."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        stats = {s.column: s for s in profile_table(
+            _BatchFails(dialect="oracle"), _table(("ID", "NUMBER"), ("ADDR", "ADDR_T")))}
+    assert stats["ID"].distinct_count == 2, "precondition: this is a PARTIAL failure"
+    assert "no column of" not in caplog.text
+    assert "ADDR" in caplog.text, "the column that did fail is still named"
