@@ -94,6 +94,23 @@ def _safe_label(label: str, fallback: str) -> str:
     return "unnameable-function"
 
 
+def _reaches_past(body, resolved_exact: set[str], resolved_folded: set[str]) -> bool:
+    """Does this body name an object the caller's list does not contain, under any spelling?
+
+    Extracted so the ambiguous-view case can ask it of EVERY candidate. A gap that every candidate
+    body demonstrates is a gap whichever body was actually read, so ambiguity about which view was
+    resolved does not make the gap unclear.
+    """
+    from mnemiq.sql.qualify import object_key
+    from mnemiq.sql.scope import base_tables
+
+    for node in base_tables(body):
+        key = object_key(node)
+        if key and key not in resolved_exact and key.lower() not in resolved_folded:
+            return True
+    return False
+
+
 def _add(out: list[str], value: str) -> None:
     """The ONE way a value reaches `unresolved`, deduplicated and grammar-checked.
 
@@ -259,6 +276,16 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
         candidates = {id(views[k]): views[k] for k in spellings({name}) if k in views}
         if len(candidates) > 1:
             _add(unclassified, f"ambiguous-view:{name}")
+            # ...and STILL scan, because a gap every candidate demonstrates is demonstrable under
+            # any resolution. Skipping here would record "unclear" where the engine can name the
+            # view, which inverts this module's own ordering rule -- and it is the third time in
+            # this file that an early `continue` has turned a demonstrated gap into an unclear
+            # one. The ambiguity is about WHICH body was read, not about whether the read is
+            # accounted for; when every answer agrees, the ambiguity does not matter.
+            bodies = [body_of(v) for v in candidates.values()]
+            if all(b is not None and _reaches_past(b, resolved_exact, resolved_folded)
+                   for b in bodies):
+                _add(reaching_views, name)
             continue
         view = next(iter(candidates.values()), None)
         parsed = body_of(view) if view is not None else None

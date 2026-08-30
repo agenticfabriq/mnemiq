@@ -828,16 +828,56 @@ def test_case_distinct_views_never_certify_by_hash_order(seed):
         from mnemiq.sql.views import inventory_for
         import json
         D = Job(id="discover:views", source_id="s", kind="discover", status="done")
+        # `dialect="postgres"`: the scenario is Postgres case-sensitivity, and DuckDB folds these
+        # two spellings to one object -- as this repo's own source comment records -- so declaring
+        # duckdb would describe a source shape that cannot exist in the dialect it names.
         views = [ViewDefinition(object_id="V", definition="SELECT id FROM secret",
-                                dialect="duckdb"),
-                 ViewDefinition(object_id="v", definition="SELECT 1 AS id", dialect="duckdb")]
+                                dialect="postgres"),
+                 ViewDefinition(object_id="v", definition="SELECT 1 AS id", dialect="postgres")]
         snap = Snapshot(version="v1", source_id="s", created_at="t", views=views, jobs=[D])
         lin = lineage_for(sqlglot.parse_one(\'SELECT id FROM "V"\', read="postgres"), ["V"],
                           inventory_for(snap))
         print(json.dumps({"c": lin.completeness, "u": lin.unresolved}))
     ''')
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
     out = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
-                         env={"PYTHONHASHSEED": seed, "PYTHONPATH": "src", "PATH": "/usr/bin:/bin"})
+                         timeout=60, cwd=root,
+                         env={"PYTHONHASHSEED": seed, "PYTHONPATH": str(root / "src"),
+                              "PATH": "/usr/bin:/bin"})
+    # The child's failure must be legible. Without this a child that cannot import surfaces as an
+    # IndexError from `splitlines()[-1]` with the real traceback discarded, and one that hangs
+    # hangs the suite with no diagnostic at all.
+    assert out.returncode == 0, f"child failed at seed {seed}:\n{out.stderr}"
     result = json.loads(out.stdout.strip().splitlines()[-1])
     assert result["c"] != COMPLETE, f"certified by hash order at seed {seed}"
     assert any(u.startswith("ambiguous-view:") for u in result["u"])
+
+
+def test_an_ambiguous_view_still_reports_a_gap_every_candidate_demonstrates():
+    """Refusing to choose must not hide what every choice would have shown. The `continue` on
+    ambiguity skipped the body scan, so when EVERY candidate body reached past the caller's list
+    the gap was recorded as UNKNOWN — "unclear" where the engine could name the view.
+
+    That inverts this module's own ordering rule, and it is the third time an early `continue` in
+    this file has turned a demonstrated gap into an unclear one. The ambiguity is about WHICH body
+    was read, not about whether the read is accounted for.
+    """
+    both_reach = [ViewDefinition(object_id="V", definition="SELECT id FROM secret",
+                                 dialect="postgres"),
+                  ViewDefinition(object_id="v", definition="SELECT id FROM other_secret",
+                                 dialect="postgres")]
+    lineage = lineage_for(_ast('SELECT id FROM "V"'), ["V"],
+                          inventory_for(_snapshot(views=both_reach, jobs=[_DISCOVERED])))
+    assert lineage.completeness == INCOMPLETE
+    assert "V" in lineage.unresolved
+    assert any(u.startswith("ambiguous-view:") for u in lineage.unresolved), "still recorded"
+
+    # ...and when the candidates DISAGREE, the ambiguity is the whole answer.
+    one_reaches = [ViewDefinition(object_id="V", definition="SELECT id FROM secret",
+                                  dialect="postgres"),
+                   ViewDefinition(object_id="v", definition="SELECT 1 AS id", dialect="postgres")]
+    mixed = lineage_for(_ast('SELECT id FROM "V"'), ["V"],
+                        inventory_for(_snapshot(views=one_reaches, jobs=[_DISCOVERED])))
+    assert mixed.completeness == UNKNOWN
