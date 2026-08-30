@@ -325,12 +325,15 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
         assess = getattr(adapter, name, None)
         if assess is None:
             continue  # this adapter cannot answer; only OracleAdapter implements either today
-        assessed.add(label.replace(" ", "-").lower())
         try:
             verdict, detail = assess()
         except Exception as exc:  # a source that will not answer must not stop the engine booting
             logger.warning("could not assess %s: %s", label, exc)
             continue
+        # Recorded only on SUCCESS. Set before the call, an advisory that RAISED counted as
+        # assessed, so an unmatched ack for it was diagnosed "the verdict changed" while the real
+        # cause -- the exception -- was logged two lines above it.
+        assessed.add(label.replace(" ", "-").lower())
         # An operator who has assessed a gap and accepted it can acknowledge THAT VERDICT, by
         # `<advisory>:<verdict>` -- not the advisory as a whole. Acknowledging the advisory would
         # silence a WORSE verdict arriving later: `read-only basis` moving from `unverifiable`
@@ -357,8 +360,9 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
         if advisory not in known:
             continue  # already warned about above, as an advisory that does not exist
         if advisory not in assessed:
-            logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply -- this source does not report "
-                        "%r at all, so nothing was acknowledged", entry, advisory)
+            logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply -- this source produced no "
+                        "verdict for %r (not implemented here, or the assessment failed above), "
+                        "so nothing was acknowledged", entry, advisory)
         else:
             logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply this boot -- either the verdict "
                         "changed, or the verdict half is misspelled", entry)

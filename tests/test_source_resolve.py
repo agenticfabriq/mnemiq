@@ -541,5 +541,38 @@ def test_an_ack_carried_to_an_adapter_that_cannot_answer_says_which_cause():
         lg.removeHandler(handler)
         lg.level = previous
     out = stream.getvalue()
-    assert "does not report" in out
+    assert "produced no verdict" in out
+    assert "not implemented here" in out, "the message must cover both ways no verdict appears"
     assert "the verdict changed" not in out, "that diagnosis would send them to the wrong place"
+
+
+def test_an_advisory_that_raised_is_not_diagnosed_as_a_changed_verdict():
+    """`assessed` was recorded BEFORE the call, so an advisory that raised counted as assessed.
+
+    An unmatched acknowledgement for it was then told "the verdict changed, or the verdict half is
+    misspelled" while the real cause -- the exception -- was logged two lines above. The wrong
+    diagnosis and its correction sat in the same output.
+    """
+    import io
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Raises:
+        def assert_read_only(self):
+            raise RuntimeError("ORA-00942: table or view does not exist")
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    lg = logging.getLogger("mnemiq.runtime")
+    lg.addHandler(handler)
+    previous, lg.level = lg.level, logging.INFO
+    try:
+        _warn_source_enforcement(_Raises(), frozenset({"read-only-basis:unverifiable"}))
+    finally:
+        lg.removeHandler(handler)
+        lg.level = previous
+    out = stream.getvalue()
+    assert "could not assess" in out and "ORA-00942" in out
+    assert "produced no verdict" in out
+    assert "the verdict changed" not in out
