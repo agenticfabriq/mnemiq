@@ -474,35 +474,58 @@ class OracleAdapter:
         """
         if not self._read_only:
             return ("writable", "this adapter is not read-only, so the question does not apply")
-        # Object privileges are read TWICE, from two dictionary views, because they arrive by two
-        # routes and neither view shows the other's. Measured on a principal owning nothing, with
-        # INSERT/UPDATE/DELETE granted to a ROLE it holds: `user_tab_privs` returned 0 -- not
-        # merely 0 for `grantee = SESSION_USER`, but 0 rows at all -- while
-        # `role_tab_privs` joined to `session_roles` returned 3, and the principal could in fact
-        # insert. `session_privs` DOES resolve role membership, so a single query mixing the two
-        # had one half role-aware and the other not. Role-granted DML is the standard enterprise
-        # shape, so this was the likeliest deployment to be told, wrongly, that it was constrained.
-        owned, direct, via_role, sysprivs = self._rows(
+        # Object privileges are read through `ALL_TAB_PRIVS`, across THREE grantee routes, and
+        # scoped to the governed schema. Every part of that is a measured correction of a wrong
+        # earlier version.
+        #
+        #   ROUTE. `USER_TAB_PRIVS` does not show role-granted privileges -- 0 rows even
+        #   unfiltered for a principal that could insert -- and shows nothing for a grant made to
+        #   PUBLIC either, which a principal can also use. Both measured, both reported
+        #   `constrained` while the principal wrote.
+        #
+        #   PRIVILEGE. **EXECUTE belongs in this list and its absence was the worst hole**, because
+        #   it is the threat itself: a principal holding EXECUTE on an AUTONOMOUS_TRANSACTION
+        #   function owns nothing, holds no DML, and writes anyway. Measured -- verdict
+        #   `constrained`, and `SELECT owner.f_writes FROM dual` inserted a row. The method's own
+        #   docstring described that attack while the query was blind to it.
+        #
+        #   DROPPED OBJECTS. `BIN$...` is Oracle's recycle-bin naming, and a dropped table keeps
+        #   its grants there. Measured: a SELECT-only principal reported `gate_only` on the
+        #   strength of a PUBLIC INSERT held by a table that no longer exists. That is the failure
+        #   that matters most for an advisory -- not a missed warning but an unearned one, because
+        #   a verdict that cannot reach `constrained` is a warning nobody reads.
+        #
+        #   SCOPE. Restricted to `table_schema = :owner` because PUBLIC holds **1829** EXECUTE
+        #   grants outside it on this instance alone -- DBMS_* and friends. Counting those makes
+        #   every connection report `gate_only` forever, and a warning that is always on is a
+        #   warning nobody reads. What matters is who can write the schema under governance.
+        owned, direct, public, via_role, sysprivs = self._rows(
             "SELECT (SELECT count(*) FROM all_tables "
             "         WHERE owner = SYS_CONTEXT('USERENV','SESSION_USER')) AS owned, "
-            "       (SELECT count(*) FROM user_tab_privs "
-            "         WHERE grantee = SYS_CONTEXT('USERENV','SESSION_USER') "
-            "           AND privilege IN ('INSERT','UPDATE','DELETE')) AS direct, "
-            "       (SELECT count(*) FROM role_tab_privs "
-            "         WHERE role IN (SELECT role FROM session_roles) "
-            "           AND privilege IN ('INSERT','UPDATE','DELETE')) AS via_role, "
+            "       (SELECT count(*) FROM all_tab_privs WHERE table_schema = :owner "
+            "         AND privilege IN ('INSERT','UPDATE','DELETE','EXECUTE','ALTER') AND table_name NOT LIKE 'BIN$%' "
+            "         AND grantee = SYS_CONTEXT('USERENV','SESSION_USER')) AS direct, "
+            "       (SELECT count(*) FROM all_tab_privs WHERE table_schema = :owner "
+            "         AND privilege IN ('INSERT','UPDATE','DELETE','EXECUTE','ALTER') AND table_name NOT LIKE 'BIN$%' "
+            "         AND grantee = 'PUBLIC') AS public_grants, "
+            "       (SELECT count(*) FROM all_tab_privs WHERE table_schema = :owner "
+            "         AND privilege IN ('INSERT','UPDATE','DELETE','EXECUTE','ALTER') AND table_name NOT LIKE 'BIN$%' "
+            "         AND grantee IN (SELECT role FROM session_roles)) AS via_role, "
             "       (SELECT count(*) FROM session_privs WHERE privilege IN "
             "         ('INSERT ANY TABLE','UPDATE ANY TABLE','DELETE ANY TABLE', "
-            "          'CREATE ANY TABLE','DROP ANY TABLE','CREATE TABLE', "
-            "          'CREATE PROCEDURE','CREATE ANY PROCEDURE')) AS sysprivs "
-            "FROM dual"
+            "          'CREATE ANY TABLE','DROP ANY TABLE','ALTER ANY TABLE','CREATE TABLE', "
+            "          'CREATE PROCEDURE','CREATE ANY PROCEDURE','EXECUTE ANY PROCEDURE', "
+            "          'CREATE ANY TRIGGER','CREATE JOB','CREATE ANY JOB')) AS sysprivs "
+            "FROM dual", owner=self._schema
         )[0]
-        granted = direct + via_role
+        granted = direct + public + via_role
         if owned or granted or sysprivs:
             return ("gate_only", (
-                f"this read-only connection CAN write: it owns {owned} table(s), holds DML grants "
-                f"on {granted} ({direct} direct, {via_role} through a role), and holds "
-                f"{sysprivs} write-shaped system privilege(s). Direct "
+                f"this read-only connection CAN write {self._schema}: it owns {owned} table(s), "
+                f"holds {granted} write-shaped object privilege(s) there ({direct} direct, "
+                f"{via_role} through a role, {public} granted to PUBLIC -- INSERT/UPDATE/DELETE/"
+                f"ALTER, and EXECUTE, which is enough on its own), and holds {sysprivs} "
+                "write-shaped system privilege(s). Direct "
                 "writes are refused by this adapter, but a SELECT that reaches an "
                 "AUTONOMOUS_TRANSACTION function -- possibly through a view, where the statement "
                 "text names nothing -- is not something any statement check can see. Connect the "

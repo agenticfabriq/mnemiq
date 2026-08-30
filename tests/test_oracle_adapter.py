@@ -992,3 +992,87 @@ def test_assert_read_only_sees_dml_granted_through_a_role():
             owner.execute("DROP TABLE role_target")
         except oracledb.DatabaseError:
             pass
+
+
+@needs_admin
+def test_assert_read_only_tracks_every_route_by_which_a_principal_can_write():
+    """Four routes and a CONTROL, because three earlier versions of this check passed against
+    whichever principal happened to be in front of them.
+
+    Each row here is a measured false verdict from a previous version:
+
+      EXECUTE on a writing function -- reported `constrained`, and `SELECT owner.f_w FROM dual`
+        inserted a row. The worst of them: EXECUTE IS the threat this method documents, a principal
+        holding it owns nothing and holds no DML, and the query was blind to exactly that.
+      granted through a ROLE -- `USER_TAB_PRIVS` shows no role-granted privilege, 0 rows even
+        unfiltered, and the principal could insert.
+      granted to PUBLIC -- invisible to every source the check read, and the principal could insert.
+      SELECT only -- **the control, and the one that matters most.** A verdict that cannot reach
+        `constrained` is a warning nobody reads, and one version could not: it counted a PUBLIC
+        INSERT held by a table in the RECYCLE BIN, so a principal with no write ability anywhere
+        was told it had one. `BIN$%` is excluded for that reason.
+    """
+    import oracledb
+
+    owner = _adapter(read_only=False)
+    users = ("p_exec", "p_role", "p_none")
+    admin = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
+                             mode=oracledb.AUTH_MODE_SYSDBA)
+    cur = admin.cursor()
+    for stmt in ("DROP ROLE r_writer",):
+        try:
+            cur.execute(stmt)
+        except oracledb.DatabaseError:
+            pass
+    for name in users:
+        _drop_user(cur, name)
+    made = []
+    try:
+        try:
+            owner.execute("DROP TABLE t_route")
+        except oracledb.DatabaseError:
+            pass
+        owner.execute("CREATE TABLE t_route (id NUMBER)")
+        owner.execute("CREATE OR REPLACE FUNCTION f_route RETURN NUMBER AS "
+                      "  PRAGMA AUTONOMOUS_TRANSACTION; "
+                      "BEGIN INSERT INTO t_route VALUES (1); COMMIT; RETURN 1; END;")
+        for name in users:
+            cur.execute(f"CREATE USER {name} IDENTIFIED BY pw")
+            cur.execute(f"GRANT CREATE SESSION TO {name}")
+        cur.execute("CREATE ROLE r_writer")
+        cur.execute("GRANT r_writer TO p_role")
+        owner.execute("GRANT EXECUTE ON f_route TO p_exec")
+        owner.execute(f"GRANT INSERT ON {USER}.t_route TO r_writer")
+        owner.execute(f"GRANT SELECT ON {USER}.t_route TO p_none")
+
+        def verdict(name):
+            a = OracleAdapter(dsn=DSN, user=name, password="pw", schema=USER)
+            made.append(a)
+            return a.assert_read_only()[0]
+
+        assert verdict("p_exec") == "gate_only", "EXECUTE alone is enough to write"
+        assert verdict("p_role") == "gate_only", "role-granted DML must be seen"
+        assert verdict("p_none") == "constrained", (
+            "a SELECT-only principal must be reachable, or the verdict is inert"
+        )
+
+        owner.execute(f"GRANT INSERT ON {USER}.t_route TO PUBLIC")
+        assert verdict("p_none") == "gate_only", "a grant to PUBLIC is usable by everyone"
+        owner.execute(f"REVOKE INSERT ON {USER}.t_route FROM PUBLIC")
+        assert verdict("p_none") == "constrained", "and it flips back when the grant goes"
+    finally:
+        for a in made:
+            a._con.close()
+        for name in users:
+            _drop_user(cur, name)
+        try:
+            cur.execute("DROP ROLE r_writer")
+        except oracledb.DatabaseError:
+            pass
+        cur.close()
+        admin.close()
+        for stmt in ("DROP FUNCTION f_route", "DROP TABLE t_route", "PURGE RECYCLEBIN"):
+            try:
+                owner.execute(stmt)
+            except oracledb.DatabaseError:
+                pass
