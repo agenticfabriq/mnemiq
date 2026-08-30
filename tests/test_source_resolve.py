@@ -655,3 +655,38 @@ def test_a_wallet_password_without_a_directory_is_refused_by_name(driver):
     assert "MNEMIQ_ORACLE_CONFIG_DIR" in str(exc.value)
     assert "MNEMIQ_ORACLE_WALLET_PASSWORD" in str(exc.value)
     assert driver.seen == {}, "it must refuse before opening a connection"
+
+
+def test_a_half_configured_wallet_arrives_as_a_clean_message_not_a_traceback(driver):
+    """`ask`, `write`, `enrich` and `refresh` all catch `SourceUnconfigured` and print it.
+
+    The adapter validates its own TLS arguments and raises `ValueError`, which none of those doors
+    catch -- so the operator got a traceback for a plain misconfiguration, while the sibling
+    missing-credential case one function up produced a sentence. It is translated at the resolver
+    because the adapter cannot import this module: the dependency runs one way.
+    """
+    s = _settings(oracle_user="app", oracle_password="pw", oracle_wallet_password="wp")
+    with pytest.raises(resolve.SourceUnconfigured) as exc:
+        resolve.adapter_for(_spec(kind="oracle", target="h:1521/S"), s)
+    assert "MNEMIQ_ORACLE_CONFIG_DIR" in str(exc.value)
+
+
+def test_build_runtime_renders_it_the_same_way_as_any_other_misconfiguration(monkeypatch, tmp_path):
+    """The door, not just the resolver -- `build_runtime` translates `SourceUnconfigured` into
+    `SnapshotMissing`, which is what the CLI actually prints."""
+    from mnemiq.contract.semantic import Snapshot
+    from mnemiq.runtime import SnapshotMissing, build_runtime
+    from mnemiq.store.bootstrap import init_store
+    from mnemiq.store.snapshot_store import save_snapshot
+
+    store = tmp_path / "s.duckdb"
+    con = init_store(str(store))
+    save_snapshot(con, Snapshot(version="v1", source_id="only", created_at="t"))
+    con.close()
+    manifest = tmp_path / "sources.json"
+    manifest.write_text(json.dumps([{"id": "only", "kind": "oracle", "target": "h:1521/S",
+                                     "catalog": "o", "schema": "APP"}]))
+    s = _settings(sources_path=str(manifest), source_id="only", store_path=str(store),
+                  oracle_user="app", oracle_password="pw", oracle_wallet_password="wp")
+    with pytest.raises(SnapshotMissing, match="MNEMIQ_ORACLE_CONFIG_DIR"):
+        build_runtime(s)
