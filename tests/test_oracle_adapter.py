@@ -466,6 +466,14 @@ def _drop_user(cur, username):
             # report "user gone" while it is still there -- the exact postcondition this function
             # exists to guarantee. The string is kept only as a fallback for an error re-raised
             # without the driver's error object.
+            #
+            # **Deliberately NARROWER than `_is_ddl_race`, which falls back unconditionally**, and
+            # the asymmetry is about consequence rather than style. A false positive there costs a
+            # retry. A false positive HERE declares a privileged account gone -- these users hold
+            # EXEMPT ACCESS POLICY or own governed tables -- and reports a clean teardown while
+            # the leak stands. A review asked for the two to be made identical; they were, and the
+            # gate then blocked it for reintroducing exactly this. Same shape, different blast
+            # radius, so they stay different on purpose.
             err = exc.args[0] if exc.args else None
             if getattr(err, "code", None) == 1918 or (
                 err is None and "ORA-01918" in str(exc)
