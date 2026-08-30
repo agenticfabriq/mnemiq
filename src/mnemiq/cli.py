@@ -135,10 +135,22 @@ def _cmd_enrich(settings: Settings) -> int:
     )
     from mnemiq.enrichment.dictionary import load_dictionary
     from mnemiq.enrichment.grounding import apply_dictionary, ground_codes
-    from mnemiq.enrichment.pipeline import content_version
+    from mnemiq.enrichment.pipeline import content_version, profile_outcome
     from mnemiq.ontology.records import load_records, merge_records
 
     snap = enrich_structural(adapter, spec.id)
+    # Read what the profile jobs say BEFORE spending LLM calls on the result or saving it. M59:
+    # the statuses were recorded honestly and nothing consumed them, so a run in which every table
+    # failed returned a zero-column snapshot and exited 0 -- and the engine then answered "I don't
+    # know about any tables" when the truth was "I could not read them".
+    outcome, detail = profile_outcome(snap)
+    if outcome == "unread":
+        print(f"enrich failed: {detail}", file=sys.stderr)
+        return 1  # nothing is saved: an empty snapshot would be indistinguishable from an empty DB
+    if outcome == "partial":
+        print(f"enrich incomplete: {detail}", file=sys.stderr)
+    elif outcome == "empty":
+        print(f"note: {detail}", file=sys.stderr)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
     _certified = fetch_certified_records(settings)

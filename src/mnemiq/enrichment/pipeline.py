@@ -55,6 +55,47 @@ def content_version(snapshot: Snapshot) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:12]
 
 
+def profile_outcome(snapshot: Snapshot) -> tuple[str, str]:
+    """What the profile jobs say about whether this snapshot describes the source at all.
+
+    `enrich_structural` is fail-soft per table: one that will not profile is logged and EXCLUDED,
+    so a single bad table never sinks a run. That is right, and it records the outcome honestly as
+    `Job(id="profile:<table>", status="failed")` -- **the truth has always been in the snapshot and
+    nothing read it** (M59). When every table failed, the run returned a snapshot with zero columns
+    and exited 0, and the engine then answered "I don't know about any tables" when the truth was
+    "I could not read them". Measured on Oracle, where a read-only transaction refused every table
+    at once (M60); reachable on any adapter, and by a second route -- a manifest naming a schema
+    that does not exist profiles nothing and looks identically empty.
+
+    FOUR outcomes, not a threshold. A bare count would collapse the two that matter most:
+
+      empty     no profile job at all -- the source has no tables. A real, sayable state.
+      complete  every table profiled.
+      partial   some failed. The model is smaller than the database and the caller should know.
+      unread    at least one table, and EVERY one failed. The snapshot describes nothing, and it
+                is not evidence that there is nothing to describe.
+
+    `discover:views` earned its third state for this same reason: "no views" and "could not ask"
+    must not share a value. This is that distinction one level up, over the whole model.
+    """
+    profiles = [j for j in snapshot.jobs if j.kind == "profile"]
+    if not profiles:
+        return ("empty", "the source reported no tables to profile")
+    failed = [j for j in profiles if j.status == "failed"]
+    if not failed:
+        return ("complete", f"all {len(profiles)} table(s) profiled")
+    if len(failed) == len(profiles):
+        return ("unread", (
+            f"every one of the {len(profiles)} table(s) failed to profile, so this snapshot "
+            "describes nothing -- which is NOT evidence that the source is empty. The per-table "
+            "reasons were logged above; the usual causes are a connection that cannot read the "
+            "schema, or a schema name that matches nothing"))
+    return ("partial", (
+        f"{len(failed)} of {len(profiles)} table(s) failed to profile and are EXCLUDED from the "
+        f"model: {', '.join(sorted(j.id.split(':', 1)[1] for j in failed))}. The engine will "
+        "answer as though those tables do not exist"))
+
+
 def enrich_structural(adapter, source_id: str) -> Snapshot:
     """The no-LLM enrichment pass: discover, profile, infer joins.
 
