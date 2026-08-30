@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 import sqlglot
@@ -16,6 +17,8 @@ from mnemiq.catalog import TableInfo, is_key_like, is_sensitive_name
 # Keyed by dialect because it is a property of the SOURCE, not of this module: Postgres aggregates
 # `text` and `bytea` without complaint, and a shared exclusion list would silently stop profiling
 # columns there that profile fine.
+logger = logging.getLogger(__name__)
+
 _UNAGGREGATABLE: dict[str, frozenset[str]] = {
     "oracle": frozenset({"CLOB", "NCLOB", "BLOB", "BFILE", "LONG", "LONG RAW", "VECTOR",
                          "XMLTYPE", "ROWID", "UROWID"}),
@@ -121,17 +124,59 @@ def profile_table(
     cols = [c.name for c in table.columns if _base_type(c.data_type) not in blocked]
     skipped = [c.name for c in table.columns if _base_type(c.data_type) in blocked]
 
+    measured: dict[str, tuple] = {}
     if cols:
         selects = ["count(*)"]
         for c in cols:
             selects += [f'count(DISTINCT "{c}")', f'count("{c}")']
-        row = adapter.execute(f'SELECT {", ".join(selects)} FROM "{table.name}"')[0]
-        row_count = row[0]
+        try:
+            row = adapter.execute(f'SELECT {", ".join(selects)} FROM "{table.name}"')[0]
+            row_count = row[0]
+            for i, c in enumerate(cols):
+                measured[c] = (row[1 + 2 * i], row[2 + 2 * i])
+        except Exception as exc:
+            # LOGGED, because otherwise this is the absence/failure collapse inside the fix for
+            # one: a column skipped by `_UNAGGREGATABLE` and a column that BROKE both end up as
+            # `distinct_count=None`, and nothing distinguishes "this type is known-uncountable"
+            # from "a permission, a driver fault, or a bug in this file". A known type is skipped
+            # before any query and logs NOTHING, so a line here always means something unplanned.
+            logger.warning("batched profile of %r failed (%s); measuring column by column",
+                           table.name, exc)
+            # ONE query per table is the fast path, and it makes any single unaggregatable column
+            # fatal to every column beside it. `_UNAGGREGATABLE` removes the ones we can NAME, and
+            # it can never be complete: a user-defined object type reports its OWN name as its
+            # data type, so `ADDR_T` is unlistable, and measured on a live instance
+            # `count(DISTINCT)` on one raises ORA-22950 -- a different code from the ORA-22849 the
+            # LOB types give. A denylist is therefore an optimisation and cannot be the guarantee.
+            #
+            # So on failure, measure column by column. A column that will not count costs ITSELF
+            # and nothing else, whatever the reason and whatever Oracle calls it.
+            row_count = adapter.execute(f'SELECT count(*) FROM "{table.name}"')[0][0]
+            for c in cols:
+                try:
+                    measured[c] = adapter.execute(
+                        f'SELECT count(DISTINCT "{c}"), count("{c}") FROM "{table.name}"')[0]
+                except Exception as col_exc:
+                    logger.warning("column %r.%r could not be counted and is carried with unknown "
+                                   "stats: %s", table.name, c, col_exc)
+                    measured[c] = (None, None)
+            if all(v == (None, None) for v in measured.values()):
+                # NOT a per-column quirk. Carrying unknowns for every column would report a table
+                # that measured NOTHING as `done`, and `enrich_structural` marks a table done
+                # whenever this returns -- so `profile_outcome` would say `complete` over a model
+                # that measured nothing. That is M59's bug class, one call frame below where it was
+                # closed this morning, and the codebase already paid for it once as the Pagila
+                # timestamptz failure that dropped 14 of 15 tables while reporting success.
+                #
+                # A cause that takes out EVERY column is systemic, not typed: a permission, a
+                # driver fault, temp space exhausted by the sort a DISTINCT needs. Re-raising
+                # restores exactly the pre-fallback behaviour for that case -- the pipeline marks
+                # the table failed and the outcome reports it.
+                raise
     else:
         # Every column is unaggregatable, so there is nothing to count them WITH; the row count
         # still is, and it is what tells a reader the table is not empty.
         row_count = adapter.execute(f'SELECT count(*) FROM "{table.name}"')[0][0]
-        row = [row_count]
 
     stats: list[ColumnStats] = []
     for name in skipped:
@@ -139,14 +184,14 @@ def profile_table(
         # and could make the column look like an empty coded vocabulary.
         stats.append(ColumnStats(table=table.name, column=name, row_count=row_count,
                                  distinct_count=None, null_count=None))
-    for i, c in enumerate(cols):
-        distinct_count, non_null = row[1 + 2 * i], row[2 + 2 * i]
+    for c in cols:
+        distinct_count, non_null = measured[c]
         s = ColumnStats(
             table=table.name,
             column=c,
             row_count=row_count,
             distinct_count=distinct_count,
-            null_count=row_count - non_null,
+            null_count=None if non_null is None else row_count - non_null,
         )
         # A small observed value set is a candidate coded vocabulary; the semantic pass gives
         # the codes meaning. Two kinds of column are excluded before we ever read a value:
@@ -157,6 +202,7 @@ def profile_table(
             not is_key_like(c)
             and c not in keys
             and not is_sensitive_name(c)
+            and distinct_count is not None  # unmeasured: not a vocabulary candidate
             and 0 < distinct_count <= code_max_distinct
             and distinct_count < row_count
         ):
