@@ -1,10 +1,13 @@
-"""M59: the profile jobs were recorded honestly and nothing read them.
+"""M59: the profile jobs were read and reported, and nothing ACTED on them.
 
 `enrich_structural` is fail-soft per table -- one that will not profile is logged and excluded, so
 a single bad table never sinks a run. It records `Job(id="profile:<t>", status="failed")` for each.
-When EVERY table failed, the run still returned a snapshot and exited 0, so an engine that had
-connected to a database and could read none of it was indistinguishable from one connected to an
-empty database. The signal existed; the consumer did not.
+
+The finding as first filed said nothing read those statuses. That was wrong: `_cmd_enrich` already
+ended with a WARNING naming the excluded tables, and had before any of this work. What nobody did
+was act on them -- the run exited 0 and SAVED the snapshot whatever they said. So a run in which
+every table failed printed "the semantic model is INCOMPLETE", which is a wild understatement for
+"describes nothing", and persisted it for the next `build` and `ask` to plan against.
 """
 
 from __future__ import annotations
@@ -125,10 +128,19 @@ def test_enrich_refuses_and_saves_nothing_for_every_describes_nothing_outcome(
     assert "enrich failed" in capsys.readouterr().err
 
 
-def test_a_partial_run_is_reported_once_not_twice(monkeypatch, tmp_path, capsys):
-    """`_cmd_enrich` already ended with a WARNING naming the excluded tables, before this change.
-    Adding a second report of the same fact at the top would have said it twice in one run -- which
-    is also the evidence that M59's "nothing read it" was overstated."""
+def test_the_early_branch_stays_silent_on_a_partial_run(monkeypatch, tmp_path, capsys):
+    """`_cmd_enrich` already reports excluded tables at its tail, so the early check must not.
+
+    **This test previously claimed more than it could show, and the way it failed is the point.**
+    It asserted `err.count("FAILED to profile") <= 1` to prove the tail warning fires exactly once
+    -- but with no LLM configured the run raises at `LLMClient(settings)` long before that tail,
+    the `except Exception: pass` swallowed it, and the count was 0, so the assertion was `0 <= 1`
+    and could not fail. It verified nothing while reading as though it verified the duplication.
+
+    So it now asserts only what this call can actually establish: on `partial` the early branch
+    neither refuses nor prints. The tail's own behaviour is unchanged by this work and is not
+    mine to claim coverage of.
+    """
     from mnemiq.cli import _cmd_enrich
     from mnemiq.config import Settings
 
@@ -137,10 +149,8 @@ def test_a_partial_run_is_reported_once_not_twice(monkeypatch, tmp_path, capsys)
     monkeypatch.setattr("mnemiq.adapters.resolve.adapter_for", lambda *a, **k: object())
     settings = Settings(llm_base_url=None, llm_api_key=None, llm_model=None, acme_data_dir=None,
                         pg_dsn="postgresql://h/db", store_path=str(tmp_path / "s.duckdb"))
-    try:
+    with pytest.raises(Exception):  # noqa: B017 - the run goes on to work this test does not set up
         _cmd_enrich(settings)
-    except Exception:
-        pass  # the run goes on to real work this test does not stand up; the count is the point
     err = capsys.readouterr().err
-    assert err.count("FAILED to profile") <= 1, "one run, one report of the same fact"
-    assert "enrich incomplete" not in err, "the early branch must not duplicate the tail warning"
+    assert "enrich failed" not in err, "a partial run must not be refused"
+    assert "enrich incomplete" not in err, "and must not be reported twice in one run"

@@ -139,10 +139,12 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.ontology.records import load_records, merge_records
 
     snap = enrich_structural(adapter, spec.id)
-    # Read what the profile jobs say BEFORE spending LLM calls on the result or saving it. M59:
-    # the statuses were recorded honestly and nothing consumed them, so a run in which every table
-    # failed returned a zero-column snapshot and exited 0 -- and the engine then answered "I don't
-    # know about any tables" when the truth was "I could not read them".
+    # Read what the profile jobs say BEFORE spending LLM calls on the result or saving it. M59,
+    # as corrected: the statuses were already read and REPORTED by the WARNING at the tail of this
+    # function, which pre-dates this check. What nobody did was ACT on them -- the run exited 0 and
+    # saved the snapshot whatever they said, so a run in which every table failed persisted a
+    # zero-column model and the engine then answered "I don't know about any tables" when the truth
+    # was "I could not read them".
     outcome, detail = profile_outcome(snap)
     if outcome in ("unread", "empty"):
         # Both mean the snapshot describes NOTHING, and saving one is the harm: the next `build`
