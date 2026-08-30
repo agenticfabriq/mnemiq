@@ -5,12 +5,12 @@ import json
 import logging
 from datetime import UTC, datetime
 
-logger = logging.getLogger(__name__)
-
 from mnemiq.catalog import introspect
 from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding, ViewDefinition
 from mnemiq.enrichment.joins import build_relationships
 from mnemiq.enrichment.profiling import profile_table
+
+logger = logging.getLogger(__name__)
 
 
 def content_version(snapshot: Snapshot) -> str:

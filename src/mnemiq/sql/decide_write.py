@@ -8,6 +8,7 @@ from mnemiq.contract import ViewDefinition
 from mnemiq.sql.authz_guard import check_access
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.prove import prove
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import base_tables
 from mnemiq.sql.rls import apply_row_filters_to_write
@@ -276,12 +277,10 @@ def decide_write(
     plan_sql = shaped.sql(dialect=dialect)
     target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
     if adapter is not None:
-        try:
-            adapter.execute(f"EXPLAIN {target_sql}")  # plans without executing; proves the SQL
-        except Exception as exc:
-            return Refusal(
-                code=RefusalCode.EXPLAIN_FAILED,
-                message=f"The source rejected this query: {exc}",
-            )
+        # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof
+        # the source understands -- `EXPLAIN` is not Oracle syntax (see mnemiq.sql.prove).
+        refused = prove(adapter, target_sql)
+        if refused is not None:
+            return refused
 
     return ApprovedWrite(plan_sql=plan_sql, target_sql=target_sql, target=tgt, tables=tables)

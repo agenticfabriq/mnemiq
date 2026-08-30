@@ -111,7 +111,9 @@ def _cmd_digest_ontology(args) -> int:
 
 
 def _cmd_enrich(settings: Settings) -> int:
-    from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
+    from mnemiq.adapters.resolve import (
+        SourceUnconfigured, UnknownSourceKind, adapter_for, source_spec,
+    )
     from mnemiq.enrichment.enricher import LLMEnricher
     from mnemiq.enrichment.examples import LLMExampleGenerator, enrich_examples
     from mnemiq.enrichment.facts import LLMFactsEnricher, enrich_table_facts
@@ -122,8 +124,11 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.store.bootstrap import init_store
     from mnemiq.store.snapshot_store import save_snapshot
 
-    if not settings.pg_dsn:
-        print("set MNEMIQ_PG_DSN", file=sys.stderr)
+    try:
+        spec = source_spec(settings)
+        adapter = adapter_for(spec, settings)
+    except (SourceUnconfigured, UnknownSourceKind) as exc:
+        print(str(exc), file=sys.stderr)
         return 1
     from mnemiq.enrichment.certified import (
         apply_certified, certified_concept_schemes, fetch_certified_records,
@@ -133,8 +138,7 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.enrichment.pipeline import content_version
     from mnemiq.ontology.records import load_records, merge_records
 
-    adapter = DuckDBPostgresAdapter(settings.pg_dsn)
-    snap = enrich_structural(adapter, settings.source_id)
+    snap = enrich_structural(adapter, spec.id)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
     _certified = fetch_certified_records(settings)
@@ -248,11 +252,14 @@ def _cmd_build(settings: Settings) -> int:
                 if v is not None:
                     publish_version(settings.control_dsn, spec.id, v)
         return 0
-    version = current_version(con, settings.source_id)
+    # The spec's id, for the reason spelled out in `load_current_snapshot`: `enrich` keys the
+    # snapshot by it, and settings.source_id is not reconciled with a manifest's.
+    from mnemiq.adapters.resolve import source_spec
+
+    sid = source_spec(settings).id
+    version = current_version(con, sid)
     if version is None:
-        print(
-            f"no snapshot for {settings.source_id!r} -- run `mnemiq enrich` first", file=sys.stderr
-        )
+        print(f"no snapshot for {sid!r} -- run `mnemiq enrich` first", file=sys.stderr)
         return 1
     snap = load_snapshot(con, version)
     n = build_index(con, snap, embedder)
@@ -261,25 +268,30 @@ def _cmd_build(settings: Settings) -> int:
     if settings.control_dsn:
         from mnemiq.store.control import publish_version
 
-        publish_version(settings.control_dsn, settings.source_id, version)
+        publish_version(settings.control_dsn, sid, version)
     return 0
 
 
 def _cmd_refresh(settings: Settings) -> int:
-    from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
+    from mnemiq.adapters.resolve import (
+        SourceUnconfigured, UnknownSourceKind, adapter_for, source_spec,
+    )
     from mnemiq.enrichment.refresh import catalog_diff
     from mnemiq.store.bootstrap import init_store
     from mnemiq.store.snapshot_store import current_version, load_snapshot
 
-    if not settings.pg_dsn:
-        print("set MNEMIQ_PG_DSN", file=sys.stderr)
+    try:
+        spec = source_spec(settings)
+        adapter = adapter_for(spec, settings)
+    except (SourceUnconfigured, UnknownSourceKind) as exc:
+        print(str(exc), file=sys.stderr)
         return 1
     con = init_store(settings.store_path)
-    version = current_version(con, settings.source_id)
+    version = current_version(con, spec.id)
     if version is None:
         print("no snapshot -- run `mnemiq enrich` first", file=sys.stderr)
         return 1
-    diff = catalog_diff(DuckDBPostgresAdapter(settings.pg_dsn), load_snapshot(con, version))
+    diff = catalog_diff(adapter, load_snapshot(con, version))
     print(f"added={diff.added} changed={diff.changed} dropped={diff.dropped}")
     if not diff.has_changes:
         print("catalog unchanged -- nothing to refresh")

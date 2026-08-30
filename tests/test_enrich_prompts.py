@@ -1,4 +1,4 @@
-from mnemiq.enrichment.prompts import ColumnFacts, render_grounding_block, render_table_facts, user_prompt
+from mnemiq.enrichment.prompts import ColumnFacts, render_grounding_block, user_prompt
 from mnemiq.enrichment.enricher import FakeEnricher
 
 _FACTS = "TABLE: t\nCOLUMNS:\n- x (type=text)"

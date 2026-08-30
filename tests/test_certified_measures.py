@@ -19,6 +19,8 @@ So a metric is offered when its source table is in the retrieved context, which 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Dimension, MeasureExpr, Metric
 from mnemiq.semantic.measures import select_dimensions, select_metrics
+from mnemiq.generate.prompts import user_prompt
+from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, retrieve
 
 
 def _settled() -> Metric:
@@ -88,9 +90,6 @@ def test_the_question_does_not_have_to_name_the_metric():
 
 
 # --- the wiring: selection is worthless if the packet never carries it to the prompt -------------
-
-from mnemiq.generate.prompts import user_prompt
-from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, retrieve
 
 
 def _packet(**kwargs) -> ContextPacket:
