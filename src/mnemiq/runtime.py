@@ -274,21 +274,29 @@ def _warn_source_enforcement(adapter) -> None:
     **M57** is open for; the value of wiring it now is that the verdict is visible from the first
     Oracle deployment rather than from the one after the trust boundary moves.
 
-    Any adapter that grows an `assert_enforcing` is picked up here without further wiring, which is
-    the property whose absence produced the finding.
+    It reports on two questions, both optional and both skipped by an adapter that cannot answer:
+    whether the SOURCE is enforcing row security, and whether `read_only` rests on this adapter's
+    statement gate alone. The second exists because that gate provably cannot see a write reached
+    through an `AUTONOMOUS_TRANSACTION` function, and a view can hide the call so the statement
+    text names nothing -- so the reachable question is whether the connection could write at all.
+
+    Any adapter that grows either method is picked up here without further wiring, which is the
+    property whose absence produced the finding.
     """
-    assess = getattr(adapter, "assert_enforcing", None)
-    if assess is None:
-        return
-    try:
-        verdict, detail = assess()
-    except Exception as exc:  # a source that will not answer must not stop the engine booting
-        logger.warning("could not assess source enforcement: %s", exc)
-        return
-    if verdict == "attached":
-        logger.info("source enforcement: %s -- %s", verdict, detail)
-    else:
-        logger.warning("source enforcement: %s -- %s", verdict, detail)
+    for name, label, clean in (("assert_enforcing", "source enforcement", "attached"),
+                               ("assert_read_only", "read-only basis", "constrained")):
+        assess = getattr(adapter, name, None)
+        if assess is None:
+            continue
+        try:
+            verdict, detail = assess()
+        except Exception as exc:  # a source that will not answer must not stop the engine booting
+            logger.warning("could not assess %s: %s", label, exc)
+            continue
+        if verdict in (clean, "writable"):
+            logger.info("%s: %s -- %s", label, verdict, detail)
+        else:
+            logger.warning("%s: %s -- %s", label, verdict, detail)
 
 
 def _resolve_verify_level(mode_verify: str, override: str | None) -> str:

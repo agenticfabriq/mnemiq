@@ -840,3 +840,66 @@ def test_concurrent_reads_through_one_adapter_do_not_corrupt_each_other():
     assert errors == []
     assert set(counts) == {1}, "every read must see the same committed state"
     assert a._con.call_timeout == 0, "a bounded query must not leave the connection bounded"
+
+
+def test_the_read_only_gate_does_not_stop_a_write_reached_through_plsql():
+    """**A known, measured hole, pinned so it cannot be forgotten or silently "fixed" wrongly.**
+
+    `_refuse_unless_read` stops direct DML and DDL and is the only thing that stops DDL. It cannot
+    stop this: a function declared `PRAGMA AUTONOMOUS_TRANSACTION` runs in its OWN transaction, so
+    the read-only one never applies to it. A function WITHOUT the pragma is stopped by Oracle
+    itself (ORA-14551), so the pragma is the whole of the gap.
+
+    The second half is why no statement check can close it: the call is wrapped in a VIEW, so the
+    SQL this adapter sees is `SELECT n FROM v_sneaky` and contains no function name at all.
+    Parsing for callables would not find it. Privilege is the control that works, which is what
+    `assert_read_only` reports on and what `test_assert_read_only_says_the_gate_is_the_only_basis`
+    covers.
+
+    If this test ever starts FAILING, the hole has closed and that is good news -- but read
+    `assert_read_only` before deleting it, because the likeliest cause is the test principal losing
+    a privilege rather than the gate gaining a power.
+    """
+    import oracledb
+
+    w = _adapter(read_only=False)
+    for stmt in ("DROP VIEW v_sneaky", "DROP FUNCTION f_auto", "DROP TABLE se_probe"):
+        try:
+            w.execute(stmt)
+        except oracledb.DatabaseError:
+            pass
+    w.execute("CREATE TABLE se_probe (id NUMBER)")
+    w.execute("CREATE OR REPLACE FUNCTION f_auto RETURN NUMBER AS "
+              "  PRAGMA AUTONOMOUS_TRANSACTION; "
+              "BEGIN INSERT INTO se_probe VALUES (1); COMMIT; RETURN 1; END;")
+    w.execute("CREATE VIEW v_sneaky AS SELECT f_auto AS n FROM dual")
+    try:
+        assert w.execute("SELECT count(*) FROM se_probe") == [(0,)]
+        _adapter().execute("SELECT n FROM v_sneaky")  # the gate allows it: it is a SELECT
+        assert w.execute("SELECT count(*) FROM se_probe") == [(1,)], (
+            "the write did NOT happen -- if this is a real fix, update assert_read_only and this "
+            "docstring; if the test principal merely lost a privilege, the hole is still open"
+        )
+    finally:
+        for stmt in ("DROP VIEW v_sneaky", "DROP FUNCTION f_auto", "DROP TABLE se_probe"):
+            try:
+                w.execute(stmt)
+            except oracledb.DatabaseError:
+                pass
+
+
+def test_assert_read_only_says_the_gate_is_the_only_basis_when_the_principal_can_write():
+    """The reachable question at boot: not "is the gate on" but "could this connection write".
+
+    The test user owns its schema, which is the common deployment shape and the one where the
+    PL/SQL hole above is reachable.
+    """
+    verdict, detail = _adapter().assert_read_only()
+    assert verdict == "gate_only"
+    assert "CAN write" in detail and "AUTONOMOUS_TRANSACTION" in detail
+    assert "SELECT and nothing else" in detail, "it must name the deployment fix"
+
+
+def test_assert_read_only_does_not_answer_for_a_writable_adapter():
+    verdict, _ = _adapter(read_only=False).assert_read_only()
+    assert verdict == "writable"
