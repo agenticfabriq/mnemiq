@@ -121,46 +121,55 @@ def _add(out: list[str], value: str) -> None:
         out.append(admitted)
 
 
-def _unclassified_functions(ast) -> list[str]:
-    """Function calls whose reach this engine cannot rule out, in one AST.
+def _functions_in(ast) -> tuple[list[str], bool]:
+    """Callables this engine cannot resolve to a source identity, and whether ANY call was seen.
 
-    Reused for the caller's statement AND for a view's body: a view defined `SELECT all_ssns()`
-    reads through a function, and checking its body only for base TABLES reported the view as
-    fully accounted for. The reach is one level down, not absent.
+    Two returns because the two facts are different. A name is worth RECORDING when it is not a
+    known builtin; but *any* call at all -- builtin-looking or not -- means completeness cannot be
+    confirmed, because sqlglot classifies a name like `log` as a typed builtin before the source
+    binds it, so a source UDF called `log` is invisible to `find_all(exp.Anonymous)`. That was a
+    documented false negative sitting as a strict xfail while COMPLETE was emitted beside it.
 
-    `_PURE` applies only to an UNQUALIFIED call. `public.now()` parses to an `Anonymous` whose
-    `name` is the bare leaf `now`, so matching on the leaf let a schema-qualified callable inherit
-    a builtin's exemption -- a UDF named `now` in any schema. A qualified call has an `exp.Dot`
-    parent, which is the structural form of "this is not the builtin you whitelisted".
+    So `_PURE` no longer licenses COMPLETE; it only spares a builtin from being NAMED as an
+    unaccounted object, which would be noise. The same reasoning that stopped a view's lexical
+    match from certifying identity applies here: the engine cannot tell a builtin from a
+    same-named UDF, and a marker must not claim what it cannot establish.
+
+    A QUOTED callable name is never admitted. `node.name` discards the delimiters, so a payload
+    that already matches the identifier grammar -- `"sk_live_abc123"()` -- passed the guard
+    unchanged into the ALWAYS tier. Quoting is the provenance that says caller-derived, and it is
+    available on the node before the string conversion throws it away.
     """
     from sqlglot import exp
 
     out: list[str] = []
+    # ANY function node, not only `Anonymous`. `log(x)` parses to `exp.Log` because sqlglot types
+    # from a name registry, so an `Anonymous` scan never sees a source UDF named after a builtin
+    # -- which is the false negative this module has carried as a strict xfail while emitting
+    # COMPLETE beside it. Shadowing is not hypothetical: `CREATE FUNCTION log(numeric)` is legal
+    # and the search path decides which one binds.
+    saw_call = bool(list(ast.find_all(exp.Func)))
     for node in ast.find_all(exp.Anonymous):
         name = (node.name or "").lower()
         if not name:
             continue
-        # Qualified means `qualifier.func()` -- the call is the Dot's EXPRESSION. Testing only
-        # `isinstance(parent, exp.Dot)` also matched `func(...).field`, where the call is the
-        # Dot's `this`, and rendering that qualifier rendered the call again: the first fix
-        # stripped arguments from one spelling and left them in its sibling. It also read
-        # `now().y` as qualified, so a whitelisted builtin became unresolved.
         parent = node.parent
         qualified = isinstance(parent, exp.Dot) and parent.expression is node
         if not qualified and name in _PURE:
             continue
 
+        identifier = node.args.get("this")
+        if getattr(identifier, "quoted", False):
+            _add(out, "unnameable-function")
+            continue
+
         label = name
         if qualified:
             qualifier = parent.this
-            # An identifier-shaped qualifier only. Anything else is not a schema name.
             if isinstance(qualifier, exp.Column | exp.Identifier):
                 label = f"{qualifier.sql()}.{name}".lower()
-
-        label = _safe_label(label, name)
-        if label not in out:
-            out.append(label)
-    return out
+        _add(out, _safe_label(label, name))
+    return out, saw_call
 
 
 def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
@@ -180,6 +189,7 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
     # READ and whose reach we can point at, versus a function whose body we cannot see at all.
     reaching_views: list[str] = []
     unclassified: list[str] = []
+    saw_any_call = False
     reasons: list[str] = []
     # The two comparisons here
     # have opposite polarity, which is the trap: widening the VIEW lookup adds matches and every
@@ -281,7 +291,7 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
                 # correct and the rename bought nothing, since the collected keys were only ever
                 # read for truthiness.
                 reaches_past_the_list = True
-        for fn in _unclassified_functions(parsed):
+        for fn in _functions_in(parsed)[0]:
             _add(unclassified, fn)
         if reaches_past_the_list:
             _add(reaching_views, name)
@@ -296,8 +306,16 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
         _add(unclassified, f"unmodelled-source:{shape.lower()}")
 
     # UNCLASSIFIABLE reach: a function whose body this engine cannot see.
-    for fn in _unclassified_functions(ast):
+    caller_fns, caller_saw_call = _functions_in(ast)
+    for fn in caller_fns:
         _add(unclassified, fn)
+    if caller_saw_call:
+        saw_any_call = True
+    if saw_any_call:
+        # ANY call downgrades COMPLETE, named or not. Without a function inventory the engine
+        # cannot bind a callable to a source identity, and `log` parsing as a typed builtin is
+        # exactly the case where a lexical answer looks confident and is not.
+        reasons.append("unconfirmed-function-identity")
 
     if not getattr(views, "available", True):
         reasons.append("view-inventory-unavailable")

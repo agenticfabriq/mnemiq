@@ -86,7 +86,13 @@ def test_a_pure_builtin_that_sqlglot_leaves_anonymous_does_not_poison_the_marker
     function stays unresolved — the `views.py` pattern, where an unlisted shape must not pass.
     """
     lineage = lineage_for(_ast(sql), ["claim"], inventory_for(_snapshot(jobs=[_DISCOVERED])))
-    assert lineage.completeness == COMPLETE, f"{sql} must not poison the marker"
+    # NOT named — that is what `_PURE` is still for, and naming `now` as an unaccounted object
+    # would be noise. But no call licenses COMPLETE any more, because sqlglot cannot tell a
+    # builtin from a source UDF of the same name, so the marker records the uncertainty as a
+    # reason rather than as a suspect.
+    assert lineage.unresolved == [], f"{sql} must not name a builtin as unaccounted"
+    assert lineage.completeness == UNKNOWN
+    assert "unconfirmed-function-identity" in lineage.reasons
 
 
 def test_an_aggregate_is_not_an_unresolved_function():
@@ -94,8 +100,8 @@ def test_an_aggregate_is_not_an_unresolved_function():
     on every real query and stops meaning anything."""
     lineage = lineage_for(_ast("SELECT count(*), upper(region) FROM claim"), ["claim"],
                           inventory_for(_snapshot(jobs=[_DISCOVERED])))
-    assert lineage.completeness == COMPLETE
-    assert lineage.unresolved == []
+    assert lineage.unresolved == [], "an aggregate is not an unaccounted object"
+    assert lineage.completeness == UNKNOWN, "but a call is still a call"
 
 
 # -- source 2: a view's body reads what base_tables does not report -------------------------------
@@ -163,20 +169,23 @@ def test_an_unresolvable_scope_is_unknown_because_the_tables_may_be_wrong():
 # -- the residual this design cannot close, pinned rather than described --------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="sqlglot assigns a function's node type from a NAME "
-                                       "registry, so a customer UDF named after a builtin parses "
-                                       "to a typed node and is indistinguishable from the builtin "
-                                       "by parsing alone. Measured: all_ssns()/pg_sleep() are "
-                                       "Anonymous, while left(x,2), log(x), trim(x) and "
-                                       "concat(x,y) are Left/Log/Trim/Concat. Closing it needs a "
-                                       "function inventory FROM THE SOURCE -- the same shape as "
-                                       "the view inventory, with the same availability problem -- "
-                                       "which is v2. Pinned so the limit cannot be forgotten, and "
-                                       "so it flips the day the inventory lands.")
-def test_a_udf_named_after_a_builtin_is_still_unresolved():
+def test_a_udf_named_after_a_builtin_no_longer_certifies_completeness():
+    """This was a strict xfail, and the narrowing closed it — from the other side.
+
+    The residual: sqlglot assigns a function's node type from a NAME registry, so a source UDF
+    called `log` parses to `exp.Log` and an `Anonymous` scan never sees it. I pinned that as an
+    unclosable limit needing a function inventory, and went on emitting COMPLETE beside it — a
+    documented false negative sitting next to a confident claim, which is the pairing a reviewer
+    called affirmatively false.
+
+    It is not closed by identifying the function. It is closed by no longer claiming what depends
+    on identifying it: ANY call now downgrades COMPLETE, so a shadowing UDF cannot ride in on a
+    COMPLETE it did not earn. The name is still unresolvable and the audit record says so.
+    """
     lineage = lineage_for(_ast("SELECT log(x) FROM claim"), ["claim"],
                           inventory_for(_snapshot(jobs=[_DISCOVERED])))
-    assert lineage.completeness == INCOMPLETE
+    assert lineage.completeness == UNKNOWN
+    assert "unconfirmed-function-identity" in lineage.reasons
 
 
 # -- it has to reach the audit store, in the tier that is always on -------------------------------
@@ -450,7 +459,7 @@ def test_a_field_access_on_a_builtin_is_not_a_qualified_call():
     EXPRESSION -- `schema.func()` -- not its `this`."""
     lineage = lineage_for(_ast("SELECT now().y FROM claim"), ["claim"],
                           inventory_for(_snapshot(jobs=[_DISCOVERED])))
-    assert lineage.completeness == COMPLETE
+    assert lineage.unresolved == [], "the builtin keeps its exemption from being NAMED"
 
 
 def test_a_table_valued_function_is_unclassified_not_a_demonstrated_gap():
@@ -622,14 +631,14 @@ def test_a_label_must_match_an_identifier_not_merely_avoid_five_characters():
     the delimiters and the name arrives with spaces and hyphens but no bracket or quote.
     Blocklisting is the pattern `views.py` documents as unfixable — an unlisted shape passes —
     which I had quoted approvingly two commits before writing one."""
-    from mnemiq.sql.lineage import _unclassified_functions
+    from mnemiq.sql.lineage import _functions_in
 
-    assert _unclassified_functions(
+    assert _functions_in(
         sqlglot.parse_one('SELECT "DOB 1990-01-01"() FROM claim', read="postgres")
-    ) == ["unnameable-function"]
+    )[0] == ["unnameable-function"]
     # ...and an ordinary name still survives, or the guard would be a blanket.
-    assert _unclassified_functions(
-        sqlglot.parse_one("SELECT all_ssns() FROM claim", read="duckdb")) == ["all_ssns"]
+    assert _functions_in(
+        sqlglot.parse_one("SELECT all_ssns() FROM claim", read="duckdb"))[0] == ["all_ssns"]
 
 
 def test_the_cli_json_surface_carries_lineage_too():
@@ -698,7 +707,7 @@ def test_complete_still_happens_for_the_ordinary_case():
     """The narrowing must not make the marker degenerate. A statement reading no view, with a
     discovered inventory and no unclassifiable call, is still COMPLETE — otherwise UNKNOWN would
     mean nothing and the artifact would be a constant."""
-    lineage = lineage_for(_ast("SELECT id, amount FROM claim WHERE created_at < now()"),
+    lineage = lineage_for(_ast("SELECT id, amount FROM claim WHERE region = 'west'"),
                           ["claim"], inventory_for(_snapshot(jobs=[_DISCOVERED])))
     assert lineage.completeness == COMPLETE
 
