@@ -9,6 +9,7 @@ review (ui-1).
 from __future__ import annotations
 
 import json
+import pytest
 from dataclasses import dataclass, field
 
 
@@ -273,3 +274,91 @@ def test_the_emitter_is_off_unless_a_url_is_configured():
     assert "if settings.verity_traces_url:" in source, (
         "the emitter must be gated on configuration, not constructed unconditionally"
     )
+
+
+# -- M54: one counter, three causes ---------------------------------------------------------------
+
+# The counter told an operator that emission failed and never which of three unrelated things
+# happened: a payload this engine could not BUILD (our bug, never self-heals), a request the
+# receiver REJECTED (our config, permanent until someone changes it), or a server that could not be
+# REACHED (their outage, self-healing). Measured live: a 401 from Verity's default auth mode
+# incremented the same counter a dead socket does, so a deployment emitting zero traces forever
+# looked exactly like one whose receiver was briefly down.
+#
+# The three want opposite responses -- fix the emitter, fix the config, wait -- which is why one
+# number cannot serve them. `dropped` stays as the total, because M18's lesson is that a fail-soft
+# producing nothing must be countable, and an operator alerting on "anything failing" should not
+# have to sum three fields.
+
+
+def _drop_counts(sink):
+    return (sink.dropped, sink.dropped_unbuildable, sink.dropped_rejected, sink.dropped_unavailable)
+
+
+def test_an_unbuildable_payload_is_counted_as_our_bug(monkeypatch):
+    """Incremented before a request is ever sent, so it can never be an outage."""
+    from mnemiq.observability import trace_sink as mod
+
+    monkeypatch.setattr(mod.json, "dumps", lambda *a, **k: (_ for _ in ()).throw(TypeError("nope")))
+    sink = VerityTraceSink(_Settings())
+    sink.record_answer(_event())
+
+    assert _drop_counts(sink) == (1, 1, 0, 0)
+
+
+def test_a_rejected_request_is_counted_as_our_configuration(monkeypatch):
+    """A 4xx is permanent and actionable: the receiver understood us and said no. Verity's DEFAULT
+    auth mode answers 401 to the headers this sink sends, so this is the live case."""
+    import urllib.error
+
+    from mnemiq.observability import trace_sink as mod
+
+    def unauthorized(request, timeout=0):
+        raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", unauthorized)
+    sink = VerityTraceSink(_Settings())
+    sink.record_answer(_event())
+
+    assert _drop_counts(sink) == (1, 0, 1, 0)
+
+
+@pytest.mark.parametrize("failure", ["url_error", "server_error"])
+def test_an_unreachable_receiver_is_counted_as_their_outage(monkeypatch, failure):
+    """Transport failure and a 5xx are the same class: the receiver is broken or absent, nothing
+    here is wrong, and it heals without anyone acting. That is what makes it a different number
+    from a 4xx rather than a different log line."""
+    import urllib.error
+
+    from mnemiq.observability import trace_sink as mod
+
+    def boom(request, timeout=0):
+        if failure == "url_error":
+            raise urllib.error.URLError("verity is down")
+        raise urllib.error.HTTPError(request.full_url, 503, "Service Unavailable", {}, None)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", boom)
+    sink = VerityTraceSink(_Settings())
+    sink.record_answer(_event())
+
+    assert _drop_counts(sink) == (1, 0, 0, 1)
+
+
+def test_the_total_still_counts_every_cause(monkeypatch):
+    """`dropped` is the sum, not a fourth cause. An operator alerting on "is anything failing"
+    keeps one number to watch; only the operator asking "why" needs the breakdown."""
+    import urllib.error
+
+    from mnemiq.observability import trace_sink as mod
+
+    sink = VerityTraceSink(_Settings())
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen",
+                        lambda r, timeout=0: (_ for _ in ()).throw(
+                            urllib.error.HTTPError(r.full_url, 401, "no", {}, None)))
+    sink.record_answer(_event())
+    monkeypatch.setattr(mod.urllib.request, "urlopen",
+                        lambda r, timeout=0: (_ for _ in ()).throw(urllib.error.URLError("down")))
+    sink.record_answer(_event())
+
+    assert _drop_counts(sink) == (2, 0, 1, 1)

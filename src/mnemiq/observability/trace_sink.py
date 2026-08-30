@@ -80,7 +80,25 @@ class VerityTraceSink(TraceSink):
 
     def __init__(self, settings: Any) -> None:
         self._settings = settings
-        self.dropped = 0  # M18's lesson: a fail-soft that produces nothing must still be countable
+        # M18's lesson: a fail-soft that produces nothing must still be countable. M54 is the next
+        # turn of it -- countable is not enough when three unrelated failures share the count.
+        #
+        # `dropped` stays the TOTAL so an operator asking "is anything failing" watches one number
+        # and does not have to sum three. The breakdown answers the second question, "which", and
+        # the three want opposite responses:
+        #
+        #   unbuildable  this engine could not build the payload   -> our BUG, never self-heals
+        #   rejected     the receiver understood us and said no    -> our CONFIG, permanent
+        #   unavailable  the receiver is broken or absent          -> their OUTAGE, self-heals
+        #
+        # Measured live: a 401 from Verity's DEFAULT auth mode incremented the same counter a dead
+        # socket does, so a deployment emitting zero traces forever looked exactly like one whose
+        # receiver was briefly down. The cause was in the per-event log and absent from the
+        # aggregate, which is the channel anyone actually alerts on.
+        self.dropped = 0
+        self.dropped_unbuildable = 0
+        self.dropped_rejected = 0
+        self.dropped_unavailable = 0
 
     # -- tier gates ------------------------------------------------------------------------------
     def _send_text(self) -> bool:
@@ -236,6 +254,18 @@ class VerityTraceSink(TraceSink):
         return record
 
     # -- transport -------------------------------------------------------------------------------
+    def _drop(self, cause: str, exc: BaseException) -> None:
+        """Count a drop against its cause AND the total, and name the cause in the log.
+
+        One place, because the two increments must never disagree about what happened -- the
+        counter and the breakdown drifting is the same defect one level down from the one this
+        exists to fix.
+        """
+        self.dropped += 1
+        setattr(self, f"dropped_{cause}", getattr(self, f"dropped_{cause}") + 1)
+        logger.warning("verity trace dropped (%s; %d total); answer unaffected: %s",
+                       cause, self.dropped, exc)
+
     def record_answer(self, event: AnswerEvent) -> None:
         url = getattr(self._settings, "verity_traces_url", None)
         if not url:
@@ -243,8 +273,7 @@ class VerityTraceSink(TraceSink):
         try:
             body = json.dumps({"traces": [self._build_trace(event)]}).encode()
         except Exception as exc:  # a payload we cannot build is a drop, not a raised answer
-            self.dropped += 1
-            logger.warning("verity trace not built; answer unaffected: %s", exc)
+            self._drop("unbuildable", exc)
             return
         token = access_token(self._settings)
         headers = {"content-type": "application/json"}
@@ -258,9 +287,14 @@ class VerityTraceSink(TraceSink):
             # Never raises into Runtime.ask: a Verity outage cannot stop mnemiq answering. But M18
             # is the cautionary tale -- a fail-soft that silently produced nothing looked exactly
             # like "no certified records", so the drop is counted and named.
-            self.dropped += 1
-            logger.warning("verity trace dropped (%d total); answer unaffected: %s",
-                           self.dropped, exc)
+            #
+            # `HTTPError` subclasses `URLError` and carries `.code`, which is the whole difference
+            # between "you are wrong" and "they are down". A 4xx is permanent and actionable; a 5xx
+            # is the receiver being broken, which is an outage that heals without anyone acting, so
+            # it groups with a refused socket rather than with a rejection.
+            code = getattr(exc, "code", None)
+            cause = "rejected" if isinstance(code, int) and 400 <= code < 500 else "unavailable"
+            self._drop(cause, exc)
 
 
 # mnemiq's `Stage` and Verity's `TraceEventKindV1` are two vocabularies for the same idea, and they
