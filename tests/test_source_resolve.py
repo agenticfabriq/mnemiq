@@ -357,47 +357,53 @@ def test_a_source_that_will_not_answer_does_not_stop_the_engine_booting(caplog):
     assert "could not assess" in caplog.text and "ORA-00942" in caplog.text
 
 
-def test_a_correctly_configured_read_only_deployment_boots_quiet(caplog):
-    """The best achievable state must not warn, or the warning means nothing.
+def test_a_minimal_read_principal_is_still_warned_that_read_only_is_not_a_guarantee(caplog):
+    """**This test previously asserted the opposite, and that is the point of keeping it here.**
 
-    `assert_read_only` has no verdict better than `unverifiable` — auditing the caller cannot
-    establish read-onlyness at all — so warning on it fired at every boot of every correctly
-    configured deployment, with nothing for the operator to change. The level tracks whether
-    something can be DONE: `gate_only` can (narrow the principal), `unverifiable` cannot.
+    It required a correctly configured deployment to boot SILENTLY, on the premise that
+    `unverifiable` means "nothing further exists to do". The premise is false: default logging is
+    WARNING, so the operator of exactly the deployment we recommend was told nothing, while a
+    principal holding SELECT on one view can still cause a write.
 
-    Note the same word is not quiet for the other method: `assert_enforcing` returning
-    `unverifiable` means no VPD policy is enforcing row security, which IS actionable.
+    The action is not "narrow the principal" -- they already have -- it is to stop treating
+    `read_only=True` as a guarantee and enforce read-only in the DATABASE, which is what the
+    2026-08-29 direction says. A verdict that reports an unclosable gap has to reach the operator;
+    the earlier noise complaint is answered by making the warning true and actionable, not by
+    silencing it.
     """
     import logging
 
     from mnemiq.runtime import _warn_source_enforcement
 
-    class _Correct:
+    class _Minimal:
         def assert_enforcing(self):
             return "attached", "every visible table carries an enabled SELECT policy"
 
         def assert_read_only(self):
-            return "unverifiable", "no write-shaped privilege was found"
+            return "unverifiable", ("no write-shaped privilege was found, and that is NOT the same "
+                                    "as being unable to write. Do not treat read_only=True as a "
+                                    "guarantee here; enforce read-only in the DATABASE")
 
     with caplog.at_level(logging.WARNING):
-        _warn_source_enforcement(_Correct())
-    assert caplog.text == "", "a deployment with nothing left to fix must boot silently"
+        _warn_source_enforcement(_Minimal())
+    assert "read-only basis" in caplog.text, "an unclosable gap must not be silent at the default level"
+    assert "DATABASE" in caplog.text, "and it must name the action, or it is the noise it was called"
+    assert "source enforcement" not in caplog.text, "a clean enforcement verdict still stays quiet"
 
 
-def test_the_same_verdict_word_warns_for_one_method_and_not_the_other(caplog):
-    """`unverifiable` is the ceiling for read-only basis and a real gap for enforcement."""
+def test_writable_is_the_only_quiet_read_only_verdict(caplog):
+    """`writable` means the question does not apply -- the engine was asked to attach read-write.
+
+    Every other verdict reports something the operator should know, so this is the one quiet case.
+    """
     import logging
 
     from mnemiq.runtime import _warn_source_enforcement
 
-    class _NoPolicies:
-        def assert_enforcing(self):
-            return "unverifiable", "no enabled VPD policy on any visible table"
-
+    class _Writable:
         def assert_read_only(self):
-            return "unverifiable", "no write-shaped privilege was found"
+            return "writable", "this adapter is not read-only, so the question does not apply"
 
     with caplog.at_level(logging.WARNING):
-        _warn_source_enforcement(_NoPolicies())
-    assert "source enforcement" in caplog.text
-    assert "read-only basis" not in caplog.text
+        _warn_source_enforcement(_Writable())
+    assert caplog.text == ""

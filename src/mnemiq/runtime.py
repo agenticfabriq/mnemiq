@@ -283,22 +283,23 @@ def _warn_source_enforcement(adapter) -> None:
     Any adapter that grows either method is picked up here without further wiring, which is the
     property whose absence produced the finding.
     """
-    # The level tracks whether the operator can DO anything, not how bad the verdict sounds, and
-    # the same word means different things to the two methods.
+    # The level tracks whether the operator can DO anything, and BOTH of this function's earlier
+    # answers to that were wrong in opposite directions.
     #
-    #   `assert_enforcing` unverifiable -> WARNING. No VPD policy is enforcing row security on the
-    #   objects this connection can see. That is actionable: attach one.
+    # It first warned on every verdict, so a correctly configured read-only deployment printed a
+    # warning at every boot -- noise, and a review said so. I then demoted `assert_read_only`'s
+    # `unverifiable` to INFO on the premise that "nothing further exists to do". **That premise is
+    # false, and demoting it suppressed a real gap**: default logging is WARNING, so the operator
+    # of exactly the deployment we recommend was told NOTHING, while a principal holding SELECT on
+    # one view can still cause a write. Measured both ways.
     #
-    #   `assert_read_only` unverifiable -> INFO. No write-shaped privilege was found, which is the
-    #   BEST achievable state -- there is no third verdict saying more, because auditing the caller
-    #   cannot establish read-onlyness at all. Warning here fired on every boot of every correctly
-    #   configured read-only deployment, with nothing for the operator to change. That is the
-    #   failure this adapter had already named one commit earlier while scoping PUBLIC grants --
-    #   "a warning that is always on is a warning nobody reads" -- and then reproduced in the log
-    #   level rather than the query.
+    # There IS an action, and it is the one the 2026-08-29 direction already names: stop treating
+    # `read_only=True` as a guarantee and enforce read-only in the DATABASE. So the verdict warns,
+    # and the message says that rather than describing a state. The cost is one line per process
+    # start, which is the right price for "this safety property does not hold"; the earlier noise
+    # complaint is answered by making the warning true and actionable, not by silencing it.
     for name, label, quiet in (("assert_enforcing", "source enforcement", {"attached"}),
-                               ("assert_read_only", "read-only basis",
-                                {"unverifiable", "writable"})):
+                               ("assert_read_only", "read-only basis", {"writable"})):
         assess = getattr(adapter, name, None)
         if assess is None:
             continue

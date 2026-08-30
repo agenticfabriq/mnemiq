@@ -565,12 +565,14 @@ class OracleAdapter:
         #   Enumerated over four principal shapes and none reached it. I added that branch in the
         #   same commit that deleted `constrained` for being unreachable.
         return ("unverifiable", (
-            f"no write-shaped privilege on {self._schema} was found for this connection, which is "
-            "not the same as none existing. A view resolves its references with the VIEW OWNER's "
-            "rights, so SELECT on one view is enough to reach a subprogram that writes in its own "
-            "transaction -- measured, a principal holding exactly that caused a row to be "
-            "inserted. This is the expected verdict for a correctly minimal read principal: the "
-            "engine reports what it checked, and read-onlyness is the database's to enforce"))
+            f"no write-shaped privilege on {self._schema} was found for this connection, and that "
+            "is NOT the same as this connection being unable to write. A view resolves its "
+            "references with the VIEW OWNER's rights, so SELECT on one view is enough to reach a "
+            "subprogram that writes in its own transaction -- measured, a principal holding "
+            "exactly that caused a row to be inserted. **Do not treat read_only=True as a "
+            "guarantee here.** This is the best verdict a minimal read principal can produce, so "
+            "it is not a misconfiguration to fix; the action is to enforce read-only in the "
+            "DATABASE -- a genuinely restricted account, or an accepted and documented risk"))
 
     def assert_enforcing(self) -> tuple[str, str]:
         """Can this CONNECTION be trusted to have VPD applied to it? -> (verdict, reason).
