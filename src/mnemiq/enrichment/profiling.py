@@ -25,53 +25,31 @@ _UNAGGREGATABLE: dict[str, frozenset[str]] = {
 }
 
 
-# Asks whether this session can perform a DISTINCT at all, without naming any user column.
+# Why a column's count failed, from the DATABASE rather than from a proxy.
 #
-# BOUNDED, and that is the point rather than an optimisation. The first version ran
-# `count(DISTINCT ROWNUM)` over the WHOLE table -- a full access plus a dedup of every row, which
-# is precisely the operation most likely to fail under the resource pressure the probe exists to
-# detect. On a large table it could turn a benign per-column failure into an excluded table by
-# failing itself. A diagnostic must not be more expensive than the thing it diagnoses. Measured on
-# 200k rows: 0.0185s unbounded, 0.0011s bounded, and the bounded plan still carries a HASH GROUP BY
-# (with a COUNT STOPKEY above it), so it still exercises the machinery.
+# The previous two versions inferred it: run a DISTINCT that names no user column and see whether
+# it works. That was unsound in both directions and each fix moved the unsoundness rather than
+# removing it -- unbounded, the probe could fail the table it was diagnosing; bounded, it could
+# succeed on 100 dense integers where every real column's DISTINCT fails on memory, and a dedup
+# over ROWNUM is nothing like one over a wide high-cardinality column however many rows it reads.
+# A proxy workload cannot answer a question about a different workload.
 #
-# ROWNUM rather than a constant, and that is measured too: `count(DISTINCT 1)` runs in 0.0020s
-# against a table where a real column's DISTINCT takes 0.0081s -- it is folded away, so it would
-# answer "yes, this session can sort" for a session that cannot. ROWNUM varies per row and costs
-# more than the real column, so it is doing the work.
+# Oracle already says why. Measured: CLOB gives ORA-22849, a user-defined object type gives
+# ORA-22950, a missing table gives ORA-00942. So a failure whose code is a TYPE error is the
+# column's own problem and the table is kept with that column unmeasured; anything else -- a
+# capacity error, a permission, an unrecognised code -- is treated as systemic and re-raised,
+# which restores the pre-fallback behaviour and is the loud direction.
 #
-# A dialect with NO entry gets no probe and the conservative answer, never a weak one. The first
-# version defaulted to that foldable constant, so on DuckDB -- this project's primary adapter -- a
-# session that could not sort still answered yes and a systemic failure landed as `done`.
-# Each value is a SQL TEMPLATE carrying a `{table}` placeholder, not a bare expression -- the
-# bounding syntax is dialect-specific, so the whole statement belongs to the dialect. An entry
-# without the placeholder is refused at import rather than probing the wrong table silently:
-# `str.format` ignores an unused keyword, so a malformed entry would run and answer
-# confidently about a table nobody asked about. A comment cannot stop that; the check below can.
-_DISTINCT_PROBE: dict[str, str] = {
-    "oracle": 'SELECT count(DISTINCT ROWNUM) FROM (SELECT 1 FROM "{table}" FETCH FIRST 100 ROWS ONLY)',
-}
-
-# The same question without the bound, asked ONLY when the bounded answer is "yes" and every
-# column still failed. Bounding fixed a probe that could fail the table it diagnosed; it also
-# shrank the probe's footprint far below the batched query's, so a genuine temp-space exhaustion
-# could pass on 100 rows while the real full-table sort cannot -- and the table would then be
-# carried as `done` with everything unknown, which is the M59 class this branch exists to stop.
-#
-# So the cheap probe runs first and settles the common cases, and this one settles only the
-# ambiguous one. It can still fail on a huge all-unmeasurable table, and that is the deliberate
-# trade: a table reported FAILED is visible and an operator sees it, while a systemically failed
-# table reported `done` is a wrong model nobody is told about.
-_DISTINCT_PROBE_FULL: dict[str, str] = {
-    "oracle": 'SELECT count(DISTINCT ROWNUM) FROM "{table}"',
-}
+# Only measured codes are listed. An unrecognised type error therefore costs its table, which is
+# the conservative way to be wrong: reported FAILED and visible, rather than `done` over a model
+# that measured nothing.
+_TYPE_ERROR_CODES: dict[str, frozenset[int]] = {"oracle": frozenset({22849, 22950})}
 
 
-if not all("{table}" in q
-           for d in (_DISTINCT_PROBE, _DISTINCT_PROBE_FULL) for q in d.values()):
-    # Raised, not asserted: `python -O` strips asserts, and a guard that a standard invocation
-    # mode removes is not a guard. Pointed out by review of the version that used one.
-    raise ValueError("every probe template must contain {table}")
+def _is_type_error(adapter: SourceAdapter, exc: Exception) -> bool:
+    codes = _TYPE_ERROR_CODES.get(getattr(adapter, "dialect", ""), frozenset())
+    err = exc.args[0] if exc.args else None
+    return getattr(err, "code", None) in codes
 
 
 def _unaggregatable(adapter: SourceAdapter) -> frozenset[str]:
@@ -201,6 +179,7 @@ def profile_table(
             # So on failure, measure column by column. A column that will not count costs ITSELF
             # and nothing else, whatever the reason and whatever Oracle calls it.
             row_count = adapter.execute(f'SELECT count(*) FROM "{table.name}"')[0][0]
+            failures: list[Exception] = []
             for c in cols:
                 try:
                     measured[c] = adapter.execute(
@@ -209,34 +188,20 @@ def profile_table(
                     logger.warning("column %r.%r could not be counted and is carried with unknown "
                                    "stats: %s", table.name, c, col_exc)
                     measured[c] = (None, None)
-            probe = _DISTINCT_PROBE.get(getattr(adapter, "dialect", ""))
-            sortable = False
-            deciding: Exception | None = None
-            if probe is not None and all(v == (None, None) for v in measured.values()):
-                try:
-                    adapter.execute(probe.format(table=table.name))
-                    sortable = True
-                except Exception:
-                    sortable = False
-                full = _DISTINCT_PROBE_FULL.get(getattr(adapter, "dialect", ""))
-                if sortable and full is not None:
-                    # Ambiguous: nothing measured, yet a 100-row dedup succeeded. Ask at full size
-                    # before concluding the columns were at fault.
-                    try:
-                        adapter.execute(full.format(table=table.name))
-                    except Exception as full_exc:
-                        logger.warning("%r sorts at 100 rows but not at full size; treating as "
-                                       "systemic rather than per-column", table.name)
-                        sortable = False
-                        # The exception that DECIDED this, not the one that started the fallback.
-                        # A bare `raise` below would re-raise the batched failure -- so a table
-                        # whose batch died on ORA-22950 (a column type) and whose full sort died on
-                        # ORA-01652 (capacity) would report the column error, misattributing a
-                        # systemic failure to a type problem for whoever reads it.
-                        deciding = full_exc
-            if not sortable and all(v == (None, None) for v in measured.values()):
-                if deciding is not None:
-                    raise deciding
+                    failures.append(col_exc)
+            nothing_measured = all(v == (None, None) for v in measured.values())
+            systemic = next((e for e in failures if not _is_type_error(adapter, e)), None)
+            if nothing_measured and systemic is not None:
+                # Not the column's type, so not the column's fault: capacity, permission, or a
+                # cause this does not recognise. Carrying unknowns here would report a table that
+                # measured nothing as `done`, which is M59's class. Raise the exception that
+                # DECIDED it, not the batched one -- reporting ORA-22950 for an ORA-01652 sends
+                # the reader to the wrong problem.
+                #
+                # Gated on nothing having measured. A PARTIAL failure keeps its table even when one
+                # column died of capacity: real statistics for the other columns are worth more
+                # than the tidiness of refusing them, and the failure is in the log either way.
+                raise systemic
                 # The session cannot DISTINCT at all, so this is systemic -- a permission, a
                 # driver fault, temp space exhausted by the sort. Carrying unknowns for every
                 # column would report a table that measured NOTHING as `done`, and
