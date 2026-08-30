@@ -259,9 +259,11 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
         # context; and UNKNOWN when it matches lexically, because that is where identity would
         # have to be resolved and cannot be. Stated precisely, because the first version of this
         # comment overstated it as "COMPLETE survives only for statements that read no view at
-        # all": COMPLETE requires that no view body reached an OBJECT whose identity could not be
-        # confirmed. A body that reaches nothing -- `SELECT 1 AS x` -- has no identity to confirm
-        # and is still COMPLETE, correctly. A narrower marker that is right beats a broader one
+        # all", and the second said "no object whose identity could not be CONFIRMED" -- which
+        # implies some can be, and none can: without a creation schema every match lands in
+        # `unconfirmed-identity`. The condition is simply that no view body reached any OBJECT.
+        # `SELECT 1 AS x` is the only way to satisfy that, and it is COMPLETE correctly, because
+        # a body reaching nothing has nothing to be uncertain about. A narrower marker that is right beats a broader one
         # that certifies a false audit record, which is the one outcome worse than no marker.
         for node in base_tables(parsed):
             key = object_key(node)
