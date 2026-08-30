@@ -257,10 +257,12 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
         # So a view's reach never yields COMPLETE. It yields INCOMPLETE when a body table matches
         # nothing the caller named under any spelling, because that is a gap under every binding
         # context; and UNKNOWN when it matches lexically, because that is where identity would
-        # have to be resolved and cannot be. COMPLETE survives only for statements that read no
-        # view at all, where every name lives in one context. A narrower marker that is right
-        # beats a broader one that certifies a false audit record -- which is the one outcome
-        # worse than shipping no marker.
+        # have to be resolved and cannot be. Stated precisely, because the first version of this
+        # comment overstated it as "COMPLETE survives only for statements that read no view at
+        # all": COMPLETE requires that no view body reached an OBJECT whose identity could not be
+        # confirmed. A body that reaches nothing -- `SELECT 1 AS x` -- has no identity to confirm
+        # and is still COMPLETE, correctly. A narrower marker that is right beats a broader one
+        # that certifies a false audit record, which is the one outcome worse than no marker.
         for node in base_tables(parsed):
             key = object_key(node)
             if not key:

@@ -739,3 +739,18 @@ def test_a_name_containing_a_colon_cannot_pose_as_a_classification():
     out = []
     _add(out, "unconfirmed-identity:claim")
     assert out == ["unconfirmed-identity:claim"]
+
+
+def test_a_view_that_reaches_no_object_at_all_is_still_complete():
+    """The narrowing must not become "any view means UNKNOWN". A body reaching no object has no
+    identity to confirm, so there is nothing the marker could be uncertain about.
+
+    Pinned because the invariant was first written as "COMPLETE survives only where no view is
+    read", which this case falsifies — the behaviour was right and the sentence was wrong, and an
+    over-broad invariant is how a later edit narrows something that did not need it.
+    """
+    views = [ViewDefinition(object_id="const_view", definition="SELECT 1 AS x", dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT x FROM const_view"), ["const_view"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == COMPLETE
+    assert lineage.unresolved == [] and lineage.reasons == []
