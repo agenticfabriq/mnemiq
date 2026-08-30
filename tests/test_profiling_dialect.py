@@ -197,6 +197,18 @@ def test_the_stem_matches_case_insensitively_and_keeps_the_sources_case(column, 
     assert _stem(column) == stem
 
 
+class _OraError(Exception):
+    """`oracledb` puts an object carrying `.code` in args[0]; the classifier reads that."""
+
+    def __init__(self, code: int, message: str):
+        super().__init__(type("E", (), {"code": code, "full_code": f"ORA-{code:05d}",
+                                        "__str__": lambda self: message})())
+        self.code = code
+
+    def __str__(self):
+        return f"ORA-{self.code:05d}"
+
+
 class _BatchFails(_Recorder):
     """A source that refuses one column, whatever the batched query asks for.
 
@@ -207,7 +219,7 @@ class _BatchFails(_Recorder):
     def execute(self, sql):
         self.sql.append(sql)
         if '"ADDR"' in sql and "count(DISTINCT" in sql:
-            raise RuntimeError("ORA-22950: cannot order objects without MAP or ORDER method")
+            raise _OraError(22950, "cannot order objects without MAP or ORDER method")
         if sql.lstrip().upper().startswith("SELECT COUNT(*) FROM"):
             return [(3,)]
         if "count(*)" in sql and "GROUP BY" not in sql:
@@ -289,12 +301,12 @@ def test_a_failure_that_takes_every_column_is_still_a_failed_table():
         def execute(self, sql):
             self.sql.append(sql)
             if "count(DISTINCT" in sql:
-                raise RuntimeError("ORA-01652: unable to extend temp segment")
+                raise _OraError(1652, "unable to extend temp segment")
             if sql.lstrip().upper().startswith("SELECT COUNT(*) FROM"):
                 return [(3,)]
             return [("x", 1)]
 
-    with pytest.raises(RuntimeError, match="ORA-01652"):
+    with pytest.raises(_OraError, match="ORA-01652"):
         profile_table(_AllDistinctFail(dialect="oracle"), _table(("A", "NUMBER"), ("B", "NUMBER")))
 
 
@@ -319,7 +331,7 @@ def test_a_single_uncountable_column_is_treated_the_same_whether_or_not_it_is_li
         def execute(self, sql):
             self.sql.append(sql)
             if "count(DISTINCT" in sql and '"ADDR"' in sql:
-                raise RuntimeError("ORA-22950: cannot order objects")
+                raise _OraError(22950, "cannot order objects")
             if "count(DISTINCT ROWNUM)" in sql:
                 return [(3,)]
             if sql.lstrip().upper().startswith("SELECT COUNT(*) FROM"):
@@ -328,47 +340,6 @@ def test_a_single_uncountable_column_is_treated_the_same_whether_or_not_it_is_li
 
     stats = profile_table(_OneBadColumn(dialect="oracle"), _table(("ADDR", data_type)))
     assert [(s.column, s.distinct_count, s.row_count) for s in stats] == [("ADDR", None, 3)]
-
-
-def test_the_probe_is_what_separates_systemic_from_column_specific():
-    """Asked, not inferred. The probe uses ROWNUM on Oracle because it varies per row and so
-    exercises the sort a temp-space failure would break; `count(DISTINCT 1)` is a constant the
-    optimiser may fold, which would answer yes on a session that cannot actually sort."""
-    class _CannotSort(_Recorder):
-        def execute(self, sql):
-            self.sql.append(sql)
-            if "count(DISTINCT" in sql:
-                raise RuntimeError("ORA-01652: unable to extend temp segment")
-            return [(3,)]
-
-    a = _CannotSort(dialect="oracle")
-    with pytest.raises(RuntimeError, match="ORA-01652"):
-        profile_table(a, _table(("ADDR", "ADDR_T")))
-    assert any("count(DISTINCT ROWNUM)" in q for q in a.sql), "the probe must actually be asked"
-
-
-def test_a_dialect_without_a_probe_keeps_the_conservative_answer():
-    """No probe means no refinement, not a weak probe.
-
-    The first version defaulted to `count(DISTINCT 1)`, and a constant is foldable -- so on DuckDB,
-    this project's primary adapter, a session that could not sort at all still answered "yes" and
-    the table came back `done` with every column unknown. That is the systemic-failure-looks-like-
-    success bug reintroduced for every dialect except Oracle, by the very commit meant to fix it.
-    """
-    class _CannotSort(_Recorder):
-        def execute(self, sql):
-            self.sql.append(sql)
-            if "count(DISTINCT" in sql:
-                raise RuntimeError("out of temporary space")
-            return [(3,)]
-
-    for dialect in ("duckdb", "postgres", "sqlite"):
-        a = _CannotSort(dialect=dialect)
-        with pytest.raises(RuntimeError, match="temporary space"):
-            profile_table(a, _table(("A", "INTEGER"), ("B", "INTEGER")))
-        assert not any("count(DISTINCT 1)" in q for q in a.sql), (
-            f"{dialect}: a foldable constant must not be used as the probe"
-        )
 
 
 def test_the_all_unknown_warning_does_not_fire_on_a_partial_failure(caplog):
@@ -384,85 +355,84 @@ def test_the_all_unknown_warning_does_not_fire_on_a_partial_failure(caplog):
     assert "ADDR" in caplog.text, "the column that did fail is still named"
 
 
-def test_the_probe_is_bounded_so_it_cannot_fail_the_table_it_is_diagnosing():
-    """A diagnostic must not be more expensive than the thing it diagnoses.
+# -- why a column failed, from the database rather than from a proxy ----------------------------
+#
+# Two earlier versions inferred this by running a DISTINCT that named no user column and seeing
+# whether it worked. Unsound both ways: unbounded, the probe could fail the table it diagnosed;
+# bounded, it could succeed on 100 dense integers where every real column's DISTINCT fails on
+# memory. A proxy workload cannot answer a question about a different workload. Oracle says why.
 
-    The first version ran `count(DISTINCT ROWNUM)` over the WHOLE table -- a full access plus a
-    dedup of every row, which is exactly the operation most likely to fail under the resource
-    pressure the probe exists to detect. On a large table it could turn a benign per-column failure
-    into an excluded table by failing itself. Measured on 200k rows: 0.0185s unbounded, 0.0011s
-    bounded, and the bounded plan still carries a HASH GROUP BY, so it still does the work.
-    """
-    class _OneBad(_Recorder):
+
+def _fails_with(exc_factory):
+    class _F(_Recorder):
         def execute(self, sql):
             self.sql.append(sql)
-            if "count(DISTINCT" in sql and '"ADDR"' in sql:
-                raise RuntimeError("ORA-22950: cannot order objects")
-            if "ROWNUM" in sql:
-                return [(3,)]
+            if "count(DISTINCT" in sql:
+                raise exc_factory()
             if sql.lstrip().upper().startswith("SELECT COUNT(*) FROM"):
                 return [(3,)]
-            return [(3, 2, 3)]
-
-    a = _OneBad(dialect="oracle")
-    profile_table(a, _table(("ADDR", "ADDR_T")))
-    probe = next(q for q in a.sql if "ROWNUM" in q)
-    assert "FETCH FIRST" in probe, "the probe must be bounded, not a full-table dedup"
-    assert "HASH" not in probe  # sanity: this is the SQL, not a plan
+            return [(3,)]
+    return _F(dialect="oracle")
 
 
-def test_a_probe_that_passes_small_and_fails_large_is_treated_as_systemic():
-    """Bounding the probe fixed one bug and opened another, and this is the seam between them.
+@pytest.mark.parametrize("code", [22849, 22950])
+def test_a_type_error_is_the_columns_own_problem_and_the_table_is_kept(code):
+    """Measured: CLOB gives ORA-22849, a user-defined object type ORA-22950."""
+    stats = profile_table(_fails_with(lambda: _OraError(code, "type")), _table(("A", "T")))
+    assert [(s.column, s.distinct_count) for s in stats] == [("A", None)]
 
-    A bounded probe's temp footprint is far below the batched query's, so a genuine ORA-01652
-    could pass on 100 rows while the real full-table sort cannot -- and the table would be carried
-    as `done` with every column unknown, which is the M59 class. The cheap probe settles the common
-    cases; the full-size one is asked ONLY when nothing measured and the cheap one said yes.
-    """
-    class _SmallOkLargeFails(_Recorder):
+
+@pytest.mark.parametrize("code", [1652, 1031, 99999])
+def test_anything_that_is_not_a_known_type_error_is_systemic(code):
+    """Capacity, permission, and an unrecognised code alike. Only measured codes are listed, so an
+    unrecognised type error costs its table -- the conservative way to be wrong, since FAILED is
+    visible and `done` over a model that measured nothing is not."""
+    with pytest.raises(_OraError):
+        profile_table(_fails_with(lambda: _OraError(code, "not a type error")), _table(("A", "T")))
+
+
+def test_the_exception_raised_is_the_one_that_decided_it():
+    """Reporting the batched ORA-22950 for a per-column ORA-01652 sends the reader to the wrong
+    problem. An earlier version's bare `raise` did exactly that, and its test could not tell
+    because it used the same message at both sites."""
+    class _MixedCauses(_Recorder):
         def execute(self, sql):
             self.sql.append(sql)
-            if "FETCH FIRST 100" in sql:
-                return [(100,)]                       # the bounded probe succeeds
-            if "count(DISTINCT ROWNUM)" in sql:
-                raise RuntimeError("ORA-01652: unable to extend temp segment")   # capacity
+            if sql.count("count(DISTINCT") > 1:
+                raise _OraError(22950, "batched failure, a column type")
             if "count(DISTINCT" in sql:
-                raise RuntimeError("ORA-22950: cannot order objects")            # column type
+                raise _OraError(1652, "per-column failure, capacity")
             return [(3,)]
 
-    a = _SmallOkLargeFails(dialect="oracle")
-    # DISTINCT messages on purpose: the batched failure and the deciding failure must be
-    # distinguishable, or the test cannot tell which exception propagated. An earlier version used
-    # the same string at both sites and so could not have caught a bare `raise` re-raising the
-    # wrong one -- which is exactly what it was doing.
-    with pytest.raises(RuntimeError, match="ORA-01652"):
-        profile_table(a, _table(("A", "NUMBER"), ("B", "NUMBER")))
-    assert any("FETCH FIRST 100" in q for q in a.sql), "the cheap probe runs first"
-    assert any(q.endswith('FROM "T"') and "ROWNUM" in q for q in a.sql), "and escalates"
+    with pytest.raises(_OraError, match="ORA-01652"):
+        profile_table(_MixedCauses(dialect="oracle"), _table(("A", "T")))
 
 
-def test_the_full_probe_is_not_asked_when_something_measured():
-    """It is the expensive one, so it runs only where the answer is genuinely ambiguous."""
-    a = _BatchFails(dialect="oracle")
-    profile_table(a, _table(("ID", "NUMBER"), ("ADDR", "ADDR_T")))
-    assert not any(q.endswith('FROM "T"') and "ROWNUM" in q for q in a.sql)
+def test_a_partial_failure_keeps_its_table_even_when_the_cause_is_systemic():
+    """Real statistics for the other columns are worth more than the tidiness of refusing them,
+    and the failure is in the log either way. The systemic concern is a table that measured
+    NOTHING, not one that measured less."""
+    class _OneCapacityFailure(_Recorder):
+        def execute(self, sql):
+            self.sql.append(sql)
+            if "count(DISTINCT" in sql and '"B"' in sql:
+                raise _OraError(1652, "capacity")
+            if sql.count("count(DISTINCT") > 1:
+                raise _OraError(1652, "capacity")
+            if sql.lstrip().upper().startswith("SELECT COUNT(*) FROM"):
+                return [(3,)]
+            return [(2, 3)]
+
+    stats = {s.column: s for s in profile_table(
+        _OneCapacityFailure(dialect="oracle"), _table(("A", "NUMBER"), ("B", "NUMBER")))}
+    assert stats["A"].distinct_count == 2 and stats["B"].distinct_count is None
 
 
-def test_a_malformed_probe_template_is_refused_under_python_O():
-    """A bare `assert` is stripped by `python -O`, so the guard has to raise."""
-    import subprocess
-    import sys
-
-    code = (
-        "import mnemiq.enrichment.profiling as p, importlib, sys\n"
-        "src = open(p.__file__).read().replace(\n"
-        "    '_DISTINCT_PROBE: dict[str, str] = {',\n"
-        "    '_DISTINCT_PROBE: dict[str, str] = {\"bad\": \"SELECT 1\",')\n"
-        "try:\n"
-        "    exec(compile(src, 'p.py', 'exec'), {'__name__': 'x'})\n"
-        "    print('ACCEPTED')\n"
-        "except ValueError:\n"
-        "    print('REFUSED')\n"
-    )
-    out = subprocess.run([sys.executable, "-O", "-c", code], capture_output=True, text=True)
-    assert "REFUSED" in out.stdout, f"guard stripped under -O: {out.stdout}{out.stderr}"
+def test_a_dialect_with_no_known_codes_treats_every_failure_as_systemic():
+    """No entry means nothing is recognised as a type error, so everything raises -- the same
+    conservative default as before, and never a weak inference."""
+    for dialect in ("duckdb", "postgres", "sqlite"):
+        a = _fails_with(lambda: _OraError(22849, "type"))
+        a.dialect = dialect
+        with pytest.raises(_OraError):
+            profile_table(a, _table(("A", "T")))
