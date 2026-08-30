@@ -303,7 +303,14 @@ def test_a_view_that_reaches_nothing_new_is_not_a_gap():
     lineage = lineage_for(_ast("SELECT v.id FROM claim_view v JOIN claim c ON c.id = v.id"),
                           ["claim_view", "claim"],
                           inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
-    assert lineage.completeness == COMPLETE, "the body's reach is already in the list"
+    # UNKNOWN, not COMPLETE, and the change is deliberate. This test asserted COMPLETE until a
+    # fourth review pass named the class: a lexical match is not identity. The view's body says
+    # `claim` and the caller says `claim`, and whether those are one object depends on the schema
+    # each was bound in -- which `ViewDefinition` does not carry. What the test still pins is that
+    # this is NOT a demonstrated gap, which is the property it was written for.
+    assert lineage.completeness == UNKNOWN
+    assert lineage.completeness != INCOMPLETE, "nothing here is a demonstrated gap"
+    assert any(u.startswith("unconfirmed-identity:") for u in lineage.unresolved)
 
 
 def test_object_names_and_engine_reason_codes_do_not_share_a_list():
@@ -358,7 +365,10 @@ def test_a_cte_inside_a_view_body_is_not_reach():
     lineage = lineage_for(_ast("SELECT v.id FROM claim_view v JOIN claim c ON c.id = v.id"),
                           ["claim_view", "claim"],
                           inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
-    assert lineage.completeness == COMPLETE, "the body's only real base is already accounted for"
+    # Not INCOMPLETE is the property: the CTE alias must not read as reach. Not COMPLETE either,
+    # since a view is involved and cross-context identity cannot be confirmed.
+    assert lineage.completeness == UNKNOWN
+    assert not any(u == "c" for u in lineage.unresolved), "a CTE alias is not a base table"
 
 
 # -- the seven findings a second model found, one test each ---------------------------------------
@@ -402,7 +412,10 @@ def test_a_quoted_identifier_that_matches_only_when_folded_is_unknown():
     lineage = lineage_for(_ast("SELECT id FROM v JOIN claim USING (id)"), ["v", "claim"],
                           inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
     assert lineage.completeness == UNKNOWN
-    assert any(u.startswith("case-ambiguous:") for u in lineage.unresolved)
+    # `case-ambiguous:` became `unconfirmed-identity:` when the rule generalised: quoting was one
+    # reason a lexical match might not be identity, and binding context is another. One label for
+    # one question.
+    assert any(u.startswith("unconfirmed-identity:") for u in lineage.unresolved)
 
 
 def test_a_quoted_qualifier_decides_identity_as_much_as_a_quoted_leaf():
@@ -629,3 +642,100 @@ def test_the_cli_json_surface_carries_lineage_too():
     src = inspect.getsource(cli._cmd_ask)
     json_block = src[src.index("if args.json"):src.index("print(ans.answer)")]
     assert '"lineage"' in json_block and '"tables_used"' in json_block
+
+
+def test_a_bare_name_in_a_view_body_is_not_the_callers_bare_name():
+    """The class four review passes each found one shape of: lexical equality is not object
+    identity across independently bound scopes.
+
+    A view `a.v` whose body says `claim` reads `a.claim`; a caller under schema `b` writing bare
+    `claim` reads `b.claim`. The strings match and the objects do not, and `ViewDefinition`
+    carries no creation schema, so the binding context is not recoverable here. Measured before
+    the narrowing: COMPLETE, with the read of `a.claim` unrecorded — which is the one outcome
+    worse than shipping no marker, because it affirmatively certifies a false audit record.
+    """
+    views = [ViewDefinition(object_id="a.v", definition="SELECT * FROM claim", dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT v.id FROM a.v v JOIN claim c ON c.id = v.id"),
+                          ["a.v", "claim"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == UNKNOWN
+    assert any(u.startswith("unconfirmed-identity:") for u in lineage.unresolved)
+
+
+def test_an_unmodelled_source_does_not_hide_a_demonstrated_gap():
+    """The uncertainty is recorded WITHOUT short-circuiting the body scan. The `continue` meant a
+    view mixing a modelled source with an unmodelled one downgraded a gap the engine could point
+    at to one it merely suspected — inverting this module's own rule that demonstrated outranks
+    unclear."""
+    views = [ViewDefinition(
+        object_id="v",
+        definition="SELECT customer.id FROM customer CROSS JOIN LATERAL (VALUES (1)) AS l(x)",
+        dialect="postgres")]
+    lineage = lineage_for(_ast("SELECT id FROM v"), ["v"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == INCOMPLETE, "customer is absent from the list and demonstrable"
+    assert any(u.startswith("unmodelled-source:") for u in lineage.unresolved), "still recorded"
+
+
+def test_every_label_goes_through_one_admission_point():
+    """`_safe_label` was called "the single admission point" and then bypassed three times in the
+    same function — a raw `object_key` interpolated into a prefix, a raw view name on parse
+    failure, and a raw key for a demonstrated gap. A view named `"DOB 1990-01-01"` therefore put
+    that string into the ALWAYS tier: the fourth disclosure of one shape, through a path created
+    while closing the third. Every append now routes through `_add`, which keeps an engine prefix
+    and grammar-checks only the caller-derived subject."""
+    views = [ViewDefinition(object_id="v", definition='SELECT id FROM "DOB 1990-01-01"',
+                            dialect="duckdb")]
+    lineage = lineage_for(_ast("SELECT id FROM v JOIN claim USING (id)"),
+                          ["v", "dob 1990-01-01"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    for label in lineage.unresolved:
+        subject = label.partition(":")[2] or label
+        assert "1990" not in subject and " " not in subject, f"raw object name admitted: {label}"
+
+
+def test_complete_still_happens_for_the_ordinary_case():
+    """The narrowing must not make the marker degenerate. A statement reading no view, with a
+    discovered inventory and no unclassifiable call, is still COMPLETE — otherwise UNKNOWN would
+    mean nothing and the artifact would be a constant."""
+    lineage = lineage_for(_ast("SELECT id, amount FROM claim WHERE created_at < now()"),
+                          ["claim"], inventory_for(_snapshot(jobs=[_DISCOVERED])))
+    assert lineage.completeness == COMPLETE
+
+
+def test_one_leaky_view_does_not_certify_every_later_view_as_a_gap():
+    """A statement-scoped gap accumulator meant that once ANY view reached past the table list,
+    every later view was named as reaching too — order-dependent, so it would not have reproduced
+    reliably, and the inverse of the false certification this design exists to remove: a clean
+    view named as a demonstrated gap purely by its position in the list.
+
+    Both orderings asserted, because the defect was invisible in one of them."""
+    views = [ViewDefinition(object_id="leaky_view", definition="SELECT id FROM secret_table",
+                            dialect="duckdb"),
+             ViewDefinition(object_id="clean_view", definition="SELECT id FROM claim",
+                            dialect="duckdb")]
+    sql = ("SELECT b.id FROM clean_view b JOIN leaky_view a ON a.id = b.id "
+           "JOIN claim c ON c.id = b.id")
+    for order in (["clean_view", "leaky_view", "claim"], ["leaky_view", "clean_view", "claim"]):
+        lineage = lineage_for(_ast(sql), order,
+                              inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+        assert "leaky_view" in lineage.unresolved, order
+        assert "clean_view" not in lineage.unresolved, f"certified by position: {order}"
+
+
+def test_a_name_containing_a_colon_cannot_pose_as_a_classification():
+    """`_add` split on the first colon and admitted whatever preceded it, so a caller-derived name
+    containing one rode in intact. The earlier test could not catch this: it partitioned on ":"
+    exactly as the code did and asserted only on the part after, which is the half a colon-bearing
+    name never lands in — a test that shares the code's assumption cannot falsify it."""
+    from mnemiq.sql.lineage import _add
+
+    for hostile in ("DOB 1990-01-01:x", "evil name: with spaces", "sk-live-abc:123"):
+        out: list[str] = []
+        _add(out, hostile)
+        assert out == ["unnameable-function"], f"admitted {out!r} for {hostile!r}"
+
+    # ...and a real engine classification still passes through with its subject intact.
+    out = []
+    _add(out, "unconfirmed-identity:claim")
+    assert out == ["unconfirmed-identity:claim"]

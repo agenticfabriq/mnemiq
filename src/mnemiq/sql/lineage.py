@@ -35,6 +35,10 @@ from dataclasses import dataclass, field
 # narrow: a name that needed quoting to be legal is a name this label cannot carry safely.
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$#]*")
 
+# The classifications this engine may prefix a label with. A CLOSED set, because anything else in
+# front of a colon is part of a caller-derived name and must face the grammar.
+_ENGINE_PREFIXES = frozenset({"unconfirmed-identity", "table-function", "unmodelled-source"})
+
 COMPLETE = "complete"
 INCOMPLETE = "incomplete"
 UNKNOWN = "unknown"
@@ -87,6 +91,34 @@ def _safe_label(label: str, fallback: str) -> str:
         if candidate and all(_IDENTIFIER.fullmatch(part) for part in candidate.split(".")):
             return candidate
     return "unnameable-function"
+
+
+def _add(out: list[str], value: str) -> None:
+    """The ONE way a value reaches `unresolved`, deduplicated and grammar-checked.
+
+    `_safe_label` was introduced as "the single admission point" and then bypassed three times in
+    the same function: `case-ambiguous:` interpolated an `object_key` straight in, a view name was
+    appended raw on parse failure, and a demonstrated gap appended a raw key. So a view named
+    `"DOB 1990-01-01"` put that string into the emitter's ALWAYS tier, which is on by default and
+    not behind the text opt-in -- the fourth disclosure of this shape, through a path created
+    while closing the third.
+
+    A prefixed label keeps its prefix (an engine code) and grammar-checks only the subject, so a
+    caller-controlled name can never ride in on a classification.
+    """
+    prefix, sep, subject = value.partition(":")
+    if sep and prefix in _ENGINE_PREFIXES:
+        admitted = f"{prefix}:{_safe_label(subject, subject)}"
+    else:
+        # Not a known classification, so the WHOLE value is caller-derived and gets the grammar.
+        # Splitting on the first colon and trusting whatever preceded it let a name containing a
+        # colon ride in intact -- `DOB 1990-01-01:x` was admitted whole. The test could not catch
+        # it either, because it partitioned on ":" exactly as the code did and asserted only on
+        # the part after, which is the half a colon-bearing name does not land in. A test that
+        # shares the code's assumption cannot falsify it.
+        admitted = _safe_label(value, value)
+    if admitted not in out:
+        out.append(admitted)
 
 
 def _unclassified_functions(ast) -> list[str]:
@@ -193,7 +225,7 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
         view = next((views[k] for k in spellings({name}) if k in views), None)
         parsed = body_of(view) if view is not None else None
         if parsed is None:
-            unclassified.append(name)  # a view we cannot PARSE: unclear, not demonstrated
+            _add(unclassified, name)  # a view we cannot PARSE: unclear, not demonstrated
             continue
         # The source-shape whitelist `views.py` already applies, reused rather than re-derived.
         # `base_tables` can return FEWER tables for a shape the resolver does not model while
@@ -201,62 +233,67 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
         # ((SELECT max(store_id) FROM customer)))` yielded COMPLETE with `customer` unaccounted.
         # An unmodelled source is exactly the case where a table list cannot be trusted, and
         # `views.py` refuses on it for the same reason.
-        if unrecognised_source(parsed) is not None:
-            label = f"unmodelled-source:{unrecognised_source(parsed)}".lower()
-            if label not in unclassified:
-                unclassified.append(label)
-            continue
+        # Recorded WITHOUT short-circuiting. The `continue` here stopped the body scan, so a view
+        # mixing a modelled source with an unmodelled one downgraded a DEMONSTRATED gap to
+        # UNKNOWN -- `SELECT customer.id FROM customer CROSS JOIN LATERAL (VALUES (1))` hid
+        # `customer` behind `unmodelled-source:lateral`. That inverts this module's own rule that
+        # a gap the engine can point at outranks one it merely suspects.
+        reaches_past_the_list = False
+        shape = unrecognised_source(parsed)
+        if shape is not None:
+            _add(unclassified, f"unmodelled-source:{shape.lower()}")
         # `base_tables`, not `find_all`: a CTE alias inside the body is not a real read, and
         # counting one reported INCOMPLETE for a view whose only true base was already in the
         # list. That is M31/M49's lesson -- the scope-aware resolver exists so that three guards
         # stopped asking "is this name a real table" three different ways -- applied one consumer
         # later, in a function that had reached for `find_all` anyway.
-        gap = False
+        # A lexical match is NOT identity, and this is the class four review passes kept finding
+        # one shape at a time: a view `a.v` whose body says `claim` reads `a.claim`, while a
+        # caller under schema `b` writing bare `claim` reads `b.claim`. The strings are equal and
+        # the objects are not. `ViewDefinition` carries no creation schema, so the binding context
+        # a body was written in is not recoverable here -- and without it a match CANNOT be
+        # confirmed, only observed.
+        #
+        # So a view's reach never yields COMPLETE. It yields INCOMPLETE when a body table matches
+        # nothing the caller named under any spelling, because that is a gap under every binding
+        # context; and UNKNOWN when it matches lexically, because that is where identity would
+        # have to be resolved and cannot be. COMPLETE survives only for statements that read no
+        # view at all, where every name lives in one context. A narrower marker that is right
+        # beats a broader one that certifies a false audit record -- which is the one outcome
+        # worse than shipping no marker.
         for node in base_tables(parsed):
             key = object_key(node)
             if not key:
-                # A table-valued function -- `generate_series`, `unnest`, `range`. `object_key`
-                # returns "" because there is no identifier to key, and treating that as an
-                # unaccounted OBJECT reported INCOMPLETE for a view that reaches no object at
-                # all. It is not demonstrated reach; it is reach we cannot classify.
-                label = f"table-function:{node.sql().split('(')[0].lower()}"
-                if label not in unclassified:
-                    unclassified.append(label)
+                _add(unclassified, f"table-function:{node.sql().split('(')[0].lower()}")
                 continue
-            # Any segment quoted, not just the leaf: `object_key` composes catalog/db/name, so a
-            # quoted mixed-case QUALIFIER (`"Public".claim`) decides identity exactly as a quoted
-            # leaf does, and inspecting `node.this` alone still folded it.
-            quoted = any(bool(getattr(part, "quoted", False)) for part in node.parts)
-            if key in resolved_exact:
-                continue  # matched exactly: accounted for under either engine's rule
-            if key.lower() in resolved_folded:
-                if quoted:
-                    ambiguous = f"case-ambiguous:{key}"
-                    if ambiguous not in unclassified:  # dedup, like every sibling append
-                        unclassified.append(ambiguous)
-                continue
-            gap = True
-        # A function inside the body reaches where the body's table list cannot show.
+            if key in resolved_exact or key.lower() in resolved_folded:
+                _add(unclassified, f"unconfirmed-identity:{key}")
+            else:
+                # PER VIEW. A statement-scoped accumulator meant that once any view contributed a
+                # gap, every LATER view in the list was named as reaching past the table list --
+                # order-dependent, so it would not have reproduced reliably, and the inverse of
+                # the false certification this design exists to remove: a clean view certified as
+                # a demonstrated gap purely by its position. The previous `gap = False` bool was
+                # correct and the rename bought nothing, since the collected keys were only ever
+                # read for truthiness.
+                reaches_past_the_list = True
         for fn in _unclassified_functions(parsed):
-            if fn not in unclassified:
-                unclassified.append(fn)
-        if gap:
-            reaching_views.append(name)
+            _add(unclassified, fn)
+        if reaches_past_the_list:
+            _add(reaching_views, name)
 
     # The caller's OWN statement gets the whitelist too, not just the bodies it reads through.
     # `SELECT x FROM LATERAL (VALUES ((SELECT max(store_id) FROM customer)))` yields
     # `base_tables == []` while scope resolution reports SUCCESS, so the list is empty and looked
     # settled -- COMPLETE over a read of `customer` the record never named. Applying the check to
     # bodies and not to the statement was the same blind spot one level out.
-    if unrecognised_source(ast) is not None:
-        label = f"unmodelled-source:{unrecognised_source(ast)}".lower()
-        if label not in unclassified:
-            unclassified.append(label)
+    shape = unrecognised_source(ast)
+    if shape is not None:
+        _add(unclassified, f"unmodelled-source:{shape.lower()}")
 
     # UNCLASSIFIABLE reach: a function whose body this engine cannot see.
     for fn in _unclassified_functions(ast):
-        if fn not in unclassified:
-            unclassified.append(fn)
+        _add(unclassified, fn)
 
     if not getattr(views, "available", True):
         reasons.append("view-inventory-unavailable")
@@ -267,7 +304,12 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
     if not scope_resolved:
         reasons.append("scope-unresolved")
 
-    unresolved = reaching_views + unclassified
+    # Through the same helper as everything else. This comprehension was the third place that
+    # bypassed the "single admission point" -- sanitised but not deduplicated, and not against
+    # `unclassified` either.
+    unresolved: list[str] = []
+    for value in reaching_views + unclassified:
+        _add(unresolved, value)
     if reaching_views:
         # A gap the engine can point at outranks one it merely suspects: naming the view is more
         # use to an auditor than recording that something was unclear. The unclear reach is still
