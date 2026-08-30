@@ -104,7 +104,8 @@ def _accounted_for(key: str, resolved_exact: set[str], resolved_folded: set[str]
 
     A first version of `_reaches_past` COPIED this loop rather than sharing it, and the commit
     message called that "extracting" -- two implementations of one question with identical
-    polarity, which is M7's bug class named in this module's own comments about thirty lines down.
+    polarity, which is M7's bug class -- named in the `spellings` comment beside the view lookup, which
+    records that two normalisations of one question drift.
     """
     return key in resolved_exact or key.lower() in resolved_folded
 
