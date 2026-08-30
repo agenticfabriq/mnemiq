@@ -881,3 +881,15 @@ def test_an_ambiguous_view_still_reports_a_gap_every_candidate_demonstrates():
     mixed = lineage_for(_ast('SELECT id FROM "V"'), ["V"],
                         inventory_for(_snapshot(views=one_reaches, jobs=[_DISCOVERED])))
     assert mixed.completeness == UNKNOWN
+
+
+def test_an_ambiguous_pair_with_an_unparseable_body_is_not_a_demonstrated_gap():
+    """The `b is not None` half of the ambiguous guard had no test: rewriting the predicate as
+    `b is None or _reaches_past(...)` — which would name a view as a demonstrated gap off a body
+    that never parsed — passed the whole suite. A body we cannot read demonstrates nothing."""
+    views = [ViewDefinition(object_id="V", definition="SELECT id FROM secret", dialect="postgres"),
+             ViewDefinition(object_id="v", definition="NOT SQL AT ALL {{{", dialect="postgres")]
+    lineage = lineage_for(_ast('SELECT id FROM "V"'), ["V"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == UNKNOWN, "an unreadable body cannot demonstrate a gap"
+    assert "V" not in lineage.unresolved

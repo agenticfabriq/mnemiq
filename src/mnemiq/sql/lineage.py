@@ -94,21 +94,32 @@ def _safe_label(label: str, fallback: str) -> str:
     return "unnameable-function"
 
 
-def _reaches_past(body, resolved_exact: set[str], resolved_folded: set[str]) -> bool:
-    """Does this body name an object the caller's list does not contain, under any spelling?
+def _accounted_for(key: str, resolved_exact: set[str], resolved_folded: set[str]) -> bool:
+    """Is this object key present in the caller's list, exactly or case-folded?
 
-    Extracted so the ambiguous-view case can ask it of EVERY candidate. A gap that every candidate
-    body demonstrates is a gap whichever body was actually read, so ambiguity about which view was
-    resolved does not make the gap unclear.
+    THE single answer to that question, called from both places that ask it. Exact-or-folded and
+    deliberately NOT the four spellings `spellings()` generates: widening this comparison is a
+    claim of COMPLETENESS, and using the shared widening helper here is what once made a view
+    reaching `pg.claim` count as accounted for against a list naming `mysql.claim`.
+
+    A first version of `_reaches_past` COPIED this loop rather than sharing it, and the commit
+    message called that "extracting" -- two implementations of one question with identical
+    polarity, which is M7's bug class named in this module's own comments about thirty lines down.
+    """
+    return key in resolved_exact or key.lower() in resolved_folded
+
+
+def _reaches_past(body, resolved_exact: set[str], resolved_folded: set[str]) -> bool:
+    """Does this body name an object the caller's list does not contain, exactly or case-folded?
+
+    Asked of EVERY candidate in the ambiguous-view case: a gap every candidate demonstrates is a
+    gap whichever body was actually read.
     """
     from mnemiq.sql.qualify import object_key
     from mnemiq.sql.scope import base_tables
 
-    for node in base_tables(body):
-        key = object_key(node)
-        if key and key not in resolved_exact and key.lower() not in resolved_folded:
-            return True
-    return False
+    return any(key and not _accounted_for(key, resolved_exact, resolved_folded)
+               for key in (object_key(node) for node in base_tables(body)))
 
 
 def _add(out: list[str], value: str) -> None:
@@ -335,7 +346,7 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
             if not key:
                 _add(unclassified, f"table-function:{node.sql().split('(')[0].lower()}")
                 continue
-            if key in resolved_exact or key.lower() in resolved_folded:
+            if _accounted_for(key, resolved_exact, resolved_folded):
                 _add(unclassified, f"unconfirmed-identity:{key}")
             else:
                 # PER VIEW. A statement-scoped accumulator meant that once any view contributed a
