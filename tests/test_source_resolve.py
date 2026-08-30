@@ -461,3 +461,54 @@ def test_acknowledgements_are_parsed_case_and_space_insensitively():
     assert _acknowledged(s) == {"read-only-basis:unverifiable", "source-enforcement:partial"}
     assert _acknowledged(_settings()) == frozenset()
     assert _acknowledged(_settings(ack_advisories="  ,, ")) == frozenset()
+
+
+def test_a_misspelled_acknowledgement_says_so_instead_of_doing_nothing_quietly():
+    """A typo'd ack silences nothing and looks exactly like no ack -- two causes, one observable.
+
+    That is the collapse this codebase keeps closing, and it appeared inside the mechanism added to
+    answer a review about the advisory itself. The two halves are reported differently on purpose:
+    an unknown ADVISORY name cannot be right, so it warns; an acknowledged VERDICT that did not
+    occur is the normal case for a deployment whose state improved, so it is INFO. Warning on the
+    second would rebuild the noise this setting exists to remove.
+    """
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Read:
+        def assert_read_only(self):
+            return "unverifiable", "detail"
+
+    def run(ack, level):
+        import io
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        lg = logging.getLogger("mnemiq.runtime")
+        lg.addHandler(handler)
+        previous, lg.level = lg.level, level
+        try:
+            _warn_source_enforcement(_Read(), frozenset(ack))
+        finally:
+            lg.removeHandler(handler)
+            lg.level = previous
+        return stream.getvalue()
+
+    unknown = run({"read-only-baiss:unverifiable"}, logging.WARNING)
+    assert "names no advisory" in unknown, "an advisory name that cannot be right must warn"
+    assert "read-only basis: unverifiable" in unknown, "and the real warning still fires"
+
+    typo = run({"read-only-basis:unverifialbe"}, logging.INFO)
+    assert "did not apply this boot" in typo
+    assert "read-only basis: unverifiable" in typo, "the gap is still reported"
+
+    good = run({"read-only-basis:unverifiable"}, logging.INFO)
+    assert "acknowledged via MNEMIQ_ACK_ADVISORIES" in good
+    assert "names no advisory" not in good and "did not apply" not in good
+
+    unused = run({"read-only-basis:gate_only"}, logging.INFO)
+    assert "did not apply this boot" in unused, (
+        "acknowledging a verdict that did not occur is legitimate -- the state may have improved -- "
+        "so it is reported, not warned about"
+    )

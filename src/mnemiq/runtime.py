@@ -304,8 +304,23 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
     # and the message says that rather than describing a state. The cost is one line per process
     # start, which is the right price for "this safety property does not hold"; the earlier noise
     # complaint is answered by making the warning true and actionable, not by silencing it.
-    for name, label, quiet in (("assert_enforcing", "source enforcement", {"attached"}),
-                               ("assert_read_only", "read-only basis", {"writable"})):
+    advisories = (("assert_enforcing", "source enforcement", {"attached"}),
+                  ("assert_read_only", "read-only basis", {"writable"}))
+    # A typo'd acknowledgement silently does nothing and looks exactly like no acknowledgement --
+    # the operator keeps getting the warning and has no way to tell which. Two different causes
+    # share one observable, which is the collapse this codebase keeps closing, here in the
+    # mechanism added to answer a review. The two halves are reported differently because only one
+    # is definitely a mistake: an unknown ADVISORY name cannot be right, while an acknowledged
+    # verdict that simply did not occur this boot is the normal case for a deployment whose state
+    # improved, and warning about it would recreate the noise this setting exists to remove.
+    known = {label.replace(" ", "-").lower() for _, label, _ in advisories}
+    for entry in sorted(acknowledged):
+        if entry.split(":", 1)[0] not in known:
+            logger.warning("MNEMIQ_ACK_ADVISORIES: %r names no advisory; known: %s. "
+                           "It acknowledges nothing", entry, ", ".join(sorted(known)))
+    matched: set[str] = set()
+
+    for name, label, quiet in advisories:
         assess = getattr(adapter, name, None)
         if assess is None:
             continue
@@ -324,10 +339,16 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
         if verdict in quiet:
             logger.info("%s: %s -- %s", label, verdict, detail)
         elif key in acknowledged:
+            matched.add(key)
             logger.info("%s: %s (acknowledged via MNEMIQ_ACK_ADVISORIES) -- %s",
                         label, verdict, detail)
         else:
             logger.warning("%s: %s -- %s", label, verdict, detail)
+
+    for entry in sorted(acknowledged - matched):
+        if entry.split(":", 1)[0] in known:
+            logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply this boot -- either the verdict "
+                        "changed, or the verdict half is misspelled", entry)
 
 
 def _resolve_verify_level(mode_verify: str, override: str | None) -> str:
