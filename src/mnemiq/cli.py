@@ -418,9 +418,20 @@ def _cmd_metrics(settings: Settings) -> int:
         con = init_store(settings.store_path)
         source_id = load_current_snapshot(settings, con)[0].source_id
     except SnapshotMissing:
-        # Nothing enriched yet, so nothing has been RECORDED either -- an empty view is the honest
-        # answer and needs no warning. `settings.source_id` is as good a label as any here.
         source_id = settings.source_id or "unknown"
+        # Quiet ONLY when the metrics are local. "Nothing enriched, so nothing recorded" was the
+        # justification for silencing this, and it holds for a NullSink and nowhere else: with a
+        # control DSN the records live in a shared Postgres written by whichever replica answered,
+        # so they exist independently of whether THIS machine ever enriched anything. A fresh
+        # operator box querying a live control plane is exactly the case -- and it took the silent
+        # branch, asked for the wrong id, and showed an empty view with no explanation.
+        #
+        # Third route to the same wrong key, through the one branch I had argued was safe.
+        if settings.control_dsn:
+            print(f"warning: no local snapshot, so the source id could not be resolved; showing "
+                  f"remote metrics for {source_id!r}, which may not be the id answers were "
+                  "recorded under. An empty result below may be that, not an absence of answers",
+                  file=sys.stderr)
     except Exception as exc:
         # Anything else means the id is a GUESS, and the guess is `settings.source_id` -- which is
         # exactly the key the two bugs above were about. Falling back to it silently resurrects
