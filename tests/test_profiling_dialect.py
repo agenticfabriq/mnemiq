@@ -409,3 +409,60 @@ def test_the_probe_is_bounded_so_it_cannot_fail_the_table_it_is_diagnosing():
     probe = next(q for q in a.sql if "ROWNUM" in q)
     assert "FETCH FIRST" in probe, "the probe must be bounded, not a full-table dedup"
     assert "HASH" not in probe  # sanity: this is the SQL, not a plan
+
+
+def test_a_probe_that_passes_small_and_fails_large_is_treated_as_systemic():
+    """Bounding the probe fixed one bug and opened another, and this is the seam between them.
+
+    A bounded probe's temp footprint is far below the batched query's, so a genuine ORA-01652
+    could pass on 100 rows while the real full-table sort cannot -- and the table would be carried
+    as `done` with every column unknown, which is the M59 class. The cheap probe settles the common
+    cases; the full-size one is asked ONLY when nothing measured and the cheap one said yes.
+    """
+    class _SmallOkLargeFails(_Recorder):
+        def execute(self, sql):
+            self.sql.append(sql)
+            if "FETCH FIRST 100" in sql:
+                return [(100,)]                       # the bounded probe succeeds
+            if "count(DISTINCT ROWNUM)" in sql:
+                raise RuntimeError("ORA-01652: unable to extend temp segment")   # capacity
+            if "count(DISTINCT" in sql:
+                raise RuntimeError("ORA-22950: cannot order objects")            # column type
+            return [(3,)]
+
+    a = _SmallOkLargeFails(dialect="oracle")
+    # DISTINCT messages on purpose: the batched failure and the deciding failure must be
+    # distinguishable, or the test cannot tell which exception propagated. An earlier version used
+    # the same string at both sites and so could not have caught a bare `raise` re-raising the
+    # wrong one -- which is exactly what it was doing.
+    with pytest.raises(RuntimeError, match="ORA-01652"):
+        profile_table(a, _table(("A", "NUMBER"), ("B", "NUMBER")))
+    assert any("FETCH FIRST 100" in q for q in a.sql), "the cheap probe runs first"
+    assert any(q.endswith('FROM "T"') and "ROWNUM" in q for q in a.sql), "and escalates"
+
+
+def test_the_full_probe_is_not_asked_when_something_measured():
+    """It is the expensive one, so it runs only where the answer is genuinely ambiguous."""
+    a = _BatchFails(dialect="oracle")
+    profile_table(a, _table(("ID", "NUMBER"), ("ADDR", "ADDR_T")))
+    assert not any(q.endswith('FROM "T"') and "ROWNUM" in q for q in a.sql)
+
+
+def test_a_malformed_probe_template_is_refused_under_python_O():
+    """A bare `assert` is stripped by `python -O`, so the guard has to raise."""
+    import subprocess
+    import sys
+
+    code = (
+        "import mnemiq.enrichment.profiling as p, importlib, sys\n"
+        "src = open(p.__file__).read().replace(\n"
+        "    '_DISTINCT_PROBE: dict[str, str] = {',\n"
+        "    '_DISTINCT_PROBE: dict[str, str] = {\"bad\": \"SELECT 1\",')\n"
+        "try:\n"
+        "    exec(compile(src, 'p.py', 'exec'), {'__name__': 'x'})\n"
+        "    print('ACCEPTED')\n"
+        "except ValueError:\n"
+        "    print('REFUSED')\n"
+    )
+    out = subprocess.run([sys.executable, "-O", "-c", code], capture_output=True, text=True)
+    assert "REFUSED" in out.stdout, f"guard stripped under -O: {out.stdout}{out.stderr}"
