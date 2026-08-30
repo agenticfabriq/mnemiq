@@ -271,3 +271,67 @@ def test_a_manifest_id_survives_enrich_to_ask(tmp_path):
 
     snap, versions = load_current_snapshot(s, con)
     assert (snap.source_id, versions) == ("warehouse", {"warehouse": "v1"})
+
+
+# -- the source-enforcement advisory -------------------------------------------------------------
+
+def test_an_adapter_that_can_assess_enforcement_is_asked_at_boot(caplog):
+    """`assert_enforcing` was written, tested across four verdicts, and called by NOTHING outside
+    its own tests -- the **M26** shape, found by an adversarial review of the lane that built it.
+
+    Warns rather than refuses, deliberately: under the 2026-08-29 direction the engine still
+    enforces, so a `bypassing` connection is one where mnemiq's filters are in force and refusing
+    to boot would take down a working deployment over a control that is not yet load-bearing.
+    Fail-closed lands with delegation (M57).
+    """
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Bypassing:
+        def assert_enforcing(self):
+            return "bypassing", "this principal holds EXEMPT ACCESS POLICY"
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Bypassing())
+    assert "bypassing" in caplog.text and "EXEMPT ACCESS POLICY" in caplog.text
+
+
+def test_a_source_that_is_enforcing_does_not_warn(caplog):
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Attached:
+        def assert_enforcing(self):
+            return "attached", "every visible table carries an enabled SELECT policy"
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Attached())
+    assert caplog.text == "", "a clean verdict must not cry wolf at every boot"
+
+
+def test_an_adapter_without_the_capability_is_not_an_error(caplog):
+    """Three of the four adapters cannot answer this. Absence is not a failure -- the distinction
+    this register keeps re-learning."""
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(object())
+    assert caplog.text == ""
+
+
+def test_a_source_that_will_not_answer_does_not_stop_the_engine_booting(caplog):
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Broken:
+        def assert_enforcing(self):
+            raise RuntimeError("ORA-00942: table or view does not exist")
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Broken())  # must not raise
+    assert "could not assess" in caplog.text and "ORA-00942" in caplog.text

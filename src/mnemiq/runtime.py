@@ -258,6 +258,39 @@ def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> 
             warn_unfiltered_dependents(grants, snapshot.relationships, role=role)
 
 
+def _warn_source_enforcement(adapter) -> None:
+    """Say, at boot, whether the SOURCE is actually enforcing row security -- when it can tell.
+
+    `OracleAdapter.assert_enforcing` was written, tested against a live instance across four
+    verdicts, and **called by nothing outside its own tests**. That is the shape **M26** is about:
+    a seam wired at one end, with a green suite, reporting nothing in production. Found by an
+    adversarial review of the lane that built it, not by the lane.
+
+    **It warns; it does not refuse**, and that is a decision rather than caution. Under the
+    2026-08-29 direction the ENGINE still enforces RLS/CLS -- delegation to the database is v2 --
+    so a `bypassing` connection today is one where mnemiq's own filters are still in force and
+    refusing to boot would take a working deployment down over a control that is not yet load
+    bearing. **When delegation lands, this must become fail-closed**, which is exactly what
+    **M57** is open for; the value of wiring it now is that the verdict is visible from the first
+    Oracle deployment rather than from the one after the trust boundary moves.
+
+    Any adapter that grows an `assert_enforcing` is picked up here without further wiring, which is
+    the property whose absence produced the finding.
+    """
+    assess = getattr(adapter, "assert_enforcing", None)
+    if assess is None:
+        return
+    try:
+        verdict, detail = assess()
+    except Exception as exc:  # a source that will not answer must not stop the engine booting
+        logger.warning("could not assess source enforcement: %s", exc)
+        return
+    if verdict == "attached":
+        logger.info("source enforcement: %s -- %s", verdict, detail)
+    else:
+        logger.warning("source enforcement: %s -- %s", verdict, detail)
+
+
 def _resolve_verify_level(mode_verify: str, override: str | None) -> str:
     """Apply the MNEMIQ_VERIFY override to a mode's default verify level.
     "0" forces off (byte-for-byte escape hatch); "1" forces full; unset keeps the mode default."""
@@ -419,6 +452,7 @@ def build_runtime(settings: Settings) -> Runtime:
     }
     _boot_authz = _authz(settings)
     _warn_policy_advisories(_boot_authz, snapshot)
+    _warn_source_enforcement(adapter)
     return Runtime(
         con=con,
         snapshot=snapshot,

@@ -66,13 +66,14 @@ class _FakeCursor:
 
 
 def _adapter(read_only: bool = True) -> OracleAdapter:
-    """An adapter with no connection. `__init__` connects, and none of this needs a database."""
-    a = object.__new__(OracleAdapter)
-    a._oracledb = _FakeOracledb
-    a._con = _FakeConnection()
-    a._schema = "APP"
-    a._read_only = read_only
-    return a
+    """An adapter over a fake connection. `__init__` connects, and none of this needs a database.
+
+    Built with `OracleAdapter.over` rather than `__new__` plus assignments, which is the point of
+    that constructor: this helper was hand-rolled, the adapter grew a concurrency lock, and these
+    tests failed at a line about timeouts with `AttributeError: no attribute '_lock'`. Two other
+    call sites had the same shape. One constructor, one answer to which fields an adapter needs.
+    """
+    return OracleAdapter.over(_FakeConnection(), _FakeOracledb, schema="APP", read_only=read_only)
 
 
 ORA_01466 = "ORA-01466: unable to read data - table definition has changed"

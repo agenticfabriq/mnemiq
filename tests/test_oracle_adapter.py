@@ -164,10 +164,31 @@ def test_execute_arrow_returns_named_columns():
 # -- read_only, which is M3's control on this adapter ------------------------------------------
 
 def test_read_only_refuses_a_write():
+    """TWO independent layers refuse this, and each is tested separately below, because the outer
+    one can hide a failure of the inner one. This asserts the outer: the adapter's own gate."""
+    from mnemiq.adapters.oracle import ReadOnlyViolation
+
+    with pytest.raises(ReadOnlyViolation):
+        _adapter().execute("INSERT INTO t_claim VALUES (2, 1, 200)")
+
+
+def test_oracles_own_read_only_transaction_also_refuses_a_write():
+    """The INNER layer, reached by going around the gate on purpose.
+
+    The adapter's gate exists because Oracle's read-only transaction does not stop DDL. It stops
+    DML perfectly well, and that is a separate guarantee worth keeping tested -- otherwise the
+    gate becomes the only thing anyone checks and a lapsed SET TRANSACTION would go unnoticed
+    behind it.
+    """
     import oracledb
 
-    with pytest.raises(oracledb.DatabaseError):
-        _adapter().execute("INSERT INTO t_claim VALUES (2, 1, 200)")
+    a = _adapter()
+    cur = a._cursor()  # deliberately NOT execute(): we are testing the layer underneath the gate
+    try:
+        with pytest.raises(oracledb.DatabaseError, match="ORA-01456"):
+            cur.execute("INSERT INTO t_claim VALUES (2, 1, 200)")
+    finally:
+        cur.close()
 
 
 def test_read_only_still_reads():
@@ -189,8 +210,17 @@ def test_the_read_only_transaction_does_not_lapse_across_statements():
     a = _adapter()
     a.execute("SELECT count(*) FROM t_claim")
     a._con.commit()  # the boundary that would end a construction-time SET TRANSACTION
-    with pytest.raises(oracledb.DatabaseError):
-        a.execute("INSERT INTO t_claim VALUES (3, 1, 300)")
+
+    # Through `_cursor()`, NOT `execute()`. The adapter's read-only gate would refuse this INSERT
+    # before Oracle ever saw it, so routing the probe through `execute()` would leave this test
+    # green even if the transaction HAD lapsed -- the outer layer masking the very failure this
+    # test exists to catch. ORA-01456 is the inner layer answering, which is the assertion.
+    cur = a._cursor()
+    try:
+        with pytest.raises(oracledb.DatabaseError, match="ORA-01456"):
+            cur.execute("INSERT INTO t_claim VALUES (3, 1, 300)")
+    finally:
+        cur.close()
 
 
 def test_a_writable_adapter_commits_so_the_row_survives_the_connection():
@@ -505,12 +535,11 @@ def test_a_sysdba_connection_is_refused(vpd):
     """
     import oracledb
 
-    a = OracleAdapter.__new__(OracleAdapter)
-    a._oracledb = oracledb
-    a._con = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
-                              mode=oracledb.AUTH_MODE_SYSDBA)
-    a._schema = "APPUSER"
-    a._read_only = True
+    a = OracleAdapter.over(
+        oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
+                         mode=oracledb.AUTH_MODE_SYSDBA),
+        oracledb, schema="APPUSER",
+    )
     try:
         assert a.execute("SELECT count(*) FROM appuser.t_vpd") == [(2,)]
         verdict, _ = a.assert_enforcing()
@@ -678,3 +707,136 @@ def test_the_real_drivers_ora_01466_is_recognised_by_the_retrys_predicate(vpd):
         assert exc.args[0].code == 1466
     finally:
         cur.close()
+
+
+# -- read_only against DDL, and the proof seam ---------------------------------------------------
+
+@pytest.mark.parametrize("stmt", [
+    "DROP TABLE t_region",
+    "TRUNCATE TABLE t_region",
+    "CREATE TABLE t_should_not_exist (id NUMBER)",
+    "ALTER TABLE t_region ADD (extra NUMBER)",
+    "GRANT SELECT ON t_region TO PUBLIC",
+    "INSERT INTO t_region VALUES (9, 'north')",
+    "  /* comment */ -- and a line comment\n  DROP TABLE t_region",
+    "BEGIN EXECUTE IMMEDIATE 'DROP TABLE t_region'; END;",
+])
+def test_a_read_only_adapter_refuses_everything_that_is_not_a_read(stmt):
+    """**Oracle's own read-only transaction does not stop DDL**, so this gate is not defence in
+    depth -- it is the only thing enforcing the claim the constructor makes.
+
+    Measured through this adapter with `read_only=True` before the gate existed: `INSERT` was
+    refused by Oracle (ORA-01456) while `CREATE TABLE`, `TRUNCATE TABLE` and `DROP TABLE` all ran
+    with no error and the table was gone afterwards. DDL performs an implicit COMMIT, which ends
+    the read-only transaction, and then executes. A read plane whose backstop a DROP walks through
+    is what **M3** is about.
+
+    The comment-prefixed case is here because a prefix scan a comment can hide DDL behind is not a
+    gate, and the PL/SQL block because `EXECUTE IMMEDIATE` is the obvious way around a check that
+    only looks at the outermost verb.
+    """
+    from mnemiq.adapters.oracle import ReadOnlyViolation
+
+    with pytest.raises(ReadOnlyViolation):
+        _adapter().execute(stmt)
+    assert "T_REGION" in _adapter().introspect(), "the table must still be there"
+
+
+def test_a_read_only_adapter_still_reads():
+    ro = _adapter()
+    assert ro.execute("SELECT count(*) FROM t_region") == [(1,)]
+    assert ro.execute("WITH c AS (SELECT 1 x FROM dual) SELECT x FROM c") == [(1,)]
+    assert ro.execute_arrow("SELECT id FROM t_region").num_rows == 1
+
+
+def test_validate_accepts_a_good_statement_and_rejects_by_the_sources_own_reason():
+    """`EXPLAIN <sql>` is ORA-02000 on Oracle and `EXPLAIN PLAN FOR <sql>` writes to PLAN_TABLE,
+    so it is ORA-01456 on the read-only adapter that does the proving. Both measured."""
+    import oracledb
+
+    ro = _adapter()
+    ro.validate("SELECT id FROM t_region")  # must not raise
+
+    for sql, code in [("SELECT nope FROM t_region", "ORA-00904"),
+                      ("SELECT id FROM no_such_table_here", "ORA-00942"),
+                      ("SELECT FROM WHERE", "ORA-00936")]:
+        with pytest.raises(oracledb.DatabaseError) as exc:
+            ro.validate(sql)
+        assert code in str(exc.value)
+
+
+def test_validate_does_not_execute_what_it_validates():
+    w = _adapter(read_only=False)
+    before = w.execute("SELECT count(*) FROM t_region")
+    w.validate("INSERT INTO t_region VALUES (7, 'south')")
+    w.validate("UPDATE t_region SET name = 'nowhere'")
+    w.validate("DELETE FROM t_region")
+    assert w.execute("SELECT count(*) FROM t_region") == before
+    assert w.execute("SELECT name FROM t_region WHERE id = 1") == [("west",)]
+
+
+@pytest.mark.parametrize("stmt", ["DROP TABLE t_region", "CREATE TABLE t_nope (id NUMBER)",
+                                  "TRUNCATE TABLE t_region", "BEGIN NULL; END;"])
+def test_validate_refuses_ddl_because_oracles_parser_executes_it(stmt):
+    """**`cursor.parse()` EXECUTES DDL.** Measured: parsing a CREATE returned without error and the
+    table existed afterwards, INSIDE a read-only transaction, because the DDL's implicit commit
+    ends that transaction first. A validation seam that runs what it is asked to check is worse
+    than no validation, so the allowlist is what stands between the two -- on the WRITABLE adapter
+    too, which is why this runs there.
+    """
+    from mnemiq.adapters.oracle import ReadOnlyViolation
+
+    with pytest.raises(ReadOnlyViolation):
+        _adapter(read_only=False).validate(stmt)
+    assert "T_REGION" in _adapter().introspect()
+    assert "T_NOPE" not in _adapter().introspect()
+
+
+def test_the_decider_proof_path_approves_a_valid_oracle_plan():
+    """The end-to-end gap: the adapter's tests never traversed `prove`, and the deciders' tests
+    use adapters that speak EXPLAIN, so an Oracle plan being refused before execution was invisible
+    to both. This is the one assertion that would have failed."""
+    from mnemiq.sql.prove import prove
+
+    assert prove(_adapter(), "SELECT id FROM t_region") is None
+    refused = prove(_adapter(), "SELECT id FROM ghost_table")
+    assert refused is not None and "ORA-00942" in refused.message
+
+
+def test_concurrent_reads_through_one_adapter_do_not_corrupt_each_other():
+    """The deployed shape: ONE Runtime, one adapter, one connection, FastAPI's worker threadpool.
+
+    This adapter mutates CONNECTION-wide state per statement -- `rollback()` then
+    `SET TRANSACTION READ ONLY`, and `call_timeout` in `execute_arrow` -- so interleaving is not a
+    slow path but a wrong one. Measured with the lock removed and everything else identical:
+    **363 failures** across 8 threads, every one `ORA-01453: SET TRANSACTION must be first
+    statement of transaction`, i.e. one thread's rollback landing inside another's setup. With the
+    lock, 0.
+
+    Only the passing side is asserted, because the control's failure count depends on scheduling.
+    The control is recorded here rather than run: a test that needs a race to occur to pass is the
+    flaky shape this file has already deleted one test for.
+    """
+    import threading
+
+    a = _adapter()
+    errors: list[str] = []
+    counts: list[int] = []
+
+    def go():
+        for _ in range(15):
+            try:
+                counts.append(a.execute("SELECT count(*) FROM t_region")[0][0])
+                a.execute_arrow("SELECT id FROM t_region", timeout_s=10.0)
+            except Exception as exc:  # noqa: BLE001 - the point is that NOTHING escapes
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=go) for _ in range(6)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert errors == []
+    assert set(counts) == {1}, "every read must see the same committed state"
+    assert a._con.call_timeout == 0, "a bounded query must not leave the connection bounded"

@@ -9,6 +9,7 @@ from mnemiq.sql.cls import check_cls
 from mnemiq.sql.guard import MAX_ROWS, check_shape
 from mnemiq.sql.lint import lint
 from mnemiq.sql.policy import AccessPolicy
+from mnemiq.sql.prove import prove
 from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.scope import base_tables
 from mnemiq.sql.rls import apply_row_and_mask
@@ -103,13 +104,10 @@ def decide(
     target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
 
     if adapter is not None:
-        try:
-            adapter.execute(f"EXPLAIN {target_sql}")
-        except Exception as exc:
-            # the snapshot can be stale, and only the source knows the truth
-            return Refusal(
-                code=RefusalCode.EXPLAIN_FAILED,
-                message=f"The source rejected this query: {exc}",
-            )
+        # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof
+        # the source understands -- `EXPLAIN` is not Oracle syntax (see mnemiq.sql.prove).
+        refused = prove(adapter, target_sql)
+        if refused is not None:
+            return refused
 
     return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables, columns=columns)

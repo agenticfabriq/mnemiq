@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+import threading
 import time
 from typing import Any
 
@@ -63,8 +65,39 @@ class OracleAdapter:
 
         self._oracledb = oracledb
         self._con = oracledb.connect(user=user, password=password, dsn=dsn)
+        # ONE connection, shared by every caller, and `python-oracledb` in thin mode does not make
+        # a connection safe for concurrent use. This adapter also mutates CONNECTION-wide state per
+        # statement -- `rollback()` then `SET TRANSACTION READ ONLY` in `_cursor`, and
+        # `call_timeout` in `execute_arrow` -- so two threads interleaving there is not a slow path
+        # but a wrong one: one request can roll back another's transaction between its cursor
+        # acquisition and its fetch, and a restored `call_timeout` can be another request's value.
+        # The HTTP server builds ONE Runtime and FastAPI runs sync endpoints on a worker
+        # threadpool, so this is the deployed shape, not a hypothetical.
+        #
+        # Serialised rather than pooled. A pool is the right answer for THROUGHPUT and is v2 work
+        # with a real cost to size (see the attach-cost question in the governance decision); a
+        # lock is the right answer for CORRECTNESS and is available now. RLock so a future method
+        # that composes two of these does not deadlock on itself.
+        self._lock = threading.RLock()
         self._schema = (schema or user).upper()
         self._read_only = read_only
+
+    @classmethod
+    def over(cls, connection, oracledb_module, schema: str, read_only: bool = True) -> "OracleAdapter":
+        """An adapter over a connection somebody else opened, e.g. one made `AS SYSDBA`.
+
+        It exists so that "which fields does an adapter need" has ONE answer. A test previously
+        built this shape by hand with `__new__` and four assignments, and adding a fifth field --
+        the concurrency lock -- broke it at a line that looked unrelated to locking. The next field
+        would have broken it again.
+        """
+        a = cls.__new__(cls)
+        a._oracledb = oracledb_module
+        a._con = connection
+        a._schema = schema.upper()
+        a._read_only = read_only
+        a._lock = threading.RLock()
+        return a
 
     # -- introspection -----------------------------------------------------------------------
     #
@@ -72,6 +105,31 @@ class OracleAdapter:
     # not hold, and asking for them would push the deployment toward exactly the over-privileged
     # role that makes VPD stop enforcing. ALL_* shows what this user can actually see, which is
     # also the honest scope for a governed engine.
+
+    # Statements a read-only adapter may run. **Default-deny, and it is not belt-and-braces: it is
+    # the only thing enforcing read_only against DDL.** `SET TRANSACTION READ ONLY` blocks INSERT,
+    # UPDATE and DELETE (ORA-01456) and does NOT block DDL, because DDL performs an implicit COMMIT
+    # -- which ends the read-only transaction -- and then executes. Measured against a live 23ai
+    # instance through this adapter with `read_only=True`: `INSERT` was refused, while
+    # `CREATE TABLE`, `TRUNCATE TABLE victim` and `DROP TABLE victim` all ran with no error and the
+    # table was gone afterwards. A read plane whose backstop a DROP walks through is the thing
+    # **M3** exists about.
+    #
+    # An allowlist of leading keywords rather than a parse: every read this adapter issues --
+    # introspection, profiling, the planner's approved SELECT -- begins with SELECT or WITH, and
+    # exotic Oracle syntax does not change the first word. Refusing on a failed parse would trade a
+    # silent write for a mysterious refusal on valid SQL; refusing on the first word cannot.
+    _READ_LEADERS = frozenset({"SELECT", "WITH"})
+
+    def _refuse_unless_read(self, sql: str) -> None:
+        if not self._read_only:
+            return
+        leader = _leading_keyword(sql)
+        if leader not in self._READ_LEADERS:
+            raise ReadOnlyViolation(
+                f"this adapter is read-only and {leader or 'that statement'} is not a read; "
+                f"Oracle's own SET TRANSACTION READ ONLY does not stop DDL, so this does"
+            )
 
     def _cursor(self):
         """A cursor with the read-only transaction re-established, when `read_only` is set.
@@ -151,11 +209,14 @@ class OracleAdapter:
         raise last
 
     def _rows(self, sql: str, **binds: Any) -> list[tuple]:
+        self._refuse_unless_read(sql)
+
         def _fetch(cur):
             cur.execute(sql, **binds)
             return cur.fetchall()
 
-        return self._with_cursor(_fetch)
+        with self._lock:
+            return self._with_cursor(_fetch)
 
     def introspect(self) -> list[str]:
         return [
@@ -251,6 +312,8 @@ class OracleAdapter:
         Under `read_only` there is nothing to commit: the transaction is read-only by
         construction, and committing would end it.
         """
+        self._refuse_unless_read(sql)
+
         def _run(cur):
             cur.execute(sql)
             if cur.description is not None:
@@ -268,7 +331,51 @@ class OracleAdapter:
 
         # Retried only under read_only, where the DDL race lives; a write is never re-executed by
         # `_with_cursor`, which is what makes retrying safe to apply on this shared method.
-        return self._with_cursor(_run)
+        with self._lock:
+            return self._with_cursor(_run)
+
+    # Statements `validate` will hand to Oracle's parser. Default-deny for a second, sharper
+    # reason than `_READ_LEADERS`: **`cursor.parse()` EXECUTES DDL.** Measured -- 
+    # `parse("CREATE TABLE parse_ddl_probe (id NUMBER)")` returned without error and the table
+    # existed afterwards, and it did so INSIDE a read-only transaction, because the DDL's implicit
+    # commit ends that transaction first. A validation seam that runs what it is asked to check is
+    # worse than no validation, so the allowlist is what stands between the two.
+    _VALIDATABLE = frozenset({"SELECT", "WITH", "INSERT", "UPDATE", "DELETE", "MERGE"})
+
+    def validate(self, sql: str) -> None:
+        """Prove a statement is executable WITHOUT executing it. Raises if it is not.
+
+        The deciders prove every plan against the source before approving it, because a snapshot
+        can be stale and only the source knows the truth. They did that by issuing
+        `EXPLAIN <sql>`, which is Postgres and DuckDB syntax and **is not Oracle's**: measured,
+        `EXPLAIN SELECT id FROM t` is ORA-02000, "missing PLAN keyword". Every Oracle plan would
+        have been refused as EXPLAIN_FAILED before execution -- the adapter's own tests never
+        traversed the deciders, so nothing caught it.
+
+        Oracle's documented form, `EXPLAIN PLAN FOR <sql>`, is not the fix either: it INSERTS the
+        plan into PLAN_TABLE, so on the read-only adapter that does the proving it fails with
+        ORA-01456, "may not perform insert, delete, update operation inside a READ ONLY
+        transaction". Measured both ways -- it succeeds on a writable connection and fails on the
+        read one, which is the one that needs it.
+
+        `cursor.parse()` is the mechanism that fits: it validates syntax, column existence and
+        object existence -- ORA-00936, ORA-00904, ORA-00942 respectively -- inside a read-only
+        transaction, and measured, parsing `INSERT INTO t VALUES (99)` left the row count
+        unchanged. Its one sharp edge is DDL, which it runs; `_VALIDATABLE` is the guard.
+        """
+        leader = _leading_keyword(sql)
+        if leader not in self._VALIDATABLE:
+            raise ReadOnlyViolation(
+                f"refusing to validate a {leader or 'statement'} statement: Oracle's parser "
+                f"EXECUTES DDL, so validation is only safe for {sorted(self._VALIDATABLE)}"
+            )
+        self._refuse_unless_read(sql)
+
+        def _parse(cur):
+            cur.parse(sql)
+
+        with self._lock:
+            self._with_cursor(_parse)
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
         """Run a query and return Arrow, bounding it by the driver's own call timeout.
@@ -284,6 +391,14 @@ class OracleAdapter:
         # safeguard's setup rather than the query. And it must be restored on every path,
         # including one where `_cursor()` itself raises -- a tightened value that leaks would
         # silently bound every later call on this adapter-lifetime connection.
+        self._refuse_unless_read(sql)
+        with self._lock:
+            return self._arrow_locked(sql, timeout_s)
+
+    def _arrow_locked(self, sql: str, timeout_s: float | None) -> pa.Table:
+        # Split out so the lock covers the CAPTURE of `call_timeout` as well as its restore.
+        # Reading `previous` outside the lock lets another thread's tightened value be captured
+        # and then written back as this call's "original", making the leak permanent.
         previous = self._con.call_timeout
 
         def _fetch(cur):
@@ -404,6 +519,29 @@ class OracleAdapter:
         return ("attached", f"all {tables} visible tables owned by {self._schema} carry an "
                             f"enabled SELECT policy and this principal holds no bypass "
                             f"privilege. {caveat}")
+
+
+class ReadOnlyViolation(RuntimeError):
+    """A read-only adapter was asked to run something that is not a read."""
+
+
+_LEAD_COMMENT = re.compile(r"\A(?:\s+|--[^\n]*|/\*.*?\*/)+", re.S)
+_LEAD_WORD = re.compile(r"\A[A-Za-z_][A-Za-z_0-9]*")
+
+
+def _leading_keyword(sql: str) -> str:
+    """The statement's first keyword, upper-cased, with leading comments stripped.
+
+    Comments are stripped in a loop rather than once: `/* a */ -- b\n DROP` interleaves the two
+    forms, and a single pass over either one leaves the other in front of the keyword. A prefix
+    scan that a comment can hide DDL behind is not a gate.
+    """
+    prev = None
+    while sql != prev:
+        prev = sql
+        sql = _LEAD_COMMENT.sub("", sql, count=1)
+    m = _LEAD_WORD.match(sql)
+    return m.group(0).upper() if m else ""
 
 
 def _is_ddl_race(exc: Exception) -> bool:
