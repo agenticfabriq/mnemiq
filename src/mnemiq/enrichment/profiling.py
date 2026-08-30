@@ -202,29 +202,16 @@ def profile_table(
                 # column died of capacity: real statistics for the other columns are worth more
                 # than the tidiness of refusing them, and the failure is in the log either way.
                 raise systemic
-                # The session cannot DISTINCT at all, so this is systemic -- a permission, a
-                # driver fault, temp space exhausted by the sort. Carrying unknowns for every
-                # column would report a table that measured NOTHING as `done`, and
-                # `enrich_structural` marks a table done whenever this returns, so
-                # `profile_outcome` would say `complete` over a model that measured nothing. That
-                # is M59's bug class, and the codebase already paid for it once as the Pagila
-                # timestamptz failure that dropped 14 of 15 tables while reporting success.
-                # Re-raising restores the pre-fallback behaviour exactly.
-                raise
-            # The session CAN sort, so every failure here was the column's own. This is asked
-            # rather than inferred from "all of them failed", which was wrong for a table of ONE
-            # column: measured, a single CLOB was carried with unknown stats while a single
-            # user-defined `ADDR_T` -- the identical situation -- was re-raised and the table
-            # excluded, purely because the first type is on `_UNAGGREGATABLE` and the second
-            # cannot be. That made the list load-bearing again, which is what the fallback exists
-            # to stop.
             if all(v == (None, None) for v in measured.values()):
-                # Gated, because it was not. It fired whenever the probe succeeded and claimed
-                # "no column could be counted ... all N carried" on a table where one column had
-                # measured perfectly well -- false on both counts, and contradicting the comment
-                # directly above it, which reasons about the partial case.
-                logger.warning("no column of %r could be counted, though the session can sort; "
-                               "all %d carried with unknown stats", table.name, len(measured))
+                # Every failure was a recognised TYPE error, so the table is kept with all of its
+                # columns unmeasured. That is a real state -- a table whose every column is a LOB
+                # or an object type -- and it is why the earlier "all of them failed, therefore
+                # systemic" rule was wrong: for a table of ONE column those are the same fact, so
+                # a single CLOB was carried while a single `ADDR_T` was excluded, the denylist
+                # deciding survival again.
+                logger.warning("no column of %r could be counted; all %d carried with unknown "
+                               "stats, every failure a known column-type error", table.name,
+                               len(measured))
     else:
         # Every column is unaggregatable, so there is nothing to count them WITH; the row count
         # still is, and it is what tells a reader the table is not empty.
