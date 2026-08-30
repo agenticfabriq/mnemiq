@@ -111,10 +111,19 @@ def adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only
                 f"source {spec.id!r} is Oracle and needs {' and '.join(missing)} -- an Easy "
                 "Connect descriptor carries no credentials, so they are configured separately"
             )
-        return OracleAdapter(dsn=spec.target, user=user, password=password,
-                             schema=spec.schema or None, read_only=read_only,
-                             config_dir=(settings.oracle_config_dir if settings else None),
-                             wallet_password=(settings.oracle_wallet_password if settings else None))
+        try:
+            return OracleAdapter(
+                dsn=spec.target, user=user, password=password,
+                schema=spec.schema or None, read_only=read_only,
+                config_dir=(settings.oracle_config_dir if settings else None),
+                wallet_password=(settings.oracle_wallet_password if settings else None))
+        except ValueError as exc:
+            # The adapter validates its own TLS arguments and cannot raise `SourceUnconfigured`:
+            # this module imports IT, so the dependency only runs one way. Translated here so a
+            # misconfiguration arrives at `ask`, `write`, `enrich` and `refresh` as the same
+            # one-line message every other missing-configuration case produces -- those doors
+            # catch `SourceUnconfigured`, and a bare ValueError reached them as a traceback.
+            raise SourceUnconfigured(str(exc)) from exc
 
     attach_type, extension, default_schema, fk_via_postgres = _ATTACH[spec.kind]
     return DuckDBAdapter(
