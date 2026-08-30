@@ -214,11 +214,11 @@ def test_a_subquerys_own_root_source_is_checked_too(body):
 def test_a_function_source_is_recognised_by_node_type_not_by_an_empty_name():
     """`query_table(...)` parses as `Table(Anonymous)`. The empty name was a symptom; the node
     type is the fact, and checking the fact does not depend on the symptom holding."""
-    from mnemiq.sql.views import _unrecognised_source
+    from mnemiq.sql.views import unrecognised_source
     import sqlglot
 
     body = sqlglot.parse_one("SELECT * FROM query_table('customer')", read="duckdb")
-    assert _unrecognised_source(body) is not None
+    assert unrecognised_source(body) is not None
 
 
 def test_a_case_varying_reference_still_matches_a_filtered_table():

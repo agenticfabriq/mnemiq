@@ -28,7 +28,7 @@ def body_of(view: ViewDefinition) -> exp.Expression | None:
     return parsed if isinstance(parsed, exp.Query) else None
 
 
-def _unrecognised_source(body: exp.Expression) -> str | None:
+def unrecognised_source(body: exp.Expression) -> str | None:
     """The name of a source shape this engine does not model, or None if all are plain.
 
     A **whitelist**, and that is the whole design. The previous rule enumerated dangerous
@@ -182,24 +182,25 @@ def inventory_for(snapshot) -> ViewInventory:
     #
     # `registry` is catalog -> schema and exists only on a FederatedSnapshot, so its size is the
     # number of sources merged. A single-source snapshot has none and needs one job.
+    # `status == "done"`, not "anything but failed". `Job.status` is a free string, so a job
+    # recorded `running` -- a partial snapshot, or a producer/version skew -- counted as coverage
+    # and lineage came back COMPLETE over an inventory that had not finished being built. Only
+    # `failed` marked it unavailable, so every other value read as success. Absence, failure and
+    # IN-PROGRESS are three states; two of them were sharing the confident one.
     discovery_jobs = {
         getattr(j, "source_id", None)
         for j in getattr(snapshot, "jobs", ()) or ()
-        if getattr(j, "id", None) == "discover:views"
+        if getattr(j, "id", None) == "discover:views" and getattr(j, "status", None) == "done"
     }
-    sources_needed = max(1, len(getattr(snapshot, "registry", {}) or {}))
-    # A CARDINALITY comparison, and its limit is stated because it cannot be closed here:
-    # `registry` is keyed by `SourceSpec.catalog` while a job carries `SourceSpec.id`, and nothing
-    # requires spec ids to be distinct. Two catalogs attached over one source id therefore collapse
-    # to one discovered id and this reports asked=False permanently, so a fully-discovered
-    # federation answers UNKNOWN with `view-inventory-never-asked`.
-    #
-    # Left that way deliberately. The two sets are not correspondable from a merged snapshot -- the
-    # catalog->source mapping lives in the pairs `merge_snapshots` consumed and does not survive
-    # into the result -- so the choice is between a conservative wrong answer and a confident one.
-    # For a value whose whole job is saying whether completeness can be CONFIRMED, "cannot confirm"
-    # is the correct direction to be wrong in.
-    asked = len(discovery_jobs) >= sources_needed
+    registry = getattr(snapshot, "registry", {}) or {}
+    sources_needed = max(1, len(registry))
+    # Correspondable now, not merely counted: `merge_snapshots` re-keys each job's `source_id` to
+    # its CATALOG, which is unique by construction and is what `registry` is keyed by. The earlier
+    # version compared the cardinality of spec ids against the cardinality of catalogs and could
+    # not check they named the same things, so two catalogs over one source id pinned asked=False
+    # forever. Documenting that limit was not the same as closing it.
+    asked = len(discovery_jobs & set(registry)) >= sources_needed if registry else bool(
+        discovery_jobs)
     return ViewInventory({v.object_id: v for v in snapshot.views}, available=not failed,
                          asked=asked)
 
@@ -326,7 +327,7 @@ def _walk(
                 ),
                 subject=name,
             )
-        unrecognised = _unrecognised_source(body)
+        unrecognised = unrecognised_source(body)
         if unrecognised is not None:
             return Refusal(
                 code=RefusalCode.UNRESOLVABLE_VIEW,

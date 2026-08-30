@@ -57,7 +57,12 @@ def merge_snapshots(pairs: list[tuple[SourceSpec, Snapshot]]) -> FederatedSnapsh
         # as knowable as its least knowable member.
         for v in snap.views:
             views.append(v.model_copy(update={"object_id": qualify_object_id(cat, v.object_id)}))
-        jobs.extend(snap.jobs)
+        # Re-keyed to the CATALOG, which is what makes discovery coverage checkable. `registry`
+        # is keyed by catalog while a job carried `source_id`, and nothing requires spec ids to be
+        # distinct -- so two catalogs attached over one source id collapsed to a single discovery
+        # entry and `inventory_for` could only compare cardinalities it had no way to correspond.
+        # The catalog is unique by construction here, so the two sets now name the same things.
+        jobs.extend(j.model_copy(update={"source_id": cat}) for j in snap.jobs)
     return FederatedSnapshot(
         version=_composite_version(pairs),
         source_id="federated",

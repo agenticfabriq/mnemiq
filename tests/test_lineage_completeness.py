@@ -449,7 +449,10 @@ def test_a_table_valued_function_is_unclassified_not_a_demonstrated_gap():
     lineage = lineage_for(_ast("SELECT * FROM g"), ["g"],
                           inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
     assert lineage.completeness == UNKNOWN
-    assert any("generate_series" in u for u in lineage.unresolved)
+    # Labelled by the SOURCE-SHAPE whitelist now rather than by the empty-object_key branch: the
+    # whitelist runs first and recognises a table-valued function as an unmodelled source, which
+    # is the same judgement reached one step earlier and by the rule `views.py` already owns.
+    assert any(u.startswith("unmodelled-source:") for u in lineage.unresolved)
 
 
 def test_one_sources_discovery_does_not_vouch_for_a_federated_snapshot():
@@ -509,3 +512,75 @@ def test_the_public_serializers_never_ship_a_bare_table_list():
     mcp = _db_read(_Runtime(), IdentityContext(tenant_id="t", principal_id="p", roles=[]), "q")
     assert mcp["trace"]["lineage"]["completeness"] == UNKNOWN
     assert mcp["trace"]["lineage"]["unresolved"] == ["all_ssns"]
+
+
+def test_a_quoted_function_name_cannot_carry_a_literal_into_the_always_tier():
+    """sqlglot strips identifier delimiters when populating `node.name`, so a UDF named
+    `"fn(sk-live-secret)"` put that string in `name` — and the previous guard sanitised the
+    COMPOSED label while falling back to that same unchecked value. Third spelling to carry a
+    literal through this one field, which is why sanitising moved to a single admission point that
+    fails closed rather than to another shape-specific branch."""
+    lineage = lineage_for(_ast('SELECT public."fn(sk-live-secret)"() FROM claim'), ["claim"],
+                          inventory_for(_snapshot(jobs=[_DISCOVERED])))
+    assert not any("sk-live" in u for u in lineage.unresolved)
+    assert "unnameable-function" in lineage.unresolved
+
+
+def test_an_unmodelled_source_in_a_view_body_is_not_a_clean_bill():
+    """`base_tables` can return FEWER tables for a shape it does not model while scope
+    construction still reports success — a Postgres view over `LATERAL (VALUES ((SELECT
+    max(store_id) FROM customer)))` gave COMPLETE with `customer` unaccounted. `views.py` refuses
+    on unmodelled sources for exactly this reason and the whitelist is reused rather than
+    re-derived."""
+    views = [ViewDefinition(
+        object_id="v",
+        definition="SELECT * FROM LATERAL (VALUES ((SELECT max(store_id) FROM customer))) AS lv(x)",
+        dialect="postgres")]
+    lineage = lineage_for(_ast("SELECT x FROM v"), ["v"],
+                          inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
+    assert lineage.completeness == UNKNOWN
+    assert any(u.startswith("unmodelled-source:") for u in lineage.unresolved)
+
+
+def test_discovery_in_progress_is_not_discovery_done():
+    """`Job.status` is a free string and only `failed` marked the inventory unavailable, so a job
+    recorded `running` counted as coverage and lineage came back COMPLETE over an inventory still
+    being built. Absence, failure and IN-PROGRESS are three states; two were sharing the confident
+    one."""
+    running = Job(id="discover:views", source_id="s", kind="discover", status="running")
+    inventory = inventory_for(_snapshot(jobs=[running]))
+    assert inventory.asked is False
+    lineage = lineage_for(_ast("SELECT id FROM claim"), ["claim"], inventory)
+    assert lineage.completeness == UNKNOWN
+
+
+def test_federated_coverage_is_correspondable_not_merely_counted():
+    """`merge_snapshots` re-keys each job's `source_id` to its CATALOG, which is unique by
+    construction and is what `registry` is keyed by — so coverage checks that the discovered set
+    names the registry's sources. Counting cardinalities pinned `asked=False` forever whenever two
+    catalogs shared a spec id, and documenting that limit was not the same as closing it."""
+    from mnemiq.semantic.federation import FederatedSnapshot
+
+    def _job(source):
+        return Job(id="discover:views", source_id=source, kind="discover", status="done")
+
+    registry = {"a": "schema_a", "b": "schema_b"}
+    both = FederatedSnapshot(version="v", source_id="f", created_at="t",
+                             jobs=[_job("a"), _job("b")], registry=registry)
+    assert inventory_for(both).asked is True
+
+    one = FederatedSnapshot(version="v", source_id="f", created_at="t",
+                            jobs=[_job("a"), _job("a")], registry=registry)
+    assert inventory_for(one).asked is False, "one catalog discovered twice is not two catalogs"
+
+
+def test_the_cli_never_prints_a_table_list_without_its_marker():
+    """The third surface, missed while the commit message said there were two. `tables: []` on a
+    function-backed query reads to a human as "nothing was touched" when it means "we could not
+    tell"."""
+    import inspect
+
+    from mnemiq import cli
+
+    src = inspect.getsource(cli._cmd_ask if hasattr(cli, "_cmd_ask") else cli)
+    assert "lineage_completeness" in src, "the CLI prints the list; it must print the marker"

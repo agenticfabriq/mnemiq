@@ -59,6 +59,27 @@ class Lineage:
 _PURE = frozenset({"now", "age", "current_timestamp", "current_date", "current_time", "today"})
 
 
+def _safe_label(label: str, fallback: str) -> str:
+    """An object id, or a generic token. Applied to EVERY label, including the fallback.
+
+    `unresolved` ships in the emitter's ALWAYS tier, which is on by default and is not behind the
+    text opt-in, so a label is an identifier or it does not go. Three spellings have now carried a
+    literal through this one field -- a rendered qualified call, its field-access sibling, and a
+    QUOTED FUNCTION NAME, because sqlglot strips the delimiters when populating `node.name` and
+    the previous guard sanitised the composed label while falling back to that same unchecked
+    name. Each was found by someone thinking of a shape.
+
+    So this is the single place a label is admitted, and it fails closed: anything holding a
+    bracket or a quote is not an identifier, and if the fallback is no better the value is
+    replaced by a token rather than trusted. An auditor learns that a function could not be
+    accounted for; they do not learn what was inside it.
+    """
+    for candidate in (label, fallback):
+        if candidate and not any(ch in candidate for ch in "('\"`"):
+            return candidate
+    return "unnameable-function"
+
+
 def _unclassified_functions(ast) -> list[str]:
     """Function calls whose reach this engine cannot rule out, in one AST.
 
@@ -95,13 +116,7 @@ def _unclassified_functions(ast) -> list[str]:
             if isinstance(qualifier, exp.Column | exp.Identifier):
                 label = f"{qualifier.sql()}.{name}".lower()
 
-        # THE BOUNDARY GUARD, and it is deliberately a check rather than care. `unresolved` ships
-        # in the emitter's ALWAYS tier, so a label is an object id or it does not go: anything
-        # carrying a bracket is a rendered call, and a rendered call carries the question's
-        # literals. Two spellings have now leaked a secret through this exact field, each fixed
-        # by reasoning about shapes; this stops the third without needing to have thought of it.
-        if "(" in label or "'" in label or '"' in label:
-            label = name
+        label = _safe_label(label, name)
         if label not in out:
             out.append(label)
     return out
@@ -117,7 +132,7 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
 
     from mnemiq.sql.qualify import object_key
     from mnemiq.sql.scope import base_tables
-    from mnemiq.sql.views import body_of, spellings
+    from mnemiq.sql.views import body_of, spellings, unrecognised_source
 
     tables = list(tables)
     # Two lists, because the two states are decided by different evidence: a view whose body we
@@ -125,7 +140,7 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
     reaching_views: list[str] = []
     unclassified: list[str] = []
     reasons: list[str] = []
-    # Two indexes, and deliberately NOT `spellings` for either. The two comparisons here
+    # The two comparisons here
     # have opposite polarity, which is the trap: widening the VIEW lookup adds matches and every
     # added match is an INCOMPLETE, so `spellings` is safe there for the reason `views.py` gives
     # ("every added match is a refusal"). Widening the REACH comparison adds matches and every
@@ -171,6 +186,17 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
         if parsed is None:
             unclassified.append(name)  # a view we cannot PARSE: unclear, not demonstrated
             continue
+        # The source-shape whitelist `views.py` already applies, reused rather than re-derived.
+        # `base_tables` can return FEWER tables for a shape the resolver does not model while
+        # scope construction still reports success -- a Postgres view over `LATERAL (VALUES
+        # ((SELECT max(store_id) FROM customer)))` yielded COMPLETE with `customer` unaccounted.
+        # An unmodelled source is exactly the case where a table list cannot be trusted, and
+        # `views.py` refuses on it for the same reason.
+        if unrecognised_source(parsed) is not None:
+            label = f"unmodelled-source:{unrecognised_source(parsed)}".lower()
+            if label not in unclassified:
+                unclassified.append(label)
+            continue
         # `base_tables`, not `find_all`: a CTE alias inside the body is not a real read, and
         # counting one reported INCOMPLETE for a view whose only true base was already in the
         # list. That is M31/M49's lesson -- the scope-aware resolver exists so that three guards
@@ -196,7 +222,9 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
                 continue  # matched exactly: accounted for under either engine's rule
             if key.lower() in resolved_folded:
                 if quoted:
-                    unclassified.append(f"case-ambiguous:{key}")  # engine-dependent identity
+                    ambiguous = f"case-ambiguous:{key}"
+                    if ambiguous not in unclassified:  # dedup, like every sibling append
+                        unclassified.append(ambiguous)
                 continue
             gap = True
         # A function inside the body reaches where the body's table list cannot show.
