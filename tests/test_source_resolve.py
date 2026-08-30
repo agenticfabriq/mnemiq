@@ -297,6 +297,26 @@ def test_an_adapter_that_can_assess_enforcement_is_asked_at_boot(caplog):
     assert "bypassing" in caplog.text and "EXEMPT ACCESS POLICY" in caplog.text
 
 
+def test_both_advisories_are_reported_and_a_clean_read_only_basis_does_not_warn(caplog):
+    """The seam carries two questions now. The second exists because the statement gate provably
+    cannot see a write reached through an AUTONOMOUS_TRANSACTION function behind a view."""
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Both:
+        def assert_enforcing(self):
+            return "attached", "every visible table carries an enabled SELECT policy"
+
+        def assert_read_only(self):
+            return "gate_only", "this read-only connection CAN write: it owns 3 table(s)"
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Both())
+    assert "gate_only" in caplog.text and "CAN write" in caplog.text
+    assert "attached" not in caplog.text, "a clean enforcement verdict must not warn"
+
+
 def test_a_source_that_is_enforcing_does_not_warn(caplog):
     import logging
 

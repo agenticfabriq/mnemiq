@@ -122,6 +122,20 @@ class OracleAdapter:
     # introspection, profiling, the planner's approved SELECT -- begins with SELECT or WITH, and
     # exotic Oracle syntax does not change the first word. Refusing on a failed parse would trade a
     # silent write for a mysterious refusal on valid SQL; refusing on the first word cannot.
+    #
+    # **WHAT THIS DOES NOT COVER, measured rather than reasoned.** A SELECT can invoke PL/SQL, and
+    # a function declared `PRAGMA AUTONOMOUS_TRANSACTION` runs in its OWN transaction -- which is
+    # not the read-only one -- so it can INSERT and COMMIT. Measured: `SELECT f_auto FROM dual`
+    # through a `read_only=True` adapter inserted a row and committed it. A function WITHOUT the
+    # pragma is stopped by Oracle (ORA-14551, "cannot perform a DML operation inside a query"), so
+    # the autonomous pragma is the whole of the gap.
+    #
+    # **No statement-text check can close it, and that is measured too**: wrapping the call in a
+    # view makes `SELECT n FROM v_sneaky` write a row while containing no function name at all.
+    # Parsing for callable names would not see it; neither would anything else reading the SQL.
+    # The control that DOES close it is privilege -- a read connection that cannot write cannot be
+    # made to write by any function it calls -- which is what `assert_read_only` reports on, and
+    # which is a deployment property this adapter can observe but not impose.
     _READ_LEADERS = frozenset({"SELECT", "WITH"})
 
     def _refuse_unless_read(self, sql: str) -> None:
@@ -438,6 +452,86 @@ class OracleAdapter:
 
 
     # -- governance ---------------------------------------------------------------------------
+
+    def assert_read_only(self) -> tuple[str, str]:
+        """Whether `read_only` rests on this adapter's gate alone, or on privilege as well.
+
+        `_refuse_unless_read` stops direct DML and DDL, and it is the ONLY thing that stops DDL --
+        Oracle's `SET TRANSACTION READ ONLY` does not. What it cannot stop is a write reached
+        through PL/SQL: an `AUTONOMOUS_TRANSACTION` function runs in its own transaction, and a
+        view can hide the call so that the statement text names nothing. Both measured.
+
+        So the honest question at boot is not "is the gate on" but **"could this connection write
+        if something got past the gate"**, and that is answerable: a principal that owns the schema
+        can always write it, and object or ANY-table grants do the same -- **including grants that
+        arrive through a ROLE, which `user_tab_privs` does not show at all**. When the answer is
+        yes,
+        `read_only` is one bug away from not holding, and the fix is a deployment one -- connect
+        the read plane as a principal with SELECT and nothing else.
+
+        Reports; never refuses. Refusing here would break every deployment that reads as its own
+        schema owner, which is most of them, over a risk that requires hostile PL/SQL to realise.
+        """
+        if not self._read_only:
+            return ("writable", "this adapter is not read-only, so the question does not apply")
+        # Object privileges are read through `ALL_TAB_PRIVS`, across THREE grantee routes, and
+        # scoped to the governed schema. Every part of that is a measured correction of a wrong
+        # earlier version.
+        #
+        #   ROUTE. `USER_TAB_PRIVS` does not show role-granted privileges -- 0 rows even
+        #   unfiltered for a principal that could insert -- and shows nothing for a grant made to
+        #   PUBLIC either, which a principal can also use. Both measured, both reported
+        #   `constrained` while the principal wrote.
+        #
+        #   PRIVILEGE. **EXECUTE belongs in this list and its absence was the worst hole**, because
+        #   it is the threat itself: a principal holding EXECUTE on an AUTONOMOUS_TRANSACTION
+        #   function owns nothing, holds no DML, and writes anyway. Measured -- verdict
+        #   `constrained`, and `SELECT owner.f_writes FROM dual` inserted a row. The method's own
+        #   docstring described that attack while the query was blind to it.
+        #
+        #   DROPPED OBJECTS. `BIN$...` is Oracle's recycle-bin naming, and a dropped table keeps
+        #   its grants there. Measured: a SELECT-only principal reported `gate_only` on the
+        #   strength of a PUBLIC INSERT held by a table that no longer exists. That is the failure
+        #   that matters most for an advisory -- not a missed warning but an unearned one, because
+        #   a verdict that cannot reach `constrained` is a warning nobody reads.
+        #
+        #   SCOPE. Restricted to `table_schema = :owner` because PUBLIC holds **1829** EXECUTE
+        #   grants outside it on this instance alone -- DBMS_* and friends. Counting those makes
+        #   every connection report `gate_only` forever, and a warning that is always on is a
+        #   warning nobody reads. What matters is who can write the schema under governance.
+        owned, direct, public, via_role, sysprivs = self._rows(
+            "SELECT (SELECT count(*) FROM all_tables "
+            "         WHERE owner = SYS_CONTEXT('USERENV','SESSION_USER')) AS owned, "
+            "       (SELECT count(*) FROM all_tab_privs WHERE table_schema = :owner "
+            "         AND privilege IN ('INSERT','UPDATE','DELETE','EXECUTE','ALTER') AND table_name NOT LIKE 'BIN$%' "
+            "         AND grantee = SYS_CONTEXT('USERENV','SESSION_USER')) AS direct, "
+            "       (SELECT count(*) FROM all_tab_privs WHERE table_schema = :owner "
+            "         AND privilege IN ('INSERT','UPDATE','DELETE','EXECUTE','ALTER') AND table_name NOT LIKE 'BIN$%' "
+            "         AND grantee = 'PUBLIC') AS public_grants, "
+            "       (SELECT count(*) FROM all_tab_privs WHERE table_schema = :owner "
+            "         AND privilege IN ('INSERT','UPDATE','DELETE','EXECUTE','ALTER') AND table_name NOT LIKE 'BIN$%' "
+            "         AND grantee IN (SELECT role FROM session_roles)) AS via_role, "
+            "       (SELECT count(*) FROM session_privs WHERE privilege IN "
+            "         ('INSERT ANY TABLE','UPDATE ANY TABLE','DELETE ANY TABLE', "
+            "          'CREATE ANY TABLE','DROP ANY TABLE','ALTER ANY TABLE','CREATE TABLE', "
+            "          'CREATE PROCEDURE','CREATE ANY PROCEDURE','EXECUTE ANY PROCEDURE', "
+            "          'CREATE ANY TRIGGER','CREATE JOB','CREATE ANY JOB')) AS sysprivs "
+            "FROM dual", owner=self._schema
+        )[0]
+        granted = direct + public + via_role
+        if owned or granted or sysprivs:
+            return ("gate_only", (
+                f"this read-only connection CAN write {self._schema}: it owns {owned} table(s), "
+                f"holds {granted} write-shaped object privilege(s) there ({direct} direct, "
+                f"{via_role} through a role, {public} granted to PUBLIC -- INSERT/UPDATE/DELETE/"
+                f"ALTER, and EXECUTE, which is enough on its own), and holds {sysprivs} "
+                "write-shaped system privilege(s). Direct "
+                "writes are refused by this adapter, but a SELECT that reaches an "
+                "AUTONOMOUS_TRANSACTION function -- possibly through a view, where the statement "
+                "text names nothing -- is not something any statement check can see. Connect the "
+                "read plane as a principal holding SELECT and nothing else"))
+        return ("constrained", "this connection holds no write privilege, so read-only does not "
+                               "rest on statement inspection alone")
 
     def assert_enforcing(self) -> tuple[str, str]:
         """Can this CONNECTION be trusted to have VPD applied to it? -> (verdict, reason).
