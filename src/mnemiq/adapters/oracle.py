@@ -515,6 +515,38 @@ class OracleAdapter:
 
     # -- governance ---------------------------------------------------------------------------
 
+    # `SELECT ... FOR UPDATE` is the only candidate of five that FLIPPED with the open mode, and
+    # it was measured against both -- READ WRITE and READ ONLY -- because a check that only ever
+    # runs against one case is not measured, which is the mistake this method's privilege query
+    # made four times. `WHERE 1=0` is what makes it safe to run at boot against a customer table:
+    # it matches no rows, so it takes no row lock, and it still raises. The others and why they
+    # cannot serve: `SYS_CONTEXT('USERENV','DATABASE_ROLE')` reports PRIMARY for a read-only PDB,
+    # seeing only a Data Guard standby; a harmless `DELETE ... WHERE 1=0` is refused for PRIVILEGE
+    # (ORA-41900) in BOTH modes, because Oracle checks privilege first; `LOCK TABLE` and
+    # `SET TRANSACTION READ WRITE` both SUCCEED on a read-only database.
+    _READ_ONLY_DB_PROBE = "SELECT 1 FROM dual WHERE 1=0 FOR UPDATE"
+
+    def _database_refuses_writes(self) -> bool:
+        """Whether the DATABASE itself refuses every write, measured rather than inferred.
+
+        Runs on the normal read path, inside `SET TRANSACTION READ ONLY` like every other read.
+        That looked like it would defeat the probe -- a write inside a read-only transaction is
+        ORA-01456, which would be the answer in both modes and so distinguish nothing. Measured
+        instead of assumed, and it is not: Oracle checks the open mode FIRST, so the two modes
+        return different codes (ORA-01456 writable, ORA-16000 read-only) and the probe never has to
+        leave the read-only transaction to tell them apart.
+
+        Any other error answers False. This is a boot advisory; a probe that cannot run must not
+        become an assurance, and `unverifiable` below is the honest verdict when it does not.
+        """
+        try:
+            self._rows(self._READ_ONLY_DB_PROBE)
+        except self._oracledb.DatabaseError as exc:
+            return _is_read_only_database(exc)
+        except Exception:
+            return False
+        return False
+
     def assert_read_only(self) -> tuple[str, str]:
         """Whether `read_only` rests on this adapter's gate alone, or on privilege as well.
 
@@ -534,17 +566,42 @@ class OracleAdapter:
         be inserted, because a view resolves its references with the VIEW OWNER's rights. Dropping
         to SELECT removes every DIRECT write; it does not make the connection unable to cause one.
 
-        Two verdicts, `gate_only` and `unverifiable`, and the absence of a third is the finding:
-        auditing the CALLER cannot establish read-onlyness at all, because a view resolves its
-        references with the VIEW OWNER's rights. Measured -- a principal holding SELECT on one view
-        and nothing else read it and a row was inserted, holding no EXECUTE, no DML and owning
-        nothing.
+        Three verdicts. `gate_only` and `unverifiable` both come from auditing the CALLER, which
+        cannot establish read-onlyness at all: a view resolves its references with the VIEW OWNER's
+        rights, and a principal holding SELECT on one view and nothing else read it and a row was
+        inserted, holding no EXECUTE, no DML and owning nothing.
+
+        `constrained` does not audit the caller. It asks whether the DATABASE is open read-only,
+        which is a different question and the only one whose answer survives the view. This method
+        previously carried a paragraph explaining that no third verdict was reachable; that was
+        drawn from two attempts which were BOTH privilege queries, in a method whose own evidence
+        is that privilege is the wrong instrument. The generalisation was the error, not the two
+        measurements it came from.
 
         Reports; never refuses. Refusing here would break every deployment that reads as its own
         schema owner, which is most of them, over a risk that requires hostile PL/SQL to realise.
         """
         if not self._read_only:
             return ("writable", "this adapter is not read-only, so the question does not apply")
+
+        # Asked BEFORE any privilege query, because it answers a strictly stronger question and the
+        # privilege answer is irrelevant once it holds. M66 deleted `constrained` as unreachable
+        # after two attempts, and the conclusion drawn was that no verdict above `unverifiable`
+        # exists for a minimal read principal. That conclusion was too broad: both attempts were
+        # PRIVILEGE queries, and the row's own evidence is that privilege is the wrong instrument.
+        # The open mode is not a privilege question. Measured on the shape M66 could not close --
+        # a definer-rights view over an AUTONOMOUS_TRANSACTION function, which writes for a caller
+        # holding SELECT and nothing else -- the write is refused with ORA-16000 on a read-only
+        # database, while plain SELECT keeps working.
+        if self._database_refuses_writes():
+            return ("constrained", (
+                "this database is open READ ONLY, so it refuses every write from every principal, "
+                "including the one path this adapter's gate cannot see: a SELECT that reaches an "
+                "AUTONOMOUS_TRANSACTION function through a view. Measured on exactly that shape -- "
+                "refused with ORA-16000 while plain reads kept working. This is the only "
+                "deployment in which read_only is enforced by the database rather than by this "
+                "process. Note the scope: it was true when this connection opened, and reopening "
+                "the database READ WRITE would end it without notifying anything here"))
         # Object privileges are read through `ALL_TAB_PRIVS`, across THREE grantee routes, and
         # scoped to the governed schema. Every part of that is a measured correction of a wrong
         # earlier version.
@@ -605,17 +662,20 @@ class OracleAdapter:
                 "references with the VIEW OWNER's rights. Read-only here is the DATABASE's to "
                 "enforce"))
 
-        # No write-shaped privilege found. That is NOT "cannot write", and there is no further
-        # query that would make it one -- which is the whole result, arrived at by deleting two
-        # attempts rather than by reasoning.
+        # No write-shaped privilege found. That is NOT "cannot write", and no further query about
+        # THIS CALLER would make it one -- arrived at by deleting two attempts rather than by
+        # reasoning. What that does not license is the stronger claim this comment used to make,
+        # that no query of any kind could: the open-mode probe above reaches `constrained` and is
+        # not a question about the caller at all.
         #
         # Measured: a principal holding SELECT on ONE VIEW and nothing else -- no EXECUTE, no DML,
         # owning nothing -- read that view and a row was inserted, because a view resolves its
         # references with the VIEW OWNER's rights and the function inside ran as the owner. So
         # auditing the CALLER cannot establish read-onlyness at any level of thoroughness.
         #
-        # Two verdicts were tried here and both were removed as UNREACHABLE, each verified against
-        # a live instance rather than argued:
+        # Two verdicts were tried HERE -- both about the caller -- and both removed as unreachable,
+        # each verified against a live instance rather than argued. Both remain unreachable; what
+        # was wrong was concluding from them that the property itself could not be established:
         #
         #   `constrained` ("no write path exists") -- needs the schema's source to prove absence,
         #   and `ALL_SOURCE` shows a non-owner nothing. DBA_SOURCE shows it but needs SELECT ANY
@@ -742,6 +802,23 @@ def _leading_keyword(sql: str) -> str:
         sql = _LEAD_COMMENT.sub("", sql, count=1)
     m = _LEAD_WORD.match(sql)
     return m.group(0).upper() if m else ""
+
+
+def _is_read_only_database(exc: Exception) -> bool:
+    """ORA-16000: the DATABASE refused a write, as opposed to this connection lacking privilege.
+
+    The distinction is the whole value. Every other instrument in this file asks what the CALLER
+    may do, and M66 established that the caller's privileges cannot answer whether a read plane can
+    cause a write -- a principal holding SELECT on one view and nothing else caused a row to be
+    inserted, because a view resolves its references with the VIEW OWNER's rights. ORA-16000 is not
+    a privilege verdict. It is the database saying that nothing writes here, whoever asks.
+
+    Same code-first, string-fallback shape as `_is_ddl_race`, for the same reason.
+    """
+    err = exc.args[0] if exc.args else None
+    if getattr(err, "code", None) == 16000 or getattr(err, "full_code", None) == "ORA-16000":
+        return True
+    return "ORA-16000" in str(exc)
 
 
 def _is_ddl_race(exc: Exception) -> bool:

@@ -75,10 +75,17 @@ def schema():
     # over tables created microseconds ago and every read test is also a test of that retry.
     # (The comment here previously pointed at a test that had been deleted for flakiness.)
     yield
+    # Teardown opens a FRESH adapter rather than reusing the one that built the schema. A
+    # module-scoped connection cannot survive this module: one test closes and reopens the PDB to
+    # measure the open mode, and `CLOSE IMMEDIATE` kills every session including this fixture's.
+    # Reusing `w` here raised DPY-1001 -- an InterfaceError, which the `DatabaseError` below does
+    # not catch -- so the drops were skipped and the error surfaced as a teardown failure against a
+    # test that had passed.
+    t = _adapter(read_only=False)
     for stmt in ("DROP VIEW t_claim_v", "DROP TABLE t_claim CASCADE CONSTRAINTS",
                  "DROP TABLE t_region CASCADE CONSTRAINTS"):
         try:
-            w.execute(stmt)
+            t.execute(stmt)
         except oracledb.DatabaseError:
             pass
 
@@ -1274,3 +1281,87 @@ def test_a_reader_on_another_owners_schema_can_actually_read_it():
             owner.execute("DROP TABLE x_orders")
         except oracledb.DatabaseError:
             pass
+
+
+def _sysdba():
+    """SYSDBA on the container, or None. The suite's own container documents ORACLE_PASSWORD=svc."""
+    import oracledb
+    try:
+        return oracledb.connect(user="sys", password=os.environ.get("ORACLE_SYS_PASSWORD", "svc"),
+                                dsn=DSN, mode=oracledb.AUTH_MODE_SYSDBA)
+    except oracledb.DatabaseError:
+        return None
+
+
+def test_a_read_only_DATABASE_is_the_one_deployment_that_closes_the_plsql_hole():
+    """M66's hole is closed by the database's open mode, and `constrained` reports it.
+
+    M66 measured that a definer-rights view over an AUTONOMOUS_TRANSACTION function writes for a
+    caller holding SELECT and nothing else, and concluded that no verdict above `unverifiable` was
+    reachable. Both attempts behind that conclusion were PRIVILEGE queries, and the finding's own
+    evidence is that privilege is the wrong instrument -- so the conclusion was broader than what
+    was measured. Open mode is not a privilege question.
+
+    This test flips the PDB and asserts BOTH directions, because a verdict that only ever runs
+    against the passing case is not measured -- the mistake the privilege query in this same method
+    made four times. It also re-measures the HOLE in both modes, so what is asserted is that the
+    verdict tracks the actual write, not merely that an error code appeared.
+    """
+    import oracledb
+
+    sysdba = _sysdba()
+    if sysdba is None:
+        pytest.skip("needs SYSDBA on the container to change the open mode")
+
+    def pdb(sql):
+        sysdba.cursor().execute(sql)
+
+    w = _adapter(read_only=False)
+    for stmt in ("DROP VIEW t_m66_v", "DROP FUNCTION f_m66", "DROP TABLE t_m66"):
+        try:
+            w.execute(stmt)
+        except oracledb.DatabaseError:
+            pass
+    w.execute("CREATE TABLE t_m66 (n NUMBER)")
+    w.execute("CREATE FUNCTION f_m66 RETURN NUMBER AS "
+              "  PRAGMA AUTONOMOUS_TRANSACTION; "
+              "BEGIN INSERT INTO t_m66 VALUES (1); COMMIT; RETURN 1; END;")
+    w.execute("CREATE VIEW t_m66_v AS SELECT f_m66 AS n FROM dual")
+
+    def wrote() -> bool:
+        before = _adapter().execute("SELECT count(*) FROM t_m66")[0][0]
+        try:
+            _adapter().execute("SELECT n FROM t_m66_v")
+        except oracledb.DatabaseError:
+            pass
+        return _adapter().execute("SELECT count(*) FROM t_m66")[0][0] > before
+
+    try:
+        # READ WRITE: the hole is open, and the verdict must NOT claim otherwise.
+        assert wrote(), "the M66 shape must reproduce, or this test proves nothing"
+        verdict, _ = _adapter().assert_read_only()
+        assert verdict != "constrained", (
+            f"a writable database reported {verdict!r} -- the probe must not read as an assurance")
+
+        pdb("ALTER PLUGGABLE DATABASE CLOSE IMMEDIATE")
+        pdb("ALTER PLUGGABLE DATABASE OPEN READ ONLY")
+
+        # READ ONLY: the hole is shut by the database, and the verdict says so.
+        assert not wrote(), "a read-only database must refuse the autonomous write"
+        verdict, detail = _adapter().assert_read_only()
+        assert verdict == "constrained", f"a read-only database reported {verdict!r}"
+        assert "READ ONLY" in detail and "ORA-16000" in detail
+        # ... and it is still a usable read plane, or the control is not one.
+        assert _adapter().execute("SELECT count(*) FROM t_m66")[0][0] >= 1
+    finally:
+        try:
+            pdb("ALTER PLUGGABLE DATABASE CLOSE IMMEDIATE")
+            pdb("ALTER PLUGGABLE DATABASE OPEN READ WRITE")
+        finally:
+            sysdba.close()
+        w2 = _adapter(read_only=False)
+        for stmt in ("DROP VIEW t_m66_v", "DROP FUNCTION f_m66", "DROP TABLE t_m66"):
+            try:
+                w2.execute(stmt)
+            except oracledb.DatabaseError:
+                pass
