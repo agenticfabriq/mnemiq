@@ -849,3 +849,41 @@ def test_no_snapshot_yet_is_quiet_because_nothing_has_been_recorded_either(
     _cmd_metrics(_settings(pg_dsn="postgresql://h/db", source_id="acme",
                            store_path=str(tmp_path / "fresh.duckdb")))
     assert "may not be the id" not in capsys.readouterr().err
+
+
+def test_a_missing_snapshot_warns_when_the_metrics_are_REMOTE(monkeypatch, tmp_path, capsys):
+    """"Nothing enriched, so nothing recorded" holds for a local sink and nowhere else.
+
+    With a control DSN the records live in a shared Postgres written by whichever replica answered,
+    so they exist independently of whether THIS machine ever enriched anything. A fresh operator
+    box querying a live control plane took the silent branch, asked for the wrong id, and showed an
+    empty view with no explanation -- the third route to the same wrong key, through the one branch
+    I had argued was safe.
+    """
+    from mnemiq.cli import _cmd_metrics
+
+    asked: list = []
+
+    class _Sink:
+        def __init__(self, *a):
+            pass
+
+        def recent(self, sid, n):
+            asked.append(sid)
+            return []
+
+    monkeypatch.setattr("mnemiq.observability.metrics.PostgresSink", _Sink)
+    # The version pointer must answer "none" WITHOUT a network call, or the control DSN sends this
+    # down the connection-failure branch instead of the missing-snapshot one -- which also warns,
+    # so the test would have passed while never reaching the branch it names.
+    monkeypatch.setattr("mnemiq.runtime.resolve_version", lambda *a, **k: None)
+    manifest = tmp_path / "sources.json"
+    manifest.write_text(json.dumps([{"id": "warehouse", "kind": "duckdb", "target": "/w.duckdb",
+                                     "catalog": "w", "schema": "main"}]))
+    _cmd_metrics(_settings(sources_path=str(manifest), source_id="acme",
+                           store_path=str(tmp_path / "fresh.duckdb"),
+                           control_dsn="postgresql://control/db"))
+    err = capsys.readouterr().err
+    assert asked == ["acme"], "it can only fall back to the setting"
+    assert "no local snapshot" in err
+    assert "may not be the id answers were recorded under" in err
