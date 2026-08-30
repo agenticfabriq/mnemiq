@@ -549,16 +549,24 @@ class OracleAdapter:
         # AUTONOMOUS_TRANSACTION hit, while a SELECT-only principal sees **zero lines** and
         # therefore zero hits. Reading that zero as "no writing code" is the absence/failure
         # collapse this codebase keeps closing, so the two are separate verdicts.
+        #
+        # DISTINCT program unit, not row: `ALL_SOURCE` holds one row per LINE, so a plain count is
+        # a line count and "3 subprograms" for a package with one autonomous procedure spanning
+        # three matching lines is simply false in operator-facing text. It counts units whose
+        # source MENTIONS the pragma, which a comment also satisfies -- deliberately conservative,
+        # since this decides whether to warn.
         lines, autonomous = self._rows(
             "SELECT (SELECT count(*) FROM all_source WHERE owner = :owner) AS lines, "
-            "       (SELECT count(*) FROM all_source WHERE owner = :owner "
+            "       (SELECT count(DISTINCT name || '.' || type) FROM all_source "
+            "         WHERE owner = :owner "
             "         AND UPPER(text) LIKE '%AUTONOMOUS\\_TRANSACTION%' ESCAPE '\\') AS autonomous "
             "FROM dual", owner=self._schema
         )[0]
         if autonomous:
             return ("gate_only", (
-                f"this connection holds no write privilege on {self._schema}, but the schema "
-                f"contains {autonomous} subprogram(s) declaring PRAGMA AUTONOMOUS_TRANSACTION. "
+                f"this connection holds no write privilege on {self._schema}, but "
+                f"{autonomous} of its program unit(s) mention AUTONOMOUS_TRANSACTION in their "
+                "source. "
                 "Such a subprogram writes in its own transaction, and reaching it needs no "
                 "privilege on it -- a view resolves references with the VIEW OWNER's rights, so "
                 "SELECT on the view is enough. Read-only cannot be established by privilege here"))
