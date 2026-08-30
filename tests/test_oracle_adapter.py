@@ -460,7 +460,16 @@ def _drop_user(cur, username):
             # here made the helper usable only in teardown, so a test that also wanted a clean
             # slate BEFORE creating its user could not call it -- and one did, passing on the run
             # where a previous run had leaked and failing on the run where it had not.
-            if "ORA-01918" in str(exc):
+            # By CODE, not by substring, for the reason `_is_ddl_race` gives in its own docstring:
+            # a rendered message that merely quotes the number would satisfy a substring test, and
+            # returning here on a wrapped error whose top-level failure is something else would
+            # report "user gone" while it is still there -- the exact postcondition this function
+            # exists to guarantee. The string is kept only as a fallback for an error re-raised
+            # without the driver's error object.
+            err = exc.args[0] if exc.args else None
+            if getattr(err, "code", None) == 1918 or (
+                err is None and "ORA-01918" in str(exc)
+            ):
                 return
             last = exc
             if attempt == 1:
