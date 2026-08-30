@@ -80,6 +80,10 @@ class Approved:
     plan_sql: str  # the dialect the model wrote in
     target_sql: str  # what will actually run on the source
     tables: list[str] = field(default_factory=list)
+    # Whether `tables` is the whole story. It rides beside the list and never apart from it: a
+    # bare list is worse than no list, because absent reads as "not recorded" and `[]` reads as
+    # "nothing was read" (M56).
+    lineage: object = None
     columns: list[str] = field(default_factory=list)
     # Set by `plan_query`, never by `decide` -- the decider does not repair, it only rules.
     # It rides here because it is a fact about THIS plan: the SQL that was approved is not the

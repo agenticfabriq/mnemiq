@@ -169,6 +169,17 @@ class VerityTraceSink(TraceSink):
             # Stage names and durations. Metadata by construction, and what Live Traces renders.
             "events": [_to_trace_event(e, i) for i, e in enumerate(event.events)],
             "artifacts": [],
+            # ---- ALWAYS: what the answer READ, and whether that is the whole story ----------
+            # M56. Deliberately NOT in the text tier: lineage beside the executed SQL would reach
+            # a text-enabled deployment and nothing else, and the deployments most likely to keep
+            # text off are the ones most likely to need an audit trail. Object ids are not the
+            # question's literals or the answer's prose -- they are the audit question itself.
+            "lineage": {
+                "tables": list(getattr(trace, "tables_used", []) or []),
+                "completeness": getattr(trace, "lineage_completeness", "unknown") or "unknown",
+                "unresolved": list(getattr(trace, "lineage_unresolved", []) or []),
+                "reasons": list(getattr(trace, "lineage_reasons", []) or []),
+            },
             "semantic_refs": self._semantic_refs(event),
             "policy_decisions": [],
             "collector_metadata": {

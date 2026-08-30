@@ -11,7 +11,8 @@ from mnemiq.sql.lint import lint
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove
 from mnemiq.sql.qualify import expand_tables, object_key
-from mnemiq.sql.scope import base_tables
+from mnemiq.sql.lineage import lineage_for
+from mnemiq.sql.scope import base_tables, scope_resolved
 from mnemiq.sql.rls import apply_row_and_mask
 from mnemiq.sql.values_check import check_values
 from mnemiq.sql.views import check_views
@@ -90,6 +91,16 @@ def decide(
     # table from the list and an example whose SQL names it is then shown to a caller who may not
     # read it. Same resolver as the three guards, so the premise cannot drift apart again.
     tables = sorted({object_key(t) for t in base_tables(shaped)})
+    # Beside the list, never apart from it (M56): a bare list is worse than no list, because
+    # absent reads as "not recorded" and `[]` reads as "nothing was read". Computed where the list
+    # is computed, so the two cannot come from different paths and disagree -- M7's shape.
+    #
+    # `views if views is not None`, NOT `views or {}`. `ViewInventory` subclasses dict, so a source
+    # with genuinely no views is FALSY and `or` would swap an inventory that knows it was asked for
+    # a bare `{}` that knows nothing -- M52's defect in one operator, inside the artifact built to
+    # prevent it.
+    lineage = lineage_for(shaped, tables, {} if views is None else views,
+                          scope_resolved=scope_resolved(shaped))
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
     if not policy.empty:
@@ -110,4 +121,5 @@ def decide(
         if refused is not None:
             return refused
 
-    return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables, columns=columns)
+    return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables,
+                    lineage=lineage, columns=columns)

@@ -1932,6 +1932,30 @@
       "identity": {
         "$ref": "#/$defs/IdentityContext"
       },
+      "lineage_completeness": {
+        "default": "unknown",
+        "enum": [
+          "complete",
+          "incomplete",
+          "unknown"
+        ],
+        "title": "Lineage Completeness",
+        "type": "string"
+      },
+      "lineage_reasons": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Lineage Reasons",
+        "type": "array"
+      },
+      "lineage_unresolved": {
+        "items": {
+          "type": "string"
+        },
+        "title": "Lineage Unresolved",
+        "type": "array"
+      },
       "plan_sql": {
         "title": "Plan Sql",
         "type": "string"

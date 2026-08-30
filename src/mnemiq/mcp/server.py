@@ -35,6 +35,11 @@ def _db_read(
         "trace": (
             {
                 "tables_used": trace.tables_used,
+                # M56: the marker travels with the list on every surface, not only the audit one.
+                "lineage": {"tables": list(trace.tables_used),
+                            "completeness": trace.lineage_completeness,
+                            "unresolved": list(trace.lineage_unresolved),
+                            "reasons": list(trace.lineage_reasons)},
                 "enrichment_version": trace.enrichment_version,
                 "timing": trace.timing,
             }

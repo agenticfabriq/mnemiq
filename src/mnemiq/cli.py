@@ -319,6 +319,17 @@ def _cmd_ask(settings: Settings, args) -> int:
                     "deferred": ans.deferred,
                     "mode": ans.mode,
                     "sql": ans.trace.target_sql if ans.trace else None,
+                    # The FOURTH surface. Human CLI, HTTP and MCP were each fixed in turn while
+                    # the commit message counted them wrong every time -- "the two surfaces",
+                    # then three. A machine consumer reading `--json` got answer/deferred/mode/sql
+                    # and no audit artifact at all, which is a worse version of the bare list: not
+                    # a misleading marker but no marker and no tables either.
+                    "tables_used": list(ans.trace.tables_used) if ans.trace else None,
+                    "lineage": ({"tables": list(ans.trace.tables_used),
+                                 "completeness": ans.trace.lineage_completeness,
+                                 "unresolved": list(ans.trace.lineage_unresolved),
+                                 "reasons": list(ans.trace.lineage_reasons)}
+                                if ans.trace else None),
                 },
                 default=str,
             )
@@ -327,7 +338,16 @@ def _cmd_ask(settings: Settings, args) -> int:
     print(ans.answer)
     if ans.trace is not None:
         print(f"\nSQL:\n{ans.trace.target_sql}")
-        print(f"\ntables: {ans.trace.tables_used}  ({ans.trace.timing.get('total_ms', 0):.0f} ms)")
+        # The list never prints without its marker. HTTP and MCP were fixed first and this was
+        # missed while the commit message said "the two surfaces a customer actually reads" --
+        # there are three, and this is the one a human reads directly. `tables: []` on a
+        # function-backed query reads as "nothing was touched"; it means "we could not tell".
+        mark = "" if ans.trace.lineage_completeness == "complete" else (
+            f"  [lineage {ans.trace.lineage_completeness}"
+            + (f": {', '.join(ans.trace.lineage_unresolved + ans.trace.lineage_reasons)}"
+               if (ans.trace.lineage_unresolved or ans.trace.lineage_reasons) else "") + "]")
+        print(f"\ntables: {ans.trace.tables_used}{mark}  "
+              f"({ans.trace.timing.get('total_ms', 0):.0f} ms)")
     return 0
 
 

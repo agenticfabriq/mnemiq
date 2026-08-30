@@ -12,7 +12,7 @@ from mnemiq.sql.verdict import Refusal, RefusalCode
 MAX_DEPTH = 8
 
 
-def _body(view: ViewDefinition) -> exp.Expression | None:
+def body_of(view: ViewDefinition) -> exp.Expression | None:
     """The SELECT a view stands for, whichever way its source spells it.
 
     Postgres hands back a bare SELECT; DuckDB and SQLite hand back the whole
@@ -28,7 +28,7 @@ def _body(view: ViewDefinition) -> exp.Expression | None:
     return parsed if isinstance(parsed, exp.Query) else None
 
 
-def _unrecognised_source(body: exp.Expression) -> str | None:
+def unrecognised_source(body: exp.Expression) -> str | None:
     """The name of a source shape this engine does not model, or None if all are plain.
 
     A **whitelist**, and that is the whole design. The previous rule enumerated dangerous
@@ -76,7 +76,7 @@ def _unrecognised_source(body: exp.Expression) -> str | None:
     return None
 
 
-def _spellings(names: set[str]) -> set[str]:
+def spellings(names: set[str]) -> set[str]:
     """Every spelling a name might be written in: itself, folded, and its bare last segment.
 
     One function for both comparisons -- what a body MENTIONS and what the source KNOWS -- 
@@ -106,7 +106,7 @@ def _mentions(body: exp.Expression) -> set[str]:
     # Folded and bare-segmented, because unquoted identifiers are case-insensitive in all three
     # engines and a body may qualify what the snapshot keys bare. Widening here can only ADD
     # matches, and every added match is a refusal.
-    return _spellings(names)
+    return spellings(names)
 
 
 class ViewInventory(dict):
@@ -129,14 +129,21 @@ class ViewInventory(dict):
     that knows otherwise says so.
     """
 
-    def __init__(self, mapping=None, available: bool = True) -> None:
+    def __init__(self, mapping=None, available: bool = True, asked: bool = True) -> None:
         super().__init__(mapping or {})
         self.available = available
+        # Whether the source was ASKED at all, which `available` cannot carry: a snapshot with a
+        # `done` job holding no views and a snapshot with no job at all are both available with an
+        # empty mapping, and nothing could tell them apart. `check_views` deliberately treats both
+        # as answerable -- refusing a query because a hand-built snapshot lacks a job would be
+        # harsh. An AUDIT RECORD is stricter, because saying "cannot confirm" costs nothing where
+        # refusing costs an answer. Same fact, different response, so it needs its own field.
+        self.asked = asked
 
 
 # Denies exactly as much as it must, and says why. Distinct from `ViewInventory({})`, which is a
 # source that answered and reported no views.
-VIEWS_UNAVAILABLE = ViewInventory(available=False)
+VIEWS_UNAVAILABLE = ViewInventory(available=False, asked=False)
 
 
 def inventory_for(snapshot) -> ViewInventory:
@@ -154,8 +161,8 @@ def inventory_for(snapshot) -> ViewInventory:
     empty list "must be treated as 'cannot reason about', never as 'there are none'". Nothing read
     it until now.
 
-    Deliberate residual: a snapshot carrying no `discover:views` job at all is treated as
-    AVAILABLE. The producer always emits one, so absence means a hand-built snapshot rather than a
+    A snapshot carrying no `discover:views` job at all is still treated as AVAILABLE, and now
+    also records `asked=False` so a consumer that wants the stricter reading can have it. The producer always emits one, so absence means a hand-built snapshot rather than a
     failed read, and the stricter rule -- demand a `done` job -- would refuse every such snapshot
     on a question about provenance rather than about views. Named here so the choice is visible
     instead of implicit; a test pins it.
@@ -166,7 +173,36 @@ def inventory_for(snapshot) -> ViewInventory:
         getattr(j, "id", None) == "discover:views" and getattr(j, "status", None) == "failed"
         for j in getattr(snapshot, "jobs", ()) or ()
     )
-    return ViewInventory({v.object_id: v for v in snapshot.views}, available=not failed)
+    # COVERAGE, not existence. `any(...)` let one source's completed discovery vouch for every
+    # source in a merged snapshot: a federated snapshot where one catalog was discovered and a
+    # legacy one never was reported asked=True, so a query of the undiscovered catalog's view came
+    # back COMPLETE. That defeats the never-asked distinction exactly where federation makes it
+    # matter -- and it is this file's own lesson, since `merge_snapshots` dropped views and jobs
+    # entirely until recently and produced the same silence one layer down.
+    #
+    # `registry` is catalog -> schema and exists only on a FederatedSnapshot, so its size is the
+    # number of sources merged. A single-source snapshot has none and needs one job.
+    # `status == "done"`, not "anything but failed". `Job.status` is a free string, so a job
+    # recorded `running` -- a partial snapshot, or a producer/version skew -- counted as coverage
+    # and lineage came back COMPLETE over an inventory that had not finished being built. Only
+    # `failed` marked it unavailable, so every other value read as success. Absence, failure and
+    # IN-PROGRESS are three states; two of them were sharing the confident one.
+    discovery_jobs = {
+        getattr(j, "source_id", None)
+        for j in getattr(snapshot, "jobs", ()) or ()
+        if getattr(j, "id", None) == "discover:views" and getattr(j, "status", None) == "done"
+    }
+    registry = getattr(snapshot, "registry", {}) or {}
+    sources_needed = max(1, len(registry))
+    # Correspondable now, not merely counted: `merge_snapshots` re-keys each job's `source_id` to
+    # its CATALOG, which is unique by construction and is what `registry` is keyed by. The earlier
+    # version compared the cardinality of spec ids against the cardinality of catalogs and could
+    # not check they named the same things, so two catalogs over one source id pinned asked=False
+    # forever. Documenting that limit was not the same as closing it.
+    asked = len(discovery_jobs & set(registry)) >= sources_needed if registry else bool(
+        discovery_jobs)
+    return ViewInventory({v.object_id: v for v in snapshot.views}, available=not failed,
+                         asked=asked)
 
 
 def check_views(
@@ -281,7 +317,7 @@ def _walk(
                 message=f"The view {name!r} nests deeper than this engine will resolve.",
                 subject=name,
             )
-        body = _body(view)
+        body = body_of(view)
         if body is None:
             return Refusal(
                 code=RefusalCode.UNRESOLVABLE_VIEW,
@@ -291,7 +327,7 @@ def _walk(
                 ),
                 subject=name,
             )
-        unrecognised = _unrecognised_source(body)
+        unrecognised = unrecognised_source(body)
         if unrecognised is not None:
             return Refusal(
                 code=RefusalCode.UNRESOLVABLE_VIEW,
@@ -320,14 +356,14 @@ def _walk(
             # `_mentions` still collects the alias, so a CTE named after a filtered table still
             # trips the filtered check below.
             local = {cte.alias_or_name for cte in body.find_all(exp.CTE)}
-            recognised = _spellings(known) | _spellings(set(views)) | _spellings(local)
+            recognised = spellings(known) | spellings(set(views)) | spellings(local)
             # BOTH sides normalised. Widening only the known set still rejected `public.film`
             # against a snapshot that keys it `film`: a name is known when ANY of its spellings
             # matches any recognised one, not when its exact text appears.
             unknown = sorted(
                 object_key(x)
                 for x in body.find_all(exp.Table)
-                if not (_spellings({object_key(x)}) & recognised)
+                if not (spellings({object_key(x)}) & recognised)
             )
             if unknown:
                 return Refusal(
