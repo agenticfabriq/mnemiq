@@ -357,47 +357,222 @@ def test_a_source_that_will_not_answer_does_not_stop_the_engine_booting(caplog):
     assert "could not assess" in caplog.text and "ORA-00942" in caplog.text
 
 
-def test_a_correctly_configured_read_only_deployment_boots_quiet(caplog):
-    """The best achievable state must not warn, or the warning means nothing.
+def test_a_minimal_read_principal_is_still_warned_that_read_only_is_not_a_guarantee(caplog):
+    """**This test previously asserted the opposite, and that is the point of keeping it here.**
 
-    `assert_read_only` has no verdict better than `unverifiable` — auditing the caller cannot
-    establish read-onlyness at all — so warning on it fired at every boot of every correctly
-    configured deployment, with nothing for the operator to change. The level tracks whether
-    something can be DONE: `gate_only` can (narrow the principal), `unverifiable` cannot.
+    It required a correctly configured deployment to boot SILENTLY, on the premise that
+    `unverifiable` means "nothing further exists to do". The premise is false: default logging is
+    WARNING, so the operator of exactly the deployment we recommend was told nothing, while a
+    principal holding SELECT on one view can still cause a write.
 
-    Note the same word is not quiet for the other method: `assert_enforcing` returning
-    `unverifiable` means no VPD policy is enforcing row security, which IS actionable.
+    The action is not "narrow the principal" -- they already have -- it is to stop treating
+    `read_only=True` as a guarantee and enforce read-only in the DATABASE, which is what the
+    2026-08-29 direction says. A verdict that reports an unclosable gap has to reach the operator;
+    the earlier noise complaint is answered by making the warning true and actionable, not by
+    silencing it.
     """
     import logging
 
     from mnemiq.runtime import _warn_source_enforcement
 
-    class _Correct:
+    class _Minimal:
         def assert_enforcing(self):
             return "attached", "every visible table carries an enabled SELECT policy"
 
         def assert_read_only(self):
-            return "unverifiable", "no write-shaped privilege was found"
+            return "unverifiable", ("no write-shaped privilege was found, and that is NOT the same "
+                                    "as being unable to write. Do not treat read_only=True as a "
+                                    "guarantee here; enforce read-only in the DATABASE")
 
     with caplog.at_level(logging.WARNING):
-        _warn_source_enforcement(_Correct())
-    assert caplog.text == "", "a deployment with nothing left to fix must boot silently"
+        _warn_source_enforcement(_Minimal())
+    assert "read-only basis" in caplog.text, "an unclosable gap must not be silent at the default level"
+    assert "DATABASE" in caplog.text, "and it must name the action, or it is the noise it was called"
+    assert "source enforcement" not in caplog.text, "a clean enforcement verdict still stays quiet"
 
 
-def test_the_same_verdict_word_warns_for_one_method_and_not_the_other(caplog):
-    """`unverifiable` is the ceiling for read-only basis and a real gap for enforcement."""
+def test_writable_is_the_only_quiet_read_only_verdict(caplog):
+    """`writable` means the question does not apply -- the engine was asked to attach read-write.
+
+    Every other verdict reports something the operator should know, so this is the one quiet case.
+    """
     import logging
 
     from mnemiq.runtime import _warn_source_enforcement
 
-    class _NoPolicies:
-        def assert_enforcing(self):
-            return "unverifiable", "no enabled VPD policy on any visible table"
-
+    class _Writable:
         def assert_read_only(self):
-            return "unverifiable", "no write-shaped privilege was found"
+            return "writable", "this adapter is not read-only, so the question does not apply"
 
     with caplog.at_level(logging.WARNING):
-        _warn_source_enforcement(_NoPolicies())
-    assert "source enforcement" in caplog.text
-    assert "read-only basis" not in caplog.text
+        _warn_source_enforcement(_Writable())
+    assert caplog.text == ""
+
+
+def test_an_acknowledged_verdict_stops_warning_but_a_worse_one_still_does(caplog):
+    """An unclosable gap must reach the operator once; it must not page them forever.
+
+    Both failure modes have now happened here in consecutive commits -- warning on every boot of
+    every correct deployment, then silencing it and hiding the gap entirely at the default level.
+    Acknowledgement resolves them: the operator who has assessed the state records it and stops
+    hearing about it.
+
+    **Keyed on `<advisory>:<verdict>`, not on the advisory.** Acknowledging the advisory as a whole
+    would silence a WORSE verdict arriving later -- `read-only basis` moving from `unverifiable`,
+    the unclosable ceiling, to `gate_only`, meaning a principal that now holds write privilege. That
+    transition is the one worth paging on, so it survives the acknowledgement that covers the state
+    before it.
+    """
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Read:
+        def __init__(self, verdict):
+            self.verdict = verdict
+
+        def assert_read_only(self):
+            return self.verdict, "detail"
+
+    ack = frozenset({"read-only-basis:unverifiable"})
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Read("unverifiable"))
+    assert "read-only basis" in caplog.text, "unacknowledged, the gap must be loud"
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Read("unverifiable"), ack)
+    assert caplog.text == "", "acknowledged, that verdict is quiet"
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Read("gate_only"), ack)
+    assert "gate_only" in caplog.text, (
+        "a DIFFERENT, worse verdict must still warn -- acknowledging a state must not "
+        "acknowledge every future state of the same advisory"
+    )
+
+
+def test_acknowledgements_are_parsed_case_and_space_insensitively():
+    from mnemiq.runtime import _acknowledged
+
+    s = _settings(ack_advisories=" Read-Only-Basis:Unverifiable , source-enforcement:partial ")
+    assert _acknowledged(s) == {"read-only-basis:unverifiable", "source-enforcement:partial"}
+    assert _acknowledged(_settings()) == frozenset()
+    assert _acknowledged(_settings(ack_advisories="  ,, ")) == frozenset()
+
+
+def test_a_misspelled_acknowledgement_says_so_instead_of_doing_nothing_quietly():
+    """A typo'd ack silences nothing and looks exactly like no ack -- two causes, one observable.
+
+    That is the collapse this codebase keeps closing, and it appeared inside the mechanism added to
+    answer a review about the advisory itself. The two halves are reported differently on purpose:
+    an unknown ADVISORY name cannot be right, so it warns; an acknowledged VERDICT that did not
+    occur is the normal case for a deployment whose state improved, so it is INFO. Warning on the
+    second would rebuild the noise this setting exists to remove.
+    """
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Read:
+        def assert_read_only(self):
+            return "unverifiable", "detail"
+
+    def run(ack, level):
+        import io
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        lg = logging.getLogger("mnemiq.runtime")
+        lg.addHandler(handler)
+        previous, lg.level = lg.level, level
+        try:
+            _warn_source_enforcement(_Read(), frozenset(ack))
+        finally:
+            lg.removeHandler(handler)
+            lg.level = previous
+        return stream.getvalue()
+
+    unknown = run({"read-only-baiss:unverifiable"}, logging.WARNING)
+    assert "names no advisory" in unknown, "an advisory name that cannot be right must warn"
+    assert "read-only basis: unverifiable" in unknown, "and the real warning still fires"
+
+    typo = run({"read-only-basis:unverifialbe"}, logging.INFO)
+    assert "did not apply this boot" in typo
+    assert "read-only basis: unverifiable" in typo, "the gap is still reported"
+
+    good = run({"read-only-basis:unverifiable"}, logging.INFO)
+    assert "acknowledged via MNEMIQ_ACK_ADVISORIES" in good
+    assert "names no advisory" not in good and "did not apply" not in good
+
+    unused = run({"read-only-basis:gate_only"}, logging.INFO)
+    assert "did not apply this boot" in unused, (
+        "acknowledging a verdict that did not occur is legitimate -- the state may have improved -- "
+        "so it is reported, not warned about"
+    )
+
+
+def test_an_ack_carried_to_an_adapter_that_cannot_answer_says_which_cause():
+    """The third reason an acknowledgement goes unused, and the one that misleads.
+
+    Only `OracleAdapter` implements `assert_read_only`/`assert_enforcing`. An operator who carries
+    `MNEMIQ_ACK_ADVISORIES` from an Oracle deployment to a Postgres one is neither stale nor
+    misspelled -- the check never ran -- and telling them "the verdict changed" sends them to look
+    at a verdict that was never produced.
+    """
+    import io
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _CannotAnswer:
+        """Every adapter but Oracle."""
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    lg = logging.getLogger("mnemiq.runtime")
+    lg.addHandler(handler)
+    previous, lg.level = lg.level, logging.INFO
+    try:
+        _warn_source_enforcement(_CannotAnswer(), frozenset({"read-only-basis:unverifiable"}))
+    finally:
+        lg.removeHandler(handler)
+        lg.level = previous
+    out = stream.getvalue()
+    assert "produced no verdict" in out
+    assert "not implemented here" in out, "the message must cover both ways no verdict appears"
+    assert "the verdict changed" not in out, "that diagnosis would send them to the wrong place"
+
+
+def test_an_advisory_that_raised_is_not_diagnosed_as_a_changed_verdict():
+    """`assessed` was recorded BEFORE the call, so an advisory that raised counted as assessed.
+
+    An unmatched acknowledgement for it was then told "the verdict changed, or the verdict half is
+    misspelled" while the real cause -- the exception -- was logged two lines above. The wrong
+    diagnosis and its correction sat in the same output.
+    """
+    import io
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Raises:
+        def assert_read_only(self):
+            raise RuntimeError("ORA-00942: table or view does not exist")
+
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    lg = logging.getLogger("mnemiq.runtime")
+    lg.addHandler(handler)
+    previous, lg.level = lg.level, logging.INFO
+    try:
+        _warn_source_enforcement(_Raises(), frozenset({"read-only-basis:unverifiable"}))
+    finally:
+        lg.removeHandler(handler)
+        lg.level = previous
+    out = stream.getvalue()
+    assert "could not assess" in out and "ORA-00942" in out
+    assert "produced no verdict" in out
+    assert "the verdict changed" not in out

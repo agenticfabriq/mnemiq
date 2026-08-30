@@ -258,7 +258,13 @@ def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> 
             warn_unfiltered_dependents(grants, snapshot.relationships, role=role)
 
 
-def _warn_source_enforcement(adapter) -> None:
+def _acknowledged(settings: Settings) -> frozenset[str]:
+    """`MNEMIQ_ACK_ADVISORIES` parsed into `{advisory}:{verdict}` keys, lowercased."""
+    raw = (settings.ack_advisories or "").strip()
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
+def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()) -> None:
     """Say, at boot, whether the SOURCE is actually enforcing row security -- when it can tell.
 
     `OracleAdapter.assert_enforcing` was written, tested against a live instance across four
@@ -283,34 +289,83 @@ def _warn_source_enforcement(adapter) -> None:
     Any adapter that grows either method is picked up here without further wiring, which is the
     property whose absence produced the finding.
     """
-    # The level tracks whether the operator can DO anything, not how bad the verdict sounds, and
-    # the same word means different things to the two methods.
+    # The level tracks whether the operator can DO anything, and BOTH of this function's earlier
+    # answers to that were wrong in opposite directions.
     #
-    #   `assert_enforcing` unverifiable -> WARNING. No VPD policy is enforcing row security on the
-    #   objects this connection can see. That is actionable: attach one.
+    # It first warned on every verdict, so a correctly configured read-only deployment printed a
+    # warning at every boot -- noise, and a review said so. I then demoted `assert_read_only`'s
+    # `unverifiable` to INFO on the premise that "nothing further exists to do". **That premise is
+    # false, and demoting it suppressed a real gap**: default logging is WARNING, so the operator
+    # of exactly the deployment we recommend was told NOTHING, while a principal holding SELECT on
+    # one view can still cause a write. Measured both ways.
     #
-    #   `assert_read_only` unverifiable -> INFO. No write-shaped privilege was found, which is the
-    #   BEST achievable state -- there is no third verdict saying more, because auditing the caller
-    #   cannot establish read-onlyness at all. Warning here fired on every boot of every correctly
-    #   configured read-only deployment, with nothing for the operator to change. That is the
-    #   failure this adapter had already named one commit earlier while scoping PUBLIC grants --
-    #   "a warning that is always on is a warning nobody reads" -- and then reproduced in the log
-    #   level rather than the query.
-    for name, label, quiet in (("assert_enforcing", "source enforcement", {"attached"}),
-                               ("assert_read_only", "read-only basis",
-                                {"unverifiable", "writable"})):
+    # There IS an action, and it is the one the 2026-08-29 direction already names: stop treating
+    # `read_only=True` as a guarantee and enforce read-only in the DATABASE. So the verdict warns,
+    # and the message says that rather than describing a state. The cost is one line per process
+    # start, which is the right price for "this safety property does not hold"; the earlier noise
+    # complaint is answered by making the warning true and actionable, not by silencing it.
+    advisories = (("assert_enforcing", "source enforcement", {"attached"}),
+                  ("assert_read_only", "read-only basis", {"writable"}))
+    # A typo'd acknowledgement silently does nothing and looks exactly like no acknowledgement --
+    # the operator keeps getting the warning and has no way to tell which. Two different causes
+    # share one observable, which is the collapse this codebase keeps closing, here in the
+    # mechanism added to answer a review. The two halves are reported differently because only one
+    # is definitely a mistake: an unknown ADVISORY name cannot be right, while an acknowledged
+    # verdict that simply did not occur this boot is the normal case for a deployment whose state
+    # improved, and warning about it would recreate the noise this setting exists to remove.
+    known = {label.replace(" ", "-").lower() for _, label, _ in advisories}
+    for entry in sorted(acknowledged):
+        if entry.split(":", 1)[0] not in known:
+            logger.warning("MNEMIQ_ACK_ADVISORIES: %r names no advisory; known: %s. "
+                           "It acknowledges nothing", entry, ", ".join(sorted(known)))
+    matched: set[str] = set()
+    assessed: set[str] = set()
+
+    for name, label, quiet in advisories:
         assess = getattr(adapter, name, None)
         if assess is None:
-            continue
+            continue  # this adapter cannot answer; only OracleAdapter implements either today
         try:
             verdict, detail = assess()
         except Exception as exc:  # a source that will not answer must not stop the engine booting
             logger.warning("could not assess %s: %s", label, exc)
             continue
+        # Recorded only on SUCCESS. Set before the call, an advisory that RAISED counted as
+        # assessed, so an unmatched ack for it was diagnosed "the verdict changed" while the real
+        # cause -- the exception -- was logged two lines above it.
+        assessed.add(label.replace(" ", "-").lower())
+        # An operator who has assessed a gap and accepted it can acknowledge THAT VERDICT, by
+        # `<advisory>:<verdict>` -- not the advisory as a whole. Acknowledging the advisory would
+        # silence a WORSE verdict arriving later: `read-only basis` moving from `unverifiable`
+        # (the unclosable ceiling) to `gate_only` (a principal that now holds write privilege) is
+        # exactly the change worth paging on, and a coarser switch would hide the regression along
+        # with the accepted state.
+        key = f"{label.replace(' ', '-')}:{verdict}".lower()
         if verdict in quiet:
             logger.info("%s: %s -- %s", label, verdict, detail)
+        elif key in acknowledged:
+            matched.add(key)
+            logger.info("%s: %s (acknowledged via MNEMIQ_ACK_ADVISORIES) -- %s",
+                        label, verdict, detail)
         else:
             logger.warning("%s: %s -- %s", label, verdict, detail)
+
+    # Three reasons an acknowledgement goes unused, and the message names the right one. The third
+    # is the one a review caught: only `OracleAdapter` implements either method, so an ack carried
+    # from an Oracle deployment to a Postgres one is neither stale nor misspelled -- the check
+    # never ran. Telling that operator "the verdict changed" sends them to look at a verdict that
+    # was never produced.
+    for entry in sorted(acknowledged - matched):
+        advisory = entry.split(":", 1)[0]
+        if advisory not in known:
+            continue  # already warned about above, as an advisory that does not exist
+        if advisory not in assessed:
+            logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply -- this source produced no "
+                        "verdict for %r (not implemented here, or the assessment failed above), "
+                        "so nothing was acknowledged", entry, advisory)
+        else:
+            logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply this boot -- either the verdict "
+                        "changed, or the verdict half is misspelled", entry)
 
 
 def _resolve_verify_level(mode_verify: str, override: str | None) -> str:
@@ -474,7 +529,7 @@ def build_runtime(settings: Settings) -> Runtime:
     }
     _boot_authz = _authz(settings)
     _warn_policy_advisories(_boot_authz, snapshot)
-    _warn_source_enforcement(adapter)
+    _warn_source_enforcement(adapter, _acknowledged(settings))
     return Runtime(
         con=con,
         snapshot=snapshot,
