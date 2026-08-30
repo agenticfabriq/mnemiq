@@ -79,9 +79,11 @@ class SourceUnconfigured(RuntimeError):
 def adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only: bool = True):
     """The adapter for one source. `settings` is required only for Oracle's credentials.
 
-    `read_only` is threaded through to every adapter rather than defaulted per-kind, because the
-    read plane must not depend on the decider being the only thing between it and a write -- the
-    finding **M3** is what happens when that switch reaches some adapters and not others.
+    `read_only` is threaded through to every adapter rather than defaulted per-kind, because a
+    per-kind default is a place for one adapter to disagree with the rest about what the switch
+    means. **M3** is what happened when `settings.write_enabled` reached only the adapter and no
+    decider ever saw it: the DATABASE was the sole control, so a disabled write was still approved
+    and executed, and the refusal was raw driver text rather than a governed decision.
     """
     if spec.kind not in KINDS:
         raise UnknownSourceKind(

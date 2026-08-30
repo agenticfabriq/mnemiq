@@ -48,8 +48,11 @@ class OracleAdapter:
         `read_only` defaults to True and is the same control every other production adapter
         carries -- `runtime.build_runtime` passes `read_only=not settings.write_enabled`, and
         **M3** is the finding that exists because that switch once reached only the adapter while
-        the decider approved the write anyway. A read plane must not depend on the decider being
-        the only thing between it and a write.
+        the decider approved the write anyway -- the database was the sole control, and a refusal
+        that is only a driver error is not a governed decision. The lesson runs the other way from
+        the obvious reading: not "the decider is enough" but "the source refusing is not enough".
+        **M61** is the same lesson one layer down, where the SOURCE's own read-only mode turned out
+        not to cover DDL.
 
         `schema` is the OWNER whose objects are introspected, defaulting to the connecting user.
         It is stored uppercased because Oracle folds unquoted identifiers UP where Postgres folds
