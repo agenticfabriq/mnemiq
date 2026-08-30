@@ -407,3 +407,57 @@ def test_writable_is_the_only_quiet_read_only_verdict(caplog):
     with caplog.at_level(logging.WARNING):
         _warn_source_enforcement(_Writable())
     assert caplog.text == ""
+
+
+def test_an_acknowledged_verdict_stops_warning_but_a_worse_one_still_does(caplog):
+    """An unclosable gap must reach the operator once; it must not page them forever.
+
+    Both failure modes have now happened here in consecutive commits -- warning on every boot of
+    every correct deployment, then silencing it and hiding the gap entirely at the default level.
+    Acknowledgement resolves them: the operator who has assessed the state records it and stops
+    hearing about it.
+
+    **Keyed on `<advisory>:<verdict>`, not on the advisory.** Acknowledging the advisory as a whole
+    would silence a WORSE verdict arriving later -- `read-only basis` moving from `unverifiable`,
+    the unclosable ceiling, to `gate_only`, meaning a principal that now holds write privilege. That
+    transition is the one worth paging on, so it survives the acknowledgement that covers the state
+    before it.
+    """
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _Read:
+        def __init__(self, verdict):
+            self.verdict = verdict
+
+        def assert_read_only(self):
+            return self.verdict, "detail"
+
+    ack = frozenset({"read-only-basis:unverifiable"})
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Read("unverifiable"))
+    assert "read-only basis" in caplog.text, "unacknowledged, the gap must be loud"
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Read("unverifiable"), ack)
+    assert caplog.text == "", "acknowledged, that verdict is quiet"
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Read("gate_only"), ack)
+    assert "gate_only" in caplog.text, (
+        "a DIFFERENT, worse verdict must still warn -- acknowledging a state must not "
+        "acknowledge every future state of the same advisory"
+    )
+
+
+def test_acknowledgements_are_parsed_case_and_space_insensitively():
+    from mnemiq.runtime import _acknowledged
+
+    s = _settings(ack_advisories=" Read-Only-Basis:Unverifiable , source-enforcement:partial ")
+    assert _acknowledged(s) == {"read-only-basis:unverifiable", "source-enforcement:partial"}
+    assert _acknowledged(_settings()) == frozenset()
+    assert _acknowledged(_settings(ack_advisories="  ,, ")) == frozenset()

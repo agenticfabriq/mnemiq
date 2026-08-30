@@ -39,6 +39,7 @@ class Settings(BaseSettings):
     pg_dsn: str | None = Field(default=None, description="source Postgres DSN")
     oracle_user: str | None = Field(default=None, description="source Oracle user (Easy Connect carries no credentials)")
     oracle_password: str | None = Field(default=None, description="source Oracle password")
+    ack_advisories: str | None = Field(default=None, description="boot advisories to log at INFO instead of WARNING, comma-separated as <advisory>:<verdict> (e.g. read-only-basis:unverifiable); a CHANGED verdict still warns")
     acme_data_dir: str | None = Field(default=None, description="ACME golden dataset dir (tests)")
     embed_model: str | None = Field(default=None, description="embedding model id")
     embed_base_url: str | None = Field(default=None, description="embedding endpoint (defaults to chat)")

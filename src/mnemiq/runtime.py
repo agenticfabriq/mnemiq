@@ -258,7 +258,13 @@ def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> 
             warn_unfiltered_dependents(grants, snapshot.relationships, role=role)
 
 
-def _warn_source_enforcement(adapter) -> None:
+def _acknowledged(settings: Settings) -> frozenset[str]:
+    """`MNEMIQ_ACK_ADVISORIES` parsed into `{advisory}:{verdict}` keys, lowercased."""
+    raw = (settings.ack_advisories or "").strip()
+    return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
+
+
+def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()) -> None:
     """Say, at boot, whether the SOURCE is actually enforcing row security -- when it can tell.
 
     `OracleAdapter.assert_enforcing` was written, tested against a live instance across four
@@ -308,8 +314,18 @@ def _warn_source_enforcement(adapter) -> None:
         except Exception as exc:  # a source that will not answer must not stop the engine booting
             logger.warning("could not assess %s: %s", label, exc)
             continue
+        # An operator who has assessed a gap and accepted it can acknowledge THAT VERDICT, by
+        # `<advisory>:<verdict>` -- not the advisory as a whole. Acknowledging the advisory would
+        # silence a WORSE verdict arriving later: `read-only basis` moving from `unverifiable`
+        # (the unclosable ceiling) to `gate_only` (a principal that now holds write privilege) is
+        # exactly the change worth paging on, and a coarser switch would hide the regression along
+        # with the accepted state.
+        key = f"{label.replace(' ', '-')}:{verdict}".lower()
         if verdict in quiet:
             logger.info("%s: %s -- %s", label, verdict, detail)
+        elif key in acknowledged:
+            logger.info("%s: %s (acknowledged via MNEMIQ_ACK_ADVISORIES) -- %s",
+                        label, verdict, detail)
         else:
             logger.warning("%s: %s -- %s", label, verdict, detail)
 
@@ -475,7 +491,7 @@ def build_runtime(settings: Settings) -> Runtime:
     }
     _boot_authz = _authz(settings)
     _warn_policy_advisories(_boot_authz, snapshot)
-    _warn_source_enforcement(adapter)
+    _warn_source_enforcement(adapter, _acknowledged(settings))
     return Runtime(
         con=con,
         snapshot=snapshot,
