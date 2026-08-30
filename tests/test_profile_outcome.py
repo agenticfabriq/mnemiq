@@ -128,7 +128,7 @@ def test_enrich_refuses_and_saves_nothing_for_every_describes_nothing_outcome(
     assert "enrich failed" in capsys.readouterr().err
 
 
-def test_the_early_branch_stays_silent_on_a_partial_run(monkeypatch, tmp_path, capsys):
+def test_a_partial_run_is_not_refused_by_the_early_branch(monkeypatch, tmp_path, capsys):
     """`_cmd_enrich` already reports excluded tables at its tail, so the early check must not.
 
     **This test previously claimed more than it could show, and the way it failed is the point.**
@@ -137,9 +137,11 @@ def test_the_early_branch_stays_silent_on_a_partial_run(monkeypatch, tmp_path, c
     the `except Exception: pass` swallowed it, and the count was 0, so the assertion was `0 <= 1`
     and could not fail. It verified nothing while reading as though it verified the duplication.
 
-    So it now asserts only what this call can actually establish: on `partial` the early branch
-    neither refuses nor prints. The tail's own behaviour is unchanged by this work and is not
-    mine to claim coverage of.
+    So it asserts only what this call can actually establish: a `partial` run is NOT refused by
+    the early branch. It does NOT show the tail warning fires exactly once -- a second attempt at
+    that, `assert "enrich incomplete" not in err`, was dead too, since that string had already been
+    deleted from `_cmd_enrich` and so could never fail. Duplicate-suppression is not testable from
+    here, and a passing assertion that implies it is worse than its absence.
     """
     from mnemiq.cli import _cmd_enrich
     from mnemiq.config import Settings
@@ -153,4 +155,3 @@ def test_the_early_branch_stays_silent_on_a_partial_run(monkeypatch, tmp_path, c
         _cmd_enrich(settings)
     err = capsys.readouterr().err
     assert "enrich failed" not in err, "a partial run must not be refused"
-    assert "enrich incomplete" not in err, "and must not be reported twice in one run"
