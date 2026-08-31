@@ -70,6 +70,7 @@ def main() -> int:
         synthesizer=LLMSynthesizer(LLMClient(settings)),
         adapter=DuckDBPostgresAdapter(settings.pg_dsn),
         cache=TwoTierCache(L1Cache()),
+        guard_undefined_terms=settings.guard_undefined_terms,
     )
     result = agent.answer(packet, snapshot, authz.grants_for(identity), identity)
 

@@ -579,11 +579,12 @@ def test_one_setting_reaches_both_ends_of_the_guard():
     that only checks the on-path cannot see a hop that ignores its argument, and a test that calls
     `system_prompt` directly is reading the call site rather than exercising it.
 
-    **Known gap.** `eval.engine.build_engine` builds its own `Agent` rather than going through
-    `build_agent`, and it is not covered here -- its only test caller is skipped without a live
-    key. Deleting its kwarg returns the eval harness to paying for the declaration and not reading
-    it, with this suite green. Closing that properly means the construction going through
-    `build_agent` like every other one, which is a refactor, not a test.
+    `eval.engine.build_engine` builds its own `Agent` rather than going through `build_agent`, and
+    this walk does not reach it -- its only test caller is skipped without a live key, and asserts
+    nothing about the flag even when it runs. That hop is covered by
+    `test_every_agent_construction_passes_the_flag` below, which is a source invariant rather than
+    a behavioural walk: it is the only form that holds for a construction site nobody has written
+    yet.
     """
     import duckdb
 
@@ -634,35 +635,61 @@ def test_every_agent_construction_passes_the_flag():
     """The invariant no per-call test can hold, because the failure is a call site that does not
     exist yet.
 
-    `Agent` is constructed in two places -- `agent.modes.build_agent` and `eval.engine.build_engine`
-    -- and only the first has an offline test. Beacon confirmed the second is uncovered on their
-    side too: their in-process SUT injects an `engine_builder`, and every beacon test of that SUT
-    passes a stub, so the real `build_engine` runs in neither suite. Delete its kwarg and BOTH stay
-    green. The seam is right for beacon -- their CI has no mnemiq -- so the guarantee has to live
-    here.
+    `Agent` is constructed in three places -- `agent.modes.build_agent`, `eval.engine.build_engine`
+    and `scripts/answer.py` -- and only the first has an offline test. Beacon confirmed the second
+    is uncovered on their side too: their in-process SUT injects an `engine_builder` and every
+    beacon test of it passes a stub, so the real `build_engine` runs in no beacon test. `test_eval_live`
+    does call it, but only with a live key configured and it asserts nothing about this flag. So
+    deleting the kwarg leaves both suites green. Their seam is right for them -- beacon's CI has no
+    mnemiq -- which means the guarantee has to live here.
 
-    A source-level invariant instead, which is what this repo already does for the ad-hoc env reads
-    `test_no_adhoc_retrieval_k_reads` forbids. It costs nothing and it holds for the THIRD
-    construction site, which is the one that will actually cause this: three hops on this branch
-    were left disconnected while its author was watching for exactly that.
+    A source-level invariant instead, the shape this repo already uses for the ad-hoc env reads
+    `test_no_adhoc_retrieval_k_reads` forbids. It costs nothing and it holds for the FOURTH site,
+    which is the one that will actually cause this: three hops on this branch were left
+    disconnected while their author was watching for exactly that failure.
+
+    **The scan fails closed**, because a scanner that finds nothing is the same silent inertness
+    one level up. It asserts it FOUND the known sites; it counts `**kwargs` as not passing the flag,
+    since a config-driven site is the likeliest next one and `Agent(**cfg)` proves nothing; and it
+    resolves import aliases, so `Agent as _A` cannot rename its way out.
     """
     import ast
     import pathlib
 
-    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "mnemiq"
-    missing = []
-    for path in root.rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
-            if not isinstance(node, ast.Call):
-                continue
-            func = node.func
-            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-            if name not in ("Agent", "build_agent"):
-                continue
-            passed = {kw.arg for kw in node.keywords}
-            if "guard_undefined_terms" not in passed and None not in passed:
-                missing.append(f"{path.relative_to(root)}:{node.lineno} {name}(...)")
+    root = pathlib.Path(__file__).resolve().parents[1]
+    roots = [root / "src" / "mnemiq", root / "scripts"]
+    for d in roots:
+        assert d.is_dir(), f"{d} must exist, or this scan guarantees nothing"
 
+    found, missing = [], []
+    for base in roots:
+        for path in base.rglob("*.py"):
+            tree = ast.parse(path.read_text())
+            # Local spellings of the two callables, including `from ... import Agent as _A`.
+            names = {"Agent", "build_agent"}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        if alias.name in ("Agent", "build_agent") and alias.asname:
+                            names.add(alias.asname)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+                if name not in names:
+                    continue
+                where = f"{path.relative_to(root)}:{node.lineno} {name}(...)"
+                found.append(where)
+                # `**kwargs` does NOT count: it cannot be read here, and a config-driven site is
+                # exactly where this goes wrong next.
+                if "guard_undefined_terms" not in {kw.arg for kw in node.keywords}:
+                    missing.append(where)
+
+    assert len(found) >= 3, (
+        f"the scan must SEE the known construction sites; it found {found}. A scanner that "
+        "matches nothing passes vacuously, which is the failure this test exists to catch"
+    )
     assert missing == [], (
         "every Agent/build_agent construction must pass guard_undefined_terms explicitly, or the "
         "guard is inert there with both suites green: " + "; ".join(missing)
