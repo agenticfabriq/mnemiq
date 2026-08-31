@@ -662,10 +662,11 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
 
     **It fails closed**, in four ways that were each a hole first. It pins the exact set of sites
     AND how many calls each file makes, because `loop.py` calls `plan_query` twice and a set keyed
-    on the pair cannot tell that one of them stopped matching. It rejects a hardcoded value -- a
-    literal OR an empty collection, since `definitions=()` is the one hardcode that reproduces the
-    very defect the corpus leg was added to catch, and the kwarg NAME being present is not the
-    guarantee. It counts `**kwargs` as not passing, since a config-driven site is the likeliest
+    on the pair cannot tell that one of them stopped matching. It rejects a value that is baked in rather than
+    derived -- asked as an allowlist (does this reference anything outside the builtins?) after
+    three rounds of enumerating bad literal spellings lost to `tuple()`. The kwarg NAME being
+    present is not the guarantee, and `definitions=()` is the hardcode that reproduces the very
+    defect the corpus leg was added to catch. It counts `**kwargs` as not passing, since a config-driven site is the likeliest
     next one. And it resolves import aliases and local
     rebindings -- plain, annotated and tuple -- so none of `plan_query as _pq`,
     `pq = plan_query` or `pq: Callable = plan_query` renames its way out.
@@ -683,7 +684,10 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     next person decides it deliberately.
     """
     import ast
+    import builtins
     import pathlib
+
+    _BUILTINS = frozenset(dir(builtins))
 
     # callable -> the half of the guard it owes. Both halves, because either alone fails open.
     REQUIRED = {
@@ -719,20 +723,27 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     }
 
     def _is_hardcoded(value: ast.expr) -> bool:
-        """A literal, including an EMPTY collection.
+        """Whether the value is baked in rather than derived from configuration or state.
 
-        `ast.Constant` alone missed `definitions=()` and `definitions=[]`, which are `Tuple` and
-        `List` nodes -- and an empty collection is not a harmless literal here, it is the precise
-        original defect: an empty certified corpus makes the guard refuse every declared term. The
-        one hardcoded value that reproduces the bug the third leg was added to catch was the one
-        the hardcode check could not see.
+        **Asked as an allowlist, after three rounds of the blocklist losing.** Enumerating bad
+        spellings went `Constant` -> `+ empty Tuple/List` -> `+ empty Dict`, and a reviewer then
+        pointed out `tuple()`, `list()`, `dict()` and `bool()` -- constructor calls producing the
+        identical value, invisible to a check that models literal node types. That is the
+        hand-enumerated-allowlist shape `views.py` documents as unfixable: each round finds another
+        spelling, because an unlisted one passes.
+
+        So the question is inverted. A real site DERIVES its value -- from a settings attribute, a
+        parameter, a snapshot. Anything that references nothing outside the builtins is baked in,
+        whatever it is spelled as: `False`, `()`, `tuple()`, `bool()`, or the next form nobody has
+        thought of. `[Definition(...)]` passes, because `Definition` is not a builtin and the site
+        is genuinely supplying something.
         """
-        if isinstance(value, ast.Constant):
-            return True
-        # No `ast.Set`: Python has no empty-set literal, and `{}` parses as `ast.Dict`.
-        if isinstance(value, ast.Dict):
-            return not value.keys
-        return isinstance(value, (ast.List, ast.Tuple)) and not value.elts
+        for node in ast.walk(value):
+            if isinstance(node, ast.Attribute):
+                return False
+            if isinstance(node, ast.Name) and node.id not in _BUILTINS:
+                return False
+        return True
 
     root = pathlib.Path(__file__).resolve().parents[1]
     roots = [root / "src" / "mnemiq", root / "scripts"]
