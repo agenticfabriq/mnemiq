@@ -241,8 +241,9 @@ def _cmd_enrich(settings: Settings) -> int:
     # identical to a column whose type cannot be aggregated, which is normal and permanent
     # (**M73**). Reported separately for that reason, and not as an excluded table, because
     # nothing was excluded.
-    unmeasured = [j.id.removeprefix("profile:") for j in snap.jobs
-                  if j.kind == "profile:column" and j.status == "failed"]
+    unmeasured = [f"{j.id.removeprefix('profile:')} ({j.detail})" if j.detail
+                  else j.id.removeprefix("profile:")
+                  for j in snap.jobs if j.kind == "profile:column" and j.status == "failed"]
     print(
         f"snapshot {snap.version} ({len(snap.source_bindings)} tables, "
         f"{n_values} indexed values"
@@ -258,7 +259,7 @@ def _cmd_enrich(settings: Settings) -> int:
         print(f"WARNING: {len(unmeasured)} column(s) could not be MEASURED and carry no counts: "
               f"{', '.join(sorted(unmeasured))}. Their tables are in the model; these columns look "
               "in the snapshot exactly like a column whose type cannot be counted, which is why "
-              "this is said out loud. The per-column reasons were logged above", file=sys.stderr)
+              "this is said out loud", file=sys.stderr)
     return 0
 
 

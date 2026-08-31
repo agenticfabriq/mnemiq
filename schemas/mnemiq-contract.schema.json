@@ -716,7 +716,7 @@
     "title": "CertifiedRecord",
     "type": "object"
   },
-  "format_version": "1.1.0",
+  "format_version": "1.2.0",
   "identity_context": {
     "properties": {
       "attributes": {
@@ -1358,6 +1358,18 @@
             },
             "title": "Checkpoints",
             "type": "array"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Detail"
           },
           "id": {
             "title": "Id",
