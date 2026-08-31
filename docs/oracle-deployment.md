@@ -114,6 +114,19 @@ warns again.
 | `MNEMIQ_ORACLE_USER` / `MNEMIQ_ORACLE_PASSWORD` | credentials for the read principal |
 | `MNEMIQ_ORACLE_CONFIG_DIR` | directory holding `tnsnames.ora`, and for mTLS the wallet |
 | `MNEMIQ_ORACLE_WALLET_PASSWORD` | password for an encrypted wallet |
+| `MNEMIQ_ORACLE_POOL_MAX` | max pooled connections (default 4). Concurrency above this queues for one |
+| `MNEMIQ_ORACLE_ACQUIRE_TIMEOUT_S` | how long a request waits for a connection before failing (default 10) |
+| `MNEMIQ_ORACLE_PROBE_TIMEOUT_S` | call timeout for statements the engine issues about itself (default 30); `0` disables |
+
+Connections are **pooled, one leased per operation**. Size the pool to your worker
+concurrency: requests beyond `MNEMIQ_ORACLE_POOL_MAX` wait for a connection and then fail with
+`DPY-4005` rather than waiting indefinitely, which is deliberate — an unbounded wait is how one
+slow statement becomes a whole-server stall.
+
+`MNEMIQ_ORACLE_PROBE_TIMEOUT_S` bounds only the statements mnemiq issues *about itself*:
+introspection, view text, the boot advisories, and the validation parse. **Your queries are not
+bounded by it.** Profiling a large table can legitimately take minutes, and there is no measured
+ceiling to default to — so if you want a ceiling on data queries, set one at the caller.
 
 The driver runs in thin mode, which needs the encrypted `ewallet.pem` from the wallet archive;
 `cwallet.sso` is not used. Keep the wallet outside every git working tree.
