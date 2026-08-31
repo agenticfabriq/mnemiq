@@ -87,6 +87,58 @@ def test_matching_ignores_case_and_padding(spelling):
     assert ungrounded_terms([spelling], _defs()) == []
 
 
+@pytest.mark.parametrize("spelling", ["total payments", "revenues", "Payment Dates"])
+def test_a_plural_is_the_same_term(spelling):
+    """The half of the mismatch that costs answers.
+
+    Retrieval and this guard were reading the same words with two different matchers.
+    `select_definitions` matches inflection-tolerantly -- `_term_pattern` appends `\\w*` to the
+    last word, which is how "premium" retrieves on a question saying "premiums" -- while this check
+    compared for exact equality. So retrieval puts `total payment` in the packet BECAUSE the model
+    said "total payments", and the guard then reports "total payments" ungrounded and refuses.
+
+    A false deferral on a defined term, sourced in a lexical detail rather than in anything about
+    meaning. It matters beyond the one answer: the withdrawal rule for this guard is a measured
+    over-declaration rate, so a matcher bug spending that budget retires a guard for a reason that
+    was never about the design.
+    """
+    assert ungrounded_terms([spelling], _defs()) == []
+
+
+def test_a_longer_phrase_is_not_grounded_by_the_term_it_contains():
+    """The limit on that tolerance, and the reason it is a full match rather than a search.
+
+    "revenue per customer" is a DERIVATION over a defined term, not the term -- exactly the M35
+    shape, where every part is certified and the composition is not. Inflection tolerance that
+    matched a substring would ground it and silence the guard on its own finding.
+    """
+    assert ungrounded_terms(["revenue per customer"], _defs()) == ["revenue per customer"]
+    assert ungrounded_terms(["lifetime value of revenue"], _defs()) == ["lifetime value of revenue"]
+
+
+def test_the_two_matchers_agree_on_the_corpus_they_both_read():
+    """Stated against `select_definitions` itself, not against a restatement of it.
+
+    The defect was not that either matcher was wrong; it was that two were reading one corpus and
+    nobody had compared them. Pinning the agreement is what stops them drifting apart again -- the
+    next edit to either has to keep a term retrieval finds groundable here.
+    """
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.semantic.glossary import select_definitions
+
+    # Bound and granted, which is how a policy definition is actually visible: `public` is False
+    # by default and an unbound non-public definition is visible to no one, so `_defs()` as written
+    # retrieves nothing and the comparison would pass on an empty set.
+    bound = [d.model_copy(update={"bound_objects": ["fs.payments"]}) for d in _defs()]
+    grants = GrantSet(objects=frozenset({"fs.payments"}))
+    for spelling in ("total payments", "revenues", "payment dates"):
+        retrieved = select_definitions(spelling, bound, grants)
+        assert retrieved, f"retrieval finds a definition for {spelling!r}"
+        assert ungrounded_terms([spelling], retrieved) == [], (
+            f"retrieval matched {spelling!r} but the guard called it ungrounded"
+        )
+
+
 def test_a_namespaced_id_is_not_a_spelling_a_model_would_use():
     """The tail of an id is a spelling; the whole namespaced id is not, and matching on the whole
     would leave those definitions unmatched.
@@ -314,3 +366,39 @@ def test_deep_mode_does_not_outvote_the_guard():
         "selective answering would defer this as DISAGREEMENT -- true of the candidate set and "
         "false of the question, and pointing the caller at a repair that cannot work"
     )
+
+
+def test_guided_mode_can_emit_the_declaration_at_all():
+    """A guided reply is constrained to `_GUIDED_SQL_SCHEMA`, and grammar backends compile over the
+    DECLARED properties only -- so a property missing from the schema is one the model cannot emit.
+
+    Inert in a way no parser test could see: the parser handles `assumed_terms` correctly and would
+    simply never receive it, on exactly the local-model deployments `MNEMIQ_GUIDED_SQL` exists for.
+    Asserted against the schema the request actually carries, because that is the artefact that
+    decides what can come back.
+    """
+    from mnemiq.generate.generator import _GUIDED_SQL_SCHEMA, _guided_extra_body
+
+    assert "assumed_terms" in _GUIDED_SQL_SCHEMA["properties"], (
+        "the model cannot declare a term the guided schema does not allow"
+    )
+
+    body = _guided_extra_body(True)
+    schema = body["response_format"]["json_schema"]["schema"]
+    assert "assumed_terms" in schema["properties"], "the sent schema must carry it, not just ours"
+    assert "assumed_terms" not in schema.get("required", []), (
+        "declaring nothing is the common case and must stay valid"
+    )
+
+
+def test_the_prompt_asks_for_the_field_the_parser_reads():
+    """The prompt names the key and the parser reads it, and nothing ties the two together. Rename
+    one and the guard goes silently inert -- the model sends a field nobody reads, or the parser
+    waits for a field nobody asked for. The same hand-enumerated-allowlist shape that caused the
+    finding this guard exists for."""
+    import inspect
+
+    from mnemiq.generate import generator, prompts
+
+    assert "assumed_terms" in inspect.getsource(prompts), "the prompt must ask for it"
+    assert "assumed_terms" in inspect.getsource(generator), "the parser must read the same key"

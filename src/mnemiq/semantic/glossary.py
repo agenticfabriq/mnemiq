@@ -14,9 +14,15 @@ def load_definitions(path: str) -> list[Definition]:
     return [Definition.model_validate(d) for d in raw]
 
 
-def _term_pattern(term: str) -> re.Pattern[str]:
-    # Each word of the term on a word boundary, in order; the last word may inflect
-    # ("premium" matches "premiums", "loss ratio" matches "loss ratios").
+def term_pattern(term: str) -> re.Pattern[str]:
+    """Each word of the term on a word boundary, in order; the last word may inflect
+    ("premium" matches "premiums", "loss ratio" matches "loss ratios").
+
+    Public because it is the tolerance rule for the whole engine, not this module's private
+    convenience: `generate.undefined_terms` grounds a model's declared term against it. Two
+    matchers over one corpus is what let retrieval offer a definition while the M35 guard called
+    the same words ungrounded, so there is one rule and it lives here, where retrieval defines it.
+    """
     words = [re.escape(w) for w in term.split()]
     body = r"\s+".join(words[:-1] + [words[-1] + r"\w*"]) if words else ""
     return re.compile(rf"\b{body}", re.IGNORECASE)
@@ -59,6 +65,6 @@ def select_definitions(
         if not visible:
             continue
         rides_with_a_table = any(obj in in_context for obj in definition.bound_objects)
-        if rides_with_a_table or _term_pattern(definition.term).search(question):
+        if rides_with_a_table or term_pattern(definition.term).search(question):
             selected.append(definition)
     return selected

@@ -26,6 +26,40 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from mnemiq.semantic.glossary import term_pattern
+
+
+def _normalized(spelling: str) -> str:
+    """One spelling, in the form both matchers can be compared in.
+
+    Underscores become spaces because a corpus spells one term two ways in one record --
+    `term="total payment"` beside `id="fspay:policy:total_payment"` -- and a model writes neither
+    form reliably.
+    """
+    return " ".join(spelling.replace("_", " ").split()).lower()
+
+
+def _same_term(one: str, other: str) -> bool:
+    r"""Whether two spellings name the same term, under RETRIEVAL's tolerance rather than a second
+    one invented here.
+
+    `term_pattern` is `select_definitions`' rule: each word on a boundary, in order, the last one
+    free to inflect. Importing it is the point -- the defect this closes was two matchers reading
+    one corpus, where retrieval put `total payment` in the packet BECAUSE the model said "total
+    payments" and this check then called "total payments" ungrounded. A guard that refuses a term
+    on the strength of a definition sitting in its own input is not measuring meaning.
+
+    `fullmatch`, not `search`: the tolerance is on the term's ENDING, not on what surrounds it.
+    "revenue per customer" is a derivation over a defined term and must stay ungrounded -- that
+    composition-of-certified-parts shape is the M35 finding itself, and a substring match would
+    silence the guard on the case it exists for.
+
+    Both directions, because inflection is not the corpus's alone: a record saying `payment
+    revisions` has to ground a model that declared `payment revision`. A longer phrase can never
+    win either direction -- `\w*` extends one word, it does not cross a space.
+    """
+    return bool(term_pattern(one).fullmatch(other) or term_pattern(other).fullmatch(one))
+
 
 def _spoken(definition: Any) -> set[str]:
     """The spellings a model might use for this definition.
@@ -64,12 +98,17 @@ def ungrounded_terms(assumed: Sequence[str], definitions: Sequence[Any]) -> list
     """
     known: set[str] = set()
     for definition in definitions or ():
-        known |= _spoken(definition)
+        known |= {_normalized(s) for s in _spoken(definition)}
     out: list[str] = []
     for term in assumed or ():
         if not isinstance(term, str):
             continue
-        cleaned = term.strip().lower()
-        if cleaned and cleaned not in known and cleaned not in {t.lower() for t in out}:
-            out.append(term.strip())
+        cleaned = _normalized(term)
+        if not cleaned:
+            continue
+        if any(_same_term(cleaned, spelling) for spelling in known):
+            continue
+        if any(_same_term(cleaned, _normalized(seen)) for seen in out):
+            continue
+        out.append(term.strip())
     return out

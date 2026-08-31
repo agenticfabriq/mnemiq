@@ -16,7 +16,16 @@ _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
 # JSON in ```json blocks and the parser saw no SQL.
 _GUIDED_SQL_SCHEMA = {
     "type": "object",
-    "properties": {"sql": {"type": "string", "minLength": 1}, "reason": {"type": "string"}},
+    "properties": {
+        "sql": {"type": "string", "minLength": 1},
+        "reason": {"type": "string"},
+        # M35. A guided reply is constrained to THIS schema, so a property missing here is a
+        # property the model cannot emit -- the grammar backends compile over declared properties
+        # only. Omitting it made the undefined-term guard structurally inert on exactly the
+        # local-model deployments guided mode exists for, and inert in a way no test over the
+        # parser could see: the parser handles the field correctly and never receives it.
+        "assumed_terms": {"type": "array", "items": {"type": "string"}},
+    },
     "required": ["sql"],
 }
 
