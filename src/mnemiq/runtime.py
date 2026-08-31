@@ -390,7 +390,7 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
                     "engine's own filters are still in force, so it is latent rather than live -- "
                     "which is exactly why acknowledging it is refused. An acknowledgement made "
                     "while it is latent would still be set on the day enforcement moves to the "
-                    "database and it stops being", key)
+                    "database and it stops being latent", key)
         elif key in acknowledged:
             matched.add(key)
             logger.info("%s: %s (acknowledged via MNEMIQ_ACK_ADVISORIES) -- %s",

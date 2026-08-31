@@ -831,8 +831,9 @@ class OracleAdapter:
                             deployment down over a control that is not yet load-bearing. When
                             delegation lands -- **M57** -- this must become fail-closed. What DID
                             change: the verdict cannot be acknowledged away, because an
-                            acknowledgement made while it is latent would still be in the
-                            environment on the day it stops being.
+                            acknowledgement made while it is latent would still be set on
+                            the day enforcement moves to the database and it stops being
+                            latent.
           `unverifiable` -- no policy is attached to anything this connection can see, so there is
                             nothing to enforce and nothing to confirm.
           `partial`      -- some tables carry a policy and some do not. NOT an acceptance: the
