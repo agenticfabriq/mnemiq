@@ -100,14 +100,19 @@ def profile_outcome(snapshot: Snapshot) -> tuple[str, str]:
     # snapshot otherwise renders as `None` -- exactly what an unaggregatable TYPE renders as.
     unmeasured = [j for j in snapshot.jobs
                   if j.kind == "profile:column" and j.status == "failed"]
-    names = ", ".join(sorted(j.id.split(":", 1)[1] for j in unmeasured))
+    # The CAUSE, from the job rather than from the log of a run that may be long over. Naming the
+    # column says which measurement is missing; naming the cause is what tells an operator whether
+    # it is worth retrying, and it was the half of this finding a first pass left in logging.
+    causes = ", ".join(sorted(
+        f"{j.id.split(':', 1)[1]} ({j.detail})" if j.detail else j.id.split(":", 1)[1]
+        for j in unmeasured))
     if not failed:
         if unmeasured:
             return ("unmeasured", (
                 f"all {len(profiles)} table(s) profiled, but {len(unmeasured)} column(s) could "
-                f"not be measured and carry no counts: {names}. That is NOT the same as a column "
-                "whose type cannot be counted, which looks identical in the snapshot -- these "
-                "failed for a cause unrelated to the column, and the reasons were logged above"))
+                f"not be measured and carry no counts: {causes}. That is NOT the same as a "
+                "column whose type cannot be counted, which looks identical in the snapshot -- "
+                "these failed for a cause unrelated to the column"))
         return ("complete", f"all {len(profiles)} table(s) profiled")
     if len(failed) == len(profiles):
         return ("unread", (
@@ -123,7 +128,7 @@ def profile_outcome(snapshot: Snapshot) -> tuple[str, str]:
         # columns of the tables it kept, and naming only the larger problem hides the smaller one
         # in the run where it is most likely to matter.
         + (f". A further {len(unmeasured)} column(s) of the surviving tables could not be "
-           f"measured and carry no counts: {names}" if unmeasured else "")))
+           f"measured and carry no counts: {causes}" if unmeasured else "")))
 
 
 def enrich_structural(adapter, source_id: str) -> Snapshot:
@@ -182,7 +187,7 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
             unmeasured = [st for st in stats.values() if st.measurement == FAILED]
             for st in unmeasured:
                 jobs.append(Job(id=f"profile:{table.name}.{st.column}", source_id=source_id,
-                                kind="profile:column", status="failed"))
+                                kind="profile:column", status="failed", detail=st.failure))
             status = "done"
         except Exception as exc:
             # fail-soft: one bad table never sinks the run. It contributes nothing --

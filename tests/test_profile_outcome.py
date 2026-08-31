@@ -262,8 +262,58 @@ def test_a_partially_measured_table_KEEPS_its_columns():
     assert [j.status for j in snap.jobs if j.id == "profile:T"] == ["done"], (
         "the table WAS profiled; only one column's measurement failed"
     )
-    assert [j.id for j in snap.jobs if j.kind == "profile:column"] == ["profile:T.BAD"]
-    assert profile_outcome(snap)[0] == "unmeasured"
+    col_job = next(j for j in snap.jobs if j.kind == "profile:column")
+    assert col_job.id == "profile:T.BAD"
+    # The CAUSE, carried from `ColumnStats.failure` to the job by the pipeline. Asserted HERE,
+    # through `enrich_structural`, because the round-trip test builds its job by hand: dropping
+    # `detail=st.failure` from the pipeline left that test green, and the mutation control is what
+    # showed the gap.
+    assert col_job.detail and "ORA-01652" in col_job.detail
+    verdict, why = profile_outcome(snap)
+    assert verdict == "unmeasured" and "ORA-01652" in why
     # ... and the surviving column still carries its real statistics.
     good = next(c for c in snap.columns if c.name == "GOOD")
     assert good.distinct_count == 5 and good.row_count == 100
+
+
+def test_the_CAUSE_survives_the_run_that_produced_it():
+    """The half of M73 a first pass left in logging, and the reason it matters.
+
+    A snapshot outlives its run. Recording only WHICH column was not measured tells a reader
+    months later that something is missing and nothing about whether it is worth retrying -- temp
+    space clears, a revoked privilege is granted back, a driver fault is fixed, and an
+    unaggregatable type never changes. The cause was in `ColumnStats.failure`, whose only reader
+    was a test: it reached no persisted record at all, and the closing note claiming otherwise was
+    caught by a review.
+    """
+    import json
+
+    from mnemiq.contract import Snapshot
+
+    snap = _snap("done", extra=[Job(id="profile:t0.AMOUNT", source_id="s", kind="profile:column",
+                                    status="failed", detail="ORA-01652: unable to extend temp")])
+
+    # Through a serialisation round trip, because "the snapshot outlives the run" is the claim.
+    reloaded = Snapshot.model_validate(json.loads(snap.model_dump_json()))
+    job = next(j for j in reloaded.jobs if j.kind == "profile:column")
+    assert job.detail == "ORA-01652: unable to extend temp"
+
+    verdict, detail = profile_outcome(reloaded)
+    assert verdict == "unmeasured"
+    assert "ORA-01652" in detail, "the operator is told WHY, not just which"
+
+
+def test_a_snapshot_written_before_the_cause_existed_still_loads():
+    """`detail` is optional and defaulted, so every snapshot persisted before this field parses
+    unchanged -- and reports the column without a cause rather than failing to load at all."""
+    import json
+
+    from mnemiq.contract import Snapshot
+
+    raw = json.loads(_snap("done").model_dump_json())
+    raw["jobs"].append({"id": "profile:t0.AMOUNT", "source_id": "s", "kind": "profile:column",
+                        "status": "failed"})  # no `detail` key at all
+    snap = Snapshot.model_validate(raw)
+    assert next(j for j in snap.jobs if j.kind == "profile:column").detail is None
+    verdict, detail = profile_outcome(snap)
+    assert verdict == "unmeasured" and "t0.AMOUNT" in detail
