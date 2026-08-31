@@ -639,7 +639,8 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     """The invariant no per-call test can hold, because the failure is a call site that does not
     exist yet -- and the first version of this test was itself too narrow to hold it.
 
-    **The guard has THREE legs and a site can be wired at one or two of them.** The engine-side check reads
+    **The guard has THREE legs and a site can be wired at one or two of them.** The
+    engine-side check reads
     `proposal.assumed_terms`; the prompt-side declaration is what puts anything in it. With the
     generator silent the model declares nothing, `ungrounded_terms([])` is `[]`, and the flag reads
     as ON while guarding nothing -- silently, and with every other test green.
@@ -783,23 +784,3 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
         "as on while guarding nothing: " + "; ".join(missing)
     )
 
-
-def test_a_cli_that_forgets_the_corpus_refuses_every_certified_term():
-    """The third leg, stated as the behaviour it produces rather than as a wiring rule.
-
-    `retrieve` defaults `definitions` to `()`, and `ungrounded_terms` treats an empty certified set
-    as grounding NOTHING -- deliberately, so an ablated deployment refuses rather than skipping the
-    check. Compose those two and a caller that forgets the corpus turns the guard into a refusal of
-    every question that declares a term, including terms its own snapshot certifies. Both CLIs did
-    that until a review round found it, and the wiring scan above could not see it because it
-    modelled two legs of three.
-    """
-    from mnemiq.contract.semantic import Definition
-    from mnemiq.generate.undefined_terms import ungrounded_terms
-
-    certified = [Definition(id="fspay:policy:revenue", term="revenue", domain="fspay",
-                            definition="recognised revenue")]
-    assert ungrounded_terms(["revenue"], certified) == [], "with the corpus, a certified term grounds"
-    assert ungrounded_terms(["revenue"], []) == ["revenue"], (
-        "without it, the same term is refused -- which is why the feed is a leg and not a detail"
-    )

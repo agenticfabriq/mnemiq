@@ -164,7 +164,8 @@ def test_a_definition_with_no_name_at_all_matches_no_question():
                           bound_objects=["fs.payments"])
     grants = GrantSet(objects=frozenset({"fs.payments"}))
     assert select_definitions("loss ratio, revenue, anything", [nameless], grants) == []
-    assert select_definitions("anything at all", [nameless], grants, ["fs.payments"]) == [nameless], (
+    rides = select_definitions("anything at all", [nameless], grants, ["fs.payments"])
+    assert rides == [nameless], (
         "it still rides with the table it is bound to"
     )
 
