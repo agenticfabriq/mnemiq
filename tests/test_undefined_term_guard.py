@@ -649,9 +649,13 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     So the scan is keyed on a MAP of callable to the kwarg that callable owes, not on one name and
     one kwarg. A new participant is added here with its half.
 
-    **It fails closed.** It pins the exact set of sites -- not a count, which a site that stopped
-    matching could clear by being replaced; it counts `**kwargs` as not passing, since a
-    config-driven site is the likeliest next one; and it resolves import aliases.
+    **It fails closed**, in four ways that were each a hole first. It pins the exact set of sites
+    AND how many calls each file makes, because `loop.py` calls `plan_query` twice and a set keyed
+    on the pair cannot tell that one of them stopped matching. It rejects a hardcoded value: the
+    kwarg NAME being present is not the guarantee, since `guard_undefined_terms=False` satisfies a
+    name check while the flag is inert at that site. It counts `**kwargs` as not passing, since a
+    config-driven site is the likeliest next one. And it resolves both import aliases and local
+    rebindings, so neither `plan_query as _pq` nor `pq = plan_query` renames its way out.
     """
     import ast
     import pathlib
@@ -663,16 +667,19 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
         "plan_query": "guard_undefined_terms",
         "LLMGenerator": "declare_assumed_terms",
     }
+    # (file, callable) -> HOW MANY calls. A count, because `agent/loop.py` calls `plan_query`
+    # twice -- single-shot and the deep-mode candidate loop -- and a set keyed on the pair alone
+    # cannot tell that one of them stopped matching: the other still contributes the tuple.
     EXPECTED_SITES = {
-        ("src/mnemiq/runtime.py", "build_agent"),
-        ("src/mnemiq/assembly.py", "LLMGenerator"),
-        ("src/mnemiq/agent/modes.py", "Agent"),
-        ("src/mnemiq/agent/loop.py", "plan_query"),
-        ("src/mnemiq/eval/engine.py", "Agent"),
-        ("scripts/answer.py", "Agent"),
-        ("scripts/answer.py", "LLMGenerator"),
-        ("scripts/ask.py", "plan_query"),
-        ("scripts/ask.py", "LLMGenerator"),
+        ("src/mnemiq/runtime.py", "build_agent"): 1,
+        ("src/mnemiq/assembly.py", "LLMGenerator"): 1,
+        ("src/mnemiq/agent/modes.py", "Agent"): 1,
+        ("src/mnemiq/agent/loop.py", "plan_query"): 2,
+        ("src/mnemiq/eval/engine.py", "Agent"): 1,
+        ("scripts/answer.py", "Agent"): 1,
+        ("scripts/answer.py", "LLMGenerator"): 1,
+        ("scripts/ask.py", "plan_query"): 1,
+        ("scripts/ask.py", "LLMGenerator"): 1,
     }
 
     root = pathlib.Path(__file__).resolve().parents[1]
@@ -680,7 +687,8 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     for d in roots:
         assert d.is_dir(), f"{d} must exist, or this scan guarantees nothing"
 
-    seen, missing = set(), []
+    seen: dict[tuple[str, str], int] = {}
+    missing = []
     for base in roots:
         for path in base.rglob("*.py"):
             tree = ast.parse(path.read_text())
@@ -692,6 +700,13 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
                     for a in node.names:
                         if a.name in REQUIRED and a.asname:
                             canonical[a.asname] = a.name
+                # `pq = plan_query` then `pq(...)`: a local rebinding, which an import-alias pass
+                # alone walks straight past.
+                elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+                    if node.value.id in canonical:
+                        for t in node.targets:
+                            if isinstance(t, ast.Name):
+                                canonical[t.id] = canonical[node.value.id]
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
@@ -701,13 +716,23 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
                     continue
                 owed = REQUIRED[canonical[name]]
                 rel = str(path.relative_to(root))
-                seen.add((rel, canonical[name]))
+                seen[(rel, canonical[name])] = seen.get((rel, canonical[name]), 0) + 1
                 # `**kwargs` does NOT count: it cannot be read here.
-                if owed not in {kw.arg for kw in node.keywords}:
+                passed = {kw.arg: kw.value for kw in node.keywords}
+                if owed not in passed:
                     missing.append(f"{rel}:{node.lineno} {name}(...) needs {owed}")
+                elif isinstance(passed[owed], ast.Constant):
+                    # The NAME being present is not the guarantee -- `guard_undefined_terms=False`
+                    # hardcoded satisfies a name check while the flag is inert at that site, which
+                    # is the "reads as ON while guarding nothing" failure this test is named for.
+                    # Every real site derives the value from a setting or a parameter.
+                    missing.append(
+                        f"{rel}:{node.lineno} {name}(...) hardcodes {owed}="
+                        f"{passed[owed].value!r} instead of deriving it from the setting"
+                    )
 
     assert seen == EXPECTED_SITES, (
-        f"the set of guard-participating sites changed; the scan matched {sorted(seen)}. If this "
+        f"the set of guard-participating sites changed; the scan matched {sorted(seen.items())}. If this "
         "is a new site, add it here AND pass its half of the guard. If a known one vanished, the "
         "scan stopped seeing it and this invariant is no longer guarding it"
     )
