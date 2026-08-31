@@ -257,6 +257,14 @@ def test_deep_mode_does_not_outvote_the_guard():
     class _Adapter:
         dialect = "duckdb"
 
+        def execute(self, sql):
+            # The decider's proof step calls `execute`, not `execute_arrow`. Without it every
+            # candidate came back `Deferred(invalid_query, "'_Adapter' object has no attribute
+            # 'execute'")`, `executed` stayed empty, and the branch this test exists for -- the
+            # early return taken while a MAJORITY is available to outvote the guard -- never ran.
+            # The test passed and documented a run that did not happen.
+            return []
+
         def execute_arrow(self, sql, timeout_s=30):
             return pa.table({"n": [1]})
 
@@ -285,3 +293,7 @@ def test_deep_mode_does_not_outvote_the_guard():
     assert answer.reason_code == DeferralReason.UNDEFINED_TERM
     assert "lifetime value" in answer.answer
     assert generator.calls == 5, "every candidate still runs; the guard decides after, not by short-circuit"
+    assert answer.candidates_executed == 3, (
+        "three candidates produced a table and were available to outvote the guard -- which is the "
+        "branch this test exists for, and which never ran while the adapter lacked `execute`"
+    )

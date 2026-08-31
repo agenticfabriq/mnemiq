@@ -320,9 +320,10 @@ class Agent:
         if undefined is not None:
             # Before the vote and before the fallback: one candidate that could not ground a term
             # settles the question, however many produced runnable SQL from a guessed meaning.
-            # `candidates_executed` like the DISAGREEMENT deferral below: every candidate DID run,
-            # and without it the workbench drops the candidate chip and the harness records nothing
-            # for a deep-mode turn that spent the full budget.
+            # `candidates_executed` like the DISAGREEMENT deferral below, and it means what that
+            # field means -- how many produced a table, so on the M35 shape it reports 3 of 5 and
+            # not 5. Without it the workbench drops the candidate chip and the harness records
+            # nothing for a deep-mode turn that spent the full budget.
             return AgentAnswer(answer=undefined.reason, deferred=True,
                                reason_code=undefined.code,
                                candidates_executed=len(executed))
