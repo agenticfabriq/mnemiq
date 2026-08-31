@@ -662,9 +662,9 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
 
     **It fails closed**, in four ways that were each a hole first. It pins the exact set of sites
     AND how many calls each file makes, because `loop.py` calls `plan_query` twice and a set keyed
-    on the pair cannot tell that one of them stopped matching. It rejects a hardcoded value: the
-    kwarg NAME being present is not the guarantee, since `guard_undefined_terms=False` satisfies a
-    name check while the flag is inert at that site. It counts `**kwargs` as not passing, since a
+    on the pair cannot tell that one of them stopped matching. It rejects a hardcoded value -- a literal OR an empty
+    collection, since `definitions=()` is the one hardcode that reproduces the very defect the
+    corpus leg was added to catch. The kwarg NAME being present is not the guarantee. It counts `**kwargs` as not passing, since a
     config-driven site is the likeliest next one. And it resolves import aliases and local
     rebindings -- plain, annotated and tuple -- so none of `plan_query as _pq`,
     `pq = plan_query` or `pq: Callable = plan_query` renames its way out.
@@ -717,6 +717,19 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
         ("scripts/ask.py", "retrieve"): 1,
     }
 
+    def _is_hardcoded(value: ast.expr) -> bool:
+        """A literal, including an EMPTY collection.
+
+        `ast.Constant` alone missed `definitions=()` and `definitions=[]`, which are `Tuple` and
+        `List` nodes -- and an empty collection is not a harmless literal here, it is the precise
+        original defect: an empty certified corpus makes the guard refuse every declared term. The
+        one hardcoded value that reproduces the bug the third leg was added to catch was the one
+        the hardcode check could not see.
+        """
+        if isinstance(value, ast.Constant):
+            return True
+        return isinstance(value, (ast.List, ast.Tuple, ast.Set)) and not value.elts
+
     root = pathlib.Path(__file__).resolve().parents[1]
     roots = [root / "src" / "mnemiq", root / "scripts"]
     for d in roots:
@@ -763,14 +776,14 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
                 passed = {kw.arg: kw.value for kw in node.keywords}
                 if owed not in passed:
                     missing.append(f"{rel}:{node.lineno} {name}(...) needs {owed}")
-                elif isinstance(passed[owed], ast.Constant):
+                elif _is_hardcoded(passed[owed]):
                     # The NAME being present is not the guarantee -- `guard_undefined_terms=False`
                     # hardcoded satisfies a name check while the flag is inert at that site, which
                     # is the "reads as ON while guarding nothing" failure this test is named for.
                     # Every real site derives the value from a setting or a parameter.
                     missing.append(
-                        f"{rel}:{node.lineno} {name}(...) hardcodes {owed}="
-                        f"{passed[owed].value!r} instead of deriving it from the setting"
+                        f"{rel}:{node.lineno} {name}(...) hardcodes {owed} "
+                        "instead of deriving it from the setting or the snapshot"
                     )
 
     assert seen == EXPECTED_SITES, (
