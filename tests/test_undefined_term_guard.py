@@ -92,7 +92,7 @@ def test_a_plural_is_the_same_term(spelling):
     """The half of the mismatch that costs answers.
 
     Retrieval and this guard were reading the same words with two different matchers.
-    `select_definitions` matches inflection-tolerantly -- `_term_pattern` appends `\\w*` to the
+    `select_definitions` matches inflection-tolerantly -- `term_pattern` appends `\\w*` to the
     last word, which is how "premium" retrieves on a question saying "premiums" -- while this check
     compared for exact equality. So retrieval puts `total payment` in the packet BECAUSE the model
     said "total payments", and the guard then reports "total payments" ungrounded and refuses.
@@ -114,6 +114,42 @@ def test_a_longer_phrase_is_not_grounded_by_the_term_it_contains():
     """
     assert ungrounded_terms(["revenue per customer"], _defs()) == ["revenue per customer"]
     assert ungrounded_terms(["lifetime value of revenue"], _defs()) == ["lifetime value of revenue"]
+
+
+@pytest.mark.parametrize(
+    "declared,certified",
+    [("policyholder", "policy"), ("claimant", "claim"), ("revenuer", "revenue")],
+)
+def test_a_word_that_merely_starts_with_a_defined_term_is_not_that_term(declared, certified):
+    """The other half of the tolerance, and the one that fails silently.
+
+    Sharing retrieval's matcher meant sharing its `\\w*`, which extends the last word without
+    limit. In retrieval that widens RECALL and the cost is a spare definition the model ignores.
+    Here it widens GROUNDING: `policy` grounds `policyholder`, so a model that declared
+    "policyholder" against a corpus certifying only "policy" is handed the confident answer this
+    guard exists to refuse -- and it is handed it with no deferral, no reason and nothing in the
+    result to read.
+
+    The phrase limit does not cover this. "revenue per customer" is blocked because the extension
+    cannot cross a space; `policyholder` needs no space. So grounding matches on a plural and
+    nothing else, while retrieval keeps the wide rule it can afford.
+    """
+    from mnemiq.contract.semantic import Definition
+
+    defs = [Definition(id=f"fspay:policy:{certified}", term=certified, domain="fspay",
+                       definition=f"the certified {certified}")]
+    assert ungrounded_terms([declared], defs) == [declared]
+    assert ungrounded_terms([certified], defs) == [], "the term itself still grounds"
+
+
+def test_every_ungrounded_term_survives_deduplication():
+    """The refusal is a repair instruction, so it names all of them. Routing dedup through the
+    same comparison is what makes that fragile: under the wide rule `policyholder` deduplicated
+    against `policy` and the caller was told to define one of the two terms they must define."""
+    assert ungrounded_terms(["policy", "policyholder"], []) == ["policy", "policyholder"]
+    assert ungrounded_terms(["revenue", "revenues"], []) == ["revenue"], (
+        "one term spelled two ways is still one term"
+    )
 
 
 def test_the_two_matchers_agree_on_the_corpus_they_both_read():
@@ -392,13 +428,27 @@ def test_guided_mode_can_emit_the_declaration_at_all():
 
 
 def test_the_prompt_asks_for_the_field_the_parser_reads():
-    """The prompt names the key and the parser reads it, and nothing ties the two together. Rename
-    one and the guard goes silently inert -- the model sends a field nobody reads, or the parser
-    waits for a field nobody asked for. The same hand-enumerated-allowlist shape that caused the
-    finding this guard exists for."""
+    """The prompt names the key, the schema permits it and the parser reads it -- three places,
+    nothing tying them together. Rename one and the guard goes silently inert: the model sends a
+    field nobody reads, or the parser waits for a field nobody asked for. The same
+    hand-enumerated-allowlist shape that caused the finding this guard exists for.
+
+    Asserted by USING the key, not by grepping the module for it. The first version was
+    `"assumed_terms" in inspect.getsource(generator)`, and the same diff put that literal in three
+    places -- the schema, the dataclass field and the parser -- so renaming the parser's
+    `payload.get` alone left it green. A substring test over a module cannot see which occurrence
+    it matched, which is exactly the silent inertness it was written to prevent.
+    """
     import inspect
+    import json
 
-    from mnemiq.generate import generator, prompts
+    from mnemiq.generate import prompts
+    from mnemiq.generate.generator import _GUIDED_SQL_SCHEMA
 
-    assert "assumed_terms" in inspect.getsource(prompts), "the prompt must ask for it"
-    assert "assumed_terms" in inspect.getsource(generator), "the parser must read the same key"
+    key = "assumed_terms"
+    assert key in inspect.getsource(prompts), "the prompt must ask for it"
+    assert key in _GUIDED_SQL_SCHEMA["properties"], "a guided reply must be permitted to carry it"
+    carried = _parse(json.dumps({"sql": "SELECT 1", key: ["lifetime value"]}))
+    assert carried.assumed_terms == ["lifetime value"], (
+        "the parser must read the key the prompt asks for"
+    )

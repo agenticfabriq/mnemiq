@@ -19,11 +19,13 @@ _GUIDED_SQL_SCHEMA = {
     "properties": {
         "sql": {"type": "string", "minLength": 1},
         "reason": {"type": "string"},
-        # M35. A guided reply is constrained to THIS schema, so a property missing here is a
-        # property the model cannot emit -- the grammar backends compile over declared properties
-        # only. Omitting it made the undefined-term guard structurally inert on exactly the
-        # local-model deployments guided mode exists for, and inert in a way no test over the
-        # parser could see: the parser handles the field correctly and never receives it.
+        # M35. Declared so a guided reply CAN carry it. How strictly a backend confines a reply to
+        # the declared properties is the backend's business and this repo pins no version, so the
+        # claim here is only the safe half: a property named in the schema is one the model is
+        # asked for and permitted, and one omitted is at best not asked for. That was enough to
+        # leave the undefined-term guard inert on the local-model deployments guided mode exists
+        # for, in a way no test over the parser could see -- the parser handles the field
+        # correctly and simply never receives it.
         "assumed_terms": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["sql"],

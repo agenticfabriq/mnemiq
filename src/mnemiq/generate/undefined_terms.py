@@ -26,7 +26,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from mnemiq.semantic.glossary import term_pattern
+from mnemiq.semantic.glossary import INFLECTION_PLURAL, term_pattern
 
 
 def _normalized(spelling: str) -> str:
@@ -55,10 +55,19 @@ def _same_term(one: str, other: str) -> bool:
     silence the guard on the case it exists for.
 
     Both directions, because inflection is not the corpus's alone: a record saying `payment
-    revisions` has to ground a model that declared `payment revision`. A longer phrase can never
-    win either direction -- `\w*` extends one word, it does not cross a space.
+    revisions` has to ground a model that declared `payment revision`.
+
+    `INFLECTION_PLURAL`, not retrieval's `\w*`. Two limits are needed and only one of them is
+    about spaces. A longer PHRASE cannot win either direction because the extension never crosses a
+    space -- but an unbounded extension of one WORD is the same failure inside a word: `\w*` makes
+    `policy` ground `policyholder`, so a model declaring "policyholder" against a corpus certifying
+    only "policy" is handed the confident answer instead of the deferral. Grounding is the
+    suppressing direction, so its tolerance has to be the narrow one.
     """
-    return bool(term_pattern(one).fullmatch(other) or term_pattern(other).fullmatch(one))
+    return bool(
+        term_pattern(one, INFLECTION_PLURAL).fullmatch(other)
+        or term_pattern(other, INFLECTION_PLURAL).fullmatch(one)
+    )
 
 
 def _spoken(definition: Any) -> set[str]:

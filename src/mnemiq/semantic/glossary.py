@@ -14,17 +14,33 @@ def load_definitions(path: str) -> list[Definition]:
     return [Definition.model_validate(d) for d in raw]
 
 
-def term_pattern(term: str) -> re.Pattern[str]:
-    """Each word of the term on a word boundary, in order; the last word may inflect
+# How far the last word may run past the term. RETRIEVAL's default: anything, because a wider
+# match there only offers the model an extra definition it can ignore.
+INFLECTION_ANY = r"\w*"
+# GROUNDING's: a plural and nothing else. The two callers need different widths because the cost
+# of a wrong match points in opposite directions -- see `term_pattern`.
+INFLECTION_PLURAL = r"(?:e?s)?"
+
+
+def term_pattern(term: str, inflection: str = INFLECTION_ANY) -> re.Pattern[str]:
+    r"""Each word of the term on a word boundary, in order; the last word may inflect
     ("premium" matches "premiums", "loss ratio" matches "loss ratios").
 
     Public because it is the tolerance rule for the whole engine, not this module's private
     convenience: `generate.undefined_terms` grounds a model's declared term against it. Two
     matchers over one corpus is what let retrieval offer a definition while the M35 guard called
     the same words ungrounded, so there is one rule and it lives here, where retrieval defines it.
+
+    **One rule, two widths, because the failure directions are opposite.** Here a loose match
+    widens RECALL: a spurious extra definition in the packet is noise the model can ignore. In the
+    M35 grounding check the same looseness widens GROUNDING and SUPPRESSES a refusal, so `\w*`
+    there is not tolerance but a hole -- it makes `policy` ground `policyholder` and `claim` ground
+    `claimant`, handing back the confident answer that guard exists to refuse. The width is a
+    parameter rather than a second function so that the words-in-order rule stays single: it was
+    two independent implementations of THAT which caused the defect.
     """
     words = [re.escape(w) for w in term.split()]
-    body = r"\s+".join(words[:-1] + [words[-1] + r"\w*"]) if words else ""
+    body = r"\s+".join(words[:-1] + [words[-1] + inflection]) if words else ""
     return re.compile(rf"\b{body}", re.IGNORECASE)
 
 
