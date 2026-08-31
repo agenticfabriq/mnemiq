@@ -177,10 +177,12 @@ def select_definitions(
     Everything else keeps the name-match rule -- its `term`, or the tail of its `id` when it has no
     term (`spellings`). That is two classes and not three: a bound definition whose table missed
     the retrieval cut, and a public one. NOT "an unbound definition": one fails
-    `bool(bound_objects)` in the visibility test above and is seen by no matcher at all. The name is normalized before matching, so an underscored
+    `bool(bound_objects)` in the visibility test above and is seen by no matcher at all. The
+    name is normalized before matching, so an underscored
     `term="total_payment"` is retrieved by a question saying "total payment" and no longer by one
     saying `total_payment`; nobody writes the underscored form into a sentence, and the same
-    normalization is what lets the M35 guard ground against the same corpus. A public standard belongs to no table, so it
+    normalization is what lets the M35 guard ground against the same corpus. A public standard
+    belongs to no table, so it
     has no table to ride with, and matching the asker's words is the right rule for something
     looked up by name.
     """
