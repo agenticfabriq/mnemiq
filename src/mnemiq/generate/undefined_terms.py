@@ -26,17 +26,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
-from mnemiq.semantic.glossary import INFLECTION_PLURAL, term_pattern
-
-
-def _normalized(spelling: str) -> str:
-    """One spelling, in the form both matchers can be compared in.
-
-    Underscores become spaces because a corpus spells one term two ways in one record --
-    `term="total payment"` beside `id="fspay:policy:total_payment"` -- and a model writes neither
-    form reliably.
-    """
-    return " ".join(spelling.replace("_", " ").split()).lower()
+from mnemiq.semantic.glossary import INFLECTION_PLURAL, normalized, spellings, term_pattern
 
 
 def _same_term(one: str, other: str) -> bool:
@@ -73,31 +63,6 @@ def _same_term(one: str, other: str) -> bool:
     )
 
 
-def _spoken(definition: Any) -> set[str]:
-    """The spellings a model might use for this definition.
-
-    Both `term` and the bare tail of `id`, because a corpus spells the term in either place: the
-    fs_payments records carry `term="revenue"` beside `id="fspay:policy:revenue"`, while others
-    carry `id="loss_ratio"` with no term at all. The tail only -- a namespaced id is not something
-    a model writes, so matching the whole of it would leave those definitions unmatched.
-    """
-    out: set[str] = set()
-    for attr in ("term", "name", "label"):
-        value = getattr(definition, attr, None)
-        if isinstance(value, str) and value.strip():
-            out.add(value.strip().lower())
-    # `id`, which is what `Definition` actually calls it. The first version read `object_id` --
-    # a field the model does not have -- so this whole branch was dead in production and the test
-    # that "proved" it passed only because the fake invented the field. A fixture that shapes
-    # itself to the code cannot falsify the code, which is why the tests now use the real type.
-    identifier = getattr(definition, "id", None)
-    if isinstance(identifier, str) and identifier:
-        # A bare id like `loss_ratio` IS how some corpora spell the term; a namespaced one is not.
-        tail = identifier.rsplit(":", 1)[-1]
-        out.add(tail.replace("_", " ").strip().lower())
-    return {s for s in out if s}
-
-
 def ungrounded_terms(assumed: Sequence[str], definitions: Sequence[Any]) -> list[str]:
     """The declared terms with no certified definition behind them, in the order declared.
 
@@ -110,17 +75,17 @@ def ungrounded_terms(assumed: Sequence[str], definitions: Sequence[Any]) -> list
     """
     known: set[str] = set()
     for definition in definitions or ():
-        known |= {_normalized(s) for s in _spoken(definition)}
+        known |= set(spellings(definition))
     out: list[str] = []
     for term in assumed or ():
         if not isinstance(term, str):
             continue
-        cleaned = _normalized(term)
+        cleaned = normalized(term)
         if not cleaned:
             continue
         if any(_same_term(cleaned, spelling) for spelling in known):
             continue
-        if any(_same_term(cleaned, _normalized(seen)) for seen in out):
+        if any(_same_term(cleaned, normalized(seen)) for seen in out):
             continue
         out.append(term.strip())
     return out

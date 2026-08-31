@@ -5,6 +5,8 @@ import re
 from collections.abc import Sequence
 
 from mnemiq.authz.grants import GrantSet
+from typing import Any
+
 from mnemiq.contract import Definition
 
 
@@ -20,6 +22,12 @@ INFLECTION_ANY = r"\w*"
 # GROUNDING's: a plural and nothing else. The two callers need different widths because the cost
 # of a wrong match points in opposite directions -- see `term_pattern`.
 INFLECTION_PLURAL = r"(?:e?s)?"
+
+
+def normalized(spelling: str) -> str:
+    """One spelling in the form every matcher compares in: lowercase, underscores as spaces,
+    whitespace collapsed."""
+    return " ".join(spelling.replace("_", " ").split()).lower()
 
 
 def _last_word(word: str, inflection: str) -> str:
@@ -59,15 +67,53 @@ def term_pattern(term: str, inflection: str = INFLECTION_ANY) -> re.Pattern[str]
     """
     words = term.split()
     if not words:
-        # Matches NOTHING. The previous expression collapsed to a bare `\b`, which matches every
-        # question, so a definition with `term=""` was offered on every packet -- and that shape is
-        # in this corpus, since a record may carry its name in `id` alone and `Definition.term`
-        # has no non-empty constraint. A definition with nothing to match on has one honest way to
-        # be retrieved, which is to ride with a table it is bound to.
+        # Matches NOTHING. The previous expression collapsed to a bare `\b`, which is true at the
+        # start of any word, so a definition with `term=""` was offered on every packet whatever
+        # was asked. `Definition.term` carries no non-empty constraint, so the shape is
+        # constructible; no corpus IN THIS REPO contains it, and whether a shipped bundle does is
+        # not checkable from here. The bare `\b` is wrong on its own terms either way.
         return re.compile(r"(?!)")
     head = [re.escape(w) for w in words[:-1]]
     body = r"\s+".join(head + [_last_word(words[-1], inflection)])
     return re.compile(rf"\b{body}", re.IGNORECASE)
+
+
+def spellings(definition: Any) -> list[str]:
+    """The names this definition answers to, normalized -- THE one implementation.
+
+    `term`, or `name`/`label` for a record that spells it either of those ways. Failing all three,
+    the bare tail of `id`, because a record may carry its name only there. The tail only: a
+    namespaced id is not something anyone writes into a sentence.
+
+    **Only when there is no term.** The tail was briefly a spelling alongside the term, and that is
+    the M35 suppressing direction: a definition with `term="net revenue"` and `id="...:revenue"`
+    certifies net revenue, so a question saying "revenue" that its TERM does not match must not
+    pull it into the packet -- doing so grounds a model declaring "revenue" against a definition
+    that does not define it, and the deferral disappears. A term, where one exists, is the
+    certified name; the id is an implementation detail that happens to be legible.
+
+    Underscores become spaces because one record spells a term two ways -- `term="total payment"`
+    beside `id="fspay:policy:total_payment"` -- and neither a question nor a model writes the
+    underscored form.
+
+    Used by BOTH `select_definitions` here and `generate.undefined_terms.ungrounded_terms`, by
+    import rather than by resemblance. Two implementations of this list is the defect this module
+    has now been fixed for three times in one branch, each time in the same direction.
+    """
+    for attr in ("term", "name", "label"):
+        value = getattr(definition, attr, None)
+        if isinstance(value, str) and value.strip():
+            return [normalized(value)]
+    identifier = getattr(definition, "id", None)
+    if isinstance(identifier, str) and identifier:
+        tail = normalized(identifier.rsplit(":", 1)[-1])
+        if tail:
+            return [tail]
+    return []
+
+
+def _asked_for(definition: Definition, question: str) -> bool:
+    return any(term_pattern(s).search(question) for s in spellings(definition))
 
 
 def select_definitions(
@@ -93,7 +139,8 @@ def select_definitions(
     matched no realistic question, so under term-matching alone they could never be retrieved
     however true they were.
 
-    An UNBOUND definition keeps the term-match rule. A public standard belongs to no table, so it
+    An UNBOUND definition keeps the name-match rule -- its `term`, or the tail of its `id` when
+    it has no term (`spellings`). A public standard belongs to no table, so it
     has no table to ride with, and matching the asker's words is the right rule for something
     looked up by name.
     """
@@ -107,6 +154,6 @@ def select_definitions(
         if not visible:
             continue
         rides_with_a_table = any(obj in in_context for obj in definition.bound_objects)
-        if rides_with_a_table or term_pattern(definition.term).search(question):
+        if rides_with_a_table or _asked_for(definition, question):
             selected.append(definition)
     return selected

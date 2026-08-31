@@ -143,21 +143,48 @@ def test_an_unbound_standard_still_needs_its_term():
     assert select_definitions("how many patients", [_standard()], grants, table_ids=["patient"]) == []
 
 
-def test_a_definition_with_no_term_matches_no_question():
+def test_a_definition_with_no_name_at_all_matches_no_question():
     """It used to match every one. The pattern for an empty term collapsed to a bare `\\b`, which
-    is true everywhere, so a record carrying its name in `id` alone -- a shape this corpus has,
-    and one `Definition` permits since `term` has no non-empty constraint -- was offered on every
-    packet regardless of what was asked. A definition with nothing to match on has one honest route
-    into a packet, which is riding with a table it is bound to."""
+    is true at the start of any word, so such a definition was offered on every packet regardless
+    of what was asked. `Definition.term` carries no non-empty constraint, so the shape is
+    constructible.
+
+    A definition with NO name -- no term and no legible id tail -- is retrievable only by riding
+    with a table it is bound to. One that has a term-less id is named by that tail; see
+    `test_a_definition_named_only_by_its_id_is_still_retrievable`.
+    """
     from mnemiq.authz.grants import GrantSet
     from mnemiq.contract.semantic import Definition
     from mnemiq.semantic.glossary import select_definitions
 
-    nameless = Definition(id="fspay:policy:loss_ratio", term="", domain="fspay",
+    nameless = Definition(id="", term="", domain="fspay",
                           definition="incurred losses over earned premium",
                           bound_objects=["fs.payments"])
     grants = GrantSet(objects=frozenset({"fs.payments"}))
-    assert select_definitions("what is our revenue", [nameless], grants) == []
+    assert select_definitions("loss ratio, revenue, anything", [nameless], grants) == []
     assert select_definitions("anything at all", [nameless], grants, ["fs.payments"]) == [nameless], (
         "it still rides with the table it is bound to"
     )
+
+
+def test_a_definition_named_only_by_its_id_is_still_retrievable():
+    """`generate.undefined_terms._spoken` already grounds a declared term against the tail of a
+    definition's `id`, because a record may carry its name there rather than in `term`. Retrieval
+    matched on `term` alone, so such a definition was never put in the packet -- and the guard,
+    finding nothing to ground against, deferred an answerable question. One corpus, two rules,
+    pointing the same way as the tolerance-width split did."""
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract.semantic import Definition
+    from mnemiq.generate.undefined_terms import ungrounded_terms
+    from mnemiq.semantic.glossary import select_definitions
+
+    by_id = Definition(id="fspay:policy:loss_ratio", term="", domain="fspay",
+                       definition="incurred losses over earned premium",
+                       bound_objects=["fs.payments"])
+    grants = GrantSet(objects=frozenset({"fs.payments"}))
+    retrieved = select_definitions("what is our loss ratio", [by_id], grants)
+    assert retrieved == [by_id], "the id's tail is a name a question can use"
+    assert ungrounded_terms(["loss ratio"], retrieved) == [], (
+        "and what retrieval found, the guard must ground"
+    )
+    assert select_definitions("what is our revenue", [by_id], grants) == []

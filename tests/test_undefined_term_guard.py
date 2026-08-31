@@ -196,24 +196,49 @@ def test_the_two_matchers_agree_on_the_corpus_they_both_read():
         )
 
 
-def test_a_namespaced_id_is_not_a_spelling_a_model_would_use():
-    """The tail of an id is a spelling; the whole namespaced id is not, and matching on the whole
-    would leave those definitions unmatched.
+def test_an_id_is_a_name_only_for_a_definition_that_has_no_other():
+    """Which name a definition answers to, and why a term shuts the id out.
 
-    Asserted with a definition whose TERM cannot also satisfy it. The earlier version used
-    `total payment`, which the fixture's `id="fspay:policy:total_payment"` yields on its own via
-    the tail -- so it passed through either path and could not have caught the `term` lookup
-    regressing, while its docstring claimed to be testing exactly that.
+    A record may carry its name in `id` alone, so the tail has to be a spelling for those -- but
+    only for those. The tail was briefly a spelling ALONGSIDE the term, and that is the M35
+    suppressing direction: `term="net revenue"` with `id="...:revenue"` certifies net revenue, so
+    grounding a model's declared "revenue" on it hands back the confident answer for a term the
+    definition does not define. Where a term exists it is the certified name; the id is an
+    implementation detail that happens to be legible.
+
+    The whole namespaced id is never a name, however spelled -- nobody writes it into a sentence.
     """
     from mnemiq.contract.semantic import Definition
 
-    defs = [Definition(id="fspay:policy:x9", term="settled volume", domain="fspay",
-                       definition="volume of settled payments")]
-    assert ungrounded_terms(["settled volume"], defs) == [], "the term must match"
-    assert ungrounded_terms(["x9"], defs) == [], "the id's tail is a spelling too"
-    assert ungrounded_terms(["fspay:policy:x9"], defs) == ["fspay:policy:x9"], (
+    named = [Definition(id="fspay:policy:x9", term="settled volume", domain="fspay",
+                        definition="volume of settled payments")]
+    assert ungrounded_terms(["settled volume"], named) == [], "the term is the name"
+    assert ungrounded_terms(["x9"], named) == ["x9"], (
+        "a definition that HAS a term is not also named by its id"
+    )
+
+    unnamed = [Definition(id="fspay:policy:loss_ratio", term="", domain="fspay",
+                          definition="incurred losses over earned premium")]
+    assert ungrounded_terms(["loss ratio"], unnamed) == [], "with no term, the tail is the name"
+    assert ungrounded_terms(["fspay:policy:loss_ratio"], unnamed) == ["fspay:policy:loss_ratio"], (
         "a namespaced id is not something a model writes"
     )
+
+
+def test_a_disagreeing_id_cannot_ground_a_term_its_definition_does_not_certify():
+    """The failure the narrowing prevents, stated as the answer it would have returned.
+
+    Certified: `net revenue`. Asked about: `revenue`. Those are different quantities and the
+    definition says so; a guard that treats the id tail as a second certified name would let the
+    model's invented plain-revenue derivation through with a certified-looking definition behind
+    it, which is worse than no guard -- it is the guard vouching for the guess.
+    """
+    from mnemiq.contract.semantic import Definition
+
+    defs = [Definition(id="fspay:policy:revenue", term="net revenue", domain="fspay",
+                       definition="revenue net of refunds and chargebacks")]
+    assert ungrounded_terms(["revenue"], defs) == ["revenue"]
+    assert ungrounded_terms(["net revenue"], defs) == []
 
 
 def test_the_guard_names_every_ungrounded_term_not_just_the_first():
