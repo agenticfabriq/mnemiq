@@ -32,7 +32,7 @@ _GUIDED_SQL_SCHEMA = {
 }
 
 
-def _guided_extra_body(guided_sql: bool) -> dict | None:
+def _guided_extra_body(guided_sql: bool, declare_assumed_terms: bool = False) -> dict | None:
     """The request field that constrains the reply to `_GUIDED_SQL_SCHEMA`.
 
     `response_format`, not vLLM's `guided_json`. Both were measured against both backends:
@@ -50,10 +50,16 @@ def _guided_extra_body(guided_sql: bool) -> dict | None:
     """
     if not guided_sql:
         return None
+    schema = _GUIDED_SQL_SCHEMA
+    if not declare_assumed_terms:
+        # A property the prompt does not ask for has no business in the grammar either: it would
+        # invite the model to fill a field nothing reads.
+        schema = {**schema, "properties": {k: v for k, v in schema["properties"].items()
+                                           if k != "assumed_terms"}}
     return {
         "response_format": {
             "type": "json_schema",
-            "json_schema": {"name": "sql_proposal", "schema": _GUIDED_SQL_SCHEMA},
+            "json_schema": {"name": "sql_proposal", "schema": schema},
         }
     }
 
@@ -104,19 +110,22 @@ class Generator(Protocol):
 
 class LLMGenerator:
     def __init__(self, client, max_tokens: int = 4000, dialect: str = "duckdb",
-                 guided_sql: bool = False, assertive: bool = False) -> None:
+                 guided_sql: bool = False, assertive: bool = False,
+                 declare_assumed_terms: bool = False) -> None:
         self._client = client
         self._max_tokens = max_tokens
         self._dialect = dialect
         self._guided_sql = guided_sql
         self._assertive = assertive
+        self._declare_assumed_terms = declare_assumed_terms
 
     def propose(
         self, packet: ContextPacket, feedback: str | None = None, strategy: str | None = None
     ) -> SqlProposal:
-        extra = _guided_extra_body(self._guided_sql)
+        extra = _guided_extra_body(self._guided_sql, self._declare_assumed_terms)
         raw = self._client.complete(
-            system_prompt(dialect=self._dialect, strategy=strategy, assertive=self._assertive),
+            system_prompt(dialect=self._dialect, strategy=strategy, assertive=self._assertive,
+                          declare_assumed_terms=self._declare_assumed_terms),
             user_prompt(packet, feedback),
             max_tokens=self._max_tokens,
             **({"extra_body": extra} if extra else {}),

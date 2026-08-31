@@ -467,7 +467,7 @@ def test_guided_mode_can_emit_the_declaration_at_all():
         "the model cannot declare a term the guided schema does not allow"
     )
 
-    body = _guided_extra_body(True)
+    body = _guided_extra_body(True, declare_assumed_terms=True)
     schema = body["response_format"]["json_schema"]["schema"]
     assert "assumed_terms" in schema["properties"], "the sent schema must carry it, not just ours"
     assert "assumed_terms" not in schema.get("required", []), (
@@ -495,7 +495,7 @@ def test_the_prompt_asks_for_the_field_the_parser_reads():
     from mnemiq.generate.generator import _GUIDED_SQL_SCHEMA
 
     key = "assumed_terms"
-    rendered = prompts.system_prompt(dialect="duckdb")
+    rendered = prompts.system_prompt(dialect="duckdb", declare_assumed_terms=True)
     # The template that carries SQL, not the `{defer}` block's own `{"sql": null, ...}` -- there
     # are two, and the first one in the prompt is the deferral shape, which needs no declaration.
     template = next((ln for ln in rendered.splitlines() if "<the SELECT" in ln), None)
@@ -564,3 +564,30 @@ def test_a_containing_phrase_is_why_this_cannot_be_fixed_by_widening():
     """
     assert ungrounded_terms(["total revenue"], _defs()) == ["total revenue"]
     assert ungrounded_terms(["revenue per customer"], _defs()) == ["revenue per customer"]
+
+
+def test_one_setting_reaches_both_ends_of_the_guard():
+    """The flag crosses four hops -- Settings, `build_agent`, `Agent`, `plan_query` -- plus a fifth
+    into the prompt, and every one of them defaults False. Dropping the kwarg at any hop leaves the
+    guard inert with the whole suite green, because every other test passes it explicitly. That is
+    the wired-at-one-end shape this branch has already produced twice.
+
+    Asserted through the real assembly rather than by reading the call sites, and in BOTH states:
+    a test that only checks the on-path cannot see a hop that ignores its argument.
+    """
+    from mnemiq.agent.modes import MODES, build_agent
+    from mnemiq.config import Settings
+    from mnemiq.generate.prompts import system_prompt
+
+    assert Settings.model_fields["guard_undefined_terms"].default is False, (
+        "the shipped default is off -- 12 false deferrals in 24, measured"
+    )
+    for wanted in (True, False):
+        agent = build_agent(
+            MODES["thinking"], generator=None, synthesizer=None, adapter=None, cache=None,
+            corrector=None, values=None, selector=None, guard_undefined_terms=wanted,
+        )
+        assert agent.guard_undefined_terms is wanted, "Settings -> build_agent -> Agent"
+        assert ("assumed_terms" in system_prompt(declare_assumed_terms=wanted)) is wanted, (
+            "the prompt must ask for the declaration only when the guard reads it"
+        )

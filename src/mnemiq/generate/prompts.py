@@ -43,15 +43,34 @@ STRATEGY_PREAMBLES = {
 }
 
 
+# M35's half of the reply, shipped only when the guard that READS it is on. Leaving it in
+# unconditionally would have meant "off" was not the pre-M35 request: the model still spends
+# tokens deciding which terms it had to assume, and the 66.7% baseline the withdrawal compares
+# against was measured on a prompt that never asked.
+_DECLARE_KEY = ''', "assumed_terms": ["<term>", ...]'''
+
+_DECLARE = """
+`assumed_terms`: business terms in the QUESTION whose meaning you had to assume because no
+definition above gave it -- terms computed by a convention rather than read from a column, like
+"lifetime value" or "churn rate". List the term as the question spells it. Leave it `[]` when every
+term you relied on was defined above, or when the question names none. Do NOT list table or column
+names: a missing column is already caught elsewhere, and listing one here would refuse a question
+that is merely misspelled.
+"""
+
+
 def system_prompt(
     dialect: str = "duckdb", max_rows: int = MAX_ROWS, strategy: str | None = None,
-    assertive: bool = False,
+    assertive: bool = False, declare_assumed_terms: bool = False,
 ) -> str:
     defer = (
         _DEFER_ASSERTIVE.format(dialect=dialect)
         if assertive
         else _DEFER_DEFAULT
     )
+    # M35's declaration ships only when the guard that reads it is on -- see `_DECLARE_KEY`.
+    declare_key = _DECLARE_KEY if declare_assumed_terms else ""
+    declare = _DECLARE if declare_assumed_terms else ""
     base = f"""{PERSONA}
 
 You will be given a question and the schema cards for the ONLY tables you may use.
@@ -74,15 +93,8 @@ data -- the raw code is the correct answer.
 {defer}
 
 Return ONLY a JSON object, no prose and no code fences:
-{{"sql": "<the SELECT, or null>", "reason": "<one sentence>", "assumed_terms": ["<term>", ...]}}
-
-`assumed_terms`: business terms in the QUESTION whose meaning you had to assume because no
-definition above gave it -- terms computed by a convention rather than read from a column, like
-"lifetime value" or "churn rate". List the term as the question spells it. Leave it `[]` when every
-term you relied on was defined above, or when the question names none. Do NOT list table or column
-names: a missing column is already caught elsewhere, and listing one here would refuse a question
-that is merely misspelled.
-"""
+{{"sql": "<the SELECT, or null>", "reason": "<one sentence>"{declare_key}}}
+{declare}"""
     preamble = STRATEGY_PREAMBLES.get(strategy or "direct", "")
     return f"{base}\n{preamble}\n" if preamble else base
 
