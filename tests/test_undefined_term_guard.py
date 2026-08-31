@@ -658,11 +658,11 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     rebindings -- plain, annotated and tuple -- so none of `plan_query as _pq`,
     `pq = plan_query` or `pq: Callable = plan_query` renames its way out.
 
-    **Known limit**: a call reached through a wrapper rather than a rebinding --
-    `partial(plan_query)`, a decorator, a dict of handlers -- is not counted, so a site added in
-    that form would be invisible. Bounded, because converting an already-pinned site to such a
-    form drives its count to zero and fails closed; the exposure is only to NEW sites written that
-    way. Closing it properly means the parameter having no default, so the interpreter enforces
+    **Known limit**: this resolves the binding forms it models and nothing else. A call reached
+    any other way -- a wrapper (`partial(plan_query)`, a decorator, a handler dict), a walrus, or
+    a form added to the language later -- is not counted, and no enumeration here should be read
+    as complete. Bounded in one direction only: converting an already-pinned site to such a form
+    drives its count to zero and fails closed, so the exposure is to sites newly written that way. Closing it properly means the parameter having no default, so the interpreter enforces
     what a scan approximates -- disproportionate for a withdrawn feature, and recorded here so the
     next person decides it deliberately.
     """
