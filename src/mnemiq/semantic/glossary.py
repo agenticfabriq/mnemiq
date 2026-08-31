@@ -76,11 +76,18 @@ def term_pattern(term: str, inflection: str = INFLECTION_ANY) -> re.Pattern[str]
         return re.compile(r"(?!)")
     head = [re.escape(w) for w in words[:-1]]
     body = r"\s+".join(head + [_last_word(words[-1], inflection)])
-    # Boundaries at BOTH ends. Only the leading one was there, so a match could end mid-word: at
-    # the plural width the tail `a` matched inside "average", putting that definition in every
-    # packet. `\w*` hid it by consuming to the end of whatever word it landed in, which is why the
-    # missing boundary surfaced only when a narrower width was introduced.
-    return re.compile(rf"\b{body}\b", re.IGNORECASE)
+    # Boundaries at BOTH ends, as word-character LOOKAROUNDS rather than `\b`.
+    #
+    # `\b` asserts a word/non-word TRANSITION, so it cannot hold next to a term that begins or ends
+    # in punctuation: `\bROI\s+\(%\)\w*\b` does not match the string `ROI (%)`, because after `)`
+    # there is no word character for the boundary to sit against. A certified `ROI (%)`,
+    # `EBITDA (adjusted)` or `C++` could not match ITSELF -- so retrieval dropped it on the
+    # always-on path and the M35 guard called it ungrounded, both silently.
+    #
+    # `(?<!\w)` / `(?!\w)` assert only that the match is not glued to more word characters, which
+    # is the property actually wanted. It keeps what the boundary was added for: at the plural
+    # width the id tail `a` still cannot match inside "average", because `v` is a word character.
+    return re.compile(rf"(?<!\w){body}(?!\w)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)

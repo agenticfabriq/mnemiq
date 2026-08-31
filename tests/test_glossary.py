@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Definition
 from mnemiq.semantic.glossary import load_definitions, select_definitions
@@ -239,3 +241,41 @@ def test_a_record_naming_itself_by_name_or_label_is_prose_too():
         term = ""
 
     assert spellings(ById()) == [Name("loss ratio", prose=False)]
+
+
+@pytest.mark.parametrize("term", ["ROI (%)", "EBITDA (adjusted)", "C++", "margin %"])
+def test_a_term_ending_in_punctuation_can_match_itself(term):
+    """A certified term could not be retrieved by its own name.
+
+    The anchors were `\\b`, which asserts a word/non-word TRANSITION -- so it cannot hold next to a
+    term ending in punctuation: after the `)` of `ROI (%)` there is no word character for the
+    boundary to sit against, and `\\bROI\\s+\\(%\\)\\w*\\b` does not match the string `ROI (%)`.
+    Retrieval dropped such a definition on the always-on path and the M35 guard called the term
+    ungrounded, both silently, and business glossaries are full of these.
+
+    `(?<!\\w)` / `(?!\\w)` assert only that the match is not glued to more word characters, which is
+    the property that was actually wanted. Found by an adversarial review, not by this suite --
+    every test here used bare alphabetic terms.
+    """
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract.semantic import Definition
+    from mnemiq.generate.undefined_terms import ungrounded_terms
+    from mnemiq.semantic.glossary import select_definitions, term_pattern
+
+    assert term_pattern(term).search(term), "a term must match its own spelling"
+
+    d = Definition(id="fspay:policy:x", term=term, domain="fspay", definition="a certified thing",
+                   bound_objects=["fs.payments"])
+    grants = GrantSet(objects=frozenset({"fs.payments"}))
+    assert select_definitions(f"what is our {term} this quarter", [d], grants) == [d]
+    assert ungrounded_terms([term], [d]) == [], "and the guard must ground it"
+
+
+def test_the_narrow_width_still_will_not_match_inside_a_word():
+    """The property the anchors were added for, kept while punctuation was let through: an id tail
+    of `a` must not match the `a` that starts "average". `(?!\\w)` fails there because `v` is a word
+    character, which is the same reason `\\b` did."""
+    from mnemiq.semantic.glossary import INFLECTION_PLURAL, term_pattern
+
+    assert not term_pattern("a", INFLECTION_PLURAL).search("what is our average revenue")
+    assert term_pattern("a", INFLECTION_PLURAL).search("give me a number")

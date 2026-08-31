@@ -72,9 +72,11 @@ def main() -> int:
         packet,
         snapshot,
         authz.grants_for(identity),
-        LLMGenerator(LLMClient(settings)),
+        LLMGenerator(LLMClient(settings),
+                     declare_assumed_terms=settings.guard_undefined_terms),
         adapter=adapter,
         target="duckdb",
+        guard_undefined_terms=settings.guard_undefined_terms,
     )
 
     if isinstance(outcome, Deferred):

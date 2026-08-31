@@ -631,82 +631,87 @@ def test_one_setting_reaches_both_ends_of_the_guard():
         )
 
 
-def test_every_agent_construction_passes_the_flag():
+def test_every_site_that_participates_in_the_guard_passes_its_half():
     """The invariant no per-call test can hold, because the failure is a call site that does not
-    exist yet.
+    exist yet -- and the first version of this test was itself too narrow to hold it.
 
-    `Agent` is constructed in three places -- `agent.modes.build_agent`, `eval.engine.build_engine`
-    and `scripts/answer.py` -- and only the first has an offline test. The scan pins FOUR paths,
-    because it covers both callables: the fourth is `runtime.py`, which calls `build_agent` rather
-    than constructing an Agent, and has to pass the flag for the same reason. Beacon confirmed the second
-    is uncovered on their side too: their in-process SUT injects an `engine_builder` and every
-    beacon test of it passes a stub, so the real `build_engine` runs in no beacon test. `test_eval_live`
-    does call it, but only with a live key configured and it asserts nothing about this flag. So
-    deleting the kwarg leaves both suites green. Their seam is right for them -- beacon's CI has no
-    mnemiq -- which means the guarantee has to live here.
+    **The guard has TWO halves and a site can be wired at one end.** The engine-side check reads
+    `proposal.assumed_terms`; the prompt-side declaration is what puts anything in it. With the
+    generator silent the model declares nothing, `ungrounded_terms([])` is `[]`, and the flag reads
+    as ON while guarding nothing -- silently, and with every other test green.
 
-    A source-level invariant instead, the shape this repo already uses for the ad-hoc env reads
-    `test_no_adhoc_retrieval_k_reads` forbids. It costs nothing and it holds for the FOURTH site,
-    which is the one that will actually cause this: three hops on this branch were left
-    disconnected while their author was watching for exactly that failure.
+    An adversarial review found exactly that in the fix this test was written to protect:
+    `scripts/answer.py` passed `guard_undefined_terms` to its `Agent` and left its `LLMGenerator`
+    at the default, and this test PASSED because it checked only the Agent keyword. It also found
+    `scripts/ask.py`, which calls `plan_query` directly and so was invisible to a scan that only
+    knew about `Agent` and `build_agent` -- neither half wired, the setting inert.
 
-    **The scan fails closed**, because a scanner that finds nothing is the same silent inertness
-    one level up. It pins the exact set of files it expects to match -- not a count, which a site
-    that stopped matching could still clear by being replaced with a new one; it counts `**kwargs`
-    as not passing the flag, since a config-driven site is the likeliest next one and `Agent(**cfg)`
-    proves nothing; and it resolves import aliases, so `Agent as _A` cannot rename its way out.
+    So the scan is keyed on a MAP of callable to the kwarg that callable owes, not on one name and
+    one kwarg. A new participant is added here with its half.
 
-    Pinning the set means a legitimate new construction site fails this test. That is intended: it
-    is a two-line edit here and a reminder to pass the flag, which is the whole point.
+    **It fails closed.** It pins the exact set of sites -- not a count, which a site that stopped
+    matching could clear by being replaced; it counts `**kwargs` as not passing, since a
+    config-driven site is the likeliest next one; and it resolves import aliases.
     """
     import ast
     import pathlib
+
+    # callable -> the half of the guard it owes. Both halves, because either alone fails open.
+    REQUIRED = {
+        "Agent": "guard_undefined_terms",
+        "build_agent": "guard_undefined_terms",
+        "plan_query": "guard_undefined_terms",
+        "LLMGenerator": "declare_assumed_terms",
+    }
+    EXPECTED_SITES = {
+        ("src/mnemiq/runtime.py", "build_agent"),
+        ("src/mnemiq/assembly.py", "LLMGenerator"),
+        ("src/mnemiq/agent/modes.py", "Agent"),
+        ("src/mnemiq/agent/loop.py", "plan_query"),
+        ("src/mnemiq/eval/engine.py", "Agent"),
+        ("scripts/answer.py", "Agent"),
+        ("scripts/answer.py", "LLMGenerator"),
+        ("scripts/ask.py", "plan_query"),
+        ("scripts/ask.py", "LLMGenerator"),
+    }
 
     root = pathlib.Path(__file__).resolve().parents[1]
     roots = [root / "src" / "mnemiq", root / "scripts"]
     for d in roots:
         assert d.is_dir(), f"{d} must exist, or this scan guarantees nothing"
 
-    found, missing = [], []
+    seen, missing = set(), []
     for base in roots:
         for path in base.rglob("*.py"):
             tree = ast.parse(path.read_text())
-            # Local spellings of the two callables, including `from ... import Agent as _A`.
-            names = {"Agent", "build_agent"}
+            # local spelling -> canonical, so `plan_query as _pq` cannot rename its way out and a
+            # site is still recorded under the name the pinned set uses.
+            canonical = {n: n for n in REQUIRED}
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom):
-                    for alias in node.names:
-                        if alias.name in ("Agent", "build_agent") and alias.asname:
-                            names.add(alias.asname)
+                    for a in node.names:
+                        if a.name in REQUIRED and a.asname:
+                            canonical[a.asname] = a.name
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
                 func = node.func
                 name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
-                if name not in names:
+                if name not in canonical:
                     continue
-                where = f"{path.relative_to(root)}:{node.lineno} {name}(...)"
-                found.append(where)
-                # `**kwargs` does NOT count: it cannot be read here, and a config-driven site is
-                # exactly where this goes wrong next.
-                if "guard_undefined_terms" not in {kw.arg for kw in node.keywords}:
-                    missing.append(where)
+                owed = REQUIRED[canonical[name]]
+                rel = str(path.relative_to(root))
+                seen.add((rel, canonical[name]))
+                # `**kwargs` does NOT count: it cannot be read here.
+                if owed not in {kw.arg for kw in node.keywords}:
+                    missing.append(f"{rel}:{node.lineno} {name}(...) needs {owed}")
 
-    # The exact set, not a floor. A floor of three still clears when one known site stops matching
-    # -- rebound through an assignment, or moved to a directory outside these roots -- and the
-    # dropped site goes unchecked while the test stays green.
-    expected = {
-        "src/mnemiq/runtime.py",
-        "src/mnemiq/agent/modes.py",
-        "src/mnemiq/eval/engine.py",
-        "scripts/answer.py",
-    }
-    assert {f.split(":")[0] for f in found} == expected, (
-        f"the set of Agent construction sites changed; the scan matched {sorted(found)}. If this "
-        "is a new site, add it here AND pass guard_undefined_terms. If a known one vanished, the "
+    assert seen == EXPECTED_SITES, (
+        f"the set of guard-participating sites changed; the scan matched {sorted(seen)}. If this "
+        "is a new site, add it here AND pass its half of the guard. If a known one vanished, the "
         "scan stopped seeing it and this invariant is no longer guarding it"
     )
     assert missing == [], (
-        "every Agent/build_agent construction must pass guard_undefined_terms explicitly, or the "
-        "guard is inert there with both suites green: " + "; ".join(missing)
+        "every site participating in the guard must pass its half explicitly, or the flag reads "
+        "as on while guarding nothing: " + "; ".join(missing)
     )

@@ -66,7 +66,11 @@ def main() -> int:
     print(f"retrieved: {[c.object_id for c in packet.cards]}\n")
 
     agent = Agent(
-        generator=LLMGenerator(LLMClient(settings)),
+        # BOTH halves. The Agent alone was the guard wired at one end: with the generator
+        # silent the model declares nothing, `ungrounded_terms([])` is `[]`, and the flag
+        # reads as on while guarding nothing.
+        generator=LLMGenerator(LLMClient(settings),
+                               declare_assumed_terms=settings.guard_undefined_terms),
         synthesizer=LLMSynthesizer(LLMClient(settings)),
         adapter=DuckDBPostgresAdapter(settings.pg_dsn),
         cache=TwoTierCache(L1Cache()),
