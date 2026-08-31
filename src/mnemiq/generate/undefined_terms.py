@@ -40,14 +40,17 @@ def _normalized(spelling: str) -> str:
 
 
 def _same_term(one: str, other: str) -> bool:
-    r"""Whether two spellings name the same term, under RETRIEVAL's tolerance rather than a second
-    one invented here.
+    r"""Whether two spellings name the same term, under retrieval's words-in-order RULE at a
+    narrower WIDTH.
 
     `term_pattern` is `select_definitions`' rule: each word on a boundary, in order, the last one
-    free to inflect. Importing it is the point -- the defect this closes was two matchers reading
-    one corpus, where retrieval put `total payment` in the packet BECAUSE the model said "total
+    free to inflect. Sharing it is the point -- the defect this closes was two matchers reading one
+    corpus, where retrieval put `total payment` in the packet BECAUSE the model said "total
     payments" and this check then called "total payments" ungrounded. A guard that refuses a term
     on the strength of a definition sitting in its own input is not measuring meaning.
+
+    What is NOT shared is how far the last word may run, and the paragraph on `INFLECTION_PLURAL`
+    below is the reason: one rule, two widths.
 
     `fullmatch`, not `search`: the tolerance is on the term's ENDING, not on what surrounds it.
     "revenue per customer" is a derivation over a defined term and must stay ungrounded -- that

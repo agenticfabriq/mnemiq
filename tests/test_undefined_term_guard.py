@@ -105,6 +105,20 @@ def test_a_plural_is_the_same_term(spelling):
     assert ungrounded_terms([spelling], _defs()) == []
 
 
+@pytest.mark.parametrize("declared,certified", [("policies", "policy"), ("entities", "entity")])
+def test_the_plural_no_suffix_rule_reaches(declared, certified):
+    """`policy` -> `policies` loses a character off the stem, so no suffix appended to the literal
+    can produce it. Neither width covered it and each was wrong in its own direction: retrieval
+    missed the definition on a question saying "policies", and grounding refused "policies" with
+    `policy` certified -- a deferral of an answerable question, which is the cost this guard is
+    measured on. Business vocabularies are made of these words."""
+    from mnemiq.contract.semantic import Definition
+
+    defs = [Definition(id=f"fspay:policy:{certified}", term=certified, domain="fspay",
+                       definition=f"the certified {certified}")]
+    assert ungrounded_terms([declared], defs) == []
+
+
 def test_a_longer_phrase_is_not_grounded_by_the_term_it_contains():
     """The limit on that tolerance, and the reason it is a full match rather than a search.
 
@@ -433,20 +447,26 @@ def test_the_prompt_asks_for_the_field_the_parser_reads():
     field nobody reads, or the parser waits for a field nobody asked for. The same
     hand-enumerated-allowlist shape that caused the finding this guard exists for.
 
-    Asserted by USING the key, not by grepping the module for it. The first version was
-    `"assumed_terms" in inspect.getsource(generator)`, and the same diff put that literal in three
-    places -- the schema, the dataclass field and the parser -- so renaming the parser's
-    `payload.get` alone left it green. A substring test over a module cannot see which occurrence
-    it matched, which is exactly the silent inertness it was written to prevent.
+    Each leg asserted against the thing that carries the key, never a substring of a module. The
+    first version was `"assumed_terms" in inspect.getsource(generator)`, and the same diff put that
+    literal in three places -- schema, dataclass field, parser -- so renaming the parser's
+    `payload.get` alone left it green. `prompts` has the same problem for the same reason: the key
+    appears in the JSON reply TEMPLATE and again in the prose explaining it, and only the template
+    rename stops the model emitting the field. So the prompt leg reads the rendered template line,
+    not the module text.
     """
-    import inspect
     import json
 
     from mnemiq.generate import prompts
     from mnemiq.generate.generator import _GUIDED_SQL_SCHEMA
 
     key = "assumed_terms"
-    assert key in inspect.getsource(prompts), "the prompt must ask for it"
+    rendered = prompts.system_prompt(dialect="duckdb")
+    # The template that carries SQL, not the `{defer}` block's own `{"sql": null, ...}` -- there
+    # are two, and the first one in the prompt is the deferral shape, which needs no declaration.
+    template = next((ln for ln in rendered.splitlines() if "<the SELECT" in ln), None)
+    assert template, "the prompt must show a JSON reply template"
+    assert key in template, "the reply template must ask for it"
     assert key in _GUIDED_SQL_SCHEMA["properties"], "a guided reply must be permitted to carry it"
     carried = _parse(json.dumps({"sql": "SELECT 1", key: ["lifetime value"]}))
     assert carried.assumed_terms == ["lifetime value"], (

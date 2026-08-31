@@ -22,6 +22,24 @@ INFLECTION_ANY = r"\w*"
 INFLECTION_PLURAL = r"(?:e?s)?"
 
 
+def _last_word(word: str, inflection: str) -> str:
+    """The last word plus its inflections, including the `-y`/`-ies` one no suffix rule reaches.
+
+    A suffix appended to the literal cannot turn `policy` into `policies` -- the stem loses a
+    character -- so neither width covered it and both callers were wrong in their own direction.
+    Retrieval missed the definition on a question saying "policies"; grounding called "policies"
+    ungrounded with `policy` certified, which is a refusal of an answerable question. Business
+    vocabularies are full of these: policy, entity, category, party.
+
+    Consonant + `y` only. `day` -> `days` is the ordinary rule and already matched, and rewriting
+    it to `daies` would match nothing a corpus contains.
+    """
+    forms = [re.escape(word) + inflection]
+    if len(word) > 2 and word[-1].lower() == "y" and word[-2].lower() not in "aeiou":
+        forms.append(re.escape(word[:-1]) + "ies")
+    return "(?:" + "|".join(forms) + ")"
+
+
 def term_pattern(term: str, inflection: str = INFLECTION_ANY) -> re.Pattern[str]:
     r"""Each word of the term on a word boundary, in order; the last word may inflect
     ("premium" matches "premiums", "loss ratio" matches "loss ratios").
@@ -39,8 +57,11 @@ def term_pattern(term: str, inflection: str = INFLECTION_ANY) -> re.Pattern[str]
     parameter rather than a second function so that the words-in-order rule stays single: it was
     two independent implementations of THAT which caused the defect.
     """
-    words = [re.escape(w) for w in term.split()]
-    body = r"\s+".join(words[:-1] + [words[-1] + inflection]) if words else ""
+    words = term.split()
+    if not words:
+        return re.compile(r"\b", re.IGNORECASE)
+    head = [re.escape(w) for w in words[:-1]]
+    body = r"\s+".join(head + [_last_word(words[-1], inflection)])
     return re.compile(rf"\b{body}", re.IGNORECASE)
 
 
