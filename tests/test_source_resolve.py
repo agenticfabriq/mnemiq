@@ -100,6 +100,12 @@ def test_oracle_takes_credentials_from_settings_and_the_descriptor_from_the_spec
         "schema": "APP", "read_only": False,
         # None unless configured: the plain TCP path must not acquire TLS arguments it never had
         "config_dir": None, "wallet_password": None,
+        # Pool shape comes from settings, so an operator raises concurrency without a code change.
+        # Asserted here rather than allowed through, because this is the equality that would
+        # otherwise quietly stop covering whatever the resolver passes next (**M72**).
+        "pool_max": s.oracle_pool_max,
+        "acquire_timeout_s": s.oracle_acquire_timeout_s,
+        "probe_timeout_s": s.oracle_probe_timeout_s,
     }
 
 
@@ -600,20 +606,35 @@ def test_an_advisory_that_raised_is_not_diagnosed_as_a_changed_verdict():
 
 
 class _RecordingOracledb:
-    """Stands in for the driver so the CONNECT ARGUMENTS can be asserted."""
+    """Stands in for the driver so the POOL ARGUMENTS can be asserted.
+
+    It records `create_pool` rather than `connect` because the adapter is pooled (**M72**). The
+    TLS keywords are the same either way -- they are connection arguments the pool passes through
+    -- so what these tests assert is unchanged; only the call recording them moved.
+    """
 
     DatabaseError = Exception
+    POOL_GETMODE_TIMEDWAIT = object()
     seen: dict = {}
 
     @classmethod
-    def connect(cls, **kwargs):
+    def create_pool(cls, **kwargs):
         cls.seen = dict(kwargs)
-        return _RecordingConnection()
+        return _RecordingPool()
 
 
-class _RecordingConnection:
-    def cursor(self):
-        raise AssertionError("no statement should run during construction")
+class _RecordingPool:
+    def acquire(self):
+        raise AssertionError("no connection should be acquired during construction")
+
+    def close(self, force=False):
+        pass
+
+
+# The TLS keywords, which are what these tests are about. Everything else `create_pool` receives is
+# pool shape -- sizing and the two deadlines -- and is asserted separately rather than by exclusion,
+# so adding a pool parameter does not fail a test about wallets.
+_TLS_KEYS = {"config_dir", "wallet_location", "wallet_password"}
 
 
 @pytest.fixture
@@ -632,7 +653,27 @@ def test_a_plain_connection_passes_no_tls_arguments(driver):
     from mnemiq.adapters.oracle import OracleAdapter
 
     OracleAdapter(dsn="h:1521/S", user="u", password="p")
-    assert set(driver.seen) == {"user", "password", "dsn"}, f"unexpected: {sorted(driver.seen)}"
+    assert _TLS_KEYS & set(driver.seen) == set(), (
+        f"a plain connection acquired TLS arguments: {sorted(_TLS_KEYS & set(driver.seen))}")
+    assert {"user", "password", "dsn"} <= set(driver.seen)
+
+
+def test_the_pool_is_built_with_both_deadlines_and_a_replacement_path(driver):
+    """The three things that make a slow statement local instead of an outage (**M72**).
+
+    Asserted on the CALL because none of them is observable from a working connection: a pool with
+    `getmode=WAIT` connects exactly as well as one with `TIMEDWAIT` and then blocks forever under
+    load, which is the failure being fixed.
+    """
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    OracleAdapter(dsn="h:1521/S", user="u", password="p", pool_max=7, acquire_timeout_s=2.5)
+    assert driver.seen["max"] == 7, "concurrency above this queues rather than serialising"
+    assert driver.seen["getmode"] is driver.POOL_GETMODE_TIMEDWAIT, (
+        "the default WAIT blocks forever, which is the old failure with extra steps")
+    assert driver.seen["wait_timeout"] == 2500, "milliseconds, and it is what bounds the wait"
+    assert driver.seen["ping_interval"], (
+        "a pooled connection outlives its request, so a dead one must be detected and replaced")
 
 
 def test_a_configured_directory_reaches_the_driver_as_both_config_and_wallet_location(driver):

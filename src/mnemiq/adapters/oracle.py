@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any
 
 import pyarrow as pa
@@ -43,7 +44,8 @@ class OracleAdapter:
 
     def __init__(self, dsn: str, user: str, password: str, schema: str | None = None,
                  read_only: bool = True, config_dir: str | None = None,
-                 wallet_password: str | None = None) -> None:
+                 wallet_password: str | None = None, pool_max: int = 4,
+                 acquire_timeout_s: float = 10.0, probe_timeout_s: float = 30.0) -> None:
         """`dsn` is an Easy Connect string or a TNS alias, e.g. `host:1521/FREEPDB1`.
 
         `config_dir` is a directory holding `tnsnames.ora` (and, for a TLS target, the wallet).
@@ -107,45 +109,79 @@ class OracleAdapter:
             extra["wallet_location"] = config_dir  # the PEM lives beside tnsnames.ora in an ADB zip
         if wallet_password:
             extra["wallet_password"] = wallet_password
-        self._con = oracledb.connect(user=user, password=password, dsn=dsn, **extra)
-        # ONE connection, shared by every caller, and `python-oracledb` in thin mode does not make
-        # a connection safe for concurrent use. This adapter also mutates CONNECTION-wide state per
-        # statement -- `rollback()` then `SET TRANSACTION READ ONLY` in `_cursor`, and
-        # `call_timeout` in `execute_arrow` -- so two threads interleaving there is not a slow path
-        # but a wrong one: one request can roll back another's transaction between its cursor
-        # acquisition and its fetch, and a restored `call_timeout` can be another request's value.
-        # The HTTP server builds ONE Runtime and FastAPI runs sync endpoints on a worker
-        # threadpool, so this is the deployed shape, not a hypothetical.
-        #
-        # Serialised rather than pooled. A pool is the right answer for THROUGHPUT and is v2 work
-        # with a real cost to size (see the attach-cost question in the governance decision); a
-        # lock is the right answer for CORRECTNESS and is available now. RLock so a future method
-        # that composes two of these does not deadlock on itself.
         self._lock = threading.RLock()
+        self._user = user.upper()
         self._schema = (schema or user).upper()
         self._read_only = read_only
-        if self._schema != user.upper():
-            # Discovery filters the data dictionary by OWNER, but the SQL this adapter generates
-            # -- profiling, the proof seam, the planner's approved statement -- names tables
-            # UNQUALIFIED, and Oracle resolves an unqualified name against the CONNECTING user.
-            # So `user=READER, schema=APP` discovered APP's tables and then failed every read with
-            # ORA-00942 on "READER"."ORDERS". Measured: discovery saw ORDERS, enrich produced 0
-            # tables and outcome `unread`.
-            #
-            # That is precisely the least-privilege deployment this adapter's own advice tells
-            # operators to adopt -- a principal holding SELECT on someone else's schema -- so the
-            # recommended configuration was the one that did not work.
-            #
-            # CURRENT_SCHEMA changes NAME RESOLUTION only; it grants nothing, so the reader still
-            # needs its SELECT. Issued on the raw cursor at construction, before any read-only
-            # transaction exists, and never through `execute` -- the read-only gate refuses ALTER,
-            # correctly, and this is the adapter configuring itself rather than running a caller's
-            # statement.
-            cur = self._con.cursor()
-            try:
-                cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{self._schema}"')
-            finally:
-                cur.close()
+        self._probe_timeout_ms = int(probe_timeout_s * 1000) if probe_timeout_s else 0
+        # Fixed here, not read per session: see `_configure_session`.
+        self._session_schema = self._schema if self._schema != self._user else None
+        # POOLED, one leased connection per operation. This adapter was a single connection behind
+        # a single `RLock`, which was correct and was also an outage: `python-oracledb` in thin
+        # mode does not make a connection safe for concurrent use, and this adapter mutates
+        # CONNECTION-wide state per statement -- `rollback()` then `SET TRANSACTION READ ONLY`, and
+        # `call_timeout` -- so serialising was the only correct option available to it. The cost is
+        # that ONE slow statement stops the whole engine: the HTTP server builds one Runtime and
+        # FastAPI runs sync endpoints on a worker threadpool, so every worker queues behind
+        # whichever request is currently holding the lock, with no deadline on the wait (**M72**).
+        #
+        # A lease per operation is what makes the failure local. Each of the three properties the
+        # lock was protecting is preserved by the connection not being shared at all: the read-only
+        # transaction is per-transaction state re-entered inside the lease, `call_timeout` is set
+        # and cleared inside the lease, and the rollback belongs to one caller's connection.
+        #
+        # `getmode=TIMEDWAIT` with `wait_timeout` is what bounds the wait. Measured: a max=1 pool
+        # raises DPY-4005 after the timeout rather than blocking, so exhaustion becomes an error a
+        # caller can see instead of a hang nobody can attribute.
+        self._pool = oracledb.create_pool(
+            user=user, password=password, dsn=dsn,
+            min=1, max=max(1, pool_max), increment=1,
+            getmode=oracledb.POOL_GETMODE_TIMEDWAIT,
+            wait_timeout=max(1, int(acquire_timeout_s * 1000)),
+            # A pooled connection outlives the request that used it, so it can be dead in the pool
+            # while the server looks healthy. `ping_interval` is the driver's check for that, and
+            # it is the replacement path this adapter previously did not have at all: a dropped
+            # connection left the Runtime with nothing.
+            ping_interval=60,
+            session_callback=self._configure_session, **extra)
+        self._con = None  # `over()` sets this; a pooled adapter has no one connection
+        self._closed = False
+
+    def _configure_session(self, connection, requested_tag) -> None:
+        """Session state a pooled connection must carry, applied once per PHYSICAL session.
+
+        Discovery filters the data dictionary by OWNER, but the SQL this adapter generates --
+        profiling, the proof seam, the planner's approved statement -- names tables UNQUALIFIED,
+        and Oracle resolves an unqualified name against the CONNECTING user. So `user=READER,
+        schema=APP` discovered APP's tables and then failed every read with ORA-00942 on
+        "READER"."ORDERS". Measured: discovery saw ORDERS, enrich produced 0 tables and outcome
+        `unread`. That is precisely the least-privilege deployment this adapter's own advice tells
+        operators to adopt, so the recommended configuration was the one that did not work.
+
+        CURRENT_SCHEMA changes NAME RESOLUTION only; it grants nothing, so the reader still needs
+        its SELECT. It is session state, not transaction state, so the pool's `session_callback`
+        is where it belongs: measured, it survives release and re-acquire and the callback fires
+        once per physical session rather than once per lease. Setting it per lease instead would
+        add a round trip to every operation to re-assert something already true.
+
+        **It reads `_session_schema`, fixed at construction, and not `_schema`.** Under the single
+        connection this ran ONCE, at construction, so a later change to `_schema` could not affect
+        the session. Reading `_schema` here restored it lazily instead -- the callback fires when
+        the pool grows a connection, which is at an arbitrary later moment -- so setting
+        `a._schema = "NO_SUCH_SCHEMA"` to test the dictionary query raised ORA-01435 from an
+        `ALTER SESSION` issued minutes later by an unrelated call. Session setup is decided when
+        the pool is built.
+
+        Never routed through `execute`: the read-only gate refuses ALTER, correctly, and this is
+        the adapter configuring itself rather than running a caller's statement.
+        """
+        if self._session_schema is None:
+            return
+        cur = connection.cursor()
+        try:
+            cur.execute(f'ALTER SESSION SET CURRENT_SCHEMA = "{self._session_schema}"')
+        finally:
+            cur.close()
 
     @classmethod
     def over(cls, connection, oracledb_module, schema: str, read_only: bool = True) -> "OracleAdapter":
@@ -159,8 +195,13 @@ class OracleAdapter:
         a = cls.__new__(cls)
         a._oracledb = oracledb_module
         a._con = connection
+        a._pool = None  # a connection we did not open is not ours to pool
         a._schema = schema.upper()
+        a._user = schema.upper()
         a._read_only = read_only
+        a._probe_timeout_ms = 0
+        a._session_schema = None
+        a._closed = False
         a._lock = threading.RLock()
         return a
 
@@ -220,7 +261,72 @@ class OracleAdapter:
                 f"Oracle's own SET TRANSACTION READ ONLY does not stop DDL, so this does"
             )
 
-    def _cursor(self):
+    @contextmanager
+    def _lease(self, timeout_ms: int | None = None):
+        """One connection, held for one operation, then returned.
+
+        This is what makes a slow statement local. Under the previous single-connection design
+        every caller queued on one `RLock` with no deadline, so one stalled hard parse was an
+        outage rather than a slow request (**M72**).
+
+        **`call_timeout` is cleared on release, and that is measured rather than tidy.** A value
+        set on a pooled connection SURVIVES the release and reaches the next borrower: set to 1234
+        and released, the next `acquire()` handed back a connection still carrying 1234. Under the
+        old design a leaked timeout bounded every later call on the one connection, which the code
+        guarded against with a save/restore; pooled, it would instead bound an unrelated later
+        REQUEST, which no caller could attribute to anything. Clearing on release makes each lease
+        start from the same state whatever the last borrower did.
+
+        `over()` has no pool -- the connection belongs to whoever opened it -- so that path keeps
+        the lock and the serialised behaviour it always had.
+        """
+        if self._pool is None:
+            # A borrowed connection is somebody else's state, so the PREVIOUS value is restored
+            # rather than cleared -- clearing would impose this adapter's idea of a timeout on a
+            # connection it does not own. This branch keeps the save/restore the pooled path no
+            # longer needs, and dropping it here was a real regression the DDL-race tests caught:
+            # `execute_arrow` sets the timeout through the cursor, and nothing else would have
+            # put it back.
+            with self._lock:
+                previous = self._con.call_timeout
+                if timeout_ms:
+                    self._con.call_timeout = timeout_ms
+                try:
+                    yield self._con
+                finally:
+                    self._con.call_timeout = previous
+            return
+        # Bounded by `wait_timeout`: DPY-4005 rather than an unbounded wait. Measured on a max=1
+        # pool, which raised after the configured 1.5s instead of blocking.
+        con = self._pool.acquire()
+        # Set rather than left alone, because a value can arrive on a pooled connection from its
+        # last borrower: measured, `call_timeout` survives release and re-acquire. This lease
+        # therefore starts from a known state whatever the previous one did.
+        con.call_timeout = timeout_ms or 0
+        try:
+            yield con
+        finally:
+            con.call_timeout = 0
+            self._pool.release(con)
+
+    def close(self) -> None:
+        """Release the pool's sessions. Idempotent.
+
+        Not called by `Runtime`, which holds one adapter for the process -- it exists so a test,
+        or a caller that builds an adapter for one job, can give the sessions back rather than
+        leaving them for the database to time out.
+
+        The pool REFERENCE is kept rather than dropped, so a later call reports the same way the
+        driver does: `acquire()` on a closed pool raises DPY-1002, "connection pool is not open",
+        which is a source that cannot answer -- the same shape as DPY-1001 on a closed connection,
+        which is what this adapter used to produce. Dropping the reference would raise
+        `AttributeError` on None instead, turning "the source is gone" into a bug in this file.
+        """
+        if self._pool is not None and not self._closed:
+            self._closed = True
+            self._pool.close(force=True)
+
+    def _cursor(self, con):
         """A cursor with the read-only transaction re-established, when `read_only` is set.
 
         **Per statement, not once at construction, and that is measured rather than stylistic.**
@@ -247,11 +353,11 @@ class OracleAdapter:
         mapping rather than with a strict ordering rule.
         """
         if self._read_only:
-            self._con.rollback()
-            cur = self._con.cursor()
+            con.rollback()
+            cur = con.cursor()
             cur.execute("SET TRANSACTION READ ONLY")
             return cur
-        return self._con.cursor()
+        return con.cursor()
 
     # Measured against a live 23ai instance: a read of a table fails with ORA-01466 0.1s after
     # its CREATE and succeeds at 1.0s, while a control read on the SAME connection at the same
@@ -260,7 +366,7 @@ class OracleAdapter:
     # room and still give up rather than loop.
     _DDL_RACE_BACKOFF = (0.25, 0.75, 1.5)
 
-    def _with_cursor(self, work):
+    def _with_cursor(self, work, timeout_ms: int | None = None):
         """Run `work(cursor)` on a fresh cursor, retrying the ORA-01466 DDL race.
 
         **This does not weaken the read-only safeguard, and the distinction is the whole reason
@@ -286,15 +392,20 @@ class OracleAdapter:
         for pause in (0.0, *self._DDL_RACE_BACKOFF):
             if pause:
                 time.sleep(pause)
-            cur = self._cursor()
-            try:
-                return work(cur)
-            except self._oracledb.DatabaseError as exc:
-                if not (self._read_only and _is_ddl_race(exc)):
-                    raise
-                last = exc
-            finally:
-                cur.close()
+            # A FRESH lease per attempt, which is what the retry wanted anyway: the point is a
+            # newer read-consistent snapshot, and a connection returned to the pool between
+            # attempts has had its transaction ended, so the next `SET TRANSACTION READ ONLY`
+            # cannot inherit the pinned SCN that failed.
+            with self._lease(timeout_ms) as con:
+                cur = self._cursor(con)
+                try:
+                    return work(cur)
+                except self._oracledb.DatabaseError as exc:
+                    if not (self._read_only and _is_ddl_race(exc)):
+                        raise
+                    last = exc
+                finally:
+                    cur.close()
         raise last
 
     def _rows(self, sql: str, **binds: Any) -> list[tuple]:
@@ -304,8 +415,12 @@ class OracleAdapter:
             cur.execute(sql, **binds)
             return cur.fetchall()
 
-        with self._lock:
-            return self._with_cursor(_fetch)
+        # Bounded by the PROBE timeout: every caller of `_rows` is the engine asking the data
+        # dictionary about itself -- introspection, view text, the boot advisories -- not a user's
+        # query. Those have no legitimate reason to run long, and leaving them unbounded is half
+        # of what M72 is about. `execute`/`execute_arrow` carry the caller's data and are not
+        # bounded by this.
+        return self._with_cursor(_fetch, self._probe_timeout_ms)
 
     def introspect(self) -> list[str]:
         return [
@@ -415,13 +530,15 @@ class OracleAdapter:
                 # `rowcount` is read BEFORE the commit and verified to survive it.
                 rows = [(cur.rowcount,)] if cur.rowcount is not None and cur.rowcount >= 0 else []
             if not self._read_only:
-                self._con.commit()
+                # The LEASED connection, not an adapter-wide one -- `cur.connection` is the only
+                # correct referent once connections are per-operation, and committing anything
+                # else would commit a different caller's transaction.
+                cur.connection.commit()
             return rows
 
         # Retried only under read_only, where the DDL race lives; a write is never re-executed by
         # `_with_cursor`, which is what makes retrying safe to apply on this shared method.
-        with self._lock:
-            return self._with_cursor(_run)
+        return self._with_cursor(_run)
 
     # Statements `validate` will hand to Oracle's parser. Default-deny for a second, sharper
     # reason than `_READ_LEADERS`: **`cursor.parse()` EXECUTES DDL.** Measured -- 
@@ -463,8 +580,10 @@ class OracleAdapter:
         def _parse(cur):
             cur.parse(sql)
 
-        with self._lock:
-            self._with_cursor(_parse)
+        # Probe-bounded. A parse is the engine asking the source about a statement, and a hard
+        # parse that stalls used to block every other caller; now it bounds itself and holds only
+        # its own leased connection while it does.
+        self._with_cursor(_parse, self._probe_timeout_ms)
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
         """Run a query and return Arrow, bounding it by the driver's own call timeout.
@@ -472,37 +591,27 @@ class OracleAdapter:
         `Connection.call_timeout` is milliseconds and is the driver's supported way to bound a
         round trip; a `threading.Timer` calling `cancel()` -- the shape the SQLite and DuckDB
         adapters use -- is not equivalent here, because it races the fetch rather than the call.
-        The timeout is restored afterwards so one bounded query cannot silently bound the next.
+        The lease clears the timeout on release, so one bounded query cannot bound the next.
         """
-        # Two orderings matter here and both are preserved by running the query inside `_fetch`.
-        # The timeout must be set only once a cursor is in hand, because `_cursor()` issues its
-        # own `SET TRANSACTION READ ONLY` round trip and a tight timeout would otherwise bound the
-        # safeguard's setup rather than the query. And it must be restored on every path,
-        # including one where `_cursor()` itself raises -- a tightened value that leaks would
-        # silently bound every later call on this adapter-lifetime connection.
+        # ONE ordering still matters, and it is why the timeout is applied inside `_fetch` rather
+        # than handed to `_lease`: `_cursor()` issues its own `SET TRANSACTION READ ONLY` round
+        # trip, and a tight query timeout applied before that would bound the SAFEGUARD's setup
+        # instead of the query -- on the first attempt and on every DDL-race retry alike.
+        #
+        # What is gone is the save/restore of a previous value. That existed because one
+        # connection was shared for the adapter's lifetime, so a leaked timeout bounded every
+        # later call and a `previous` read outside the lock could capture another thread's
+        # tightened value and write it back as the original. A leased connection is held by one
+        # caller and cleared on release, so there is no previous value to preserve and no other
+        # thread to race -- which is the concurrency bug removed rather than guarded.
         self._refuse_unless_read(sql)
-        with self._lock:
-            return self._arrow_locked(sql, timeout_s)
-
-    def _arrow_locked(self, sql: str, timeout_s: float | None) -> pa.Table:
-        # Split out so the lock covers the CAPTURE of `call_timeout` as well as its restore.
-        # Reading `previous` outside the lock lets another thread's tightened value be captured
-        # and then written back as this call's "original", making the leak permanent.
-        previous = self._con.call_timeout
 
         def _fetch(cur):
-            # The timeout is set with the cursor already in hand, and restored before this
-            # returns, so it bounds the QUERY and never `_cursor()`'s own SET TRANSACTION round
-            # trip -- on the first attempt and on every retry alike. Restoring here rather than
-            # only in the outer `finally` is what keeps a retry's setup unbounded.
             if timeout_s is not None:
-                self._con.call_timeout = int(timeout_s * 1000)
-            try:
-                cur.execute(sql)
-                names = [d[0] for d in cur.description] if cur.description else []
-                return names, cur.fetchall()
-            finally:
-                self._con.call_timeout = previous
+                cur.connection.call_timeout = int(timeout_s * 1000)
+            cur.execute(sql)
+            names = [d[0] for d in cur.description] if cur.description else []
+            return names, cur.fetchall()
 
         try:
             names, rows = self._with_cursor(_fetch)
@@ -512,9 +621,6 @@ class OracleAdapter:
             if timeout_s is not None and _is_timeout(exc):
                 raise RuntimeError(f"query timed out after {timeout_s}s") from exc
             raise
-        finally:
-            # Belt and braces: `_cursor()` can raise before `_fetch` is ever entered.
-            self._con.call_timeout = previous
 
         # Column-major, by position, so duplicate output names survive -- a dict would collapse
         # `SELECT a AS x, b AS x` into one column and silently change the result.

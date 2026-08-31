@@ -154,7 +154,7 @@ def test_view_definitions_raises_rather_than_reporting_no_views():
     a._schema = "NO_SUCH_SCHEMA"
     assert a.view_definitions() == [], "an unknown owner legitimately has no views"
 
-    a._con.close()  # a dead connection is 'could not ask', not 'has none'
+    a.close()  # a dead connection is 'could not ask', not 'has none'
     # `oracledb.Error`, not `DatabaseError`: a closed connection raises InterfaceError (DPY-1001),
     # which is NOT a DatabaseError subclass. The first version of this test asserted the narrower
     # class and failed on the very case it exists to pin -- the contract is that the failure
@@ -190,12 +190,14 @@ def test_oracles_own_read_only_transaction_also_refuses_a_write():
     import oracledb
 
     a = _adapter()
-    cur = a._cursor()  # deliberately NOT execute(): we are testing the layer underneath the gate
-    try:
-        with pytest.raises(oracledb.DatabaseError, match="ORA-01456"):
-            cur.execute("INSERT INTO t_claim VALUES (2, 1, 200)")
-    finally:
-        cur.close()
+    with a._lease() as con:
+        # deliberately NOT execute(): we are testing the layer underneath the gate
+        cur = a._cursor(con)
+        try:
+            with pytest.raises(oracledb.DatabaseError, match="ORA-01456"):
+                cur.execute("INSERT INTO t_claim VALUES (2, 1, 200)")
+        finally:
+            cur.close()
 
 
 def test_read_only_still_reads():
@@ -216,18 +218,25 @@ def test_the_read_only_transaction_does_not_lapse_across_statements():
 
     a = _adapter()
     a.execute("SELECT count(*) FROM t_claim")
-    a._con.commit()  # the boundary that would end a construction-time SET TRANSACTION
 
-    # Through `_cursor()`, NOT `execute()`. The adapter's read-only gate would refuse this INSERT
-    # before Oracle ever saw it, so routing the probe through `execute()` would leave this test
-    # green even if the transaction HAD lapsed -- the outer layer masking the very failure this
-    # test exists to catch. ORA-01456 is the inner layer answering, which is the assertion.
-    cur = a._cursor()
-    try:
-        with pytest.raises(oracledb.DatabaseError, match="ORA-01456"):
-            cur.execute("INSERT INTO t_claim VALUES (3, 1, 300)")
-    finally:
-        cur.close()
+    # The commit and the probe must be on the SAME leased connection, or this tests nothing: a
+    # commit on one pooled connection says nothing about the transaction state of another, and
+    # the probe would pass because it got a fresh session rather than because the safeguard was
+    # re-entered. Under the single-connection design that was automatic; pooled, it is the whole
+    # setup.
+    with a._lease() as con:
+        con.commit()  # the boundary that would end a construction-time SET TRANSACTION
+
+        # Through `_cursor()`, NOT `execute()`. The adapter's read-only gate would refuse this
+        # INSERT before Oracle ever saw it, so routing the probe through `execute()` would leave
+        # this test green even if the transaction HAD lapsed -- the outer layer masking the very
+        # failure this test exists to catch. ORA-01456 is the inner layer answering.
+        cur = a._cursor(con)
+        try:
+            with pytest.raises(oracledb.DatabaseError, match="ORA-01456"):
+                cur.execute("INSERT INTO t_claim VALUES (3, 1, 300)")
+        finally:
+            cur.close()
 
 
 def test_a_writable_adapter_commits_so_the_row_survives_the_connection():
@@ -256,7 +265,13 @@ def test_a_bounded_query_does_not_leak_its_timeout_onto_the_connection():
     """
     a = _adapter()
     a.execute_arrow("SELECT 1 FROM dual", timeout_s=5)
-    assert a._con.call_timeout == 0, "the bounded query left its timeout on the connection"
+    # Pooled, the question is not "is this adapter's one connection still bounded" but "does the
+    # next BORROWER get a bounded connection" -- and that is load-bearing rather than tidy:
+    # measured, `call_timeout` SURVIVES release and re-acquire, so a driver that reset it would
+    # make this assertion vacuous and it does not. A leak here bounds an unrelated later request
+    # that nobody could attribute to this one.
+    with a._lease() as con:
+        assert con.call_timeout == 0, "a bounded query left its timeout on the pooled connection"
 
 
 def test_the_timeout_is_not_left_behind_when_the_cursor_cannot_be_acquired():
@@ -268,15 +283,19 @@ def test_the_timeout_is_not_left_behind_when_the_cursor_cannot_be_acquired():
     connection. Failing `_cursor()` while the connection stays alive is what actually tests it.
     """
     a = _adapter()
-    before = a._con.call_timeout
 
-    def boom():
+    def boom(_con):
         raise RuntimeError("cursor acquisition failed")
 
     a._cursor = boom
     with pytest.raises(RuntimeError):
         a.execute_arrow("SELECT 1 FROM dual", timeout_s=5)
-    assert a._con.call_timeout == before, "a failed acquisition changed the connection's timeout"
+    # The lease's `finally` is what covers this now, rather than a save/restore that had to be
+    # correct on every path. The connection went back to the pool, so the assertion is about what
+    # the next borrower receives.
+    del a._cursor
+    with a._lease() as con:
+        assert con.call_timeout == 0, "a failed acquisition left the pooled connection bounded"
 
 
 # `test_a_read_only_adapter_cannot_read_a_table_created_this_instant` lived here and is REMOVED,
@@ -554,7 +573,7 @@ def test_a_principal_with_exempt_access_policy_is_refused(vpd, exempt_principal)
         assert verdict == "bypassing"
         assert "EXEMPT ACCESS POLICY" in reason
     finally:
-        a._con.close()  # DROP USER in teardown fails while this session is open
+        a.close()  # DROP USER in teardown fails while this session is open
 
 
 @needs_admin
@@ -578,7 +597,7 @@ def test_a_sysdba_connection_is_refused(vpd):
         verdict, _ = a.assert_enforcing()
         assert verdict == "bypassing"
     finally:
-        a._con.close()
+        a.close()
 
 
 def test_a_policy_that_does_not_apply_to_select_is_not_counted_as_governing(vpd):
@@ -669,9 +688,9 @@ def test_full_coverage_reports_attached():
         assert "all 1 visible tables" in reason
         assert "not proof of enforcement" in reason.lower(), \
             "even full coverage must disclaim: an inert policy function is reported enabled"
-        reader._con.close()
+        reader.close()
     finally:
-        owner._con.close()
+        owner.close()
         try:
             _drop_user(cur, "t_full")
         finally:
@@ -729,17 +748,19 @@ def test_the_real_drivers_ora_01466_is_recognised_by_the_retrys_predicate(vpd):
     from mnemiq.adapters.oracle import _is_ddl_race
 
     vpd("T_WEST_F")  # re-attach: the read below must land in the window this opens
-    cur = _adapter()._cursor()  # deliberately NOT _with_cursor: we want the raw failure
-    try:
-        cur.execute("SELECT count(*) FROM t_vpd")
-        cur.fetchall()
-        pytest.skip("the DDL race did not fire on this run; nothing to inspect")
-    except oracledb.DatabaseError as exc:
-        assert _is_ddl_race(exc), f"the retry would not have recognised this: {exc}"
-        assert exc.args[0].full_code == "ORA-01466"
-        assert exc.args[0].code == 1466
-    finally:
-        cur.close()
+    a = _adapter()
+    with a._lease() as con:
+        cur = a._cursor(con)  # deliberately NOT _with_cursor: we want the raw failure
+        try:
+            cur.execute("SELECT count(*) FROM t_vpd")
+            cur.fetchall()
+            pytest.skip("the DDL race did not fire on this run; nothing to inspect")
+        except oracledb.DatabaseError as exc:
+            assert _is_ddl_race(exc), f"the retry would not have recognised this: {exc}"
+            assert exc.args[0].full_code == "ORA-01466"
+            assert exc.args[0].code == 1466
+        finally:
+            cur.close()
 
 
 # -- read_only against DDL, and the proof seam ---------------------------------------------------
@@ -872,7 +893,8 @@ def test_concurrent_reads_through_one_adapter_do_not_corrupt_each_other():
 
     assert errors == []
     assert set(counts) == {1}, "every read must see the same committed state"
-    assert a._con.call_timeout == 0, "a bounded query must not leave the connection bounded"
+    with a._lease() as con:
+        assert con.call_timeout == 0, "a bounded query must not leave a pooled connection bounded"
 
 
 def test_the_read_only_gate_does_not_stop_a_write_reached_through_plsql():
@@ -993,7 +1015,7 @@ def test_assert_read_only_sees_dml_granted_through_a_role():
         )
     finally:
         if probe is not None:
-            probe._con.close()
+            probe.close()
         try:
             cur.execute("DROP ROLE writer_role")
         except oracledb.DatabaseError:
@@ -1109,7 +1131,7 @@ def test_assert_read_only_tracks_every_route_by_which_a_principal_can_write():
         )
     finally:
         for a in made:
-            a._con.close()
+            a.close()
         for name in users:
             _drop_user(cur, name)
         try:
@@ -1179,7 +1201,7 @@ def test_a_definer_rights_view_writes_for_a_principal_with_only_select():
         assert probe.assert_read_only()[0] == "unverifiable"
     finally:
         if probe is not None:
-            probe._con.close()
+            probe.close()
         _drop_user(cur, "v_reader")
         cur.close()
         admin.close()
@@ -1220,7 +1242,7 @@ def test_a_tns_alias_resolves_through_the_config_dir(tmp_path):
             "the alias must reach the same database as the Easy Connect path"
         )
     finally:
-        aliased._con.close()
+        aliased.close()
 
     with pytest.raises(oracledb.DatabaseError, match="DPY-4027"):
         OracleAdapter(dsn="mnemiq_alias", user=USER, password=PASSWORD)
@@ -1271,9 +1293,24 @@ def test_a_reader_on_another_owners_schema_can_actually_read_it():
         assert profile_outcome(snap)[0] != "unread"
         assert any(c.object_id == "X_ORDERS" for c in snap.columns)
         assert prove(probe, 'SELECT count(*) FROM "X_ORDERS"') is None
+
+        # EVERY pooled session, not just the first. `CURRENT_SCHEMA` is session state applied by
+        # the pool's `session_callback`, so a connection the pool creates later must get it too --
+        # otherwise the second concurrent request in this deployment fails ORA-00942 while the
+        # first succeeds, which is the intermittent shape that is hardest to diagnose. Two leases
+        # held at once forces a second physical session rather than reusing the first.
+        with probe._lease() as first, probe._lease() as second:
+            for con in (first, second):
+                cur2 = con.cursor()
+                cur2.execute("SELECT SYS_CONTEXT('USERENV','CURRENT_SCHEMA') FROM dual")
+                assert cur2.fetchall()[0][0] == USER.upper(), (
+                    "a pooled session did not get CURRENT_SCHEMA, so unqualified reads on it "
+                    "resolve against the connecting user"
+                )
+                cur2.close()
     finally:
         if probe is not None:
-            probe._con.close()
+            probe.close()
         _drop_user(cur, "x_reader")
         cur.close()
         admin.close()
@@ -1365,3 +1402,80 @@ def test_a_read_only_DATABASE_is_the_one_deployment_that_closes_the_plsql_hole()
                 w2.execute(stmt)
             except oracledb.DatabaseError:
                 pass
+
+
+def test_one_held_connection_does_not_stop_every_other_caller():
+    """**M72 itself.** A statement that holds a connection must not be an outage.
+
+    The previous design was one connection behind one `RLock`, so every caller queued behind
+    whichever request held it, with no deadline on the wait. The HTTP server builds one Runtime and
+    FastAPI runs sync endpoints on a worker threadpool, so a single stalled hard parse blocked
+    every worker.
+
+    This test cannot pass on that design and is not a timing heuristic: the holder keeps its lease
+    until the assertion has already been made, so on a serialised adapter the second caller waits
+    forever and the `wait(timeout=...)` returns False rather than the test being slow.
+    """
+    import threading
+
+    a = _adapter()
+    holding = threading.Event()
+    release = threading.Event()
+    done = threading.Event()
+
+    def hold():
+        with a._lease():
+            holding.set()
+            release.wait(timeout=30)
+
+    def other():
+        a.execute("SELECT 1 FROM dual")
+        done.set()
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    try:
+        assert holding.wait(timeout=10), "the holder never acquired a connection"
+        second = threading.Thread(target=other)
+        second.start()
+        assert done.wait(timeout=15), (
+            "a second caller could not run while one connection was held -- head-of-line blocking"
+        )
+        second.join(timeout=10)
+    finally:
+        release.set()
+        holder.join(timeout=10)
+
+
+def test_waiting_for_a_connection_is_bounded_rather_than_indefinite():
+    """Exhaustion must be an error a caller can see, not a hang nobody can attribute.
+
+    `getmode=TIMEDWAIT` plus `wait_timeout` is what makes that true; the default `WAIT` would block
+    forever, which is the old failure with extra steps. Measured on a max=1 pool.
+    """
+    import time
+
+    import oracledb
+
+    a = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, pool_max=1, acquire_timeout_s=1.0)
+    try:
+        with a._lease():  # the pool's only connection
+            t0 = time.monotonic()
+            with pytest.raises(oracledb.DatabaseError, match="DPY-4005"):
+                a.execute("SELECT 1 FROM dual")
+            waited = time.monotonic() - t0
+        assert waited < 10, f"the bounded wait took {waited:.1f}s, so it is not bounded by 1s"
+    finally:
+        a.close()
+
+
+def test_a_closed_pool_reports_a_source_that_cannot_answer():
+    """`close()` is idempotent, and a later call must look like an unavailable source rather than
+    a bug in this file -- DPY-1002 from the driver, the pooled counterpart of DPY-1001."""
+    import oracledb
+
+    a = _adapter()
+    a.close()
+    a.close()  # idempotent: the driver raises DPY-1002 on a second close of its own
+    with pytest.raises(oracledb.Error):
+        a.execute("SELECT 1 FROM dual")
