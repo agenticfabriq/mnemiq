@@ -40,6 +40,14 @@ export const REASONS: Record<DeferralReason, { title: string; next: string }> = 
     title: "Nothing retrieved for this question",
     next: "Rephrase it, or check that enrichment has run over this source.",
   },
+  undefined_term: {
+    // M35. Distinct from `unanswerable` because the caller's next move is different: the tables
+    // CAN answer it and nobody has said what the term means, so rephrasing is the one thing that
+    // will not work. Without this entry the card fell through to UNKNOWN and told the operator
+    // the code was unrecognised -- in exactly the case the engine had just added a code for.
+    title: "No certified definition for a term in the question",
+    next: "Certify a definition for the term named above, then ask again. Rephrasing will not help — the engine can read the data and does not know what the term means.",
+  },
   unanswerable: {
     title: "Not answerable from the tables in scope",
     next: "Ask about a column the data actually holds.",

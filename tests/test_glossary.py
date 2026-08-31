@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Definition
 from mnemiq.semantic.glossary import load_definitions, select_definitions
@@ -141,3 +143,172 @@ def test_an_unbound_standard_still_needs_its_term():
 
     assert select_definitions("what is an MPAA rating", [_standard()], grants, table_ids=["patient"])
     assert select_definitions("how many patients", [_standard()], grants, table_ids=["patient"]) == []
+
+
+def test_a_definition_with_no_name_at_all_matches_no_question():
+    """It used to match every one. The pattern for an empty term collapsed to a bare `\\b`, which
+    is true at the start of any word, so such a definition was offered on every packet regardless
+    of what was asked. `Definition.term` carries no non-empty constraint, so the shape is
+    constructible.
+
+    A definition with NO name -- no term and no legible id tail -- is retrievable only by riding
+    with a table it is bound to. One that has a term-less id is named by that tail; see
+    `test_a_definition_named_only_by_its_id_is_still_retrievable`.
+    """
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract.semantic import Definition
+    from mnemiq.semantic.glossary import select_definitions
+
+    nameless = Definition(id="", term="", domain="fspay",
+                          definition="incurred losses over earned premium",
+                          bound_objects=["fs.payments"])
+    grants = GrantSet(objects=frozenset({"fs.payments"}))
+    assert select_definitions("loss ratio, revenue, anything", [nameless], grants) == []
+    rides = select_definitions("anything at all", [nameless], grants, ["fs.payments"])
+    assert rides == [nameless], (
+        "it still rides with the table it is bound to"
+    )
+
+
+def test_a_definition_named_only_by_its_id_is_still_retrievable():
+    """A record may carry its name in `id` rather than in `term`, so the tail is a name for those
+    -- and for those only, since a definition that HAS a term is certified under that term alone.
+
+    Retrieval once matched on `term` and nothing else while the M35 guard accepted the tail, so
+    such a definition was never put in the packet and the guard, finding nothing to ground against,
+    deferred an answerable question. Both now read `spellings`, which is the one list."""
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract.semantic import Definition
+    from mnemiq.generate.undefined_terms import ungrounded_terms
+    from mnemiq.semantic.glossary import select_definitions
+
+    by_id = Definition(id="fspay:policy:loss_ratio", term="", domain="fspay",
+                       definition="incurred losses over earned premium",
+                       bound_objects=["fs.payments"])
+    grants = GrantSet(objects=frozenset({"fs.payments"}))
+    retrieved = select_definitions("what is our loss ratio", [by_id], grants)
+    assert retrieved == [by_id], "the id's tail is a name a question can use"
+    assert ungrounded_terms(["loss ratio"], retrieved) == [], (
+        "and what retrieval found, the guard must ground"
+    )
+    assert select_definitions("what is our revenue", [by_id], grants) == []
+
+
+def test_a_short_id_tail_is_not_a_word_that_matches_everything():
+    """An id tail is an identifier, not prose, so it does not get prose's inflection tolerance.
+
+    Under the wide width a definition whose tail is `a` was selected by "what is our average
+    revenue" -- `a` plus `\\w*` -- and `re` and `rev` behaved the same, putting an unrelated
+    definition in every packet. Nothing certified is lost by narrowing it: a definition that wants
+    prose tolerance has a `term`, which is what a term is for."""
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract.semantic import Definition
+    from mnemiq.semantic.glossary import select_definitions
+
+    short = Definition(id="fspay:policy:a", term="", domain="fspay", definition="a thing",
+                       bound_objects=["fs.payments"])
+    grants = GrantSet(objects=frozenset({"fs.payments"}))
+    assert select_definitions("what is our average revenue and churn", [short], grants) == []
+
+    prose = Definition(id="fspay:policy:x", term="premium", domain="fspay",
+                       definition="the premium", bound_objects=["fs.payments"])
+    assert select_definitions("total premiums by month", [prose], grants) == [prose], (
+        "a term keeps prose tolerance"
+    )
+
+
+def test_a_record_naming_itself_by_name_or_label_is_prose_too():
+    """The width follows what KIND of name it is, not which attribute happened to be read.
+
+    `spellings` answers to `name` and `label` as well as `term`, for corpora that spell it those
+    ways, and those are prose. An earlier version picked the width by re-reading `definition.term`,
+    so a record named by `name` fell through to the identifier width and lost inflection tolerance
+    -- and nothing failed, because no in-repo record uses the field. `Name.prose` carries the
+    answer out of the one place that decides it.
+    """
+    from mnemiq.semantic.glossary import Name, spellings, term_pattern
+
+    class Labelled:
+        id = "fspay:policy:z"
+        name = "loss ratio"
+
+    assert spellings(Labelled()) == [Name("loss ratio", prose=True)]
+    assert term_pattern("loss ratio").search("compare loss ratios by month"), (
+        "a prose name inflects"
+    )
+
+    class ById:
+        id = "fspay:policy:loss_ratio"
+        term = ""
+
+    assert spellings(ById()) == [Name("loss ratio", prose=False)]
+
+
+@pytest.mark.parametrize("term", ["ROI (%)", "EBITDA (adjusted)", "C++", "margin %"])
+def test_a_term_ending_in_punctuation_can_match_itself(term):
+    """A certified term could not be retrieved by its own name.
+
+    The anchors were `\\b`, which asserts a word/non-word TRANSITION -- so it cannot hold next to a
+    term ending in punctuation: after the `)` of `ROI (%)` there is no word character for the
+    boundary to sit against, and `\\bROI\\s+\\(%\\)\\w*\\b` does not match the string `ROI (%)`.
+    Retrieval dropped such a definition on the always-on path and the M35 guard called the term
+    ungrounded, both silently, and business glossaries are full of these.
+
+    `(?<!\\w)` / `(?!\\w)` assert only that the match is not glued to more word characters, which is
+    the property that was actually wanted. Found by an adversarial review, not by this suite --
+    every test here used bare alphabetic terms.
+    """
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract.semantic import Definition
+    from mnemiq.generate.undefined_terms import ungrounded_terms
+    from mnemiq.semantic.glossary import select_definitions, term_pattern
+
+    assert term_pattern(term).search(term), "a term must match its own spelling"
+
+    d = Definition(id="fspay:policy:x", term=term, domain="fspay", definition="a certified thing",
+                   bound_objects=["fs.payments"])
+    grants = GrantSet(objects=frozenset({"fs.payments"}))
+    assert select_definitions(f"what is our {term} this quarter", [d], grants) == [d]
+    assert ungrounded_terms([term], [d]) == [], "and the guard must ground it"
+
+
+def test_the_narrow_width_still_will_not_match_inside_a_word():
+    """The property the anchors were added for, kept while punctuation was let through: an id tail
+    of `a` must not match the `a` that starts "average". `(?!\\w)` fails there because `v` is a word
+    character, which is the same reason `\\b` did."""
+    from mnemiq.semantic.glossary import INFLECTION_PLURAL, term_pattern
+
+    assert not term_pattern("a", INFLECTION_PLURAL).search("what is our average revenue")
+    assert term_pattern("a", INFLECTION_PLURAL).search("give me a number")
+
+
+@pytest.mark.parametrize(
+    "term,question",
+    [("C+", "we write C++ here"), ("margin %", "margin %% is odd"), ("C++", "C+++ is not a thing")],
+)
+def test_a_punctuation_run_is_one_token_not_a_prefix(term, question):
+    """The one property `\\b` gave for free that a bare `(?!\\w)` does not.
+
+    `\\b` needs a word/non-word transition, so a term ending in punctuation could never sit inside
+    a longer run of it. Swapping to `(?!\\w)` to let `ROI (%)` match itself also let `C+` match
+    inside `C++` and `margin %` inside `margin %%` -- so retrieval, which uses `search`, offered
+    one term's definition on a question naming a different one. Grounding was safe because it uses
+    `fullmatch`; the always-on path was not.
+
+    A run of the SAME character is one token. A different character after it is a delimiter, which
+    is why only the repeat is forbidden and `margin %.` still matches in a sentence.
+    """
+    from mnemiq.semantic.glossary import term_pattern
+
+    assert not term_pattern(term).search(question)
+    assert term_pattern(term).search(f"our {term} today"), "the term still matches itself"
+
+
+def test_sentence_punctuation_after_a_punctuation_term_still_matches():
+    """The false negative the narrow rule must not create: `.` after `margin %` ends a sentence,
+    it does not continue the term."""
+    from mnemiq.semantic.glossary import term_pattern
+
+    assert term_pattern("margin %").search("the margin %.")
+    assert term_pattern("ROI (%)").search("our ROI (%) rose")
+    assert term_pattern("revenue").search("our revenue.")

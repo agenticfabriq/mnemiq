@@ -64,7 +64,12 @@ def main() -> int:
     )
     embedder = LLMEmbedder(settings)
 
-    packet = retrieve(con, question, identity, authz, embedder, k=5)
+    # The certified corpus is the guard's THIRD leg: the prompt asks, the engine checks, and
+    # `packet.definitions` is what it checks AGAINST. `retrieve` defaults it to `()`, so with
+    # the guard on this script refused every declared term -- including terms the loaded
+    # snapshot certifies. Fed the same way the runtime feeds it.
+    packet = retrieve(con, question, identity, authz, embedder, k=5,
+                      definitions=snapshot.definitions if snapshot else ())
     print(f"retrieved: {[c.object_id for c in packet.cards]}")
 
     adapter = DuckDBPostgresAdapter(settings.pg_dsn) if settings.pg_dsn else None
@@ -72,9 +77,11 @@ def main() -> int:
         packet,
         snapshot,
         authz.grants_for(identity),
-        LLMGenerator(LLMClient(settings)),
+        LLMGenerator(LLMClient(settings),
+                     declare_assumed_terms=settings.guard_undefined_terms),
         adapter=adapter,
         target="duckdb",
+        guard_undefined_terms=settings.guard_undefined_terms,
     )
 
     if isinstance(outcome, Deferred):

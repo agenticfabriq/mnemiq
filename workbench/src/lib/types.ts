@@ -16,6 +16,7 @@ export type DeferralReason =
   | "policy_unavailable"
   | "no_tables"
   | "unanswerable"
+  | "undefined_term"
   | "invalid_query"
   | "verification"
   | "disagreement"

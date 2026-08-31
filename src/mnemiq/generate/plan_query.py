@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import DeferralReason, Snapshot
+from mnemiq.generate.undefined_terms import ungrounded_terms
 from mnemiq.generate.generator import Generator
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.decide import decide
@@ -40,6 +41,7 @@ def plan_query(
     feedback: str | None = None,
     corrector=None,
     values=None,
+    guard_undefined_terms: bool = False,
 ) -> Outcome:
     """Propose, decide, repair -- and defer rather than guess.
 
@@ -85,6 +87,57 @@ def plan_query(
 
     for _attempt in range(max_attempts):
         proposal = generator.propose(packet, feedback)
+
+        # M35, and OFF BY DEFAULT -- withdrawn on its own pre-registered criterion.
+        #
+        # The rule: a term the model had to ASSUME a meaning for, with nothing certified behind
+        # it, is a question the data cannot answer however plausible the SQL looks. Checked before
+        # the SQL is decided, because the SQL is what makes it look answerable -- it parses, it
+        # runs, it returns rows -- and the guard the engine already had is "no such column", which
+        # cannot see a term whose derivation is spelled from columns that all exist.
+        #
+        # It works on the item it was built for: `lifetime value` defers with a reason naming the
+        # term, where the engine used to answer with an invented derivation 4 times in 6.
+        #
+        # It is off because of what it costs. Beacon's answerable band, one pass over 24 items at
+        # `30632b9` (run 06a95802-d794-7a2b-8000-ead4e3573b73): **12 deferrals**, against a prior
+        # of 0 in 144 observations. Strict accuracy 66.7% -> 45.8%. The threshold named in advance
+        # was 2-3%, with "pull it rather than tune it" written down before the number was seen.
+        #
+        # Two causes, and only the smaller one is fixable here. Some refusals are containment --
+        # `total revenue` declared against a certified `revenue` -- which grounding could discharge
+        # if a phrase containing a defined term counted as that term. It must not: "revenue per
+        # customer" is a DERIVATION over a certified term and is the exact shape M35 is about, so
+        # discharging containment silences the guard on its own finding.
+        #
+        # The rest is the declaration itself. The model declared `data` ("which currencies appear
+        # in the data"), `processed`, `take in`, `fourth quarter of 2025` and `merchants` as terms
+        # requiring a certified definition. No glossary defines those, and none ever will. The
+        # 2026-08-13 review killed the DETERMINISTIC version of this on the sentence "two
+        # consecutive words absent from a schema vocabulary is the normal condition of a sentence,
+        # not a signal" -- and the same failure arrived through the model-declared version, which
+        # was built specifically to route around it. Even discounting every containment case, the
+        # residual is ~29%, an order of magnitude past the line.
+        #
+        # Kept, not deleted, because the mechanism is proven on ltv and the failure is in the
+        # DECLARATION's scope rather than in the engine keeping the decision. Reviving it means a
+        # narrower thing for the model to declare, and a new measurement -- not a prompt tweak.
+        missing = (
+            ungrounded_terms(proposal.assumed_terms, packet.definitions)
+            if guard_undefined_terms
+            else []
+        )
+        if missing:
+            return Deferred(
+                reason=(
+                    "No certified definition for "
+                    + ", ".join(repr(t) for t in missing)
+                    + ". The data does not say how to compute it, so any answer would be a guess "
+                    "at your business rule rather than a reading of your data."
+                ),
+                code=DeferralReason.UNDEFINED_TERM,
+            )
+
         if proposal.sql is None:
             return Deferred(
                 reason=proposal.reason or "The model could not answer from these tables.",

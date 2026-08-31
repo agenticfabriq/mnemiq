@@ -153,6 +153,10 @@ def build_engine(
         values=kit.values,
         selector=kit.selector if candidates > 1 else None,
         verifier=verifier,
+        # M35, off by default. Without this the eval path could pay for the declaration -- the
+        # generator asks for it from the same setting -- and never read it, which is precisely the
+        # harness the withdrawal says a revival has to be measured through.
+        guard_undefined_terms=settings.guard_undefined_terms,
     )
 
     # k=12 measured +2.3 strict / +2.3 facts over k=6 (recall probe: k=12 -> 100% gold-table
