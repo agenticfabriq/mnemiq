@@ -179,9 +179,16 @@ def test_the_two_matchers_agree_on_the_corpus_they_both_read():
     # Bound and granted, which is how a policy definition is actually visible: `public` is False
     # by default and an unbound non-public definition is visible to no one, so `_defs()` as written
     # retrieves nothing and the comparison would pass on an empty set.
-    bound = [d.model_copy(update={"bound_objects": ["fs.payments"]}) for d in _defs()]
+    bound = [d.model_copy(update={"bound_objects": ["fs.payments"]}) for d in _defs()] + [
+        # `policy` -> `policies` is the pairing that had NEITHER matcher: retrieval missed the
+        # definition and grounding refused the term. Listed here rather than only in its own test
+        # because this is the test whose job is that the two stay agreed -- dropping the `-ies`
+        # branch from retrieval's width alone must not leave the suite green.
+        Definition(id="fspay:policy:policy", term="policy", domain="fspay",
+                   definition="a written contract", bound_objects=["fs.payments"]),
+    ]
     grants = GrantSet(objects=frozenset({"fs.payments"}))
-    for spelling in ("total payments", "revenues", "payment dates"):
+    for spelling in ("total payments", "revenues", "payment dates", "policies"):
         retrieved = select_definitions(spelling, bound, grants)
         assert retrieved, f"retrieval finds a definition for {spelling!r}"
         assert ungrounded_terms([spelling], retrieved) == [], (

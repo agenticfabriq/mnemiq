@@ -59,7 +59,12 @@ def term_pattern(term: str, inflection: str = INFLECTION_ANY) -> re.Pattern[str]
     """
     words = term.split()
     if not words:
-        return re.compile(r"\b", re.IGNORECASE)
+        # Matches NOTHING. The previous expression collapsed to a bare `\b`, which matches every
+        # question, so a definition with `term=""` was offered on every packet -- and that shape is
+        # in this corpus, since a record may carry its name in `id` alone and `Definition.term`
+        # has no non-empty constraint. A definition with nothing to match on has one honest way to
+        # be retrieved, which is to ride with a table it is bound to.
+        return re.compile(r"(?!)")
     head = [re.escape(w) for w in words[:-1]]
     body = r"\s+".join(head + [_last_word(words[-1], inflection)])
     return re.compile(rf"\b{body}", re.IGNORECASE)

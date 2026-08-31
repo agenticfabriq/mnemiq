@@ -141,3 +141,23 @@ def test_an_unbound_standard_still_needs_its_term():
 
     assert select_definitions("what is an MPAA rating", [_standard()], grants, table_ids=["patient"])
     assert select_definitions("how many patients", [_standard()], grants, table_ids=["patient"]) == []
+
+
+def test_a_definition_with_no_term_matches_no_question():
+    """It used to match every one. The pattern for an empty term collapsed to a bare `\\b`, which
+    is true everywhere, so a record carrying its name in `id` alone -- a shape this corpus has,
+    and one `Definition` permits since `term` has no non-empty constraint -- was offered on every
+    packet regardless of what was asked. A definition with nothing to match on has one honest route
+    into a packet, which is riding with a table it is bound to."""
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract.semantic import Definition
+    from mnemiq.semantic.glossary import select_definitions
+
+    nameless = Definition(id="fspay:policy:loss_ratio", term="", domain="fspay",
+                          definition="incurred losses over earned premium",
+                          bound_objects=["fs.payments"])
+    grants = GrantSet(objects=frozenset({"fs.payments"}))
+    assert select_definitions("what is our revenue", [nameless], grants) == []
+    assert select_definitions("anything at all", [nameless], grants, ["fs.payments"]) == [nameless], (
+        "it still rides with the table it is bound to"
+    )
