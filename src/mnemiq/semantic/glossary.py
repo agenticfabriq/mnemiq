@@ -75,7 +75,11 @@ def term_pattern(term: str, inflection: str = INFLECTION_ANY) -> re.Pattern[str]
         return re.compile(r"(?!)")
     head = [re.escape(w) for w in words[:-1]]
     body = r"\s+".join(head + [_last_word(words[-1], inflection)])
-    return re.compile(rf"\b{body}", re.IGNORECASE)
+    # Boundaries at BOTH ends. Only the leading one was there, so a match could end mid-word: at
+    # the plural width the tail `a` matched inside "average", putting that definition in every
+    # packet. `\w*` hid it by consuming to the end of whatever word it landed in, which is why the
+    # missing boundary surfaced only when a narrower width was introduced.
+    return re.compile(rf"\b{body}\b", re.IGNORECASE)
 
 
 def spellings(definition: Any) -> list[str]:
@@ -113,7 +117,19 @@ def spellings(definition: Any) -> list[str]:
 
 
 def _asked_for(definition: Definition, question: str) -> bool:
-    return any(term_pattern(s).search(question) for s in spellings(definition))
+    """Whether the question names this definition.
+
+    A TERM is prose and gets prose's tolerance: `premium` should retrieve on "premiums". An id
+    TAIL is not prose -- it is an identifier that happens to be legible -- and giving it `\w*`
+    made a short one match nearly everything: a definition whose tail is `a` was selected by "what
+    is our average revenue", and `re`, `rev` likewise, so an unrelated definition appeared in every
+    packet. The tail is matched at the plural width instead. Nothing certified is lost by that; a
+    definition wanting prose tolerance has a `term`, which is what a term is for.
+    """
+    term = definition.term if isinstance(definition.term, str) else ""
+    if term.strip():
+        return bool(term_pattern(normalized(term)).search(question))
+    return any(term_pattern(s, INFLECTION_PLURAL).search(question) for s in spellings(definition))
 
 
 def select_definitions(
@@ -139,8 +155,11 @@ def select_definitions(
     matched no realistic question, so under term-matching alone they could never be retrieved
     however true they were.
 
-    An UNBOUND definition keeps the name-match rule -- its `term`, or the tail of its `id` when
-    it has no term (`spellings`). A public standard belongs to no table, so it
+    An UNBOUND definition keeps the name-match rule -- its `term`, or the tail of its `id` when it
+    has no term (`spellings`). The name is normalized before matching, so an underscored
+    `term="total_payment"` is retrieved by a question saying "total payment" and no longer by one
+    saying `total_payment`; nobody writes the underscored form into a sentence, and the same
+    normalization is what lets the M35 guard ground against the same corpus. A public standard belongs to no table, so it
     has no table to ride with, and matching the asker's words is the right rule for something
     looked up by name.
     """

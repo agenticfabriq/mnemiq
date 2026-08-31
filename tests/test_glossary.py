@@ -168,11 +168,12 @@ def test_a_definition_with_no_name_at_all_matches_no_question():
 
 
 def test_a_definition_named_only_by_its_id_is_still_retrievable():
-    """`generate.undefined_terms._spoken` already grounds a declared term against the tail of a
-    definition's `id`, because a record may carry its name there rather than in `term`. Retrieval
-    matched on `term` alone, so such a definition was never put in the packet -- and the guard,
-    finding nothing to ground against, deferred an answerable question. One corpus, two rules,
-    pointing the same way as the tolerance-width split did."""
+    """A record may carry its name in `id` rather than in `term`, so the tail is a name for those
+    -- and for those only, since a definition that HAS a term is certified under that term alone.
+
+    Retrieval once matched on `term` and nothing else while the M35 guard accepted the tail, so
+    such a definition was never put in the packet and the guard, finding nothing to ground against,
+    deferred an answerable question. Both now read `spellings`, which is the one list."""
     from mnemiq.authz.grants import GrantSet
     from mnemiq.contract.semantic import Definition
     from mnemiq.generate.undefined_terms import ungrounded_terms
@@ -188,3 +189,26 @@ def test_a_definition_named_only_by_its_id_is_still_retrievable():
         "and what retrieval found, the guard must ground"
     )
     assert select_definitions("what is our revenue", [by_id], grants) == []
+
+
+def test_a_short_id_tail_is_not_a_word_that_matches_everything():
+    """An id tail is an identifier, not prose, so it does not get prose's inflection tolerance.
+
+    Under the wide width a definition whose tail is `a` was selected by "what is our average
+    revenue" -- `a` plus `\\w*` -- and `re` and `rev` behaved the same, putting an unrelated
+    definition in every packet. Nothing certified is lost by narrowing it: a definition that wants
+    prose tolerance has a `term`, which is what a term is for."""
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract.semantic import Definition
+    from mnemiq.semantic.glossary import select_definitions
+
+    short = Definition(id="fspay:policy:a", term="", domain="fspay", definition="a thing",
+                       bound_objects=["fs.payments"])
+    grants = GrantSet(objects=frozenset({"fs.payments"}))
+    assert select_definitions("what is our average revenue and churn", [short], grants) == []
+
+    prose = Definition(id="fspay:policy:x", term="premium", domain="fspay",
+                       definition="the premium", bound_objects=["fs.payments"])
+    assert select_definitions("total premiums by month", [prose], grants) == [prose], (
+        "a term keeps prose tolerance"
+    )
