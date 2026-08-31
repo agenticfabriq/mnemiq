@@ -576,6 +576,12 @@ def test_one_setting_reaches_both_ends_of_the_guard():
     consume the flag -- the prompt the model is sent, and the schema the request carries. A test
     that only checks the on-path cannot see a hop that ignores its argument, and a test that calls
     `system_prompt` directly is reading the call site rather than exercising it.
+
+    **Known gap.** `eval.engine.build_engine` builds its own `Agent` rather than going through
+    `build_agent`, and it is not covered here -- its only test caller is skipped without a live
+    key. Deleting its kwarg returns the eval harness to paying for the declaration and not reading
+    it, with this suite green. Closing that properly means the construction going through
+    `build_agent` like every other one, which is a refactor, not a test.
     """
     import duckdb
 
