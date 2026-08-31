@@ -174,8 +174,11 @@ def select_definitions(
     matched no realistic question, so under term-matching alone they could never be retrieved
     however true they were.
 
-    An UNBOUND definition keeps the name-match rule -- its `term`, or the tail of its `id` when it
-    has no term (`spellings`). The name is normalized before matching, so an underscored
+    Everything else keeps the name-match rule -- its `term`, or the tail of its `id` when it has no
+    term (`spellings`). That is two classes and not three: a bound definition whose table missed
+    the retrieval cut, and a public one. NOT "an unbound definition", which this docstring used to
+    say ten lines under the paragraph that disproves it -- an unbound non-public definition fails
+    `bool(bound_objects)` above and is visible to no one, so no matcher ever sees it. The name is normalized before matching, so an underscored
     `term="total_payment"` is retrieved by a question saying "total payment" and no longer by one
     saying `total_payment`; nobody writes the underscored form into a sentence, and the same
     normalization is what lets the M35 guard ground against the same corpus. A public standard belongs to no table, so it
