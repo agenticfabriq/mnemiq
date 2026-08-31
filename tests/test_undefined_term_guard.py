@@ -649,9 +649,13 @@ def test_every_agent_construction_passes_the_flag():
     disconnected while their author was watching for exactly that failure.
 
     **The scan fails closed**, because a scanner that finds nothing is the same silent inertness
-    one level up. It asserts it FOUND the known sites; it counts `**kwargs` as not passing the flag,
-    since a config-driven site is the likeliest next one and `Agent(**cfg)` proves nothing; and it
-    resolves import aliases, so `Agent as _A` cannot rename its way out.
+    one level up. It pins the exact set of files it expects to match -- not a count, which a site
+    that stopped matching could still clear by being replaced with a new one; it counts `**kwargs`
+    as not passing the flag, since a config-driven site is the likeliest next one and `Agent(**cfg)`
+    proves nothing; and it resolves import aliases, so `Agent as _A` cannot rename its way out.
+
+    Pinning the set means a legitimate new construction site fails this test. That is intended: it
+    is a two-line edit here and a reminder to pass the flag, which is the whole point.
     """
     import ast
     import pathlib
@@ -686,9 +690,19 @@ def test_every_agent_construction_passes_the_flag():
                 if "guard_undefined_terms" not in {kw.arg for kw in node.keywords}:
                     missing.append(where)
 
-    assert len(found) >= 3, (
-        f"the scan must SEE the known construction sites; it found {found}. A scanner that "
-        "matches nothing passes vacuously, which is the failure this test exists to catch"
+    # The exact set, not a floor. A floor of three still clears when one known site stops matching
+    # -- rebound through an assignment, or moved to a directory outside these roots -- and the
+    # dropped site goes unchecked while the test stays green.
+    expected = {
+        "src/mnemiq/runtime.py",
+        "src/mnemiq/agent/modes.py",
+        "src/mnemiq/eval/engine.py",
+        "scripts/answer.py",
+    }
+    assert {f.split(":")[0] for f in found} == expected, (
+        f"the set of Agent construction sites changed; the scan matched {sorted(found)}. If this "
+        "is a new site, add it here AND pass guard_undefined_terms. If a known one vanished, the "
+        "scan stopped seeing it and this invariant is no longer guarding it"
     )
     assert missing == [], (
         "every Agent/build_agent construction must pass guard_undefined_terms explicitly, or the "
