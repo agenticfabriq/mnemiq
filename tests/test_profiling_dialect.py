@@ -448,3 +448,81 @@ def test_the_all_unknown_log_describes_what_was_actually_checked(caplog):
         profile_table(_fails_with(lambda: _OraError(22849, "type")), _table(("A", "T")))
     assert "can sort" not in caplog.text
     assert "known column-type error" in caplog.text
+
+
+# -- M73: the cause of an unmeasured column, recorded rather than logged -------------------------
+
+
+class _OneColumnFails:
+    """Counts everything except BAD, which fails on ORA-01652 -- temp space, a SYSTEMIC cause.
+
+    Systemic matters: the per-column fallback re-raises only when NOTHING measured AND the cause
+    is systemic, so a single systemic failure alongside a success is precisely the case that keeps
+    the table and loses the column quietly.
+    """
+
+    dialect = "oracle"
+
+    class DatabaseError(Exception):
+        # Renders the way `oracledb` renders -- "ORA-01652: ..." -- because the code under test
+        # stores `str(exc)` as the recorded cause. A fake whose __str__ prints the args tuple
+        # would have made the assertion about the CAUSE pass or fail for reasons that have
+        # nothing to do with the code.
+        def __str__(self):
+            return f"{self.args[0].full_code}: {self.args[1]}"
+
+    def __init__(self, bad: str = "BAD", code: int = 1652):
+        self.bad, self.code = bad, code
+
+    def _err(self):
+        class _E:
+            pass
+        e = _E()
+        e.code, e.full_code = self.code, f"ORA-{self.code:05d}"
+        exc = self.DatabaseError(e, "unable to extend temp segment")
+        exc.args = (e, "unable to extend temp segment")
+        return exc
+
+    def execute(self, sql):
+        u = sql.upper()
+        if f'"{self.bad}"' in sql and "COUNT(DISTINCT" in u:
+            raise self._err()
+        if u.startswith("SELECT COUNT(*) FROM"):
+            return [(100,)]
+        if u.startswith("SELECT COUNT(DISTINCT"):
+            return [(5, 100)]
+        if "COUNT(DISTINCT" in u and "GROUP BY" not in u:
+            return [tuple([100] + [5, 100] * sql.count("count(DISTINCT"))]
+        return [("a", 4)]
+
+
+def test_a_failed_column_and_an_unsupported_column_stop_looking_identical():
+    """**M73.** Both carry `distinct_count=None`; only one of them is a problem.
+
+    A CLOB cannot be counted by the source and never will be -- nothing to fix, nothing to retry.
+    A column that lost its measurement to temp space is a gap in the model that a retry might
+    close. They were the same two `None`s, and the difference lived only in a log line.
+    """
+    stats = {s.column: s for s in profile_table(
+        _OneColumnFails(), _table(("GOOD", "NUMBER"), ("BAD", "NUMBER"), ("BLOB_C", "CLOB")))}
+
+    assert stats["GOOD"].measurement == "measured"
+    assert stats["GOOD"].distinct_count == 5
+
+    assert stats["BAD"].distinct_count is None and stats["BLOB_C"].distinct_count is None, (
+        "precondition: the two carry the same counts, which is why the field exists"
+    )
+    assert stats["BAD"].measurement == "failed"
+    assert "ORA-01652" in stats["BAD"].failure, "the CAUSE, not just the fact"
+    assert stats["BLOB_C"].measurement == "unsupported"
+    assert stats["BAD"].measurement != stats["BLOB_C"].measurement
+
+
+def test_a_recognised_type_error_on_one_column_is_unsupported_not_failed():
+    """The classification is the same one the re-raise uses, so the two cannot disagree: a column
+    excluded by the denylist and a column that raised a known type error are the same fact, and
+    ORA-22849 on a LOB is not a failure to report to anybody."""
+    stats = {s.column: s for s in profile_table(
+        _OneColumnFails(bad="LOBBY", code=22849), _table(("GOOD", "NUMBER"), ("LOBBY", "NUMBER")))}
+    assert stats["LOBBY"].measurement == "unsupported", (
+        "a known column-type error is not a systemic failure and must not be reported as one")

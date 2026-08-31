@@ -155,3 +155,115 @@ def test_a_partial_run_is_not_refused_by_the_early_branch(monkeypatch, tmp_path,
         _cmd_enrich(settings)
     err = capsys.readouterr().err
     assert "enrich failed" not in err, "a partial run must not be refused"
+
+
+# -- M73: a column that FAILED to measure, vs one whose type cannot be measured ------------------
+#
+# Both persist as `distinct_count=None, null_count=None`. One is a permanent, expected property of
+# the schema and needs no action; the other is a measurement that did not complete, for a cause
+# with nothing to do with the column -- temp space, a privilege, a driver fault. Before this, the
+# failure existed only in a log line, the table's job said `done`, and the run reported `complete`.
+
+
+def _col_job(name: str) -> Job:
+    return Job(id=f"profile:{name}", source_id="s", kind="profile:column", status="failed")
+
+
+def test_a_column_that_failed_to_measure_is_not_a_complete_profile():
+    verdict, detail = profile_outcome(_snap("done", "done", extra=[_col_job("t0.AMOUNT")]))
+    assert verdict == "unmeasured", "every table profiled, so this is not `partial` -- but it is"
+    assert "t0.AMOUNT" in detail, "the operator has to know WHICH column"
+    assert "type cannot be counted" in detail, (
+        "the detail must say what it is NOT, because that is the state it is confusable with")
+
+
+def test_a_column_job_is_not_counted_as_a_table():
+    """`kind` is deliberately not "profile": `profile_outcome` and `_cmd_enrich` both filter on
+    that exact string to count TABLES, so a column job landing in that count would report a table
+    that does not exist -- and would make a one-table source claim two."""
+    verdict, detail = profile_outcome(_snap("done", extra=[_col_job("t0.AMOUNT")]))
+    assert "all 1 table(s) profiled" in detail
+    assert verdict == "unmeasured"
+
+
+def test_lost_tables_and_unmeasured_columns_are_both_reported():
+    """A run can lose whole tables AND fail to measure columns of the tables it kept. Naming only
+    the larger problem hides the smaller one in exactly the run where it matters most."""
+    verdict, detail = profile_outcome(
+        _snap("failed", "done", extra=[_col_job("t1.AMOUNT")]))
+    assert verdict == "partial", "a missing table is the bigger fact and still decides the verdict"
+    assert "t0" in detail and "EXCLUDED" in detail
+    assert "t1.AMOUNT" in detail and "A further 1 column(s)" in detail
+
+
+def test_a_clean_run_is_still_complete():
+    """The control. `unmeasured` must not fire on a run with nothing wrong with it, or it becomes
+    the always-on warning this codebase has already had to remove twice."""
+    assert profile_outcome(_snap("done", "done"))[0] == "complete"
+
+
+def test_a_partially_measured_table_KEEPS_its_columns():
+    """The regression this fix had to avoid, pinned so it cannot be reintroduced.
+
+    `enrich_structural` uses `status == "done"` as the allowlist deciding whether a table's columns
+    are kept -- `views.py` documents that `Job.status` is a free string for exactly this reason. So
+    recording a per-column failure as a THIRD table status would have silently dropped every column
+    of a partially measured table: a fix that loses more of the model than the finding it closes.
+    The failure is a separate job and the table stays `done`.
+    """
+    from dataclasses import dataclass
+
+    from mnemiq.enrichment.pipeline import enrich_structural
+
+    class _Err(Exception):
+        def __init__(self, code, msg):
+            e = type("E", (), {})()
+            e.code, e.full_code = code, f"ORA-{code:05d}"
+            super().__init__(e, msg)
+            self.args = (e, msg)
+
+        def __str__(self):
+            return f"{self.args[0].full_code}: {self.args[1]}"
+
+    @dataclass
+    class _A:
+        dialect: str = "oracle"
+        DatabaseError = _Err
+
+        def introspect(self):
+            return ["T"]
+
+        def list_columns(self):
+            return [("T", "GOOD", "NUMBER"), ("T", "BAD", "NUMBER")]
+
+        def foreign_keys(self):
+            return []
+
+        def view_definitions(self):
+            return []
+
+        def execute(self, sql):
+            u = sql.upper()
+            if "COUNT(DISTINCT" in u and '"BAD"' in sql:
+                raise _Err(1652, "unable to extend temp segment")
+            if u.startswith("SELECT COUNT(*) FROM"):
+                return [(100,)]
+            if u.startswith("SELECT COUNT(DISTINCT"):
+                return [(5, 100)]
+            if "COUNT(DISTINCT" in u and "GROUP BY" not in u:
+                return [tuple([100] + [5, 100] * sql.count("count(DISTINCT"))]
+            return []
+
+    snap = enrich_structural(_A(), "s")
+
+    assert {c.name for c in snap.columns} == {"GOOD", "BAD"}, (
+        "the partially measured table lost columns -- the fix would cost more than the finding"
+    )
+    assert [j.status for j in snap.jobs if j.id == "profile:T"] == ["done"], (
+        "the table WAS profiled; only one column's measurement failed"
+    )
+    assert [j.id for j in snap.jobs if j.kind == "profile:column"] == ["profile:T.BAD"]
+    assert profile_outcome(snap)[0] == "unmeasured"
+    # ... and the surviving column still carries its real statistics.
+    good = next(c for c in snap.columns if c.name == "GOOD")
+    assert good.distinct_count == 5 and good.row_count == 100
