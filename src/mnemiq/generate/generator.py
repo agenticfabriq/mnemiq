@@ -19,7 +19,10 @@ _GUIDED_SQL_SCHEMA = {
     "properties": {
         "sql": {"type": "string", "minLength": 1},
         "reason": {"type": "string"},
-        # M35. Declared so a guided reply CAN carry it. How strictly a backend confines a reply to
+        # M35. Declared so a guided reply CAN carry it -- but `_guided_extra_body` STRIPS it from
+        # the schema it sends unless the guard that reads it is on, because a property the prompt
+        # does not ask for would only invite the model to fill a field nothing reads.
+        # How strictly a backend confines a reply to
         # the declared properties is the backend's business and this repo pins no version, so the
         # claim here is only the safe half: a property named in the schema is one the model is
         # asked for and permitted, and one omitted is at best not asked for. That was enough to

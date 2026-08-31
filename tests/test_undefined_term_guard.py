@@ -572,22 +572,51 @@ def test_one_setting_reaches_both_ends_of_the_guard():
     guard inert with the whole suite green, because every other test passes it explicitly. That is
     the wired-at-one-end shape this branch has already produced twice.
 
-    Asserted through the real assembly rather than by reading the call sites, and in BOTH states:
-    a test that only checks the on-path cannot see a hop that ignores its argument.
+    Walked from `Settings` outward, in BOTH states, ending at the two things that actually
+    consume the flag -- the prompt the model is sent, and the schema the request carries. A test
+    that only checks the on-path cannot see a hop that ignores its argument, and a test that calls
+    `system_prompt` directly is reading the call site rather than exercising it.
     """
+    import duckdb
+
     from mnemiq.agent.modes import MODES, build_agent
+    from mnemiq.assembly import build_components
     from mnemiq.config import Settings
-    from mnemiq.generate.prompts import system_prompt
+    from mnemiq.generate.generator import _GUIDED_SQL_SCHEMA, _guided_extra_body
 
     assert Settings.model_fields["guard_undefined_terms"].default is False, (
         "the shipped default is off -- 12 false deferrals in 24, measured"
     )
+
+    class _Adapter:
+        dialect = "duckdb"
+
     for wanted in (True, False):
+        # A base_url/api_key because `build_components` builds a real client; nothing calls it.
+        settings = Settings(guard_undefined_terms=wanted,
+                            llm_base_url="http://localhost:1/v1", llm_api_key="unused")
+
         agent = build_agent(
             MODES["thinking"], generator=None, synthesizer=None, adapter=None, cache=None,
-            corrector=None, values=None, selector=None, guard_undefined_terms=wanted,
+            corrector=None, values=None, selector=None,
+            guard_undefined_terms=settings.guard_undefined_terms,
         )
         assert agent.guard_undefined_terms is wanted, "Settings -> build_agent -> Agent"
-        assert ("assumed_terms" in system_prompt(declare_assumed_terms=wanted)) is wanted, (
-            "the prompt must ask for the declaration only when the guard reads it"
+
+        # The hop this is easiest to drop, because nothing downstream of it fails loudly: with the
+        # prompt silent the model declares nothing, `ungrounded_terms([])` is `[]`, and the guard
+        # is permanently inert with every test still green.
+        con = duckdb.connect()  # ValueIndex reads a real connection at build time
+        kit = build_components(settings, _Adapter(), con)
+        assert kit.generator._declare_assumed_terms is wanted, (
+            "Settings -> build_components -> LLMGenerator"
+        )
+
+        body = _guided_extra_body(True, declare_assumed_terms=wanted)
+        properties = body["response_format"]["json_schema"]["schema"]["properties"]
+        assert ("assumed_terms" in properties) is wanted, (
+            "the SENT schema must declare the property only when the guard reads it"
+        )
+        assert "assumed_terms" in _GUIDED_SQL_SCHEMA["properties"], (
+            "and the module constant must not be mutated by the strip"
         )
