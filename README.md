@@ -107,7 +107,7 @@ The Oracle read plane refuses writes, but that refusal is partly a property of y
 rather than of the engine: a `SELECT` can reach an `AUTONOMOUS_TRANSACTION` function through a
 view, and restricting the caller does not close it, because a view resolves its references with the
 view owner's rights. Pointing the read plane at a database that is open read-only does close it,
-measured, and mnemiq reports at boot which of the two you have. See
+measured, and mnemiq reports at boot whether you are in that deployment or resting on the engine's gate alone. See
 [docs/oracle-deployment.md](docs/oracle-deployment.md) before connecting a production source.
 
 ## Open core

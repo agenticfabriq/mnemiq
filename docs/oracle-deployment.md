@@ -88,7 +88,7 @@ as the control.
 |---|---|---|
 | `constrained` | The database is open READ ONLY and refuses every write from every principal. | Nothing. This is the deployment §3 describes. Logged at INFO. |
 | `gate_only` | This connection holds write-shaped privilege — it owns tables, or holds INSERT/UPDATE/DELETE/ALTER/EXECUTE directly, through a role, or via PUBLIC. `read_only` rests on the engine's gate alone. | Narrow the principal (§3), and prefer a read-only database. Logged at WARNING. |
-| `unverifiable` | No write-shaped privilege found, which is **not** the same as being unable to write. | This is the ceiling for a minimal read principal on a writable database. Nothing further exists to check. Logged at INFO. |
+| `unverifiable` | No write-shaped privilege found, which is **not** the same as being unable to write. | This is the ceiling for a minimal read principal on a writable database — no further check exists, so the action is §3 or an accepted risk. Logged at WARNING, and it is the verdict `MNEMIQ_ACK_ADVISORIES` exists for: it was once demoted to INFO and that suppressed the gap entirely at the default level. |
 
 `assert_enforcing()` separately reports whether VPD is attached to what this connection can see:
 `bypassing` (the principal holds `EXEMPT ACCESS POLICY`), `partial`, `attached`, or `unverifiable`.
