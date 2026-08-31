@@ -654,8 +654,17 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     on the pair cannot tell that one of them stopped matching. It rejects a hardcoded value: the
     kwarg NAME being present is not the guarantee, since `guard_undefined_terms=False` satisfies a
     name check while the flag is inert at that site. It counts `**kwargs` as not passing, since a
-    config-driven site is the likeliest next one. And it resolves both import aliases and local
-    rebindings, so neither `plan_query as _pq` nor `pq = plan_query` renames its way out.
+    config-driven site is the likeliest next one. And it resolves import aliases and local
+    rebindings -- plain, annotated and tuple -- so none of `plan_query as _pq`,
+    `pq = plan_query` or `pq: Callable = plan_query` renames its way out.
+
+    **Known limit**: a call reached through a wrapper rather than a rebinding --
+    `partial(plan_query)`, a decorator, a dict of handlers -- is not counted, so a site added in
+    that form would be invisible. Bounded, because converting an already-pinned site to such a
+    form drives its count to zero and fails closed; the exposure is only to NEW sites written that
+    way. Closing it properly means the parameter having no default, so the interpreter enforces
+    what a scan approximates -- disproportionate for a withdrawn feature, and recorded here so the
+    next person decides it deliberately.
     """
     import ast
     import pathlib
@@ -701,12 +710,19 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
                         if a.name in REQUIRED and a.asname:
                             canonical[a.asname] = a.name
                 # `pq = plan_query` then `pq(...)`: a local rebinding, which an import-alias pass
-                # alone walks straight past.
-                elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
-                    if node.value.id in canonical:
-                        for t in node.targets:
-                            if isinstance(t, ast.Name):
-                                canonical[t.id] = canonical[node.value.id]
+                # alone walks straight past. Annotated and tuple forms too, because
+                # `pq: Callable = plan_query` is ordinary typed Python rather than an evasion
+                # someone has to reach for.
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    values = [node.value] if node.value is not None else []
+                    if len(targets) == 1 and isinstance(targets[0], ast.Tuple) and \
+                            isinstance(values[0] if values else None, ast.Tuple):
+                        targets, values = list(targets[0].elts), list(values[0].elts)
+                    for t, v in zip(targets, values * len(targets) if len(values) == 1 else values):
+                        if isinstance(t, ast.Name) and isinstance(v, ast.Name) \
+                                and v.id in canonical:
+                            canonical[t.id] = canonical[v.id]
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
