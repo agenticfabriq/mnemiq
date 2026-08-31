@@ -570,7 +570,9 @@ def test_one_setting_reaches_both_ends_of_the_guard():
     """The flag crosses four hops -- Settings, `build_agent`, `Agent`, `plan_query` -- plus a fifth
     into the prompt, and every one of them defaults False. Dropping the kwarg at any hop leaves the
     guard inert with the whole suite green, because every other test passes it explicitly. That is
-    the wired-at-one-end shape this branch has already produced twice.
+    the wired-at-one-end shape this branch produced three times: the guided schema not declaring
+    the field, the prompt asking while the check was gated off, and the eval path's Agent never
+    receiving the flag.
 
     Walked from `Settings` outward, in BOTH states, ending at the two things that actually
     consume the flag -- the prompt the model is sent, and the schema the request carries. A test
