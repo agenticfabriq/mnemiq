@@ -320,8 +320,15 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
     # and the message says that rather than describing a state. The cost is one line per process
     # start, which is the right price for "this safety property does not hold"; the earlier noise
     # complaint is answered by making the warning true and actionable, not by silencing it.
+    # The QUIET set is what an operator can do nothing further about, not what sounds acceptable --
+    # the same rule that demoted `unverifiable` to INFO. `constrained` belongs here for the
+    # opposite reason to `writable`: it is the STRONGEST verdict this check produces, a database
+    # open read-only that refuses every write from every principal. It was omitted when it was
+    # added one commit earlier, so the single deployment that actually closes M66 was the one
+    # warned at every boot -- the always-on warning that finding already spent five rounds removing,
+    # recreated for the good case by adding the good case.
     advisories = (("assert_enforcing", "source enforcement", {"attached"}),
-                  ("assert_read_only", "read-only basis", {"writable"}))
+                  ("assert_read_only", "read-only basis", {"writable", "constrained"}))
     # A typo'd acknowledgement silently does nothing and looks exactly like no acknowledgement --
     # the operator keeps getting the warning and has no way to tell which. Two different causes
     # share one observable, which is the collapse this codebase keeps closing, here in the
