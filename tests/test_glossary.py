@@ -279,3 +279,35 @@ def test_the_narrow_width_still_will_not_match_inside_a_word():
 
     assert not term_pattern("a", INFLECTION_PLURAL).search("what is our average revenue")
     assert term_pattern("a", INFLECTION_PLURAL).search("give me a number")
+
+
+@pytest.mark.parametrize(
+    "term,question",
+    [("C+", "we write C++ here"), ("margin %", "margin %% is odd"), ("C++", "C+++ is not a thing")],
+)
+def test_a_punctuation_run_is_one_token_not_a_prefix(term, question):
+    """The one property `\\b` gave for free that a bare `(?!\\w)` does not.
+
+    `\\b` needs a word/non-word transition, so a term ending in punctuation could never sit inside
+    a longer run of it. Swapping to `(?!\\w)` to let `ROI (%)` match itself also let `C+` match
+    inside `C++` and `margin %` inside `margin %%` -- so retrieval, which uses `search`, offered
+    one term's definition on a question naming a different one. Grounding was safe because it uses
+    `fullmatch`; the always-on path was not.
+
+    A run of the SAME character is one token. A different character after it is a delimiter, which
+    is why only the repeat is forbidden and `margin %.` still matches in a sentence.
+    """
+    from mnemiq.semantic.glossary import term_pattern
+
+    assert not term_pattern(term).search(question)
+    assert term_pattern(term).search(f"our {term} today"), "the term still matches itself"
+
+
+def test_sentence_punctuation_after_a_punctuation_term_still_matches():
+    """The false negative the narrow rule must not create: `.` after `margin %` ends a sentence,
+    it does not continue the term."""
+    from mnemiq.semantic.glossary import term_pattern
+
+    assert term_pattern("margin %").search("the margin %.")
+    assert term_pattern("ROI (%)").search("our ROI (%) rose")
+    assert term_pattern("revenue").search("our revenue.")

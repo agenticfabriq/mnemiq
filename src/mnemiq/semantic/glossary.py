@@ -87,7 +87,16 @@ def term_pattern(term: str, inflection: str = INFLECTION_ANY) -> re.Pattern[str]
     # `(?<!\w)` / `(?!\w)` assert only that the match is not glued to more word characters, which
     # is the property actually wanted. It keeps what the boundary was added for: at the plural
     # width the id tail `a` still cannot match inside "average", because `v` is a word character.
-    return re.compile(rf"(?<!\w){body}(?!\w)", re.IGNORECASE)
+    #
+    # Plus one thing `\b` gave for free and a bare `(?!\w)` does not: it stopped a match ENDING in
+    # punctuation from sitting inside a longer run of it. Without that, `C+` matched inside `C++`
+    # and `margin %` inside `margin %%`, so retrieval offered one term's definition on a question
+    # naming a different one. A run of the same character is one token; a different character
+    # after it is a delimiter, which is why this forbids only the repeat and leaves `margin %.`
+    # matching in a sentence.
+    tail = words[-1][-1]
+    repeat = "" if tail.isalnum() or tail == "_" else f"(?!{re.escape(tail)})"
+    return re.compile(rf"(?<!\w){body}(?!\w){repeat}", re.IGNORECASE)
 
 
 @dataclass(frozen=True)

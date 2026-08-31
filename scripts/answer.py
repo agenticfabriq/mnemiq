@@ -62,7 +62,10 @@ def main() -> int:
         roles=[r for r in os.getenv("MNEMIQ_ROLES", "").split(",") if r],
     )
 
-    packet = retrieve(con, question, identity, authz, LLMEmbedder(settings), k=5)
+    # See `ask.py`: `retrieve` defaults `definitions` to `()`, so an enabled guard checked
+    # declared terms against an empty corpus and refused all of them.
+    packet = retrieve(con, question, identity, authz, LLMEmbedder(settings), k=5,
+                      definitions=snapshot.definitions if snapshot else ())
     print(f"retrieved: {[c.object_id for c in packet.cards]}\n")
 
     agent = Agent(

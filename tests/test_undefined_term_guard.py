@@ -639,10 +639,16 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     """The invariant no per-call test can hold, because the failure is a call site that does not
     exist yet -- and the first version of this test was itself too narrow to hold it.
 
-    **The guard has TWO halves and a site can be wired at one end.** The engine-side check reads
+    **The guard has THREE legs and a site can be wired at one or two of them.** The engine-side check reads
     `proposal.assumed_terms`; the prompt-side declaration is what puts anything in it. With the
     generator silent the model declares nothing, `ungrounded_terms([])` is `[]`, and the flag reads
     as ON while guarding nothing -- silently, and with every other test green.
+
+    The third leg is the certified corpus: `plan_query` checks declared terms against
+    `packet.definitions`, and `retrieve` defaults that to `()`. A caller that omits it hands the
+    guard an empty glossary, and an empty glossary grounds nothing -- so the guard refuses every
+    declared term, including ones the loaded snapshot certifies. Both CLIs did that, and a second
+    review round found it after the first had found the other two legs in the same files.
 
     An adversarial review found exactly that in the fix this test was written to protect:
     `scripts/answer.py` passed `guard_undefined_terms` to its `Agent` and left its `LLMGenerator`
@@ -683,20 +689,31 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
         "build_agent": "guard_undefined_terms",
         "plan_query": "guard_undefined_terms",
         "LLMGenerator": "declare_assumed_terms",
+        # The THIRD leg. `plan_query` checks declared terms against `packet.definitions`, and
+        # `retrieve` defaults that to `()` -- so a caller that omits it feeds the guard an empty
+        # certified corpus and the guard refuses every declared term, including ones the loaded
+        # snapshot certifies. Both CLIs did exactly that. Declaration and checking are not enough:
+        # the corpus is a leg, and a scan that models only two of three is not the invariant it
+        # says it is.
+        "retrieve": "definitions",
     }
     # (file, callable) -> HOW MANY calls. A count, because `agent/loop.py` calls `plan_query`
     # twice -- single-shot and the deep-mode candidate loop -- and a set keyed on the pair alone
     # cannot tell that one of them stopped matching: the other still contributes the tuple.
     EXPECTED_SITES = {
         ("src/mnemiq/runtime.py", "build_agent"): 1,
+        ("src/mnemiq/runtime.py", "retrieve"): 1,
         ("src/mnemiq/assembly.py", "LLMGenerator"): 1,
         ("src/mnemiq/agent/modes.py", "Agent"): 1,
         ("src/mnemiq/agent/loop.py", "plan_query"): 2,
         ("src/mnemiq/eval/engine.py", "Agent"): 1,
+        ("src/mnemiq/eval/engine.py", "retrieve"): 1,
         ("scripts/answer.py", "Agent"): 1,
         ("scripts/answer.py", "LLMGenerator"): 1,
+        ("scripts/answer.py", "retrieve"): 1,
         ("scripts/ask.py", "plan_query"): 1,
         ("scripts/ask.py", "LLMGenerator"): 1,
+        ("scripts/ask.py", "retrieve"): 1,
     }
 
     root = pathlib.Path(__file__).resolve().parents[1]
@@ -764,4 +781,25 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     assert missing == [], (
         "every site participating in the guard must pass its half explicitly, or the flag reads "
         "as on while guarding nothing: " + "; ".join(missing)
+    )
+
+
+def test_a_cli_that_forgets_the_corpus_refuses_every_certified_term():
+    """The third leg, stated as the behaviour it produces rather than as a wiring rule.
+
+    `retrieve` defaults `definitions` to `()`, and `ungrounded_terms` treats an empty certified set
+    as grounding NOTHING -- deliberately, so an ablated deployment refuses rather than skipping the
+    check. Compose those two and a caller that forgets the corpus turns the guard into a refusal of
+    every question that declares a term, including terms its own snapshot certifies. Both CLIs did
+    that until a review round found it, and the wiring scan above could not see it because it
+    modelled two legs of three.
+    """
+    from mnemiq.contract.semantic import Definition
+    from mnemiq.generate.undefined_terms import ungrounded_terms
+
+    certified = [Definition(id="fspay:policy:revenue", term="revenue", domain="fspay",
+                            definition="recognised revenue")]
+    assert ungrounded_terms(["revenue"], certified) == [], "with the corpus, a certified term grounds"
+    assert ungrounded_terms(["revenue"], []) == ["revenue"], (
+        "without it, the same term is refused -- which is why the feed is a leg and not a detail"
     )
