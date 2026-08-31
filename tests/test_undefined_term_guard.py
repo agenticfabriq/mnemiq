@@ -662,12 +662,13 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
 
     **It fails closed**, in four ways that were each a hole first. It pins the exact set of sites
     AND how many calls each file makes, because `loop.py` calls `plan_query` twice and a set keyed
-    on the pair cannot tell that one of them stopped matching. It rejects a value that is baked in rather than
-    derived -- asked as an allowlist (does this reference anything outside the builtins?) after
-    three rounds of enumerating bad literal spellings lost to `tuple()`. The kwarg NAME being
-    present is not the guarantee, and `definitions=()` is the hardcode that reproduces the very
-    defect the corpus leg was added to catch. It counts `**kwargs` as not passing, since a config-driven site is the likeliest
-    next one. And it resolves import aliases and local
+    on the pair cannot tell that one of them stopped matching. It rejects a value that NAMES
+    NOTHING outside the builtins -- asked that way round after three rounds of enumerating bad
+    literal spellings lost to `tuple()`. That is narrower than "every baked-in value": a site
+    passing an unrelated attribute satisfies it. The kwarg NAME being present is not the
+    guarantee, and `definitions=()` is the hardcode that reproduces the very defect the corpus leg
+    was added to catch. It counts `**kwargs` as not passing, since a config-driven site is the
+    likeliest next one. And it resolves import aliases and local
     rebindings -- plain, annotated and tuple -- so none of `plan_query as _pq`,
     `pq = plan_query` or `pq: Callable = plan_query` renames its way out.
 
