@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from mnemiq.catalog import introspect
 from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding, ViewDefinition
 from mnemiq.enrichment.joins import build_relationships
-from mnemiq.enrichment.profiling import profile_table
+from mnemiq.enrichment.profiling import FAILED, profile_table
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ def profile_outcome(snapshot: Snapshot) -> tuple[str, str]:
     at once (M60); reachable on any adapter, and by a second route -- a manifest naming a schema
     that does not exist profiles nothing and looks identically empty.
 
-    FOUR outcomes, not a threshold. A bare count would collapse the two that matter most:
+    FIVE outcomes, not a threshold. A bare count would collapse the ones that matter most:
 
       empty     no profile job at all -- an empty source, OR a schema name matching nothing,
                 which introspects to zero tables and so never reaches a profile at all.
@@ -80,6 +80,12 @@ def profile_outcome(snapshot: Snapshot) -> tuple[str, str]:
       partial   some failed. The model is smaller than the database and the caller should know.
       unread    at least one table, and EVERY one failed. The snapshot describes nothing, and it
                 is not evidence that there is nothing to describe.
+      unmeasured  every table profiled, but some COLUMN could not be measured. The model has all
+                its tables and one of them carries a column with no statistics -- which in the
+                snapshot is indistinguishable from a column whose TYPE cannot be counted, a normal
+                and permanent state needing no action. Distinct from `partial` because nothing is
+                missing from the model; what is missing is knowledge about something in it
+                (**M73**).
 
     `discover:views` earned its third state for this same reason: "no views" and "could not ask"
     must not share a value. This is that distinction one level up, over the whole model.
@@ -88,7 +94,20 @@ def profile_outcome(snapshot: Snapshot) -> tuple[str, str]:
     if not profiles:
         return ("empty", "the source reported no tables to profile")
     failed = [j for j in profiles if j.status == "failed"]
+    # Columns that failed to MEASURE, which is a different fact from a table that failed to
+    # profile and is reported separately for that reason. Their tables are present and their other
+    # columns carry real statistics; what is missing is the counts for these columns, which the
+    # snapshot otherwise renders as `None` -- exactly what an unaggregatable TYPE renders as.
+    unmeasured = [j for j in snapshot.jobs
+                  if j.kind == "profile:column" and j.status == "failed"]
+    names = ", ".join(sorted(j.id.split(":", 1)[1] for j in unmeasured))
     if not failed:
+        if unmeasured:
+            return ("unmeasured", (
+                f"all {len(profiles)} table(s) profiled, but {len(unmeasured)} column(s) could "
+                f"not be measured and carry no counts: {names}. That is NOT the same as a column "
+                "whose type cannot be counted, which looks identical in the snapshot -- these "
+                "failed for a cause unrelated to the column, and the reasons were logged above"))
         return ("complete", f"all {len(profiles)} table(s) profiled")
     if len(failed) == len(profiles):
         return ("unread", (
@@ -99,7 +118,12 @@ def profile_outcome(snapshot: Snapshot) -> tuple[str, str]:
     return ("partial", (
         f"{len(failed)} of {len(profiles)} table(s) failed to profile and are EXCLUDED from the "
         f"model: {', '.join(sorted(j.id.split(':', 1)[1] for j in failed))}. The engine will "
-        "answer as though those tables do not exist"))
+        "answer as though those tables do not exist"
+        # Reported alongside rather than instead: a run can lose whole tables AND fail to measure
+        # columns of the tables it kept, and naming only the larger problem hides the smaller one
+        # in the run where it is most likely to matter.
+        + (f". A further {len(unmeasured)} column(s) of the surviving tables could not be "
+           f"measured and carry no counts: {names}" if unmeasured else "")))
 
 
 def enrich_structural(adapter, source_id: str) -> Snapshot:
@@ -145,6 +169,20 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
                 )
                 for col in table.columns
             ]
+            # A column that FAILED to measure is recorded as its own job, and the TABLE's job
+            # stays `done` deliberately (**M73**). Two reasons it is not a table-level status:
+            # the table really was profiled and its other columns carry real statistics, and
+            # `status == "done"` is the allowlist below that decides whether the columns are kept
+            # at all -- inventing a third status here would silently DROP every column of a
+            # partially measured table, which is a worse failure than the one being fixed.
+            #
+            # `kind` is deliberately not "profile": `profile_outcome` and `_cmd_enrich` both
+            # filter on that exact string to count TABLES, and a column job landing in that count
+            # would report a table that does not exist.
+            unmeasured = [st for st in stats.values() if st.measurement == FAILED]
+            for st in unmeasured:
+                jobs.append(Job(id=f"profile:{table.name}.{st.column}", source_id=source_id,
+                                kind="profile:column", status="failed"))
             status = "done"
         except Exception as exc:
             # fail-soft: one bad table never sinks the run. It contributes nothing --
