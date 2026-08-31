@@ -116,7 +116,13 @@ def adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only
                 dsn=spec.target, user=user, password=password,
                 schema=spec.schema or None, read_only=read_only,
                 config_dir=(settings.oracle_config_dir if settings else None),
-                wallet_password=(settings.oracle_wallet_password if settings else None))
+                wallet_password=(settings.oracle_wallet_password if settings else None),
+                # Pool sizing and both deadlines come from settings so an operator can raise
+                # concurrency without a code change. The adapter's own defaults are what a test
+                # or a one-off caller gets; these are what a server gets (**M72**).
+                **({"pool_max": settings.oracle_pool_max,
+                    "acquire_timeout_s": settings.oracle_acquire_timeout_s,
+                    "probe_timeout_s": settings.oracle_probe_timeout_s} if settings else {}))
         except ValueError as exc:
             # The adapter validates its own TLS arguments and cannot raise `SourceUnconfigured`:
             # this module imports IT, so the dependency only runs one way. Translated here so a

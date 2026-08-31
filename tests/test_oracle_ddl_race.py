@@ -49,6 +49,13 @@ class _FakeCursor:
         self._con = con
         self.closed = False
 
+    @property
+    def connection(self):
+        """`execute_arrow` reaches the connection THROUGH the cursor now, because a pooled
+        adapter has no single connection to reach for -- `cur.connection` is the only correct
+        referent for "the connection this statement is running on"."""
+        return self._con
+
     def execute(self, sql, **_binds):
         if sql == "SET TRANSACTION READ ONLY":
             self._con.read_only_set += 1
