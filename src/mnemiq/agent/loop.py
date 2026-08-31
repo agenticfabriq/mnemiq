@@ -56,7 +56,10 @@ class AgentAnswer:
     agreement: float | None = None
     judge_engaged: bool | None = None  # multi-candidate only: did the judge get consulted?
     judge_override: bool | None = None  # ...and did it pick against the majority?
-    candidates_executed: int | None = None  # multi-candidate only: how many of N ran
+    # Multi-candidate only: how many of N produced a TABLE. Not how many were attempted --
+    # a candidate that deferred, or that ran and hit an ExecutionError, is dropped by _execute and
+    # never counted. The looser "how many of N ran" left that ambiguous at the definition site.
+    candidates_executed: int | None = None
     # What the mode actually spent. `instant` and `thinking` differ only in the corrector and
     # the retry ceiling, and both are invisible on a question that succeeds first time -- so the
     # control read as inert when it was working exactly as designed (M33). `attempts` counts the

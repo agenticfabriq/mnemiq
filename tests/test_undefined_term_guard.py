@@ -214,10 +214,22 @@ def test_a_definition_is_matched_by_its_id_when_that_is_how_a_corpus_spells_the_
 
 
 def test_deep_mode_does_not_outvote_the_guard():
-    """Deep mode ran five candidates, dropped every non-Approved outcome, and let the survivors
-    vote -- so two candidates declaring "lifetime value" deferred, three answered from a guessed
-    meaning, and the majority won. The guard was in force on instant and thinking and inert on the
-    mode a caller reaches for precisely when the question is hard.
+    """In deep mode a declared term must defer AS an undefined term, not as a disagreement.
+
+    What this changes is the REASON, and the original framing of the finding was wrong about that.
+    It said deep mode "returns the invented derivation with no trace of the guard having fired". It
+    does not: real deep mode sets `min_agreement=0.6`, and selective answering defers whenever
+    `len(executed) < candidates` -- so two candidates deferring already made it 3 of 5 and the
+    answer was withheld either way. I accepted that framing without checking it.
+
+    The guard was never inert; it was ILLEGIBLE. The caller was told "the candidates disagreed too
+    much to answer confidently", which is false -- they did not disagree, two of them found the
+    question unanswerable -- and it points at the one repair that cannot work. Now it says which
+    term has no definition.
+
+    That is also the difference beacon can measure: their grader reads `deferred` as a boolean and
+    both paths defer, but the reason is persisted, and today every deferral in that corpus carries
+    the identical string. A DISAGREEMENT here would be indistinguishable from a genuine one.
 
     The asymmetry is why one declaration settles it rather than getting a vote: a candidate
     DECLARING the term is evidence the question names an undefined one; the others not declaring it
@@ -258,10 +270,10 @@ def test_deep_mode_does_not_outvote_the_guard():
         dialect = "duckdb"
 
         def execute(self, sql):
-            # The decider's proof step calls `execute`, not `execute_arrow`. Without it every
-            # candidate came back `Deferred(invalid_query, "'_Adapter' object has no attribute
-            # 'execute'")`, `executed` stayed empty, and the branch this test exists for -- the
-            # early return taken while a MAJORITY is available to outvote the guard -- never ran.
+            # The decider's proof step calls `execute`, not `execute_arrow`. Without it candidates
+            # 3-5 came back `Deferred(invalid_query, "'_Adapter' object has no attribute
+            # 'execute'")` -- candidates 1-2 never got that far, because the guard fires before
+            # `decide` -- so `executed` stayed empty and the branch this test exists for never ran.
             # The test passed and documented a run that did not happen.
             return []
 
@@ -276,6 +288,10 @@ def test_deep_mode_does_not_outvote_the_guard():
         cache=TwoTierCache(L1Cache()),
         budget=Budget(wall_clock_s=5.0, max_attempts=1),
         candidates=5,
+        # Deep mode's real setting. Omitting it skipped selective answering entirely, so the test
+        # exercised a configuration that does not ship and its rationale described a vote that
+        # could never have happened.
+        min_agreement=0.6,
     )
     packet = ContextPacket(
         question="What is the lifetime value of our average customer?",
@@ -289,11 +305,12 @@ def test_deep_mode_does_not_outvote_the_guard():
     answer = agent.answer(packet, snapshot, GrantSet(frozenset({"claim"})),
                           IdentityContext(tenant_id="t", principal_id="u", roles=["analyst"]))
 
-    assert answer.deferred is True, "three silent candidates outvoted two that declared the term"
+    assert answer.deferred is True
     assert answer.reason_code == DeferralReason.UNDEFINED_TERM
     assert "lifetime value" in answer.answer
     assert generator.calls == 5, "every candidate still runs; the guard decides after, not by short-circuit"
-    assert answer.candidates_executed == 3, (
-        "three candidates produced a table and were available to outvote the guard -- which is the "
-        "branch this test exists for, and which never ran while the adapter lacked `execute`"
+    assert answer.candidates_executed == 3, "three produced a table; the adapter must reach `execute`"
+    assert "disagreed" not in answer.answer, (
+        "selective answering would defer this as DISAGREEMENT -- true of the candidate set and "
+        "false of the question, and pointing the caller at a repair that cannot work"
     )
