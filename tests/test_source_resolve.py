@@ -955,3 +955,78 @@ def test_the_one_deployment_that_closes_the_hole_is_not_the_one_that_warns(caplo
         _warn_source_enforcement(_ReadOnlyDatabase())
     assert caplog.text == "", (
         "the best-configured deployment there is warned at boot: " + caplog.text)
+
+
+# -- M74: the one verdict an acknowledgement cannot silence --------------------------------------
+
+
+class _Bypassing:
+    def assert_enforcing(self):
+        return "bypassing", "this principal holds EXEMPT ACCESS POLICY, so no VPD policy applies"
+
+    def assert_read_only(self):
+        return "constrained", "this database is open READ ONLY"
+
+
+def test_bypassing_cannot_be_acknowledged_away(caplog):
+    """`bypassing` says the DATABASE enforces nothing for this connection.
+
+    Every other verdict describes a gap an operator can assess and accept. This one is refused a
+    silencer for a reason that sounds like the opposite of an argument: it is LATENT today, since
+    the engine still applies its own filters, and an environment variable set while it is latent
+    would still be set on the day enforcement moves to the database (**M57**) and it becomes the
+    only thing standing between a principal and every row.
+    """
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    # The acknowledgement is passed explicitly, not through the environment: this function reads
+    # its parameter, and setting the env var here would suggest the variable is what is under test.
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_Bypassing(), acknowledged=frozenset({"source-enforcement:bypassing"}))
+
+    assert "bypassing" in caplog.text, "an acknowledgement silenced the one it must not"
+    assert "cannot silence" in caplog.text, "and the operator must be told the ack did nothing"
+
+
+def test_a_refused_acknowledgement_is_not_diagnosed_as_a_changed_verdict(caplog):
+    """The trap in the fix. An unmatched ack gets a diagnosis -- "the verdict changed", "no such
+    advisory", "the check never ran" -- and a refused one is none of those: the verdict DID occur
+    and was denied a silencer. Leaving it unmatched would have produced a confidently wrong
+    diagnosis, which is the same collapse this function exists to avoid, reintroduced by the guard
+    against it."""
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    # INFO, not WARNING: the diagnosis this test is about is logged at INFO, so capturing only
+    # WARNING made the assertion pass without the message ever being able to appear. Caught by
+    # mutating the code to leave the ack unmatched and finding the test still green.
+    with caplog.at_level(logging.INFO):
+        _warn_source_enforcement(_Bypassing(), acknowledged=frozenset({"source-enforcement:bypassing"}))
+
+    assert "did not apply" not in caplog.text, (
+        "a refused acknowledgement was diagnosed as an unused one -- the verdict DID occur")
+    assert "the verdict changed" not in caplog.text
+    assert "names no advisory" not in caplog.text
+
+
+def test_every_other_verdict_can_still_be_acknowledged(caplog):
+    """The control. If the refusal leaked to the other verdicts, `MNEMIQ_ACK_ADVISORIES` would
+    stop working at all and every deployment would be warned at every boot -- which is the failure
+    that setting was added to end."""
+    import logging
+
+    from mnemiq.runtime import _warn_source_enforcement
+
+    class _GateOnly:
+        def assert_enforcing(self):
+            return "attached", "every visible table carries an enabled policy"
+
+        def assert_read_only(self):
+            return "gate_only", "this read-only connection CAN write: it owns 3 table(s)"
+
+    with caplog.at_level(logging.WARNING):
+        _warn_source_enforcement(_GateOnly(), acknowledged=frozenset({"read-only-basis:gate_only"}))
+    assert caplog.text == "", f"an ordinary acknowledgement stopped working: {caplog.text}"

@@ -327,6 +327,14 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
     # added one commit earlier, so the single deployment that actually closes M66 was the one
     # warned at every boot -- the always-on warning that finding already spent five rounds removing,
     # recreated for the good case by adding the good case.
+    # The one verdict an acknowledgement cannot silence (**M74**). Every other verdict describes
+    # a gap an operator can assess and accept; this one says the database's own row security does
+    # not apply to this principal at all. It is not currently load-bearing -- the engine still
+    # enforces, so `bypassing` is latent -- and that is the argument FOR refusing the ack rather
+    # than against it: an environment variable set today survives into the deployment where
+    # enforcement moves to the database (**M57**), and would silence the control on the first day
+    # it means anything.
+    _UNACKNOWLEDGEABLE = {"source-enforcement:bypassing"}
     advisories = (("assert_enforcing", "source enforcement", {"attached"}),
                   ("assert_read_only", "read-only basis", {"writable", "constrained"}))
     # A typo'd acknowledgement silently does nothing and looks exactly like no acknowledgement --
@@ -366,6 +374,23 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
         key = f"{label.replace(' ', '-')}:{verdict}".lower()
         if verdict in quiet:
             logger.info("%s: %s -- %s", label, verdict, detail)
+        elif key in _UNACKNOWLEDGEABLE:
+            # Counted as MATCHED even though it silences nothing, and that is the careful part:
+            # leaving it unmatched would send it to the diagnosis below, which would tell the
+            # operator "the verdict changed" about a verdict that occurred and was refused a
+            # silencer. Two different causes sharing one message is the collapse this function
+            # already exists to avoid.
+            matched.add(key)
+            logger.warning("%s: %s -- %s", label, verdict, detail)
+            if key in acknowledged:
+                logger.warning(
+                    "MNEMIQ_ACK_ADVISORIES: the entry %r was set and is REFUSED -- it is the one "
+                    "entry that cannot silence its verdict, because that verdict says the "
+                    "DATABASE enforces nothing for this connection. Today the "
+                    "engine's own filters are still in force, so it is latent rather than live -- "
+                    "which is exactly why acknowledging it is refused. An acknowledgement made "
+                    "while it is latent would still be set on the day enforcement moves to the "
+                    "database and it stops being", key)
         elif key in acknowledged:
             matched.add(key)
             logger.info("%s: %s (acknowledged via MNEMIQ_ACK_ADVISORIES) -- %s",

@@ -819,9 +819,20 @@ class OracleAdapter:
         connecting principal the single point of failure: a connection privileged enough to bypass
         VPD means nothing enforces, silently, and no adapter previously inspected this at all.
 
-        Three verdicts, and the third is the point:
+        FOUR verdicts, and `bypassing` is the point. (This said "three" while listing four,
+        which is the kind of drift a docstring acquires when a verdict is added to the list and
+        not to the sentence above it.)
 
-          `bypassing`    -- measured to bypass. Refuse.
+          `bypassing`    -- measured to bypass. **The caller WARNS; nothing refuses**, and this
+                            line said "Refuse." until **M74**. That is a decision and not an
+                            oversight: under the 2026-08-29 direction the ENGINE still enforces
+                            RLS/CLS, so a bypassing connection today is one where mnemiq's own
+                            filters are still in force, and refusing to boot would take a working
+                            deployment down over a control that is not yet load-bearing. When
+                            delegation lands -- **M57** -- this must become fail-closed. What DID
+                            change: the verdict cannot be acknowledged away, because an
+                            acknowledgement made while it is latent would still be in the
+                            environment on the day it stops being.
           `unverifiable` -- no policy is attached to anything this connection can see, so there is
                             nothing to enforce and nothing to confirm.
           `partial`      -- some tables carry a policy and some do not. NOT an acceptance: the
