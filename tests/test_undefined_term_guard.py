@@ -628,3 +628,42 @@ def test_one_setting_reaches_both_ends_of_the_guard():
         assert "assumed_terms" in _GUIDED_SQL_SCHEMA["properties"], (
             "and the module constant must not be mutated by the strip"
         )
+
+
+def test_every_agent_construction_passes_the_flag():
+    """The invariant no per-call test can hold, because the failure is a call site that does not
+    exist yet.
+
+    `Agent` is constructed in two places -- `agent.modes.build_agent` and `eval.engine.build_engine`
+    -- and only the first has an offline test. Beacon confirmed the second is uncovered on their
+    side too: their in-process SUT injects an `engine_builder`, and every beacon test of that SUT
+    passes a stub, so the real `build_engine` runs in neither suite. Delete its kwarg and BOTH stay
+    green. The seam is right for beacon -- their CI has no mnemiq -- so the guarantee has to live
+    here.
+
+    A source-level invariant instead, which is what this repo already does for the ad-hoc env reads
+    `test_no_adhoc_retrieval_k_reads` forbids. It costs nothing and it holds for the THIRD
+    construction site, which is the one that will actually cause this: three hops on this branch
+    were left disconnected while its author was watching for exactly that.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "src" / "mnemiq"
+    missing = []
+    for path in root.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if name not in ("Agent", "build_agent"):
+                continue
+            passed = {kw.arg for kw in node.keywords}
+            if "guard_undefined_terms" not in passed and None not in passed:
+                missing.append(f"{path.relative_to(root)}:{node.lineno} {name}(...)")
+
+    assert missing == [], (
+        "every Agent/build_agent construction must pass guard_undefined_terms explicitly, or the "
+        "guard is inert there with both suites green: " + "; ".join(missing)
+    )
