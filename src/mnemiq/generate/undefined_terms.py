@@ -75,7 +75,7 @@ def ungrounded_terms(assumed: Sequence[str], definitions: Sequence[Any]) -> list
     """
     known: set[str] = set()
     for definition in definitions or ():
-        known |= set(spellings(definition))
+        known |= {n.spelling for n in spellings(definition)}
     out: list[str] = []
     for term in assumed or ():
         if not isinstance(term, str):

@@ -5,6 +5,7 @@ import re
 from collections.abc import Sequence
 
 from mnemiq.authz.grants import GrantSet
+from dataclasses import dataclass
 from typing import Any
 
 from mnemiq.contract import Definition
@@ -82,15 +83,29 @@ def term_pattern(term: str, inflection: str = INFLECTION_ANY) -> re.Pattern[str]
     return re.compile(rf"\b{body}\b", re.IGNORECASE)
 
 
-def spellings(definition: Any) -> list[str]:
+@dataclass(frozen=True)
+class Name:
+    """A spelling a definition answers to, and whether it is prose.
+
+    The pair travels together because the two callers need different halves of it and deriving
+    either one separately is how this module keeps breaking: `select_definitions` picks a matching
+    width from `prose`, `ungrounded_terms` compares on `spelling`, and neither re-walks the
+    precedence.
+    """
+
+    spelling: str
+    prose: bool  # a term/name/label a person writes, as opposed to the tail of an id
+
+
+def spellings(definition: Any) -> list[Name]:
     """The names this definition answers to, normalized -- THE one implementation.
 
     `term`, or `name`/`label` for a record that spells it either of those ways. Failing all three,
     the bare tail of `id`, because a record may carry its name only there. The tail only: a
     namespaced id is not something anyone writes into a sentence.
 
-    **Only when there is no term.** The tail was briefly a spelling alongside the term, and that is
-    the M35 suppressing direction: a definition with `term="net revenue"` and `id="...:revenue"`
+    **The tail only when there is no term.** It was briefly a spelling alongside the term, and that
+    is the M35 suppressing direction: a definition with `term="net revenue"` and `id="...:revenue"`
     certifies net revenue, so a question saying "revenue" that its TERM does not match must not
     pull it into the packet -- doing so grounds a model declaring "revenue" against a definition
     that does not define it, and the deferral disappears. A term, where one exists, is the
@@ -102,34 +117,38 @@ def spellings(definition: Any) -> list[str]:
 
     Used by BOTH `select_definitions` here and `generate.undefined_terms.ungrounded_terms`, by
     import rather than by resemblance. Two implementations of this list is the defect this module
-    has now been fixed for three times in one branch, each time in the same direction.
+    has now been fixed for four times in one branch, each time in the same direction.
     """
     for attr in ("term", "name", "label"):
         value = getattr(definition, attr, None)
         if isinstance(value, str) and value.strip():
-            return [normalized(value)]
+            return [Name(normalized(value), prose=True)]
     identifier = getattr(definition, "id", None)
     if isinstance(identifier, str) and identifier:
         tail = normalized(identifier.rsplit(":", 1)[-1])
         if tail:
-            return [tail]
+            return [Name(tail, prose=False)]
     return []
 
 
 def _asked_for(definition: Definition, question: str) -> bool:
-    """Whether the question names this definition.
+    r"""Whether the question names this definition.
 
-    A TERM is prose and gets prose's tolerance: `premium` should retrieve on "premiums". An id
-    TAIL is not prose -- it is an identifier that happens to be legible -- and giving it `\w*`
-    made a short one match nearly everything: a definition whose tail is `a` was selected by "what
-    is our average revenue", and `re`, `rev` likewise, so an unrelated definition appeared in every
-    packet. The tail is matched at the plural width instead. Nothing certified is lost by that; a
-    definition wanting prose tolerance has a `term`, which is what a term is for.
+    Prose gets prose's tolerance: `premium` should retrieve on "premiums". An id TAIL is not prose
+    -- it is an identifier that happens to be legible -- and giving it `\w*` made a short one match
+    nearly everything: a definition whose tail is `a` was selected by "what is our average
+    revenue", and `re`, `rev` likewise, so an unrelated definition appeared in every packet. The
+    tail is matched at the plural width instead. Nothing certified is lost by that; a definition
+    wanting prose tolerance has a name, which is what a name is for.
+
+    `Name.prose` rather than a second reading of `definition.term`: `spellings` also answers to
+    `name` and `label`, which ARE prose, and re-deriving only the `term` case here gave those the
+    identifier width.
     """
-    term = definition.term if isinstance(definition.term, str) else ""
-    if term.strip():
-        return bool(term_pattern(normalized(term)).search(question))
-    return any(term_pattern(s, INFLECTION_PLURAL).search(question) for s in spellings(definition))
+    return any(
+        term_pattern(n.spelling, INFLECTION_ANY if n.prose else INFLECTION_PLURAL).search(question)
+        for n in spellings(definition)
+    )
 
 
 def select_definitions(

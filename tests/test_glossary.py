@@ -212,3 +212,30 @@ def test_a_short_id_tail_is_not_a_word_that_matches_everything():
     assert select_definitions("total premiums by month", [prose], grants) == [prose], (
         "a term keeps prose tolerance"
     )
+
+
+def test_a_record_naming_itself_by_name_or_label_is_prose_too():
+    """The width follows what KIND of name it is, not which attribute happened to be read.
+
+    `spellings` answers to `name` and `label` as well as `term`, for corpora that spell it those
+    ways, and those are prose. An earlier version picked the width by re-reading `definition.term`,
+    so a record named by `name` fell through to the identifier width and lost inflection tolerance
+    -- and nothing failed, because no in-repo record uses the field. `Name.prose` carries the
+    answer out of the one place that decides it.
+    """
+    from mnemiq.semantic.glossary import Name, spellings, term_pattern
+
+    class Labelled:
+        id = "fspay:policy:z"
+        name = "loss ratio"
+
+    assert spellings(Labelled()) == [Name("loss ratio", prose=True)]
+    assert term_pattern("loss ratio").search("compare loss ratios by month"), (
+        "a prose name inflects"
+    )
+
+    class ById:
+        id = "fspay:policy:loss_ratio"
+        term = ""
+
+    assert spellings(ById()) == [Name("loss ratio", prose=False)]
