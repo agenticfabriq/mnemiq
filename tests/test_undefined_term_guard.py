@@ -636,7 +636,9 @@ def test_every_agent_construction_passes_the_flag():
     exist yet.
 
     `Agent` is constructed in three places -- `agent.modes.build_agent`, `eval.engine.build_engine`
-    and `scripts/answer.py` -- and only the first has an offline test. Beacon confirmed the second
+    and `scripts/answer.py` -- and only the first has an offline test. The scan pins FOUR paths,
+    because it covers both callables: the fourth is `runtime.py`, which calls `build_agent` rather
+    than constructing an Agent, and has to pass the flag for the same reason. Beacon confirmed the second
     is uncovered on their side too: their in-process SUT injects an `engine_builder` and every
     beacon test of it passes a stub, so the real `build_engine` runs in no beacon test. `test_eval_live`
     does call it, but only with a live key configured and it asserts nothing about this flag. So
