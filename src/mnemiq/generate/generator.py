@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 from mnemiq.generate.prompts import system_prompt, user_prompt
@@ -51,6 +51,14 @@ def _guided_extra_body(guided_sql: bool) -> dict | None:
 class SqlProposal:
     sql: str | None  # None is a deferral, not a failure
     reason: str = ""
+    # M35: business terms the model had to ASSUME a meaning for. It rides in the reply that
+    # produces the SQL rather than in a call of its own -- the model has already read the question
+    # and the packet, so a second round trip would ask the same model about the same text.
+    #
+    # A DECLARATION, not a decision. `undefined_terms.ungrounded_terms` checks each against the
+    # certified set and the planner refuses; asking the model to refuse when unsure is asking the
+    # thing that invented the derivation to notice it invented it, which it does 2 times in 6.
+    assumed_terms: list[str] = field(default_factory=list)
 
 
 def _parse(raw: str) -> SqlProposal:
@@ -67,9 +75,15 @@ def _parse(raw: str) -> SqlProposal:
 
     sql = payload.get("sql")
     reason = payload.get("reason")
+    # Absent means "declared nothing", never "unknown": every existing prompt and every test double
+    # omits the key, and a missing field that deferred would break the engine rather than guard it.
+    assumed = payload.get("assumed_terms")
     return SqlProposal(
         sql=sql.strip() if isinstance(sql, str) and sql.strip() else None,
         reason=reason if isinstance(reason, str) else "",
+        assumed_terms=[t.strip() for t in assumed if isinstance(t, str) and t.strip()]
+        if isinstance(assumed, list)
+        else [],
     )
 
 

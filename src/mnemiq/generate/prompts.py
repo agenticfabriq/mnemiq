@@ -74,7 +74,14 @@ data -- the raw code is the correct answer.
 {defer}
 
 Return ONLY a JSON object, no prose and no code fences:
-{{"sql": "<the SELECT, or null>", "reason": "<one sentence>"}}
+{{"sql": "<the SELECT, or null>", "reason": "<one sentence>", "assumed_terms": ["<term>", ...]}}
+
+`assumed_terms`: business terms in the QUESTION whose meaning you had to assume because no
+definition above gave it -- terms computed by a convention rather than read from a column, like
+"lifetime value" or "churn rate". List the term as the question spells it. Leave it `[]` when every
+term you relied on was defined above, or when the question names none. Do NOT list table or column
+names: a missing column is already caught elsewhere, and listing one here would refuse a question
+that is merely misspelled.
 """
     preamble = STRATEGY_PREAMBLES.get(strategy or "direct", "")
     return f"{base}\n{preamble}\n" if preamble else base

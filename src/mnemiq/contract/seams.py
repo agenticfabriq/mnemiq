@@ -20,6 +20,18 @@ class DeferralReason(StrEnum):
     POLICY_UNAVAILABLE = "policy_unavailable"  # the policy could not be read -> page an operator
     NO_TABLES = "no_tables"  # nothing retrieved -> rephrase, or check enrichment
     UNANSWERABLE = "unanswerable"  # the model could not form a query from these tables
+    # M35: the question names a business term nobody certified a meaning for -> get it defined.
+    #
+    # A separate code on M6's own test, which is what the caller should DO next. UNANSWERABLE says
+    # "rephrase, these tables cannot answer that"; this says "the tables can answer it, and nobody
+    # has said what the term MEANS" -- and the fix is external and specific, closer in shape to
+    # AUTHORIZATION's "request a grant" than to "try different words". Rephrasing cannot help.
+    #
+    # It is also the only thing that makes the guard MEASURABLE. Beacon's grader reads deferred as
+    # a boolean and never inspects the reason, but the reason is persisted and queryable -- and
+    # today every deferral in the corpus carries the identical string `unanswerable`, so a pass
+    # cannot be told from luck. A distinct code lands in `output.reason` with no harness change.
+    UNDEFINED_TERM = "undefined_term"
     INVALID_QUERY = "invalid_query"  # could not produce valid SQL within the budget
     VERIFICATION = "verification"  # we answered, then the verifier declined to stand behind it
     DISAGREEMENT = "disagreement"  # candidates diverged too much to pick one

@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import DeferralReason, Snapshot
+from mnemiq.generate.undefined_terms import ungrounded_terms
 from mnemiq.generate.generator import Generator
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.decide import decide
@@ -85,6 +86,28 @@ def plan_query(
 
     for _attempt in range(max_attempts):
         proposal = generator.propose(packet, feedback)
+
+        # M35: a term the model had to ASSUME a meaning for, with nothing certified behind it, is a
+        # question the data cannot answer -- however plausible the SQL looks. Measured on
+        # fs_payments: "lifetime value" has no definition while `revenue` and `total_payment` do,
+        # and the model composes one from them and answers with confidence.
+        #
+        # Checked BEFORE the SQL is decided, because the SQL is exactly what makes it look
+        # answerable: it parses, it runs, it returns four rows. The guard the engine already had
+        # is "no such column", which cannot see a term whose derivation is spelled from columns
+        # that all exist.
+        missing = ungrounded_terms(proposal.assumed_terms, packet.definitions)
+        if missing:
+            return Deferred(
+                reason=(
+                    "No certified definition for "
+                    + ", ".join(repr(t) for t in missing)
+                    + ". The data does not say how to compute it, so any answer would be a guess "
+                    "at your business rule rather than a reading of your data."
+                ),
+                code=DeferralReason.UNDEFINED_TERM,
+            )
+
         if proposal.sql is None:
             return Deferred(
                 reason=proposal.reason or "The model could not answer from these tables.",
