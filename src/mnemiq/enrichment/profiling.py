@@ -85,7 +85,10 @@ class ColumnStats:
     # failure existed only in a log line (**M73**). This is the absence/failure collapse inside
     # the per-column fallback added for **M67**, which was itself a fix for that collapse.
     measurement: str = MEASURED
-    failure: str | None = None  # set only when `measurement` is FAILED
+    # Why `measurement` is not MEASURED, for BOTH of the states that are not:
+    # the driver's error text for FAILED, and the standing reason for
+    # UNSUPPORTED. `None` only on a column that measured.
+    failure: str | None = None
 
 
 def _top_k(adapter: SourceAdapter, table: str, column: str, k: int) -> list[tuple]:
