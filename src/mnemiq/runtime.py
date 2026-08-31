@@ -547,6 +547,7 @@ def build_runtime(settings: Settings) -> Runtime:
             values=kit.values,
             selector=kit.selector,
             verifier=verifiers[name],
+            guard_undefined_terms=settings.guard_undefined_terms,
         )
         for name, mode in MODES.items()
     }

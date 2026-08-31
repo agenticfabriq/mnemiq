@@ -326,7 +326,8 @@ def test_the_planner_defers_on_an_ungrounded_term_before_deciding_the_sql():
         definitions=list(_defs()),
     )
 
-    out = plan_query(packet, snapshot, GrantSet(frozenset({"payment"})), _Gen())
+    out = plan_query(packet, snapshot, GrantSet(frozenset({"payment"})), _Gen(),
+                     guard_undefined_terms=True)
     assert isinstance(out, Deferred), f"a plausible derivation still answered: {out}"
     assert out.code == DeferralReason.UNDEFINED_TERM
     assert "lifetime value" in out.reason
@@ -426,6 +427,7 @@ def test_deep_mode_does_not_outvote_the_guard():
         # exercised a configuration that does not ship and its rationale described a vote that
         # could never have happened.
         min_agreement=0.6,
+        guard_undefined_terms=True,
     )
     packet = ContextPacket(
         question="What is the lifetime value of our average customer?",
@@ -504,3 +506,61 @@ def test_the_prompt_asks_for_the_field_the_parser_reads():
     assert carried.assumed_terms == ["lifetime value"], (
         "the parser must read the key the prompt asks for"
     )
+
+
+# -- withdrawn on its own criterion ----------------------------------------------------------------
+
+
+def test_the_guard_is_off_unless_asked_for():
+    """The measurement, as a test, so the default cannot drift back silently.
+
+    Beacon's answerable band at `30632b9`, one pass over 24 items (run
+    `06a95802-d794-7a2b-8000-ead4e3573b73`): **12 deferrals**, against a prior of 0 in 144
+    observations. Strict accuracy 66.7% -> 45.8%. The threshold was 2-3%, written down before the
+    number was seen, together with "pull the guard rather than tune it".
+
+    The model declared `data` ("which currencies appear in the data"), `processed`, `take in`,
+    `fourth quarter of 2025` and `merchants` as business terms requiring a certified definition.
+    The 2026-08-13 review killed the DETERMINISTIC version of this rule on the sentence "two
+    consecutive words absent from a schema vocabulary is the normal condition of a sentence, not a
+    signal", and the same failure arrived through the model-declared version built to route around
+    it. That is the design's premise -- that declaring is a question the model can answer reliably
+    where refusing is not -- and the band falsified it.
+
+    So the same reply that defers under the flag answers without it. Turning the default back on
+    means a new measurement, not a prompt tweak.
+    """
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract import Column, Snapshot
+    from mnemiq.generate.generator import FakeGenerator
+    from mnemiq.generate.plan_query import Deferred, plan_query
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+
+    reply = '{"sql": "SELECT n FROM payment", "assumed_terms": ["lifetime value"]}'
+    packet = ContextPacket(
+        question="What is the lifetime value of our average customer?",
+        cards=[RetrievedCard(object_id="payment", card="TABLE payment", score=1.0)],
+        grant_fingerprint="f", enrichment_version="v1", definitions=_defs(),
+    )
+    snapshot = Snapshot(version="v1", source_id="fs", created_at="t",
+                        columns=[Column(id="payment.n", object_id="payment", name="n")])
+    grants = GrantSet(frozenset({"payment"}))
+
+    on = plan_query(packet, snapshot, grants, FakeGenerator([reply]), guard_undefined_terms=True)
+    assert isinstance(on, Deferred) and on.code == DeferralReason.UNDEFINED_TERM
+
+    off = plan_query(packet, snapshot, grants, FakeGenerator([reply]))
+    assert not isinstance(off, Deferred), "the default must answer, as it did before M35"
+
+
+def test_a_containing_phrase_is_why_this_cannot_be_fixed_by_widening():
+    """The half of the 12 that looks like a matcher bug, and the reason it is not one.
+
+    Beacon refused `total revenue` while `revenue` is certified -- a phrase CONTAINING a defined
+    term. Discharging containment would clear several of the false deferrals, and it would also
+    ground "revenue per customer", which is a DERIVATION over a certified term and is the exact
+    shape M35 exists to refuse. The two are the same lexical relation and the guard cannot want
+    one without the other. Widening is not the road back.
+    """
+    assert ungrounded_terms(["total revenue"], _defs()) == ["total revenue"]
+    assert ungrounded_terms(["revenue per customer"], _defs()) == ["revenue per customer"]

@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     # --- behavior levers / MCP standalone identity ---
     guided_sql: bool = Field(default=False, description="constrained decoding: force non-empty sql (response_format json_schema; works on vLLM and OpenAI-compatible endpoints)")
     assertive_sql: bool = Field(default=False, description="assertive prompt: attempt an answer instead of deferring")
+    # M35, off by default: withdrawn on its own pre-registered criterion. Beacon's answerable band
+    # deferred 12 of 24 against a prior of 0 in 144, where the threshold named in advance was 2-3%.
+    # See `plan_query` for what the number decomposes into and what reviving it would take.
+    guard_undefined_terms: bool = Field(default=False, description="M35: refuse when the model declares a business term with no certified definition (measured 12/24 false deferrals -- off pending a narrower declaration scope)")
     answer_markdown: bool = Field(default=False, description="let the answer use markdown (lists, tables) when the result has structure")
     enrich_facts: bool = Field(default=False, description="eval: table-facts enrichment phase (plan-20, default off)")
     enrich_examples: bool = Field(default=False, description="eval: verified-example enrichment phase (plan-20, default off)")
