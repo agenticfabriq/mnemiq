@@ -101,6 +101,15 @@ Short codes like `E11` or `NC-17` mean nothing on their own. mnemiq grounds them
 itself, from a standard code system (an ontology in TTL/SKOS/OWL), or from a hand-written operator
 dictionary — always **grounded-or-bare**, never guessed. See [docs/grounding.md](docs/grounding.md).
 
+## Deploying against Oracle
+
+The Oracle read plane refuses writes, but that refusal is partly a property of your **deployment**
+rather than of the engine: a `SELECT` can reach an `AUTONOMOUS_TRANSACTION` function through a
+view, and restricting the caller does not close it, because a view resolves its references with the
+view owner's rights. Pointing the read plane at a database that is open read-only does close it,
+measured, and mnemiq reports at boot which of the two you have. See
+[docs/oracle-deployment.md](docs/oracle-deployment.md) before connecting a production source.
+
 ## Open core
 
 The engine is Apache-2.0 and stands alone. Two commercial planes build on it and are **not**
