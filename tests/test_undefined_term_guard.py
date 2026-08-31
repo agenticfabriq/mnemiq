@@ -444,8 +444,12 @@ def test_deep_mode_does_not_outvote_the_guard():
     assert answer.deferred is True
     assert answer.reason_code == DeferralReason.UNDEFINED_TERM
     assert "lifetime value" in answer.answer
-    assert generator.calls == 5, "every candidate still runs; the guard decides after, not by short-circuit"
-    assert answer.candidates_executed == 3, "three produced a table; the adapter must reach `execute`"
+    assert generator.calls == 5, (
+        "every candidate still runs; the guard decides after, not by short-circuit"
+    )
+    assert answer.candidates_executed == 3, (
+        "three produced a table; the adapter must reach `execute`"
+    )
     assert "disagreed" not in answer.answer, (
         "selective answering would defer this as DISAGREEMENT -- true of the candidate set and "
         "false of the question, and pointing the caller at a repair that cannot work"
@@ -662,7 +666,11 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     any other way -- a wrapper (`partial(plan_query)`, a decorator, a handler dict), a walrus, or
     a form added to the language later -- is not counted, and no enumeration here should be read
     as complete. Bounded in one direction only: converting an already-pinned site to such a form
-    drives its count to zero and fails closed, so the exposure is to sites newly written that way. Closing it properly means the parameter having no default, so the interpreter enforces
+    drives its count to zero and fails closed, so the exposure is to sites newly written that
+    way.
+
+    Closing it properly is not more scanning: it is the parameter having no default, so the
+    interpreter enforces
     what a scan approximates -- disproportionate for a withdrawn feature, and recorded here so the
     next person decides it deliberately.
     """
@@ -748,7 +756,8 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
                     )
 
     assert seen == EXPECTED_SITES, (
-        f"the set of guard-participating sites changed; the scan matched {sorted(seen.items())}. If this "
+        f"the set of guard-participating sites changed; the scan matched "
+        f"{sorted(seen.items())}. If this "
         "is a new site, add it here AND pass its half of the guard. If a known one vanished, the "
         "scan stopped seeing it and this invariant is no longer guarding it"
     )
