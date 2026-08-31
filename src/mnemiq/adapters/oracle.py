@@ -195,9 +195,19 @@ class OracleAdapter:
     # **No statement-text check can close it, and that is measured too**: wrapping the call in a
     # view makes `SELECT n FROM v_sneaky` write a row while containing no function name at all.
     # Parsing for callable names would not see it; neither would anything else reading the SQL.
-    # The control that DOES close it is privilege -- a read connection that cannot write cannot be
-    # made to write by any function it calls -- which is what `assert_read_only` reports on, and
-    # which is a deployment property this adapter can observe but not impose.
+    # Privilege is NOT the control, and this comment claimed it was for longer than any other
+    # copy of the claim survived. A read connection that cannot write CAN be made to write by a
+    # function it calls: measured, a principal holding SELECT on one view and nothing else -- no
+    # EXECUTE, no DML, owning nothing -- read that view and a row was inserted, because a view
+    # resolves its references with the VIEW OWNER's rights. The correction reached the
+    # `assert_read_only` docstring and the boot message and not these three lines, two hundred
+    # above them, which is the defect this lane keeps producing.
+    #
+    # The control that DOES close it is the DATABASE being open read-only, which refuses every
+    # write from every principal -- measured on this exact shape, ORA-16000, while plain SELECT
+    # kept working. `assert_read_only` reports that as `constrained`, and narrowing the principal
+    # is a worthwhile reduction that is not a fix. Both are deployment properties this adapter can
+    # observe and not impose; see docs/oracle-deployment.md.
     _READ_LEADERS = frozenset({"SELECT", "WITH"})
 
     def _refuse_unless_read(self, sql: str) -> None:
