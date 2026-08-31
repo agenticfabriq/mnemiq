@@ -662,10 +662,11 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
 
     **It fails closed**, in four ways that were each a hole first. It pins the exact set of sites
     AND how many calls each file makes, because `loop.py` calls `plan_query` twice and a set keyed
-    on the pair cannot tell that one of them stopped matching. It rejects a hardcoded value -- a literal OR an empty
-    collection, since `definitions=()` is the one hardcode that reproduces the very defect the
-    corpus leg was added to catch. The kwarg NAME being present is not the guarantee. It counts `**kwargs` as not passing, since a
-    config-driven site is the likeliest next one. And it resolves import aliases and local
+    on the pair cannot tell that one of them stopped matching. It rejects a hardcoded value -- a
+    literal OR an empty collection, since `definitions=()` is the one hardcode that reproduces the
+    very defect the corpus leg was added to catch, and the kwarg NAME being present is not the
+    guarantee. It counts `**kwargs` as not passing, since a config-driven site is the likeliest
+    next one. And it resolves import aliases and local
     rebindings -- plain, annotated and tuple -- so none of `plan_query as _pq`,
     `pq = plan_query` or `pq: Callable = plan_query` renames its way out.
 
@@ -728,7 +729,10 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
         """
         if isinstance(value, ast.Constant):
             return True
-        return isinstance(value, (ast.List, ast.Tuple, ast.Set)) and not value.elts
+        # No `ast.Set`: Python has no empty-set literal, and `{}` parses as `ast.Dict`.
+        if isinstance(value, ast.Dict):
+            return not value.keys
+        return isinstance(value, (ast.List, ast.Tuple)) and not value.elts
 
     root = pathlib.Path(__file__).resolve().parents[1]
     roots = [root / "src" / "mnemiq", root / "scripts"]
