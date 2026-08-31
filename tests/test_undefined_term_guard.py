@@ -20,24 +20,31 @@ Deliberately not a term list, because an unlisted term passes and that is the sh
 documents as unfixable.
 """
 
+
 import pytest
 
 from mnemiq.contract.seams import DeferralReason
+from mnemiq.contract.semantic import Definition
 from mnemiq.generate.generator import SqlProposal, _parse
 from mnemiq.generate.undefined_terms import ungrounded_terms
 
 
-class _Def:
-    def __init__(self, object_id, term):
-        self.object_id = object_id
-        self.term = term
-
-
 def _defs():
-    # The fs_payments certified set, as `policy_records.json` actually carries it.
-    return [_Def("fspay:policy:revenue", "revenue"),
-            _Def("fspay:policy:total_payment", "total payment"),
-            _Def("fspay:policy:payment_date", "payment date")]
+    """The fs_payments certified set, as `policy_records.json` actually carries it.
+
+    The REAL `Definition`, not a fake. The first version of this file used a stand-in with an
+    `object_id` attribute, which the model does not have -- so the code read a field that never
+    existed, the id branch was dead in production, and every test here passed anyway. A fixture
+    shaped to the code cannot falsify the code.
+    """
+    return [
+        Definition(id="fspay:policy:revenue", term="revenue", domain="fspay",
+                   definition="recognised revenue"),
+        Definition(id="fspay:policy:total_payment", term="total payment", domain="fspay",
+                   definition="sum of settled payments"),
+        Definition(id="fspay:policy:payment_date", term="payment date", domain="fspay",
+                   definition="the settlement date"),
+    ]
 
 
 # -- the parser carries the model's own declaration ------------------------------------------------
@@ -80,10 +87,24 @@ def test_matching_ignores_case_and_padding(spelling):
     assert ungrounded_terms([spelling], _defs()) == []
 
 
-def test_a_multi_word_definition_matches_on_its_term_not_its_object_id():
-    """`fspay:policy:total_payment` is an id, not something a model says. Matching on the id would
-    make every definition ungrounded and the guard would refuse everything."""
-    assert ungrounded_terms(["total payment"], _defs()) == []
+def test_a_namespaced_id_is_not_a_spelling_a_model_would_use():
+    """The tail of an id is a spelling; the whole namespaced id is not, and matching on the whole
+    would leave those definitions unmatched.
+
+    Asserted with a definition whose TERM cannot also satisfy it. The earlier version used
+    `total payment`, which the fixture's `id="fspay:policy:total_payment"` yields on its own via
+    the tail -- so it passed through either path and could not have caught the `term` lookup
+    regressing, while its docstring claimed to be testing exactly that.
+    """
+    from mnemiq.contract.semantic import Definition
+
+    defs = [Definition(id="fspay:policy:x9", term="settled volume", domain="fspay",
+                       definition="volume of settled payments")]
+    assert ungrounded_terms(["settled volume"], defs) == [], "the term must match"
+    assert ungrounded_terms(["x9"], defs) == [], "the id's tail is a spelling too"
+    assert ungrounded_terms(["fspay:policy:x9"], defs) == ["fspay:policy:x9"], (
+        "a namespaced id is not something a model writes"
+    )
 
 
 def test_the_guard_names_every_ungrounded_term_not_just_the_first():
@@ -175,3 +196,92 @@ def test_the_planner_defers_on_an_ungrounded_term_before_deciding_the_sql():
     assert isinstance(out, Deferred), f"a plausible derivation still answered: {out}"
     assert out.code == DeferralReason.UNDEFINED_TERM
     assert "lifetime value" in out.reason
+
+
+def test_a_definition_is_matched_by_its_id_when_that_is_how_a_corpus_spells_the_term():
+    """The branch that was dead in production. Some corpora carry `loss_ratio` as the id and the
+    term a model writes is "loss ratio" -- so a bare id, underscores normalised, is a spelling.
+
+    Asserted against the REAL `Definition`. The earlier fake carried `object_id`, the code read
+    `object_id`, and both were wrong together: a test and its subject sharing a mistake cannot
+    detect it.
+    """
+    from mnemiq.contract.semantic import Definition
+
+    defs = [Definition(id="loss_ratio", term="", domain="ins", definition="claims over premium")]
+    assert ungrounded_terms(["loss ratio"], defs) == []
+    assert ungrounded_terms(["lifetime value"], defs) == ["lifetime value"]
+
+
+def test_deep_mode_does_not_outvote_the_guard():
+    """Deep mode ran five candidates, dropped every non-Approved outcome, and let the survivors
+    vote -- so two candidates declaring "lifetime value" deferred, three answered from a guessed
+    meaning, and the majority won. The guard was in force on instant and thinking and inert on the
+    mode a caller reaches for precisely when the question is hard.
+
+    The asymmetry is why one declaration settles it rather than getting a vote: a candidate
+    DECLARING the term is evidence the question names an undefined one; the others not declaring it
+    is not evidence against -- they simply did not say.
+
+    RUNS THE AGENT. The first version of this test installed a fake over `plan_query`, never called
+    it, and asserted on the SOURCE TEXT of `_answer_consistent` -- so the behaviour change shipped
+    with no test that executed it, and the file's own `_defs` docstring two screens up says exactly
+    why that does not count. It also encoded a contract the code contradicts, raising on the third
+    candidate when the code deliberately runs all of them, so the first maintainer to make it real
+    would have got a failure on correct code and "fixed" the code to match the test.
+    """
+    import pyarrow as pa
+
+    from mnemiq.agent.budget import Budget
+    from mnemiq.agent.loop import Agent
+    from mnemiq.agent.synthesize import FakeSynthesizer
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.cache.store import L1Cache, TwoTierCache
+    from mnemiq.contract import Column, IdentityContext, Snapshot
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+
+    class _MixedGenerator:
+        """Two candidates declare the undefined term; the rest answer confidently."""
+
+        def __init__(self):
+            self.calls = 0
+
+        def propose(self, packet, feedback=None, strategy=None):
+            #  because deep mode wraps each candidate in StrategyGenerator, which passes
+            # it through -- a real Agent run finds that; a hand-rolled fake over plan_query did not.
+            self.calls += 1
+            if self.calls <= 2:
+                return SqlProposal(sql="SELECT 1", reason="", assumed_terms=["lifetime value"])
+            return SqlProposal(sql="SELECT 1", reason="", assumed_terms=[])
+
+    class _Adapter:
+        dialect = "duckdb"
+
+        def execute_arrow(self, sql, timeout_s=30):
+            return pa.table({"n": [1]})
+
+    generator = _MixedGenerator()
+    agent = Agent(
+        generator=generator,
+        synthesizer=FakeSynthesizer(),
+        adapter=_Adapter(),
+        cache=TwoTierCache(L1Cache()),
+        budget=Budget(wall_clock_s=5.0, max_attempts=1),
+        candidates=5,
+    )
+    packet = ContextPacket(
+        question="What is the lifetime value of our average customer?",
+        cards=[RetrievedCard(object_id="claim", card="TABLE claim", score=1.0)],
+        grant_fingerprint="f",
+        enrichment_version="v1",
+        definitions=_defs(),
+    )
+    snapshot = Snapshot(version="v1", source_id="fs_payments", created_at="t",
+                        columns=[Column(id="claim.n", object_id="claim", name="n")])
+    answer = agent.answer(packet, snapshot, GrantSet(frozenset({"claim"})),
+                          IdentityContext(tenant_id="t", principal_id="u", roles=["analyst"]))
+
+    assert answer.deferred is True, "three silent candidates outvoted two that declared the term"
+    assert answer.reason_code == DeferralReason.UNDEFINED_TERM
+    assert "lifetime value" in answer.answer
+    assert generator.calls == 5, "every candidate still runs; the guard decides after, not by short-circuit"

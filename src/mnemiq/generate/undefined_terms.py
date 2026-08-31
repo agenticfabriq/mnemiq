@@ -30,18 +30,24 @@ from typing import Any
 def _spoken(definition: Any) -> set[str]:
     """The spellings a model might use for this definition.
 
-    `term` and not `object_id`: `fspay:policy:total_payment` is an identifier, and matching on it
-    would leave every definition unmatched and the guard refusing everything.
+    Both `term` and the bare tail of `id`, because a corpus spells the term in either place: the
+    fs_payments records carry `term="revenue"` beside `id="fspay:policy:revenue"`, while others
+    carry `id="loss_ratio"` with no term at all. The tail only -- a namespaced id is not something
+    a model writes, so matching the whole of it would leave those definitions unmatched.
     """
     out: set[str] = set()
     for attr in ("term", "name", "label"):
         value = getattr(definition, attr, None)
         if isinstance(value, str) and value.strip():
             out.add(value.strip().lower())
-    object_id = getattr(definition, "object_id", None)
-    if isinstance(object_id, str) and object_id:
+    # `id`, which is what `Definition` actually calls it. The first version read `object_id` --
+    # a field the model does not have -- so this whole branch was dead in production and the test
+    # that "proved" it passed only because the fake invented the field. A fixture that shapes
+    # itself to the code cannot falsify the code, which is why the tests now use the real type.
+    identifier = getattr(definition, "id", None)
+    if isinstance(identifier, str) and identifier:
         # A bare id like `loss_ratio` IS how some corpora spell the term; a namespaced one is not.
-        tail = object_id.rsplit(":", 1)[-1]
+        tail = identifier.rsplit(":", 1)[-1]
         out.add(tail.replace("_", " ").strip().lower())
     return {s for s in out if s}
 

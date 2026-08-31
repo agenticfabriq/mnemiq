@@ -280,9 +280,12 @@ class Agent:
         deadline,
         emit: Emit | None = None,
     ) -> AgentAnswer:
-        # Generate N candidates across engineered strategies and let execution vote. Each
-        # is decided independently; a refusal/deferral just drops that candidate.
+        # Generate N candidates across engineered strategies and let execution vote. Each is
+        # decided independently; a refusal or deferral just drops that candidate -- EXCEPT an
+        # undefined-term deferral, which is a finding about the question rather than about the
+        # candidate, and is carried out below rather than outvoted.
         executed: list[tuple[Approved, object]] = []
+        undefined: Deferred | None = None
         for i in range(self.candidates):
             with step(emit, Stage.CANDIDATE, index=i + 1, of=self.candidates):
                 outcome = plan_query(
@@ -298,10 +301,31 @@ class Agent:
                     values=self.values,
                 )
                 if not isinstance(outcome, Approved):
+                    # M35: an UNDEFINED_TERM deferral is a finding about the QUESTION, not a
+                    # failed attempt by this candidate, so it must not be dropped and outvoted.
+                    #
+                    # The asymmetry is the point. A candidate declaring "lifetime value" is
+                    # evidence the question names an undefined term; the others NOT declaring it
+                    # is not evidence against -- they simply did not say. Letting three silent
+                    # candidates outvote two that spoke would restore the exact failure the guard
+                    # exists for, and deep mode is where it would land, because deep mode is what
+                    # a caller reaches for on the hard questions.
+                    if getattr(outcome, "code", None) == DeferralReason.UNDEFINED_TERM:
+                        undefined = outcome
                     continue
                 table = self._execute(outcome, grants, packet)
             if table is not None:
                 executed.append((outcome, table))
+
+        if undefined is not None:
+            # Before the vote and before the fallback: one candidate that could not ground a term
+            # settles the question, however many produced runnable SQL from a guessed meaning.
+            # `candidates_executed` like the DISAGREEMENT deferral below: every candidate DID run,
+            # and without it the workbench drops the candidate chip and the harness records nothing
+            # for a deep-mode turn that spent the full budget.
+            return AgentAnswer(answer=undefined.reason, deferred=True,
+                               reason_code=undefined.code,
+                               candidates_executed=len(executed))
 
         if not executed:
             # no candidate ran -> fall back to the single repairing path (today's floor)
