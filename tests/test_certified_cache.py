@@ -69,8 +69,8 @@ def test_a_second_pull_returns_the_same_set_not_an_empty_delta(tmp_path, monkeyp
         {"records": [], "watermark": None, "next_cursor": None},   # the empty delta
     ])
 
-    first = fetch_certified_records(settings)
-    second = fetch_certified_records(settings)
+    first = fetch_certified_records(settings).records
+    second = fetch_certified_records(settings).records
 
     assert _ids(first) == ["a", "b"]
     assert _ids(second) == ["a", "b"], (
@@ -88,8 +88,8 @@ def test_a_delta_adds_to_the_cached_set(tmp_path, monkeypatch):
         {"records": [_record("b")], "watermark": "t2", "next_cursor": None},
     ])
 
-    fetch_certified_records(settings)
-    merged = fetch_certified_records(settings)
+    fetch_certified_records(settings).records
+    merged = fetch_certified_records(settings).records
 
     assert _ids(merged) == ["a", "b"], "a delta must add to what is cached, not replace it"
 
@@ -109,8 +109,8 @@ def test_a_changed_record_replaces_rather_than_duplicates(tmp_path, monkeypatch)
         {"records": [_record("a", "new")], "watermark": "t2", "next_cursor": None},
     ])
 
-    fetch_certified_records(settings)
-    merged = fetch_certified_records(settings)
+    fetch_certified_records(settings).records
+    merged = fetch_certified_records(settings).records
 
     assert _ids(merged) == ["a", "b"], f"expected a replaced and b kept, got {_ids(merged)}"
     assert [r for r in merged if r.envelope.object_id == "a"][0].payload.definition == "new"
@@ -129,8 +129,8 @@ def test_an_outage_serves_the_cached_set_rather_than_nothing(tmp_path, monkeypat
         urllib.error.URLError("verity is down"),
     ])
 
-    fetch_certified_records(settings)
-    during_outage = fetch_certified_records(settings)
+    fetch_certified_records(settings).records
+    during_outage = fetch_certified_records(settings).records
 
     assert _ids(during_outage) == ["a", "b"], "an outage must not empty the certified set"
 
@@ -147,9 +147,9 @@ def test_an_outage_does_not_advance_the_watermark(tmp_path, monkeypatch):
         urllib.error.URLError("verity is down"),
     ])
 
-    fetch_certified_records(settings)
+    fetch_certified_records(settings).records
     before = json.loads((tmp_path / "cache.json").read_text())
-    fetch_certified_records(settings)
+    fetch_certified_records(settings).records
     after = json.loads((tmp_path / "cache.json").read_text())
 
     assert before == after, "a failed pull must leave the sidecar untouched"
@@ -168,7 +168,7 @@ def test_a_legacy_watermark_only_sidecar_forces_a_full_pull(tmp_path, monkeypatc
         {"records": [_record("a")], "watermark": "t1", "next_cursor": None},
     ])
 
-    records = fetch_certified_records(settings)
+    records = fetch_certified_records(settings).records
 
     assert _ids(records) == ["a"]
     assert "since=" not in seen[0], f"a legacy sidecar must not send a watermark it cannot merge into: {seen[0]}"
@@ -187,8 +187,8 @@ def test_a_stale_cache_triggers_a_full_resync(tmp_path, monkeypatch):
         {"records": [_record("a")], "watermark": "t2", "next_cursor": None},
     ])
 
-    fetch_certified_records(settings)
-    after = fetch_certified_records(settings)
+    fetch_certified_records(settings).records
+    after = fetch_certified_records(settings).records
 
     assert "since=" not in seen[1], f"a stale cache must re-sync in full: {seen[1]}"
     assert _ids(after) == ["a"], (
@@ -207,8 +207,8 @@ def test_a_fresh_cache_stays_incremental(tmp_path, monkeypatch):
         {"records": [_record("b")], "watermark": "t2", "next_cursor": None},
     ])
 
-    fetch_certified_records(settings)
-    fetch_certified_records(settings)
+    fetch_certified_records(settings).records
+    fetch_certified_records(settings).records
 
     assert "since=" in seen[1], f"a fresh cache should ask only for the delta: {seen[1]}"
 
@@ -226,11 +226,11 @@ def test_an_incremental_pull_does_not_advance_synced_at(tmp_path, monkeypatch):
         {"records": [_record("b")], "watermark": "t2", "next_cursor": None},
     ])
 
-    fetch_certified_records(settings)
+    fetch_certified_records(settings).records
     first = json.loads((tmp_path / "cache.json").read_text())["sources"][
         "https://v/api/semantic/records/open"]["synced_at"]
     time.sleep(0.01)
-    fetch_certified_records(settings)
+    fetch_certified_records(settings).records
     second = json.loads((tmp_path / "cache.json").read_text())["sources"][
         "https://v/api/semantic/records/open"]["synced_at"]
 

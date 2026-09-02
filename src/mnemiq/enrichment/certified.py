@@ -5,6 +5,7 @@ import logging
 import os
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from mnemiq.contract import PII_LEVELS, CertifiedRecord, CodedValue, Job, Snapshot
@@ -50,7 +51,54 @@ _CACHE_VERSION = 1
 _DEFAULT_RESYNC_SECS = 86400
 
 
-def fetch_certified_records(settings) -> list[CertifiedRecord]:
+@dataclass(frozen=True)
+class CertifiedSet:
+    """The certified corpus, and whether we could READ it.
+
+    `records` alone could not distinguish a tenant that has certified nothing from a Verity that
+    refused us: both were `[]`. That is M2's defect a second time -- `GrantSet.available` exists
+    because "the policy could not be read" and "the policy grants nothing" both denied everything
+    and were the same empty set -- and here it is worse, because the failure looks like health. A
+    deployment configured to answer from a certified corpus, whose pull 401s, answers UNGROUNDED
+    and is indistinguishable from one that is working.
+
+    NOT iterable, deliberately. A caller that ignores `available` should not compile: every call
+    site has to decide what an unreadable corpus means for it, and the two that matter -- enrich
+    and the eval runners -- decide to refuse.
+
+    `available` is True when we have a corpus to stand on, which includes two states that are not
+    failures: nothing has been certified yet, and no `verity_records_url` is configured at all. It
+    is also True when a failed pull degraded to a POPULATED cache, because last-known-good is an
+    answer (M18); it is False only when we asked and came away with nothing to ground on.
+    """
+
+    records: list[CertifiedRecord]
+    available: bool = True
+
+
+def require_certified(certified, settings) -> None:
+    """Refuse when a deployment ASKED for a certified corpus and has none to stand on.
+
+    Fail-soft is right for freshness and wrong for grounding. With `verity_records_url` set, an
+    unreadable corpus means every answer is composed without the meanings a human certified -- and
+    it looks exactly like a healthy ungrounded engine, which is why nothing caught it. Beacon gates
+    its own grounded arm on `expect_records` for this reason; this is the engine doing the same for
+    itself.
+
+    Not raised on emptiness: a tenant that has certified nothing, an unconfigured local run, and a
+    failed pull that degraded to a populated cache all keep `available` True. Only "we asked and
+    came away with nothing" refuses.
+    """
+    if getattr(settings, "verity_records_url", None) and not certified.available:
+        raise RuntimeError(
+            "certified records were configured but could not be read, so this run would be "
+            "grounded on nothing while looking healthy. The per-event log above carries the cause "
+            "verbatim (a 401 and an outage are different problems). Set no verity_records_url to "
+            "run local-only on purpose."
+        )
+
+
+def fetch_certified_records(settings) -> CertifiedSet:
     """The certified set: whatever was cached locally, brought up to date from Verity.
 
     The pull is incremental (`since` watermark) and `enrich` is a from-scratch rebuild, so before
@@ -70,7 +118,9 @@ def fetch_certified_records(settings) -> list[CertifiedRecord]:
     """
     url = getattr(settings, "verity_records_url", None)
     if not url:
-        return []
+        # Unconfigured is a supported deployment, not an outage: a local run grounds on whatever
+        # the local digest produced and never asked Verity for anything.
+        return CertifiedSet([], available=True)
 
     cache_path = _watermark_path(settings)
     cached, watermark, synced_at = _read_cache(cache_path, url)
@@ -100,7 +150,10 @@ def fetch_certified_records(settings) -> list[CertifiedRecord]:
         # would silently truncate the set. Serve what we last knew and leave the sidecar alone.
         logger.warning(
             "verity pull incomplete; serving %d cached certified records", len(cached))
-        return _parse(cached)
+        # Degraded freshness is not absence. A populated cache still grounds the engine, so it
+        # stays available; an EMPTY one means we asked for a corpus and have none, which is the
+        # state a configured deployment must not answer from silently.
+        return CertifiedSet(_parse(cached), available=bool(cached))
 
     records = pulled if full else _merge(cached, pulled)
     if cache_path:
@@ -112,7 +165,7 @@ def fetch_certified_records(settings) -> list[CertifiedRecord]:
             # while looking fixed.
             synced_at=_now_iso() if full else synced_at,
         )
-    return _parse(records)
+    return CertifiedSet(_parse(records), available=True)
 
 
 def _record_identity(item: dict) -> tuple[str, str]:

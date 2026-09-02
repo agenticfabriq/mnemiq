@@ -132,6 +132,7 @@ def _cmd_enrich(settings: Settings) -> int:
         return 1
     from mnemiq.enrichment.certified import (
         apply_certified, certified_concept_schemes, fetch_certified_records,
+        require_certified,
     )
     from mnemiq.enrichment.dictionary import load_dictionary
     from mnemiq.enrichment.grounding import apply_dictionary, ground_codes
@@ -160,7 +161,9 @@ def _cmd_enrich(settings: Settings) -> int:
     # and it did so before this change. Saying it twice in one run is worse than saying it once.
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
-    _certified = fetch_certified_records(settings)
+    _certified_set = fetch_certified_records(settings)
+    require_certified(_certified_set, settings)
+    _certified = _certified_set.records
     # Governed concept schemes join the local digest before binding + indexing; certified wins.
     _cert_schemes = certified_concept_schemes(_certified)
     if _cert_schemes:

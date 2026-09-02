@@ -171,9 +171,12 @@ def enrich_bird_db(
     is the key -- the enriched snapshot depends on the model, so switching models must not
     silently reuse another model's enrichment. The facts/examples toggles enter the key too,
     so an A/B run never reuses another config's enrichment."""
-    from mnemiq.enrichment.certified import apply_certified, fetch_certified_records
+    from mnemiq.enrichment.certified import (
+        apply_certified, fetch_certified_records, require_certified)
 
-    _certified = fetch_certified_records(settings)
+    _certified_set = fetch_certified_records(settings)
+    require_certified(_certified_set, settings)
+    _certified = _certified_set.records
     _cert_digest = hashlib.sha256(
         "".join(sorted(r.envelope.version for r in _certified)).encode()
     ).hexdigest() if _certified else ""
