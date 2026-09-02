@@ -27,7 +27,19 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 NODB = ROOT / "tests" / "test_oracle_nodb.py"
 CI = ROOT / ".github" / "workflows" / "ci.yml"
-MARKERS = "not integration and not live_llm"
+def _cis_marker_expression() -> str:
+    """Read out of the workflow, never restated here.
+
+    A copy drifts: add `and not oracle` to the run line and mark the module, and a guard holding
+    the old string still collects seven tests under an expression CI no longer uses -- green,
+    while the thing it guards does not run. The `-m` flag is on the run line this already reads.
+    """
+    for line in _the_job_that_runs_pytest():
+        if "pytest" in line and "-m" in line:
+            m = re.search(r'-m\s+"([^"]+)"', line) or re.search(r"-m\s+'([^']+)'", line)
+            assert m, f"cannot read the marker expression out of: {line.strip()}"
+            return m.group(1)
+    raise AssertionError("the pytest job has no `-m` marker expression to read")
 
 
 def _the_job_that_runs_pytest() -> list[str]:
@@ -63,11 +75,18 @@ def test_ci_installs_the_extra_the_oracle_tests_import():
 @pytest.mark.skipif(not NODB.exists(), reason="the module this guards is gone")
 def test_cis_marker_expression_actually_selects_those_tests():
     pytest.importorskip("oracledb", reason="without the driver this measures the environment")
+    markers = _cis_marker_expression()
     out = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", MARKERS, str(NODB)],
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", markers, str(NODB)],
         cwd=ROOT, capture_output=True, text=True, timeout=120)
     selected = sum(1 for ln in out.stdout.splitlines() if "::test_" in ln)
-    assert selected > 0, (
-        f"CI runs `-m \"{MARKERS}\"` and it selects nothing from {NODB.name}: the database-free "
-        f"guards are deselected by a mark and the build stays green.\n{out.stdout[-800:]}"
+
+    # EVERY test, not merely one. `> 0` sees all-or-nothing deselection only, and the attack is
+    # not all-or-nothing: a single `@pytest.mark.integration` on the retry-storm guard leaves six
+    # selected, a passing assertion, and that guard silently out of CI.
+    written = len(re.findall(r"^def (test_\w+)", NODB.read_text(), re.M))
+    assert selected == written, (
+        f"CI runs `-m \"{markers}\"`; {NODB.name} defines {written} tests and it selects "
+        f"{selected}. The difference is deselected by a mark and the build stays green."
+        f"\n{out.stdout[-800:]}"
     )
