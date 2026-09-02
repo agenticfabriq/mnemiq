@@ -836,11 +836,12 @@ class OracleAdapter:
 
     # -- governance ---------------------------------------------------------------------------
 
-    # The widest gap between two UNVERIFIED lines -- OR one probe cadence, whichever is longer,
-    # and the second half is not a caveat to skip. A line can only be emitted where a probe runs,
-    # so a `read_only_ttl_s` above this cap sets the real floor: measured at ttl=7200s, the widest
-    # gap is 120 minutes against a cap claiming 60. Doubling alone goes quiet for a day after a
-    # day, which is the silence the cap does prevent, within that bound.
+    # The target gap between two UNVERIFIED lines. What is DELIVERED is this rounded UP to the
+    # next whole probe cadence, because a line can only be emitted where a probe runs -- so with
+    # `read_only_ttl_s` at 2400s against this 3600s cap the widest silence is 4800s, two cadences,
+    # not 3600s and not one cadence. "Whichever is longer" was the earlier statement of this and
+    # it is wrong wherever the cadence does not divide the cap. Doubling alone goes quiet for a
+    # day after a day, which is the silence the cap does prevent, within that rounding.
     _RO_UNVERIFIED_MAX_GAP_S = 3600.0
 
     # `SELECT ... FOR UPDATE` is the only candidate of five that FLIPPED with the open mode, and

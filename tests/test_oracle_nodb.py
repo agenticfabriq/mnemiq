@@ -346,7 +346,7 @@ def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
     # 1200, 2400 at today's constant, so a fourfold rise, which is exactly what the assertion
     # below demands and no more -- and the same 300s TTL this used to hardcode. That the cadence
     # settles AT the cap rather than doubling past it is asserted here and again, either side of
-    # the cap, in `test_the_widest_silence_is_the_cap_OR_one_probe_cadence`.
+    # the cap, in `test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence`.
     cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
     a = _constrained_adapter(ttl=cap / 12)
     con = _ProbeFails()
@@ -495,8 +495,9 @@ def test_a_check_that_SUCCEEDS_ends_the_incident_it_interrupts():
         f"the new incident inherited the old one's elapsed time: {after[0].getMessage()}")
 
 
-@pytest.mark.parametrize("ttl_ratio", [1 / 12, 2.0], ids=["cadence-under-cap", "cadence-over-cap"])
-def test_the_widest_silence_is_the_cap_OR_one_probe_cadence(ttl_ratio):
+@pytest.mark.parametrize("ttl_ratio", [1 / 12, 2.0, 2 / 3],
+                         ids=["cadence-under-cap", "cadence-over-cap", "cadence-not-dividing-cap"])
+def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
     """Whichever is longer, and both halves are measured.
 
     A line can only be emitted where a probe runs, so a `read_only_ttl_s` above the cap sets the
@@ -513,6 +514,12 @@ def test_the_widest_silence_is_the_cap_OR_one_probe_cadence(ttl_ratio):
     What makes the derivation sound here is the other side of the assertion: measured gaps, from
     running the real backoff, against a predicted bound. Removing the cap fails both cases at every
     value swept -- 120s, 300s, 1800s, 3600s, 10800s.
+
+    The third case is the one the rounding exists for. The first two divide the cap evenly, so
+    `ceil` never rounds and every candidate formula agrees -- `max(cap, ttl)` passed both, which is
+    the whole distinction the previous commit claimed to have fixed. At two thirds the three
+    disagree: ceil predicts 4800s, `max(cap, ttl)` 3600s, flooring 2400s, and only one of them is
+    what the code does.
 
     What this does NOT do, and what nothing in this file does, is fail when an operator merely
     lowers the constant. Both sides of the comparison move with it. Catching that would need a
