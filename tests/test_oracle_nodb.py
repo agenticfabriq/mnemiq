@@ -21,7 +21,9 @@ from mnemiq.adapters.oracle import OracleAdapter  # noqa: E402
 
 
 def caplog_at(level):
-    """Records on the adapter's own logger, independent of pytest's `caplog` fixture."""
+    """Records on the adapter's own logger. The independence from pytest's `caplog` comes from
+    handling the adapter's logger directly -- there is nothing else to save and restore, and a
+    save/restore that reassigns a value to itself would only look like a control."""
     logger = logging.getLogger("mnemiq.adapters.oracle")
     records = []
 
@@ -36,7 +38,6 @@ def caplog_at(level):
         h = _H()
         h.setLevel(level)
         logger.addHandler(h)
-        old, logger.propagate = logger.propagate, logger.propagate
         prev = logger.level
         logger.setLevel(min(level, prev or level))
         try:
@@ -44,7 +45,6 @@ def caplog_at(level):
         finally:
             logger.removeHandler(h)
             logger.setLevel(prev)
-            logger.propagate = old
 
     return _cm()
 
