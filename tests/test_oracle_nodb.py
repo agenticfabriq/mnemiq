@@ -494,8 +494,8 @@ def test_a_check_that_SUCCEEDS_ends_the_incident_it_interrupts():
         f"the new incident inherited the old one's elapsed time: {after[0].getMessage()}")
 
 
-@pytest.mark.parametrize("ttl_s", [300.0, 7200.0])
-def test_the_widest_silence_is_the_cap_OR_one_probe_cadence(ttl_s):
+@pytest.mark.parametrize("ttl_ratio", [1 / 12, 2.0], ids=["cadence-under-cap", "cadence-over-cap"])
+def test_the_widest_silence_is_the_cap_OR_one_probe_cadence(ttl_ratio):
     """Whichever is longer, and both halves are measured.
 
     A line can only be emitted where a probe runs, so a `read_only_ttl_s` above the cap sets the
@@ -507,13 +507,14 @@ def test_the_widest_silence_is_the_cap_OR_one_probe_cadence(ttl_s):
     so lowering the constant -- the change an operator would make to get a line every half hour --
     could not fail this test, which is precisely what its docstring promised it would catch.
     """
+    # One cadence either side of the cap, expressed AS A RATIO so both branches stay covered for
+    # any cap. Absolute values could not: at a three-hour cap both fell cap-side and the
+    # probe-cadence half stopped being exercised, and the guard written to detect that compared
+    # against its own hardcoded copy of the parameters, so it could not be cleared by changing
+    # them. Deriving the cadence does not weaken the assertion, which compares MEASURED gaps
+    # against a predicted bound -- remove the cap and the ratio-derived case still fails.
     cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
-    # The parameters are absolute, so the branch they cover depends on the constant. Raise the cap
-    # past 7200 and BOTH cases become cap-side, the probe-cadence half stops being exercised, and
-    # nothing says so -- this keeps the docstring's promise checkable.
-    assert max([300.0, 7200.0]) > cap, (
-        f"both TTLs are now under a {cap:.0f}s cap, so no case covers a probe cadence wider than "
-        f"the cap; raise the parameter above the constant")
+    ttl_s = cap * ttl_ratio
     a = _constrained_adapter(ttl=ttl_s)
     con = _ProbeFails()
     said = []
@@ -529,8 +530,8 @@ def test_the_widest_silence_is_the_cap_OR_one_probe_cadence(ttl_s):
                 said.append(now[0])
 
     # The bound is the cap rounded UP to the probe grid, not `max(cap, ttl)`. The two agree only
-    # while the cap is a whole multiple of the TTL: measured with a three-hour cap and a 7200s
-    # cadence, the gaps are 14400s, because the first probe at or past the cap lands at 2x7200.
+    # while the cap is a whole multiple of the cadence: measured at a three-hour cap with a 7200s
+    # cadence, the gaps were 14400s, because the first probe at or past the cap lands at 2x7200.
     bound = math.ceil(cap / ttl_s) * ttl_s
     gaps = [b - a_ for a_, b in zip(said, said[1:])]
     assert gaps, f"two days of failing probes at ttl={ttl_s}s produced fewer than two lines"
