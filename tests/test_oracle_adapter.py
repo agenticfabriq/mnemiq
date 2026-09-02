@@ -1721,7 +1721,7 @@ def _constrained_adapter(ttl=0.001, probe_ms=30000):
     a = OracleAdapter.__new__(OracleAdapter)
     a._oracledb = __import__("oracledb")
     a._read_only, a._ro_ttl_s, a._ro_state = True, ttl, "constrained"
-    a._ro_checked_at, a._ro_unverified = 0.0, False
+    a._ro_checked_at, a._ro_attempted_at, a._ro_unverified = 0.0, 0.0, False
     a._probe_timeout_ms = probe_ms
     return a
 
@@ -1781,3 +1781,30 @@ def test_the_probe_is_BOUNDED_and_hands_the_connection_back_unchanged():
     assert 1234 in con.timeouts, "the probe ran unbounded on the caller's timeout"
     assert con.timeouts[-1] == 0, "the connection was not handed back as it was found"
     assert con.closed == 1, "the probe cursor leaked"
+
+
+def test_a_failing_probe_does_not_retry_on_every_lease():
+    """The retry storm. Not advancing the clock on failure stopped the silent renewal and made
+    every lease retry instead — and each retry is bounded by the PROBE timeout, so on a wedged
+    session that is thirty seconds of hang per operation while holding a pooled connection: the
+    exhaustion this method's own commit was fixing, reached from the fix for the fix.
+
+    Two clocks. The attempt clock gates the cadence and advances whatever happens; the assurance
+    clock records the last SUCCESSFUL check and only a completed probe moves it.
+    """
+    a = _constrained_adapter(ttl=60.0)
+    con = _ProbeFails()
+
+    a._recheck_read_only(con)
+    assert con.closed == 1, "precondition: the first lease probed"
+    assert a._ro_checked_at == 0.0, "a failed probe must not age the assurance forward"
+
+    for _ in range(5):
+        a._recheck_read_only(con)
+    assert con.closed == 1, "a failing probe retried on every lease -- a storm"
+
+    # ...and it retries once the cadence elapses, rather than never again.
+    a._ro_attempted_at -= 61.0
+    a._recheck_read_only(con)
+    assert con.closed == 2, "the probe stopped retrying altogether"
+    assert a._ro_checked_at == 0.0, "still nothing has been verified"
