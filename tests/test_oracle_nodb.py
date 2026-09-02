@@ -496,8 +496,9 @@ def test_a_check_that_SUCCEEDS_ends_the_incident_it_interrupts():
         f"the new incident inherited the old one's elapsed time: {after[0].getMessage()}")
 
 
-@pytest.mark.parametrize("ttl_ratio", [1 / 12, 2.0, 2 / 3],
-                         ids=["cadence-under-cap", "cadence-over-cap", "cadence-not-dividing-cap"])
+@pytest.mark.parametrize("ttl_ratio", [1 / 12, 2.0, 2 / 3, 5 / 6],
+                         ids=["cadence-under-cap", "cadence-over-cap", "cadence-not-dividing-cap",
+                              "cadence-just-under-cap"])
 def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
     """The cap rounded UP to the next whole probe cadence.
 
@@ -514,7 +515,12 @@ def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
         flooring 2400s. The code delivers 4800s, because the first probe at or past the cap lands
         at two cadences. Round-to-nearest is NOT separated here -- `round(1.5)` is 2 in Python, so
         it agrees with `ceil` on exactly this ratio; it is the over-cap case that rules it out,
-        where `round(0.5)` is 0 and the predicted bound collapses to nothing.
+        where `round(0.5)` is 0 and the predicted bound collapses to nothing;
+      * five sixths -- 3000s against a 3600s cap, where every alternative agrees with itself and
+        not with the code. `ceil` predicts 6000s; `max(cap, ttl)` 3600s; flooring, banker's
+        rounding and half-up rounding all 3000s. Half-up survives all three cases above -- it
+        matches `ceil` at 1.5 and at 0.5 -- so without this one a maintainer could rewrite the
+        bound as `int(cap / ttl + 0.5) * ttl` and keep a green suite.
 
     Without that third case `max(cap, ttl)` passed everything -- not because `ceil` never rounded
     (at a doubled cadence it rounds 0.5 up to 1) but because the two formulas coincide wherever
