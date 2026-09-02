@@ -16,8 +16,13 @@ path argument all deselect just as silently, and enumerating them is a losing ga
 line is replayed verbatim, whatever it contains, and the question is whether these tests survive
 it.
 
-One hole is left and is named rather than implied away: a `@pytest.mark.skip` suppresses execution
-without changing what is collected, so no collection-based check can see it.
+This check reads one `run:` line and asks what it collects. That bounds it, and the bound is
+stated here because three drafts running claimed a completeness they did not have: a
+`@pytest.mark.skip` suppresses execution without changing what is collected, and `if: false` or
+`continue-on-error: true` on the step -- or the job never running at all -- is workflow context
+this never reads. Those are not a list of the remaining holes. They are examples of the kind, and
+the honest summary is that a green result here means CI's pytest line would collect these tests,
+not that CI runs them.
 """
 
 import pathlib
