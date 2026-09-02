@@ -516,8 +516,8 @@ def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
         at two cadences. Round-to-nearest is NOT separated here -- `round(1.5)` is 2 in Python, so
         it agrees with `ceil` on exactly this ratio; it is the over-cap case that rules it out,
         where `round(0.5)` is 0 and the predicted bound collapses to nothing;
-      * five sixths -- 3000s against a 3600s cap, where every alternative agrees with itself and
-        not with the code. `ceil` predicts 6000s; `max(cap, ttl)` 3600s; flooring, banker's
+      * five sixths -- 3000s against a 3600s cap, where every alternative disagrees with the code,
+        though not with each other. `ceil` predicts 6000s; `max(cap, ttl)` 3600s; flooring, banker's
         rounding and half-up rounding all 3000s. Half-up survives all three cases above -- it
         matches `ceil` at 1.5 and at 0.5 -- so without this one a maintainer could rewrite the
         bound as `int(cap / ttl + 0.5) * ttl` and keep a green suite.
