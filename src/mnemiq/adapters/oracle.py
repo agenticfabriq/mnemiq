@@ -154,6 +154,7 @@ class OracleAdapter:
         self._ro_ttl_s = read_only_ttl_s
         self._ro_checked_at = 0.0
         self._ro_state = "unknown"
+        self._ro_unverified = False
 
     def _configure_session(self, connection, requested_tag) -> None:
         """Session state a pooled connection must carry, applied once per PHYSICAL session.
@@ -213,6 +214,7 @@ class OracleAdapter:
         a._ro_ttl_s = 0.0  # a borrowed connection is not ours to re-probe on a timer
         a._ro_checked_at = 0.0
         a._ro_state = "unknown"
+        a._ro_unverified = False
         a._lock = threading.RLock()
         return a
 
@@ -366,9 +368,17 @@ class OracleAdapter:
         now = time.monotonic()
         if now - self._ro_checked_at < self._ro_ttl_s:
             return
-        self._ro_checked_at = now
+
+        # BOUNDED, and restored. The lease sets `call_timeout` from the CALLER's needs, which for
+        # a data query is 0 -- no limit -- so an unbounded probe on a wedged session would hang
+        # holding a leased connection, which is the pool exhaustion this whole change exists to
+        # prevent. It borrows the probe timeout, the one for statements the engine issues about
+        # itself, and hands the connection back exactly as it found it.
+        previous = con.call_timeout
         cur = con.cursor()
         try:
+            if self._probe_timeout_ms:
+                con.call_timeout = self._probe_timeout_ms
             cur.execute(self._READ_ONLY_DB_PROBE)
             cur.fetchall()
         except self._oracledb.DatabaseError as exc:
@@ -380,12 +390,23 @@ class OracleAdapter:
             # on that branch: a failed probe and an opened database sharing one observable, in the
             # fix for a control that did not hold. The collapse this codebase keeps producing,
             # produced again by the paragraph above it.
-            _ = _is_read_only_database(exc)
+            if _is_read_only_database(exc):
+                # Refused the write: the assurance HOLDS, and only here does the clock move.
+                self._ro_checked_at = now
+                self._ro_unverified = False
+            else:
+                self._report_unverified(exc)
             return
-        except Exception:
-            return  # same reasoning: a probe that cannot run establishes nothing
+        except Exception as exc:
+            self._report_unverified(exc)
+            return  # a probe that cannot run establishes nothing
         finally:
             cur.close()
+            try:
+                con.call_timeout = previous
+            except Exception:
+                pass  # the lease's own cleanup drops a connection it cannot reset
+        self._ro_checked_at = now
         # The probe RAN and was not refused: this database now accepts writes.
         self._ro_state = "lapsed"
         logger.warning(
@@ -394,6 +415,28 @@ class OracleAdapter:
             "adapter's statement gate alone, which cannot see a SELECT that reaches an "
             "AUTONOMOUS_TRANSACTION function through a view (M66, M71). Re-open the read plane "
             "against a read-only database, or accept that gap knowingly")
+
+    def _report_unverified(self, exc: Exception) -> None:
+        """A probe that could not run leaves the assurance UNVERIFIED, which is not the same as
+        confirmed and must not be recorded as it.
+
+        **The clock is deliberately NOT advanced here.** It was advanced before the probe ran, so
+        every failure renewed the TTL having established nothing: a permanently failing probe
+        silently kept `constrained` standing forever, and a failed check and a passed check moved
+        the same clock. That is this codebase's own collapse, in the fix for a control that had
+        stopped being one -- the second time in two commits on this method.
+
+        Said once, not per lease: the retry happens on the next lease anyway, and a line per query
+        is the always-on warning M66 already had to remove.
+        """
+        if self._ro_unverified:
+            return
+        self._ro_unverified = True
+        logger.warning(
+            "read-only basis can no longer be VERIFIED: the open-mode probe did not complete "
+            "(%s), so `constrained` is standing on its last successful check rather than on a "
+            "current one. It is not evidence the database reopened -- it is evidence nothing is "
+            "checking. The next operation retries", exc)
 
     def close(self) -> None:
         """Release the pool's sessions. Idempotent.

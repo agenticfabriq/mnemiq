@@ -1686,3 +1686,98 @@ def test_a_probe_that_FAILS_is_not_evidence_the_database_opened():
         assert a._ro_state == "constrained", "a failed probe must not change the recorded state"
     finally:
         a.close()
+
+
+class _ProbeFails:
+    """A leased connection whose probe cursor always raises, and which records timeout writes."""
+
+    def __init__(self):
+        # `object.__setattr__` so the initial value is not counted as a write, and
+        # `call_timeout` present from the start because a real connection always has it.
+        object.__setattr__(self, "timeouts", [])
+        object.__setattr__(self, "closed", 0)
+        object.__setattr__(self, "call_timeout", 0)
+
+    def cursor(self):
+        outer = self
+
+        class _C:
+            def execute(self, sql, **k):
+                raise RuntimeError("probe cannot run")
+
+            def close(self):
+                outer.closed += 1
+        return _C()
+
+    def __setattr__(self, name, value):
+        if name == "call_timeout" and hasattr(self, "timeouts"):
+            self.timeouts.append(value)
+        object.__setattr__(self, name, value)
+
+
+def _constrained_adapter(ttl=0.001, probe_ms=30000):
+    # A POSITIVE ttl: `ttl <= 0` disables re-probing entirely, so a 0.0 default made both tests
+    # below assert against a method that had returned at its first line.
+    a = OracleAdapter.__new__(OracleAdapter)
+    a._oracledb = __import__("oracledb")
+    a._read_only, a._ro_ttl_s, a._ro_state = True, ttl, "constrained"
+    a._ro_checked_at, a._ro_unverified = 0.0, False
+    a._probe_timeout_ms = probe_ms
+    return a
+
+
+def test_a_probe_that_cannot_run_does_NOT_renew_the_assurance():
+    """The clock was advanced BEFORE the probe, so every failure renewed the TTL having
+    established nothing — a permanently failing probe kept `constrained` standing forever, and a
+    failed check and a passed check moved the same clock. This codebase's own collapse, in the fix
+    for a control that had stopped being one.
+    """
+    import logging
+
+    # BOTH failure branches, because they are separate code paths and a mutation in one was
+    # invisible to a test that only drove the other.
+    class _OraFails(_ProbeFails):
+        def cursor(self):
+            import oracledb
+            outer = self
+
+            class _C:
+                def execute(self, sql, **k):
+                    raise oracledb.DatabaseError("ORA-00942: table or view does not exist")
+
+                def close(self):
+                    outer.closed += 1
+            return _C()
+
+    for con in (_ProbeFails(), _OraFails()):
+        a = _constrained_adapter()
+        with caplog_at(logging.WARNING) as rec:
+            a._recheck_read_only(con)
+        assert a._ro_checked_at == 0.0, f"a failed probe renewed the TTL ({type(con).__name__})"
+        assert a._ro_state == "constrained"
+        assert any("no longer be VERIFIED" in r.getMessage() for r in rec)
+
+    a = _constrained_adapter()
+    con = _ProbeFails()
+    with caplog_at(logging.WARNING) as rec:
+        a._recheck_read_only(con)
+    assert a._ro_checked_at == 0.0, "a failed probe renewed the TTL"
+    assert a._ro_state == "constrained", "a failed probe must not change the verdict either way"
+    assert any("no longer be VERIFIED" in r.getMessage() for r in rec)
+
+    # Said once, not per lease.
+    with caplog_at(logging.WARNING) as rec2:
+        a._recheck_read_only(con)
+    assert not rec2, "the unverified warning repeated on every lease"
+
+
+def test_the_probe_is_BOUNDED_and_hands_the_connection_back_unchanged():
+    """The lease sets `call_timeout` from the CALLER's needs — 0, no limit, for a data query — so
+    an unbounded probe on a wedged session hangs while holding a leased connection, which is the
+    pool exhaustion this change exists to prevent."""
+    a = _constrained_adapter(probe_ms=1234)
+    con = _ProbeFails()           # starts at 0, which is what the lease leaves for a data query
+    a._recheck_read_only(con)
+    assert 1234 in con.timeouts, "the probe ran unbounded on the caller's timeout"
+    assert con.timeouts[-1] == 0, "the connection was not handed back as it was found"
+    assert con.closed == 1, "the probe cursor leaked"
