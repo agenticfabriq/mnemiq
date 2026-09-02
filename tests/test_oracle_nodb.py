@@ -17,6 +17,7 @@ removing the mechanism, instead of defending it.
 
 import contextlib
 import logging
+import math
 import threading
 import types
 import unittest.mock as mock
@@ -341,8 +342,9 @@ def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
 
     # The TTL is expressed against the cap, because this test is about the SHAPE of the backoff
     # and the shape needs room: the phase runs from a `ttl * 2` floor up to the cap, so a TTL too
-    # close to the cap leaves two or three gaps and no doubling to measure. A twelfth gives four
-    # doublings and, at today's constant, the same 300s this used to hardcode. The cap's own value
+    # close to the cap leaves nothing to measure. A twelfth gives four sub-cap gaps -- 600, 600,
+    # 1200, 2400 at today's constant, so a fourfold rise, which is exactly what the assertion
+    # below demands and no more -- and the same 300s TTL this used to hardcode. The cap's own value
     # is measured by `test_the_widest_silence_is_the_cap_OR_one_probe_cadence`, on absolute TTLs.
     cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
     a = _constrained_adapter(ttl=cap / 12)
@@ -506,6 +508,12 @@ def test_the_widest_silence_is_the_cap_OR_one_probe_cadence(ttl_s):
     could not fail this test, which is precisely what its docstring promised it would catch.
     """
     cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
+    # The parameters are absolute, so the branch they cover depends on the constant. Raise the cap
+    # past 7200 and BOTH cases become cap-side, the probe-cadence half stops being exercised, and
+    # nothing says so -- this keeps the docstring's promise checkable.
+    assert max([300.0, 7200.0]) > cap, (
+        f"both TTLs are now under a {cap:.0f}s cap, so no case covers a probe cadence wider than "
+        f"the cap; raise the parameter above the constant")
     a = _constrained_adapter(ttl=ttl_s)
     con = _ProbeFails()
     said = []
@@ -520,12 +528,16 @@ def test_the_widest_silence_is_the_cap_OR_one_probe_cadence(ttl_s):
             if len(rec) > before:
                 said.append(now[0])
 
+    # The bound is the cap rounded UP to the probe grid, not `max(cap, ttl)`. The two agree only
+    # while the cap is a whole multiple of the TTL: measured with a three-hour cap and a 7200s
+    # cadence, the gaps are 14400s, because the first probe at or past the cap lands at 2x7200.
+    bound = math.ceil(cap / ttl_s) * ttl_s
     gaps = [b - a_ for a_, b in zip(said, said[1:])]
     assert gaps, f"two days of failing probes at ttl={ttl_s}s produced fewer than two lines"
-    assert max(gaps) == pytest.approx(max(cap, ttl_s), abs=step + 1), (
-        f"at ttl={ttl_s:.0f}s with a {cap:.0f}s cap the widest silence was {max(gaps):.0f}s; the "
-        f"bound is whichever of the two is longer, so this is either a backoff running past the "
-        f"cap or a cap the probe cadence cannot deliver")
+    assert max(gaps) == pytest.approx(bound, abs=step + 1), (
+        f"at ttl={ttl_s:.0f}s with a {cap:.0f}s cap the widest silence was {max(gaps):.0f}s "
+        f"against a bound of {bound:.0f}s -- either a backoff running past the cap, or a cap the "
+        f"probe cadence cannot deliver")
 
 
 def test_only_ONE_place_records_a_constrained_verdict():
@@ -541,9 +553,11 @@ def test_only_ONE_place_records_a_constrained_verdict():
     import re
 
     # Any ASSIGNMENT of `_ro_state` naming the constrained verdict, on any receiver and in any
-    # spelling. Matching the literal `self._ro_state = ` prefix missed the two that reproduce this
-    # bug exactly: a tuple target (`self._ro_state, self._ro_checked_at = "constrained", ...`) and
-    # the `a._ro_state = ` receiver `over()` already uses.
+    # spelling on one line. Matching the literal `self._ro_state = ` prefix missed the two that
+    # reproduce this bug exactly: a tuple target (`self._ro_state, self._ro_checked_at =
+    # "constrained", ...`) and the `a._ro_state = ` receiver `over()` already uses. It is a source
+    # match, so its reach is bounded and the bound is stated rather than implied: `setattr(self,
+    # "_ro_state", ...)` and an assignment whose literal wraps to a second line both evade it.
     src = inspect.getsource(OracleAdapter)
     assign = re.compile(r"_ro_state\b[^=!<>]*=(?!=)")
     assignments = [ln.strip() for ln in src.splitlines()
