@@ -6,18 +6,19 @@ were written database-free precisely so they would not need an instance, ran onl
 laptop holding live credentials. The lease-leak fix and the expiring-`constrained` fix had their
 only coverage behind that gate: a control that runs against one machine is not measured.
 
-Everything here drives the adapter through fakes and `__new__`, so the gate is the driver import
-alone.
+Everything here drives the adapter through fakes and `__new__`, and the driver is imported rather
+than skipped past: `oracledb` is a dev dependency, so a checkout that can run the suite at all can
+run these, and a missing driver is a collection ERROR rather than a skip. That replaced a guard
+that had to reason about CI's sync line and marker expression to notice a fail-open -- removing
+the mechanism, instead of defending it.
 """
 
 import logging
 import threading
 
-import pytest
+import pytest  # noqa: F401  -- imported by the tests below
 
-pytest.importorskip("oracledb", reason="the Oracle adapter needs mnemiq[oracle]")
-
-from mnemiq.adapters.oracle import OracleAdapter  # noqa: E402
+from mnemiq.adapters.oracle import OracleAdapter
 
 
 def caplog_at(level):
