@@ -339,14 +339,21 @@ def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
     """
     import re
 
-    a = _constrained_adapter(ttl=300.0)
+    # The TTL is expressed against the cap, because this test is about the SHAPE of the backoff
+    # and the shape needs room: the phase runs from a `ttl * 2` floor up to the cap, so a TTL too
+    # close to the cap leaves two or three gaps and no doubling to measure. A twelfth gives four
+    # doublings and, at today's constant, the same 300s this used to hardcode. The cap's own value
+    # is measured by `test_the_widest_silence_is_the_cap_OR_one_probe_cadence`, on absolute TTLs.
+    cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
+    a = _constrained_adapter(ttl=cap / 12)
     con = _ProbeFails()
     said = []
+    step = min(60.0, a._ro_ttl_s / 4)
 
     with driven_clock() as now, caplog_at(logging.WARNING) as rec:
         a._ro_checked_at = now[0]        # a real check, just now
-        for _ in range(24 * 60):         # a day, one lease a minute
-            now[0] += 60.0
+        for _ in range(int(24 * 3600 / step)):
+            now[0] += step
             before = len(rec)
             a._recheck_read_only(con)
             if len(rec) > before:
@@ -354,7 +361,6 @@ def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
 
     when = [t for t, _ in said]
     gaps = [b - a_ for a_, b in zip(when, when[1:])]
-    cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
 
     assert len(said) > 1, (
         f"a probe broken for a full day said so {len(said)} time(s); after that, a failing check "
@@ -371,8 +377,8 @@ def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
     assert max(growing) / min(growing) >= 4, f"the gaps barely grew, so this is not a backoff: {gaps}"
 
     # CAPPED: it settles at the cap rather than doubling into silence, and stays there.
-    assert gaps[-1] == pytest.approx(cap, abs=120), f"the cadence did not settle at the cap: {gaps}"
-    assert max(gaps) <= cap + 60, f"the cadence went quiet for {max(gaps):.0f}s, past the cap"
+    assert gaps[-1] == pytest.approx(cap, abs=step + 1), f"did not settle at the cap: {gaps}"
+    assert max(gaps) <= cap + step, f"the cadence went quiet for {max(gaps):.0f}s, past the cap"
 
     # Two different numbers, and the earlier version read only the first while claiming the
     # second: `VERIFIED for Ns` is how long checking has been failing, and `a check Ns old` is the
@@ -386,8 +392,10 @@ def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
         f"operator on hour twenty gets less than the operator in the first minute")
     assert float(standing[-1].group(1)) > 20 * 3600, "the last line's assurance age was small"
 
-    # Not per lease: 1440 leases, 288 probes at a 300s TTL.
-    assert len(said) < 40, f"{len(said)} lines in a day is the per-query warning M66 removed"
+    # Not per lease: a day of leases, and a probe on every TTL boundary among them.
+    probes = 24 * 3600 / a._ro_ttl_s
+    assert len(said) < probes / 5, (
+        f"{len(said)} lines against {probes:.0f} probes is the per-query warning M66 removed")
 
 
 class _ProbeSaysReadOnly:
@@ -484,37 +492,40 @@ def test_a_check_that_SUCCEEDS_ends_the_incident_it_interrupts():
         f"the new incident inherited the old one's elapsed time: {after[0].getMessage()}")
 
 
-def test_the_cap_cannot_be_tighter_than_the_probe_cadence():
-    """The cap promises a line at least hourly. A line can only be emitted where a probe runs, so
-    a `read_only_ttl_s` wider than the cap sets the real floor -- and the constant said otherwise
-    until it was measured: at ttl=7200s the widest gap is 120 minutes against a cap claiming 60.
+@pytest.mark.parametrize("ttl_s", [300.0, 7200.0])
+def test_the_widest_silence_is_the_cap_OR_one_probe_cadence(ttl_s):
+    """Whichever is longer, and both halves are measured.
 
-    Asserted as the true bound rather than the wished-for one, so a future change that tightens
-    the cap without touching the probe cadence cannot look like it worked.
+    A line can only be emitted where a probe runs, so a `read_only_ttl_s` above the cap sets the
+    real floor -- the constant claimed an hourly line until this was measured at ttl=7200s, where
+    the widest gap is 120 minutes.
+
+    The TTLs are absolute, not derived from the cap. An earlier version took `ttl = cap * 2`, which
+    made both assertions tautologies in the cap: they held for every cap value from 120s to 43200s,
+    so lowering the constant -- the change an operator would make to get a line every half hour --
+    could not fail this test, which is precisely what its docstring promised it would catch.
     """
     cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
-    ttl = cap * 2
-    a = _constrained_adapter(ttl=ttl)
+    a = _constrained_adapter(ttl=ttl_s)
     con = _ProbeFails()
     said = []
 
     with driven_clock() as now, caplog_at(logging.WARNING) as rec:
         a._ro_checked_at = now[0]
-        for _ in range(48 * 60):
-            now[0] += 60.0
+        step = min(60.0, ttl_s / 4)
+        for _ in range(int(48 * 3600 / step)):
+            now[0] += step
             before = len(rec)
             a._recheck_read_only(con)
             if len(rec) > before:
                 said.append(now[0])
 
     gaps = [b - a_ for a_, b in zip(said, said[1:])]
-    assert gaps, "two days of failing probes produced fewer than two lines"
-    assert max(gaps) > cap + 60, (
-        "a TTL wider than the cap did NOT widen the gaps; if the probe cadence no longer bounds "
-        "the warning cadence, the comment on _RO_UNVERIFIED_MAX_GAP_S is now wrong the other way")
-    assert max(gaps) <= ttl + 60, (
-        f"the widest gap {max(gaps):.0f}s exceeds even one probe cadence ({ttl:.0f}s), so the "
-        f"backoff is running past the bound the cap is supposed to hold it to")
+    assert gaps, f"two days of failing probes at ttl={ttl_s}s produced fewer than two lines"
+    assert max(gaps) == pytest.approx(max(cap, ttl_s), abs=step + 1), (
+        f"at ttl={ttl_s:.0f}s with a {cap:.0f}s cap the widest silence was {max(gaps):.0f}s; the "
+        f"bound is whichever of the two is longer, so this is either a backoff running past the "
+        f"cap or a cap the probe cadence cannot deliver")
 
 
 def test_only_ONE_place_records_a_constrained_verdict():
@@ -527,9 +538,16 @@ def test_only_ONE_place_records_a_constrained_verdict():
     """
     import inspect
 
+    import re
+
+    # Any ASSIGNMENT of `_ro_state` naming the constrained verdict, on any receiver and in any
+    # spelling. Matching the literal `self._ro_state = ` prefix missed the two that reproduce this
+    # bug exactly: a tuple target (`self._ro_state, self._ro_checked_at = "constrained", ...`) and
+    # the `a._ro_state = ` receiver `over()` already uses.
     src = inspect.getsource(OracleAdapter)
+    assign = re.compile(r"_ro_state\b[^=!<>]*=(?!=)")
     assignments = [ln.strip() for ln in src.splitlines()
-                   if ln.strip().startswith("self._ro_state = ") and "constrained" in ln]
+                   if "constrained" in ln and assign.search(ln)]
     assert assignments == ['self._ro_state = "constrained"'], (
         f"{len(assignments)} places record a `constrained` verdict: {assignments}. Two did once, "
         f"they cleared different fields, and a fresh failure inherited a six-hour-old incident.")
