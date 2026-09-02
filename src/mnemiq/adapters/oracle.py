@@ -435,13 +435,16 @@ class OracleAdapter:
         """A probe that could not run leaves the assurance UNVERIFIED, which is not the same as
         confirmed and must not be recorded as it.
 
-        **The ASSURANCE clock is deliberately not advanced here.** Nor is the attempt clock -- that
-        moved before the probe ran, which is what bounds the retry cadence; this method only
-        records that the last attempt established nothing. It was advanced before the probe ran, so
-        every failure renewed the TTL having established nothing: a permanently failing probe
-        silently kept `constrained` standing forever, and a failed check and a passed check moved
-        the same clock. That is this codebase's own collapse, in the fix for a control that had
-        stopped being one -- the second time in two commits on this method.
+        **The ASSURANCE clock is deliberately not advanced here.** The attempt clock already moved,
+        before the probe ran and whatever its outcome -- that is what bounds the retry cadence, and
+        it is correct. This method must not touch either: it records that the last attempt
+        established nothing.
+
+        The single clock this replaced is why. It gated the cadence AND carried the assurance, so
+        advancing it on failure renewed a TTL nothing had verified -- a permanently failing probe
+        silently kept `constrained` standing forever, because a failed check and a passed check
+        moved the same value. Not advancing it instead made every lease retry. Neither is
+        survivable, which is the argument for two clocks, not a reason to revert to one.
 
         Said once, not per lease: the retry happens on the next lease anyway, and a line per query
         is the always-on warning M66 already had to remove.
@@ -449,11 +452,17 @@ class OracleAdapter:
         if self._ro_unverified:
             return
         self._ro_unverified = True
+        # The ASSURANCE clock's one consumer. Without an age this line says only that checking
+        # stopped; the operator still has to decide whether that matters, and the age is what
+        # decides it -- a lapse of one TTL is a blip, a lapse of hours is an unattended read plane
+        # resting on a stale statement. A clock nothing reads would not be a clock.
+        age = time.monotonic() - self._ro_checked_at
+        standing = f"a check {age:.0f}s old" if self._ro_checked_at else "no successful check at all"
         logger.warning(
             "read-only basis can no longer be VERIFIED: the open-mode probe did not complete "
-            "(%s), so `constrained` is standing on its last successful check rather than on a "
-            "current one. It is not evidence the database reopened -- it is evidence nothing is "
-            "checking. The next operation retries", exc)
+            "(%s), so `constrained` is standing on %s rather than on a current one. It is not "
+            "evidence the database reopened -- it is evidence nothing is checking. The next "
+            "operation retries", exc, standing)
 
     def close(self) -> None:
         """Release the pool's sessions. Idempotent.
