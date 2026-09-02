@@ -62,9 +62,10 @@ class CertifiedSet:
     deployment configured to answer from a certified corpus, whose pull 401s, answers UNGROUNDED
     and is indistinguishable from one that is working.
 
-    NOT iterable, deliberately. A caller that ignores `available` should not compile: every call
-    site has to decide what an unreadable corpus means for it, and the two that matter -- enrich
-    and the eval runners -- decide to refuse.
+    NOT iterable and NOT truthy, deliberately. `if certified:` used to mean "non-empty"; on an
+    object it would be silently True even for an unreadable corpus, which is this defect wearing a
+    different hat -- so it raises rather than answering. Both refusals push every call site into
+    saying `.records` or `.available` explicitly, which is the decision the type exists to force.
 
     `available` is True when we have a corpus to stand on, which includes two states that are not
     failures: nothing has been certified yet, and no `verity_records_url` is configured at all. It
@@ -74,6 +75,13 @@ class CertifiedSet:
 
     records: list[CertifiedRecord]
     available: bool = True
+
+    def __bool__(self) -> bool:
+        raise TypeError(
+            "CertifiedSet has no truth value: `if certified:` used to mean 'non-empty' and would "
+            "now be True even for a corpus we could not read. Say `.records` for what we have or "
+            "`.available` for whether we could read it."
+        )
 
 
 def require_certified(certified, settings) -> None:

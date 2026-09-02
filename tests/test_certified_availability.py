@@ -188,3 +188,19 @@ def test_every_fetch_site_also_requires():
     assert fetches <= guards, (
         f"these fetch a certified corpus and never check it is readable: {sorted(fetches - guards)}"
     )
+
+
+def test_the_set_has_no_truth_value():
+    """`if certified:` used to mean "non-empty". On an object it is silently True even for a corpus
+    we could not read -- the same conflation this type exists to remove, wearing a different hat.
+    So it raises rather than answering, which is the non-iterable decision applied to the other
+    implicit conversion."""
+    import pytest
+
+    from mnemiq.enrichment.certified import CertifiedSet
+
+    with pytest.raises(TypeError, match="no truth value"):
+        bool(CertifiedSet([], available=False))
+    with pytest.raises(TypeError):
+        if CertifiedSet(["r"], available=True):  # noqa: SIM103 - the point is that this raises
+            pass
