@@ -202,5 +202,5 @@ def test_the_set_has_no_truth_value():
     with pytest.raises(TypeError, match="no truth value"):
         bool(CertifiedSet([], available=False))
     with pytest.raises(TypeError):
-        if CertifiedSet(["r"], available=True):  # noqa: SIM103 - the point is that this raises
+        if CertifiedSet(["r"], available=True):  # the point is that this raises
             pass
