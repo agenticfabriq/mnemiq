@@ -345,8 +345,9 @@ def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
     # close to the cap leaves nothing to measure. A twelfth gives four sub-cap gaps -- 600, 600,
     # 1200, 2400 at today's constant, so a fourfold rise, which is exactly what the assertion
     # below demands and no more -- and the same 300s TTL this used to hardcode. That the cadence
-    # settles AT the cap rather than doubling past it is asserted here and again, either side of
-    # the cap, in `test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence`.
+    # stops widening rather than doubling on is asserted here, and again across three cadences --
+    # under, over, and not dividing the cap -- in
+    # `test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence`.
     cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
     a = _constrained_adapter(ttl=cap / 12)
     con = _ProbeFails()
@@ -498,28 +499,35 @@ def test_a_check_that_SUCCEEDS_ends_the_incident_it_interrupts():
 @pytest.mark.parametrize("ttl_ratio", [1 / 12, 2.0, 2 / 3],
                          ids=["cadence-under-cap", "cadence-over-cap", "cadence-not-dividing-cap"])
 def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
-    """Whichever is longer, and both halves are measured.
+    """The cap rounded UP to the next whole probe cadence.
 
-    A line can only be emitted where a probe runs, so a `read_only_ttl_s` above the cap sets the
-    real floor -- the constant claimed an hourly line until this was measured at ttl=7200s, where
+    A line can only be emitted where a probe runs, so the cadence, not the cap alone, decides the
+    widest silence. The constant claimed an hourly line until this was measured at ttl=7200s, where
     the widest gap is 120 minutes.
 
-    The cadences ARE derived from the cap, one either side, and the history matters because a
-    derived cadence was also the first mistake here. That version took `ttl = cap * 2` and asserted
-    `gap > cap` and `gap <= ttl`, comparing two derived quantities: tautologies that held for every
-    cap from 120s to 43200s. Absolute values fixed the tautology and broke the coverage instead --
-    at a three-hour cap both fell on the same side of it -- and the guard added to detect THAT
-    compared against its own hardcoded copy of the parameters, so its advice could not clear it.
+    THREE cadences, all derived from the cap as ratios, and each covers something different:
 
-    What makes the derivation sound here is the other side of the assertion: measured gaps, from
-    running the real backoff, against a predicted bound. Removing the cap fails both cases at every
-    value swept -- 120s, 300s, 1800s, 3600s, 10800s.
+      * a twelfth -- well under the cap, where the backoff has room to double and then settle;
+      * double -- over the cap, where the cadence alone sets the silence;
+      * two thirds -- under the cap but not dividing it, which is the case the rounding exists
+        for. Against a 3600s cap that is 2400s, and the candidate formulas disagree: `ceil`
+        predicts 4800s, `max(cap, ttl)` 3600s, flooring or rounding-to-nearest 2400s. The code
+        delivers 4800s, because the first probe at or past the cap lands at two cadences.
 
-    The third case is the one the rounding exists for. The first two divide the cap evenly, so
-    `ceil` never rounds and every candidate formula agrees -- `max(cap, ttl)` passed both, which is
-    the whole distinction the previous commit claimed to have fixed. At two thirds the three
-    disagree: ceil predicts 4800s, `max(cap, ttl)` 3600s, flooring 2400s, and only one of them is
-    what the code does.
+    Without that third case `max(cap, ttl)` passed everything -- not because `ceil` never rounded
+    (at a doubled cadence it rounds 0.5 up to 1) but because the two formulas coincide wherever
+    the cadence is at least the cap, and wherever it divides the cap exactly. Both of the first two
+    cases are one of those.
+
+    Derived cadences were also the first mistake here, which is why the soundness is worth stating.
+    That version took `ttl = cap * 2` and asserted `gap > cap` and `gap <= ttl` -- two derived
+    quantities compared to each other, tautologies holding for every cap from 120s to 43200s.
+    Absolute values fixed the tautology and lost the coverage instead, both cases falling the same
+    side of a three-hour cap, and the guard added to detect THAT compared against its own hardcoded
+    copy of the parameters, so its own advice could not clear it. What makes the derivation sound
+    is the other side of the assertion: measured gaps, from running the real backoff, against a
+    predicted bound. Removing the cap fails all three cases at every value swept -- 120s, 300s,
+    1800s, 3600s, 10800s.
 
     What this does NOT do, and what nothing in this file does, is fail when an operator merely
     lowers the constant. Both sides of the comparison move with it. Catching that would need a
