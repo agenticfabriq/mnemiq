@@ -374,9 +374,17 @@ def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
     assert gaps[-1] == pytest.approx(cap, abs=120), f"the cadence did not settle at the cap: {gaps}"
     assert max(gaps) <= cap + 60, f"the cadence went quiet for {max(gaps):.0f}s, past the cap"
 
-    # And the age is carried on every line, not only the first.
-    ages = [float(re.search(r"VERIFIED for (\d+)s", msg).group(1)) for _, msg in said]
-    assert ages[-1] > 20 * 3600, f"the last line of the day reported a small age: {ages[-1]}s"
+    # Two different numbers, and the earlier version read only the first while claiming the
+    # second: `VERIFIED for Ns` is how long checking has been failing, and `a check Ns old` is the
+    # assurance age. Emitting the age on the opening line alone left this green.
+    elapsed = [float(re.search(r"VERIFIED for (\d+)s", msg).group(1)) for _, msg in said]
+    assert elapsed[-1] > 20 * 3600, f"the last line of the day reported a small elapsed: {elapsed[-1]}s"
+
+    standing = [re.search(r"standing on a check (\d+)s old", msg) for _, msg in said]
+    assert all(standing), (
+        f"{sum(m is None for m in standing)} of {len(said)} lines carried no assurance age; the "
+        f"operator on hour twenty gets less than the operator in the first minute")
+    assert float(standing[-1].group(1)) > 20 * 3600, "the last line's assurance age was small"
 
     # Not per lease: 1440 leases, 288 probes at a 300s TTL.
     assert len(said) < 40, f"{len(said)} lines in a day is the per-query warning M66 removed"
