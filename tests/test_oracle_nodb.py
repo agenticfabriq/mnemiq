@@ -518,12 +518,6 @@ def test_the_widest_silence_is_the_cap_OR_one_probe_cadence(ttl_ratio):
     lowers the constant. Both sides of the comparison move with it. Catching that would need a
     fixed expectation of how often a line appears, which is a policy nobody has stated.
     """
-    # One cadence either side of the cap, expressed AS A RATIO so both branches stay covered for
-    # any cap. Absolute values could not: at a three-hour cap both fell cap-side and the
-    # probe-cadence half stopped being exercised, and the guard written to detect that compared
-    # against its own hardcoded copy of the parameters, so it could not be cleared by changing
-    # them. Deriving the cadence does not weaken the assertion, which compares MEASURED gaps
-    # against a predicted bound -- remove the cap and the ratio-derived case still fails.
     cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
     ttl_s = cap * ttl_ratio
     a = _constrained_adapter(ttl=ttl_s)
