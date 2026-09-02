@@ -17,6 +17,7 @@ removing the mechanism, instead of defending it.
 
 import logging
 import threading
+import time
 
 import pytest
 
@@ -295,3 +296,106 @@ def test_the_age_of_the_STANDING_check_reaches_the_operator():
         b._recheck_read_only(_ProbeFails())
     assert "no successful check at all" in next(
         r.getMessage() for r in rec2 if "no longer be VERIFIED" in r.getMessage())
+
+
+def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
+    """Said once defeated the age it was reporting.
+
+    The dedupe emitted exactly one line, at the first failure, carrying an age of about one TTL --
+    the moment the staleness matters least. Every hour after that was silent, so a probe that had
+    been broken since morning and a probe that had recovered looked identical to an operator. An
+    ongoing failure and a resolved one sharing one observable is this codebase's own collapse.
+
+    A day is simulated on a fake clock because the property is invisible at test speed: real time
+    would need twenty-four hours to show the second line.
+    """
+    import re
+    import types
+    import unittest.mock as m
+
+    import mnemiq.adapters.oracle as mod
+
+    clock = [1_000_000.0]
+    fake = types.SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda s: None)
+
+    a = _constrained_adapter(ttl=300.0)
+    a._ro_checked_at = clock[0]          # a real check, just now
+    con = _ProbeFails()
+    said = []                            # (when, age-reported) per line
+
+    with m.patch.object(mod, "time", fake), caplog_at(logging.WARNING) as rec:
+        for _ in range(24 * 60):         # a day, one lease a minute
+            clock[0] += 60.0
+            before = len(rec)
+            a._recheck_read_only(con)
+            if len(rec) > before:
+                said.append((clock[0], rec[-1].getMessage()))
+
+    ages = [float(re.search(r"VERIFIED for (\d+)s", msg).group(1)) for _, msg in said]
+
+    assert len(said) > 1, (
+        f"a probe broken for a full day said so {len(said)} time(s); after that, a failing check "
+        f"and a recovered one are the same silence")
+    assert ages == sorted(ages) and ages[-1] > ages[0], (
+        f"the reported age did not grow across the day: {ages}")
+    assert ages[-1] > 20 * 3600 / 24, f"the last line still reported a small age: {ages[-1]}s"
+
+    # Widening, not per lease: 1440 leases, and the probe ran on 288 of them at a 300s TTL.
+    assert len(said) < 40, f"{len(said)} lines in a day is the per-query warning M66 removed"
+
+    # And never silent: no two consecutive lines are further apart than the cap.
+    gaps = [b - a_ for (a_, _), (b, _) in zip(said, said[1:])]
+    assert max(gaps) <= mod.OracleAdapter._RO_UNVERIFIED_MAX_GAP_S + 60, (
+        f"the cadence went quiet for {max(gaps):.0f}s, past the {mod.OracleAdapter._RO_UNVERIFIED_MAX_GAP_S:.0f}s cap")
+
+
+class _ProbeSaysReadOnly:
+    """A probe that raises ORA-16000 -- the database confirming it is still open READ ONLY, which
+    is what a SUCCESSFUL check looks like for this probe."""
+
+    call_timeout = 0
+
+    def cursor(self):
+        import oracledb
+
+        class _C:
+            def execute(self, sql, **k):
+                raise oracledb.DatabaseError("ORA-16000: database open for read-only access")
+
+            def fetchall(self):
+                return []
+
+            def close(self):
+                pass
+
+        return _C()
+
+
+def test_a_recovered_probe_reports_the_next_failure_as_new():
+    """The escalation has to RESET, or a probe that failed this morning and fails again tonight
+    inherits tonight's silence from this morning's backoff.
+
+    The recovery is driven through the real ORA-16000 path, not by assigning the flags this test
+    then checks. Doing it by hand made the earlier version agree with itself: deleting the reset
+    from `_recheck_read_only` left it green.
+    """
+    a = _constrained_adapter(ttl=0.001)
+    a._ro_checked_at = time.monotonic()
+
+    with caplog_at(logging.WARNING) as first:
+        a._recheck_read_only(_ProbeFails())
+    assert len(first) == 1, "the first failure was not reported"
+    assert a._ro_unverified is True
+
+    # A probe that completes: ORA-16000 is the database confirming it still refuses writes.
+    a._ro_attempted_at -= 10.0
+    a._recheck_read_only(_ProbeSaysReadOnly())
+    assert a._ro_unverified is False, "a successful check did not clear the unverified state"
+
+    # Tonight's failure is a new incident, not a continuation of this morning's backoff.
+    a._ro_attempted_at -= 10.0
+    with caplog_at(logging.WARNING) as second:
+        a._recheck_read_only(_ProbeFails())
+    assert len(second) == 1, "a failure after a recovery was swallowed by the earlier backoff"
+    assert "VERIFIED for 0s" in second[0].getMessage(), (
+        "the new incident inherited the old one's elapsed time")

@@ -156,6 +156,8 @@ class OracleAdapter:
         self._ro_attempted_at = 0.0
         self._ro_state = "unknown"
         self._ro_unverified = False
+        self._ro_unverified_since = 0.0
+        self._ro_unverified_next_s = 0.0
 
     def _configure_session(self, connection, requested_tag) -> None:
         """Session state a pooled connection must carry, applied once per PHYSICAL session.
@@ -217,6 +219,8 @@ class OracleAdapter:
         a._ro_attempted_at = 0.0
         a._ro_state = "unknown"
         a._ro_unverified = False
+        a._ro_unverified_since = 0.0
+        a._ro_unverified_next_s = 0.0
         a._lock = threading.RLock()
         return a
 
@@ -408,6 +412,9 @@ class OracleAdapter:
             if _is_read_only_database(exc):
                 # Refused the write: the assurance HOLDS, and only here does the clock move.
                 self._ro_checked_at = now
+                # Clearing the flag is the whole reset: the next failure takes the `else` branch
+                # in `_report_unverified`, which re-stamps `_ro_unverified_since` itself. A line
+                # zeroing it here read as hygiene and mutation could not observe it.
                 self._ro_unverified = False
             else:
                 self._report_unverified(exc)
@@ -446,23 +453,46 @@ class OracleAdapter:
         moved the same value. Not advancing it instead made every lease retry. Neither is
         survivable, which is the argument for two clocks, not a reason to revert to one.
 
-        Said once, not per lease: the retry happens on the next lease anyway, and a line per query
-        is the always-on warning M66 already had to remove.
+        Not once, and not per lease. Said once was the first answer and it defeated the age this
+        method exists to report: the only line an operator ever saw was the FIRST, carrying an age
+        of roughly one TTL, which is the moment the staleness matters least. Every hour after that
+        looked exactly like a probe that had recovered -- both silent. An ongoing failure and a
+        resolved one sharing one observable is the collapse this whole change set is about.
+
+        So the cadence widens instead of closing: each line waits twice as long as the last, and
+        the gap is capped so it never stops. Measured at a 300s TTL, twenty-seven lines across a
+        day -- doubling through the first four hours, hourly after that -- rather than one at the
+        start, or the 288 a per-probe line would give and the per-query warning M66 had to remove.
         """
+        now = time.monotonic()
         if self._ro_unverified:
-            return
-        self._ro_unverified = True
-        # The ASSURANCE clock's one consumer. Without an age this line says only that checking
-        # stopped; the operator still has to decide whether that matters, and the age is what
-        # decides it -- a lapse of one TTL is a blip, a lapse of hours is an unattended read plane
-        # resting on a stale statement. A clock nothing reads would not be a clock.
-        age = time.monotonic() - self._ro_checked_at
+            unverified_for = now - self._ro_unverified_since
+            if unverified_for < self._ro_unverified_next_s:
+                return
+            # The cap bounds the GAP to the next line, not the threshold itself. Capping the
+            # threshold made it a constant that total elapsed time passes once and never falls
+            # back under, so every probe after the first hour logged -- the per-query warning,
+            # arrived at by way of a fix for silence.
+            gap = min(max(unverified_for, self._ro_ttl_s * 2), self._RO_UNVERIFIED_MAX_GAP_S)
+            self._ro_unverified_next_s = unverified_for + gap
+        else:
+            self._ro_unverified = True
+            self._ro_unverified_since = now
+            self._ro_unverified_next_s = min(self._ro_ttl_s * 2, self._RO_UNVERIFIED_MAX_GAP_S)
+            unverified_for = 0.0
+
+        # The ASSURANCE clock's consumer. Without an age this line says only that checking stopped;
+        # the operator still has to decide whether that matters, and the age is what decides it --
+        # a lapse of one TTL is a blip, a lapse of hours is an unattended read plane resting on a
+        # stale statement. A clock nothing reads would not be a clock, and an age reported once
+        # would not be an age.
+        age = now - self._ro_checked_at
         standing = f"a check {age:.0f}s old" if self._ro_checked_at else "no successful check at all"
         logger.warning(
-            "read-only basis can no longer be VERIFIED: the open-mode probe did not complete "
-            "(%s), so `constrained` is standing on %s rather than on a current one. It is not "
-            "evidence the database reopened -- it is evidence nothing is checking. The next "
-            "operation retries", exc, standing)
+            "read-only basis can no longer be VERIFIED for %.0fs: the open-mode probe did not "
+            "complete (%s), so `constrained` is standing on %s rather than on a current one. It "
+            "is not evidence the database reopened -- it is evidence nothing is checking. The "
+            "next operation retries", unverified_for, exc, standing)
 
     def close(self) -> None:
         """Release the pool's sessions. Idempotent.
@@ -785,6 +815,11 @@ class OracleAdapter:
 
 
     # -- governance ---------------------------------------------------------------------------
+
+    # The widest gap between two UNVERIFIED lines. Doubling alone goes quiet for a day after a
+    # day, which is the silence this cap exists to prevent: an assurance nobody is checking should
+    # keep saying so for as long as it is being relied on.
+    _RO_UNVERIFIED_MAX_GAP_S = 3600.0
 
     # `SELECT ... FOR UPDATE` is the only candidate of five that FLIPPED with the open mode, and
     # it was measured against both -- READ WRITE and READ ONLY -- because a check that only ever
