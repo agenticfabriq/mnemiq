@@ -506,26 +506,24 @@ def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
     widest silence. The constant claimed an hourly line until this was measured at ttl=7200s, where
     the widest gap is 120 minutes.
 
-    FOUR cadences, all derived from the cap as ratios, and each covers something different:
+    FOUR cadences, derived from the cap as ratios so every case survives a change to the
+    constant. What each rules out, at a 3600s cap -- `code` is what the run measures, and the
+    columns beside it are formulas that have been proposed here and are wrong:
 
-      * a twelfth -- well under the cap, where the backoff has room to double and then settle;
-      * double -- over the cap, where the cadence alone sets the silence;
-      * two thirds -- under the cap but not dividing it, which is the case the rounding exists
-        for. Against a 3600s cap that is 2400s: `ceil` predicts 4800s, `max(cap, ttl)` 3600s,
-        flooring 2400s. The code delivers 4800s, because the first probe at or past the cap lands
-        at two cadences. Round-to-nearest is NOT separated here -- `round(1.5)` is 2 in Python, so
-        it agrees with `ceil` on exactly this ratio; it is the over-cap case that rules it out,
-        where `round(0.5)` is 0 and the predicted bound collapses to nothing;
-      * five sixths -- 3000s against a 3600s cap, where all four alternatives predict something
-        other than what the code does (3600s or 3000s, not agreeing among themselves either). `ceil` predicts 6000s; `max(cap, ttl)` 3600s; flooring, banker's
-        rounding and half-up rounding all 3000s. Half-up survives all three cases above -- it
-        matches `ceil` at 1.5 and at 0.5 -- so without this one a maintainer could rewrite the
-        bound as `int(cap / ttl + 0.5) * ttl` and keep a green suite.
+        ratio  cadence   code   max(cap,ttl)  floor  banker  half-up
+        1/12       300   3600       3600       3600    3600     3600
+        2         7200   7200       7200       7200       0     7200
+        2/3       2400   4800       3600       2400    4800     4800
+        5/6       3000   6000       3600       3000    3000     3000
 
-    Without that third case `max(cap, ttl)` passed everything -- not because `ceil` never rounded
-    (at a doubled cadence it rounds 0.5 up to 1) but because the two formulas coincide wherever
-    the cadence is at least the cap, and wherever it divides the cap exactly. Both of the first two
-    cases are one of those.
+    Reading down the columns, and confirmed by mutating the bound four ways: `max(cap, ttl)` and
+    flooring are each caught by two thirds and five sixths; banker's rounding by over-cap (where
+    `round(0.5)` is 0 and the bound collapses) and again by five sixths; half-up by five sixths
+    ALONE, since it matches `ceil` at both 1.5 and 0.5. The twelfth catches no wrong formula by
+    itself -- it is the case where the backoff has room to double and settle at the cap.
+
+    The code delivers 6000s at a 3000s cadence because the first probe at or past the cap lands at
+    two cadences. That is the whole content of "rounded up to a probe cadence".
 
     Derived cadences were also the first mistake here, which is why the soundness is worth stating.
     That version took `ttl = cap * 2` and asserted `gap > cap` and `gap <= ttl` -- two derived
