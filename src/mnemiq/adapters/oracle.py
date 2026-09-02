@@ -153,6 +153,7 @@ class OracleAdapter:
         # `constrained` expires: see `_recheck_read_only`.
         self._ro_ttl_s = read_only_ttl_s
         self._ro_checked_at = 0.0
+        self._ro_attempted_at = 0.0
         self._ro_state = "unknown"
         self._ro_unverified = False
 
@@ -213,6 +214,7 @@ class OracleAdapter:
         a._closed = False
         a._ro_ttl_s = 0.0  # a borrowed connection is not ours to re-probe on a timer
         a._ro_checked_at = 0.0
+        a._ro_attempted_at = 0.0
         a._ro_state = "unknown"
         a._ro_unverified = False
         a._lock = threading.RLock()
@@ -366,8 +368,21 @@ class OracleAdapter:
         if not self._read_only or self._ro_ttl_s <= 0 or self._ro_state != "constrained":
             return
         now = time.monotonic()
-        if now - self._ro_checked_at < self._ro_ttl_s:
+        # TWO CLOCKS, and conflating them is what produced all three defects on this method.
+        #
+        #   `_ro_attempted_at` -- when a probe last RAN. It gates the cadence, and it advances
+        #                         whatever the outcome, so a failing probe cannot storm.
+        #   `_ro_checked_at`   -- when a probe last SUCCEEDED. It is the age of the assurance,
+        #                         and only a completed check moves it.
+        #
+        # One clock could not carry both. Advancing it on failure renewed an assurance nothing had
+        # verified; not advancing it made every lease retry -- and each retry is bounded by the
+        # probe timeout, so on a wedged session that is thirty seconds of hang per operation while
+        # holding a pooled connection: the exact exhaustion this method's own commit was fixing,
+        # reached from the fix for the fix.
+        if now - self._ro_attempted_at < self._ro_ttl_s:
             return
+        self._ro_attempted_at = now
 
         # BOUNDED, and restored. The lease sets `call_timeout` from the CALLER's needs, which for
         # a data query is 0 -- no limit -- so an unbounded probe on a wedged session would hang
@@ -420,7 +435,9 @@ class OracleAdapter:
         """A probe that could not run leaves the assurance UNVERIFIED, which is not the same as
         confirmed and must not be recorded as it.
 
-        **The clock is deliberately NOT advanced here.** It was advanced before the probe ran, so
+        **The ASSURANCE clock is deliberately not advanced here.** Nor is the attempt clock -- that
+        moved before the probe ran, which is what bounds the retry cadence; this method only
+        records that the last attempt established nothing. It was advanced before the probe ran, so
         every failure renewed the TTL having established nothing: a permanently failing probe
         silently kept `constrained` standing forever, and a failed check and a passed check moved
         the same clock. That is this codebase's own collapse, in the fix for a control that had
@@ -843,6 +860,7 @@ class OracleAdapter:
             # the verdict is a string a human read once.
             self._ro_state = "constrained"
             self._ro_checked_at = time.monotonic()
+            self._ro_attempted_at = self._ro_checked_at
             return ("constrained", (
                 "this database is open READ ONLY, so it refuses every write from every principal, "
                 "including the one path this adapter's gate cannot see: a SELECT that reaches an "
