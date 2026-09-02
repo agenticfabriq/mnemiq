@@ -446,3 +446,95 @@ def test_a_recovered_probe_reports_the_next_failure_as_new():
     assert len(second) == 1, "a failure after a recovery was swallowed by the earlier backoff"
     assert "VERIFIED for 0s" in second[0].getMessage(), (
         "the new incident inherited the old one's elapsed time")
+
+
+def test_a_check_that_SUCCEEDS_ends_the_incident_it_interrupts():
+    """A fresh failure must not inherit a stale one's backoff or its elapsed time.
+
+    `assert_read_only` recorded a `constrained` verdict by setting the state and the assurance
+    clock, and cleared none of the unverified bookkeeping -- so an outage that ended in a
+    successful re-check left `_ro_unverified_since` hours stale. Measured before the fix: after a
+    six-hour outage and a successful re-check, the next failure went unreported for twenty-five
+    minutes, then announced 22800s of failed verification twenty-five minutes after verification
+    had succeeded. Silent when it should speak, and wrong when it spoke.
+
+    Both sites now go through `_record_constrained`, which is what this drives.
+    """
+    a = _constrained_adapter(ttl=300.0)
+    con = _ProbeFails()
+
+    with driven_clock() as now:
+        a._ro_checked_at = now[0]
+        for _ in range(6 * 60):                  # six hours of failing probes
+            now[0] += 60.0
+            a._recheck_read_only(con)
+        assert a._ro_unverified is True and now[0] - a._ro_unverified_since > 5 * 3600
+
+        # What a successful check does, through the one method that owns it.
+        a._record_constrained(now[0])
+        assert a._ro_unverified is False, "a successful check left the incident standing"
+
+        now[0] += 400.0                          # past the TTL: the next lease probes, and fails
+        with caplog_at(logging.WARNING) as after:
+            a._recheck_read_only(con)
+
+    assert len(after) == 1, (
+        "the failure after a successful check was silent, suppressed by the old incident's backoff")
+    assert "VERIFIED for 0s" in after[0].getMessage(), (
+        f"the new incident inherited the old one's elapsed time: {after[0].getMessage()}")
+
+
+def test_the_cap_cannot_be_tighter_than_the_probe_cadence():
+    """The cap promises a line at least hourly. A line can only be emitted where a probe runs, so
+    a `read_only_ttl_s` wider than the cap sets the real floor -- and the constant said otherwise
+    until it was measured: at ttl=7200s the widest gap is 120 minutes against a cap claiming 60.
+
+    Asserted as the true bound rather than the wished-for one, so a future change that tightens
+    the cap without touching the probe cadence cannot look like it worked.
+    """
+    cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
+    ttl = cap * 2
+    a = _constrained_adapter(ttl=ttl)
+    con = _ProbeFails()
+    said = []
+
+    with driven_clock() as now, caplog_at(logging.WARNING) as rec:
+        a._ro_checked_at = now[0]
+        for _ in range(48 * 60):
+            now[0] += 60.0
+            before = len(rec)
+            a._recheck_read_only(con)
+            if len(rec) > before:
+                said.append(now[0])
+
+    gaps = [b - a_ for a_, b in zip(said, said[1:])]
+    assert gaps, "two days of failing probes produced fewer than two lines"
+    assert max(gaps) > cap + 60, (
+        "a TTL wider than the cap did NOT widen the gaps; if the probe cadence no longer bounds "
+        "the warning cadence, the comment on _RO_UNVERIFIED_MAX_GAP_S is now wrong the other way")
+    assert max(gaps) <= ttl + 60, (
+        f"the widest gap {max(gaps):.0f}s exceeds even one probe cadence ({ttl:.0f}s), so the "
+        f"backoff is running past the bound the cap is supposed to hold it to")
+
+
+def test_only_ONE_place_records_a_constrained_verdict():
+    """The divergence that caused the stale-incident bug was two sites recording the same thing.
+
+    `_recheck_read_only`'s ORA-16000 branch and `assert_read_only`'s verdict each set the state and
+    the assurance clock, and only one of them cleared the unverified bookkeeping. The call site in
+    `assert_read_only` needs a live database, so no database-free test can drive it -- what CAN be
+    held is that it does not grow its own copy again.
+    """
+    import inspect
+
+    src = inspect.getsource(OracleAdapter)
+    assignments = [ln.strip() for ln in src.splitlines()
+                   if ln.strip().startswith("self._ro_state = ") and "constrained" in ln]
+    assert assignments == ['self._ro_state = "constrained"'], (
+        f"{len(assignments)} places record a `constrained` verdict: {assignments}. Two did once, "
+        f"they cleared different fields, and a fresh failure inherited a six-hour-old incident.")
+
+    owner = inspect.getsource(OracleAdapter._record_constrained)
+    assert 'self._ro_state = "constrained"' in owner, (
+        "the one assignment is no longer inside `_record_constrained`, so the owner is not the "
+        "owner and the other fields it clears will drift from it again")
