@@ -8,15 +8,17 @@ only coverage behind that gate: a control that runs against one machine is not m
 
 Everything here drives the adapter through fakes and `__new__`, and the driver is imported rather
 than skipped past: `oracledb` is a dev dependency, so a checkout that can run the suite at all can
-run these, and a missing driver is a collection ERROR rather than a skip. That replaced a guard
-that had to reason about CI's sync line and marker expression to notice a fail-open -- removing
-the mechanism, instead of defending it.
+run these. Without it the build goes RED -- measured as four errors and three passes, not a
+collection error, because `OracleAdapter.__init__` imports the driver lazily and only the tests
+that build an adapter reach it. Red either way, which is the property that matters; a skip was
+not. That replaced a guard which had to reason about CI's sync line to notice a fail-open --
+removing the mechanism, instead of defending it.
 """
 
 import logging
 import threading
 
-import pytest  # noqa: F401  -- imported by the tests below
+import pytest
 
 from mnemiq.adapters.oracle import OracleAdapter
 

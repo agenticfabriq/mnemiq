@@ -5,10 +5,17 @@ the lease-leak fix and the expiring-`constrained` fix among them. They were unme
 the module they lived in skipped without a live DSN, and after the split an `importorskip` skipped
 them wherever the driver was absent, which included CI.
 
-The driver hole is closed by construction now: `oracledb` is a dev dependency and the module
-imports it outright, so a missing driver is a collection ERROR rather than a green skip. What
+The driver hole is closed by construction now: `oracledb` is a dev dependency and the module no
+longer skips past it, so a missing driver turns the build red -- as four errors and three passes,
+since the adapter imports the driver lazily -- rather than green with seven skips. What
 construction cannot close is a MARK -- module-level or per-function, `integration` or a new one
-minted tomorrow -- silently removing these tests from CI's selection. That is what this asks about,
+minted tomorrow -- silently removing these tests from CI's SELECTION. Two holes remain open and
+are recorded rather than papered over: a `@pytest.mark.skip` suppresses execution without changing
+what is collected, so counting collected tests cannot see it; and CI naming explicit paths would
+drop this file while the check, which collects it by path, stayed green. Both need a different
+instrument than a collection count.
+
+That is what this asks about,
 and it asks the collector rather than reading the file, because every textual version of this check
 was defeated by moving a mark or requoting a line.
 
