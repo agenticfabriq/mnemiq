@@ -122,7 +122,8 @@ def adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only
                 # or a one-off caller gets; these are what a server gets (**M72**).
                 **({"pool_max": settings.oracle_pool_max,
                     "acquire_timeout_s": settings.oracle_acquire_timeout_s,
-                    "probe_timeout_s": settings.oracle_probe_timeout_s} if settings else {}))
+                    "probe_timeout_s": settings.oracle_probe_timeout_s,
+                    "read_only_ttl_s": settings.oracle_read_only_ttl_s} if settings else {}))
         except ValueError as exc:
             # The adapter validates its own TLS arguments and cannot raise `SourceUnconfigured`:
             # this module imports IT, so the dependency only runs one way. Translated here so a

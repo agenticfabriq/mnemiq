@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
@@ -7,6 +8,8 @@ from contextlib import contextmanager
 from typing import Any
 
 import pyarrow as pa
+
+logger = logging.getLogger(__name__)
 
 
 class OracleAdapter:
@@ -45,7 +48,8 @@ class OracleAdapter:
     def __init__(self, dsn: str, user: str, password: str, schema: str | None = None,
                  read_only: bool = True, config_dir: str | None = None,
                  wallet_password: str | None = None, pool_max: int = 4,
-                 acquire_timeout_s: float = 10.0, probe_timeout_s: float = 30.0) -> None:
+                 acquire_timeout_s: float = 10.0, probe_timeout_s: float = 30.0,
+                 read_only_ttl_s: float = 300.0) -> None:
         """`dsn` is an Easy Connect string or a TNS alias, e.g. `host:1521/FREEPDB1`.
 
         `config_dir` is a directory holding `tnsnames.ora` (and, for a TLS target, the wallet).
@@ -146,6 +150,10 @@ class OracleAdapter:
             session_callback=self._configure_session, **extra)
         self._con = None  # `over()` sets this; a pooled adapter has no one connection
         self._closed = False
+        # `constrained` expires: see `_recheck_read_only`.
+        self._ro_ttl_s = read_only_ttl_s
+        self._ro_checked_at = 0.0
+        self._ro_state = "unknown"
 
     def _configure_session(self, connection, requested_tag) -> None:
         """Session state a pooled connection must carry, applied once per PHYSICAL session.
@@ -202,6 +210,9 @@ class OracleAdapter:
         a._probe_timeout_ms = 0
         a._session_schema = None
         a._closed = False
+        a._ro_ttl_s = 0.0  # a borrowed connection is not ours to re-probe on a timer
+        a._ro_checked_at = 0.0
+        a._ro_state = "unknown"
         a._lock = threading.RLock()
         return a
 
@@ -299,15 +310,90 @@ class OracleAdapter:
         # Bounded by `wait_timeout`: DPY-4005 rather than an unbounded wait. Measured on a max=1
         # pool, which raised after the configured 1.5s instead of blocking.
         con = self._pool.acquire()
-        # Set rather than left alone, because a value can arrive on a pooled connection from its
-        # last borrower: measured, `call_timeout` survives release and re-acquire. This lease
-        # therefore starts from a known state whatever the previous one did.
-        con.call_timeout = timeout_ms or 0
         try:
+            # Set rather than left alone, because a value can arrive on a pooled connection from
+            # its last borrower: measured, `call_timeout` survives release and re-acquire. This
+            # lease therefore starts from a known state whatever the previous one did.
+            #
+            # INSIDE the try, and that is the whole point. It sat above it, so a connection that
+            # raised here -- a closed or otherwise invalid session, which is exactly the state a
+            # pool hands back after a network fault -- was never released. Repeat that and the
+            # pool runs out: one poisoned session becomes DPY-4005 for every healthy request,
+            # which is M72's own failure mode reintroduced by M72's fix.
+            con.call_timeout = timeout_ms or 0
+            self._recheck_read_only(con)
             yield con
         finally:
-            con.call_timeout = 0
-            self._pool.release(con)
+            try:
+                con.call_timeout = 0
+            except Exception:
+                # Two things this must not do: mask the body's exception, and skip the return.
+                # A bare `finally` did both -- a raise here replaced whatever the caller was
+                # already failing with, and jumped over `release`.
+                #
+                # DROPPED rather than released, because a connection that will not accept a
+                # timeout reset would go back into the pool carrying an unknown one, and the
+                # next borrower would inherit a bound nobody set. `drop` retires it and the pool
+                # opens a replacement.
+                self._pool.drop(con)
+            else:
+                self._pool.release(con)
+
+    def _recheck_read_only(self, con) -> None:
+        """Re-probe the database's open mode on a bounded cadence, and say so when it lapses.
+
+        **`constrained` was a boot sample presented as a control.** `assert_read_only` runs once,
+        from `build_runtime`, and nothing re-probed it — so a database reopened READ WRITE while
+        the process lived took the assurance with it silently, and the SELECT-through-
+        AUTONOMOUS_TRANSACTION path (**M66**, **M71**) came back with no transition anywhere. The
+        verdict's own text admitted the time bound and the runtime did nothing with it, which is
+        an admission standing in for a control.
+
+        Probed on the ALREADY-LEASED connection, which is what keeps this from recursing:
+        `assert_read_only` reaches the database through `_rows`, and `_rows` takes a lease, so
+        re-probing from inside `_lease` through the public path would deadlock on a max=1 pool
+        and burn a second connection on any other.
+
+        Bounded by TTL rather than run per operation: one extra round trip per interval, not per
+        query. The window is the exposure, and it is stated rather than argued away.
+
+        Only the LAPSE is reported. A deployment that was never `constrained` is already warned at
+        boot by `gate_only`/`unverifiable`, and re-announcing it here would rebuild the always-on
+        warning M66 spent five rounds removing.
+        """
+        if not self._read_only or self._ro_ttl_s <= 0 or self._ro_state != "constrained":
+            return
+        now = time.monotonic()
+        if now - self._ro_checked_at < self._ro_ttl_s:
+            return
+        self._ro_checked_at = now
+        cur = con.cursor()
+        try:
+            cur.execute(self._READ_ONLY_DB_PROBE)
+            cur.fetchall()
+        except self._oracledb.DatabaseError as exc:
+            # RETURNS EITHER WAY, and the `if` is only about which fact was established.
+            # ORA-16000 means the database is still refusing writes, so the assurance holds.
+            # ANY OTHER DatabaseError -- a dropped connection, a revoked privilege, a table that
+            # went missing -- means the probe did not run to completion, which is not evidence of
+            # anything about the open mode. An earlier version fell through to the LAPSED warning
+            # on that branch: a failed probe and an opened database sharing one observable, in the
+            # fix for a control that did not hold. The collapse this codebase keeps producing,
+            # produced again by the paragraph above it.
+            _ = _is_read_only_database(exc)
+            return
+        except Exception:
+            return  # same reasoning: a probe that cannot run establishes nothing
+        finally:
+            cur.close()
+        # The probe RAN and was not refused: this database now accepts writes.
+        self._ro_state = "lapsed"
+        logger.warning(
+            "read-only basis LAPSED: this database answered a write probe that it refused at "
+            "boot, so it is no longer open READ ONLY. `read_only=True` now rests on this "
+            "adapter's statement gate alone, which cannot see a SELECT that reaches an "
+            "AUTONOMOUS_TRANSACTION function through a view (M66, M71). Re-open the read plane "
+            "against a read-only database, or accept that gap knowingly")
 
     def close(self) -> None:
         """Release the pool's sessions. Idempotent.
@@ -710,6 +796,10 @@ class OracleAdapter:
         # holding SELECT and nothing else -- the write is refused with ORA-16000 on a read-only
         # database, while plain SELECT keeps working.
         if self._database_refuses_writes():
+            # Recorded so `_recheck_read_only` knows there is an assurance to lose. Without this
+            # the verdict is a string a human read once.
+            self._ro_state = "constrained"
+            self._ro_checked_at = time.monotonic()
             return ("constrained", (
                 "this database is open READ ONLY, so it refuses every write from every principal, "
                 "including the one path this adapter's gate cannot see: a SELECT that reaches an "

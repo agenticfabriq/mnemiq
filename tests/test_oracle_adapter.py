@@ -24,7 +24,9 @@ Run against the container the spike used:
 
 from __future__ import annotations
 
+import contextlib
 import os
+import threading
 import time
 
 import pytest
@@ -41,6 +43,29 @@ if not DSN:
                 allow_module_level=True)
 
 from mnemiq.adapters.oracle import OracleAdapter  # noqa: E402
+
+
+@contextlib.contextmanager
+def caplog_at(level):
+    """Records on the adapter's own logger.  is a fixture and these helpers are called
+    from tests that also need SYSDBA, so a plain handler keeps the two independent."""
+    import logging
+    logger = logging.getLogger("mnemiq.adapters.oracle")
+    records = []
+
+    class _H(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    h = _H(level=level)
+    logger.addHandler(h)
+    old = logger.level
+    logger.setLevel(level)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(h)
+        logger.setLevel(old)
 
 
 def _adapter(read_only: bool = True) -> OracleAdapter:
@@ -1479,3 +1504,185 @@ def test_a_closed_pool_reports_a_source_that_cannot_answer():
     a.close()  # idempotent: the driver raises DPY-1002 on a second close of its own
     with pytest.raises(oracledb.Error):
         a.execute("SELECT 1 FROM dual")
+
+
+def _pool_probe(a):
+    """How many connections the pool will still hand out. A leaked lease shows up here and
+    nowhere else -- the adapter keeps working until the pool is empty, then fails on a healthy
+    request with DPY-4005, which is why this is measured rather than inspected."""
+    held = []
+    try:
+        while True:
+            held.append(a._pool.acquire())
+    except Exception:
+        return len(held)
+    finally:
+        for c in held:
+            a._pool.release(c)
+
+
+class _FakeCon:
+    """Records timeout writes and can be told to raise on the nth one."""
+
+    def __init__(self, raise_on=None):
+        # `object.__setattr__` for all three: a plain `self.call_timeout = 0` here goes through
+        # the counter below and consumes write #1, so `raise_on=1` blew up in the constructor and
+        # `raise_on=2` fired on the lease's SETUP rather than its reset. The fake was off by one
+        # and the tests failed for a reason that had nothing to do with the code under test.
+        object.__setattr__(self, "writes", 0)
+        object.__setattr__(self, "_raise_on", raise_on)
+        object.__setattr__(self, "call_timeout", 0)
+
+    def __setattr__(self, name, value):
+        if name == "call_timeout":
+            object.__setattr__(self, "writes", self.writes + 1)
+            if self._raise_on == self.writes:
+                raise RuntimeError(f"write#{self.writes}")
+        object.__setattr__(self, name, value)
+
+
+class _FakePool:
+    def __init__(self, con):
+        self.con, self.released, self.dropped = con, [], []
+
+    def acquire(self):
+        return self.con
+
+    def release(self, c):
+        self.released.append(c)
+
+    def drop(self, c):
+        self.dropped.append(c)
+
+
+def _leased(pool):
+    """An adapter that owns nothing but the lease logic. NO DATABASE: what is under test is the
+    lease's control flow, which is pure Python -- an earlier version drove it through a real pool
+    and failed only inside the full suite, on timing that had nothing to do with the behaviour."""
+    a = OracleAdapter.__new__(OracleAdapter)
+    a._pool, a._con, a._closed = pool, None, False
+    a._read_only, a._ro_ttl_s, a._ro_state, a._ro_checked_at = True, 0.0, "unknown", 0.0
+    a._lock = threading.RLock()
+    return a
+
+
+def test_a_lease_whose_SETUP_raises_still_returns_its_connection():
+    """The leak. `call_timeout = ...` sat ABOVE the try, so a connection that raised on the
+    assignment -- a closed or invalid session, which is what a pool hands back after a network
+    fault -- was acquired and never released. Repeat it and the pool empties: one poisoned
+    session becomes DPY-4005 for every healthy request, M72's own failure mode reintroduced by
+    M72's fix.
+    """
+    pool = _FakePool(_FakeCon(raise_on=1))
+    a = _leased(pool)
+    with pytest.raises(RuntimeError, match="write#1"):
+        with a._lease():
+            pass
+    assert pool.released or pool.dropped, "the failed lease never returned its connection"
+
+
+def test_a_lease_whose_CLEANUP_raises_neither_leaks_nor_masks():
+    """Two failures in one: a raise in the reset skipped `release` AND replaced the exception the
+    caller was already failing with. A connection that will not accept a reset is DROPPED rather
+    than released, because it would otherwise rejoin the pool carrying a bound nobody set."""
+    class _Body(Exception):
+        pass
+
+    pool = _FakePool(_FakeCon(raise_on=2))  # setup succeeds, the reset raises
+    a = _leased(pool)
+    with pytest.raises(_Body):  # the BODY's exception, not the cleanup's
+        with a._lease():
+            raise _Body("what the caller was actually failing with")
+    assert pool.dropped, "a connection that cannot be reset must be dropped, not released"
+    assert not pool.released, "it must not rejoin the pool carrying an unknown timeout"
+
+
+def test_a_clean_lease_releases_rather_than_drops():
+    """The control. Without it both assertions above are satisfied by an adapter that drops
+    every connection it ever takes, which would empty the pool just as effectively."""
+    pool = _FakePool(_FakeCon())
+    a = _leased(pool)
+    with a._lease():
+        pass
+    assert pool.released and not pool.dropped
+
+
+def test_the_constrained_verdict_LAPSES_when_the_database_reopens(caplog):
+    """**A boot sample presented as a control.** `assert_read_only` runs once, from
+    `build_runtime`, and nothing re-probed it — so a database reopened READ WRITE while the
+    process lived took the assurance with it silently, and M66/M71's write path came back with no
+    transition anywhere. The verdict's text admitted the time bound; the runtime did nothing with
+    it, which is an admission standing in for a control.
+
+    This flips the PDB underneath a live adapter, which is the only way to observe the thing.
+    """
+    import logging
+
+    sysdba = _sysdba()
+    if sysdba is None:
+        pytest.skip("needs SYSDBA on the container to change the open mode")
+
+    def pdb(sql):
+        sysdba.cursor().execute(sql)
+
+    try:
+        pdb("ALTER PLUGGABLE DATABASE CLOSE IMMEDIATE")
+        pdb("ALTER PLUGGABLE DATABASE OPEN READ ONLY")
+
+        a = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, read_only_ttl_s=0.01)
+        verdict, _ = a.assert_read_only()
+        assert verdict == "constrained", "precondition: the assurance exists to be lost"
+
+        # Reopen underneath it. Nothing tells the adapter; that is the point.
+        pdb("ALTER PLUGGABLE DATABASE CLOSE IMMEDIATE")
+        pdb("ALTER PLUGGABLE DATABASE OPEN READ WRITE")
+
+        time.sleep(0.02)  # past the TTL
+        with caplog.at_level(logging.WARNING):
+            a.execute("SELECT 1 FROM dual")
+
+        assert "LAPSED" in caplog.text, "the assurance was lost and nothing said so"
+        assert "M66" in caplog.text, "the operator needs the finding, not just the fact"
+
+        # And it says it once, not on every query: an always-on warning is the failure M66
+        # already spent five rounds removing.
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            a.execute("SELECT 1 FROM dual")
+        assert "LAPSED" not in caplog.text, "the lapse warning repeated on every query"
+        a.close()
+    finally:
+        try:
+            pdb("ALTER PLUGGABLE DATABASE CLOSE IMMEDIATE")
+            pdb("ALTER PLUGGABLE DATABASE OPEN READ WRITE")
+        finally:
+            sysdba.close()
+
+
+def test_a_probe_that_FAILS_is_not_evidence_the_database_opened():
+    """The collapse, produced inside the fix for a control that did not hold.
+
+    `_recheck_read_only` returned early only when the error was ORA-16000; any OTHER
+    `DatabaseError` — a dropped connection, a revoked privilege — fell through to the LAPSED
+    warning. So a probe that never completed and a database that genuinely reopened shared one
+    observable, which is the finding class this whole lane is a catalogue of.
+    """
+    import logging
+
+    a = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, read_only_ttl_s=0.01)
+    try:
+        a._ro_state = "constrained"   # as `assert_read_only` would have left it
+        a._ro_checked_at = 0.0        # already stale
+
+        # Point the probe at a table that does not exist: ORA-00942 is a DatabaseError and is
+        # emphatically not ORA-16000, which is the whole distinction under test.
+        import unittest.mock as m
+        with m.patch.object(type(a), "_READ_ONLY_DB_PROBE", "SELECT 1 FROM no_such_table_xyz"):
+            with caplog_at(logging.WARNING) as rec:
+                a.execute("SELECT 1 FROM dual")
+        assert not any("LAPSED" in r.getMessage() for r in rec), (
+            "an unrelated probe failure was reported as the database having reopened"
+        )
+        assert a._ro_state == "constrained", "a failed probe must not change the recorded state"
+    finally:
+        a.close()

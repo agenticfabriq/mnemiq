@@ -106,6 +106,7 @@ def test_oracle_takes_credentials_from_settings_and_the_descriptor_from_the_spec
         "pool_max": s.oracle_pool_max,
         "acquire_timeout_s": s.oracle_acquire_timeout_s,
         "probe_timeout_s": s.oracle_probe_timeout_s,
+        "read_only_ttl_s": s.oracle_read_only_ttl_s,
     }
 
 

@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     oracle_pool_max: int = Field(default=4, description="max pooled Oracle connections; concurrency above this queues for one, bounded by oracle_acquire_timeout_s")
     oracle_acquire_timeout_s: float = Field(default=10.0, description="how long a request waits for a pooled Oracle connection before failing; a bounded wait, because the alternative is every worker blocking on one stalled statement")
     oracle_probe_timeout_s: float = Field(default=30.0, description="call timeout for Oracle statements the engine issues about ITSELF -- validation parses and boot advisories -- which have no legitimate reason to run long; 0 disables. Data queries are NOT bounded by this")
+    oracle_read_only_ttl_s: float = Field(default=300.0, description="how long a `constrained` read-only verdict stands before the adapter re-probes the database's open mode; the window is the exposure, since a database reopened READ WRITE reopens M66's PL/SQL write path. 0 disables re-probing")
     ack_advisories: str | None = Field(default=None, description="boot advisories to log at INFO instead of WARNING, comma-separated as <advisory>:<verdict> (e.g. read-only-basis:unverifiable); a CHANGED verdict still warns")
     acme_data_dir: str | None = Field(default=None, description="ACME golden dataset dir (tests)")
     embed_model: str | None = Field(default=None, description="embedding model id")
