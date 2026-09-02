@@ -8,7 +8,7 @@ jobs:
       - uses: astral-sh/setup-uv@v3
       # `ontology` carries rdflib, which tests/test_ontology_digest.py imports at
       # collection time; without it those tests error rather than skip.
-      - run: uv sync --extra dev --extra ontology
+      - run: uv sync --extra dev --extra ontology --extra oracle
       - run: uv run ruff check .
       - run: uv run pytest -m "not integration and not live_llm" -v
 
