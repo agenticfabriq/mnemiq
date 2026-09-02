@@ -18,7 +18,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "ruff>=0.6", "httpx>=0.27", "fastapi>=0.115", "uvicorn>=0.30"]
+# `oracledb` is here as well as in the `oracle` extra, and deliberately: the database-free Oracle
+# tests guard the read-only controls, and behind an `importorskip` a missing driver turned them
+# into silent SKIPPED lines under a green build. In thin mode it needs no Oracle client
+# libraries, so the cost of installing it for every developer is a pure-python wheel.
+dev = ["pytest>=8", "ruff>=0.6", "httpx>=0.27", "fastapi>=0.115", "uvicorn>=0.30", "oracledb>=2"]
 server = ["fastapi>=0.115", "uvicorn>=0.30"]
 # Oracle is a v1 target and an OPTIONAL extra, not a core dependency: only an Oracle
 # deployment needs the driver, and `oracledb` in thin mode needs no Oracle client libraries.

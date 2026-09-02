@@ -481,6 +481,7 @@ dependencies = [
 dev = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "oracledb" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "uvicorn" },
@@ -505,6 +506,7 @@ requires-dist = [
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
     { name = "mcp", specifier = ">=1.28" },
     { name = "openai", specifier = ">=1.40" },
+    { name = "oracledb", marker = "extra == 'dev'", specifier = ">=2" },
     { name = "oracledb", marker = "extra == 'oracle'", specifier = ">=2" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pyarrow", specifier = ">=17" },

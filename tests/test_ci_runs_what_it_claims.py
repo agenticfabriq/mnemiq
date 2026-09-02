@@ -1,20 +1,20 @@
-"""CI's own selection, asserted two ways.
+"""CI's marker expression is asked what it selects, not told.
 
-`test_oracle_nodb.py` opens with `pytest.importorskip("oracledb")`, which fails OPEN: drop the
-driver and seven tests -- the lease-leak guard and the expiring-`constrained` guard among them --
-become silent SKIPPED lines under a green build. That is the same fail-open the file was created to
-end, one level up, and it had already happened once: the driver lives in the `oracle` extra and
-CI's sync line did not name it.
+`tests/test_oracle_nodb.py` holds the database-free guards for the Oracle read-only controls --
+the lease-leak fix and the expiring-`constrained` fix among them. They were unmeasured twice over:
+the module they lived in skipped without a live DSN, and after the split an `importorskip` skipped
+them wherever the driver was absent, which included CI.
 
-Two checks, because neither covers the other and the first drafts of both disarmed too easily:
+The driver hole is closed by construction now: `oracledb` is a dev dependency and the module
+imports it outright, so a missing driver is a collection ERROR rather than a green skip. What
+construction cannot close is a MARK -- module-level or per-function, `integration` or a new one
+minted tomorrow -- silently removing these tests from CI's selection. That is what this asks about,
+and it asks the collector rather than reading the file, because every textual version of this check
+was defeated by moving a mark or requoting a line.
 
-  * the workflow TEXT, for the extra. It needs no driver, no env var and no CI, so it holds
-    wherever the suite runs rather than only where the thing it guards already works.
-  * pytest's OWN collection under CI's marker expression, for everything else. A textual guard
-    against a module-level `pytestmark` reads as protection and is not: seven function-level
-    `@pytest.mark.integration` decorators deselect exactly the same tests and leave the text
-    clean. Asking the collector how many tests survive cannot be fooled by where a mark is
-    written, or by reformatting the `importorskip` line it used to key on.
+Both counts come from the same collector, differing only in `-m`. An earlier draft compared
+collected ITEMS against `def test_` lines: one added `parametrize` and one added `integration` mark
+cancel out to an equal count, which is the fail-open it was written to prevent.
 """
 
 import pathlib
@@ -22,71 +22,44 @@ import re
 import subprocess
 import sys
 
-import pytest
-
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 NODB = ROOT / "tests" / "test_oracle_nodb.py"
 CI = ROOT / ".github" / "workflows" / "ci.yml"
-def _cis_marker_expression() -> str:
-    """Read out of the workflow, never restated here.
 
-    A copy drifts: add `and not oracle` to the run line and mark the module, and a guard holding
-    the old string still collects seven tests under an expression CI no longer uses -- green,
-    while the thing it guards does not run. The `-m` flag is on the run line this already reads.
+
+def _cis_pytest_invocation() -> str:
+    """The one `pytest` run line in the job that runs pytest.
+
+    Uniqueness is asserted rather than assumed: returning the first of several would validate one
+    invocation and stay green for another.
     """
-    for line in _the_job_that_runs_pytest():
-        if "pytest" in line and "-m" in line:
-            m = re.search(r'-m\s+"([^"]+)"', line) or re.search(r"-m\s+'([^']+)'", line)
-            assert m, f"cannot read the marker expression out of: {line.strip()}"
-            return m.group(1)
-    raise AssertionError("the pytest job has no `-m` marker expression to read")
+    runs = [ln for ln in CI.read_text().splitlines()
+            if re.search(r"\brun:.*\bpytest\b", ln)]
+    assert len(runs) == 1, f"expected exactly one pytest invocation in ci.yml, found {runs}"
+    return runs[0]
 
 
-def _the_job_that_runs_pytest() -> list[str]:
-    """The `run:` lines of the one job that runs pytest.
-
-    Split on the job keys rather than parsed: pyyaml is not a dependency of this project, and
-    adding one so a guard can read a 30-line workflow is a worse trade than a block scan.
-    """
-    blocks, current = {}, None
-    for line in CI.read_text().splitlines():
-        if re.fullmatch(r"  ([\w-]+):", line):
-            current = line.strip().rstrip(":")
-            blocks[current] = []
-        elif current and line.startswith("    "):
-            blocks[current].append(line)
-    hits = [name for name, body in blocks.items() if any("pytest" in ln for ln in body)]
-    assert len(hits) == 1, f"expected exactly one pytest job in ci.yml, found {hits}"
-    return blocks[hits[0]]
-
-
-@pytest.mark.skipif(not NODB.exists(), reason="the module this guards is gone")
-def test_ci_installs_the_extra_the_oracle_tests_import():
-    # Scoped to the job that actually runs pytest: a docs or lint job syncing a narrower set is
-    # correct, and `all()` over every sync line in the file would turn the suite red for it.
-    syncs = [ln for ln in _the_job_that_runs_pytest() if "uv sync" in ln]
-    assert syncs, "the pytest job has no `uv sync` step to check"
-    assert all("--extra oracle" in ln for ln in syncs), (
-        "tests/test_oracle_nodb.py skips itself without `oracledb`, and the job that runs pytest "
-        f"does not install it: {syncs}. Seven tests would report SKIPPED, build still green."
-    )
-
-
-@pytest.mark.skipif(not NODB.exists(), reason="the module this guards is gone")
-def test_cis_marker_expression_actually_selects_those_tests():
-    pytest.importorskip("oracledb", reason="without the driver this measures the environment")
-    markers = _cis_marker_expression()
+def _collect(*marker_args: str) -> int:
     out = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", markers, str(NODB)],
-        cwd=ROOT, capture_output=True, text=True, timeout=120)
-    selected = sum(1 for ln in out.stdout.splitlines() if "::test_" in ln)
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", *marker_args, str(NODB)],
+        cwd=ROOT, capture_output=True, text=True, timeout=180)
+    return sum(1 for ln in out.stdout.splitlines() if "::test_" in ln)
 
-    # EVERY test, not merely one. `> 0` sees all-or-nothing deselection only, and the attack is
-    # not all-or-nothing: a single `@pytest.mark.integration` on the retry-storm guard leaves six
-    # selected, a passing assertion, and that guard silently out of CI.
-    written = len(re.findall(r"^def (test_\w+)", NODB.read_text(), re.M))
-    assert selected == written, (
-        f"CI runs `-m \"{markers}\"`; {NODB.name} defines {written} tests and it selects "
-        f"{selected}. The difference is deselected by a mark and the build stays green."
-        f"\n{out.stdout[-800:]}"
+
+def test_cis_marker_expression_selects_every_database_free_oracle_test():
+    line = _cis_pytest_invocation()
+    m = re.search(r"""-m\s+(["'])(.+?)\1""", line)
+    assert m, f"cannot read a marker expression out of CI's pytest line: {line.strip()}"
+    markers = m.group(2)
+
+    everything = _collect()
+    # The floor. Without it a file that collects nothing at all -- gutted, or its tests moved under
+    # a class -- makes both sides zero and the equality vacuously true.
+    assert everything > 0, f"{NODB.name} collects no tests at all; nothing here is measuring CI"
+
+    selected = _collect("-m", markers)
+    assert selected == everything, (
+        f"CI runs `-m \"{markers}\"`, which selects {selected} of {NODB.name}'s {everything} "
+        f"tests. The rest carry a mark that deselects them, and the build stays green without "
+        f"the Oracle read-only guards ever running."
     )
