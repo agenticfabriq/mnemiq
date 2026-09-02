@@ -344,8 +344,9 @@ def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
     # and the shape needs room: the phase runs from a `ttl * 2` floor up to the cap, so a TTL too
     # close to the cap leaves nothing to measure. A twelfth gives four sub-cap gaps -- 600, 600,
     # 1200, 2400 at today's constant, so a fourfold rise, which is exactly what the assertion
-    # below demands and no more -- and the same 300s TTL this used to hardcode. The cap's own value
-    # is measured by `test_the_widest_silence_is_the_cap_OR_one_probe_cadence`, on absolute TTLs.
+    # below demands and no more -- and the same 300s TTL this used to hardcode. That the cadence
+    # settles AT the cap rather than doubling past it is asserted here and again, either side of
+    # the cap, in `test_the_widest_silence_is_the_cap_OR_one_probe_cadence`.
     cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
     a = _constrained_adapter(ttl=cap / 12)
     con = _ProbeFails()
@@ -502,10 +503,20 @@ def test_the_widest_silence_is_the_cap_OR_one_probe_cadence(ttl_ratio):
     real floor -- the constant claimed an hourly line until this was measured at ttl=7200s, where
     the widest gap is 120 minutes.
 
-    The TTLs are absolute, not derived from the cap. An earlier version took `ttl = cap * 2`, which
-    made both assertions tautologies in the cap: they held for every cap value from 120s to 43200s,
-    so lowering the constant -- the change an operator would make to get a line every half hour --
-    could not fail this test, which is precisely what its docstring promised it would catch.
+    The cadences ARE derived from the cap, one either side, and the history matters because a
+    derived cadence was also the first mistake here. That version took `ttl = cap * 2` and asserted
+    `gap > cap` and `gap <= ttl`, comparing two derived quantities: tautologies that held for every
+    cap from 120s to 43200s. Absolute values fixed the tautology and broke the coverage instead --
+    at a three-hour cap both fell on the same side of it -- and the guard added to detect THAT
+    compared against its own hardcoded copy of the parameters, so its advice could not clear it.
+
+    What makes the derivation sound here is the other side of the assertion: measured gaps, from
+    running the real backoff, against a predicted bound. Removing the cap fails both cases at every
+    value swept -- 120s, 300s, 1800s, 3600s, 10800s.
+
+    What this does NOT do, and what nothing in this file does, is fail when an operator merely
+    lowers the constant. Both sides of the comparison move with it. Catching that would need a
+    fixed expectation of how often a line appears, which is a policy nobody has stated.
     """
     # One cadence either side of the cap, expressed AS A RATIO so both branches stay covered for
     # any cap. Absolute values could not: at a three-hour cap both fell cap-side and the
