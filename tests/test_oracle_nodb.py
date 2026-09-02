@@ -510,11 +510,15 @@ def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
     constant. What each rules out, at a 3600s cap -- `code` is what the run measures, and the
     columns beside it are formulas that have been proposed here and are wrong:
 
-        ratio  cadence   code   max(cap,ttl)  floor  banker  half-up
+        ratio  cadence   code   max(cap,ttl)  floor*  banker  half-up
         1/12       300   3600       3600       3600    3600     3600
         2         7200   7200       7200       7200       0     7200
         2/3       2400   4800       3600       2400    4800     4800
         5/6       3000   6000       3600       3000    3000     3000
+
+    `floor*` is `max(1, floor(cap / ttl))`, the spelling that was mutated; a BARE floor returns 0
+    at the over-cap ratio and is caught there as well, so the column below is the harder of the two
+    to distinguish, not the easier.
 
     Reading down the columns, and confirmed by mutating the bound four ways: `max(cap, ttl)` and
     flooring are each caught by two thirds and five sixths; banker's rounding by over-cap (where
