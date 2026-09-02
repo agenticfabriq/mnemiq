@@ -345,8 +345,8 @@ def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
     # close to the cap leaves nothing to measure. A twelfth gives four sub-cap gaps -- 600, 600,
     # 1200, 2400 at today's constant, so a fourfold rise, which is exactly what the assertion
     # below demands and no more -- and the same 300s TTL this used to hardcode. That the cadence
-    # stops widening rather than doubling on is asserted here, and again across three cadences --
-    # under, over, and not dividing the cap -- in
+    # stops widening rather than doubling on is asserted here, and again across four cadences --
+    # under, over, not dividing, and just under the cap -- in
     # `test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence`.
     cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
     a = _constrained_adapter(ttl=cap / 12)
@@ -496,8 +496,9 @@ def test_a_check_that_SUCCEEDS_ends_the_incident_it_interrupts():
         f"the new incident inherited the old one's elapsed time: {after[0].getMessage()}")
 
 
-@pytest.mark.parametrize("ttl_ratio", [1 / 12, 2.0, 2 / 3],
-                         ids=["cadence-under-cap", "cadence-over-cap", "cadence-not-dividing-cap"])
+@pytest.mark.parametrize("ttl_ratio", [1 / 12, 2.0, 2 / 3, 5 / 6],
+                         ids=["cadence-under-cap", "cadence-over-cap", "cadence-not-dividing-cap",
+                              "cadence-just-under-cap"])
 def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
     """The cap rounded UP to the next whole probe cadence.
 
@@ -505,7 +506,7 @@ def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
     widest silence. The constant claimed an hourly line until this was measured at ttl=7200s, where
     the widest gap is 120 minutes.
 
-    THREE cadences, all derived from the cap as ratios, and each covers something different:
+    FOUR cadences, all derived from the cap as ratios, and each covers something different:
 
       * a twelfth -- well under the cap, where the backoff has room to double and then settle;
       * double -- over the cap, where the cadence alone sets the silence;
@@ -514,7 +515,12 @@ def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
         flooring 2400s. The code delivers 4800s, because the first probe at or past the cap lands
         at two cadences. Round-to-nearest is NOT separated here -- `round(1.5)` is 2 in Python, so
         it agrees with `ceil` on exactly this ratio; it is the over-cap case that rules it out,
-        where `round(0.5)` is 0 and the predicted bound collapses to nothing.
+        where `round(0.5)` is 0 and the predicted bound collapses to nothing;
+      * five sixths -- 3000s against a 3600s cap, where all four alternatives predict something
+        other than what the code does (3600s or 3000s, not agreeing among themselves either). `ceil` predicts 6000s; `max(cap, ttl)` 3600s; flooring, banker's
+        rounding and half-up rounding all 3000s. Half-up survives all three cases above -- it
+        matches `ceil` at 1.5 and at 0.5 -- so without this one a maintainer could rewrite the
+        bound as `int(cap / ttl + 0.5) * ttl` and keep a green suite.
 
     Without that third case `max(cap, ttl)` passed everything -- not because `ceil` never rounded
     (at a doubled cadence it rounds 0.5 up to 1) but because the two formulas coincide wherever
@@ -528,7 +534,7 @@ def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
     side of a three-hour cap, and the guard added to detect THAT compared against its own hardcoded
     copy of the parameters, so its own advice could not clear it. What makes the derivation sound
     is the other side of the assertion: measured gaps, from running the real backoff, against a
-    predicted bound. Removing the cap fails all three cases at every value swept -- 120s, 300s,
+    predicted bound. Removing the cap fails all four cases at every value swept -- 120s, 300s,
     1800s, 3600s, 10800s.
 
     What this does NOT do, and what nothing in this file does, is fail when an operator merely
