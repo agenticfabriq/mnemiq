@@ -510,9 +510,11 @@ def test_the_widest_silence_is_the_cap_ROUNDED_UP_to_a_probe_cadence(ttl_ratio):
       * a twelfth -- well under the cap, where the backoff has room to double and then settle;
       * double -- over the cap, where the cadence alone sets the silence;
       * two thirds -- under the cap but not dividing it, which is the case the rounding exists
-        for. Against a 3600s cap that is 2400s, and the candidate formulas disagree: `ceil`
-        predicts 4800s, `max(cap, ttl)` 3600s, flooring or rounding-to-nearest 2400s. The code
-        delivers 4800s, because the first probe at or past the cap lands at two cadences.
+        for. Against a 3600s cap that is 2400s: `ceil` predicts 4800s, `max(cap, ttl)` 3600s,
+        flooring 2400s. The code delivers 4800s, because the first probe at or past the cap lands
+        at two cadences. Round-to-nearest is NOT separated here -- `round(1.5)` is 2 in Python, so
+        it agrees with `ceil` on exactly this ratio; it is the over-cap case that rules it out,
+        where `round(0.5)` is 0 and the predicted bound collapses to nothing.
 
     Without that third case `max(cap, ttl)` passed everything -- not because `ceil` never rounded
     (at a doubled cadence it rounds 0.5 up to 1) but because the two formulas coincide wherever
