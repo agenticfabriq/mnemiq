@@ -460,9 +460,10 @@ class OracleAdapter:
         resolved one sharing one observable is the collapse this whole change set is about.
 
         So the cadence widens instead of closing: each line waits twice as long as the last, and
-        the gap is capped so it never stops. Measured at a 300s TTL, twenty-seven lines across a
-        day -- doubling through the first four hours, hourly after that -- rather than one at the
-        start, or the 288 a per-probe line would give and the per-query warning M66 had to remove.
+        the gap is capped so it never stops. Measured at a 300s TTL: twenty-seven lines across a
+        day, at 600s, 1200s, 2400s and 4800s and hourly from there -- so the doubling phase is the
+        first eighty minutes, not the first several hours. Against one line at the start, or the
+        288 a per-probe line would give and the per-query warning M66 had to remove.
         """
         now = time.monotonic()
         if self._ro_unverified:
