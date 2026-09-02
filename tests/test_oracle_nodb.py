@@ -22,8 +22,9 @@ from mnemiq.adapters.oracle import OracleAdapter  # noqa: E402
 
 def caplog_at(level):
     """Records on the adapter's own logger. The independence from pytest's `caplog` comes from
-    handling the adapter's logger directly -- there is nothing else to save and restore, and a
-    save/restore that reassigns a value to itself would only look like a control."""
+    handling that logger directly; the level IS saved and restored, because raising it leaks into
+    every later test. What was dropped here was a `propagate` save/restore that assigned the value
+    back to itself -- the shape of a control without the effect of one."""
     logger = logging.getLogger("mnemiq.adapters.oracle")
     records = []
 
@@ -213,9 +214,15 @@ def test_a_probe_that_cannot_run_does_NOT_renew_the_assurance():
     assert a._ro_state == "constrained", "a failed probe must not change the verdict either way"
     assert any("no longer be VERIFIED" in r.getMessage() for r in rec)
 
-    # Said once, not per lease.
+    # Said once, not per lease -- and the second call has to REACH the probe for that to be what
+    # is under test. At a 1ms TTL it did not: the two calls land ~0.1ms apart, so the cadence gate
+    # returned first and the assertion held with the dedupe deleted. Age the attempt clock past the
+    # TTL, and the suppression is the only thing left that can keep the log quiet.
+    a._ro_attempted_at -= 10.0
+    before = con.closed
     with caplog_at(logging.WARNING) as rec2:
         a._recheck_read_only(con)
+    assert con.closed > before, "the second call never probed, so nothing tested the suppression"
     assert not rec2, "the unverified warning repeated on every lease"
 
 
