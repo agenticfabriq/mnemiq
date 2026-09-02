@@ -435,7 +435,9 @@ class OracleAdapter:
         """A probe that could not run leaves the assurance UNVERIFIED, which is not the same as
         confirmed and must not be recorded as it.
 
-        **The ASSURANCE clock is deliberately not advanced here**, though the ATTEMPT clock is. It was advanced before the probe ran, so
+        **The ASSURANCE clock is deliberately not advanced here.** Nor is the attempt clock -- that
+        moved before the probe ran, which is what bounds the retry cadence; this method only
+        records that the last attempt established nothing. It was advanced before the probe ran, so
         every failure renewed the TTL having established nothing: a permanently failing probe
         silently kept `constrained` standing forever, and a failed check and a passed check moved
         the same clock. That is this codebase's own collapse, in the fix for a control that had
