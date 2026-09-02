@@ -410,12 +410,8 @@ class OracleAdapter:
             # fix for a control that did not hold. The collapse this codebase keeps producing,
             # produced again by the paragraph above it.
             if _is_read_only_database(exc):
-                # Refused the write: the assurance HOLDS, and only here does the clock move.
-                self._ro_checked_at = now
-                # Clearing the flag is the whole reset: the next failure takes the `else` branch
-                # in `_report_unverified`, which re-stamps `_ro_unverified_since` itself. A line
-                # zeroing it here read as hygiene and mutation could not observe it.
-                self._ro_unverified = False
+                # Everything a fresh check implies, in one place -- see `_record_constrained`.
+                self._record_constrained(now)
             else:
                 self._report_unverified(exc)
             return
@@ -437,6 +433,28 @@ class OracleAdapter:
             "adapter's statement gate alone, which cannot see a SELECT that reaches an "
             "AUTONOMOUS_TRANSACTION function through a view (M66, M71). Re-open the read plane "
             "against a read-only database, or accept that gap knowingly")
+
+    def _record_constrained(self, now: float) -> None:
+        """Record a check that just SUCCEEDED, and everything that follows from it.
+
+        Two sites established a fresh assurance -- the ORA-16000 branch of `_recheck_read_only`
+        and the `constrained` verdict in `assert_read_only` -- and they cleared different fields.
+        The second cleared none of the unverified bookkeeping, so a six-hour outage ending in a
+        successful re-check left `_ro_unverified_since` six hours stale. Measured: the next failure
+        went unreported for twenty-five minutes, suppressed by the OLD incident's backoff, then
+        announced 22800s of failed verification twenty-five minutes AFTER verification had
+        succeeded. A fresh failure inheriting a stale one, in both directions at once.
+
+        So there is one method, and it owns all of it.
+        """
+        self._ro_state = "constrained"
+        self._ro_checked_at = now
+        self._ro_attempted_at = now
+        # Clearing the flag is the whole reset, and mutation says so: without it two tests fail,
+        # and zeroing `_ro_unverified_since`/`_ro_unverified_next_s` here fails none. The next
+        # failure takes the `else` branch in `_report_unverified`, which re-stamps both. Lines that
+        # read as hygiene and change nothing are what this file keeps having to delete.
+        self._ro_unverified = False
 
     def _report_unverified(self, exc: Exception) -> None:
         """A probe that could not run leaves the assurance UNVERIFIED, which is not the same as
@@ -818,9 +836,11 @@ class OracleAdapter:
 
     # -- governance ---------------------------------------------------------------------------
 
-    # The widest gap between two UNVERIFIED lines. Doubling alone goes quiet for a day after a
-    # day, which is the silence this cap exists to prevent: an assurance nobody is checking should
-    # keep saying so for as long as it is being relied on.
+    # The widest gap between two UNVERIFIED lines -- OR one probe cadence, whichever is longer,
+    # and the second half is not a caveat to skip. A line can only be emitted where a probe runs,
+    # so a `read_only_ttl_s` above this cap sets the real floor: measured at ttl=7200s, the widest
+    # gap is 120 minutes against a cap claiming 60. Doubling alone goes quiet for a day after a
+    # day, which is the silence the cap does prevent, within that bound.
     _RO_UNVERIFIED_MAX_GAP_S = 3600.0
 
     # `SELECT ... FOR UPDATE` is the only candidate of five that FLIPPED with the open mode, and
@@ -904,9 +924,7 @@ class OracleAdapter:
         if self._database_refuses_writes():
             # Recorded so `_recheck_read_only` knows there is an assurance to lose. Without this
             # the verdict is a string a human read once.
-            self._ro_state = "constrained"
-            self._ro_checked_at = time.monotonic()
-            self._ro_attempted_at = self._ro_checked_at
+            self._record_constrained(time.monotonic())
             return ("constrained", (
                 "this database is open READ ONLY, so it refuses every write from every principal, "
                 "including the one path this adapter's gate cannot see: a SELECT that reaches an "
