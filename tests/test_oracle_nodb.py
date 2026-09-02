@@ -15,12 +15,31 @@ not. That replaced a guard which had to reason about CI's sync line to notice a 
 removing the mechanism, instead of defending it.
 """
 
+import contextlib
 import logging
 import threading
+import types
+import unittest.mock as mock
 
 import pytest
 
+import mnemiq.adapters.oracle as mod
 from mnemiq.adapters.oracle import OracleAdapter
+
+
+@contextlib.contextmanager
+def driven_clock(start=1_000_000.0):
+    """A monotonic clock the test advances, replacing the adapter module's `time`.
+
+    Every assertion below is about an INTERVAL, and against the real clock the small TTLs these
+    tests use turn them into races: at `ttl=0.001` the backoff window is 2ms, and a GC pause or a
+    loaded box between two calls flips the outcome. Driving the clock makes the interval the only
+    variable.
+    """
+    holder = [start]
+    fake = types.SimpleNamespace(monotonic=lambda: holder[0], sleep=lambda _s: None)
+    with mock.patch.object(mod, "time", fake):
+        yield holder
 
 
 def caplog_at(level):
@@ -217,14 +236,20 @@ def test_a_probe_that_cannot_run_does_NOT_renew_the_assurance():
     assert a._ro_state == "constrained", "a failed probe must not change the verdict either way"
     assert any("no longer be VERIFIED" in r.getMessage() for r in rec)
 
-    # Said once, not per lease -- and the second call has to REACH the probe for that to be what
-    # is under test. At a 1ms TTL it did not: the two calls land ~0.1ms apart, so the cadence gate
-    # returned first and the assertion held with the dedupe deleted. Age the attempt clock past the
-    # TTL, and the suppression is the only thing left that can keep the log quiet.
-    a._ro_attempted_at -= 10.0
-    before = con.closed
-    with caplog_at(logging.WARNING) as rec2:
-        a._recheck_read_only(con)
+    # Not per lease -- and the second call has to REACH the probe for that to be what is under
+    # test. At a 1ms TTL it did not: the two calls land ~0.1ms apart, so the cadence gate returned
+    # first and the assertion held with the dedupe deleted. Age the attempt clock past the TTL, and
+    # the backoff is the only thing left that can keep the log quiet.
+    #
+    # On a driven clock, because the suppression window is now `ttl * 2` = 2ms rather than an
+    # unconditional dedupe: against the real clock a pause between these two calls emits the second
+    # line and fails a test that has nothing to do with the pause.
+    with driven_clock() as now:
+        a._ro_attempted_at = now[0] - 10.0
+        a._ro_unverified_since = now[0]
+        before = con.closed
+        with caplog_at(logging.WARNING) as rec2:
+            a._recheck_read_only(con)
     assert con.closed > before, "the second call never probed, so nothing tested the suppression"
     assert not rec2, "the unverified warning repeated on every lease"
 
@@ -295,3 +320,121 @@ def test_the_age_of_the_STANDING_check_reaches_the_operator():
         b._recheck_read_only(_ProbeFails())
     assert "no successful check at all" in next(
         r.getMessage() for r in rec2 if "no longer be VERIFIED" in r.getMessage())
+
+
+def test_a_probe_that_keeps_failing_keeps_SAYING_so_at_a_widening_cadence():
+    """Said once defeated the age it was reporting.
+
+    The dedupe emitted exactly one line, at the first failure, carrying an age of about one TTL --
+    the moment the staleness matters least. Every hour after that was silent, so a probe that had
+    been broken since morning and a probe that had recovered looked identical to an operator. An
+    ongoing failure and a resolved one sharing one observable is this codebase's own collapse.
+
+    The assertions are on the GAPS between lines, because that is where the policy lives. An
+    earlier version asserted the reported ages rose, which is true of ANY logging policy -- the age
+    is measured from a fixed start -- and a flat hourly cadence with no backoff at all passed every
+    one of its five assertions.
+
+    A day is simulated on a driven clock: the property is invisible at test speed.
+    """
+    import re
+
+    a = _constrained_adapter(ttl=300.0)
+    con = _ProbeFails()
+    said = []
+
+    with driven_clock() as now, caplog_at(logging.WARNING) as rec:
+        a._ro_checked_at = now[0]        # a real check, just now
+        for _ in range(24 * 60):         # a day, one lease a minute
+            now[0] += 60.0
+            before = len(rec)
+            a._recheck_read_only(con)
+            if len(rec) > before:
+                said.append((now[0], rec[-1].getMessage()))
+
+    when = [t for t, _ in said]
+    gaps = [b - a_ for a_, b in zip(when, when[1:])]
+    cap = OracleAdapter._RO_UNVERIFIED_MAX_GAP_S
+
+    assert len(said) > 1, (
+        f"a probe broken for a full day said so {len(said)} time(s); after that, a failing check "
+        f"and a recovered one are the same silence")
+
+    # WIDENING: each gap about twice the last, until the cap takes over. This is what a flat
+    # cadence fails and the tautological age assertions did not.
+    growing = [g for g in gaps if g < cap]
+    assert len(growing) >= 3, f"no backoff phase to speak of: {gaps}"
+    assert gaps == sorted(gaps), f"the cadence narrowed somewhere: {gaps}"
+    # The first two gaps are equal by construction -- the opening line lands at elapsed 0 and the
+    # second at the `ttl * 2` floor -- so the growth is asserted across the phase rather than pair
+    # by pair. A flat cadence, the mutant that passed the previous version of this test, gives 1.0.
+    assert max(growing) / min(growing) >= 4, f"the gaps barely grew, so this is not a backoff: {gaps}"
+
+    # CAPPED: it settles at the cap rather than doubling into silence, and stays there.
+    assert gaps[-1] == pytest.approx(cap, abs=120), f"the cadence did not settle at the cap: {gaps}"
+    assert max(gaps) <= cap + 60, f"the cadence went quiet for {max(gaps):.0f}s, past the cap"
+
+    # And the age is carried on every line, not only the first.
+    ages = [float(re.search(r"VERIFIED for (\d+)s", msg).group(1)) for _, msg in said]
+    assert ages[-1] > 20 * 3600, f"the last line of the day reported a small age: {ages[-1]}s"
+
+    # Not per lease: 1440 leases, 288 probes at a 300s TTL.
+    assert len(said) < 40, f"{len(said)} lines in a day is the per-query warning M66 removed"
+
+
+class _ProbeSaysReadOnly:
+    """A probe that raises ORA-16000 -- the database confirming it is still open READ ONLY, which
+    is what a SUCCESSFUL check looks like for this probe."""
+
+    call_timeout = 0
+
+    def cursor(self):
+        import oracledb
+
+        class _C:
+            def execute(self, sql, **k):
+                raise oracledb.DatabaseError("ORA-16000: database open for read-only access")
+
+            def fetchall(self):
+                return []
+
+            def close(self):
+                pass
+
+        return _C()
+
+
+def test_a_recovered_probe_reports_the_next_failure_as_new():
+    """The escalation has to RESET, or a probe that failed this morning and fails again tonight
+    inherits tonight's silence from this morning's backoff.
+
+    The recovery is driven through the real ORA-16000 path, not by assigning the flags this test
+    then checks. Doing it by hand made an earlier version agree with itself: deleting the reset
+    from `_recheck_read_only` left it green.
+
+    On a driven clock, and the clock is the point: at a 1ms TTL the mutation was caught only while
+    real elapsed time stayed inside a 2ms window, so a slow box would have passed the mutant.
+    """
+    a = _constrained_adapter(ttl=300.0)
+    con = _ProbeFails()
+
+    with driven_clock() as now:
+        a._ro_checked_at = now[0]
+
+        with caplog_at(logging.WARNING) as first:
+            a._recheck_read_only(con)
+        assert len(first) == 1, "the first failure was not reported"
+        assert a._ro_unverified is True
+
+        # Well inside the backoff window: without a recovery this would stay silent.
+        now[0] += 400.0
+        a._recheck_read_only(_ProbeSaysReadOnly())   # ORA-16000: still read-only, check completed
+        assert a._ro_unverified is False, "a successful check did not clear the unverified state"
+
+        now[0] += 400.0
+        with caplog_at(logging.WARNING) as second:
+            a._recheck_read_only(con)
+
+    assert len(second) == 1, "a failure after a recovery was swallowed by the earlier backoff"
+    assert "VERIFIED for 0s" in second[0].getMessage(), (
+        "the new incident inherited the old one's elapsed time")
