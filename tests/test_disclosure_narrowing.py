@@ -25,6 +25,15 @@ def _ast(sql):
     return sqlglot.parse_one(sql, read="duckdb")
 
 
+# The write fixtures resolve their target with `_target_node`, the same function the decider calls,
+# so the fixture asks the question production asks. Measured on `DELETE s FROM t JOIN s`: `ast.this`
+# is the whole join expression and a `this`-first resolver returns `t`, a table the statement only
+# READS -- the authorization defect decide_write records. `find(exp.Table)` happens to return `s`
+# there, so the fix was never "stop using find"; it was to stop guessing, which is why
+# `_target_node` returns None on that shape. A fixture that guesses would hand the loop a node the
+# decider never passes, and assertions on the narrowing flags could not see the difference.
+
+
 def test_a_row_filter_is_reported_as_a_row_narrowing():
     _, narrowed = apply_row_and_mask(
         _ast("SELECT id, amount FROM claim"),
@@ -67,11 +76,6 @@ def test_the_WRITE_TARGETS_own_filter_is_reported():
     a governed DELETE narrowed from forty-seven rows to three reports nothing.
     """
     ast = _ast("DELETE FROM claim WHERE id = 1")
-    # `_target_node`, not `find(Table)` -- the fixture must ask the question production asks.
-    # `find(Table)` is the resolver decide_write records as a removed authorization defect:
-    # `DELETE s FROM t JOIN s` resolved to `t`, checking the grant against a table the statement
-    # only reads. The two agree on these shapes; copying the idiom into a multi-target case would
-    # hand the loop a node production never passes, and the flag assertions would not notice.
     target = _target_node(ast)
     out, narrowed = apply_row_filters_to_write(
         ast, AccessPolicy(row_filters={"claim": "amount > 0"}), _VISIBLE, target, "duckdb")
@@ -109,11 +113,6 @@ def test_a_write_whose_WHERE_reads_its_own_target_reports_it_once():
     """Two paths reach `claim`: the loop wraps the inner read, and the target is conjoined after
     it. Before merging, that emitted the same object twice from two different code paths."""
     ast = _ast("DELETE FROM claim WHERE id IN (SELECT id FROM claim)")
-    # `_target_node`, not `find(Table)` -- the fixture must ask the question production asks.
-    # `find(Table)` is the resolver decide_write records as a removed authorization defect:
-    # `DELETE s FROM t JOIN s` resolved to `t`, checking the grant against a table the statement
-    # only reads. The two agree on these shapes; copying the idiom into a multi-target case would
-    # hand the loop a node production never passes, and the flag assertions would not notice.
     target = _target_node(ast)
     _, narrowed = apply_row_filters_to_write(
         ast, AccessPolicy(row_filters={"claim": "amount > 0"}), _VISIBLE, target, "duckdb")
@@ -139,11 +138,6 @@ def test_merging_a_write_target_does_not_DROP_the_mask_the_read_loop_found():
     reintroduced by the fix for duplicates.
     """
     ast = _ast("DELETE FROM claim WHERE id IN (SELECT ssn FROM claim)")
-    # `_target_node`, not `find(Table)` -- the fixture must ask the question production asks.
-    # `find(Table)` is the resolver decide_write records as a removed authorization defect:
-    # `DELETE s FROM t JOIN s` resolved to `t`, checking the grant against a table the statement
-    # only reads. The two agree on these shapes; copying the idiom into a multi-target case would
-    # hand the loop a node production never passes, and the flag assertions would not notice.
     target = _target_node(ast)
     out, narrowed = apply_row_filters_to_write(
         ast,
