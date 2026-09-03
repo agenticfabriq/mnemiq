@@ -127,13 +127,22 @@ class Narrowing:
 
     object: str          # the table, in the query's own spelling
     rows: bool           # a row filter was applied to it
-    # At least one column WAS MASKED IN THE REWRITE of this table -- not "a column you asked for
-    # was withheld". The masking loop matches masked column NAMES across the whole query without
-    # resolving which table owns each reference, so `SELECT p.ssn FROM person p JOIN claim c` with
-    # `claim.ssn` masked wraps `claim` and reports it here, though the answer carried only
-    # `person.ssn`. That over-approximation is SAFE for masking (it masks more, never less) and is
-    # deliberately not changed by this feature; the disclosure inherits it and must not describe
-    # itself as impact on the caller's own columns.
+    # The query REFERENCED a column name this table masks. That is the flag's exact meaning, and
+    # it is neither "your answer lost a column" nor "the rewrite masked something" -- it misses in
+    # BOTH directions, so state them rather than let a consumer infer either:
+    #
+    #   OVER  -- names are matched across the whole query without resolving which table owns each
+    #            reference, so `SELECT p.ssn FROM person p JOIN claim c` with `claim.ssn` masked
+    #            reports `claim` though only `person.ssn` was read.
+    #   UNDER -- a table wrapped for its ROW FILTER has its masked columns NULLed regardless, so
+    #            `SELECT id FROM claim` under a filter plus a mask on `ssn` rewrites to
+    #            `... NULL AS ssn ...` while this stays False. The rewrite masked; the answer did
+    #            not lose anything the caller asked for.
+    #
+    # The under-approximation is the one to keep: a caller reading `id` was not narrowed by a mask
+    # on `ssn`, and reporting it would be a false alarm on every filtered table that has any mask.
+    # The over-approximation is inherited from the masking loop, which is SAFE there (it masks
+    # more, never less) and is deliberately not changed by a disclosure feature.
     columns: bool
 
 
