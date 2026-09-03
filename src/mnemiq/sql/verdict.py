@@ -90,11 +90,13 @@ class Approved:
     # SQL the model first proposed. Without it the corrector is the one mode difference nobody
     # can observe (M33).
     corrected: bool = False
-    # What the access policy narrowed, table-granular. Rides on the SAME rule as `lineage`: the
-    # fact travels with the answer or not at all. An empty list means "the policy narrowed
-    # nothing", which is a claim; it is never the shape absence takes, because a query that was
-    # never governed does not reach a decider that sets this.
-    narrowed: list = field(default_factory=list)
+    # What the access policy narrowed, table-granular, on the SAME rule as `lineage`: the fact
+    # travels with the answer or not at all -- INCLUDING its absence. `None` is "not evaluated",
+    # `[]` is the claim "the policy narrowed nothing". They are different sentences and a default
+    # of `[]` would say the second whenever nobody said anything, which is how M56 started:
+    # `Approved` is constructed outside any decider (`eval/verify_replay.py`), and there the
+    # honest value is None.
+    narrowed: list | None = None
 
 
 @dataclass
@@ -104,8 +106,9 @@ class ApprovedWrite:
     target: str  # the mutated table
     tables: list[str] = field(default_factory=list)  # all referenced tables
     # The write path narrows too, and its target is narrowed OUTSIDE the read loop, so this is the
-    # only place a governed UPDATE/DELETE's own filtering can be reported from.
-    narrowed: list = field(default_factory=list)
+    # only place a governed UPDATE/DELETE's own filtering can be reported from. `None` vs `[]`
+    # carries the same distinction as on `Approved`.
+    narrowed: list | None = None
 
 
 Verdict = Approved | Refusal

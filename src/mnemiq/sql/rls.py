@@ -127,7 +127,30 @@ class Narrowing:
 
     object: str          # the table, in the query's own spelling
     rows: bool           # a row filter was applied to it
-    columns: bool        # at least one referenced column of it was masked
+    # At least one column WAS MASKED IN THE REWRITE of this table -- not "a column you asked for
+    # was withheld". The masking loop matches masked column NAMES across the whole query without
+    # resolving which table owns each reference, so `SELECT p.ssn FROM person p JOIN claim c` with
+    # `claim.ssn` masked wraps `claim` and reports it here, though the answer carried only
+    # `person.ssn`. That over-approximation is SAFE for masking (it masks more, never less) and is
+    # deliberately not changed by this feature; the disclosure inherits it and must not describe
+    # itself as impact on the caller's own columns.
+    columns: bool
+
+
+def _record(into: list[Narrowing], one: Narrowing) -> None:
+    """One OBJECT, one record -- the loop walks table NODES, and an object can appear many times.
+
+    A self-join, or a DELETE whose WHERE reads its own target, reaches the same table twice and
+    would otherwise emit "claim, claim" to anyone listing or counting narrowed objects. Merging
+    ORs the flags, because two references can be narrowed differently: one filtered, one masked.
+    """
+    for i, existing in enumerate(into):
+        if existing.object == one.object:
+            into[i] = Narrowing(object=one.object,
+                                rows=existing.rows or one.rows,
+                                columns=existing.columns or one.columns)
+            return
+    into.append(one)
 
 
 def apply_row_and_mask(
@@ -199,7 +222,7 @@ def apply_row_and_mask(
             masked_by_table.get(name.lower(), set()), filt
         )
         table_node.replace(derived)
-        narrowed.append(Narrowing(object=name, rows=needs_filter, columns=needs_mask))
+        _record(narrowed, Narrowing(object=name, rows=needs_filter, columns=needs_mask))
     return ast, narrowed
 
 
@@ -256,5 +279,5 @@ def apply_row_filters_to_write(
     # its narrowing is recorded here or nowhere. An implementer who wires up the read path and
     # stops ships a governed DELETE narrowed from 47 rows to 3 that reports nothing: this feature's
     # own silence, one decider over.
-    narrowed.append(Narrowing(object=name, rows=True, columns=False))
+    _record(narrowed, Narrowing(object=name, rows=True, columns=False))
     return ast, narrowed

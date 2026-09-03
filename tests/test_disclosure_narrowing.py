@@ -88,3 +88,31 @@ def test_the_narrowing_names_no_predicate_and_no_policy():
         "a table narrowed BOTH ways must say both; reporting one hides the other")
     text = repr(narrowed[0])
     assert "4242" not in text and ">" not in text, f"the predicate leaked into the record: {text}"
+
+
+def test_one_OBJECT_yields_one_record_however_often_it_is_referenced():
+    """The loop walks table NODES. A self-join reaches `claim` twice and would report
+    "claim, claim" to anyone listing or counting narrowed objects."""
+    _, narrowed = apply_row_and_mask(
+        _ast("SELECT a.id FROM claim a JOIN claim b ON a.id = b.id"),
+        AccessPolicy(row_filters={"claim": "amount > 0"}), _VISIBLE, dialect="duckdb")
+    assert narrowed == [Narrowing(object="claim", rows=True, columns=False)], narrowed
+
+
+def test_a_write_whose_WHERE_reads_its_own_target_reports_it_once():
+    """Two paths reach `claim`: the loop wraps the inner read, and the target is conjoined after
+    it. Before merging, that emitted the same object twice from two different code paths."""
+    ast = _ast("DELETE FROM claim WHERE id IN (SELECT id FROM claim)")
+    target = next(iter(ast.find_all(sqlglot.exp.Table)))
+    _, narrowed = apply_row_filters_to_write(
+        ast, AccessPolicy(row_filters={"claim": "amount > 0"}), _VISIBLE, target, "duckdb")
+    assert [n.object for n in narrowed] == ["claim"], narrowed
+
+
+def test_NOT_EVALUATED_is_distinguishable_from_narrowed_nothing():
+    """`Approved` is built outside any decider — `eval/verify_replay.py` does it — and there
+    nobody evaluated governance at all. A default of `[]` would say "the policy narrowed nothing"
+    on that record's behalf, which is M56's collapse in a new field."""
+    from mnemiq.sql.verdict import Approved
+
+    assert Approved(plan_sql="SELECT 1", target_sql="SELECT 1").narrowed is None
