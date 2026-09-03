@@ -117,8 +117,12 @@ class Narrowing:
     TABLE-GRANULAR on purpose. Column granularity would require the loop to know which projected
     column each masked source column reaches, and it does not -- a masked column can be consumed by
     an aggregate and never appear in the output at all. Claiming per-column detail the loop cannot
-    support is how a disclosure becomes a lie, so this says "columns were masked on this table" and
-    stops there.
+    support is how a disclosure becomes a lie, so this names the OBJECT and stops there.
+
+    Each flag has exactly one meaning and it is written on the field. Do not paraphrase them here:
+    an earlier draft of this docstring glossed `columns` as "columns were masked on this table",
+    which is the rewrite-based reading the field explicitly disclaims -- two contracts for one
+    field, in the type whose purpose is to not over-claim. The field comment is the contract.
 
     It carries NO predicate and NO policy identity. The caller is entitled to know its answer was
     narrowed; it is not entitled to the rule that narrowed it, which would leak the shape of other
