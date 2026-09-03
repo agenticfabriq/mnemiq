@@ -22,6 +22,13 @@ dev = ["pytest>=8", "ruff>=0.6"]
 ontology = [
     "rdflib>=7",
 ]
+# Warehouse benchmarking: load the BIRD/Spider Parquet export into a vendor
+# warehouse and run its NL->SQL product against the same questions.
+bench = [
+    "snowflake-connector-python>=3.12",
+    "databricks-sql-connector>=3.4",
+    "databricks-sdk>=0.30",
+]
 
 [project.scripts]
 mnemiq = "mnemiq.cli:main"

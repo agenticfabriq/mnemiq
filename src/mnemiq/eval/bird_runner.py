@@ -97,11 +97,17 @@ def enrich_bird_db(
     cache_dir: str | None = None,
     refresh: bool = False,
     semantic: bool = True,
+    db_path_fn: Callable[[str, str], str] = bird_db_path,
 ) -> Snapshot:
     """Enrich one BIRD database. Cached to disk: BIRD DBs never change, so (db_id, model)
     is the key -- the enriched snapshot depends on the model, so switching models must not
     silently reuse another model's enrichment. The facts/examples toggles enter the key too,
-    so an A/B run never reuses another config's enrichment."""
+    so an A/B run never reuses another config's enrichment.
+
+    `db_path_fn` is the only BIRD-specific thing here: everything downstream is a SQLite file
+    and a db_id. Spider 1.0 ships the same shape at a different path, so it reuses this whole
+    pipeline by passing spider_db_path rather than forking a parallel enricher that would drift.
+    Callers that pass nothing keep BIRD's behaviour exactly."""
     from mnemiq.enrichment.certified import apply_certified, fetch_certified_records
 
     _certified = fetch_certified_records(settings)
@@ -124,7 +130,7 @@ def enrich_bird_db(
     from mnemiq.enrichment.pipeline import content_version
     from mnemiq.ontology.records import load_records
 
-    adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
+    adapter = SQLiteAdapter(db_path_fn(minidev_dir, db_id))
     snapshot = enrich_structural(adapter, db_id)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
@@ -228,10 +234,15 @@ def run_bird(
     results_path: str | None = None,
     workers: int = 1,
     candidates: int = 1,
+    db_path_fn: Callable[[str, str], str] = bird_db_path,
 ) -> tuple[list[CaseResult], dict]:
     """Run BIRD cases grouped by database. Resumable: with results_path, each result is
     checkpointed as it completes and a re-run skips everything already answered -- a long
-    live run survives a kill without re-paying for the questions it already got through."""
+    live run survives a kill without re-paying for the questions it already got through.
+
+    With db_path_fn (and a matching cases list) this runs Spider 1.0 unchanged: same
+    enrichment, same engine, same single-engine SQLite grading, so the two benchmarks are
+    measured by identical machinery rather than by two runners that can quietly diverge."""
     by_db: dict[str, list[EvaluationCase]] = {}
     for case in cases:
         by_db.setdefault(case.db_id, []).append(case)
@@ -248,14 +259,16 @@ def run_bird(
         if not remaining:
             continue  # whole DB already done in a prior segment -- no enrichment, no client
 
-        snapshot = enrich_bird_db(minidev_dir, db_id, settings, cache_dir=cache_dir)
+        snapshot = enrich_bird_db(
+            minidev_dir, db_id, settings, cache_dir=cache_dir, db_path_fn=db_path_fn
+        )
 
         def _build():  # each worker builds its own isolated engine (thread-safe connections)
             # BIRD grades single-engine on native SQLite: the engine generates + executes
             # SQLite and gold runs on the same engine, so a wrong answer is a real error,
             # never a cross-engine artifact (parity measured 1.5% otherwise). DuckDB is the
             # executor in the product path (DuckDBAdapter); the benchmark stays apples-to-apples.
-            adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
+            adapter = SQLiteAdapter(db_path_fn(minidev_dir, db_id))
             ask, client = build_engine(snapshot, adapter, settings, candidates=candidates)
             return ask, adapter, adapter, client  # engine + gold: same native SQLite executor
 

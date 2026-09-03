@@ -39,17 +39,37 @@ def results_match(
         column_choices = [tuple(range(candidate.num_columns))]
 
     gold_rows = _rows(gold)
+
+    # Normalize the candidate ONCE and project the normalized cells, rather than calling
+    # _rows() -- and so normalize() on every cell -- again for each column choice. The
+    # choices are combinatorial (C(candidate_cols, gold_cols)), so re-normalizing inside
+    # the loop multiplies the same work by the number of projections: a 20-column SELECT *
+    # graded against a 5-column gold over 1000 rows is 15,504 projections and ~77M
+    # normalize calls, which is hours, not milliseconds. Found when a BEAVER nova case
+    # burned 426 CPU-minutes inside normalize without finishing.
+    all_candidate_rows = _rows(candidate)
+    # repr() is the sort key for the column-order retry below, and it was being recomputed
+    # for every cell of every projection -- the same combinatorial multiplier that made
+    # normalize() the first bottleneck. Computed once per cell here; the projection then
+    # sorts precomputed keys.
+    all_candidate_keys = [[repr(cell) for cell in row] for row in all_candidate_rows]
+
+    # Column order is not meaning: `SELECT k, count(*)` and `SELECT count(*), k` are
+    # the same answer. Retry with each row's values sorted into a canonical order.
+    def sort_cells(rows: list[list[object]]) -> list[list[object]]:
+        return [sorted(row, key=repr) for row in rows]
+
+    sorted_gold_rows = sort_cells(gold_rows)
+
     for keep in column_choices:
-        projected = candidate.select(list(keep))
-        candidate_rows = _rows(projected)
+        candidate_rows = [[row[i] for i in keep] for row in all_candidate_rows]
         if _match_rows(gold_rows, candidate_rows, rel_tol):
             return True
-
-        # Column order is not meaning: `SELECT k, count(*)` and `SELECT count(*), k` are
-        # the same answer. Retry with each row's values sorted into a canonical order.
-        def sort_cells(rows: list[list[object]]) -> list[list[object]]:
-            return [sorted(row, key=repr) for row in rows]
-
-        if _match_rows(sort_cells(gold_rows), sort_cells(candidate_rows), rel_tol):
+        sorted_candidate_rows = [
+            [value for _, value in sorted(
+                ((keys[i], row[i]) for i in keep), key=lambda pair: pair[0])]
+            for row, keys in zip(all_candidate_rows, all_candidate_keys, strict=True)
+        ]
+        if _match_rows(sorted_gold_rows, sorted_candidate_rows, rel_tol):
             return True
     return False

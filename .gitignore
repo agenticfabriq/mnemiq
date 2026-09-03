@@ -15,3 +15,6 @@ __pycache__/
 
 # OS
 .DS_Store
+
+# BIRD/Spider Parquet exports for warehouse benchmarking
+/out/
