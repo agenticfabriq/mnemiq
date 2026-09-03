@@ -34,7 +34,7 @@ def test_cls_denies_qualified_column():
 def test_rls_wraps_qualified_table():
     policy = AccessPolicy(row_filters={"pg.person": "id > 0"})
     visible = {"pg.person": {"id", "last_name"}}
-    out = apply_row_and_mask(_ast("SELECT id FROM pg.person"), policy, visible, dialect="duckdb")
+    out, _ = apply_row_and_mask(_ast("SELECT id FROM pg.person"), policy, visible, dialect="duckdb")
     low = out.sql(dialect="duckdb").lower()
     assert "id > 0" in low and "from pg.person" in low  # filter applied at the (still-qualified) source
 

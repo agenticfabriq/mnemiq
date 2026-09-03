@@ -39,7 +39,7 @@ CHILD = "customer_id IN (SELECT customer_id FROM customer WHERE store_id = 1)"
 
 def rewrite(sql: str, policy: AccessPolicy, visible=None):
     ast = sqlglot.parse_one(sql, read=DIALECT)
-    return apply_row_and_mask(ast, policy, visible or VISIBLE, dialect=DIALECT)
+    return apply_row_and_mask(ast, policy, visible or VISIBLE, dialect=DIALECT)[0]
 
 
 def policy(**kw) -> AccessPolicy:

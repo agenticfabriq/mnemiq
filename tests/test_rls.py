@@ -14,7 +14,7 @@ def _sql(ast):
 def test_row_filter_is_injected_at_the_source():
     ast = sqlglot.parse_one("SELECT id, amount FROM claim", read="duckdb")
     out = apply_row_and_mask(ast, AccessPolicy(row_filters={"claim": "amount > 0"}),
-                             _VISIBLE, dialect="duckdb")
+                             _VISIBLE, dialect="duckdb")[0]
     text = _sql(out).lower()
     assert "amount > 0" in text and "from claim" in text
     assert "select *" not in text  # explicit column list, never a star
@@ -22,7 +22,7 @@ def test_row_filter_is_injected_at_the_source():
 
 def test_masked_column_becomes_null_at_the_source():
     ast = sqlglot.parse_one("SELECT id, ssn FROM claim", read="duckdb")
-    out = apply_row_and_mask(ast, AccessPolicy(masked={("claim", "ssn")}), _VISIBLE, "duckdb")
+    out = apply_row_and_mask(ast, AccessPolicy(masked={("claim", "ssn")}), _VISIBLE, "duckdb")[0]
     text = _sql(out).lower()
     assert "null as ssn" in text  # masked at the source, raw value never fetched
 
@@ -30,12 +30,12 @@ def test_masked_column_becomes_null_at_the_source():
 def test_invalid_filter_is_refused():
     ast = sqlglot.parse_one("SELECT id FROM claim", read="duckdb")
     out = apply_row_and_mask(ast, AccessPolicy(row_filters={"claim": "nonexistent > 0"}),
-                             _VISIBLE, "duckdb")
+                             _VISIBLE, "duckdb")[0]
     assert isinstance(out, Refusal) and out.code == RefusalCode.INVALID_ROW_FILTER
 
 
 def test_untouched_when_no_filter_or_mask():
     ast = sqlglot.parse_one("SELECT id FROM claim", read="duckdb")
     before = _sql(ast)
-    out = apply_row_and_mask(ast, AccessPolicy(), _VISIBLE, "duckdb")
+    out = apply_row_and_mask(ast, AccessPolicy(), _VISIBLE, "duckdb")[0]
     assert _sql(out) == before
