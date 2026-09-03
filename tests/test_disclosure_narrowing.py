@@ -13,6 +13,7 @@ is the only arrangement in which silence cannot be the default.
 
 import sqlglot
 
+from mnemiq.sql.decide_write import _target_node
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.rls import Narrowing, apply_row_and_mask, apply_row_filters_to_write
 from mnemiq.sql.verdict import Refusal
@@ -66,7 +67,12 @@ def test_the_WRITE_TARGETS_own_filter_is_reported():
     a governed DELETE narrowed from forty-seven rows to three reports nothing.
     """
     ast = _ast("DELETE FROM claim WHERE id = 1")
-    target = next(iter(ast.find_all(sqlglot.exp.Table)))
+    # `_target_node`, not `find(Table)` -- the fixture must ask the question production asks.
+    # `find(Table)` is the resolver decide_write records as a removed authorization defect:
+    # `DELETE s FROM t JOIN s` resolved to `t`, checking the grant against a table the statement
+    # only reads. The two agree on these shapes; copying the idiom into a multi-target case would
+    # hand the loop a node production never passes, and the flag assertions would not notice.
+    target = _target_node(ast)
     out, narrowed = apply_row_filters_to_write(
         ast, AccessPolicy(row_filters={"claim": "amount > 0"}), _VISIBLE, target, "duckdb")
     assert not isinstance(out, Refusal)
@@ -103,7 +109,12 @@ def test_a_write_whose_WHERE_reads_its_own_target_reports_it_once():
     """Two paths reach `claim`: the loop wraps the inner read, and the target is conjoined after
     it. Before merging, that emitted the same object twice from two different code paths."""
     ast = _ast("DELETE FROM claim WHERE id IN (SELECT id FROM claim)")
-    target = next(iter(ast.find_all(sqlglot.exp.Table)))
+    # `_target_node`, not `find(Table)` -- the fixture must ask the question production asks.
+    # `find(Table)` is the resolver decide_write records as a removed authorization defect:
+    # `DELETE s FROM t JOIN s` resolved to `t`, checking the grant against a table the statement
+    # only reads. The two agree on these shapes; copying the idiom into a multi-target case would
+    # hand the loop a node production never passes, and the flag assertions would not notice.
+    target = _target_node(ast)
     _, narrowed = apply_row_filters_to_write(
         ast, AccessPolicy(row_filters={"claim": "amount > 0"}), _VISIBLE, target, "duckdb")
     assert [n.object for n in narrowed] == ["claim"], narrowed
@@ -128,11 +139,17 @@ def test_merging_a_write_target_does_not_DROP_the_mask_the_read_loop_found():
     reintroduced by the fix for duplicates.
     """
     ast = _ast("DELETE FROM claim WHERE id IN (SELECT ssn FROM claim)")
-    target = next(iter(ast.find_all(sqlglot.exp.Table)))
-    _, narrowed = apply_row_filters_to_write(
+    # `_target_node`, not `find(Table)` -- the fixture must ask the question production asks.
+    # `find(Table)` is the resolver decide_write records as a removed authorization defect:
+    # `DELETE s FROM t JOIN s` resolved to `t`, checking the grant against a table the statement
+    # only reads. The two agree on these shapes; copying the idiom into a multi-target case would
+    # hand the loop a node production never passes, and the flag assertions would not notice.
+    target = _target_node(ast)
+    out, narrowed = apply_row_filters_to_write(
         ast,
         AccessPolicy(row_filters={"claim": "amount > 0"}, masked={("claim", "ssn")}),
         _VISIBLE, target, "duckdb")
+    assert not isinstance(out, Refusal), out   # else `len(narrowed) == 1` fails for the wrong reason
     assert len(narrowed) == 1, narrowed
     assert narrowed[0].rows and narrowed[0].columns, (
         f"the merge dropped a flag one of the two records carried: {narrowed[0]}")
