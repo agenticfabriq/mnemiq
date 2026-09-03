@@ -116,3 +116,23 @@ def test_NOT_EVALUATED_is_distinguishable_from_narrowed_nothing():
     from mnemiq.sql.verdict import Approved
 
     assert Approved(plan_sql="SELECT 1", target_sql="SELECT 1").narrowed is None
+
+
+def test_merging_a_write_target_does_not_DROP_the_mask_the_read_loop_found():
+    """The merge ORs; last-write-wins would silently unmask.
+
+    On a governed write whose target is both filtered and masked, two records arrive for one
+    object from two code paths: the read loop first with `columns=True`, then the conjoined target
+    with `columns=False`. Replacing rather than ORing keeps the second and reports the masking as
+    absent — the same "reporting one hides the other" failure the unmerged case is guarded for,
+    reintroduced by the fix for duplicates.
+    """
+    ast = _ast("DELETE FROM claim WHERE id IN (SELECT ssn FROM claim)")
+    target = next(iter(ast.find_all(sqlglot.exp.Table)))
+    _, narrowed = apply_row_filters_to_write(
+        ast,
+        AccessPolicy(row_filters={"claim": "amount > 0"}, masked={("claim", "ssn")}),
+        _VISIBLE, target, "duckdb")
+    assert len(narrowed) == 1, narrowed
+    assert narrowed[0].rows and narrowed[0].columns, (
+        f"the merge dropped a flag one of the two records carried: {narrowed[0]}")
