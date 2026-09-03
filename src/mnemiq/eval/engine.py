@@ -92,13 +92,16 @@ def build_engine(
     build_value_index(adapter, snapshot, con)
 
     ontology_index = None
-    from mnemiq.enrichment.certified import certified_concept_schemes, fetch_certified_records
+    from mnemiq.enrichment.certified import (
+        certified_concept_schemes, fetch_certified_records, require_certified)
     from mnemiq.ontology.records import load_records, merge_records
 
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
     # Governed concept schemes join the local digest so the eval measures the same index production
     # builds. fetch is fail-soft: no verity_records_url -> [] -> no-op (no overhead for local runs).
-    _cert_schemes = certified_concept_schemes(fetch_certified_records(settings))
+    _certified_set = fetch_certified_records(settings)
+    require_certified(_certified_set, settings)
+    _cert_schemes = certified_concept_schemes(_certified_set.records)
     if _cert_schemes:
         _onto = merge_records(_onto, _cert_schemes)
     if _onto is not None:

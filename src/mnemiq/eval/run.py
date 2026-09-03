@@ -30,7 +30,8 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
     if not settings.pg_dsn:
         print("set MNEMIQ_PG_DSN")
         return 1
-    from mnemiq.enrichment.certified import apply_certified, fetch_certified_records
+    from mnemiq.enrichment.certified import (
+        apply_certified, fetch_certified_records, require_certified)
     from mnemiq.enrichment.dictionary import load_dictionary
     from mnemiq.enrichment.grounding import apply_dictionary, ground_codes
     from mnemiq.enrichment.pipeline import content_version
@@ -40,7 +41,9 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
     _snap = enrich_structural(adapter, settings.source_id)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
-    _certified = fetch_certified_records(settings)
+    _certified_set = fetch_certified_records(settings)
+    require_certified(_certified_set, settings)
+    _certified = _certified_set.records
     # precedence: ontology < correlated < lookup < certified < dictionary
     _snap = ground_codes(adapter, _snap, dictionary=None, ontology=_onto)
     _snap = apply_certified(_snap, _certified)

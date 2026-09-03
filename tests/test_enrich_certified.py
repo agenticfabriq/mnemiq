@@ -105,7 +105,7 @@ def test_fetch_parses_records_and_presents_the_bearer_token(monkeypatch):
         verity_records_url="https://v/api/semantic/records",
         verity_token_url="https://v/api/auth/token",
         verity_client_id="cid_abc123",
-        verity_client_secret="s3cret"))
+        verity_client_secret="s3cret")).records
 
     assert len(records) == 1  # the malformed second item is skipped, not fatal
     assert records[0].payload.description == "Order status."
@@ -134,7 +134,7 @@ def test_fetch_sends_no_authorization_header_when_unconfigured(monkeypatch):
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
     records = mod.fetch_certified_records(
-        Settings(verity_records_url="https://v/api/semantic/records"))
+        Settings(verity_records_url="https://v/api/semantic/records")).records
 
     assert len(records) == 1
     assert len(seen) == 1, "no token exchange without client credentials"
@@ -173,7 +173,7 @@ def test_fetch_refreshes_the_token_once_on_401(monkeypatch):
         verity_records_url="https://v/api/semantic/records",
         verity_token_url="https://v/api/auth/token",
         verity_client_id="cid_abc123",
-        verity_client_secret="s3cret"))
+        verity_client_secret="s3cret")).records
 
     assert len(records) == 1, "the retry after refresh must succeed"
     assert record_attempts == ["Bearer tok-1", "Bearer tok-2"]
@@ -208,7 +208,7 @@ def test_fetch_gives_up_after_one_refresh_when_401_persists(monkeypatch):
         verity_records_url="https://v/api/semantic/records",
         verity_token_url="https://v/api/auth/token",
         verity_client_id="cid_abc123",
-        verity_client_secret="s3cret")) == []
+        verity_client_secret="s3cret")).records == []
     assert len(record_attempts) == 2
 
 
@@ -223,14 +223,14 @@ def test_fetch_is_fail_soft_on_network_error(monkeypatch):
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", boom)
     assert mod.fetch_certified_records(
-        Settings(verity_records_url="https://v/api/semantic/records")) == []
+        Settings(verity_records_url="https://v/api/semantic/records")).records == []
 
 
 def test_fetch_returns_empty_when_unconfigured():
     from mnemiq.config import Settings
     from mnemiq.enrichment.certified import fetch_certified_records
 
-    assert fetch_certified_records(Settings()) == []
+    assert fetch_certified_records(Settings()).records == []
 
 
 def test_flow_certified_over_local_but_dictionary_over_certified():
