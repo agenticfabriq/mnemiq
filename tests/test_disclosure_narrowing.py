@@ -147,3 +147,21 @@ def test_merging_a_write_target_does_not_DROP_the_mask_the_read_loop_found():
     assert len(narrowed) == 1, narrowed
     assert narrowed[0].rows and narrowed[0].columns, (
         f"the merge dropped a flag one of the two records carried: {narrowed[0]}")
+
+
+def test_a_mask_the_query_never_REFERENCED_is_not_reported_though_the_rewrite_applies_it():
+    """`columns` tracks what the caller asked for, not what the rewrite did — and the two differ.
+
+    A table wrapped for its row filter has its masked columns NULLed regardless of whether the
+    query mentions them, so the rewritten SQL below contains `NULL AS ssn` while this reports
+    `columns=False`. That is deliberate: a caller selecting `id` was not narrowed by a mask on
+    `ssn`, and reporting it would raise a false alarm on every filtered table carrying any mask.
+    Pinned because the SQL and the flag disagree on purpose, which is exactly the shape someone
+    later "fixes" without reading why.
+    """
+    out, narrowed = apply_row_and_mask(
+        _ast("SELECT id FROM claim"),
+        AccessPolicy(row_filters={"claim": "amount > 0"}, masked={("claim", "ssn")}),
+        _VISIBLE, dialect="duckdb")
+    assert "null as ssn" in out.sql(dialect="duckdb").lower(), "the rewrite should still mask"
+    assert narrowed == [Narrowing(object="claim", rows=True, columns=False)], narrowed
