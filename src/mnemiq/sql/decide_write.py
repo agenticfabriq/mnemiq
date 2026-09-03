@@ -269,7 +269,8 @@ def decide_write(
     # filter was spliced in without validation (M7). Both are one defect: there were two
     # implementations and the second was wrong. `apply_row_filters_to_write` wraps the reads and
     # conjoins the target, using the same `_validate_filter` the read decider uses.
-    governed = apply_row_filters_to_write(shaped, policy, visible, _target_node(shaped), dialect)
+    governed, narrowed = apply_row_filters_to_write(
+        shaped, policy, visible, _target_node(shaped), dialect)
     if isinstance(governed, Refusal):
         return governed
     shaped = governed
@@ -283,4 +284,5 @@ def decide_write(
         if refused is not None:
             return refused
 
-    return ApprovedWrite(plan_sql=plan_sql, target_sql=target_sql, target=tgt, tables=tables)
+    return ApprovedWrite(plan_sql=plan_sql, target_sql=target_sql, target=tgt, tables=tables,
+                         narrowed=narrowed)

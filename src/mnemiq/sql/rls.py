@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import sqlglot
 from sqlglot import exp
 
@@ -108,13 +110,56 @@ def _derived_table(
     return exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier(alias)))
 
 
+@dataclass(frozen=True)
+class Narrowing:
+    """What the access policy did to ONE object, so an answer can say it was narrowed.
+
+    TABLE-GRANULAR on purpose. Column granularity would require the loop to know which projected
+    column each masked source column reaches, and it does not -- a masked column can be consumed by
+    an aggregate and never appear in the output at all. Claiming per-column detail the loop cannot
+    support is how a disclosure becomes a lie, so this says "columns were masked on this table" and
+    stops there.
+
+    It carries NO predicate and NO policy identity. The caller is entitled to know its answer was
+    narrowed; it is not entitled to the rule that narrowed it, which would leak the shape of other
+    principals' access.
+    """
+
+    object: str          # the table, in the query's own spelling
+    rows: bool           # a row filter was applied to it
+    # At least one column WAS MASKED IN THE REWRITE of this table -- not "a column you asked for
+    # was withheld". The masking loop matches masked column NAMES across the whole query without
+    # resolving which table owns each reference, so `SELECT p.ssn FROM person p JOIN claim c` with
+    # `claim.ssn` masked wraps `claim` and reports it here, though the answer carried only
+    # `person.ssn`. That over-approximation is SAFE for masking (it masks more, never less) and is
+    # deliberately not changed by this feature; the disclosure inherits it and must not describe
+    # itself as impact on the caller's own columns.
+    columns: bool
+
+
+def _record(into: list[Narrowing], one: Narrowing) -> None:
+    """One OBJECT, one record -- the loop walks table NODES, and an object can appear many times.
+
+    A self-join, or a DELETE whose WHERE reads its own target, reaches the same table twice and
+    would otherwise emit "claim, claim" to anyone listing or counting narrowed objects. Merging
+    ORs the flags, because two references can be narrowed differently: one filtered, one masked.
+    """
+    for i, existing in enumerate(into):
+        if existing.object == one.object:
+            into[i] = Narrowing(object=one.object,
+                                rows=existing.rows or one.rows,
+                                columns=existing.columns or one.columns)
+            return
+    into.append(one)
+
+
 def apply_row_and_mask(
     ast: exp.Expression,
     policy: AccessPolicy,
     visible: dict[str, set[str]],
     dialect: str = "duckdb",
     exclude: exp.Expression | None = None,
-) -> exp.Expression | Refusal:
+) -> tuple[exp.Expression | Refusal, list[Narrowing]]:
     """Wrap each base table that has a row filter or a referenced masked column in a derived
     table that applies the filter and NULLs masked columns AT THE SOURCE. Returns the rewritten
     AST, or a Refusal for a policy-invalid filter.
@@ -127,8 +172,12 @@ def apply_row_and_mask(
     claim ...)` is two nodes with one name that need opposite treatment, and matching on the name
     would skip both -- the flat-name-set bypass M31 and the view rounds each paid for once.
     """
+    # The list rides with the AST rather than beside it, and the return type is a tuple so a
+    # caller CANNOT quietly drop it: an ignored narrowing is exactly the silence this exists to
+    # end, and it would be invisible at the call site if the signature still returned one value.
+    narrowed: list[Narrowing] = []
     if not policy.row_filters and not policy.masked:
-        return ast
+        return ast, narrowed
 
     # Folded on BOTH sides: the table keys come from the snapshot and `name` below comes from the
     # query, and comparing them exactly is what let `CLAIM` and `claim` name different objects.
@@ -163,7 +212,7 @@ def apply_row_and_mask(
                     code=RefusalCode.INVALID_ROW_FILTER,
                     message=f"The row-access policy for {name!r} is not a valid predicate.",
                     subject=name,
-                )
+                ), []
         derived = _derived_table(
             name, table_node.alias_or_name, visible[name],
             # `.lower()`: this dict is keyed folded and `name` is the QUERY's spelling.
@@ -173,7 +222,8 @@ def apply_row_and_mask(
             masked_by_table.get(name.lower(), set()), filt
         )
         table_node.replace(derived)
-    return ast
+        _record(narrowed, Narrowing(object=name, rows=needs_filter, columns=needs_mask))
+    return ast, narrowed
 
 
 def apply_row_filters_to_write(
@@ -182,8 +232,9 @@ def apply_row_filters_to_write(
     visible: dict[str, set[str]],
     target: exp.Expression | None,
     dialect: str = "duckdb",
-) -> exp.Expression | Refusal:
-    """Govern a write with the read path's RLS. Returns the rewritten AST, or a Refusal.
+) -> tuple[exp.Expression | Refusal, list[Narrowing]]:
+    """Govern a write with the read path's RLS. Returns the rewritten AST or a Refusal, and what
+    the policy narrowed.
 
     M7 filed "two implementations with different semantics" and M30 measured what the second one
     permitted. The measurements, on `2af9443`: the write path bound a filter only to the table
@@ -203,25 +254,30 @@ def apply_row_filters_to_write(
     An INSERT target is exempt and stays exempt: an INSERT does not read its target, and filtering
     rows on the way IN is not what a row filter means.
     """
-    rewritten = apply_row_and_mask(ast, policy, visible, dialect=dialect, exclude=target)
+    rewritten, narrowed = apply_row_and_mask(ast, policy, visible, dialect=dialect, exclude=target)
     if isinstance(rewritten, Refusal):
-        return rewritten
+        return rewritten, []
     ast = rewritten
 
     if not isinstance(ast, (exp.Update, exp.Delete)) or not isinstance(target, exp.Table):
-        return ast
+        return ast, narrowed
     name = object_key(target)
     filt = policy.row_filter_for(name)
     if filt is None:
-        return ast
+        return ast, narrowed
     predicate = _validate_filter(filt, visible.get(name, set()), dialect, policy.policy_schema)
     if predicate is None:
         return Refusal(
             code=RefusalCode.INVALID_ROW_FILTER,
             message=f"The row-access policy for {name!r} is not a valid predicate.",
             subject=name,
-        )
+        ), []
     existing = ast.args.get("where")
     combined = exp.and_(existing.this, predicate) if existing is not None else predicate
     ast.set("where", exp.Where(this=combined))
-    return ast
+    # The target is EXCLUDED from the loop above -- it cannot be wrapped in a derived table -- so
+    # its narrowing is recorded here or nowhere. An implementer who wires up the read path and
+    # stops ships a governed DELETE narrowed from 47 rows to 3 that reports nothing: this feature's
+    # own silence, one decider over.
+    _record(narrowed, Narrowing(object=name, rows=True, columns=False))
+    return ast, narrowed
