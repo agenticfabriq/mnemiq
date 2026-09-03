@@ -50,9 +50,13 @@ def _target_node(ast: exp.Expression) -> exp.Table | None:
     derived table, and the same name can appear elsewhere in the statement as an ordinary read
     that must be.
 
-    None means REFUSE, never "guess". This used to fall back to `ast.find(exp.Table)` -- the
-    first table in the tree -- which is a source for any shape whose target is not `this`.
-    Measured: `DELETE s FROM t JOIN s` resolved to `t`, so the grant was checked against a table
+    None means REFUSE, never "guess". This used to prefer `ast.this`, which for a multi-target DELETE is the whole join
+    expression, so `DELETE s FROM t JOIN s` resolved to `t` -- a table the statement only READS,
+    and the grant was checked against it. Re-measured 2026-09-03 on sqlglot 30.12.0: `ast.this`
+    prints `t JOIN s ON t.id = s.id`, while a bare `find(exp.Table)` returns `s`, the right
+    table. So the defect was the `this`-first ordering, not the `find` fallback, which this
+    comment previously blamed and which never ran on that shape. The fix is to refuse rather
+    than guess: None
     the statement only reads while `s`, the one it deletes from, was never authorized at all.
     sqlglot puts the deleted tables in `args["tables"]` for that shape. DuckDB happens to reject
     the syntax, so the EXPLAIN proof caught it downstream -- an authorization decision rescued by
