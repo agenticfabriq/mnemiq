@@ -357,7 +357,7 @@ def test_value_grounding_still_names_values_when_nothing_is_filtered():
     assert isinstance(r, Refusal) and "west" in r.message, r
 
 
-def test_a_filter_for_a_DIFFERENT_table_cannot_widen_this_one():
+def test_row_filter_for_does_not_let_one_spelling_widen_another():
     """`claim` and `"Claim"` are two different tables on Postgres, and spellings that fold together
     reach `row_filter_for` as separate keys. OR-combining them let one table's filter widen the
     other's: measured, `{"claim": "tenant = 1", "Claim": "1 = 1"}` gave
@@ -367,7 +367,13 @@ def test_a_filter_for_a_DIFFERENT_table_cannot_widen_this_one():
     into a single entry, folding as it merges, so this path is reached only by a hand-built policy
     or a provider that does not fold. Quoting is gone by then, so this cannot tell one object from
     two, and the combinator that is safe without knowing shows a row only if EVERY candidate allows
-    it."""
+    it.
+
+    Scoped to `row_filter_for`. The same widening through the ROLE-MERGE path is still open and
+    marked xfail above: `grants_for` folds case as it merges, so two roles granting `claim` and
+    `Claim` become one OR'd filter before `AccessPolicy` is built. That is M50 -- it needs quoting
+    preserved to the policy lookup, and the note there records that every fix tried without it
+    leaked worse on the unquoted path."""
     policy = AccessPolicy(row_filters={"claim": "tenant = 1", "Claim": "1 = 1"})
     combined = policy.row_filter_for("claim")
     assert combined == "(tenant = 1) AND (1 = 1)", combined

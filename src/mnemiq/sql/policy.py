@@ -53,7 +53,7 @@ class AccessPolicy:
                    for t, c in self.masked)
 
     def row_filter_for(self, table: str) -> str | None:
-        """Every filter naming this table, whatever its spelling, OR-combined.
+        """Every filter naming this table, whatever its spelling, AND-combined.
 
         NOT "the exact match, else a folded one". That made the applied policy depend on how the
         CALLER spelled the table: measured, one identity whose `row_filters` held both `claim` and
@@ -75,9 +75,6 @@ class AccessPolicy:
         cannot tell the two apart, and the combinator that is safe without knowing is the one that
         shows a row only if EVERY candidate filter allows it.
 
-        Picking a winner instead is worse than either, and was the first version: it made the
-        applied policy depend on how the CALLER spelled the table, so one identity got a different
-        predicate from `FROM claim` than from `FROM CLAIM`.
         """
         matches = [f for t, f in self.row_filters.items() if names_one_object(table, [t])]
         if not matches:
