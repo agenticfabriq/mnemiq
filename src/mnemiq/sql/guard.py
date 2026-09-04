@@ -45,12 +45,13 @@ def check_shape(
             subject=type(ast).__name__.upper(),
         )
 
-    if _has_projection_star(ast, dialect):
+    if _has_projection_star(ast, dialect) or _projects_a_row(ast):
         return Refusal(
             code=RefusalCode.SELECT_STAR,
             message=(
-                "Do not use SELECT *. List the explicit columns you need -- the engine must "
-                "know which columns it returns."
+                "List the explicit columns you need -- the engine must know which columns it "
+                "returns. That rules out `SELECT *`, `COLUMNS(...)`, and projecting a table's "
+                "own name, which returns the whole row."
             ),
         )
 
@@ -109,25 +110,55 @@ def _is_star(projection: exp.Expression) -> bool:
     return False
 
 
-def _names_a_source(select: exp.Select, projection: exp.Expression) -> bool:
-    """Does this projection reference a SOURCE rather than one of its columns?
+def _names_a_source(select: exp.Select, projection: exp.Expression) -> exp.Expression | None:
+    """The SOURCE this projection references as a whole row, or None if it references none.
 
-    A third spelling of the same expansion, and it contains no star at all. DuckDB resolves a bare
-    reference to a source name as the whole ROW: `SELECT claim FROM claim` returns a struct holding
-    every value including a denied one, and `SELECT UNNEST(claim) FROM claim` spreads that struct
-    back into `id, amount, ssn`. Both were permitted, and `check_cls` found no `exp.Column` for
-    `ssn` in either -- the column is never spelled, exactly as with a star.
-
-    Keyed on naming a SOURCE, which is what separates it from the legitimate use: `UNNEST(tags)`
-    over a LIST column expands rows and returns one column, and must keep working. `UNNEST(claim)`
-    names the table.
-
-    A source that is a CTE or derived table is still bounded by its own projection, so this only
-    reports the reference; `_expands_a_base_table` decides whether that source reaches a base table.
+    Keyed on naming a SOURCE, which is what separates it from the legitimate use -- `UNNEST(tags)`
+    over a list column names a COLUMN, expands ROWS, and returns one column. And on the reference
+    being BARE, since a qualified one names a column even where the column shares its table's name.
+    The source name is folded because DuckDB folds: `SELECT CLAIM FROM claim` returns the struct.
     """
-    names = {name.lower() for name in _sources(select)}
-    return any(not column.table and column.name.lower() in names
-               for column in projection.find_all(exp.Column))
+    sources = {name.lower(): source for name, source in _sources(select).items()}
+    for column in projection.find_all(exp.Column):
+        source = None if column.table else sources.get(column.name.lower())
+        if source is not None:
+            return source
+    return None
+
+
+def _projects_a_row(ast: exp.Expression) -> bool:
+    """Is a whole ROW projected as a value, anywhere in the statement?
+
+    A third spelling of the same expansion, containing no star at all. DuckDB resolves a bare
+    reference to a source NAME as the entire row: `SELECT claim FROM claim` returns a struct
+    holding every value including a denied one, and `SELECT UNNEST(claim) FROM claim` spreads it
+    back into columns. `check_cls` finds no `exp.Column` for the denied name in either, because the
+    column is never spelled.
+
+    EVERY select, not only the ones whose projections leave the engine. An explicit outer
+    projection bounds the column COUNT and not the column SET once one item is a whole row, so
+    `SELECT x FROM (SELECT claim AS x FROM claim) t` carried the struct out through a projection
+    that looks entirely ordinary. Scanning every select is what reaches it: the derived table's
+    body is itself a select, and it is there that the row is taken.
+
+    A SUBQUERY source is skipped HERE and handled by the star walk instead, which recurses into
+    that subquery's own projection with the CTE scopes already resolved. It is emphatically NOT
+    covered by this scan: `_names_a_source` looks at `exp.Column` nodes, and a star or `COLUMNS(*)`
+    inside the derived table yields none -- so `SELECT UNNEST(t) FROM (SELECT * FROM claim) t`
+    passes this check entirely and is refused by the walk. Claiming the sibling scan covered it is
+    how that shape briefly became permitted again.
+
+    A TABLE source gets no exemption, whether or not it names a CTE. That refuses `SELECT c FROM c`
+    over a CTE, whose struct is in fact bounded -- a deliberate false refusal, taken because the
+    alternative is resolving CTE scopes a second way here, and a rarely-written shape is a better
+    price than a second copy of a rule this file has already had wrong twice.
+    """
+    for select in ast.find_all(exp.Select):
+        for projection in select.expressions:
+            source = _names_a_source(select, projection)
+            if source is not None and not isinstance(source, exp.Subquery):
+                return True
+    return False
 
 
 def _sources(select: exp.Select) -> dict[str, exp.Expression]:
@@ -262,7 +293,10 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
             _expands_a_base_table(select, projection, inner, memo, within, dialect)
             for select in selects
             for projection in select.expressions
-            if _is_star(projection) or _names_a_source(select, projection)
+            # A row reference joins the walk too: naming a DERIVED TABLE is bounded by that
+            # table's projection exactly as a star over it is, and only this recursion can say
+            # whether that projection reaches a base table.
+            if _is_star(projection) or _names_a_source(select, projection) is not None
         )
     memo[id(node)] = answer
     return answer
@@ -322,10 +356,6 @@ def _has_projection_star(ast: exp.Expression, dialect: str) -> bool:
       projection, and `SELECT a FROM (SELECT * FROM t)` still returns exactly `a`.
     - A star over a *derived table or CTE* expands an explicit projection, so the output
       columns are known: `SELECT * FROM (SELECT a, b FROM t)` returns exactly a and b.
-
-    A projection naming a SOURCE rather than a column is the same expansion without a star --
-    `SELECT claim FROM claim` is the row as a struct, `UNNEST(claim)` spreads it back out -- and is
-    refused on the same terms. `UNNEST(tags)` over a list column names a COLUMN and is untouched.
 
     What is refused is a star that expands a **base table**, directly or through a wrapper the
     walker can follow -- there the column set is unbounded, and neither we nor column-level

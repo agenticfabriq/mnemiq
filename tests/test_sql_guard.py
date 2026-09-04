@@ -434,7 +434,16 @@ def test_naming_a_SOURCE_is_the_same_expansion_without_a_star():
                 "SELECT claim FROM claim",
                 "SELECT unnest(c) FROM claim c",
                 "SELECT c FROM claim c",
-                "SELECT * FROM (SELECT UNNEST(claim) FROM claim) t"):
+                "SELECT CLAIM FROM claim",                # duckdb folds; an exact match misses it
+                "SELECT UNNEST(CLAIM) FROM claim",
+                "SELECT * FROM (SELECT UNNEST(claim) FROM claim) t",
+                # ALIASED and carried out through an ordinary-looking projection. An explicit
+                # outer projection bounds the column COUNT and not the column SET once one item
+                # is a whole row, so scanning only OUTPUT selects left every one of these live.
+                "SELECT x FROM (SELECT claim AS x FROM claim) t",
+                "SELECT UNNEST(x) FROM (SELECT claim AS x FROM claim) t",
+                "SELECT (SELECT c FROM claim c LIMIT 1) AS x FROM policy",
+                "WITH w AS (SELECT claim AS x FROM claim) SELECT x FROM w"):
         assert _refused(sql).code == RefusalCode.SELECT_STAR, sql
 
 
@@ -443,8 +452,10 @@ def test_unnesting_a_COLUMN_is_untouched():
     unnesting a LIST column expands ROWS and returns one column, which is ordinary SQL."""
     _ok("SELECT UNNEST(tags) FROM claim")
     _ok("SELECT a.id FROM claim a JOIN policy p ON a.id = p.id")
-    # a CTE source is bounded by its own projection, so naming it returns known columns
-    _ok("WITH c AS (SELECT id FROM claim) SELECT c FROM c")
+    # A DERIVED TABLE source is bounded by its OWN projection, so naming it returns known columns.
+    # `SELECT id` is load-bearing here: with `SELECT *` inside, this same query must be refused,
+    # which the test below asserts. One token separates the control from the leak.
+    _ok("SELECT t FROM (SELECT id FROM claim) t")
 
     # A QUALIFIED reference names a column even when the column shares its table's name, so the
     # check keys on the reference being BARE. Without that it refuses ordinary SQL: a `policy`
@@ -452,6 +463,53 @@ def test_unnesting_a_COLUMN_is_untouched():
     _ok("SELECT p.policy FROM policy p")
     _ok("SELECT policy.policy FROM policy")
     _ok("SELECT claim.claim FROM claim")
+
+
+def test_naming_a_derived_table_is_bounded_by_ITS_projection_not_by_being_a_wrapper():
+    """The row check SKIPS a derived-table source and the star walk handles it, because the row
+    check looks at `exp.Column` nodes and a star inside the derived table yields none.
+
+    Getting that wrong reopened a closed hole for one commit: with the row check claiming to cover
+    subqueries and the star walk no longer entered for a row reference, `SELECT UNNEST(t) FROM
+    (SELECT * FROM claim) t` returned `(1, 100, '999-11-2222')` and `check_cls` returned None. One
+    token separates it from the permitted control above."""
+    for sql in ("SELECT t FROM (SELECT * FROM claim) t",
+                "SELECT UNNEST(t) FROM (SELECT * FROM claim) t",
+                "SELECT t FROM ((SELECT * FROM claim)) t",
+                "SELECT t FROM (SELECT COLUMNS(*) FROM claim) t",
+                "SELECT t FROM (SELECT claim AS x FROM claim) t"):
+        assert _refused(sql).code == RefusalCode.SELECT_STAR, sql
+
+    # and the control, whose inner projection really is explicit
+    _ok("SELECT t FROM (SELECT id FROM claim) t")
+    _ok("SELECT UNNEST(t) FROM (SELECT id FROM claim) t")
+
+
+def test_three_deliberate_false_refusals_of_this_check():
+    """All fail-CLOSED, all recorded rather than discovered later.
+
+    A CTE projected as a struct IS bounded by its own explicit projection, so refusing it is
+    stricter than necessary -- taken because the alternative is resolving CTE scopes a second way
+    inside this check, and this file has already had that rule wrong twice.
+
+    A BARE reference cannot be told apart from a same-named COLUMN without a schema, which
+    `check_shape` does not have: duckdb resolves `SELECT policy FROM policy` to the column when one
+    exists, and this refuses it. The qualified spelling above is the one that keeps working.
+
+    And scanning every select reaches DISCARDED projections, so a row reference inside an EXISTS
+    is refused although nothing it projects leaves the engine. Scoping the scan to output selects
+    is what let the aliased row-struct through, so this is the cost of reaching that."""
+    assert _refused("WITH c AS (SELECT id FROM claim) SELECT c FROM c").code == (
+        RefusalCode.SELECT_STAR)
+    assert _refused("SELECT policy FROM policy").code == RefusalCode.SELECT_STAR
+    # the same schema ambiguity wearing an ALIAS rather than a table name
+    assert _refused("SELECT amount FROM claim amount").code == RefusalCode.SELECT_STAR
+    # and the third: scanning EVERY select means a DISCARDED projection is scanned too, so a row
+    # reference inside an EXISTS is refused although it never leaves the engine -- the one
+    # position the star rule deliberately permits.
+    assert _refused("SELECT id FROM claim WHERE EXISTS (SELECT policy FROM policy)").code == (
+        RefusalCode.SELECT_STAR)
+    _ok("SELECT id FROM claim WHERE EXISTS (SELECT * FROM policy)")  # the star form still passes
 
 
 def test_the_declared_sqlglot_floor_carries_the_symbols_the_guard_USES():

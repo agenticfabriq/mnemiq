@@ -516,7 +516,7 @@ requires-dist = [
     { name = "pytz" },
     { name = "rdflib", marker = "extra == 'ontology'", specifier = ">=7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
-    { name = "sqlglot", specifier = ">=25" },
+    { name = "sqlglot", specifier = ">=25.34.1" },
     { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.30" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.30" },
 ]
