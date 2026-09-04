@@ -515,8 +515,9 @@ def test_three_deliberate_false_refusals_of_this_check():
 def test_the_declared_sqlglot_floor_carries_the_symbols_the_guard_USES():
     """`exp.Columns` and `exp.SetOperation` are both absent from sqlglot 25.0.0 and present from
     25.34.1, and `check_shape` only wraps `sqlglot.parse` in a try -- so at the old declared floor
-    of `>=25` an `AttributeError` would escape it and every star-bearing query would CRASH rather
-    than refuse. uv.lock pins 30.12.0, so nothing resolved from the lock was affected; the
+    of `>=25` an `AttributeError` would escape it and EVERY select would CRASH rather than refuse,
+    not only star-bearing ones: `_is_star` reaches `exp.Columns` for the first projection of every
+    output select. uv.lock pins 30.12.0, so nothing resolved from the lock was affected; the
     declaration was."""
     import re
     import tomllib
@@ -529,4 +530,8 @@ def test_the_declared_sqlglot_floor_carries_the_symbols_the_guard_USES():
     floor = Version(re.search(r">=\s*([0-9.]+)", spec).group(1))
 
     assert floor >= Version("25.34.1"), f"{spec} predates exp.Columns and exp.SetOperation"
+
+    # The `hasattr` below passes on any modern sqlglot and so proves nothing about the FLOOR --
+    # it guards the running environment, not the declaration. The floor itself was established by
+    # installing 25.0.0 and 25.34.1 and reading both symbols: absent, then present.
     assert hasattr(exp, "Columns") and hasattr(exp, "SetOperation")
