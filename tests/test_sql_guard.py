@@ -373,3 +373,49 @@ def test_a_DENIED_column_cannot_come_back_through_a_wrapped_star():
         # so the guard must refuse it, or those real `ssn` values reach the caller
         assert isinstance(check_shape(wrapped), Refusal), (
             f"a {expect} column came back through a star the guard permitted")
+
+
+def test_COLUMNS_is_the_other_spelling_of_a_star():
+    """DuckDB's `COLUMNS(*)` expands to a column set exactly as `*` does, and is not an
+    `exp.Star`, so it parsed straight past a check that only knew that type.
+
+    Measured on duckdb 1.5.4: `SELECT COLUMNS(*) FROM claim` returned every column including a
+    DENIED one, and `SELECT COLUMNS('s.*') FROM claim` returned ONLY `ssn` -- the denied value
+    exfiltrated without its name appearing anywhere in the query, which is what makes the regex
+    form worse than the plain star rather than a variant of it.
+    """
+    for sql in ("SELECT COLUMNS(*) FROM claim",
+                "SELECT columns(*) FROM claim",
+                "SELECT COLUMNS('s.*') FROM claim",
+                "SELECT min(COLUMNS(*)) FROM claim",           # still one column per column
+                "SELECT claim.COLUMNS(*) FROM claim",          # Dot(Identifier, Anonymous)
+                "SELECT claim.columns(*) FROM claim",           # sqlglot PRESERVES this case
+                "SELECT claim.Columns(*) FROM claim",
+                "SELECT c.COLUMNS('s.*') FROM claim c",
+                "SELECT * FROM (SELECT COLUMNS(*) FROM claim) t",
+                "WITH c AS (SELECT COLUMNS(*) FROM claim) SELECT * FROM c",
+                "SELECT id FROM claim UNION ALL SELECT COLUMNS(*) FROM claim"):
+        assert _refused(sql).code == RefusalCode.SELECT_STAR, sql
+
+
+def test_the_qualified_form_carries_no_Columns_NODE_at_all():
+    """Why the check matches on the name and not only on the type: an unqualified `COLUMNS(*)`
+    parses to `exp.Columns`, a qualified one to `Dot(Identifier, Anonymous(this="COLUMNS"))` with
+    no `exp.Columns` anywhere in it."""
+    bare = sqlglot.parse_one("SELECT COLUMNS(*) FROM claim", read="duckdb").expressions[0]
+    qualified = sqlglot.parse_one("SELECT claim.COLUMNS(*) FROM claim", read="duckdb").expressions[0]
+
+    assert isinstance(bare, exp.Columns)
+    assert not list(qualified.find_all(exp.Columns)), "a type check alone cannot see this one"
+    assert any(isinstance(n, exp.Anonymous) and str(n.this).upper() == "COLUMNS"
+               for n in qualified.walk())
+
+
+def test_COUNT_STAR_is_not_an_expansion_and_stays_permitted():
+    """The control. Searching for a bare `exp.Star` would be simpler and would refuse the most
+    common analytics query there is -- `COUNT(*)` contains one and collapses it to ONE column.
+    What is refused is the expansion, not the asterisk."""
+    _ok("SELECT count(*) FROM claim")
+    _ok("SELECT COUNT(*) FROM claim c")
+    _ok("SELECT id, count(*) FROM claim GROUP BY id")
+    _ok("SELECT id FROM claim WHERE EXISTS (SELECT * FROM policy)")

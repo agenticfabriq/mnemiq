@@ -76,10 +76,37 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
 
 
 def _is_star(projection: exp.Expression) -> bool:
-    """`COUNT(*)` contains an `exp.Star` too, so this asks about the PROJECTION, not the tree."""
-    return isinstance(projection, exp.Star) or (
-        isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star)
-    )
+    """`COUNT(*)` contains an `exp.Star` too, so this asks about the PROJECTION, not the tree.
+
+    `exp.Columns` is the other spelling and it is not a subclass of `exp.Star`: DuckDB's
+    `COLUMNS(*)` and `COLUMNS('regex')` expand to a column set the same way and parsed straight
+    past a check that only knew `Star`. `SELECT COLUMNS(*) FROM claim` returned every column
+    including a DENIED one, and `COLUMNS('s.*')` returned ONLY that column -- the denied value
+    exfiltrated without its name ever appearing in the query.
+
+    Searched rather than matched, because the expansion can sit inside another node and anything
+    CONTAINING one returns an unbounded column set whatever wraps it -- `min(COLUMNS(*))` is still
+    one output column per input column.
+
+    Matched by NAME as well as by type, and that is not belt-and-braces: an unqualified
+    `COLUMNS(*)` parses to `exp.Columns`, while a qualified `claim.COLUMNS(*)` parses to
+    `Dot(Identifier, Anonymous(this="COLUMNS", ...))` -- no `exp.Columns` node anywhere in it. A
+    type check alone therefore misses the qualified spelling.
+
+    Searching for a bare `exp.Star` instead would be simpler and wrong: `COUNT(*)` contains one and
+    collapses it to a single column, which is the most common analytics query there is. What is
+    refused is the expansion, not the asterisk.
+    """
+    if isinstance(projection, exp.Star | exp.Columns):
+        return True
+    if isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star):
+        return True
+    for node in projection.walk():
+        if isinstance(node, exp.Columns):
+            return True
+        if isinstance(node, exp.Anonymous) and str(node.this).upper() == "COLUMNS":
+            return True
+    return False
 
 
 def _sources(select: exp.Select) -> dict[str, exp.Expression]:
