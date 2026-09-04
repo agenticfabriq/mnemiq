@@ -131,19 +131,26 @@ class Narrowing:
 
     object: str          # the table, in the query's own spelling
     rows: bool           # a row filter was applied to it
-    # The query REFERENCED a column THIS table masks. That is the flag's exact meaning, and it is
-    # not "the rewrite masked something": a table wrapped for its ROW FILTER has its masked columns
-    # NULLed regardless, so `SELECT id FROM claim` under a filter plus a mask on `ssn` rewrites to
-    # `... NULL AS ssn ...` while this stays False. That gap is deliberate and kept -- a caller
-    # reading `id` was not narrowed by a mask on `ssn`, and saying so would be a false alarm on
-    # every filtered table carrying any mask.
+    # TRUE when the query references a column name this table masks AND either ownership resolved
+    # to THIS table, or ownership could not be resolved at all. That is the whole rule; the two
+    # halves are why neither "your answer lost a column" nor "the rewrite masked something" is a
+    # safe reading of it.
     #
-    # It no longer over-reports. Names used to be matched across the whole query without resolving
-    # ownership, so `SELECT p.ssn FROM person p JOIN claim c` with `claim.ssn` masked reported
-    # `claim`. Tolerable while this was an internal flag; a lie once a caller-facing sentence was
-    # built on it. Ownership is now resolved through `column_tables`, and the cases it cannot
-    # resolve -- resolver failure, a CTE qualifier, a genuinely ambiguous unqualified name -- keep
-    # the old over-approximation, because that direction only ever masks MORE.
+    # Where ownership RESOLVES, the flag is exact. `SELECT p.ssn FROM person p JOIN claim c` with
+    # `claim.ssn` masked no longer reports `claim` -- it did until ownership resolution landed,
+    # which was tolerable for an internal flag and a lie once a caller-facing sentence was built
+    # on it.
+    #
+    # Where ownership does NOT resolve -- resolver failure, a CTE qualifier, a genuinely ambiguous
+    # unqualified name -- it still over-reports, deliberately: the same fallback makes the masking
+    # itself apply, and that direction only ever masks MORE. So a disclosure on those queries can
+    # still name a table whose column the caller never read. That is the residual, it is bounded to
+    # the unresolved cases, and `tests/test_mask_attribution.py` pins each one.
+    #
+    # And it UNDER-reports independently of any of that: a table wrapped for its ROW FILTER has its
+    # masked columns NULLed regardless, so `SELECT id FROM claim` under a filter plus a mask on
+    # `ssn` rewrites to `... NULL AS ssn ...` while this stays False. Kept, because a caller reading
+    # `id` was not narrowed by a mask on `ssn`.
     columns: bool
 
 
