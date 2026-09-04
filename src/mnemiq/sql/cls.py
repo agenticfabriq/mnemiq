@@ -45,13 +45,14 @@ def _is_bare_projection(column: exp.Column) -> bool:
     )
 
 
-def check_cls(ast: exp.Expression, policy: AccessPolicy) -> Refusal | None:
+def check_cls(ast: exp.Expression, policy: AccessPolicy,
+              dialect: str | None = None) -> Refusal | None:
     """Refuse a query that reads a denied column, or uses a masked column anywhere but a bare
     projection (masking a filtered/aggregated column would silently change the answer)."""
     if not policy.denied and not policy.masked:
         return None
     # resolve columns against every base table the query references (not just visible ones)
-    tables = base_tables(ast)
+    tables = base_tables(ast, dialect)
     referenced = {object_key(t) for t in tables}
     resolved = column_tables(ast)
     local = {cte.alias_or_name for cte in ast.find_all(exp.CTE)}

@@ -39,15 +39,15 @@ def decide(
     the model that the table exists.
     """
     policy = policy or AccessPolicy()
-    shaped = check_shape(sql, dialect=dialect, max_rows=max_rows)
+    shaped = check_shape(sql, dialect=dialect, max_rows=max_rows, executes_as=target)
     if isinstance(shaped, Refusal):
         return shaped
 
-    refusal = check_access(shaped, visible)
+    refusal = check_access(shaped, visible, target)
     if refusal is not None:
         return refusal
 
-    cls = check_cls(shaped, policy)  # column deny / mask-in-predicate
+    cls = check_cls(shaped, policy, target)  # column deny / mask-in-predicate
     if cls is not None:
         return cls
 
@@ -90,7 +90,7 @@ def decide(
     # ACL `_retrieve_examples` filters on, so a CTE named after a governed table deletes that
     # table from the list and an example whose SQL names it is then shown to a caller who may not
     # read it. Same resolver as the three guards, so the premise cannot drift apart again.
-    tables = sorted({object_key(t) for t in base_tables(shaped)})
+    tables = sorted({object_key(t) for t in base_tables(shaped, target)})
     # Beside the list, never apart from it (M56): a bare list is worse than no list, because
     # absent reads as "not recorded" and `[]` reads as "nothing was read". Computed where the list
     # is computed, so the two cannot come from different paths and disagree -- M7's shape.
@@ -105,7 +105,8 @@ def decide(
 
     narrowed: list = []
     if not policy.empty:
-        shaped, narrowed = apply_row_and_mask(shaped, policy, visible, dialect=dialect)
+        shaped, narrowed = apply_row_and_mask(shaped, policy, visible, dialect=dialect,
+                                              executes_as=target)
         if isinstance(shaped, Refusal):
             return shaped
 

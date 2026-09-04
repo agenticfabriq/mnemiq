@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlglot
 from sqlglot import exp
 
+from mnemiq.sql.identifiers import resolve_name
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 MAX_ROWS = 1000
@@ -13,7 +14,7 @@ _ALLOWED_ROOTS = (exp.Select, exp.Union)
 
 
 def check_shape(
-    sql: str, dialect: str = "duckdb", max_rows: int = MAX_ROWS
+    sql: str, dialect: str = "duckdb", max_rows: int = MAX_ROWS, executes_as: str | None = None
 ) -> exp.Expression | Refusal:
     """Parse and enforce the shape of the query. Returns the AST, with a LIMIT guaranteed.
 
@@ -45,7 +46,11 @@ def check_shape(
             subject=type(ast).__name__.upper(),
         )
 
-    if _has_projection_star(ast, dialect) or _projects_a_row(ast):
+    # `executes_as`, not `dialect`. One is what we PARSE as and the other is what will RUN the
+    # statement, and identifier folding belongs to the second: `decide` defaults to parsing duckdb
+    # and targeting postgres, so keying the fold on the parse dialect answers for the wrong engine.
+    # Production passes them equal, which is exactly why the mismatch would not have surfaced.
+    if _has_projection_star(ast, executes_as or dialect) or _projects_a_row(ast):
         return Refusal(
             code=RefusalCode.SELECT_STAR,
             message=(
@@ -178,44 +183,12 @@ def _sources(select: exp.Select) -> dict[str, exp.Expression]:
 # scope it is read from. `Scope` is that pair, and pairing them is the whole point: a bare
 # `name -> body` map has to borrow some caller's names to interpret the body, and the caller's
 # names are not the ones the body was written against.
-# Keyed by RESOLVED identifier, never by the name as typed. Two spellings name one object or two
+# Keyed by RESOLVED identifier, never by the name as typed -- `identifiers.resolve_name` owns that
+# rule for every resolver in this package, after this file got it wrong twice in consecutive
+# commits. Two spellings name one object or two
 # depending on quoting, and getting that wrong in either direction has a cost: too wide and a CTE
 # vouches for a base table, too narrow and ordinary SQL is refused.
 Scope = dict[str, tuple[exp.Expression, "Scope"]]
-
-
-# Oracle folds unquoted identifiers UP where the others fold them down -- `adapters/oracle.py`
-# states it, and it is why a schema name is stored uppercased there. Both are "case-insensitive",
-# and a single hardcoded direction is wrong for one of them in the direction that VOUCHES: fold
-# down on Oracle and `WITH "claim" AS (...) SELECT * FROM claim` keys both sides to `claim`, while
-# Oracle resolves that reference to `CLAIM`, the base table.
-_FOLDS_UP = {"oracle"}
-
-
-def _identity(node: exp.Expression, dialect: str) -> str:
-    """What this name RESOLVES to in the dialect that will RUN it: unquoted identifiers are folded,
-    quoted ones are preserved.
-
-    So on Postgres `Claim` resolves to `claim` while `"Claim"` stays `Claim` -- two objects, which
-    is why a quoted CTE must not vouch for an unquoted reference to a base table; and `"claim"`
-    resolves to `claim` like the bare form, so the common shape of quoting a definition but not
-    its reference is ONE object and is not refused. On Oracle every one of those answers changes,
-    which is why the fold cannot be a constant here.
-
-    Treating a quoted name as preserved is fail-closed on DuckDB, which folds those too: it can
-    only refuse a shape DuckDB would resolve to the CTE, never vouch for one it would not.
-
-    A CTE is identified by the name it DEFINES; a table reference by the name it READS. Those come
-    from different places: `alias_or_name` on `c21 AS a` is the alias `a`, so using it for both
-    made every aliased CTE reference miss and fall through to the base-table branch.
-    """
-    if isinstance(node, exp.CTE):
-        identifier, name = node.args["alias"].this, node.alias_or_name
-    else:
-        identifier, name = node.this, node.name
-    if isinstance(identifier, exp.Identifier) and identifier.args.get("quoted"):
-        return name
-    return name.upper() if dialect in _FOLDS_UP else name.lower()
 
 
 def _visible_ctes(node: exp.Expression, outer: Scope, dialect: str) -> Scope:
@@ -247,7 +220,7 @@ def _visible_ctes(node: exp.Expression, outer: Scope, dialect: str) -> Scope:
     recursive = bool(with_.args.get("recursive"))
     scope: Scope = dict(outer)
     for cte in with_.expressions:
-        key = _identity(cte, dialect)
+        key = resolve_name(cte, dialect)
         # snapshot BEFORE binding this name: the body sees the outer scope and its preceding
         # siblings, plus itself only when the WITH is RECURSIVE
         body_scope: Scope = dict(scope)
@@ -334,8 +307,8 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
         # `WITH claim AS (SELECT id FROM policy) SELECT * FROM main.claim` resolves to the CTE
         # here and to the base table in the database, which returned every column of `claim`.
         if isinstance(source, exp.Table) and not source.db and not source.catalog \
-                and _identity(source, dialect) in ctes:
-            body, body_scope = ctes[_identity(source, dialect)]
+                and resolve_name(source, dialect) in ctes:
+            body, body_scope = ctes[resolve_name(source, dialect)]
             # `body_scope`, not `ctes`: the body is interpreted where it was written
             if _star_reaches_base(body, body_scope, memo, stack, dialect):
                 return True

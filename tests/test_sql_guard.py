@@ -218,14 +218,21 @@ def test_a_cte_name_matches_what_it_RESOLVES_to_not_how_it_was_typed():
 
     TOO NARROW: requiring identical QUOTING then refused `WITH "claim" AS (...) SELECT * FROM
     claim`, which is one object in Postgres and is the ordinary shape of a model quoting a
-    definition but not its reference."""
+    definition but not its reference.
+
+    Whether these are one object or two is the DIALECT's answer, not a constant -- Postgres and
+    Oracle preserve a quoted name, DuckDB folds it. Measured on duckdb 1.5.4:
+    `WITH "Claim" AS (SELECT id FROM policy) SELECT id FROM Claim` returns the CTE's row, so
+    refusing it there was a false refusal, which is what an engine-independent rule cost."""
     for sql in ('WITH "Claim" AS (SELECT id FROM policy) SELECT * FROM Claim',
                 'WITH Claim AS (SELECT id FROM policy) SELECT * FROM "Claim"'):
-        assert _refused(sql).code == RefusalCode.SELECT_STAR, sql
+        for engine in ("postgres", "oracle"):
+            assert isinstance(check_shape(sql, executes_as=engine), Refusal), f"{engine}: {sql}"
+        _ok(sql)  # duckdb folds quoted names, so the CTE really does shadow
 
     # And it must not over-refuse, which is the other direction and equally live. Everything below
     # is ONE object under the default `duckdb` these run on, and under every DOWN-folding engine --
-    # NOT under Oracle, where the two mixed-quoting cases are two objects and are refused; the
+    # NOT under Oracle, where the mixed-quoting cases are two objects and are refused; the
     # dialect test below asserts that, and it is the rule rather than a bug. Refusing these would
     # reject ordinary model-written SQL, which is what makes a guard broken rather than safe:
     # quoting a definition but not its reference is the common LLM shape, and a bare case mismatch

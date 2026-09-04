@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlglot import exp
 from sqlglot.optimizer.scope import build_scope
 
+from mnemiq.sql.identifiers import resolve_identifier, resolve_name
 from mnemiq.sql.qualify import object_key
 
 
@@ -110,7 +111,43 @@ def scope_resolved(ast: exp.Expression) -> bool:
     return ast_root is not None and not _unscoped_ctes(ast, ast_root)
 
 
-def base_tables(ast: exp.Expression) -> list[exp.Table]:
+def _defining_identifier(source, ast: exp.Expression) -> exp.Expression | None:
+    """The identifier that NAMES a local source, with its quoting intact.
+
+    `scope.sources` is keyed by bare text, so the quoting is gone by the time a name is looked up
+    there. The defining node still has it, and a source's `.expression` IS the node's inner query,
+    so identity maps back to it.
+    """
+    inner = getattr(source, "expression", None)
+    if inner is None:
+        return None
+    for node in ast.find_all(exp.CTE, exp.Subquery):
+        if node.this is inner:
+            return node.args.get("alias")
+    return None
+
+
+def _engine_shadows(table: exp.Table, source, ast: exp.Expression, dialect: str | None) -> bool:
+    """Would the EXECUTING engine resolve this reference to that local source?
+
+    sqlglot matches a source by its bare name and the engine does not, so a CTE could hide a base
+    table from the grant check that shares nothing with it but spelling. Measured: `WITH "Claim" AS
+    (SELECT id FROM policy) SELECT id FROM Claim` was Approved with `tables=['policy']`, while
+    `SELECT id FROM Claim` alone is refused `unauthorized_table` -- the CTE's mere presence was
+    what unlocked the base table. Postgres folds the unquoted reference to `claim` and preserves
+    `"Claim"`, so the two are different objects there and the read was never authorized. (M79.)
+
+    Answering True when the defining node cannot be found keeps the previous behaviour for a shape
+    this cannot read, which is the direction that over-reports rather than under-reports only
+    because the caller then has to find the name in `visible`.
+    """
+    alias = _defining_identifier(source, ast)
+    if alias is None:
+        return True
+    return resolve_identifier(alias, dialect) == resolve_name(table, dialect)
+
+
+def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Table]:
     """Every `exp.Table` node that reads a real object in the source.
 
     A CTE alias is reported as a Table by `find_all`, and must not be authorized as a source
@@ -137,7 +174,11 @@ def base_tables(ast: exp.Expression) -> list[exp.Table]:
     out: list[exp.Table] = []
     for scope in root.traverse():
         for table in scope.tables:
-            if isinstance(scope.sources.get(table.alias_or_name), exp.Table):
+            source = scope.sources.get(table.alias_or_name)
+            if isinstance(source, exp.Table):
+                out.append(table)
+            elif source is not None and not _engine_shadows(table, source, ast, dialect):
+                # sqlglot calls it a local source; the ENGINE would not. It is a real read.
                 out.append(table)
     # The write target, which no scope names. Added here rather than in each guard so the three
     # of them keep sharing one premise -- the M31 lesson, and the reason M48 sits in this file.
