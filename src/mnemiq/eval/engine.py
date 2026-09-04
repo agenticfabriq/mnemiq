@@ -77,6 +77,7 @@ def build_engine(
     definitions: Sequence[Definition] = (),
     candidates: int = 1,
     verify: bool = False,
+    grants: GrantSet | None = None,
 ) -> tuple[Engine, LLMClient]:
     """Retrieval + agent over one snapshot, assembled exactly once.
 
@@ -118,8 +119,19 @@ def build_engine(
     # Grade SQL capability with FULL data access: clear every PII level the enrichment tagged,
     # so CLS does not refuse legitimate columns (e.g. CustomerID). Governance/RLS/CLS have their
     # own tests; a benchmark that denied enrichment-tagged PII would under-count every attempt.
-    levels = frozenset(c.pii_level for c in snapshot.columns if c.pii_level and c.pii_level != "none")
-    grants = GrantSet(frozenset(tables), pii_clearance=levels)
+    if grants is None:
+        levels = frozenset(
+            c.pii_level for c in snapshot.columns if c.pii_level and c.pii_level != "none")
+        grants = GrantSet(frozenset(tables), pii_clearance=levels)
+    else:
+        # A GOVERNED arm. Every arm above this line grants everything by design, so nothing the
+        # benchmark has ever measured exercised a narrowed answer end to end -- which is why the
+        # disclosure work could ship four defects that unit tests passed and review caught. The
+        # caller supplies the grants; this seam only stops assuming them.
+        #
+        # The objects are still the caller's to choose: a governed arm that granted no tables would
+        # measure refusal, not narrowing, and the two are different signals.
+        pass
     authz = _GrantAll(grants)
 
     kit = build_components(settings, adapter, con)
