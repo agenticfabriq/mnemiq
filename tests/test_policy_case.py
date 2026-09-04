@@ -178,8 +178,8 @@ def test_the_applied_row_policy_does_not_depend_on_how_the_caller_spells_the_tab
       SELECT id FROM claim  -> WHERE region = 'west'
       SELECT id FROM CLAIM  -> WHERE region = 'east'
 
-    Picking a winner in any order still leaves the caller choosing. Both apply now, OR-combined,
-    which is the combinator `grants.py` already uses for per-role filters."""
+    Picking a winner in any order still leaves the caller choosing. Both apply now -- AND-combined,
+    see the test below for why it is not OR."""
     policy = AccessPolicy(row_filters={"claim": "region = 'west'", "CLAIM": "region = 'east'"})
     plans = {}
     for q in CASES:
@@ -355,3 +355,29 @@ def test_value_grounding_still_names_values_when_nothing_is_filtered():
     ast = sqlglot.parse_one("SELECT id FROM claim WHERE region = 'nope'", read="duckdb")
     r = check_values(ast, {"claim": {"id", "region"}}, _StubValueIndex(), row_filtered=set())
     assert isinstance(r, Refusal) and "west" in r.message, r
+
+
+def test_a_filter_for_a_DIFFERENT_table_cannot_widen_this_one():
+    """`claim` and `"Claim"` are two different tables on Postgres, and spellings that fold together
+    reach `row_filter_for` as separate keys. OR-combining them let one table's filter widen the
+    other's: measured, `{"claim": "tenant = 1", "Claim": "1 = 1"}` gave
+    `WHERE (tenant = 1) OR (1 = 1)` on `FROM claim` -- every row, from a policy that restricted it.
+
+    More than one match here is not more ROLES: `grants_for` already OR-combines per-role filters
+    into a single entry, folding as it merges, so this path is reached only by a hand-built policy
+    or a provider that does not fold. Quoting is gone by then, so this cannot tell one object from
+    two, and the combinator that is safe without knowing shows a row only if EVERY candidate allows
+    it."""
+    policy = AccessPolicy(row_filters={"claim": "tenant = 1", "Claim": "1 = 1"})
+    combined = policy.row_filter_for("claim")
+    assert combined == "(tenant = 1) AND (1 = 1)", combined
+
+    verdict = decide("SELECT id FROM claim", {"claim": {"id", "tenant"}},
+                     target="postgres", dialect="postgres", policy=policy)
+    assert "AND" in verdict.target_sql and "OR" not in verdict.target_sql, verdict.target_sql
+
+    # unchanged where there is one match: the ordinary case must not become a conjunction
+    assert AccessPolicy(row_filters={"claim": "tenant = 1"}).row_filter_for("claim") == "tenant = 1"
+
+    # and still independent of how the caller spells it
+    assert policy.row_filter_for("CLAIM") == policy.row_filter_for("claim")

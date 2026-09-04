@@ -61,17 +61,30 @@ class AccessPolicy:
         choosing its own row policy by changing case is the defect, and picking a winner in any
         order still leaves them choosing.
 
-        OR is the right combinator because it is the one `grants.py` uses to merge per-role
-        filters -- more roles mean more visible rows. `grants_for` now folds when it merges, so
-        duplicates should not reach here at all; this is the second line of defence for a policy
-        built by hand or by a provider that does not fold.
+        AND, not OR, when several DISTINCT spellings match. OR is right for merging one object's
+        filters across roles -- more roles mean more visible rows -- and `grants_for` already does
+        that, folding as it merges into a single entry. So more than one match here is not more
+        roles: it is more SPELLINGS, reaching this second line of defence from a hand-built policy
+        or a provider that does not fold.
+
+        And spellings that fold together are not always one object. On Postgres `claim` and
+        `"Claim"` are two different tables, so OR-ing let a filter belonging to one WIDEN the
+        other: measured, `row_filters={"claim": "tenant = 1", "Claim": "1 = 1"}` produced
+        `WHERE (tenant = 1) OR (1 = 1)` on `FROM claim` -- every row, from a policy that restricted
+        it. Quoting is gone by the time a name reaches here (`object_key` strips it), so this
+        cannot tell the two apart, and the combinator that is safe without knowing is the one that
+        shows a row only if EVERY candidate filter allows it.
+
+        Picking a winner instead is worse than either, and was the first version: it made the
+        applied policy depend on how the CALLER spelled the table, so one identity got a different
+        predicate from `FROM claim` than from `FROM CLAIM`.
         """
         matches = [f for t, f in self.row_filters.items() if names_one_object(table, [t])]
         if not matches:
             return None
         if len(matches) == 1:
             return matches[0]
-        return " OR ".join(f"({m})" for m in matches)
+        return " AND ".join(f"({m})" for m in matches)
 
 
 def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
