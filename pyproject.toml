@@ -11,7 +11,7 @@ dependencies = [
   "pydantic>=2",
   "pydantic-settings>=2",
   "pytz",  # DuckDB needs it to profile Postgres timestamptz columns (else profiling throws)
-  "sqlglot>=25",
+  "sqlglot>=25.34.1",
   "pyarrow>=17",
   "cachetools>=5",
   "mcp>=1.28",

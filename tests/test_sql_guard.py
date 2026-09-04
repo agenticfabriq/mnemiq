@@ -1,3 +1,5 @@
+import pathlib
+
 import pytest
 import sqlglot
 from sqlglot import exp
@@ -419,3 +421,54 @@ def test_COUNT_STAR_is_not_an_expansion_and_stays_permitted():
     _ok("SELECT COUNT(*) FROM claim c")
     _ok("SELECT id, count(*) FROM claim GROUP BY id")
     _ok("SELECT id FROM claim WHERE EXISTS (SELECT * FROM policy)")
+
+
+def test_naming_a_SOURCE_is_the_same_expansion_without_a_star():
+    """DuckDB resolves a bare reference to a source name as the whole ROW. Measured on 1.5.4:
+    `SELECT claim FROM claim` returns a struct holding every value including a denied `ssn`, and
+    `SELECT UNNEST(claim) FROM claim` spreads it back into `id, amount, ssn`.
+
+    There is no star anywhere in either, and `check_cls` finds no `exp.Column` for `ssn` -- the
+    column is never spelled, exactly as with a star."""
+    for sql in ("SELECT UNNEST(claim) FROM claim",
+                "SELECT claim FROM claim",
+                "SELECT unnest(c) FROM claim c",
+                "SELECT c FROM claim c",
+                "SELECT * FROM (SELECT UNNEST(claim) FROM claim) t"):
+        assert _refused(sql).code == RefusalCode.SELECT_STAR, sql
+
+
+def test_unnesting_a_COLUMN_is_untouched():
+    """The control, and the reason this is keyed on naming a SOURCE rather than on `UNNEST`:
+    unnesting a LIST column expands ROWS and returns one column, which is ordinary SQL."""
+    _ok("SELECT UNNEST(tags) FROM claim")
+    _ok("SELECT a.id FROM claim a JOIN policy p ON a.id = p.id")
+    # a CTE source is bounded by its own projection, so naming it returns known columns
+    _ok("WITH c AS (SELECT id FROM claim) SELECT c FROM c")
+
+    # A QUALIFIED reference names a column even when the column shares its table's name, so the
+    # check keys on the reference being BARE. Without that it refuses ordinary SQL: a `policy`
+    # table with a `policy` column is not an exotic schema.
+    _ok("SELECT p.policy FROM policy p")
+    _ok("SELECT policy.policy FROM policy")
+    _ok("SELECT claim.claim FROM claim")
+
+
+def test_the_declared_sqlglot_floor_carries_the_symbols_the_guard_USES():
+    """`exp.Columns` and `exp.SetOperation` are both absent from sqlglot 25.0.0 and present from
+    25.34.1, and `check_shape` only wraps `sqlglot.parse` in a try -- so at the old declared floor
+    of `>=25` an `AttributeError` would escape it and every star-bearing query would CRASH rather
+    than refuse. uv.lock pins 30.12.0, so nothing resolved from the lock was affected; the
+    declaration was."""
+    import re
+    import tomllib
+
+    from packaging.version import Version
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    deps = tomllib.loads((root / "pyproject.toml").read_text())["project"]["dependencies"]
+    spec = next(d for d in deps if d.startswith("sqlglot"))
+    floor = Version(re.search(r">=\s*([0-9.]+)", spec).group(1))
+
+    assert floor >= Version("25.34.1"), f"{spec} predates exp.Columns and exp.SetOperation"
+    assert hasattr(exp, "Columns") and hasattr(exp, "SetOperation")
