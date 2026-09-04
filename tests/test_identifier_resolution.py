@@ -72,19 +72,71 @@ def test_an_ordinary_shadow_is_approved_everywhere(sql):
 
 
 def test_every_resolver_gets_the_SAME_answer():
-    """Threading the dialect to SOME call sites is worse than to none. Measured while building
-    this: `check_access` called `base_tables` without it and said the name was a CTE, while
-    `decide`'s audit list called it WITH the target and said it was a base read -- one statement,
-    two answers, Approved with `claim` in `tables` and no grant covering it."""
-    from mnemiq.sql.authz_guard import check_access
-    from mnemiq.sql.guard import check_shape
+    """Threading the dialect to SOME call sites is worse than to none, twice measured while
+    building this. First: `check_access` called `base_tables` without it and said the name was a
+    CTE while `decide`'s audit list said it was a base read -- Approved with `claim` in `tables`
+    and no grant covering it. Then: `column_tables` had not learned the fold either, so
+    `check_cls` treated a DENIED column's qualifier as a CTE on the statement `base_tables` had
+    just called a real read, and the denied column came back Approved.
 
-    for engine, expect_read in (("oracle", True), ("postgres", False)):
-        ast = check_shape(_ORACLE_ONLY, dialect=engine, executes_as=engine)
-        reads = {t.name for t in base_tables(ast, engine)}
-        refused = check_access(ast, _VISIBLE, engine) is not None
-        assert ("claim" in reads) is expect_read, engine
-        assert refused is expect_read, f"{engine}: the two resolvers disagree"
+    So this exercises resolvers that do NOT share a call, which the first version of this test did
+    not -- it asked `base_tables` and `check_access`, whose names both come from one
+    `base_tables(ast, dialect)`, and stayed green under the mutation it was named for."""
+    from mnemiq.sql.authz_guard import check_access
+    from mnemiq.sql.cls import check_cls
+    from mnemiq.sql.guard import check_shape
+    from mnemiq.sql.policy import AccessPolicy
+    from mnemiq.sql.scope import column_tables
+
+    denied = AccessPolicy(denied={("claim", "ssn")})
+    sql = 'WITH "claim" AS (SELECT id FROM policy) SELECT claim.ssn FROM claim'
+
+    for engine, engine_reads_the_table in (("oracle", True), ("postgres", False), ("duckdb", False)):
+        ast = check_shape(sql, dialect=engine, executes_as=engine)
+
+        reads = {t.name for t in base_tables(ast, engine)}                      # audit list
+        owners = column_tables(ast, engine) or {}                               # CLS attribution
+        attributed = {v for v in owners.values()}
+        refused_col = check_cls(ast, denied, engine) is not None                # column guard
+
+        assert ("claim" in reads) is engine_reads_the_table, f"{engine}: base_tables"
+        assert ("claim" in attributed) is engine_reads_the_table, f"{engine}: column_tables"
+        assert refused_col is engine_reads_the_table, f"{engine}: check_cls disagrees"
+
+        # and the table guard agrees with all three
+        assert (check_access(ast, {"policy": {"id"}}, engine) is not None) is engine_reads_the_table
+
+
+def test_the_WRITE_path_resolves_reads_the_same_way_the_read_path_does():
+    """`apply_row_filters_to_write` took `executes_as` and forwarded it to the filter validator but
+    not to `apply_row_and_mask`, so the write path governed its reads with the PARSE dialect while
+    the read path used the executing one. The write half is the one that copies unfiltered rows
+    somewhere durable."""
+    import sqlglot
+
+    from mnemiq.sql.decide_write import _target_node
+    from mnemiq.sql.policy import AccessPolicy
+    from mnemiq.sql.rls import apply_row_filters_to_write
+
+    # `claim` is the CTE under a DOWN fold and the base table under Oracle's UP fold, so the row
+    # filter must reach it there and must not here.
+    sql = ('INSERT INTO scratch SELECT id, amount FROM '
+           '(WITH "claim" AS (SELECT id, amount FROM src) SELECT id, amount FROM claim) t')
+    visible = {"claim": {"id", "amount"}, "src": {"id", "amount"}, "scratch": {"id", "amount"}}
+    policy = AccessPolicy(row_filters={"claim": "amount > 0"})
+
+    def narrow(executes_as):
+        ast = sqlglot.parse_one(sql, read="duckdb")
+        out, narrowed = apply_row_filters_to_write(ast, policy, visible, _target_node(ast),
+                                                   "duckdb", executes_as=executes_as)
+        return {n.object for n in narrowed}, "amount > 0" in str(out)
+
+    assert narrow("oracle") == ({"claim"}, True), "unfiltered rows would be copied into scratch"
+    assert narrow("duckdb") == (set(), False), "the CTE really does shadow here"
+
+    # asserted BEHAVIOURALLY rather than by reading the source: an earlier version of this test
+    # checked that `executes_as=executes_as` appeared in the function's text, which is true of the
+    # filter-validator call in the same function -- so it passed with the read-path call stripped.
 
 
 def test_an_UNKNOWN_dialect_gets_the_strictest_reading_not_a_guess():

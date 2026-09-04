@@ -21,7 +21,7 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     # set of CTE names -- because a reference inside a CTE body naming that same CTE reads the
     # base table, and skipping it let an ungranted table through (M31).
     alias_to_table: dict[str, str] = {}
-    resolved = column_tables(ast)
+    resolved = column_tables(ast, dialect)
     for table in base_tables(ast, dialect):
         name = object_key(table)
         if name not in visible:

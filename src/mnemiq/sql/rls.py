@@ -67,7 +67,7 @@ def _validate_filter(
         wrapped = sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {filt}", read=dialect)
     except Exception:
         return None
-    resolved = column_tables(wrapped)
+    resolved = column_tables(wrapped, executes_as or dialect)
     if resolved is None:
         return None  # scopes unreadable -> the filter cannot be validated, so it is refused
 
@@ -220,7 +220,7 @@ def apply_row_and_mask(
     #     resolution declines to guess -> mask, as before.
     # Only a column resolved to a DIFFERENT base table is dropped, which is the reported defect
     # and the one case where the old answer was certainly wrong.
-    owners = column_tables(ast)
+    owners = column_tables(ast, executes_as or dialect)
     referenced_masked: set[str] = set()
     for column in ast.find_all(exp.Column):
         owner = None if owners is None else owners.get(id(column))
@@ -295,7 +295,11 @@ def apply_row_filters_to_write(
     An INSERT target is exempt and stays exempt: an INSERT does not read its target, and filtering
     rows on the way IN is not what a row filter means.
     """
-    rewritten, narrowed = apply_row_and_mask(ast, policy, visible, dialect=dialect, exclude=target)
+    # `executes_as` forwarded, or the write path governs its reads with the PARSE dialect
+    # while the read path uses the executing one -- two resolvers, one statement, and the
+    # write half is the one that copies unfiltered rows somewhere durable.
+    rewritten, narrowed = apply_row_and_mask(ast, policy, visible, dialect=dialect,
+                                            exclude=target, executes_as=executes_as)
     if isinstance(rewritten, Refusal):
         return rewritten, []
     ast = rewritten

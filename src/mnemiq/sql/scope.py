@@ -137,14 +137,31 @@ def _engine_shadows(table: exp.Table, source, ast: exp.Expression, dialect: str 
     what unlocked the base table. Postgres folds the unquoted reference to `claim` and preserves
     `"Claim"`, so the two are different objects there and the read was never authorized. (M79.)
 
-    Answering True when the defining node cannot be found keeps the previous behaviour for a shape
-    this cannot read, which is the direction that over-reports rather than under-reports only
-    because the caller then has to find the name in `visible`.
+    Answering True when the defining node cannot be found keeps the previous behaviour, and that
+    fails OPEN rather than closed -- the node is dropped from the read list and never reaches the
+    `visible` lookup. An earlier version of this note claimed the opposite. It is kept because no
+    shape was found that reaches it: `UNNEST`, `VALUES`, `LATERAL`, a table function and
+    `generate_series` all resolve to an `exp.Table` source or to no source at all. Kept, recorded,
+    and not defended -- if a shape does turn up, this is the line to change.
     """
     alias = _defining_identifier(source, ast)
     if alias is None:
         return True
     return resolve_identifier(alias, dialect) == resolve_name(table, dialect)
+
+
+def _is_base_read(table: exp.Table, scope, ast: exp.Expression, dialect: str | None) -> bool:
+    """Is this reference a real read, or does a local source stand in front of it?
+
+    ONE predicate, shared by `base_tables` and `column_tables`, because the two disagreeing inside
+    a single statement is the defect rather than a detail of it: with only `base_tables` taught the
+    dialect, the audit list named a base table while `check_cls` still believed the qualifier was a
+    CTE, and a DENIED column came back Approved on Oracle.
+    """
+    source = scope.sources.get(table.alias_or_name)
+    if isinstance(source, exp.Table):
+        return True
+    return source is not None and not _engine_shadows(table, source, ast, dialect)
 
 
 def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Table]:
@@ -174,11 +191,7 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
     out: list[exp.Table] = []
     for scope in root.traverse():
         for table in scope.tables:
-            source = scope.sources.get(table.alias_or_name)
-            if isinstance(source, exp.Table):
-                out.append(table)
-            elif source is not None and not _engine_shadows(table, source, ast, dialect):
-                # sqlglot calls it a local source; the ENGINE would not. It is a real read.
+            if _is_base_read(table, scope, ast, dialect):
                 out.append(table)
     # The write target, which no scope names. Added here rather than in each guard so the three
     # of them keep sharing one premise -- the M31 lesson, and the reason M48 sits in this file.
@@ -188,7 +201,7 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
     return out
 
 
-def column_tables(ast: exp.Expression) -> dict[int, str] | None:
+def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, str] | None:
     """`id(column node)` -> the base table its qualifier names **in that column's own scope**,
     or **None** when the scopes could not be resolved at all.
 
@@ -215,10 +228,14 @@ def column_tables(ast: exp.Expression) -> dict[int, str] | None:
 
     out: dict[int, str] = {}
     for scope in root.traverse():
+        # Built from `_is_base_read`, not from `sources` alone: a reference sqlglot bound to a
+        # same-named CTE that the ENGINE would not shadow is a base table, and reading `sources`
+        # here left it unattributed -- so `check_cls` treated a denied column's qualifier as a CTE
+        # and let it through, on the very statement `base_tables` had just called a real read.
         local = {
-            name: object_key(source)
-            for name, source in scope.sources.items()
-            if isinstance(source, exp.Table)
+            table.alias_or_name: object_key(table)
+            for table in scope.tables
+            if _is_base_read(table, scope, ast, dialect)
         }
         for column in getattr(scope, "columns", ()):
             table = local.get(column.table)

@@ -87,6 +87,15 @@ def resolve_stored(name: str, dialect: str | None) -> str:
 
     Always as an UNQUOTED identifier: the database has already applied its own folding by the time
     a name reaches its data dictionary, so `CREATE TABLE Claim` is `claim` in Postgres and `CLAIM`
-    in Oracle. Re-folding it is what makes a stored name comparable to a resolved reference.
+    in Oracle.
+
+    NOT yet wired, and named here so the next reader knows it was considered rather than missed.
+    The plan-versus-snapshot comparison still runs on as-typed text -- `check_access` tests
+    `object_key(table) not in visible` -- so on Postgres `SELECT id FROM CLAIM` is refused
+    `unauthorized_table` against a granted `claim`, though the engine folds them to one object.
+    That direction only ever REFUSES, which is why it is a usability defect rather than the leak
+    this module was written for, and why it is deferred rather than rushed: `visible`, the column
+    schema and the policy maps are all keyed by that text, so resolving one side means resolving
+    the boundary where all of them are built. This function is what that boundary will call.
     """
     return resolve(name, quoted=False, dialect=dialect)

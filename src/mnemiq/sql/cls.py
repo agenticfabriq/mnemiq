@@ -54,7 +54,7 @@ def check_cls(ast: exp.Expression, policy: AccessPolicy,
     # resolve columns against every base table the query references (not just visible ones)
     tables = base_tables(ast, dialect)
     referenced = {object_key(t) for t in tables}
-    resolved = column_tables(ast)
+    resolved = column_tables(ast, dialect)
     local = {cte.alias_or_name for cte in ast.find_all(exp.CTE)}
     aliased = local | {s.alias_or_name for s in ast.find_all(exp.Subquery) if s.alias_or_name}
 

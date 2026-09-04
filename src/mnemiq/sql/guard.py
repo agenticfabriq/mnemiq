@@ -357,12 +357,10 @@ def _has_projection_star(ast: exp.Expression, dialect: str) -> bool:
     the others fold them down -- one constant is wrong for one of them in the direction that
     vouches.
 
-    What remains is a false refusal where DuckDB folds a QUOTED name and the rule here preserves
-    it: a CTE `"CLAIM"` or `"Claim"` against any unquoted reference is one object in DuckDB and
-    two here. (Not `"claim"` -- that already folds to the same key, and an earlier version of this
-    note named it, sending a reader to a shape that passes.) Fail-closed, and it is M55's
-    question: quoting is discarded before `qualify.py` sees a name at all.
-    """
+    The fold itself belongs to `identifiers.resolve_name`, which knows both rules per dialect
+    -- so the false refusal this paragraph used to record, a quoted CTE against an unquoted
+    reference on DuckDB, is gone: DuckDB folds quoted names and the resolver now says so.
+"""
     # The top level keeps its own fail-open reading: a statement whose shape `_output_selects`
     # does not recognise returns no columns to a caller here, and refusing every such statement
     # would refuse writes and DDL this function is not the gate for. Fail-CLOSED starts one level
