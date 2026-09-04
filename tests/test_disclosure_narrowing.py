@@ -152,9 +152,10 @@ def test_merging_a_write_target_does_not_DROP_the_mask_the_read_loop_found():
 def test_a_mask_the_query_never_REFERENCED_is_not_reported_though_the_rewrite_applies_it():
     """`columns` tracks REFERENCE, not the rewrite — and it is imprecise in both directions.
 
-    This case is the UNDER one. The OVER one is live too: the masked-name scan never reads
-    `column.table`, so `SELECT p.ssn FROM person p JOIN claim c` sets `columns=True` on `claim`,
-    a table the caller asked nothing of. Neither is a bug to fix here; see `Narrowing`.
+    This is the UNDER case, and it is the only one left. The OVER case -- a same-named column on
+    another table setting the flag here -- was real when this test was written and is fixed:
+    ownership resolves through `column_tables`, and `tests/test_mask_attribution.py` guards both
+    that and the unresolved cases that must still over-mask.
 
     A table wrapped for its row filter has its masked columns NULLed regardless of whether the
     query mentions them, so the rewritten SQL below contains `NULL AS ssn` while this reports

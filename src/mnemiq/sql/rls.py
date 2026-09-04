@@ -131,22 +131,19 @@ class Narrowing:
 
     object: str          # the table, in the query's own spelling
     rows: bool           # a row filter was applied to it
-    # The query REFERENCED a column name this table masks. That is the flag's exact meaning, and
-    # it is neither "your answer lost a column" nor "the rewrite masked something" -- it misses in
-    # BOTH directions, so state them rather than let a consumer infer either:
+    # The query REFERENCED a column THIS table masks. That is the flag's exact meaning, and it is
+    # not "the rewrite masked something": a table wrapped for its ROW FILTER has its masked columns
+    # NULLed regardless, so `SELECT id FROM claim` under a filter plus a mask on `ssn` rewrites to
+    # `... NULL AS ssn ...` while this stays False. That gap is deliberate and kept -- a caller
+    # reading `id` was not narrowed by a mask on `ssn`, and saying so would be a false alarm on
+    # every filtered table carrying any mask.
     #
-    #   OVER  -- names are matched across the whole query without resolving which table owns each
-    #            reference, so `SELECT p.ssn FROM person p JOIN claim c` with `claim.ssn` masked
-    #            reports `claim` though only `person.ssn` was read.
-    #   UNDER -- a table wrapped for its ROW FILTER has its masked columns NULLed regardless, so
-    #            `SELECT id FROM claim` under a filter plus a mask on `ssn` rewrites to
-    #            `... NULL AS ssn ...` while this stays False. The rewrite masked; the answer did
-    #            not lose anything the caller asked for.
-    #
-    # The under-approximation is the one to keep: a caller reading `id` was not narrowed by a mask
-    # on `ssn`, and reporting it would be a false alarm on every filtered table that has any mask.
-    # The over-approximation is inherited from the masking loop, which is SAFE there (it masks
-    # more, never less) and is deliberately not changed by a disclosure feature.
+    # It no longer over-reports. Names used to be matched across the whole query without resolving
+    # ownership, so `SELECT p.ssn FROM person p JOIN claim c` with `claim.ssn` masked reported
+    # `claim`. Tolerable while this was an internal flag; a lie once a caller-facing sentence was
+    # built on it. Ownership is now resolved through `column_tables`, and the cases it cannot
+    # resolve -- resolver failure, a CTE qualifier, a genuinely ambiguous unqualified name -- keep
+    # the old over-approximation, because that direction only ever masks MORE.
     columns: bool
 
 
@@ -198,10 +195,28 @@ def apply_row_and_mask(
     for tbl, col in policy.masked:
         masked_by_table.setdefault(tbl.lower(), set()).add(col.lower())
 
+    # WHICH table a masked column name belongs to. Matching the bare name against every table
+    # marked a table as masked whenever any table masked that name -- so `SELECT p.ssn FROM person
+    # p JOIN claim c` with only `claim.ssn` masked reported `claim`, and the caller-facing sentence
+    # built on that flag told them a column was masked when nothing they read was.
+    #
+    # SAFETY IS THE CONSTRAINT, not accuracy: the old behaviour masked MORE than necessary, never
+    # less. So attribution only ever NARROWS this set where the owner is known, and every
+    # unresolved case keeps the old answer:
+    #   * `column_tables` returns None -- scopes could not be resolved at all -> mask, as before.
+    #   * a column has no entry -- its qualifier names a CTE or derived table -> mask, as before.
+    #   * an unqualified `ssn` across two tables that both mask it is genuinely ambiguous, and
+    #     resolution declines to guess -> mask, as before.
+    # Only a column resolved to a DIFFERENT base table is dropped, which is the reported defect
+    # and the one case where the old answer was certainly wrong.
+    owners = column_tables(ast)
     referenced_masked: set[str] = set()
     for column in ast.find_all(exp.Column):
+        owner = None if owners is None else owners.get(id(column))
         for tbl, cols in masked_by_table.items():
-            if column.name.lower() in cols:
+            if column.name.lower() not in cols:
+                continue
+            if owner is None or owner.lower() == tbl:
                 referenced_masked.add(tbl)
 
     # Resolved before the loop mutates the tree: `replace` invalidates the scope it was read from.
