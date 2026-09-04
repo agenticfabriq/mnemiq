@@ -322,9 +322,11 @@ def test_every_non_table_binding_resolves_a_definer():
     """The property the "costs nothing" claim rests on, read directly rather than inferred from
     verdicts: every non-table source a reference binds to has a definer that NAMES it.
 
-    These are the WORST case rather than the ordinary one -- collision shapes and CTEs, chosen
-    because they are what reaches a non-table binding at all. The ordinary shapes are next door,
-    and what they measure is the cost.
+    The CTE shapes here are the ORDINARY ones, verbatim from the sibling test -- a chained CTE
+    reaches a non-table binding in the normal course of things and gets a real answer. Only the
+    derived-table shapes are contrived, and only because nothing runnable makes a reference bind
+    to a derived table. What the sibling test measures is the cost; what this reads is the
+    property.
 
     The two halves are counted separately because they are reached by different SQL and were not
     equally covered: an earlier version listed five shapes of which three asserted nothing at all,
@@ -367,9 +369,10 @@ def test_every_non_table_binding_resolves_a_definer():
     # per half, so losing one cannot hide behind the other -- and one shape each, so a deleted
     # `, o` shows up rather than being absorbed by slack
     # Exact counts, not floors. `len(ctes)` was 2 against 4 observed bindings -- `a`, `b`, and `r`
-    # TWICE, the outer reference plus the recursive self-reference -- so if that self-reference
-    # stopped binding to a scope, which is the precise M79 regression `_defining_identifier`
-    # exists for, the count would fall 4 -> 3 and a `>= 2` floor would not notice.
+    # TWICE, the outer reference plus the recursive self-reference -- so a shape silently ceasing
+    # to produce a binding would have gone unseen. What the count guards is COVERAGE, not the
+    # resolver: if `_defining_identifier` regresses, the inner assert fires and the count stays 4.
+    # A count that falls means fewer sources were examined than this test believes it examines.
     assert bindings(derived) == 3, "the derived-table half asserted on the wrong number of sources"
     assert bindings(ctes) == 4, "the CTE half asserted on the wrong number of sources"
 
