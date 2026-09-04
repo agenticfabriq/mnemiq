@@ -22,10 +22,11 @@ _V = {"claim": {"id", "amount", "ssn"}, "person": {"id", "email"}}
 def _end_to_end(sql, policy, visible=None):
     """Run the REAL disclosure path, then check it against an independently derived `touched`."""
     ast = sqlglot.parse_one(sql, read="duckdb")
-    _out, narrowed = apply_row_and_mask(ast, policy, visible or _V, dialect="duckdb")
+    schema = visible or _V
+    _out, narrowed = apply_row_and_mask(ast, policy, schema, dialect="duckdb")
     # `touched` is derived from a FRESH parse of the original plan: `apply_row_and_mask` rewrites
     # in place, and deriving from the rewritten tree would read the fix back to itself.
-    return check(sqlglot.parse_one(sql, read="duckdb"), policy, narrowed)
+    return check(sqlglot.parse_one(sql, read="duckdb"), policy, narrowed, schema)
 
 
 def test_a_filtered_table_agrees():
@@ -150,11 +151,18 @@ def test_candidate_tables_would_have_called_that_reference_attributable():
 
 
 def test_an_unmeasurable_answer_does_not_count_as_agreeing():
+    """The fixture must be unmeasurable AND disagreeing. An unmeasurable answer that happens to
+    agree computes `disagreed == 0` with or without the `measurable` conjunct in `summarise`, so
+    it cannot fail on the mutation this assertion is named for -- a control that only runs against
+    the passing case is not measured."""
     c = check(sqlglot.parse_one("SELECT bogus.ssn FROM claim", read="duckdb"),
-              AccessPolicy(masked={("claim", "ssn")}), [])
+              AccessPolicy(masked={("claim", "ssn")}),
+              [Narrowed(object="claim", rows=False, columns=True)])
     assert not c.measurable
-    assert summarise([c]).unmeasurable == 1
-    assert summarise([c]).disagreed == 0, "an unmeasurable answer is not ALSO counted as disagreeing"
+    assert not c.agrees, "and it disagrees, so dropping the conjunct would change the count"
+    v = summarise([c])
+    assert v.unmeasurable == 1
+    assert v.disagreed == 0, "an unmeasurable answer is not ALSO counted as disagreeing"
 
 
 def test_a_column_matching_no_mask_never_makes_an_answer_unmeasurable():
@@ -209,3 +217,79 @@ def test_it_reports_WHICH_DIRECTION_failed():
     over = check(ast, AccessPolicy(), [Narrowed(object="claim", rows=True, columns=False)])
     assert not over.agrees and over.spurious == {("filter", "claim")} and over.missing == set()
     assert summarise([under, over]).disagreed == 2, "two defects must not cancel to green"
+
+
+# --- the plan is model-written, so it is mostly UNQUALIFIED ---------------------------------
+
+def test_an_UNQUALIFIED_masked_reference_is_measured_not_invalidated():
+    """`column_tables` records an entry only for a qualified column, the approved plan is
+    model-written, and nothing in the pipeline qualifies it -- so without the criterion's own
+    qualification step a plain `SELECT ssn FROM claim` is unmeasurable and the zero threshold fails
+    a run that was measurable all along. The whole control is then unable to pass."""
+    ast = sqlglot.parse_one("SELECT ssn FROM claim", read="duckdb")
+    policy = AccessPolicy(masked={("claim", "ssn")})
+
+    bare = touched(ast, policy)                       # no schema: exactly as written
+    assert bare.unattributable == ("ssn",) and bare.entries == set()
+
+    with_schema = touched(ast, policy, _V)            # the spec's named fix
+    assert with_schema.entries == {("mask", "claim")} and not with_schema.unattributable
+
+    c = _end_to_end("SELECT ssn FROM claim", policy)
+    assert c.agrees and c.measurable, (c.missing, c.spurious)
+
+
+def test_an_unqualified_reference_across_a_JOIN_attributes_to_the_owning_table():
+    sql = "SELECT p.id, ssn FROM person p JOIN claim c ON p.id = c.id"
+    c = _end_to_end(sql, AccessPolicy(masked={("claim", "ssn")}))
+    assert c.measurable and c.agrees and c.touched == {("mask", "claim")}
+
+
+def test_qualification_does_not_rescue_a_reference_naming_nothing():
+    """The exotic case stays unattributable: the qualifier is real, names no source, and inventing
+    an attribution for it is what would score the answer green unmeasured."""
+    t = touched(sqlglot.parse_one("SELECT bogus.ssn FROM claim", read="duckdb"),
+                AccessPolicy(masked={("claim", "ssn")}), _V)
+    assert t.unattributable and t.entries == set()
+
+
+def test_a_mask_only_arm_is_refused_because_it_can_never_clear_the_FLOOR():
+    """The two halves of this change must agree: `vacuous` requires an answer of EACH kind, so an
+    arm that can only ever produce mask entries is not a weaker governed arm -- every run of it is
+    scored vacuous, which reads as a failed control when the fault is the configuration."""
+    from mnemiq.contract import Column, Snapshot
+    from mnemiq.eval.governed import governed_grants
+
+    snap = Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="claim.id", object_id="claim", name="id"),
+        Column(id="claim.ssn", object_id="claim", name="ssn", pii_level="high"),
+    ])
+
+    mask_only = governed_grants(snap, ["claim"], mask_level="high")
+    assert mask_only.masked_columns and not mask_only.filtered_table
+    assert not mask_only.narrows_something, "a mask-only arm can never clear the non-vacuity floor"
+
+    both = governed_grants(snap, ["claim"], mask_level="high",
+                           filter_table="claim", filter_predicate="ssn IS NOT NULL")
+    assert both.narrows_something
+
+
+def test_an_AMBIGUOUS_unqualified_mask_stays_unmeasurable_rather_than_guessed():
+    """Both tables carry `email` and the reference names neither. The qualifier does not raise and
+    does not choose -- it leaves the column bare -- so `column_tables` records nothing and the
+    answer is UNMEASURABLE.
+
+    The disclosure path meanwhile masks it, because `referenced_masked` falls back to every
+    candidate when ownership is unresolved. That divergence is the point: the criterion must not
+    ratify a mask it cannot attribute, and a corpus containing this shape makes the run invalid
+    until the corpus or the harness is fixed -- not green, and not red against the product."""
+    sql = "SELECT email FROM claim JOIN person ON claim.id = person.id"
+    policy = AccessPolicy(masked={("claim", "email")})
+
+    t = touched(sqlglot.parse_one(sql, read="duckdb"), policy, _COLLIDE)
+    assert t.unattributable == ("email",), "ambiguous: attributing it either way is a guess"
+    assert t.entries == set()
+
+    c = _end_to_end(sql, policy, _COLLIDE)
+    assert not c.measurable, "so the answer is reported unmeasurable, not scored"
+    assert summarise([c]).unmeasurable == 1 and not summarise([c]).passes

@@ -16,6 +16,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from sqlglot import exp
+from sqlglot.errors import OptimizeError
+from sqlglot.optimizer.qualify_columns import qualify_columns
+from sqlglot.schema import MappingSchema
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import object_key
@@ -37,8 +40,48 @@ class Touched:
     unattributable: tuple[str, ...] = ()
 
 
-def touched(ast: exp.Expression, policy: AccessPolicy) -> Touched:
+def _qualified(ast: exp.Expression, schema) -> exp.Expression:
+    """The plan with every column attributed to its object, or the plan unchanged.
+
+    Without this the criterion cannot pass an ordinary run. `column_tables` records an entry only
+    for a column carrying a qualifier, the approved plan is MODEL-written, and nothing in the
+    pipeline runs sqlglot's qualifier -- so a plain `SELECT ssn FROM claim` is unattributable, the
+    answer is unmeasurable, and the zero threshold fails a run that was in fact measurable all
+    along. The spec names this fix: qualify the approved plan before deriving `touched`.
+
+    It is applied to a COPY and only to derive `touched`. The plan that ran is untouched, and the
+    disclosure side keeps reading the tree the engine actually saw.
+
+    Ambiguity is NOT an error the qualifier reports. Measured on the installed sqlglot, none of
+    `SELECT bogus.ssn FROM claim`, an unqualified `ssn` across two tables that BOTH carry one, or
+    an unknown column raises: each is left bare or left as written, so `column_tables` records
+    nothing and the reference reports unattributable. That is the outcome this wants -- an
+    ambiguous masked reference must not be silently assigned to one of its candidates -- and it is
+    why the except clause below is defensive rather than the mechanism. No naturally-parsed shape
+    was found to reach it.
+
+    A failure there leaves the plan alone rather than guessing, which lands in the same place:
+    unattributable, run invalid, loud. That is the direction that does not score an under-firing
+    build green.
+    """
+    if not schema:
+        return ast
+    try:
+        return qualify_columns(
+            ast.copy(),
+            MappingSchema({t: {c: "UNKNOWN" for c in cols} for t, cols in schema.items()}),
+            infer_schema=True,
+        )
+    except (OptimizeError, KeyError, ValueError):
+        return ast
+
+
+def touched(ast: exp.Expression, policy: AccessPolicy, schema=None) -> Touched:
     """What the policy narrows in what the plan REFERENCED.
+
+    `schema` is the caller's visible map -- the same one the disclosure path gets. Omitting it
+    measures the plan exactly as written, which reports every unqualified masked reference as
+    unattributable.
 
     "Referenced" is load-bearing and a draft of the spec dropped it, which inverted the criterion:
     without it `touched` becomes every masked pair whose table merely appears, so
@@ -59,6 +102,7 @@ def touched(ast: exp.Expression, policy: AccessPolicy) -> Touched:
     side reports, so the comparison itself stays exact on the object.
     """
     entries: set[Entry] = set()
+    ast = _qualified(ast, schema)
 
     for name in {object_key(t) for t in base_tables(ast)}:
         if policy.row_filter_for(name) is not None:
@@ -121,10 +165,10 @@ class AnswerCheck:
         return not self.unattributable
 
 
-def check(ast: exp.Expression, policy: AccessPolicy, narrowed) -> AnswerCheck:
+def check(ast: exp.Expression, policy: AccessPolicy, narrowed, schema=None) -> AnswerCheck:
     """Both directions are reported rather than a bool alone: a caller that sees only `False`
     cannot tell an under-fire from an over-fire, and they are not the same defect."""
-    t = touched(ast, policy)
+    t = touched(ast, policy, schema)
     d = disclosed(narrowed)
     return AnswerCheck(agrees=t.entries == d, missing=t.entries - d, spurious=d - t.entries,
                        unattributable=t.unattributable, touched=t.entries)
