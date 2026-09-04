@@ -382,11 +382,14 @@ def _respond(monkeypatch, payload: bytes):
         def __exit__(self, *a):
             return False
 
+        headers = {"Content-Length": str(len(payload))}
+
         def read(self, *args):
-            # `*args` because the real `HTTPResponse.read(amt)` takes a byte cap and the sink
-            # passes one. A stub narrower than the API it stands in for fails on the production
-            # call rather than on the behaviour under test.
-            return payload
+            # HONOURS the cap. A stub that ignores it cannot tell a working cap from a disabling
+            # one: with `_MAX_RECEIPT_BYTES = 64` every test stayed green here while production
+            # truncated every real receipt into invalid JSON and the feature silently did nothing.
+            amt = args[0] if args else None
+            return payload if amt is None else payload[:amt]
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
 
@@ -484,14 +487,20 @@ def test_a_receipt_whose_voided_field_is_not_a_list_cannot_break_the_answer(monk
     assert sink.dropped == 0, "the trace was accepted; an unreadable receipt is not a drop"
 
 
-def test_the_receipt_read_is_bounded(monkeypatch):
-    """`response.read()` is new blocking work on the synchronous answer path -- `Runtime.ask` does
-    not return until `record_answer` does. Unbounded, a receiver that trickles a large body extends
-    every user-visible answer, and `timeout=10` bounds each socket operation rather than the whole
-    read. So the read is capped, and the cap is asserted rather than trusted."""
+def test_the_receipt_read_is_bounded_by_the_declared_length(monkeypatch):
+    """The read asks for exactly what the receiver declared, never an open-ended slurp.
+
+    Asserted as an EQUALITY against the declared length rather than as an upper bound. The first
+    version of this test asserted only `limit <= 1 MiB`, which `_MAX_RECEIPT_BYTES = 64` satisfies
+    -- so a cap that silently disabled the feature (every real receipt refused for declaring more
+    than the cap allows) passed it.
+    """
+    body = json.dumps({"status": "accepted", "lineage_voided": ["trace-abc"]}).encode()
     seen = {}
 
     class _Resp:
+        headers = {"Content-Length": str(len(body))}
+
         def __enter__(self):
             return self
 
@@ -500,10 +509,138 @@ def test_the_receipt_read_is_bounded(monkeypatch):
 
         def read(self, *args):
             seen["limit"] = args[0] if args else None
-            return b'{"lineage_voided": []}'
+            return body
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
-    VerityTraceSink(_Settings()).record_answer(_event())
+    sink = VerityTraceSink(_Settings())
+    sink.record_answer(_event())
 
-    assert seen["limit"] is not None, "the body must be read with a byte cap, not slurped whole"
-    assert 0 < seen["limit"] <= 1 << 20, f"cap should be modest; got {seen['limit']}"
+    assert seen["limit"] == len(body), "the read must be bounded by the declared length"
+    assert sink.lineage_voided == 1, "and the receipt must still be understood"
+
+
+def test_a_receipt_without_a_declared_length_is_not_waited_on(monkeypatch):
+    """**A byte cap bounds bytes, not time.** `HTTPResponse.read(amt)` clips to `Content-Length`
+    only when it is known; on a chunked or length-unknown body it blocks on the socket until `amt`
+    bytes arrive, and `timeout=10` bounds each `recv` rather than the whole read. So a receiver
+    dribbling one byte per window holds the SYNCHRONOUS answer path -- `Runtime.ask` does not
+    return until `record_answer` does -- and the cap does nothing about it.
+
+    Refusing to start removes the UNDECLARED and over-large cases; it does not bound time in
+    general -- a receiver declaring a length within the cap can still dribble, and chunked bodies
+    trickle even when a `Content-Length` is present. Bounding time needs a deadline, which sync
+    urllib does not offer. This pins the case that is actually closed.
+    """
+    reads: list = []
+
+    class _Resp:
+        headers: dict[str, str] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, *args):
+            reads.append(args)
+            return b"{}"
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
+    sink = VerityTraceSink(_Settings())
+
+    sink.record_answer(_event())
+
+    assert reads == [], (
+        "the body must not be read at all. Asserted by RECORDING rather than by raising: "
+        "`_note_voided_claims` catches Exception, so a raising stub is swallowed and the test "
+        "passes whether or not the read happened"
+    )
+    assert sink.lineage_voided == 0
+    assert sink.dropped == 0, "declining to read a receipt is not a dropped trace"
+
+
+def test_a_receipt_larger_than_the_cap_is_not_read(monkeypatch):
+    """The same refusal, for a length that IS declared and is implausible for a batch receipt."""
+    reads: list = []
+
+    class _Resp:
+        headers = {"Content-Length": str(64 * 1024 * 1024)}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, *args):
+            reads.append(args)
+            return b"{}"
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
+    sink = VerityTraceSink(_Settings())
+
+    sink.record_answer(_event())
+
+    assert reads == [], "a body larger than the cap must not be read"
+    assert sink.lineage_voided == 0
+    assert sink.dropped == 0
+
+
+def test_the_cap_is_large_enough_for_a_real_receipt(monkeypatch):
+    """Bounds the cap from BELOW. The previous version asserted only `<= 1 MiB`, so setting the cap
+    to 64 bytes kept every test green while refusing every real receipt for declaring more than
+    the cap allows -- `lineage_voided` would read 0 forever and the feature would silently do
+    nothing. A cap that disables the feature must fail a test."""
+    ids = [f"trace-{i:04d}" for i in range(50)]
+    body = json.dumps({"status": "accepted", "accepted": 50, "lineage_voided": ids}).encode()
+    assert len(body) > 700, "a 50-trace receipt should be substantial enough to be a real probe"
+
+    _respond(monkeypatch, body)
+    sink = VerityTraceSink(_Settings())
+    sink.record_answer(_event())
+
+    assert sink.lineage_voided == 50, (
+        "a plausible real receipt must survive the cap intact; if this fails, "
+        "_MAX_RECEIPT_BYTES is too small and the feature is silently disabled"
+    )
+
+
+@pytest.mark.parametrize("declared", ["-1", "-65537", "not-a-number", ""])
+def test_a_nonsensical_declared_length_is_refused(monkeypatch, declared):
+    """**A BLOCKER from the review gate: the previous version traded a hard cap for trust.**
+
+    `read(_MAX_RECEIPT_BYTES)` capped memory on every response unconditionally. Replacing it with
+    `read(declared)` put the receiver's own number in that position, and only the UPPER bound was
+    checked -- so `Content-Length: -1` passed `-1 > 65536` and `read(-1)` takes `HTTPResponse`'s
+    unbounded branch: `http/client.py` sets `self.length = None` for a negative header and falls
+    through to `self.fp.read()`, which reads until EOF. A receiver declaring `-1` and dribbling
+    would get an unbounded, uncapped buffer on the synchronous answer path.
+
+    The lesson is narrower than "validate input": a guard that REPLACES a hard limit with a
+    negotiated one has to re-establish every bound the hard limit gave for free, not just the one
+    it was written to add.
+    """
+    reads: list = []
+
+    class _Resp:
+        headers = {"Content-Length": declared}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, *args):
+            reads.append(args)
+            return b"{}"
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
+    sink = VerityTraceSink(_Settings())
+
+    sink.record_answer(_event())
+
+    assert reads == [], f"a declared length of {declared!r} must not reach read()"
+    assert sink.lineage_voided == 0
+    assert sink.dropped == 0

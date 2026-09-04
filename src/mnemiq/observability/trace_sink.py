@@ -75,12 +75,18 @@ def _sha256(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
 
 
-# The receipt is read on the SYNCHRONOUS answer path -- `Runtime.ask` does not return until
-# `record_answer` does -- so it is capped rather than slurped. `timeout=10` on the request bounds
-# each socket operation, not the total body read, so a receiver that answers headers promptly and
-# then trickles would otherwise extend every user-visible answer. 64 KiB is far above any real
-# batch receipt (a few counts and a list of trace ids) and far below anything worth waiting for; a
-# truncated body fails to parse, which lands in the same guard as any other unreadable receipt.
+# The largest receipt worth holding a user's answer open for. Read on the SYNCHRONOUS answer path
+# -- `Runtime.ask` does not return until `record_answer` does -- so this bounds what we agree to
+# wait for, and the length must be DECLARED: see `_note_voided_claims` for why a byte cap alone
+# does not bound time. 64 KiB is far above any real batch receipt (a few counts and a list of
+# trace ids) and far below anything worth blocking an answer on.
+#
+# Too SMALL is a silent failure, not a loud one: every real receipt would be REFUSED before it is
+# read -- it declares more than the cap allows -- so `lineage_voided` would read 0 forever with
+# the feature quietly doing nothing and no error anywhere.
+# `test_the_cap_is_large_enough_for_a_real_receipt` is what makes a disabling value fail a test
+# instead. (An earlier draft said such a receipt would truncate into invalid JSON; that was the
+# mechanism before the declared-length check, and no longer a live path.)
 _MAX_RECEIPT_BYTES = 64 * 1024
 
 
@@ -307,7 +313,33 @@ class VerityTraceSink(TraceSink):
             # COUNT in its audit event, so both representations exist in the feature already.
             # `isinstance(..., list)` is the whole check -- a report is a list of ids or it is not
             # a report, and this receiver does not guess which.
-            voided = json.loads(response.read(_MAX_RECEIPT_BYTES)).get("lineage_voided")
+            # Read only what the receiver DECLARES, and only when that declaration is sane.
+            #
+            # `0 <=` is not defensive boilerplate; it is a BLOCKER this guard introduced and then
+            # closed. Putting the receiver's number where `_MAX_RECEIPT_BYTES` used to sit traded
+            # a hard cap for a negotiated one, and only the upper bound was checked -- so
+            # `Content-Length: -1` passed, and `read(-1)` takes `HTTPResponse`'s read-until-EOF
+            # branch (a negative header sets `self.length = None`), i.e. an unbounded buffer on
+            # the synchronous answer path. A guard that replaces a hard limit with a negotiated
+            # one must re-establish every bound the hard limit gave for free.
+            #
+            # WHAT THIS BOUNDS, precisely, because the first two drafts of this comment claimed
+            # more: bytes, and the undeclared and over-large cases. It does NOT bound TIME. A
+            # receiver that declares 1000 and dribbles still blocks -- `self.fp.read(amt)` loops
+            # on `recv` until `amt` bytes arrive and the request timeout bounds each `recv`, not
+            # the total -- and `Transfer-Encoding: chunked` alongside a `Content-Length` parses
+            # here while http.client still reads chunked, trickling just the same. Bounding time
+            # needs a deadline, which sync urllib does not give us. The residual exposure is a
+            # hostile or badly broken Verity holding an answer open; it is stated rather than
+            # papered over.
+            #
+            # A batch receipt is a few counts and a list of trace ids. One that will not say how
+            # big it is, or says something implausible, does not get to hold an answer open; we
+            # lose the report, which is the same outcome as an older Verity that never sends one.
+            declared = int(response.headers.get("Content-Length"))
+            if not (0 <= declared <= _MAX_RECEIPT_BYTES):
+                return
+            voided = json.loads(response.read(declared)).get("lineage_voided")
             if not isinstance(voided, list) or not voided:
                 return
             voided = [str(trace_id) for trace_id in voided]
