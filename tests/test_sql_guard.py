@@ -221,11 +221,13 @@ def test_a_cte_name_matches_what_it_RESOLVES_to_not_how_it_was_typed():
                 'WITH Claim AS (SELECT id FROM policy) SELECT * FROM "Claim"'):
         assert _refused(sql).code == RefusalCode.SELECT_STAR, sql
 
-    # And it must not over-refuse, which is the other direction and equally live. Everything
-    # below is ONE object in every engine here -- `qualify.py`: unquoted identifiers are
-    # case-insensitive -- so refusing them would reject ordinary model-written SQL, which is what
-    # makes a guard broken rather than safe. Quoting a definition but not its reference is the
-    # common LLM shape; a bare case mismatch was refused even before quoting entered the key.
+    # And it must not over-refuse, which is the other direction and equally live. Everything below
+    # is ONE object under the default `duckdb` these run on, and under every DOWN-folding engine --
+    # NOT under Oracle, where the two mixed-quoting cases are two objects and are refused; the
+    # dialect test below asserts that, and it is the rule rather than a bug. Refusing these would
+    # reject ordinary model-written SQL, which is what makes a guard broken rather than safe:
+    # quoting a definition but not its reference is the common LLM shape, and a bare case mismatch
+    # was refused even before quoting entered the key.
     _ok("WITH claim AS (SELECT id FROM policy) SELECT * FROM claim")
     _ok('WITH "claim" AS (SELECT id FROM policy) SELECT * FROM "claim"')
     _ok('WITH "claim" AS (SELECT id FROM policy) SELECT * FROM claim')
