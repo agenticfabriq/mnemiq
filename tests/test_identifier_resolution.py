@@ -284,8 +284,10 @@ def test_a_source_whose_definer_cannot_be_IDENTIFIED_is_checked_not_assumed_loca
     for engine in ("postgres", "oracle"):
         assert _verdict(leak, engine) == "Refusal", engine
 
-    # the control: same shape, alias the engine folds onto the reference, nothing to check
-    assert _verdict("SELECT id FROM (VALUES (1)) AS v(id)", "postgres") == "Approved"
+    # There is no APPROVING case for this branch to control against, and saying so is more
+    # honest than offering one that is vacuous: `SELECT id FROM (VALUES (1)) AS v(id)` names no
+    # table at all, so it is Approved under either answer and moves for neither. What the
+    # fail-closed choice actually costs is measured by the test below instead.
 
 
 def test_failing_closed_costs_no_ordinary_query():
@@ -297,6 +299,17 @@ def test_failing_closed_costs_no_ordinary_query():
                 "WITH c AS (SELECT id FROM policy) SELECT id FROM c",
                 "WITH RECURSIVE r AS (SELECT id FROM policy UNION ALL SELECT id FROM r) "
                 "SELECT id FROM r",
-                "SELECT p.id FROM policy p JOIN (SELECT id FROM policy) q ON p.id = q.id"):
+                "SELECT p.id FROM policy p JOIN (SELECT id FROM policy) q ON p.id = q.id",
+                "SELECT id FROM policy, LATERAL (SELECT id FROM policy) y",
+                "SELECT id FROM ((SELECT id FROM policy)) x",
+                "SELECT id FROM (SELECT id FROM (SELECT id FROM policy) i) o",
+                "WITH a AS (SELECT id FROM policy), b AS (SELECT id FROM a) SELECT id FROM b"):
         for engine in ("postgres", "oracle", "duckdb"):
             assert _verdict(sql, engine) == "Approved", f"{engine}: {sql}"
+
+    # The branch is consulted ONLY for a table NODE whose source is not an `exp.Table`, so none of
+    # the above reaches it -- a LATERAL or a derived table is not a collision. Measured directly
+    # across sqlglot 25.34.1, 26.16.4, 28.0.0 and 30.12.0: thirteen ordinary shapes, zero hits.
+    ast = sqlglot.parse_one("SELECT id FROM policy, LATERAL (SELECT id FROM policy) y",
+                            read="postgres")
+    assert {t.name for t in base_tables(ast, "postgres")} == {"policy"}

@@ -160,8 +160,14 @@ def _engine_shadows(table: exp.Table, source, dialect: str | None) -> bool:
 
     Failing closed retires the class instead of the instance: a source whose definer cannot be
     identified is one this cannot reason about, and the safe answer for a governance guard is to
-    check the name rather than to assume it is local. Measured, it costs nothing -- the whole
-    suite is unchanged -- because the shapes that reach it are the ones no legitimate query writes.
+    check the name rather than to assume it is local.
+
+    Its cost is measured, not assumed, because a guard that refuses legitimate analytics SQL is
+    broken rather than safe. The branch is consulted ONLY for a table NODE whose source is not an
+    `exp.Table` -- so a derived table, a CTE, a LATERAL or a UNION branch never reaches it unless a
+    reference COLLIDES with its name. Across sqlglot 25.34.1, 26.16.4, 28.0.0 and 30.12.0 -- the
+    whole range `pyproject.toml` declares, and this file already notes that scope internals differ
+    within it -- thirteen ordinary shapes produce zero hits, and the suite is unchanged.
     """
     alias = _defining_identifier(source)
     if alias is None:
