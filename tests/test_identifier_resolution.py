@@ -190,12 +190,30 @@ def test_a_RECURSIVE_cte_self_reference_does_not_fall_through_to_fail_open():
         assert _verdict(control, engine) == "Approved", engine
 
 
+def test_a_PARENTHESISED_body_does_not_hide_the_definer():
+    """One pair of parentheses turned the M79 refusal back into an Approved.
+
+    A parenthesised CTE body wraps the query in a `Subquery` that NAMES nothing, and the upward
+    walk stopped at it and answered "no definer" for a source that plainly has one. Walking past a
+    definer with no alias is the close; the shape is otherwise identical to `_LEAK`."""
+    for sql in ('WITH "Claim" AS ((SELECT id FROM policy)) SELECT id FROM Claim',
+                'WITH RECURSIVE "Claim" AS ((SELECT id FROM policy) UNION ALL '
+                '(SELECT id FROM Claim)) SELECT id FROM "Claim"'):
+        for engine in ("postgres", "oracle"):
+            assert _verdict(sql, engine) == "Refusal", f"{engine}: {sql}"
+
+    # and the parenthesised CONTROLS still run: an ordinary shadow, and a plain derived table
+    assert _verdict('WITH claim AS ((SELECT id FROM policy)) SELECT id FROM claim',
+                    "postgres") == "Approved"
+    assert _verdict("SELECT id FROM ((SELECT id FROM policy)) t", "postgres") == "Approved"
+
+
 def test_the_measuring_instrument_resolves_the_way_the_measured_path_does():
     """`touched` called `column_tables` with no dialect while the disclosure path called it with
     one, so the criterion disagreed with a CORRECT build: a quoted CTE sharing a masked table's
     name gave `touched={("mask","Claim")}` against an empty `disclosed`. Loud rather than silent,
     and still the defect this criterion exists to catch elsewhere."""
-    from mnemiq.eval.criterion import check
+    from mnemiq.eval.criterion import check, summarise
     from mnemiq.sql.policy import AccessPolicy
     from mnemiq.sql.rls import apply_row_and_mask
 
@@ -209,9 +227,19 @@ def test_the_measuring_instrument_resolves_the_way_the_measured_path_does():
                                             dialect="duckdb", executes_as="duckdb")
         return check(sqlglot.parse_one(sql, read="duckdb"), policy, narrowed, visible, "duckdb")
 
-    # the MASK half: `touched` reads `column_tables`
+    # The MASK half: `touched` reads `column_tables`. What the threading fixed is the spurious
+    # ENTRY -- `touched` was naming a mask on a table this answer never reads.
     mask = agree(sql, policy, visible)
-    assert mask.agrees and mask.touched == set(), (mask.missing, mask.spurious)
+    assert mask.touched == set(), mask.touched
+
+    # It is still UNMEASURABLE, and saying only `agrees` here would misreport that: `AnswerCheck`
+    # documents `agrees` as meaningless while `unattributable` is non-empty, and the run-level
+    # verdict on this answer is red either way. The reason is the spec's own classifier -- a
+    # qualifier naming a CTE records nothing in `column_tables`, and `ssn` matches a masked name,
+    # so the reference cannot be attributed. That is a limit of the instrument, not a defect in
+    # the product, and the spec's remedy for it is to fix the corpus or the harness.
+    assert not mask.measurable and mask.unattributable == ("Claim.ssn",)
+    assert summarise([mask]).unmeasurable == 1
 
     # the FILTER half reads `base_tables`, and needs its own case -- the mask case above stays
     # green with the dialect stripped from that call, so it is not a control for it. Without it
@@ -220,6 +248,7 @@ def test_the_measuring_instrument_resolves_the_way_the_measured_path_does():
                      AccessPolicy(row_filters={"claim": "id > 0"}),
                      {"claim": {"id"}, "policy": {"id"}})
     assert filtered.agrees and filtered.touched == set(), (filtered.missing, filtered.spurious)
+    assert filtered.measurable, "the filter half has no masked-column reference to lose"
 
 
 def test_sqlglot_binds_by_exact_text_which_over_reports_rather_than_under():

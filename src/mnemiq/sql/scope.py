@@ -128,12 +128,18 @@ def _defining_identifier(source) -> exp.Expression | None:
     node = getattr(source, "expression", None)
     while node is not None:
         if isinstance(node, exp.CTE | exp.Subquery):
-            return node.args.get("alias")
+            alias = node.args.get("alias")
+            if alias is not None:
+                return alias
+            # An alias-less definer NAMES nothing, so stopping here answers "no definer" for a
+            # source that plainly has one. A parenthesised CTE body -- `WITH "Claim" AS ((SELECT
+            # ...))` -- wraps the body in exactly that, and one pair of parentheses turned the M79
+            # refusal back into an Approved. Keep walking to the node that does name it.
         node = node.parent
     return None
 
 
-def _engine_shadows(table: exp.Table, source, ast: exp.Expression, dialect: str | None) -> bool:
+def _engine_shadows(table: exp.Table, source, dialect: str | None) -> bool:
     """Would the EXECUTING engine resolve this reference to that local source?
 
     sqlglot matches a source by its bare name and the engine does not, so a CTE could hide a base
@@ -156,7 +162,7 @@ def _engine_shadows(table: exp.Table, source, ast: exp.Expression, dialect: str 
     return resolve_identifier(alias, dialect) == resolve_name(table, dialect)
 
 
-def _is_base_read(table: exp.Table, scope, ast: exp.Expression, dialect: str | None) -> bool:
+def _is_base_read(table: exp.Table, scope, dialect: str | None) -> bool:
     """Is this reference a real read, or does a local source stand in front of it?
 
     ONE predicate, shared by `base_tables` and `column_tables`, because the two disagreeing inside
@@ -167,7 +173,7 @@ def _is_base_read(table: exp.Table, scope, ast: exp.Expression, dialect: str | N
     source = scope.sources.get(table.alias_or_name)
     if isinstance(source, exp.Table):
         return True
-    return source is not None and not _engine_shadows(table, source, ast, dialect)
+    return source is not None and not _engine_shadows(table, source, dialect)
 
 
 def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Table]:
@@ -197,7 +203,7 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
     out: list[exp.Table] = []
     for scope in root.traverse():
         for table in scope.tables:
-            if _is_base_read(table, scope, ast, dialect):
+            if _is_base_read(table, scope, dialect):
                 out.append(table)
     # The write target, which no scope names. Added here rather than in each guard so the three
     # of them keep sharing one premise -- the M31 lesson, and the reason M48 sits in this file.
@@ -241,7 +247,7 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
         local = {
             table.alias_or_name: object_key(table)
             for table in scope.tables
-            if _is_base_read(table, scope, ast, dialect)
+            if _is_base_read(table, scope, dialect)
         }
         for column in getattr(scope, "columns", ()):
             table = local.get(column.table)
