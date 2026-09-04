@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import logging
 import urllib.error
 import urllib.request
@@ -75,6 +76,39 @@ def _sha256(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
 
 
+# The largest receipt worth holding a user's answer open for. Read on the SYNCHRONOUS answer path
+# -- `Runtime.ask` does not return until `record_answer` does -- so this bounds what we agree to
+# wait for, and the length must be DECLARED: see `_note_voided_claims` for why a byte cap alone
+# does not bound time. 64 KiB is far above any real batch receipt (a few counts and a list of
+# trace ids) and far below anything worth blocking an answer on.
+#
+# Too SMALL is a silent failure, not a loud one: every real receipt would be REFUSED before it is
+# read -- it declares more than the cap allows -- so `lineage_voided` would read 0 forever with
+# the feature quietly doing nothing and no error anywhere.
+# `test_the_cap_is_large_enough_for_a_real_receipt` is what makes a disabling value fail a test
+# instead. (An earlier draft said such a receipt would truncate into invalid JSON; that was the
+# mechanism before the declared-length check, and no longer a live path.)
+_MAX_RECEIPT_BYTES = 64 * 1024
+
+# The wall-clock budget for reading a receipt, and the real bound on this feature's cost to a user.
+#
+# **Codex adversarial review, [high].** urllib's `timeout` is per socket OPERATION, not a total
+# deadline, so a receiver that declares an allowed length and then dribbles keeps `read` alive
+# indefinitely -- and `Runtime.ask` does not return until `record_answer` does, so it can hang
+# answers and exhaust request workers after having already accepted the trace. A byte cap does not
+# touch that; only a clock does. Documenting it as residual, which is what the previous version
+# did, left a live way for Verity to degrade answers inside the one class whose entire contract is
+# that it cannot -- and one that did not exist before this feature read the body at all.
+_RECEIPT_DEADLINE_SECONDS = 2.0
+
+# The most one `read1` call may return. NOT what makes the deadline enforceable -- `read1`'s
+# short-return semantics are; a mutation setting this to the whole cap leaves the bound intact,
+# because `read1` comes back after one underlying read whatever size it was asked for. It caps the
+# memory a single call can commit, and nothing more. An earlier comment here claimed slicing was
+# the mechanism, which was true only of the `read`-based version that did not work.
+_RECEIPT_CHUNK_BYTES = 8 * 1024
+
+
 class VerityTraceSink(TraceSink):
     """Post one trace per answer, fail-soft, with the tier table as the only source of payload."""
 
@@ -99,6 +133,11 @@ class VerityTraceSink(TraceSink):
         self.dropped_unbuildable = 0
         self.dropped_rejected = 0
         self.dropped_unavailable = 0
+        # NOT a drop, and deliberately not part of `dropped`: the trace reached the store and the
+        # audit record is whole. What was lost is the lineage claim riding on it, because this
+        # engine sent a shape Verity could not read. An operator summing `dropped` must not see
+        # this; an engineer asking "is our payload right" must.
+        self.lineage_voided = 0
 
     # -- tier gates ------------------------------------------------------------------------------
     def _send_text(self) -> bool:
@@ -294,6 +333,117 @@ class VerityTraceSink(TraceSink):
         logger.warning("verity trace dropped (%s; %d total); answer unaffected: %s",
                        cause, self.dropped, exc)
 
+    def _read_within_deadline(self, response: Any, declared: int) -> bytes | None:
+        """Read `declared` bytes, or give up at the deadline. `None` means abandoned.
+
+        Abandoning is a normal outcome, not an error: the trace is stored and the report is lost,
+        which is exactly what an older Verity that never sends one produces. An answer is worth
+        more than a diagnostic about the answer's payload.
+
+        The loop bounds the total ONLY because each slice is a `read1` that returns after one
+        underlying read. Built on `read` it was decorative: the budget was checked between calls
+        that never came back early.
+        """
+        # `read1`, NOT `read`, and this is the whole mechanism.
+        #
+        # `HTTPResponse.read(amt)` does not return short: it delegates to `BufferedReader.read`,
+        # which blocks until `amt` bytes arrive or EOF. Every receipt the cap admits is under one
+        # slice, so a loop built on `read` consumes the whole body in ONE call and never re-checks
+        # its own budget -- a deadline that cannot be reached. Measured against a real dribbling
+        # server, 100 bytes at one per 50ms with a 1.0s budget: `read` returned all 100 bytes
+        # after 5.60s; `read1` returned 19 bytes after 1.01s. `read1` returns after a single
+        # underlying read, which is what gives the loop somewhere to stand.
+        read1 = getattr(response, "read1", None)
+        if read1 is None:
+            # Nothing to bound the read with, so we do not start one. Losing the report is the
+            # same outcome as an older Verity that never sends one; an unbounded read on the
+            # answer path is not.
+            return None
+
+        deadline = time.monotonic() + _RECEIPT_DEADLINE_SECONDS
+        chunks: list[bytes] = []
+        remaining = declared
+        while remaining > 0:
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "verity receipt abandoned after %.1fs; the trace is stored and any voided "
+                    "lineage claim goes unreported rather than delaying an answer",
+                    _RECEIPT_DEADLINE_SECONDS,
+                )
+                return None
+            chunk = read1(min(remaining, _RECEIPT_CHUNK_BYTES))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def _note_voided_claims(self, response: Any) -> None:
+        """Read the receipt. Verity accepts a trace whose lineage claim it could not read and
+        names it in `lineage_voided`; this sink read no response body at all, so that 200 was
+        byte-identical to a clean one.
+
+        That is the receiving side's own finding seen from here: Verity was fixed to SAY it had
+        dropped a claim, and a producer that never reads the answer is told nothing either way.
+        Being told is worth nothing if nobody listens.
+
+        Absent means absent -- an older Verity, or any other receiver, answers without the field,
+        and that is not a voided claim. The same distinction the field exists for, one level up.
+
+        Fail-soft like the rest of this class: the answer already succeeded and the trace is
+        stored, so a receipt this sink cannot parse changes nothing and is not a drop.
+        """
+        try:
+            # Bounded, and EVERYTHING that touches the value is inside this block. The first
+            # version guarded only the parse, so a receipt that was valid JSON with a non-list
+            # `lineage_voided` escaped: `3` and `true` raised TypeError out of `record_answer`,
+            # past the caller's `except (URLError, OSError, ValueError)` and into `Runtime.ask` --
+            # breaking the one promise this class exists to keep. `"trace-abc"` did not raise and
+            # was worse, counting 9 and logging nine single characters as trace ids.
+            #
+            # A count-shaped value is not hypothetical: Verity writes this same field name as a
+            # COUNT in its audit event, so both representations exist in the feature already.
+            # `isinstance(..., list)` is the whole check -- a report is a list of ids or it is not
+            # a report, and this receiver does not guess which.
+            # Read only what the receiver DECLARES, and only when that declaration is sane.
+            #
+            # `0 <=` is not defensive boilerplate; it is a BLOCKER this guard introduced and then
+            # closed. Putting the receiver's number where `_MAX_RECEIPT_BYTES` used to sit traded
+            # a hard cap for a negotiated one, and only the upper bound was checked -- so
+            # `Content-Length: -1` passed, and `read(-1)` takes `HTTPResponse`'s read-until-EOF
+            # branch (a negative header sets `self.length = None`), i.e. an unbounded buffer on
+            # the synchronous answer path. A guard that replaces a hard limit with a negotiated
+            # one must re-establish every bound the hard limit gave for free.
+            #
+            # WHAT THIS BOUNDS: bytes, and the undeclared and over-large cases. TIME is bounded
+            # separately, by `_read_within_deadline` below -- a receiver that declares a size
+            # inside the cap and then dribbles is a real threat and this check does nothing about
+            # it. Two earlier drafts of this comment claimed the byte cap bounded time, and one
+            # claimed the exposure was merely residual; both were wrong, and the second was wrong
+            # in a worse way, because it read as a decision rather than a defect.
+            #
+            # A batch receipt is a few counts and a list of trace ids. One that will not say how
+            # big it is, or says something implausible, does not get to hold an answer open; we
+            # lose the report, which is the same outcome as an older Verity that never sends one.
+            declared = int(response.headers.get("Content-Length"))
+            if not (0 <= declared <= _MAX_RECEIPT_BYTES):
+                return
+            body = self._read_within_deadline(response, declared)
+            if body is None:
+                return
+            voided = json.loads(body).get("lineage_voided")
+            if not isinstance(voided, list) or not voided:
+                return
+            voided = [str(trace_id) for trace_id in voided]
+        except Exception:  # noqa: BLE001 - a receipt we cannot read is not a reason to act
+            return
+        self.lineage_voided += len(voided)
+        logger.warning(
+            "verity kept %d trace(s) but could not read the lineage claim on them (%d total); "
+            "the drift is in this engine's payload: %s",
+            len(voided), self.lineage_voided, ", ".join(voided),
+        )
+
     def record_answer(self, event: AnswerEvent) -> None:
         url = getattr(self._settings, "verity_traces_url", None)
         if not url:
@@ -309,7 +459,8 @@ class VerityTraceSink(TraceSink):
             headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=10):
+            with urllib.request.urlopen(request, timeout=10) as response:
+                self._note_voided_claims(response)
                 return
         except (urllib.error.URLError, OSError, ValueError) as exc:
             # Never raises into Runtime.ask: a Verity outage cannot stop mnemiq answering. But M18
