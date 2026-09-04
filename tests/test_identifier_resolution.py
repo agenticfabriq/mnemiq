@@ -307,44 +307,64 @@ def test_failing_closed_costs_no_ordinary_query():
         for engine in ("postgres", "oracle", "duckdb"):
             assert _verdict(sql, engine) == "Approved", f"{engine}: {sql}"
 
-    # WHY it costs nothing, asserted rather than asserted-about. The `_verdict` loop above is not
-    # a control for this -- it stays green with the fail-open answer restored -- so this reads the
-    # property directly: for every ordinary shape, each non-table source a reference binds to has
-    # a definer that NAMES it, so the `alias is None` fallback is never the answer.
-    #
-    # Note it is the FALLBACK that is unreached, not `_engine_shadows` itself: a chained CTE
-    # reaches the function and gets a real answer from it. An earlier version of this assertion
-    # conflated the two and failed on exactly that shape.
-    from sqlglot.optimizer.scope import build_scope
-
-    from mnemiq.sql.scope import _defining_identifier
-
-    # A shape only counts here if a reference actually BINDS to a non-table source. Three of the
-    # first five did not -- their table nodes all bind to `exp.Table` and skip the assertion --
-    # so the derived-table half went unasserted and dropping `exp.Subquery` from the definer walk
-    # left the whole suite green. `..., x` is what makes a reference bind to a derived table.
-    examined = 0
-    for sql in ("SELECT id FROM policy, LATERAL (SELECT id FROM policy) y",
-                "SELECT id FROM ((SELECT id FROM policy)) x",
-                "SELECT id FROM (SELECT id FROM policy) x, x",           # binds to a Subquery
-                "SELECT id FROM ((SELECT id FROM policy)) x, x",         # ...through parentheses
-                "SELECT id FROM (SELECT id FROM (SELECT id FROM policy) i) o, o",
-                "WITH a AS (SELECT id FROM policy), b AS (SELECT id FROM a) SELECT id FROM b",
-                "WITH RECURSIVE r AS (SELECT id FROM policy UNION ALL SELECT id FROM r) "
-                "SELECT id FROM r"):
-        root = build_scope(sqlglot.parse_one(sql, read="postgres"))
-        for scope in root.traverse():
-            for table in scope.tables:
-                source = scope.sources.get(table.alias_or_name)
-                if source is None or isinstance(source, exp.Table):
-                    continue
-                examined += 1
-                assert _defining_identifier(source) is not None, (
-                    f"{table.sql()} in {sql} reaches the fail-closed fallback")
-
-    assert examined >= 6, f"the loop asserted on only {examined} sources -- it proves nothing"
+    # These are RUNNABLE queries, and what they measure is the cost: none is refused. The
+    # property behind that -- that no ordinary shape reaches the fallback -- is read directly by
+    # `test_no_ORDINARY_shape_reaches_the_fail_closed_fallback`, because this loop is not a
+    # control for it: it stays green with the fail-open answer restored.
 
     # Run on ONE sqlglot -- whatever the lock pins -- so this proves nothing about other versions.
     # 25.34.1, 26.16.4, 28.0.0 and 30.12.0 were each installed and probed by hand and each gave
     # zero hits over thirteen shapes; that is a sample of a floor with no ceiling, not the range,
     # and nothing here re-runs it.
+
+
+def test_no_ORDINARY_shape_reaches_the_fail_closed_fallback():
+    """The property the "costs nothing" claim rests on, read directly rather than inferred from
+    verdicts: every non-table source a reference binds to has a definer that NAMES it.
+
+    The two halves are counted separately because they are reached by different SQL and were not
+    equally covered: an earlier version listed five shapes of which three asserted nothing at all,
+    every table node in them binding to an `exp.Table`, so dropping `exp.Subquery` from the walk
+    left the whole suite green.
+
+    It is the FALLBACK that ordinary shapes miss, not `_engine_shadows` -- a chained CTE reaches
+    the function and gets a real answer from it. A first version conflated those and failed on
+    exactly that shape.
+    """
+    from sqlglot.optimizer.scope import build_scope
+
+    from mnemiq.sql.scope import _defining_identifier
+
+    # NOT executable SQL: a derived-table alias is not a relation in its own FROM, so duckdb says
+    # "Table with name x does not exist". They are here because they are the only way to make a
+    # REFERENCE bind to a derived-table source, which is the half `exp.Subquery` covers. Their
+    # cost is not what this measures -- the sibling test measures that, on runnable queries.
+    derived = ("SELECT id FROM (SELECT id FROM policy) x, x",
+               "SELECT id FROM ((SELECT id FROM policy)) x, x",
+               "SELECT id FROM (SELECT id FROM (SELECT id FROM policy) i) o, o")
+    ctes = ("WITH a AS (SELECT id FROM policy), b AS (SELECT id FROM a) SELECT id FROM b",
+            "WITH RECURSIVE r AS (SELECT id FROM policy UNION ALL SELECT id FROM r) "
+            "SELECT id FROM r")
+
+    def bindings(shapes):
+        seen = 0
+        for sql in shapes:
+            root = build_scope(sqlglot.parse_one(sql, read="postgres"))
+            for scope in root.traverse():
+                for table in scope.tables:
+                    source = scope.sources.get(table.alias_or_name)
+                    if source is None or isinstance(source, exp.Table):
+                        continue
+                    seen += 1
+                    assert _defining_identifier(source) is not None, (
+                        f"{table.sql()} in {sql} reaches the fail-closed fallback")
+        return seen
+
+    # per half, so losing one cannot hide behind the other -- and one shape each, so a deleted
+    # `, o` shows up rather than being absorbed by slack
+    assert bindings(derived) >= len(derived), "the derived-table half asserted on too few sources"
+    assert bindings(ctes) >= len(ctes), "the CTE half asserted on too few sources"
+
+    # Counted on the pinned sqlglot only. `pyproject` declares `>=25.34.1` with no ceiling and
+    # this repo already records that scope internals differ across that span, so a version binding
+    # these differently fails the count rather than the property it stands for.
