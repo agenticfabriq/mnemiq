@@ -103,8 +103,9 @@ def decide(
                           scope_resolved=scope_resolved(shaped))
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
+    narrowed: list = []
     if not policy.empty:
-        shaped = apply_row_and_mask(shaped, policy, visible, dialect=dialect)
+        shaped, narrowed = apply_row_and_mask(shaped, policy, visible, dialect=dialect)
         if isinstance(shaped, Refusal):
             return shaped
 
@@ -122,4 +123,4 @@ def decide(
             return refused
 
     return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables,
-                    lineage=lineage, columns=columns)
+                    lineage=lineage, columns=columns, narrowed=narrowed)

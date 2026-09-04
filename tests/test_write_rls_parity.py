@@ -107,7 +107,7 @@ _INVALID = [
 @pytest.mark.parametrize("label,filt", _INVALID, ids=[c[0] for c in _INVALID])
 def test_an_invalid_row_filter_is_refused_identically_on_both_paths(label, filt):
     read = apply_row_and_mask(sqlglot.parse_one("SELECT id FROM claim", read="duckdb"),
-                              _policy(filt), _VISIBLE, dialect="duckdb")
+                              _policy(filt), _VISIBLE, dialect="duckdb")[0]
     assert isinstance(read, Refusal) and read.code == RefusalCode.INVALID_ROW_FILTER
 
     write = _write("UPDATE claim SET amount = 0 WHERE id = 1", _policy(filt))
@@ -197,7 +197,7 @@ def test_the_write_path_rewrites_a_read_exactly_as_the_read_path_does(label, sel
     *nearly* the same.
     """
     read = sqlglot.parse_one(select_sql, read="duckdb")
-    governed_read = apply_row_and_mask(read, policy, _VISIBLE, dialect="duckdb")
+    governed_read = apply_row_and_mask(read, policy, _VISIBLE, dialect="duckdb")[0]
     assert not isinstance(governed_read, Refusal)
 
     verdict = _write(f"INSERT INTO scratch (id, amount) {select_sql}", policy)

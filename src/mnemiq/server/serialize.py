@@ -40,6 +40,10 @@ def answer_payload(ans: AgentAnswer) -> dict:
                      "completeness": t.lineage_completeness,
                      "unresolved": list(t.lineage_unresolved),
                      "reasons": list(t.lineage_reasons)} if t else None),
+        # Structured beside the sentence that is already in `answer`. `null` distinguishes "not
+        # evaluated" from the `[]` that claims nothing was narrowed.
+        "narrowed": ([n.model_dump() for n in t.narrowed]
+                     if t and t.narrowed is not None else None),
         "enrichment_version": t.enrichment_version if t else None,
         "timing": t.timing if t else None,
         "preview": ({"columns": p.columns, "rows": p.rows, "row_count": p.row_count,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from mnemiq.contract import IdentityContext, Trace
+from mnemiq.contract.seams import Narrowed
 from mnemiq.sql.verdict import Approved
 
 
@@ -32,5 +33,11 @@ def build_trace(
         lineage_completeness=getattr(approved.lineage, "completeness", "unknown"),
         lineage_unresolved=list(getattr(approved.lineage, "unresolved", []) or []),
         lineage_reasons=list(getattr(approved.lineage, "reasons", []) or []),
+        # Narrowing rides to the audit store on the same rule as lineage: with the answer or not
+        # at all. `getattr` default None, so a decider that never evaluated governance records
+        # "not evaluated" rather than the claim that it narrowed nothing.
+        narrowed=[Narrowed(object=n.object, rows=n.rows, columns=n.columns)
+                  for n in (getattr(approved, "narrowed", None) or [])]
+        if getattr(approved, "narrowed", None) is not None else None,
         definitions_used=[],  # the glossary lands in Plan 08
     )
