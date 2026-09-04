@@ -45,7 +45,7 @@ def check_shape(
             subject=type(ast).__name__.upper(),
         )
 
-    if _has_projection_star(ast):
+    if _has_projection_star(ast, dialect):
         return Refusal(
             code=RefusalCode.SELECT_STAR,
             message=(
@@ -99,27 +99,47 @@ def _sources(select: exp.Select) -> dict[str, exp.Expression]:
 # scope it is read from. `Scope` is that pair, and pairing them is the whole point: a bare
 # `name -> body` map has to borrow some caller's names to interpret the body, and the caller's
 # names are not the ones the body was written against.
-# Keyed by (name, quoted), never by name alone. Quoting is half the identity: Postgres folds an
-# unquoted name and preserves a quoted one, so `"Claim"` and `Claim` are two different objects
-# there and matching them let a CTE vouch for a base table.
-Scope = dict[tuple[str, bool], tuple[exp.Expression, "Scope"]]
+# Keyed by RESOLVED identifier, never by the name as typed. Two spellings name one object or two
+# depending on quoting, and getting that wrong in either direction has a cost: too wide and a CTE
+# vouches for a base table, too narrow and ordinary SQL is refused.
+Scope = dict[str, tuple[exp.Expression, "Scope"]]
 
 
-def _identity(node: exp.Expression) -> tuple[str, bool]:
-    """A name plus whether it was written quoted -- the pair a dialect resolves, not the name.
+# Oracle folds unquoted identifiers UP where the others fold them down -- `adapters/oracle.py`
+# states it, and it is why a schema name is stored uppercased there. Both are "case-insensitive",
+# and a single hardcoded direction is wrong for one of them in the direction that VOUCHES: fold
+# down on Oracle and `WITH "claim" AS (...) SELECT * FROM claim` keys both sides to `claim`, while
+# Oracle resolves that reference to `CLAIM`, the base table.
+_FOLDS_UP = {"oracle"}
+
+
+def _identity(node: exp.Expression, dialect: str) -> str:
+    """What this name RESOLVES to in the dialect that will RUN it: unquoted identifiers are folded,
+    quoted ones are preserved.
+
+    So on Postgres `Claim` resolves to `claim` while `"Claim"` stays `Claim` -- two objects, which
+    is why a quoted CTE must not vouch for an unquoted reference to a base table; and `"claim"`
+    resolves to `claim` like the bare form, so the common shape of quoting a definition but not
+    its reference is ONE object and is not refused. On Oracle every one of those answers changes,
+    which is why the fold cannot be a constant here.
+
+    Treating a quoted name as preserved is fail-closed on DuckDB, which folds those too: it can
+    only refuse a shape DuckDB would resolve to the CTE, never vouch for one it would not.
 
     A CTE is identified by the name it DEFINES; a table reference by the name it READS. Those come
     from different places: `alias_or_name` on `c21 AS a` is the alias `a`, so using it for both
     made every aliased CTE reference miss and fall through to the base-table branch.
     """
-    identifier = node.args.get("alias").this if isinstance(node, exp.CTE) else node.this
-    while isinstance(identifier, exp.TableAlias):
-        identifier = identifier.this
-    quoted = bool(identifier.args.get("quoted")) if isinstance(identifier, exp.Identifier) else False
-    return ((node.alias_or_name if isinstance(node, exp.CTE) else node.name), quoted)
+    if isinstance(node, exp.CTE):
+        identifier, name = node.args["alias"].this, node.alias_or_name
+    else:
+        identifier, name = node.this, node.name
+    if isinstance(identifier, exp.Identifier) and identifier.args.get("quoted"):
+        return name
+    return name.upper() if dialect in _FOLDS_UP else name.lower()
 
 
-def _visible_ctes(node: exp.Expression, outer: Scope) -> Scope:
+def _visible_ctes(node: exp.Expression, outer: Scope, dialect: str) -> Scope:
     """The CTE names visible inside `node`, each bound to the scope ITS OWN body sees.
 
     Lexical, and lexical at the definition site. Two rules make that different from "the names
@@ -148,7 +168,7 @@ def _visible_ctes(node: exp.Expression, outer: Scope) -> Scope:
     recursive = bool(with_.args.get("recursive"))
     scope: Scope = dict(outer)
     for cte in with_.expressions:
-        key = _identity(cte)
+        key = _identity(cte, dialect)
         # snapshot BEFORE binding this name: the body sees the outer scope and its preceding
         # siblings, plus itself only when the WITH is RECURSIVE
         body_scope: Scope = dict(scope)
@@ -159,8 +179,8 @@ def _visible_ctes(node: exp.Expression, outer: Scope) -> Scope:
     return scope
 
 
-def _star_reaches_base(node: exp.Expression, ctes: Scope,
-                       memo: dict[int, bool], stack: frozenset[int]) -> bool:
+def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
+                       stack: frozenset[int], dialect: str) -> bool:
     """Does this expression's own OUTPUT projection reach a base table's unbounded column set?
 
     The recursion is the point. "Its projection is explicit" is a claim about the derived table,
@@ -189,9 +209,9 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope,
     selects = _output_selects(node)
     answer = True  # cannot be read -> cannot be vouched for
     if selects:
-        inner, within = _visible_ctes(node, ctes), stack | {id(node)}
+        inner, within = _visible_ctes(node, ctes, dialect), stack | {id(node)}
         answer = any(
-            _expands_a_base_table(select, projection, inner, memo, within)
+            _expands_a_base_table(select, projection, inner, memo, within, dialect)
             for select in selects
             for projection in select.expressions
             if _is_star(projection)
@@ -201,7 +221,7 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope,
 
 
 def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
-                          memo: dict[int, bool], stack: frozenset[int]) -> bool:
+                          memo: dict[int, bool], stack: frozenset[int], dialect: str) -> bool:
     """Would this star pull in the columns of a real source table?
 
     Over a base table the columns are unbounded: we would not know what we are returning, and
@@ -224,7 +244,7 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
 
     for source in candidates:
         if isinstance(source, exp.Subquery):
-            if _star_reaches_base(source.this, ctes, memo, stack):
+            if _star_reaches_base(source.this, ctes, memo, stack, dialect):
                 return True
             continue  # derived table whose projection really is explicit
         # A CTE reference is always a BARE name. Matching on `source.name` alone let a
@@ -232,17 +252,17 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
         # `WITH claim AS (SELECT id FROM policy) SELECT * FROM main.claim` resolves to the CTE
         # here and to the base table in the database, which returned every column of `claim`.
         if isinstance(source, exp.Table) and not source.db and not source.catalog \
-                and _identity(source) in ctes:
-            body, body_scope = ctes[_identity(source)]
+                and _identity(source, dialect) in ctes:
+            body, body_scope = ctes[_identity(source, dialect)]
             # `body_scope`, not `ctes`: the body is interpreted where it was written
-            if _star_reaches_base(body, body_scope, memo, stack):
+            if _star_reaches_base(body, body_scope, memo, stack, dialect):
                 return True
             continue  # a CTE: same
         return True
     return False
 
 
-def _has_projection_star(ast: exp.Expression) -> bool:
+def _has_projection_star(ast: exp.Expression, dialect: str) -> bool:
     """A star that would return columns we cannot name.
 
     Three things this deliberately does not reject -- a guard that refuses legitimate
@@ -267,18 +287,25 @@ def _has_projection_star(ast: exp.Expression) -> bool:
     refusing it, so the two rules that could widen one are asserted rather than assumed: a CTE
     reference is a bare name, and a body is read in the scope it was written in.
 
-    A CTE name matches only when the reference is spelled identically AND quoted identically.
-    Quoting is half an identifier's identity on the default transpile target -- Postgres folds an
-    unquoted name and preserves a quoted one -- so `WITH "Claim" AS (...) SELECT * FROM Claim`
-    matched on the name alone while Postgres resolves that reference to the base table `claim`,
-    whose columns then reached no grant check at all. `decide` approved exactly that with
-    `tables=['policy']`.
+    A CTE name matches on what the identifier RESOLVES to, which is the rule `qualify.py` already
+    states for these engines: unquoted is case-insensitive, quoted is preserved. Matching the name
+    as typed is wrong in both directions and both were live. Too wide:
+    `WITH "Claim" AS (...) SELECT * FROM Claim` matched, while Postgres -- the default transpile
+    target -- folds the reference to `claim` and resolves it to the base table, whose columns then
+    reached no grant check at all; `decide` approved exactly that with `tables=['policy']`. Too
+    narrow: requiring identical quoting refused `WITH "claim" AS (...) SELECT * FROM claim`, which
+    is one object in every engine here and is the ordinary shape of a model quoting a definition
+    but not its reference.
 
-    Requiring both narrows the match, and only a WIDER one can vouch for a star that should have
-    been refused, so this is fail-closed in every dialect rather than tuned to one. It leaves a
-    known false refusal on DuckDB, which folds unquoted AND quoted names: `... FROM CLAIM` against
-    a CTE `claim` resolves to the CTE there and is refused here. Closing that means resolving
-    identifiers by the EXECUTING dialect's rule, which neither exact nor folded matching is.
+    The fold direction is the EXECUTING dialect's, because Oracle folds unquoted names up where
+    the others fold them down -- one constant is wrong for one of them in the direction that
+    vouches.
+
+    What remains is a false refusal where DuckDB folds a QUOTED name and the rule here preserves
+    it: a CTE `"CLAIM"` or `"Claim"` against any unquoted reference is one object in DuckDB and
+    two here. (Not `"claim"` -- that already folds to the same key, and an earlier version of this
+    note named it, sending a reader to a shape that passes.) Fail-closed, and it is M55's
+    question: quoting is discarded before `qualify.py` sees a name at all.
     """
     # The top level keeps its own fail-open reading: a statement whose shape `_output_selects`
     # does not recognise returns no columns to a caller here, and refusing every such statement
@@ -286,7 +313,7 @@ def _has_projection_star(ast: exp.Expression) -> bool:
     # down, where the question is whether a wrapper can be vouched for.
     if not _output_selects(ast):
         return False
-    return _star_reaches_base(ast, {}, {}, frozenset())
+    return _star_reaches_base(ast, {}, {}, frozenset(), dialect)
 
 
 def _with_limit(ast: exp.Expression, max_rows: int) -> exp.Expression:

@@ -206,25 +206,55 @@ def test_a_QUALIFIED_name_is_never_a_cte_reference():
     _ok("WITH claim AS (SELECT id FROM policy) SELECT * FROM claim")
 
 
-def test_QUOTING_is_half_a_cte_name_and_a_mismatch_does_not_vouch():
-    """Postgres -- `decide`'s default transpile target -- folds an unquoted name and preserves a
-    quoted one, so `"Claim"` and `Claim` are two different objects there. Matching on the name
-    alone let the CTE vouch for a star that Postgres resolves to the base table `claim`, whose
-    columns then reached no grant check: `decide` approved exactly that with `tables=['policy']`.
+def test_a_cte_name_matches_what_it_RESOLVES_to_not_how_it_was_typed():
+    """A CTE vouches for a star, so the name it is matched on must be the one the engine will
+    resolve. Both directions of getting that wrong are live and only one of them is a leak.
 
-    Narrowing the match is fail-closed in every dialect, because only a WIDER match can vouch for
-    a star that should have been refused."""
+    TOO WIDE: matching the text alone let `WITH "Claim" AS (...) SELECT * FROM Claim` match, while
+    Postgres folds the reference to `claim` and resolves it to the base table -- whose columns then
+    reached no grant check. `decide` approved exactly that with `tables=['policy']`.
+
+    TOO NARROW: requiring identical QUOTING then refused `WITH "claim" AS (...) SELECT * FROM
+    claim`, which is one object in Postgres and is the ordinary shape of a model quoting a
+    definition but not its reference."""
     for sql in ('WITH "Claim" AS (SELECT id FROM policy) SELECT * FROM Claim',
                 'WITH Claim AS (SELECT id FROM policy) SELECT * FROM "Claim"'):
         assert _refused(sql).code == RefusalCode.SELECT_STAR, sql
 
-    # spelled and quoted identically, so it really is the CTE
+    # And it must not over-refuse, which is the other direction and equally live. Everything
+    # below is ONE object in every engine here -- `qualify.py`: unquoted identifiers are
+    # case-insensitive -- so refusing them would reject ordinary model-written SQL, which is what
+    # makes a guard broken rather than safe. Quoting a definition but not its reference is the
+    # common LLM shape; a bare case mismatch was refused even before quoting entered the key.
     _ok("WITH claim AS (SELECT id FROM policy) SELECT * FROM claim")
     _ok('WITH "claim" AS (SELECT id FROM policy) SELECT * FROM "claim"')
+    _ok('WITH "claim" AS (SELECT id FROM policy) SELECT * FROM claim')
+    _ok('WITH claim AS (SELECT id FROM policy) SELECT * FROM "claim"')
+    _ok("WITH claim AS (SELECT id FROM policy) SELECT * FROM CLAIM")
+    _ok("WITH Sales AS (SELECT id FROM policy) SELECT * FROM sales")
 
     # and a CTE reference carrying its own alias still resolves by the name it READS: `c x` is a
     # reference to `c`, not to `x`, and reading `alias_or_name` for both sides missed every one
     _ok("WITH c AS (SELECT id FROM claim) SELECT * FROM c x")
+
+
+def test_the_fold_direction_belongs_to_the_dialect_that_will_RUN_it():
+    """Oracle folds unquoted identifiers UP where the others fold them down -- `adapters/oracle.py`
+    states it, `oracle` is a shipped source kind, and `check_shape` is called with the adapter's
+    own dialect. So one hardcoded direction is wrong for one of them in the direction that VOUCHES,
+    and the same statement has to get opposite answers.
+
+    `qualify.py` scopes its case rule to "all three engines". Oracle is the fourth."""
+    quoted_lower = 'WITH "claim" AS (SELECT id FROM policy) SELECT * FROM claim'
+    # down-folding engines: the bare reference lands on `claim`, which IS the quoted CTE
+    for dialect in ("postgres", "duckdb", "sqlite"):
+        _ok(quoted_lower, dialect=dialect)
+    # Oracle folds it to `CLAIM`, a different object -- the base table, whose star must be refused
+    assert isinstance(check_shape(quoted_lower, dialect="oracle"), Refusal)
+
+    quoted_upper = 'WITH "CLAIM" AS (SELECT id FROM policy) SELECT * FROM claim'
+    assert isinstance(check_shape(quoted_upper, dialect="postgres"), Refusal)
+    _ok(quoted_upper, dialect="oracle")
 
 
 def test_the_verdict_does_not_depend_on_UNION_BRANCH_ORDER():
@@ -242,7 +272,7 @@ def test_a_shape_the_walker_cannot_decompose_is_refused_rather_than_permitted():
     recognise, and reading that as "no star reaches a base table" made every gap in it a silent
     hole -- which is exactly how EXCEPT and doubled parentheses got through."""
     from mnemiq.sql.guard import _star_reaches_base
-    assert _star_reaches_base(exp.Anonymous(this="opaque"), {}, {}, frozenset()) is True
+    assert _star_reaches_base(exp.Anonymous(this="opaque"), {}, {}, frozenset(), "duckdb") is True
 
 
 def test_the_recursion_stays_linear_in_wrapper_depth():
