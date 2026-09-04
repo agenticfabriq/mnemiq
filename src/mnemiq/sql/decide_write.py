@@ -208,12 +208,12 @@ def decide_write(
     if isinstance(shaped, Refusal):
         return shaped
 
-    refusal = check_access(shaped, visible)  # every referenced table readable, columns exist
+    refusal = check_access(shaped, visible, target)  # every referenced table readable, cols exist
     if refusal is not None:
         return refusal
 
     # A write needs RAW access: a masked column is treated as denied for writes.
-    write_cls = check_cls(shaped, AccessPolicy(denied=policy.denied | policy.masked))
+    write_cls = check_cls(shaped, AccessPolicy(denied=policy.denied | policy.masked), target)
     if write_cls is not None:
         return write_cls
 
@@ -266,7 +266,7 @@ def decide_write(
     # target, and an upsert's, as the reads they are. Earlier drafts of this comment claimed the
     # asymmetry ran the other way, then that the target was absent from every resolving shape --
     # both measured false, and the second was describing a defect rather than a design.
-    tables = sorted({object_key(t) for t in base_tables(shaped)} | {tgt})
+    tables = sorted({object_key(t) for t in base_tables(shaped, target)} | {tgt})
 
     # RLS: the read path's implementation, not a second copy of it. This block used to filter
     # only the table being WRITTEN -- so every table a write READ was ungoverned (M30), and the
@@ -274,7 +274,7 @@ def decide_write(
     # implementations and the second was wrong. `apply_row_filters_to_write` wraps the reads and
     # conjoins the target, using the same `_validate_filter` the read decider uses.
     governed, narrowed = apply_row_filters_to_write(
-        shaped, policy, visible, _target_node(shaped), dialect)
+        shaped, policy, visible, _target_node(shaped), dialect, executes_as=target)
     if isinstance(governed, Refusal):
         return governed
     shaped = governed

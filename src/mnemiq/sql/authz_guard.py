@@ -7,8 +7,11 @@ from mnemiq.sql.scope import base_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
-def check_access(ast: exp.Expression, visible: dict[str, set[str]]) -> Refusal | None:
+def check_access(ast: exp.Expression, visible: dict[str, set[str]],
+                 dialect: str | None = None) -> Refusal | None:
     """Re-check every table and column the query touches against what the identity may see.
+
+    `dialect` is the ENGINE that will run this, not the one it was parsed as. Identifier folding differs between them -- Oracle folds unquoted names up, the rest fold them down, and quoting is significant in Postgres and Oracle but not DuckDB -- so a resolver keyed on the wrong one answers for the wrong engine. Threading it to SOME call sites and not others is worse than either: `check_access` said a name was a CTE while the audit list said it was a base read, in the same statement.
 
     Retrieval scoping (the semantic store) means the model was never *shown* a forbidden
     table. It can still *name* one -- `users`, `employees`, `salaries` are in every schema it
@@ -18,8 +21,8 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]]) -> Refusal |
     # set of CTE names -- because a reference inside a CTE body naming that same CTE reads the
     # base table, and skipping it let an ungranted table through (M31).
     alias_to_table: dict[str, str] = {}
-    resolved = column_tables(ast)
-    for table in base_tables(ast):
+    resolved = column_tables(ast, dialect)
+    for table in base_tables(ast, dialect):
         name = object_key(table)
         if name not in visible:
             return Refusal(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlglot import exp
 from sqlglot.optimizer.scope import build_scope
 
+from mnemiq.sql.identifiers import resolve_identifier, resolve_name
 from mnemiq.sql.qualify import object_key
 
 
@@ -110,7 +111,90 @@ def scope_resolved(ast: exp.Expression) -> bool:
     return ast_root is not None and not _unscoped_ctes(ast, ast_root)
 
 
-def base_tables(ast: exp.Expression) -> list[exp.Table]:
+def _defining_identifier(source) -> exp.Expression | None:
+    """The identifier that NAMES a local source, with its quoting intact.
+
+    `scope.sources` is keyed by bare text, so the quoting is gone by the time a name is looked up
+    there. The defining node still has it, so this walks UP from the source's expression to the
+    nearest node that defines a name.
+
+    Upward, not by matching the expression against every CTE: a RECURSIVE CTE's self-reference
+    binds to a scope whose expression is one BRANCH of the union while the CTE's own body is the
+    whole union, so identity matched nothing, `_engine_shadows` fell through to its fail-open
+    answer, and `WITH RECURSIVE "Claim" AS (... UNION ALL SELECT id FROM Claim) SELECT id FROM
+    "Claim"` came back Approved with the base table dropped from the read list -- the M79 leak, in
+    the one shape a note in this file claimed could not reach that branch.
+    """
+    node = getattr(source, "expression", None)
+    while node is not None:
+        if isinstance(node, exp.CTE | exp.Subquery):
+            alias = node.args.get("alias")
+            if alias is not None:
+                return alias
+            # An alias-less definer NAMES nothing, so stopping here answers "no definer" for a
+            # source that plainly has one. A parenthesised CTE body -- `WITH "Claim" AS ((SELECT
+            # ...))` -- wraps the body in exactly that, and one pair of parentheses turned the M79
+            # refusal back into an Approved. Keep walking to the node that does name it.
+        node = node.parent
+    return None
+
+
+def _engine_shadows(table: exp.Table, source, dialect: str | None) -> bool:
+    """Would the EXECUTING engine resolve this reference to that local source?
+
+    sqlglot matches a source by its bare name and the engine does not, so a CTE could hide a base
+    table from the grant check that shares nothing with it but spelling. Measured: `WITH "Claim" AS
+    (SELECT id FROM policy) SELECT id FROM Claim` was Approved with `tables=['policy']`, while
+    `SELECT id FROM Claim` alone is refused `unauthorized_table` -- the CTE's mere presence was
+    what unlocked the base table. Postgres folds the unquoted reference to `claim` and preserves
+    `"Claim"`, so the two are different objects there and the read was never authorized. (M79.)
+
+    When no defining identifier can be found, this now answers that the engine does NOT shadow --
+    so the reference is treated as a real read and has to be found in `visible`. That is the
+    opposite of what it did, and the reason is a record rather than a principle: THREE shapes
+    reached the old fail-open answer within a day, each time under a note claiming none could.
+    A recursive CTE, whose self-reference binds to one BRANCH of the union; a parenthesised body,
+    which wraps the query in a `Subquery` that names nothing; and a `VALUES` alias, where the
+    source is not reached by walking at all. Each was the M79 leak again, and each was closed by
+    teaching the walk one more shape.
+
+    Failing closed retires the class instead of the instance: a source whose definer cannot be
+    identified is one this cannot reason about, and the safe answer for a governance guard is to
+    check the name rather than to assume it is local.
+
+    Its cost is measured, not assumed, because a guard that refuses legitimate analytics SQL is
+    broken rather than safe. The branch is consulted ONLY for a table NODE whose source is not an
+    `exp.Table` -- so a derived table, a CTE, a LATERAL or a UNION branch never reaches it unless a
+    reference COLLIDES with its name. Thirteen ordinary shapes produce zero hits on sqlglot
+    25.34.1, 26.16.4, 28.0.0 and 30.12.0, and the suite is unchanged.
+
+    Four versions are a SAMPLE, not the range: `pyproject.toml` declares `>=25.34.1` with no
+    ceiling, so any later release is supported and unmeasured -- and this file already notes that
+    scope internals differ across that span. The probe was run by hand against each install and
+    nothing in the repo re-runs it; what the tests DO assert is the property the number rests on,
+    that ordinary shapes never reach the branch at all.
+    """
+    alias = _defining_identifier(source)
+    if alias is None:
+        return False
+    return resolve_identifier(alias, dialect) == resolve_name(table, dialect)
+
+
+def _is_base_read(table: exp.Table, scope, dialect: str | None) -> bool:
+    """Is this reference a real read, or does a local source stand in front of it?
+
+    ONE predicate, shared by `base_tables` and `column_tables`, because the two disagreeing inside
+    a single statement is the defect rather than a detail of it: with only `base_tables` taught the
+    dialect, the audit list named a base table while `check_cls` still believed the qualifier was a
+    CTE, and a DENIED column came back Approved on Oracle.
+    """
+    source = scope.sources.get(table.alias_or_name)
+    if isinstance(source, exp.Table):
+        return True
+    return source is not None and not _engine_shadows(table, source, dialect)
+
+
+def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Table]:
     """Every `exp.Table` node that reads a real object in the source.
 
     A CTE alias is reported as a Table by `find_all`, and must not be authorized as a source
@@ -137,7 +221,7 @@ def base_tables(ast: exp.Expression) -> list[exp.Table]:
     out: list[exp.Table] = []
     for scope in root.traverse():
         for table in scope.tables:
-            if isinstance(scope.sources.get(table.alias_or_name), exp.Table):
+            if _is_base_read(table, scope, dialect):
                 out.append(table)
     # The write target, which no scope names. Added here rather than in each guard so the three
     # of them keep sharing one premise -- the M31 lesson, and the reason M48 sits in this file.
@@ -147,7 +231,7 @@ def base_tables(ast: exp.Expression) -> list[exp.Table]:
     return out
 
 
-def column_tables(ast: exp.Expression) -> dict[int, str] | None:
+def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, str] | None:
     """`id(column node)` -> the base table its qualifier names **in that column's own scope**,
     or **None** when the scopes could not be resolved at all.
 
@@ -174,10 +258,14 @@ def column_tables(ast: exp.Expression) -> dict[int, str] | None:
 
     out: dict[int, str] = {}
     for scope in root.traverse():
+        # Built from `_is_base_read`, not from `sources` alone: a reference sqlglot bound to a
+        # same-named CTE that the ENGINE would not shadow is a base table, and reading `sources`
+        # here left it unattributed -- so `check_cls` treated a denied column's qualifier as a CTE
+        # and let it through, on the very statement `base_tables` had just called a real read.
         local = {
-            name: object_key(source)
-            for name, source in scope.sources.items()
-            if isinstance(source, exp.Table)
+            table.alias_or_name: object_key(table)
+            for table in scope.tables
+            if _is_base_read(table, scope, dialect)
         }
         for column in getattr(scope, "columns", ()):
             table = local.get(column.table)

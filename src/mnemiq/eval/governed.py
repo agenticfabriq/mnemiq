@@ -30,17 +30,21 @@ class GovernedPlan:
 
     @property
     def narrows_something(self) -> bool:
-        """False when the policy cannot narrow this corpus, whatever it says.
+        """False when this arm cannot satisfy the kill criterion's non-vacuity floor.
 
-        The kill criterion reads a disclosure RATE, and a rate over an arm that never narrows is
-        zero for the wrong reason -- indistinguishable from a disclosure path that is broken.
+        BOTH kinds, not either. The floor requires `touched` non-empty for at least one answer of
+        each kind, so a mask-only arm is not a weaker governed arm -- it is one every run of which
+        `RunVerdict.vacuous` fails, reading as a failed control when the real fault is the
+        configuration. Refusing it here makes that a configuration error before the run instead of
+        an unexplained red after it. An earlier version of this property returned True for either
+        half alone, which admitted exactly that arm.
 
         A resolved table is NOT sufficient: `1 = 1` names a real table and withholds no row, and
         it was this module's own default predicate, so the check written to refuse arms that
         cannot narrow certified one by construction. `filtered_table` is set only when the
         predicate can exclude something.
         """
-        return bool(self.filtered_table) or bool(self.masked_columns)
+        return bool(self.filtered_table) and bool(self.masked_columns)
 
 
 _TAUTOLOGIES = {"1 = 1", "1=1", "true", "1", "1 is not null"}

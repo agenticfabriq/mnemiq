@@ -38,7 +38,7 @@ def test_the_masked_level_is_withheld_from_clearance():
 def test_it_names_the_columns_the_mask_actually_reaches():
     plan = governed_grants(_snap(), ["claim", "person"], mask_level="high")
     assert plan.masked_columns == ("claim.ssn",)
-    assert plan.narrows_something
+    assert not plan.narrows_something, "resolved, but one half of the floor is still missing"
 
 
 def test_a_level_NO_column_carries_does_not_look_governed():
@@ -50,17 +50,29 @@ def test_a_level_NO_column_carries_does_not_look_governed():
 
 
 def test_a_filter_on_a_table_outside_the_corpus_does_not_look_governed():
-    plan = governed_grants(_snap(), ["claim", "person"], filter_table="not_queried",
-                           filter_predicate="amount > 0")
+    plan = governed_grants(_snap(), ["claim", "person"], mask_level="high",
+                           filter_table="not_queried", filter_predicate="amount > 0")
     assert plan.filtered_table is None
-    assert not plan.narrows_something
+    assert not plan.narrows_something, "the mask half resolves; the filter half is what fails"
 
 
 def test_a_filter_on_a_real_table_reaches_the_grants():
     plan = governed_grants(_snap(), ["claim", "person"],
                            filter_table="claim", filter_predicate="amount > 0")
     assert plan.grants.row_filters == {"claim": "amount > 0"}
-    assert plan.narrows_something
+    assert not plan.narrows_something, "a filter alone cannot clear the floor either"
+
+
+def test_BOTH_halves_are_required_because_the_floor_wants_an_answer_of_EACH_KIND():
+    """`narrows_something` first returned True for either half alone, which admitted an arm the
+    kill criterion can never pass: `RunVerdict.vacuous` requires `touched` non-empty for at least
+    one filter answer AND one mask answer, so a single-half arm is scored vacuous on every run and
+    reads as a failed control when the fault is the configuration. Refusing it here makes that a
+    configuration error before the run rather than an unexplained red after it."""
+    both = governed_grants(_snap(), ["claim", "person"], mask_level="high",
+                           filter_table="claim", filter_predicate="amount > 0")
+    assert both.filtered_table == "claim" and both.masked_columns == ("claim.ssn",)
+    assert both.narrows_something
 
 
 def test_build_engine_still_grants_everything_when_no_plan_is_given():
@@ -83,13 +95,16 @@ def test_a_TAUTOLOGICAL_filter_does_not_certify_the_arm():
     else rather than pretending to decide satisfiability. `amount > -1` on non-negative amounts is
     still total and still passes; the guard for THAT is the arm's measured disclosure count.
     """
+    # `mask_level` is passed so `narrows_something` actually turns on `_can_exclude`. Without it
+    # `masked_columns` is empty, the `and` is already False, and the assertion below could not
+    # fail whatever `_can_exclude` decided.
     for total in ("1 = 1", "1=1", "TRUE", " true ", "1"):
-        plan = governed_grants(_snap(), ["claim", "person"],
+        plan = governed_grants(_snap(), ["claim", "person"], mask_level="high",
                                filter_table="claim", filter_predicate=total)
         assert plan.filtered_table is None, f"{total!r} certified an arm that withholds no row"
         assert not plan.narrows_something
 
-    real = governed_grants(_snap(), ["claim", "person"],
+    real = governed_grants(_snap(), ["claim", "person"], mask_level="high",
                            filter_table="claim", filter_predicate="amount > 0")
     assert real.filtered_table == "claim" and real.narrows_something
 
@@ -103,5 +118,5 @@ def test_naming_a_table_without_a_predicate_is_refused_rather_than_defaulted():
     with pytest.raises(ValueError, match="can exclude rows"):
         governed_grants(_snap(), ["claim"], filter_table="claim")
 
-    # mask-only stays valid without one
-    assert governed_grants(_snap(), ["claim"], mask_level="high").narrows_something
+    # a mask-only plan still RESOLVES without one -- it just cannot clear the floor by itself
+    assert governed_grants(_snap(), ["claim"], mask_level="high").masked_columns

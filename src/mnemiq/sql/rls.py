@@ -21,6 +21,8 @@ def _validate_filter(
     cols: set[str],
     dialect: str,
     policy_schema: dict[str, set[str]] | None = None,
+    *,
+    executes_as: str | None = None,
 ) -> exp.Expression | None:
     """Parse a row filter and confirm it can only speak about what it is entitled to; else None.
 
@@ -65,11 +67,11 @@ def _validate_filter(
         wrapped = sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {filt}", read=dialect)
     except Exception:
         return None
-    resolved = column_tables(wrapped)
+    resolved = column_tables(wrapped, executes_as or dialect)
     if resolved is None:
         return None  # scopes unreadable -> the filter cannot be validated, so it is refused
 
-    for table in base_tables(wrapped):
+    for table in base_tables(wrapped, executes_as or dialect):
         if any("." in part for part in (table.text("catalog"), table.text("db"), table.name)):
             return None  # `"pg.entitlement"` is not `pg.entitlement`, and a dotted key cannot
         key = object_key(table)
@@ -83,7 +85,8 @@ def _validate_filter(
                 return None  # qualified by something no scope here defines
             # Unqualified: the subquery's own tables, or a correlated reference to the row
             # being filtered. Fail-closed across both rather than resolving ambiguity.
-            reachable = {c for t in base_tables(wrapped) for c in schema.get(object_key(t), ())}
+            reachable = {c for t in base_tables(wrapped, executes_as or dialect)
+                         for c in schema.get(object_key(t), ())}
             if column.name not in reachable:
                 return None
         elif column.name not in schema.get(owner, set()):
@@ -176,6 +179,7 @@ def apply_row_and_mask(
     visible: dict[str, set[str]],
     dialect: str = "duckdb",
     exclude: exp.Expression | None = None,
+    executes_as: str | None = None,
 ) -> tuple[exp.Expression | Refusal, list[Narrowing]]:
     """Wrap each base table that has a row filter or a referenced masked column in a derived
     table that applies the filter and NULLs masked columns AT THE SOURCE. Returns the rewritten
@@ -216,7 +220,7 @@ def apply_row_and_mask(
     #     resolution declines to guess -> mask, as before.
     # Only a column resolved to a DIFFERENT base table is dropped, which is the reported defect
     # and the one case where the old answer was certainly wrong.
-    owners = column_tables(ast)
+    owners = column_tables(ast, executes_as or dialect)
     referenced_masked: set[str] = set()
     for column in ast.find_all(exp.Column):
         owner = None if owners is None else owners.get(id(column))
@@ -227,7 +231,7 @@ def apply_row_and_mask(
                 referenced_masked.add(tbl)
 
     # Resolved before the loop mutates the tree: `replace` invalidates the scope it was read from.
-    for table_node in base_tables(ast):
+    for table_node in base_tables(ast, executes_as or dialect):
         if exclude is not None and table_node is exclude:
             continue
         name = object_key(table_node)
@@ -240,7 +244,8 @@ def apply_row_and_mask(
         filt: exp.Expression | None = None
         if needs_filter:
             filt = _validate_filter(
-                policy.row_filter_for(name), visible[name], dialect, policy.policy_schema
+                policy.row_filter_for(name), visible[name], dialect, policy.policy_schema,
+                executes_as=executes_as,
             )
             if filt is None:
                 return Refusal(
@@ -267,6 +272,7 @@ def apply_row_filters_to_write(
     visible: dict[str, set[str]],
     target: exp.Expression | None,
     dialect: str = "duckdb",
+    executes_as: str | None = None,
 ) -> tuple[exp.Expression | Refusal, list[Narrowing]]:
     """Govern a write with the read path's RLS. Returns the rewritten AST or a Refusal, and what
     the policy narrowed.
@@ -289,7 +295,11 @@ def apply_row_filters_to_write(
     An INSERT target is exempt and stays exempt: an INSERT does not read its target, and filtering
     rows on the way IN is not what a row filter means.
     """
-    rewritten, narrowed = apply_row_and_mask(ast, policy, visible, dialect=dialect, exclude=target)
+    # `executes_as` forwarded, or the write path governs its reads with the PARSE dialect
+    # while the read path uses the executing one -- two resolvers, one statement, and the
+    # write half is the one that copies unfiltered rows somewhere durable.
+    rewritten, narrowed = apply_row_and_mask(ast, policy, visible, dialect=dialect,
+                                            exclude=target, executes_as=executes_as)
     if isinstance(rewritten, Refusal):
         return rewritten, []
     ast = rewritten
@@ -300,7 +310,8 @@ def apply_row_filters_to_write(
     filt = policy.row_filter_for(name)
     if filt is None:
         return ast, narrowed
-    predicate = _validate_filter(filt, visible.get(name, set()), dialect, policy.policy_schema)
+    predicate = _validate_filter(filt, visible.get(name, set()), dialect, policy.policy_schema,
+                                 executes_as=executes_as)
     if predicate is None:
         return Refusal(
             code=RefusalCode.INVALID_ROW_FILTER,
