@@ -268,3 +268,35 @@ def test_sqlglot_binds_by_exact_text_which_over_reports_rather_than_under():
     assert type(result).__name__ == "Approved"
     assert "claim" in result.tables, "reported as a read the engine would have shadowed"
     assert result.narrowed, "and masked accordingly -- redundant, not permissive"
+
+
+def test_a_source_whose_definer_cannot_be_IDENTIFIED_is_checked_not_assumed_local():
+    """The third shape to reach the fail-open branch, and the last one chased individually.
+
+    A `VALUES` alias is not reached by walking up from the source's expression at all, so the
+    definer came back None and the reference was assumed to be that local alias -- dropping base
+    table `Claim` from the read list entirely, `tables=[]` on a statement that names it.
+
+    The fallback answers "not shadowed" now, so an unidentifiable source costs a grant check rather
+    than a bypass. Three shapes reached that branch in a day, each under a note saying none could;
+    failing closed retires the class instead of the next instance."""
+    leak = 'SELECT id FROM (VALUES (1)) AS "Claim"(id), Claim'
+    for engine in ("postgres", "oracle"):
+        assert _verdict(leak, engine) == "Refusal", engine
+
+    # the control: same shape, alias the engine folds onto the reference, nothing to check
+    assert _verdict("SELECT id FROM (VALUES (1)) AS v(id)", "postgres") == "Approved"
+
+
+def test_failing_closed_costs_no_ordinary_query():
+    """The whole point of measuring it: a guard that refuses legitimate analytics SQL is broken,
+    not safe. These are the shapes that DO resolve a definer, and none of them reaches the
+    fallback."""
+    for sql in ("SELECT id FROM policy",
+                "SELECT id FROM (SELECT id FROM policy) t",
+                "WITH c AS (SELECT id FROM policy) SELECT id FROM c",
+                "WITH RECURSIVE r AS (SELECT id FROM policy UNION ALL SELECT id FROM r) "
+                "SELECT id FROM r",
+                "SELECT p.id FROM policy p JOIN (SELECT id FROM policy) q ON p.id = q.id"):
+        for engine in ("postgres", "oracle", "duckdb"):
+            assert _verdict(sql, engine) == "Approved", f"{engine}: {sql}"

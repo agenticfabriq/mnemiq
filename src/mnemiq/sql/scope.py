@@ -149,16 +149,23 @@ def _engine_shadows(table: exp.Table, source, dialect: str | None) -> bool:
     what unlocked the base table. Postgres folds the unquoted reference to `claim` and preserves
     `"Claim"`, so the two are different objects there and the read was never authorized. (M79.)
 
-    Answering True when no defining identifier can be found fails OPEN -- the node is dropped from
-    the read list and never reaches the `visible` lookup. Two earlier versions of this note were
-    wrong about it: one called it fail-closed, the next claimed no shape reached it, and a
-    RECURSIVE CTE reached it the same day. Walking UP to the nearest definer is what closed that,
-    so this branch is now only for a source with no enclosing definer at all -- which is why it is
-    stated as a fail-open with no shape currently known to reach it, rather than as safe.
+    When no defining identifier can be found, this now answers that the engine does NOT shadow --
+    so the reference is treated as a real read and has to be found in `visible`. That is the
+    opposite of what it did, and the reason is a record rather than a principle: THREE shapes
+    reached the old fail-open answer within a day, each time under a note claiming none could.
+    A recursive CTE, whose self-reference binds to one BRANCH of the union; a parenthesised body,
+    which wraps the query in a `Subquery` that names nothing; and a `VALUES` alias, where the
+    source is not reached by walking at all. Each was the M79 leak again, and each was closed by
+    teaching the walk one more shape.
+
+    Failing closed retires the class instead of the instance: a source whose definer cannot be
+    identified is one this cannot reason about, and the safe answer for a governance guard is to
+    check the name rather than to assume it is local. Measured, it costs nothing -- the whole
+    suite is unchanged -- because the shapes that reach it are the ones no legitimate query writes.
     """
     alias = _defining_identifier(source)
     if alias is None:
-        return True
+        return False
     return resolve_identifier(alias, dialect) == resolve_name(table, dialect)
 
 
