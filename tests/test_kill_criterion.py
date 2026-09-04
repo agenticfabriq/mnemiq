@@ -293,3 +293,30 @@ def test_an_AMBIGUOUS_unqualified_mask_stays_unmeasurable_rather_than_guessed():
     c = _end_to_end(sql, policy, _COLLIDE)
     assert not c.measurable, "so the answer is reported unmeasurable, not scored"
     assert summarise([c]).unmeasurable == 1 and not summarise([c]).passes
+
+
+def test_a_STAR_reads_nothing_on_either_side():
+    """`SELECT id FROM (SELECT * FROM claim) t`, a shape `check_shape` permits. The disclosure side
+    walks `find_all(exp.Column)`, where a star is an `exp.Star` and references no masked column --
+    and only `id` reaches the caller. If qualification expanded the star, `touched` would name a
+    mask nothing disclosed and a CORRECT build would go red, with the obvious repair being to add
+    a disclosure that should not exist."""
+    sql = "SELECT id FROM (SELECT * FROM claim) t"
+    policy = AccessPolicy(masked={("claim", "ssn")})
+    assert touched(sqlglot.parse_one(sql, read="duckdb"), policy, _V).entries == set()
+    c = _end_to_end(sql, policy)
+    assert c.agrees and c.measurable, (c.missing, c.spurious)
+
+
+def test_a_qualification_failure_degrades_instead_of_propagating():
+    """Two shapes reach the except clause and neither is an OptimizeError alone, which is all it
+    used to catch. Both must land as unattributable rather than as an exception out of `touched`."""
+    # a QUALIFIED unknown column -- OptimizeError, the opposite of the unqualified form
+    t1 = touched(sqlglot.parse_one("SELECT claim.nonexistent, claim.ssn FROM claim", read="duckdb"),
+                 AccessPolicy(masked={("claim", "ssn")}), _V)
+    assert t1.entries == {("mask", "claim")}, "qualified already, so still attributable"
+
+    # a schema carrying a table with no columns -- SchemaError, which is not an OptimizeError
+    t2 = touched(sqlglot.parse_one("SELECT ssn FROM claim", read="duckdb"),
+                 AccessPolicy(masked={("claim", "ssn")}), {**_V, "empty": set()})
+    assert t2.unattributable == ("ssn",), "degraded to the unqualified reading, not raised"

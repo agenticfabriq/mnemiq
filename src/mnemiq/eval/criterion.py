@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from sqlglot import exp
-from sqlglot.errors import OptimizeError
+from sqlglot.errors import SqlglotError
 from sqlglot.optimizer.qualify_columns import qualify_columns
 from sqlglot.schema import MappingSchema
 
@@ -52,13 +52,18 @@ def _qualified(ast: exp.Expression, schema) -> exp.Expression:
     It is applied to a COPY and only to derive `touched`. The plan that ran is untouched, and the
     disclosure side keeps reading the tree the engine actually saw.
 
-    Ambiguity is NOT an error the qualifier reports. Measured on the installed sqlglot, none of
-    `SELECT bogus.ssn FROM claim`, an unqualified `ssn` across two tables that BOTH carry one, or
-    an unknown column raises: each is left bare or left as written, so `column_tables` records
-    nothing and the reference reports unattributable. That is the outcome this wants -- an
-    ambiguous masked reference must not be silently assigned to one of its candidates -- and it is
-    why the except clause below is defensive rather than the mechanism. No naturally-parsed shape
-    was found to reach it.
+    Ambiguity is NOT an error the qualifier reports. Measured on the installed sqlglot,
+    `SELECT bogus.ssn FROM claim`, an unqualified `ssn` across two tables that BOTH carry one, and
+    an UNQUALIFIED unknown column are all left as written rather than raising, so `column_tables`
+    records nothing and the reference reports unattributable. That is the outcome this wants: an
+    ambiguous masked reference must not be silently assigned to one of its candidates.
+
+    The except clause is reachable, and an earlier version of this note wrongly said no shape
+    reached it -- inviting a maintainer to drop it. A QUALIFIED unknown column does raise
+    (`SELECT claim.nonexistent FROM claim` -> OptimizeError), the opposite of the unqualified form
+    two sentences up, and building the schema raises SchemaError for a table with no columns. Both
+    subclass SqlglotError and neither is an OptimizeError alone, which is what the clause used to
+    catch -- so the promise below was false for the SchemaError half.
 
     A failure there leaves the plan alone rather than guessing, which lands in the same place:
     unattributable, run invalid, loud. That is the direction that does not score an under-firing
@@ -71,8 +76,15 @@ def _qualified(ast: exp.Expression, schema) -> exp.Expression:
             ast.copy(),
             MappingSchema({t: {c: "UNKNOWN" for c in cols} for t, cols in schema.items()}),
             infer_schema=True,
+            # Stars stay stars. Expanding them gives `touched` a definition of "referenced" the
+            # disclosure side does not share -- that side walks `find_all(exp.Column)` on the raw
+            # tree, where a star is an `exp.Star` and reads nothing. With expansion,
+            # `SELECT id FROM (SELECT * FROM claim) t` -- a shape `check_shape` permits -- makes
+            # `touched` name a mask the caller never sees, so the run goes RED against a correct
+            # build and the obvious "fix" is to add a disclosure that should not exist.
+            expand_stars=False,
         )
-    except (OptimizeError, KeyError, ValueError):
+    except (SqlglotError, KeyError, ValueError):
         return ast
 
 

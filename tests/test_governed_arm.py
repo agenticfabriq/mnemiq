@@ -50,10 +50,10 @@ def test_a_level_NO_column_carries_does_not_look_governed():
 
 
 def test_a_filter_on_a_table_outside_the_corpus_does_not_look_governed():
-    plan = governed_grants(_snap(), ["claim", "person"], filter_table="not_queried",
-                           filter_predicate="amount > 0")
+    plan = governed_grants(_snap(), ["claim", "person"], mask_level="high",
+                           filter_table="not_queried", filter_predicate="amount > 0")
     assert plan.filtered_table is None
-    assert not plan.narrows_something
+    assert not plan.narrows_something, "the mask half resolves; the filter half is what fails"
 
 
 def test_a_filter_on_a_real_table_reaches_the_grants():
@@ -95,8 +95,11 @@ def test_a_TAUTOLOGICAL_filter_does_not_certify_the_arm():
     else rather than pretending to decide satisfiability. `amount > -1` on non-negative amounts is
     still total and still passes; the guard for THAT is the arm's measured disclosure count.
     """
+    # `mask_level` is passed so `narrows_something` actually turns on `_can_exclude`. Without it
+    # `masked_columns` is empty, the `and` is already False, and the assertion below could not
+    # fail whatever `_can_exclude` decided.
     for total in ("1 = 1", "1=1", "TRUE", " true ", "1"):
-        plan = governed_grants(_snap(), ["claim", "person"],
+        plan = governed_grants(_snap(), ["claim", "person"], mask_level="high",
                                filter_table="claim", filter_predicate=total)
         assert plan.filtered_table is None, f"{total!r} certified an arm that withholds no row"
         assert not plan.narrows_something
