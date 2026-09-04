@@ -34,8 +34,31 @@ class GovernedPlan:
 
         The kill criterion reads a disclosure RATE, and a rate over an arm that never narrows is
         zero for the wrong reason -- indistinguishable from a disclosure path that is broken.
+
+        A resolved table is NOT sufficient: `1 = 1` names a real table and withholds no row, and
+        it was this module's own default predicate, so the check written to refuse arms that
+        cannot narrow certified one by construction. `filtered_table` is set only when the
+        predicate can exclude something.
         """
         return bool(self.filtered_table) or bool(self.masked_columns)
+
+
+_TAUTOLOGIES = {"1 = 1", "1=1", "true", "1", "1 is not null"}
+
+
+def _can_exclude(predicate: str) -> bool:
+    """Whether a row filter can withhold ANY row.
+
+    Syntactic and deliberately conservative: it rejects the handful of spellings that are
+    unambiguously total, and accepts everything else rather than pretending to decide satisfiability.
+    A predicate that is subtly total on the actual data -- `amount > -1` on non-negative amounts --
+    still passes here, and the honest guard for that is the arm's own measured disclosure count,
+    not this function.
+
+    It exists because `1 = 1` was this module's DEFAULT, so the plainest possible non-narrowing
+    filter was the one a caller got for free.
+    """
+    return bool(predicate) and predicate.strip().lower().rstrip(";") not in _TAUTOLOGIES
 
 
 def governed_grants(
@@ -43,7 +66,7 @@ def governed_grants(
     tables: list[str],
     *,
     filter_table: str | None = None,
-    filter_predicate: str = "1 = 1",
+    filter_predicate: str | None = None,
     mask_level: str | None = None,
 ) -> GovernedPlan:
     """Grants that filter one queried table and mask one reached column level.
@@ -53,6 +76,14 @@ def governed_grants(
     nothing. Every other level stays cleared, so the arm measures the effect of ONE mask rather
     than the effect of denying most of the schema.
     """
+    # No default predicate. The one that reads most natural is `1 = 1`, which withholds no row --
+    # it WAS the default here, and it certified an arm that could not narrow. A mask-only arm needs
+    # no predicate at all, so this is required only when a table is actually named.
+    if filter_table and not filter_predicate:
+        raise ValueError(
+            "filter_table needs a filter_predicate that can exclude rows; there is no safe "
+            "default, because the obvious one (`1 = 1`) withholds nothing")
+
     all_levels = {c.pii_level for c in snapshot.columns if c.pii_level and c.pii_level != "none"}
 
     chosen_level = mask_level if mask_level in all_levels else None
@@ -61,12 +92,13 @@ def governed_grants(
         if chosen_level and c.pii_level == chosen_level))
 
     known = {t.lower() for t in tables}
-    chosen_table = filter_table if (filter_table or "").lower() in known else None
+    in_corpus = (filter_table or "").lower() in known
+    chosen_table = filter_table if (in_corpus and _can_exclude(filter_predicate or "")) else None
 
     return GovernedPlan(
         grants=GrantSet(
             frozenset(tables),
-            row_filters={chosen_table: filter_predicate} if chosen_table else {},
+            row_filters={chosen_table: filter_predicate} if chosen_table and filter_predicate else {},
             # cleared: everything EXCEPT the level under test
             pii_clearance=frozenset(all_levels - ({chosen_level} if chosen_level else set())),
             pii_mask=frozenset({chosen_level} if chosen_level else set()),

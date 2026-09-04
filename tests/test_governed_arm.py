@@ -50,7 +50,8 @@ def test_a_level_NO_column_carries_does_not_look_governed():
 
 
 def test_a_filter_on_a_table_outside_the_corpus_does_not_look_governed():
-    plan = governed_grants(_snap(), ["claim", "person"], filter_table="not_queried")
+    plan = governed_grants(_snap(), ["claim", "person"], filter_table="not_queried",
+                           filter_predicate="amount > 0")
     assert plan.filtered_table is None
     assert not plan.narrows_something
 
@@ -72,3 +73,35 @@ def test_build_engine_still_grants_everything_when_no_plan_is_given():
     src = inspect.getsource(engine.build_engine)
     assert "if grants is None:" in src
     assert "pii_clearance=levels" in src, "the ungoverned default must still clear every level"
+
+
+def test_a_TAUTOLOGICAL_filter_does_not_certify_the_arm():
+    """`1 = 1` names a real table and withholds no row -- and it was this module's DEFAULT
+    predicate, so the check written to refuse arms that cannot narrow certified one for free.
+
+    Conservative by design: it rejects the unambiguously total spellings and accepts everything
+    else rather than pretending to decide satisfiability. `amount > -1` on non-negative amounts is
+    still total and still passes; the guard for THAT is the arm's measured disclosure count.
+    """
+    for total in ("1 = 1", "1=1", "TRUE", " true ", "1"):
+        plan = governed_grants(_snap(), ["claim", "person"],
+                               filter_table="claim", filter_predicate=total)
+        assert plan.filtered_table is None, f"{total!r} certified an arm that withholds no row"
+        assert not plan.narrows_something
+
+    real = governed_grants(_snap(), ["claim", "person"],
+                           filter_table="claim", filter_predicate="amount > 0")
+    assert real.filtered_table == "claim" and real.narrows_something
+
+
+def test_naming_a_table_without_a_predicate_is_refused_rather_than_defaulted():
+    """There is no safe default. The value that reads most natural is `1 = 1`, which withholds
+    nothing -- it was the default, and it certified an arm that could not narrow. A mask-only arm
+    needs no predicate, so this is required only when a table is named."""
+    import pytest
+
+    with pytest.raises(ValueError, match="can exclude rows"):
+        governed_grants(_snap(), ["claim"], filter_table="claim")
+
+    # mask-only stays valid without one
+    assert governed_grants(_snap(), ["claim"], mask_level="high").narrows_something
