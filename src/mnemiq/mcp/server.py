@@ -40,6 +40,11 @@ def _db_read(
                             "completeness": trace.lineage_completeness,
                             "unresolved": list(trace.lineage_unresolved),
                             "reasons": list(trace.lineage_reasons)},
+                  # Structured beside the sentence already in `answer`. An agent acting on a
+                  # narrowed result needs the fact machine-readable; `null` means governance was
+                  # not evaluated, `[]` that it narrowed nothing.
+                  "narrowed": ([n.model_dump() for n in trace.narrowed]
+                               if trace.narrowed is not None else None),
                 "enrichment_version": trace.enrichment_version,
                 "timing": trace.timing,
             }
@@ -57,6 +62,10 @@ def _db_write(runtime: Runtime, identity: IdentityContext, sql: str) -> dict:
         "rows_affected": res.rows_affected,
         "refusal": res.refusal,
         "sql": res.target_sql,
+        # Beside `rows_affected`, which is exactly where an agent needs it: 3 of 47 deleted reads
+        # as success without this. `null` means the decision was not evaluated.
+        "narrowed": ([{"object": n.object, "rows": n.rows, "columns": n.columns}
+                      for n in res.narrowed] if res.narrowed is not None else None),
     }
 
 

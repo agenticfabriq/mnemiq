@@ -49,6 +49,14 @@ class WriteResult:
     refusal: str | None = None
     plan_sql: str | None = None
     target_sql: str | None = None
+    # What the access decision narrowed. `None` is "not evaluated", `[]` is "narrowed nothing".
+    #
+    # `rows_affected` is the reason this cannot be optional. A governed DELETE narrowed from 47
+    # rows to 3 returns `approved=True, rows_affected=3` and reads as an ordinary success -- the
+    # caller asked to delete 47 and is told 3, with nothing saying why. The decider has carried
+    # this since `ApprovedWrite` gained it; the boundary dropped it, which is the same "done at the
+    # layer I touched" the read path made twice.
+    narrowed: list | None = None
 
 
 @dataclass
@@ -236,13 +244,17 @@ class Runtime:
         try:
             result = self.adapter.execute(verdict.target_sql)
         except Exception as exc:  # the read-only attach backstop rejects the write here
+            # The decision was evaluated even though the source refused the statement, so the
+            # narrowing is a fact about this attempt and travels with it.
             return WriteResult(approved=False, refusal=f"the source rejected the write: {exc}",
                                target=verdict.target, plan_sql=verdict.plan_sql,
-                               target_sql=verdict.target_sql)
+                               target_sql=verdict.target_sql,
+                               narrowed=getattr(verdict, "narrowed", None))
         rows = (result[0][0] if result and len(result[0]) == 1
                 and isinstance(result[0][0], int) else None)
         return WriteResult(approved=True, target=verdict.target, rows_affected=rows,
-                           plan_sql=verdict.plan_sql, target_sql=verdict.target_sql)
+                           plan_sql=verdict.plan_sql, target_sql=verdict.target_sql,
+                           narrowed=getattr(verdict, "narrowed", None))
 
 
 def _authz(settings: Settings) -> AuthzProvider:

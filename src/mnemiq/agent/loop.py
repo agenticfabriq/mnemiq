@@ -8,6 +8,7 @@ from mnemiq.agent.trace import build_trace
 from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.keys import cache_key
 from mnemiq.cache.store import Cache, from_ipc, to_ipc
+from mnemiq.contract.seams import disclosure_sentence
 from mnemiq.contract import DeferralReason, IdentityContext, Snapshot, Trace
 from mnemiq.llm.client import ModelUnavailable
 from mnemiq.progress import Emit, Stage, step
@@ -42,6 +43,22 @@ def result_preview(table, cap: int) -> ResultPreview:
                          row_count=table.num_rows, truncated=table.num_rows > cap)
 
 
+def _narrowed_of(executed):
+    """The access decision behind a multi-candidate deferral.
+
+    Every candidate was governed by the same grants against the same objects, so the narrowing is
+    a property of the request rather than of whichever candidate won -- and none of them won here,
+    which is why this path exists. Taking the first EXECUTED candidate reports the decision that
+    actually reached the source; `None` when nothing executed, because then nothing was decided
+    against a real statement.
+    """
+    for approved, _table in executed:
+        found = getattr(approved, "narrowed", None)
+        if found is not None:
+            return found
+    return None
+
+
 @dataclass
 class AgentAnswer:
     answer: str
@@ -66,6 +83,14 @@ class AgentAnswer:
     # OUTER loop, which repairs what the database rejected; `corrected` is the inner surgical
     # pass, which repairs what the decider rejected. Two different judges, two different numbers.
     attempts: int | None = None
+    # What the access decision narrowed, carried on the ANSWER and not only via `trace`.
+    #
+    # The trace is built after execution -- it needs timing and result shape -- so a deferral or a
+    # provider failure that happens AFTER the decision returns an answer with no trace at all. The
+    # audit sink read that as "governance was never evaluated" and recorded it on queries that were
+    # governed and had already run against the source. A false audit fact is worse than a missing
+    # one, so the fact rides here from the moment the decider produces it.
+    narrowed: list | None = None
     corrected: bool | None = None
     mode: str | None = None  # resolved mode name, stamped by the Runtime (the Agent IS a mode)
     preview: ResultPreview | None = None  # None on every deferral path -- never fabricated
@@ -333,7 +358,8 @@ class Agent:
             # nothing for a deep-mode turn that spent the full budget.
             return AgentAnswer(answer=undefined.reason, deferred=True,
                                reason_code=undefined.code,
-                               candidates_executed=len(executed))
+                               candidates_executed=len(executed),
+                               narrowed=_narrowed_of(executed))
 
         if not executed:
             # no candidate ran -> fall back to the single repairing path (today's floor)
@@ -365,6 +391,7 @@ class Agent:
                     reason_code=DeferralReason.DISAGREEMENT,
                     agreement=largest / len(executed),
                     candidates_executed=len(executed),
+                    narrowed=_narrowed_of(executed),
                 )
 
         judge_engaged = judge_override = None
@@ -421,7 +448,10 @@ class Agent:
             return AgentAnswer(answer=verdict.reason, deferred=True,
                                reason_code=DeferralReason.VERIFICATION,
                                verify_confidence=verdict.confidence,
-                               verify_layer=verdict.layer), verdict
+                               verify_layer=verdict.layer,
+                               # The query RAN before the verifier saw it, so the decision is a
+                               # fact about this attempt whatever the verifier then decided.
+                               narrowed=getattr(approved, "narrowed", None)), verdict
         return None, verdict
 
     def _synthesize(
@@ -450,6 +480,17 @@ class Agent:
             timing={"execute_ms": execute_ms, "total_ms": deadline.elapsed_ms},
             result_shape=_shape(table.num_rows, table.num_columns),
         )
+        # Appended HERE, once, rather than rendered by each surface. The four surfaces were fixed
+        # one at a time before -- the comment in `cli.py` records the commit messages saying "the
+        # two surfaces", then three -- and a disclosure that four places must remember to print is
+        # a disclosure that will be missing from one of them. Every surface prints `answer`.
+        #
+        # After the synthesizer and never through it: a governed fact must not pass a stochastic
+        # step that can soften it, drop it, or attach it to the wrong object.
+        disclosure = disclosure_sentence(trace.narrowed)
+        if disclosure:
+            answer = f"{answer}\n\n{disclosure}"
         return AgentAnswer(answer=answer, trace=trace, deferred=False, cached=cached,
+                           narrowed=getattr(approved, "narrowed", None),
                            preview=result_preview(table, self.preview_rows),
                            attempts=attempts, corrected=approved.corrected)

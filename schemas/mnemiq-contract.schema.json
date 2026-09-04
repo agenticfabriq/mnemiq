@@ -716,7 +716,7 @@
     "title": "CertifiedRecord",
     "type": "object"
   },
-  "format_version": "1.2.0",
+  "format_version": "1.3.0",
   "identity_context": {
     "properties": {
       "attributes": {
@@ -1927,6 +1927,30 @@
         ],
         "title": "IdentityContext",
         "type": "object"
+      },
+      "Narrowed": {
+        "description": "One object the access decision narrowed, as it reaches a consumer.\n\nMirrors `sql.rls.Narrowing` across the contract boundary. The flags mean exactly what that\ntype's field comments say -- in particular `columns` is \"the query referenced a column name\nthis table masks\", which is neither \"your answer lost a column\" nor \"the rewrite masked\nsomething\". Do not restate them here; one contract, one place.\n\nThe vocabulary is deliberate: this docstring reaches the OPEN contract schema, which bans the\npaid plane's terms outright (`tests/test_contract_schema.py`). An earlier draft used the paid\nword for access rules and failed that test -- twice, because the note explaining the failure\nused the word again. The boundary is enforced on words, in the artifact other systems read.",
+        "properties": {
+          "columns": {
+            "title": "Columns",
+            "type": "boolean"
+          },
+          "object": {
+            "title": "Object",
+            "type": "string"
+          },
+          "rows": {
+            "title": "Rows",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "object",
+          "rows",
+          "columns"
+        ],
+        "title": "Narrowed",
+        "type": "object"
       }
     },
     "properties": {
@@ -1967,6 +1991,21 @@
         },
         "title": "Lineage Unresolved",
         "type": "array"
+      },
+      "narrowed": {
+        "anyOf": [
+          {
+            "items": {
+              "$ref": "#/$defs/Narrowed"
+            },
+            "type": "array"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Narrowed"
       },
       "plan_sql": {
         "title": "Plan Sql",

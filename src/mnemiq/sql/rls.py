@@ -131,22 +131,26 @@ class Narrowing:
 
     object: str          # the table, in the query's own spelling
     rows: bool           # a row filter was applied to it
-    # The query REFERENCED a column name this table masks. That is the flag's exact meaning, and
-    # it is neither "your answer lost a column" nor "the rewrite masked something" -- it misses in
-    # BOTH directions, so state them rather than let a consumer infer either:
+    # TRUE when the query references a column name this table masks AND either ownership resolved
+    # to THIS table, or ownership could not be resolved at all. That is the whole rule; the two
+    # halves are why neither "your answer lost a column" nor "the rewrite masked something" is a
+    # safe reading of it.
     #
-    #   OVER  -- names are matched across the whole query without resolving which table owns each
-    #            reference, so `SELECT p.ssn FROM person p JOIN claim c` with `claim.ssn` masked
-    #            reports `claim` though only `person.ssn` was read.
-    #   UNDER -- a table wrapped for its ROW FILTER has its masked columns NULLed regardless, so
-    #            `SELECT id FROM claim` under a filter plus a mask on `ssn` rewrites to
-    #            `... NULL AS ssn ...` while this stays False. The rewrite masked; the answer did
-    #            not lose anything the caller asked for.
+    # Where ownership RESOLVES, the flag is exact. `SELECT p.ssn FROM person p JOIN claim c` with
+    # `claim.ssn` masked no longer reports `claim` -- it did until ownership resolution landed,
+    # which was tolerable for an internal flag and a lie once a caller-facing sentence was built
+    # on it.
     #
-    # The under-approximation is the one to keep: a caller reading `id` was not narrowed by a mask
-    # on `ssn`, and reporting it would be a false alarm on every filtered table that has any mask.
-    # The over-approximation is inherited from the masking loop, which is SAFE there (it masks
-    # more, never less) and is deliberately not changed by a disclosure feature.
+    # Where ownership does NOT resolve -- resolver failure, a CTE qualifier, a genuinely ambiguous
+    # unqualified name -- it still over-reports, deliberately: the same fallback makes the masking
+    # itself apply, and that direction only ever masks MORE. So a disclosure on those queries can
+    # still name a table whose column the caller never read. That is the residual, it is bounded to
+    # the unresolved cases, and `tests/test_mask_attribution.py` pins each one.
+    #
+    # And it UNDER-reports independently of any of that: a table wrapped for its ROW FILTER has its
+    # masked columns NULLed regardless, so `SELECT id FROM claim` under a filter plus a mask on
+    # `ssn` rewrites to `... NULL AS ssn ...` while this stays False. Kept, because a caller reading
+    # `id` was not narrowed by a mask on `ssn`.
     columns: bool
 
 
@@ -198,10 +202,28 @@ def apply_row_and_mask(
     for tbl, col in policy.masked:
         masked_by_table.setdefault(tbl.lower(), set()).add(col.lower())
 
+    # WHICH table a masked column name belongs to. Matching the bare name against every table
+    # marked a table as masked whenever any table masked that name -- so `SELECT p.ssn FROM person
+    # p JOIN claim c` with only `claim.ssn` masked reported `claim`, and the caller-facing sentence
+    # built on that flag told them a column was masked when nothing they read was.
+    #
+    # SAFETY IS THE CONSTRAINT, not accuracy: the old behaviour masked MORE than necessary, never
+    # less. So attribution only ever NARROWS this set where the owner is known, and every
+    # unresolved case keeps the old answer:
+    #   * `column_tables` returns None -- scopes could not be resolved at all -> mask, as before.
+    #   * a column has no entry -- its qualifier names a CTE or derived table -> mask, as before.
+    #   * an unqualified `ssn` across two tables that both mask it is genuinely ambiguous, and
+    #     resolution declines to guess -> mask, as before.
+    # Only a column resolved to a DIFFERENT base table is dropped, which is the reported defect
+    # and the one case where the old answer was certainly wrong.
+    owners = column_tables(ast)
     referenced_masked: set[str] = set()
     for column in ast.find_all(exp.Column):
+        owner = None if owners is None else owners.get(id(column))
         for tbl, cols in masked_by_table.items():
-            if column.name.lower() in cols:
+            if column.name.lower() not in cols:
+                continue
+            if owner is None or owner.lower() == tbl:
                 referenced_masked.add(tbl)
 
     # Resolved before the loop mutates the tree: `replace` invalidates the scope it was read from.

@@ -199,12 +199,40 @@ class VerityTraceSink(TraceSink):
                 "reasons": list(getattr(trace, "lineage_reasons", []) or []),
             },
             "semantic_refs": self._semantic_refs(event),
+            # ---- ALWAYS: what the access decision did to WHICH OBJECT ----------------------
+            # The field existed and was always `[]`, next to a `grant_fingerprint` whose own
+            # comment calls itself "a hash of the policy, not the policy" -- so the store could
+            # tell two answers apart under different grants and could not say what either grant
+            # DID. That is the M56 question one layer on, and this is its answer.
+            #
+            # SHAPED TO THE STORE, which is a typed contract and not a free-form bag:
+            # `trace_schema::PolicyDecisionV1` requires `policy_id` and `effect` as strings and
+            # takes `metadata` as free JSON. A first version of this emitted
+            # `{object, rows, columns}` and `null` for the not-evaluated case; the field is
+            # `Vec<PolicyDecisionV1>` with `#[serde(default)]`, which covers a MISSING key and not
+            # an explicit null, so that version rejected the whole trace on the governed path --
+            # storing nothing where the old empty list at least stored the rest.
+            #
+            # `policy_id` is a constant because mnemiq does not know one: the decision comes from
+            # the provider, and `Narrowing` deliberately carries no policy identity. Inventing an
+            # id here would put a fabricated identifier into an audit record.
+            # Empty because mnemiq has no policies to decide with -- not because nothing was
+            # recorded. What it DID is `access_effects` in `collector_metadata` below.
             "policy_decisions": [],
             "collector_metadata": {
                 "elapsed_ms": round(event.elapsed_ms, 3),
                 # A hash of the policy, not the policy. Two answers to one question under different
                 # grants are different events and must not be indistinguishable in the store.
                 "grant_fingerprint": getattr(answer, "grant_fingerprint", None),
+                # `policy_decisions` cannot carry this: it is a typed Vec, so `[]` is the only
+                # empty it can express and "evaluated, narrowed nothing" would be identical to
+                # "never evaluated". The marker lives here, in the one part of the record that is
+                # free-form JSON on the store side.
+                "access_evaluated": _decision(trace, answer) is not None,
+                # The effects themselves, unattributed by design. `access_evaluated` distinguishes
+                # "evaluated and narrowed nothing" from "never evaluated"; a bare empty list here
+                # could not.
+                "access_effects": _access_effects(trace, answer),
             },
             "captured_at": _now(),
             "idempotency_key": "",
@@ -311,6 +339,50 @@ _STAGE_TO_KIND = {
     "verify": "model_call",  # lossy, see above
     "synthesize": "answer",
 }
+
+
+def _decision(trace, answer):
+    """What the access decision narrowed, from whichever object still has it.
+
+    The trace is built AFTER execution -- it needs timing and result shape -- so a verifier
+    deferral or a synthesis failure returns an answer with no trace, and reading the trace alone
+    recorded "governance was never evaluated" for queries that were governed and had already run.
+    The answer carries the same fact from the moment the decider produces it, so it is the more
+    complete source; the trace is preferred only because a successful answer has both and they
+    agree by construction.
+    """
+    for holder in (trace, answer):
+        found = getattr(holder, "narrowed", None)
+        if found is not None:
+            return found
+    return None
+
+
+def _access_effects(trace, answer):
+    """What the access decision did, per object, as UNATTRIBUTED effects.
+
+    Deliberately NOT `PolicyDecisionV1`. That struct requires a `policy_id`, and mnemiq has no
+    policy identity to give: `GrantSet` carries a fingerprint (a hash of the grant SET) and
+    `AccessPolicy` carries a column map, and neither is a policy identifier. An earlier version
+    filled the field with the constant `mnemiq.access`, which is not a placeholder awaiting a real
+    value -- there is no path by which it becomes one. A signed audit export would then carry a
+    policy identifier for a policy that does not exist, collapsing every provider decision into
+    one fiction and making reconciliation impossible. A shape-valid record can still be a false
+    one.
+
+    So `policy_decisions` stays `[]` -- which is now true rather than merely unpopulated, because
+    mnemiq records no POLICY decisions -- and the effects go to `collector_metadata`, which is
+    `serde_json::Value` on the store side and is where this engine's own observations belong.
+
+    A function rather than an inline comprehension so tests CALL it: earlier versions regex-matched
+    this module's source and eval-ed the expression, testing the text rather than the value.
+    """
+    return [
+        {"object": n.object,
+         "effect": ("row_filter+column_mask" if (n.rows and n.columns)
+                    else "row_filter" if n.rows else "column_mask")}
+        for n in (_decision(trace, answer) or [])
+    ]
 
 
 def _to_trace_event(raw: dict, index: int) -> dict:
