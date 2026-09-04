@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import pytest
 from dataclasses import dataclass, field
 
@@ -384,6 +385,11 @@ def _respond(monkeypatch, payload: bytes):
 
         headers = {"Content-Length": str(len(payload))}
 
+        def read1(self, *args):
+            # `read1`, mirroring the real `HTTPResponse`: the sink reads only through it, because
+            # `read` cannot be interrupted and so cannot be bounded.
+            return self.read(*args)
+
         def read(self, *args):
             # Honours whatever `amt` it is handed. With `Content-Length` declared as exactly
             # `len(payload)` above, that is always the full body -- so this slice is a no-op on
@@ -511,7 +517,11 @@ def test_the_receipt_read_is_bounded_by_the_declared_length(monkeypatch):
         def __exit__(self, *a):
             return False
 
-        def read(self, *args):
+        def read1(self, *args):
+            seen["limit"] = args[0] if args else None
+            return body
+
+        def read(self, *args):  # pragma: no cover - the sink reads only through read1
             seen["limit"] = args[0] if args else None
             return body
 
@@ -530,10 +540,10 @@ def test_a_receipt_without_a_declared_length_is_not_waited_on(monkeypatch):
     dribbling one byte per window holds the SYNCHRONOUS answer path -- `Runtime.ask` does not
     return until `record_answer` does -- and the cap does nothing about it.
 
-    Refusing to start removes the UNDECLARED and over-large cases; it does not bound time in
-    general -- a receiver declaring a length within the cap can still dribble, and chunked bodies
-    trickle even when a `Content-Length` is present. Bounding time needs a deadline, which sync
-    urllib does not offer. This pins the case that is actually closed.
+    Refusing to start removes the UNDECLARED and over-large cases. It does not bound time -- a
+    receiver declaring a length within the cap can still dribble -- which is what
+    `_read_within_deadline` is for; see `test_a_dribbling_receiver_cannot_hold_an_answer_open`.
+    This pins the refusal, not the deadline.
     """
     reads: list = []
 
@@ -545,6 +555,10 @@ def test_a_receipt_without_a_declared_length_is_not_waited_on(monkeypatch):
 
         def __exit__(self, *a):
             return False
+
+        def read1(self, *args):
+            reads.append(args)
+            return b"{}"
 
         def read(self, *args):
             reads.append(args)
@@ -576,6 +590,10 @@ def test_a_receipt_larger_than_the_cap_is_not_read(monkeypatch):
 
         def __exit__(self, *a):
             return False
+
+        def read1(self, *args):
+            reads.append(args)
+            return b"{}"
 
         def read(self, *args):
             reads.append(args)
@@ -636,6 +654,10 @@ def test_a_nonsensical_declared_length_is_refused(monkeypatch, declared):
         def __exit__(self, *a):
             return False
 
+        def read1(self, *args):
+            reads.append(args)
+            return b"{}"
+
         def read(self, *args):
             reads.append(args)
             return b"{}"
@@ -648,3 +670,75 @@ def test_a_nonsensical_declared_length_is_refused(monkeypatch, declared):
     assert reads == [], f"a declared length of {declared!r} must not reach read()"
     assert sink.lineage_voided == 0
     assert sink.dropped == 0
+
+
+def _dribbling_server(declared: int, per_byte: float) -> int:
+    """A real HTTP server that declares a length and then trickles. Returns its port.
+
+    A REAL server, not a stub, because a stub is what hid this defect twice. The first probe
+    returned one byte per `read` call -- a shape a non-chunked `HTTPResponse` never produces -- so
+    it exercised many loop iterations that the real dependency collapses into a single blocking
+    call, and the mutation `_RECEIPT_CHUNK_BYTES = 64 * 1024` left it green. A stub WIDER than the
+    thing it stands in for cannot observe a defect that lives in the narrowness.
+    """
+    import socket
+    import threading
+
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def serve() -> None:
+        try:
+            conn, _ = srv.accept()
+            conn.recv(65536)
+            conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\n\r\n".encode())
+            for _ in range(declared):
+                conn.sendall(b"x")
+                time.sleep(per_byte)
+            conn.close()
+        except OSError:
+            pass
+        finally:
+            srv.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return port
+
+
+def test_a_dribbling_receiver_cannot_hold_an_answer_open(monkeypatch):
+    """**Codex adversarial review, [high], then a review-gate BLOCKER on the first fix.**
+
+    `Runtime.ask` does not return until `record_answer` does, and urllib's `timeout` is per socket
+    OPERATION, not a total deadline -- so a receiver that declares an allowed length and then
+    dribbles can hold an answer open and exhaust request workers after already accepting the trace.
+    The exposure was NEW: before the receipt was read at all, the sink returned once headers
+    arrived.
+
+    The first fix was a deadline checked between `read()` calls, and it did nothing, because
+    `HTTPResponse.read(amt)` does not return short -- it blocks until `amt` bytes arrive, so a
+    receipt inside the cap is consumed in ONE call and the budget is never re-checked. Measured
+    against this very server: `read` returned all 100 bytes after 5.60s under a 1.0s budget;
+    `read1`, which returns after a single underlying read, returned 19 bytes after 1.01s.
+
+    So this asserts against a real socket, and it is the mutation-checked shape: setting
+    `_RECEIPT_CHUNK_BYTES` to the whole cap, or reverting `read1` to `read`, must fail it.
+    """
+    monkeypatch.setattr(mod, "_RECEIPT_DEADLINE_SECONDS", 0.5)
+    port = _dribbling_server(declared=200, per_byte=0.05)  # 10s if read to completion
+    sink = VerityTraceSink(
+        _Settings(verity_traces_url=f"http://127.0.0.1:{port}/api/traces/batch")
+    )
+
+    started = time.monotonic()
+    sink.record_answer(_event())
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 3.0, (
+        f"the answer path must not wait on a dribbling receiver; took {elapsed:.2f}s. "
+        "Reading to completion would be ~10s."
+    )
+    assert sink.lineage_voided == 0, "an abandoned receipt reports nothing, like an older Verity"
+    assert sink.dropped == 0, "the trace was accepted; abandoning its receipt is not a drop"
