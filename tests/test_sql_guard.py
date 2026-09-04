@@ -254,11 +254,13 @@ def test_the_fold_direction_belongs_to_the_dialect_that_will_RUN_it():
     # Oracle folds it to `CLAIM`, a different object -- the base table, whose star must be refused
     assert isinstance(check_shape(quoted_lower, dialect="oracle"), Refusal)
 
-    # and the MIRROR case, which is a separate assertion rather than a corollary: preserving the
-    # fold for a quoted reference while keeping it for a quoted definition flips this one back to
-    # permitted on Oracle and leaves every other case in this test green
+    # The MIRROR case, and only the Oracle half of it is new -- the duckdb half is asserted in the
+    # test above. It is a separate assertion rather than a corollary because exactly one mutation
+    # reaches it: FOLDING a quoted reference while still PRESERVING a quoted definition. (Not
+    # folding both sides -- that flips `quoted_lower` above and is caught there.) Under it the
+    # definition `claim` keys to `CLAIM` on Oracle and the reference `"claim"` folds to `CLAIM`
+    # too, so the CTE vouches for a star over the base table and every other case here stays green.
     mirror = 'WITH claim AS (SELECT id FROM policy) SELECT * FROM "claim"'
-    _ok(mirror)
     assert isinstance(check_shape(mirror, dialect="oracle"), Refusal)
 
     quoted_upper = 'WITH "CLAIM" AS (SELECT id FROM policy) SELECT * FROM claim'
