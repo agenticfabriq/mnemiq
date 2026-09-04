@@ -99,6 +99,11 @@ class VerityTraceSink(TraceSink):
         self.dropped_unbuildable = 0
         self.dropped_rejected = 0
         self.dropped_unavailable = 0
+        # NOT a drop, and deliberately not part of `dropped`: the trace reached the store and the
+        # audit record is whole. What was lost is the lineage claim riding on it, because this
+        # engine sent a shape Verity could not read. An operator summing `dropped` must not see
+        # this; an engineer asking "is our payload right" must.
+        self.lineage_voided = 0
 
     # -- tier gates ------------------------------------------------------------------------------
     def _send_text(self) -> bool:
@@ -266,6 +271,34 @@ class VerityTraceSink(TraceSink):
         logger.warning("verity trace dropped (%s; %d total); answer unaffected: %s",
                        cause, self.dropped, exc)
 
+    def _note_voided_claims(self, response: Any) -> None:
+        """Read the receipt. Verity accepts a trace whose lineage claim it could not read and
+        names it in `lineage_voided`; this sink read no response body at all, so that 200 was
+        byte-identical to a clean one.
+
+        That is the receiving side's own finding seen from here: Verity was fixed to SAY it had
+        dropped a claim, and a producer that never reads the answer is told nothing either way.
+        Being told is worth nothing if nobody listens.
+
+        Absent means absent -- an older Verity, or any other receiver, answers without the field,
+        and that is not a voided claim. The same distinction the field exists for, one level up.
+
+        Fail-soft like the rest of this class: the answer already succeeded and the trace is
+        stored, so a receipt this sink cannot parse changes nothing and is not a drop.
+        """
+        try:
+            voided = json.loads(response.read()).get("lineage_voided") or []
+        except Exception:  # noqa: BLE001 - a receipt we cannot read is not a reason to act
+            return
+        if not voided:
+            return
+        self.lineage_voided += len(voided)
+        logger.warning(
+            "verity kept %d trace(s) but could not read the lineage claim on them (%d total); "
+            "the drift is in this engine's payload: %s",
+            len(voided), self.lineage_voided, ", ".join(str(t) for t in voided),
+        )
+
     def record_answer(self, event: AnswerEvent) -> None:
         url = getattr(self._settings, "verity_traces_url", None)
         if not url:
@@ -281,7 +314,8 @@ class VerityTraceSink(TraceSink):
             headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=10):
+            with urllib.request.urlopen(request, timeout=10) as response:
+                self._note_voided_claims(response)
                 return
         except (urllib.error.URLError, OSError, ValueError) as exc:
             # Never raises into Runtime.ask: a Verity outage cannot stop mnemiq answering. But M18

@@ -9,12 +9,14 @@ review (ui-1).
 from __future__ import annotations
 
 import json
+import logging
 import pytest
 from dataclasses import dataclass, field
 
 
 from mnemiq.contract.seams import IdentityContext
 from mnemiq.contract.semantic import CertifiedRef
+from mnemiq.observability import trace_sink as mod
 from mnemiq.observability.trace_sink import AnswerEvent, VerityTraceSink
 
 
@@ -362,3 +364,82 @@ def test_the_total_still_counts_every_cause(monkeypatch):
     sink.record_answer(_event())
 
     assert _drop_counts(sink) == (2, 0, 1, 1)
+
+
+def _respond(monkeypatch, payload: bytes, status: int = 200):
+    """Answer the post with a real body, which the sink had never read."""
+    class _Resp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return payload
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
+
+
+def test_a_voided_lineage_claim_is_counted_not_swallowed(monkeypatch, caplog):
+    """**D158's residue, from the producer's side.**
+
+    Verity now answers a drifted claim with `accepted:1, lineage_voided:["..."]` -- the trace was
+    kept and the claim it carried could not be read. The sink read no response body at all, so
+    that 200 was byte-identical to a clean one and the report landed nowhere.
+
+    Which is D158's own shape one repo over: the receiver was fixed to SAY it dropped something,
+    and the producer still could not tell. Being told is worth nothing if nobody listens.
+    """
+    _respond(
+        monkeypatch,
+        json.dumps({
+            "status": "accepted", "accepted": 1, "deduped": 0, "rejected": 0,
+            "trace_ids": ["trace-abc"], "errors": [], "grading_jobs_created": 0,
+            "lineage_voided": ["trace-abc"],
+        }).encode(),
+    )
+    sink = VerityTraceSink(_Settings())
+    with caplog.at_level(logging.WARNING):
+        sink.record_answer(_event())
+
+    assert sink.lineage_voided == 1, "a voided claim must be countable, like every other loss"
+    assert sink.dropped == 0, "nothing was dropped: the trace is in the store"
+    assert "trace-abc" in caplog.text, "the log must name the trace whose claim was voided"
+
+
+def test_a_clean_acceptance_counts_no_voided_claim(monkeypatch):
+    """A counter that fires on every success measures nothing."""
+    _respond(
+        monkeypatch,
+        json.dumps({
+            "status": "accepted", "accepted": 1, "deduped": 0, "rejected": 0,
+            "trace_ids": ["trace-abc"], "errors": [], "grading_jobs_created": 0,
+            "lineage_voided": [],
+        }).encode(),
+    )
+    sink = VerityTraceSink(_Settings())
+    sink.record_answer(_event())
+    assert sink.lineage_voided == 0
+
+
+def test_a_receiver_that_says_nothing_about_lineage_is_not_a_voided_claim(monkeypatch):
+    """An older Verity, or any other receiver, answers without the field. Absent is not voided --
+    the same distinction this whole finding is about, applied to the response instead of the claim.
+    """
+    _respond(monkeypatch, json.dumps({"status": "accepted", "accepted": 1}).encode())
+    sink = VerityTraceSink(_Settings())
+    sink.record_answer(_event())
+    assert sink.lineage_voided == 0
+
+
+def test_an_unreadable_response_body_does_not_fail_the_answer(monkeypatch):
+    """The sink's whole contract is that Verity cannot break mnemiq. Reading the body is new
+    surface for that promise to break on, so it is asserted rather than assumed."""
+    _respond(monkeypatch, b"this is not json")
+    sink = VerityTraceSink(_Settings())
+    sink.record_answer(_event())
+    assert sink.lineage_voided == 0
+    assert sink.dropped == 0, "the trace was accepted; an unreadable receipt is not a drop"
