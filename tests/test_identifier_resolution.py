@@ -167,3 +167,75 @@ def test_a_CTE_is_known_by_what_it_DEFINES_and_a_reference_by_what_it_READS():
     assert resolve_name(cte, "postgres") == "c"
     assert resolve_name(ref, "postgres") == "c", "the name it READS, not its own alias `x`"
     assert base_tables(ast, "postgres") == [t for t in ast.find_all(exp.Table) if t.name == "policy"]
+
+
+def test_a_RECURSIVE_cte_self_reference_does_not_fall_through_to_fail_open():
+    """The shape a note in `scope.py` claimed could not reach its fail-open branch, which reached
+    it the same day.
+
+    A recursive CTE's self-reference binds to a scope whose expression is one BRANCH of the union,
+    while the CTE's own body is the whole union -- so matching the expression against every CTE
+    node found nothing, `_engine_shadows` returned its fallback, and the base table was dropped
+    from the read list. `_defining_identifier` walks UP to the nearest definer instead."""
+    leak = ('WITH RECURSIVE "Claim" AS (SELECT id FROM policy UNION ALL SELECT id FROM Claim) '
+            'SELECT id FROM "Claim"')
+    for engine in ("postgres", "oracle"):
+        assert _verdict(leak, engine) == "Refusal", engine
+    assert _verdict(leak, "duckdb") == "Approved", "duckdb folds, so the CTE really does shadow"
+
+    # the control: all bare, so every engine shadows it and a legitimate recursive CTE still runs
+    control = ('WITH RECURSIVE claim AS (SELECT id FROM policy UNION ALL SELECT id FROM claim) '
+               'SELECT id FROM claim')
+    for engine in ("postgres", "oracle", "duckdb", "sqlite"):
+        assert _verdict(control, engine) == "Approved", engine
+
+
+def test_the_measuring_instrument_resolves_the_way_the_measured_path_does():
+    """`touched` called `column_tables` with no dialect while the disclosure path called it with
+    one, so the criterion disagreed with a CORRECT build: a quoted CTE sharing a masked table's
+    name gave `touched={("mask","Claim")}` against an empty `disclosed`. Loud rather than silent,
+    and still the defect this criterion exists to catch elsewhere."""
+    from mnemiq.eval.criterion import check
+    from mnemiq.sql.policy import AccessPolicy
+    from mnemiq.sql.rls import apply_row_and_mask
+
+    visible = {"claim": {"id", "ssn"}, "policy": {"id"}}
+    policy = AccessPolicy(masked={("claim", "ssn")})
+    sql = 'WITH "Claim" AS (SELECT id FROM policy) SELECT Claim.ssn FROM Claim'
+
+    def agree(sql, policy, visible):
+        ast = sqlglot.parse_one(sql, read="duckdb")
+        _out, narrowed = apply_row_and_mask(ast, policy, visible,
+                                            dialect="duckdb", executes_as="duckdb")
+        return check(sqlglot.parse_one(sql, read="duckdb"), policy, narrowed, visible, "duckdb")
+
+    # the MASK half: `touched` reads `column_tables`
+    mask = agree(sql, policy, visible)
+    assert mask.agrees and mask.touched == set(), (mask.missing, mask.spurious)
+
+    # the FILTER half reads `base_tables`, and needs its own case -- the mask case above stays
+    # green with the dialect stripped from that call, so it is not a control for it. Without it
+    # `touched` gains a spurious ("filter", "Claim") against an empty disclosure.
+    filtered = agree('WITH "Claim" AS (SELECT id FROM policy) SELECT id FROM Claim',
+                     AccessPolicy(row_filters={"claim": "id > 0"}),
+                     {"claim": {"id"}, "policy": {"id"}})
+    assert filtered.agrees and filtered.touched == set(), (filtered.missing, filtered.spurious)
+
+
+def test_sqlglot_binds_by_exact_text_which_over_reports_rather_than_under():
+    """Recorded, not fixed. `scope.sources` is keyed by the name as typed, so a reference the
+    ENGINE would fold onto a CTE -- `WITH "Claim" AS (...) ... FROM claim` on duckdb -- is bound to
+    no source and reported as a real read.
+
+    That direction only ever adds a table to the list the grant check walks, so it costs a refusal
+    or a redundant mask, never a leak. Closing it means re-binding sources by resolved name instead
+    of using sqlglot's, which is a deeper change than the one this file makes."""
+    from mnemiq.sql.policy import AccessPolicy
+
+    sql = 'WITH "Claim" AS (SELECT id FROM policy) SELECT claim.ssn FROM claim'
+    result = decide(sql, {"claim": {"id", "ssn"}, "policy": {"id"}},
+                    target="duckdb", dialect="duckdb",
+                    policy=AccessPolicy(masked={("claim", "ssn")}))
+    assert type(result).__name__ == "Approved"
+    assert "claim" in result.tables, "reported as a read the engine would have shadowed"
+    assert result.narrowed, "and masked accordingly -- redundant, not permissive"

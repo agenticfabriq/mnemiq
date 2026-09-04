@@ -88,12 +88,18 @@ def _qualified(ast: exp.Expression, schema) -> exp.Expression:
         return ast
 
 
-def touched(ast: exp.Expression, policy: AccessPolicy, schema=None) -> Touched:
+def touched(ast: exp.Expression, policy: AccessPolicy, schema=None, dialect=None) -> Touched:
     """What the policy narrows in what the plan REFERENCED.
 
     `schema` is the caller's visible map -- the same one the disclosure path gets. Omitting it
     measures the plan exactly as written, which reports every unqualified masked reference as
     unattributable.
+
+    `dialect` is the ENGINE the answer ran against, and it has to be the same one the disclosure
+    path resolved with. Leaving it off made the instrument disagree with what it measures: a quoted
+    CTE sharing a masked table's name gave `touched={("mask","Claim")}` against an empty
+    `disclosed`, so a CORRECT build scored RED -- loud rather than silent, and still the same
+    "threaded to some call sites" defect this criterion exists to catch elsewhere.
 
     "Referenced" is load-bearing and a draft of the spec dropped it, which inverted the criterion:
     without it `touched` becomes every masked pair whose table merely appears, so
@@ -116,7 +122,7 @@ def touched(ast: exp.Expression, policy: AccessPolicy, schema=None) -> Touched:
     entries: set[Entry] = set()
     ast = _qualified(ast, schema)
 
-    for name in {object_key(t) for t in base_tables(ast)}:
+    for name in {object_key(t) for t in base_tables(ast, dialect)}:
         if policy.row_filter_for(name) is not None:
             entries.add(("filter", name))
 
@@ -131,7 +137,7 @@ def touched(ast: exp.Expression, policy: AccessPolicy, schema=None) -> Touched:
     # exactly what was. On `SELECT bogus.ssn FROM claim` it answers `{claim}`, a definite single
     # object, where `column_tables` records nothing; keying on it would mark the reference
     # attributable and score the answer green unmeasured.
-    owners = column_tables(ast)
+    owners = column_tables(ast, dialect)
     unattributable: list[str] = []
     for column in ast.find_all(exp.Column):
         name = column.name.lower()
@@ -177,10 +183,11 @@ class AnswerCheck:
         return not self.unattributable
 
 
-def check(ast: exp.Expression, policy: AccessPolicy, narrowed, schema=None) -> AnswerCheck:
+def check(ast: exp.Expression, policy: AccessPolicy, narrowed, schema=None,
+          dialect=None) -> AnswerCheck:
     """Both directions are reported rather than a bool alone: a caller that sees only `False`
     cannot tell an under-fire from an over-fire, and they are not the same defect."""
-    t = touched(ast, policy, schema)
+    t = touched(ast, policy, schema, dialect)
     d = disclosed(narrowed)
     return AnswerCheck(agrees=t.entries == d, missing=t.entries - d, spurious=d - t.entries,
                        unattributable=t.unattributable, touched=t.entries)

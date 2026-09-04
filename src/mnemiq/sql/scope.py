@@ -111,19 +111,25 @@ def scope_resolved(ast: exp.Expression) -> bool:
     return ast_root is not None and not _unscoped_ctes(ast, ast_root)
 
 
-def _defining_identifier(source, ast: exp.Expression) -> exp.Expression | None:
+def _defining_identifier(source) -> exp.Expression | None:
     """The identifier that NAMES a local source, with its quoting intact.
 
     `scope.sources` is keyed by bare text, so the quoting is gone by the time a name is looked up
-    there. The defining node still has it, and a source's `.expression` IS the node's inner query,
-    so identity maps back to it.
+    there. The defining node still has it, so this walks UP from the source's expression to the
+    nearest node that defines a name.
+
+    Upward, not by matching the expression against every CTE: a RECURSIVE CTE's self-reference
+    binds to a scope whose expression is one BRANCH of the union while the CTE's own body is the
+    whole union, so identity matched nothing, `_engine_shadows` fell through to its fail-open
+    answer, and `WITH RECURSIVE "Claim" AS (... UNION ALL SELECT id FROM Claim) SELECT id FROM
+    "Claim"` came back Approved with the base table dropped from the read list -- the M79 leak, in
+    the one shape a note in this file claimed could not reach that branch.
     """
-    inner = getattr(source, "expression", None)
-    if inner is None:
-        return None
-    for node in ast.find_all(exp.CTE, exp.Subquery):
-        if node.this is inner:
+    node = getattr(source, "expression", None)
+    while node is not None:
+        if isinstance(node, exp.CTE | exp.Subquery):
             return node.args.get("alias")
+        node = node.parent
     return None
 
 
@@ -137,14 +143,14 @@ def _engine_shadows(table: exp.Table, source, ast: exp.Expression, dialect: str 
     what unlocked the base table. Postgres folds the unquoted reference to `claim` and preserves
     `"Claim"`, so the two are different objects there and the read was never authorized. (M79.)
 
-    Answering True when the defining node cannot be found keeps the previous behaviour, and that
-    fails OPEN rather than closed -- the node is dropped from the read list and never reaches the
-    `visible` lookup. An earlier version of this note claimed the opposite. It is kept because no
-    shape was found that reaches it: `UNNEST`, `VALUES`, `LATERAL`, a table function and
-    `generate_series` all resolve to an `exp.Table` source or to no source at all. Kept, recorded,
-    and not defended -- if a shape does turn up, this is the line to change.
+    Answering True when no defining identifier can be found fails OPEN -- the node is dropped from
+    the read list and never reaches the `visible` lookup. Two earlier versions of this note were
+    wrong about it: one called it fail-closed, the next claimed no shape reached it, and a
+    RECURSIVE CTE reached it the same day. Walking UP to the nearest definer is what closed that,
+    so this branch is now only for a source with no enclosing definer at all -- which is why it is
+    stated as a fail-open with no shape currently known to reach it, rather than as safe.
     """
-    alias = _defining_identifier(source, ast)
+    alias = _defining_identifier(source)
     if alias is None:
         return True
     return resolve_identifier(alias, dialect) == resolve_name(table, dialect)
