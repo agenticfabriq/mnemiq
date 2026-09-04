@@ -307,8 +307,8 @@ def test_failing_closed_costs_no_ordinary_query():
         for engine in ("postgres", "oracle", "duckdb"):
             assert _verdict(sql, engine) == "Approved", f"{engine}: {sql}"
 
-    # WHY it costs nothing, asserted rather than asserted-about. The `_ok` loop above is not a
-    # control for this -- it stays green with the fail-open answer restored -- so this reads the
+    # WHY it costs nothing, asserted rather than asserted-about. The `_verdict` loop above is not
+    # a control for this -- it stays green with the fail-open answer restored -- so this reads the
     # property directly: for every ordinary shape, each non-table source a reference binds to has
     # a definer that NAMES it, so the `alias is None` fallback is never the answer.
     #
@@ -319,9 +319,16 @@ def test_failing_closed_costs_no_ordinary_query():
 
     from mnemiq.sql.scope import _defining_identifier
 
+    # A shape only counts here if a reference actually BINDS to a non-table source. Three of the
+    # first five did not -- their table nodes all bind to `exp.Table` and skip the assertion --
+    # so the derived-table half went unasserted and dropping `exp.Subquery` from the definer walk
+    # left the whole suite green. `..., x` is what makes a reference bind to a derived table.
+    examined = 0
     for sql in ("SELECT id FROM policy, LATERAL (SELECT id FROM policy) y",
                 "SELECT id FROM ((SELECT id FROM policy)) x",
-                "SELECT id FROM (SELECT id FROM (SELECT id FROM policy) i) o",
+                "SELECT id FROM (SELECT id FROM policy) x, x",           # binds to a Subquery
+                "SELECT id FROM ((SELECT id FROM policy)) x, x",         # ...through parentheses
+                "SELECT id FROM (SELECT id FROM (SELECT id FROM policy) i) o, o",
                 "WITH a AS (SELECT id FROM policy), b AS (SELECT id FROM a) SELECT id FROM b",
                 "WITH RECURSIVE r AS (SELECT id FROM policy UNION ALL SELECT id FROM r) "
                 "SELECT id FROM r"):
@@ -331,8 +338,11 @@ def test_failing_closed_costs_no_ordinary_query():
                 source = scope.sources.get(table.alias_or_name)
                 if source is None or isinstance(source, exp.Table):
                     continue
+                examined += 1
                 assert _defining_identifier(source) is not None, (
                     f"{table.sql()} in {sql} reaches the fail-closed fallback")
+
+    assert examined >= 6, f"the loop asserted on only {examined} sources -- it proves nothing"
 
     # Run on ONE sqlglot -- whatever the lock pins -- so this proves nothing about other versions.
     # 25.34.1, 26.16.4, 28.0.0 and 30.12.0 were each installed and probed by hand and each gave
