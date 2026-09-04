@@ -165,9 +165,14 @@ def _engine_shadows(table: exp.Table, source, dialect: str | None) -> bool:
     Its cost is measured, not assumed, because a guard that refuses legitimate analytics SQL is
     broken rather than safe. The branch is consulted ONLY for a table NODE whose source is not an
     `exp.Table` -- so a derived table, a CTE, a LATERAL or a UNION branch never reaches it unless a
-    reference COLLIDES with its name. Across sqlglot 25.34.1, 26.16.4, 28.0.0 and 30.12.0 -- the
-    whole range `pyproject.toml` declares, and this file already notes that scope internals differ
-    within it -- thirteen ordinary shapes produce zero hits, and the suite is unchanged.
+    reference COLLIDES with its name. Thirteen ordinary shapes produce zero hits on sqlglot
+    25.34.1, 26.16.4, 28.0.0 and 30.12.0, and the suite is unchanged.
+
+    Four versions are a SAMPLE, not the range: `pyproject.toml` declares `>=25.34.1` with no
+    ceiling, so any later release is supported and unmeasured -- and this file already notes that
+    scope internals differ across that span. The probe was run by hand against each install and
+    nothing in the repo re-runs it; what the tests DO assert is the property the number rests on,
+    that ordinary shapes never reach the branch at all.
     """
     alias = _defining_identifier(source)
     if alias is None:

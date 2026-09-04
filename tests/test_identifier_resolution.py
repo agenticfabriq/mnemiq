@@ -307,9 +307,34 @@ def test_failing_closed_costs_no_ordinary_query():
         for engine in ("postgres", "oracle", "duckdb"):
             assert _verdict(sql, engine) == "Approved", f"{engine}: {sql}"
 
-    # The branch is consulted ONLY for a table NODE whose source is not an `exp.Table`, so none of
-    # the above reaches it -- a LATERAL or a derived table is not a collision. Measured directly
-    # across sqlglot 25.34.1, 26.16.4, 28.0.0 and 30.12.0: thirteen ordinary shapes, zero hits.
-    ast = sqlglot.parse_one("SELECT id FROM policy, LATERAL (SELECT id FROM policy) y",
-                            read="postgres")
-    assert {t.name for t in base_tables(ast, "postgres")} == {"policy"}
+    # WHY it costs nothing, asserted rather than asserted-about. The `_ok` loop above is not a
+    # control for this -- it stays green with the fail-open answer restored -- so this reads the
+    # property directly: for every ordinary shape, each non-table source a reference binds to has
+    # a definer that NAMES it, so the `alias is None` fallback is never the answer.
+    #
+    # Note it is the FALLBACK that is unreached, not `_engine_shadows` itself: a chained CTE
+    # reaches the function and gets a real answer from it. An earlier version of this assertion
+    # conflated the two and failed on exactly that shape.
+    from sqlglot.optimizer.scope import build_scope
+
+    from mnemiq.sql.scope import _defining_identifier
+
+    for sql in ("SELECT id FROM policy, LATERAL (SELECT id FROM policy) y",
+                "SELECT id FROM ((SELECT id FROM policy)) x",
+                "SELECT id FROM (SELECT id FROM (SELECT id FROM policy) i) o",
+                "WITH a AS (SELECT id FROM policy), b AS (SELECT id FROM a) SELECT id FROM b",
+                "WITH RECURSIVE r AS (SELECT id FROM policy UNION ALL SELECT id FROM r) "
+                "SELECT id FROM r"):
+        root = build_scope(sqlglot.parse_one(sql, read="postgres"))
+        for scope in root.traverse():
+            for table in scope.tables:
+                source = scope.sources.get(table.alias_or_name)
+                if source is None or isinstance(source, exp.Table):
+                    continue
+                assert _defining_identifier(source) is not None, (
+                    f"{table.sql()} in {sql} reaches the fail-closed fallback")
+
+    # Run on ONE sqlglot -- whatever the lock pins -- so this proves nothing about other versions.
+    # 25.34.1, 26.16.4, 28.0.0 and 30.12.0 were each installed and probed by hand and each gave
+    # zero hits over thirteen shapes; that is a sample of a floor with no ceiling, not the range,
+    # and nothing here re-runs it.
