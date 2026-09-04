@@ -99,7 +99,24 @@ def _sources(select: exp.Select) -> dict[str, exp.Expression]:
 # scope it is read from. `Scope` is that pair, and pairing them is the whole point: a bare
 # `name -> body` map has to borrow some caller's names to interpret the body, and the caller's
 # names are not the ones the body was written against.
-Scope = dict[str, tuple[exp.Expression, "Scope"]]
+# Keyed by (name, quoted), never by name alone. Quoting is half the identity: Postgres folds an
+# unquoted name and preserves a quoted one, so `"Claim"` and `Claim` are two different objects
+# there and matching them let a CTE vouch for a base table.
+Scope = dict[tuple[str, bool], tuple[exp.Expression, "Scope"]]
+
+
+def _identity(node: exp.Expression) -> tuple[str, bool]:
+    """A name plus whether it was written quoted -- the pair a dialect resolves, not the name.
+
+    A CTE is identified by the name it DEFINES; a table reference by the name it READS. Those come
+    from different places: `alias_or_name` on `c21 AS a` is the alias `a`, so using it for both
+    made every aliased CTE reference miss and fall through to the base-table branch.
+    """
+    identifier = node.args.get("alias").this if isinstance(node, exp.CTE) else node.this
+    while isinstance(identifier, exp.TableAlias):
+        identifier = identifier.this
+    quoted = bool(identifier.args.get("quoted")) if isinstance(identifier, exp.Identifier) else False
+    return ((node.alias_or_name if isinstance(node, exp.CTE) else node.name), quoted)
 
 
 def _visible_ctes(node: exp.Expression, outer: Scope) -> Scope:
@@ -131,14 +148,14 @@ def _visible_ctes(node: exp.Expression, outer: Scope) -> Scope:
     recursive = bool(with_.args.get("recursive"))
     scope: Scope = dict(outer)
     for cte in with_.expressions:
-        name = cte.alias_or_name
+        key = _identity(cte)
         # snapshot BEFORE binding this name: the body sees the outer scope and its preceding
         # siblings, plus itself only when the WITH is RECURSIVE
         body_scope: Scope = dict(scope)
         entry = (cte.this, body_scope)
         if recursive:
-            body_scope[name] = entry
-        scope[name] = entry
+            body_scope[key] = entry
+        scope[key] = entry
     return scope
 
 
@@ -215,8 +232,8 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
         # `WITH claim AS (SELECT id FROM policy) SELECT * FROM main.claim` resolves to the CTE
         # here and to the base table in the database, which returned every column of `claim`.
         if isinstance(source, exp.Table) and not source.db and not source.catalog \
-                and source.name in ctes:
-            body, body_scope = ctes[source.name]
+                and _identity(source) in ctes:
+            body, body_scope = ctes[_identity(source)]
             # `body_scope`, not `ctes`: the body is interpreted where it was written
             if _star_reaches_base(body, body_scope, memo, stack):
                 return True
@@ -250,15 +267,18 @@ def _has_projection_star(ast: exp.Expression) -> bool:
     refusing it, so the two rules that could widen one are asserted rather than assumed: a CTE
     reference is a bare name, and a body is read in the scope it was written in.
 
-    CTE names are then matched case-SENSITIVELY, and that is not yet justified in either
-    direction. On DuckDB it over-refuses: `... SELECT * FROM CLAIM` against a CTE `claim` is
-    refused here while the engine resolves it to the CTE -- and folding quoted identifiers too,
-    measured, so there is no `"CLAIM"` shape that folding this match would leak. On the default
-    transpile target the question is open the other way: Postgres folds unquoted names and
-    preserves quoted ones, so `WITH "Claim" AS (...) SELECT * FROM Claim` matches HERE while
-    Postgres resolves the reference to a base table -- a wider match, which is the direction that
-    vouches. Whichever way it is settled, the rule is the executing dialect's, and neither exact
-    nor folded matching is that rule. Recorded rather than asserted safe.
+    A CTE name matches only when the reference is spelled identically AND quoted identically.
+    Quoting is half an identifier's identity on the default transpile target -- Postgres folds an
+    unquoted name and preserves a quoted one -- so `WITH "Claim" AS (...) SELECT * FROM Claim`
+    matched on the name alone while Postgres resolves that reference to the base table `claim`,
+    whose columns then reached no grant check at all. `decide` approved exactly that with
+    `tables=['policy']`.
+
+    Requiring both narrows the match, and only a WIDER one can vouch for a star that should have
+    been refused, so this is fail-closed in every dialect rather than tuned to one. It leaves a
+    known false refusal on DuckDB, which folds unquoted AND quoted names: `... FROM CLAIM` against
+    a CTE `claim` resolves to the CTE there and is refused here. Closing that means resolving
+    identifiers by the EXECUTING dialect's rule, which neither exact nor folded matching is.
     """
     # The top level keeps its own fail-open reading: a statement whose shape `_output_selects`
     # does not recognise returns no columns to a caller here, and refusing every such statement

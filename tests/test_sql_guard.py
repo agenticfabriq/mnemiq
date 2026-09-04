@@ -206,6 +206,27 @@ def test_a_QUALIFIED_name_is_never_a_cte_reference():
     _ok("WITH claim AS (SELECT id FROM policy) SELECT * FROM claim")
 
 
+def test_QUOTING_is_half_a_cte_name_and_a_mismatch_does_not_vouch():
+    """Postgres -- `decide`'s default transpile target -- folds an unquoted name and preserves a
+    quoted one, so `"Claim"` and `Claim` are two different objects there. Matching on the name
+    alone let the CTE vouch for a star that Postgres resolves to the base table `claim`, whose
+    columns then reached no grant check: `decide` approved exactly that with `tables=['policy']`.
+
+    Narrowing the match is fail-closed in every dialect, because only a WIDER match can vouch for
+    a star that should have been refused."""
+    for sql in ('WITH "Claim" AS (SELECT id FROM policy) SELECT * FROM Claim',
+                'WITH Claim AS (SELECT id FROM policy) SELECT * FROM "Claim"'):
+        assert _refused(sql).code == RefusalCode.SELECT_STAR, sql
+
+    # spelled and quoted identically, so it really is the CTE
+    _ok("WITH claim AS (SELECT id FROM policy) SELECT * FROM claim")
+    _ok('WITH "claim" AS (SELECT id FROM policy) SELECT * FROM "claim"')
+
+    # and a CTE reference carrying its own alias still resolves by the name it READS: `c x` is a
+    # reference to `c`, not to `x`, and reading `alias_or_name` for both sides missed every one
+    _ok("WITH c AS (SELECT id FROM claim) SELECT * FROM c x")
+
+
 def test_the_verdict_does_not_depend_on_UNION_BRANCH_ORDER():
     """The memo keys on node id, which is sound only because each node now sits in exactly one
     scope. While a body borrowed its caller's names, one branch's answer was cached for the other
