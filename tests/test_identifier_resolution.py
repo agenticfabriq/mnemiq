@@ -300,7 +300,7 @@ def test_failing_closed_costs_no_ordinary_query():
                 "WITH RECURSIVE r AS (SELECT id FROM policy UNION ALL SELECT id FROM r) "
                 "SELECT id FROM r",
                 "SELECT p.id FROM policy p JOIN (SELECT id FROM policy) q ON p.id = q.id",
-                "SELECT id FROM policy, LATERAL (SELECT id FROM policy) y",
+                "SELECT y.id FROM policy, LATERAL (SELECT id FROM policy) y",
                 "SELECT id FROM ((SELECT id FROM policy)) x",
                 "SELECT id FROM (SELECT id FROM (SELECT id FROM policy) i) o",
                 "WITH a AS (SELECT id FROM policy), b AS (SELECT id FROM a) SELECT id FROM b"):
@@ -309,7 +309,7 @@ def test_failing_closed_costs_no_ordinary_query():
 
     # These are RUNNABLE queries, and what they measure is the cost: none is refused. The
     # property behind that -- that no ordinary shape reaches the fallback -- is read directly by
-    # `test_no_ORDINARY_shape_reaches_the_fail_closed_fallback`, because this loop is not a
+    # `test_every_non_table_binding_resolves_a_definer`, because this loop is not a
     # control for it: it stays green with the fail-open answer restored.
 
     # Run on ONE sqlglot -- whatever the lock pins -- so this proves nothing about other versions.
@@ -318,9 +318,13 @@ def test_failing_closed_costs_no_ordinary_query():
     # and nothing here re-runs it.
 
 
-def test_no_ORDINARY_shape_reaches_the_fail_closed_fallback():
+def test_every_non_table_binding_resolves_a_definer():
     """The property the "costs nothing" claim rests on, read directly rather than inferred from
     verdicts: every non-table source a reference binds to has a definer that NAMES it.
+
+    These are the WORST case rather than the ordinary one -- collision shapes and CTEs, chosen
+    because they are what reaches a non-table binding at all. The ordinary shapes are next door,
+    and what they measure is the cost.
 
     The two halves are counted separately because they are reached by different SQL and were not
     equally covered: an earlier version listed five shapes of which three asserted nothing at all,
@@ -362,8 +366,12 @@ def test_no_ORDINARY_shape_reaches_the_fail_closed_fallback():
 
     # per half, so losing one cannot hide behind the other -- and one shape each, so a deleted
     # `, o` shows up rather than being absorbed by slack
-    assert bindings(derived) >= len(derived), "the derived-table half asserted on too few sources"
-    assert bindings(ctes) >= len(ctes), "the CTE half asserted on too few sources"
+    # Exact counts, not floors. `len(ctes)` was 2 against 4 observed bindings -- `a`, `b`, and `r`
+    # TWICE, the outer reference plus the recursive self-reference -- so if that self-reference
+    # stopped binding to a scope, which is the precise M79 regression `_defining_identifier`
+    # exists for, the count would fall 4 -> 3 and a `>= 2` floor would not notice.
+    assert bindings(derived) == 3, "the derived-table half asserted on the wrong number of sources"
+    assert bindings(ctes) == 4, "the CTE half asserted on the wrong number of sources"
 
     # Counted on the pinned sqlglot only. `pyproject` declares `>=25.34.1` with no ceiling and
     # this repo already records that scope internals differ across that span, so a version binding
