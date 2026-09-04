@@ -51,65 +51,97 @@ def test_the_answer_carries_it_so_every_surface_does():
     assert i < j, "the disclosure must be appended BEFORE the answer is returned"
 
 
-def _sink_source():
-    import inspect
-
-    from mnemiq.observability import trace_sink
-
-    return inspect.getsource(trace_sink)
+class _Holder:
+    def __init__(self, narrowed=None):
+        self.narrowed = narrowed
 
 
 def test_the_audit_record_carries_what_the_decision_DID_not_only_a_hash_of_the_grant():
     """Spec item 4, and it is not satisfied by `Trace` carrying the field.
 
-    The sink builds its payload key by key, so a new `Trace` field is silently dropped -- I marked
-    item 4 done once while `policy_decisions` was still the empty list it had always been. The
-    store could distinguish two answers under different grants (`grant_fingerprint`) and could not
-    say what either grant DID.
+    The sink builds its payload key by key, so a new `Trace` field is dropped silently -- I marked
+    item 4 done once while `policy_decisions` was still the empty list it had always been, beside a
+    `grant_fingerprint` whose own comment calls itself "a hash of the policy, not the policy".
     """
-    src = _sink_source()
-    assert '"policy_decisions": [],' not in src, "restored the hardcoded empty decision list"
-    assert 'getattr(trace, "narrowed", None)' in src, "decisions are not sourced from the trace"
+    from mnemiq.contract.seams import Narrowed
+    from mnemiq.observability.trace_sink import _policy_decisions
+
+    got = _policy_decisions(_Holder([Narrowed(object="claim", rows=True, columns=False)]),
+                            _Holder(None))
+    assert got and got[0]["metadata"]["object"] == "claim"
 
 
 def test_every_entry_matches_the_STORES_required_shape():
-    """`policy_decisions` is `Vec<trace_schema::PolicyDecisionV1>`, not free-form JSON:
-    `policy_id` and `effect` are required strings. A first version emitted
-    `{object, rows, columns}` and the store would have rejected the whole trace.
+    """`policy_decisions` is `Vec<trace_schema::PolicyDecisionV1>`, not free-form JSON: `policy_id`
+    and `effect` are required strings. A first version emitted `{object, rows, columns}` and the
+    store would have rejected the whole trace.
 
-    Asserted on the built record rather than on the source, because the shape is what travels.
+    Asserted by CALLING the builder. The first version of this test regex-matched the sink's source
+    and eval-ed the expression, so it tested the text and broke when the expression changed.
     """
     from mnemiq.contract.seams import Narrowed
+    from mnemiq.observability.trace_sink import _policy_decisions
 
-    class _T:
-        narrowed = [Narrowed(object="claim", rows=True, columns=False),
-                    Narrowed(object="person", rows=False, columns=True)]
-
-    src = _sink_source()
-    i = src.index('"policy_decisions": [')
-    j = src.index("],", i)
-    expr = src[i + len('"policy_decisions": '):j + 1]
-    decisions = eval(expr, {"getattr": getattr}, {"trace": _T, "n": None})  # noqa: S307
-    assert len(decisions) == 2
-    for d in decisions:
-        assert isinstance(d.get("policy_id"), str) and d["policy_id"], d
-        assert isinstance(d.get("effect"), str) and d["effect"], d
-        assert isinstance(d.get("metadata"), dict), d
-    assert {d["effect"] for d in decisions} == {"row_filter", "column_mask"}
-    assert {d["metadata"]["object"] for d in decisions} == {"claim", "person"}
+    got = _policy_decisions(
+        _Holder([Narrowed(object="claim", rows=True, columns=False),
+                 Narrowed(object="person", rows=False, columns=True),
+                 Narrowed(object="both", rows=True, columns=True)]), _Holder(None))
+    assert len(got) == 3
+    for d in got:
+        assert isinstance(d.get("policy_id"), str) and d["policy_id"]
+        assert isinstance(d.get("effect"), str) and d["effect"]
+        assert isinstance(d.get("metadata"), dict)
+    assert {d["effect"] for d in got} == {"row_filter", "column_mask", "row_filter+column_mask"}
 
 
 def test_policy_decisions_is_NEVER_null_because_the_store_cannot_deserialize_it():
     """`#[serde(default)]` covers a missing key, not an explicit null. Emitting null rejected the
     whole trace -- storing nothing where the old empty list at least stored the rest."""
-    src = _sink_source()
-    i = src.index('"policy_decisions"')
-    j = src.index("],", i)
-    assert "else None" not in src[i:j], "a null policy_decisions rejects the trace at the store"
+    from mnemiq.observability.trace_sink import _policy_decisions
+
+    assert _policy_decisions(_Holder(None), _Holder(None)) == []
 
 
-def test_the_not_evaluated_marker_lives_where_the_record_is_free_form():
-    """A typed Vec has one empty, so `[]` cannot mean both "narrowed nothing" and "never ran".
-    `collector_metadata` is `serde_json::Value` on the store side, so the marker goes there."""
-    src = _sink_source()
-    assert '"access_evaluated": getattr(trace, "narrowed", None) is not None' in src
+def test_a_POST_DECISION_failure_is_not_recorded_as_ungoverned():
+    """The trace is built after execution, so a verifier deferral or a synthesis failure returns an
+    answer with NO trace -- and reading the trace alone recorded `access_evaluated: false` for a
+    query that was governed and had already run against the source. A false audit fact, on the
+    record that outlives the answer.
+    """
+    from mnemiq.contract.seams import Narrowed
+    from mnemiq.observability.trace_sink import _decision, _policy_decisions
+
+    answer_only = _Holder([Narrowed(object="claim", rows=True, columns=False)])
+    assert _decision(None, answer_only) is not None, "post-decision failure reads as ungoverned"
+    assert _policy_decisions(None, answer_only), "its effects are lost from the audit record"
+    # and a request that never reached a decision still records that honestly
+    assert _decision(None, _Holder(None)) is None
+
+
+def test_the_VERIFIER_DEFERRAL_carries_the_decision_it_has_no_trace_for():
+    """Exercised, not counted.
+
+    An earlier version of this guard counted `narrowed=` occurrences in the module, which stayed
+    green when the verifier path dropped it -- the arithmetic held because other sites carried it.
+    This drives `_verified` with a verifier that defers, on an `approved` that was narrowed, and
+    asserts the answer it returns still knows.
+
+    That path is the sharpest case in the whole feature: the SQL has already executed against the
+    source when the verifier defers, so the decision is a fact about a query that ran.
+    """
+    from types import SimpleNamespace
+
+    from mnemiq.agent.loop import Agent
+    from mnemiq.contract.seams import Narrowed
+
+    approved = SimpleNamespace(narrowed=[Narrowed(object="claim", rows=True, columns=False)])
+    deferring = SimpleNamespace(
+        verify=lambda packet, approved, table: SimpleNamespace(
+            defer=True, reason="not confident", confidence=0.1, layer="judge"))
+    agent = Agent.__new__(Agent)
+    agent.verifier = deferring
+
+    answer, _verdict = agent._verified(packet=None, approved=approved, table=None)
+    assert answer is not None and answer.deferred
+    assert answer.narrowed == approved.narrowed, (
+        "the verifier deferred AFTER the query ran; its answer must still carry what was narrowed")

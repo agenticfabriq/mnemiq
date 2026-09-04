@@ -216,13 +216,7 @@ class VerityTraceSink(TraceSink):
             # `policy_id` is a constant because mnemiq does not know one: the decision comes from
             # the provider, and `Narrowing` deliberately carries no policy identity. Inventing an
             # id here would put a fabricated identifier into an audit record.
-            "policy_decisions": [
-                {"policy_id": "mnemiq.access",
-                 "effect": ("row_filter+column_mask" if (n.rows and n.columns)
-                            else "row_filter" if n.rows else "column_mask"),
-                 "metadata": {"object": n.object}}
-                for n in (getattr(trace, "narrowed", None) or [])
-            ],
+            "policy_decisions": _policy_decisions(trace, answer),
             "collector_metadata": {
                 "elapsed_ms": round(event.elapsed_ms, 3),
                 # A hash of the policy, not the policy. Two answers to one question under different
@@ -232,7 +226,7 @@ class VerityTraceSink(TraceSink):
                 # empty it can express and "evaluated, narrowed nothing" would be identical to
                 # "never evaluated". The marker lives here, in the one part of the record that is
                 # free-form JSON on the store side.
-                "access_evaluated": getattr(trace, "narrowed", None) is not None,
+                "access_evaluated": _decision(trace, answer) is not None,
             },
             "captured_at": _now(),
             "idempotency_key": "",
@@ -339,6 +333,39 @@ _STAGE_TO_KIND = {
     "verify": "model_call",  # lossy, see above
     "synthesize": "answer",
 }
+
+
+def _decision(trace, answer):
+    """What the access decision narrowed, from whichever object still has it.
+
+    The trace is built AFTER execution -- it needs timing and result shape -- so a verifier
+    deferral or a synthesis failure returns an answer with no trace, and reading the trace alone
+    recorded "governance was never evaluated" for queries that were governed and had already run.
+    The answer carries the same fact from the moment the decider produces it, so it is the more
+    complete source; the trace is preferred only because a successful answer has both and they
+    agree by construction.
+    """
+    for holder in (trace, answer):
+        found = getattr(holder, "narrowed", None)
+        if found is not None:
+            return found
+    return None
+
+
+def _policy_decisions(trace, answer):
+    """The access effects, shaped to `trace_schema::PolicyDecisionV1`.
+
+    A function rather than a comprehension inline in the record so it can be tested by CALLING it.
+    The first version was asserted by regex-matching the sink's source and eval-ing the expression,
+    which broke the moment the expression changed and tested the text rather than the value.
+    """
+    return [
+        {"policy_id": "mnemiq.access",
+         "effect": ("row_filter+column_mask" if (n.rows and n.columns)
+                    else "row_filter" if n.rows else "column_mask"),
+         "metadata": {"object": n.object}}
+        for n in (_decision(trace, answer) or [])
+    ]
 
 
 def _to_trace_event(raw: dict, index: int) -> dict:
