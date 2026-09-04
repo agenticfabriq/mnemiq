@@ -193,6 +193,14 @@ def test_a_QUALIFIED_name_is_never_a_cte_reference():
                 "WITH claim AS (SELECT id FROM policy) SELECT * FROM db.main.claim"):
         assert _refused(sql).code == RefusalCode.SELECT_STAR, sql
 
+    # Neither case reaches the `catalog` half of that check: sqlglot parses a three-part name as
+    # db='main', catalog='db', so `db` alone already refuses both. The only shape setting catalog
+    # with an empty db is `db..claim`, which DuckDB rejects at parse time -- so the clause is
+    # correct, unreachable today, and NOT covered here despite this test's name.
+    parsed = sqlglot.parse_one("SELECT * FROM db.main.claim", read="duckdb")
+    source = (parsed.args.get("from") or parsed.args.get("from_")).this
+    assert (source.db, source.catalog) == ("main", "db")
+
     # the control: unqualified, so it really is the CTE, and its projection really is explicit
     _ok("WITH claim AS (SELECT id FROM policy) SELECT * FROM claim")
 

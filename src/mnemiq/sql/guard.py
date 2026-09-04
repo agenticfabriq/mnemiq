@@ -246,10 +246,15 @@ def _has_projection_star(ast: exp.Expression) -> bool:
     follows is what `_output_selects` decomposes, and a shape it cannot read is refused rather
     than waved through, so THAT gap costs a false refusal instead of a leak.
 
-    Name resolution is the other half and does not have that property -- getting a name wrong
-    vouches for a star rather than refusing it -- so the two rules it depends on are asserted
-    rather than assumed: a CTE reference is a bare name, and a body is read in the scope it was
-    written in.
+    Name resolution is the other half, and there a WIDER match vouches for a star rather than
+    refusing it, so the two rules that could widen one are asserted rather than assumed: a CTE
+    reference is a bare name, and a body is read in the scope it was written in.
+
+    A NARROWER match only over-refuses, which is why CTE names are matched case-sensitively even
+    though DuckDB folds unquoted identifiers: `... SELECT * FROM CLAIM` against a CTE `claim` is
+    refused here and resolves to the CTE there. Folding to fix that would make
+    `SELECT * FROM "CLAIM"` -- a quoted, case-SENSITIVE reference to a real table -- resolve to
+    the CTE and be vouched for, trading a false refusal for the leak.
     """
     # The top level keeps its own fail-open reading: a statement whose shape `_output_selects`
     # does not recognise returns no columns to a caller here, and refusing every such statement
