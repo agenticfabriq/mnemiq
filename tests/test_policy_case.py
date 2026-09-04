@@ -371,9 +371,11 @@ def test_row_filter_for_does_not_let_one_spelling_widen_another():
 
     Scoped to `row_filter_for`. The same widening through the ROLE-MERGE path is still open and
     marked xfail above: `grants_for` folds case as it merges, so two roles granting `claim` and
-    `Claim` become one OR'd filter before `AccessPolicy` is built. That is M50 -- it needs quoting
-    preserved to the policy lookup, and the note there records that every fix tried without it
-    leaked worse on the unquoted path."""
+    `Claim` become one OR'd filter before `AccessPolicy` is built. That residual is M55, and the
+    note above it is precise about why HEAD keeps the over-broad direction -- the NARROW one is
+    what leaked on the unquoted path, by dropping the filter for `FROM Claim`; always-folding
+    fails toward more governance there, which is the only path an LLM-generated query takes.
+    Closing it needs quoting carried to the policy lookup, which is M50's question."""
     policy = AccessPolicy(row_filters={"claim": "tenant = 1", "Claim": "1 = 1"})
     combined = policy.row_filter_for("claim")
     assert combined == "(tenant = 1) AND (1 = 1)", combined
