@@ -32,8 +32,10 @@ class GovernedPlan:
     def narrows_something(self) -> bool:
         """False when the policy cannot narrow this corpus, whatever it says.
 
-        The kill criterion reads a disclosure RATE, and a rate over an arm that never narrows is
-        zero for the wrong reason -- indistinguishable from a disclosure path that is broken.
+        The kill criterion is a per-answer set equality, so an arm that narrows nothing satisfies
+        it trivially: `touched` and `disclosed` are both empty on every answer and the run is green
+        without the disclosure path having been exercised once. Passing for that reason is
+        indistinguishable from passing because it works.
 
         A resolved table is NOT sufficient: `1 = 1` names a real table and withholds no row, and
         it was this module's own default predicate, so the check written to refuse arms that
