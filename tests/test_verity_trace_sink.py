@@ -366,10 +366,15 @@ def test_the_total_still_counts_every_cause(monkeypatch):
     assert _drop_counts(sink) == (2, 0, 1, 1)
 
 
-def _respond(monkeypatch, payload: bytes, status: int = 200):
-    """Answer the post with a real body, which the sink had never read."""
+def _respond(monkeypatch, payload: bytes):
+    """Answer the post with a real body, which the sink had never read.
+
+    No `status` parameter: an earlier version took one, ignored it, and hardcoded 200 -- so a test
+    written as `_respond(..., status=500)` to pin 5xx handling would have exercised the 200 path
+    and passed green. The sink does not read `.status` either; a test that needs a 5xx must raise
+    `HTTPError`, which is what the transport actually delivers.
+    """
     class _Resp:
-        status = 200
 
         def __enter__(self):
             return self
@@ -377,7 +382,10 @@ def _respond(monkeypatch, payload: bytes, status: int = 200):
         def __exit__(self, *a):
             return False
 
-        def read(self):
+        def read(self, *args):
+            # `*args` because the real `HTTPResponse.read(amt)` takes a byte cap and the sink
+            # passes one. A stub narrower than the API it stands in for fails on the production
+            # call rather than on the behaviour under test.
             return payload
 
     monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
@@ -443,3 +451,59 @@ def test_an_unreadable_response_body_does_not_fail_the_answer(monkeypatch):
     sink.record_answer(_event())
     assert sink.lineage_voided == 0
     assert sink.dropped == 0, "the trace was accepted; an unreadable receipt is not a drop"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"lineage_voided": 3}',
+        b'{"lineage_voided": true}',
+        b'{"lineage_voided": "trace-abc"}',
+        b'{"lineage_voided": {"trace-abc": 1}}',
+    ],
+)
+def test_a_receipt_whose_voided_field_is_not_a_list_cannot_break_the_answer(monkeypatch, body):
+    """**The review gate caught a real fail-soft violation, and a probe confirmed it.**
+
+    The guard covered only the parse; `len(voided)` and the join sat outside it. So a receipt that
+    is valid JSON with a non-list `lineage_voided` escaped: `3` and `true` raised `TypeError` out
+    of `record_answer` past the `except (URLError, OSError, ValueError)` whose own comment promises
+    it never raises into `Runtime.ask`, and `"trace-abc"` did not raise but counted 9 and logged
+    nine single characters as trace ids.
+
+    A count-shaped value is not invented for this test: Verity writes this same field name AS A
+    COUNT in its audit event, so both representations already exist in the feature and a receiver
+    that ever answered with one would take mnemiq's answer path down.
+    """
+    _respond(monkeypatch, body)
+    sink = VerityTraceSink(_Settings())
+
+    sink.record_answer(_event())  # must not raise
+
+    assert sink.lineage_voided == 0, "only a list of ids is a report; anything else is unreadable"
+    assert sink.dropped == 0, "the trace was accepted; an unreadable receipt is not a drop"
+
+
+def test_the_receipt_read_is_bounded(monkeypatch):
+    """`response.read()` is new blocking work on the synchronous answer path -- `Runtime.ask` does
+    not return until `record_answer` does. Unbounded, a receiver that trickles a large body extends
+    every user-visible answer, and `timeout=10` bounds each socket operation rather than the whole
+    read. So the read is capped, and the cap is asserted rather than trusted."""
+    seen = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, *args):
+            seen["limit"] = args[0] if args else None
+            return b'{"lineage_voided": []}'
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
+    VerityTraceSink(_Settings()).record_answer(_event())
+
+    assert seen["limit"] is not None, "the body must be read with a byte cap, not slurped whole"
+    assert 0 < seen["limit"] <= 1 << 20, f"cap should be modest; got {seen['limit']}"

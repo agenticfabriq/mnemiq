@@ -75,6 +75,15 @@ def _sha256(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
 
 
+# The receipt is read on the SYNCHRONOUS answer path -- `Runtime.ask` does not return until
+# `record_answer` does -- so it is capped rather than slurped. `timeout=10` on the request bounds
+# each socket operation, not the total body read, so a receiver that answers headers promptly and
+# then trickles would otherwise extend every user-visible answer. 64 KiB is far above any real
+# batch receipt (a few counts and a list of trace ids) and far below anything worth waiting for; a
+# truncated body fails to parse, which lands in the same guard as any other unreadable receipt.
+_MAX_RECEIPT_BYTES = 64 * 1024
+
+
 class VerityTraceSink(TraceSink):
     """Post one trace per answer, fail-soft, with the tier table as the only source of payload."""
 
@@ -287,16 +296,28 @@ class VerityTraceSink(TraceSink):
         stored, so a receipt this sink cannot parse changes nothing and is not a drop.
         """
         try:
-            voided = json.loads(response.read()).get("lineage_voided") or []
+            # Bounded, and EVERYTHING that touches the value is inside this block. The first
+            # version guarded only the parse, so a receipt that was valid JSON with a non-list
+            # `lineage_voided` escaped: `3` and `true` raised TypeError out of `record_answer`,
+            # past the caller's `except (URLError, OSError, ValueError)` and into `Runtime.ask` --
+            # breaking the one promise this class exists to keep. `"trace-abc"` did not raise and
+            # was worse, counting 9 and logging nine single characters as trace ids.
+            #
+            # A count-shaped value is not hypothetical: Verity writes this same field name as a
+            # COUNT in its audit event, so both representations exist in the feature already.
+            # `isinstance(..., list)` is the whole check -- a report is a list of ids or it is not
+            # a report, and this receiver does not guess which.
+            voided = json.loads(response.read(_MAX_RECEIPT_BYTES)).get("lineage_voided")
+            if not isinstance(voided, list) or not voided:
+                return
+            voided = [str(trace_id) for trace_id in voided]
         except Exception:  # noqa: BLE001 - a receipt we cannot read is not a reason to act
-            return
-        if not voided:
             return
         self.lineage_voided += len(voided)
         logger.warning(
             "verity kept %d trace(s) but could not read the lineage claim on them (%d total); "
             "the drift is in this engine's payload: %s",
-            len(voided), self.lineage_voided, ", ".join(str(t) for t in voided),
+            len(voided), self.lineage_voided, ", ".join(voided),
         )
 
     def record_answer(self, event: AnswerEvent) -> None:
