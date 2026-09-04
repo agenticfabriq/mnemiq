@@ -385,9 +385,13 @@ def _respond(monkeypatch, payload: bytes):
         headers = {"Content-Length": str(len(payload))}
 
         def read(self, *args):
-            # HONOURS the cap. A stub that ignores it cannot tell a working cap from a disabling
-            # one: with `_MAX_RECEIPT_BYTES = 64` every test stayed green here while production
-            # truncated every real receipt into invalid JSON and the feature silently did nothing.
+            # Honours whatever `amt` it is handed. With `Content-Length` declared as exactly
+            # `len(payload)` above, that is always the full body -- so this slice is a no-op on
+            # every current test and is kept only so the stub is not WIDER than the thing it
+            # stands in for. What actually catches a disabling cap is the refusal path in
+            # `test_the_cap_is_large_enough_for_a_real_receipt`: a too-small cap now returns
+            # before `read` is called at all, rather than truncating a body into invalid JSON as
+            # it did before the declared-length check.
             amt = args[0] if args else None
             return payload if amt is None else payload[:amt]
 
