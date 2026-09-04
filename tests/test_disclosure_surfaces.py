@@ -64,42 +64,54 @@ def test_the_audit_record_carries_what_the_decision_DID_not_only_a_hash_of_the_g
     `grant_fingerprint` whose own comment calls itself "a hash of the policy, not the policy".
     """
     from mnemiq.contract.seams import Narrowed
-    from mnemiq.observability.trace_sink import _policy_decisions
+    from mnemiq.observability.trace_sink import _access_effects
 
-    got = _policy_decisions(_Holder([Narrowed(object="claim", rows=True, columns=False)]),
-                            _Holder(None))
-    assert got and got[0]["metadata"]["object"] == "claim"
+    got = _access_effects(_Holder([Narrowed(object="claim", rows=True, columns=False)]),
+                          _Holder(None))
+    assert got and got[0]["object"] == "claim" and got[0]["effect"] == "row_filter"
 
 
-def test_every_entry_matches_the_STORES_required_shape():
-    """`policy_decisions` is `Vec<trace_schema::PolicyDecisionV1>`, not free-form JSON: `policy_id`
-    and `effect` are required strings. A first version emitted `{object, rows, columns}` and the
-    store would have rejected the whole trace.
+def test_the_record_NEVER_fabricates_a_policy_identity():
+    """`PolicyDecisionV1` requires a `policy_id` and mnemiq has none: `GrantSet` carries a
+    fingerprint of the grant SET, `AccessPolicy` a column map, neither a policy identifier. Filling
+    it with a constant put a policy id for a nonexistent policy into records that may be signed and
+    reconciled -- shape-valid and false, which no shape test can catch.
 
-    Asserted by CALLING the builder. The first version of this test regex-matched the sink's source
-    and eval-ed the expression, so it tested the text and broke when the expression changed.
+    So the effects are unattributed, and `policy_decisions` is left empty because it is TRUE that
+    mnemiq records no policy decisions.
     """
     from mnemiq.contract.seams import Narrowed
-    from mnemiq.observability.trace_sink import _policy_decisions
+    from mnemiq.observability.trace_sink import _access_effects
 
-    got = _policy_decisions(
+    got = _access_effects(
         _Holder([Narrowed(object="claim", rows=True, columns=False),
                  Narrowed(object="person", rows=False, columns=True),
                  Narrowed(object="both", rows=True, columns=True)]), _Holder(None))
     assert len(got) == 3
     for d in got:
-        assert isinstance(d.get("policy_id"), str) and d["policy_id"]
+        assert "policy_id" not in d, f"a fabricated policy identity is back: {d}"
+        assert isinstance(d.get("object"), str) and d["object"]
         assert isinstance(d.get("effect"), str) and d["effect"]
-        assert isinstance(d.get("metadata"), dict)
     assert {d["effect"] for d in got} == {"row_filter", "column_mask", "row_filter+column_mask"}
+
+    import inspect
+
+    from mnemiq.observability import trace_sink
+
+    src = inspect.getsource(trace_sink)
+    assert '"policy_decisions": [],' in src, "effects must not be filed as policy decisions"
+    # The EMITTED pair, not the word: this module's own docstring names the discarded constant
+    # while explaining why it is gone, and a bare substring check fails on the explanation.
+    assert '"policy_id": "mnemiq.access"' not in src, "the constant policy id is back"
 
 
 def test_policy_decisions_is_NEVER_null_because_the_store_cannot_deserialize_it():
     """`#[serde(default)]` covers a missing key, not an explicit null. Emitting null rejected the
-    whole trace -- storing nothing where the old empty list at least stored the rest."""
-    from mnemiq.observability.trace_sink import _policy_decisions
+    whole trace -- storing nothing where the old empty list at least stored the rest. It is now
+    always `[]`, and the effects live in free-form metadata instead."""
+    from mnemiq.observability.trace_sink import _access_effects
 
-    assert _policy_decisions(_Holder(None), _Holder(None)) == []
+    assert _access_effects(_Holder(None), _Holder(None)) == []
 
 
 def test_a_POST_DECISION_failure_is_not_recorded_as_ungoverned():
@@ -109,11 +121,11 @@ def test_a_POST_DECISION_failure_is_not_recorded_as_ungoverned():
     record that outlives the answer.
     """
     from mnemiq.contract.seams import Narrowed
-    from mnemiq.observability.trace_sink import _decision, _policy_decisions
+    from mnemiq.observability.trace_sink import _access_effects, _decision
 
     answer_only = _Holder([Narrowed(object="claim", rows=True, columns=False)])
     assert _decision(None, answer_only) is not None, "post-decision failure reads as ungoverned"
-    assert _policy_decisions(None, answer_only), "its effects are lost from the audit record"
+    assert _access_effects(None, answer_only), "its effects are lost from the audit record"
     # and a request that never reached a decision still records that honestly
     assert _decision(None, _Holder(None)) is None
 

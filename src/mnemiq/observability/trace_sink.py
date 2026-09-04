@@ -216,7 +216,9 @@ class VerityTraceSink(TraceSink):
             # `policy_id` is a constant because mnemiq does not know one: the decision comes from
             # the provider, and `Narrowing` deliberately carries no policy identity. Inventing an
             # id here would put a fabricated identifier into an audit record.
-            "policy_decisions": _policy_decisions(trace, answer),
+            # Empty because mnemiq has no policies to decide with -- not because nothing was
+            # recorded. What it DID is `access_effects` in `collector_metadata` below.
+            "policy_decisions": [],
             "collector_metadata": {
                 "elapsed_ms": round(event.elapsed_ms, 3),
                 # A hash of the policy, not the policy. Two answers to one question under different
@@ -227,6 +229,10 @@ class VerityTraceSink(TraceSink):
                 # "never evaluated". The marker lives here, in the one part of the record that is
                 # free-form JSON on the store side.
                 "access_evaluated": _decision(trace, answer) is not None,
+                # The effects themselves, unattributed by design. `access_evaluated` distinguishes
+                # "evaluated and narrowed nothing" from "never evaluated"; a bare empty list here
+                # could not.
+                "access_effects": _access_effects(trace, answer),
             },
             "captured_at": _now(),
             "idempotency_key": "",
@@ -352,18 +358,29 @@ def _decision(trace, answer):
     return None
 
 
-def _policy_decisions(trace, answer):
-    """The access effects, shaped to `trace_schema::PolicyDecisionV1`.
+def _access_effects(trace, answer):
+    """What the access decision did, per object, as UNATTRIBUTED effects.
 
-    A function rather than a comprehension inline in the record so it can be tested by CALLING it.
-    The first version was asserted by regex-matching the sink's source and eval-ing the expression,
-    which broke the moment the expression changed and tested the text rather than the value.
+    Deliberately NOT `PolicyDecisionV1`. That struct requires a `policy_id`, and mnemiq has no
+    policy identity to give: `GrantSet` carries a fingerprint (a hash of the grant SET) and
+    `AccessPolicy` carries a column map, and neither is a policy identifier. An earlier version
+    filled the field with the constant `mnemiq.access`, which is not a placeholder awaiting a real
+    value -- there is no path by which it becomes one. A signed audit export would then carry a
+    policy identifier for a policy that does not exist, collapsing every provider decision into
+    one fiction and making reconciliation impossible. A shape-valid record can still be a false
+    one.
+
+    So `policy_decisions` stays `[]` -- which is now true rather than merely unpopulated, because
+    mnemiq records no POLICY decisions -- and the effects go to `collector_metadata`, which is
+    `serde_json::Value` on the store side and is where this engine's own observations belong.
+
+    A function rather than an inline comprehension so tests CALL it: earlier versions regex-matched
+    this module's source and eval-ed the expression, testing the text rather than the value.
     """
     return [
-        {"policy_id": "mnemiq.access",
+        {"object": n.object,
          "effect": ("row_filter+column_mask" if (n.rows and n.columns)
-                    else "row_filter" if n.rows else "column_mask"),
-         "metadata": {"object": n.object}}
+                    else "row_filter" if n.rows else "column_mask")}
         for n in (_decision(trace, answer) or [])
     ]
 
