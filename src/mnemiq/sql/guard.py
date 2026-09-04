@@ -294,8 +294,9 @@ def _has_projection_star(ast: exp.Expression, dialect: str) -> bool:
     target -- folds the reference to `claim` and resolves it to the base table, whose columns then
     reached no grant check at all; `decide` approved exactly that with `tables=['policy']`. Too
     narrow: requiring identical quoting refused `WITH "claim" AS (...) SELECT * FROM claim`, which
-    is one object in every engine here and is the ordinary shape of a model quoting a definition
-    but not its reference.
+    is one object in every DOWN-folding engine here -- Oracle is the exception and the paragraph
+    below is why -- and is the ordinary shape of a model quoting a definition but not its
+    reference.
 
     The fold direction is the EXECUTING dialect's, because Oracle folds unquoted names up where
     the others fold them down -- one constant is wrong for one of them in the direction that

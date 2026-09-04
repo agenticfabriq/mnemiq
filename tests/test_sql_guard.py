@@ -254,6 +254,13 @@ def test_the_fold_direction_belongs_to_the_dialect_that_will_RUN_it():
     # Oracle folds it to `CLAIM`, a different object -- the base table, whose star must be refused
     assert isinstance(check_shape(quoted_lower, dialect="oracle"), Refusal)
 
+    # and the MIRROR case, which is a separate assertion rather than a corollary: preserving the
+    # fold for a quoted reference while keeping it for a quoted definition flips this one back to
+    # permitted on Oracle and leaves every other case in this test green
+    mirror = 'WITH claim AS (SELECT id FROM policy) SELECT * FROM "claim"'
+    _ok(mirror)
+    assert isinstance(check_shape(mirror, dialect="oracle"), Refusal)
+
     quoted_upper = 'WITH "CLAIM" AS (SELECT id FROM policy) SELECT * FROM claim'
     assert isinstance(check_shape(quoted_upper, dialect="postgres"), Refusal)
     _ok(quoted_upper, dialect="oracle")
