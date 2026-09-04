@@ -8,6 +8,7 @@ from mnemiq.agent.trace import build_trace
 from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.keys import cache_key
 from mnemiq.cache.store import Cache, from_ipc, to_ipc
+from mnemiq.contract.seams import disclosure_sentence
 from mnemiq.contract import DeferralReason, IdentityContext, Snapshot, Trace
 from mnemiq.llm.client import ModelUnavailable
 from mnemiq.progress import Emit, Stage, step
@@ -450,6 +451,16 @@ class Agent:
             timing={"execute_ms": execute_ms, "total_ms": deadline.elapsed_ms},
             result_shape=_shape(table.num_rows, table.num_columns),
         )
+        # Appended HERE, once, rather than rendered by each surface. The four surfaces were fixed
+        # one at a time before -- the comment in `cli.py` records the commit messages saying "the
+        # two surfaces", then three -- and a disclosure that four places must remember to print is
+        # a disclosure that will be missing from one of them. Every surface prints `answer`.
+        #
+        # After the synthesizer and never through it: a governed fact must not pass a stochastic
+        # step that can soften it, drop it, or attach it to the wrong object.
+        disclosure = disclosure_sentence(trace.narrowed)
+        if disclosure:
+            answer = f"{answer}\n\n{disclosure}"
         return AgentAnswer(answer=answer, trace=trace, deferred=False, cached=cached,
                            preview=result_preview(table, self.preview_rows),
                            attempts=attempts, corrected=approved.corrected)

@@ -71,6 +71,47 @@ class HistoryTurn(BaseModel):
     grant_fingerprint: str = ""
 
 
+class Narrowed(BaseModel):
+    """One object the access decision narrowed, as it reaches a consumer.
+
+    Mirrors `sql.rls.Narrowing` across the contract boundary. The flags mean exactly what that
+    type's field comments say -- in particular `columns` is "the query referenced a column name
+    this table masks", which is neither "your answer lost a column" nor "the rewrite masked
+    something". Do not restate them here; one contract, one place.
+
+    The vocabulary is deliberate: this docstring reaches the OPEN contract schema, which bans the
+    paid plane's terms outright (`tests/test_contract_schema.py`). An earlier draft used the paid
+    word for access rules and failed that test -- twice, because the note explaining the failure
+    used the word again. The boundary is enforced on words, in the artifact other systems read.
+    """
+
+    object: str
+    rows: bool
+    columns: bool
+
+
+def disclosure_sentence(narrowed: "list[Narrowed] | None") -> str:
+    """The caller-facing sentence, rendered DETERMINISTICALLY and never by the model.
+
+    A governed fact must not pass through a stochastic step: a model asked to phrase "some rows
+    were withheld" can soften it, drop it, or attach it to the wrong object. So this is a pure
+    function of the record, appended to the answer after synthesis.
+
+    Empty when nothing was narrowed, and empty when nothing was EVALUATED -- silence is correct in
+    both cases, because a disclosure is a claim and neither state supports one. What distinguishes
+    them is `Trace.narrowed`, which a machine consumer reads.
+    """
+    if not narrowed:
+        return ""
+    rows = any(n.rows for n in narrowed)
+    cols = any(n.columns for n in narrowed)
+    if rows and cols:
+        return "Some rows were withheld and some columns masked by policy."
+    if rows:
+        return "Some rows were withheld by policy."
+    return "Some columns were masked by policy."
+
+
 class Trace(BaseModel):
     question: str
     plan_sql: str
@@ -89,3 +130,7 @@ class Trace(BaseModel):
     # objects would otherwise show `scope-unresolved` as a table name.
     lineage_reasons: list[str] = Field(default_factory=list)
     definitions_used: list[str] = Field(default_factory=list)
+    # What the access decision narrowed, per object. `None` is "it was not evaluated";
+    # `[]` is the claim "it narrowed nothing" -- the same distinction `lineage_completeness`
+    # draws with `unknown`, and for the same reason.
+    narrowed: list[Narrowed] | None = None

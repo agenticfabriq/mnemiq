@@ -365,6 +365,11 @@ def _cmd_ask(settings: Settings, args) -> int:
                                  "unresolved": list(ans.trace.lineage_unresolved),
                                  "reasons": list(ans.trace.lineage_reasons)}
                                 if ans.trace else None),
+                    # The sentence is already in `answer`; this is the same fact structured, so a
+                    # machine consumer never has to parse prose to learn it was narrowed. `null`
+                    # means governance was not evaluated, `[]` that it narrowed nothing.
+                    "narrowed": ([n.model_dump() for n in ans.trace.narrowed]
+                                 if ans.trace and ans.trace.narrowed is not None else None),
                 },
                 default=str,
             )

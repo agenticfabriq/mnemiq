@@ -199,12 +199,40 @@ class VerityTraceSink(TraceSink):
                 "reasons": list(getattr(trace, "lineage_reasons", []) or []),
             },
             "semantic_refs": self._semantic_refs(event),
-            "policy_decisions": [],
+            # ---- ALWAYS: what the access decision did to WHICH OBJECT ----------------------
+            # The field existed and was always `[]`, next to a `grant_fingerprint` whose own
+            # comment calls itself "a hash of the policy, not the policy" -- so the store could
+            # tell two answers apart under different grants and could not say what either grant
+            # DID. That is the M56 question one layer on, and this is its answer.
+            #
+            # SHAPED TO THE STORE, which is a typed contract and not a free-form bag:
+            # `trace_schema::PolicyDecisionV1` requires `policy_id` and `effect` as strings and
+            # takes `metadata` as free JSON. A first version of this emitted
+            # `{object, rows, columns}` and `null` for the not-evaluated case; the field is
+            # `Vec<PolicyDecisionV1>` with `#[serde(default)]`, which covers a MISSING key and not
+            # an explicit null, so that version rejected the whole trace on the governed path --
+            # storing nothing where the old empty list at least stored the rest.
+            #
+            # `policy_id` is a constant because mnemiq does not know one: the decision comes from
+            # the provider, and `Narrowing` deliberately carries no policy identity. Inventing an
+            # id here would put a fabricated identifier into an audit record.
+            "policy_decisions": [
+                {"policy_id": "mnemiq.access",
+                 "effect": ("row_filter+column_mask" if (n.rows and n.columns)
+                            else "row_filter" if n.rows else "column_mask"),
+                 "metadata": {"object": n.object}}
+                for n in (getattr(trace, "narrowed", None) or [])
+            ],
             "collector_metadata": {
                 "elapsed_ms": round(event.elapsed_ms, 3),
                 # A hash of the policy, not the policy. Two answers to one question under different
                 # grants are different events and must not be indistinguishable in the store.
                 "grant_fingerprint": getattr(answer, "grant_fingerprint", None),
+                # `policy_decisions` cannot carry this: it is a typed Vec, so `[]` is the only
+                # empty it can express and "evaluated, narrowed nothing" would be identical to
+                # "never evaluated". The marker lives here, in the one part of the record that is
+                # free-form JSON on the store side.
+                "access_evaluated": getattr(trace, "narrowed", None) is not None,
             },
             "captured_at": _now(),
             "idempotency_key": "",

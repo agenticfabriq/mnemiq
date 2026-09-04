@@ -6,7 +6,7 @@ from .semantic import Snapshot
 # Semver of the record FORMAT (the contract's shape), distinct from a record's content hash.
 # Bump minor for additive changes (new optional field / new object_type), major for breaking
 # ones. Regenerate schemas/mnemiq-contract.schema.json on any bump.
-FORMAT_VERSION = "1.2.0"
+FORMAT_VERSION = "1.3.0"
 
 
 def export_json_schema() -> dict:

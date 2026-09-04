@@ -40,6 +40,11 @@ def _db_read(
                             "completeness": trace.lineage_completeness,
                             "unresolved": list(trace.lineage_unresolved),
                             "reasons": list(trace.lineage_reasons)},
+                  # Structured beside the sentence already in `answer`. An agent acting on a
+                  # narrowed result needs the fact machine-readable; `null` means governance was
+                  # not evaluated, `[]` that it narrowed nothing.
+                  "narrowed": ([n.model_dump() for n in trace.narrowed]
+                               if trace.narrowed is not None else None),
                 "enrichment_version": trace.enrichment_version,
                 "timing": trace.timing,
             }
