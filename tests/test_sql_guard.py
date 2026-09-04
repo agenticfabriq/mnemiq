@@ -196,7 +196,8 @@ def test_a_QUALIFIED_name_is_never_a_cte_reference():
     # Neither case reaches the `catalog` half of that check: sqlglot parses a three-part name as
     # db='main', catalog='db', so `db` alone already refuses both. The only shape setting catalog
     # with an empty db is `db..claim`, which DuckDB rejects at parse time -- so the clause is
-    # correct, unreachable today, and NOT covered here despite this test's name.
+    # correct, unreachable today, and NOT covered here despite this test's name. (`db.""."claim"`
+    # parses that way too; DuckDB rejects it as a zero-length delimited identifier.)
     parsed = sqlglot.parse_one("SELECT * FROM db.main.claim", read="duckdb")
     source = (parsed.args.get("from") or parsed.args.get("from_")).this
     assert (source.db, source.catalog) == ("main", "db")

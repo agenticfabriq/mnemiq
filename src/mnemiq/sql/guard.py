@@ -250,11 +250,15 @@ def _has_projection_star(ast: exp.Expression) -> bool:
     refusing it, so the two rules that could widen one are asserted rather than assumed: a CTE
     reference is a bare name, and a body is read in the scope it was written in.
 
-    A NARROWER match only over-refuses, which is why CTE names are matched case-sensitively even
-    though DuckDB folds unquoted identifiers: `... SELECT * FROM CLAIM` against a CTE `claim` is
-    refused here and resolves to the CTE there. Folding to fix that would make
-    `SELECT * FROM "CLAIM"` -- a quoted, case-SENSITIVE reference to a real table -- resolve to
-    the CTE and be vouched for, trading a false refusal for the leak.
+    CTE names are then matched case-SENSITIVELY, and that is not yet justified in either
+    direction. On DuckDB it over-refuses: `... SELECT * FROM CLAIM` against a CTE `claim` is
+    refused here while the engine resolves it to the CTE -- and folding quoted identifiers too,
+    measured, so there is no `"CLAIM"` shape that folding this match would leak. On the default
+    transpile target the question is open the other way: Postgres folds unquoted names and
+    preserves quoted ones, so `WITH "Claim" AS (...) SELECT * FROM Claim` matches HERE while
+    Postgres resolves the reference to a base table -- a wider match, which is the direction that
+    vouches. Whichever way it is settled, the rule is the executing dialect's, and neither exact
+    nor folded matching is that rule. Recorded rather than asserted safe.
     """
     # The top level keeps its own fail-open reading: a statement whose shape `_output_selects`
     # does not recognise returns no columns to a caller here, and refusing every such statement
