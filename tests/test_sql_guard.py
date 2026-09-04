@@ -185,6 +185,18 @@ def test_a_cte_body_is_read_in_the_scope_it_was_WRITTEN_in():
     _ok("WITH RECURSIVE c AS (SELECT * FROM c) SELECT * FROM c")
 
 
+def test_a_QUALIFIED_name_is_never_a_cte_reference():
+    """A CTE reference is a bare name. Matching on the bare name alone let a schema-qualified base
+    table borrow an unrelated CTE's explicit projection -- the guard resolved `main.claim` to the
+    CTE while the database resolved it to the table, and every column came back."""
+    for sql in ("WITH claim AS (SELECT id FROM policy) SELECT * FROM main.claim",
+                "WITH claim AS (SELECT id FROM policy) SELECT * FROM db.main.claim"):
+        assert _refused(sql).code == RefusalCode.SELECT_STAR, sql
+
+    # the control: unqualified, so it really is the CTE, and its projection really is explicit
+    _ok("WITH claim AS (SELECT id FROM policy) SELECT * FROM claim")
+
+
 def test_the_verdict_does_not_depend_on_UNION_BRANCH_ORDER():
     """The memo keys on node id, which is sound only because each node now sits in exactly one
     scope. While a body borrowed its caller's names, one branch's answer was cached for the other

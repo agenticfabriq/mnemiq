@@ -210,7 +210,12 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
             if _star_reaches_base(source.this, ctes, memo, stack):
                 return True
             continue  # derived table whose projection really is explicit
-        if isinstance(source, exp.Table) and source.name in ctes:
+        # A CTE reference is always a BARE name. Matching on `source.name` alone let a
+        # schema-qualified base table be vouched for by an unrelated CTE that merely shares it:
+        # `WITH claim AS (SELECT id FROM policy) SELECT * FROM main.claim` resolves to the CTE
+        # here and to the base table in the database, which returned every column of `claim`.
+        if isinstance(source, exp.Table) and not source.db and not source.catalog \
+                and source.name in ctes:
             body, body_scope = ctes[source.name]
             # `body_scope`, not `ctes`: the body is interpreted where it was written
             if _star_reaches_base(body, body_scope, memo, stack):
@@ -239,7 +244,12 @@ def _has_projection_star(ast: exp.Expression) -> bool:
     when the derived table or CTE projects named columns, and not when it projects a star of its
     own. "A wrapper the walker can follow" is the honest limit rather than a universal: what it
     follows is what `_output_selects` decomposes, and a shape it cannot read is refused rather
-    than waved through, so the gap costs a false refusal instead of a leak.
+    than waved through, so THAT gap costs a false refusal instead of a leak.
+
+    Name resolution is the other half and does not have that property -- getting a name wrong
+    vouches for a star rather than refusing it -- so the two rules it depends on are asserted
+    rather than assumed: a CTE reference is a bare name, and a body is read in the scope it was
+    written in.
     """
     # The top level keeps its own fail-open reading: a statement whose shape `_output_selects`
     # does not recognise returns no columns to a caller here, and refusing every such statement
