@@ -8,6 +8,7 @@ import sys
 
 from mnemiq.agent.modes import MODES
 from mnemiq.config import Settings
+from mnemiq.contract.seams import disclosure_sentence
 from mnemiq.contract import IdentityContext
 from mnemiq.runtime import SnapshotMissing, build_runtime
 
@@ -401,10 +402,20 @@ def _cmd_write(settings: Settings, args) -> int:
     if args.json:
         import json
 
-        print(json.dumps(vars(res), default=str))
+        # `vars(res)` would emit `narrowed` as stringified dataclasses via `default=str`, which is
+        # present but unparseable. A machine consumer of a governed write needs it structured.
+        payload = dict(vars(res))
+        payload["narrowed"] = ([{"object": n.object, "rows": n.rows, "columns": n.columns}
+                                for n in res.narrowed] if res.narrowed is not None else None)
+        print(json.dumps(payload, default=str))
         return 0
     if res.approved:
-        print(f"OK: wrote to {res.target} (rows affected: {res.rows_affected})")
+        # The disclosure belongs BESIDE the row count, which is what makes it legible: "rows
+        # affected: 3" for a request over 47 is an ordinary success until this sentence follows it.
+        # Rendered by the shared function so the read and write surfaces cannot drift apart.
+        note = disclosure_sentence(res.narrowed)
+        print(f"OK: wrote to {res.target} (rows affected: {res.rows_affected})"
+              + (f"\n{note}" if note else ""))
     else:
         print(f"refused: {res.refusal}")
     return 0
