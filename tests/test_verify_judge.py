@@ -169,9 +169,11 @@ def test_a_judge_that_never_emits_json_cannot_certify():
 
 
 def test_zero_attempts_is_refused_rather_than_silently_skipping_the_judge():
-    """`attempts < 1` makes the retry loop body never execute, so `score` returns the fail-open
-    constant without calling the judge and without counting it -- a whole sweep of constants with
-    `unrecovered: 0`, certified, reachable from a command-line flag."""
+    """`attempts < 1` makes the retry loop body never execute, so the judge is never called and
+    every score is the fail-open constant. It would not certify -- `gave_up` still increments, so
+    the gate refuses it as contamination -- but refusing at construction says the true thing: the
+    judge was never invoked. A contamination refusal after paying for the run names the wrong
+    cause."""
     import pytest
 
     with pytest.raises(ValueError, match="attempts must be >= 1"):
