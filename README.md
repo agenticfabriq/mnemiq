@@ -89,11 +89,18 @@ schema with a golden set, the regime a real deployment is in. BIRD and Spider ar
 unseen schemas, no glossary, no examples. Spider 2.0 is the hard one by design — real
 data-application schemas, often more than a thousand columns.
 
-On BIRD the single-shot engine sits in the range of BIRD's own reported single-shot baselines
-(GPT-4o 34.4, Claude 3.7 41.1, o3-mini 42.6) — at 42.3% it is level with the top of that range, not
-past it. The distance to leaderboard pipelines is added
-machinery — candidate selection, verification — and task-specific fine-tuning, not a difference
-in the core.
+On BIRD, **the table's row** sits in the range of BIRD's own reported single-shot baselines
+(GPT-4o 34.4, Claude 3.7 41.1, o3-mini 42.6): at 42.3% it is level with the top of that range, not
+past it.
+
+The 48.7% reported further down is not a counter-example to that, and the difference is
+configuration rather than a contradiction — that run executes up to five candidates per question
+and five on 339 of 487, so it is not a single-shot number and does not belong beside a single-shot
+baseline. The table's run records no candidate count at all, which is a gap in its provenance
+rather than evidence either way.
+
+The distance to leaderboard pipelines is added machinery — candidate selection, verification — and
+task-specific fine-tuning, not a difference in the core.
 
 **On local models, the honest result** — and these are two different runs, not one configuration
 measured twice. On BIRD, a 24 GB Qwen2.5-Coder-14B with constrained decoding and 5-sample
