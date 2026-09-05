@@ -36,13 +36,13 @@ def reasoning_budget(model: str, max_tokens: int) -> int:
     200 -> 10/10 failed, 400 -> 5/10, 600 -> 0/10. The judge's own default was 200, which is
     ample for `{"confidence": 0.9}` and nowhere near enough to reach it.
 
-    The floor sits well above 600 because that boundary moves with prompt length. A cap is not a
-    spend: when the model succeeds it emits one tiny JSON object, and the cap never becomes the
-    bill. Below the floor it does not emit a short verdict -- it emits nothing and the request
-    fails, which is the whole defect. Whether the provider bills the reasoning tokens of a request it then fails is not
-    knowable from this repo, so budget a hosted sweep from a measured run, not from this comment:
-    the honest floor of the change is that a truncated request buys nothing at all. Callers that
-    ask for more keep what they asked for.
+    The floor sits well above 600 because that boundary moves with prompt length.
+    A cap is not a spend: on success the judge emits one tiny JSON object, so the
+    cap never becomes the bill. Below the floor it does not emit a cheaper verdict
+    -- it emits nothing and the request fails, which is the defect itself. Whether
+    the provider bills the reasoning behind a request it then fails is not knowable
+    from this repo, so size a hosted sweep from a measured run rather than from this
+    comment. Callers that ask for more keep what they asked for.
     """
     return max(max_tokens, _REASONING_FLOOR) if _GPT5.search(model) else max_tokens
 
