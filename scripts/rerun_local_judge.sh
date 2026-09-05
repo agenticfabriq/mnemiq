@@ -161,10 +161,12 @@ print(f"  cache entries {n_cache} over {n_answerable} answerable records ({len(r
 
 # A PARTIAL outage is not detectable from the scores -- a mid-sweep death leaves real scores
 # followed by fallbacks that no value test can separate from genuine ones. The post-sweep probe is
-# ASYMMETRIC evidence and only that. NEITHER result establishes what the scores are: TRUE rules out
-# one failure mode, and FALSE is equally consistent with a clean sweep followed by a shutdown. What
-# FALSE does establish is that contamination can no longer be RULED OUT, and an uncertifiable sweep
-# is the one thing this script must not stamp as certified. `LLMClient.complete` turns
+# WEAK evidence, and contamination is never ruled out by EITHER result -- a 429 burst or per-request
+# timeout leaves the judge writing its constant into the cache while `/v1/models` keeps answering.
+# So the exit on FALSE is precautionary, not inferential: it is not that a dead endpoint proves the
+# scores are bad, but that certifying a run which also carries a known-bad signal is worse than
+# declining one that might have been fine. `scoring_complete` is the field a later reader trusts,
+# and the cost of withholding it is a re-run. `LLMClient.complete` turns
 # every API error into `ModelUnavailable` -- timeout, rate limit, bad gateway -- and the judge
 # swallows all of them to its constant, so a 429 burst or per-request timeout leaves `/v1/models`
 # answering seconds later with contaminated scores already in the cache. True here is not evidence
