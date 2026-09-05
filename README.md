@@ -53,16 +53,15 @@ outside that is not one thing:
   BigQuery or Snowflake adapters and credentials it does not have. Those are not failures, and
   they are not attempts either — the row covers a quarter of the suite.
 
-**Two caveats on exact-match, one per benchmark.** The harness subtracts results it cannot
+**A caveat on exact-match.** The harness subtracts results it cannot
 verify against the gold engine (`exact = correct - unportable_exact`). Both BIRD runs cited on this
 page — the table row and the local-model figure below — predate that accounting and carry no
 portability data, so their exact-match is the raw `correct` rate and should be read as the ceiling
-of a range: the gap is about 2.4 points on a 487-case run. The Spider figures are unaffected, though not by a
-check that could have found otherwise: on the local slice the flag is set from the adapter
-(`dialect == "sqlite"`), so every executed case records portable and the subtraction is
-structurally zero. Gold and engine are the same engine there, which is why the code calls the
-claim free — the published Spider rates are what the harness prints, and nothing was verified to
-make that so.
+of a range: the gap is about 2.4 points on a 487-case run. The Spider and ACME rates are unaffected, but not
+because anything checked them: portability is only recorded when gold runs on a DIFFERENT engine
+than the answer, and neither of those corpora does that. Their subtraction is structurally zero,
+so their exact-match is also a raw `correct` rate — verified against nothing, on a path where
+there is nothing to verify against.
 
 The Spider row is the retrieval `k=24` configuration. Across the three hosted Spider runs
 exact-match spans 34.8–37.8% and got-the-facts 51.9–58.5%, so read it as one point in that spread
@@ -85,21 +84,20 @@ self-consistency reaches **50.7% exact-match** (54.4% got-the-facts,
 single-shot reaches **5.9%** (6.7% got-the-facts, `spider2-qwen2.5-coder-14b.jsonl`), where the
 frontier configuration holds at 37.0% and 58.5%.
 
-**What constrained decoding does on Spider, we cannot say from these runs**, and the arithmetic is
-the reason. The 32B pair is controlled — same engine revision — and moves 3 correct cases to 7 of
-135 (`spider2-32b-baseline.jsonl` → `spider2-32b-guided.jsonl`). The 14B pair moves 8 to 6, and is
-not controlled at all: its two runs are 311 engine commits apart and the baseline's revision is
-recorded dirty. Four cases either way is smaller than the 3.0-point spread this page already
-reports across three runs of ONE hosted configuration, so neither delta is separable from
-run-to-run variance on a 135-case slice.
+**These local runs do not support comparisons between them, and the counts are why.** On a
+135-case slice, the 32B moves 3 correct cases to 7 with constrained decoding; the 14B moves 8 to
+6, across runs 311 engine commits apart with a `-dirty` baseline. Two hosted runs of the frontier
+configuration differ by 4 cases from each other. Every difference on this benchmark is the same
+handful of cases, so no ordering among the local arms is claimed here, and the effect of
+constrained decoding on Spider is not something these runs can settle.
 
-What the local Spider runs do support is a ceiling: every one of them lands under 7% exact-match
-where the frontier configuration holds at 37.0%. That gap is an order of magnitude, and it is the
-only claim here that does not rest on four cases.
+The one durable observation is the size of the remaining gap: no local arm exceeds 8 of 135
+exact-match, against 50 of 135 for the frontier configuration. That is not a comparison between
+local arms, and it does not isolate a cause — the BIRD and Spider local figures use different
+configurations as well as different schemas, so the 50.7% / 5.9% contrast is not a schema effect
+on its own.
 
-Local capability is far more schema-dependent than the BIRD number alone suggests — the same 14B
-reaching 50.7% on BIRD is the contrast. Measure on your own schema before committing an
-architecture to it.
+Measure on your own schema before committing an architecture to it.
 
 ## Quickstart
 
