@@ -23,7 +23,7 @@ import os
 
 from mnemiq.config import Settings
 from mnemiq.eval.bird_runner import enrich_bird_db
-from mnemiq.eval.verify_replay import judge_scores, load_records, replay, sweep
+from mnemiq.eval.verify_replay import _ANSWERABLE, judge_scores, load_records, replay, sweep
 from mnemiq.llm.client import LLMClient
 from mnemiq.semantic.cards import build_cards
 from mnemiq.verify.judge import SemanticJudge
@@ -96,7 +96,41 @@ def main() -> int:
         return "\n".join(c.text for c in build_cards(snap))
 
     print(f"judge endpoint: {base} | model: {model}")
+    inner = judge._judge  # the instrumented SemanticJudge sitting under the cache wrapper
     scores = judge_scores(records, judge, cards_for)
+
+    # How many of those "scores" are the fail-open constant rather than a judgement. Nothing in the
+    # cache can answer this: `SemanticJudge` clamps a real reply to 1.0 and returns 1.0 on error, so
+    # a dead endpoint and a judge that approved everything write identical files. Only the judge's
+    # own counters separate them, and a sweep that cannot be told from an outage must not be
+    # published as a measurement. Written beside the cache; counts THIS process's calls, so a run
+    # resumed over a warm cache reports only what it re-scored.
+    errpath = f"{args.run}.judgeerrors.{tag}.json"
+    json.dump({"model": model, "calls": inner.calls, "errors": inner.errors,
+               "unparsed": inner.unparsed, "fallbacks": inner.fallbacks,
+               "scored_cases": len(scores)}, open(errpath, "w"), indent=2)
+    print(f"judge calls {inner.calls} of {len(scores)} scored cases: {inner.errors} endpoint "
+          f"errors, {inner.unparsed} unreadable replies -> {inner.fallbacks} fail-open constants "
+          f"(recorded in {errpath})")
+    if inner.fallbacks:
+        print("WARNING: some scores are the fail-open constant, not judgements. Any figure taken "
+              "from this sweep is contaminated by that many cases.")
+    # Against DISTINCT pairs, not the record count: `_CachingJudge` dedupes in memory too, so a
+    # repeated (question, sql) makes the second record a hit that never reaches the judge. Comparing
+    # to `len(scores)` would warn "came from the CACHE" about a case this run judged, and tell the
+    # operator to delete a cache that cannot fix it.
+    distinct_pairs = len({(r["question"], r.get("sql") or "") for r in records
+                          if r["outcome"] in _ANSWERABLE})
+    if inner.calls < distinct_pairs:
+        # These counters see only THIS process's calls. `_CachingJudge` returns a persisted score
+        # without touching the judge, and it writes each score as it goes -- so a sweep killed
+        # mid-run leaves fail-open constants on disk, and the resumed run this script's own
+        # docstring prescribes would report zero of them over a cache that is mostly constants.
+        print(f"WARNING: {distinct_pairs - inner.calls} distinct cases came from the CACHE on "
+              "disk and were not "
+              "re-judged, so the counts above say nothing about them. Delete the cache to make "
+              "this a complete measurement, or read the counts as covering only what was re-scored.")
+
     print(f"scored {len(scores)} answerable cases; sweeping thresholds:")
     for row in sweep(records, scores, _THRESHOLDS):
         print(f"thr {row['threshold']:.1f}:{_line(row)}")

@@ -23,15 +23,31 @@ class SemanticJudge:
     def __init__(self, client, max_tokens: int = 200) -> None:
         self._client = client
         self._max_tokens = max_tokens
+        # Fail-open is right for the product and ruinous for a MEASUREMENT: a dead endpoint scores
+        # every case 1.0, which is indistinguishable BY VALUE from a judge that approved everything
+        # (`min(1.0, ...)` below clamps a real reply to the same number). These counters are the
+        # only way a replay can tell the two apart, so they exist for the eval harness, not for the
+        # verifier -- they change no behaviour and cost an increment.
+        self.calls = 0
+        self.errors = 0        # the endpoint raised: outage, timeout, rate limit, bad gateway
+        self.unparsed = 0      # it answered, but no confidence could be read out of the reply
+
+    @property
+    def fallbacks(self) -> int:
+        """Scores that are the constant rather than a judgement -- errors plus unreadable replies."""
+        return self.errors + self.unparsed
 
     def score(self, question: str, schema: str, sql: str, preview: str) -> float:
+        self.calls += 1
         try:
             raw = self._client.complete(_SYSTEM, _prompt(question, schema, sql, preview), max_tokens=self._max_tokens)
             m = _CONF.search(raw or "")
             if not m:
+                self.unparsed += 1
                 return 1.0
             return max(0.0, min(1.0, float(m.group(1))))
         except Exception:
+            self.errors += 1
             return 1.0
 
 

@@ -32,6 +32,7 @@ VERSION_JSON="$(printf '%s' "$VERSION_BODY" | sed '$d')"
 TAG="$(python3 -c 'import sys; print("".join(c if c.isalnum() else "_" for c in sys.argv[1]))' "$SERVED")"
 CACHE="${RUN}.judgecache.${TAG}.json"
 PROV="${RUN}.judgeprov.${TAG}.json"
+ERRS="${RUN}.judgeerrors.${TAG}.json"
 
 # ARCHIVE FIRST, then write the new provenance. Both files carry a stable per-(run, model) name,
 # so writing the new provenance before this block would truncate the previous sweep's -- and then
@@ -43,10 +44,27 @@ PROV="${RUN}.judgeprov.${TAG}.json"
 # truncates it. Losing the judge's identity is the second failure this script exists to prevent,
 # so it must not be lost by the preventing.
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+# An error record with NO cache beside it is not an interrupted sweep -- the cache is rewritten on
+# every fresh score while the error record is written only at the end, so an interruption leaves
+# the cache and no error record, which the branch below handles. This is the other way round: a
+# sweep that finished having made zero judge calls, or a hand-deleted cache. Archive both files, or
+# the next run overwrites the record AND truncates the provenance naming whose counts those were.
+if [ ! -f "$CACHE" ] && [ -f "$ERRS" ]; then
+  mv "$ERRS" "${ERRS}.superseded.${STAMP}"
+  echo "  archived an orphan error record (no cache beside it) -> $(basename "${ERRS}.superseded.${STAMP}")"
+  if [ -f "$PROV" ]; then
+    mv "$PROV" "${PROV}.superseded.${STAMP}"
+    echo "  archived its provenance -> $(basename "${PROV}.superseded.${STAMP}")"
+  fi
+fi
 if [ -f "$CACHE" ]; then
   mv "$CACHE" "${CACHE}.superseded.${STAMP}"
   echo "  archived stale cache -> $(basename "${CACHE}.superseded.${STAMP}")"
   echo "  (had $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "${CACHE}.superseded.${STAMP}") entries)"
+  if [ -f "$ERRS" ]; then
+    mv "$ERRS" "${ERRS}.superseded.${STAMP}"
+    echo "  archived its error record -> $(basename "${ERRS}.superseded.${STAMP}")"
+  fi
   if [ -f "$PROV" ]; then
     mv "$PROV" "${PROV}.superseded.${STAMP}"
     echo "  archived its provenance -> $(basename "${PROV}.superseded.${STAMP}")"
@@ -142,11 +160,11 @@ MNEMIQ_VERIFY_API_KEY="${MNEMIQ_VERIFY_API_KEY:-EMPTY}" \
   .venv/bin/python scripts/run_verify_replay.py "$RUN" --judge
 
 echo "== check the run was not a cache replay =="
-JUDGE_MODELS_URL="${BASE%/}/models" .venv/bin/python - "$CACHE" "$RUN" "$PROV" <<'PY'
+JUDGE_MODELS_URL="${BASE%/}/models" .venv/bin/python - "$CACHE" "$RUN" "$PROV" "$ERRS" <<'PY'
 import json, os, sys, pathlib
 # the venv, not system python3: this imports mnemiq, and the scoring step above already uses it
 from mnemiq.eval.verify_replay import _ANSWERABLE
-cache_p, run_p, prov_p = (pathlib.Path(a) for a in sys.argv[1:4])
+cache_p, run_p, prov_p, errs_p = (pathlib.Path(a) for a in sys.argv[1:5])
 
 def refuse(reason, **extra):
     """Record WHY before exiting. A bare `scoring_complete: false` cannot tell a dead endpoint from
@@ -170,30 +188,41 @@ n_answerable = sum(1 for r in rows if r["outcome"] in _ANSWERABLE)
 # the script takes a run path and other corpora defer.
 print(f"  cache entries {n_cache} over {n_answerable} answerable records ({len(rows)} rows total)")
 
+# THE EXACT COUNT, not an inference. The judge now counts its own fail-open path, so a partial
+# outage -- real scores followed by constants, which no value test can separate -- is reported
+# rather than guessed at. This is what the post-sweep probe below could only gesture at.
+if not errs_p.exists():
+    refuse("no judge error record written -- cannot tell judgements from fail-open constants")
+errs = json.load(errs_p.open())
+print(f"  judge calls {errs['calls']}: {errs['errors']} endpoint errors, {errs['unparsed']} "
+      f"unreadable replies -> {errs['fallbacks']} fail-open constants")
+if errs["fallbacks"]:
+    refuse(f"{errs['fallbacks']} of {errs['calls']} scores are the fail-open constant, not "
+           f"judgements ({errs['errors']} endpoint errors, {errs['unparsed']} unreadable replies)",
+           judge_calls=errs["calls"], judge_fallbacks=errs["fallbacks"],
+           judge_errors=errs["errors"], judge_unparsed=errs["unparsed"])
+
 # A PARTIAL outage is not detectable from the scores -- a mid-sweep death leaves real scores
 # followed by fallbacks that no value test can separate from genuine ones. The post-sweep probe is
-# WEAK evidence, and contamination is never ruled out by EITHER result -- a 429 burst or per-request
-# timeout leaves the judge writing its constant into the cache while `/v1/models` keeps answering.
-# So the exit on FALSE is precautionary, not inferential: it is not that a dead endpoint proves the
-# scores are bad, but that certifying a run which also carries a known-bad signal is worse than
-# declining one that might have been fine. `scoring_complete` is the field a later reader trusts,
-# and the cost of withholding it is a re-run. `LLMClient.complete` turns
-# every API error into `ModelUnavailable` -- timeout, rate limit, bad gateway -- and the judge
-# swallows all of them to its constant, so a 429 burst or per-request timeout leaves `/v1/models`
-# answering seconds later with contaminated scores already in the cache. True here is not evidence
-# of clean scores.
+# RECORDED, NOT A GATE -- and it lost that job to the counters above rather than never having had
+# one. Every contamination shape this once guessed at (a mid-sweep death, a 429 burst, a
+# per-request timeout) raises inside `LLMClient.complete`, is caught by the judge, and increments
+# `errors`, which is refused exactly. What is left for a probe is nothing: a sweep that never ran
+# and one with no counts are both refused further up. Keeping it as a REFUSAL would only reject
+# good sweeps whose endpoint was shut down afterwards, so it is kept as an observation instead.
 import urllib.error, urllib.request
 try:
     with urllib.request.urlopen(os.environ["JUDGE_MODELS_URL"], timeout=10) as r:
         healthy_after = r.status == 200
 except (urllib.error.URLError, OSError, KeyError, ValueError):
     healthy_after = False
-print(f"  endpoint still answering after the sweep: {healthy_after}")
+print(f"  endpoint still answering after the sweep: {healthy_after} (recorded, not a gate)")
 if not healthy_after:
-    refuse("endpoint not answering after the sweep -- it may have died mid-run, leaving this "
-           "judge's error constant in the cache, or been taken down after a clean run; neither "
-           "can be ruled out from here",
-           endpoint_healthy_after_sweep=False)
+    # Recorded and NOT refused, which is the whole point of the demotion above: a sweep whose
+    # endpoint was shut down after finishing cleanly is a valid sweep, and every contamination
+    # shape this probe once stood for is now refused exactly by the fallback count. Rejecting on
+    # it would throw away good measurements to catch nothing the counters miss.
+    print("  (not a refusal: the fallback count above is what decides contamination)")
 # n_answerable is printed for the operator; the ASSERTION below uses the distinct-pair count.
 # The cache dedupes on (model, question, sql), so the exact expected size is the number of
 # DISTINCT (question, sql) pairs among answerable records -- not the record count, which
@@ -238,6 +267,8 @@ prov["score_distinct_values"] = distinct
 # and no more -- claiming these were fallbacks would assert a provenance the number cannot carry.
 prov["scores_at_exactly_1_0"] = at_one
 prov["endpoint_healthy_after_sweep"] = healthy_after
+prov["judge_calls"] = errs["calls"]
+prov["judge_fallbacks"] = errs["fallbacks"]
 json.dump(prov, prov_p.open("w"), indent=2)
 print(f"  OK: fresh cache under the served model's tag; {prov_p.name} marked complete")
 PY
