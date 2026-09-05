@@ -44,11 +44,27 @@ ERRS="${RUN}.judgeerrors.${TAG}.json"
 # truncates it. Losing the judge's identity is the second failure this script exists to prevent,
 # so it must not be lost by the preventing.
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+# An error record with NO cache beside it is not an interrupted sweep -- the cache is rewritten on
+# every fresh score while the error record is written only at the end, so an interruption leaves
+# the cache and no error record, which the branch below handles. This is the other way round: a
+# sweep that finished having made zero judge calls, or a hand-deleted cache. Archive both files, or
+# the next run overwrites the record AND truncates the provenance naming whose counts those were.
+if [ ! -f "$CACHE" ] && [ -f "$ERRS" ]; then
+  mv "$ERRS" "${ERRS}.superseded.${STAMP}"
+  echo "  archived an orphan error record (no cache beside it) -> $(basename "${ERRS}.superseded.${STAMP}")"
+  if [ -f "$PROV" ]; then
+    mv "$PROV" "${PROV}.superseded.${STAMP}"
+    echo "  archived its provenance -> $(basename "${PROV}.superseded.${STAMP}")"
+  fi
+fi
 if [ -f "$CACHE" ]; then
   mv "$CACHE" "${CACHE}.superseded.${STAMP}"
   echo "  archived stale cache -> $(basename "${CACHE}.superseded.${STAMP}")"
   echo "  (had $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "${CACHE}.superseded.${STAMP}") entries)"
-  [ -f "$ERRS" ] && mv "$ERRS" "${ERRS}.superseded.${STAMP}"
+  if [ -f "$ERRS" ]; then
+    mv "$ERRS" "${ERRS}.superseded.${STAMP}"
+    echo "  archived its error record -> $(basename "${ERRS}.superseded.${STAMP}")"
+  fi
   if [ -f "$PROV" ]; then
     mv "$PROV" "${PROV}.superseded.${STAMP}"
     echo "  archived its provenance -> $(basename "${PROV}.superseded.${STAMP}")"
@@ -188,23 +204,19 @@ if errs["fallbacks"]:
 
 # A PARTIAL outage is not detectable from the scores -- a mid-sweep death leaves real scores
 # followed by fallbacks that no value test can separate from genuine ones. The post-sweep probe is
-# WEAK evidence, and contamination is never ruled out by EITHER result -- a 429 burst or per-request
-# timeout leaves the judge writing its constant into the cache while `/v1/models` keeps answering.
-# So the exit on FALSE is precautionary, not inferential: it is not that a dead endpoint proves the
-# scores are bad, but that certifying a run which also carries a known-bad signal is worse than
-# declining one that might have been fine. `scoring_complete` is the field a later reader trusts,
-# and the cost of withholding it is a re-run. `LLMClient.complete` turns
-# every API error into `ModelUnavailable` -- timeout, rate limit, bad gateway -- and the judge
-# swallows all of them to its constant, so a 429 burst or per-request timeout leaves `/v1/models`
-# answering seconds later with contaminated scores already in the cache. True here is not evidence
-# of clean scores.
+# RECORDED, NOT A GATE -- and it lost that job to the counters above rather than never having had
+# one. Every contamination shape this once guessed at (a mid-sweep death, a 429 burst, a
+# per-request timeout) raises inside `LLMClient.complete`, is caught by the judge, and increments
+# `errors`, which is refused exactly. What is left for a probe is nothing: a sweep that never ran
+# and one with no counts are both refused further up. Keeping it as a REFUSAL would only reject
+# good sweeps whose endpoint was shut down afterwards, so it is kept as an observation instead.
 import urllib.error, urllib.request
 try:
     with urllib.request.urlopen(os.environ["JUDGE_MODELS_URL"], timeout=10) as r:
         healthy_after = r.status == 200
 except (urllib.error.URLError, OSError, KeyError, ValueError):
     healthy_after = False
-print(f"  endpoint still answering after the sweep: {healthy_after}")
+print(f"  endpoint still answering after the sweep: {healthy_after} (recorded, not a gate)")
 if not healthy_after:
     refuse("endpoint not answering after the sweep -- it may have died mid-run, leaving this "
            "judge's error constant in the cache, or been taken down after a clean run; neither "
