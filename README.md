@@ -98,9 +98,10 @@ configuration rather than a contradiction. That run executes up to five candidat
 and five on 339 of 487, so it is not a single-shot number and does not belong beside a single-shot
 baseline. The table's run is single-shot. Its candidate count and
 inter-candidate agreement score are both unset on all 487 of its cases, which a five-candidate run
-cannot produce — the comparison run sets both on the large majority of its own. That is the
-inference the artifact supports; it is not a claim that every multi-candidate answer records both
-fields, because some deferral branches record only one.
+cannot produce — the comparison run sets both on the large majority of its own. The warrant is the WHOLE run, not any single
+case: a five-candidate run does emit cases with both fields blank — 54 of them here, 8 graded
+correct — because a case where no candidate executed falls back to the single-candidate path. What
+it cannot do is emit 487 of 487 that way while answering 238 of them correctly.
 
 The distance to leaderboard pipelines is added machinery — candidate selection, verification — and
 task-specific fine-tuning, not a difference in the core.
