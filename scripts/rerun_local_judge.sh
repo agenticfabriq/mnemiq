@@ -172,10 +172,26 @@ if n_cache < expected:
     print(f"  FAIL: {n_cache} scored of {expected} distinct answerable (question, sql) pairs "
           f"-- partial sweep, provenance left marked incomplete")
     raise SystemExit(1)
+
+# A FULL CACHE IS NOT A SUCCESSFUL SWEEP. `SemanticJudge.score` catches every exception and returns
+# 1.0 -- deliberately, so the product degrades to answering rather than crashing. In a MEASUREMENT
+# that fail-open is indistinguishable from a judge that approved everything: a dead endpoint yields
+# one 1.0 per case, a cache of exactly the right size, and a sweep reporting "0 wrong caught at
+# every threshold", which reads as a finding rather than as an outage. Refuse to certify it.
+scores = list(json.load(cache_p.open()).values())
+distinct = len(set(scores))
+at_one = sum(1 for v in scores if v == 1.0)
+print(f"  score distribution: {distinct} distinct value(s), {at_one}/{len(scores)} at exactly 1.0")
+if distinct == 1 and at_one == len(scores):
+    print("  FAIL: every score is exactly 1.0, which is this judge's error fallback -- a dead or")
+    print("        unreachable endpoint produces precisely this. Not certifying the sweep.")
+    raise SystemExit(1)
 prov = json.load(prov_p.open())
 prov["scoring_complete"] = True
 prov["cache_file"] = cache_p.name
 prov["cache_entries"] = n_cache
+prov["score_distinct_values"] = distinct
+prov["scores_at_fallback_1_0"] = at_one
 json.dump(prov, prov_p.open("w"), indent=2)
 print(f"  OK: fresh cache under the served model's tag; {prov_p.name} marked complete")
 PY
