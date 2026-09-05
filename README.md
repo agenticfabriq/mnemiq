@@ -53,7 +53,7 @@ outside that is not one thing:
   BigQuery or Snowflake adapters and credentials it does not have. Those are not failures, and
   they are not attempts either — the row covers a quarter of the suite.
 
-**One caveat, and it applies to the BIRD figures only.** The harness subtracts results it cannot
+**Two caveats on exact-match, one per benchmark.** The harness subtracts results it cannot
 verify against the gold engine (`exact = correct - unportable_exact`). Both BIRD runs cited on this
 page — the table row and the local-model figure below — predate that accounting and carry no
 portability data, so their exact-match is the raw `correct` rate and should be read as the ceiling
@@ -85,14 +85,21 @@ self-consistency reaches **50.7% exact-match** (54.4% got-the-facts,
 single-shot reaches **5.9%** (6.7% got-the-facts, `spider2-qwen2.5-coder-14b.jsonl`), where the
 frontier configuration holds at 37.0% and 58.5%.
 
-Constrained decoding does not settle it either way, and the two model sizes disagree about it:
-guiding COST the 14B 1.5 points on Spider (5.9% → 4.4%, `spider2-14b-guided.jsonl`) while it more
-than DOUBLED the 32B (2.2% → 5.2%, `spider2-32b-baseline.jsonl` → `spider2-32b-guided.jsonl`).
-Either number alone tells a story the pair does not support. What survives both is the ceiling:
-every local arm lands between 2% and 6% where the frontier configuration holds at 37%.
+**What constrained decoding does on Spider, we cannot say from these runs**, and the arithmetic is
+the reason. The 32B pair is controlled — same engine revision — and moves 3 correct cases to 7 of
+135 (`spider2-32b-baseline.jsonl` → `spider2-32b-guided.jsonl`). The 14B pair moves 8 to 6, and is
+not controlled at all: its two runs are 311 engine commits apart and the baseline's revision is
+recorded dirty. Four cases either way is smaller than the 3.0-point spread this page already
+reports across three runs of ONE hosted configuration, so neither delta is separable from
+run-to-run variance on a 135-case slice.
 
-Local capability is far more schema-dependent than the BIRD number alone suggests. Measure on your
-own schema before committing an architecture to it.
+What the local Spider runs do support is a ceiling: every one of them lands under 7% exact-match
+where the frontier configuration holds at 37.0%. That gap is an order of magnitude, and it is the
+only claim here that does not rest on four cases.
+
+Local capability is far more schema-dependent than the BIRD number alone suggests — the same 14B
+reaching 50.7% on BIRD is the contrast. Measure on your own schema before committing an
+architecture to it.
 
 ## Quickstart
 
