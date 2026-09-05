@@ -10,6 +10,15 @@
 #
 # So: it runs nightly on the default branch and on demand, and a regression is caught within a
 # day rather than blocked at merge. That trade is deliberate and is the weaker half of it.
+#
+# **It had never once completed a comparison.** Every run of this workflow that exists -- two of
+# them -- failed in about fifteen seconds on `set MNEMIQ_PG_DSN`, because the source database was
+# reached for through a secret that was never set and could not have routed anywhere a runner can
+# see. Nothing was gating while the ACME number moved four points below its baseline -- eight on the
+# developer machine, half of which turned out to be that source's own contents. Two changes:
+# the database is PROVISIONED here rather than reached for, so it needs no secret and cannot point
+# somewhere unreachable; and "the gate could not run" is now its own named step, because the whole
+# harm was that it and "accuracy regressed" were the same red X in a list nobody opens.
 name: eval-nightly
 
 on:
@@ -23,15 +32,117 @@ concurrency:
   group: eval-nightly
   cancel-in-progress: false
 
+# The dataset the ACME golden set is asked about: dbt-labs' semantic-layer benchmark, Apache-2.0,
+# pinned to a commit. FETCHED rather than vendored -- 132K of CSV would be small enough to copy in,
+# but copying a third-party corpus into a public repo takes on redistribution and attribution that
+# a pinned fetch does not, and the pin gives the same reproducibility.
+env:
+  ACME_DATASET_REPO: dbt-labs/semantic-layer-llm-benchmarking
+  ACME_DATASET_REF: ac20c9292fa88ec44d30aeeae61ee41a51e31748
+
 jobs:
   acme:
     runs-on: ubuntu-latest
-    # The full run enriches 51 tables before it asks 30 questions.
+    # The full run re-enriches the whole source before it asks 30 questions. The seeded source
+    # is 29 objects -- the seeder creates tables only, never views; the flat "51" this comment gave was
+    # the count profiled from a DEVELOPER database, which had accumulated mnemiq's own control
+    # tables on top of ACME's. A number measured on one machine's drift is not a property of
+    # the job.
     timeout-minutes: 90
+
+    # Job scope for the NON-secret configuration only. The model credentials stay on the two steps
+    # that need them: hoisting them here would put the API key into the environment of `uv sync`,
+    # which runs third-party build backends, and of the dataset checkout -- steps that have no use
+    # for it. A duplicated list of three names across two steps is the smaller risk, and the reason
+    # it is duplicated is written at the preflight so the next reader does not "tidy" it back.
+    env:
+      # The service container, not a secret pointing somewhere unroutable.
+      MNEMIQ_PG_DSN: postgresql://postgres:postgres@localhost:5432/acme
+      MNEMIQ_SOURCE_ID: acme
+
+    # The source database, stood up here rather than reached for. It used to come from an
+    # `MNEMIQ_ACME_PG_DSN` secret pointing at a host the runner could not route to, which is half
+    # of why this job has never once completed a comparison. A service container needs no secret
+    # and cannot drift away from the schema the seeder writes.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: acme
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v3
       - run: uv sync --extra dev --extra ontology
+
+      # ITS OWN STEP, and named, because the whole defect this job carries is that "the gate could
+      # not run" and "accuracy regressed" were the same red X in the Actions list. Now the FAILING
+      # STEP NAME says which: this one means unarmed, the gate step below means regressed. Nobody
+      # has to open a log to tell them apart.
+      #
+      # It fails rather than skipping. A green tick for a gate that did not run is the M34 shape
+      # itself -- a control reporting success for work it never did -- and this job exists to
+      # close that, not to reproduce it one level out.
+      - name: "Preflight: the gate is armed"
+        # These three are repeated on the gate step below, deliberately. Declaring them once at job
+        # level would scope a model credential to every step in the job, including dependency
+        # resolution and a third-party checkout. If a fourth requirement is ever added to the gate,
+        # add it in THREE places -- this `env:`, the loop below, and the gate step's `env:`.
+        # The drift that invites is the lesser of the two risks, and naming all three is how
+        # the next person gets it right.
+        env:
+          MNEMIQ_LLM_BASE_URL: ${{ secrets.MNEMIQ_LLM_BASE_URL }}
+          MNEMIQ_LLM_API_KEY: ${{ secrets.MNEMIQ_LLM_API_KEY }}
+          MNEMIQ_LLM_MODEL: ${{ secrets.MNEMIQ_LLM_MODEL }}
+        shell: bash
+        run: |
+          missing=()
+          # BASE_URL and API_KEY only. `LLMClient.__init__` raises on those two; `llm_model`
+          # is filled with `DEFAULT_MODEL` by `Settings._fill_defaults`, so requiring it here
+          # would hold the gate dark for a secret the run does not need -- this job's own
+          # failure in miniature, refusing to run for a reason that is not real.
+          for name in MNEMIQ_LLM_BASE_URL MNEMIQ_LLM_API_KEY; do
+            [ -n "${!name}" ] || missing+=("$name")
+          done
+          if [ ${#missing[@]} -ne 0 ]; then
+            {
+              echo "## THE ACCURACY GATE IS NOT ARMED"
+              echo
+              echo "This run compared nothing. It is **not** a regression."
+              echo
+              echo "Missing repository secrets: \`${missing[*]}\`"
+              echo
+              echo "Add them under Settings -> Secrets and variables -> Actions."
+            echo ""
+            echo "MNEMIQ_LLM_MODEL is optional -- Settings fills a default. The source"
+              echo "database needs no secret: this job provisions and seeds its own."
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "armed: model endpoint configured; database provisioned by this job"
+
+      # The corpus, at the pinned commit. `path:` keeps it out of the checkout the tests import.
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.ACME_DATASET_REPO }}
+          ref: ${{ env.ACME_DATASET_REF }}
+          path: .acme-dataset
+
+      - name: Seed ACME into the service database
+        env:
+          MNEMIQ_ACME_DATA_DIR: .acme-dataset/ACME_Insurance
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run python -m scripts.seed_acme | tee -a "$GITHUB_STEP_SUMMARY"
 
       # `--gate`, never `--record`. The nightly is a READER: it compares and fails, and it
       # never writes the baseline. A job that recorded its own result would restore the ratchet
@@ -43,8 +154,6 @@ jobs:
       # Both used to pass, which is why nothing noticed a published number drifting 16 points.
       - name: Gate ACME accuracy against the recorded baseline
         env:
-          MNEMIQ_PG_DSN: ${{ secrets.MNEMIQ_ACME_PG_DSN }}
-          MNEMIQ_SOURCE_ID: acme
           MNEMIQ_LLM_BASE_URL: ${{ secrets.MNEMIQ_LLM_BASE_URL }}
           MNEMIQ_LLM_API_KEY: ${{ secrets.MNEMIQ_LLM_API_KEY }}
           MNEMIQ_LLM_MODEL: ${{ secrets.MNEMIQ_LLM_MODEL }}

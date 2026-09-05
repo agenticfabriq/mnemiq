@@ -128,7 +128,7 @@ def check_regression(report: Report, previous: RunRecord | None,
     the second is most of the drift worth catching, so **widening this is not the right answer
     to a flapping gate** -- find out which case moved instead.
 
-    The likeliest source of a flap is not the model: `run_acme` re-enriches all 51 tables every
+    The likeliest source of a flap is not the model: `run_acme` re-enriches every table in the source every
     run, so two runs compare engines over independently regenerated snapshots. If the nightly
     reddens on a night nothing changed, pin the snapshot rather than loosen this.
 
