@@ -49,7 +49,7 @@ class _RetryingJudge:
         # `attempts < 1` makes the loop body never run, so `score` returns the fail-open constant
         # without calling the judge AND without counting it -- a full sweep of constants with
         # `unrecovered: 0`, certified, from a flag. Refused here rather than validated at the
-        # arg parser, so the class cannot be reached by any caller.
+        # arg parser, so the invalid STATE cannot be reached however the class is constructed.
         if attempts < 1:
             raise ValueError(f"attempts must be >= 1, got {attempts}: fewer means the judge is "
                              "never called and every score is the fail-open constant")
@@ -71,9 +71,8 @@ class _RetryingJudge:
             # instead of `attempts`. It is still a fail-open constant rather than a judgement, so
             # it counts as UNRECOVERED at once: not retried, and not forgiven. Keying the retry on
             # errors alone, WITHOUT the unparsed check below, is the trap -- unparsed then reaches
-            # neither the retry nor `gave_up`, and a judge answering unreadably every time certifies
-            # with
-            # `unrecovered` at zero. The two halves ship together for that reason.
+            # neither the retry nor `gave_up`, and a judge answering unreadably every time
+            # certifies with `unrecovered` at zero. The two halves ship together for that reason.
             errors_before, unparsed_before = self._judge.errors, self._judge.unparsed
             last = self._judge.score(*args, **kwargs)
             if self._judge.unparsed != unparsed_before:
