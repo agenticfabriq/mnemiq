@@ -88,8 +88,16 @@ n_answerable = sum(1 for r in rows if r["outcome"] in _ANSWERABLE)
 # On mini-dev every record is answerable, so these two coincide; the distinction is kept because
 # the script takes a run path and other corpora defer.
 print(f"  cache entries {n_cache} over {n_answerable} answerable records ({len(rows)} rows total)")
-if n_cache == 0:
-    print("  FAIL: empty cache"); raise SystemExit(1)
+# n_answerable is printed for the operator; the ASSERTION below uses the distinct-pair count.
+# The cache dedupes on (model, question, sql), so the exact expected size is the number of
+# DISTINCT (question, sql) pairs among answerable records -- not the record count, which
+# double-counts any repeated pair. Comparing against it is what makes this a completeness check:
+# testing only for "not empty" would stamp a sweep that scored ONE case as complete.
+expected = len({(r["question"], r.get("sql") or "") for r in rows if r["outcome"] in _ANSWERABLE})
+if n_cache < expected:
+    print(f"  FAIL: {n_cache} scored of {expected} distinct answerable (question, sql) pairs "
+          f"-- partial sweep, provenance left marked incomplete")
+    raise SystemExit(1)
 prov = json.load(prov_p.open())
 prov["scoring_complete"] = True
 prov["cache_file"] = cache_p.name
