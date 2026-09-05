@@ -161,8 +161,10 @@ print(f"  cache entries {n_cache} over {n_answerable} answerable records ({len(r
 
 # A PARTIAL outage is not detectable from the scores -- a mid-sweep death leaves real scores
 # followed by fallbacks that no value test can separate from genuine ones. The post-sweep probe is
-# ASYMMETRIC evidence and only that: a FALSE result means something is wrong and the sweep must not
-# be certified, while a TRUE result rules out only one failure mode. `LLMClient.complete` turns
+# ASYMMETRIC evidence and only that. NEITHER result establishes what the scores are: TRUE rules out
+# one failure mode, and FALSE is equally consistent with a clean sweep followed by a shutdown. What
+# FALSE does establish is that contamination can no longer be RULED OUT, and an uncertifiable sweep
+# is the one thing this script must not stamp as certified. `LLMClient.complete` turns
 # every API error into `ModelUnavailable` -- timeout, rate limit, bad gateway -- and the judge
 # swallows all of them to its constant, so a 429 burst or per-request timeout leaves `/v1/models`
 # answering seconds later with contaminated scores already in the cache. True here is not evidence
@@ -175,8 +177,10 @@ except (urllib.error.URLError, OSError, KeyError, ValueError):
     healthy_after = False
 print(f"  endpoint still answering after the sweep: {healthy_after}")
 if not healthy_after:
-    print("  FAIL: it is not. Scores taken after it stopped answering are this judge's error")
-    print("        constant, and no value test separates them from real ones. Not certifying.")
+    print("  FAIL: it is not. That may mean it died mid-sweep -- leaving this judge's error")
+    print("        constant in the cache, which no value test separates from real scores -- or")
+    print("        simply that it was taken down after a clean run. Neither can be ruled out")
+    print("        from here, so the sweep is not certified. Re-probe and re-run to settle it.")
     raise SystemExit(1)
 # n_answerable is printed for the operator; the ASSERTION below uses the distinct-pair count.
 # The cache dedupes on (model, question, sql), so the exact expected size is the number of
