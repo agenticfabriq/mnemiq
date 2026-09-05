@@ -224,7 +224,10 @@ print(f"  score distribution: {distinct} distinct value(s), {at_one}/{len(scores
 if distinct == 1:
     refuse(f"every score is the same value ({scores[0]!r}); this judge returns a constant on error, "
            f"so a dead endpoint produces exactly this shape",
-           score_distinct_values=distinct, scores_at_exactly_1_0=at_one)
+           score_distinct_values=distinct, scores_at_exactly_1_0=at_one,
+           # known True here -- the False case exited earlier. Recorded because the message blames
+           # a dead endpoint, and this is the datum that rules that cause out.
+           endpoint_healthy_after_sweep=healthy_after)
 prov = json.load(prov_p.open())
 prov["scoring_complete"] = True
 prov["cache_file"] = cache_p.name
