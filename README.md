@@ -35,15 +35,32 @@ passes; the harness reports both exact-match and got-the-facts accuracy.
 | BIRD mini-dev (487 answerable, 11 unseen schemas) | 48.9% | 63.2% | `gpt55-duckdb-pg.jsonl` |
 | Spider 2.0-lite (135 questions, 30 schemas) | 37.0% | 58.5% | `spider2-full-k24.jsonl` |
 
-Every rate is `correct` (exact-match) or `correct + correct_facts` (got-the-facts) over the
-**answerable** cases — `correct + correct_facts + wrong + deferred_wrongly + error`. A case the
-engine correctly declines is not in the denominator, which is why ACME reads 25 rather than 30:
-five of its thirty are correct deferrals.
+Each row names ONE run and both of its numbers come from that run. Those artifacts are not
+distributed — `eval-reports/` is gitignored — so the names identify a run in our records rather
+than a file you can open.
 
-Each row names ONE run, and both of its numbers come from that run. The Spider row is the
-retrieval `k=24` configuration; across the three hosted Spider runs exact-match spans 34.8–37.8%
-and got-the-facts 51.9–58.5%, so read a single Spider row as one point in that spread rather than
-as a stable rate.
+**The denominators differ by row, and for different reasons.** Both rates are taken over the
+*answerable* cases (`correct + correct_facts + wrong + deferred_wrongly + error`), but what falls
+outside that is not one thing:
+
+- **ACME** — 25 of 30. The five missing are cases the engine correctly declined; a correct
+  deferral is not scored as an attempt.
+- **BIRD** — 487 of mini-dev's 500. The thirteen missing were never measured: the harness drops a
+  case whose *gold* result set exceeds its row cap, before the engine sees it. They are not
+  refusals.
+- **Spider** — all 135 attempted.
+
+**One caveat, and it applies to the BIRD figures only.** The harness subtracts results it cannot
+verify against the gold engine (`exact = correct - unportable_exact`). Both BIRD runs cited on this
+page — the table row and the local-model figure below — predate that accounting and carry no
+portability data, so their exact-match is the raw `correct` rate and should be read as the ceiling
+of a range: the gap is about 2.4 points on a 487-case run. The Spider figures are unaffected, and
+measured rather than assumed to be — both Spider runs carry the field, and zero of their exact
+cases are unportable, so the published rates are what the harness prints.
+
+The Spider row is the retrieval `k=24` configuration. Across the three hosted Spider runs
+exact-match spans 34.8–37.8% and got-the-facts 51.9–58.5%, so read it as one point in that spread
+rather than as a stable rate.
 
 Those are three different questions, not three attempts at one. ACME is in-domain — one enriched
 schema with a golden set, the regime a real deployment is in. BIRD and Spider are **cold start**:
@@ -55,12 +72,17 @@ On BIRD the single-shot engine sits in the range of BIRD's own reported single-s
 machinery — candidate selection, verification — and task-specific fine-tuning, not a difference
 in the core.
 
-**On local models, the honest result:** a 24 GB Qwen2.5-Coder-14B with constrained decoding and
-5-sample self-consistency reaches **50.7% exact-match** on BIRD (54.4% got-the-facts,
-`minidev-pg-14b-guided-sc5.jsonl`) — close to frontier — and **5.9% exact-match on Spider 2.0-lite**
-(6.7% got-the-facts, `spider2-qwen2.5-coder-14b.jsonl`), where the frontier configuration holds at
-37.0% and 58.5%. Local capability is far more schema-dependent than the BIRD number alone suggests.
-Measure on your own schema before committing an architecture to it.
+**On local models, the honest result** — and these are two different runs, not one configuration
+measured twice. On BIRD, a 24 GB Qwen2.5-Coder-14B with constrained decoding and 5-sample
+self-consistency reaches **50.7% exact-match** (54.4% got-the-facts,
+`minidev-pg-14b-guided-sc5.jsonl`), close to frontier. On Spider 2.0-lite the same model
+single-shot reaches **5.9%** (6.7% got-the-facts, `spider2-qwen2.5-coder-14b.jsonl`), where the
+frontier configuration holds at 37.0% and 58.5%.
+
+Constrained decoding does not rescue it there: the guided Spider run of the same model scores
+**lower**, 4.4% exact-match, and a 32B at 5.2% does not close the gap either. Local capability is
+far more schema-dependent than the BIRD number alone suggests. Measure on your own schema before
+committing an architecture to it.
 
 ## Quickstart
 
