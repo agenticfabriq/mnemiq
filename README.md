@@ -62,8 +62,9 @@ two DIFFERENT reasons, neither of which is a check that passed. Spider records t
 case, but from the adapter — `dialect == "sqlite"` — so on this SQLite slice it is `True` whatever
 SQL was emitted; run the same slice through a DuckDB attachment and it flips `False` for every
 case and the printed exact-match becomes 0.0%. ACME never records it at all: portability is probed
-only when gold runs on a different adapter than the answer, and ACME passes one. So both are raw
-`correct` rates as well — one from a flag that cannot fail here, one from a probe that never ran.
+only when gold runs on a different adapter than the answer, and ACME passes one. Neither is a ceiling the way the BIRD
+figures are, though: on a single-engine run there is genuinely nothing to subtract, so the zero is
+right rather than missing. What is absent is the check, not the correction.
 
 The Spider row is the retrieval `k=24` configuration. Across the three hosted Spider runs
 exact-match spans 34.8–37.8% and got-the-facts 51.9–58.5%, so read it as one point in that spread
@@ -89,8 +90,8 @@ frontier configuration holds at 37.0% and 58.5%.
 **These local runs do not support comparisons between them, and the counts are why.** On a
 135-case slice, the 32B moves 3 correct cases to 7 with constrained decoding; the 14B moves 8 to
 6, across runs 311 engine commits apart with a `-dirty` baseline. Two hosted runs of the frontier
-configuration differ by 4 cases from each other. Every difference AMONG THESE ARMS is the same
-handful of cases, so no ordering among them is claimed here, and the effect of
+configuration differ by 4 cases from each other. Every difference among the LOCAL arms is the same
+handful of cases, so no ordering among those is claimed here, and the effect of
 constrained decoding on Spider is not something these runs can settle.
 
 The one durable observation is the size of the remaining gap: no local arm exceeds 8 of 135
