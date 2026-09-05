@@ -142,13 +142,24 @@ MNEMIQ_VERIFY_API_KEY="${MNEMIQ_VERIFY_API_KEY:-EMPTY}" \
   .venv/bin/python scripts/run_verify_replay.py "$RUN" --judge
 
 echo "== check the run was not a cache replay =="
-.venv/bin/python - "$CACHE" "$RUN" "$PROV" <<'PY'
-import json, sys, pathlib
+JUDGE_MODELS_URL="${BASE%/}/models" .venv/bin/python - "$CACHE" "$RUN" "$PROV" <<'PY'
+import json, os, sys, pathlib
 # the venv, not system python3: this imports mnemiq, and the scoring step above already uses it
 from mnemiq.eval.verify_replay import _ANSWERABLE
 cache_p, run_p, prov_p = (pathlib.Path(a) for a in sys.argv[1:4])
+
+def refuse(reason, **extra):
+    """Record WHY before exiting. A bare `scoring_complete: false` cannot tell a dead endpoint from
+    a partial sweep from a single-valued outage, so the re-run it asks for is undirected."""
+    prov = json.load(prov_p.open())
+    prov["scoring_complete"] = False
+    prov["incomplete_reason"] = reason
+    prov.update(extra)
+    json.dump(prov, prov_p.open("w"), indent=2)
+    print(f"  FAIL: {reason}")
+    raise SystemExit(1)
 if not cache_p.exists():
-    print("  FAIL: no cache written -- the judge never scored"); raise SystemExit(1)
+    refuse("no cache written -- the judge never scored")
 n_cache = len(json.load(cache_p.open()))
 # Compared against ANSWERABLE records, not every line: the judge scores only those, and the cache
 # dedupes on (model, question, sql). Comparing against the raw line count always looks short by
@@ -158,6 +169,31 @@ n_answerable = sum(1 for r in rows if r["outcome"] in _ANSWERABLE)
 # On mini-dev every record is answerable, so these two coincide; the distinction is kept because
 # the script takes a run path and other corpora defer.
 print(f"  cache entries {n_cache} over {n_answerable} answerable records ({len(rows)} rows total)")
+
+# A PARTIAL outage is not detectable from the scores -- a mid-sweep death leaves real scores
+# followed by fallbacks that no value test can separate from genuine ones. The post-sweep probe is
+# WEAK evidence, and contamination is never ruled out by EITHER result -- a 429 burst or per-request
+# timeout leaves the judge writing its constant into the cache while `/v1/models` keeps answering.
+# So the exit on FALSE is precautionary, not inferential: it is not that a dead endpoint proves the
+# scores are bad, but that certifying a run which also carries a known-bad signal is worse than
+# declining one that might have been fine. `scoring_complete` is the field a later reader trusts,
+# and the cost of withholding it is a re-run. `LLMClient.complete` turns
+# every API error into `ModelUnavailable` -- timeout, rate limit, bad gateway -- and the judge
+# swallows all of them to its constant, so a 429 burst or per-request timeout leaves `/v1/models`
+# answering seconds later with contaminated scores already in the cache. True here is not evidence
+# of clean scores.
+import urllib.error, urllib.request
+try:
+    with urllib.request.urlopen(os.environ["JUDGE_MODELS_URL"], timeout=10) as r:
+        healthy_after = r.status == 200
+except (urllib.error.URLError, OSError, KeyError, ValueError):
+    healthy_after = False
+print(f"  endpoint still answering after the sweep: {healthy_after}")
+if not healthy_after:
+    refuse("endpoint not answering after the sweep -- it may have died mid-run, leaving this "
+           "judge's error constant in the cache, or been taken down after a clean run; neither "
+           "can be ruled out from here",
+           endpoint_healthy_after_sweep=False)
 # n_answerable is printed for the operator; the ASSERTION below uses the distinct-pair count.
 # The cache dedupes on (model, question, sql), so the exact expected size is the number of
 # DISTINCT (question, sql) pairs among answerable records -- not the record count, which
@@ -169,13 +205,39 @@ expected = len({(r["question"], r.get("sql") or "") for r in rows if r["outcome"
 # testing only for a non-empty cache -- would certify a one-case sweep as complete the moment
 # that stops being true, and `scoring_complete` is the one field a later reader trusts.
 if n_cache < expected:
-    print(f"  FAIL: {n_cache} scored of {expected} distinct answerable (question, sql) pairs "
-          f"-- partial sweep, provenance left marked incomplete")
-    raise SystemExit(1)
+    refuse(f"partial sweep: {n_cache} scored of {expected} distinct answerable (question, sql) pairs",
+           cache_entries=n_cache, expected_entries=expected)
+
+# A FULL CACHE IS NOT A SUCCESSFUL SWEEP. `SemanticJudge.score` catches every exception and returns
+# 1.0 -- deliberately, so the product degrades to answering rather than crashing. In a MEASUREMENT
+# that fail-open is indistinguishable from a judge that approved everything: a dead endpoint yields
+# one 1.0 per case, a cache of exactly the right size, and a sweep reporting "0 wrong caught at
+# every threshold", which reads as a finding rather than as an outage. Refuse to certify it.
+scores = list(json.load(cache_p.open()).values())
+distinct = len(set(scores))
+at_one = sum(1 for v in scores if v == 1.0)
+print(f"  score distribution: {distinct} distinct value(s), {at_one}/{len(scores)} at exactly 1.0")
+# Keyed on distinct == 1, NOT on the fallback's value. Hardcoding 1.0 here duplicates a literal
+# from `SemanticJudge.score` with nothing linking them: change that fallback to 0.0 and an
+# all-0.0 outage would pass, certified, reporting every wrong answer caught. Any single-valued
+# sweep over hundreds of cases is a red flag whatever the value is.
+if distinct == 1:
+    refuse(f"every score is the same value ({scores[0]!r}); this judge returns a constant on error, "
+           f"so a dead endpoint produces exactly this shape",
+           score_distinct_values=distinct, scores_at_exactly_1_0=at_one,
+           # known True here -- the False case exited earlier. Recorded because the message blames
+           # a dead endpoint, and this is the datum that rules that cause out.
+           endpoint_healthy_after_sweep=healthy_after)
 prov = json.load(prov_p.open())
 prov["scoring_complete"] = True
 prov["cache_file"] = cache_p.name
 prov["cache_entries"] = n_cache
+prov["score_distinct_values"] = distinct
+# NOT "at_fallback": `SemanticJudge` clamps a parsed confidence with min(1.0, ...), so a healthy
+# judge replying 1.0 is indistinguishable BY VALUE from its error path. This counts what it says
+# and no more -- claiming these were fallbacks would assert a provenance the number cannot carry.
+prov["scores_at_exactly_1_0"] = at_one
+prov["endpoint_healthy_after_sweep"] = healthy_after
 json.dump(prov, prov_p.open("w"), indent=2)
 print(f"  OK: fresh cache under the served model's tag; {prov_p.name} marked complete")
 PY
