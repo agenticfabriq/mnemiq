@@ -25,7 +25,9 @@ echo "  serving: $SERVED"
 # Best-effort. Captured as RAW TEXT and parsed defensively below -- `curl -sS` without `-f` exits 0
 # on a 404 and hands back the error page, and a --max-time abort leaves a truncated body, so
 # parsing here would abort the script under `set -e` AFTER the archive has moved the cache aside.
-VERSION_JSON="$(curl -sS --max-time 10 "${BASE%/}/../version" 2>/dev/null || echo '')"
+VERSION_BODY="$(curl -sS --max-time 10 -w '\n%{http_code}' "${BASE%/}/../version" 2>/dev/null || echo '')"
+VERSION_CODE="$(printf '%s' "$VERSION_BODY" | tail -n1)"
+VERSION_JSON="$(printf '%s' "$VERSION_BODY" | sed '$d')"
 
 TAG="$(python3 -c 'import sys; print("".join(c if c.isalnum() else "_" for c in sys.argv[1]))' "$SERVED")"
 CACHE="${RUN}.judgecache.${TAG}.json"
@@ -58,9 +60,9 @@ fi
 # and if scoring aborts, "the most recent provenance" then describes a run that produced no scores
 # while the surviving cache belongs to an earlier one. That is the July failure mode this script
 # exists to close, so it must not be reintroduced by the closing.
-python3 - "$PROV" "$SERVED" "$BASE" "$MODELS_JSON" "$VERSION_JSON" <<'PY'
+python3 - "$PROV" "$SERVED" "$BASE" "$MODELS_JSON" "$VERSION_JSON" "$VERSION_CODE" <<'PY'
 import json, os, re, subprocess, sys, datetime
-path, served, base, models, version_raw = sys.argv[1:6]
+path, served, base, models, version_raw, version_code = sys.argv[1:7]
 models_obj = json.loads(models)
 
 # A NAME IS NOT A VERSION. `qwen` is what the July judge recorded, and it is why 22/186 cannot be
@@ -79,22 +81,38 @@ def immutable_id():
             print(f"  IGNORING MNEMIQ_JUDGE_MODEL_VERSION={env!r}: expected <served_model>=<version>")
         elif scope != served:
             print(f"  IGNORING MNEMIQ_JUDGE_MODEL_VERSION: scoped to {scope!r}, serving {served!r}")
+        elif not value.strip():
+            # `export X="$SERVED=$SHA"` with SHA unset gives `qwen=`, which is truthy and scoped.
+            # Returning "" from here sets `model_version_recorded: true` on an empty version while
+            # the console prints the unversioned warning -- record and operator told opposite things.
+            print(f"  IGNORING MNEMIQ_JUDGE_MODEL_VERSION={env!r}: version half is empty")
         else:
             return value, f"MNEMIQ_JUDGE_MODEL_VERSION, scoped to {scope!r}"
     # Only a snapshot PATH counts: it ties the hex to the weights on disk. A bare 40-hex anywhere in
     # the payload is not evidence -- a permission id, a lora directory or a server-generated id would
     # all match, and be recorded as the model's version under a label naming a source it never had.
-    m = re.search(r"snapshots/([0-9a-f]{40})", json.dumps(models_obj))
-    return (m.group(1), "HF snapshot sha in the /v1/models payload") if m else (None, None)
+    # Scoped to the entry actually being served. Searching the whole payload would take a LORA
+    # adapter's snapshot sha -- a second `data` entry with `parent: "qwen"` -- and record it as the
+    # base model's version, which the label would then vouch for.
+    entry = next((e for e in models_obj.get("data", []) if e.get("id") == served), None)
+    if entry is None:
+        return None, None
+    m = re.search(r"snapshots/([0-9a-f]{40})", json.dumps(entry))
+    return (m.group(1), f"HF snapshot sha on the /v1/models entry for {served!r}") if m else (None, None)
 
 value, source = immutable_id()
 
 # Never fatal, never silently wrong: a body that will not parse is kept verbatim so a reader can
 # see what the endpoint actually said.
+# A JSON error body parses. `{"detail":"Not Found"}` is structurally a version response, so without
+# the status a reader cannot tell it from `{"version": "0.9.0.1"}` -- `curl -sS` without `-f` exits
+# 0 on a 404 and hands back the error page.
 try:
-    server_version = json.loads(version_raw) if version_raw.strip() else None
+    parsed = json.loads(version_raw) if version_raw.strip() else None
 except (ValueError, TypeError):
-    server_version = {"unparsed_response": version_raw[:500]}
+    parsed = {"unparsed_response": version_raw[:500]}
+server_version = {"http_status": version_code or None, "body": parsed,
+                  "ok": version_code == "200"}
 rev = subprocess.run(["git","rev-parse","--short","HEAD"], capture_output=True, text=True).stdout.strip()
 dirty = bool(subprocess.run(["git","status","--porcelain"], capture_output=True, text=True).stdout.strip())
 json.dump({"served_model": served, "base_url": base, "engine_rev": rev + ("-dirty" if dirty else ""),
