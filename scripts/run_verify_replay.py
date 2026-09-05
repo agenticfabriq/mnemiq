@@ -96,7 +96,25 @@ def main() -> int:
         return "\n".join(c.text for c in build_cards(snap))
 
     print(f"judge endpoint: {base} | model: {model}")
+    inner = judge._judge  # the instrumented SemanticJudge sitting under the cache wrapper
     scores = judge_scores(records, judge, cards_for)
+
+    # How many of those "scores" are the fail-open constant rather than a judgement. Nothing in the
+    # cache can answer this: `SemanticJudge` clamps a real reply to 1.0 and returns 1.0 on error, so
+    # a dead endpoint and a judge that approved everything write identical files. Only the judge's
+    # own counters separate them, and a sweep that cannot be told from an outage must not be
+    # published as a measurement. Written beside the cache; counts THIS process's calls, so a run
+    # resumed over a warm cache reports only what it re-scored.
+    errpath = f"{args.run}.judgeerrors.{tag}.json"
+    json.dump({"model": model, "calls": inner.calls, "errors": inner.errors,
+               "unparsed": inner.unparsed, "fallbacks": inner.fallbacks,
+               "scored_cases": len(scores)}, open(errpath, "w"), indent=2)
+    print(f"judge calls {inner.calls}: {inner.errors} endpoint errors, {inner.unparsed} unreadable "
+          f"replies -> {inner.fallbacks} fail-open constants (recorded in {errpath})")
+    if inner.fallbacks:
+        print("WARNING: some scores are the fail-open constant, not judgements. Any figure taken "
+              "from this sweep is contaminated by that many cases.")
+
     print(f"scored {len(scores)} answerable cases; sweeping thresholds:")
     for row in sweep(records, scores, _THRESHOLDS):
         print(f"thr {row['threshold']:.1f}:{_line(row)}")
