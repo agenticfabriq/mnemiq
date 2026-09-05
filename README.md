@@ -33,7 +33,7 @@ passes; the harness reports both exact-match and got-the-facts accuracy.
 |---|---|---|---|
 | ACME (in-domain, 25 answerable of 30) | 88.0% | 100.0% | `plan15/enrichment-on.json` |
 | BIRD mini-dev (487 answerable, 11 unseen schemas) | 48.9% | 63.2% | `gpt55-duckdb-pg.jsonl` |
-| Spider 2.0-lite (135 questions, 30 schemas) | 37.0% | 58.5% | `spider2-full-k24.jsonl` |
+| Spider 2.0-lite (135 local of 547, 30 schemas) | 37.0% | 58.5% | `spider2-full-k24.jsonl` |
 
 Each row names ONE run and both of its numbers come from that run. Those artifacts are not
 distributed — `eval-reports/` is gitignored — so the names identify a run in our records rather
@@ -48,15 +48,21 @@ outside that is not one thing:
 - **BIRD** — 487 of mini-dev's 500. The thirteen missing were never measured: the harness drops a
   case whose *gold* result set exceeds its row cap, before the engine sees it. They are not
   refusals.
-- **Spider** — all 135 attempted.
+- **Spider** — all 135 attempted, but 135 is not the benchmark. Spider 2.0-lite ships 547
+  instances; the engine runs the 135 **local (SQLite)** ones and filters out 412 that need
+  BigQuery or Snowflake adapters and credentials it does not have. Those are not failures, and
+  they are not attempts either — the row covers a quarter of the suite.
 
 **One caveat, and it applies to the BIRD figures only.** The harness subtracts results it cannot
 verify against the gold engine (`exact = correct - unportable_exact`). Both BIRD runs cited on this
 page — the table row and the local-model figure below — predate that accounting and carry no
 portability data, so their exact-match is the raw `correct` rate and should be read as the ceiling
-of a range: the gap is about 2.4 points on a 487-case run. The Spider figures are unaffected, and
-measured rather than assumed to be — both Spider runs carry the field, and zero of their exact
-cases are unportable, so the published rates are what the harness prints.
+of a range: the gap is about 2.4 points on a 487-case run. The Spider figures are unaffected, though not by a
+check that could have found otherwise: on the local slice the flag is set from the adapter
+(`dialect == "sqlite"`), so every executed case records portable and the subtraction is
+structurally zero. Gold and engine are the same engine there, which is why the code calls the
+claim free — the published Spider rates are what the harness prints, and nothing was verified to
+make that so.
 
 The Spider row is the retrieval `k=24` configuration. Across the three hosted Spider runs
 exact-match spans 34.8–37.8% and got-the-facts 51.9–58.5%, so read it as one point in that spread
@@ -79,10 +85,14 @@ self-consistency reaches **50.7% exact-match** (54.4% got-the-facts,
 single-shot reaches **5.9%** (6.7% got-the-facts, `spider2-qwen2.5-coder-14b.jsonl`), where the
 frontier configuration holds at 37.0% and 58.5%.
 
-Constrained decoding does not rescue it there: the guided Spider run of the same model scores
-**lower**, 4.4% exact-match, and a 32B at 5.2% does not close the gap either. Local capability is
-far more schema-dependent than the BIRD number alone suggests. Measure on your own schema before
-committing an architecture to it.
+Constrained decoding does not settle it either way, and the two model sizes disagree about it:
+guiding COST the 14B 1.5 points on Spider (5.9% → 4.4%, `spider2-14b-guided.jsonl`) while it more
+than DOUBLED the 32B (2.2% → 5.2%, `spider2-32b-baseline.jsonl` → `spider2-32b-guided.jsonl`).
+Either number alone tells a story the pair does not support. What survives both is the ceiling:
+every local arm lands between 2% and 6% where the frontier configuration holds at 37%.
+
+Local capability is far more schema-dependent than the BIRD number alone suggests. Measure on your
+own schema before committing an architecture to it.
 
 ## Quickstart
 
