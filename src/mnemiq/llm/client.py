@@ -23,6 +23,27 @@ def token_param_name(model: str) -> str:
     return "max_completion_tokens" if _GPT5.search(model) else "max_tokens"
 
 
+# Sized above the measured boundary in `reasoning_budget`, not at it.
+_REASONING_FLOOR = 1024
+
+
+def reasoning_budget(model: str, max_tokens: int) -> int:
+    """Raise a cap sized for the visible answer to one that also covers the thinking.
+
+    A reasoning model spends the budget BEFORE it emits anything, so a cap sized for the reply
+    truncates the reasoning -- and the provider reports that as a request failure, not as a short
+    answer. MEASURED (openai.gpt-5.5, 10 real `SemanticJudge` prompts, same cases back to back):
+    200 -> 10/10 failed, 400 -> 5/10, 600 -> 0/10. The judge's own default was 200, which is
+    ample for `{"confidence": 0.9}` and nowhere near enough to reach it.
+
+    The floor sits well above 600 because that boundary moves with prompt length, and because a
+    cap is not a spend: raising it costs nothing unless the model emits more tokens, while the
+    reasoning underneath was already being paid for and thrown away. Callers that ask for more
+    keep what they asked for.
+    """
+    return max(max_tokens, _REASONING_FLOOR) if _GPT5.search(model) else max_tokens
+
+
 class LLMClient:
     def __init__(self, settings: Settings) -> None:
         if not settings.llm_base_url or not settings.llm_api_key:
@@ -41,7 +62,7 @@ class LLMClient:
 
     def complete(self, system: str, user: str, max_tokens: int = 512,
                  extra_body: dict | None = None) -> str:
-        kwargs = {token_param_name(self._model): max_tokens}
+        kwargs = {token_param_name(self._model): reasoning_budget(self._model, max_tokens)}
         if self._seed is not None:
             # Forwarded, not guaranteed. MEASURED: vLLM honours it; the hosted endpoint accepts
             # it, returns no system_fingerprint, and still varies its output -- two identical
