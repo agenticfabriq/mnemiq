@@ -89,23 +89,34 @@ schema with a golden set, the regime a real deployment is in. BIRD and Spider ar
 unseen schemas, no glossary, no examples. Spider 2.0 is the hard one by design — real
 data-application schemas, often more than a thousand columns.
 
-On BIRD the single-shot engine sits in the range of BIRD's own reported single-shot baselines
-(GPT-4o 34.4, Claude 3.7 41.1, o3-mini 42.6) — at 42.3% it is level with the top of that range, not
-past it. The distance to leaderboard pipelines is added
-machinery — candidate selection, verification — and task-specific fine-tuning, not a difference
-in the core.
+On BIRD, **the table's row** sits in the range of BIRD's own reported single-shot baselines
+(GPT-4o 34.4, Claude 3.7 41.1, o3-mini 42.6): at 42.3% it is level with the top of that range, not
+past it.
+
+The 48.7% reported further down is not a counter-example to that, and the difference is
+configuration rather than a contradiction. That run executes up to five candidates per question
+and five on 339 of 487, so it is not a single-shot number and does not belong beside a single-shot
+baseline. The table's run reads as single-shot: its candidate count and
+inter-candidate agreement score are unset on all 487 cases, where the five-candidate run populates
+both on most of its own. Read that as strong evidence rather than proof — several code paths write
+a blank pair, so the signature is not unique to a single-shot run, and neither artifact ships here
+for anyone to re-check.
+
+The distance to leaderboard pipelines is added machinery — candidate selection, verification — and
+task-specific fine-tuning, not a difference in the core.
 
 **On local models, the honest result** — and these are two different runs, not one configuration
 measured twice. On BIRD, a 24 GB Qwen2.5-Coder-14B with constrained decoding and 5-sample
 self-consistency reaches **48.7% exact-match** (54.4% got-the-facts,
 `minidev-pg-14b-guided-sc5.jsonl`).
 
-On that metric it is **above** the frontier run in the table — 48.7% against 42.3% — and the reason
-is portability rather than answers: on raw CORRECT the local run is
+On that metric it is **above** the frontier run in the table — 48.7% against 42.3%, and note that
+those two are not like for like: five candidates against one, which is why the baselines paragraph
+compares only the table's row. What separates them here is portability rather than answers: on raw CORRECT the local run is
 already slightly ahead (247 against 238, nine cases), and the frontier run then loses three times
 as many to SQL Postgres will not parse (32 against 10). Read it as one run each, and as a statement about which dialect these two RUNS emitted -- not
-about which model reasons better, and not about the models either, since the runs differ in
-decoding as well. On got-the-facts, where portability is not excluded, the order is the
+about which model reasons better, and not about the models either: the runs differ in candidate
+count (five against one) and in decoding, so the model is one of at least three variables. On got-the-facts, where portability is not excluded, the order is the
 usual one: 63.2% against 54.4%. That does not settle the question either -- the same run
 differences sit under both metrics -- it just shows the reversal is specific to what exact-match
 excludes. On Spider 2.0-lite the same model
