@@ -14,14 +14,32 @@
 # Usage:  scripts/rerun_local_judge.sh <run.jsonl> [base_url]
 set -euo pipefail
 
-RUN="${1:?usage: rerun_local_judge.sh <run.jsonl> [base_url]}"
+RUN="${1:?usage: rerun_local_judge.sh <run.jsonl> [base_url] [model]}"
 BASE="${2:-http://localhost:8000/v1}"
+# Only needed when the endpoint exposes no /models listing -- hosted providers frequently do not.
+MODEL_ARG="${3:-${MNEMIQ_VERIFY_MODEL:-}}"
 [ -f "$RUN" ] || { echo "no such run: $RUN" >&2; exit 2; }
 
 echo "== endpoint =="
-MODELS_JSON="$(curl -sS --max-time 10 "${BASE%/}/models")" || { echo "endpoint unreachable: $BASE" >&2; exit 3; }
-SERVED="$(printf '%s' "$MODELS_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')"
-echo "  serving: $SERVED"
+# `-w %{http_code}` because `curl -sS` without `-f` exits 0 on a 404 and hands back the error page,
+# so a status is the only way to tell a listing from an apology.
+MODELS_RAW="$(curl -sS --max-time 10 -H "Authorization: Bearer ${MNEMIQ_VERIFY_API_KEY:-EMPTY}" \
+                   -w '\n%{http_code}' "${BASE%/}/models" 2>/dev/null || echo)"
+MODELS_CODE="$(printf '%s' "$MODELS_RAW" | tail -n1)"
+MODELS_JSON="$(printf '%s' "$MODELS_RAW" | sed '$d')"
+if [ "$MODELS_CODE" = "200" ] && printf '%s' "$MODELS_JSON" | python3 -c 'import json,sys; json.load(sys.stdin)["data"][0]["id"]' 2>/dev/null; then
+  SERVED="$(printf '%s' "$MODELS_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')"
+  SERVED_SOURCE="/v1/models listing"
+else
+  # No listing. The model must then be NAMED by the caller, and the record must say that the name
+  # is an operator assertion rather than something the endpoint confirmed -- the same distinction
+  # `model_version_source` exists for one field down.
+  [ -n "$MODEL_ARG" ] || { echo "endpoint has no /models listing (HTTP ${MODELS_CODE:-none}); pass the model as arg 3 or set MNEMIQ_VERIFY_MODEL" >&2; exit 3; }
+  SERVED="$MODEL_ARG"
+  SERVED_SOURCE="operator; endpoint returned HTTP ${MODELS_CODE:-none} for /models"
+  MODELS_JSON='{"data":[],"note":"endpoint exposes no model listing"}'
+fi
+echo "  judging with: $SERVED  ($SERVED_SOURCE)"
 # Best-effort. Captured as RAW TEXT and parsed defensively below -- `curl -sS` without `-f` exits 0
 # on a 404 and hands back the error page, and a --max-time abort leaves a truncated body, so
 # parsing here would abort the script under `set -e` AFTER the archive has moved the cache aside.
@@ -78,9 +96,9 @@ fi
 # and if scoring aborts, "the most recent provenance" then describes a run that produced no scores
 # while the surviving cache belongs to an earlier one. That is the July failure mode this script
 # exists to close, so it must not be reintroduced by the closing.
-python3 - "$PROV" "$SERVED" "$BASE" "$MODELS_JSON" "$VERSION_JSON" "$VERSION_CODE" <<'PY'
+python3 - "$PROV" "$SERVED" "$BASE" "$MODELS_JSON" "$VERSION_JSON" "$VERSION_CODE" "$SERVED_SOURCE" <<'PY'
 import json, os, re, subprocess, sys, datetime
-path, served, base, models, version_raw, version_code = sys.argv[1:7]
+path, served, base, models, version_raw, version_code, served_source = sys.argv[1:8]
 models_obj = json.loads(models)
 
 # A NAME IS NOT A VERSION. `qwen` is what the July judge recorded, and it is why 22/186 cannot be
@@ -138,7 +156,7 @@ server_version = {"http_status": version_code or None, "body": parsed,
                   "ok": version_code == "200" and parse_ok}
 rev = subprocess.run(["git","rev-parse","--short","HEAD"], capture_output=True, text=True).stdout.strip()
 dirty = bool(subprocess.run(["git","status","--porcelain"], capture_output=True, text=True).stdout.strip())
-json.dump({"served_model": served, "base_url": base, "engine_rev": rev + ("-dirty" if dirty else ""),
+json.dump({"served_model": served, "served_model_source": served_source, "base_url": base, "engine_rev": rev + ("-dirty" if dirty else ""),
            "captured_at": datetime.datetime.now(datetime.UTC).isoformat(),
            "model_version": value, "model_version_source": source,
            "model_version_recorded": value is not None,
