@@ -1,24 +1,35 @@
 # The accuracy gate. Separate from `ci` on purpose, and scheduled rather than per-PR.
 #
-# Why not per-PR, which is the stronger thing to want: GitHub does not expose secrets to
-# workflows triggered from a fork, and this repo is public. A per-PR gate would therefore pass
-# vacuously for exactly the contributors it most needs to check -- a fail-open created by CI
-# topology rather than by code, which is the same shape as the finding this job exists to close
-# (M34). The eval also needs a live model endpoint, and one Spider2 run logged 10 provider
-# outages in 270 calls; a gate that goes red for an outage is a gate people learn to route
-# around, which is how repo-guard's over-matching became a problem (M19).
+# Why not per-PR, which is the stronger thing to want. Two reasons, and the first is written for
+# where this repo is GOING rather than where it is: mnemiq is announced as open source and this
+# repo is private today, so the fork argument does not bite yet -- but the day it goes public,
+# GitHub stops exposing secrets to workflows triggered from a fork, and a per-PR gate would pass
+# vacuously for exactly the contributors it most needs to check. That is a fail-open created by CI
+# topology rather than by code, the same shape as the finding this job exists to close (M34), and
+# it would arrive silently on the day of the flip rather than announcing itself. The second reason
+# bites now: the eval needs a live model endpoint, and one Spider2 run logged 10 provider outages
+# in 270 calls; a gate that goes red for an outage is a gate people learn to route around, which is
+# how repo-guard's over-matching became a problem (M19).
 #
 # So: it runs nightly on the default branch and on demand, and a regression is caught within a
 # day rather than blocked at merge. That trade is deliberate and is the weaker half of it.
 #
-# **It had never once completed a comparison.** Every run of this workflow that exists -- two of
-# them -- failed in about fifteen seconds on `set MNEMIQ_PG_DSN`, because the source database was
-# reached for through a secret that was never set and could not have routed anywhere a runner can
-# see. Nothing was gating while the ACME number moved four points below its baseline -- eight on the
-# developer machine, half of which turned out to be that source's own contents. Two changes:
-# the database is PROVISIONED here rather than reached for, so it needs no secret and cannot point
-# somewhere unreachable; and "the gate could not run" is now its own named step, because the whole
-# harm was that it and "accuracy regressed" were the same red X in a list nobody opens.
+# **For its first two runs it never once completed a comparison.** Both failed in about fifteen
+# seconds on `set MNEMIQ_PG_DSN`, because the source database was reached for through a secret that
+# was never set and could not have routed anywhere a runner can see. Nothing was gating while the
+# ACME number moved four points below its baseline -- eight on the developer machine, half of which
+# turned out to be that source's own contents. Two changes: the database is PROVISIONED here rather
+# than reached for, so it needs no secret and cannot point somewhere unreachable; and "the gate
+# could not run" is now its own named step, because the whole harm was that it and "accuracy
+# regressed" were the same red X in a list nobody opens.
+#
+# Run 3 (2026-09-05, dispatched once the model secrets were set) is the first that ever compared
+# anything: it armed, provisioned and seeded its own database, ran 30 cases in 5m34s and went red
+# on `GATE FAILED: accuracy regressed: 88.0% < previous 96.0% - 2% tolerance`, quoted as printed.
+# That is the job working. Whether 88 is a
+# regression to fix or a baseline recorded against a different source is a question for a human
+# reading `evals/trend.json`, which is exactly the split the `--gate`-never-`--record` rule below
+# exists to preserve.
 name: eval-nightly
 
 on:
@@ -34,8 +45,8 @@ concurrency:
 
 # The dataset the ACME golden set is asked about: dbt-labs' semantic-layer benchmark, Apache-2.0,
 # pinned to a commit. FETCHED rather than vendored -- 132K of CSV would be small enough to copy in,
-# but copying a third-party corpus into a public repo takes on redistribution and attribution that
-# a pinned fetch does not, and the pin gives the same reproducibility.
+# but copying a third-party corpus into a repo that will be public takes on redistribution and
+# attribution that a pinned fetch does not, and the pin gives the same reproducibility.
 env:
   ACME_DATASET_REPO: dbt-labs/semantic-layer-llm-benchmarking
   ACME_DATASET_REF: ac20c9292fa88ec44d30aeeae61ee41a51e31748
@@ -62,7 +73,7 @@ jobs:
 
     # The source database, stood up here rather than reached for. It used to come from an
     # `MNEMIQ_ACME_PG_DSN` secret pointing at a host the runner could not route to, which is half
-    # of why this job has never once completed a comparison. A service container needs no secret
+    # of why this job's first two runs completed no comparison. A service container needs no secret
     # and cannot drift away from the schema the seeder writes.
     services:
       postgres:
@@ -121,8 +132,8 @@ jobs:
               echo "Missing repository secrets: \`${missing[*]}\`"
               echo
               echo "Add them under Settings -> Secrets and variables -> Actions."
-            echo ""
-            echo "MNEMIQ_LLM_MODEL is optional -- Settings fills a default. The source"
+              echo
+              echo "MNEMIQ_LLM_MODEL is optional -- Settings fills a default. The source"
               echo "database needs no secret: this job provisions and seeds its own."
             } | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
