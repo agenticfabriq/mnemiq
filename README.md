@@ -32,7 +32,7 @@ passes; the harness reports both exact-match and got-the-facts accuracy.
 | corpus | exact-match | got-the-facts | run |
 |---|---|---|---|
 | ACME (in-domain, 25 answerable of 30) | 88.0% | 100.0% | `plan15/enrichment-on.json` |
-| BIRD mini-dev (487 answerable, 11 unseen schemas) | 48.9% | 63.2% | `gpt55-duckdb-pg.jsonl` |
+| BIRD mini-dev (487 answerable, 11 unseen schemas) | 42.3% | 63.2% | `gpt55-duckdb-pg.jsonl` |
 | Spider 2.0-lite (135 local of 547, 30 schemas) | 37.0% | 58.5% | `spider2-full-k24.jsonl` |
 
 Each row names ONE run and both of its numbers come from that run. Those artifacts are not
@@ -53,11 +53,18 @@ outside that is not one thing:
   BigQuery or Snowflake adapters and credentials it does not have. Those are not failures, and
   they are not attempts either — the row covers a quarter of the suite.
 
-**A caveat on exact-match.** The harness subtracts results it cannot
-verify against the gold engine (`exact = correct - unportable_exact`). Both BIRD runs cited on this
-page — the table row and the local-model figure below — predate that accounting and carry no
-portability data, so their exact-match is the raw `correct` rate and should be read as the ceiling
-of a range: the gap is about 2.4 points on a 487-case run. The Spider and ACME rates are unaffected, and for
+**Exact-match on BIRD excludes answers that are right but not portable.** BIRD grades one engine
+against itself; mnemiq answers over DuckDB and the gold runs on Postgres, so an answer can be
+correct and still use SQL the gold engine will not parse — `DOUBLE` for `DOUBLE PRECISION`,
+`YEAR(d)`, `QUALIFY`, or a quoted `"Match"` where Postgres holds `match`. Those are excluded from
+exact-match and kept in got-the-facts, which is why the two columns differ by more on BIRD than
+elsewhere.
+
+Neither BIRD run stored that probe, so it was **replayed** for this page: every case each run
+graded CORRECT was re-executed against the Postgres gold engine. The frontier run loses 32 of 238
+(48.9% raw → **42.3%**), the local run 10 of 247 (50.7% raw → **48.7%**). An earlier version of
+this section put the gap at "about 2.4 points" from a fleet-wide average; per run it is 6.6 and
+2.1, so the average was not usable as an estimate for either. The Spider and ACME rates are unaffected, and for
 two DIFFERENT reasons, neither of which is a check that passed. Spider records the flag on every
 case, but from the adapter — `dialect == "sqlite"` — so on this SQLite slice it is `True` whatever
 SQL was emitted; run the same slice through a DuckDB attachment and it flips `False` for every
@@ -76,14 +83,22 @@ unseen schemas, no glossary, no examples. Spider 2.0 is the hard one by design �
 data-application schemas, often more than a thousand columns.
 
 On BIRD the single-shot engine sits in the range of BIRD's own reported single-shot baselines
-(GPT-4o 34.4, Claude 3.7 41.1, o3-mini 42.6). The distance to leaderboard pipelines is added
+(GPT-4o 34.4, Claude 3.7 41.1, o3-mini 42.6) — at 42.3% it is level with the top of that range, not
+past it. The distance to leaderboard pipelines is added
 machinery — candidate selection, verification — and task-specific fine-tuning, not a difference
 in the core.
 
 **On local models, the honest result** — and these are two different runs, not one configuration
 measured twice. On BIRD, a 24 GB Qwen2.5-Coder-14B with constrained decoding and 5-sample
-self-consistency reaches **50.7% exact-match** (54.4% got-the-facts,
-`minidev-pg-14b-guided-sc5.jsonl`), close to frontier. On Spider 2.0-lite the same model
+self-consistency reaches **48.7% exact-match** (54.4% got-the-facts,
+`minidev-pg-14b-guided-sc5.jsonl`).
+
+On that metric it is **above** the frontier run in the table — 48.7% against 42.3% — and the reason
+is portability rather than answers: on raw CORRECT the local run is
+already slightly ahead (247 against 238, nine cases), and the frontier run then loses three times
+as many to SQL Postgres will not parse (32 against 10). Read it as one run each, and as a statement about which dialect the two models reach for,
+not about which reasons better. On got-the-facts, where nothing is excluded, the order is the usual
+one: 63.2% against 54.4%. On Spider 2.0-lite the same model
 single-shot reaches **5.9%** (6.7% got-the-facts, `spider2-qwen2.5-coder-14b.jsonl`), where the
 frontier configuration holds at 37.0% and 58.5%.
 
