@@ -94,6 +94,10 @@ print(f"  cache entries {n_cache} over {n_answerable} answerable records ({len(r
 # double-counts any repeated pair. Comparing against it is what makes this a completeness check:
 # testing only for "not empty" would stamp a sweep that scored ONE case as complete.
 expected = len({(r["question"], r.get("sql") or "") for r in rows if r["outcome"] in _ANSWERABLE})
+# Defensive, and unreachable under today's control flow: `set -e` aborts on a failed sweep, and
+# a sweep that returns has scored every answerable record. It exists because the alternative --
+# testing only for a non-empty cache -- would certify a one-case sweep as complete the moment
+# that stops being true, and `scoring_complete` is the one field a later reader trusts.
 if n_cache < expected:
     print(f"  FAIL: {n_cache} scored of {expected} distinct answerable (question, sql) pairs "
           f"-- partial sweep, provenance left marked incomplete")
