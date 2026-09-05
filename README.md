@@ -65,10 +65,10 @@ elsewhere.
 Neither BIRD run stored that probe, so it was **replayed** for this page: every case each run
 graded CORRECT was re-executed against the Postgres gold engine. The frontier run loses 32 of 238
 (48.9% raw → **42.3%**), the local run 10 of 247 (50.7% raw → **48.7%**). An earlier version of
-this section put the gap at "about 2.4 points" from a fleet-wide average. That was close for the
-local run (2.05 actual) and 2.75x low for the frontier one, which is the point: the fleet average
-is not a per-run estimate, because unportable volume ranges from 10 to 32 cases between two runs
-of the same corpus. What drives that is
+this section put the gap at "about 2.4 points" from a fleet-wide average. In cases rather than points, which is
+how the counts read without rounding: it predicts about 12 per run, the local run lost 10 and the
+frontier run 32. Close for one and a third of the way for the other -- the fleet average is not a
+per-run estimate. What drives that is
 not isolated here — the local run also used constrained decoding, which is a plausible direct
 cause of fewer `QUALIFY`s reaching the gold engine — so treat it as a property of the RUN, not of
 the model. The Spider and ACME rates are unaffected, and for
@@ -105,8 +105,10 @@ is portability rather than answers: on raw CORRECT the local run is
 already slightly ahead (247 against 238, nine cases), and the frontier run then loses three times
 as many to SQL Postgres will not parse (32 against 10). Read it as one run each, and as a statement about which dialect these two RUNS emitted -- not
 about which model reasons better, and not about the models either, since the runs differ in
-decoding as well. On got-the-facts, where nothing is excluded, the order is the usual
-one: 63.2% against 54.4%. On Spider 2.0-lite the same model
+decoding as well. On got-the-facts, where portability is not excluded, the order is the
+usual one: 63.2% against 54.4%. That does not settle the question either -- the same run
+differences sit under both metrics -- it just shows the reversal is specific to what exact-match
+excludes. On Spider 2.0-lite the same model
 single-shot reaches **5.9%** (6.7% got-the-facts, `spider2-qwen2.5-coder-14b.jsonl`), where the
 frontier configuration holds at 37.0% and 58.5%.
 
