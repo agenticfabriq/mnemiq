@@ -46,10 +46,15 @@ class _RetryingJudge:
     """
 
     def __init__(self, judge, attempts: int = 4, backoff: float = 1.5) -> None:
-        # `attempts < 1` makes the loop body never run, so `score` returns the fail-open constant
-        # without calling the judge AND without counting it -- a full sweep of constants with
-        # `unrecovered: 0`, certified, from a flag. Refused here rather than validated at the
-        # arg parser, so the invalid STATE cannot be reached however the class is constructed.
+        # `attempts < 1` makes the loop body never run, so every score is the fail-open constant
+        # and the judge is never called at all -- `calls` stays 0. It would NOT certify silently
+        # (control falls through to `gave_up += 1`, so `unrecovered` equals the case count and the
+        # gate refuses); the reason to refuse it HERE is that a sweep whose judge was never invoked
+        # is not a measurement, and finding that out after paying for the run and reading a
+        # contamination refusal tells the operator the wrong thing about why.
+        # Enforced in the constructor rather than at the arg parser so no caller can reach the
+        # state -- though `_attempts` stays rebindable afterwards; this is a construction check,
+        # not an invariant.
         if attempts < 1:
             raise ValueError(f"attempts must be >= 1, got {attempts}: fewer means the judge is "
                              "never called and every score is the fail-open constant")
