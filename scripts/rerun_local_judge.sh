@@ -207,7 +207,10 @@ if errs["fallbacks"]:
 # RECORDED, NOT A GATE -- and it lost that job to the counters above rather than never having had
 # one. Every contamination shape this once guessed at (a mid-sweep death, a 429 burst, a
 # per-request timeout) raises inside `LLMClient.complete`, is caught by the judge, and increments
-# `errors`, which is refused exactly. What is left for a probe is nothing: a sweep that never ran
+# `errors`, which is refused exactly -- BUT ONLY BECAUSE this script archives the cache before
+# scoring. The counters see this process's calls alone, so over a warm cache they report zero for
+# scores they never made; the archive is what makes "no fallbacks" cover the whole sweep rather
+# than the part of it that ran today. What is left for a probe is nothing: a sweep that never ran
 # and one with no counts are both refused further up. Keeping it as a REFUSAL would only reject
 # good sweeps whose endpoint was shut down afterwards, so it is kept as an observation instead.
 import urllib.error, urllib.request
@@ -218,10 +221,6 @@ except (urllib.error.URLError, OSError, KeyError, ValueError):
     healthy_after = False
 print(f"  endpoint still answering after the sweep: {healthy_after} (recorded, not a gate)")
 if not healthy_after:
-    # Recorded and NOT refused, which is the whole point of the demotion above: a sweep whose
-    # endpoint was shut down after finishing cleanly is a valid sweep, and every contamination
-    # shape this probe once stood for is now refused exactly by the fallback count. Rejecting on
-    # it would throw away good measurements to catch nothing the counters miss.
     print("  (not a refusal: the fallback count above is what decides contamination)")
 # n_answerable is printed for the operator; the ASSERTION below uses the distinct-pair count.
 # The cache dedupes on (model, question, sql), so the exact expected size is the number of
