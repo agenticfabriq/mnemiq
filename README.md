@@ -94,10 +94,11 @@ On BIRD, **the table's row** sits in the range of BIRD's own reported single-sho
 past it.
 
 The 48.7% reported further down is not a counter-example to that, and the difference is
-configuration rather than a contradiction — that run executes up to five candidates per question
+configuration rather than a contradiction. That run executes up to five candidates per question
 and five on 339 of 487, so it is not a single-shot number and does not belong beside a single-shot
-baseline. The table's run records no candidate count at all, which is a gap in its provenance
-rather than evidence either way.
+baseline. The table's run is: the multi-candidate path records both a candidate count and an
+inter-candidate agreement score, and on that run neither is set on any of the 487 cases, while the
+five-candidate run sets both.
 
 The distance to leaderboard pipelines is added machinery — candidate selection, verification — and
 task-specific fine-tuning, not a difference in the core.
@@ -107,8 +108,9 @@ measured twice. On BIRD, a 24 GB Qwen2.5-Coder-14B with constrained decoding and
 self-consistency reaches **48.7% exact-match** (54.4% got-the-facts,
 `minidev-pg-14b-guided-sc5.jsonl`).
 
-On that metric it is **above** the frontier run in the table — 48.7% against 42.3% — and the reason
-is portability rather than answers: on raw CORRECT the local run is
+On that metric it is **above** the frontier run in the table — 48.7% against 42.3%, and note that
+those two are not like for like: five candidates against one, which is why the baselines paragraph
+compares only the table's row. What separates them here is portability rather than answers: on raw CORRECT the local run is
 already slightly ahead (247 against 238, nine cases), and the frontier run then loses three times
 as many to SQL Postgres will not parse (32 against 10). Read it as one run each, and as a statement about which dialect these two RUNS emitted -- not
 about which model reasons better, and not about the models either, since the runs differ in
