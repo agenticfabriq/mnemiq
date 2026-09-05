@@ -236,6 +236,17 @@ if n_cache < expected:
     refuse(f"partial sweep: {n_cache} scored of {expected} distinct answerable (question, sql) pairs",
            cache_entries=n_cache, expected_entries=expected)
 
+# The fallback count is only exact over a sweep this process actually made, which the archive above
+# arranges -- and this is what CHECKS it rather than trusting the ordering. Move or drop that
+# archive and every other guard here still passes over a warm cache: the entries are all present,
+# the scores are varied, and `fallbacks` is 0 because `_CachingJudge` returns from disk without
+# ever calling the judge. `scoring_complete: true` with `judge_calls: 0` is precisely the
+# certified-but-unmeasured state this script exists to make impossible.
+if errs["calls"] < expected:
+    refuse(f"only {errs['calls']} judge calls for {expected} distinct cases -- the rest came from a "
+           f"warm cache, so the fail-open count covers only part of this sweep",
+           judge_calls=errs["calls"], expected_entries=expected)
+
 # A FULL CACHE IS NOT A SUCCESSFUL SWEEP. `SemanticJudge.score` catches every exception and returns
 # 1.0 -- deliberately, so the product degrades to answering rather than crashing. In a MEASUREMENT
 # that fail-open is indistinguishable from a judge that approved everything: a dead endpoint yields
