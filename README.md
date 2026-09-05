@@ -35,9 +35,11 @@ passes; the harness reports both exact-match and got-the-facts accuracy.
 | BIRD mini-dev (487 answerable, 11 unseen schemas) | 42.3% | 63.2% | `gpt55-duckdb-pg.jsonl` |
 | Spider 2.0-lite (135 local of 547, 30 schemas) | 37.0% | 58.5% | `spider2-full-k24.jsonl` |
 
-Each row names ONE run and both of its numbers come from that run. Those artifacts are not
-distributed — `eval-reports/` is gitignored — so the names identify a run in our records rather
-than a file you can open.
+Each row names ONE run, and every number comes from that run alone — but not all of them are
+READ from it: BIRD's exact-match is a probe replayed against the gold engine, described below,
+because the run predates that accounting. Those artifacts are not distributed — `eval-reports/`
+is gitignored — so the names identify a run in our records rather than a file you can open, and
+reproducing the BIRD replay needs the artifact plus a Postgres holding mini-dev.
 
 **The denominators differ by row, and for different reasons.** Both rates are taken over the
 *answerable* cases (`correct + correct_facts + wrong + deferred_wrongly + error`), but what falls
@@ -63,8 +65,10 @@ elsewhere.
 Neither BIRD run stored that probe, so it was **replayed** for this page: every case each run
 graded CORRECT was re-executed against the Postgres gold engine. The frontier run loses 32 of 238
 (48.9% raw → **42.3%**), the local run 10 of 247 (50.7% raw → **48.7%**). An earlier version of
-this section put the gap at "about 2.4 points" from a fleet-wide average; per run it is 6.6 and
-2.1, so the average was not usable as an estimate for either. The Spider and ACME rates are unaffected, and for
+this section put the gap at "about 2.4 points" from a fleet-wide average. That was close for the
+local run (2.05 actual) and wrong by nearly a factor of three for the frontier one, which is the
+point: the fleet average is not a per-run estimate, because how much unportable SQL a model writes
+is a property of the model. The Spider and ACME rates are unaffected, and for
 two DIFFERENT reasons, neither of which is a check that passed. Spider records the flag on every
 case, but from the adapter — `dialect == "sqlite"` — so on this SQLite slice it is `True` whatever
 SQL was emitted; run the same slice through a DuckDB attachment and it flips `False` for every
@@ -112,7 +116,7 @@ constrained decoding on Spider is not something these runs can settle.
 The one durable observation is the size of the remaining gap: no local arm exceeds 8 of 135
 exact-match, against 50 of 135 for the frontier configuration. That is not a comparison between
 local arms, and it does not isolate a cause — the BIRD and Spider local figures use different
-configurations as well as different schemas, so the 50.7% / 5.9% contrast is not a schema effect
+configurations as well as different schemas, so the 48.7% / 5.9% contrast is not a schema effect
 on its own.
 
 Measure on your own schema before committing an architecture to it.
