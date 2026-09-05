@@ -23,28 +23,32 @@ def token_param_name(model: str) -> str:
     return "max_completion_tokens" if _GPT5.search(model) else "max_tokens"
 
 
-# Sized above the measured boundary in `reasoning_budget`, not at it.
-_REASONING_FLOOR = 1024
+# Reasoning room ADDED to every caller's request, not a threshold a few of them fall under.
+_REASONING_RESERVE = 1024
 
 
 def reasoning_budget(model: str, max_tokens: int) -> int:
-    """Raise a cap sized for the visible answer to one that also covers the thinking.
+    """Give a reasoning model room to think on top of the room the caller asked to write in.
 
-    A reasoning model spends the budget BEFORE it emits anything, so a cap sized for the reply
-    truncates the reasoning -- and the provider reports that as a request failure, not as a short
-    answer. MEASURED (openai.gpt-5.5, 10 real `SemanticJudge` prompts, same cases back to back):
-    200 -> 10/10 failed, 400 -> 5/10, 600 -> 0/10. The judge's own default was 200, which is
-    ample for `{"confidence": 0.9}` and nowhere near enough to reach it.
+    Callers size `max_tokens` for their OUTPUT -- 200 for a confidence object, 4000 for a query.
+    A reasoning model spends the same budget on thinking FIRST, so the number means something
+    different to it than to the caller who wrote it, and a cap sized for the answer truncates the
+    reasoning before the answer starts. The provider reports that as a failed request, not a short
+    reply. MEASURED (openai.gpt-5.5, 10 real `SemanticJudge` prompts): 200 -> 10/10 failed,
+    400 -> 5/10, 600 -> 0/10.
 
-    The floor sits well above 600 because that boundary moves with prompt length.
-    A cap is not a spend: on success the judge emits one tiny JSON object, so the
-    cap never becomes the bill. Below the floor it does not emit a cheaper verdict
-    -- it emits nothing and the request fails, which is the defect itself. Whether
-    the provider bills the reasoning behind a request it then fails is not knowable
-    from this repo, so size a hosted sweep from a measured run rather than from this
-    comment. Callers that ask for more keep what they asked for.
+    A reserve, not a floor. A floor is the wrong shape: it would lift the judge's 200 to something
+    workable while leaving `synthesize`'s 1000 -- a caller that genuinely wants 1000 tokens of
+    prose -- with whatever the floor left over, which is not reasoning room at all. Adding instead
+    means every caller keeps what it asked for and the same allowance is granted for the same
+    reason.
+
+    Cheap, and MEASURED rather than assumed: over caps of 1224, 2048, 4024 and 8192 on one prompt,
+    billed completion tokens were 89, 89, 105 and 118 -- a 6.7x allowance for ~33% more spend, so
+    the bill tracks the work, not the cap. It is not free, so this is a reserve and not a blank
+    cheque; it is far too cheap to justify truncating a request instead.
     """
-    return max(max_tokens, _REASONING_FLOOR) if _GPT5.search(model) else max_tokens
+    return max_tokens + _REASONING_RESERVE if _GPT5.search(model) else max_tokens
 
 
 class LLMClient:
