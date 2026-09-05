@@ -147,8 +147,19 @@ import json, os, sys, pathlib
 # the venv, not system python3: this imports mnemiq, and the scoring step above already uses it
 from mnemiq.eval.verify_replay import _ANSWERABLE
 cache_p, run_p, prov_p = (pathlib.Path(a) for a in sys.argv[1:4])
+
+def refuse(reason, **extra):
+    """Record WHY before exiting. A bare `scoring_complete: false` cannot tell a dead endpoint from
+    a partial sweep from a single-valued outage, so the re-run it asks for is undirected."""
+    prov = json.load(prov_p.open())
+    prov["scoring_complete"] = False
+    prov["incomplete_reason"] = reason
+    prov.update(extra)
+    json.dump(prov, prov_p.open("w"), indent=2)
+    print(f"  FAIL: {reason}")
+    raise SystemExit(1)
 if not cache_p.exists():
-    print("  FAIL: no cache written -- the judge never scored"); raise SystemExit(1)
+    refuse("no cache written -- the judge never scored")
 n_cache = len(json.load(cache_p.open()))
 # Compared against ANSWERABLE records, not every line: the judge scores only those, and the cache
 # dedupes on (model, question, sql). Comparing against the raw line count always looks short by
@@ -179,11 +190,10 @@ except (urllib.error.URLError, OSError, KeyError, ValueError):
     healthy_after = False
 print(f"  endpoint still answering after the sweep: {healthy_after}")
 if not healthy_after:
-    print("  FAIL: it is not. That may mean it died mid-sweep -- leaving this judge's error")
-    print("        constant in the cache, which no value test separates from real scores -- or")
-    print("        simply that it was taken down after a clean run. Neither can be ruled out")
-    print("        from here, so the sweep is not certified. Re-probe and re-run to settle it.")
-    raise SystemExit(1)
+    refuse("endpoint not answering after the sweep -- it may have died mid-run, leaving this "
+           "judge's error constant in the cache, or been taken down after a clean run; neither "
+           "can be ruled out from here",
+           endpoint_healthy_after_sweep=False)
 # n_answerable is printed for the operator; the ASSERTION below uses the distinct-pair count.
 # The cache dedupes on (model, question, sql), so the exact expected size is the number of
 # DISTINCT (question, sql) pairs among answerable records -- not the record count, which
@@ -195,9 +205,8 @@ expected = len({(r["question"], r.get("sql") or "") for r in rows if r["outcome"
 # testing only for a non-empty cache -- would certify a one-case sweep as complete the moment
 # that stops being true, and `scoring_complete` is the one field a later reader trusts.
 if n_cache < expected:
-    print(f"  FAIL: {n_cache} scored of {expected} distinct answerable (question, sql) pairs "
-          f"-- partial sweep, provenance left marked incomplete")
-    raise SystemExit(1)
+    refuse(f"partial sweep: {n_cache} scored of {expected} distinct answerable (question, sql) pairs",
+           cache_entries=n_cache, expected_entries=expected)
 
 # A FULL CACHE IS NOT A SUCCESSFUL SWEEP. `SemanticJudge.score` catches every exception and returns
 # 1.0 -- deliberately, so the product degrades to answering rather than crashing. In a MEASUREMENT
@@ -213,9 +222,9 @@ print(f"  score distribution: {distinct} distinct value(s), {at_one}/{len(scores
 # all-0.0 outage would pass, certified, reporting every wrong answer caught. Any single-valued
 # sweep over hundreds of cases is a red flag whatever the value is.
 if distinct == 1:
-    print(f"  FAIL: every score is the same value ({scores[0]!r}). This judge returns a constant on")
-    print("        error, so a dead endpoint produces exactly this shape. Not certifying the sweep.")
-    raise SystemExit(1)
+    refuse(f"every score is the same value ({scores[0]!r}); this judge returns a constant on error, "
+           f"so a dead endpoint produces exactly this shape",
+           score_distinct_values=distinct, scores_at_exactly_1_0=at_one)
 prov = json.load(prov_p.open())
 prov["scoring_complete"] = True
 prov["cache_file"] = cache_p.name
