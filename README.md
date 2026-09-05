@@ -96,9 +96,11 @@ past it.
 The 48.7% reported further down is not a counter-example to that, and the difference is
 configuration rather than a contradiction. That run executes up to five candidates per question
 and five on 339 of 487, so it is not a single-shot number and does not belong beside a single-shot
-baseline. The table's run is: the multi-candidate path records both a candidate count and an
-inter-candidate agreement score, and on that run neither is set on any of the 487 cases, while the
-five-candidate run sets both.
+baseline. The table's run is single-shot. Its candidate count and
+inter-candidate agreement score are both unset on all 487 of its cases, which a five-candidate run
+cannot produce — the comparison run sets both on the large majority of its own. That is the
+inference the artifact supports; it is not a claim that every multi-candidate answer records both
+fields, because some deferral branches record only one.
 
 The distance to leaderboard pipelines is added machinery — candidate selection, verification — and
 task-specific fine-tuning, not a difference in the core.
@@ -113,8 +115,8 @@ those two are not like for like: five candidates against one, which is why the b
 compares only the table's row. What separates them here is portability rather than answers: on raw CORRECT the local run is
 already slightly ahead (247 against 238, nine cases), and the frontier run then loses three times
 as many to SQL Postgres will not parse (32 against 10). Read it as one run each, and as a statement about which dialect these two RUNS emitted -- not
-about which model reasons better, and not about the models either, since the runs differ in
-decoding as well. On got-the-facts, where portability is not excluded, the order is the
+about which model reasons better, and not about the models either: the runs differ in candidate
+count (five against one) and in decoding, so the model is one of at least three variables. On got-the-facts, where portability is not excluded, the order is the
 usual one: 63.2% against 54.4%. That does not settle the question either -- the same run
 differences sit under both metrics -- it just shows the reversal is specific to what exact-match
 excludes. On Spider 2.0-lite the same model
