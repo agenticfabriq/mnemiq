@@ -86,3 +86,101 @@ def test_a_healthy_judge_records_no_fallbacks():
     scores = [j.score("q", "s", "x", "p") for _ in range(5)]
     assert scores == [0.25] * 5
     assert (j.calls, j.fallbacks) == (5, 0)
+
+
+def _retrying(judge, **kw):
+    # Resolved from THIS file, not the process CWD: `pythonpath` in pyproject covers "." and "src"
+    # but not scripts/, and a CWD-relative insert collects only when pytest starts at the repo root.
+    import pathlib
+    import sys
+    scripts = str(pathlib.Path(__file__).resolve().parents[1] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from run_verify_replay import _RetryingJudge
+    return _RetryingJudge(judge, backoff=0.001, **kw)
+
+
+def test_a_recovered_failure_is_not_contamination():
+    """The measurement path retries where the product fails open. A call that errored and then
+    succeeded leaves a REAL judgement in the cache, so refusing on the underlying error would
+    reject every sweep against a flaky endpoint even when every case was recovered."""
+    class Flaky:
+        n = 0
+        def complete(self, *a, **k):
+            Flaky.n += 1
+            if Flaky.n % 2:
+                raise RuntimeError("500")
+            return '{"confidence": 0.4}'
+
+    j = SemanticJudge(Flaky())
+    r = _retrying(j, attempts=4)
+    assert [r.score("q", "s", "x", "p") for _ in range(6)] == [0.4] * 6
+    assert j.errors == 6, "the underlying failures are still counted"
+    assert r.gave_up == 0, "but none is unrecovered, so the sweep is clean"
+
+
+def test_an_unrecoverable_failure_is_counted_as_given_up():
+    class Dead:
+        def complete(self, *a, **k):
+            raise RuntimeError("500")
+
+    j = SemanticJudge(Dead())
+    r = _retrying(j, attempts=3)
+    assert [r.score("q", "s", "x", "p") for _ in range(4)] == [1.0] * 4
+    assert r.gave_up == 4, "every case exhausted its attempts and kept the constant"
+    # the CALL count too: without it, a mutation to the attempt loop leaves gave_up right while
+    # silently paying for a different number of hosted calls, which on a paid endpoint is the cost
+    assert j.calls == 12, "4 cases x 3 attempts"
+
+
+def test_an_unreadable_reply_is_NOT_retried():
+    """It is deterministic for a model that cannot emit the JSON, so retrying buys nothing and
+    costs a full round of attempts on every case."""
+    class Mute:
+        calls = 0
+        def complete(self, *a, **k):
+            Mute.calls += 1
+            return "no json"
+
+    j = SemanticJudge(Mute())
+    r = _retrying(j, attempts=4)
+    assert r.score("q", "s", "x", "p") == 1.0
+    assert Mute.calls == 1, "one call, not four"
+    assert j.unparsed == 1
+
+    # ...but it is STILL a fail-open constant, so it counts as unrecovered immediately. Not
+    # retried and not forgiven: a judge that answers unreadably every time would otherwise fill
+    # the cache with constants and certify with `unrecovered` at zero.
+    assert r.gave_up == 1, "an unreadable reply is contamination, not a judgement"
+
+
+def test_a_judge_that_never_emits_json_cannot_certify():
+    """The hole this closes, end to end: every call answers, nothing errors, and every score is
+    the constant."""
+    class Mute:
+        def complete(self, *a, **k):
+            return "I think it is fine"
+
+    j = SemanticJudge(Mute())
+    r = _retrying(j, attempts=4)
+    scores = [r.score("q", "s", "x", "p") for _ in range(20)]
+    assert scores == [1.0] * 20
+    assert (j.errors, j.unparsed, r.gave_up) == (0, 20, 20)
+
+
+def test_zero_attempts_is_refused_rather_than_silently_skipping_the_judge():
+    """`attempts < 1` makes the retry loop body never execute, so `score` returns the fail-open
+    constant without calling the judge and without counting it -- a whole sweep of constants with
+    `unrecovered: 0`, certified, reachable from a command-line flag."""
+    import pytest
+
+    with pytest.raises(ValueError, match="attempts must be >= 1"):
+        _retrying(SemanticJudge(_Client('{"confidence": 0.5}')), attempts=0)
+    with pytest.raises(ValueError, match="attempts must be >= 1"):
+        _retrying(SemanticJudge(_Client('{"confidence": 0.5}')), attempts=-3)
+
+    # and 1 is legal: no retry, but the judge is still called and still counted
+    j = SemanticJudge(_Client("unreadable"))
+    r = _retrying(j, attempts=1)
+    assert r.score("q", "s", "x", "p") == 1.0
+    assert (j.calls, r.gave_up) == (1, 1)

@@ -20,6 +20,7 @@ import functools
 import hashlib
 import json
 import os
+import time
 
 from mnemiq.config import Settings
 from mnemiq.eval.bird_runner import enrich_bird_db
@@ -30,6 +31,59 @@ from mnemiq.verify.judge import SemanticJudge
 from mnemiq.verify.verifier import Verifier
 
 _THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+
+
+class _RetryingJudge:
+    """Retry a judge call that FAILED, which only the counters can tell from one that scored 1.0.
+
+    The product's judge fails open on the first error, deliberately -- a dead judge must not stop
+    an answer. A MEASUREMENT wants the opposite: a fail-open score is not a judgement, and one
+    flaky call should not become a data point. This sits between the cache and the judge, notices
+    `errors` incrementing, and tries again with backoff.
+
+    It cannot inspect the exception -- `SemanticJudge` swallows it -- so the counter delta IS the
+    signal. That is the second thing those counters bought.
+    """
+
+    def __init__(self, judge, attempts: int = 4, backoff: float = 1.5) -> None:
+        # `attempts < 1` makes the loop body never run, so `score` returns the fail-open constant
+        # without calling the judge AND without counting it -- a full sweep of constants with
+        # `unrecovered: 0`, certified, from a flag. Refused here rather than validated at the
+        # arg parser, so the invalid STATE cannot be reached however the class is constructed.
+        if attempts < 1:
+            raise ValueError(f"attempts must be >= 1, got {attempts}: fewer means the judge is "
+                             "never called and every score is the fail-open constant")
+        self._judge, self._attempts, self._backoff = judge, attempts, backoff
+        # A failure that RETRIED SUCCESSFULLY is not contamination -- the score that survives is a
+        # real judgement. Only a case that exhausted its attempts leaves the fail-open constant in
+        # the cache, so that is what the gate must key on. Counting raw `errors` there would refuse
+        # every sweep against a flaky endpoint even when every case was recovered.
+        self.gave_up = 0
+
+    def __getattr__(self, name):          # calls/errors/unparsed/fallbacks read through
+        return getattr(self._judge, name)
+
+    def score(self, *args, **kwargs) -> float:
+        last = 1.0
+        for attempt in range(self._attempts):
+            # Retried on ERRORS only: an unreadable reply is deterministic for a model that
+            # cannot emit the JSON, so attempts buy nothing -- the saving is one call per case
+            # instead of `attempts`. It is still a fail-open constant rather than a judgement, so
+            # it counts as UNRECOVERED at once: not retried, and not forgiven. Keying the retry on
+            # errors alone, WITHOUT the unparsed check below, is the trap -- unparsed then reaches
+            # neither the retry nor `gave_up`, and a judge answering unreadably every time
+            # certifies with `unrecovered` at zero. The two halves ship together for that reason.
+            errors_before, unparsed_before = self._judge.errors, self._judge.unparsed
+            last = self._judge.score(*args, **kwargs)
+            if self._judge.unparsed != unparsed_before:
+                self.gave_up += 1
+                return last
+            if self._judge.errors == errors_before:
+                return last               # answered, and readable -- a real judgement
+            if attempt + 1 < self._attempts:
+                time.sleep(self._backoff * (2 ** attempt))
+        self.gave_up += 1
+        return last                       # the fail-open constant, and recorded as such
 
 
 class _CachingJudge:
@@ -65,6 +119,8 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("run")
     p.add_argument("--judge", action="store_true")
+    p.add_argument("--judge-attempts", type=int, default=4,
+                   help="total ATTEMPTS per judge call that errors (1 = no retry); a low score is never retried")
     p.add_argument("--minidev", default=os.environ.get(
         "MNEMIQ_MINIDEV_DIR", os.path.expanduser("~/src/dataset/bird-minidev/MINIDEV")))
     p.add_argument("--cache", default="eval-reports/minidev-pg-cache")
@@ -86,7 +142,9 @@ def main() -> int:
     model = os.getenv("MNEMIQ_VERIFY_MODEL") or settings.llm_model
     client = LLMClient(settings.model_copy(update={"llm_base_url": base, "llm_api_key": key, "llm_model": model}))
     tag = "".join(ch if ch.isalnum() else "_" for ch in model)
-    judge = _CachingJudge(SemanticJudge(client), f"{args.run}.judgecache.{tag}.json", model)
+    inner_judge = SemanticJudge(client)
+    judge = _CachingJudge(_RetryingJudge(inner_judge, attempts=args.judge_attempts),
+                          f"{args.run}.judgecache.{tag}.json", model)
 
     @functools.lru_cache(maxsize=None)
     def cards_for(db_id: str) -> str:
@@ -96,7 +154,7 @@ def main() -> int:
         return "\n".join(c.text for c in build_cards(snap))
 
     print(f"judge endpoint: {base} | model: {model}")
-    inner = judge._judge  # the instrumented SemanticJudge sitting under the cache wrapper
+    inner = inner_judge  # the instrumented SemanticJudge, under the retry and cache wrappers
     scores = judge_scores(records, judge, cards_for)
 
     # How many of those "scores" are the fail-open constant rather than a judgement. Nothing in the
@@ -106,15 +164,18 @@ def main() -> int:
     # published as a measurement. Written beside the cache; counts THIS process's calls, so a run
     # resumed over a warm cache reports only what it re-scored.
     errpath = f"{args.run}.judgeerrors.{tag}.json"
+    gave_up = judge._judge.gave_up
     json.dump({"model": model, "calls": inner.calls, "errors": inner.errors,
                "unparsed": inner.unparsed, "fallbacks": inner.fallbacks,
+               "unrecovered": gave_up, "attempts_per_case": args.judge_attempts,
                "scored_cases": len(scores)}, open(errpath, "w"), indent=2)
-    print(f"judge calls {inner.calls} of {len(scores)} scored cases: {inner.errors} endpoint "
-          f"errors, {inner.unparsed} unreadable replies -> {inner.fallbacks} fail-open constants "
-          f"(recorded in {errpath})")
-    if inner.fallbacks:
-        print("WARNING: some scores are the fail-open constant, not judgements. Any figure taken "
-              "from this sweep is contaminated by that many cases.")
+    print(f"judge calls {inner.calls} for {len(scores)} cases: {inner.errors} endpoint errors, "
+          f"{inner.unparsed} unreadable replies, retried to {gave_up} UNRECOVERED fail-open "
+          f"constants (recorded in {errpath})")
+    if gave_up:
+        print(f"WARNING: {gave_up} scores are the fail-open constant after {args.judge_attempts} "
+              "attempts each, not judgements. Any figure from this sweep is contaminated by that "
+              "many cases.")
     # Against DISTINCT pairs, not the record count: `_CachingJudge` dedupes in memory too, so a
     # repeated (question, sql) makes the second record a hit that never reaches the judge. Comparing
     # to `len(scores)` would warn "came from the CACHE" about a case this run judged, and tell the

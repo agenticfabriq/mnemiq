@@ -11,17 +11,37 @@
 #      local model produced them -- the cache tag carries a bare model string, no version. This
 #      captures what /v1/models reports, beside the run, before scoring anything.
 #
-# Usage:  scripts/rerun_local_judge.sh <run.jsonl> [base_url]
+# Usage:  scripts/rerun_local_judge.sh <run.jsonl> [base_url] [model]
 set -euo pipefail
 
-RUN="${1:?usage: rerun_local_judge.sh <run.jsonl> [base_url]}"
+RUN="${1:?usage: rerun_local_judge.sh <run.jsonl> [base_url] [model]}"
 BASE="${2:-http://localhost:8000/v1}"
+# Only needed when the endpoint exposes no /models listing -- hosted providers frequently do not.
+MODEL_ARG="${3:-${MNEMIQ_VERIFY_MODEL:-}}"
 [ -f "$RUN" ] || { echo "no such run: $RUN" >&2; exit 2; }
 
 echo "== endpoint =="
-MODELS_JSON="$(curl -sS --max-time 10 "${BASE%/}/models")" || { echo "endpoint unreachable: $BASE" >&2; exit 3; }
-SERVED="$(printf '%s' "$MODELS_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')"
-echo "  serving: $SERVED"
+# `-w %{http_code}` because `curl -sS` without `-f` exits 0 on a 404 and hands back the error page,
+# so a status is the only way to tell a listing from an apology.
+MODELS_RAW="$(curl -sS --max-time 10 -H "Authorization: Bearer ${MNEMIQ_VERIFY_API_KEY:-EMPTY}" \
+                   -w '\n%{http_code}' "${BASE%/}/models" 2>/dev/null || echo)"
+MODELS_CODE="$(printf '%s' "$MODELS_RAW" | tail -n1)"
+MODELS_JSON="$(printf '%s' "$MODELS_RAW" | sed '$d')"
+if [ "$MODELS_CODE" = "200" ] && printf '%s' "$MODELS_JSON" | python3 -c 'import json,sys; json.load(sys.stdin)["data"][0]["id"]' 2>/dev/null; then
+  SERVED="$(printf '%s' "$MODELS_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')"
+  SERVED_SOURCE="/v1/models listing"
+else
+  # No listing. The model must then be NAMED by the caller, and the record must say that the name
+  # is an operator assertion rather than something the endpoint confirmed -- the same distinction
+  # `model_version_source` exists for one field down.
+  [ -n "$MODEL_ARG" ] || { echo "endpoint has no /models listing (HTTP ${MODELS_CODE:-none}); pass the model as arg 3 or set MNEMIQ_VERIFY_MODEL" >&2; exit 3; }
+  SERVED="$MODEL_ARG"
+  SERVED_SOURCE="operator; endpoint returned HTTP ${MODELS_CODE:-none} for /models"
+  # the endpoint's ACTUAL reply, not a synthesised stand-in: a field named for what the
+  # endpoint said must not hold something it never sent.
+  MODELS_JSON="$(python3 -c 'import json,sys; print(json.dumps({"unlisted": True, "http_status": sys.argv[1], "body": sys.argv[2][:500]}))' "${MODELS_CODE:-none}" "$MODELS_JSON")"
+fi
+echo "  judging with: $SERVED  ($SERVED_SOURCE)"
 # Best-effort. Captured as RAW TEXT and parsed defensively below -- `curl -sS` without `-f` exits 0
 # on a 404 and hands back the error page, and a --max-time abort leaves a truncated body, so
 # parsing here would abort the script under `set -e` AFTER the archive has moved the cache aside.
@@ -78,9 +98,9 @@ fi
 # and if scoring aborts, "the most recent provenance" then describes a run that produced no scores
 # while the surviving cache belongs to an earlier one. That is the July failure mode this script
 # exists to close, so it must not be reintroduced by the closing.
-python3 - "$PROV" "$SERVED" "$BASE" "$MODELS_JSON" "$VERSION_JSON" "$VERSION_CODE" <<'PY'
+python3 - "$PROV" "$SERVED" "$BASE" "$MODELS_JSON" "$VERSION_JSON" "$VERSION_CODE" "$SERVED_SOURCE" <<'PY'
 import json, os, re, subprocess, sys, datetime
-path, served, base, models, version_raw, version_code = sys.argv[1:7]
+path, served, base, models, version_raw, version_code, served_source = sys.argv[1:8]
 models_obj = json.loads(models)
 
 # A NAME IS NOT A VERSION. `qwen` is what the July judge recorded, and it is why 22/186 cannot be
@@ -138,7 +158,7 @@ server_version = {"http_status": version_code or None, "body": parsed,
                   "ok": version_code == "200" and parse_ok}
 rev = subprocess.run(["git","rev-parse","--short","HEAD"], capture_output=True, text=True).stdout.strip()
 dirty = bool(subprocess.run(["git","status","--porcelain"], capture_output=True, text=True).stdout.strip())
-json.dump({"served_model": served, "base_url": base, "engine_rev": rev + ("-dirty" if dirty else ""),
+json.dump({"served_model": served, "served_model_source": served_source, "base_url": base, "engine_rev": rev + ("-dirty" if dirty else ""),
            "captured_at": datetime.datetime.now(datetime.UTC).isoformat(),
            "model_version": value, "model_version_source": source,
            "model_version_recorded": value is not None,
@@ -196,10 +216,16 @@ if not errs_p.exists():
 errs = json.load(errs_p.open())
 print(f"  judge calls {errs['calls']}: {errs['errors']} endpoint errors, {errs['unparsed']} "
       f"unreadable replies -> {errs['fallbacks']} fail-open constants")
-if errs["fallbacks"]:
-    refuse(f"{errs['fallbacks']} of {errs['calls']} scores are the fail-open constant, not "
-           f"judgements ({errs['errors']} endpoint errors, {errs['unparsed']} unreadable replies)",
-           judge_calls=errs["calls"], judge_fallbacks=errs["fallbacks"],
+# UNRECOVERED, not raw errors: a call that failed and succeeded on retry leaves a real judgement
+# in the cache, and refusing on the underlying failure would reject every sweep against a flaky
+# endpoint even when every case was recovered.
+unrecovered = errs.get("unrecovered", errs["fallbacks"])
+if unrecovered:
+    refuse(f"{unrecovered} of {errs['scored_cases']} scores are the fail-open constant after "
+           f"retries, not judgements ({errs['errors']} underlying endpoint errors, "
+           f"{errs['unparsed']} unreadable replies)",
+           judge_calls=errs["calls"], judge_unrecovered=unrecovered,
+           judge_fallbacks=errs["fallbacks"],
            judge_errors=errs["errors"], judge_unparsed=errs["unparsed"])
 
 # A PARTIAL outage is not detectable from the scores -- a mid-sweep death leaves real scores
