@@ -22,6 +22,10 @@ echo "== endpoint =="
 MODELS_JSON="$(curl -sS --max-time 10 "${BASE%/}/models")" || { echo "endpoint unreachable: $BASE" >&2; exit 3; }
 SERVED="$(printf '%s' "$MODELS_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')"
 echo "  serving: $SERVED"
+# Best-effort. Captured as RAW TEXT and parsed defensively below -- `curl -sS` without `-f` exits 0
+# on a 404 and hands back the error page, and a --max-time abort leaves a truncated body, so
+# parsing here would abort the script under `set -e` AFTER the archive has moved the cache aside.
+VERSION_JSON="$(curl -sS --max-time 10 "${BASE%/}/../version" 2>/dev/null || echo '')"
 
 TAG="$(python3 -c 'import sys; print("".join(c if c.isalnum() else "_" for c in sys.argv[1]))' "$SERVED")"
 CACHE="${RUN}.judgecache.${TAG}.json"
@@ -54,16 +58,59 @@ fi
 # and if scoring aborts, "the most recent provenance" then describes a run that produced no scores
 # while the surviving cache belongs to an earlier one. That is the July failure mode this script
 # exists to close, so it must not be reintroduced by the closing.
-python3 - "$PROV" "$SERVED" "$BASE" "$MODELS_JSON" <<'PY'
-import json, subprocess, sys, datetime
-path, served, base, models = sys.argv[1:5]
+python3 - "$PROV" "$SERVED" "$BASE" "$MODELS_JSON" "$VERSION_JSON" <<'PY'
+import json, os, re, subprocess, sys, datetime
+path, served, base, models, version_raw = sys.argv[1:6]
+models_obj = json.loads(models)
+
+# A NAME IS NOT A VERSION. `qwen` is what the July judge recorded, and it is why 22/186 cannot be
+# reproduced -- the same weights could be re-served under it forever, or different ones tomorrow.
+# So this looks for something IMMUTABLE and, finding none, says so in the record rather than
+# letting a filled-in `served_model` read as provenance.
+def immutable_id():
+    # Operator-supplied, and SCOPED to a model: `MNEMIQ_JUDGE_MODEL_VERSION=<served_model>=<version>`.
+    # An unscoped value exported once in a shell profile would mark every later sweep, against any
+    # model on any endpoint, as versioned -- stamping the exact unreproducibility this script exists
+    # to close. A value naming a different model than the one being served is ignored, loudly.
+    env = os.environ.get("MNEMIQ_JUDGE_MODEL_VERSION", "").strip()
+    if env:
+        scope, sep, value = env.partition("=")
+        if not sep:
+            print(f"  IGNORING MNEMIQ_JUDGE_MODEL_VERSION={env!r}: expected <served_model>=<version>")
+        elif scope != served:
+            print(f"  IGNORING MNEMIQ_JUDGE_MODEL_VERSION: scoped to {scope!r}, serving {served!r}")
+        else:
+            return value, f"MNEMIQ_JUDGE_MODEL_VERSION, scoped to {scope!r}"
+    # Only a snapshot PATH counts: it ties the hex to the weights on disk. A bare 40-hex anywhere in
+    # the payload is not evidence -- a permission id, a lora directory or a server-generated id would
+    # all match, and be recorded as the model's version under a label naming a source it never had.
+    m = re.search(r"snapshots/([0-9a-f]{40})", json.dumps(models_obj))
+    return (m.group(1), "HF snapshot sha in the /v1/models payload") if m else (None, None)
+
+value, source = immutable_id()
+
+# Never fatal, never silently wrong: a body that will not parse is kept verbatim so a reader can
+# see what the endpoint actually said.
+try:
+    server_version = json.loads(version_raw) if version_raw.strip() else None
+except (ValueError, TypeError):
+    server_version = {"unparsed_response": version_raw[:500]}
 rev = subprocess.run(["git","rev-parse","--short","HEAD"], capture_output=True, text=True).stdout.strip()
 dirty = bool(subprocess.run(["git","status","--porcelain"], capture_output=True, text=True).stdout.strip())
 json.dump({"served_model": served, "base_url": base, "engine_rev": rev + ("-dirty" if dirty else ""),
            "captured_at": datetime.datetime.now(datetime.UTC).isoformat(),
+           "model_version": value, "model_version_source": source,
+           "model_version_recorded": value is not None,
            "scoring_complete": False,   # flipped only after the sweep returns; see below
-           "models_endpoint": json.loads(models)}, open(path, "w"), indent=2)
+           "server_version": server_version,
+           "models_endpoint": models_obj}, open(path, "w"), indent=2)
 print(f"  provenance -> {path}")
+if value:
+    print(f"  model version: {value}  ({source})")
+else:
+    print("  WARNING: no immutable model version available. `served_model` is a NAME, and a name is")
+    print("           what made the July figures unreproducible. The record says so")
+    print("           (`model_version_recorded: false`); set MNEMIQ_JUDGE_MODEL_VERSION to fix it.")
 PY
 
 echo "== scoring =="
