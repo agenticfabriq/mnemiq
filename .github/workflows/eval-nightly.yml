@@ -1,12 +1,15 @@
 # The accuracy gate. Separate from `ci` on purpose, and scheduled rather than per-PR.
 #
-# Why not per-PR, which is the stronger thing to want: GitHub does not expose secrets to
-# workflows triggered from a fork, and this repo is public. A per-PR gate would therefore pass
-# vacuously for exactly the contributors it most needs to check -- a fail-open created by CI
-# topology rather than by code, which is the same shape as the finding this job exists to close
-# (M34). The eval also needs a live model endpoint, and one Spider2 run logged 10 provider
-# outages in 270 calls; a gate that goes red for an outage is a gate people learn to route
-# around, which is how repo-guard's over-matching became a problem (M19).
+# Why not per-PR, which is the stronger thing to want. Two reasons, and the first is written for
+# where this repo is GOING rather than where it is: mnemiq is announced as open source and this
+# repo is private today, so the fork argument does not bite yet -- but the day it goes public,
+# GitHub stops exposing secrets to workflows triggered from a fork, and a per-PR gate would pass
+# vacuously for exactly the contributors it most needs to check. That is a fail-open created by CI
+# topology rather than by code, the same shape as the finding this job exists to close (M34), and
+# it would arrive silently on the day of the flip rather than announcing itself. The second reason
+# bites now: the eval needs a live model endpoint, and one Spider2 run logged 10 provider outages
+# in 270 calls; a gate that goes red for an outage is a gate people learn to route around, which is
+# how repo-guard's over-matching became a problem (M19).
 #
 # So: it runs nightly on the default branch and on demand, and a regression is caught within a
 # day rather than blocked at merge. That trade is deliberate and is the weaker half of it.
@@ -121,8 +124,8 @@ jobs:
               echo "Missing repository secrets: \`${missing[*]}\`"
               echo
               echo "Add them under Settings -> Secrets and variables -> Actions."
-            echo ""
-            echo "MNEMIQ_LLM_MODEL is optional -- Settings fills a default. The source"
+              echo
+              echo "MNEMIQ_LLM_MODEL is optional -- Settings fills a default. The source"
               echo "database needs no secret: this job provisions and seeds its own."
             } | tee -a "$GITHUB_STEP_SUMMARY"
             exit 1
