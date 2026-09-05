@@ -109,7 +109,20 @@ class _CachingJudge:
         key = hashlib.sha1(f"{self._model}\x00{question}\x00{sql}".encode()).hexdigest()
         if key in self._cache:
             return self._cache[key]
+        gave_up_before = getattr(self._judge, "gave_up", 0)
         s = self._judge.score(question, schema, sql, preview)
+        # NEVER PERSIST A NON-JUDGEMENT. A fail-open score is exactly 1.0, which is also what a
+        # judge returns when it approves, so a cached constant cannot be told from a verdict by
+        # inspection afterwards -- and the whole cache then has to be thrown away and re-paid for
+        # to remove one case. MEASURED: a single transient burst left 1 unrecovered case in a
+        # 487-call sweep, and repairing it any other way meant re-scoring all 487. Skipping the
+        # write leaves that case ABSENT, which a re-run refills by scoring exactly it.
+        #
+        # The counter delta is the signal, the same way `_RetryingJudge` reads `errors` -- a
+        # recovered retry increments `errors` while still producing a real judgement, so `errors`
+        # is the wrong counter to key on here and `gave_up` is the right one.
+        if getattr(self._judge, "gave_up", 0) != gave_up_before:
+            return s
         self._cache[key] = s
         json.dump(self._cache, open(self._path, "w"))
         return s
