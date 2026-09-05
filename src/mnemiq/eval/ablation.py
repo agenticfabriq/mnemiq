@@ -12,14 +12,18 @@ runs on the gold's engine -- is deliberately absent: it is only meaningful when 
 different engines, and here one adapter executes both, so `run_case` never sets it and a column of
 `None` would suggest a measurement that was not taken rather than one that does not apply.
 
-**Why this runs the PRODUCT path and not `build_engine`.** `Runtime.ask` passes the snapshot's
-`metrics` and `dimensions` into retrieval; the eval engine's `ask` does not. Certified metrics are
-exactly what `apply_certified` appends, so an ablation driven through `build_engine` would ground
-the grounded arm less than production does -- and a null result would be indistinguishable from the
-layer never having been connected. That is the failure this module's gate exists to prevent, so it
-would be a poor thing to build into its foundation. Running through `Runtime` also means the traces
-Part 2 needs are emitted by the same code the product uses, rather than by a second emitter written
-for the experiment.
+**Why this runs the PRODUCT path and not `build_engine`.** Two reasons, and only one of them is
+still about grounding. When this was written the eval engine's `ask` passed neither `metrics` nor
+`dimensions` to retrieval while `Runtime.ask` passed both -- so an ablation driven through
+`build_engine` would have grounded the grounded arm less than production does, and a null result
+would have been indistinguishable from the layer never having been connected. That was register
+**M81**, and it is CLOSED: both doors now pass the same grounding, pinned by a test that compares
+the two call sites rather than either one alone.
+
+What remains is the reason that does not expire: `Runtime` is the code the product runs, so the
+traces Part 2 grades are emitted by the emitter a customer would use rather than by a second one
+written for the experiment. An ablation through `build_engine` would measure the engine correctly
+today and still have to grow its own trace emission to be Part 2.
 """
 
 from __future__ import annotations

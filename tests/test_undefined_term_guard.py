@@ -691,18 +691,35 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     _BUILTINS = frozenset(dir(builtins))
 
     # callable -> the half of the guard it owes. Both halves, because either alone fails open.
+    # The value is a TUPLE: a callable can owe more than one argument, and `retrieve` owes four.
     REQUIRED = {
-        "Agent": "guard_undefined_terms",
-        "build_agent": "guard_undefined_terms",
-        "plan_query": "guard_undefined_terms",
-        "LLMGenerator": "declare_assumed_terms",
+        "Agent": ("guard_undefined_terms",),
+        "build_agent": ("guard_undefined_terms",),
+        "plan_query": ("guard_undefined_terms",),
+        "LLMGenerator": ("declare_assumed_terms",),
         # The THIRD leg. `plan_query` checks declared terms against `packet.definitions`, and
         # `retrieve` defaults that to `()` -- so a caller that omits it feeds the guard an empty
         # certified corpus and the guard refuses every declared term, including ones the loaded
         # snapshot certifies. Both CLIs did exactly that. Declaration and checking are not enough:
         # the corpus is a leg, and a scan that models only two of three is not the invariant it
         # says it is.
-        "retrieve": "definitions",
+        # `metrics`, `dimensions` and `snapshot` joined `definitions` for the same reason, one
+        # generation later (register M81). `apply_certified` APPENDS certified metrics and
+        # dimensions to the snapshot, and `retrieve` defaults both to `()` -- so a caller that
+        # omits them grounds on strictly less than the snapshot carries, silently. Measured: the
+        # eval door's packet held 0 of the 5 certified metrics a grounded snapshot carried, so
+        # `mnemiq eval` measured a weaker engine than the product ran and an ablation through it
+        # reported a false null. `snapshot` is the fourth: without it retrieval cannot re-render a
+        # card against the caller's column policy and serves the unscoped one (M4).
+        #
+        # Naming them here rather than in a bespoke test is the point. This scan already asks the
+        # harder question -- is the value DERIVED, or baked in -- at EVERY call site, so
+        # `metrics=()` fails it where a check on argument names would pass.
+        # `table_facts` is here for the same reason and was nearly missed: deleting it from
+        # BOTH doors keeps the name sets equal, so the AST comparison stays green, and the
+        # only value assertion on it accepts `[]` -- exactly what the omitted argument
+        # defaults to. Every card would lose its GRAIN line and no guard would say so.
+        "retrieve": ("definitions", "metrics", "dimensions", "snapshot", "table_facts"),
     }
     # (file, callable) -> HOW MANY calls. A count, because `agent/loop.py` calls `plan_query`
     # twice -- single-shot and the deep-mode candidate loop -- and a set keyed on the pair alone
@@ -785,14 +802,16 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
                 name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
                 if name not in canonical:
                     continue
-                owed = REQUIRED[canonical[name]]
                 rel = str(path.relative_to(root))
                 seen[(rel, canonical[name])] = seen.get((rel, canonical[name]), 0) + 1
                 # `**kwargs` does NOT count: it cannot be read here.
                 passed = {kw.arg: kw.value for kw in node.keywords}
-                if owed not in passed:
-                    missing.append(f"{rel}:{node.lineno} {name}(...) needs {owed}")
-                elif _is_hardcoded(passed[owed]):
+                for owed in REQUIRED[canonical[name]]:
+                    if owed not in passed:
+                        missing.append(f"{rel}:{node.lineno} {name}(...) needs {owed}")
+                        continue
+                    if not _is_hardcoded(passed[owed]):
+                        continue
                     # The NAME being present is not the guarantee -- `guard_undefined_terms=False`
                     # hardcoded satisfies a name check while the flag is inert at that site, which
                     # is the "reads as ON while guarding nothing" failure this test is named for.

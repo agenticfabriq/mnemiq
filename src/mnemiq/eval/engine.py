@@ -179,9 +179,27 @@ def build_engine(
     k = settings.retrieval_k
 
     def ask(question: str) -> AgentAnswer:
+        # EVERY grounding argument `Runtime.ask` passes, and for the same reasons. This call used
+        # to omit `metrics`, `dimensions` and `snapshot`, which meant an eval measured a strictly
+        # less-grounded engine than production:
+        #
+        #   * `metrics`/`dimensions` are what `apply_certified` APPENDS to the snapshot, so the
+        #     certified meaning a human reviewed reached the model not at all. Measured on the
+        #     Part 2 ablation's two arms: the grounded arm gained 5 metrics and 5 dimensions, and
+        #     all ten were invisible through this door. An ablation scored here reported a false
+        #     null -- "the semantic layer does not help" is indistinguishable from "the eval
+        #     dropped the layer" (register M81).
+        #   * `snapshot` lets retrieval re-render a card against the caller's column policy (M4);
+        #     without it the unscoped card is served.
+        #
+        # The gap has now appeared in BOTH directions -- the ontology index and glossary once
+        # reached this door and not the product's -- which is why the test that guards it compares
+        # the two call sites rather than either one alone.
         packet = retrieve(con, question, IDENTITY, authz, embedder, k=k,
                           definitions=definitions, table_facts=snapshot.table_facts,
-                          columns=snapshot.columns, ontology_index=ontology_index)
+                          metrics=snapshot.metrics, dimensions=snapshot.dimensions,
+                          columns=snapshot.columns, ontology_index=ontology_index,
+                          snapshot=snapshot)
         return agent.answer(packet, snapshot, grants, IDENTITY)
 
     return ask, client
