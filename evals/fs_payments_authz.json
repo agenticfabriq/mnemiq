@@ -1,0 +1,13 @@
+{
+  "roles": {
+    "analyst": {
+      "read": [
+        "payment_transaction",
+        "payment_tender",
+        "payment_split",
+        "payment_transaction_status_details"
+      ],
+      "pii_clearance": ["none", "pii", "phi"]
+    }
+  }
+}

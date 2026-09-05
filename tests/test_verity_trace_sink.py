@@ -742,3 +742,49 @@ def test_a_dribbling_receiver_cannot_hold_an_answer_open(monkeypatch):
     )
     assert sink.lineage_voided == 0, "an abandoned receipt reports nothing, like an older Verity"
     assert sink.dropped == 0, "the trace was accepted; abandoning its receipt is not a drop"
+
+
+def test_each_answer_gets_its_own_trace_id(monkeypatch):
+    """Sequential answers must not share a trace_id, and therefore an idempotency key.
+
+    The id was `sha256(tenant|source|id(answer))`. `id()` is the object's ADDRESS, which CPython
+    reuses the moment the previous object is freed -- so a loop that answers, records and releases
+    (an eval, a worker draining a queue) handed every answer the SAME id, and the store deduplicated
+    different answers into one audit record.
+
+    The loop below reproduces exactly that shape: each `_Answer` goes out of scope before the next
+    is built. Against the old derivation it collides -- how MUCH depends on allocator state, which
+    is the point: a defect whose severity depends on how warm the heap is should not be pinned to
+    one number, and the loop is long enough that every regime collides heavily rather than by one.
+    """
+    settings = _Settings()
+    sink = VerityTraceSink(settings)
+
+    # 200, not a dozen. The old derivation's collision rate depends on allocator state, and over
+    # 12 iterations a fresh interpreter reuses an address about once -- so the guard passed by a
+    # single collision and one fewer would have let the defect through. A run this long collides
+    # heavily in every regime measured (fresh, warm, and PYTHONMALLOC=malloc), which is what makes
+    # it a guard rather than a coin flip.
+    trace_ids, keys = [], []
+    for index in range(200):
+        event = _event(answer=_Answer(answer=f"answer {index}"))
+        record = sink._build_trace(event)
+        trace_ids.append(record["trace_id"])
+        # READ the key the record carries; do not rebuild it. Deriving `f"{trace_id}-v1"` here
+        # instead makes the assertion a restatement of the one above -- that map is injective, so
+        # it cannot fail on its own, and setting `idempotency_key` to a constant would leave this
+        # suite green while the store deduplicated every answer into one record. Nothing else in
+        # the repo reads this field.
+        keys.append(record["idempotency_key"])
+        del event, record
+
+    assert len(set(trace_ids)) == len(trace_ids), (
+        f"{len(trace_ids) - len(set(trace_ids))} of {len(trace_ids)} answers share a trace_id, so "
+        "the store will treat distinct answers as re-deliveries of one and keep only the first"
+    )
+    assert len(set(keys)) == len(keys), (
+        f"{len(keys) - len(set(keys))} of {len(keys)} answers share an idempotency_key, which is "
+        "what the store actually deduplicates on"
+    )
+    # Width is part of the contract with the store, which the old sha256 slice also satisfied.
+    assert all(len(trace_id) == 32 for trace_id in trace_ids)

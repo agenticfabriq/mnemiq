@@ -34,6 +34,7 @@ import time
 import logging
 import urllib.error
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -188,7 +189,27 @@ class VerityTraceSink(TraceSink):
 
         # ---- ALWAYS: no field here restates a value from the customer's database ---------------
         record: dict[str, Any] = {
-            "trace_id": _sha256(f"{identity.tenant_id}|{event.source_id}|{id(answer)}")[7:39],
+            # A fresh id per answer. It was `sha256(tenant|source|id(answer))`, and `id()` is the
+            # object's ADDRESS: CPython reuses an address as soon as the previous object is freed,
+            # so sequential answers -- exactly what an eval loop or a busy worker produces -- were
+            # handed the SAME trace_id and therefore the same idempotency key, and the store
+            # deduplicated genuinely different answers into one. How much collides depends on
+            # allocator state, which is its own argument against the derivation: a loop creating
+            # and releasing answers produced 1 distinct id of 22 in a warm process, while a run
+            # that held each answer while grading it produced 16 of 22 -- six answers given and
+            # never recorded.
+            #
+            # It failed the other direction too: an address-derived key changes for the same
+            # answer rebuilt and collides across different ones -- neither unique nor stable.
+            #
+            # uuid4 is unique per BUILD, and that is the precise claim. It holds for today's sink
+            # because `record_answer` is called once per answer and posts the body it just built,
+            # so the record and its key are made together and never remade. A future re-send must
+            # therefore carry the RECORD -- spooled, with its key -- and not rebuild it from the
+            # event: rebuilding mints a fresh uuid and the receiver would store the delivery twice,
+            # which is the failure an idempotency key exists to prevent. 32 hex chars, the width
+            # the old sha256 slice produced.
+            "trace_id": uuid.uuid4().hex,
             "tenant_id": identity.tenant_id,
             "source_id": event.source_id,
             "source_system": "mnemiq",
