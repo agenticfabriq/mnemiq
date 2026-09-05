@@ -25,7 +25,8 @@
 #
 # Run 3 (2026-09-05, dispatched once the model secrets were set) is the first that ever compared
 # anything: it armed, provisioned and seeded its own database, ran 30 cases in 5m34s and went red
-# on `accuracy 88.0% < previous 96.0% - 2% tolerance`. That is the job working. Whether 88 is a
+# on `GATE FAILED: accuracy regressed: 88.0% < previous 96.0% - 2% tolerance`, quoted as printed.
+# That is the job working. Whether 88 is a
 # regression to fix or a baseline recorded against a different source is a question for a human
 # reading `evals/trend.json`, which is exactly the split the `--gate`-never-`--record` rule below
 # exists to preserve.
@@ -72,7 +73,7 @@ jobs:
 
     # The source database, stood up here rather than reached for. It used to come from an
     # `MNEMIQ_ACME_PG_DSN` secret pointing at a host the runner could not route to, which is half
-    # of why this job has never once completed a comparison. A service container needs no secret
+    # of why this job's first two runs completed no comparison. A service container needs no secret
     # and cannot drift away from the schema the seeder writes.
     services:
       postgres:
