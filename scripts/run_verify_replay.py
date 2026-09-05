@@ -46,6 +46,13 @@ class _RetryingJudge:
     """
 
     def __init__(self, judge, attempts: int = 4, backoff: float = 1.5) -> None:
+        # `attempts < 1` makes the loop body never run, so `score` returns the fail-open constant
+        # without calling the judge AND without counting it -- a full sweep of constants with
+        # `unrecovered: 0`, certified, from a flag. Refused here rather than validated at the
+        # arg parser, so the class cannot be reached by any caller.
+        if attempts < 1:
+            raise ValueError(f"attempts must be >= 1, got {attempts}: fewer means the judge is "
+                             "never called and every score is the fail-open constant")
         self._judge, self._attempts, self._backoff = judge, attempts, backoff
         # A failure that RETRIED SUCCESSFULLY is not contamination -- the score that survives is a
         # real judgement. Only a case that exhausted its attempts leaves the fail-open constant in
@@ -63,8 +70,9 @@ class _RetryingJudge:
             # cannot emit the JSON, so attempts buy nothing -- the saving is one call per case
             # instead of `attempts`. It is still a fail-open constant rather than a judgement, so
             # it counts as UNRECOVERED at once: not retried, and not forgiven. Keying the retry on
-            # errors alone WITHOUT this line is the trap -- unparsed then reaches neither the retry
-            # nor `gave_up`, and a judge answering unreadably every time certifies with
+            # errors alone, WITHOUT the unparsed check below, is the trap -- unparsed then reaches
+            # neither the retry nor `gave_up`, and a judge answering unreadably every time certifies
+            # with
             # `unrecovered` at zero. The two halves ship together for that reason.
             errors_before, unparsed_before = self._judge.errors, self._judge.unparsed
             last = self._judge.score(*args, **kwargs)

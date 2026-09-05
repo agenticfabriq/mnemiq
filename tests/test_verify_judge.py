@@ -166,3 +166,21 @@ def test_a_judge_that_never_emits_json_cannot_certify():
     scores = [r.score("q", "s", "x", "p") for _ in range(20)]
     assert scores == [1.0] * 20
     assert (j.errors, j.unparsed, r.gave_up) == (0, 20, 20)
+
+
+def test_zero_attempts_is_refused_rather_than_silently_skipping_the_judge():
+    """`attempts < 1` makes the retry loop body never execute, so `score` returns the fail-open
+    constant without calling the judge and without counting it -- a whole sweep of constants with
+    `unrecovered: 0`, certified, reachable from a command-line flag."""
+    import pytest
+
+    with pytest.raises(ValueError, match="attempts must be >= 1"):
+        _retrying(SemanticJudge(_Client('{"confidence": 0.5}')), attempts=0)
+    with pytest.raises(ValueError, match="attempts must be >= 1"):
+        _retrying(SemanticJudge(_Client('{"confidence": 0.5}')), attempts=-3)
+
+    # and 1 is legal: no retry, but the judge is still called and still counted
+    j = SemanticJudge(_Client("unreadable"))
+    r = _retrying(j, attempts=1)
+    assert r.score("q", "s", "x", "p") == 1.0
+    assert (j.calls, r.gave_up) == (1, 1)
