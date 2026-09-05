@@ -48,8 +48,10 @@ class _RetryingJudge:
     def __init__(self, judge, attempts: int = 4, backoff: float = 1.5) -> None:
         # `attempts < 1` makes the loop body never run, so every score is the fail-open constant
         # and the judge is never called at all -- `calls` stays 0. It would NOT certify silently
-        # (control falls through to `gave_up += 1`, so `unrecovered` equals the case count and the
-        # gate refuses); the reason to refuse it HERE is that a sweep whose judge was never invoked
+        # (control falls through to `gave_up += 1`, and the gate refuses on any non-zero
+        # `unrecovered` -- not on its magnitude, which the cache in front of this wrapper makes a
+        # distinct-pair count rather than a record count); the reason to refuse it HERE is that a
+        # sweep whose judge was never invoked
         # is not a measurement, and finding that out after paying for the run and reading a
         # contamination refusal tells the operator the wrong thing about why.
         # Enforced in the constructor rather than at the arg parser so no caller can reach the
