@@ -11,7 +11,7 @@
 #      local model produced them -- the cache tag carries a bare model string, no version. This
 #      captures what /v1/models reports, beside the run, before scoring anything.
 #
-# Usage:  scripts/rerun_local_judge.sh <run.jsonl> [base_url]
+# Usage:  scripts/rerun_local_judge.sh <run.jsonl> [base_url] [model]
 set -euo pipefail
 
 RUN="${1:?usage: rerun_local_judge.sh <run.jsonl> [base_url] [model]}"
@@ -37,7 +37,9 @@ else
   [ -n "$MODEL_ARG" ] || { echo "endpoint has no /models listing (HTTP ${MODELS_CODE:-none}); pass the model as arg 3 or set MNEMIQ_VERIFY_MODEL" >&2; exit 3; }
   SERVED="$MODEL_ARG"
   SERVED_SOURCE="operator; endpoint returned HTTP ${MODELS_CODE:-none} for /models"
-  MODELS_JSON='{"data":[],"note":"endpoint exposes no model listing"}'
+  # the endpoint's ACTUAL reply, not a synthesised stand-in: a field named for what the
+  # endpoint said must not hold something it never sent.
+  MODELS_JSON="$(python3 -c 'import json,sys; print(json.dumps({"unlisted": True, "http_status": sys.argv[1], "body": sys.argv[2][:500]}))' "${MODELS_CODE:-none}" "$MODELS_JSON")"
 fi
 echo "  judging with: $SERVED  ($SERVED_SOURCE)"
 # Best-effort. Captured as RAW TEXT and parsed defensively below -- `curl -sS` without `-f` exits 0
@@ -214,10 +216,16 @@ if not errs_p.exists():
 errs = json.load(errs_p.open())
 print(f"  judge calls {errs['calls']}: {errs['errors']} endpoint errors, {errs['unparsed']} "
       f"unreadable replies -> {errs['fallbacks']} fail-open constants")
-if errs["fallbacks"]:
-    refuse(f"{errs['fallbacks']} of {errs['calls']} scores are the fail-open constant, not "
-           f"judgements ({errs['errors']} endpoint errors, {errs['unparsed']} unreadable replies)",
-           judge_calls=errs["calls"], judge_fallbacks=errs["fallbacks"],
+# UNRECOVERED, not raw errors: a call that failed and succeeded on retry leaves a real judgement
+# in the cache, and refusing on the underlying failure would reject every sweep against a flaky
+# endpoint even when every case was recovered.
+unrecovered = errs.get("unrecovered", errs["fallbacks"])
+if unrecovered:
+    refuse(f"{unrecovered} of {errs['scored_cases']} scores are the fail-open constant after "
+           f"retries, not judgements ({errs['errors']} underlying endpoint errors, "
+           f"{errs['unparsed']} unreadable replies)",
+           judge_calls=errs["calls"], judge_unrecovered=unrecovered,
+           judge_fallbacks=errs["fallbacks"],
            judge_errors=errs["errors"], judge_unparsed=errs["unparsed"])
 
 # A PARTIAL outage is not detectable from the scores -- a mid-sweep death leaves real scores
