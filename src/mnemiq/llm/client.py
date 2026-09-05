@@ -36,10 +36,12 @@ def reasoning_budget(model: str, max_tokens: int) -> int:
     200 -> 10/10 failed, 400 -> 5/10, 600 -> 0/10. The judge's own default was 200, which is
     ample for `{"confidence": 0.9}` and nowhere near enough to reach it.
 
-    The floor sits well above 600 because that boundary moves with prompt length, and because a
-    cap is not a spend: raising it costs nothing unless the model emits more tokens, while the
-    reasoning underneath was already being paid for and thrown away. Callers that ask for more
-    keep what they asked for.
+    The floor sits well above 600 because that boundary moves with prompt length. A cap is not a
+    spend -- the judge emits the same tiny JSON object either way, so the VISIBLE output is
+    unchanged. Whether the provider bills the reasoning tokens of a request it then fails is not
+    knowable from this repo, so budget a hosted sweep from a measured run, not from this comment:
+    the honest floor of the change is that a truncated request buys nothing at all. Callers that
+    ask for more keep what they asked for.
     """
     return max(max_tokens, _REASONING_FLOOR) if _GPT5.search(model) else max_tokens
 
