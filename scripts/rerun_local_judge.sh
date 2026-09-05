@@ -107,12 +107,17 @@ value, source = immutable_id()
 # A JSON error body parses. `{"detail":"Not Found"}` is structurally a version response, so without
 # the status a reader cannot tell it from `{"version": "0.9.0.1"}` -- `curl -sS` without `-f` exits
 # 0 on a 404 and hands back the error page.
+parse_ok = False
 try:
     parsed = json.loads(version_raw) if version_raw.strip() else None
+    parse_ok = parsed is not None
 except (ValueError, TypeError):
     parsed = {"unparsed_response": version_raw[:500]}
+# `ok` needs BOTH: `%{http_code}` reports the STATUS LINE, not transfer completion, so a --max-time
+# abort mid-body still yields 200 with a truncated payload. Status alone would certify that as
+# captured -- the same "said yes on the wrong evidence" shape as the rest of this block.
 server_version = {"http_status": version_code or None, "body": parsed,
-                  "ok": version_code == "200"}
+                  "ok": version_code == "200" and parse_ok}
 rev = subprocess.run(["git","rev-parse","--short","HEAD"], capture_output=True, text=True).stdout.strip()
 dirty = bool(subprocess.run(["git","status","--porcelain"], capture_output=True, text=True).stdout.strip())
 json.dump({"served_model": served, "base_url": base, "engine_rev": rev + ("-dirty" if dirty else ""),
