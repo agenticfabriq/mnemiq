@@ -59,10 +59,20 @@ class _RetryingJudge:
     def score(self, *args, **kwargs) -> float:
         last = 1.0
         for attempt in range(self._attempts):
-            before = self._judge.errors + self._judge.unparsed
+            # Retried on ERRORS only: an unreadable reply is deterministic for a model that
+            # cannot emit the JSON, so attempts buy nothing -- the saving is one call per case
+            # instead of `attempts`. It is still a fail-open constant rather than a judgement, so
+            # it counts as UNRECOVERED at once: not retried, and not forgiven. Keying the retry on
+            # errors alone WITHOUT this line is the trap -- unparsed then reaches neither the retry
+            # nor `gave_up`, and a judge answering unreadably every time certifies with
+            # `unrecovered` at zero. The two halves ship together for that reason.
+            errors_before, unparsed_before = self._judge.errors, self._judge.unparsed
             last = self._judge.score(*args, **kwargs)
-            if self._judge.errors + self._judge.unparsed == before:
-                return last               # a real judgement
+            if self._judge.unparsed != unparsed_before:
+                self.gave_up += 1
+                return last
+            if self._judge.errors == errors_before:
+                return last               # answered, and readable -- a real judgement
             if attempt + 1 < self._attempts:
                 time.sleep(self._backoff * (2 ** attempt))
         self.gave_up += 1
@@ -103,7 +113,7 @@ def main() -> int:
     p.add_argument("run")
     p.add_argument("--judge", action="store_true")
     p.add_argument("--judge-attempts", type=int, default=4,
-                   help="retries for a judge call that FAILED (not one that scored low)")
+                   help="total ATTEMPTS per judge call that errors (1 = no retry); a low score is never retried")
     p.add_argument("--minidev", default=os.environ.get(
         "MNEMIQ_MINIDEV_DIR", os.path.expanduser("~/src/dataset/bird-minidev/MINIDEV")))
     p.add_argument("--cache", default="eval-reports/minidev-pg-cache")
