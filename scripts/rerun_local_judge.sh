@@ -218,10 +218,11 @@ except (urllib.error.URLError, OSError, KeyError, ValueError):
     healthy_after = False
 print(f"  endpoint still answering after the sweep: {healthy_after} (recorded, not a gate)")
 if not healthy_after:
-    refuse("endpoint not answering after the sweep -- it may have died mid-run, leaving this "
-           "judge's error constant in the cache, or been taken down after a clean run; neither "
-           "can be ruled out from here",
-           endpoint_healthy_after_sweep=False)
+    # Recorded and NOT refused, which is the whole point of the demotion above: a sweep whose
+    # endpoint was shut down after finishing cleanly is a valid sweep, and every contamination
+    # shape this probe once stood for is now refused exactly by the fallback count. Rejecting on
+    # it would throw away good measurements to catch nothing the counters miss.
+    print("  (not a refusal: the fallback count above is what decides contamination)")
 # n_answerable is printed for the operator; the ASSERTION below uses the distinct-pair count.
 # The cache dedupes on (model, question, sql), so the exact expected size is the number of
 # DISTINCT (question, sql) pairs among answerable records -- not the record count, which
