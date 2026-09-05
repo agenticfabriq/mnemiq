@@ -96,12 +96,11 @@ past it.
 The 48.7% reported further down is not a counter-example to that, and the difference is
 configuration rather than a contradiction. That run executes up to five candidates per question
 and five on 339 of 487, so it is not a single-shot number and does not belong beside a single-shot
-baseline. The table's run is single-shot. Its candidate count and
-inter-candidate agreement score are both unset on all 487 of its cases, which a five-candidate run
-cannot produce — the comparison run sets both on the large majority of its own. The warrant is the WHOLE run, not any single
-case: a five-candidate run does emit cases with both fields blank — 54 of them here, 8 graded
-correct — because a case where no candidate executed falls back to the single-candidate path. What
-it cannot do is emit 487 of 487 that way while answering 238 of them correctly.
+baseline. The table's run reads as single-shot: its candidate count and
+inter-candidate agreement score are unset on all 487 cases, where the five-candidate run populates
+both on most of its own. Read that as strong evidence rather than proof — several code paths write
+a blank pair, so the signature is not unique to a single-shot run, and neither artifact ships here
+for anyone to re-check.
 
 The distance to leaderboard pipelines is added machinery — candidate selection, verification — and
 task-specific fine-tuning, not a difference in the core.
