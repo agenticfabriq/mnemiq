@@ -1,0 +1,37 @@
+[
+  {
+    "id": "fs-control-rows",
+    "question": "How many rows are in the payment_transaction table?",
+    "gold_sql": "select count(*) as n from payment_transaction",
+    "expected_answer": "5000. Deliberately the ROW count, which is what the schema can answer. Its certified twin, 'how many payments were there', is a different number because most of the difference is superseded CDC revisions.",
+    "tags": ["control"]
+  },
+  {
+    "id": "fs-control-channels",
+    "question": "How many distinct values appear in the payment_channel column of payment_transaction?",
+    "gold_sql": "select count(distinct payment_channel) as n from payment_transaction",
+    "expected_answer": "3. The question names its column, so nothing about certified meaning is needed to answer it.",
+    "tags": ["control"]
+  },
+  {
+    "id": "fs-control-max-amount",
+    "question": "What is the maximum value of the payment_amount column in payment_transaction?",
+    "gold_sql": "select max(payment_amount) as n from payment_transaction",
+    "expected_answer": "The largest single payment_amount. A column maximum is recoverable from the DDL; whether that column belongs in 'revenue' is not, and is asked elsewhere.",
+    "tags": ["control"]
+  },
+  {
+    "id": "fs-control-currencies",
+    "question": "How many distinct currency_code values are there in payment_transaction?",
+    "gold_sql": "select count(distinct currency_code) as n from payment_transaction",
+    "expected_answer": "The number of distinct currency codes present. Named column, plain count.",
+    "tags": ["control"]
+  },
+  {
+    "id": "fs-control-settled-rows",
+    "question": "How many rows have payment_transaction_status equal to 'SETTLED' in payment_transaction?",
+    "gold_sql": "select count(*) as n from payment_transaction where payment_transaction_status = 'SETTLED'",
+    "expected_answer": "The row count for one literal status value. The question supplies the filter, so no certified rule is required -- unlike 'settled payment volume', which must also dedupe CDC revisions and sum the right column.",
+    "tags": ["control"]
+  }
+]
