@@ -23,9 +23,37 @@ MODELS_JSON="$(curl -sS --max-time 10 "${BASE%/}/models")" || { echo "endpoint u
 SERVED="$(printf '%s' "$MODELS_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')"
 echo "  serving: $SERVED"
 
-# Record the judge's identity beside the run, BEFORE scoring -- this is the gap that made the
-# July numbers unreproducible, and it is item 15's rule applied to the judge.
-PROV="${RUN}.judgeprov.$(date -u +%Y%m%dT%H%M%SZ).json"
+TAG="$(python3 -c 'import sys; print("".join(c if c.isalnum() else "_" for c in sys.argv[1]))' "$SERVED")"
+CACHE="${RUN}.judgecache.${TAG}.json"
+PROV="${RUN}.judgeprov.${TAG}.json"
+
+# ARCHIVE FIRST, then write the new provenance. Both files carry a stable per-(run, model) name,
+# so writing the new provenance before this block would truncate the previous sweep's -- and then
+# archive the file that has just been written, filing the NEW judge's identity as if it described
+# the OLD scores. Order is the whole guarantee here.
+# Archive the cache and its provenance TOGETHER, under one timestamp. They are linked by name,
+# so moving only the cache leaves the archived scores with no provenance and leaves a live
+# provenance file describing a sweep whose scores are no longer on disk -- and the next run then
+# truncates it. Losing the judge's identity is the second failure this script exists to prevent,
+# so it must not be lost by the preventing.
+STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+if [ -f "$CACHE" ]; then
+  mv "$CACHE" "${CACHE}.superseded.${STAMP}"
+  echo "  archived stale cache -> $(basename "${CACHE}.superseded.${STAMP}")"
+  echo "  (had $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "${CACHE}.superseded.${STAMP}") entries)"
+  if [ -f "$PROV" ]; then
+    mv "$PROV" "${PROV}.superseded.${STAMP}"
+    echo "  archived its provenance -> $(basename "${PROV}.superseded.${STAMP}")"
+  else
+    echo "  NOTE: that cache had no provenance file -- it predates this script"
+  fi
+fi
+
+# Record the judge's identity beside the run. Named after the CACHE TAG, not a timestamp, so the
+# provenance and the scores it describes are linked by NAME -- a timestamped file links to nothing,
+# and if scoring aborts, "the most recent provenance" then describes a run that produced no scores
+# while the surviving cache belongs to an earlier one. That is the July failure mode this script
+# exists to close, so it must not be reintroduced by the closing.
 python3 - "$PROV" "$SERVED" "$BASE" "$MODELS_JSON" <<'PY'
 import json, subprocess, sys, datetime
 path, served, base, models = sys.argv[1:5]
@@ -33,18 +61,10 @@ rev = subprocess.run(["git","rev-parse","--short","HEAD"], capture_output=True, 
 dirty = bool(subprocess.run(["git","status","--porcelain"], capture_output=True, text=True).stdout.strip())
 json.dump({"served_model": served, "base_url": base, "engine_rev": rev + ("-dirty" if dirty else ""),
            "captured_at": datetime.datetime.now(datetime.UTC).isoformat(),
+           "scoring_complete": False,   # flipped only after the sweep returns; see below
            "models_endpoint": json.loads(models)}, open(path, "w"), indent=2)
 print(f"  provenance -> {path}")
 PY
-
-TAG="$(python3 -c 'import sys; print("".join(c if c.isalnum() else "_" for c in sys.argv[1]))' "$SERVED")"
-CACHE="${RUN}.judgecache.${TAG}.json"
-if [ -f "$CACHE" ]; then
-  STALE="${CACHE}.superseded.$(date -u +%Y%m%dT%H%M%SZ)"
-  mv "$CACHE" "$STALE"
-  echo "  moved stale cache aside -> $(basename "$STALE")"
-  echo "  (had $(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$STALE") entries)"
-fi
 
 echo "== scoring =="
 MNEMIQ_VERIFY_BASE_URL="$BASE" MNEMIQ_VERIFY_MODEL="$SERVED" \
@@ -52,15 +72,28 @@ MNEMIQ_VERIFY_API_KEY="${MNEMIQ_VERIFY_API_KEY:-EMPTY}" \
   .venv/bin/python scripts/run_verify_replay.py "$RUN" --judge
 
 echo "== check the run was not a cache replay =="
-python3 - "$CACHE" "$RUN" <<'PY'
+.venv/bin/python - "$CACHE" "$RUN" "$PROV" <<'PY'
 import json, sys, pathlib
-cache_p, run_p = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+# the venv, not system python3: this imports mnemiq, and the scoring step above already uses it
+from mnemiq.eval.verify_replay import _ANSWERABLE
+cache_p, run_p, prov_p = (pathlib.Path(a) for a in sys.argv[1:4])
 if not cache_p.exists():
     print("  FAIL: no cache written -- the judge never scored"); raise SystemExit(1)
 n_cache = len(json.load(cache_p.open()))
-n_run = sum(1 for line in run_p.open() if line.strip())
-print(f"  cache entries {n_cache} over {n_run} run rows")
+# Compared against ANSWERABLE records, not every line: the judge scores only those, and the cache
+# dedupes on (model, question, sql). Comparing against the raw line count always looks short by
+# the deferred cases and reads as if a complete run had skipped hundreds of rows.
+rows = [json.loads(l) for l in run_p.open() if l.strip()]
+n_answerable = sum(1 for r in rows if r["outcome"] in _ANSWERABLE)
+# On mini-dev every record is answerable, so these two coincide; the distinction is kept because
+# the script takes a run path and other corpora defer.
+print(f"  cache entries {n_cache} over {n_answerable} answerable records ({len(rows)} rows total)")
 if n_cache == 0:
     print("  FAIL: empty cache"); raise SystemExit(1)
-print("  OK: a fresh cache was written under the served model's own tag")
+prov = json.load(prov_p.open())
+prov["scoring_complete"] = True
+prov["cache_file"] = cache_p.name
+prov["cache_entries"] = n_cache
+json.dump(prov, prov_p.open("w"), indent=2)
+print(f"  OK: fresh cache under the served model's tag; {prov_p.name} marked complete")
 PY
