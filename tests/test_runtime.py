@@ -306,3 +306,103 @@ def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
     assert [d.term for d in seen["definitions"]] == ["ICD-10-CM"]  # glossary seam fed
     assert seen["metrics"] == ["patient_count"]      # ...and the certified measures
     assert seen["dimensions"] == ["patient.icd10_cd"]
+
+
+def test_the_eval_door_and_the_product_door_ground_identically():
+    """The eval door and the product door must NAME the same grounding arguments.
+
+    **This is the weaker half of two guards, and it is worth knowing which half.** It compares
+    argument NAMES; `test_undefined_term_guard`'s `REQUIRED`/`_is_hardcoded` scan compares VALUES,
+    at every `retrieve` site in the repo, and is the one that catches the real regression. Verified:
+    replacing `metrics=snapshot.metrics` with `metrics=()` leaves both name sets identical and this
+    test green, while the derivation scan reports "hardcodes metrics instead of deriving it".
+
+    What this adds that the scan cannot: the scan checks a PINNED list of owed arguments, so a NEW
+    grounding argument threaded into one door and not the other is invisible to it until someone
+    remembers to add it to `REQUIRED`. This notices the asymmetry itself.
+
+    The gap it exists for has happened in both directions. The ontology index, the glossary and the
+    bound columns once reached eval's `build_engine` and not `Runtime.ask` -- the test above was
+    written for that. Then `apply_certified`'s metrics and dimensions, plus M4's snapshot, reached
+    `Runtime.ask` and not `build_engine`, so every `mnemiq eval` measured a less-grounded engine
+    than production and an ablation through it reported a false null (register M81).
+
+    Only these two doors, deliberately. `retrieve` has four call sites -- `scripts/answer.py` and
+    `scripts/ask.py` are the others -- but those are developer scripts, and it is the EVAL claiming
+    to measure the product that has to match it. The scan covers all four.
+
+    Compared as an AST, so reformatting cannot break it and an added argument cannot hide behind a
+    line break. A deliberate divergence is allowed; it just has to be made here, with a reason.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    import mnemiq.runtime as runtime_module
+    from mnemiq.eval.engine import build_engine
+
+    def retrieve_kwargs(function) -> set[str]:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "retrieve":
+                return {keyword.arg for keyword in node.keywords}
+        raise AssertionError(f"{function.__qualname__} no longer calls retrieve()")
+
+    eval_door = retrieve_kwargs(build_engine)
+    product_door = retrieve_kwargs(runtime_module.Runtime.ask)
+
+    assert eval_door == product_door, (
+        "the eval and product doors ground differently, so an eval no longer measures the engine "
+        f"the product runs. Only the product passes {sorted(product_door - eval_door)}; only the "
+        f"eval passes {sorted(eval_door - product_door)}"
+    )
+    # Named explicitly as well as compared, because two doors that BOTH stopped passing the
+    # certified measures would agree with each other and ground nothing -- the equality above
+    # cannot tell that from two doors that are both right.
+    assert {"metrics", "dimensions", "snapshot", "definitions", "ontology_index"} <= eval_door
+
+
+def test_allow_all_clears_the_pii_levels_the_snapshot_tags():
+    """`_AllowAll` must mean what it says once the snapshot reaches retrieval.
+
+    These demo scripts print "every table is visible" and then hand `retrieve` the snapshot, which
+    makes the column policy live. `GrantSet.pii_clearance` defaults to EMPTY, so an `_AllowAll` that
+    forgets it DENIES every enrichment-tagged column: the card is served with those columns stripped
+    and nothing on screen says why. Measured on the ACME snapshot -- 11 of 51 cards change.
+
+    Asserted here because nothing else can see it: `_AllowAll` lives in two scripts, and the
+    derivation scan reads `retrieve`'s keywords, not `GrantSet` construction. Reverting the
+    clearance leaves the whole suite green without this.
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    from mnemiq.contract import Column, Snapshot
+    from mnemiq.semantic.cards import build_cards
+    from mnemiq.sql.policy import build_access_policy
+
+    snapshot = Snapshot(
+        version="v", source_id="s", created_at="t",
+        columns=[Column(id="patient.name", object_id="patient", name="name", pii_level="pii"),
+                 Column(id="patient.id", object_id="patient", name="id")],
+    )
+    levels = {c.pii_level for c in snapshot.columns if c.pii_level and c.pii_level != "none"}
+
+    for script in ("ask", "answer"):
+        path = Path(__file__).resolve().parents[1] / "scripts" / f"{script}.py"
+        spec = importlib.util.spec_from_file_location(f"_script_{script}", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        grants = module._AllowAll(["patient"], levels).grants_for(None)
+        policy = build_access_policy(snapshot, grants)
+        assert not policy.denied, (
+            f"scripts/{script}.py: _AllowAll denies {sorted(policy.denied)} -- a provider whose own "
+            "docstring says every table is visible must clear the levels the snapshot tags, or the "
+            "cards it serves silently lose those columns"
+        )
+        # The card must still carry the tagged column, which is the observable consequence.
+        card = next(c for c in build_cards(snapshot, policy=policy) if c.object_id == "patient")
+        assert "name" in card.text

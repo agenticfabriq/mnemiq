@@ -21,10 +21,17 @@ from mnemiq.store.snapshot_store import current_version, load_snapshot
 
 
 class _AllowAll:
-    """Only for a local demo run with no policy file. Never a default in a real deployment."""
+    """Only for a local demo run with no policy file. Never a default in a real deployment.
 
-    def __init__(self, objects):
-        self._grants = GrantSet(frozenset(objects))
+    Clears every PII level the snapshot tags, which is what "allow all" has to mean once the
+    snapshot reaches retrieval. `GrantSet`'s `pii_clearance` defaults to EMPTY, so without this the
+    policy denies every tagged column and the demo silently serves cards with those columns
+    stripped -- an answer missing a column, and nothing on screen naming the cause. The eval door
+    clears the same set for the same reason.
+    """
+
+    def __init__(self, objects, pii_levels=frozenset()):
+        self._grants = GrantSet(frozenset(objects), pii_clearance=frozenset(pii_levels))
 
     def grants_for(self, identity):
         return self._grants
@@ -51,8 +58,12 @@ def main() -> int:
         authz = FileAuthzProvider(settings.authz_path)
     elif os.getenv("MNEMIQ_ALLOW_ALL") == "1":
         indexed = [r[0] for r in con.execute("SELECT object_id FROM semantic_object").fetchall()]
-        authz = _AllowAll(indexed)
-        print("WARNING: MNEMIQ_ALLOW_ALL=1 -- every table is visible", file=sys.stderr)
+        authz = _AllowAll(indexed, {c.pii_level for c in snapshot.columns
+                                   if c.pii_level and c.pii_level != "none"}
+                          if snapshot else frozenset())
+        print("WARNING: MNEMIQ_ALLOW_ALL=1 -- every table is visible, and every column: "
+              "PII levels the enrichment tagged are CLEARED, so those values can appear "
+              "in the SQL and in the printed answer", file=sys.stderr)
     else:
         authz = DenyAll()
 
@@ -65,7 +76,17 @@ def main() -> int:
     # See `ask.py`: `retrieve` defaults `definitions` to `()`, so an enabled guard checked
     # declared terms against an empty corpus and refused all of them.
     packet = retrieve(con, question, identity, authz, LLMEmbedder(settings), k=5,
-                      definitions=snapshot.definitions if snapshot else ())
+                      definitions=snapshot.definitions if snapshot else (),
+                      # The certified measures and the snapshot, for the same reason the
+                      # product path passes them: `apply_certified` appends metrics and
+                      # dimensions to the snapshot and `retrieve` defaults both to `()`,
+                      # so omitting them grounds on less than the snapshot carries --
+                      # silently, because an absent argument is not an error (M81).
+                      table_facts=snapshot.table_facts if snapshot else (),
+                      columns=snapshot.columns if snapshot else (),
+                      metrics=snapshot.metrics if snapshot else (),
+                      dimensions=snapshot.dimensions if snapshot else (),
+                      snapshot=snapshot)
     print(f"retrieved: {[c.object_id for c in packet.cards]}\n")
 
     agent = Agent(
