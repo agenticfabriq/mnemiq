@@ -142,8 +142,8 @@ MNEMIQ_VERIFY_API_KEY="${MNEMIQ_VERIFY_API_KEY:-EMPTY}" \
   .venv/bin/python scripts/run_verify_replay.py "$RUN" --judge
 
 echo "== check the run was not a cache replay =="
-.venv/bin/python - "$CACHE" "$RUN" "$PROV" <<'PY'
-import json, sys, pathlib
+JUDGE_MODELS_URL="${BASE%/}/models" .venv/bin/python - "$CACHE" "$RUN" "$PROV" <<'PY'
+import json, os, sys, pathlib
 # the venv, not system python3: this imports mnemiq, and the scoring step above already uses it
 from mnemiq.eval.verify_replay import _ANSWERABLE
 cache_p, run_p, prov_p = (pathlib.Path(a) for a in sys.argv[1:4])
@@ -158,6 +158,20 @@ n_answerable = sum(1 for r in rows if r["outcome"] in _ANSWERABLE)
 # On mini-dev every record is answerable, so these two coincide; the distinction is kept because
 # the script takes a run path and other corpora defer.
 print(f"  cache entries {n_cache} over {n_answerable} answerable records ({len(rows)} rows total)")
+
+# A PARTIAL outage is not detectable from the scores -- a mid-sweep death leaves real scores
+# followed by fallbacks that no value test can separate from genuine ones. Re-probing the endpoint
+# is the evidence that IS available: an endpoint still answering afterwards did not die during.
+import urllib.error, urllib.request
+try:
+    with urllib.request.urlopen(os.environ["JUDGE_MODELS_URL"], timeout=10) as r:
+        healthy_after = r.status == 200
+except (urllib.error.URLError, OSError, KeyError, ValueError):
+    healthy_after = False
+print(f"  endpoint still answering after the sweep: {healthy_after}")
+if not healthy_after:
+    print("  WARNING: it is not. Scores after the moment it died are this judge's error constant,")
+    print("           and no value test can separate them from real ones. Treat this sweep as suspect.")
 # n_answerable is printed for the operator; the ASSERTION below uses the distinct-pair count.
 # The cache dedupes on (model, question, sql), so the exact expected size is the number of
 # DISTINCT (question, sql) pairs among answerable records -- not the record count, which
@@ -182,16 +196,24 @@ scores = list(json.load(cache_p.open()).values())
 distinct = len(set(scores))
 at_one = sum(1 for v in scores if v == 1.0)
 print(f"  score distribution: {distinct} distinct value(s), {at_one}/{len(scores)} at exactly 1.0")
-if distinct == 1 and at_one == len(scores):
-    print("  FAIL: every score is exactly 1.0, which is this judge's error fallback -- a dead or")
-    print("        unreachable endpoint produces precisely this. Not certifying the sweep.")
+# Keyed on distinct == 1, NOT on the fallback's value. Hardcoding 1.0 here duplicates a literal
+# from `SemanticJudge.score` with nothing linking them: change that fallback to 0.0 and an
+# all-0.0 outage would pass, certified, reporting every wrong answer caught. Any single-valued
+# sweep over hundreds of cases is a red flag whatever the value is.
+if distinct == 1:
+    print(f"  FAIL: every score is the same value ({scores[0]!r}). This judge returns a constant on")
+    print("        error, so a dead endpoint produces exactly this shape. Not certifying the sweep.")
     raise SystemExit(1)
 prov = json.load(prov_p.open())
 prov["scoring_complete"] = True
 prov["cache_file"] = cache_p.name
 prov["cache_entries"] = n_cache
 prov["score_distinct_values"] = distinct
-prov["scores_at_fallback_1_0"] = at_one
+# NOT "at_fallback": `SemanticJudge` clamps a parsed confidence with min(1.0, ...), so a healthy
+# judge replying 1.0 is indistinguishable BY VALUE from its error path. This counts what it says
+# and no more -- claiming these were fallbacks would assert a provenance the number cannot carry.
+prov["scores_at_exactly_1_0"] = at_one
+prov["endpoint_healthy_after_sweep"] = healthy_after
 json.dump(prov, prov_p.open("w"), indent=2)
 print(f"  OK: fresh cache under the served model's tag; {prov_p.name} marked complete")
 PY
