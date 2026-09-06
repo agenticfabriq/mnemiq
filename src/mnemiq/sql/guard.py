@@ -131,12 +131,24 @@ def _names_a_source(select: exp.Select, projection: exp.Expression) -> exp.Expre
     return None
 
 
-# Aggregates whose result type cannot be their argument's, so a struct argument is a type error
-# rather than a value that escapes. NOT `exp.AggFunc`, which was the obvious reach and is wrong:
-# `max` is an aggregate and DuckDB's `max(claim)` over a struct returns a STRUCT, carrying every
-# value in the row -- including a denied one -- out through a projection that looks like an
-# aggregate. `min` and `any_value` likewise. The safety is about the RETURN type, and being an
-# aggregate does not imply it.
+# Aggregates whose result carries NO VALUE out of their argument. That is the criterion, and it is
+# narrower than it first looks -- an earlier wording said "result type cannot be the argument's",
+# which is both wrong about these three and dangerous as a guide for extending the tuple. Measured
+# on DuckDB against `claim(id, salary, ssn)`:
+#
+#   sum(claim)       -> Binder Error, no function matches      (no value escapes: it does not run)
+#   avg(claim)       -> likewise
+#   count(claim)     -> 2                                      (no value escapes: a cardinality)
+#   max(claim)       -> the whole STRUCT, ssn included         <- LEAKS
+#   array_agg(claim) -> a LIST of whole structs, ssn included  <- LEAKS
+#
+# `count` is the one that shows the old wording was wrong: it takes a struct without erroring at
+# all, and is safe for the other reason -- it discards values and returns how many there were. And
+# `array_agg`'s result type is `LIST(argument)`, which is not the argument's type, so the old
+# criterion would have admitted the worst leak of the set.
+#
+# NOT `exp.AggFunc`, for the same reason: `max` and `min` are aggregates and both carry the row out
+# through a projection that looks like one. Being an aggregate implies nothing here.
 _COLLAPSING_AGGREGATES = (exp.Sum, exp.Avg, exp.Count)
 
 
@@ -156,10 +168,18 @@ def _aggregates_every_bare_reference(select: exp.Select, projection: exp.Express
     That argument is about the aggregate's ARGUMENT being the bare struct, and stops being true
     the moment anything sits in between.
 
-    Applied at the `_projects_a_row` call site, never inside `_names_a_source`, which does double
-    duty: the star walk uses that function as its ENTRY condition, so exempting there dropped
-    these projections out of the walk and let `sum(t['salary']) FROM (SELECT * FROM claim) t`
-    reach a base-table star that no grant check ever examined.
+    Kept OUT of `_names_a_source`, which does double duty -- `_projects_a_row` asks it and the star
+    walk uses it as an entry condition. With the direct-parent test the two placements happen to
+    agree, because the walk ANDs the same predicate; with the broad "nearest enclosing function"
+    version they did not, and exempting inside the shared helper dropped
+    `sum(t['salary']) FROM (SELECT * FROM claim) t` out of the walk entirely. Each caller stating
+    its own exemption is what made that difference visible instead of implicit, so it stays that
+    way whether or not the current predicate needs it.
+
+    `DISTINCT` is stepped over. sqlglot parses `count(DISTINCT claim_amount)` as
+    `Count(this=Distinct(...))`, which puts a node between the column and the aggregate and defeats
+    a parent test -- and it changes nothing about the argument being the bare struct, so the same
+    question deferred for the same two ACME cases one phrasing over.
     """
     sources = {name.lower() for name in _sources(select)}
     bare = [
@@ -167,8 +187,18 @@ def _aggregates_every_bare_reference(select: exp.Select, projection: exp.Express
         if not column.table and column.name.lower() in sources
     ]
     return bool(bare) and all(
-        isinstance(column.parent, _COLLAPSING_AGGREGATES) for column in bare
+        isinstance(_past_distinct(column.parent), _COLLAPSING_AGGREGATES) for column in bare
     )
+
+
+def _past_distinct(node: exp.Expression | None) -> exp.Expression | None:
+    """The node above, stepping over a `DISTINCT` wrapper and nothing else.
+
+    Deliberately not a loop over "harmless" wrappers. Every node this steps over has to be one
+    that cannot extract a field, and `Distinct` is the only one that qualifies today; a general
+    skip is how `Bracket` got walked past the first time.
+    """
+    return node.parent if isinstance(node, exp.Distinct) else node
 
 
 def _projects_a_row(ast: exp.Expression) -> bool:

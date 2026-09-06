@@ -592,6 +592,25 @@ def test_an_aggregate_that_returns_its_argument_is_still_refused():
     """
     assert _is_refused("SELECT max(claim_amount) FROM claim_amount")
     assert _is_refused("SELECT min(claim_amount) FROM claim_amount")
+    # The one the old justification would have admitted. `array_agg`'s result type is
+    # LIST(argument), which is not the argument's type -- and on DuckDB it returns a list of whole
+    # structs, every value in every row. It is the worst leak of the set, so it guards the tuple.
+    assert _is_refused("SELECT array_agg(claim_amount) FROM claim_amount")
+    assert _is_refused("SELECT any_value(claim_amount) FROM claim_amount")
+
+
+def test_distinct_does_not_change_whether_the_argument_is_a_bare_struct():
+    """`Distinct` sits between the column and the aggregate and defeated a parent test.
+
+    The same deferral as the two ACME cases, one phrasing over: `count(DISTINCT claim_amount)` is
+    what a model writes for "how many different claim amounts", and it was refused for a reason
+    that has nothing to do with distinctness.
+    """
+    assert not _is_refused("SELECT count(DISTINCT claim_amount) FROM claim_amount")
+    assert not _is_refused("SELECT sum(DISTINCT claim_amount) FROM claim_amount")
+    # Stepping over DISTINCT must not step over an extraction underneath it.
+    assert _is_refused("SELECT count(DISTINCT claim['salary']) FROM claim")
+    assert _is_refused("SELECT max(DISTINCT claim_amount) FROM claim_amount")
 
 
 def test_a_spreading_function_over_a_table_named_column_is_still_refused():
