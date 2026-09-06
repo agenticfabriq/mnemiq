@@ -27,12 +27,17 @@
 # anything: it armed, provisioned and seeded its own database, ran 30 cases in 5m34s and went red
 # on `GATE FAILED: accuracy regressed: 88.0% < previous 96.0% - 2% tolerance`, quoted as printed.
 #
-# That red was neither of the two things it looked like. Not model drift and not a baseline from
-# another source: the whole 8-point gap was M84, a SELECT-star guard refusing the GOLD query for
-# two golden cases, which four identical runs at 88.0/76.0 had already shown was not noise. With it
-# fixed the same job answers every answerable case, and `evals/trend.json` now holds a baseline
-# measured here rather than on a developer machine -- 100.0/88.0, recorded by hand from two
-# identical runs, because accepting a level is still a human's commit.
+# That red was mostly neither of the two things it looked like. Not a baseline from another source:
+# the two `deferred_wrongly` cases were M84, a SELECT-star guard refusing the GOLD query, which
+# four identical runs at 88.0/76.0 had already shown was no fluke. The THIRD case that moved --
+# `fire-count`, wrong in those four and correct in the two after -- is NOT explained by it: the
+# only production file that changed between those runs is the guard, and nothing in it touches that
+# question. Model variance on one case is the honest reading, and it is why the recorded baseline
+# is worth watching: at 100.0 a single case flipping back is a red nightly.
+#
+# `evals/trend.json` now holds a baseline measured here rather than on a developer machine --
+# 100.0/88.0, recorded by hand from two identical runs, because accepting a level is a human's
+# commit.
 name: eval-nightly
 
 on:
