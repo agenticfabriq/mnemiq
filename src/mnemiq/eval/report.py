@@ -67,7 +67,19 @@ class Report:
             f"llm calls        {self.llm_calls}",
             f"tokens           {self.tokens}",
         ]
-        failures = [r for r in self.results if r.outcome in (Outcome.WRONG, Outcome.ERROR)]
+        # Every outcome that COST accuracy, which is what this list is for. `DEFERRED_WRONGLY` was
+        # missing and it is not a lesser failure: accuracy is got-the-facts over answerable, so a
+        # case the engine gave up on subtracts exactly what a wrong one does. The gate printed
+        # "accuracy regressed: 88.0% < previous 96.0%" beside a single failure line while three
+        # cases were responsible, and `check_regression`'s own advice -- find which case moved
+        # rather than widen the tolerance -- was unfollowable from the output that gave it.
+        #
+        # `DEFERRED_CORRECTLY` stays out: refusing the unanswerable is the product working, and
+        # collapsing the two deferral outcomes here would undo the reason there are two.
+        failures = [
+            r for r in self.results
+            if r.outcome in (Outcome.WRONG, Outcome.ERROR, Outcome.DEFERRED_WRONGLY)
+        ]
         if failures:
             lines += ["", "failures:"]
             lines += [f"  [{r.outcome}] {r.case_id}: {r.sql or r.answer}"[:160] for r in failures]
