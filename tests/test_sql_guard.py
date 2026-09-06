@@ -655,6 +655,18 @@ def test_the_star_walk_still_examines_a_distinct_count_over_a_derived_star():
         "SELECT count(DISTINCT claim_amount) + count(DISTINCT x) FROM claim_amount, c AS x",
     ):
         assert _is_refused(sql), sql
+    # Quoted and mixed-case, since `resolve_name` is what folds these and a raw string compare
+    # would pass the unquoted spellings above while missing these.
+    assert _is_refused('WITH "c" AS (SELECT * FROM claim) SELECT count(DISTINCT x) FROM "c" AS x')
+    assert _is_refused("WITH c AS (SELECT * FROM claim) SELECT count(DISTINCT x) FROM C AS x")
+
+    # The other direction, which this change also moved: an ALIAS that collides with an unrelated
+    # CTE name used to force the walk, and no longer does. The new verdict is the right one -- the
+    # reference resolves to a BASE table, where `count(DISTINCT row)` is the M85 exemption -- but
+    # nothing pinned it, so a future edit could re-tighten or further loosen it unnoticed.
+    assert not _is_refused(
+        "WITH c AS (SELECT id FROM policy) SELECT count(DISTINCT c) FROM claim_amount AS c"
+    )
 
 
 def test_a_bounded_derived_table_beside_a_base_table_is_a_known_false_refusal():
@@ -769,6 +781,18 @@ def test_a_field_read_from_a_whole_row_is_refused_in_every_clause():
         "SELECT claim_identifier FROM claim WHERE claim IN (SELECT c FROM claim c)",
     ):
         assert _is_refused(sql), sql
+    # Quoted and mixed-case, since `resolve_name` is what folds these and a raw string compare
+    # would pass the unquoted spellings above while missing these.
+    assert _is_refused('WITH "c" AS (SELECT * FROM claim) SELECT count(DISTINCT x) FROM "c" AS x')
+    assert _is_refused("WITH c AS (SELECT * FROM claim) SELECT count(DISTINCT x) FROM C AS x")
+
+    # The other direction, which this change also moved: an ALIAS that collides with an unrelated
+    # CTE name used to force the walk, and no longer does. The new verdict is the right one -- the
+    # reference resolves to a BASE table, where `count(DISTINCT row)` is the M85 exemption -- but
+    # nothing pinned it, so a future edit could re-tighten or further loosen it unnoticed.
+    assert not _is_refused(
+        "WITH c AS (SELECT id FROM policy) SELECT count(DISTINCT c) FROM claim_amount AS c"
+    )
 
 
 def test_a_comparison_against_a_whole_row_is_refused_too():

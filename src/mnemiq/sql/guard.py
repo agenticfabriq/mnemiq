@@ -520,9 +520,13 @@ def _skipped_row_source(select: exp.Select, projection: exp.Expression,
     #
     # Resolved through `resolve_name`, and on the table's NAME rather than `alias_or_name`, which is
     # the ALIAS when the reference is aliased -- `FROM c AS x` answers `x`, misses a CTE named `c`,
-    # and reopens the same gap one spelling over. `_expands_a_base_table` asks this identical
-    # question a screen below and asks it that way; two answers to one question is what the
-    # first version shipped.
+    # and reopens the same gap one spelling over. `_expands_a_base_table` resolves identifiers the
+    # same way, which is the part that has to agree.
+    #
+    # It is NOT the same question otherwise, deliberately: this matches every CTE in the statement
+    # while that one matches the lexically visible scope. Being wrong here costs a walk that was
+    # not needed; being wrong there costs a star nobody examined. So this one over-approximates and
+    # says so rather than pretending the two are one rule.
     root = select
     while root.parent is not None:
         root = root.parent
