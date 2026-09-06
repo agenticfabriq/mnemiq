@@ -274,7 +274,18 @@ def _binds_to_a_row(column: exp.Column, columns: dict[str, set[str]] | None) -> 
     Both handed back a working extraction oracle past a `check_cls` that sees no `exp.Column` for
     the field. So each scope is asked in turn and the FIRST one that resolves the name decides: a
     column there means column, a source there means row, and only a scope that knows neither passes
-    the question outward -- which is what keeps M86's correlated case refused.
+    the question outward -- which is what keeps M86's correlated case refused. A SUBQUERY source
+    answers neither: its columns are its own projection's business, and "unknown" has to read as
+    "not a known column" so a derived table cannot exempt anything.
+
+    **The guarantee this depends on, written here because it is not otherwise stated in this
+    repo.** The verdict comes from the SNAPSHOT and is trusted in the fail-OPEN direction: a
+    snapshot listing a column the live table no longer has makes `SELECT claim FROM claim` read as
+    a column reference and pass, while the engine binds the bare name to the row struct and hands
+    back every field, a denied one included. `prove`'s EXPLAIN succeeds on that statement, so it
+    does not separate the two. Before the schema was consulted the same drift cost a false
+    refusal; now it costs a leak. Whoever changes enrichment cadence owns that trade -- tracked as
+    M89 in the findings register, which lives outside this repo, which is why it is also here.
     """
     lookup = (
         {key.lower(): {name.lower() for name in names} for key, names in columns.items()}

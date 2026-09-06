@@ -903,11 +903,11 @@ def test_a_known_column_sharing_its_table_name_is_a_column():
     for sql in (
         "SELECT claim_amount FROM claim_amount",
         "SELECT id FROM claim_amount WHERE claim_amount > 10",
+        # `decide` still refuses the next one, through `lint` rather than here: ascending order
+        # with a LIMIT surfaces NULLs first. A different rule doing its job, repairable, and worth
+        # knowing the shape check is no longer what stops it.
         "SELECT id FROM claim_amount ORDER BY claim_amount",
         "SELECT id FROM claim_amount GROUP BY id HAVING count(DISTINCT claim_amount) > 1",
-        # `decide` still refuses this one, through `lint` rather than here: ORDER BY ascending
-        # with a LIMIT surfaces NULLs first. That is a different rule doing its job, it is
-        # repairable, and it is worth knowing the shape check is no longer what stops it.
         "SELECT abs(claim_amount) FROM claim_amount",
         "SELECT max(claim_amount) FROM claim_amount",
     ):
