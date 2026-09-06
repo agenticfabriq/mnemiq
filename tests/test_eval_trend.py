@@ -123,3 +123,50 @@ def test_gating_alone_never_writes():
 
     assert should_record(record=False, gate=True, gate_failed=False) is False
     assert should_record(record=False, gate=True, gate_failed=True) is False
+
+
+# --- M87: the exact-match rate is recorded on every row and compared by nothing ------------------
+
+
+def _shaped(*, correct, correct_facts, total):
+    """A report whose two rates differ, which is the whole point of having both."""
+    return Report(total=total, correct=correct, correct_facts=correct_facts,
+                  wrong=total - correct - correct_facts)
+
+
+def test_exact_matches_decaying_into_right_shape_is_a_regression():
+    """The degradation `accuracy` cannot see, and the reason `strict_accuracy` exists.
+
+    `CORRECT_FACTS` is "right data, different shape" and is deliberately not a failure for the
+    product metric -- which is exactly why something has to watch the exact-match rate separately.
+    Three exact matches turning into differently-shaped ones leaves accuracy untouched and takes
+    strict from 0.84 to 0.72, and the gate was green through it.
+    """
+    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.96, strict_accuracy=0.84,
+                         total=25, correct=21, correct_facts=3, wrong=1, deferred_wrongly=0,
+                         error=0)
+    now = _shaped(correct=18, correct_facts=6, total=25)
+    assert now.accuracy == previous.accuracy, "the product metric must be unmoved by this shape"
+
+    message = check_regression(now, previous, tolerance=0.02)
+    assert message is not None, "an exact-match collapse must not pass as a green run"
+    assert "exact" in message.lower(), message
+
+
+def test_a_strict_drop_names_which_number_moved():
+    """Two numbers can fail, so the message has to say which, or an operator chases the wrong one."""
+    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.96, strict_accuracy=0.84,
+                         total=25, correct=21, correct_facts=3, wrong=1, deferred_wrongly=0,
+                         error=0)
+    strict_only = check_regression(_shaped(correct=18, correct_facts=6, total=25), previous)
+    assert "exact" in strict_only.lower() and "got-the-facts" not in strict_only.lower()
+
+    both = check_regression(_shaped(correct=15, correct_facts=3, total=25), previous)
+    assert both is not None and "got-the-facts" in both.lower()
+
+
+def test_the_exact_rate_improving_is_not_a_regression():
+    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.96, strict_accuracy=0.84,
+                         total=25, correct=21, correct_facts=3, wrong=1, deferred_wrongly=0,
+                         error=0)
+    assert check_regression(_shaped(correct=24, correct_facts=0, total=25), previous) is None
