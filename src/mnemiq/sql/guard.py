@@ -131,6 +131,71 @@ def _names_a_source(select: exp.Select, projection: exp.Expression) -> exp.Expre
     return None
 
 
+# Aggregates whose result carries NO VALUE out of their argument. That is the criterion, and it is
+# narrower than it first looks -- an earlier wording said "result type cannot be the argument's",
+# which is both wrong about these three and dangerous as a guide for extending the tuple. Measured
+# on DuckDB against `claim(id, salary, ssn)`:
+#
+#   sum(claim)       -> Binder Error, no function matches      (no value escapes: it does not run)
+#   avg(claim)       -> likewise
+#   count(claim)     -> 2                                      (no value escapes: a cardinality)
+#   max(claim)       -> the whole STRUCT, ssn included         <- LEAKS
+#   array_agg(claim) -> a LIST of whole structs, ssn included  <- LEAKS
+#
+# `count` is the one that shows the old wording was wrong: it takes a struct without erroring at
+# all, and is safe for the other reason -- it discards values and returns how many there were. And
+# `array_agg`'s result type is `LIST(argument)`, which is not the argument's type, so the old
+# criterion would have admitted the worst leak of the set.
+#
+# NOT `exp.AggFunc`, for the same reason: `max` and `min` are aggregates and both carry the row out
+# through a projection that looks like one. Being an aggregate implies nothing here.
+_COLLAPSING_AGGREGATES = (exp.Sum, exp.Avg, exp.Count)
+
+
+def _aggregates_every_bare_reference(select: exp.Select, projection: exp.Expression) -> bool:
+    """Is every bare source reference here the DIRECT argument of a collapsing aggregate?
+
+    The narrow exemption that lets `SELECT sum(claim_amount) FROM claim_amount` through -- a
+    column sharing its table's name, which the ACME source has twice, and the gold SQL for two
+    golden cases. Whichever way that name resolves nothing escapes: as a column `sum` returns a
+    number, and as a bare struct `sum(STRUCT)` is a type error and the query fails.
+
+    **Direct argument, and nothing looser.** The first version asked for the nearest enclosing
+    FUNCTION, and `exp.Bracket` and `exp.Dot` are not `exp.Func` subclasses -- so
+    `sum(claim['salary'])` walked past the extraction to the `sum` and was exempted, while the
+    only `exp.Column` in it is `claim` and the CLS scan never saw `salary` to ask whether it was
+    denied. The narrow form refuses it: the column's parent is the `Bracket`, not the aggregate.
+    That argument is about the aggregate's ARGUMENT being the bare struct, and stops being true
+    the moment anything sits in between.
+
+    Kept OUT of `_names_a_source`, which does double duty -- `_projects_a_row` asks it and the star
+    walk uses it as an entry condition. With the direct-parent test the two placements happen to
+    agree, because the walk ANDs the same predicate; with the broad "nearest enclosing function"
+    version they did not, and exempting inside the shared helper dropped
+    `sum(t['salary']) FROM (SELECT * FROM claim) t` out of the walk entirely. Each caller stating
+    its own exemption is what made that difference visible instead of implicit, so it stays that
+    way whether or not the current predicate needs it.
+
+    **`DISTINCT` is NOT stepped over, and that is a known false refusal.** sqlglot parses
+    `count(DISTINCT claim_amount)` as `Count(this=Distinct(...))`, so a node sits between the
+    column and the aggregate and this returns False -- the same deferral as the two ACME cases,
+    one phrasing over. Stepping over it was tried and reverted: this predicate is also the star
+    walk's exclusion, so the step-over silently widened THAT too, and
+    `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. The property
+    still holds there (a count carries no value out), but widening a control that stops denied
+    columns escaping is not something to do as a side effect of a convenience, and the phrasing
+    this refuses is one a rewrite can avoid. Filed as M85 rather than fixed here.
+    """
+    sources = {name.lower() for name in _sources(select)}
+    bare = [
+        column for column in projection.find_all(exp.Column)
+        if not column.table and column.name.lower() in sources
+    ]
+    return bool(bare) and all(
+        isinstance(column.parent, _COLLAPSING_AGGREGATES) for column in bare
+    )
+
+
 def _projects_a_row(ast: exp.Expression) -> bool:
     """Is a whole ROW projected as a value, anywhere in the statement?
 
@@ -161,8 +226,11 @@ def _projects_a_row(ast: exp.Expression) -> bool:
     for select in ast.find_all(exp.Select):
         for projection in select.expressions:
             source = _names_a_source(select, projection)
-            if source is not None and not isinstance(source, exp.Subquery):
-                return True
+            if source is None or isinstance(source, exp.Subquery):
+                continue
+            if _aggregates_every_bare_reference(select, projection):
+                continue
+            return True
     return False
 
 
@@ -269,7 +337,20 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
             # A row reference joins the walk too: naming a DERIVED TABLE is bounded by that
             # table's projection exactly as a star over it is, and only this recursion can say
             # whether that projection reaches a base table.
-            if _is_star(projection) or _names_a_source(select, projection) is not None
+            #
+            # The aggregate exemption is applied to the ROW-REFERENCE half only, never to
+            # `_is_star`: a star is a star whatever wraps it, and skipping the walk for one would
+            # be the leak this guard was built for. Reached only when every bare reference in the
+            # projection is the DIRECT argument of a collapsing aggregate -- nothing in between,
+            # not an extraction and not a `DISTINCT`. So
+            # `sum(t['salary']) FROM (SELECT * FROM claim) t` still walks: its bare reference sits
+            # under a `Bracket`. This predicate is shared with `_projects_a_row`, and anything
+            # loosened for that caller's benefit widens THIS one too -- which is what happened when
+            # a `DISTINCT` step-over was tried.
+            if _is_star(projection) or (
+                _names_a_source(select, projection) is not None
+                and not _aggregates_every_bare_reference(select, projection)
+            )
         )
     memo[id(node)] = answer
     return answer

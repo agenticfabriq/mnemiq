@@ -542,3 +542,116 @@ def test_the_declared_sqlglot_floor_carries_the_symbols_the_guard_USES():
     # it guards the running environment, not the declaration. The floor itself was established by
     # installing 25.0.0 and 25.34.1 and reading both symbols: absent, then present.
     assert hasattr(exp, "Columns") and hasattr(exp, "SetOperation")
+
+
+# --- A column that shares its table's name, inside an aggregate -------------------------------
+#
+# Found by the ACME accuracy gate, which is what the gate is for. Two golden cases --
+# `claim-amount-total` and `policy-amount-total` -- were deferring, and the engine's three
+# attempts were all refused by this guard. The gold SQL itself is refused:
+#
+#     SELECT sum(claim_amount) AS total FROM claim_amount     -> select_star
+#     SELECT sum(c.claim_amount) AS total FROM claim_amount c -> allowed
+#
+# Two answerable cases, eight accuracy points, unreachable by any phrasing the model could pick
+# except one that qualifies the column. It looked like model drift for exactly that reason: the
+# baseline run happened to write the aliased form.
+
+
+def _is_refused(sql: str) -> bool:
+    """Bool form, for the cases below that only care THAT it refused.
+
+    Named apart from this file's `_refused`, which returns the Refusal so a caller can assert on
+    `.code`. Defining a second `_refused` silently replaced it for every test after this point --
+    21 of them started failing on `'bool' object has no attribute 'code'`, which looked like a
+    guard regression and was a name collision.
+    """
+    return isinstance(check_shape(sql), Refusal)
+
+
+def test_a_collapsing_aggregate_over_a_table_named_column_is_allowed():
+    """`sum` cannot carry a struct out of the engine, whichever way the name resolves.
+
+    The rule this guard enforces is real -- a BARE reference to a source name is the whole row in
+    DuckDB, and `check_cls` cannot see a denied column that is never spelled. It just does not
+    reach here. If `claim_amount` resolves to the column, `sum` returns a number; if it resolves
+    to the row, `sum(STRUCT)` is a type error and the query fails. Neither leaks a value.
+    """
+    assert not _is_refused("SELECT sum(claim_amount) AS total FROM claim_amount")
+    assert not _is_refused("SELECT avg(claim_amount) FROM claim_amount")
+    assert not _is_refused("SELECT count(claim_amount) FROM claim_amount")
+
+
+def test_an_aggregate_that_returns_its_argument_is_still_refused():
+    """The distinction the fix turns on, and the reason `exp.AggFunc` is the wrong test.
+
+    `max` IS an aggregate and in DuckDB `max(claim)` over a struct returns a STRUCT -- every value
+    in the row, including a denied one, through a projection that looks like an aggregate. Same
+    for `min` and `any_value`. Only aggregates whose result type cannot be the argument's type
+    are safe.
+    """
+    assert _is_refused("SELECT max(claim_amount) FROM claim_amount")
+    assert _is_refused("SELECT min(claim_amount) FROM claim_amount")
+    # The one the old justification would have admitted. `array_agg`'s result type is
+    # LIST(argument), which is not the argument's type -- and on DuckDB it returns a list of whole
+    # structs, every value in every row. It is the worst leak of the set, so it guards the tuple.
+    assert _is_refused("SELECT array_agg(claim_amount) FROM claim_amount")
+    assert _is_refused("SELECT any_value(claim_amount) FROM claim_amount")
+
+
+def test_distinct_is_a_known_false_refusal_and_stays_one(): 
+    """Pinned as REFUSED on purpose, so the next person meets the decision rather than the bug.
+
+    `count(DISTINCT claim_amount)` is what a model writes for "how many different claim amounts",
+    and it defers for a reason that has nothing to do with distinctness. Stepping over `Distinct`
+    fixes it and also widens the STAR WALK, which shares this predicate -- measured:
+    `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. Widening a
+    control that stops denied columns escaping is not a thing to do as a side effect of a
+    convenience, so this stays refused and is filed as M85.
+    """
+    assert _is_refused("SELECT count(DISTINCT claim_amount) FROM claim_amount")
+    # The shape that must never become allowed while fixing the one above.
+    assert _is_refused("SELECT count(DISTINCT t) FROM (SELECT * FROM claim) t")
+
+
+def test_a_spreading_function_over_a_table_named_column_is_still_refused():
+    """`UNNEST` is the shape the original rule was written for and must not regress."""
+    assert _is_refused("SELECT UNNEST(claim_amount) FROM claim_amount")
+    assert _is_refused("SELECT sum(UNNEST(claim_amount)) FROM claim_amount")
+
+
+def test_a_struct_extraction_inside_an_aggregate_is_still_refused():
+    """The hole the first version of this exemption opened, and why it is narrow now.
+
+    `exp.Bracket` and `exp.Dot` are not `exp.Func` subclasses, so a walk looking for the first
+    enclosing FUNCTION strolls past the extraction to the `sum` above it. The only `exp.Column`
+    in `sum(claim['salary'])` is `claim`, so the CLS scan never sees `salary` and never asks
+    whether it is denied -- an exempted projection reading a column no grant check can see, which
+    is the precise thing this guard exists to stop.
+    """
+    assert _is_refused("SELECT sum(claim['salary']) FROM claim")
+    assert _is_refused("SELECT claim_identifier, sum(claim['salary']) FROM claim "
+                       "GROUP BY claim_identifier")
+    # NOT included: `sum(claim.salary)`. That names a column explicitly, `check_cls` sees it,
+    # and it was allowed before this change as well -- a qualified reference is the shape the
+    # whole-row rule is defined against, not an instance of it.
+
+
+def test_the_exemption_does_not_stop_the_star_walk_reaching_a_base_table():
+    """The second hole, and why the exemption is applied where it is.
+
+    `_names_a_source` does double duty: `_projects_a_row` asks it, and the star walk uses it as
+    an ENTRY condition. Exempting inside it removed these projections from the walk entirely, so
+    the inner `SELECT *`'s unbounded column set reached no grant check -- the regression
+    `_projects_a_row`'s own docstring warns about. The exemption lives at the `_projects_a_row`
+    call site now, and `_names_a_source` answers exactly what it answered before.
+    """
+    assert _is_refused("SELECT sum(t['salary']) FROM (SELECT * FROM claim) t")
+    assert _is_refused("WITH t AS (SELECT * FROM claim) SELECT sum(t['salary']) FROM t")
+
+
+def test_a_bare_whole_row_projection_is_still_refused():
+    """Nothing about this fix touches the case the guard exists for."""
+    assert _is_refused("SELECT claim_amount FROM claim_amount")
+    assert _is_refused("SELECT claim_amount AS everything FROM claim_amount")
+    assert _is_refused("SELECT x FROM (SELECT claim_amount AS x FROM claim_amount) t")
