@@ -665,10 +665,11 @@ def test_a_bare_whole_row_projection_is_still_refused():
 # is asked about `claim` and answers no. The row count then answers the predicate -- a binary
 # oracle over a column the caller may not read.
 #
-# The rule has to distinguish reading a FIELD from using a column that happens to share its table's
-# name (M84). Extraction needs a Bracket, a Dot, or a function call; comparison and arithmetic
-# operators cannot reach a field. So those three are refused and operators are not, which is
-# fail-closed: a spelling nobody thought of is still one of the three.
+# The rule is the SAME one the projection uses: a bare source reference is refused, with M84's
+# collapsing-aggregate exemption and the derived-table skip. Two narrower versions leaked first --
+# refusing only subscripts/dots/calls misses the struct-comparison oracle below, and resolving
+# names against the innermost select only misses correlated references. See
+# `_uses_a_row_outside_the_projection` for the measurements.
 
 
 def test_a_field_read_from_a_whole_row_is_refused_in_every_clause():
@@ -680,8 +681,8 @@ def test_a_field_read_from_a_whole_row_is_refused_in_every_clause():
         "SELECT claim_identifier FROM claim c WHERE c['ssn'] = 'x'",
         "SELECT claim_identifier FROM claim WHERE claim['address']['city'] = 'x'",
         "SELECT claim_identifier FROM claim WHERE (claim).ssn = 'x'",
-        # A function is the third way to reach a field, and naming the dangerous ones would be a
-        # list that leaks when it is incomplete. Any function over a bare row reference is refused.
+        # A function reaches a field without a subscript, and naming the dangerous ones would be a
+        # list that leaks the moment it fell behind DuckDB.
         "SELECT claim_identifier FROM claim WHERE struct_extract(claim, 'ssn') = 'x'",
         "SELECT claim_identifier FROM claim WHERE claim IN (SELECT c FROM claim c)",
     ):
@@ -733,6 +734,33 @@ def test_a_table_named_column_in_a_predicate_is_a_known_false_refusal():
     # The escape hatch, and the reason the cost is bounded.
     assert not _is_refused("SELECT c.id FROM claim_amount c WHERE c.claim_amount > 10")
     assert not _is_refused("SELECT c.id FROM claim_amount c ORDER BY c.claim_amount")
+
+
+def test_a_bare_name_matching_an_outer_source_is_refused_in_any_scope():
+    """Fail closed across scopes, which is a decision and cost M88, not an oversight.
+
+    Honouring scope boundaries here was tried and reverted. Stopping the outward walk at a CTE
+    looks right -- a CTE body should not see the outer FROM -- but DuckDB resolves outer columns
+    into a CTE body nested in a correlated subquery, so the break re-armed the oracle: the second
+    case below returned the row for a correct guess and nothing for a wrong one.
+    """
+    # The oracle, one CTE inside one correlated subquery deep.
+    assert _is_refused(
+        "SELECT claim_identifier FROM claim WHERE EXISTS "
+        "(WITH y AS (SELECT 1 WHERE claim['ssn'] = 'x') SELECT * FROM y)"
+    )
+    assert _is_refused(
+        "SELECT claim_identifier FROM claim WHERE EXISTS "
+        "(SELECT 1 FROM policy WHERE claim['ssn'] = 'x')"
+    )
+    # The cost: a local column refused because an OUTER table shares its name. M88, across a
+    # scope, with the same rewrite.
+    assert _is_refused(
+        "WITH x AS (SELECT id FROM policy WHERE claim_amount > 10) SELECT id FROM claim_amount"
+    )
+    assert not _is_refused(
+        "WITH x AS (SELECT id FROM policy p WHERE p.claim_amount > 10) SELECT id FROM claim_amount"
+    )
 
 
 def test_indexing_a_list_column_is_not_a_row_read():

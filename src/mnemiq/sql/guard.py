@@ -56,10 +56,13 @@ def check_shape(
             code=RefusalCode.SELECT_STAR,
             message=(
                 "Name the columns you need explicitly -- the engine must know which columns a "
-                "query reads. That rules out `SELECT *` and `COLUMNS(...)`, projecting a table's "
-                "own name (which is the whole row), and reading a field out of that row anywhere "
-                "in the statement, such as `WHERE claim['ssn'] = ...` -- the field never appears "
-                "as a column, so nothing can check whether you may read it."
+                "query reads. That rules out `SELECT *` and `COLUMNS(...)`, and using a table's "
+                "own name as a value anywhere in the statement, which means the whole row: "
+                "`SELECT claim`, `WHERE claim[\'ssn\'] = ...`, `WHERE claim > ...`, `ORDER BY "
+                "claim`. A field read like that never names the field as a column, so nothing "
+                "can check whether you may read it. Name the column instead and qualify it: "
+                "`FROM claim_amount c` then `WHERE c.claim_amount > 10`, or `SELECT c.ssn` -- a "
+                "named column is allowed if your grants permit it, and refused by name if not."
             ),
         )
 
@@ -249,6 +252,17 @@ def _visible_sources(node: exp.Expression) -> dict[str, exp.Expression]:
     sources: dict[str, exp.Expression] = {}
     scope = node.parent
     while scope is not None:
+        # No scope boundary is honoured here, deliberately, after trying one. Stopping at a CTE
+        # looks right -- a CTE body should not see the outer FROM -- and DuckDB resolves outer
+        # columns into a CTE body nested in a correlated subquery anyway, so the break re-armed the
+        # oracle: `... WHERE EXISTS (WITH y AS (SELECT 1 WHERE claim['ssn'] = 'x') SELECT * FROM y)`
+        # returned the row for a correct guess and nothing for a wrong one.
+        #
+        # The false refusals this causes are the M88 collision seen across a scope: a bare name is
+        # refused when it matches ANY enclosing source name, so a local column called
+        # `claim_amount` inside a CTE is refused because an outer table is called that too. Same
+        # cost, same rewrite -- qualify it -- and the alternative was modelling four scoping rules
+        # that DuckDB does not follow, to buy back a shape the qualified spelling already handles.
         if isinstance(scope, exp.Select):
             for name, source in _sources(scope).items():
                 sources.setdefault(name.lower(), source)
@@ -289,10 +303,12 @@ def _uses_a_row_outside_the_projection(ast: exp.Expression) -> bool:
             source = _visible_sources(column).get(column.name.lower())
             if source is None:
                 continue  # names a column, not a source: `tags[1]` is list indexing
-            # A derived table or CTE is bounded by its OWN projection, and the star walk decides
-            # whether that projection reaches a base table -- the same division of labour
-            # `_projects_a_row` keeps. Refusing here would forbid `UNNEST(t) FROM (SELECT id FROM
-            # claim) t`, which is explicit and legitimate.
+            # A DERIVED TABLE is bounded by its own projection, and the star walk decides whether
+            # that projection reaches a base table -- the same division of labour `_projects_a_row`
+            # keeps. Refusing here would forbid `UNNEST(t) FROM (SELECT id FROM claim) t`, which is
+            # explicit and legitimate. A CTE reference is an `exp.Table` and gets no exemption, for
+            # the reason `_projects_a_row` already gives: resolving CTE scopes a second way here is
+            # a worse price than refusing a rarely-written shape.
             if isinstance(source, exp.Subquery):
                 continue
             if isinstance(column.parent, _COLLAPSING_AGGREGATES):
