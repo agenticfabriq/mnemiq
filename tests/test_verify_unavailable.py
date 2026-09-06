@@ -99,19 +99,44 @@ def test_the_unavailable_state_reaches_the_wire():
     assert _payload("judge_unavailable")["verified"] == "unavailable"
 
 
-def test_a_checked_answer_says_checked_and_leaks_no_score():
+def test_a_judged_answer_says_judged_and_leaks_no_score():
     p = _payload("judge")
-    assert p["verified"] == "checked"
+    assert p["verified"] == "judged"
     assert "verify_confidence" not in p and "verify_layer" not in p, \
         "the score and the layer name stay withheld; only the derived state ships"
 
 
-def test_no_verifier_configured_is_its_own_state():
-    """`null` is not 'checked' and not 'unavailable'. A mode with no verifier is a third thing, and
-    collapsing it into either would misreport one of them."""
+def test_no_verifier_read_is_its_own_state():
+    """`null` is neither. It also has more causes than "this mode does not verify" -- a deferral
+    raised before verification and an execution failure both leave the field unset -- so a client
+    must not read it as a statement about the mode."""
     assert _payload(None)["verified"] is None
 
 
-def test_every_deterministic_layer_counts_as_checked():
+def test_the_deterministic_net_does_NOT_claim_the_answer_was_judged():
+    """The distinction that makes this graded rather than boolean. `instant` and `thinking` -- and
+    `thinking` is the DEFAULT mode -- run only the empty/null net, which never reads whether the
+    answer is right. Reporting that as the same state as a judge-approved answer would make the
+    accuracy claim the withheld confidence exists to refuse, on the modes with the most traffic."""
     for layer in ("sanity", "grounding", "pass"):
-        assert _payload(layer)["verified"] == "checked", layer
+        assert _payload(layer)["verified"] == "basic", layer
+    assert _payload("judge")["verified"] == "judged"
+
+
+def test_an_unrecognised_layer_fails_CLOSED():
+    """The layer vocabulary is a comment, not a type. A future layer meaning "no judgement
+    happened" -- the shape `judge_unavailable` itself had before it existed -- must not ship as a
+    check. Defaulting to "checked" is how M89 stayed invisible."""
+    assert _payload("some_future_layer")["verified"] == "unavailable"
+
+
+def test_the_mcp_surface_reports_the_same_state_as_the_http_one():
+    """MCP is how a governing agent reads an answer, and it hand-builds its own dict. An agent
+    deciding whether to act needs the same signal; two surfaces deriving it separately is how they
+    come to disagree."""
+    from mnemiq.mcp.server import verified_state as mcp_state
+    from mnemiq.server.serialize import verified_state as http_state
+
+    assert mcp_state is http_state, "MCP must import the derivation, not restate it"
+    for layer in (None, "judge", "judge_unavailable", "sanity", "pass", "unknown_future"):
+        assert mcp_state(layer) == http_state(layer), layer
