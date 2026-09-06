@@ -43,9 +43,11 @@ class SemanticJudge:
         self._max_tokens = max_tokens
         # Fail-open is right for the product and ruinous for a MEASUREMENT: a dead endpoint scores
         # every case 1.0, which is indistinguishable BY VALUE from a judge that approved everything
-        # (`min(1.0, ...)` below clamps a real reply to the same number). These counters are the
-        # only way a replay can report the two apart IN AGGREGATE, so they exist for the eval
-        # harness, not for the verifier -- they change no behaviour and cost an increment.
+        # (`min(1.0, ...)` below clamps a real reply to the same number). These counters are a
+        # running TOTAL for the eval harness, not a per-call signal and not the only way to get one:
+        # summing `read`'s `fell_open` gives the same aggregate. What they add is the CAUSE split --
+        # `errors` against `unparsed`, which the harness reports separately and which a single
+        # gave-up count cannot show. They change no behaviour and cost an increment.
         #
         # They are NOT the per-call signal, and were briefly used as one: a caller diffing them
         # around its own `score` sees any concurrent caller's failure as its own, because they are
