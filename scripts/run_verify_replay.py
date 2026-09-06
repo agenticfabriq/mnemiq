@@ -27,7 +27,7 @@ from mnemiq.eval.bird_runner import enrich_bird_db
 from mnemiq.eval.verify_replay import _ANSWERABLE, judge_scores, load_records, replay, sweep
 from mnemiq.llm.client import LLMClient
 from mnemiq.semantic.cards import build_cards
-from mnemiq.verify.judge import SemanticJudge
+from mnemiq.verify.judge import JudgeRead, SemanticJudge
 from mnemiq.verify.verifier import Verifier
 
 _THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -82,16 +82,24 @@ class _RetryingJudge:
 
     def __getattr__(self, name):          # calls/errors/unparsed/fallbacks read through
         if name == "read":
-            # NOT proxied, deliberately. `Verifier` prefers `read` when a judge offers one, and
-            # proxying it here would hand the caller the INNER judge's single attempt -- silently
-            # skipping every retry this class exists to perform, while `score` beside it still
-            # retried. No caller does that today (the replay builds its verifiers without a judge)
-            # and the failure would be invisible if one started.
-            raise AttributeError(
-                "_RetryingJudge does not expose `read`: it would bypass the retry loop. "
-                "Call `score`, which retries and returns the surviving judgement."
-            )
+            # Not proxied -- see `read` below, which is the retrying version. Proxying the inner
+            # judge's would hand back a single attempt and skip every retry this class performs.
+            raise AttributeError("use _RetryingJudge.read")
         return getattr(self._judge, name)
+
+    def read(self, *args, **kwargs):
+        """The retrying counterpart of `score`, reporting whether it ever got a judgement.
+
+        `Verifier` prefers `read` when a judge offers one. An earlier version made this class
+        REFUSE it, so a verifier handed a retrying judge fell back to `score` -- which returns the
+        bare fail-open constant when the retries are exhausted, with `gave_up` visible only on this
+        object. Those cases then read as VERIFIED at the answer while the sweep's error record said
+        `unrecovered > 0`, and nothing at the answer told the two apart. Refusing documented the
+        bypass and created a quieter hole beside it.
+        """
+        gave_up_before = self.gave_up
+        score = self.score(*args, **kwargs)
+        return JudgeRead(score, fell_open=self.gave_up != gave_up_before)
 
     def score(self, *args, **kwargs) -> float:
         last = 1.0

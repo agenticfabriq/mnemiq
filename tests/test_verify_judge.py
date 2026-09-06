@@ -259,3 +259,56 @@ class _AlwaysErrors:
         self.calls += 1
         self.errors += 1
         return 1.0
+
+
+def test_the_retrying_judge_reports_a_verdict_it_never_got():
+    """`Verifier` prefers `read`. An earlier version made this class refuse it, so a verifier fell
+    back to `score` -- which returns the bare fail-open constant once the retries are exhausted,
+    with `gave_up` visible only on this object. Those answers then read as VERIFIED while the
+    sweep's own error record said `unrecovered > 0`, and nothing at the answer separated them."""
+    import pathlib
+    import sys
+
+    scripts = str(pathlib.Path(__file__).resolve().parents[1] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from run_verify_replay import _RetryingJudge
+
+    exhausted = _RetryingJudge(_AlwaysErrors(), attempts=2, backoff=0)
+    got = exhausted.read("q", "s", "SELECT 1", "p")
+    assert got.fell_open is True and got.score == 1.0
+    assert exhausted.gave_up == 1
+
+    class _Answers(_AlwaysErrors):
+        def score(self, *_a, **_k):
+            self.calls += 1
+            return 0.4
+
+    fine = _RetryingJudge(_Answers(), attempts=2, backoff=0)
+    got = fine.read("q", "s", "SELECT 1", "p")
+    assert got.fell_open is False and got.score == 0.4
+
+
+def test_a_recovered_retry_is_not_reported_as_a_missing_verdict():
+    """The distinction the wrapper exists for: a call that failed and then succeeded IS a
+    judgement, and must not read as an unavailable verifier."""
+    import pathlib
+    import sys
+
+    scripts = str(pathlib.Path(__file__).resolve().parents[1] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from run_verify_replay import _RetryingJudge
+
+    class _FailsOnce(_AlwaysErrors):
+        def score(self, *_a, **_k):
+            self.calls += 1
+            if self.calls == 1:
+                self.errors += 1
+                return 1.0
+            return 0.3
+
+    j = _FailsOnce()
+    got = _RetryingJudge(j, attempts=3, backoff=0).read("q", "s", "SELECT 1", "p")
+    assert j.errors == 1, "it really did fail once"
+    assert got.fell_open is False and got.score == 0.3
