@@ -182,23 +182,28 @@ def test_one_exact_match_decaying_is_already_a_regression():
     one_case = _shaped(correct=20, correct_facts=4, total=25)
     assert one_case.accuracy == previous.accuracy
     assert one_case.strict_accuracy == 0.80
-    message = check_regression(one_case, previous, tolerance=0.02)
+    # No explicit tolerance: the DEFAULT is what the gate runs with, and passing 0.02 here would
+    # leave the default free to drift to a band that lets one case through.
+    message = check_regression(one_case, previous)
     assert message is not None and "exact" in message.lower(), message
 
 
 def test_each_rate_is_compared_against_its_own_predecessor():
     """Substituting `previous.accuracy` for `previous.strict_accuracy` must not pass.
 
-    Every other fixture here has the two baseline numbers far enough apart that the mix-up still
-    trips; this one puts the previous strict rate ABOVE the previous accuracy, so comparing against
-    the wrong field reads the run as fine.
+    Not pinned with an inverted baseline, which was the first attempt: `strict_accuracy` counts
+    exact matches and `accuracy` counts those PLUS right-shape ones, so strict can never exceed
+    accuracy and a fixture where it does proves nothing about a real run. With realistic numbers
+    the mix-up makes the check stricter rather than looser, so what catches it is an UNCHANGED
+    run -- the mutation reads 84.0% against the previous 96.0% and cries regression at a run that
+    reproduced its baseline exactly, which is the nightly reddening every night.
     """
-    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.50, strict_accuracy=0.96,
-                         total=25, correct=24, correct_facts=0, wrong=1, deferred_wrongly=0,
+    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.96, strict_accuracy=0.84,
+                         total=25, correct=21, correct_facts=3, wrong=1, deferred_wrongly=0,
                          error=0)
-    now = _shaped(correct=20, correct_facts=5, total=25)  # accuracy 1.0, strict 0.80
-    message = check_regression(now, previous, tolerance=0.02)
-    assert message is not None and "exact" in message.lower(), message
+    unchanged = _shaped(correct=21, correct_facts=3, total=25)
+    assert unchanged.accuracy == 0.96 and unchanged.strict_accuracy == 0.84
+    assert check_regression(unchanged, previous) is None
 
 
 def test_the_exact_rate_improving_is_not_a_regression():
