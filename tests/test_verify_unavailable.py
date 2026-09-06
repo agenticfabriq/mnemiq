@@ -11,11 +11,12 @@ import pytest
 
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
+from mnemiq.verify.judge import JudgeRead
 from mnemiq.verify.verifier import Verifier
 
 
 class _Judge:
-    """A SemanticJudge-shaped stub whose fail-open path is under the test's control."""
+    """A SemanticJudge-shaped stub: it answers `read`, so the fact travels with the score."""
 
     def __init__(self, score: float, falls_open: bool = False) -> None:
         self._score, self._falls_open = score, falls_open
@@ -25,15 +26,18 @@ class _Judge:
     def fallbacks(self) -> int:
         return self.errors + self.unparsed
 
-    def score(self, question, schema, sql, preview) -> float:
+    def read(self, question, schema, sql, preview) -> JudgeRead:
         if self._falls_open:
             self.errors += 1
-            return 1.0          # the fail-open constant, identical to an approval
-        return self._score
+            return JudgeRead(1.0, fell_open=True)   # the constant, identical in value to approval
+        return JudgeRead(self._score, fell_open=False)
+
+    def score(self, *a, **k) -> float:
+        return self.read(*a, **k).score
 
 
 class _NoCounters:
-    """A judge with no `fallbacks` -- FakeJudge, or anyone's stub."""
+    """A judge that speaks only the float protocol -- FakeJudge, or anyone's stub."""
 
     def score(self, *_a, **_k) -> float:
         return 0.9
@@ -155,3 +159,60 @@ def test_the_mcp_surface_reports_the_same_state_as_the_http_one():
         ans = AgentAnswer(answer="x", preview=None)
         ans.verify_layer = layer
         assert _db_read(_RT(ans), None, "q")["verified"] == answer_payload(ans)["verified"], layer
+
+
+def test_a_concurrent_request_failing_does_not_mislabel_one_that_was_judged():
+    """The judge is SHARED -- `runtime.py` builds one for every mode -- and FastAPI runs the sync
+    endpoint in a threadpool, so two answers are verified against it at once. The first version of
+    this feature read a cumulative `fallbacks` counter before and after its own call, which counts
+    any other thread's failure as its own.
+
+    MEASURED before the fix: the request below was judged 0.95 and came back `judge_unavailable`,
+    with that real confidence sitting beside the claim that nothing had judged it.
+    """
+    import threading
+
+    started = threading.Event()
+    may_finish = threading.Event()
+
+    class _Shared:
+        def __init__(self):
+            self.errors = self.unparsed = 0
+
+        @property
+        def fallbacks(self):
+            return self.errors + self.unparsed
+
+        def read(self, question, schema, sql, preview):
+            if question == "judged-but-slow":
+                started.set()
+                may_finish.wait(2)
+                return JudgeRead(0.95, fell_open=False)
+            self.errors += 1                       # the OTHER request's judge fails
+            return JudgeRead(1.0, fell_open=True)
+
+        def score(self, *a, **k):
+            return self.read(*a, **k).score
+
+    judge = _Shared()
+    v = Verifier(threshold=0.5, sanity=False, judge=judge)
+    approved = Approved(plan_sql="SELECT 1", target_sql="SELECT 1")
+    table = pa.table({"n": [1]})
+    out = {}
+
+    def run(q):
+        packet = ContextPacket(question=q, cards=[], grant_fingerprint="", enrichment_version=None)
+        out[q] = v.verify(packet, approved, table)
+
+    slow = threading.Thread(target=run, args=("judged-but-slow",))
+    other = threading.Thread(target=run, args=("other",))
+    slow.start()
+    assert started.wait(2)
+    other.start()
+    other.join()
+    may_finish.set()
+    slow.join()
+
+    assert out["judged-but-slow"].layer == "judge", out["judged-but-slow"]
+    assert out["judged-but-slow"].confidence == 0.95
+    assert out["other"].layer == "judge_unavailable"
