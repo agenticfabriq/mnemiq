@@ -50,13 +50,16 @@ def check_shape(
     # statement, and identifier folding belongs to the second: `decide` defaults to parsing duckdb
     # and targeting postgres, so keying the fold on the parse dialect answers for the wrong engine.
     # Production passes them equal, which is exactly why the mismatch would not have surfaced.
-    if _has_projection_star(ast, executes_as or dialect) or _projects_a_row(ast):
+    if _has_projection_star(ast, executes_as or dialect) or _projects_a_row(ast) \
+            or _reads_a_field_of_a_row(ast):
         return Refusal(
             code=RefusalCode.SELECT_STAR,
             message=(
-                "List the explicit columns you need -- the engine must know which columns it "
-                "returns. That rules out `SELECT *`, `COLUMNS(...)`, and projecting a table's "
-                "own name, which returns the whole row."
+                "Name the columns you need explicitly -- the engine must know which columns a "
+                "query reads. That rules out `SELECT *` and `COLUMNS(...)`, projecting a table's "
+                "own name (which is the whole row), and reading a field out of that row anywhere "
+                "in the statement, such as `WHERE claim['ssn'] = ...` -- the field never appears "
+                "as a column, so nothing can check whether you may read it."
             ),
         )
 
@@ -233,6 +236,65 @@ def _projects_a_row(ast: exp.Expression) -> bool:
             return True
     return False
 
+
+
+def _owning_select(node: exp.Expression) -> exp.Select | None:
+    """The SELECT this node is written in, so its names resolve against the right sources."""
+    parent = node.parent
+    while parent is not None:
+        if isinstance(parent, exp.Select):
+            return parent
+        parent = parent.parent
+    return None
+
+
+def _reads_a_field_of_a_row(ast: exp.Expression) -> bool:
+    """Does anything here read a FIELD of a whole-row reference, in any clause?
+
+    **Register M86.** `_projects_a_row` scans `select.expressions`, so every clause but the
+    projection was unguarded. `check_cls` does walk the whole statement -- but it can only rule on
+    columns that are SPELLED, and `claim['ssn']` yields `Column(claim)` with no `exp.Column` named
+    `ssn` anywhere. So `policy.denies` is asked about `claim`, answers no, and the row count answers
+    the predicate: a binary oracle over a column the caller may not read, one WHERE clause at a
+    time.
+
+    The rule has to separate reading a field from using a column that happens to share its table's
+    name, which is M84 and which `WHERE claim_amount > 10` does legitimately. Reaching a field of a
+    struct takes a subscript, a dot, or a function call; a comparison or an arithmetic operator
+    cannot. So those three are refused over a bare source reference and operators are not.
+
+    That direction matters: it is a closed list of what CAN extract, not an open list of extraction
+    spellings. `struct_extract(claim, 'ssn')` is a function and refused without being named, and a
+    spelling nobody has thought of is still a subscript, a dot or a call. Naming the dangerous
+    functions instead would leak the moment the list fell behind DuckDB.
+    """
+    for column in ast.find_all(exp.Column):
+        if column.table:
+            continue  # qualified: it names a column, and `check_cls` can rule on it
+        select = _owning_select(column)
+        if select is None:
+            continue
+        sources = {name.lower(): source for name, source in _sources(select).items()}
+        source = sources.get(column.name.lower())
+        if source is None:
+            continue  # names a column, not a source: `tags[1]` is list indexing
+        # A derived table or CTE is bounded by its OWN projection, and the star walk is what
+        # decides whether that projection reaches a base table -- the same division of labour
+        # `_projects_a_row` keeps. Refusing here would forbid `UNNEST(t) FROM (SELECT id FROM
+        # claim) t`, which is explicit and legitimate.
+        if isinstance(source, exp.Subquery):
+            continue
+        # `Paren` is not the extraction, it is punctuation around the row: `(claim).ssn` parses as
+        # `Dot(Paren(Column(claim)), ssn)`, so a parent test that stopped at the paren read the
+        # dot as absent and let the oracle through.
+        parent = column.parent
+        while isinstance(parent, exp.Paren):
+            parent = parent.parent
+        if isinstance(parent, (exp.Bracket, exp.Dot)):
+            return True
+        if isinstance(parent, exp.Func) and not isinstance(parent, _COLLAPSING_AGGREGATES):
+            return True
+    return False
 
 def _sources(select: exp.Select) -> dict[str, exp.Expression]:
     """Everything the SELECT reads from, keyed by the name a star could be qualified with."""

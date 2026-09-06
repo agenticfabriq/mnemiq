@@ -655,3 +655,58 @@ def test_a_bare_whole_row_projection_is_still_refused():
     assert _is_refused("SELECT claim_amount FROM claim_amount")
     assert _is_refused("SELECT claim_amount AS everything FROM claim_amount")
     assert _is_refused("SELECT x FROM (SELECT claim_amount AS x FROM claim_amount) t")
+
+
+# --- M86: a whole-row reference outside the projection -----------------------------------------
+#
+# `_projects_a_row` scanned `select.expressions` only, so every clause but the projection was
+# unguarded. `check_cls` walks the whole statement, but it can only see columns that are SPELLED:
+# `claim['ssn']` yields `Column(claim)` and never an `exp.Column` named `ssn`, so `policy.denies`
+# is asked about `claim` and answers no. The row count then answers the predicate -- a binary
+# oracle over a column the caller may not read.
+#
+# The rule has to distinguish reading a FIELD from using a column that happens to share its table's
+# name (M84). Extraction needs a Bracket, a Dot, or a function call; comparison and arithmetic
+# operators cannot reach a field. So those three are refused and operators are not, which is
+# fail-closed: a spelling nobody thought of is still one of the three.
+
+
+def test_a_field_read_from_a_whole_row_is_refused_in_every_clause():
+    for sql in (
+        "SELECT claim_identifier FROM claim WHERE claim['ssn'] = 'x'",
+        "SELECT claim_identifier FROM claim ORDER BY claim['ssn']",
+        "SELECT claim_identifier FROM claim GROUP BY claim['ssn']",
+        "SELECT count(*) FROM claim HAVING max(claim['ssn']) > 'x'",
+        "SELECT claim_identifier FROM claim c WHERE c['ssn'] = 'x'",
+        "SELECT claim_identifier FROM claim WHERE claim['address']['city'] = 'x'",
+        "SELECT claim_identifier FROM claim WHERE (claim).ssn = 'x'",
+        # A function is the third way to reach a field, and naming the dangerous ones would be a
+        # list that leaks when it is incomplete. Any function over a bare row reference is refused.
+        "SELECT claim_identifier FROM claim WHERE struct_extract(claim, 'ssn') = 'x'",
+        "SELECT claim_identifier FROM claim WHERE claim IN (SELECT c FROM claim c)",
+    ):
+        assert _is_refused(sql), sql
+
+
+def test_a_column_that_shares_its_table_name_still_works_in_a_predicate():
+    """M84's false refusal must not reappear one clause over.
+
+    These name a column, so `check_cls` sees it and can rule on it -- which is the whole difference.
+    A comparison or an arithmetic operator cannot reach a field of a struct, so there is nothing
+    here that a grant check cannot see.
+    """
+    for sql in (
+        "SELECT id FROM claim_amount WHERE claim_amount > 10",
+        "SELECT id FROM claim_amount WHERE claim_amount BETWEEN 1 AND 2",
+        "SELECT id FROM claim_amount ORDER BY claim_amount",
+        "SELECT id FROM claim_amount GROUP BY id HAVING sum(claim_amount) > 10",
+        "SELECT id FROM claim_amount WHERE claim_amount IS NOT NULL",
+        "SELECT id FROM claim_amount WHERE claim_amount + 1 > 10",
+    ):
+        assert not _is_refused(sql), sql
+
+
+def test_indexing_a_list_column_is_not_a_row_read():
+    """`tags[1]` names a COLUMN, which `check_cls` can see. Only a SOURCE name is a whole row."""
+    assert not _is_refused("SELECT id FROM claim WHERE tags[1] = 'x'")
+    assert not _is_refused("SELECT tags[1] FROM claim")
