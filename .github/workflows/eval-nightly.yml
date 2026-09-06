@@ -29,15 +29,22 @@
 #
 # That red was mostly neither of the two things it looked like. Not a baseline from another source:
 # the two `deferred_wrongly` cases were M84, a SELECT-star guard refusing the GOLD query, which
-# four identical runs at 88.0/76.0 had already shown was no fluke. The THIRD case that moved --
-# `fire-count`, wrong in those four and correct in the two after -- is NOT explained by it: the
-# only production file that changed between those runs is the guard, and nothing in it touches that
-# question. Model variance on one case is the honest reading, and it is why the recorded baseline
-# is worth watching: at 100.0 a single case flipping back is a red nightly.
+# four identical runs at 88.0/76.0 had already shown was no fluke. Fixed, and `deferred_wrongly` is
+# 0 in every run since.
 #
-# `evals/trend.json` now holds a baseline measured here rather than on a developer machine --
-# 100.0/88.0, recorded by hand from two identical runs, because accepting a level is a human's
-# commit.
+# The THIRD case that moved, `fire-count`, is model variance and nearly went into the record as
+# progress. Two runs after the fix came in at 100.0/88.0; recording that as the baseline seemed
+# right and would have been wrong, because the next two came back at 96.0/84.0 with that case wrong
+# again -- six of eight runs have it wrong. A 100.0 baseline against a tolerance that is a proxy for
+# zero would have reddened most nights, and each red would have been read as a regression.
+#
+# So the number CI reproduces is 96.0/84.0, and its counts (21/3/1/0) are byte-identical to the
+# baseline recorded before any of this. **The re-record confirmed the old number rather than
+# replacing it** -- the whole apparent 8-point regression was M84, and the source difference this
+# exercise set out to absorb turned out not to exist. The 100.0 row is left in the file above the
+# one that supersedes it, because a trend is a history and a sample that misled us is worth keeping
+# visible.
+
 name: eval-nightly
 
 on:
