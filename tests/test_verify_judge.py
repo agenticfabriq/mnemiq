@@ -422,3 +422,25 @@ def test_a_concurrent_failure_on_the_SHARED_inner_judge_does_not_mislabel(monkey
     assert out["judged-but-slow"].fell_open is False, out["judged-but-slow"]
     assert out["judged-but-slow"].score == 0.62
     assert out["other"].fell_open is True
+
+
+def test_a_judge_without_read_is_refused_at_CONSTRUCTION_not_mid_sweep():
+    """Beside the `attempts` guard and for its stated reason: so no caller can reach the state.
+
+    Raising at call time aborts a sweep only after `cards_for` has already paid for that database's
+    enrichment, and `FakeJudge` -- exported from `mnemiq.verify` and carrying only `score` -- is
+    exactly the judge someone would wrap.
+    """
+    import pathlib
+    import sys
+
+    scripts = str(pathlib.Path(__file__).resolve().parents[1] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import pytest
+
+    from mnemiq.verify.judge import FakeJudge
+    from run_verify_replay import _RetryingJudge
+
+    with pytest.raises(TypeError, match="has no `read`"):
+        _RetryingJudge(FakeJudge(0.9))

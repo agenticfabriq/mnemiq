@@ -73,6 +73,17 @@ class _RetryingJudge:
         if attempts < 1:
             raise ValueError(f"attempts must be >= 1, got {attempts}: fewer means the judge is "
                              "never called and every score is the fail-open constant")
+        # Checked HERE, beside the `attempts` guard above and for its stated reason: so no caller
+        # can reach the state. `read` is the only way this wrapper learns whether a call produced a
+        # judgement -- deriving it from the shared judge's counters is the race this class was
+        # fixed twice to stop -- and raising at call time would abort a sweep only after
+        # `cards_for` had paid for that database's enrichment. `FakeJudge` has just `score`.
+        if not hasattr(judge, "read"):
+            raise TypeError(
+                f"{type(judge).__name__} has no `read`, so this wrapper cannot tell a judgement "
+                "from the fail-open constant without consulting shared counters -- which is the "
+                "race it exists without. Wrap a judge that answers `read`."
+            )
         self._judge, self._attempts, self._backoff = judge, attempts, backoff
         # A failure that RETRIED SUCCESSFULLY is not contamination -- the score that survives is a
         # real judgement. Only a case that exhausted its attempts leaves the fail-open constant in
@@ -100,13 +111,7 @@ class _RetryingJudge:
         reaches neither the retry nor `gave_up`, and a judge answering unreadably every time
         certifies with `unrecovered` at zero.
         """
-        reader = getattr(self._judge, "read", None)
-        if reader is None:
-            raise TypeError(
-                f"{type(self._judge).__name__} has no `read`. This wrapper needs the per-call "
-                "outcome; deriving it from shared counters is the race this class was fixed to "
-                "stop, so it is refused rather than silently reintroduced."
-            )
+        reader = self._judge.read
         got = JudgeRead(1.0, fell_open=True, reason="error")
         for attempt in range(self._attempts):
             got = reader(*args, **kwargs)
