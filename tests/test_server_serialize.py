@@ -115,7 +115,10 @@ _WITHHELD: dict[str, str] = {
     # Surfacing it is a UI decision with its own argument, not a side effect of measuring.
     "verify_confidence": "engine telemetry; a raw score beside an answer would read as an "
                          "accuracy claim we have not earned",
-    "verify_layer": "engine telemetry; meaningless to a user without the confidence",
+    "verify_layer": "engine telemetry; meaningless to a user without the confidence -- but see "
+                    "`verified` on the payload, which is DERIVED from it and does ship: whether the "
+                    "check ran needs no score to be meaningful, and is the half a reader is worse "
+                    "off not knowing",
 }
 
 
