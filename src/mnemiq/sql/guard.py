@@ -131,6 +131,46 @@ def _names_a_source(select: exp.Select, projection: exp.Expression) -> exp.Expre
     return None
 
 
+# Aggregates whose result type cannot be their argument's, so a struct argument is a type error
+# rather than a value that escapes. NOT `exp.AggFunc`, which was the obvious reach and is wrong:
+# `max` is an aggregate and DuckDB's `max(claim)` over a struct returns a STRUCT, carrying every
+# value in the row -- including a denied one -- out through a projection that looks like an
+# aggregate. `min` and `any_value` likewise. The safety is about the RETURN type, and being an
+# aggregate does not imply it.
+_COLLAPSING_AGGREGATES = (exp.Sum, exp.Avg, exp.Count)
+
+
+def _aggregates_every_bare_reference(select: exp.Select, projection: exp.Expression) -> bool:
+    """Is every bare source reference here the DIRECT argument of a collapsing aggregate?
+
+    The narrow exemption that lets `SELECT sum(claim_amount) FROM claim_amount` through -- a
+    column sharing its table's name, which the ACME source has twice, and the gold SQL for two
+    golden cases. Whichever way that name resolves nothing escapes: as a column `sum` returns a
+    number, and as a bare struct `sum(STRUCT)` is a type error and the query fails.
+
+    **Direct argument, and nothing looser.** The first version asked for the nearest enclosing
+    FUNCTION, and `exp.Bracket` and `exp.Dot` are not `exp.Func` subclasses -- so
+    `sum(claim['salary'])` walked past the extraction to the `sum` and was exempted, while the
+    only `exp.Column` in it is `claim` and the CLS scan never saw `salary` to ask whether it was
+    denied. The narrow form refuses it: the column's parent is the `Bracket`, not the aggregate.
+    That argument is about the aggregate's ARGUMENT being the bare struct, and stops being true
+    the moment anything sits in between.
+
+    Applied at the `_projects_a_row` call site, never inside `_names_a_source`, which does double
+    duty: the star walk uses that function as its ENTRY condition, so exempting there dropped
+    these projections out of the walk and let `sum(t['salary']) FROM (SELECT * FROM claim) t`
+    reach a base-table star that no grant check ever examined.
+    """
+    sources = {name.lower() for name in _sources(select)}
+    bare = [
+        column for column in projection.find_all(exp.Column)
+        if not column.table and column.name.lower() in sources
+    ]
+    return bool(bare) and all(
+        isinstance(column.parent, _COLLAPSING_AGGREGATES) for column in bare
+    )
+
+
 def _projects_a_row(ast: exp.Expression) -> bool:
     """Is a whole ROW projected as a value, anywhere in the statement?
 
@@ -161,8 +201,11 @@ def _projects_a_row(ast: exp.Expression) -> bool:
     for select in ast.find_all(exp.Select):
         for projection in select.expressions:
             source = _names_a_source(select, projection)
-            if source is not None and not isinstance(source, exp.Subquery):
-                return True
+            if source is None or isinstance(source, exp.Subquery):
+                continue
+            if _aggregates_every_bare_reference(select, projection):
+                continue
+            return True
     return False
 
 
@@ -269,7 +312,17 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
             # A row reference joins the walk too: naming a DERIVED TABLE is bounded by that
             # table's projection exactly as a star over it is, and only this recursion can say
             # whether that projection reaches a base table.
-            if _is_star(projection) or _names_a_source(select, projection) is not None
+            #
+            # The aggregate exemption is applied to the ROW-REFERENCE half only, never to
+            # `_is_star`: a star is a star whatever wraps it, and skipping the walk for one would
+            # be the leak this guard was built for. Reached only when every bare reference in the
+            # projection is the direct argument of a collapsing aggregate, so
+            # `sum(t['salary']) FROM (SELECT * FROM claim) t` still walks -- its bare reference
+            # sits under a `Bracket`, not under the `sum`.
+            if _is_star(projection) or (
+                _names_a_source(select, projection) is not None
+                and not _aggregates_every_bare_reference(select, projection)
+            )
         )
     memo[id(node)] = answer
     return answer
