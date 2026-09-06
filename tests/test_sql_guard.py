@@ -638,6 +638,29 @@ def test_the_star_walk_still_examines_a_distinct_count_over_a_derived_star():
     # cardinality ever left, so nothing leaked -- but "nobody looked" is not a property to keep.
     assert _is_refused("SELECT count(t) FROM (SELECT * FROM claim) t")
     assert _is_refused("SELECT sum(t) FROM (SELECT * FROM claim) t")
+    # The CTE spelling of the same thing. A CTE reference is an `exp.Table`, so matching only
+    # `exp.Subquery` left this star unwalked.
+    assert _is_refused("WITH c AS (SELECT * FROM claim) SELECT count(DISTINCT c) FROM c")
+    assert _is_refused(
+        "WITH c AS (SELECT * FROM claim) "
+        "SELECT count(DISTINCT claim_amount) + count(DISTINCT c) FROM claim_amount, c"
+    )
+
+
+def test_a_bounded_derived_table_beside_a_base_table_is_a_known_false_refusal():
+    """M88 again, in the star walk. Named here because it arrived as a side effect.
+
+    `t` projects an explicit column list, so nothing about it is unbounded. But an UNQUALIFIED row
+    reference makes `_expands_a_base_table` read the projection as a star over every source in the
+    FROM, and the sibling base table answers yes. The qualified spelling is the rewrite, as it is
+    everywhere else this collision shows up.
+    """
+    assert _is_refused(
+        "SELECT count(claim_amount) + count(t) FROM claim_amount, (SELECT id FROM claim) t"
+    )
+    assert not _is_refused(
+        "SELECT count(a.claim_amount) + count(t.id) FROM claim_amount a, (SELECT id FROM claim) t"
+    )
 
 
 def test_the_distinct_phrasing_works_outside_the_projection_too():
@@ -655,6 +678,12 @@ def test_the_distinct_phrasing_works_outside_the_projection_too():
     assert _is_refused(
         "SELECT id FROM claim_amount GROUP BY id HAVING max(DISTINCT claim_amount) > 1"
     )
+    # The aggregate has to be the DIRECT parent here as much as in the projection. Asking whether
+    # one appears anywhere above -- the "nearest enclosing function" shape that leaked twice
+    # already -- would allow this, a denied column read through an extraction the CLS scan cannot
+    # see, and it changes the verdict on nothing else in this file.
+    assert _is_refused("SELECT id FROM claim GROUP BY id HAVING sum(claim['salary']) > 1")
+    assert _is_refused("SELECT id FROM claim GROUP BY id HAVING count(DISTINCT claim['ssn']) > 1")
 
 
 def test_a_spreading_function_over_a_table_named_column_is_still_refused():

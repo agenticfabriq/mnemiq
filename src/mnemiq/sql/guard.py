@@ -513,8 +513,18 @@ def _skipped_row_source(select: exp.Select, projection: exp.Expression) -> exp.E
     ]
     if not named:
         return None
+    # A CTE reference is an `exp.Table`, so matching `exp.Subquery` alone missed the CTE spelling
+    # of exactly the shape above: `WITH c AS (SELECT * FROM claim) SELECT count(DISTINCT c) FROM c`
+    # took the exemption and left that star unwalked. Every CTE name in the STATEMENT counts, not
+    # just the ones in scope here -- an over-approximation, which errs towards walking.
+    root = select
+    while root.parent is not None:
+        root = root.parent
+    cte_names = {cte.alias_or_name.lower() for cte in root.find_all(exp.CTE)}
     for source in named:
         if isinstance(source, exp.Subquery):
+            return source
+        if isinstance(source, exp.Table) and source.alias_or_name.lower() in cte_names:
             return source
     return None if _every_bare_reference_is_aggregated(
         select, projection, through_distinct=True
