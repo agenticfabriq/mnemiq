@@ -161,8 +161,44 @@ def test_a_strict_drop_names_which_number_moved():
     strict_only = check_regression(_shaped(correct=18, correct_facts=6, total=25), previous)
     assert "exact" in strict_only.lower() and "got-the-facts" not in strict_only.lower()
 
+    # When BOTH fall, both must be named. Reporting only the first left the exact-match drop
+    # invisible here AND in the run output, since the failure list excludes `CORRECT_FACTS` -- so
+    # an operator would fix the case they were told about and ship the other.
     both = check_regression(_shaped(correct=15, correct_facts=3, total=25), previous)
-    assert both is not None and "got-the-facts" in both.lower()
+    assert both is not None
+    assert "got-the-facts" in both.lower() and "exact" in both.lower(), both
+
+
+def test_one_exact_match_decaying_is_already_a_regression():
+    """The exact-match tolerance sits in the same "no case may regress" band as the other.
+
+    Without this, raising the strict tolerance to 0.05 leaves every test in this file green while
+    a single case silently stops being caught -- and a single case is 4 points on 25, which is the
+    whole reason the tolerance is a proxy for zero rather than a tuned band.
+    """
+    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.96, strict_accuracy=0.84,
+                         total=25, correct=21, correct_facts=3, wrong=1, deferred_wrongly=0,
+                         error=0)
+    one_case = _shaped(correct=20, correct_facts=4, total=25)
+    assert one_case.accuracy == previous.accuracy
+    assert one_case.strict_accuracy == 0.80
+    message = check_regression(one_case, previous, tolerance=0.02)
+    assert message is not None and "exact" in message.lower(), message
+
+
+def test_each_rate_is_compared_against_its_own_predecessor():
+    """Substituting `previous.accuracy` for `previous.strict_accuracy` must not pass.
+
+    Every other fixture here has the two baseline numbers far enough apart that the mix-up still
+    trips; this one puts the previous strict rate ABOVE the previous accuracy, so comparing against
+    the wrong field reads the run as fine.
+    """
+    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.50, strict_accuracy=0.96,
+                         total=25, correct=24, correct_facts=0, wrong=1, deferred_wrongly=0,
+                         error=0)
+    now = _shaped(correct=20, correct_facts=5, total=25)  # accuracy 1.0, strict 0.80
+    message = check_regression(now, previous, tolerance=0.02)
+    assert message is not None and "exact" in message.lower(), message
 
 
 def test_the_exact_rate_improving_is_not_a_regression():

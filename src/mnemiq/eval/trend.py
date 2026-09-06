@@ -184,16 +184,19 @@ def check_regression(report: Report, previous: RunRecord | None,
     # It costs no extra flapping on the corpus this gates, measured rather than hoped: across the
     # twelve CI runs that produced a comparison the two rates moved in lockstep, twelve points
     # apart every time (88.0/76.0, 100.0/88.0, 96.0/84.0).
-    for label, now, before in (
-        ("got-the-facts accuracy", report.accuracy, previous.accuracy),
-        ("exact-match accuracy", report.strict_accuracy, previous.strict_accuracy),
-    ):
-        if now < before - tolerance:
-            # Named, because two numbers can fail and an operator told only "accuracy regressed"
-            # goes looking at the wrong one.
-            return (f"{label} regressed: {now:.1%} < previous {before:.1%} - "
-                    f"{tolerance:.0%} tolerance")
-    return None
+    # EVERY rate that regressed, not the first. Returning on the first said "got-the-facts
+    # regressed" while the exact-match rate had fallen too and went unnamed -- and the shape half
+    # is invisible in the run output as well, since the failure list excludes `CORRECT_FACTS`. An
+    # operator would have fixed the case they were told about and shipped the other.
+    regressions = [
+        f"{label} regressed: {now:.1%} < previous {before:.1%} - {tolerance:.0%} tolerance"
+        for label, now, before in (
+            ("got-the-facts accuracy", report.accuracy, previous.accuracy),
+            ("exact-match accuracy", report.strict_accuracy, previous.strict_accuracy),
+        )
+        if now < before - tolerance
+    ]
+    return "; ".join(regressions) if regressions else None
 
 
 def gate_outcome(report: Report, previous: RunRecord | None,
