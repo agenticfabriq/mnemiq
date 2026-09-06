@@ -599,19 +599,113 @@ def test_an_aggregate_that_returns_its_argument_is_still_refused():
     assert _is_refused("SELECT any_value(claim_amount) FROM claim_amount")
 
 
-def test_distinct_is_a_known_false_refusal_and_stays_one(): 
-    """Pinned as REFUSED on purpose, so the next person meets the decision rather than the bug.
+def test_distinct_does_not_change_whether_the_argument_is_a_bare_struct():
+    """M85. `count(DISTINCT claim_amount)` is what a model writes for "how many different claim
+    amounts", and it deferred for a reason that has nothing to do with distinctness: sqlglot parses
+    it as `Count(this=Distinct(...))`, so a node sits between the column and the aggregate.
 
-    `count(DISTINCT claim_amount)` is what a model writes for "how many different claim amounts",
-    and it defers for a reason that has nothing to do with distinctness. Stepping over `Distinct`
-    fixes it and also widens the STAR WALK, which shares this predicate -- measured:
-    `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. Widening a
-    control that stops denied columns escaping is not a thing to do as a side effect of a
-    convenience, so this stays refused and is filed as M85.
+    Fixed by giving the two callers their OWN predicate rather than sharing one, which is what the
+    first attempt got wrong -- stepping over `Distinct` in the shared helper widened the star walk
+    too, and `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. The
+    projection rule can afford the step-over because it is deciding whether a VALUE leaves; the
+    star walk cannot, because it is deciding whether to LOOK.
     """
-    assert _is_refused("SELECT count(DISTINCT claim_amount) FROM claim_amount")
-    # The shape that must never become allowed while fixing the one above.
+    assert not _is_refused("SELECT count(DISTINCT claim_amount) FROM claim_amount")
+    assert not _is_refused("SELECT sum(DISTINCT claim_amount) FROM claim_amount")
+    # Stepping over DISTINCT must not step over an extraction underneath it.
+    assert _is_refused("SELECT count(DISTINCT claim['salary']) FROM claim")
+    assert _is_refused("SELECT max(DISTINCT claim_amount) FROM claim_amount")
+
+
+def test_the_star_walk_still_examines_a_distinct_count_over_a_derived_star():
+    """The shape that must never become allowed while fixing the one above.
+
+    This is where the two callers differ. `count(DISTINCT t)` carries no value out, so the
+    projection rule has nothing to object to -- but the star walk's job is to decide whether an
+    unbounded column set is reached at all, and a projection it declines to walk is one it never
+    examines.
+    """
     assert _is_refused("SELECT count(DISTINCT t) FROM (SELECT * FROM claim) t")
+    assert _is_refused("SELECT sum(DISTINCT t['salary']) FROM (SELECT * FROM claim) t")
+    # One addend over. `_names_a_source` returns the FIRST match, so asking it alone resolved this
+    # to the base table, took the exemption, and left the derived star unwalked.
+    assert _is_refused(
+        "SELECT count(DISTINCT claim_amount) + count(DISTINCT t) "
+        "FROM claim_amount, (SELECT * FROM claim) t"
+    )
+    # Stricter than before this rule existed, and intended: `count(t)` over a derived star was
+    # allowed because the exemption skipped the walk, so the inner star was never examined. Only a
+    # cardinality ever left, so nothing leaked -- but "nobody looked" is not a property to keep.
+    assert _is_refused("SELECT count(t) FROM (SELECT * FROM claim) t")
+    assert _is_refused("SELECT sum(t) FROM (SELECT * FROM claim) t")
+    # The CTE spelling of the same thing. A CTE reference is an `exp.Table`, so matching only
+    # `exp.Subquery` left this star unwalked.
+    assert _is_refused("WITH c AS (SELECT * FROM claim) SELECT count(DISTINCT c) FROM c")
+    assert _is_refused(
+        "WITH c AS (SELECT * FROM claim) "
+        "SELECT count(DISTINCT claim_amount) + count(DISTINCT c) FROM claim_amount, c"
+    )
+    # ALIASED, which is where matching `alias_or_name` reopened it: `FROM c AS x` answers `x` and
+    # misses a CTE named `c`. Every spelling that reaches the exemption, not just the bare one.
+    for sql in (
+        "WITH c AS (SELECT * FROM claim) SELECT count(DISTINCT x) FROM c AS x",
+        "WITH c AS (SELECT * FROM claim) SELECT count(x) FROM c AS x",
+        "WITH c AS (SELECT * FROM claim) SELECT sum(x) FROM c AS x",
+        "WITH c AS (SELECT * FROM claim) "
+        "SELECT count(DISTINCT claim_amount) + count(DISTINCT x) FROM claim_amount, c AS x",
+    ):
+        assert _is_refused(sql), sql
+    # Quoted and mixed-case, since `resolve_name` is what folds these and a raw string compare
+    # would pass the unquoted spellings above while missing these.
+    assert _is_refused('WITH "c" AS (SELECT * FROM claim) SELECT count(DISTINCT x) FROM "c" AS x')
+    assert _is_refused("WITH c AS (SELECT * FROM claim) SELECT count(DISTINCT x) FROM C AS x")
+
+    # The other direction, which this change also moved: an ALIAS that collides with an unrelated
+    # CTE name used to force the walk, and no longer does. The new verdict is the right one -- the
+    # reference resolves to a BASE table, where `count(DISTINCT row)` is the M85 exemption -- but
+    # nothing pinned it, so a future edit could re-tighten or further loosen it unnoticed.
+    assert not _is_refused(
+        "WITH c AS (SELECT id FROM policy) SELECT count(DISTINCT c) FROM claim_amount AS c"
+    )
+
+
+def test_a_bounded_derived_table_beside_a_base_table_is_a_known_false_refusal():
+    """M88 again, in the star walk. Named here because it arrived as a side effect.
+
+    `t` projects an explicit column list, so nothing about it is unbounded. But an UNQUALIFIED row
+    reference makes `_expands_a_base_table` read the projection as a star over every source in the
+    FROM, and the sibling base table answers yes. The qualified spelling is the rewrite, as it is
+    everywhere else this collision shows up.
+    """
+    assert _is_refused(
+        "SELECT count(claim_amount) + count(t) FROM claim_amount, (SELECT id FROM claim) t"
+    )
+    assert not _is_refused(
+        "SELECT count(a.claim_amount) + count(t.id) FROM claim_amount a, (SELECT id FROM claim) t"
+    )
+
+
+def test_the_distinct_phrasing_works_outside_the_projection_too():
+    """Three sites make this judgement, not two, and the third kept deferring.
+
+    `count` returns a cardinality wherever it is written, so the reasoning that allows the
+    projection spelling allows this one.
+    """
+    assert not _is_refused(
+        "SELECT id FROM claim_amount GROUP BY id HAVING count(DISTINCT claim_amount) > 1"
+    )
+    assert not _is_refused(
+        "SELECT id FROM claim_amount GROUP BY id HAVING count(claim_amount) > 1"
+    )
+    assert _is_refused(
+        "SELECT id FROM claim_amount GROUP BY id HAVING max(DISTINCT claim_amount) > 1"
+    )
+    # The aggregate has to be the DIRECT parent here as much as in the projection. Asking whether
+    # one appears anywhere above -- the "nearest enclosing function" shape that leaked twice
+    # already -- would allow this, a denied column read through an extraction the CLS scan cannot
+    # see, and it changes the verdict on nothing else in this file.
+    assert _is_refused("SELECT id FROM claim GROUP BY id HAVING sum(claim['salary']) > 1")
+    assert _is_refused("SELECT id FROM claim GROUP BY id HAVING count(DISTINCT claim['ssn']) > 1")
 
 
 def test_a_spreading_function_over_a_table_named_column_is_still_refused():
@@ -655,3 +749,128 @@ def test_a_bare_whole_row_projection_is_still_refused():
     assert _is_refused("SELECT claim_amount FROM claim_amount")
     assert _is_refused("SELECT claim_amount AS everything FROM claim_amount")
     assert _is_refused("SELECT x FROM (SELECT claim_amount AS x FROM claim_amount) t")
+
+
+# --- M86: a whole-row reference outside the projection -----------------------------------------
+#
+# `_projects_a_row` scanned `select.expressions` only, so every clause but the projection was
+# unguarded. `check_cls` walks the whole statement, but it can only see columns that are SPELLED:
+# `claim['ssn']` yields `Column(claim)` and never an `exp.Column` named `ssn`, so `policy.denies`
+# is asked about `claim` and answers no. The row count then answers the predicate -- a binary
+# oracle over a column the caller may not read.
+#
+# The rule is the SAME one the projection uses: a bare source reference is refused, with M84's
+# collapsing-aggregate exemption and the derived-table skip. Two narrower versions leaked first --
+# refusing only subscripts/dots/calls misses the struct-comparison oracle below, and resolving
+# names against the innermost select only misses correlated references. See
+# `_uses_a_row_outside_the_projection` for the measurements.
+
+
+def test_a_field_read_from_a_whole_row_is_refused_in_every_clause():
+    for sql in (
+        "SELECT claim_identifier FROM claim WHERE claim['ssn'] = 'x'",
+        "SELECT claim_identifier FROM claim ORDER BY claim['ssn']",
+        "SELECT claim_identifier FROM claim GROUP BY claim['ssn']",
+        "SELECT count(*) FROM claim HAVING max(claim['ssn']) > 'x'",
+        "SELECT claim_identifier FROM claim c WHERE c['ssn'] = 'x'",
+        "SELECT claim_identifier FROM claim WHERE claim['address']['city'] = 'x'",
+        "SELECT claim_identifier FROM claim WHERE (claim).ssn = 'x'",
+        # A function reaches a field without a subscript, and naming the dangerous ones would be a
+        # list that leaks the moment it fell behind DuckDB.
+        "SELECT claim_identifier FROM claim WHERE struct_extract(claim, 'ssn') = 'x'",
+        "SELECT claim_identifier FROM claim WHERE claim IN (SELECT c FROM claim c)",
+    ):
+        assert _is_refused(sql), sql
+    # Quoted and mixed-case, since `resolve_name` is what folds these and a raw string compare
+    # would pass the unquoted spellings above while missing these.
+    assert _is_refused('WITH "c" AS (SELECT * FROM claim) SELECT count(DISTINCT x) FROM "c" AS x')
+    assert _is_refused("WITH c AS (SELECT * FROM claim) SELECT count(DISTINCT x) FROM C AS x")
+
+    # The other direction, which this change also moved: an ALIAS that collides with an unrelated
+    # CTE name used to force the walk, and no longer does. The new verdict is the right one -- the
+    # reference resolves to a BASE table, where `count(DISTINCT row)` is the M85 exemption -- but
+    # nothing pinned it, so a future edit could re-tighten or further loosen it unnoticed.
+    assert not _is_refused(
+        "WITH c AS (SELECT id FROM policy) SELECT count(DISTINCT c) FROM claim_amount AS c"
+    )
+
+
+def test_a_comparison_against_a_whole_row_is_refused_too():
+    """The reason the rule outside the projection is blanket rather than clever.
+
+    The first version refused subscripts, dots and calls, reasoning that only those can reach a
+    field. True of extracting a value, false about the threat: DuckDB compares structs
+    field-by-field, so this is a binary search over a denied column with no subscript, dot or call
+    in it -- measured 1/0/0 against the real value on a live DuckDB.
+    """
+    assert _is_refused(
+        "SELECT count(*) FROM claim WHERE claim > {'claim_identifier': 1, 'ssn': 'guess'}"
+    )
+    assert _is_refused("SELECT claim_identifier FROM claim ORDER BY claim")
+    assert _is_refused("SELECT count(*) FROM claim GROUP BY claim")
+
+
+def test_a_correlated_reference_to_an_outer_row_is_refused():
+    """Names resolve OUTWARD, so the nearest select is not the whole answer.
+
+    Resolving a bare reference against only the innermost select's sources missed an outer table
+    entirely, and the oracle survived one `EXISTS (...)` deep -- verified returning the row for a
+    correct guess and nothing for a wrong one.
+    """
+    assert _is_refused(
+        "SELECT claim_identifier FROM claim WHERE EXISTS "
+        "(SELECT 1 FROM policy WHERE claim['ssn'] = 'x')"
+    )
+    assert _is_refused(
+        "SELECT p.id FROM policy p WHERE EXISTS (SELECT 1 FROM claim WHERE claim['ssn'] = 'x')"
+    )
+
+
+def test_a_table_named_column_in_a_predicate_is_a_known_false_refusal():
+    """Pinned REFUSED on purpose, so the next person meets the decision rather than the bug.
+
+    Nothing here can tell a column that shares its table's name from the row itself, and outside
+    the projection every use of the row turned out to leak. So this pays the same price the
+    projection rule has always paid. No ACME gold case filters or orders on such a column --
+    checked, not assumed -- and `WHERE c.claim_amount > 10` names a column and is allowed, which
+    is the rewrite that makes it work. Filed as M88.
+    """
+    assert _is_refused("SELECT id FROM claim_amount WHERE claim_amount > 10")
+    assert _is_refused("SELECT id FROM claim_amount ORDER BY claim_amount")
+    # The escape hatch, and the reason the cost is bounded.
+    assert not _is_refused("SELECT c.id FROM claim_amount c WHERE c.claim_amount > 10")
+    assert not _is_refused("SELECT c.id FROM claim_amount c ORDER BY c.claim_amount")
+
+
+def test_a_bare_name_matching_an_outer_source_is_refused_in_any_scope():
+    """Fail closed across scopes, which is a decision and cost M88, not an oversight.
+
+    Honouring scope boundaries here was tried and reverted. Stopping the outward walk at a CTE
+    looks right -- a CTE body should not see the outer FROM -- but DuckDB resolves outer columns
+    into a CTE body nested in a correlated subquery, so the break re-armed the oracle: the FIRST
+    assertion below returned the row for a correct guess and nothing for a wrong one. The second
+    stayed refused throughout, which is what made the break look safe.
+    """
+    # The oracle, one CTE inside one correlated subquery deep.
+    assert _is_refused(
+        "SELECT claim_identifier FROM claim WHERE EXISTS "
+        "(WITH y AS (SELECT 1 WHERE claim['ssn'] = 'x') SELECT * FROM y)"
+    )
+    assert _is_refused(
+        "SELECT claim_identifier FROM claim WHERE EXISTS "
+        "(SELECT 1 FROM policy WHERE claim['ssn'] = 'x')"
+    )
+    # The cost: a local column refused because an OUTER table shares its name. M88, across a
+    # scope, with the same rewrite.
+    assert _is_refused(
+        "WITH x AS (SELECT id FROM policy WHERE claim_amount > 10) SELECT id FROM claim_amount"
+    )
+    assert not _is_refused(
+        "WITH x AS (SELECT id FROM policy p WHERE p.claim_amount > 10) SELECT id FROM claim_amount"
+    )
+
+
+def test_indexing_a_list_column_is_not_a_row_read():
+    """`tags[1]` names a COLUMN, which `check_cls` can see. Only a SOURCE name is a whole row."""
+    assert not _is_refused("SELECT id FROM claim WHERE tags[1] = 'x'")
+    assert not _is_refused("SELECT tags[1] FROM claim")

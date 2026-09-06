@@ -147,7 +147,7 @@ def last_run(control_dsn: str | None, source_id: str,
 
 def check_regression(report: Report, previous: RunRecord | None,
                      tolerance: float = 0.02) -> str | None:
-    """A message if accuracy dropped more than tolerance below the previous run, else None.
+    """A message if either accuracy dropped more than tolerance below the previous run, else None.
 
     **`tolerance` is a proxy for zero, not a tuned band.** Read it before changing it.
 
@@ -171,17 +171,39 @@ def check_regression(report: Report, previous: RunRecord | None,
     """
     if previous is None:
         return None
-    if report.accuracy < previous.accuracy - tolerance:
-        return (f"accuracy regressed: {report.accuracy:.1%} < previous "
-                f"{previous.accuracy:.1%} - {tolerance:.0%} tolerance")
-    return None
+    # **Register M87.** Both rates, because `strict_accuracy` was computed, stored on every trend
+    # row, and compared by nothing -- so half of a recorded 96.0/84.0 bar was advertised and
+    # unguarded. The degradation it misses is specific and real: `CORRECT_FACTS` is "right data,
+    # different shape" and is deliberately not a failure for the product metric, which is exactly
+    # why the exact-match rate needs its own watch. Three exact matches decaying into differently
+    # shaped ones leaves accuracy untouched and takes strict 84.0 -> 72.0, green throughout.
+    #
+    # Same tolerance, for the same reason: strict is also over `answerable`, so it moves in steps
+    # of one case and anything under 0.04 means "no case may regress".
+    #
+    # It costs no extra flapping on the corpus this gates, measured rather than hoped: across the
+    # twelve CI runs that produced a comparison the two rates moved in lockstep, twelve points
+    # apart every time (88.0/76.0, 100.0/88.0, 96.0/84.0).
+    # EVERY rate that regressed, not the first. Returning on the first said "got-the-facts
+    # regressed" while the exact-match rate had fallen too and went unnamed -- and the shape half
+    # is invisible in the run output as well, since the failure list excludes `CORRECT_FACTS`. An
+    # operator would have fixed the case they were told about and shipped the other.
+    regressions = [
+        f"{label} regressed: {now:.1%} < previous {before:.1%} - {tolerance:.0%} tolerance"
+        for label, now, before in (
+            ("got-the-facts accuracy", report.accuracy, previous.accuracy),
+            ("exact-match accuracy", report.strict_accuracy, previous.strict_accuracy),
+        )
+        if now < before - tolerance
+    ]
+    return "; ".join(regressions) if regressions else None
 
 
 def gate_outcome(report: Report, previous: RunRecord | None,
                  store_error: str | None = None) -> str | None:
     """The reason `--gate` should fail, or None to pass.
 
-    `check_regression` answers one question -- did accuracy drop? -- and answering "no" when
+    `check_regression` answers one question -- did either rate drop? -- and answering "no" when
     there is nothing to compare is correct at that level. The GATE's question is different:
     *did this run get checked?* Reading an absent comparison as a pass is what made the
     mechanism unfailable, and it held while a published 100% drifted sixteen points with CI

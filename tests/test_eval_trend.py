@@ -123,3 +123,91 @@ def test_gating_alone_never_writes():
 
     assert should_record(record=False, gate=True, gate_failed=False) is False
     assert should_record(record=False, gate=True, gate_failed=True) is False
+
+
+# --- M87: the exact-match rate is recorded on every row and compared by nothing ------------------
+
+
+def _shaped(*, correct, correct_facts, total):
+    """A report whose two rates differ, which is the whole point of having both."""
+    return Report(total=total, correct=correct, correct_facts=correct_facts,
+                  wrong=total - correct - correct_facts)
+
+
+def test_exact_matches_decaying_into_right_shape_is_a_regression():
+    """The degradation `accuracy` cannot see, and the reason `strict_accuracy` exists.
+
+    `CORRECT_FACTS` is "right data, different shape" and is deliberately not a failure for the
+    product metric -- which is exactly why something has to watch the exact-match rate separately.
+    Three exact matches turning into differently-shaped ones leaves accuracy untouched and takes
+    strict from 0.84 to 0.72, and the gate was green through it.
+    """
+    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.96, strict_accuracy=0.84,
+                         total=25, correct=21, correct_facts=3, wrong=1, deferred_wrongly=0,
+                         error=0)
+    now = _shaped(correct=18, correct_facts=6, total=25)
+    assert now.accuracy == previous.accuracy, "the product metric must be unmoved by this shape"
+
+    message = check_regression(now, previous, tolerance=0.02)
+    assert message is not None, "an exact-match collapse must not pass as a green run"
+    assert "exact" in message.lower(), message
+
+
+def test_a_strict_drop_names_which_number_moved():
+    """Two numbers can fail, so the message has to say which, or an operator chases the wrong one."""
+    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.96, strict_accuracy=0.84,
+                         total=25, correct=21, correct_facts=3, wrong=1, deferred_wrongly=0,
+                         error=0)
+    strict_only = check_regression(_shaped(correct=18, correct_facts=6, total=25), previous)
+    assert "exact" in strict_only.lower() and "got-the-facts" not in strict_only.lower()
+
+    # When BOTH fall, both must be named. Reporting only the first left the exact-match drop
+    # invisible here AND in the run output, since the failure list excludes `CORRECT_FACTS` -- so
+    # an operator would fix the case they were told about and ship the other.
+    both = check_regression(_shaped(correct=15, correct_facts=3, total=25), previous)
+    assert both is not None
+    assert "got-the-facts" in both.lower() and "exact" in both.lower(), both
+
+
+def test_one_exact_match_decaying_is_already_a_regression():
+    """The exact-match tolerance sits in the same "no case may regress" band as the other.
+
+    Without this, raising the strict tolerance to 0.05 leaves every test in this file green while
+    a single case silently stops being caught -- and a single case is 4 points on 25, which is the
+    whole reason the tolerance is a proxy for zero rather than a tuned band.
+    """
+    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.96, strict_accuracy=0.84,
+                         total=25, correct=21, correct_facts=3, wrong=1, deferred_wrongly=0,
+                         error=0)
+    one_case = _shaped(correct=20, correct_facts=4, total=25)
+    assert one_case.accuracy == previous.accuracy
+    assert one_case.strict_accuracy == 0.80
+    # No explicit tolerance: the DEFAULT is what the gate runs with, and passing 0.02 here would
+    # leave the default free to drift to a band that lets one case through.
+    message = check_regression(one_case, previous)
+    assert message is not None and "exact" in message.lower(), message
+
+
+def test_each_rate_is_compared_against_its_own_predecessor():
+    """Substituting `previous.accuracy` for `previous.strict_accuracy` must not pass.
+
+    Not pinned with an inverted baseline, which was the first attempt: `strict_accuracy` counts
+    exact matches and `accuracy` counts those PLUS right-shape ones, so strict can never exceed
+    accuracy and a fixture where it does proves nothing about a real run. With realistic numbers
+    the mix-up makes the check stricter rather than looser, so what catches it is an UNCHANGED
+    run -- the mutation reads 84.0% against the previous 96.0% and cries regression at a run that
+    reproduced its baseline exactly, which is the nightly reddening every night.
+    """
+    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.96, strict_accuracy=0.84,
+                         total=25, correct=21, correct_facts=3, wrong=1, deferred_wrongly=0,
+                         error=0)
+    unchanged = _shaped(correct=21, correct_facts=3, total=25)
+    assert unchanged.accuracy == 0.96 and unchanged.strict_accuracy == 0.84
+    assert check_regression(unchanged, previous) is None
+
+
+def test_the_exact_rate_improving_is_not_a_regression():
+    previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.96, strict_accuracy=0.84,
+                         total=25, correct=21, correct_facts=3, wrong=1, deferred_wrongly=0,
+                         error=0)
+    assert check_regression(_shaped(correct=24, correct_facts=0, total=25), previous) is None

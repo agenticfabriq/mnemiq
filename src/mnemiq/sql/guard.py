@@ -50,13 +50,19 @@ def check_shape(
     # statement, and identifier folding belongs to the second: `decide` defaults to parsing duckdb
     # and targeting postgres, so keying the fold on the parse dialect answers for the wrong engine.
     # Production passes them equal, which is exactly why the mismatch would not have surfaced.
-    if _has_projection_star(ast, executes_as or dialect) or _projects_a_row(ast):
+    if _has_projection_star(ast, executes_as or dialect) or _projects_a_row(ast) \
+            or _uses_a_row_outside_the_projection(ast):
         return Refusal(
             code=RefusalCode.SELECT_STAR,
             message=(
-                "List the explicit columns you need -- the engine must know which columns it "
-                "returns. That rules out `SELECT *`, `COLUMNS(...)`, and projecting a table's "
-                "own name, which returns the whole row."
+                "Name the columns you need explicitly -- the engine must know which columns a "
+                "query reads. That rules out `SELECT *` and `COLUMNS(...)`, and using a table's "
+                "own name as a value anywhere in the statement, which means the whole row: "
+                "`SELECT claim`, `WHERE claim[\'ssn\'] = ...`, `WHERE claim > ...`, `ORDER BY "
+                "claim`. A field read like that never names the field as a column, so nothing "
+                "can check whether you may read it. Name the column instead and qualify it: "
+                "`FROM claim_amount c` then `WHERE c.claim_amount > 10`, or `SELECT c.ssn` -- a "
+                "named column is allowed if your grants permit it, and refused by name if not."
             ),
         )
 
@@ -152,48 +158,44 @@ def _names_a_source(select: exp.Select, projection: exp.Expression) -> exp.Expre
 _COLLAPSING_AGGREGATES = (exp.Sum, exp.Avg, exp.Count)
 
 
-def _aggregates_every_bare_reference(select: exp.Select, projection: exp.Expression) -> bool:
-    """Is every bare source reference here the DIRECT argument of a collapsing aggregate?
+def _every_bare_reference_is_aggregated(select: exp.Select, projection: exp.Expression, *,
+                                        through_distinct: bool) -> bool:
+    """The shared walk. `through_distinct` is the part each caller has to decide for itself.
 
-    The narrow exemption that lets `SELECT sum(claim_amount) FROM claim_amount` through -- a
-    column sharing its table's name, which the ACME source has twice, and the gold SQL for two
-    golden cases. Whichever way that name resolves nothing escapes: as a column `sum` returns a
-    number, and as a bare struct `sum(STRUCT)` is a type error and the query fails.
+    **Register M85.** sqlglot parses `count(DISTINCT claim_amount)` as `Count(this=Distinct(...))`,
+    so a node sits between the column and the aggregate and a direct-parent test says no -- the M84
+    deferral, one phrasing over, on what a model writes for "how many different claim amounts".
 
-    **Direct argument, and nothing looser.** The first version asked for the nearest enclosing
-    FUNCTION, and `exp.Bracket` and `exp.Dot` are not `exp.Func` subclasses -- so
-    `sum(claim['salary'])` walked past the extraction to the `sum` and was exempted, while the
-    only `exp.Column` in it is `claim` and the CLS scan never saw `salary` to ask whether it was
-    denied. The narrow form refuses it: the column's parent is the `Bracket`, not the aggregate.
-    That argument is about the aggregate's ARGUMENT being the bare struct, and stops being true
-    the moment anything sits in between.
-
-    Kept OUT of `_names_a_source`, which does double duty -- `_projects_a_row` asks it and the star
-    walk uses it as an entry condition. With the direct-parent test the two placements happen to
-    agree, because the walk ANDs the same predicate; with the broad "nearest enclosing function"
-    version they did not, and exempting inside the shared helper dropped
-    `sum(t['salary']) FROM (SELECT * FROM claim) t` out of the walk entirely. Each caller stating
-    its own exemption is what made that difference visible instead of implicit, so it stays that
-    way whether or not the current predicate needs it.
-
-    **`DISTINCT` is NOT stepped over, and that is a known false refusal.** sqlglot parses
-    `count(DISTINCT claim_amount)` as `Count(this=Distinct(...))`, so a node sits between the
-    column and the aggregate and this returns False -- the same deferral as the two ACME cases,
-    one phrasing over. Stepping over it was tried and reverted: this predicate is also the star
-    walk's exclusion, so the step-over silently widened THAT too, and
-    `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. The property
-    still holds there (a count carries no value out), but widening a control that stops denied
-    columns escaping is not something to do as a side effect of a convenience, and the phrasing
-    this refuses is one a rewrite can avoid. Filed as M85 rather than fixed here.
+    Stepping over `Distinct` in a SHARED predicate was the first attempt and it widened the star
+    walk too: `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. The
+    two callers are asking different questions and can afford different answers. `_projects_a_row`
+    asks whether a VALUE leaves, and `DISTINCT` changes nothing about that -- `count` still returns
+    a cardinality. The star walk asks whether to LOOK at a projection at all, and a projection it
+    declines to walk is one whose inner star nobody examines; there, anything short of certainty is
+    a reason to keep walking.
     """
     sources = {name.lower() for name in _sources(select)}
     bare = [
         column for column in projection.find_all(exp.Column)
         if not column.table and column.name.lower() in sources
     ]
-    return bool(bare) and all(
-        isinstance(column.parent, _COLLAPSING_AGGREGATES) for column in bare
+    if not bare:
+        return False
+    return all(
+        isinstance(_past_distinct(column.parent) if through_distinct else column.parent,
+                   _COLLAPSING_AGGREGATES)
+        for column in bare
     )
+
+
+def _past_distinct(node: exp.Expression | None) -> exp.Expression | None:
+    """The node above, stepping over a `DISTINCT` wrapper and nothing else.
+
+    Deliberately not a loop over "harmless" wrappers. Everything skipped has to be a node that
+    cannot extract a field, and `Distinct` is the only one that qualifies; a general skip is how
+    `Bracket` got walked past when this rule was first written.
+    """
+    return node.parent if isinstance(node, exp.Distinct) else node
 
 
 def _projects_a_row(ast: exp.Expression) -> bool:
@@ -228,9 +230,101 @@ def _projects_a_row(ast: exp.Expression) -> bool:
             source = _names_a_source(select, projection)
             if source is None or isinstance(source, exp.Subquery):
                 continue
-            if _aggregates_every_bare_reference(select, projection):
+            if _every_bare_reference_is_aggregated(select, projection,
+                                                   through_distinct=True):
                 continue
             return True
+    return False
+
+
+
+def _visible_sources(node: exp.Expression) -> dict[str, exp.Expression]:
+    """Every source a name here could resolve to, from this SELECT outward.
+
+    Correlated references resolve OUTWARD, so the nearest select is not enough: a bare row
+    reference to an outer query's table, written inside a subquery, resolves against the inner
+    select's sources, misses, and would be waved through. Measured -- the oracle below survived one
+    `EXISTS (...)` deep, and again through `LATERAL`.
+    """
+    sources: dict[str, exp.Expression] = {}
+    scope = node.parent
+    while scope is not None:
+        # No scope boundary is honoured here, deliberately, after trying one. Stopping at a CTE
+        # looks right -- a CTE body should not see the outer FROM -- and DuckDB resolves outer
+        # columns into a CTE body nested in a correlated subquery anyway, so the break re-armed the
+        # oracle: `... WHERE EXISTS (WITH y AS (SELECT 1 WHERE claim['ssn'] = 'x') SELECT * FROM y)`
+        # returned the row for a correct guess and nothing for a wrong one.
+        #
+        # The false refusals this causes are the M88 collision seen across a scope: a bare name is
+        # refused when it matches ANY enclosing source name, so a local column called
+        # `claim_amount` inside a CTE is refused because an outer table is called that too. Same
+        # cost, same rewrite -- qualify it -- and the alternative was modelling four scoping rules
+        # that DuckDB does not follow, to buy back a shape the qualified spelling already handles.
+        if isinstance(scope, exp.Select):
+            for name, source in _sources(scope).items():
+                sources.setdefault(name.lower(), source)
+        scope = scope.parent
+    return sources
+
+
+def _uses_a_row_outside_the_projection(ast: exp.Expression) -> bool:
+    """Is a whole-row reference used anywhere but the projection?
+
+    **Register M86.** `_projects_a_row` scans `select.expressions`, so WHERE, ORDER BY, GROUP BY
+    and HAVING were unguarded. `check_cls` walks the whole statement but can only rule on columns
+    that are SPELLED, and `claim['ssn']` yields `Column(claim)` with no `exp.Column` named `ssn` --
+    so `policy.denies` is asked about `claim`, answers no, and the row count answers the predicate.
+    A caller who may not read `ssn` recovers it one guess at a time.
+
+    **Blanket, matching what the projection already does, after two narrower rules leaked.** The
+    first refused subscripts, dots and calls on the reasoning that only those can reach a field.
+    That is true of EXTRACTING a value and false about the threat: DuckDB compares structs
+    field-by-field, so `WHERE claim > {'claim_identifier': 1, 'ssn': <guess>}` is a binary search
+    over a denied column with no subscript, dot or call anywhere in it -- measured 1/0/0 across the
+    real value. `ORDER BY claim` and `GROUP BY claim` leak the same way. Once comparison operators
+    are dangerous too, what is left to permit is nothing, and the discriminating rule was only ever
+    a list of the leaks that had been thought of.
+
+    The cost is real and is the same cost the projection rule already pays: `WHERE claim_amount >
+    10` is refused, because nothing here can tell a column that shares its table's name from the
+    row itself. No ACME gold case filters or orders on one -- checked, not assumed -- and the
+    engine can rewrite it as `WHERE c.claim_amount > 10`, which names a column and is allowed.
+    Filed as M88 rather than left as a surprise.
+    """
+    for select in ast.find_all(exp.Select):
+        for column in select.find_all(exp.Column):
+            if column.table:
+                continue  # qualified: it names a column, and `check_cls` can rule on it
+            if _in_projection(column, select):
+                continue  # `_projects_a_row` owns that clause, with its own exemptions
+            source = _visible_sources(column).get(column.name.lower())
+            if source is None:
+                continue  # names a column, not a source: `tags[1]` is list indexing
+            # A DERIVED TABLE is bounded by its own projection, and the star walk decides whether
+            # that projection reaches a base table -- the same division of labour `_projects_a_row`
+            # keeps. Refusing here would forbid `UNNEST(t) FROM (SELECT id FROM claim) t`, which is
+            # explicit and legitimate. A CTE reference is an `exp.Table` and gets no exemption, for
+            # the reason `_projects_a_row` already gives: resolving CTE scopes a second way here is
+            # a worse price than refusing a rarely-written shape.
+            if isinstance(source, exp.Subquery):
+                continue
+            # M84: `sum` of a struct is a type error, so nothing escapes either way; M85: a
+            # `DISTINCT` between the column and the aggregate changes neither. This is the
+            # THIRD site making this judgement, and it kept deferring
+            # `HAVING count(DISTINCT claim_amount) > 1` while the projection stopped.
+            if isinstance(_past_distinct(column.parent), _COLLAPSING_AGGREGATES):
+                continue
+            return True
+    return False
+
+
+def _in_projection(column: exp.Expression, select: exp.Select) -> bool:
+    """Is this column part of the SELECT list, rather than a clause hanging off it?"""
+    node = column
+    while node is not None and node is not select:
+        if node.parent is select:
+            return any(node is projection for projection in select.expressions)
+        node = node.parent
     return False
 
 
@@ -340,16 +434,16 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
             #
             # The aggregate exemption is applied to the ROW-REFERENCE half only, never to
             # `_is_star`: a star is a star whatever wraps it, and skipping the walk for one would
-            # be the leak this guard was built for. Reached only when every bare reference in the
-            # projection is the DIRECT argument of a collapsing aggregate -- nothing in between,
-            # not an extraction and not a `DISTINCT`. So
-            # `sum(t['salary']) FROM (SELECT * FROM claim) t` still walks: its bare reference sits
-            # under a `Bracket`. This predicate is shared with `_projects_a_row`, and anything
-            # loosened for that caller's benefit widens THIS one too -- which is what happened when
-            # a `DISTINCT` step-over was tried.
+            # be the leak this guard was built for.
+            #
+            # It also stops at a SUBQUERY source, which is the whole difference between this caller
+            # and `_projects_a_row`. Over a base table, `count(DISTINCT claim_amount)` carries no
+            # value out and there is nothing here to examine (M85). Over a derived table the row
+            # reference is a door onto that table's own projection, and declining to walk it is
+            # declining to look at the star inside -- `count(DISTINCT t) FROM (SELECT * FROM claim)
+            # t` is the shape, and a shared step-over let it through once already.
             if _is_star(projection) or (
-                _names_a_source(select, projection) is not None
-                and not _aggregates_every_bare_reference(select, projection)
+                _skipped_row_source(select, projection, dialect) is not None
             )
         )
     memo[id(node)] = answer
@@ -396,6 +490,57 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
             continue  # a CTE: same
         return True
     return False
+
+
+def _skipped_row_source(select: exp.Select, projection: exp.Expression,
+                        dialect: str) -> exp.Expression | None:
+    """A row source this projection names that the star walk must examine, or None.
+
+    None means "nothing here for the walk": no bare source reference at all, or every one of them
+    aggregated into a scalar over a BASE table. A subquery source is never None, because the walk is
+    what reads that subquery's own projection.
+
+    **Every source it names, not the first.** `_names_a_source` returns the first match, so asking
+    it alone let `count(DISTINCT claim_amount) + count(DISTINCT t) FROM claim_amount, (SELECT *
+    FROM claim) t` resolve to the base table, take the exemption, and leave the star inside the
+    derived table unwalked -- the shape one addend over from the one this exemption is pinned not
+    to open.
+    """
+    sources = {name.lower(): source for name, source in _sources(select).items()}
+    named = [
+        sources[column.name.lower()]
+        for column in projection.find_all(exp.Column)
+        if not column.table and column.name.lower() in sources
+    ]
+    if not named:
+        return None
+    # A CTE reference is an `exp.Table`, so matching `exp.Subquery` alone missed the CTE spelling
+    # of exactly the shape above: `WITH c AS (SELECT * FROM claim) SELECT count(DISTINCT c) FROM c`
+    # took the exemption and left that star unwalked.
+    #
+    # Resolved through `resolve_name`, and on the table's NAME rather than `alias_or_name`, which is
+    # the ALIAS when the reference is aliased -- `FROM c AS x` answers `x`, misses a CTE named `c`,
+    # and reopens the same gap one spelling over. `_expands_a_base_table` resolves identifiers the
+    # same way, which is the part that has to agree.
+    #
+    # It is NOT the same question otherwise, deliberately: this matches every CTE in the statement
+    # while that one matches the lexically visible scope. Being wrong here costs a walk that was
+    # not needed; being wrong there costs a star nobody examined. So this one over-approximates and
+    # says so rather than pretending the two are one rule.
+    root = select
+    while root.parent is not None:
+        root = root.parent
+    cte_names = {
+        name for name in (resolve_name(cte, dialect) for cte in root.find_all(exp.CTE)) if name
+    }
+    for source in named:
+        if isinstance(source, exp.Subquery):
+            return source
+        if isinstance(source, exp.Table) and resolve_name(source, dialect) in cte_names:
+            return source
+    return None if _every_bare_reference_is_aggregated(
+        select, projection, through_distinct=True
+    ) else named[0]
 
 
 def _has_projection_star(ast: exp.Expression, dialect: str) -> bool:
