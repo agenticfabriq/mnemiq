@@ -1030,3 +1030,212 @@ def test_a_column_of_ANOTHER_table_in_scope_also_resolves():
     assert isinstance(check_shape("SELECT claim FROM claim, other",
                                   columns={"claim": {"claim_identifier"}, "other": {"id"}}),
                       Refusal)
+
+
+# --- M90: trusting the snapshot, without depending on it being fresh ---------------------------
+#
+# M88 let the schema decide whether a bare name is a column or the whole row, and that put a stale
+# snapshot in the fail-OPEN direction: a snapshot claiming a column the table no longer has makes
+# `SELECT claim FROM claim` pass as a column reference while the engine binds it to the row struct
+# and returns every field, a denied one included.
+#
+# The fix is not a freshness promise, which nothing here can keep. It is to stop the query relying
+# on the claim: when the schema says a bare name is a column, the reference is QUALIFIED. If the
+# schema was right the query means exactly what it did; if it was stale the engine's binder refuses
+# it rather than resolving to a row. Measured on DuckDB: `SELECT claim.claim FROM claim` is a
+# Binder Error where `SELECT claim FROM claim` returns the struct.
+
+
+def _shaped_sql(sql: str, schema: dict[str, set[str]]) -> str:
+    result = check_shape(sql, columns=schema)
+    assert not isinstance(result, Refusal), result
+    return result.sql(dialect="duckdb")
+
+
+def test_a_schema_resolved_name_is_qualified_in_the_query_that_runs():
+    """The rewrite that makes the schema's answer checkable rather than trusted."""
+    out = _shaped_sql("SELECT claim_amount FROM claim_amount",
+                      {"claim_amount": {"claim_amount", "id"}})
+    assert "claim_amount.claim_amount" in out, out
+
+
+def test_an_aliased_source_needs_no_qualifier_because_it_has_no_collision():
+    """`FROM claim_amount c` makes the table reachable only as `c`, so a bare `claim_amount`
+    is unambiguously the column and there was never anything for the schema to arbitrate.
+
+    Worth pinning because the obvious rewrite here is wrong: qualifying an aliased source by its
+    TABLE name is a Binder Error on DuckDB, not a synonym. Nothing is touched, which is the
+    correct amount of touching.
+    """
+    out = _shaped_sql("SELECT claim_amount FROM claim_amount c",
+                      {"claim_amount": {"claim_amount", "id"}})
+    assert "claim_amount.claim_amount" not in out and "c.claim_amount" not in out, out
+
+
+def test_an_alias_equal_to_the_table_name_still_collides_and_is_qualified():
+    """The one aliased shape that does collide -- and the qualifier must be the alias, which here
+    happens to spell the same as the table."""
+    out = _shaped_sql("SELECT claim_amount FROM claim_amount AS claim_amount",
+                      {"claim_amount": {"claim_amount", "id"}})
+    assert "claim_amount.claim_amount" in out, out
+
+
+def test_a_name_the_schema_does_not_claim_is_left_alone():
+    """Only the ambiguous ones are touched. An ordinary column needs no qualifier from us."""
+    out = _shaped_sql("SELECT id FROM claim_amount", {"claim_amount": {"claim_amount", "id"}})
+    assert out.count("id") == 1, out
+
+
+def test_the_rewrite_only_touches_names_that_collide_with_a_source():
+    """A column that shares no table's name is not made ambiguous by being qualified, but it is
+    also not this rule's business -- and rewriting more than necessary is how a shape guard starts
+    changing what queries mean."""
+    schema = {"claim": {"id", "ssn"}, "other": {"claim", "id"}}
+    out = _shaped_sql("SELECT ssn FROM claim, other", schema)
+    assert "other.ssn" not in out and "claim.ssn" not in out, out
+    # `claim` DOES collide, and resolves to the one source that has it as a column.
+    out = _shaped_sql("SELECT claim FROM claim, other", schema)
+    assert "other.claim" in out, out
+
+
+def test_the_qualifier_comes_from_the_scope_that_resolves_the_name():
+    """The blocker version qualified with an OUTER table a name an INNER source owns.
+
+    `line_item.claim` -- a foreign key named after the table it references, which is the ordinary
+    shape -- became `other.claim`, turning an inner column into a correlated reference to the outer
+    query. Valid SQL, EXPLAIN passes, no refusal, and different rows come back. That is worse than
+    anything this guard refuses, because nothing anywhere says it happened.
+    """
+    schema = {"claim": {"id", "ssn"}, "other": {"claim", "oid"}, "line_item": {"claim", "amount"}}
+    out = _shaped_sql(
+        "SELECT ssn FROM claim, other WHERE claim.id IN (SELECT claim FROM line_item)", schema
+    )
+    assert "other.claim" not in out, out
+    assert "line_item.claim" in out or "SELECT claim FROM line_item" in out, out
+
+
+def test_a_name_that_binds_to_a_select_alias_is_never_qualified():
+    """ORDER BY resolves a bare name to a SELECT ALIAS before any table column.
+
+    So qualifying it repoints the sort at a different column: measured, the asked query returns
+    rows 1 and 2 and the emitted one returns rows 3 and 2. Valid SQL, EXPLAIN passes, no refusal,
+    different rows -- the second time this rewrite changed what a query MEANS, which is why the
+    precondition is now "the name actually binds to a table column here" rather than "the name
+    collides with a source".
+    """
+    schema = {"claim_amount": {"id", "amount", "claim_amount"}}
+    out = _shaped_sql(
+        "SELECT id, amount AS claim_amount FROM claim_amount ORDER BY claim_amount", schema
+    )
+    assert "claim_amount.claim_amount" not in out, out
+
+
+def test_an_alias_shadowing_a_source_does_not_disarm_the_projection_rule():
+    """The alias rule applies OUTSIDE the projection only, and getting that wrong disarmed
+    everything this file exists for.
+
+    A select alias wins in ORDER BY, GROUP BY and HAVING. It does not win in the projection --
+    DuckDB's lateral aliases only see EARLIER items -- so a bare name there still binds to the
+    table. Applying the rule scope-wide let `AS claim` switch off the row check for the clause
+    where the leak lives: measured with an ACCURATE snapshot and `ssn` denied, all three of these
+    came back Approved and the first returned `[(1, 'SECRET')]` on live DuckDB.
+    """
+    accurate = {"claim": {"id", "ssn"}}
+    for sql in (
+        # The projection: a lateral alias only sees EARLIER items, so these still bind to the table.
+        "SELECT UNNEST(claim) AS claim FROM claim",
+        "SELECT claim, id AS claim FROM claim",
+        "SELECT max(claim) AS claim FROM claim",
+        # WHERE and GROUP BY bind to the STRUCT too, verified against DuckDB rather than assumed:
+        # `WHERE claim['ssn']` runs (an int alias cannot be subscripted by a field name), and
+        # `GROUP BY claim` errors with "column id must appear in the GROUP BY clause", which is
+        # only true if `claim` was not the alias. Listing them as alias-bound reopened M86's
+        # extraction oracle and a frequency count over a denied column.
+        "SELECT id AS claim FROM claim WHERE claim['ssn'] = 'x'",
+        "SELECT id AS claim FROM claim WHERE claim > {'id': 1, 'ssn': 'x'}",
+        "SELECT count(*) AS claim FROM claim GROUP BY claim['ssn']",
+    ):
+        assert isinstance(check_shape(sql, columns=accurate), Refusal), sql
+
+
+def test_an_ordered_alias_is_neither_rewritten_nor_refused():
+    """No alias rule exists any more, and none is needed.
+
+    The rewrite is confined to the projection, where a lateral alias cannot shadow anything, so
+    `ORDER BY claim_amount` is never qualified and never has its sort repointed. And
+    `_binds_to_a_row` resolves it to a column from the schema, so it is not refused either. Four
+    versions of an explicit alias exemption each reopened a leak; removing the question removed
+    them.
+    """
+    schema = {"claim_amount": {"id", "amount", "claim_amount"}}
+    for sql in (
+        "SELECT id, amount AS claim_amount FROM claim_amount ORDER BY claim_amount",
+        "SELECT id, amount AS claim_amount FROM claim_amount GROUP BY id, amount "
+        "HAVING claim_amount > 1",
+    ):
+        out = _shaped_sql(sql, schema)
+        assert "claim_amount.claim_amount" not in out, out
+
+    # And the shape the last exemption still let through: only the BARE name binds to an alias, so
+    # a subscript on it is the struct again and must stay refused.
+    accurate = {"claim": {"id", "ssn"}}
+    for sql in (
+        "SELECT id AS claim FROM claim ORDER BY claim['ssn']",
+        "SELECT id AS claim FROM claim GROUP BY id HAVING max(claim['ssn']) > 'x'",
+    ):
+        assert isinstance(check_shape(sql, columns=accurate), Refusal), sql
+
+
+def test_a_name_two_tables_claim_is_refused_rather_than_guessed():
+    """Ambiguity is not a reason to fall back on the snapshot's word.
+
+    With no single holder there is nothing to qualify with, and leaving the reference bare put the
+    M90 leak straight back: measured on live DuckDB with a snapshot claiming a `claim` column on
+    two tables that do not have one, the statement came back as the whole row struct with the
+    denied column in it. Unresolvable means refused.
+    """
+    schema = {"claim": {"id", "ssn"}, "other": {"claim", "o"}, "third": {"claim", "t"}}
+    assert isinstance(
+        check_shape("SELECT claim FROM claim, other, third", columns=schema), Refusal
+    )
+
+
+def test_a_quoted_source_keeps_its_quoting_in_the_qualifier():
+    """`decide` targets postgres, where quoting preserves case.
+
+    Rebuilding the qualifier as a bare identifier folded `"Claim"` to `claim`, which names no
+    source in the statement, so a legitimate query on a quoted mixed-case table became
+    EXPLAIN_FAILED. Fail-closed, and invisible on DuckDB, which folds quoted names -- and DuckDB is
+    what every other test here runs against.
+    """
+    out = _shaped_sql('SELECT "Claim" FROM "Claim"', {"Claim": {"Claim", "id"}})
+    assert '"Claim"."Claim"' in out, out
+
+
+def test_a_stale_snapshot_now_fails_closed_at_the_engine():
+    """The property M90 is about, demonstrated end to end against a real DuckDB.
+
+    The snapshot claims `claim` has a column called `claim`; the live table does not. Before the
+    rewrite the guard passed the bare reference and the engine bound it to the row struct, handing
+    back `ssn`. After it, the statement the guard emits is one the binder refuses -- so a catalog
+    that has drifted costs a failed query instead of a leak, and `prove` turns that into a refusal
+    before anything executes.
+    """
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, ssn TEXT)")
+    con.execute("INSERT INTO claim VALUES (1, 'SECRET')")
+    stale = {"claim": {"id", "ssn", "claim"}}  # `claim` is the column that no longer exists
+
+    emitted = _shaped_sql("SELECT claim FROM claim", stale)
+    assert "claim.claim" in emitted, emitted
+
+    # The bare form is what leaked, and still would.
+    assert "SECRET" in str(con.execute("SELECT claim FROM claim").fetchall())
+    # What the guard emits does not.
+    try:
+        rows = con.execute(emitted).fetchall()
+    except duckdb.BinderException:
+        return
+    raise AssertionError(f"a stale snapshot still resolved to a row: {rows}")
