@@ -5,6 +5,44 @@ from __future__ import annotations
 from mnemiq.agent.loop import AgentAnswer
 
 
+# M89. NOT the confidence and NOT the layer name -- both stay withheld, and the argument for
+# withholding them is untouched: a bare "0.62" beside an answer reads as an accuracy claim we have
+# not earned, and a layer name means nothing without it. What ships is the one thing that is
+# meaningful with no score attached and that a reader is worse off not knowing -- WHAT KIND of
+# check ran, if any.
+#
+# Graded, not boolean, because "checked" would collapse two very different guarantees. `instant`
+# and `thinking` -- and `thinking` is the default mode -- run the deterministic net only, which
+# rejects empty and null results and never reads whether the answer is RIGHT. Serialising that
+# identically to a judge-approved `deep` answer would make exactly the accuracy claim the withheld
+# confidence exists to refuse, on the modes that get the most traffic.
+_VERIFIED_STATE = {
+    "judge": "judged",                  # a judge scored this answer
+    "judge_unavailable": "unavailable",  # a judge was configured and could not be reached
+    "sanity": "basic",                  # deterministic net only; says nothing about correctness
+    "grounding": "basic",
+    "pass": "basic",
+}
+
+
+def verified_state(layer: str | None) -> str | None:
+    """What kind of verification this answer actually received, for the wire.
+
+    `None` means NO verifier read produced a stamp, and it has several causes that a client must
+    not conflate with "this mode does not verify": a deferral raised before verification, an
+    execution failure, and a mode with no verifier all leave the field unset because the verifier
+    never saw a table.
+
+    FAILS CLOSED on an unrecognised layer. The layer vocabulary is a comment, not a type, so a
+    future layer meaning "no judgement happened" -- which is the shape `judge_unavailable` itself
+    had before it existed -- must not ship as though it were a check. Defaulting to "checked" is
+    how M89 stayed invisible for as long as it did.
+    """
+    if layer is None:
+        return None
+    return _VERIFIED_STATE.get(layer, "unavailable")
+
+
 def answer_payload(ans: AgentAnswer) -> dict:
     t = ans.trace
     p = ans.preview
@@ -22,23 +60,7 @@ def answer_payload(ans: AgentAnswer) -> dict:
         "grant_fingerprint": ans.grant_fingerprint,
         "cached": ans.cached,
         "agreement": ans.agreement,
-        # M89. NOT the confidence and NOT the layer -- both stay withheld, and the argument for
-        # withholding them still holds: a bare "0.62" beside an answer reads as an accuracy claim
-        # we have not earned, and the layer name is meaningless without it. This is the one thing
-        # in the verifier's read that IS meaningful with no score attached, and that a reader is
-        # worse off not knowing: whether the check ran at all.
-        #
-        # The failure it exists for is silent by construction. `SemanticJudge.score` fails open and
-        # the constant it returns is 1.0, which is exactly what approval returns, so an answer from
-        # a verifier that was switched off is byte-identical on the wire to a verified one. That
-        # was true of every reasoning model until the token budget was fixed, and is true again
-        # whenever the endpoint is down.
-        #
-        # Three states, and `null` is a real one: no verifier was configured for this mode, which
-        # is different from one that ran and different from one that could not be reached.
-        "verified": (None if ans.verify_layer is None
-                     else "unavailable" if ans.verify_layer == "judge_unavailable"
-                     else "checked"),
+        "verified": verified_state(ans.verify_layer),
         "judge_engaged": ans.judge_engaged,
         "judge_override": ans.judge_override,
         "candidates_executed": ans.candidates_executed,

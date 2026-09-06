@@ -10,6 +10,7 @@ from __future__ import annotations
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
 from mnemiq.runtime import Runtime, build_runtime
+from mnemiq.server.serialize import verified_state
 
 
 def _db_read(
@@ -25,6 +26,11 @@ def _db_read(
         "failed": ans.failed,
         "reason_code": str(ans.reason_code) if ans.reason_code else None,
         "mode": ans.mode,
+        # M89: the same derivation as the HTTP payload, imported rather than restated. A governing
+        # agent deciding whether to act on an answer needs to know the verifier could not be
+        # reached; hand-building a second dict here is how this surface would silently diverge,
+        # which is the failure M56's marker comment warns about one field down.
+        "verified": verified_state(ans.verify_layer),
         "sql": trace.target_sql if trace else None,  # a deferral never carries a fabricated query
         "preview": (
             {"columns": ans.preview.columns, "rows": ans.preview.rows,
