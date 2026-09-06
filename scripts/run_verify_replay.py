@@ -80,9 +80,10 @@ class _RetryingJudge:
         # `cards_for` had paid for that database's enrichment. `FakeJudge` has just `score`.
         if not hasattr(judge, "read"):
             raise TypeError(
-                f"{type(judge).__name__} has no `read`, so this wrapper cannot tell a judgement "
-                "from the fail-open constant without consulting shared counters -- which is the "
-                "race it exists without. Wrap a judge that answers `read`."
+                f"{type(judge).__name__} has no `read`. Without it this wrapper cannot tell a "
+                "judgement from the fail-open constant except by diffing the shared judge's "
+                "counters, which is the race this class was fixed twice to stop. Wrap a judge "
+                "that answers `read`."
             )
         self._judge, self._attempts, self._backoff = judge, attempts, backoff
         # A failure that RETRIED SUCCESSFULLY is not contamination -- the score that survives is a
