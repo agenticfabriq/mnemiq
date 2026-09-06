@@ -290,7 +290,9 @@ def test_a_shape_the_walker_cannot_decompose_is_refused_rather_than_permitted():
     recognise, and reading that as "no star reaches a base table" made every gap in it a silent
     hole -- which is exactly how EXCEPT and doubled parentheses got through."""
     from mnemiq.sql.guard import _star_reaches_base
-    assert _star_reaches_base(exp.Anonymous(this="opaque"), {}, {}, frozenset(), "duckdb") is True
+    assert _star_reaches_base(
+        exp.Anonymous(this="opaque"), {}, {}, None, frozenset(), "duckdb"
+    ) is True
 
 
 def test_the_recursion_stays_linear_in_wrapper_depth():
@@ -874,3 +876,157 @@ def test_indexing_a_list_column_is_not_a_row_read():
     """`tags[1]` names a COLUMN, which `check_cls` can see. Only a SOURCE name is a whole row."""
     assert not _is_refused("SELECT id FROM claim WHERE tags[1] = 'x'")
     assert not _is_refused("SELECT tags[1] FROM claim")
+
+
+# --- M88: with a schema, the guard stops guessing ----------------------------------------------
+#
+# Every false refusal in this family -- M84's `sum(claim_amount)`, M85's distinct-count, M88's
+# `WHERE claim_amount > 10` -- comes from one unanswerable question: is a bare name the COLUMN or
+# the whole ROW? The guard had no schema, so it fails closed and pays for it.
+#
+# The decider has one. `decide` already takes `visible: dict[str, set[str]]`, table to columns, and
+# passes it to `check_access` two lines later. Handed the same map, the question stops being a
+# guess: DuckDB resolves a name to the COLUMN when one exists and to the row only when none does,
+# measured both ways, so a name that is a known column is a column.
+
+
+_ACME = {"claim_amount": {"claim_amount", "id"}, "claim": {"claim_identifier", "salary", "ssn"}}
+
+
+def _with_schema(sql: str) -> bool:
+    """Refused, when the guard is told what the columns are."""
+    return isinstance(check_shape(sql, columns=_ACME), Refusal)
+
+
+def test_a_known_column_sharing_its_table_name_is_a_column():
+    """The M84/M88 family, ended rather than traded."""
+    for sql in (
+        "SELECT claim_amount FROM claim_amount",
+        "SELECT id FROM claim_amount WHERE claim_amount > 10",
+        "SELECT id FROM claim_amount ORDER BY claim_amount",
+        "SELECT id FROM claim_amount GROUP BY id HAVING count(DISTINCT claim_amount) > 1",
+        # `decide` still refuses this one, through `lint` rather than here: ORDER BY ascending
+        # with a LIMIT surfaces NULLs first. That is a different rule doing its job, it is
+        # repairable, and it is worth knowing the shape check is no longer what stops it.
+        "SELECT abs(claim_amount) FROM claim_amount",
+        "SELECT max(claim_amount) FROM claim_amount",
+    ):
+        assert not _with_schema(sql), sql
+
+
+def test_a_name_with_no_such_column_is_still_the_whole_row():
+    """`claim` has no column called `claim`, so it is the row -- and every leak stays closed."""
+    for sql in (
+        "SELECT claim FROM claim",
+        "SELECT claim_identifier FROM claim WHERE claim['ssn'] = 'x'",
+        "SELECT count(*) FROM claim WHERE claim > {'claim_identifier': 1, 'ssn': 'guess'}",
+        "SELECT claim_identifier FROM claim ORDER BY claim",
+        "SELECT UNNEST(claim) FROM claim",
+        "SELECT max(claim) FROM claim",
+        "SELECT claim_identifier FROM claim WHERE EXISTS "
+        "(SELECT 1 FROM claim_amount WHERE claim['ssn'] = 'x')",
+    ):
+        assert _with_schema(sql), sql
+
+
+def test_a_star_is_still_a_star_when_the_schema_is_known():
+    """The schema answers "column or row". It says nothing about an unbounded projection."""
+    for sql in (
+        "SELECT * FROM claim_amount",
+        "SELECT * FROM (SELECT * FROM claim) t",
+        "SELECT COLUMNS(*) FROM claim_amount",
+    ):
+        assert _with_schema(sql), sql
+
+
+def test_without_a_schema_the_guard_behaves_exactly_as_before():
+    """The map is optional, and its absence must not quietly loosen anything.
+
+    Every production path reaches this through `decide`, which forwards `visible` -- so the
+    unmapped behaviour is what a direct caller and this test file get, and it must stay the strict
+    one. Loosening on a missing map would make forgetting to pass it a silent grant.
+    """
+    assert _is_refused("SELECT id FROM claim_amount WHERE claim_amount > 10")
+    assert not _with_schema("SELECT id FROM claim_amount WHERE claim_amount > 10")
+
+
+def test_a_column_name_from_another_scope_does_not_exempt_a_row_here():
+    """The schema has to be read per SCOPE, not unioned over the statement.
+
+    A flat set of "every column name anywhere in this query" let a name that is a column
+    SOMEWHERE exempt a whole-row reference WHERE IT IS NOT. Here `other.claim` is a column and
+    `claim.claim` is not, so the outer `SELECT claim FROM claim` is the row -- and DuckDB returns
+    the whole struct, `ssn` included, past a CLS check that sees no `exp.Column` named `ssn`.
+    """
+    schema = {"claim": {"id", "ssn"}, "other": {"claim", "id"}}
+    assert isinstance(
+        check_shape("SELECT claim FROM claim WHERE id IN (SELECT claim FROM other)",
+                    columns=schema),
+        Refusal,
+    )
+    # The extraction oracle rides back in on the same exemption.
+    assert isinstance(
+        check_shape("SELECT id FROM claim WHERE claim['ssn'] = 'x' "
+                    "AND id IN (SELECT claim FROM other)", columns=schema),
+        Refusal,
+    )
+    # The inner reference really is `other.claim`, and stays allowed on its own.
+    assert not isinstance(check_shape("SELECT claim FROM other", columns=schema), Refusal)
+
+    # The MIRROR: an OUTER table's column must not exempt a row reference in an INNER scope where
+    # the name is a source. Measured on DuckDB, the inner bare `claim` binds to the inner table's
+    # row struct, not to the correlated `other.claim` -- so the oracle works, and returns the row
+    # on a correct guess and nothing on a wrong one.
+    assert isinstance(
+        check_shape("SELECT id FROM other WHERE EXISTS "
+                    "(SELECT 1 FROM claim WHERE claim['ssn'] = 'x')", columns=schema),
+        Refusal,
+    )
+
+
+def test_a_cte_shadowing_a_granted_table_does_not_borrow_its_columns():
+    """A CTE reference is an `exp.Table`, so keying the schema on it lends a base table's columns
+    to something that is not that table.
+
+    `WITH other AS (SELECT id FROM other)` shadows the granted `other`, whose column list contains
+    `claim`. That made the bare `claim` in the outer select look like a column, the row rule was
+    never reached, and DuckDB returned the whole `claim` struct -- denied `ssn` included -- past a
+    CLS check that sees no column for it.
+    """
+    schema = {"claim": {"claim_identifier", "ssn"}, "other": {"claim", "id"}}
+    assert isinstance(
+        check_shape("WITH other AS (SELECT id FROM other) SELECT claim FROM claim, other",
+                    columns=schema),
+        Refusal,
+    )
+    # Without the shadowing CTE the same name really is `other.claim`, and stays allowed.
+    assert not isinstance(check_shape("SELECT claim FROM claim, other", columns=schema), Refusal)
+
+
+def test_a_derived_table_cannot_exempt_anything_through_the_schema():
+    """The schema is keyed by BASE table, so a derived table must not lend its alias to the lookup.
+
+    What makes this hold is `object_key`, which answers `""` for an `exp.Subquery` -- so the map is
+    missed whatever the alias is. The `isinstance(source, exp.Table)` guard beside it is belt to
+    that braces and would not be missed by this test on its own; the mechanism worth knowing is the
+    key, and a caller that built the map from ALIASES rather than table names is what would break
+    it: the star walk then never opens the derived table and the star over `claim` inside it is
+    never examined.
+    """
+    schema = {"claim": {"id", "ssn"}, "t": {"t", "id"}}
+    assert isinstance(
+        check_shape("SELECT max(t) AS x FROM (SELECT * FROM claim) t", columns=schema), Refusal
+    )
+    assert isinstance(
+        check_shape("SELECT t FROM (SELECT * FROM claim) t", columns=schema), Refusal
+    )
+
+
+def test_a_column_of_ANOTHER_table_in_scope_also_resolves():
+    """Bare names resolve across every source in the FROM, not only the one they look like."""
+    schema = {"claim": {"claim_identifier"}, "other": {"claim"}}
+    assert not isinstance(check_shape("SELECT claim FROM claim, other", columns=schema), Refusal)
+    # And with no such column anywhere, it is the row again.
+    assert isinstance(check_shape("SELECT claim FROM claim, other",
+                                  columns={"claim": {"claim_identifier"}, "other": {"id"}}),
+                      Refusal)

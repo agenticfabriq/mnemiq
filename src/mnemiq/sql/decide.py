@@ -39,7 +39,12 @@ def decide(
     the model that the table exists.
     """
     policy = policy or AccessPolicy()
-    shaped = check_shape(sql, dialect=dialect, max_rows=max_rows, executes_as=target)
+    # M88: `visible` is the schema, and the shape check was guessing about the same names at
+    # the same moment -- is a bare `claim_amount` the column or the whole row? Handing it the
+    # map two lines before `check_access` gets it turns three findings' worth of fail-closed
+    # false refusals into a question with an answer.
+    shaped = check_shape(sql, dialect=dialect, max_rows=max_rows, executes_as=target,
+                         columns=visible)
     if isinstance(shaped, Refusal):
         return shaped
 
