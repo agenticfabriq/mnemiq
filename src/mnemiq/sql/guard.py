@@ -279,6 +279,9 @@ def _resolve_bare(column: exp.Column,
       nor a column of a table and nothing may be rewritten. `ORDER BY claim_amount` against
       `amount AS claim_amount` was qualified to `claim_amount.claim_amount` and repointed the sort;
     * exactly ONE source claiming the name resolves it to that column;
+    * a CTE reference is skipped when reading the schema: it is an `exp.Table`, so the lookup
+      would hand it the columns of whatever BASE table it shadows, and `WITH other AS (...)`
+      borrowed the granted `other`'s column list and returned a struct with a denied field in it;
     * two or more claiming it is unresolvable, and so is a name that collides with a source no
       snapshot claims -- both answer "row", which refuses. Leaving an ambiguous one bare put the
       M90 leak back verbatim: measured, a snapshot claiming the name on two tables that do not have

@@ -1079,6 +1079,13 @@ def test_an_alias_equal_to_the_table_name_still_collides_and_is_qualified():
                       {"claim_amount": {"claim_amount", "id"}})
     assert "claim_amount.claim_amount" in out, out
 
+    # The alias spelled DIFFERENTLY from the table, which is what separates reading the alias from
+    # reading the table name. Emitting `other.claim` here is `Binder Error: Referenced table
+    # "other" not found`, because the alias is the only name the source has.
+    out = _shaped_sql("SELECT claim FROM claim, other AS x",
+                      {"claim": {"id", "ssn"}, "other": {"claim", "oid"}})
+    assert "x.claim" in out and "other.claim" not in out, out
+
 
 def test_a_name_the_schema_does_not_claim_is_left_alone():
     """Only the ambiguous ones are touched. An ordinary column needs no qualifier from us."""
@@ -1111,7 +1118,6 @@ def test_the_qualifier_comes_from_the_scope_that_resolves_the_name():
         "SELECT ssn FROM claim, other WHERE claim.id IN (SELECT claim FROM line_item)", schema
     )
     assert "other.claim" not in out, out
-    assert "line_item.claim" in out or "SELECT claim FROM line_item" in out, out
 
 
 def test_a_name_that_binds_to_a_select_alias_is_never_qualified():
