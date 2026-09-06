@@ -33,7 +33,7 @@
 # 0 in every run since.
 #
 # The THIRD case that moved, `fire-count`, is model variance and nearly went into the record as
-# progress. Across the eleven runs that have produced a comparison it is wrong in EIGHT. Three came
+# progress. Across the twelve runs that have produced a comparison it is wrong in EIGHT. Three came
 # in at 100.0/88.0 -- including one that passed against the 100.0 baseline while it was briefly
 # recorded, which is the run hardest on this conclusion and is why it is named rather than left out
 # of the tally. Then two at 96.0/84.0 with the case wrong again. Recording 100.0 against a tolerance

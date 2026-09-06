@@ -35,7 +35,7 @@ passes; the harness reports both exact-match and got-the-facts accuracy.
 | BIRD mini-dev (487 answerable, 11 unseen schemas) | 42.3% | 63.2% | `gpt55-duckdb-pg.jsonl` |
 | Spider 2.0-lite (135 local of 547, 30 schemas) | 37.0% | 58.5% | `spider2-full-k24.jsonl` |
 
-<a id="a-note-on-the-acme-row"></a>**A note on the ACME row.** That run is a favourable sample of a corpus with one unstable case. Across the eleven CI runs of the nightly gate that produced a comparison, `fire-count` is answered wrongly in eight of them, and the level the project actually gates on is 96.0% got-the-facts (`evals/trend.json`; the exact-match figure is recorded beside it but not compared by anything — M87). The row above is not false — it names its run, and that run really scored it — but the reproducible number is one case lower, and a reader comparing the headline against the gate deserves to be told which is which.
+<a id="a-note-on-the-acme-row"></a>**A note on the ACME row.** That run is a favourable sample of a corpus with one unstable case. Across the twelve CI runs of the nightly gate that produced a comparison, `fire-count` is answered wrongly in eight of them, and the level the project actually gates on is 96.0% got-the-facts (`evals/trend.json`; the exact-match figure is recorded beside it but not compared by anything — M87). The row above is not false — it names its run, and that run really scored it — but the reproducible number is one case lower, and a reader comparing the headline against the gate deserves to be told which is which.
 
 Each row names ONE run, and every number comes from that run alone — but not all of them are
 READ from it: BIRD's exact-match is a probe replayed against the gold engine, described below,
