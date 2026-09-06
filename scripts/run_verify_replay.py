@@ -45,7 +45,18 @@ class _RetryingJudge:
     signal. That is the second thing those counters bought.
     """
 
-    def __init__(self, judge, attempts: int = 4, backoff: float = 1.5) -> None:
+    # The backoff spans the OUTAGE, not just the request. MEASURED: at 1.5 the four attempts
+    # finish 10.5s after the first (1.5 + 3 + 6), and two consecutive 487-case sweeps each lost
+    # exactly one case -- a different one each time, each scoring fine minutes later, and one of
+    # them failing all four attempts again on a later run before succeeding on the next. Those are
+    # bursts lasting longer than the retry window, not four independent 1.4% draws, whose odds
+    # would be about 4e-8 per case. At 8 the same four attempts span 56s (8 + 16 + 32), which is
+    # past every blip observed here.
+    #
+    # The cost is paid only on the failing path: a case that answers first time never sleeps, so a
+    # healthy sweep is unchanged and a sweep with one bad case pays under a minute rather than
+    # losing the whole run's certification.
+    def __init__(self, judge, attempts: int = 4, backoff: float = 8.0) -> None:
         # `attempts < 1` makes the loop body never run, so every score is the fail-open constant
         # and the judge is never called at all -- `calls` stays 0. It would NOT certify silently
         # (control falls through to `gave_up += 1`, and the gate refuses on any non-zero
