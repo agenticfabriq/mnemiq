@@ -38,8 +38,20 @@ class Verifier:
             if v is not None:
                 return v
         if self.judge is not None:
+            # The counter delta, for the reason `_RetryingJudge` documents at length: `score` swallows
+            # the exception and returns the fail-open constant, so the RETURN VALUE cannot say whether
+            # a judgement happened. `fallbacks` counts errors plus unreadable replies; a judge without
+            # the counter (FakeJudge, a stub) is taken at its word rather than assumed broken.
+            before = getattr(self.judge, "fallbacks", None)
             c = self.judge.score(
                 packet.question, _cards_text(packet), approved.plan_sql, render_result(table, max_rows=5)
             )
+            if before is not None and getattr(self.judge, "fallbacks", before) != before:
+                # Answer anyway -- that is the product's decision and it is unchanged -- but stop
+                # calling it verified. This is the shape M89 was: the verifier switched off against
+                # every reasoning model and every answer still read as confidently checked.
+                return VerifyVerdict(c, False,
+                                     "The verifier could not be reached; this answer was not checked.",
+                                     "judge_unavailable")
             return VerifyVerdict(c, c < self.threshold, "The result may not correctly answer the question.", "judge")
         return VerifyVerdict.passed()
