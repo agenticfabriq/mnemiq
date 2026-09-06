@@ -205,6 +205,15 @@ def test_each_rate_is_compared_against_its_own_predecessor():
     assert unchanged.accuracy == 0.96 and unchanged.strict_accuracy == 0.84
     assert check_regression(unchanged, previous) is None
 
+    # The MIRROR substitution, which is the loosening one and therefore the one that matters:
+    # got-the-facts compared against the previous STRICT rate. With realistic baselines strict sits
+    # below accuracy, so the product metric would be judged against the lower number and this run
+    # -- accuracy 96.0% -> 88.0%, two answerable cases lost -- would pass green.
+    dropped = _shaped(correct=22, correct_facts=0, total=25)
+    assert dropped.accuracy == 0.88 and dropped.strict_accuracy == 0.88
+    message = check_regression(dropped, previous)
+    assert message is not None and "got-the-facts" in message.lower(), message
+
 
 def test_the_exact_rate_improving_is_not_a_regression():
     previous = RunRecord(source_id="acme", run_at="t0", accuracy=0.96, strict_accuracy=0.84,
