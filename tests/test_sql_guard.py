@@ -688,22 +688,51 @@ def test_a_field_read_from_a_whole_row_is_refused_in_every_clause():
         assert _is_refused(sql), sql
 
 
-def test_a_column_that_shares_its_table_name_still_works_in_a_predicate():
-    """M84's false refusal must not reappear one clause over.
+def test_a_comparison_against_a_whole_row_is_refused_too():
+    """The reason the rule outside the projection is blanket rather than clever.
 
-    These name a column, so `check_cls` sees it and can rule on it -- which is the whole difference.
-    A comparison or an arithmetic operator cannot reach a field of a struct, so there is nothing
-    here that a grant check cannot see.
+    The first version refused subscripts, dots and calls, reasoning that only those can reach a
+    field. True of extracting a value, false about the threat: DuckDB compares structs
+    field-by-field, so this is a binary search over a denied column with no subscript, dot or call
+    in it -- measured 1/0/0 against the real value on a live DuckDB.
     """
-    for sql in (
-        "SELECT id FROM claim_amount WHERE claim_amount > 10",
-        "SELECT id FROM claim_amount WHERE claim_amount BETWEEN 1 AND 2",
-        "SELECT id FROM claim_amount ORDER BY claim_amount",
-        "SELECT id FROM claim_amount GROUP BY id HAVING sum(claim_amount) > 10",
-        "SELECT id FROM claim_amount WHERE claim_amount IS NOT NULL",
-        "SELECT id FROM claim_amount WHERE claim_amount + 1 > 10",
-    ):
-        assert not _is_refused(sql), sql
+    assert _is_refused(
+        "SELECT count(*) FROM claim WHERE claim > {'claim_identifier': 1, 'ssn': 'guess'}"
+    )
+    assert _is_refused("SELECT claim_identifier FROM claim ORDER BY claim")
+    assert _is_refused("SELECT count(*) FROM claim GROUP BY claim")
+
+
+def test_a_correlated_reference_to_an_outer_row_is_refused():
+    """Names resolve OUTWARD, so the nearest select is not the whole answer.
+
+    Resolving a bare reference against only the innermost select's sources missed an outer table
+    entirely, and the oracle survived one `EXISTS (...)` deep -- verified returning the row for a
+    correct guess and nothing for a wrong one.
+    """
+    assert _is_refused(
+        "SELECT claim_identifier FROM claim WHERE EXISTS "
+        "(SELECT 1 FROM policy WHERE claim['ssn'] = 'x')"
+    )
+    assert _is_refused(
+        "SELECT p.id FROM policy p WHERE EXISTS (SELECT 1 FROM claim WHERE claim['ssn'] = 'x')"
+    )
+
+
+def test_a_table_named_column_in_a_predicate_is_a_known_false_refusal():
+    """Pinned REFUSED on purpose, so the next person meets the decision rather than the bug.
+
+    Nothing here can tell a column that shares its table's name from the row itself, and outside
+    the projection every use of the row turned out to leak. So this pays the same price the
+    projection rule has always paid. No ACME gold case filters or orders on such a column --
+    checked, not assumed -- and `WHERE c.claim_amount > 10` names a column and is allowed, which
+    is the rewrite that makes it work. Filed as M88.
+    """
+    assert _is_refused("SELECT id FROM claim_amount WHERE claim_amount > 10")
+    assert _is_refused("SELECT id FROM claim_amount ORDER BY claim_amount")
+    # The escape hatch, and the reason the cost is bounded.
+    assert not _is_refused("SELECT c.id FROM claim_amount c WHERE c.claim_amount > 10")
+    assert not _is_refused("SELECT c.id FROM claim_amount c ORDER BY c.claim_amount")
 
 
 def test_indexing_a_list_column_is_not_a_row_read():

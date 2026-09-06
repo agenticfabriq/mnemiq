@@ -51,7 +51,7 @@ def check_shape(
     # and targeting postgres, so keying the fold on the parse dialect answers for the wrong engine.
     # Production passes them equal, which is exactly why the mismatch would not have surfaced.
     if _has_projection_star(ast, executes_as or dialect) or _projects_a_row(ast) \
-            or _reads_a_field_of_a_row(ast):
+            or _uses_a_row_outside_the_projection(ast):
         return Refusal(
             code=RefusalCode.SELECT_STAR,
             message=(
@@ -238,63 +238,78 @@ def _projects_a_row(ast: exp.Expression) -> bool:
 
 
 
-def _owning_select(node: exp.Expression) -> exp.Select | None:
-    """The SELECT this node is written in, so its names resolve against the right sources."""
-    parent = node.parent
-    while parent is not None:
-        if isinstance(parent, exp.Select):
-            return parent
-        parent = parent.parent
-    return None
+def _visible_sources(node: exp.Expression) -> dict[str, exp.Expression]:
+    """Every source a name here could resolve to, from this SELECT outward.
 
-
-def _reads_a_field_of_a_row(ast: exp.Expression) -> bool:
-    """Does anything here read a FIELD of a whole-row reference, in any clause?
-
-    **Register M86.** `_projects_a_row` scans `select.expressions`, so every clause but the
-    projection was unguarded. `check_cls` does walk the whole statement -- but it can only rule on
-    columns that are SPELLED, and `claim['ssn']` yields `Column(claim)` with no `exp.Column` named
-    `ssn` anywhere. So `policy.denies` is asked about `claim`, answers no, and the row count answers
-    the predicate: a binary oracle over a column the caller may not read, one WHERE clause at a
-    time.
-
-    The rule has to separate reading a field from using a column that happens to share its table's
-    name, which is M84 and which `WHERE claim_amount > 10` does legitimately. Reaching a field of a
-    struct takes a subscript, a dot, or a function call; a comparison or an arithmetic operator
-    cannot. So those three are refused over a bare source reference and operators are not.
-
-    That direction matters: it is a closed list of what CAN extract, not an open list of extraction
-    spellings. `struct_extract(claim, 'ssn')` is a function and refused without being named, and a
-    spelling nobody has thought of is still a subscript, a dot or a call. Naming the dangerous
-    functions instead would leak the moment the list fell behind DuckDB.
+    Correlated references resolve OUTWARD, so the nearest select is not enough: a bare row
+    reference to an outer query's table, written inside a subquery, resolves against the inner
+    select's sources, misses, and would be waved through. Measured -- the oracle below survived one
+    `EXISTS (...)` deep, and again through `LATERAL`.
     """
-    for column in ast.find_all(exp.Column):
-        if column.table:
-            continue  # qualified: it names a column, and `check_cls` can rule on it
-        select = _owning_select(column)
-        if select is None:
-            continue
-        sources = {name.lower(): source for name, source in _sources(select).items()}
-        source = sources.get(column.name.lower())
-        if source is None:
-            continue  # names a column, not a source: `tags[1]` is list indexing
-        # A derived table or CTE is bounded by its OWN projection, and the star walk is what
-        # decides whether that projection reaches a base table -- the same division of labour
-        # `_projects_a_row` keeps. Refusing here would forbid `UNNEST(t) FROM (SELECT id FROM
-        # claim) t`, which is explicit and legitimate.
-        if isinstance(source, exp.Subquery):
-            continue
-        # `Paren` is not the extraction, it is punctuation around the row: `(claim).ssn` parses as
-        # `Dot(Paren(Column(claim)), ssn)`, so a parent test that stopped at the paren read the
-        # dot as absent and let the oracle through.
-        parent = column.parent
-        while isinstance(parent, exp.Paren):
-            parent = parent.parent
-        if isinstance(parent, (exp.Bracket, exp.Dot)):
-            return True
-        if isinstance(parent, exp.Func) and not isinstance(parent, _COLLAPSING_AGGREGATES):
+    sources: dict[str, exp.Expression] = {}
+    scope = node.parent
+    while scope is not None:
+        if isinstance(scope, exp.Select):
+            for name, source in _sources(scope).items():
+                sources.setdefault(name.lower(), source)
+        scope = scope.parent
+    return sources
+
+
+def _uses_a_row_outside_the_projection(ast: exp.Expression) -> bool:
+    """Is a whole-row reference used anywhere but the projection?
+
+    **Register M86.** `_projects_a_row` scans `select.expressions`, so WHERE, ORDER BY, GROUP BY
+    and HAVING were unguarded. `check_cls` walks the whole statement but can only rule on columns
+    that are SPELLED, and `claim['ssn']` yields `Column(claim)` with no `exp.Column` named `ssn` --
+    so `policy.denies` is asked about `claim`, answers no, and the row count answers the predicate.
+    A caller who may not read `ssn` recovers it one guess at a time.
+
+    **Blanket, matching what the projection already does, after two narrower rules leaked.** The
+    first refused subscripts, dots and calls on the reasoning that only those can reach a field.
+    That is true of EXTRACTING a value and false about the threat: DuckDB compares structs
+    field-by-field, so `WHERE claim > {'claim_identifier': 1, 'ssn': <guess>}` is a binary search
+    over a denied column with no subscript, dot or call anywhere in it -- measured 1/0/0 across the
+    real value. `ORDER BY claim` and `GROUP BY claim` leak the same way. Once comparison operators
+    are dangerous too, what is left to permit is nothing, and the discriminating rule was only ever
+    a list of the leaks that had been thought of.
+
+    The cost is real and is the same cost the projection rule already pays: `WHERE claim_amount >
+    10` is refused, because nothing here can tell a column that shares its table's name from the
+    row itself. No ACME gold case filters or orders on one -- checked, not assumed -- and the
+    engine can rewrite it as `WHERE c.claim_amount > 10`, which names a column and is allowed.
+    Filed as M88 rather than left as a surprise.
+    """
+    for select in ast.find_all(exp.Select):
+        for column in select.find_all(exp.Column):
+            if column.table:
+                continue  # qualified: it names a column, and `check_cls` can rule on it
+            if _in_projection(column, select):
+                continue  # `_projects_a_row` owns that clause, with its own exemptions
+            source = _visible_sources(column).get(column.name.lower())
+            if source is None:
+                continue  # names a column, not a source: `tags[1]` is list indexing
+            # A derived table or CTE is bounded by its OWN projection, and the star walk decides
+            # whether that projection reaches a base table -- the same division of labour
+            # `_projects_a_row` keeps. Refusing here would forbid `UNNEST(t) FROM (SELECT id FROM
+            # claim) t`, which is explicit and legitimate.
+            if isinstance(source, exp.Subquery):
+                continue
+            if isinstance(column.parent, _COLLAPSING_AGGREGATES):
+                continue  # M84: `sum` of a struct is a type error, so nothing escapes either way
             return True
     return False
+
+
+def _in_projection(column: exp.Expression, select: exp.Select) -> bool:
+    """Is this column part of the SELECT list, rather than a clause hanging off it?"""
+    node = column
+    while node is not None and node is not select:
+        if node.parent is select:
+            return any(node is projection for projection in select.expressions)
+        node = node.parent
+    return False
+
 
 def _sources(select: exp.Select) -> dict[str, exp.Expression]:
     """Everything the SELECT reads from, keyed by the name a star could be qualified with."""
