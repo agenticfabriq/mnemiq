@@ -186,3 +186,76 @@ def test_zero_attempts_is_refused_rather_than_silently_skipping_the_judge():
     r = _retrying(j, attempts=1)
     assert r.score("q", "s", "x", "p") == 1.0
     assert (j.calls, r.gave_up) == (1, 1)
+
+
+def test_a_failing_call_is_retried_and_backs_off(monkeypatch):
+    """What the retry is actually for, now that the outage story is gone.
+
+    An earlier test asserted the window exceeded 45s, on the theory that it had to outlast an
+    endpoint outage. It did not: raising the reasoning reserve took endpoint errors from 7, 6 and 4
+    per ~490 calls to 0 in 487, so those failures were this code truncating its own requests. There
+    is no measured outage length to size against, and a test asserting one would pin a number to a
+    story rather than to evidence. What IS worth pinning is the SHAPE: that a failure retries at all, and that successive waits
+    grow rather than repeat. And a floor, which the first version of this
+    left out: growth alone is satisfied by a backoff of 0.001, whose four attempts finish inside
+    ten milliseconds -- hammering an endpoint that has just failed.
+
+    The floor is sized from REQUEST RATE, not from any outage length. That distinction is the whole
+    point: the retracted claim needed to know how long a provider stays down, which nothing here
+    ever measured, whereas "do not re-ask a failing endpoint more than once a second" needs only a
+    view about politeness and holds whatever the provider is doing.
+    """
+    import pathlib
+    import sys
+
+    scripts = str(pathlib.Path(__file__).resolve().parents[1] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import run_verify_replay as rvr
+
+    slept: list[float] = []
+    monkeypatch.setattr(rvr.time, "sleep", slept.append)
+    attempts = _argparse_default_attempts(rvr)
+    judge = _AlwaysErrors()
+    rvr._RetryingJudge(judge, attempts=attempts).score("q", "s", "SELECT 1", "p")
+
+    assert judge.calls == attempts, "every attempt should have been made"
+    assert len(slept) == attempts - 1, "one wait between each pair of attempts"
+    assert slept == sorted(slept) and slept[0] < slept[-1], f"waits do not grow: {slept}"
+    assert min(slept) >= 1.0, f"retries faster than 1/s hammer a failing endpoint: {slept}"
+
+
+def _argparse_default_attempts(rvr) -> int:
+    """Read `--judge-attempts`'s default off the parser the script actually builds, so the test
+    tracks the value sweeps run with rather than a constructor default nothing passes."""
+    import argparse
+    from unittest.mock import patch
+
+    captured = {}
+    real_add = argparse.ArgumentParser.add_argument
+
+    def spy(self, *a, **kw):
+        if a and a[0] == "--judge-attempts":
+            captured["v"] = kw["default"]
+        return real_add(self, *a, **kw)
+
+    with patch.object(argparse.ArgumentParser, "add_argument", spy), patch.object(
+            argparse.ArgumentParser, "parse_args", side_effect=SystemExit):
+        try:
+            rvr.main()
+        except SystemExit:
+            pass
+    assert "v" in captured, "--judge-attempts not found; the flag was renamed"
+    return captured["v"]
+
+
+class _AlwaysErrors:
+    """Errors on every call, so the retry loop runs to exhaustion and every sleep is taken."""
+
+    def __init__(self) -> None:
+        self.calls = self.errors = self.unparsed = 0
+
+    def score(self, *_args, **_kw) -> float:
+        self.calls += 1
+        self.errors += 1
+        return 1.0

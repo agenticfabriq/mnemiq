@@ -45,6 +45,19 @@ class _RetryingJudge:
     signal. That is the second thing those counters bought.
     """
 
+    # Retries exist because this is a network call, and for no stronger reason than that. An
+    # earlier version of this comment claimed the window had to outlast an OUTAGE, and widened the
+    # backoff to 8 on the strength of sweeps that each lost one case -- which that comment read
+    # as a different case each time, and which later turned out to be the same hard case. That
+    # explanation was wrong. Raising the reasoning reserve to 4096 took endpoint errors from
+    # 7, 6 and 4 per ~490 calls to 0 in 487 -- under the old rate the chance of a clean run is
+    # 0.4% -- so every "endpoint error" measured here was this code truncating its own request,
+    # not the provider faltering. No genuine outage was ever demonstrated, and a window sized for
+    # one would be sized for nothing.
+    #
+    # 1.5 restored deliberately. The wider value cost nothing on the success path, which is exactly
+    # why it could have stayed: an unfalsifiable comfort, justified by a story already known to be
+    # false.
     def __init__(self, judge, attempts: int = 4, backoff: float = 1.5) -> None:
         # `attempts < 1` makes the loop body never run, so every score is the fail-open constant
         # and the judge is never called at all -- `calls` stays 0. It would NOT certify silently
@@ -109,7 +122,20 @@ class _CachingJudge:
         key = hashlib.sha1(f"{self._model}\x00{question}\x00{sql}".encode()).hexdigest()
         if key in self._cache:
             return self._cache[key]
+        gave_up_before = getattr(self._judge, "gave_up", 0)
         s = self._judge.score(question, schema, sql, preview)
+        # NEVER PERSIST A NON-JUDGEMENT. A fail-open score is exactly 1.0, which is also what a
+        # judge returns when it approves, so a cached constant cannot be told from a verdict by
+        # inspection afterwards -- and the whole cache then has to be thrown away and re-paid for
+        # to remove one case. MEASURED: a single transient burst left 1 unrecovered case in a
+        # 487-call sweep, and repairing it any other way meant re-scoring all 487. Skipping the
+        # write leaves that case ABSENT, which a re-run refills by scoring exactly it.
+        #
+        # The counter delta is the signal, the same way `_RetryingJudge` reads `errors` -- a
+        # recovered retry increments `errors` while still producing a real judgement, so `errors`
+        # is the wrong counter to key on here and `gave_up` is the right one.
+        if getattr(self._judge, "gave_up", 0) != gave_up_before:
+            return s
         self._cache[key] = s
         json.dump(self._cache, open(self._path, "w"))
         return s
@@ -151,7 +177,7 @@ def main() -> int:
     tag = "".join(ch if ch.isalnum() else "_" for ch in model)
     inner_judge = SemanticJudge(client)
     judge = _CachingJudge(_RetryingJudge(inner_judge, attempts=args.judge_attempts),
-                          f"{args.run}.judgecache.{tag}.json", model)
+                          f"{args.run}.judgecache2.{tag}.json", model)
 
     @functools.lru_cache(maxsize=None)
     def cards_for(db_id: str) -> str:

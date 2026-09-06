@@ -50,7 +50,13 @@ VERSION_CODE="$(printf '%s' "$VERSION_BODY" | tail -n1)"
 VERSION_JSON="$(printf '%s' "$VERSION_BODY" | sed '$d')"
 
 TAG="$(python3 -c 'import sys; print("".join(c if c.isalnum() else "_" for c in sys.argv[1]))' "$SERVED")"
-CACHE="${RUN}.judgecache.${TAG}.json"
+# `judgecache2`, and the 2 is load-bearing. A cache file cannot describe its own contents:
+# `_CachingJudge` INHERITS every entry of any file it finds at this path and rewrites them all, so
+# a flag written by the current process states what wrote the FLAG, not what wrote the ENTRIES.
+# The format version in the NAME says the one thing that cannot be inherited -- only code that
+# never persists a fail-open has ever created a file called `judgecache2`. A pre-guarantee cache
+# is simply not found and is re-scored, which is the safe direction to be wrong in.
+CACHE="${RUN}.judgecache2.${TAG}.json"
 PROV="${RUN}.judgeprov.${TAG}.json"
 ERRS="${RUN}.judgeerrors.${TAG}.json"
 
@@ -69,6 +75,19 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 # the cache and no error record, which the branch below handles. This is the other way round: a
 # sweep that finished having made zero judge calls, or a hand-deleted cache. Archive both files, or
 # the next run overwrites the record AND truncates the provenance naming whose counts those were.
+# The rename to `judgecache2` leaves any pre-guarantee `judgecache` beside the run, and nothing
+# below looks at it -- so without this the operator sees a clean run and never learns that a cache
+# whose entries may be fail-open constants is still sitting there, one `git checkout` of an older
+# script away from being loaded again. Named, and moved out of the way, but NOT deleted: its scores
+# are the only record of what that sweep produced.
+LEGACY="${RUN}.judgecache.${TAG}.json"
+if [ -f "$LEGACY" ]; then
+  mv "$LEGACY" "${LEGACY}.pre-purity.${STAMP}"
+  echo "  NOTE: a pre-guarantee cache was beside this run and has been set aside ->"
+  echo "        $(basename "${LEGACY}.pre-purity.${STAMP}") ($(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "${LEGACY}.pre-purity.${STAMP}") entries)"
+  echo "        Its scores cannot be told apart from fail-open constants, which is why this run"
+  echo "        will re-score rather than resume from it."
+fi
 if [ ! -f "$CACHE" ] && [ -f "$ERRS" ]; then
   mv "$ERRS" "${ERRS}.superseded.${STAMP}"
   echo "  archived an orphan error record (no cache beside it) -> $(basename "${ERRS}.superseded.${STAMP}")"
