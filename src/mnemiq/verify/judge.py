@@ -48,12 +48,11 @@ class SemanticJudge:
         # in them is derivable from `read`, whose `fell_open` sums to the total and whose `reason`
         # tallies to the same errors/unparsed split. They are kept because a sweep wants the figure
         # without holding every result, not because they are the only source. DO NOT write that
-        # they are. This comment has claimed exclusivity three times and the last two were false
-        # WHEN WRITTEN, not overtaken later: one asserted the counters were the only aggregate
-        # source three commits after `fell_open` existed, the next that they alone carried the
-        # cause split two commits after `reason` was added -- each disproved by a field already in
-        # this dataclass, a few lines up, while the comment was being edited. The failure is not
-        # falling behind the code; it is asserting uniqueness without reading what is beside it.
+        # they are. That claim has been made here repeatedly and has been false on arrival more
+        # than once -- disproved by a field already sitting in `JudgeRead` a few lines up, while
+        # this very comment was being edited. The trap is not the code outrunning the comment; it
+        # is asserting uniqueness without reading what is beside it. `git log -p` on this file has
+        # the instances, and needs no tally here to stay accurate.
         # They change no behaviour and cost an increment.
         #
         # They are NOT the per-call signal, and were briefly used as one: a caller diffing them
