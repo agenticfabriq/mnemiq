@@ -86,15 +86,17 @@ class _RetryingJudge:
     def read(self, *args, **kwargs) -> JudgeRead:
         """Retry a failed judge call, and report whether a judgement was ever obtained.
 
-        This is the PRIMITIVE and `score` delegates to it, rather than the other way round. The
-        first version called `score` and diffed `gave_up` around it -- a before/after read of
-        mutable state, which is precisely the pattern `SemanticJudge.read` exists to retire, and
-        and it was CORRECT -- the objection is not that it
-        gave wrong answers but that nothing could tell it from `gave_up > 0`, since every test built
-        a fresh wrapper and read once. In a sweep there is ONE wrapper for every case, and the
-        absolute form would then mark every answer after the first unrecovered one as unavailable.
-        Returning the fact from the branch that knows it needs no counter, so the two forms are no
-        longer even expressible.
+        This is the PRIMITIVE and `score` delegates to it, rather than the other way round.
+
+        The version this replaced called `score` and diffed `gave_up` around it. That gave the
+        RIGHT answer; what was wrong is that nothing could tell it apart from the absolute
+        `gave_up > 0`, because every test built a fresh wrapper and read once. A sweep builds ONE
+        wrapper for every case, where the absolute form marks every answer after the first
+        unrecovered one as unavailable. Returning the fact from the branch that decided it needs no
+        counter, so this call's outcome no longer depends on the wrapper's history.
+
+        The delta form is still right where the question really is "did anything change" --
+        `_CachingJudge` below uses it to decide whether to persist, and should.
         """
         last = 1.0
         for attempt in range(self._attempts):
