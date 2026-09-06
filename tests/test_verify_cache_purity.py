@@ -88,3 +88,39 @@ def test_a_score_recovered_on_retry_IS_written(tmp_path):
     assert c.score("q", "s", "SELECT 1", "p") == 0.25
     assert inner.errors == 1                                    # it did fail once
     assert list(json.load(open(tmp_path / "c.json")).values()) == [0.25]
+
+
+def test_entries_are_INHERITED_from_whatever_file_is_at_the_path(tmp_path):
+    """Why the guarantee cannot be recorded as a flag inside the file.
+
+    `_CachingJudge` loads any cache it finds and rewrites the whole dict, so entries written by an
+    older, pre-guarantee process survive untouched into a file the current process then stamps.
+    A flag written here would state which version wrote the FLAG, never which wrote the ENTRIES --
+    so the format version lives in the FILE NAME instead, where it cannot be inherited.
+    """
+    path = tmp_path / "c.json"
+    path.write_text(json.dumps({"inherited-key": 1.0}))     # as a pre-guarantee run would leave it
+    judge = _Judge()
+    c = _CachingJudge(_RetryingJudge(judge, attempts=2, backoff=0), str(path), "m")
+    c.score("q", "s", "SELECT 1", "p")
+    on_disk = json.load(open(path))
+    assert on_disk["inherited-key"] == 1.0       # untouched, unexamined, and now beside new scores
+    assert judge.calls == 1                      # the new case was scored; the old one never was
+
+
+def test_the_cache_path_carries_the_format_version():
+    """The guarantee is the NAME. If this ever reverts to `judgecache`, every pre-guarantee cache
+    on disk becomes loadable again -- and a fail-open constant in one is indistinguishable from a
+    verdict, which is the whole reason the version exists."""
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    # BOTH files, because the exemption rests on the shell's path just as much as the writer's:
+    # reverting only `rerun_local_judge.sh` would leave resume finding a pre-guarantee cache under
+    # the old name and certifying it, with every test here still green.
+    py = (scripts / "run_verify_replay.py").read_text()
+    sh = (scripts / "rerun_local_judge.sh").read_text()
+    assert ".judgecache2." in py and '.judgecache.{tag}' not in py
+    # The ASSIGNMENT, not any mention: the shell also names the legacy path deliberately, to set an
+    # older cache aside. Forbidding the string outright fails on that, which is a true report of
+    # the wrong thing.
+    assert 'CACHE="${RUN}.judgecache2.${TAG}.json"' in sh
+    assert 'CACHE="${RUN}.judgecache.${TAG}.json"' not in sh

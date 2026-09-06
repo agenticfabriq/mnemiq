@@ -164,7 +164,7 @@ def main() -> int:
     tag = "".join(ch if ch.isalnum() else "_" for ch in model)
     inner_judge = SemanticJudge(client)
     judge = _CachingJudge(_RetryingJudge(inner_judge, attempts=args.judge_attempts),
-                          f"{args.run}.judgecache.{tag}.json", model)
+                          f"{args.run}.judgecache2.{tag}.json", model)
 
     @functools.lru_cache(maxsize=None)
     def cards_for(db_id: str) -> str:
