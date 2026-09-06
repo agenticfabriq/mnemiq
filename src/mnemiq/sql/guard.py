@@ -4,6 +4,7 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.sql.identifiers import resolve_name
+from mnemiq.sql.qualify import object_key
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 MAX_ROWS = 1000
@@ -14,12 +15,27 @@ _ALLOWED_ROOTS = (exp.Select, exp.Union)
 
 
 def check_shape(
-    sql: str, dialect: str = "duckdb", max_rows: int = MAX_ROWS, executes_as: str | None = None
+    sql: str, dialect: str = "duckdb", max_rows: int = MAX_ROWS, executes_as: str | None = None,
+    columns: dict[str, set[str]] | None = None,
 ) -> exp.Expression | Refusal:
     """Parse and enforce the shape of the query. Returns the AST, with a LIMIT guaranteed.
 
     The limit is *injected*, not requested: asking a model to add LIMIT is a request, and
     rewriting the tree is a guarantee.
+
+    **Register M88.** `columns` is the schema -- table to column names, the same `visible` map
+    `decide` hands `check_access` two lines later -- and supplying it ends a guess this file has
+    been paying for in three findings. Is a bare `claim_amount` the COLUMN or the whole ROW?
+    Without a schema that is unanswerable, so the rules fail closed and refuse legitimate queries
+    (M84's `sum(claim_amount)`, M85's distinct-count, M88's `WHERE claim_amount > 10`). With one it
+    is not a judgement call at all: DuckDB resolves the name to the COLUMN when one exists and to
+    the row only when none does -- measured both ways -- so a name that is a known column is a
+    column, and the row rules simply do not apply to it.
+
+    Optional, and its absence changes nothing. A caller that cannot supply a schema keeps the
+    fail-closed behaviour and the false refusals that come with it; loosening on a missing map
+    would make forgetting to pass it a silent grant, which is the shape this whole file exists
+    against.
     """
     try:
         statements = sqlglot.parse(sql, read=dialect)
@@ -50,8 +66,9 @@ def check_shape(
     # statement, and identifier folding belongs to the second: `decide` defaults to parsing duckdb
     # and targeting postgres, so keying the fold on the parse dialect answers for the wrong engine.
     # Production passes them equal, which is exactly why the mismatch would not have surfaced.
-    if _has_projection_star(ast, executes_as or dialect) or _projects_a_row(ast) \
-            or _uses_a_row_outside_the_projection(ast):
+    if _has_projection_star(ast, executes_as or dialect, columns) \
+            or _projects_a_row(ast, columns) \
+            or _uses_a_row_outside_the_projection(ast, columns):
         return Refusal(
             code=RefusalCode.SELECT_STAR,
             message=(
@@ -121,7 +138,8 @@ def _is_star(projection: exp.Expression) -> bool:
     return False
 
 
-def _names_a_source(select: exp.Select, projection: exp.Expression) -> exp.Expression | None:
+def _names_a_source(select: exp.Select, projection: exp.Expression,
+                    columns: dict[str, set[str]] | None = None) -> exp.Expression | None:
     """The SOURCE this projection references as a whole row, or None if it references none.
 
     Keyed on naming a SOURCE, which is what separates it from the legitimate use -- `UNNEST(tags)`
@@ -131,9 +149,11 @@ def _names_a_source(select: exp.Select, projection: exp.Expression) -> exp.Expre
     """
     sources = {name.lower(): source for name, source in _sources(select).items()}
     for column in projection.find_all(exp.Column):
-        source = None if column.table else sources.get(column.name.lower())
-        if source is not None:
-            return source
+        if column.table:
+            continue  # qualified: it names a column
+        source = _binds_to_a_row(column, columns)
+        if source is not None and column.name.lower() in sources:
+            return sources[column.name.lower()]
     return None
 
 
@@ -198,7 +218,8 @@ def _past_distinct(node: exp.Expression | None) -> exp.Expression | None:
     return node.parent if isinstance(node, exp.Distinct) else node
 
 
-def _projects_a_row(ast: exp.Expression) -> bool:
+def _projects_a_row(ast: exp.Expression,
+                    columns: dict[str, set[str]] | None = None) -> bool:
     """Is a whole ROW projected as a value, anywhere in the statement?
 
     A third spelling of the same expansion, containing no star at all. DuckDB resolves a bare
@@ -227,7 +248,7 @@ def _projects_a_row(ast: exp.Expression) -> bool:
     """
     for select in ast.find_all(exp.Select):
         for projection in select.expressions:
-            source = _names_a_source(select, projection)
+            source = _names_a_source(select, projection, columns)
             if source is None or isinstance(source, exp.Subquery):
                 continue
             if _every_bare_reference_is_aggregated(select, projection,
@@ -238,36 +259,71 @@ def _projects_a_row(ast: exp.Expression) -> bool:
 
 
 
-def _visible_sources(node: exp.Expression) -> dict[str, exp.Expression]:
-    """Every source a name here could resolve to, from this SELECT outward.
+def _binds_to_a_row(column: exp.Column, columns: dict[str, set[str]] | None) -> exp.Expression | None:
+    """The source this bare name binds to as a WHOLE ROW, or None if it is a column.
 
-    Correlated references resolve OUTWARD, so the nearest select is not enough: a bare row
-    reference to an outer query's table, written inside a subquery, resolves against the inner
-    select's sources, misses, and would be waved through. Measured -- the oracle below survived one
-    `EXISTS (...)` deep, and again through `LATERAL`.
+    **Innermost scope first, and stopping there.** SQL resolves a bare name in the nearest scope
+    that can answer it, and both directions of getting that wrong have now been measured:
+
+    * unioning every column name in the statement let `other.claim` exempt the row reference in
+      `SELECT claim FROM claim WHERE id IN (SELECT claim FROM other)`;
+    * walking OUTWARD for columns let the same `other.claim` exempt the INNER row reference in
+      `... FROM other WHERE EXISTS (SELECT 1 FROM claim WHERE claim['ssn'] = ...)`, where DuckDB
+      binds `claim` to the inner table's struct.
+
+    Both handed back a working extraction oracle past a `check_cls` that sees no `exp.Column` for
+    the field. So each scope is asked in turn and the FIRST one that resolves the name decides: a
+    column there means column, a source there means row, and only a scope that knows neither passes
+    the question outward -- which is what keeps M86's correlated case refused. A SUBQUERY source
+    answers neither: its columns are its own projection's business, and "unknown" has to read as
+    "not a known column" so a derived table cannot exempt anything.
+
+    **The guarantee this depends on, written here because it is not otherwise stated in this
+    repo.** The verdict comes from the SNAPSHOT and is trusted in the fail-OPEN direction: a
+    snapshot listing a column the live table no longer has makes `SELECT claim FROM claim` read as
+    a column reference and pass, while the engine binds the bare name to the row struct and hands
+    back every field, a denied one included. `prove`'s EXPLAIN succeeds on that statement, so it
+    does not separate the two. Before the schema was consulted the same drift cost a false
+    refusal; now it costs a leak. Whoever changes enrichment cadence owns that trade -- tracked as
+    M89 in the findings register, which lives outside this repo, which is why it is also here.
     """
-    sources: dict[str, exp.Expression] = {}
-    scope = node.parent
+    lookup = (
+        {key.lower(): {name.lower() for name in names} for key, names in columns.items()}
+        if columns else {}
+    )
+    # A CTE reference is an `exp.Table`, so the schema lookup would hand it the columns of whatever
+    # BASE table it shadows: `WITH other AS (SELECT id FROM other)` borrowed the granted `other`'s
+    # column list, made a bare `claim` look like a column, and returned the whole `claim` struct
+    # with a denied `ssn` in it. Matched without dialect folding on purpose -- over-matching a base
+    # table that shares a CTE's name costs a refusal, and under-matching costs the row rule.
+    root = column
+    while root.parent is not None:
+        root = root.parent
+    cte_names = {cte.alias_or_name.lower() for cte in root.find_all(exp.CTE)}
+    name = column.name.lower()
+    scope = column.parent
     while scope is not None:
-        # No scope boundary is honoured here, deliberately, after trying one. Stopping at a CTE
-        # looks right -- a CTE body should not see the outer FROM -- and DuckDB resolves outer
-        # columns into a CTE body nested in a correlated subquery anyway, so the break re-armed the
-        # oracle: `... WHERE EXISTS (WITH y AS (SELECT 1 WHERE claim['ssn'] = 'x') SELECT * FROM y)`
-        # returned the row for a correct guess and nothing for a wrong one.
-        #
-        # The false refusals this causes are the M88 collision seen across a scope: a bare name is
-        # refused when it matches ANY enclosing source name, so a local column called
-        # `claim_amount` inside a CTE is refused because an outer table is called that too. Same
-        # cost, same rewrite -- qualify it -- and the alternative was modelling four scoping rules
-        # that DuckDB does not follow, to buy back a shape the qualified spelling already handles.
         if isinstance(scope, exp.Select):
-            for name, source in _sources(scope).items():
-                sources.setdefault(name.lower(), source)
+            sources = {key.lower(): source for key, source in _sources(scope).items()}
+            # A column in THIS scope wins over a table of the same name in it -- which is what
+            # DuckDB does, measured -- and a SUBQUERY source answers neither, so its columns stay
+            # its own projection's business and cannot exempt anything.
+            if any(
+                isinstance(source, exp.Table)
+                and source.name.lower() not in cte_names
+                and name in lookup.get(object_key(source).lower(), frozenset())
+                for source in sources.values()
+            ):
+                return None
+            if name in sources:
+                return sources[name]
         scope = scope.parent
-    return sources
+    return None
 
 
-def _uses_a_row_outside_the_projection(ast: exp.Expression) -> bool:
+def _uses_a_row_outside_the_projection(
+    ast: exp.Expression, columns: dict[str, set[str]] | None = None
+) -> bool:
     """Is a whole-row reference used anywhere but the projection?
 
     **Register M86.** `_projects_a_row` scans `select.expressions`, so WHERE, ORDER BY, GROUP BY
@@ -285,11 +341,10 @@ def _uses_a_row_outside_the_projection(ast: exp.Expression) -> bool:
     are dangerous too, what is left to permit is nothing, and the discriminating rule was only ever
     a list of the leaks that had been thought of.
 
-    The cost is real and is the same cost the projection rule already pays: `WHERE claim_amount >
-    10` is refused, because nothing here can tell a column that shares its table's name from the
-    row itself. No ACME gold case filters or orders on one -- checked, not assumed -- and the
-    engine can rewrite it as `WHERE c.claim_amount > 10`, which names a column and is allowed.
-    Filed as M88 rather than left as a surprise.
+    **Given a schema this costs nothing** (M88): `WHERE claim_amount > 10` is allowed, because
+    `_binds_to_a_row` can see that `claim_amount` is a column of the table in scope. Without one it
+    is refused, the same fail-closed price the projection rule pays, and the qualified spelling
+    `WHERE c.claim_amount > 10` is the rewrite -- which the refusal message names.
     """
     for select in ast.find_all(exp.Select):
         for column in select.find_all(exp.Column):
@@ -297,9 +352,13 @@ def _uses_a_row_outside_the_projection(ast: exp.Expression) -> bool:
                 continue  # qualified: it names a column, and `check_cls` can rule on it
             if _in_projection(column, select):
                 continue  # `_projects_a_row` owns that clause, with its own exemptions
-            source = _visible_sources(column).get(column.name.lower())
+            # ONE lookup, which is also the scope rule. Asking `_binds_to_a_row` whether this is a
+            # row and then a second function WHICH row is how two answers to one question get
+            # into a file; this returns the source it bound to, or None for a column, a list-typed
+            # name like `tags[1]`, or a name that resolves nowhere.
+            source = _binds_to_a_row(column, columns)
             if source is None:
-                continue  # names a column, not a source: `tags[1]` is list indexing
+                continue
             # A DERIVED TABLE is bounded by its own projection, and the star walk decides whether
             # that projection reaches a base table -- the same division of labour `_projects_a_row`
             # keeps. Refusing here would forbid `UNNEST(t) FROM (SELECT id FROM claim) t`, which is
@@ -394,6 +453,7 @@ def _visible_ctes(node: exp.Expression, outer: Scope, dialect: str) -> Scope:
 
 
 def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
+                       columns: dict[str, set[str]] | None,
                        stack: frozenset[int], dialect: str) -> bool:
     """Does this expression's own OUTPUT projection reach a base table's unbounded column set?
 
@@ -425,7 +485,7 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
     if selects:
         inner, within = _visible_ctes(node, ctes, dialect), stack | {id(node)}
         answer = any(
-            _expands_a_base_table(select, projection, inner, memo, within, dialect)
+            _expands_a_base_table(select, projection, inner, columns, memo, within, dialect)
             for select in selects
             for projection in select.expressions
             # A row reference joins the walk too: naming a DERIVED TABLE is bounded by that
@@ -443,7 +503,7 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
             # declining to look at the star inside -- `count(DISTINCT t) FROM (SELECT * FROM claim)
             # t` is the shape, and a shared step-over let it through once already.
             if _is_star(projection) or (
-                _skipped_row_source(select, projection, dialect) is not None
+                _skipped_row_source(select, projection, dialect, columns) is not None
             )
         )
     memo[id(node)] = answer
@@ -451,7 +511,8 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
 
 
 def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
-                          memo: dict[int, bool], stack: frozenset[int], dialect: str) -> bool:
+                          columns: dict[str, set[str]] | None, memo: dict[int, bool],
+                          stack: frozenset[int], dialect: str) -> bool:
     """Would this star pull in the columns of a real source table?
 
     Over a base table the columns are unbounded: we would not know what we are returning, and
@@ -474,7 +535,7 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
 
     for source in candidates:
         if isinstance(source, exp.Subquery):
-            if _star_reaches_base(source.this, ctes, memo, stack, dialect):
+            if _star_reaches_base(source.this, ctes, memo, columns, stack, dialect):
                 return True
             continue  # derived table whose projection really is explicit
         # A CTE reference is always a BARE name. Matching on `source.name` alone let a
@@ -485,7 +546,7 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
                 and resolve_name(source, dialect) in ctes:
             body, body_scope = ctes[resolve_name(source, dialect)]
             # `body_scope`, not `ctes`: the body is interpreted where it was written
-            if _star_reaches_base(body, body_scope, memo, stack, dialect):
+            if _star_reaches_base(body, body_scope, memo, columns, stack, dialect):
                 return True
             continue  # a CTE: same
         return True
@@ -493,7 +554,8 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
 
 
 def _skipped_row_source(select: exp.Select, projection: exp.Expression,
-                        dialect: str) -> exp.Expression | None:
+                        dialect: str,
+                        columns: dict[str, set[str]] | None) -> exp.Expression | None:
     """A row source this projection names that the star walk must examine, or None.
 
     None means "nothing here for the walk": no bare source reference at all, or every one of them
@@ -510,7 +572,8 @@ def _skipped_row_source(select: exp.Select, projection: exp.Expression,
     named = [
         sources[column.name.lower()]
         for column in projection.find_all(exp.Column)
-        if not column.table and column.name.lower() in sources
+        if not column.table and _binds_to_a_row(column, columns) is not None
+        and column.name.lower() in sources
     ]
     if not named:
         return None
@@ -543,7 +606,8 @@ def _skipped_row_source(select: exp.Select, projection: exp.Expression,
     ) else named[0]
 
 
-def _has_projection_star(ast: exp.Expression, dialect: str) -> bool:
+def _has_projection_star(ast: exp.Expression, dialect: str,
+                         columns: dict[str, set[str]] | None = None) -> bool:
     """A star that would return columns we cannot name.
 
     Three things this deliberately does not reject -- a guard that refuses legitimate
@@ -593,7 +657,7 @@ def _has_projection_star(ast: exp.Expression, dialect: str) -> bool:
     # down, where the question is whether a wrapper can be vouched for.
     if not _output_selects(ast):
         return False
-    return _star_reaches_base(ast, {}, {}, frozenset(), dialect)
+    return _star_reaches_base(ast, {}, {}, columns, frozenset(), dialect)
 
 
 def _with_limit(ast: exp.Expression, max_rows: int) -> exp.Expression:

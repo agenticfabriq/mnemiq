@@ -90,3 +90,37 @@ def test_an_unqualified_column_must_exist_in_some_referenced_table():
     assert (
         _check("SELECT salary FROM claim JOIN policy ON TRUE").code == RefusalCode.UNKNOWN_COLUMN
     )
+
+
+# --- M88: the decider already knows the schema, so the guard stops guessing ---------------------
+
+
+def test_decide_hands_the_guard_the_schema_it_already_has():
+    """`decide` takes `visible` -- table to columns -- and passes it to `check_access` two lines
+    below. The shape check was guessing about the same names at the same moment.
+
+    ACME has two tables whose amount column shares the table's name, so `WHERE claim_amount > 10`
+    was refused as a whole-row reference. Nothing about that is ambiguous once the columns are
+    known: DuckDB resolves the name to the COLUMN when one exists.
+    """
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.verdict import Refusal
+
+    visible = {"claim_amount": {"claim_amount", "id"}}
+    verdict = decide("SELECT id FROM claim_amount WHERE claim_amount > 10", visible)
+    assert not isinstance(verdict, Refusal), getattr(verdict, "message", verdict)
+
+
+def test_decide_still_refuses_a_real_whole_row_reference():
+    """The same call, on a table with no column of that name, is the row and stays refused."""
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.verdict import Refusal, RefusalCode
+
+    visible = {"claim": {"claim_identifier", "ssn"}}
+    for sql in (
+        "SELECT claim FROM claim",
+        "SELECT claim_identifier FROM claim WHERE claim['ssn'] = 'x'",
+    ):
+        verdict = decide(sql, visible)
+        assert isinstance(verdict, Refusal), sql
+        assert verdict.code == RefusalCode.SELECT_STAR, sql
