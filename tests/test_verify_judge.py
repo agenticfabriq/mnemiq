@@ -262,10 +262,12 @@ class _AlwaysErrors:
 
 
 def test_the_retrying_judge_reports_a_verdict_it_never_got():
-    """`Verifier` prefers `read`. An earlier version made this class refuse it, so a verifier fell
-    back to `score` -- which returns the bare fail-open constant once the retries are exhausted,
-    with `gave_up` visible only on this object. Those answers then read as VERIFIED while the
-    sweep's own error record said `unrecovered > 0`, and nothing at the answer separated them."""
+    """`Verifier` prefers `read`, so this class must answer it truthfully.
+
+    No answer has ever been mislabelled this way -- `main()` builds its verifiers with no judge and
+    `judge_scores` calls `score` directly -- so this is the hole that WOULD open the first time a
+    verifier is handed a retrying judge, not something observed. Saying otherwise reads as history.
+    """
     import pathlib
     import sys
 
@@ -312,3 +314,41 @@ def test_a_recovered_retry_is_not_reported_as_a_missing_verdict():
     got = _RetryingJudge(j, attempts=3, backoff=0).read("q", "s", "SELECT 1", "p")
     assert j.errors == 1, "it really did fail once"
     assert got.fell_open is False and got.score == 0.3
+
+
+def test_one_wrapper_reads_many_cases_and_only_the_failing_ones_are_unavailable():
+    """A sweep builds ONE wrapper for every case, so `fell_open` must describe THIS call.
+
+    The version this pins replaced computed it by diffing `gave_up` around the call. That is
+    indistinguishable from `gave_up > 0` when every test builds a fresh wrapper and reads once --
+    and under one long-lived wrapper the absolute form marks every answer after the first failure
+    as unavailable, which is the shape the whole feature exists to prevent.
+    """
+    import pathlib
+    import sys
+
+    scripts = str(pathlib.Path(__file__).resolve().parents[1] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from run_verify_replay import _RetryingJudge
+
+    class _FailsFirstCaseOnly:
+        def __init__(self):
+            self.calls = self.errors = self.unparsed = 0
+
+        def score(self, question, *_a, **_k):
+            self.calls += 1
+            if question == "doomed":
+                self.errors += 1
+                return 1.0
+            return 0.4
+
+    wrapper = _RetryingJudge(_FailsFirstCaseOnly(), attempts=2, backoff=0)
+    first = wrapper.read("doomed", "s", "SELECT 1", "p")
+    assert first.fell_open is True and wrapper.gave_up == 1
+
+    for case in ("fine-1", "fine-2", "fine-3"):
+        got = wrapper.read(case, "s", "SELECT 1", "p")
+        assert got.fell_open is False, f"{case} was judged, on a wrapper that had already given up"
+        assert got.score == 0.4
+    assert wrapper.gave_up == 1, "no further case gave up"
