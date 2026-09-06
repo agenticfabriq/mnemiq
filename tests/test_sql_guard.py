@@ -1073,8 +1073,12 @@ def test_an_aliased_source_needs_no_qualifier_because_it_has_no_collision():
 
 
 def test_an_alias_equal_to_the_table_name_still_collides_and_is_qualified():
-    """The one aliased shape that does collide -- and the qualifier must be the alias, which here
-    happens to spell the same as the table."""
+    """The aliased shapes that DO collide, and where the qualifier has to be the alias.
+
+    Two of them, because they separate different things: the first spells the alias the same as the
+    table, so it proves the collision is seen at all; the second spells it differently, which is the
+    only way to tell reading the alias apart from reading the table name.
+    """
     out = _shaped_sql("SELECT claim_amount FROM claim_amount AS claim_amount",
                       {"claim_amount": {"claim_amount", "id"}})
     assert "claim_amount.claim_amount" in out, out
