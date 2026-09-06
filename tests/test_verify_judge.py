@@ -186,3 +186,72 @@ def test_zero_attempts_is_refused_rather_than_silently_skipping_the_judge():
     r = _retrying(j, attempts=1)
     assert r.score("q", "s", "x", "p") == 1.0
     assert (j.calls, r.gave_up) == (1, 1)
+
+
+def test_the_retry_window_outlasts_a_blip_not_just_a_request(monkeypatch):
+    """The defect this closes is arithmetic. Four attempts at backoff 1.5 finish 10.5s after the
+    first, and the endpoint's outages measured longer -- so all four landed inside one blip and the
+    case was recorded as unrecovered.
+
+    The sleeps are OBSERVED, not recomputed from the signature. Recomputing would assert the
+    formula this test was written beside rather than the one the code runs: dropping the `2 **
+    attempt` term, or the sleep entirely, leaves a signature-derived sum unchanged while the real
+    window collapses to 24s or to nothing. And `attempts` comes from the ARGPARSE default, because
+    that is the value every sweep actually passes -- the constructor default is never used there.
+    """
+    import pathlib
+    import sys
+
+    scripts = str(pathlib.Path(__file__).resolve().parents[1] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import run_verify_replay as rvr
+
+    slept: list[float] = []
+    monkeypatch.setattr(rvr.time, "sleep", slept.append)
+
+    attempts = _argparse_default_attempts(rvr)
+
+    judge = _AlwaysErrors()
+    rvr._RetryingJudge(judge, attempts=attempts).score("q", "s", "SELECT 1", "p")
+
+    assert judge.calls == attempts, "every attempt should have been made"
+    window = sum(slept)
+    assert window >= 45, (f"the retry window is {window}s across {attempts} attempts; "
+                          f"the blips measured here outlast it")
+
+
+def _argparse_default_attempts(rvr) -> int:
+    """Read `--judge-attempts`'s default off the parser the script actually builds, so the test
+    tracks the value sweeps run with rather than a constructor default nothing passes."""
+    import argparse
+    from unittest.mock import patch
+
+    captured = {}
+    real_init = argparse.ArgumentParser.add_argument
+
+    def spy(self, *a, **kw):
+        if a and a[0] == "--judge-attempts":
+            captured["v"] = kw["default"]
+        return real_init(self, *a, **kw)
+
+    with patch.object(argparse.ArgumentParser, "add_argument", spy), patch.object(
+            argparse.ArgumentParser, "parse_args", side_effect=SystemExit):
+        try:
+            rvr.main()
+        except SystemExit:
+            pass
+    assert "v" in captured, "--judge-attempts not found; the flag was renamed"
+    return captured["v"]
+
+
+class _AlwaysErrors:
+    """Errors on every call, so the retry loop runs to exhaustion and every sleep is taken."""
+
+    def __init__(self) -> None:
+        self.calls = self.errors = self.unparsed = 0
+
+    def score(self, *_args, **_kw) -> float:
+        self.calls += 1
+        self.errors += 1
+        return 1.0
