@@ -47,9 +47,10 @@ class SemanticJudge:
         # running tally the eval harness reads at the end of a sweep, and nothing more: everything
         # in them is derivable from `read`, whose `fell_open` sums to the total and whose `reason`
         # tallies to the same errors/unparsed split. They are kept because a sweep wants the figure
-        # without holding every result, not because they are the only source -- two earlier versions
-        # of this comment claimed they were, in two different ways, and both were wrong the moment
-        # `read` existed. They change no behaviour and cost an increment.
+        # without holding every result, not because they are the only source. Resist writing that
+        # they are: this comment has claimed exclusivity in several forms and each was falsified by
+        # the field that had just been added beside it. They change no behaviour and cost an
+        # increment.
         #
         # They are NOT the per-call signal, and were briefly used as one: a caller diffing them
         # around its own `score` sees any concurrent caller's failure as its own, because they are
