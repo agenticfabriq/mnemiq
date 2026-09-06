@@ -599,19 +599,34 @@ def test_an_aggregate_that_returns_its_argument_is_still_refused():
     assert _is_refused("SELECT any_value(claim_amount) FROM claim_amount")
 
 
-def test_distinct_is_a_known_false_refusal_and_stays_one(): 
-    """Pinned as REFUSED on purpose, so the next person meets the decision rather than the bug.
+def test_distinct_does_not_change_whether_the_argument_is_a_bare_struct():
+    """M85. `count(DISTINCT claim_amount)` is what a model writes for "how many different claim
+    amounts", and it deferred for a reason that has nothing to do with distinctness: sqlglot parses
+    it as `Count(this=Distinct(...))`, so a node sits between the column and the aggregate.
 
-    `count(DISTINCT claim_amount)` is what a model writes for "how many different claim amounts",
-    and it defers for a reason that has nothing to do with distinctness. Stepping over `Distinct`
-    fixes it and also widens the STAR WALK, which shares this predicate -- measured:
-    `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. Widening a
-    control that stops denied columns escaping is not a thing to do as a side effect of a
-    convenience, so this stays refused and is filed as M85.
+    Fixed by giving the two callers their OWN predicate rather than sharing one, which is what the
+    first attempt got wrong -- stepping over `Distinct` in the shared helper widened the star walk
+    too, and `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. The
+    projection rule can afford the step-over because it is deciding whether a VALUE leaves; the
+    star walk cannot, because it is deciding whether to LOOK.
     """
-    assert _is_refused("SELECT count(DISTINCT claim_amount) FROM claim_amount")
-    # The shape that must never become allowed while fixing the one above.
+    assert not _is_refused("SELECT count(DISTINCT claim_amount) FROM claim_amount")
+    assert not _is_refused("SELECT sum(DISTINCT claim_amount) FROM claim_amount")
+    # Stepping over DISTINCT must not step over an extraction underneath it.
+    assert _is_refused("SELECT count(DISTINCT claim['salary']) FROM claim")
+    assert _is_refused("SELECT max(DISTINCT claim_amount) FROM claim_amount")
+
+
+def test_the_star_walk_still_examines_a_distinct_count_over_a_derived_star():
+    """The shape that must never become allowed while fixing the one above.
+
+    This is where the two callers differ. `count(DISTINCT t)` carries no value out, so the
+    projection rule has nothing to object to -- but the star walk's job is to decide whether an
+    unbounded column set is reached at all, and a projection it declines to walk is one it never
+    examines.
+    """
     assert _is_refused("SELECT count(DISTINCT t) FROM (SELECT * FROM claim) t")
+    assert _is_refused("SELECT sum(DISTINCT t['salary']) FROM (SELECT * FROM claim) t")
 
 
 def test_a_spreading_function_over_a_table_named_column_is_still_refused():
@@ -741,8 +756,9 @@ def test_a_bare_name_matching_an_outer_source_is_refused_in_any_scope():
 
     Honouring scope boundaries here was tried and reverted. Stopping the outward walk at a CTE
     looks right -- a CTE body should not see the outer FROM -- but DuckDB resolves outer columns
-    into a CTE body nested in a correlated subquery, so the break re-armed the oracle: the second
-    case below returned the row for a correct guess and nothing for a wrong one.
+    into a CTE body nested in a correlated subquery, so the break re-armed the oracle: the FIRST
+    assertion below returned the row for a correct guess and nothing for a wrong one. The second
+    stayed refused throughout, which is what made the break look safe.
     """
     # The oracle, one CTE inside one correlated subquery deep.
     assert _is_refused(

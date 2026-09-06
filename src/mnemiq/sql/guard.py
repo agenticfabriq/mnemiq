@@ -192,14 +192,47 @@ def _aggregates_every_bare_reference(select: exp.Select, projection: exp.Express
     columns escaping is not something to do as a side effect of a convenience, and the phrasing
     this refuses is one a rewrite can avoid. Filed as M85 rather than fixed here.
     """
+    return _every_bare_reference_is_aggregated(select, projection, through_distinct=False)
+
+
+def _every_bare_reference_is_aggregated(select: exp.Select, projection: exp.Expression, *,
+                                        through_distinct: bool) -> bool:
+    """The shared walk. `through_distinct` is the part each caller has to decide for itself.
+
+    **Register M85.** sqlglot parses `count(DISTINCT claim_amount)` as `Count(this=Distinct(...))`,
+    so a node sits between the column and the aggregate and a direct-parent test says no -- the M84
+    deferral, one phrasing over, on what a model writes for "how many different claim amounts".
+
+    Stepping over `Distinct` in a SHARED predicate was the first attempt and it widened the star
+    walk too: `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. The
+    two callers are asking different questions and can afford different answers. `_projects_a_row`
+    asks whether a VALUE leaves, and `DISTINCT` changes nothing about that -- `count` still returns
+    a cardinality. The star walk asks whether to LOOK at a projection at all, and a projection it
+    declines to walk is one whose inner star nobody examines; there, anything short of certainty is
+    a reason to keep walking.
+    """
     sources = {name.lower() for name in _sources(select)}
     bare = [
         column for column in projection.find_all(exp.Column)
         if not column.table and column.name.lower() in sources
     ]
-    return bool(bare) and all(
-        isinstance(column.parent, _COLLAPSING_AGGREGATES) for column in bare
+    if not bare:
+        return False
+    return all(
+        isinstance(_past_distinct(column.parent) if through_distinct else column.parent,
+                   _COLLAPSING_AGGREGATES)
+        for column in bare
     )
+
+
+def _past_distinct(node: exp.Expression | None) -> exp.Expression | None:
+    """The node above, stepping over a `DISTINCT` wrapper and nothing else.
+
+    Deliberately not a loop over "harmless" wrappers. Everything skipped has to be a node that
+    cannot extract a field, and `Distinct` is the only one that qualifies; a general skip is how
+    `Bracket` got walked past when this rule was first written.
+    """
+    return node.parent if isinstance(node, exp.Distinct) else node
 
 
 def _projects_a_row(ast: exp.Expression) -> bool:
@@ -234,7 +267,8 @@ def _projects_a_row(ast: exp.Expression) -> bool:
             source = _names_a_source(select, projection)
             if source is None or isinstance(source, exp.Subquery):
                 continue
-            if _aggregates_every_bare_reference(select, projection):
+            if _every_bare_reference_is_aggregated(select, projection,
+                                                   through_distinct=True):
                 continue
             return True
     return False
@@ -433,16 +467,16 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
             #
             # The aggregate exemption is applied to the ROW-REFERENCE half only, never to
             # `_is_star`: a star is a star whatever wraps it, and skipping the walk for one would
-            # be the leak this guard was built for. Reached only when every bare reference in the
-            # projection is the DIRECT argument of a collapsing aggregate -- nothing in between,
-            # not an extraction and not a `DISTINCT`. So
-            # `sum(t['salary']) FROM (SELECT * FROM claim) t` still walks: its bare reference sits
-            # under a `Bracket`. This predicate is shared with `_projects_a_row`, and anything
-            # loosened for that caller's benefit widens THIS one too -- which is what happened when
-            # a `DISTINCT` step-over was tried.
+            # be the leak this guard was built for.
+            #
+            # It also stops at a SUBQUERY source, which is the whole difference between this caller
+            # and `_projects_a_row`. Over a base table, `count(DISTINCT claim_amount)` carries no
+            # value out and there is nothing here to examine (M85). Over a derived table the row
+            # reference is a door onto that table's own projection, and declining to walk it is
+            # declining to look at the star inside -- `count(DISTINCT t) FROM (SELECT * FROM claim)
+            # t` is the shape, and a shared step-over let it through once already.
             if _is_star(projection) or (
-                _names_a_source(select, projection) is not None
-                and not _aggregates_every_bare_reference(select, projection)
+                _skipped_row_source(select, projection) is not None
             )
         )
     memo[id(node)] = answer
@@ -489,6 +523,23 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
             continue  # a CTE: same
         return True
     return False
+
+
+def _skipped_row_source(select: exp.Select, projection: exp.Expression) -> exp.Expression | None:
+    """The row source this projection names and the star walk must therefore examine, or None.
+
+    None means "nothing here for the walk": either no bare source reference at all, or one whose
+    every occurrence is aggregated into a scalar over a BASE table. A subquery source is never
+    None, because the walk is what reads that subquery's own projection.
+    """
+    source = _names_a_source(select, projection)
+    if source is None:
+        return None
+    if isinstance(source, exp.Subquery):
+        return source
+    return None if _every_bare_reference_is_aggregated(
+        select, projection, through_distinct=True
+    ) else source
 
 
 def _has_projection_star(ast: exp.Expression, dialect: str) -> bool:
