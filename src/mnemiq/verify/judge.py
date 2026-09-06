@@ -44,10 +44,12 @@ class SemanticJudge:
         # Fail-open is right for the product and ruinous for a MEASUREMENT: a dead endpoint scores
         # every case 1.0, which is indistinguishable BY VALUE from a judge that approved everything
         # (`min(1.0, ...)` below clamps a real reply to the same number). These counters are a
-        # running TOTAL for the eval harness, not a per-call signal and not the only way to get one:
-        # summing `read`'s `fell_open` gives the same aggregate. What they add is the CAUSE split --
-        # `errors` against `unparsed`, which the harness reports separately and which a single
-        # gave-up count cannot show. They change no behaviour and cost an increment.
+        # running tally the eval harness reads at the end of a sweep, and nothing more: everything
+        # in them is derivable from `read`, whose `fell_open` sums to the total and whose `reason`
+        # tallies to the same errors/unparsed split. They are kept because a sweep wants the figure
+        # without holding every result, not because they are the only source -- two earlier versions
+        # of this comment claimed they were, in two different ways, and both were wrong the moment
+        # `read` existed. They change no behaviour and cost an increment.
         #
         # They are NOT the per-call signal, and were briefly used as one: a caller diffing them
         # around its own `score` sees any concurrent caller's failure as its own, because they are
