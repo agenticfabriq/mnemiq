@@ -1,1 +1,26 @@
-[{"source_id": "acme", "run_at": "", "accuracy": 0.96, "strict_accuracy": 0.84, "total": 30, "correct": 21, "correct_facts": 3, "wrong": 1, "deferred_wrongly": 0, "error": 0}]
+[
+ {
+  "source_id": "acme",
+  "run_at": "",
+  "accuracy": 0.96,
+  "strict_accuracy": 0.84,
+  "total": 30,
+  "correct": 21,
+  "correct_facts": 3,
+  "wrong": 1,
+  "deferred_wrongly": 0,
+  "error": 0
+ },
+ {
+  "source_id": "acme",
+  "run_at": "2026-09-06T04:31:00+00:00",
+  "accuracy": 1.0,
+  "strict_accuracy": 0.88,
+  "total": 30,
+  "correct": 22,
+  "correct_facts": 3,
+  "wrong": 0,
+  "deferred_wrongly": 0,
+  "error": 0
+ }
+]
