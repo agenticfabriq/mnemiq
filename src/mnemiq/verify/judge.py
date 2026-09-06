@@ -44,8 +44,13 @@ class SemanticJudge:
         # Fail-open is right for the product and ruinous for a MEASUREMENT: a dead endpoint scores
         # every case 1.0, which is indistinguishable BY VALUE from a judge that approved everything
         # (`min(1.0, ...)` below clamps a real reply to the same number). These counters are the
-        # only way a replay can tell the two apart, so they exist for the eval harness, not for the
-        # verifier -- they change no behaviour and cost an increment.
+        # only way a replay can report the two apart IN AGGREGATE, so they exist for the eval
+        # harness, not for the verifier -- they change no behaviour and cost an increment.
+        #
+        # They are NOT the per-call signal, and were briefly used as one: a caller diffing them
+        # around its own `score` sees any concurrent caller's failure as its own, because they are
+        # cumulative and this judge is shared across every mode and request. `read` returns that
+        # fact with the score instead. Totals here, per-call there.
         self.calls = 0
         self.errors = 0        # the endpoint raised: outage, timeout, rate limit, bad gateway
         self.unparsed = 0      # it answered, but no confidence could be read out of the reply
