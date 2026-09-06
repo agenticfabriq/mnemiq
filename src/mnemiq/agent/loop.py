@@ -102,10 +102,11 @@ class AgentAnswer:
     # score wrong answers below right ones -- so a threshold can only be tuned by running the
     # whole suite again. Measured once with these dropped: caught 4, killed 4, missed 37.
     verify_confidence: float | None = None
-    # `judge_unavailable` is the value the wire's `verified` state keys off: the judge was
-    # configured and could not be reached, so the score is the fail-open constant and not a
-    # judgement. `None` here is not "no verifier" -- a deferral or an execution failure also
-    # leaves it unset, because the verifier never saw a table.
+    # EVERY value here is mapped on the wire, by `verified_state` in `server/serialize.py` --
+    # a new layer added below is not inert there, it ships as `unknown`. `judge_unavailable`
+    # means the judge was configured and could not be reached, so the score is the fail-open
+    # constant and not a judgement. `None` is not "no verifier": a deferral or an execution
+    # failure also leaves it unset, because the verifier never saw a table.
     verify_layer: str | None = None  # sanity | grounding | judge | judge_unavailable | pass
 
 

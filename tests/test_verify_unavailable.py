@@ -127,16 +127,31 @@ def test_an_unrecognised_layer_fails_CLOSED():
     """The layer vocabulary is a comment, not a type. A future layer meaning "no judgement
     happened" -- the shape `judge_unavailable` itself had before it existed -- must not ship as a
     check. Defaulting to "checked" is how M89 stayed invisible."""
-    assert _payload("some_future_layer")["verified"] == "unavailable"
+    assert _payload("some_future_layer")["verified"] == "unknown", \
+        "and NOT 'unavailable' -- that state means a judge could not be reached, which an operator " \
+        "may page on; an untaught layer name is not an outage"
 
 
 def test_the_mcp_surface_reports_the_same_state_as_the_http_one():
     """MCP is how a governing agent reads an answer, and it hand-builds its own dict. An agent
     deciding whether to act needs the same signal; two surfaces deriving it separately is how they
     come to disagree."""
+    from mnemiq.agent.loop import AgentAnswer
+    from mnemiq.mcp.server import _db_read
     from mnemiq.mcp.server import verified_state as mcp_state
+    from mnemiq.server.serialize import answer_payload
     from mnemiq.server.serialize import verified_state as http_state
 
     assert mcp_state is http_state, "MCP must import the derivation, not restate it"
+
+    class _RT:
+        def __init__(self, ans): self._ans = ans
+        def ask(self, *_a, **_k): return self._ans
+
+    # Sharing the function is not enough: `_db_read` hand-builds its dict, so the KEY is what has
+    # to be exercised. An earlier version of this test asserted only the identity, and a one-line
+    # change inside `_db_read` could have made a dead judge read as judged with it still green.
     for layer in (None, "judge", "judge_unavailable", "sanity", "pass", "unknown_future"):
-        assert mcp_state(layer) == http_state(layer), layer
+        ans = AgentAnswer(answer="x", preview=None)
+        ans.verify_layer = layer
+        assert _db_read(_RT(ans), None, "q")["verified"] == answer_payload(ans)["verified"], layer

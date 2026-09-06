@@ -33,14 +33,17 @@ def verified_state(layer: str | None) -> str | None:
     execution failure, and a mode with no verifier all leave the field unset because the verifier
     never saw a table.
 
-    FAILS CLOSED on an unrecognised layer. The layer vocabulary is a comment, not a type, so a
-    future layer meaning "no judgement happened" -- which is the shape `judge_unavailable` itself
-    had before it existed -- must not ship as though it were a check. Defaulting to "checked" is
-    how M89 stayed invisible for as long as it did.
+    FAILS CLOSED on an unrecognised layer, to `"unknown"` and NOT to `"unavailable"`. The layer
+    vocabulary is a comment, not a type, so a future layer meaning "no judgement happened" -- the
+    shape `judge_unavailable` itself had before it existed -- must not ship as though it were a
+    check; defaulting to a check is how M89 stayed invisible. But `"unavailable"` means one
+    specific thing an operator may page on, a judge that could not be reached, and folding an
+    unrecognised layer into it buys a false outage signal. `"unknown"` says the true thing: this
+    engine emitted a verification state this serializer has not been taught.
     """
     if layer is None:
         return None
-    return _VERIFIED_STATE.get(layer, "unavailable")
+    return _VERIFIED_STATE.get(layer, "unknown")
 
 
 def answer_payload(ans: AgentAnswer) -> dict:
