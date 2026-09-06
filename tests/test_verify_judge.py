@@ -196,11 +196,14 @@ def test_a_failing_call_is_retried_and_backs_off(monkeypatch):
     per ~490 calls to 0 in 487, so those failures were this code truncating its own requests. There
     is no measured outage length to size against, and a test asserting one would pin a number to a
     story rather than to evidence. What IS worth pinning is the SHAPE: that a failure retries at all, and that successive waits
-    grow rather than repeat. Note what this deliberately does not pin -- a minimum duration. A
-    backoff of 0.001 satisfies every assertion here and finishes all four attempts in milliseconds,
-    which is hammering. Catching that needs a magnitude, and a magnitude needs a measured outage
-    length to size against, which is exactly the thing that turned out not to exist. An unpinned
-    gap named here is better than a number pinned to a retracted story.
+    grow rather than repeat. And a floor, which the first version of this
+    left out: growth alone is satisfied by a backoff of 0.001, whose four attempts finish inside
+    ten milliseconds -- hammering an endpoint that has just failed.
+
+    The floor is sized from REQUEST RATE, not from any outage length. That distinction is the whole
+    point: the retracted claim needed to know how long a provider stays down, which nothing here
+    ever measured, whereas "do not re-ask a failing endpoint more than once a second" needs only a
+    view about politeness and holds whatever the provider is doing.
     """
     import pathlib
     import sys
@@ -219,6 +222,7 @@ def test_a_failing_call_is_retried_and_backs_off(monkeypatch):
     assert judge.calls == attempts, "every attempt should have been made"
     assert len(slept) == attempts - 1, "one wait between each pair of attempts"
     assert slept == sorted(slept) and slept[0] < slept[-1], f"waits do not grow: {slept}"
+    assert min(slept) >= 1.0, f"retries faster than 1/s hammer a failing endpoint: {slept}"
 
 
 def _argparse_default_attempts(rvr) -> int:
