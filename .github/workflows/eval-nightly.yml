@@ -29,15 +29,27 @@
 #
 # That red was mostly neither of the two things it looked like. Not a baseline from another source:
 # the two `deferred_wrongly` cases were M84, a SELECT-star guard refusing the GOLD query, which
-# four identical runs at 88.0/76.0 had already shown was no fluke. The THIRD case that moved --
-# `fire-count`, wrong in those four and correct in the two after -- is NOT explained by it: the
-# only production file that changed between those runs is the guard, and nothing in it touches that
-# question. Model variance on one case is the honest reading, and it is why the recorded baseline
-# is worth watching: at 100.0 a single case flipping back is a red nightly.
+# four identical runs at 88.0/76.0 had already shown was no fluke. Fixed, and `deferred_wrongly` is
+# 0 in every run since.
 #
-# `evals/trend.json` now holds a baseline measured here rather than on a developer machine --
-# 100.0/88.0, recorded by hand from two identical runs, because accepting a level is a human's
-# commit.
+# The THIRD case that moved, `fire-count`, is model variance and nearly went into the record as
+# progress. Across the eleven runs that have produced a comparison it is wrong in EIGHT. Three came
+# in at 100.0/88.0 -- including one that passed against the 100.0 baseline while it was briefly
+# recorded, which is the run hardest on this conclusion and is why it is named rather than left out
+# of the tally. Then two at 96.0/84.0 with the case wrong again. Recording 100.0 against a tolerance
+# that is a proxy for zero would redden roughly three nights in four, and every red would be read as
+# a regression by whoever saw it.
+#
+# So the number CI reproduces is 96.0/84.0, and its counts (21/3/1/0) are byte-identical to the
+# baseline recorded before any of this. **The re-record confirmed the old number rather than
+# replacing it** -- the whole apparent 8-point regression was M84, and the source difference this
+# exercise set out to absorb turned out not to exist. The 100.0 row is left in the file above the
+# one that supersedes it, because a trend is a history and a sample that misled us is worth keeping
+# visible. **The bar is the row with the newest `run_at`, not the largest number and not the last
+# line** -- the JSON backend used to take `rows[-1]` by position, so leaving a higher row above a
+# lower one meant any reordering of this file silently restored 100.0 as the level to beat, with
+# nightly reds on `fire-count` as the only symptom. Both backends order by `run_at` now.
+
 name: eval-nightly
 
 on:

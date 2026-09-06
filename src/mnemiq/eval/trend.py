@@ -18,6 +18,20 @@ _DDL = (
 )
 
 
+def _at(row: dict) -> datetime:
+    """A row's `run_at` as a comparable instant, tolerant of one that will not parse.
+
+    An unparseable stamp sorts to the beginning rather than raising: this runs inside the gate's
+    baseline lookup, and a malformed row in the history is not a reason to refuse to compare -- but
+    it is emphatically not a reason to let that row BE the baseline either.
+    """
+    try:
+        parsed = datetime.fromisoformat(row["run_at"])
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=UTC)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 class TrendUnavailable(RuntimeError):
     """The trend store could not be READ. Distinct from "no baseline yet", and the distinction
     is the finding: `last_run` swallowed every exception into the same `None` that means a
@@ -103,7 +117,26 @@ def last_run(control_dsn: str | None, source_id: str,
         if path and os.path.exists(path):
             with open(path) as fh:
                 rows = [r for r in json.load(fh) if r["source_id"] == source_id]
-            return RunRecord(**rows[-1]) if rows else None
+            if not rows:
+                return None
+            # By `run_at`, matching what the Postgres backend does. This took `rows[-1]` -- the
+            # last LINE -- so the two stores answered the same question differently the moment a
+            # file was not in chronological order, and a trend file is edited by hand whenever a
+            # level is accepted. It became load-bearing when a superseded 100.0 sample was kept
+            # above the 96.0 that replaced it: any reordering silently restored the higher number
+            # as the bar, with nightly reds on one unstable case as the only symptom.
+            #
+            # Undated rows are IGNORED while any dated row exists, and position decides only when
+            # none is dated at all. They pre-date `run_at` defaulting to now and they still exist,
+            # so an empty string must neither win by sorting nor win by sitting last.
+            dated = [r for r in rows if r.get("run_at")]
+            if not dated:
+                return RunRecord(**rows[-1])
+            # Parsed, not compared as text. ISO-8601 strings only sort correctly when every stamp
+            # carries the same offset, and nothing enforces that: a row written `+00:00` and one
+            # written `Z`, or any local offset, would order by their punctuation. Ties keep the
+            # LAST row, which is what position-based selection did.
+            return RunRecord(**max(enumerate(dated), key=lambda pair: (_at(pair[1]), pair[0]))[1])
     except Exception as exc:
         # Raise rather than return None. Returning None here is how the gate came to pass
         # forever: it is the same value that means "first run", so a broken store read as a
