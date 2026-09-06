@@ -81,6 +81,16 @@ class _RetryingJudge:
         self.gave_up = 0
 
     def __getattr__(self, name):          # calls/errors/unparsed/fallbacks read through
+        if name == "read":
+            # NOT proxied, deliberately. `Verifier` prefers `read` when a judge offers one, and
+            # proxying it here would hand the caller the INNER judge's single attempt -- silently
+            # skipping every retry this class exists to perform, while `score` beside it still
+            # retried. No caller does that today (the replay builds its verifiers without a judge)
+            # and the failure would be invisible if one started.
+            raise AttributeError(
+                "_RetryingJudge does not expose `read`: it would bypass the retry loop. "
+                "Call `score`, which retries and returns the surviving judgement."
+            )
         return getattr(self._judge, name)
 
     def score(self, *args, **kwargs) -> float:

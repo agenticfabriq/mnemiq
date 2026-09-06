@@ -38,15 +38,26 @@ class Verifier:
             if v is not None:
                 return v
         if self.judge is not None:
-            # The counter delta, for the reason `_RetryingJudge` documents at length: `score` swallows
-            # the exception and returns the fail-open constant, so the RETURN VALUE cannot say whether
-            # a judgement happened. `fallbacks` counts errors plus unreadable replies; a judge without
-            # the counter (FakeJudge, a stub) is taken at its word rather than assumed broken.
-            before = getattr(self.judge, "fallbacks", None)
-            c = self.judge.score(
-                packet.question, _cards_text(packet), approved.plan_sql, render_result(table, max_rows=5)
-            )
-            if before is not None and getattr(self.judge, "fallbacks", before) != before:
+            # `read` when the judge offers it, because the fact must come back WITH the score.
+            # The counter-delta this replaced was concurrency-unsafe: the counters are cumulative
+            # and the judge is shared across every mode and every request, so a delta measured
+            # around one call includes any other thread's failure. MEASURED: a request judged 0.95
+            # was reported `judge_unavailable` because a concurrent one failed mid-call.
+            #
+            # A judge without `read` -- FakeJudge, anyone's stub -- is taken at its word rather
+            # than assumed broken, the same way the counter version treated a judge with no
+            # counters.
+            reader = getattr(self.judge, "read", None)
+            if reader is not None:
+                got = reader(packet.question, _cards_text(packet), approved.plan_sql,
+                             render_result(table, max_rows=5))
+                c, fell_open = got.score, got.fell_open
+            else:
+                c, fell_open = self.judge.score(
+                    packet.question, _cards_text(packet), approved.plan_sql,
+                    render_result(table, max_rows=5)
+                ), False
+            if fell_open:
                 # Answer anyway -- that is the product's decision and it is unchanged -- but stop
                 # calling it verified. This is the shape M89 was: the verifier switched off against
                 # every reasoning model and every answer still read as confidently checked.
