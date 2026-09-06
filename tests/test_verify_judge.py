@@ -195,8 +195,12 @@ def test_a_failing_call_is_retried_and_backs_off(monkeypatch):
     endpoint outage. It did not: raising the reasoning reserve took endpoint errors from 7, 6 and 4
     per ~490 calls to 0 in 487, so those failures were this code truncating its own requests. There
     is no measured outage length to size against, and a test asserting one would pin a number to a
-    story rather than to evidence. What IS worth pinning is that a failure retries at all, and that
-    successive attempts wait longer instead of hammering.
+    story rather than to evidence. What IS worth pinning is the SHAPE: that a failure retries at all, and that successive waits
+    grow rather than repeat. Note what this deliberately does not pin -- a minimum duration. A
+    backoff of 0.001 satisfies every assertion here and finishes all four attempts in milliseconds,
+    which is hammering. Catching that needs a magnitude, and a magnitude needs a measured outage
+    length to size against, which is exactly the thing that turned out not to exist. An unpinned
+    gap named here is better than a number pinned to a retracted story.
     """
     import pathlib
     import sys
