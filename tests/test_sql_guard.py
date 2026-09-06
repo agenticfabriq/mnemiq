@@ -645,6 +645,16 @@ def test_the_star_walk_still_examines_a_distinct_count_over_a_derived_star():
         "WITH c AS (SELECT * FROM claim) "
         "SELECT count(DISTINCT claim_amount) + count(DISTINCT c) FROM claim_amount, c"
     )
+    # ALIASED, which is where matching `alias_or_name` reopened it: `FROM c AS x` answers `x` and
+    # misses a CTE named `c`. Every spelling that reaches the exemption, not just the bare one.
+    for sql in (
+        "WITH c AS (SELECT * FROM claim) SELECT count(DISTINCT x) FROM c AS x",
+        "WITH c AS (SELECT * FROM claim) SELECT count(x) FROM c AS x",
+        "WITH c AS (SELECT * FROM claim) SELECT sum(x) FROM c AS x",
+        "WITH c AS (SELECT * FROM claim) "
+        "SELECT count(DISTINCT claim_amount) + count(DISTINCT x) FROM claim_amount, c AS x",
+    ):
+        assert _is_refused(sql), sql
 
 
 def test_a_bounded_derived_table_beside_a_base_table_is_a_known_false_refusal():

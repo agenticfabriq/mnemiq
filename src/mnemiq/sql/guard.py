@@ -443,7 +443,7 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
             # declining to look at the star inside -- `count(DISTINCT t) FROM (SELECT * FROM claim)
             # t` is the shape, and a shared step-over let it through once already.
             if _is_star(projection) or (
-                _skipped_row_source(select, projection) is not None
+                _skipped_row_source(select, projection, dialect) is not None
             )
         )
     memo[id(node)] = answer
@@ -492,7 +492,8 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
     return False
 
 
-def _skipped_row_source(select: exp.Select, projection: exp.Expression) -> exp.Expression | None:
+def _skipped_row_source(select: exp.Select, projection: exp.Expression,
+                        dialect: str) -> exp.Expression | None:
     """A row source this projection names that the star walk must examine, or None.
 
     None means "nothing here for the walk": no bare source reference at all, or every one of them
@@ -515,16 +516,23 @@ def _skipped_row_source(select: exp.Select, projection: exp.Expression) -> exp.E
         return None
     # A CTE reference is an `exp.Table`, so matching `exp.Subquery` alone missed the CTE spelling
     # of exactly the shape above: `WITH c AS (SELECT * FROM claim) SELECT count(DISTINCT c) FROM c`
-    # took the exemption and left that star unwalked. Every CTE name in the STATEMENT counts, not
-    # just the ones in scope here -- an over-approximation, which errs towards walking.
+    # took the exemption and left that star unwalked.
+    #
+    # Resolved through `resolve_name`, and on the table's NAME rather than `alias_or_name`, which is
+    # the ALIAS when the reference is aliased -- `FROM c AS x` answers `x`, misses a CTE named `c`,
+    # and reopens the same gap one spelling over. `_expands_a_base_table` asks this identical
+    # question a screen below and asks it that way; two answers to one question is what the
+    # first version shipped.
     root = select
     while root.parent is not None:
         root = root.parent
-    cte_names = {cte.alias_or_name.lower() for cte in root.find_all(exp.CTE)}
+    cte_names = {
+        name for name in (resolve_name(cte, dialect) for cte in root.find_all(exp.CTE)) if name
+    }
     for source in named:
         if isinstance(source, exp.Subquery):
             return source
-        if isinstance(source, exp.Table) and source.alias_or_name.lower() in cte_names:
+        if isinstance(source, exp.Table) and resolve_name(source, dialect) in cte_names:
             return source
     return None if _every_bare_reference_is_aggregated(
         select, projection, through_distinct=True
