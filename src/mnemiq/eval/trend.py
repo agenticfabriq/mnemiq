@@ -103,7 +103,19 @@ def last_run(control_dsn: str | None, source_id: str,
         if path and os.path.exists(path):
             with open(path) as fh:
                 rows = [r for r in json.load(fh) if r["source_id"] == source_id]
-            return RunRecord(**rows[-1]) if rows else None
+            if not rows:
+                return None
+            # By `run_at`, matching what the Postgres backend does. This took `rows[-1]` -- the
+            # last LINE -- so the two stores answered the same question differently the moment a
+            # file was not in chronological order, and a trend file is edited by hand whenever a
+            # level is accepted. It became load-bearing when a superseded 100.0 sample was kept
+            # above the 96.0 that replaced it: any reordering silently restored the higher number
+            # as the bar, with nightly reds on one unstable case as the only symptom.
+            #
+            # Undated rows fall back to position. They pre-date `run_at` defaulting to now, they
+            # still exist, and an empty string must neither win by sorting nor win by sitting last.
+            dated = [r for r in rows if r.get("run_at")]
+            return RunRecord(**(max(dated, key=lambda r: r["run_at"]) if dated else rows[-1]))
     except Exception as exc:
         # Raise rather than return None. Returning None here is how the gate came to pass
         # forever: it is the same value that means "first run", so a broken store read as a
