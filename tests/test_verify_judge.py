@@ -188,16 +188,15 @@ def test_zero_attempts_is_refused_rather_than_silently_skipping_the_judge():
     assert (j.calls, r.gave_up) == (1, 1)
 
 
-def test_the_retry_window_outlasts_a_blip_not_just_a_request(monkeypatch):
-    """The defect this closes is arithmetic. Four attempts at backoff 1.5 finish 10.5s after the
-    first, and the endpoint's outages measured longer -- so all four landed inside one blip and the
-    case was recorded as unrecovered.
+def test_a_failing_call_is_retried_and_backs_off(monkeypatch):
+    """What the retry is actually for, now that the outage story is gone.
 
-    The sleeps are OBSERVED, not recomputed from the signature. Recomputing would assert the
-    formula this test was written beside rather than the one the code runs: dropping the `2 **
-    attempt` term, or the sleep entirely, leaves a signature-derived sum unchanged while the real
-    window collapses to 24s or to nothing. And `attempts` comes from the ARGPARSE default, because
-    that is the value every sweep actually passes -- the constructor default is never used there.
+    An earlier test asserted the window exceeded 45s, on the theory that it had to outlast an
+    endpoint outage. It did not: raising the reasoning reserve took endpoint errors from 7, 6 and 4
+    per ~490 calls to 0 in 487, so those failures were this code truncating its own requests. There
+    is no measured outage length to size against, and a test asserting one would pin a number to a
+    story rather than to evidence. What IS worth pinning is that a failure retries at all, and that
+    successive attempts wait longer instead of hammering.
     """
     import pathlib
     import sys
@@ -209,16 +208,13 @@ def test_the_retry_window_outlasts_a_blip_not_just_a_request(monkeypatch):
 
     slept: list[float] = []
     monkeypatch.setattr(rvr.time, "sleep", slept.append)
-
     attempts = _argparse_default_attempts(rvr)
-
     judge = _AlwaysErrors()
     rvr._RetryingJudge(judge, attempts=attempts).score("q", "s", "SELECT 1", "p")
 
     assert judge.calls == attempts, "every attempt should have been made"
-    window = sum(slept)
-    assert window >= 45, (f"the retry window is {window}s across {attempts} attempts; "
-                          f"the blips measured here outlast it")
+    assert len(slept) == attempts - 1, "one wait between each pair of attempts"
+    assert slept == sorted(slept) and slept[0] < slept[-1], f"waits do not grow: {slept}"
 
 
 def _argparse_default_attempts(rvr) -> int:
@@ -228,12 +224,12 @@ def _argparse_default_attempts(rvr) -> int:
     from unittest.mock import patch
 
     captured = {}
-    real_init = argparse.ArgumentParser.add_argument
+    real_add = argparse.ArgumentParser.add_argument
 
     def spy(self, *a, **kw):
         if a and a[0] == "--judge-attempts":
             captured["v"] = kw["default"]
-        return real_init(self, *a, **kw)
+        return real_add(self, *a, **kw)
 
     with patch.object(argparse.ArgumentParser, "add_argument", spy), patch.object(
             argparse.ArgumentParser, "parse_args", side_effect=SystemExit):

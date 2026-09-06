@@ -45,18 +45,19 @@ class _RetryingJudge:
     signal. That is the second thing those counters bought.
     """
 
-    # The backoff spans the OUTAGE, not just the request. MEASURED: at 1.5 the four attempts
-    # finish 10.5s after the first (1.5 + 3 + 6), and two consecutive 487-case sweeps each lost
-    # exactly one case -- a different one each time, each scoring fine minutes later, and one of
-    # them failing all four attempts again on a later run before succeeding on the next. Those are
-    # bursts lasting longer than the retry window, not four independent 1.4% draws, whose odds
-    # would be about 4e-8 per case. At 8 the same four attempts span 56s (8 + 16 + 32), which is
-    # past every blip observed here.
+    # Retries exist because this is a network call, and for no stronger reason than that. An
+    # earlier version of this comment claimed the window had to outlast an OUTAGE, and widened the
+    # backoff to 8 on the strength of one case that kept failing across three sweeps. That
+    # explanation was wrong. Raising the reasoning reserve to 4096 took endpoint errors from
+    # 7, 6 and 4 per ~490 calls to 0 in 487 -- under the old rate the chance of a clean run is
+    # 0.4% -- so every "endpoint error" measured here was this code truncating its own request,
+    # not the provider faltering. No genuine outage was ever demonstrated, and a window sized for
+    # one would be sized for nothing.
     #
-    # The cost is paid only on the failing path: a case that answers first time never sleeps, so a
-    # healthy sweep is unchanged and a sweep with one bad case pays under a minute rather than
-    # losing the whole run's certification.
-    def __init__(self, judge, attempts: int = 4, backoff: float = 8.0) -> None:
+    # 1.5 restored deliberately. The wider value cost nothing on the success path, which is exactly
+    # why it could have stayed: an unfalsifiable comfort, justified by a story already known to be
+    # false.
+    def __init__(self, judge, attempts: int = 4, backoff: float = 1.5) -> None:
         # `attempts < 1` makes the loop body never run, so every score is the fail-open constant
         # and the judge is never called at all -- `calls` stays 0. It would NOT certify silently
         # (control falls through to `gave_up += 1`, and the gate refuses on any non-zero
