@@ -75,3 +75,40 @@ def test_another_source_is_not_the_baseline_for_this_one(tmp_path):
         {**_row(0.10, "2026-09-06T05:00:00+00:00"), "source_id": "bird"},
     ])
     assert last_run(None, "acme", path=path).accuracy == 0.96
+
+
+def test_stamps_are_compared_as_instants_not_as_text(tmp_path):
+    """`Z` and `+00:00` spell the same instant and sort differently as strings.
+
+    Nothing enforces one spelling: `record_run` writes `isoformat()` (`+00:00`), a hand-recorded
+    row may use `Z`, and a local offset sorts by its punctuation. Here the LATER instant is
+    written `Z` and sorts BEFORE the earlier `+00:00` one as text.
+    """
+    path = _write(tmp_path, [
+        _row(0.60, "2026-09-06T05:00:00+00:00"),
+        _row(0.96, "2026-09-06T06:00:00Z"),
+    ])
+    assert last_run(None, "acme", path=path).accuracy == 0.96
+
+    # And an offset that is not UTC: 05:00-07:00 is 12:00Z, later than either above.
+    path = _write(tmp_path, [
+        _row(0.96, "2026-09-06T05:00:00-07:00"),
+        _row(0.60, "2026-09-06T06:00:00Z"),
+    ])
+    assert last_run(None, "acme", path=path).accuracy == 0.96
+
+
+def test_a_tie_keeps_the_later_row_as_position_did(tmp_path):
+    path = _write(tmp_path, [
+        _row(0.60, "2026-09-06T05:00:00+00:00"),
+        _row(0.96, "2026-09-06T05:00:00+00:00"),
+    ])
+    assert last_run(None, "acme", path=path).accuracy == 0.96
+
+
+def test_a_row_whose_stamp_cannot_be_parsed_does_not_become_the_baseline(tmp_path):
+    path = _write(tmp_path, [
+        _row(0.96, "2026-09-06T05:00:00+00:00"),
+        _row(0.10, "last Tuesday"),
+    ])
+    assert last_run(None, "acme", path=path).accuracy == 0.96
