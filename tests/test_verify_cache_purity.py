@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from mnemiq.verify.judge import JudgeRead  # noqa: E402
 from run_verify_replay import _CachingJudge, _RetryingJudge  # noqa: E402
 
 
@@ -23,12 +24,15 @@ class _Judge:
         self.calls = self.errors = self.unparsed = 0
         self._fail_first = fail_first
 
-    def score(self, question, schema, sql, preview):
+    def read(self, question, schema, sql, preview):
         self.calls += 1
         if self.calls <= self._fail_first:
             self.errors += 1
-            return 1.0          # the fail-open constant
-        return 0.25
+            return JudgeRead(1.0, fell_open=True, reason="error")   # the fail-open constant
+        return JudgeRead(0.25, fell_open=False)
+
+    def score(self, *a, **k):
+        return self.read(*a, **k).score
 
 
 def _cache(tmp_path, judge):

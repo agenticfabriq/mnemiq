@@ -23,6 +23,10 @@ class JudgeRead:
 
     score: float
     fell_open: bool
+    # WHY it fell open, because the retry policy differs by cause and a caller must not have to
+    # consult counters to learn it. `unparsed` is deterministic for a model that cannot emit the
+    # JSON, so retrying buys nothing; `error` is worth another attempt.
+    reason: str = "ok"          # "ok" | "error" | "unparsed"
 
 
 def _prompt(question: str, schema: str, sql: str, preview: str) -> str:
@@ -71,11 +75,11 @@ class SemanticJudge:
             m = _CONF.search(raw or "")
             if not m:
                 self.unparsed += 1
-                return JudgeRead(1.0, fell_open=True)
+                return JudgeRead(1.0, fell_open=True, reason="unparsed")
             return JudgeRead(max(0.0, min(1.0, float(m.group(1)))), fell_open=False)
         except Exception:
             self.errors += 1
-            return JudgeRead(1.0, fell_open=True)
+            return JudgeRead(1.0, fell_open=True, reason="error")
 
     def score(self, question: str, schema: str, sql: str, preview: str) -> float:
         """The float protocol the eval wrappers speak. Behaviour is unchanged, including fail-open."""
