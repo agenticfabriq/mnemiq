@@ -599,18 +599,19 @@ def test_an_aggregate_that_returns_its_argument_is_still_refused():
     assert _is_refused("SELECT any_value(claim_amount) FROM claim_amount")
 
 
-def test_distinct_does_not_change_whether_the_argument_is_a_bare_struct():
-    """`Distinct` sits between the column and the aggregate and defeated a parent test.
+def test_distinct_is_a_known_false_refusal_and_stays_one(): 
+    """Pinned as REFUSED on purpose, so the next person meets the decision rather than the bug.
 
-    The same deferral as the two ACME cases, one phrasing over: `count(DISTINCT claim_amount)` is
-    what a model writes for "how many different claim amounts", and it was refused for a reason
-    that has nothing to do with distinctness.
+    `count(DISTINCT claim_amount)` is what a model writes for "how many different claim amounts",
+    and it defers for a reason that has nothing to do with distinctness. Stepping over `Distinct`
+    fixes it and also widens the STAR WALK, which shares this predicate -- measured:
+    `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. Widening a
+    control that stops denied columns escaping is not a thing to do as a side effect of a
+    convenience, so this stays refused and is filed as M85.
     """
-    assert not _is_refused("SELECT count(DISTINCT claim_amount) FROM claim_amount")
-    assert not _is_refused("SELECT sum(DISTINCT claim_amount) FROM claim_amount")
-    # Stepping over DISTINCT must not step over an extraction underneath it.
-    assert _is_refused("SELECT count(DISTINCT claim['salary']) FROM claim")
-    assert _is_refused("SELECT max(DISTINCT claim_amount) FROM claim_amount")
+    assert _is_refused("SELECT count(DISTINCT claim_amount) FROM claim_amount")
+    # The shape that must never become allowed while fixing the one above.
+    assert _is_refused("SELECT count(DISTINCT t) FROM (SELECT * FROM claim) t")
 
 
 def test_a_spreading_function_over_a_table_named_column_is_still_refused():

@@ -176,10 +176,15 @@ def _aggregates_every_bare_reference(select: exp.Select, projection: exp.Express
     its own exemption is what made that difference visible instead of implicit, so it stays that
     way whether or not the current predicate needs it.
 
-    `DISTINCT` is stepped over. sqlglot parses `count(DISTINCT claim_amount)` as
-    `Count(this=Distinct(...))`, which puts a node between the column and the aggregate and defeats
-    a parent test -- and it changes nothing about the argument being the bare struct, so the same
-    question deferred for the same two ACME cases one phrasing over.
+    **`DISTINCT` is NOT stepped over, and that is a known false refusal.** sqlglot parses
+    `count(DISTINCT claim_amount)` as `Count(this=Distinct(...))`, so a node sits between the
+    column and the aggregate and this returns False -- the same deferral as the two ACME cases,
+    one phrasing over. Stepping over it was tried and reverted: this predicate is also the star
+    walk's exclusion, so the step-over silently widened THAT too, and
+    `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. The property
+    still holds there (a count carries no value out), but widening a control that stops denied
+    columns escaping is not something to do as a side effect of a convenience, and the phrasing
+    this refuses is one a rewrite can avoid. Filed as M85 rather than fixed here.
     """
     sources = {name.lower() for name in _sources(select)}
     bare = [
@@ -187,18 +192,8 @@ def _aggregates_every_bare_reference(select: exp.Select, projection: exp.Express
         if not column.table and column.name.lower() in sources
     ]
     return bool(bare) and all(
-        isinstance(_past_distinct(column.parent), _COLLAPSING_AGGREGATES) for column in bare
+        isinstance(column.parent, _COLLAPSING_AGGREGATES) for column in bare
     )
-
-
-def _past_distinct(node: exp.Expression | None) -> exp.Expression | None:
-    """The node above, stepping over a `DISTINCT` wrapper and nothing else.
-
-    Deliberately not a loop over "harmless" wrappers. Every node this steps over has to be one
-    that cannot extract a field, and `Distinct` is the only one that qualifies today; a general
-    skip is how `Bracket` got walked past the first time.
-    """
-    return node.parent if isinstance(node, exp.Distinct) else node
 
 
 def _projects_a_row(ast: exp.Expression) -> bool:
@@ -346,9 +341,12 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
             # The aggregate exemption is applied to the ROW-REFERENCE half only, never to
             # `_is_star`: a star is a star whatever wraps it, and skipping the walk for one would
             # be the leak this guard was built for. Reached only when every bare reference in the
-            # projection is the direct argument of a collapsing aggregate, so
-            # `sum(t['salary']) FROM (SELECT * FROM claim) t` still walks -- its bare reference
-            # sits under a `Bracket`, not under the `sum`.
+            # projection is the DIRECT argument of a collapsing aggregate -- nothing in between,
+            # not an extraction and not a `DISTINCT`. So
+            # `sum(t['salary']) FROM (SELECT * FROM claim) t` still walks: its bare reference sits
+            # under a `Bracket`. This predicate is shared with `_projects_a_row`, and anything
+            # loosened for that caller's benefit widens THIS one too -- which is what happened when
+            # a `DISTINCT` step-over was tried.
             if _is_star(projection) or (
                 _names_a_source(select, projection) is not None
                 and not _aggregates_every_bare_reference(select, projection)
