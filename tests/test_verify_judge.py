@@ -255,10 +255,14 @@ class _AlwaysErrors:
     def __init__(self) -> None:
         self.calls = self.errors = self.unparsed = 0
 
-    def score(self, *_args, **_kw) -> float:
+    def read(self, *_args, **_kw):
+        from mnemiq.verify.judge import JudgeRead
         self.calls += 1
         self.errors += 1
-        return 1.0
+        return JudgeRead(1.0, fell_open=True, reason="error")
+
+    def score(self, *a, **k) -> float:
+        return self.read(*a, **k).score
 
 
 def test_the_retrying_judge_reports_a_verdict_it_never_got():
@@ -282,9 +286,10 @@ def test_the_retrying_judge_reports_a_verdict_it_never_got():
     assert exhausted.gave_up == 1
 
     class _Answers(_AlwaysErrors):
-        def score(self, *_a, **_k):
+        def read(self, *_a, **_k):
+            from mnemiq.verify.judge import JudgeRead
             self.calls += 1
-            return 0.4
+            return JudgeRead(0.4, fell_open=False)
 
     fine = _RetryingJudge(_Answers(), attempts=2, backoff=0)
     got = fine.read("q", "s", "SELECT 1", "p")
@@ -303,12 +308,13 @@ def test_a_recovered_retry_is_not_reported_as_a_missing_verdict():
     from run_verify_replay import _RetryingJudge
 
     class _FailsOnce(_AlwaysErrors):
-        def score(self, *_a, **_k):
+        def read(self, *_a, **_k):
+            from mnemiq.verify.judge import JudgeRead
             self.calls += 1
             if self.calls == 1:
                 self.errors += 1
-                return 1.0
-            return 0.3
+                return JudgeRead(1.0, fell_open=True, reason="error")
+            return JudgeRead(0.3, fell_open=False)
 
     j = _FailsOnce()
     got = _RetryingJudge(j, attempts=3, backoff=0).read("q", "s", "SELECT 1", "p")
@@ -336,12 +342,16 @@ def test_one_wrapper_reads_many_cases_and_only_the_failing_ones_are_unavailable(
         def __init__(self):
             self.calls = self.errors = self.unparsed = 0
 
-        def score(self, question, *_a, **_k):
+        def read(self, question, *_a, **_k):
+            from mnemiq.verify.judge import JudgeRead
             self.calls += 1
             if question == "doomed":
                 self.errors += 1
-                return 1.0
-            return 0.4
+                return JudgeRead(1.0, fell_open=True, reason="error")
+            return JudgeRead(0.4, fell_open=False)
+
+        def score(self, *a, **k):
+            return self.read(*a, **k).score
 
     wrapper = _RetryingJudge(_FailsFirstCaseOnly(), attempts=2, backoff=0)
     first = wrapper.read("doomed", "s", "SELECT 1", "p")
@@ -352,3 +362,63 @@ def test_one_wrapper_reads_many_cases_and_only_the_failing_ones_are_unavailable(
         assert got.fell_open is False, f"{case} was judged, on a wrapper that had already given up"
         assert got.score == 0.4
     assert wrapper.gave_up == 1, "no further case gave up"
+
+
+def test_a_concurrent_failure_on_the_SHARED_inner_judge_does_not_mislabel(monkeypatch):
+    """The race one level down. `_RetryingJudge` wraps a judge that is shared, and two earlier
+    versions of `read` diffed that judge's `errors`/`unparsed` around their own call -- so another
+    thread's failure, landing between the two reads, made this call retry a judgement it already
+    had and could end with `fell_open` on an answer that was judged.
+
+    This is the same defect `SemanticJudge.read` was added to retire, which is why it kept coming
+    back: it was fixed at the Verifier and left in the wrapper, twice.
+    """
+    import pathlib
+    import sys
+    import threading
+
+    scripts = str(pathlib.Path(__file__).resolve().parents[1] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    from mnemiq.verify.judge import JudgeRead
+    from run_verify_replay import _RetryingJudge
+
+    started = threading.Event()
+    may_finish = threading.Event()
+
+    class _SharedInner:
+        """One judge behind two wrappers, as a sweep and a server both arrange."""
+
+        def __init__(self):
+            self.calls = self.errors = self.unparsed = 0
+
+        def read(self, question, *_a, **_k):
+            self.calls += 1
+            if question == "judged-but-slow":
+                started.set()
+                may_finish.wait(2)
+                return JudgeRead(0.62, fell_open=False)
+            self.errors += 1                      # the OTHER caller's judge fails
+            return JudgeRead(1.0, fell_open=True, reason="error")
+
+        def score(self, *a, **k):
+            return self.read(*a, **k).score
+
+    inner = _SharedInner()
+    out = {}
+
+    def run(q):
+        out[q] = _RetryingJudge(inner, attempts=3, backoff=0).read(q, "s", "SELECT 1", "p")
+
+    slow = threading.Thread(target=run, args=("judged-but-slow",))
+    other = threading.Thread(target=run, args=("other",))
+    slow.start()
+    assert started.wait(2)
+    other.start()
+    other.join()
+    may_finish.set()
+    slow.join()
+
+    assert out["judged-but-slow"].fell_open is False, out["judged-but-slow"]
+    assert out["judged-but-slow"].score == 0.62
+    assert out["other"].fell_open is True
