@@ -47,10 +47,14 @@ class SemanticJudge:
         # running tally the eval harness reads at the end of a sweep, and nothing more: everything
         # in them is derivable from `read`, whose `fell_open` sums to the total and whose `reason`
         # tallies to the same errors/unparsed split. They are kept because a sweep wants the figure
-        # without holding every result, not because they are the only source. Resist writing that
-        # they are: this comment has claimed exclusivity in several forms and each was falsified by
-        # the field that had just been added beside it. They change no behaviour and cost an
-        # increment.
+        # without holding every result, not because they are the only source. DO NOT write that
+        # they are. This comment has claimed exclusivity three times and the last two were false
+        # WHEN WRITTEN, not overtaken later: one asserted the counters were the only aggregate
+        # source three commits after `fell_open` existed, the next that they alone carried the
+        # cause split two commits after `reason` was added -- each disproved by a field already in
+        # this dataclass, a few lines up, while the comment was being edited. The failure is not
+        # falling behind the code; it is asserting uniqueness without reading what is beside it.
+        # They change no behaviour and cost an increment.
         #
         # They are NOT the per-call signal, and were briefly used as one: a caller diffing them
         # around its own `score` sees any concurrent caller's failure as its own, because they are
