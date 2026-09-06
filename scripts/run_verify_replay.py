@@ -81,47 +81,43 @@ class _RetryingJudge:
         self.gave_up = 0
 
     def __getattr__(self, name):          # calls/errors/unparsed/fallbacks read through
-        if name == "read":
-            # Not proxied -- see `read` below, which is the retrying version. Proxying the inner
-            # judge's would hand back a single attempt and skip every retry this class performs.
-            raise AttributeError("use _RetryingJudge.read")
         return getattr(self._judge, name)
 
-    def read(self, *args, **kwargs):
-        """The retrying counterpart of `score`, reporting whether it ever got a judgement.
+    def read(self, *args, **kwargs) -> JudgeRead:
+        """Retry a failed judge call, and report whether a judgement was ever obtained.
 
-        `Verifier` prefers `read` when a judge offers one. An earlier version made this class
-        REFUSE it, so a verifier handed a retrying judge fell back to `score` -- which returns the
-        bare fail-open constant when the retries are exhausted, with `gave_up` visible only on this
-        object. Those cases then read as VERIFIED at the answer while the sweep's error record said
-        `unrecovered > 0`, and nothing at the answer told the two apart. Refusing documented the
-        bypass and created a quieter hole beside it.
+        This is the PRIMITIVE and `score` delegates to it, rather than the other way round. The
+        first version called `score` and diffed `gave_up` around it -- a before/after read of
+        mutable state, which is precisely the pattern `SemanticJudge.read` exists to retire, and
+        which two tests could not have distinguished from `gave_up > 0` because each built a fresh
+        wrapper and read once. In a sweep there is ONE wrapper for every case, so that variant
+        would have marked every answer after the first unrecovered one as unavailable. Returning
+        the fact from the branch that knows it needs no counter at all.
         """
-        gave_up_before = self.gave_up
-        score = self.score(*args, **kwargs)
-        return JudgeRead(score, fell_open=self.gave_up != gave_up_before)
-
-    def score(self, *args, **kwargs) -> float:
         last = 1.0
         for attempt in range(self._attempts):
-            # Retried on ERRORS only: an unreadable reply is deterministic for a model that
-            # cannot emit the JSON, so attempts buy nothing -- the saving is one call per case
-            # instead of `attempts`. It is still a fail-open constant rather than a judgement, so
-            # it counts as UNRECOVERED at once: not retried, and not forgiven. Keying the retry on
-            # errors alone, WITHOUT the unparsed check below, is the trap -- unparsed then reaches
-            # neither the retry nor `gave_up`, and a judge answering unreadably every time
-            # certifies with `unrecovered` at zero. The two halves ship together for that reason.
+            # Retried on ERRORS only: an unreadable reply is deterministic for a model that cannot
+            # emit the JSON, so attempts buy nothing -- the saving is one call per case instead of
+            # `attempts`. It is still a fail-open constant rather than a judgement, so it counts as
+            # UNRECOVERED at once: not retried, and not forgiven. Keying the retry on errors alone,
+            # WITHOUT the unparsed check below, is the trap -- unparsed then reaches neither the
+            # retry nor `gave_up`, and a judge answering unreadably every time certifies with
+            # `unrecovered` at zero. The two halves ship together for that reason.
             errors_before, unparsed_before = self._judge.errors, self._judge.unparsed
             last = self._judge.score(*args, **kwargs)
             if self._judge.unparsed != unparsed_before:
                 self.gave_up += 1
-                return last
+                return JudgeRead(last, fell_open=True)
             if self._judge.errors == errors_before:
-                return last               # answered, and readable -- a real judgement
+                return JudgeRead(last, fell_open=False)   # answered, readable -- a judgement
             if attempt + 1 < self._attempts:
                 time.sleep(self._backoff * (2 ** attempt))
         self.gave_up += 1
-        return last                       # the fail-open constant, and recorded as such
+        return JudgeRead(last, fell_open=True)            # the constant, and recorded as such
+
+    def score(self, *args, **kwargs) -> float:
+        """The float protocol the cache and `judge_scores` speak. Unchanged, fail-open included."""
+        return self.read(*args, **kwargs).score
 
 
 class _CachingJudge:
