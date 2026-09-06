@@ -89,10 +89,12 @@ class _RetryingJudge:
         This is the PRIMITIVE and `score` delegates to it, rather than the other way round. The
         first version called `score` and diffed `gave_up` around it -- a before/after read of
         mutable state, which is precisely the pattern `SemanticJudge.read` exists to retire, and
-        which two tests could not have distinguished from `gave_up > 0` because each built a fresh
-        wrapper and read once. In a sweep there is ONE wrapper for every case, so that variant
-        would have marked every answer after the first unrecovered one as unavailable. Returning
-        the fact from the branch that knows it needs no counter at all.
+        and it was CORRECT -- the objection is not that it
+        gave wrong answers but that nothing could tell it from `gave_up > 0`, since every test built
+        a fresh wrapper and read once. In a sweep there is ONE wrapper for every case, and the
+        absolute form would then mark every answer after the first unrecovered one as unavailable.
+        Returning the fact from the branch that knows it needs no counter, so the two forms are no
+        longer even expressible.
         """
         last = 1.0
         for attempt in range(self._attempts):
