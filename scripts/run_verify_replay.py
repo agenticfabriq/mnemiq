@@ -47,7 +47,8 @@ class _RetryingJudge:
 
     # Retries exist because this is a network call, and for no stronger reason than that. An
     # earlier version of this comment claimed the window had to outlast an OUTAGE, and widened the
-    # backoff to 8 on the strength of one case that kept failing across three sweeps. That
+    # backoff to 8 on the strength of sweeps that each lost one case -- which that comment read
+    # as a different case each time, and which later turned out to be the same hard case. That
     # explanation was wrong. Raising the reasoning reserve to 4096 took endpoint errors from
     # 7, 6 and 4 per ~490 calls to 0 in 487 -- under the old rate the chance of a clean run is
     # 0.4% -- so every "endpoint error" measured here was this code truncating its own request,
