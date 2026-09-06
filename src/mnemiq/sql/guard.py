@@ -158,43 +158,6 @@ def _names_a_source(select: exp.Select, projection: exp.Expression) -> exp.Expre
 _COLLAPSING_AGGREGATES = (exp.Sum, exp.Avg, exp.Count)
 
 
-def _aggregates_every_bare_reference(select: exp.Select, projection: exp.Expression) -> bool:
-    """Is every bare source reference here the DIRECT argument of a collapsing aggregate?
-
-    The narrow exemption that lets `SELECT sum(claim_amount) FROM claim_amount` through -- a
-    column sharing its table's name, which the ACME source has twice, and the gold SQL for two
-    golden cases. Whichever way that name resolves nothing escapes: as a column `sum` returns a
-    number, and as a bare struct `sum(STRUCT)` is a type error and the query fails.
-
-    **Direct argument, and nothing looser.** The first version asked for the nearest enclosing
-    FUNCTION, and `exp.Bracket` and `exp.Dot` are not `exp.Func` subclasses -- so
-    `sum(claim['salary'])` walked past the extraction to the `sum` and was exempted, while the
-    only `exp.Column` in it is `claim` and the CLS scan never saw `salary` to ask whether it was
-    denied. The narrow form refuses it: the column's parent is the `Bracket`, not the aggregate.
-    That argument is about the aggregate's ARGUMENT being the bare struct, and stops being true
-    the moment anything sits in between.
-
-    Kept OUT of `_names_a_source`, which does double duty -- `_projects_a_row` asks it and the star
-    walk uses it as an entry condition. With the direct-parent test the two placements happen to
-    agree, because the walk ANDs the same predicate; with the broad "nearest enclosing function"
-    version they did not, and exempting inside the shared helper dropped
-    `sum(t['salary']) FROM (SELECT * FROM claim) t` out of the walk entirely. Each caller stating
-    its own exemption is what made that difference visible instead of implicit, so it stays that
-    way whether or not the current predicate needs it.
-
-    **`DISTINCT` is NOT stepped over, and that is a known false refusal.** sqlglot parses
-    `count(DISTINCT claim_amount)` as `Count(this=Distinct(...))`, so a node sits between the
-    column and the aggregate and this returns False -- the same deferral as the two ACME cases,
-    one phrasing over. Stepping over it was tried and reverted: this predicate is also the star
-    walk's exclusion, so the step-over silently widened THAT too, and
-    `count(DISTINCT t) FROM (SELECT * FROM claim) t` stopped being examined at all. The property
-    still holds there (a count carries no value out), but widening a control that stops denied
-    columns escaping is not something to do as a side effect of a convenience, and the phrasing
-    this refuses is one a rewrite can avoid. Filed as M85 rather than fixed here.
-    """
-    return _every_bare_reference_is_aggregated(select, projection, through_distinct=False)
-
-
 def _every_bare_reference_is_aggregated(select: exp.Select, projection: exp.Expression, *,
                                         through_distinct: bool) -> bool:
     """The shared walk. `through_distinct` is the part each caller has to decide for itself.
@@ -345,8 +308,12 @@ def _uses_a_row_outside_the_projection(ast: exp.Expression) -> bool:
             # a worse price than refusing a rarely-written shape.
             if isinstance(source, exp.Subquery):
                 continue
-            if isinstance(column.parent, _COLLAPSING_AGGREGATES):
-                continue  # M84: `sum` of a struct is a type error, so nothing escapes either way
+            # M84: `sum` of a struct is a type error, so nothing escapes either way; M85: a
+            # `DISTINCT` between the column and the aggregate changes neither. This is the
+            # THIRD site making this judgement, and it kept deferring
+            # `HAVING count(DISTINCT claim_amount) > 1` while the projection stopped.
+            if isinstance(_past_distinct(column.parent), _COLLAPSING_AGGREGATES):
+                continue
             return True
     return False
 
@@ -526,20 +493,32 @@ def _expands_a_base_table(select: exp.Select, star: exp.Expression, ctes: Scope,
 
 
 def _skipped_row_source(select: exp.Select, projection: exp.Expression) -> exp.Expression | None:
-    """The row source this projection names and the star walk must therefore examine, or None.
+    """A row source this projection names that the star walk must examine, or None.
 
-    None means "nothing here for the walk": either no bare source reference at all, or one whose
-    every occurrence is aggregated into a scalar over a BASE table. A subquery source is never
-    None, because the walk is what reads that subquery's own projection.
+    None means "nothing here for the walk": no bare source reference at all, or every one of them
+    aggregated into a scalar over a BASE table. A subquery source is never None, because the walk is
+    what reads that subquery's own projection.
+
+    **Every source it names, not the first.** `_names_a_source` returns the first match, so asking
+    it alone let `count(DISTINCT claim_amount) + count(DISTINCT t) FROM claim_amount, (SELECT *
+    FROM claim) t` resolve to the base table, take the exemption, and leave the star inside the
+    derived table unwalked -- the shape one addend over from the one this exemption is pinned not
+    to open.
     """
-    source = _names_a_source(select, projection)
-    if source is None:
+    sources = {name.lower(): source for name, source in _sources(select).items()}
+    named = [
+        sources[column.name.lower()]
+        for column in projection.find_all(exp.Column)
+        if not column.table and column.name.lower() in sources
+    ]
+    if not named:
         return None
-    if isinstance(source, exp.Subquery):
-        return source
+    for source in named:
+        if isinstance(source, exp.Subquery):
+            return source
     return None if _every_bare_reference_is_aggregated(
         select, projection, through_distinct=True
-    ) else source
+    ) else named[0]
 
 
 def _has_projection_star(ast: exp.Expression, dialect: str) -> bool:

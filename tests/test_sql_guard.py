@@ -627,6 +627,34 @@ def test_the_star_walk_still_examines_a_distinct_count_over_a_derived_star():
     """
     assert _is_refused("SELECT count(DISTINCT t) FROM (SELECT * FROM claim) t")
     assert _is_refused("SELECT sum(DISTINCT t['salary']) FROM (SELECT * FROM claim) t")
+    # One addend over. `_names_a_source` returns the FIRST match, so asking it alone resolved this
+    # to the base table, took the exemption, and left the derived star unwalked.
+    assert _is_refused(
+        "SELECT count(DISTINCT claim_amount) + count(DISTINCT t) "
+        "FROM claim_amount, (SELECT * FROM claim) t"
+    )
+    # Stricter than before this rule existed, and intended: `count(t)` over a derived star was
+    # allowed because the exemption skipped the walk, so the inner star was never examined. Only a
+    # cardinality ever left, so nothing leaked -- but "nobody looked" is not a property to keep.
+    assert _is_refused("SELECT count(t) FROM (SELECT * FROM claim) t")
+    assert _is_refused("SELECT sum(t) FROM (SELECT * FROM claim) t")
+
+
+def test_the_distinct_phrasing_works_outside_the_projection_too():
+    """Three sites make this judgement, not two, and the third kept deferring.
+
+    `count` returns a cardinality wherever it is written, so the reasoning that allows the
+    projection spelling allows this one.
+    """
+    assert not _is_refused(
+        "SELECT id FROM claim_amount GROUP BY id HAVING count(DISTINCT claim_amount) > 1"
+    )
+    assert not _is_refused(
+        "SELECT id FROM claim_amount GROUP BY id HAVING count(claim_amount) > 1"
+    )
+    assert _is_refused(
+        "SELECT id FROM claim_amount GROUP BY id HAVING max(DISTINCT claim_amount) > 1"
+    )
 
 
 def test_a_spreading_function_over_a_table_named_column_is_still_refused():
