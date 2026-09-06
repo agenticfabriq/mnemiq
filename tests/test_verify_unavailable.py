@@ -79,3 +79,39 @@ def test_unavailable_never_depends_on_the_threshold(threshold):
     look like a working verifier catching something. It is still not a judgement."""
     v = _verify(_Judge(1.0, falls_open=True), threshold=threshold)
     assert v.layer == "judge_unavailable"
+
+
+# --- the wire half: engine-side visibility is not visibility ---
+
+def _payload(layer):
+    from mnemiq.agent.loop import AgentAnswer
+    from mnemiq.server.serialize import answer_payload
+    a = AgentAnswer(answer="x", preview=None)
+    a.verify_layer = layer
+    a.verify_confidence = 1.0
+    return answer_payload(a)
+
+
+def test_the_unavailable_state_reaches_the_wire():
+    """`verify_layer` is deliberately withheld from clients, so stamping the answer engine-side
+    changes nothing a reader sees. Without this, an answer from a switched-off verifier is
+    byte-identical on the wire to a verified one -- which is the whole defect."""
+    assert _payload("judge_unavailable")["verified"] == "unavailable"
+
+
+def test_a_checked_answer_says_checked_and_leaks_no_score():
+    p = _payload("judge")
+    assert p["verified"] == "checked"
+    assert "verify_confidence" not in p and "verify_layer" not in p, \
+        "the score and the layer name stay withheld; only the derived state ships"
+
+
+def test_no_verifier_configured_is_its_own_state():
+    """`null` is not 'checked' and not 'unavailable'. A mode with no verifier is a third thing, and
+    collapsing it into either would misreport one of them."""
+    assert _payload(None)["verified"] is None
+
+
+def test_every_deterministic_layer_counts_as_checked():
+    for layer in ("sanity", "grounding", "pass"):
+        assert _payload(layer)["verified"] == "checked", layer

@@ -22,6 +22,23 @@ def answer_payload(ans: AgentAnswer) -> dict:
         "grant_fingerprint": ans.grant_fingerprint,
         "cached": ans.cached,
         "agreement": ans.agreement,
+        # M89. NOT the confidence and NOT the layer -- both stay withheld, and the argument for
+        # withholding them still holds: a bare "0.62" beside an answer reads as an accuracy claim
+        # we have not earned, and the layer name is meaningless without it. This is the one thing
+        # in the verifier's read that IS meaningful with no score attached, and that a reader is
+        # worse off not knowing: whether the check ran at all.
+        #
+        # The failure it exists for is silent by construction. `SemanticJudge.score` fails open and
+        # the constant it returns is 1.0, which is exactly what approval returns, so an answer from
+        # a verifier that was switched off is byte-identical on the wire to a verified one. That
+        # was true of every reasoning model until the token budget was fixed, and is true again
+        # whenever the endpoint is down.
+        #
+        # Three states, and `null` is a real one: no verifier was configured for this mode, which
+        # is different from one that ran and different from one that could not be reached.
+        "verified": (None if ans.verify_layer is None
+                     else "unavailable" if ans.verify_layer == "judge_unavailable"
+                     else "checked"),
         "judge_engaged": ans.judge_engaged,
         "judge_override": ans.judge_override,
         "candidates_executed": ans.candidates_executed,
