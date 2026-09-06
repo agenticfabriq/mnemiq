@@ -24,7 +24,7 @@ def token_param_name(model: str) -> str:
 
 
 # Reasoning room ADDED to every caller's request, not a threshold a few of them fall under.
-_REASONING_RESERVE = 1024
+_REASONING_RESERVE = 4096
 
 
 def reasoning_budget(model: str, max_tokens: int) -> int:
@@ -36,6 +36,15 @@ def reasoning_budget(model: str, max_tokens: int) -> int:
     reasoning before the answer starts. The provider reports that as a failed request, not a short
     reply. MEASURED (openai.gpt-5.5, 10 real `SemanticJudge` prompts): 200 -> 10/10 failed,
     400 -> 5/10, 600 -> 0/10.
+
+    Sized for the HARD TAIL, not the median, because the first version was sized for the median and
+    the tail is what found it. At a reserve of 1024 exactly one case in 487 still failed every
+    sweep -- a harder question, on which the model reasons longer. Pooled trials on that one case,
+    by the budget actually sent: 1224 -> 6/7 failed, 2224 -> 1/9, 3248 and above -> 0/24. Note 2224
+    gave 1/3 in one batch and 0/6 in another: reasoning length varies per call, so there is no
+    budget above which this becomes impossible, only a probability that falls steeply. That is the
+    argument for headroom over the smallest number that passed once, and the reason the product
+    still needs its fail-open to be visible rather than merely rare.
 
     A reserve, not a floor. A floor is the wrong shape: it would lift the judge's 200 to something
     workable while leaving `synthesize`'s 1000 -- a caller that genuinely wants 1000 tokens of
