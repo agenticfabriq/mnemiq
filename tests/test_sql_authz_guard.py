@@ -124,3 +124,61 @@ def test_decide_still_refuses_a_real_whole_row_reference():
         verdict = decide(sql, visible)
         assert isinstance(verdict, Refusal), sql
         assert verdict.code == RefusalCode.SELECT_STAR, sql
+
+
+def test_a_stale_snapshot_is_refused_before_execution_not_leaked():
+    """M90, end to end. A catalog that has drifted costs a refusal, not a denied column.
+
+    The snapshot claims `claim` has a column of that name and the live table does not. The guard
+    qualifies the reference on the schema's word, the binder rejects what it cannot resolve, and
+    `prove` turns that into a refusal before anything runs. Without the rewrite the bare name bound
+    to the row struct and returned `ssn` -- and `prove` could not tell the difference, because a
+    query that resolves to a row EXPLAINs perfectly well.
+    """
+    import duckdb
+
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.policy import AccessPolicy
+    from mnemiq.sql.verdict import Refusal, RefusalCode
+
+    class _Adapter:
+        """`execute`, because that is what `prove` calls -- `validate` first, else `execute`.
+
+        The first version of this double exposed `explain`, so every query raised AttributeError
+        and came back EXPLAIN_FAILED for a reason that had nothing to do with the query. The
+        assertion below passed with the rewrite under test DELETED, and the commit message called
+        that end-to-end verification. DuckDB was never consulted.
+        """
+
+        def __init__(self, con):
+            self.con = con
+
+        def execute(self, sql):
+            return self.con.execute(sql).fetchall()
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, ssn TEXT)")
+    con.execute("INSERT INTO claim VALUES (1, 'SECRET')")
+
+    verdict = decide("SELECT claim FROM claim", {"claim": {"id", "ssn", "claim"}},
+                     adapter=_Adapter(con), target="duckdb",
+                     policy=AccessPolicy(denied={("claim", "ssn")}))
+
+    assert isinstance(verdict, Refusal)
+    assert verdict.code == RefusalCode.EXPLAIN_FAILED, verdict.code
+    # The refusal must be the BINDER refusing the qualified name, not the double falling over.
+    assert "does not have a column named" in verdict.message, verdict.message
+
+    # And a plainly valid query through the same adapter is approved, so the double is not simply
+    # refusing everything -- which is exactly what the broken one did.
+    from mnemiq.sql.verdict import Approved
+    assert isinstance(
+        decide("SELECT ssn FROM claim", {"claim": {"id", "ssn"}},
+               adapter=_Adapter(con), target="duckdb"),
+        Approved,
+    )
+    # And the control: with an accurate snapshot the same shape is the row, refused earlier.
+    unstale = decide("SELECT claim FROM claim", {"claim": {"id", "ssn"}},
+                     adapter=_Adapter(con), target="duckdb")
+    assert isinstance(unstale, Refusal)
+    assert unstale.code == RefusalCode.SELECT_STAR, unstale.code

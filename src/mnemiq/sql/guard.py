@@ -83,6 +83,11 @@ def check_shape(
             ),
         )
 
+    # The schema said which of these are columns; qualifying them is what makes that answer
+    # checkable by the engine rather than taken on trust (M90). Before `_with_limit` so the
+    # returned tree is the one that runs, and before `check_cls` ever sees it -- a qualified
+    # reference is one that grant checking can rule on.
+    _qualify_schema_resolved(ast, columns)
     return _with_limit(ast, max_rows)
 
 
@@ -259,66 +264,139 @@ def _projects_a_row(ast: exp.Expression,
 
 
 
-def _binds_to_a_row(column: exp.Column, columns: dict[str, set[str]] | None) -> exp.Expression | None:
-    """The source this bare name binds to as a WHOLE ROW, or None if it is a column.
 
-    **Innermost scope first, and stopping there.** SQL resolves a bare name in the nearest scope
-    that can answer it, and both directions of getting that wrong have now been measured:
+def _resolve_bare(column: exp.Column,
+                  columns: dict[str, set[str]] | None) -> tuple[str, exp.Expression | None]:
+    """What a bare name binds to: ``("column", source | None)``, ``("row", source)`` or ``("", None)``.
 
-    * unioning every column name in the statement let `other.claim` exempt the row reference in
-      `SELECT claim FROM claim WHERE id IN (SELECT claim FROM other)`;
-    * walking OUTWARD for columns let the same `other.claim` exempt the INNER row reference in
-      `... FROM other WHERE EXISTS (SELECT 1 FROM claim WHERE claim['ssn'] = ...)`, where DuckDB
-      binds `claim` to the inner table's struct.
+    **One resolver, two callers.** `_binds_to_a_row` asks whether to refuse and `_schema_qualifier`
+    asks what to qualify with, and every time this file has answered one question in two places the
+    two have drifted -- four findings this week, three of them leaks. Both read this.
 
-    Both handed back a working extraction oracle past a `check_cls` that sees no `exp.Column` for
-    the field. So each scope is asked in turn and the FIRST one that resolves the name decides: a
-    column there means column, a source there means row, and only a scope that knows neither passes
-    the question outward -- which is what keeps M86's correlated case refused. A SUBQUERY source
-    answers neither: its columns are its own projection's business, and "unknown" has to read as
-    "not a known column" so a derived table cannot exempt anything.
+    Innermost scope decides, as SQL does. At each scope:
 
-    **The guarantee this depends on, written here because it is not otherwise stated in this
-    repo.** The verdict comes from the SNAPSHOT and is trusted in the fail-OPEN direction: a
-    snapshot listing a column the live table no longer has makes `SELECT claim FROM claim` read as
-    a column reference and pass, while the engine binds the bare name to the row struct and hands
-    back every field, a denied one included. `prove`'s EXPLAIN succeeds on that statement, so it
-    does not separate the two. Before the schema was consulted the same drift cost a false
-    refusal; now it costs a leak. Whoever changes enrichment cadence owns that trade -- tracked as
-    M90 in the findings register, which lives outside this repo, which is why it is also here.
+    * a SELECT ALIAS of the same name wins over any table column, so the reference is neither a row
+      nor a column of a table and nothing may be rewritten. `ORDER BY claim_amount` against
+      `amount AS claim_amount` was qualified to `claim_amount.claim_amount` and repointed the sort;
+    * exactly ONE source claiming the name resolves it to that column;
+    * a CTE reference is skipped when reading the schema: it is an `exp.Table`, so the lookup
+      would hand it the columns of whatever BASE table it shadows, and `WITH other AS (...)`
+      borrowed the granted `other`'s column list and returned a struct with a denied field in it;
+    * two or more claiming it is unresolvable, and so is a name that collides with a source no
+      snapshot claims -- both answer "row", which refuses. Leaving an ambiguous one bare put the
+      M90 leak back verbatim: measured, a snapshot claiming the name on two tables that do not have
+      it returned the whole struct with a denied column in it.
     """
     lookup = (
         {key.lower(): {name.lower() for name in names} for key, names in columns.items()}
         if columns else {}
     )
-    # A CTE reference is an `exp.Table`, so the schema lookup would hand it the columns of whatever
-    # BASE table it shadows: `WITH other AS (SELECT id FROM other)` borrowed the granted `other`'s
-    # column list, made a bare `claim` look like a column, and returned the whole `claim` struct
-    # with a denied `ssn` in it. Matched without dialect folding on purpose -- over-matching a base
-    # table that shares a CTE's name costs a refusal, and under-matching costs the row rule.
+    name = column.name.lower()
     root = column
     while root.parent is not None:
         root = root.parent
     cte_names = {cte.alias_or_name.lower() for cte in root.find_all(exp.CTE)}
-    name = column.name.lower()
     scope = column.parent
     while scope is not None:
         if isinstance(scope, exp.Select):
             sources = {key.lower(): source for key, source in _sources(scope).items()}
-            # A column in THIS scope wins over a table of the same name in it -- which is what
-            # DuckDB does, measured -- and a SUBQUERY source answers neither, so its columns stay
-            # its own projection's business and cannot exempt anything.
-            if any(
-                isinstance(source, exp.Table)
+            holders = [
+                source for source in sources.values()
+                if isinstance(source, exp.Table)
                 and source.name.lower() not in cte_names
                 and name in lookup.get(object_key(source).lower(), frozenset())
-                for source in sources.values()
-            ):
-                return None
+            ]
             if name in sources:
-                return sources[name]
+                return ("column", holders[0]) if len(holders) == 1 else ("row", sources[name])
+            if holders:
+                return "column", None  # an ordinary column; no collision to arbitrate
         scope = scope.parent
-    return None
+    return "", None
+
+
+def _schema_qualifier(column: exp.Column, columns: dict[str, set[str]] | None) -> str | None:
+    """The source to qualify this bare name with, when the SCHEMA is what resolved it to a column.
+
+    **Register M90.** Letting the schema decide "column or row" (M88) put a stale snapshot in the
+    fail-OPEN direction: one claiming a column the table no longer has makes `SELECT claim FROM
+    claim` pass as a column reference while the engine binds it to the row STRUCT and hands back
+    every field, a denied one included. `prove`'s EXPLAIN succeeds either way, because a query that
+    resolves to a row is perfectly valid SQL, so nothing downstream separates them.
+
+    A freshness promise is not available -- nothing in this process knows when the catalog was
+    built. So the query stops RELYING on the claim: the reference is QUALIFIED, which makes the
+    schema's answer checkable by the engine. Right, and the query means exactly what it did; stale,
+    and the binder refuses it. `SELECT claim.claim FROM claim` is a Binder Error on DuckDB where the
+    bare form returns the struct.
+
+    The qualifier keeps the source's own quoting -- rebuilding it bare folded `"Claim"` to `claim`,
+    which names no source against postgres and turned a legitimate query into `EXPLAIN_FAILED`.
+
+    **What this does NOT cover, stated because deleting the sentence that said so was itself a
+    finding.** Only a name that COLLIDES with a source is qualified, since that is the case the
+    schema had to arbitrate. A stale entry claiming a column on a source the name does not collide
+    with is still left bare and can still bind outward to an outer table's row --
+    `SELECT (SELECT claim['ssn'] FROM line_item LIMIT 1) AS x FROM claim` with `line_item`
+    stale-claiming `claim` is approved and returns the denied value. That hole predates this and is
+    not closed by it; the guarantee is narrower than "the query stops relying on the claim", and
+    saying the broad version would put the file back to trusting something it cannot check.
+    """
+    if column.table:
+        return None
+    kind, source = _resolve_bare(column, columns)
+    return _qualifier_of(source) if kind == "column" and source is not None else None
+
+
+def _qualifier_of(source: exp.Table) -> str:
+    """How to spell this source in a qualifier, keeping the quoting it was written with."""
+    alias = source.args.get("alias")
+    identifier = alias.this if alias is not None and alias.this is not None else source.this
+    return identifier.sql(dialect="duckdb") if isinstance(identifier, exp.Identifier) else str(identifier)
+
+
+def _qualify_schema_resolved(ast: exp.Expression, columns: dict[str, set[str]] | None) -> None:
+    """Qualify the bare PROJECTION names the schema resolved to a column, in place.
+
+    **Projections only, and the narrowing is the finding.** Four versions of an exemption for
+    select aliases each reopened something: scope-wide disarmed the projection check entirely,
+    outside-the-projection reopened M86's oracle in WHERE and a frequency count in GROUP BY, and
+    ORDER-BY-and-HAVING still exempted `ORDER BY claim['ssn']`, because only the BARE name binds to
+    an alias and a subscript on it is the struct again. Every version was a rule about WHERE a
+    reference sits rather than what the engine does with it, and every one was wrong towards the
+    leak.
+
+    There is no alias question in the projection: a lateral alias sees only EARLIER items, so a
+    bare name there binds to the table. Confining the rewrite removes the exemption and everything
+    that kept going wrong inside it, and `_binds_to_a_row` keeps its full strength in every clause
+    -- an aliased `ORDER BY claim_amount` is neither rewritten nor refused, because the schema
+    resolves it to a column and nothing needs to touch it.
+
+    The cost is that staleness is only caught where the rewrite reaches. A snapshot claiming a
+    column the table lacks still lets a WHERE-clause row use through, which is an oracle rather
+    than an escape -- the projection is where a struct actually leaves in the answer, and that is
+    the half now checked by the engine instead of trusted.
+    """
+    for select in ast.find_all(exp.Select):
+        for projection in select.expressions:
+            _qualify_in(projection, columns)
+
+
+def _qualify_in(node: exp.Expression, columns: dict[str, set[str]] | None) -> None:
+    for column in node.find_all(exp.Column):
+        qualifier = _schema_qualifier(column, columns)
+        if qualifier:
+            # Parsed rather than constructed, so a quoted qualifier stays quoted.
+            column.set("table", sqlglot.parse_one(qualifier, read="duckdb", into=exp.Identifier))
+
+def _binds_to_a_row(column: exp.Column,
+                    columns: dict[str, set[str]] | None) -> exp.Expression | None:
+    """The source this bare name binds to as a WHOLE ROW, or None if it is a column.
+
+    The refusing half of `_resolve_bare`, which carries the scope rules and the measurements
+    behind them.
+    """
+    kind, source = _resolve_bare(column, columns)
+    return source if kind == "row" else None
 
 
 def _uses_a_row_outside_the_projection(
