@@ -34,15 +34,21 @@ _THRESHOLDS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 
 class _RetryingJudge:
-    """Retry a judge call that FAILED, which only the counters can tell from one that scored 1.0.
+    """Retry a judge call that FAILED, which its score alone cannot distinguish from one that
+    scored 1.0.
 
     The product's judge fails open on the first error, deliberately -- a dead judge must not stop
     an answer. A MEASUREMENT wants the opposite: a fail-open score is not a judgement, and one
-    flaky call should not become a data point. This sits between the cache and the judge, notices
-    `errors` incrementing, and tries again with backoff.
+    flaky call should not become a data point. This sits between the cache and the judge and tries
+    again with backoff.
 
-    It cannot inspect the exception -- `SemanticJudge` swallows it -- so the counter delta IS the
-    signal. That is the second thing those counters bought.
+    It learns what happened from `JudgeRead`, which the inner judge returns WITH the score. An
+    earlier design read the inner judge's `errors`/`unparsed` counters before and after each call
+    and treated the delta as the signal -- and this docstring described that for three commits
+    after it was removed. Those counters are cumulative and the judge is shared, so under
+    concurrency the delta includes another caller's failure: the call retries a judgement it
+    already had, and can report a fail-open for an answer that was judged. Nothing here reads them
+    now, and the constructor refuses a judge that cannot answer `read`.
     """
 
     # Retries exist because this is a network call, and for no stronger reason than that. An
@@ -156,7 +162,10 @@ class _CachingJudge:
         # 487-call sweep, and repairing it any other way meant re-scoring all 487. Skipping the
         # write leaves that case ABSENT, which a re-run refills by scoring exactly it.
         #
-        # The counter delta is the signal, the same way `_RetryingJudge` reads `errors` -- a
+        # A delta, and safe here for a reason `_RetryingJudge` no longer shares: `gave_up` belongs
+        # to the wrapper this cache was handed, not to the judge behind it, so no other caller can
+        # move it. (`_RetryingJudge` used to diff the SHARED judge's counters and does not any
+        # more -- do not read this as precedent for that.) A
         # recovered retry increments `errors` while still producing a real judgement, so `errors`
         # is the wrong counter to key on here and `gave_up` is the right one.
         if getattr(self._judge, "gave_up", 0) != gave_up_before:
