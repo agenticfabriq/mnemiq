@@ -55,6 +55,12 @@ export type AnswerPayload = {
   agreement: number | null;
   judge_engaged: boolean | null;
   judge_override: boolean | null;
+  /** Whether the engaged judge FELL BACK to the majority vote instead of picking. The selector
+   *  fails closed on an outage, an unreadable reply or a pick outside the clusters, and the
+   *  fallback returns the same index a judge agreeing with the majority returns -- so without
+   *  this, `judge_engaged` alone claims a judgement that may never have happened. `null` means
+   *  the engine did not report it, which is not evidence of a fallback. */
+  judge_fell_back: boolean | null;
   candidates_executed: number | null;
   /** What the mode spent: outer attempts (the database rejected the SQL) and whether the
    *  corrector's surgical pass carried it (the decider rejected it). Two different judges. */

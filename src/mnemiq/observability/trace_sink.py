@@ -241,6 +241,10 @@ class VerityTraceSink(TraceSink):
                 "enrichment_version": getattr(trace, "enrichment_version", None),
                 "candidates_executed": getattr(answer, "candidates_executed", None),
                 "judge_engaged": getattr(answer, "judge_engaged", None),
+                # ...and whether it answered. Engaged-but-fallen-back is indistinguishable
+                # from a judgement without this, and the audit store is the reader that
+                # cannot ask again later (M11).
+                "judge_fell_back": getattr(answer, "judge_fell_back", None),
                 "agreement": getattr(answer, "agreement", None),
                 "cached": getattr(answer, "cached", None),
             },

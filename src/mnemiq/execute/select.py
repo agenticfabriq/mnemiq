@@ -26,6 +26,31 @@ class Selector(Protocol):
     def select(self, question: str, clusters: list[ClusterView]) -> int: ...
 
 
+@dataclass(frozen=True)
+class SelectorRead:
+    """A pick, and whether it IS a pick or the fallback.
+
+    The two are indistinguishable by value: a judge that studied the clusters and agreed with the
+    majority returns the same index a dead endpoint returns. That is M11's second clause -- the
+    loop derived `judge_engaged` from whether the clusters disagreed, so a failed selector shipped
+    `judge_engaged=True, judge_override=False` on `/v1/ask` and in the audit record, byte for byte
+    what a judgement produces. Carrying the fact beside the index is the only way a caller can tell
+    them apart, and it is the same fix `JudgeRead` is for the verifier.
+
+    NOT counters. `SemanticJudge` keeps cumulative ones for an eval sweep and its own docstring
+    records why they cannot answer this: the selector is shared across every request, so a caller
+    diffing a counter around its own call reads a concurrent request's failure as its own.
+    """
+
+    choice: int
+    fell_back: bool
+    # WHY, because the three causes want different responses and an operator must not have to
+    # guess: `error` is an outage worth alerting on, `unparsed` means this model cannot emit the
+    # format at all, and `out_of_range` means it answered in the right shape and named a cluster
+    # that does not exist -- a prompt problem, not an availability one.
+    reason: str = "ok"          # "ok" | "error" | "unparsed" | "out_of_range"
+
+
 def majority_index(clusters: list[ClusterView]) -> int:
     """Largest cluster, first on ties -- the exact semantics of max(groups, key=len)."""
     best = 0
@@ -79,16 +104,30 @@ class LLMSelector:
         self._client = client
         self._max_tokens = max_tokens
 
-    def select(self, question: str, clusters: list[ClusterView]) -> int:
+    def read(self, question: str, clusters: list[ClusterView]) -> SelectorRead:
+        """One pick, carrying whether the judge made it.
+
+        The fallback is unchanged in every case -- this returns the same index `select` always
+        returned. What is new is that the caller can tell a judgement from a fallback, which no
+        consumer of the bare int ever could.
+        """
         try:
             raw = self._client.complete(
                 _SYSTEM, _judge_prompt(question, clusters), max_tokens=self._max_tokens
             )
-            match = _INT.search(raw or "")
-            choice = int(match.group(0)) if match else -1
         except Exception:
-            choice = -1
-        return choice if 0 <= choice < len(clusters) else majority_index(clusters)
+            return SelectorRead(majority_index(clusters), fell_back=True, reason="error")
+        match = _INT.search(raw or "")
+        if match is None:
+            return SelectorRead(majority_index(clusters), fell_back=True, reason="unparsed")
+        choice = int(match.group(0))
+        if not 0 <= choice < len(clusters):
+            return SelectorRead(majority_index(clusters), fell_back=True, reason="out_of_range")
+        return SelectorRead(choice, fell_back=False)
+
+    def select(self, question: str, clusters: list[ClusterView]) -> int:
+        """The int protocol every `Selector` speaks. Behaviour is unchanged, fallback included."""
+        return self.read(question, clusters).choice
 
 
 class FakeSelector:

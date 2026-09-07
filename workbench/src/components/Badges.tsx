@@ -31,7 +31,15 @@ export function Badges({ answer }: { answer: AnswerPayload }) {
   if (answer.candidates_executed !== null) {
     chips.push(<Chip key="cand">{answer.candidates_executed} candidates</Chip>);
   }
-  if (answer.judge_engaged) chips.push(<Chip key="judge">judge engaged</Chip>);
+  // `judge_engaged` says the judge was ASKED. The selector fails closed to the majority vote, so
+  // a chip reading "judge engaged" was the same words whether one judged or the endpoint was
+  // down -- and this is the surface a person reads. `null` is not a fallback: an engine that does
+  // not report the fact must not be rendered as an outage.
+  if (answer.judge_engaged) {
+    chips.push(
+      <Chip key="judge">{answer.judge_fell_back ? "judge unavailable" : "judge engaged"}</Chip>,
+    );
+  }
   if (answer.judge_override) {
     chips.push(
       <Chip key="override" accent>

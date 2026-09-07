@@ -73,6 +73,14 @@ class AgentAnswer:
     agreement: float | None = None
     judge_engaged: bool | None = None  # multi-candidate only: did the judge get consulted?
     judge_override: bool | None = None  # ...and did it pick against the majority?
+    # ...and did it ANSWER. `judge_engaged` says only that the clusters disagreed enough to ask,
+    # and `LLMSelector` fails closed to the majority on an outage, an unreadable reply or a pick
+    # outside the clusters -- so without this, a dead selector and a judge that studied the
+    # clusters and agreed with the majority are the same two booleans on the wire and in the audit
+    # record (M11). `None` = no judgement was attempted, which is not the same as one that held.
+    # Non-None exactly when `judge_engaged` is True, and a selector speaking only the int protocol
+    # is taken at its word rather than assumed broken.
+    judge_fell_back: bool | None = None
     # Multi-candidate only: how many of N produced a TABLE. Not how many were attempted --
     # a candidate that deferred, or that ran and hit an ExecutionError, is dropped by _execute and
     # never counted. The looser "how many of N ran" left that ambiguous at the definition site.
@@ -399,10 +407,24 @@ class Agent:
                     narrowed=_narrowed_of(executed),
                 )
 
-        judge_engaged = judge_override = None
+        judge_engaged = judge_override = judge_fell_back = None
         if self.selector is not None:
             judge_engaged = not auto_accepted(views)
-            chosen = self.selector.select(packet.question, views) if judge_engaged else majority
+            if not judge_engaged:
+                chosen = majority
+            else:
+                # `read` when the selector offers it, because the fact must come back WITH the
+                # pick -- the fallback returns the majority index, which is also what a judgement
+                # agreeing with the majority returns. A selector speaking only `select` (any
+                # stub, `FakeSelector`, `MajoritySelector`) is taken at its word, the same rule
+                # the verifier applies to a judge without `read`: absence of the richer protocol
+                # is not evidence of a failure.
+                reader = getattr(self.selector, "read", None)
+                if reader is not None:
+                    got = reader(packet.question, views)
+                    chosen, judge_fell_back = got.choice, got.fell_back
+                else:
+                    chosen, judge_fell_back = self.selector.select(packet.question, views), False
             judge_override = chosen != majority
         else:
             chosen = majority  # no selector wired: Plan 12's vote, byte-for-byte
@@ -430,6 +452,7 @@ class Agent:
             agreement=agreement,
             judge_engaged=judge_engaged,
             judge_override=judge_override,
+            judge_fell_back=judge_fell_back,
             candidates_executed=len(executed),
             preview=base.preview,
             # Carried from `base`: this branch rebuilds the answer to append the agreement
