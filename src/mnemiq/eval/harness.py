@@ -43,6 +43,10 @@ class CaseResult:
     difficulty: str | None = None
     agreement: float | None = None  # self-consistency: winning-cluster fraction, if any
     judge_engaged: bool | None = None  # selector-judge: consulted on this case?
+    # ...and did it answer, or fall back to the vote. Per-CASE and not a sweep counter,
+    # deliberately: `SemanticJudge`'s cumulative counters cannot say which case degraded, and a
+    # sweep whose selector was down scores like one whose selector agreed with every majority.
+    judge_fell_back: bool | None = None
     # The RESULT verifier's read -- recorded on passes as well as refusals, because the only
     # question worth asking of a judge is whether it scores wrong answers below right ones,
     # and the passes are half that comparison.
@@ -110,6 +114,7 @@ def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None) -
     result.ms = (time.perf_counter() - started) * 1000
     result.agreement = answer.agreement
     result.judge_engaged = answer.judge_engaged
+    result.judge_fell_back = answer.judge_fell_back
     result.verify_confidence = answer.verify_confidence
     result.verify_layer = answer.verify_layer
     result.judge_override = answer.judge_override

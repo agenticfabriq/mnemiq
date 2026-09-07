@@ -66,6 +66,11 @@ def answer_payload(ans: AgentAnswer) -> dict:
         "verified": verified_state(ans.verify_layer),
         "judge_engaged": ans.judge_engaged,
         "judge_override": ans.judge_override,
+        # M11. `judge_engaged` alone says the judge was ASKED, and the selector fails closed
+        # to the majority vote, so a client reading the pair could not tell an outage from a
+        # judge that agreed. The fallback is the product decision and is unchanged; what
+        # ships now is whether a judgement actually happened.
+        "judge_fell_back": ans.judge_fell_back,
         "candidates_executed": ans.candidates_executed,
         # M33: what the mode actually spent. Without these, `instant` and `thinking` are
         # indistinguishable on a question that succeeds first time -- which is most of them.

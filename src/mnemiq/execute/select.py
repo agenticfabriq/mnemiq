@@ -26,6 +26,107 @@ class Selector(Protocol):
     def select(self, question: str, clusters: list[ClusterView]) -> int: ...
 
 
+@dataclass(frozen=True)
+class SelectorRead:
+    """A pick, and whether it IS a pick or the fallback.
+
+    The two are indistinguishable by value: a judge that studied the clusters and agreed with the
+    majority returns the same index a dead endpoint returns. That is M11's second clause -- the
+    loop derived `judge_engaged` from whether the clusters disagreed, so a failed selector shipped
+    `judge_engaged=True, judge_override=False` on `/v1/ask` and in the audit record, byte for byte
+    what a judgement produces. Carrying the fact beside the index is the only way a caller can tell
+    them apart, and it is the same fix `JudgeRead` is for the verifier.
+
+    NOT counters. `SemanticJudge` keeps cumulative ones for an eval sweep and its own docstring
+    records why they cannot answer this: the selector is shared across every request, so a caller
+    diffing a counter around its own call reads a concurrent request's failure as its own.
+    """
+
+    choice: int
+    fell_back: bool
+    # WHY, because the three causes want different responses and an operator must not have to
+    # guess: `error` is an outage worth alerting on, `unparsed` means this model cannot emit the
+    # format at all, and `out_of_range` means it answered in the right shape and named a cluster
+    # that does not exist -- a prompt problem, not an availability one.
+    reason: str = "ok"          # "ok" | one of FALLBACK_REASONS
+
+
+# The vocabulary, as a value rather than a comment. `SelectorRead` arrives from a DUCK-TYPED
+# `read` -- any object with the method -- so `reason` is whatever that object put there, and
+# `f"error: {exc}"` is the obvious variant to write. A provider's exception text carries hosts,
+# URLs and schema fragments, and the answer's cause reaches the audit record's ALWAYS tier, which
+# ships to deployments that deliberately kept text off. Owned here, beside the values it lists,
+# so the one clamp and the one producer cannot drift apart.
+FALLBACK_REASONS = frozenset({"error", "unparsed", "out_of_range"})
+
+# Deliberately not "error": that names an outage an operator may act on, and a vocabulary this
+# build has not been taught is not an outage. `verified_state` refuses the same conflation for
+# the same reason.
+UNRECOGNISED_REASON = "unrecognised"
+
+
+def trust(read: "SelectorRead", clusters: list[ClusterView]) -> "SelectorRead":
+    """Whatever a selector returned, narrowed to something the loop can act on.
+
+    A `Selector` is a Protocol: any object with the method, written by whoever wrote it. The
+    ATTRIBUTES are the protocol and a missing one is a programming error that should fail loudly
+    -- but their VALUES come from a model over a network, and every one of them is consumed
+    somewhere that assumes a type nothing enforces. `choice` indexes a list, so an out-of-range
+    int is an IndexError and a string is a TypeError, both killing a request in the path whose
+    whole contract is that a broken selector never does. `fell_back` is annotated `bool` and
+    lands in the audit record's always tier, so text put there ships to a deployment that
+    deliberately kept text off -- the leak the `reason` clamp exists to stop, one field over.
+
+    Applied at the ONE point an untrusted pick enters the engine, and to both protocols. A
+    narrowing threaded to some callers and not others is worse than none: it reads as a
+    guarantee while the unguarded path carries the same value.
+    """
+    # Narrowed by RECONSTRUCTION, not by coercing fields: every path below returns a freshly
+    # built `SelectorRead`, so `fell_back` is a literal `bool` and `reason` a vocabulary word
+    # whatever the selector put there. A `bool()` call here was measurably dead -- no mutation
+    # could see it -- because the reconstruction already does the work, and a coercion that
+    # cannot be observed to matter reads as though the guarantee lives in it.
+    choice, fell_back = read.choice, read.fell_back
+    # `isinstance(True, int)` is True, and `groups[True]` is a real lookup of cluster 1 -- so a
+    # boolean would pick a cluster by accident rather than be caught.
+    if isinstance(choice, bool) or not isinstance(choice, int):
+        return SelectorRead(majority_index(clusters), fell_back=True, reason=UNRECOGNISED_REASON)
+    if not 0 <= choice < len(clusters):
+        return SelectorRead(majority_index(clusters), fell_back=True, reason="out_of_range")
+    if not fell_back:
+        return SelectorRead(choice, fell_back=False)
+    return SelectorRead(choice, fell_back=True, reason=_clamped(read.reason))
+
+
+def fallback_reason(read: "SelectorRead") -> str | None:
+    """The cause to record for one pick: a member of `FALLBACK_REASONS`, `UNRECOGNISED_REASON`,
+    or None when there is no fallback to explain. Those three cases ARE the recorded vocabulary,
+    and `UNRECOGNISED_REASON` is deliberately not a member of the frozenset -- so a reader
+    enumerating the audit column from the set alone misses the one value that means a selector
+    this build has not been taught.
+
+    A judgement is not a fallback: the field is named for the event it explains, and an operator
+    filtering an audit store on IS NOT NULL must not count every judged answer as a failure.
+    `fell_back` already carries whether a judgement happened.
+    """
+    return _clamped(read.reason) if read.fell_back else None
+
+
+def _clamped(reason: object) -> str:
+    """One cause, narrowed to this engine's vocabulary.
+
+    `isinstance` BEFORE the membership test, because `in` on a frozenset is a hash lookup and a
+    duck-typed selector is under no obligation to put a string there -- a structured cause is the
+    natural thing for a third party to return. An unhashable one raises `TypeError` out of here,
+    out of the selector call (which sits under no `except` on this path) and out of the request:
+    a guard against free text that turns a fallback into a killed request, in the one function
+    whose contract is that it never kills one.
+    """
+    if not isinstance(reason, str) or reason not in FALLBACK_REASONS:
+        return UNRECOGNISED_REASON
+    return reason
+
+
 def majority_index(clusters: list[ClusterView]) -> int:
     """Largest cluster, first on ties -- the exact semantics of max(groups, key=len)."""
     best = 0
@@ -79,16 +180,40 @@ class LLMSelector:
         self._client = client
         self._max_tokens = max_tokens
 
-    def select(self, question: str, clusters: list[ClusterView]) -> int:
+    def read(self, question: str, clusters: list[ClusterView]) -> SelectorRead:
+        """One pick, carrying whether the judge made it.
+
+        The fallback is unchanged in every case -- this returns the same index `select` always
+        returned. What is new is that the caller can tell a judgement from a fallback, which no
+        consumer of the bare int ever could.
+        """
         try:
             raw = self._client.complete(
                 _SYSTEM, _judge_prompt(question, clusters), max_tokens=self._max_tokens
             )
-            match = _INT.search(raw or "")
-            choice = int(match.group(0)) if match else -1
         except Exception:
-            choice = -1
-        return choice if 0 <= choice < len(clusters) else majority_index(clusters)
+            return SelectorRead(majority_index(clusters), fell_back=True, reason="error")
+        match = _INT.search(raw or "")
+        # `int()` is guarded, not just the search: CPython refuses a conversion above 4300 digits
+        # and a 2000-token reply has room for several times that, so a degenerate repetition
+        # raises where the regex matched happily. Before this was a `read`, the parse sat inside
+        # the try that catches the endpoint and fell back with everything else; pulling the client
+        # call out of that try to tell an outage from an unreadable reply took the parse with it,
+        # and turned a fallback into a killed request in the one function whose contract is that
+        # it never kills one.
+        try:
+            choice = int(match.group(0)) if match is not None else None
+        except ValueError:
+            choice = None
+        if choice is None:
+            return SelectorRead(majority_index(clusters), fell_back=True, reason="unparsed")
+        if not 0 <= choice < len(clusters):
+            return SelectorRead(majority_index(clusters), fell_back=True, reason="out_of_range")
+        return SelectorRead(choice, fell_back=False)
+
+    def select(self, question: str, clusters: list[ClusterView]) -> int:
+        """The int protocol every `Selector` speaks. Behaviour is unchanged, fallback included."""
+        return self.read(question, clusters).choice
 
 
 class FakeSelector:

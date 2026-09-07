@@ -119,6 +119,12 @@ _WITHHELD: dict[str, str] = {
                     "`verified` on the payload, which is DERIVED from it and does ship: whether the "
                     "check ran needs no score to be meaningful, and is the half a reader is worse "
                     "off not knowing",
+    # M11. WHICH WAY the selector broke -- an outage, a model that cannot emit the format, a pick
+    # naming a cluster that does not exist. A client acts on whether the answer was judged, and
+    # `judge_fell_back` ships and answers that; the cause is an operator's question, asked after
+    # the fact by someone who cannot re-run the request, so it goes to the audit record instead.
+    "judge_fallback_reason": "operator diagnostics; the client-facing half is `judge_fell_back`, "
+                             "which does ship -- see the Verity trace for the cause",
 }
 
 

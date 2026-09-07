@@ -15,7 +15,14 @@ from mnemiq.progress import Emit, Stage, step
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
 from mnemiq.execute.runner import ExecutionError, run
-from mnemiq.execute.select import ClusterView, auto_accepted, majority_index
+from mnemiq.execute.select import (
+    ClusterView,
+    SelectorRead,
+    auto_accepted,
+    fallback_reason,
+    majority_index,
+    trust,
+)
 from mnemiq.generate.generator import Generator, StrategyGenerator
 from mnemiq.generate.plan_query import Deferred, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
@@ -73,6 +80,27 @@ class AgentAnswer:
     agreement: float | None = None
     judge_engaged: bool | None = None  # multi-candidate only: did the judge get consulted?
     judge_override: bool | None = None  # ...and did it pick against the majority?
+    # ...and did it ANSWER. `judge_engaged` says only that the clusters disagreed enough to ask,
+    # and `LLMSelector` fails closed to the majority on an outage, an unreadable reply or a pick
+    # outside the clusters -- so without this, a dead selector and a judge that studied the
+    # clusters and agreed with the majority are the same two booleans on the wire and in the audit
+    # record (M11). `None` = no judgement was attempted, which is not the same as one that held.
+    # Non-None exactly when `judge_engaged` is True, and a selector speaking only the int protocol
+    # is taken at its word rather than assumed broken.
+    judge_fell_back: bool | None = None
+    # ...and which way it broke, when it did. An outage, a model that cannot emit the format and
+    # a pick naming a cluster that does not exist want three different responses, and the audit
+    # record is where that is asked after the fact by someone who cannot re-run the request.
+    #
+    # `None` whenever there is no fallback to explain -- INCLUDING a successful judgement, which
+    # is not a fallback and whose "ok" would make an operator's `IS NOT NULL` count every judged
+    # answer as a failure. Otherwise a member of `FALLBACK_REASONS` **or `UNRECOGNISED_REASON`**,
+    # which is deliberately not in that frozenset: enumerating the vocabulary from the set alone
+    # misses the one value that means a selector this build has not been taught. `fallback_reason`
+    # reads it off the pick `trust` has already narrowed, so nothing downstream carries a
+    # third party's free text into the audit record's always tier. Deliberately NOT on the wire: a client acts
+    # on whether the answer was judged, not on how the judge broke.
+    judge_fallback_reason: str | None = None
     # Multi-candidate only: how many of N produced a TABLE. Not how many were attempted --
     # a candidate that deferred, or that ran and hit an ExecutionError, is dropped by _execute and
     # never counted. The looser "how many of N ran" left that ambiguous at the definition site.
@@ -399,10 +427,29 @@ class Agent:
                     narrowed=_narrowed_of(executed),
                 )
 
-        judge_engaged = judge_override = None
+        judge_engaged = judge_override = judge_fell_back = judge_fallback_reason = None
         if self.selector is not None:
             judge_engaged = not auto_accepted(views)
-            chosen = self.selector.select(packet.question, views) if judge_engaged else majority
+            if not judge_engaged:
+                chosen = majority
+            else:
+                # `read` when the selector offers it, because the fact must come back WITH the
+                # pick -- the fallback returns the majority index, which is also what a judgement
+                # agreeing with the majority returns. A selector speaking only `select` (any
+                # stub, `FakeSelector`, `MajoritySelector`) is taken at its word, the same rule
+                # the verifier applies to a judge without `read`: absence of the richer protocol
+                # is not evidence of a failure.
+                reader = getattr(self.selector, "read", None)
+                if reader is not None:
+                    got = trust(reader(packet.question, views), views)
+                else:
+                    # Taken at its word about whether it JUDGED -- absence of `read` is not
+                    # evidence of a failure -- and not taken at its word that the word is an
+                    # index. Same narrowing, because it is the same untrusted object.
+                    got = trust(SelectorRead(self.selector.select(packet.question, views),
+                                             fell_back=False), views)
+                chosen, judge_fell_back = got.choice, got.fell_back
+                judge_fallback_reason = fallback_reason(got)
             judge_override = chosen != majority
         else:
             chosen = majority  # no selector wired: Plan 12's vote, byte-for-byte
@@ -430,6 +477,8 @@ class Agent:
             agreement=agreement,
             judge_engaged=judge_engaged,
             judge_override=judge_override,
+            judge_fell_back=judge_fell_back,
+            judge_fallback_reason=judge_fallback_reason,
             candidates_executed=len(executed),
             preview=base.preview,
             # Carried from `base`: this branch rebuilds the answer to append the agreement

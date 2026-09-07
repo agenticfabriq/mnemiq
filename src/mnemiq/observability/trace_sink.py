@@ -241,6 +241,15 @@ class VerityTraceSink(TraceSink):
                 "enrichment_version": getattr(trace, "enrichment_version", None),
                 "candidates_executed": getattr(answer, "candidates_executed", None),
                 "judge_engaged": getattr(answer, "judge_engaged", None),
+                # ...and whether it answered. Engaged-but-fallen-back is indistinguishable
+                # from a judgement without this, and the audit store is the reader that
+                # cannot ask again later (M11).
+                "judge_fell_back": getattr(answer, "judge_fell_back", None),
+                # ...and which way. `judge_fell_back` alone makes an outage, a model that cannot
+                # emit the format and a pick outside the clusters one event. A fourth value,
+                # `unrecognised`, means a selector reported a cause this build has not been
+                # taught -- clamped in the loop, so no third party's free text reaches this tier.
+                "judge_fallback_reason": getattr(answer, "judge_fallback_reason", None),
                 "agreement": getattr(answer, "agreement", None),
                 "cached": getattr(answer, "cached", None),
             },
