@@ -173,19 +173,27 @@ def fetch_certified_records(settings) -> CertifiedSet:
     asked: set[str] = set()
     for _ in range(_MAX_PAGES):
         page_url = _page_url(url, since, cursor, page_size)
-        if page_url in asked:
+        # Keyed on what is SENT, not on what was built. With a `#` in the configured URL the
+        # built string differs every page -- it carries a fresh cursor, after the `#` -- while
+        # urllib cuts the request line there, so the identical request goes out each time.
+        # Measured: keyed on the built string, that case sent 10000 requests with one distinct
+        # selector and this guard never fired, which is the pathology it exists to stop.
+        sent = page_url.split("#", 1)[0]
+        if sent in asked:
             # A cursor that does not advance. `_MAX_PAGES` bounds this and does not DIAGNOSE it:
             # the loop re-requested one identical URL ten thousand times before giving up, which
             # is ten thousand hits on Verity to reach "pull incomplete". Two causes, both real --
             # a server repeating a cursor, and a `#` in the configured URL dropping the one we
             # send -- and neither is helped by asking again.
             logger.warning(
-                "verity returned a cursor that does not advance; the same page was requested "
-                "twice (%s). Treating the pull as incomplete rather than asking %d more times",
-                page_url, _MAX_PAGES - len(asked),
+                "the certified pull asked for the same page twice (%s), so the cursor is not "
+                "advancing -- either verity repeated one, or a `#` in verity_records_url is "
+                "dropping the one we send. Treating the pull as incomplete rather than asking "
+                "%d more times",
+                sent, _MAX_PAGES - len(asked),
             )
             break
-        asked.add(page_url)
+        asked.add(sent)
         payload = _get_records(settings, page_url)
         if payload is None:
             break  # a page failed -> keep what we have; do NOT advance the watermark
@@ -290,8 +298,8 @@ def _url_complaint(url: str) -> str | None:
             "contains a `#`; the pull appends `since`, `cursor` and `limit` after it and urllib "
             "drops everything from there, so every page is requested unparameterised. What that "
             "looks like depends on the corpus: a full dump merged as though it were a delta if "
-            "it fits one server page, and the same page fetched again and again until the pull "
-            "gives up undrained if it does not"
+            "it fits one server page, and if it does not, the same page asked for twice and the "
+            "pull giving up undrained with nothing to ground on"
         )
     if not parts.path.rstrip("/").endswith(CERTIFIED_RECORDS_PATH):
         return (

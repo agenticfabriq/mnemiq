@@ -356,3 +356,34 @@ def test_a_server_that_never_advances_the_cursor_is_not_asked_ten_thousand_times
     assert "cursor" in caplog.text
     assert got.available is False, "an undrained pull with no cache is still nothing to stand on"
 
+
+def test_a_dropped_cursor_stops_even_when_the_server_keeps_inventing_new_ones(tmp_path,
+                                                                             monkeypatch,
+                                                                             caplog):
+    """The guard has to key on what is SENT, not on what was built.
+
+    With a `#` in the URL the built page URL differs every time -- it carries a fresh cursor,
+    after the `#` -- while the request line urllib puts on the wire is byte-identical, because
+    everything from the `#` is cut. So a guard keyed on the built string never fires and the loop
+    still asks ten thousand times. Measured before the fix: 10000 requests, one distinct selector.
+    """
+    from mnemiq.config import Settings
+    from mnemiq.enrichment import certified as mod
+
+    selectors = []
+    tokens = iter(range(100_000))
+
+    def fake_urlopen(req, timeout=0):
+        selectors.append(req.selector)
+        return _Resp(_json.dumps({"records": [_record("a")], "watermark": "t1",
+                                  "next_cursor": f"page-{next(tokens)}"}).encode())
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    with caplog.at_level("WARNING"):
+        mod.fetch_certified_records(Settings(
+            verity_records_url="https://v/api/semantic/records/open#frag",
+            verity_watermark_path=str(tmp_path / "wm.json")))
+
+    assert len(selectors) < 5, f"sent {len(selectors)} requests, all {set(selectors)}"
+    assert len(set(selectors)) == 1, "the fixture must really be sending one identical request"
+
