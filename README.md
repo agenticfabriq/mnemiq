@@ -104,7 +104,7 @@ is the hard one by design — real data-application schemas, often more than a t
 rows to anything.** Both suites ship a human-written hint with the question, and the harness passes
 it through: **485 of the 487** BIRD cases carry one, and 13 of the 135 Spider cases. **No deployment
 gets this.** It is the largest effect BIRD reports about itself — GPT-4 scores 54.89% with that
-field and 34.88% without — and BIRD's leaderboard has a column for declaring it, so any number
+field and 34.88% without (BIRD, arXiv 2305.03111) — and BIRD's leaderboard has a column for declaring it, so any number
 quoted from either suite has to say which side of that 20-point line it sits on. Every number on
 this page is **with** it.
 
