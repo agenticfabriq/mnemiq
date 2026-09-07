@@ -186,10 +186,10 @@ def fetch_certified_records(settings) -> CertifiedSet:
             # a server repeating a cursor, and a `#` in the configured URL dropping the one we
             # send -- and neither is helped by asking again.
             logger.warning(
-                "the certified pull asked for the same page twice (%s), so the cursor is not "
-                "advancing -- either verity repeated one, or a `#` in verity_records_url is "
-                "dropping the one we send. Treating the pull as incomplete rather than asking "
-                "%d more times",
+                "the certified pull was about to request a page it has already fetched (%s), "
+                "so the cursor is not advancing -- either verity repeated one, or a `#` in "
+                "verity_records_url is dropping the one we send. Stopping here rather than "
+                "asking up to %d more times",
                 sent, _MAX_PAGES - len(asked),
             )
             break
@@ -298,8 +298,8 @@ def _url_complaint(url: str) -> str | None:
             "contains a `#`; the pull appends `since`, `cursor` and `limit` after it and urllib "
             "drops everything from there, so every page is requested unparameterised. What that "
             "looks like depends on the corpus: a full dump merged as though it were a delta if "
-            "it fits one server page, and if it does not, the same page asked for twice and the "
-            "pull giving up undrained with nothing to ground on"
+            "it fits one server page, and if it does not, the pull stopping undrained on the "
+            "second request for the same page and serving whatever was last cached"
         )
     if not parts.path.rstrip("/").endswith(CERTIFIED_RECORDS_PATH):
         return (

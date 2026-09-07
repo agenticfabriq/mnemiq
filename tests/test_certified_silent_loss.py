@@ -353,7 +353,7 @@ def test_a_server_that_never_advances_the_cursor_is_not_asked_ten_thousand_times
 
     assert len(seen) < 5, f"asked {len(seen)} times for the same page"
     assert len(set(seen)) == len(seen) or len(seen) <= 2
-    assert "cursor" in caplog.text
+    assert "cursor is not advancing" in caplog.text
     assert got.available is False, "an undrained pull with no cache is still nothing to stand on"
 
 
@@ -386,4 +386,8 @@ def test_a_dropped_cursor_stops_even_when_the_server_keeps_inventing_new_ones(tm
 
     assert len(selectors) < 5, f"sent {len(selectors)} requests, all {set(selectors)}"
     assert len(set(selectors)) == 1, "the fixture must really be sending one identical request"
+    # ...and it DIAGNOSES rather than merely bounding. Without this the test passes on any stop,
+    # including one that says nothing about why -- which is the whole difference from `_MAX_PAGES`.
+    assert "cursor is not advancing" in caplog.text
+    assert "`#`" in caplog.text, "and names the cause this URL actually has"
 
