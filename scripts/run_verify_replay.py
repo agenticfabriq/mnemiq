@@ -269,8 +269,10 @@ def main() -> int:
         print(f"thr {row['threshold']:.1f}:{_line(row)}")
 
     if args.with_sanity:
-        # The sanity layer is deterministic and free -- it re-runs here rather than being read from
-        # anywhere, so this row and the `--judge`-less rows above always describe the same code.
+        # The sanity layer is deterministic and free, so it re-runs here rather than being read
+        # from anywhere. It is the same `Verifier()` the no-`--judge` invocation reports as
+        # "sanity-only", which is a SEPARATE run of this script -- those rows are not printed
+        # above, because `--judge` takes the other branch.
         sanity = layer_defers(records, Verifier())
         print(f"\nsanity layer alone defers {sum(sanity)} of {len(sanity)} answerable cases; "
               "sweeping the judge BESIDE it (either layer defers):")
