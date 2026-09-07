@@ -127,7 +127,9 @@ verdict that needs no action; at the default WARNING level the read-only line go
 That silence covers one advisory of the two. The VPD advisory is scored and acknowledged
 separately, under the `source-enforcement` key, so a `constrained` deployment whose enforcement
 verdict is `partial` or `unverifiable` still warns on that line until you acknowledge that verdict
-too — `source-enforcement:partial`. `bypassing` warns whether or not you acknowledge it, for the
+too. Use the verdict you actually got: `source-enforcement:partial` or
+`source-enforcement:unverifiable`. Either one silences only itself — copying the wrong one is a
+silent no-op that looks exactly like no acknowledgement at all. `bypassing` warns whether or not you acknowledge it, for the
 reason below.
 
 Two verdicts cannot be silenced at all, and setting a key for either is worse than not setting one.
