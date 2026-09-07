@@ -932,8 +932,9 @@ class OracleAdapter:
                 "AUTONOMOUS_TRANSACTION function through a view. Measured on exactly that shape -- "
                 "refused with ORA-16000 while plain reads kept working. This is the only "
                 "deployment in which read_only is enforced by the database rather than by this "
-                "process. Note the scope: it was true when this connection opened, and reopening "
-                "the database READ WRITE would end it without notifying anything here"))
+                "process. Note the scope: it was true when this connection opened, and it is re-probed "
+                "on a bounded TTL thereafter -- reopening the database READ WRITE ends it and "
+                "is reported as a LAPSED warning within that window, which is the exposure"))
         # Object privileges are read through `ALL_TAB_PRIVS`, across THREE grantee routes, and
         # scoped to the governed schema. Every part of that is a measured correction of a wrong
         # earlier version.
