@@ -96,14 +96,30 @@ exact-match spans 34.8–37.0% and got-the-facts 51.1–58.5%, so read it as one
 rather than as a stable rate.
 
 Those are three different questions, not three attempts at one. ACME is in-domain — one enriched
-schema with a golden set, the regime a real deployment is in. BIRD and Spider are **cold start**:
-unseen schemas, no glossary, no examples. Spider 2.0 is the hard one by design — real
-data-application schemas, often more than a thousand columns.
+schema with a golden set, the regime a real deployment is in. BIRD and Spider are **cold start** in
+the sense that matters for schemas — unseen, with no glossary of ours and no examples. Spider 2.0
+is the hard one by design — real data-application schemas, often more than a thousand columns.
 
-On BIRD, **the table's row** sits in the range of BIRD's own reported single-shot baselines
-(GPT-4o 34.4, Claude 3.7 41.1, o3-mini 42.6): at 40.5% it sits inside that range and below its top
-two, not past it. An earlier version of this page put it at 42.3% and called it level with the top;
-that figure was graded under the pre-2026-08-06 rule.
+**They are not cold on the question, and that is the one caveat to read before comparing these
+rows to anything.** Both suites ship a human-written hint with the question, and the harness passes
+it through: **485 of the 487** BIRD cases carry one, and 13 of the 135 Spider cases. **No deployment
+gets this.** It is the largest effect BIRD reports about itself — GPT-4 scores 54.89% with that
+field and 34.88% without — and BIRD's leaderboard has a column for declaring it, so any number
+quoted from either suite has to say which side of that 20-point line it sits on. Every number on
+this page is **with** it.
+
+On BIRD, **the table's row** sits in the range of published single-shot baselines: at 40.5% it is
+inside that range and below its top, not past it. An earlier version of this page put it at 42.3%
+and called it level with the top; that figure was graded under the pre-2026-08-06 rule.
+
+> **The three baselines this sentence used to name are withdrawn pending a source.** It cited
+> GPT-4o 34.4, Claude 3.7 41.1 and o3-mini 42.6 as *"BIRD's own reported"* figures. They are not in
+> `bird-bench/mini_dev`'s EX table, which carries `gpt-4`, `gpt-4-32k` and `gpt-4-turbo`, and they
+> are not on BIRD's leaderboard; no commit records where they came from, and their
+> external-knowledge setting is therefore unknown — which, given the 20-point gap above, is the one
+> thing a comparison figure cannot leave open. The sourced comparison is in the technical report:
+> `bird-bench/mini_dev` at `b3d4bcb`, PostgreSQL column, **with** the knowledge field on both
+> sides.
 
 The 47.6% reported further down is not a counter-example to that, and the difference is
 configuration rather than a contradiction. That run executes up to five candidates per question
