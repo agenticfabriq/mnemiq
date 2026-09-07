@@ -43,7 +43,6 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
     _certified_set = fetch_certified_records(settings)
     require_certified(_certified_set, settings)
-    _certified = _certified_set.records
     # precedence: ontology < correlated < lookup < certified < dictionary
     _snap = ground_codes(adapter, _snap, dictionary=None, ontology=_onto)
     _snap, _protected = apply_certified_set(_snap, _certified_set)

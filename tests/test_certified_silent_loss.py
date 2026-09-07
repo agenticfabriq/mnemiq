@@ -149,23 +149,27 @@ def test_the_shared_step_reports_what_the_corpus_PINS():
 
 # --- M82: the documented endpoint, and the refusal that explains it ---
 
-def test_every_verity_field_names_the_same_endpoint():
+# The settings that describe this ONE pull. Listed rather than filtered: the first version of
+# this guard selected fields whose description already contained `/api/semantic/records`, which
+# is one field, so the two it was named for were never examined -- and rewriting either of them
+# to drop `/open` left it green. A filter keyed on the text being checked can only shrink.
+_PULL_SETTINGS = ("verity_records_url", "verity_watermark_path", "verity_page_size")
+
+
+def test_every_setting_that_describes_the_pull_names_the_same_endpoint():
     """M82. Three settings describe this one pull and two of them said `/open` while the field
     holding the URL said `/api/semantic/records` -- which takes no `since`, so it cannot serve an
     incremental pull at all. A deployment configured from the field's own description gets a 400
     on every page and `mnemiq enrich` fails outright."""
     from mnemiq.config import Settings
 
-    described = {
-        name: field.description or ""
-        for name, field in Settings.model_fields.items()
-        if name.startswith("verity_") and "/api/semantic/records" in (field.description or "")
-    }
-    assert described, "this guard is worthless if it stops finding the fields it checks"
-    for name, text in described.items():
-        assert "/api/semantic/records/open" in text, (
-            f"{name} names the records endpoint without `/open`. Only `/open` accepts `since`, "
-            "so the other one silently stops being incremental rather than failing"
+    unknown = [name for name in _PULL_SETTINGS if name not in Settings.model_fields]
+    assert not unknown, f"renamed out from under this guard: {unknown}"
+    for name in _PULL_SETTINGS:
+        text = Settings.model_fields[name].description or ""
+        assert "/open" in text, (
+            f"{name} describes the certified pull without naming `/open`. Only `/open` accepts "
+            "`since`, so the sibling silently stops being incremental rather than failing"
         )
 
 
@@ -198,3 +202,24 @@ def test_the_refusal_verity_gave_reaches_the_operator(tmp_path, monkeypatch, cap
     assert expected in caplog.text
     if absent is not None:
         assert absent not in caplog.text
+
+
+def test_a_huge_error_page_is_not_read_into_memory_to_be_thrown_away():
+    """The bound that matters is on the READ, not on the log line -- truncating a string already
+    in memory saves nothing. Measured on the stream itself rather than on the log, because the
+    log cannot tell 4KB read from 100KB read when both print the same 500 characters. That is why
+    the mutation reverting `exc.read(N)` to `exc.read()` survived every other test here."""
+    import io
+    import urllib.error
+
+    from mnemiq.enrichment.certified import _REFUSAL_BODY_BYTES, _refusal_detail
+
+    stream = io.BytesIO(b"<html>" + b"x" * 200_000 + b"</html>")
+    exc = urllib.error.HTTPError("https://v/x", 400, "Bad Request", {}, stream)
+    detail = _refusal_detail(exc)
+
+    assert stream.tell() <= _REFUSAL_BODY_BYTES, (
+        f"read {stream.tell()} bytes of a 200KB error page; the cap is {_REFUSAL_BODY_BYTES}"
+    )
+    assert "verity said" in detail, "and it still says what it managed to read"
+

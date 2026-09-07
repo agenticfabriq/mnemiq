@@ -48,6 +48,11 @@ _STANDALONE = {
 # with no name is worse than a name, and better than the silence this replaced.
 _UNIDENTIFIED = "<unidentified record>"
 
+# How much of a refusal body to read at all, and how much of it to log. The first bound is
+# the one that matters: the second only shortens a string already in memory.
+_REFUSAL_BODY_BYTES = 4096
+_REFUSAL_LOG_CHARS = 500
+
 _MAX_PAGES = 10000  # a guard against a misbehaving server; real corpora are far smaller
 _CACHE_VERSION = 1
 # How stale a merged set may get before it is reconciled in full. A withdrawal is invisible to
@@ -419,7 +424,10 @@ def _refusal_detail(exc: "urllib.error.HTTPError") -> str:
     a diagnosis worth pasting whole.
     """
     try:
-        body = exc.read().decode("utf-8", "replace").strip()
+        # Bounded at the READ, not only at the log line: a proxy answering a large error
+        # page to the records URL would otherwise be pulled into memory in full and then
+        # thrown away, under a docstring promising it was not.
+        body = exc.read(_REFUSAL_BODY_BYTES).decode("utf-8", "replace").strip()
     except Exception:
         return ""
     if not body:
@@ -434,7 +442,7 @@ def _refusal_detail(exc: "urllib.error.HTTPError") -> str:
                     break
     except ValueError:
         pass
-    return f" -- verity said: {body[:500]}"
+    return f" -- verity said: {body[:_REFUSAL_LOG_CHARS]}"
 
 
 def certified_concept_schemes(records: list[CertifiedRecord]) -> list[ConceptScheme]:
