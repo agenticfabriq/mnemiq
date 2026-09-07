@@ -85,10 +85,13 @@ as the control.
 `assert_read_only()` runs at startup and reports one of three verdicts. **Only `constrained` is
 re-probed afterwards** — it is the only verdict with an assurance to lose.
 
-Read that as a limit on *reporting*, not on protection. If you reopen a `gate_only` or `unverifiable`
+Read that as a limit on *reporting*, not on protection. If you reopen a `gate_only` or
+`unverifiable`
 database as READ ONLY while the process runs, **the database begins refusing writes immediately** —
-`ORA-16000` does not wait for mnemiq to notice. What does not update is the verdict: it was emitted once at
-startup and is not re-emitted, so nothing further appears in the log for that deployment. So reopening read-only is the right move during an
+`ORA-16000` does not wait for mnemiq to notice. What does not update is the verdict: it was
+emitted once at
+startup and is not re-emitted, so nothing further appears in the log for that deployment. So
+reopening read-only is the right move during an
 incident and takes effect at once; restart afterwards to make the engine's own report agree.
 
 | verdict | meaning | what to do |
@@ -107,7 +110,8 @@ What holds after boot, and what does not:
   reopened `READ WRITE` mid-process reports the **lapse** rather than carrying the boot assurance
   silently to the end of the run. The TTL is the exposure window and is stated rather than argued
   away: one extra round trip per interval, not per query. It is `MNEMIQ_ORACLE_READ_ONLY_TTL_S`,
-  default **300 seconds**; `0` disables re-probing and returns the old boot-sample behaviour. Only the lapse is reported — a deployment
+  default **300 seconds**; `0` disables re-probing and returns the old boot-sample behaviour. Only
+the lapse is reported — a deployment
   that was never `constrained` was already warned at boot. The VPD verdicts from
   `assert_enforcing()` are still boot samples and do not re-probe.
 - **They warn; they do not refuse.** A `bypassing` verdict does not stop startup today, because
@@ -120,7 +124,8 @@ What holds after boot, and what does not:
 purpose: the match is on the exact key, so a changed verdict falls outside the
 acknowledgement. Whether that is audible depends on the new verdict, not on the acknowledgement:
 acknowledge `read-only-basis:gate_only` and narrow the principal as §3 advises, and the resulting
-`unverifiable` **warns** at boot — you acknowledged a state you assessed and this is a different one.
+`unverifiable` **warns** at boot — you acknowledged a state you assessed and this is a different
+one.
 Reopen the database read-only instead and the resulting `constrained` is **quiet**, because it is a
 verdict that needs no action; at the default WARNING level the read-only line goes quiet.
 
@@ -129,17 +134,20 @@ separately, under the `source-enforcement` key, so a `constrained` deployment wh
 verdict is `partial` or `unverifiable` still warns on that line until you acknowledge that verdict
 too. Use the verdict you actually got: `source-enforcement:partial` or
 `source-enforcement:unverifiable`. Either one silences only itself — copying the wrong one is a
-silent no-op that looks exactly like no acknowledgement at all. `bypassing` warns whether or not you acknowledge it, for the
+silent no-op that looks exactly like no acknowledgement at all. `bypassing` warns whether or not
+you acknowledge it, for the
 reason below.
 
 Two verdicts cannot be silenced at all, and setting a key for either is worse than not setting one.
 
-**`source-enforcement:bypassing` is refused.** Acknowledging it produces the original warning *and* a
+**`source-enforcement:bypassing` is refused.** Acknowledging it produces the original warning
+*and* a
 second warning saying the acknowledgement was refused. A principal holding `EXEMPT ACCESS POLICY`
 bypasses every row policy in the database; that is not a deployment shape to accept quietly, and the
 engine declines to let you.
 
-**A lapse is not acknowledgeable either.** The re-probe reports through the log directly and consults no
+**A lapse is not acknowledgeable either.** The re-probe reports through the log directly and
+consults no
 acknowledgement set, so there is no `read-only-basis:lapsed` key and setting one silences nothing.
 That is deliberate in effect if not by design — an acknowledgement records a judgement about a
 deployment you inspected, and a database that has *changed open mode underneath you* is not that
