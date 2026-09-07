@@ -170,8 +170,23 @@ def fetch_certified_records(settings) -> CertifiedSet:
     cursor: str | None = None
     latest_watermark: str | None = None
     fully_drained = False
+    asked: set[str] = set()
     for _ in range(_MAX_PAGES):
-        payload = _get_records(settings, _page_url(url, since, cursor, page_size))
+        page_url = _page_url(url, since, cursor, page_size)
+        if page_url in asked:
+            # A cursor that does not advance. `_MAX_PAGES` bounds this and does not DIAGNOSE it:
+            # the loop re-requested one identical URL ten thousand times before giving up, which
+            # is ten thousand hits on Verity to reach "pull incomplete". Two causes, both real --
+            # a server repeating a cursor, and a `#` in the configured URL dropping the one we
+            # send -- and neither is helped by asking again.
+            logger.warning(
+                "verity returned a cursor that does not advance; the same page was requested "
+                "twice (%s). Treating the pull as incomplete rather than asking %d more times",
+                page_url, _MAX_PAGES - len(asked),
+            )
+            break
+        asked.add(page_url)
+        payload = _get_records(settings, page_url)
         if payload is None:
             break  # a page failed -> keep what we have; do NOT advance the watermark
         pulled.extend(payload.get("records", []))
@@ -272,9 +287,11 @@ def _url_complaint(url: str) -> str | None:
     # follows it.
     if "#" in url:
         return (
-            "carries a URL fragment; the pull appends `since`, `cursor` and `limit` after it and "
-            "urllib drops everything from the `#`, so every page is requested unparameterised "
-            "and the pull is a full dump wearing the shape of a delta"
+            "contains a `#`; the pull appends `since`, `cursor` and `limit` after it and urllib "
+            "drops everything from there, so every page is requested unparameterised. What that "
+            "looks like depends on the corpus: a full dump merged as though it were a delta if "
+            "it fits one server page, and the same page fetched again and again until the pull "
+            "gives up undrained if it does not"
         )
     if not parts.path.rstrip("/").endswith(CERTIFIED_RECORDS_PATH):
         return (

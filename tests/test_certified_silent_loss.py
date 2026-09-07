@@ -282,11 +282,11 @@ def test_a_huge_error_page_is_not_read_into_memory_to_be_thrown_away():
     # MEASURED: `_page_url` appends after the `#` and urllib cuts the request line there, so this
     # shape requests every page with no `since`, `cursor` or `limit` at all. The correct path is
     # not enough to make it a working pull, and the first version of this check called it quiet.
-    ("https://v/api/semantic/records/open#frag", "fragment"),
+    ("https://v/api/semantic/records/open#frag", "`#`"),
     # A BARE `#`: `urlsplit` calls that an EMPTY fragment, which is falsy, and the parameters are
     # dropped exactly the same. Measured on the built request, not reasoned from the parse.
-    ("https://v/api/semantic/records/open#", "fragment"),
-    ("https://v/api/semantic/records/open?tenant=acme#", "fragment"),
+    ("https://v/api/semantic/records/open#", "`#`"),
+    ("https://v/api/semantic/records/open?tenant=acme#", "`#`"),
 ])
 def test_the_warning_reads_the_PATH_and_not_the_whole_url(tmp_path, monkeypatch, caplog,
                                                          url, expected):
@@ -313,7 +313,46 @@ def test_the_fragment_and_the_wrong_path_are_told_apart():
     from mnemiq.enrichment.certified import _url_complaint
 
     assert _url_complaint("https://v/api/semantic/records/open") is None
-    assert "fragment" in _url_complaint("https://v/api/semantic/records/open#f")
+    assert "`#`" in _url_complaint("https://v/api/semantic/records/open#f")
     assert "path" in _url_complaint("https://v/api/semantic/records")
-    assert "fragment" not in _url_complaint("https://v/api/semantic/records")
+    assert "`#`" not in _url_complaint("https://v/api/semantic/records")
+
+
+def test_the_complaint_names_both_symptoms_a_dropped_cursor_produces():
+    """`#` drops `cursor` as well as `since`, and which symptom an operator sees depends on
+    whether the corpus fits one server page: a full dump merged as a delta if it does, and a
+    drain loop re-requesting one identical URL if it does not. A message naming only the first
+    points the operator away from the one they are looking at."""
+    from mnemiq.enrichment.certified import _url_complaint
+
+    complaint = _url_complaint("https://v/api/semantic/records/open#")
+    assert "`#`" in complaint, "and not `fragment`, which parses as empty for this very URL"
+    assert "cursor" in complaint and "since" in complaint
+    assert "same page" in complaint or "again" in complaint, "the paginated symptom, named"
+
+
+def test_a_server_that_never_advances_the_cursor_is_not_asked_ten_thousand_times(tmp_path,
+                                                                                monkeypatch,
+                                                                                caplog):
+    """`_MAX_PAGES` is a bound, not a diagnosis. A cursor that does not advance -- from a
+    misbehaving server, or from a `#` in the URL that drops the one we send -- had the drain loop
+    re-request ONE identical URL ten thousand times before giving up, hitting Verity that many
+    times to end in "pull incomplete". A repeated page is a stop, and it says why."""
+    from mnemiq.enrichment import certified as mod
+
+    seen = []
+
+    def fake_urlopen(req, timeout=0):
+        seen.append(req.full_url)
+        return _Resp(_json.dumps({"records": [_record("a")], "watermark": "t1",
+                                  "next_cursor": "stuck"}).encode())
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    with caplog.at_level("WARNING"):
+        got = mod.fetch_certified_records(_settings(tmp_path))
+
+    assert len(seen) < 5, f"asked {len(seen)} times for the same page"
+    assert len(set(seen)) == len(seen) or len(seen) <= 2
+    assert "cursor" in caplog.text
+    assert got.available is False, "an undrained pull with no cache is still nothing to stand on"
 
