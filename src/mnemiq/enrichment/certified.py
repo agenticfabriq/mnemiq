@@ -8,6 +8,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from mnemiq.config import CERTIFIED_RECORDS_PATH
 from mnemiq.contract import PII_LEVELS, CertifiedRecord, CodedValue, Job, Snapshot
 from mnemiq.contract.semantic import CertifiedRef
 from mnemiq.enrichment.verity_auth import access_token
@@ -46,6 +47,7 @@ _STANDALONE = {
 
 # A record whose envelope will not yield an identity either. Named rather than dropped: a count
 # with no name is worse than a name, and better than the silence this replaced.
+
 _UNIDENTIFIED = "<unidentified record>"
 
 # How much of a refusal body to read at all, and how much of it to log. The first bound is
@@ -145,6 +147,17 @@ def fetch_certified_records(settings) -> CertifiedSet:
         # Unconfigured is a supported deployment, not an outage: a local run grounds on whatever
         # the local digest produced and never asked Verity for anything.
         return CertifiedSet([], available=True)
+
+    if not url.rstrip("/").endswith(CERTIFIED_RECORDS_PATH):
+        # Said once, before the pull, because the symptom otherwise is either a 400 on every page
+        # or -- worse -- a pull that drains and has quietly stopped being incremental. A WARNING
+        # and not a refusal: the path is the operator's to choose and a proxy in front of Verity
+        # may legitimately serve it elsewhere.
+        logger.warning(
+            "verity_records_url %r does not end in %s; only that endpoint accepts `since`, so a "
+            "pull against any other one is not incremental however well it appears to work",
+            url, CERTIFIED_RECORDS_PATH,
+        )
 
     cache_path = _watermark_path(settings)
     cached, watermark, synced_at = _read_cache(cache_path, url)

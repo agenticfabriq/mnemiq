@@ -149,40 +149,66 @@ def test_the_shared_step_reports_what_the_corpus_PINS():
 
 # --- M82: the documented endpoint, and the refusal that explains it ---
 
-# The settings that describe this ONE pull. Listed rather than filtered: the first version of
-# this guard selected fields whose description already contained `/api/semantic/records`, which
-# is one field, so the two it was named for were never examined -- and rewriting either of them
-# to drop `/open` left it green. A filter keyed on the text being checked can only shrink.
-_PULL_SETTINGS = ("verity_records_url", "verity_watermark_path", "verity_page_size")
+def test_the_endpoint_this_pull_needs_is_a_VALUE_not_a_sentence():
+    """M82, and the third shape of this guard.
+
+    The first two checked the field's prose -- `/open` appears somewhere, then `/open` appears
+    first -- and each round of review found a phrasing that defeated it: a description can warn
+    against the endpoint it names first, or spell a path the pattern does not match. A rule about
+    how prose goes wrong is prose. So the endpoint an operator is told to set is a constant the
+    description is BUILT from, and this checks the constant.
+    """
+    from mnemiq.config import Settings
+    from mnemiq.enrichment.certified import CERTIFIED_RECORDS_PATH
+
+    assert CERTIFIED_RECORDS_PATH.endswith("/open"), (
+        "only `/open` accepts `since`; the sibling silently stops being incremental"
+    )
+    assert CERTIFIED_RECORDS_PATH in (Settings.model_fields["verity_records_url"].description or "")
 
 
-def test_every_setting_that_describes_the_pull_names_the_same_endpoint():
-    """M82. Three settings describe this one pull and two of them said `/open` while the field
-    holding the URL said `/api/semantic/records` -- which takes no `since`, so it cannot serve an
-    incremental pull at all. A deployment configured from the field's own description gets a 400
-    on every page and `mnemiq enrich` fails outright."""
+def test_a_url_that_is_not_the_open_endpoint_is_called_out_before_the_pull(tmp_path, monkeypatch,
+                                                                          caplog):
+    """The check that a docstring cannot make: what the deployment actually configured.
+
+    A description only helps somebody reading it. This is the operator who already got it wrong
+    -- and whose symptom, otherwise, is a 400 on every page or, worse, a pull that drains and
+    quietly stops being incremental. A WARNING and not a refusal, because the path is the
+    operator's to choose and a proxy in front of Verity may legitimately serve it elsewhere.
+    """
+    from mnemiq.enrichment import certified as mod
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", _serving({
+        "records": [], "watermark": "t1", "next_cursor": None}))
+    from mnemiq.config import Settings
+    settings = Settings(verity_records_url="https://v/api/semantic/records",
+                        verity_watermark_path=str(tmp_path / "wm.json"))
+    with caplog.at_level("WARNING"):
+        mod.fetch_certified_records(settings)
+    assert "since" in caplog.text and mod.CERTIFIED_RECORDS_PATH in caplog.text
+
+
+def test_the_open_endpoint_is_not_second_guessed(tmp_path, monkeypatch, caplog):
+    from mnemiq.enrichment import certified as mod
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", _serving({
+        "records": [], "watermark": "t1", "next_cursor": None}))
+    with caplog.at_level("WARNING"):
+        mod.fetch_certified_records(_settings(tmp_path))
+    assert "since" not in caplog.text
+
+
+def test_the_page_size_setting_warns_where_the_operator_turns_it():
+    """The `nor to 0` warning went on the field an operator is told NOT to change, while the knob
+    they actually reach for after a 400 still advertised 0 as a plain supported mode."""
     from mnemiq.config import Settings
 
-    import re
-
-    unknown = [name for name in _PULL_SETTINGS if name not in Settings.model_fields]
-    assert not unknown, f"renamed out from under this guard: {unknown}"
-    for name in _PULL_SETTINGS:
-        text = Settings.model_fields[name].description or ""
-        assert "/open" in text, (
-            f"{name} describes the certified pull without naming `/open`. Only `/open` accepts "
-            "`since`, so the sibling silently stops being incremental rather than failing"
-        )
-        # ...and names it FIRST. Mentioning `/open` somewhere is satisfied by a description that
-        # prescribes the bare endpoint and warns against `/open` -- the M82 defect with its
-        # clauses swapped, which the substring check alone cannot see. What an operator sets is
-        # the first endpoint the sentence names.
-        paths = re.findall(r"/api/semantic/records(?:/open)?", text)
-        if paths:
-            assert paths[0] == "/api/semantic/records/open", (
-                f"{name} names {paths[0]} before it names /open, so the endpoint it appears to "
-                "prescribe is the one that cannot serve this pull"
-            )
+    text = Settings.model_fields["verity_page_size"].description or ""
+    assert "0 = " in text, "it still has to say what 0 does"
+    assert "/open" in text and "since" in text, (
+        "and say why 0 is not a way to make the other endpoint work: it sends no `limit` at all, "
+        "so that endpoint drains happily and ignores `since` forever"
+    )
 
 
 @pytest.mark.parametrize("body,expected,absent", [
