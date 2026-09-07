@@ -113,7 +113,7 @@ def _leased(pool):
     and failed only inside the full suite, on timing that had nothing to do with the behaviour."""
     a = OracleAdapter.__new__(OracleAdapter)
     a._pool, a._con, a._closed = pool, None, False
-    a._read_only, a._ro_ttl_s, a._ro_state, a._ro_checked_at = True, 0.0, "unknown", 0.0
+    a._read_only, a._ro_ttl_s, a._ro_state, a._ro_checked_at = True, 0.0, "unknown", None
     a._lock = threading.RLock()
     return a
 
@@ -193,7 +193,7 @@ def _constrained_adapter(ttl=0.001, probe_ms=30000):
     a = OracleAdapter.__new__(OracleAdapter)
     a._oracledb = __import__("oracledb")
     a._read_only, a._ro_ttl_s, a._ro_state = True, ttl, "constrained"
-    a._ro_checked_at, a._ro_attempted_at, a._ro_unverified = 0.0, 0.0, False
+    a._ro_checked_at, a._ro_attempted_at, a._ro_unverified = None, None, False
     a._probe_timeout_ms = probe_ms
     return a
 
@@ -225,7 +225,7 @@ def test_a_probe_that_cannot_run_does_NOT_renew_the_assurance():
         a = _constrained_adapter()
         with caplog_at(logging.WARNING) as rec:
             a._recheck_read_only(con)
-        assert a._ro_checked_at == 0.0, f"a failed probe renewed the TTL ({type(con).__name__})"
+        assert a._ro_checked_at is None, f"a failed probe renewed the TTL ({type(con).__name__})"
         assert a._ro_state == "constrained"
         assert any("no longer be VERIFIED" in r.getMessage() for r in rec)
 
@@ -233,7 +233,7 @@ def test_a_probe_that_cannot_run_does_NOT_renew_the_assurance():
     con = _ProbeFails()
     with caplog_at(logging.WARNING) as rec:
         a._recheck_read_only(con)
-    assert a._ro_checked_at == 0.0, "a failed probe renewed the TTL"
+    assert a._ro_checked_at is None, "a failed probe renewed the TTL"
     assert a._ro_state == "constrained", "a failed probe must not change the verdict either way"
     assert any("no longer be VERIFIED" in r.getMessage() for r in rec)
 
@@ -281,7 +281,7 @@ def test_a_failing_probe_does_not_retry_on_every_lease():
 
     a._recheck_read_only(con)
     assert con.closed == 1, "precondition: the first lease probed"
-    assert a._ro_checked_at == 0.0, "a failed probe must not age the assurance forward"
+    assert a._ro_checked_at is None, "a failed probe must not age the assurance forward"
 
     for _ in range(5):
         a._recheck_read_only(con)
@@ -291,7 +291,7 @@ def test_a_failing_probe_does_not_retry_on_every_lease():
     a._ro_attempted_at -= 61.0
     a._recheck_read_only(con)
     assert con.closed == 2, "the probe stopped retrying altogether"
-    assert a._ro_checked_at == 0.0, "still nothing has been verified"
+    assert a._ro_checked_at is None, "still nothing has been verified"
 
 
 def test_the_age_of_the_STANDING_check_reaches_the_operator():
@@ -316,7 +316,7 @@ def test_the_age_of_the_STANDING_check_reaches_the_operator():
     # And the never-verified case reads as such rather than as a check at the epoch, which is what
     # a bare subtraction against 0.0 would print — an age of several decades.
     b = _constrained_adapter()
-    b._ro_checked_at = 0.0
+    b._ro_checked_at = None
     with caplog_at(logging.WARNING) as rec2:
         b._recheck_read_only(_ProbeFails())
     assert "no successful check at all" in next(
@@ -601,3 +601,23 @@ def test_only_ONE_place_records_a_constrained_verdict():
     assert 'self._ro_state = "constrained"' in owner, (
         "the one assignment is no longer inside `_record_constrained`, so the owner is not the "
         "owner and the other fields it clears will drift from it again")
+
+
+def test_the_first_reprobe_runs_on_a_freshly_booted_host(monkeypatch):
+    """`time.monotonic()` counts from host boot on Linux, so 0.0 is a real instant and not "never".
+
+    With `_ro_attempted_at` initialised to 0.0, the cadence gate `now - attempted < ttl` was true
+    for the whole first TTL of a host's uptime: the adapter skipped the very first re-probe, and
+    the window it exists to bound was unbounded exactly when a container starts with its host.
+
+    CI is the only place this could ever fail -- a runner boots fresh, a developer's machine has
+    been up for days -- which is why it arrived as a flake with a passing local suite. Pinned by
+    moving the clock rather than by waiting for one.
+    """
+    monkeypatch.setattr(mod.time, "monotonic", lambda: 41.0)
+    a = _constrained_adapter(ttl=60.0)
+    assert a._ro_attempted_at is None, "the sentinel must not be a point on the clock"
+
+    con = _ProbeFails()
+    a._recheck_read_only(con)
+    assert con.closed == 1, "the first lease on a freshly-booted host did not probe"
