@@ -114,7 +114,7 @@ and called it level with the top; that figure was graded under the pre-2026-08-0
 
 > **The three baselines this sentence used to name are withdrawn pending a source.** It cited
 > GPT-4o 34.4, Claude 3.7 41.1 and o3-mini 42.6 as *"BIRD's own reported"* figures. They are not in
-> `bird-bench/mini_dev`'s EX table, which carries `gpt-4`, `gpt-4-32k` and `gpt-4-turbo`, and they
+> `bird-bench/mini_dev`'s EX Evaluation table, which carries `gpt-4`, `gpt-4-32k` and `gpt-4-turbo`, and they
 > are not on BIRD's leaderboard; no commit records where they came from, and their
 > external-knowledge setting is therefore unknown — which, given the 20-point gap above, is the one
 > thing a comparison figure cannot leave open. The baseline that IS checkable is BIRD's own:
