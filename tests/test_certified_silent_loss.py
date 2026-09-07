@@ -346,6 +346,18 @@ def test_the_complaint_names_all_THREE_outcomes_a_dropped_cursor_produces():
     # green -- the two-of-three defect, inside the guard against it.
     assert "serves the last cached" in complaint and "refuses" in complaint
 
+    # WHAT THIS TEST DOES NOT HOLD, said rather than implied: substring checks catch a DELETED
+    # outcome and cannot catch a MISPAIRED one. Swapping which corpus condition leads to which
+    # outcome -- "a full dump if it does NOT fit one server page" -- leaves all three assertions
+    # green while handing a multi-page deployment the inverted diagnosis.
+    #
+    # Not tightened a fourth time, deliberately. Two rounds of review already took apart a
+    # substring guard over the endpoint description, and the answer there was to stop testing
+    # prose and test a VALUE. There is no value here: the mapping is three conditionals in one
+    # English sentence, and a regex that appeared to check it would claim more than it holds --
+    # which is worse than a bound stated out loud. The pairing is reviewed by a human reading the
+    # message; what a machine can hold is that no outcome has gone missing.
+
 
 def test_a_server_that_never_advances_the_cursor_is_not_asked_ten_thousand_times(tmp_path,
                                                                                 monkeypatch,
