@@ -297,9 +297,10 @@ def _url_complaint(url: str) -> str | None:
         return (
             "contains a `#`; the pull appends `since`, `cursor` and `limit` after it and urllib "
             "drops everything from there, so every page is requested unparameterised. What that "
-            "looks like depends on the corpus: a full dump merged as though it were a delta if "
-            "it fits one server page, and if it does not, the pull stopping undrained on the "
-            "second request for the same page and serving whatever was last cached"
+            "looks like depends on the corpus and on what is cached: a full dump merged as "
+            "though it were a delta if the corpus fits one server page; otherwise a pull that "
+            "stops on finding itself about to re-request a page it already fetched, and then "
+            "serves the last cached set -- or, with no cache, refuses the run outright"
         )
     if not parts.path.rstrip("/").endswith(CERTIFIED_RECORDS_PATH):
         return (

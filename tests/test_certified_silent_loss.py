@@ -328,7 +328,13 @@ def test_the_complaint_names_both_symptoms_a_dropped_cursor_produces():
     complaint = _url_complaint("https://v/api/semantic/records/open#")
     assert "`#`" in complaint, "and not `fragment`, which parses as empty for this very URL"
     assert "cursor" in complaint and "since" in complaint
-    assert "same page" in complaint or "again" in complaint, "the paginated symptom, named"
+    # All THREE outcomes, because which one an operator sees depends on the corpus AND on what
+    # is cached, and each rewrite of this sentence has named a different two of them: a full dump
+    # merged as a delta, a stop that then serves the cache, and a stop with no cache that refuses
+    # the run outright. Naming two of three points somebody at the wrong diagnosis.
+    assert "delta" in complaint
+    assert "already fetched" in complaint or "re-request" in complaint
+    assert "cached" in complaint and "refuses" in complaint
 
 
 def test_a_server_that_never_advances_the_cursor_is_not_asked_ten_thousand_times(tmp_path,
@@ -388,6 +394,12 @@ def test_a_dropped_cursor_stops_even_when_the_server_keeps_inventing_new_ones(tm
     assert len(set(selectors)) == 1, "the fixture must really be sending one identical request"
     # ...and it DIAGNOSES rather than merely bounding. Without this the test passes on any stop,
     # including one that says nothing about why -- which is the whole difference from `_MAX_PAGES`.
-    assert "cursor is not advancing" in caplog.text
-    assert "`#`" in caplog.text, "and names the cause this URL actually has"
+    #
+    # Asserted on the STOP record, not on `caplog.text`: this URL also trips the pre-pull
+    # complaint, which says `#` itself, so an aggregate check for `#` could not fail however the
+    # stop message was written. A guard that cannot fail is worse than none, which this file says
+    # about a different guard a hundred lines up.
+    stop = [r.getMessage() for r in caplog.records if "cursor is not advancing" in r.getMessage()]
+    assert len(stop) == 1, f"expected one stop record, got {len(stop)}"
+    assert "`#`" in stop[0], "and the stop itself names the cause this URL actually has"
 
