@@ -321,10 +321,9 @@ def test_the_FLAG_is_no_more_trusted_than_the_word():
     and the comment claiming the tier was protected made it worse than the silent version."""
     leak = "error: conn refused to https://provider.internal (tenant acme_prod)"
     ans = _answer(_agent_with(_rogue(fell_back=leak, reason="error")))
+    # `is True`, not truthiness: the narrowing works by RECONSTRUCTION, so handing the selector's
+    # own object back -- string and all -- fails here rather than passing on a truthy value.
     assert ans.judge_fell_back is True, "a truthy claim IS a fallback -- believed, then narrowed"
-    assert isinstance(ans.judge_fell_back, bool), \
-        "and narrowed by RECONSTRUCTION: returning the selector's own object back would put its " \
-        "string in the always tier while `is True` still passed on a truthy one"
     assert leak not in json.dumps(_trace_of(ans))
 
 
@@ -374,8 +373,7 @@ def test_a_FALSY_non_bool_flag_becomes_False_and_not_None():
     which the wire ships uncoerced and which the field documents as "no judgement was attempted"
     -- the opposite of what happened."""
     ans = _answer(_agent_with(_rogue(choice=0, fell_back=None)))
-    assert ans.judge_fell_back is False
-    assert isinstance(ans.judge_fell_back, bool)
+    assert ans.judge_fell_back is False, "the `False` singleton, which `None` is not"
     assert ans.judge_fallback_reason is None
 
 
@@ -399,4 +397,32 @@ def test_the_pick_ONE_PAST_the_last_cluster_is_refused():
     assert ans.deferred is False
     assert ans.agreement == 2 / 3, "the majority cluster"
     assert ans.judge_fell_back is True and ans.judge_fallback_reason == "out_of_range"
+
+
+def test_the_fallback_goes_to_the_MAJORITY_and_not_to_the_first_cluster():
+    """Every other loop-level case here shares one fixture, and that fixture's majority IS
+    cluster 0 -- so `majority_index(clusters)` and a hardcoded `0` are the same integer, and
+    replacing the fallback destination with a literal left the whole suite green. This is the
+    diff's own failure shape one line over: a rejected pick lands on the wrong cluster and ships
+    it as a confident answer with `judge_fell_back=True`, indistinguishable from a correct
+    fallback.
+
+    The candidates are ordered so the majority is cluster 1: one `sum` (5) then two `count`s (7).
+    """
+    from mnemiq.execute.select import SelectorRead
+
+    sizes = {}
+
+    class _R:
+        def read(self, question, clusters) -> SelectorRead:
+            sizes["by_index"] = [c.size for c in clusters]
+            return SelectorRead(99, fell_back=False)      # rejected: out of range
+
+    agent = _vote_agent([_sql("sum(n)"), _sql("count(*)"), _sql("count(*)")], 3)
+    agent.selector = _R()
+    ans = _answer(agent)
+
+    assert sizes["by_index"] == [1, 2], "the fixture must put the majority at index 1, not 0"
+    assert ans.judge_fell_back is True and ans.judge_fallback_reason == "out_of_range"
+    assert ans.agreement == 2 / 3, "the 2-candidate cluster at index 1 -- not the first one"
 
