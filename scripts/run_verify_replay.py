@@ -24,7 +24,8 @@ import time
 
 from mnemiq.config import Settings
 from mnemiq.eval.bird_runner import enrich_bird_db
-from mnemiq.eval.verify_replay import _ANSWERABLE, judge_scores, load_records, replay, sweep
+from mnemiq.eval.verify_replay import (_ANSWERABLE, judge_scores, layer_defers, load_records,
+                                       replay, sweep)
 from mnemiq.llm.client import LLMClient
 from mnemiq.semantic.cards import build_cards
 from mnemiq.verify.judge import JudgeRead, SemanticJudge
@@ -191,6 +192,10 @@ def main() -> int:
     p.add_argument("--minidev", default=os.environ.get(
         "MNEMIQ_MINIDEV_DIR", os.path.expanduser("~/src/dataset/bird-minidev/MINIDEV")))
     p.add_argument("--cache", default="eval-reports/minidev-pg-cache")
+    p.add_argument("--with-sanity", action="store_true",
+                   help="also sweep the judge WITH the sanity layer beside it (the product's shape: "
+                        "either layer defers). The combined row is not the sum of the two separate "
+                        "rows -- they overlap")
     args = p.parse_args()
 
     records = load_records(args.run)
@@ -262,6 +267,15 @@ def main() -> int:
     print(f"scored {len(scores)} answerable cases; sweeping thresholds:")
     for row in sweep(records, scores, _THRESHOLDS):
         print(f"thr {row['threshold']:.1f}:{_line(row)}")
+
+    if args.with_sanity:
+        # The sanity layer is deterministic and free -- it re-runs here rather than being read from
+        # anywhere, so this row and the `--judge`-less rows above always describe the same code.
+        sanity = layer_defers(records, Verifier())
+        print(f"\nsanity layer alone defers {sum(sanity)} of {len(sanity)} answerable cases; "
+              "sweeping the judge BESIDE it (either layer defers):")
+        for row in sweep(records, scores, _THRESHOLDS, also_defer=sanity):
+            print(f"thr {row['threshold']:.1f}:{_line(row)}")
     return 0
 
 
