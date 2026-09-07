@@ -8,6 +8,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from mnemiq.config import CERTIFIED_RECORDS_PATH
 from mnemiq.contract import PII_LEVELS, CertifiedRecord, CodedValue, Job, Snapshot
 from mnemiq.contract.semantic import CertifiedRef
 from mnemiq.enrichment.verity_auth import access_token
@@ -44,6 +45,15 @@ _STANDALONE = {
 }
 
 
+# A record whose envelope will not yield an identity either. Named rather than dropped: a count
+# with no name is worse than a name, and better than the silence this replaced.
+_UNIDENTIFIED = "<unidentified record>"
+
+# How much of a refusal body to read at all, and how much of it to log. The first bound is
+# the one that matters: the second only shortens a string already in memory.
+_REFUSAL_BODY_BYTES = 4096
+_REFUSAL_LOG_CHARS = 500
+
 _MAX_PAGES = 10000  # a guard against a misbehaving server; real corpora are far smaller
 _CACHE_VERSION = 1
 # How stale a merged set may get before it is reconciled in full. A withdrawal is invisible to
@@ -75,6 +85,13 @@ class CertifiedSet:
 
     records: list[CertifiedRecord]
     available: bool = True
+    # What arrived and could NOT be read, by `<object_type>:<object_id>` off the envelope. A
+    # record that fails validation is dropped so one bad row cannot sink the batch -- right, and
+    # silent: the column it described then keeps the LLM's GUESSED `pii_level`, which
+    # `build_access_policy` reads, so the loss quietly UN-MASKS a column and shrinks `_protected`
+    # so the LLM may re-guess a meaning a human certified. Carried here so the run can say so
+    # (M10); `available` is untouched, because part of a corpus is not none of it.
+    skipped: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
         raise TypeError(
@@ -130,6 +147,18 @@ def fetch_certified_records(settings) -> CertifiedSet:
         # the local digest produced and never asked Verity for anything.
         return CertifiedSet([], available=True)
 
+    complaint = _url_complaint(url)
+    if complaint:
+        # Said once, before the pull, because the symptom otherwise is either a 400 on every page
+        # or -- worse -- a pull that drains and has quietly stopped being incremental.
+        #
+        # A WARNING and not a refusal, and that is a judgement about the PATH only: a proxy in
+        # front of Verity may legitimately serve this endpoint somewhere else, so the engine is
+        # not entitled to overrule the operator. No such legitimacy exists for the `#` cause --
+        # urllib cuts the URL client-side before anything is sent, so no deployment makes that
+        # shape work -- and this comment must not be read as covering it.
+        logger.warning("verity_records_url %r %s", url, complaint)
+
     cache_path = _watermark_path(settings)
     cached, watermark, synced_at = _read_cache(cache_path, url)
 
@@ -141,8 +170,31 @@ def fetch_certified_records(settings) -> CertifiedSet:
     cursor: str | None = None
     latest_watermark: str | None = None
     fully_drained = False
+    asked: set[str] = set()
     for _ in range(_MAX_PAGES):
-        payload = _get_records(settings, _page_url(url, since, cursor, page_size))
+        page_url = _page_url(url, since, cursor, page_size)
+        # Keyed on what is SENT, not on what was built. With a `#` in the configured URL the
+        # built string differs every page -- it carries a fresh cursor, after the `#` -- while
+        # urllib cuts the request line there, so the identical request goes out each time.
+        # Measured: keyed on the built string, that case sent 10000 requests with one distinct
+        # selector and this guard never fired, which is the pathology it exists to stop.
+        sent = page_url.split("#", 1)[0]
+        if sent in asked:
+            # A cursor that does not advance. `_MAX_PAGES` bounds this and does not DIAGNOSE it:
+            # the loop re-requested one identical URL ten thousand times before giving up, which
+            # is ten thousand hits on Verity to reach "pull incomplete". Two causes, both real --
+            # a server repeating a cursor, and a `#` in the configured URL dropping the one we
+            # send -- and neither is helped by asking again.
+            logger.warning(
+                "the certified pull was about to request a page it has already fetched (%s), "
+                "so the cursor is not advancing -- either verity repeated one, or a `#` in "
+                "verity_records_url is dropping the one we send. Stopping here rather than "
+                "asking up to %d more times",
+                sent, _MAX_PAGES - len(asked),
+            )
+            break
+        asked.add(sent)
+        payload = _get_records(settings, page_url)
         if payload is None:
             break  # a page failed -> keep what we have; do NOT advance the watermark
         pulled.extend(payload.get("records", []))
@@ -161,7 +213,8 @@ def fetch_certified_records(settings) -> CertifiedSet:
         # Degraded freshness is not absence. A populated cache still grounds the engine, so it
         # stays available; an EMPTY one means we asked for a corpus and have none, which is the
         # state a configured deployment must not answer from silently.
-        return CertifiedSet(_parse(cached), available=bool(cached))
+        records, skipped = _parse(cached)
+        return CertifiedSet(records, available=bool(cached), skipped=skipped)
 
     records = pulled if full else _merge(cached, pulled)
     if cache_path:
@@ -173,7 +226,89 @@ def fetch_certified_records(settings) -> CertifiedSet:
             # while looking fixed.
             synced_at=_now_iso() if full else synced_at,
         )
-    return CertifiedSet(_parse(records), available=True)
+    parsed, skipped = _parse(records)
+    return CertifiedSet(parsed, available=True, skipped=skipped)
+
+
+def apply_certified_set(snapshot: Snapshot, certified: CertifiedSet
+                        ) -> tuple[Snapshot, frozenset[str]]:
+    """A pull result, laid onto a snapshot: the overlay, what the corpus PINS, and what it lost.
+
+    Every product caller wrote these three steps out itself -- apply the records, derive
+    `_protected` from the same list, and ignore the rest of the set -- so `cli`, `eval/run` and
+    `eval/bird_runner` each carried the same five lines. That is why this exists rather than a
+    keyword on `apply_certified`: a fact the pull learns has to reach the snapshot through ONE
+    step, or it reaches two callers of three and reads as a guarantee (**M79**, and M11 one
+    week later).
+
+    `apply_certified` stays a pure overlay of the records it is HANDED. The unreadable ones are a
+    fact about the pull, not about the records that arrived, and this is the seam where a pull
+    meets a snapshot -- so the job is written here.
+    """
+    snapshot = apply_certified(snapshot, certified.records)
+    if certified.skipped:
+        # M2's lesson, and M10's: a security-relevant loss belongs in the structured run record.
+        # A dropped column record leaves the LLM's guessed `pii_level` standing, which
+        # `build_access_policy` reads -- so this is the difference between an un-masked column
+        # somebody can be asked about afterwards and one nobody can.
+        logger.warning(
+            "%d certified record(s) could not be read and were dropped; the columns they "
+            "described keep their locally guessed meaning: %s",
+            len(certified.skipped), ", ".join(certified.skipped),
+        )
+        snapshot = snapshot.model_copy(update={"jobs": [*snapshot.jobs, Job(
+            id="certified:record_unreadable",
+            source_id=snapshot.source_id,
+            kind="certified_record_unreadable",
+            status="refused",
+            checkpoints=list(certified.skipped),
+        )]}, deep=True)
+    protected = frozenset(r.envelope.object_id for r in certified.records
+                          if r.envelope.object_type == "column")
+    return snapshot, protected
+
+
+def _url_complaint(url: str) -> str | None:
+    """What is wrong with this records URL for an INCREMENTAL pull, if anything.
+
+    Two different problems, and only one of them is about the path:
+
+    * **the wrong endpoint.** Compared on the parsed PATH, not the whole string: `_page_url`
+      appends its parameters with `"&" if "?" in url else "?"`, so a records URL that already
+      carries a query string is a shape this module supports, and an `endswith` over the raw URL
+      called every one of them misconfigured.
+    * **a `#` anywhere.** MEASURED, not reasoned: `_page_url` appends `?since=...&limit=...`
+      AFTER the `#`, and `urllib` cuts the request line at the first `#` -- so
+      `.../records/open#frag` requests `/api/semantic/records/open` with no parameters at all,
+      on every page. That is the silent full-dump-merged-as-a-delta this warning exists to
+      announce, wearing the correct path, and the first version of this check called it fine.
+      A BARE trailing `#` does the same and parses to an empty fragment, which the second
+      version then called fine as well.
+    """
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(url)
+    # `"#" in url`, not `parts.fragment`: a trailing bare `#` splits to an EMPTY fragment, which
+    # is falsy, while urllib still cuts the request line there and the parameters are still lost.
+    # Measured: `.../records/open#` and `.../records/open?tenant=acme#` both went unwarned while
+    # sending no `since` at all. The property is that the URL carries a `#`, not that anything
+    # follows it.
+    if "#" in url:
+        return (
+            "contains a `#`; the pull appends `since`, `cursor` and `limit` after it and urllib "
+            "drops everything from there, so every page is requested unparameterised. What that "
+            "looks like depends on the corpus and on what is cached: a full dump merged as "
+            "though it were a delta if the corpus fits one server page; otherwise a pull that "
+            "stops on finding itself about to re-request a page it already fetched, and then "
+            "serves the last cached set -- or, with no cache, refuses the run outright"
+        )
+    if not parts.path.rstrip("/").endswith(CERTIFIED_RECORDS_PATH):
+        return (
+            f"has the path {parts.path!r}, not {CERTIFIED_RECORDS_PATH}; only that endpoint "
+            "accepts `since`, so a pull against any other one is not incremental however well "
+            "it appears to work"
+        )
+    return None
 
 
 def _record_identity(item: dict) -> tuple[str, str]:
@@ -196,14 +331,25 @@ def _merge(cached: list[dict], delta: list[dict]) -> list[dict]:
     return [by_identity[key] for key in sorted(by_identity)]
 
 
-def _parse(items: list[dict]) -> list[CertifiedRecord]:
+def _parse(items: list[dict]) -> tuple[list[CertifiedRecord], tuple[str, ...]]:
+    """The records that validated, and the identities of the ones that did not.
+
+    The identity is read off the ENVELOPE, which is a plain dict here and survives a payload that
+    does not validate -- so the caller learns WHICH column silently kept its guess, rather than
+    only that something was dropped. A record whose envelope is unusable too has no name to give
+    and says so, because a count with no identity is still better than a log line nobody reads.
+    """
     out: list[CertifiedRecord] = []
+    skipped: list[str] = []
     for item in items:
         try:
             out.append(CertifiedRecord.model_validate(item))
         except Exception as exc:  # one malformed record must not sink the batch
-            logger.warning("skipping malformed certified record: %s", exc)
-    return out
+            object_type, object_id = _record_identity(item) if isinstance(item, dict) else ("", "")
+            identity = f"{object_type}:{object_id}" if object_type or object_id else _UNIDENTIFIED
+            logger.warning("skipping unreadable certified record %s: %s", identity, exc)
+            skipped.append(identity)
+    return out, tuple(sorted(skipped))
 
 
 def _needs_full_sync(cached, watermark, synced_at, settings) -> bool:
@@ -335,12 +481,47 @@ def _get_records(settings, url: str) -> dict | None:
             if exc.code == 401 and token is not None and not force_refresh:
                 logger.info("verity rejected the token (401); refreshing once")
                 continue
-            logger.warning("verity records unreachable; enriching local-only: %s", exc)
+            # The BODY, not just the status. `require_certified` tells the operator the log
+            # "carries the cause verbatim", and for a 400 it did not: `HTTPError.__str__` is
+            # "HTTP Error 400: Bad Request" while the sentence naming the bad parameter -- which
+            # is how a deployment learns its `verity_records_url` points at the endpoint that
+            # takes no `since` (M82) -- sits in a body nothing read.
+            logger.warning("verity records unreachable; enriching local-only: %s%s",
+                           exc, _refusal_detail(exc))
             return None
         except (urllib.error.URLError, OSError, ValueError) as exc:
             logger.warning("verity records unreachable; enriching local-only: %s", exc)
             return None
     return None
+
+
+def _refusal_detail(exc: "urllib.error.HTTPError") -> str:
+    """Verity's own words for the refusal, or nothing at all.
+
+    Read defensively and BOUNDED: this is a remote server's response reaching a log line, the body
+    may already have been consumed, and an HTML error page from a proxy in front of Verity is not
+    a diagnosis worth pasting whole.
+    """
+    try:
+        # Bounded at the READ, not only at the log line: a proxy answering a large error
+        # page to the records URL would otherwise be pulled into memory in full and then
+        # thrown away, under a docstring promising it was not.
+        body = exc.read(_REFUSAL_BODY_BYTES).decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+    if not body:
+        return ""
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
+            for key in ("detail", "message", "error"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value:
+                    body = value
+                    break
+    except ValueError:
+        pass
+    return f" -- verity said: {body[:_REFUSAL_LOG_CHARS]}"
 
 
 def certified_concept_schemes(records: list[CertifiedRecord]) -> list[ConceptScheme]:

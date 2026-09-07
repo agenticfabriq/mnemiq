@@ -31,7 +31,7 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
         print("set MNEMIQ_PG_DSN")
         return 1
     from mnemiq.enrichment.certified import (
-        apply_certified, fetch_certified_records, require_certified)
+        apply_certified_set, fetch_certified_records, require_certified)
     from mnemiq.enrichment.dictionary import load_dictionary
     from mnemiq.enrichment.grounding import apply_dictionary, ground_codes
     from mnemiq.enrichment.pipeline import content_version
@@ -43,12 +43,9 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
     _certified_set = fetch_certified_records(settings)
     require_certified(_certified_set, settings)
-    _certified = _certified_set.records
     # precedence: ontology < correlated < lookup < certified < dictionary
     _snap = ground_codes(adapter, _snap, dictionary=None, ontology=_onto)
-    _snap = apply_certified(_snap, _certified)
-    _protected = frozenset(r.envelope.object_id for r in _certified
-                           if r.envelope.object_type == "column")
+    _snap, _protected = apply_certified_set(_snap, _certified_set)
     _snap = enrich_semantic(_snap, LLMEnricher(LLMClient(settings)), protected=_protected)
     if _dict:
         _snap = apply_dictionary(_snap, _dict)

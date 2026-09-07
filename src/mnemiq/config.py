@@ -6,6 +6,22 @@ from dataclasses import dataclass
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The Verity endpoint the certified pull needs, as a VALUE. It is the one that accepts `since`
+# and returns a `watermark`; its sibling `/api/semantic/records` does neither, so a deployment
+# pointed there either 400s on every page (at this pull's default page size) or -- at any limit
+# that endpoint tolerates, 0 included, since none is then sent -- drains happily and merges a
+# full dump as though it were a delta, forever (M82).
+#
+# A constant rather than a sentence, and the field's description is BUILT from it. Three rounds
+# of review found a phrasing that defeated a prose guard: `/open` appearing somewhere is
+# satisfied by a description warning against it, and `/open` appearing FIRST is satisfied by
+# "/open is deprecated, set the other one". A rule about how prose goes wrong is prose.
+#
+# It lives here rather than beside the pull because the description needs it at class-definition
+# time, and this module imports nothing from `mnemiq` -- so the pull imports it and there is no
+# cycle, where the other direction would drag the contract models into settings import.
+CERTIFIED_RECORDS_PATH = "/api/semantic/records/open"
+
 DEFAULT_MODEL = "openai.gpt-5.5"
 DEFAULT_EMBED_MODEL = "openai.text-embedding-3-small"
 # Measured on the full Spider 2.0-lite sweep against a variance control; see
@@ -71,9 +87,9 @@ class Settings(BaseSettings):
     enrich_examples: bool = Field(default=False, description="eval: verified-example enrichment phase (plan-20, default off)")
     dictionary_path: str | None = Field(default=None, description="operator code data-dictionary JSON path (grounds code meanings)")
     ontology_records_path: str | None = Field(default=None, description="ontology records JSON path (binds code schemes, grounds bare codes)")
-    verity_records_url: str | None = Field(default=None, description="Verity GET /api/semantic/records endpoint (governed certified records)")
+    verity_records_url: str | None = Field(default=None, description=f"Verity GET {CERTIFIED_RECORDS_PATH} endpoint (governed certified records). NOT the sibling without `/open`, and DO NOT change the page size to make that one fit: it accepts no `since`, so ANY page size it tolerates -- 0 included -- makes every pull a full dump merged as though it were a delta, silently, while this pull's default 500 makes it refuse outright. Loud is the better failure. Verity's published OpenAPI is where that endpoint's missing `since` and its own limit ceiling are declared")
     verity_watermark_path: str | None = Field(default=None, description="path to the Verity /open incremental-sync watermark sidecar JSON (defaults beside the store)")
-    verity_page_size: int = Field(default=500, ge=0, description="Verity /open page size sent as ?limit= (0 = unbounded full dump)")
+    verity_page_size: int = Field(default=500, ge=0, description="Verity /open page size sent as ?limit= (0 = unbounded full dump: no ?limit is sent at all). NOT a way to make the sibling endpoint work -- it accepts no `since` at any page size, so lowering this to its ceiling or to 0 turns a loud 400 into a pull that has silently stopped being incremental")
     verity_full_resync_after_secs: int = Field(default=86400, ge=0, description="how stale the locally merged certified set may get before it is re-pulled in full; a withdrawal is invisible to an incremental delta, so this window is the only thing that removes one locally (0 = always full)")
     verity_traces_url: str | None = Field(default=None, description="Verity POST /api/traces/batch endpoint; unset = emit nothing (the engine is unchanged)")
     # The disclosure tiers. Default-closed, and enforced in the EMITTER rather than by Verity
