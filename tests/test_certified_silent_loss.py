@@ -318,11 +318,18 @@ def test_the_fragment_and_the_wrong_path_are_told_apart():
     assert "`#`" not in _url_complaint("https://v/api/semantic/records")
 
 
-def test_the_complaint_names_both_symptoms_a_dropped_cursor_produces():
-    """`#` drops `cursor` as well as `since`, and which symptom an operator sees depends on
-    whether the corpus fits one server page: a full dump merged as a delta if it does, and a
-    drain loop re-requesting one identical URL if it does not. A message naming only the first
-    points the operator away from the one they are looking at."""
+def test_the_complaint_names_all_THREE_outcomes_a_dropped_cursor_produces():
+    """`#` drops `cursor` as well as `since`, and what an operator then sees turns on two things,
+    not one -- whether the corpus fits a single server page, and whether anything is cached:
+
+    * it fits: a full dump merged as though it were a delta, quietly;
+    * it does not, and a cache exists: the pull stops on finding itself about to re-request a
+      page it already fetched, and serves the last cached set;
+    * it does not, and nothing is cached: `require_certified` refuses and the run will not start.
+
+    Three rewrites of this sentence each named a different TWO of them, and the last one told
+    the operator whose deployment cannot start at all to expect stale data.
+    """
     from mnemiq.enrichment.certified import _url_complaint
 
     complaint = _url_complaint("https://v/api/semantic/records/open#")
@@ -334,7 +341,10 @@ def test_the_complaint_names_both_symptoms_a_dropped_cursor_produces():
     # the run outright. Naming two of three points somebody at the wrong diagnosis.
     assert "delta" in complaint
     assert "already fetched" in complaint or "re-request" in complaint
-    assert "cached" in complaint and "refuses" in complaint
+    # On the phrase only the OUTCOME carries: bare `"cached"` is satisfied by the sentence's own
+    # preamble ("depends on the corpus and on what is cached"), so deleting the outcome left it
+    # green -- the two-of-three defect, inside the guard against it.
+    assert "serves the last cached" in complaint and "refuses" in complaint
 
 
 def test_a_server_that_never_advances_the_cursor_is_not_asked_ten_thousand_times(tmp_path,
