@@ -163,6 +163,8 @@ def test_every_setting_that_describes_the_pull_names_the_same_endpoint():
     on every page and `mnemiq enrich` fails outright."""
     from mnemiq.config import Settings
 
+    import re
+
     unknown = [name for name in _PULL_SETTINGS if name not in Settings.model_fields]
     assert not unknown, f"renamed out from under this guard: {unknown}"
     for name in _PULL_SETTINGS:
@@ -171,6 +173,16 @@ def test_every_setting_that_describes_the_pull_names_the_same_endpoint():
             f"{name} describes the certified pull without naming `/open`. Only `/open` accepts "
             "`since`, so the sibling silently stops being incremental rather than failing"
         )
+        # ...and names it FIRST. Mentioning `/open` somewhere is satisfied by a description that
+        # prescribes the bare endpoint and warns against `/open` -- the M82 defect with its
+        # clauses swapped, which the substring check alone cannot see. What an operator sets is
+        # the first endpoint the sentence names.
+        paths = re.findall(r"/api/semantic/records(?:/open)?", text)
+        if paths:
+            assert paths[0] == "/api/semantic/records/open", (
+                f"{name} names {paths[0]} before it names /open, so the endpoint it appears to "
+                "prescribe is the one that cannot serve this pull"
+            )
 
 
 @pytest.mark.parametrize("body,expected,absent", [
@@ -218,8 +230,14 @@ def test_a_huge_error_page_is_not_read_into_memory_to_be_thrown_away():
     exc = urllib.error.HTTPError("https://v/x", 400, "Bad Request", {}, stream)
     detail = _refusal_detail(exc)
 
+    # Against a LITERAL as well as the constant: comparing only against the constant lets the
+    # guard agree with itself, since raising `_REFUSAL_BODY_BYTES` to a million reads the whole
+    # page and still passes. The property is "a small fraction of what was offered".
+    assert stream.tell() < 50_000, (
+        f"read {stream.tell()} bytes of a 200KB error page into memory to log 500 of them"
+    )
     assert stream.tell() <= _REFUSAL_BODY_BYTES, (
-        f"read {stream.tell()} bytes of a 200KB error page; the cap is {_REFUSAL_BODY_BYTES}"
+        f"read {stream.tell()} bytes; the cap this module declares is {_REFUSAL_BODY_BYTES}"
     )
     assert "verity said" in detail, "and it still says what it managed to read"
 
