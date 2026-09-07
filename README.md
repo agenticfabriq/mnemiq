@@ -92,7 +92,7 @@ figures are, though: on a single-engine run there is genuinely nothing to subtra
 right rather than missing. What is absent is the check, not the correction.
 
 The Spider row is the retrieval `k=24` configuration. Across the three hosted Spider runs
-exact-match spans 34.8–37.8% and got-the-facts 51.9–58.5%, so read it as one point in that spread
+exact-match spans 34.8–37.0% and got-the-facts 51.1–58.5%, so read it as one point in that spread
 rather than as a stable rate.
 
 Those are three different questions, not three attempts at one. ACME is in-domain — one enriched
@@ -138,7 +138,7 @@ frontier configuration holds at 37.0% and 58.5%.
 **These local runs do not support comparisons between them, and the counts are why.** On a
 135-case slice, the 32B moves 3 correct cases to 7 with constrained decoding; the 14B moves 8 to
 6, across runs 311 engine commits apart with a `-dirty` baseline. Two hosted runs of the frontier
-configuration differ by 4 cases from each other. Every difference among the LOCAL arms is the same
+configuration differ by 3 cases from each other. Every difference among the LOCAL arms is the same
 handful of cases, so no ordering among those is claimed here, and the effect of
 constrained decoding on Spider is not something these runs can settle.
 
