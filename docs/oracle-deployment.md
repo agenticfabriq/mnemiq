@@ -87,8 +87,8 @@ re-probed afterwards** — it is the only verdict with an assurance to lose.
 
 Read that as a limit on *reporting*, not on protection. If you reopen a `gate_only` or `unverifiable`
 database as READ ONLY while the process runs, **the database begins refusing writes immediately** —
-`ORA-16000` does not wait for mnemiq to notice. What does not update is the verdict: the engine will
-keep reporting the boot state until it restarts. So reopening read-only is the right move during an
+`ORA-16000` does not wait for mnemiq to notice. What does not update is the verdict: it was emitted once at
+startup and is not re-emitted, so nothing further appears in the log for that deployment. So reopening read-only is the right move during an
 incident and takes effect at once; restart afterwards to make the engine's own report agree.
 
 | verdict | meaning | what to do |
@@ -117,10 +117,12 @@ What holds after boot, and what does not:
 
 `MNEMIQ_ACK_ADVISORIES` silences a **boot** verdict you have assessed and accepted, keyed
 `<advisory>:<verdict>` — for example `read-only-basis:gate_only`. It is keyed by verdict on
-purpose: the match is on the exact key, so **any** change of verdict falls outside the
-acknowledgement and warns — including an improvement. Acknowledge `read-only-basis:gate_only`, narrow
-the principal as §3 advises, and the resulting `unverifiable` warns at boot. That is the intended
-behaviour, not a regression: you acknowledged a state you had assessed, and this is a different one.
+purpose: the match is on the exact key, so a changed verdict falls outside the
+acknowledgement. Whether that is audible depends on the new verdict, not on the acknowledgement:
+acknowledge `read-only-basis:gate_only` and narrow the principal as §3 advises, and the resulting
+`unverifiable` **warns** at boot — you acknowledged a state you assessed and this is a different one.
+Reopen the database read-only instead and the resulting `constrained` is **quiet**, because it is a
+verdict that needs no action; at the default WARNING level you will see nothing at all.
 
 Two verdicts cannot be silenced at all, and setting a key for either is worse than not setting one.
 
