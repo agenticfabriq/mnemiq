@@ -150,9 +150,13 @@ def fetch_certified_records(settings) -> CertifiedSet:
     complaint = _url_complaint(url)
     if complaint:
         # Said once, before the pull, because the symptom otherwise is either a 400 on every page
-        # or -- worse -- a pull that drains and has quietly stopped being incremental. A WARNING
-        # and not a refusal: the URL is the operator's to choose and a proxy in front of Verity
-        # may legitimately serve this endpoint elsewhere.
+        # or -- worse -- a pull that drains and has quietly stopped being incremental.
+        #
+        # A WARNING and not a refusal, and that is a judgement about the PATH only: a proxy in
+        # front of Verity may legitimately serve this endpoint somewhere else, so the engine is
+        # not entitled to overrule the operator. No such legitimacy exists for the `#` cause --
+        # urllib cuts the URL client-side before anything is sent, so no deployment makes that
+        # shape work -- and this comment must not be read as covering it.
         logger.warning("verity_records_url %r %s", url, complaint)
 
     cache_path = _watermark_path(settings)
@@ -250,16 +254,23 @@ def _url_complaint(url: str) -> str | None:
       appends its parameters with `"&" if "?" in url else "?"`, so a records URL that already
       carries a query string is a shape this module supports, and an `endswith` over the raw URL
       called every one of them misconfigured.
-    * **a fragment.** MEASURED, not reasoned: `_page_url` appends `?since=...&limit=...` AFTER
-      the `#`, and `urllib` cuts the request line at the first `#` -- so
+    * **a `#` anywhere.** MEASURED, not reasoned: `_page_url` appends `?since=...&limit=...`
+      AFTER the `#`, and `urllib` cuts the request line at the first `#` -- so
       `.../records/open#frag` requests `/api/semantic/records/open` with no parameters at all,
       on every page. That is the silent full-dump-merged-as-a-delta this warning exists to
       announce, wearing the correct path, and the first version of this check called it fine.
+      A BARE trailing `#` does the same and parses to an empty fragment, which the second
+      version then called fine as well.
     """
     from urllib.parse import urlsplit
 
     parts = urlsplit(url)
-    if parts.fragment:
+    # `"#" in url`, not `parts.fragment`: a trailing bare `#` splits to an EMPTY fragment, which
+    # is falsy, while urllib still cuts the request line there and the parameters are still lost.
+    # Measured: `.../records/open#` and `.../records/open?tenant=acme#` both went unwarned while
+    # sending no `since` at all. The property is that the URL carries a `#`, not that anything
+    # follows it.
+    if "#" in url:
         return (
             "carries a URL fragment; the pull appends `since`, `cursor` and `limit` after it and "
             "urllib drops everything from the `#`, so every page is requested unparameterised "

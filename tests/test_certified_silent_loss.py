@@ -267,25 +267,29 @@ def test_a_huge_error_page_is_not_read_into_memory_to_be_thrown_away():
     assert "verity said" in detail, "and it still says what it managed to read"
 
 
-@pytest.mark.parametrize("url,quiet", [
-    ("https://v/api/semantic/records/open", True),
-    ("https://v/api/semantic/records/open/", True),
+@pytest.mark.parametrize("url,expected", [
+    ("https://v/api/semantic/records/open", None),
+    ("https://v/api/semantic/records/open/", None),
     # A records URL that already carries a query string is a shape `_page_url` supports -- it
     # picks its separator with `"&" if "?" in url else "?"` -- so comparing the whole URL called
     # every correct deployment of that shape misconfigured, once per run.
-    ("https://v/api/semantic/records/open?tenant=acme", True),
-    ("https://v/api/semantic/records", False),
-    ("https://v/api/semantic/records?limit=200", False),
+    ("https://v/api/semantic/records/open?tenant=acme", None),
+    ("https://v/api/semantic/records", "path"),
+    ("https://v/api/semantic/records?limit=200", "path"),
     # The full path, not a `/open` suffix: nothing else here separates the two, so the check
     # could accept any path ending that way while the constant's own assertion stayed green.
-    ("https://v/api/semantic/definitions/open", False),
+    ("https://v/api/semantic/definitions/open", "path"),
     # MEASURED: `_page_url` appends after the `#` and urllib cuts the request line there, so this
     # shape requests every page with no `since`, `cursor` or `limit` at all. The correct path is
     # not enough to make it a working pull, and the first version of this check called it quiet.
-    ("https://v/api/semantic/records/open#frag", False),
+    ("https://v/api/semantic/records/open#frag", "fragment"),
+    # A BARE `#`: `urlsplit` calls that an EMPTY fragment, which is falsy, and the parameters are
+    # dropped exactly the same. Measured on the built request, not reasoned from the parse.
+    ("https://v/api/semantic/records/open#", "fragment"),
+    ("https://v/api/semantic/records/open?tenant=acme#", "fragment"),
 ])
 def test_the_warning_reads_the_PATH_and_not_the_whole_url(tmp_path, monkeypatch, caplog,
-                                                         url, quiet):
+                                                         url, expected):
     from mnemiq.config import Settings
     from mnemiq.enrichment import certified as mod
 
@@ -294,7 +298,13 @@ def test_the_warning_reads_the_PATH_and_not_the_whole_url(tmp_path, monkeypatch,
     with caplog.at_level("WARNING"):
         mod.fetch_certified_records(Settings(
             verity_records_url=url, verity_watermark_path=str(tmp_path / "wm.json")))
-    assert ("verity_records_url" in caplog.text) is not quiet
+    # The WORDING each cause carries, not merely that something was logged: an operator whose
+    # path is already right must not be told to change the path.
+    if expected is None:
+        assert "verity_records_url" not in caplog.text
+    else:
+        assert expected in caplog.text
+        assert url in caplog.text, "and the URL it is complaining about"
 
 
 def test_the_fragment_and_the_wrong_path_are_told_apart():
