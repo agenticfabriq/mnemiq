@@ -95,8 +95,14 @@ as the control.
 
 Two honest limits on all of this:
 
-- **The verdicts are true at boot.** Nothing re-probes. Reopening the database READ WRITE ends
-  `constrained` with no signal anywhere.
+- **`constrained` is re-probed; the others are boot samples.** The database's open mode is
+  re-checked on a bounded TTL, on the connection already leased for the query, so a database
+  reopened `READ WRITE` mid-process reports the **lapse** rather than carrying the boot assurance
+  silently to the end of the run. The TTL is the exposure window and is stated rather than argued
+  away: one extra round trip per interval, not per query. It is `MNEMIQ_ORACLE_READ_ONLY_TTL_S`,
+  default **300 seconds**; `0` disables re-probing and returns the old boot-sample behaviour. Only the lapse is reported — a deployment
+  that was never `constrained` was already warned at boot. The VPD verdicts from
+  `assert_enforcing()` are still boot samples and do not re-probe.
 - **They warn; they do not refuse.** A `bypassing` verdict does not stop startup today, because
   under the current design the engine still applies its own row and column filters, so refusing to
   boot would take down a working deployment over a control that is not yet load-bearing. When
