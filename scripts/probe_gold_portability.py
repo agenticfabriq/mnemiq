@@ -12,7 +12,7 @@ failure; its "0 execution failures" is therefore not evidence about portability.
 to be re-run whenever the labels move -- it subtracts from the CORRECT set, and a re-grade changes
 which cases those are.
 
-  scripts/probe_gold_portability.py <run>.regraded-2026-09-06.jsonl [...]
+  .venv/bin/python scripts/probe_gold_portability.py <run>.regraded-2026-09-06.jsonl [...]
 
 Needs mini-dev in Postgres (`MNEMIQ_PG_DSN`; the database name is replaced with `bird_dev`).
 """

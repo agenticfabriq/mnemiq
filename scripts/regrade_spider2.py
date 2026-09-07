@@ -16,7 +16,8 @@ Two shortcuts were tried while writing this and each returned a confident wrong 
 A rule change that moves half a corpus is a harness bug, not a finding. The correct pass moves 0
 labels on five of six arms. Treat a large movement here as a reason to check this script.
 
-  scripts/regrade_spider2.py --spider2-dir ~/src/dataset/spider2-lite eval-reports/<run>.jsonl
+  .venv/bin/python scripts/regrade_spider2.py --spider2-dir ~/src/dataset/spider2-lite \
+    eval-reports/<run>.jsonl
 """
 
 from __future__ import annotations
