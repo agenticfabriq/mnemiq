@@ -11,6 +11,8 @@ byte what a judge that looked and agreed with the majority produces. That pair s
 The fallback stays. What changes is that the record stops claiming a judgement happened --
 the same fix `judge_unavailable` is for the verifier, and the reason the two files read alike.
 """
+import json
+
 import pytest
 
 from mnemiq.execute.select import ClusterView, FakeSelector, LLMSelector
@@ -188,7 +190,12 @@ def test_the_audit_record_says_WHY_the_judge_fell_back():
     from mnemiq.observability.trace_sink import VerityTraceSink
 
     for reply, reason in ((RuntimeError("down"), "error"), ("no idea", "unparsed"),
-                          ('{"choice": 9}', "out_of_range"), ('{"choice": 0}', "ok")):
+                          ('{"choice": 9}', "out_of_range"),
+                          # A judgement is not a fallback and carries no reason for one. The
+                          # field is named for the event it explains, and an operator filtering
+                          # the store on IS NOT NULL must not count every judged answer as a
+                          # failure -- `judge_fell_back` already says a judgement happened.
+                          ('{"choice": 0}', None)):
         ans = _answer(_agent_with(LLMSelector(_Client(reply))))
         record = VerityTraceSink(_Settings())._build_trace(_event(answer=ans))
         assert record["resolved_intent"]["judge_fallback_reason"] == reason, reply
@@ -199,3 +206,56 @@ def test_the_audit_record_says_WHY_the_judge_fell_back():
     agent.selector = FakeSelector([0])
     record = VerityTraceSink(_Settings())._build_trace(_event(answer=_answer(agent)))
     assert record["resolved_intent"]["judge_fallback_reason"] is None
+
+
+def test_a_selectors_free_TEXT_never_reaches_the_always_tier():
+    """`reason` arrives from a DUCK-TYPED `read` -- any object with the method -- and it is a
+    `str` with a vocabulary written in a comment. `reason=f"error: {exc}"` is the obvious variant
+    to write, and a provider's exception text carries hosts, URLs and schema fragments. The audit
+    record's own sibling field states the rule this has to obey: the ENUM, never the message,
+    because the always tier ships to deployments that deliberately kept text off.
+
+    Clamped where the untrusted value ENTERS the engine, not at each exit: the answer object
+    itself never holds a string this engine did not choose, so a future consumer inherits the
+    guarantee instead of having to re-derive it. The unrecognised marker is deliberately not
+    `error` -- that one names an outage an operator may act on, and a vocabulary this build has
+    not been taught is not an outage. `verified_state` refuses the same conflation.
+    """
+    import sys
+
+    sys.path.insert(0, "tests")
+    from test_verity_trace_sink import _Settings, _event
+
+    from mnemiq.execute.select import SelectorRead
+    from mnemiq.observability.trace_sink import VerityTraceSink
+
+    leak = "error: connection refused to https://provider.internal/v1 (tenant acme_prod)"
+
+    class _Rogue:
+        def read(self, question, clusters) -> SelectorRead:
+            return SelectorRead(0, fell_back=True, reason=leak)
+
+    ans = _answer(_agent_with(_Rogue()))
+    assert ans.judge_fell_back is True, "the FACT is still believed -- only its text is not"
+    assert ans.judge_fallback_reason == "unrecognised"
+
+    record = VerityTraceSink(_Settings())._build_trace(_event(answer=ans))
+    assert leak not in json.dumps(record)
+
+
+def test_a_fallback_reported_as_ok_is_not_recorded_as_ok():
+    """The mutation that found this: adding `"ok"` to the vocabulary changed nothing any test
+    could see, because the guard returns early on a judgement and `"ok"` never reached the
+    membership check. It reaches it from a selector that fell back and SAID ok -- and a fallback
+    recorded as a success is worse than free text, since free text is at least visibly wrong.
+    `ok` is the one word in the enum that must never survive this clamp.
+    """
+    from mnemiq.execute.select import SelectorRead
+
+    class _Rogue:
+        def read(self, question, clusters) -> SelectorRead:
+            return SelectorRead(0, fell_back=True, reason="ok")
+
+    ans = _answer(_agent_with(_Rogue()))
+    assert ans.judge_fell_back is True
+    assert ans.judge_fallback_reason == "unrecognised"

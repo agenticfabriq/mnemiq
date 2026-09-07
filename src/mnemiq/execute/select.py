@@ -48,7 +48,33 @@ class SelectorRead:
     # guess: `error` is an outage worth alerting on, `unparsed` means this model cannot emit the
     # format at all, and `out_of_range` means it answered in the right shape and named a cluster
     # that does not exist -- a prompt problem, not an availability one.
-    reason: str = "ok"          # "ok" | "error" | "unparsed" | "out_of_range"
+    reason: str = "ok"          # "ok" | one of FALLBACK_REASONS
+
+
+# The vocabulary, as a value rather than a comment. `SelectorRead` arrives from a DUCK-TYPED
+# `read` -- any object with the method -- so `reason` is whatever that object put there, and
+# `f"error: {exc}"` is the obvious variant to write. A provider's exception text carries hosts,
+# URLs and schema fragments, and the answer's cause reaches the audit record's ALWAYS tier, which
+# ships to deployments that deliberately kept text off. Owned here, beside the values it lists,
+# so the one clamp and the one producer cannot drift apart.
+FALLBACK_REASONS = frozenset({"error", "unparsed", "out_of_range"})
+
+# Deliberately not "error": that names an outage an operator may act on, and a vocabulary this
+# build has not been taught is not an outage. `verified_state` refuses the same conflation for
+# the same reason.
+UNRECOGNISED_REASON = "unrecognised"
+
+
+def fallback_reason(read: "SelectorRead") -> str | None:
+    """The cause to record for one pick, or None when there is no fallback to explain.
+
+    A judgement is not a fallback: the field is named for the event it explains, and an operator
+    filtering an audit store on IS NOT NULL must not count every judged answer as a failure.
+    `fell_back` already carries whether a judgement happened.
+    """
+    if not read.fell_back:
+        return None
+    return read.reason if read.reason in FALLBACK_REASONS else UNRECOGNISED_REASON
 
 
 def majority_index(clusters: list[ClusterView]) -> int:

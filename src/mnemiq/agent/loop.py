@@ -15,7 +15,12 @@ from mnemiq.progress import Emit, Stage, step
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
 from mnemiq.execute.runner import ExecutionError, run
-from mnemiq.execute.select import ClusterView, auto_accepted, majority_index
+from mnemiq.execute.select import (
+    ClusterView,
+    auto_accepted,
+    fallback_reason,
+    majority_index,
+)
 from mnemiq.generate.generator import Generator, StrategyGenerator
 from mnemiq.generate.plan_query import Deferred, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
@@ -81,12 +86,16 @@ class AgentAnswer:
     # Non-None exactly when `judge_engaged` is True, and a selector speaking only the int protocol
     # is taken at its word rather than assumed broken.
     judge_fell_back: bool | None = None
-    # ...and which way it broke. An outage, a model that cannot emit the format and a pick naming
-    # a cluster that does not exist want three different responses, and the audit record is where
-    # that is asked after the fact by someone who cannot re-run the request. `None` when no
-    # judgement was attempted, and when the selector speaks only the int protocol and has no
-    # cause to report. Deliberately NOT on the wire: a client acts on whether the answer was
-    # judged, not on how the judge broke.
+    # ...and which way it broke, when it did. An outage, a model that cannot emit the format and
+    # a pick naming a cluster that does not exist want three different responses, and the audit
+    # record is where that is asked after the fact by someone who cannot re-run the request.
+    #
+    # `None` whenever there is no fallback to explain -- INCLUDING a successful judgement, which
+    # is not a fallback and whose "ok" would make an operator's `IS NOT NULL` count every judged
+    # answer as a failure. The values are `FALLBACK_REASONS`, clamped by `fallback_reason` as the
+    # duck-typed selector's string enters the engine, so nothing downstream carries free text
+    # into the audit record's always tier. Deliberately NOT on the wire: a client acts on whether
+    # the answer was judged, not on how the judge broke.
     judge_fallback_reason: str | None = None
     # Multi-candidate only: how many of N produced a TABLE. Not how many were attempted --
     # a candidate that deferred, or that ran and hit an ExecutionError, is dropped by _execute and
@@ -430,7 +439,7 @@ class Agent:
                 if reader is not None:
                     got = reader(packet.question, views)
                     chosen, judge_fell_back = got.choice, got.fell_back
-                    judge_fallback_reason = got.reason
+                    judge_fallback_reason = fallback_reason(got)
                 else:
                     chosen, judge_fell_back = self.selector.select(packet.question, views), False
             judge_override = chosen != majority
