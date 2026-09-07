@@ -83,9 +83,13 @@ as the control.
 ## 4. Telling which deployment you have — at boot, and after
 
 `assert_read_only()` runs at startup and reports one of three verdicts. **Only `constrained` is
-re-probed afterwards** — it is the only verdict with an assurance to lose. A `gate_only` or
-`unverifiable` deployment is never re-checked, so moving that database to READ ONLY mid-run buys you
-nothing until the process restarts.
+re-probed afterwards** — it is the only verdict with an assurance to lose.
+
+Read that as a limit on *reporting*, not on protection. If you reopen a `gate_only` or `unverifiable`
+database as READ ONLY while the process runs, **the database begins refusing writes immediately** —
+`ORA-16000` does not wait for mnemiq to notice. What does not update is the verdict: the engine will
+keep reporting the boot state until it restarts. So reopening read-only is the right move during an
+incident and takes effect at once; restart afterwards to make the engine's own report agree.
 
 | verdict | meaning | what to do |
 |---|---|---|
