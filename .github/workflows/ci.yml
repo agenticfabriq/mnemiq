@@ -19,7 +19,12 @@ jobs:
         working-directory: workbench
     steps:
       - uses: actions/checkout@v4
+      # `defaults.run.working-directory` governs `run:` steps only, never a `uses:` action.
+      # Without this the action looks for `packageManager` in a root package.json that does
+      # not exist, and fails with "No pnpm version is specified".
       - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: workbench/package.json
       - uses: actions/setup-node@v4
         with:
           node-version: 24
