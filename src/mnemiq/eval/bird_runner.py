@@ -172,7 +172,7 @@ def enrich_bird_db(
     silently reuse another model's enrichment. The facts/examples toggles enter the key too,
     so an A/B run never reuses another config's enrichment."""
     from mnemiq.enrichment.certified import (
-        apply_certified, fetch_certified_records, require_certified)
+        apply_certified_set, fetch_certified_records, require_certified)
 
     _certified_set = fetch_certified_records(settings)
     require_certified(_certified_set, settings)
@@ -202,10 +202,8 @@ def enrich_bird_db(
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
     # precedence: ontology < correlated < lookup < certified < dictionary
     snapshot = ground_codes(adapter, snapshot, dictionary=None, ontology=_onto)
-    snapshot = apply_certified(snapshot, _certified)
+    snapshot, _protected = apply_certified_set(snapshot, _certified_set)
     if semantic:
-        _protected = frozenset(r.envelope.object_id for r in _certified
-                               if r.envelope.object_type == "column")
         snapshot = enrich_semantic(snapshot, LLMEnricher(LLMClient(settings)), protected=_protected)
         if settings.enrich_facts:
             snapshot = enrich_table_facts(snapshot, LLMFactsEnricher(LLMClient(settings)))

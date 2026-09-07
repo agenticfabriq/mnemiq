@@ -132,7 +132,7 @@ def _cmd_enrich(settings: Settings) -> int:
         print(str(exc), file=sys.stderr)
         return 1
     from mnemiq.enrichment.certified import (
-        apply_certified, certified_concept_schemes, fetch_certified_records,
+        apply_certified_set, certified_concept_schemes, fetch_certified_records,
         require_certified,
     )
     from mnemiq.enrichment.dictionary import load_dictionary
@@ -179,9 +179,7 @@ def _cmd_enrich(settings: Settings) -> int:
 
     # precedence: ontology < correlated < lookup < certified < dictionary
     snap = ground_codes(adapter, snap, dictionary=None, ontology=_onto)  # local grounding, no dict yet
-    snap = apply_certified(snap, _certified)
-    _protected = frozenset(r.envelope.object_id for r in _certified
-                           if r.envelope.object_type == "column")
+    snap, _protected = apply_certified_set(snap, _certified_set)
     retriever = None
     if _onto is not None:
         try:

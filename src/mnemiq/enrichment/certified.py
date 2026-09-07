@@ -44,6 +44,10 @@ _STANDALONE = {
 }
 
 
+# A record whose envelope will not yield an identity either. Named rather than dropped: a count
+# with no name is worse than a name, and better than the silence this replaced.
+_UNIDENTIFIED = "<unidentified record>"
+
 _MAX_PAGES = 10000  # a guard against a misbehaving server; real corpora are far smaller
 _CACHE_VERSION = 1
 # How stale a merged set may get before it is reconciled in full. A withdrawal is invisible to
@@ -75,6 +79,13 @@ class CertifiedSet:
 
     records: list[CertifiedRecord]
     available: bool = True
+    # What arrived and could NOT be read, by `<object_type>:<object_id>` off the envelope. A
+    # record that fails validation is dropped so one bad row cannot sink the batch -- right, and
+    # silent: the column it described then keeps the LLM's GUESSED `pii_level`, which
+    # `build_access_policy` reads, so the loss quietly UN-MASKS a column and shrinks `_protected`
+    # so the LLM may re-guess a meaning a human certified. Carried here so the run can say so
+    # (M10); `available` is untouched, because part of a corpus is not none of it.
+    skipped: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
         raise TypeError(
@@ -161,7 +172,8 @@ def fetch_certified_records(settings) -> CertifiedSet:
         # Degraded freshness is not absence. A populated cache still grounds the engine, so it
         # stays available; an EMPTY one means we asked for a corpus and have none, which is the
         # state a configured deployment must not answer from silently.
-        return CertifiedSet(_parse(cached), available=bool(cached))
+        records, skipped = _parse(cached)
+        return CertifiedSet(records, available=bool(cached), skipped=skipped)
 
     records = pulled if full else _merge(cached, pulled)
     if cache_path:
@@ -173,7 +185,46 @@ def fetch_certified_records(settings) -> CertifiedSet:
             # while looking fixed.
             synced_at=_now_iso() if full else synced_at,
         )
-    return CertifiedSet(_parse(records), available=True)
+    parsed, skipped = _parse(records)
+    return CertifiedSet(parsed, available=True, skipped=skipped)
+
+
+def apply_certified_set(snapshot: Snapshot, certified: CertifiedSet
+                        ) -> tuple[Snapshot, frozenset[str]]:
+    """A pull result, laid onto a snapshot: the overlay, what the corpus PINS, and what it lost.
+
+    Every product caller wrote these three steps out itself -- apply the records, derive
+    `_protected` from the same list, and ignore the rest of the set -- so `cli`, `eval/run` and
+    `eval/bird_runner` each carried the same five lines. That is why this exists rather than a
+    keyword on `apply_certified`: a fact the pull learns has to reach the snapshot through ONE
+    step, or it reaches two callers of three and reads as a guarantee (**M79**, and M11 one
+    week later).
+
+    `apply_certified` stays a pure overlay of the records it is HANDED. The unreadable ones are a
+    fact about the pull, not about the records that arrived, and this is the seam where a pull
+    meets a snapshot -- so the job is written here.
+    """
+    snapshot = apply_certified(snapshot, certified.records)
+    if certified.skipped:
+        # M2's lesson, and M10's: a security-relevant loss belongs in the structured run record.
+        # A dropped column record leaves the LLM's guessed `pii_level` standing, which
+        # `build_access_policy` reads -- so this is the difference between an un-masked column
+        # somebody can be asked about afterwards and one nobody can.
+        logger.warning(
+            "%d certified record(s) could not be read and were dropped; the columns they "
+            "described keep their locally guessed meaning: %s",
+            len(certified.skipped), ", ".join(certified.skipped),
+        )
+        snapshot = snapshot.model_copy(update={"jobs": [*snapshot.jobs, Job(
+            id="certified:record_unreadable",
+            source_id=snapshot.source_id,
+            kind="certified_record_unreadable",
+            status="refused",
+            checkpoints=list(certified.skipped),
+        )]}, deep=True)
+    protected = frozenset(r.envelope.object_id for r in certified.records
+                          if r.envelope.object_type == "column")
+    return snapshot, protected
 
 
 def _record_identity(item: dict) -> tuple[str, str]:
@@ -196,14 +247,25 @@ def _merge(cached: list[dict], delta: list[dict]) -> list[dict]:
     return [by_identity[key] for key in sorted(by_identity)]
 
 
-def _parse(items: list[dict]) -> list[CertifiedRecord]:
+def _parse(items: list[dict]) -> tuple[list[CertifiedRecord], tuple[str, ...]]:
+    """The records that validated, and the identities of the ones that did not.
+
+    The identity is read off the ENVELOPE, which is a plain dict here and survives a payload that
+    does not validate -- so the caller learns WHICH column silently kept its guess, rather than
+    only that something was dropped. A record whose envelope is unusable too has no name to give
+    and says so, because a count with no identity is still better than a log line nobody reads.
+    """
     out: list[CertifiedRecord] = []
+    skipped: list[str] = []
     for item in items:
         try:
             out.append(CertifiedRecord.model_validate(item))
         except Exception as exc:  # one malformed record must not sink the batch
-            logger.warning("skipping malformed certified record: %s", exc)
-    return out
+            object_type, object_id = _record_identity(item) if isinstance(item, dict) else ("", "")
+            identity = f"{object_type}:{object_id}" if object_type or object_id else _UNIDENTIFIED
+            logger.warning("skipping unreadable certified record %s: %s", identity, exc)
+            skipped.append(identity)
+    return out, tuple(sorted(skipped))
 
 
 def _needs_full_sync(cached, watermark, synced_at, settings) -> bool:
@@ -335,12 +397,44 @@ def _get_records(settings, url: str) -> dict | None:
             if exc.code == 401 and token is not None and not force_refresh:
                 logger.info("verity rejected the token (401); refreshing once")
                 continue
-            logger.warning("verity records unreachable; enriching local-only: %s", exc)
+            # The BODY, not just the status. `require_certified` tells the operator the log
+            # "carries the cause verbatim", and for a 400 it did not: `HTTPError.__str__` is
+            # "HTTP Error 400: Bad Request" while the sentence naming the bad parameter -- which
+            # is how a deployment learns its `verity_records_url` points at the endpoint that
+            # takes no `since` (M82) -- sits in a body nothing read.
+            logger.warning("verity records unreachable; enriching local-only: %s%s",
+                           exc, _refusal_detail(exc))
             return None
         except (urllib.error.URLError, OSError, ValueError) as exc:
             logger.warning("verity records unreachable; enriching local-only: %s", exc)
             return None
     return None
+
+
+def _refusal_detail(exc: "urllib.error.HTTPError") -> str:
+    """Verity's own words for the refusal, or nothing at all.
+
+    Read defensively and BOUNDED: this is a remote server's response reaching a log line, the body
+    may already have been consumed, and an HTML error page from a proxy in front of Verity is not
+    a diagnosis worth pasting whole.
+    """
+    try:
+        body = exc.read().decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+    if not body:
+        return ""
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
+            for key in ("detail", "message", "error"):
+                value = parsed.get(key)
+                if isinstance(value, str) and value:
+                    body = value
+                    break
+    except ValueError:
+        pass
+    return f" -- verity said: {body[:500]}"
 
 
 def certified_concept_schemes(records: list[CertifiedRecord]) -> list[ConceptScheme]:
