@@ -45,6 +45,7 @@ def main() -> int:
     for run in args.runs:
         records = [json.loads(line) for line in open(run)]
         n = len(records)
+        graded = sum(1 for r in records if r["outcome"] in _GRADED)
         before = sum(1 for r in records if r["outcome"] == "correct")
         changed = failed = no_gold = 0
         for r in records:
@@ -54,8 +55,18 @@ def main() -> int:
             if not alternatives:
                 no_gold += 1
                 continue
+            # Opening the database is NOT inside the try. A missing or unopenable file is an
+            # environment fault, and counting it as an unrunnable candidate would be this script's
+            # own worst outcome: every case in that database keeps its label, nothing "changes",
+            # and the run prints that the labels ARE the current rule's -- a verification that
+            # cannot fail. Absent data and a wrong answer must not share an exit.
+            path = spider2_db_path(args.spider2_dir, r["db_id"])
+            if not os.path.exists(path):
+                raise SystemExit(f"{run}: no database for db_id {r['db_id']!r} at {path}. "
+                                 "Re-grading without it would report labels as confirmed that "
+                                 "were never re-checked; pass --spider2-dir.")
+            adapter = SQLiteAdapter(path)
             try:
-                adapter = SQLiteAdapter(spider2_db_path(args.spider2_dir, r["db_id"]))
                 candidate = adapter.execute_arrow(r["sql"], timeout_s=60)
             except Exception:  # noqa: BLE001 -- an unrunnable candidate keeps the label it has
                 failed += 1
@@ -74,7 +85,20 @@ def main() -> int:
                     fh.write(json.dumps(r) + "\n")
             print(f"  wrote {out}")
         else:
-            print("  no file written: the labels it has ARE the current rule's")
+            # "Nothing changed" is the answer this script exists to give and the answer it gives
+            # when it does nothing at all. So the claim is made only for cases actually re-graded,
+            # and the two reasons a case was skipped are named separately -- a candidate that would
+            # not run is a property of the answer, a case with no published gold is a property of
+            # the checkout, and reading the second as the first sent an earlier version of this
+            # script looking for a dialect problem in a missing directory.
+            skipped = failed + no_gold
+            if skipped:
+                print(f"  no file written, and {skipped} of {graded} graded cases were NOT "
+                      f"re-checked ({failed} unrunnable candidates, {no_gold} with no published "
+                      "gold): they keep the labels they had, which this run says nothing about")
+            else:
+                print(f"  no file written: all {graded} graded cases re-checked, and the labels "
+                      "they have ARE the current rule's")
     return 0
 
 
