@@ -82,8 +82,10 @@ as the control.
 
 ## 4. Telling which deployment you have — at boot, and after
 
-`assert_read_only()` runs at startup and reports one of three verdicts. The open-mode half of
-that verdict is then re-probed while the process runs; the rest are boot samples.
+`assert_read_only()` runs at startup and reports one of three verdicts. **Only `constrained` is
+re-probed afterwards** — it is the only verdict with an assurance to lose. A `gate_only` or
+`unverifiable` deployment is never re-checked, so moving that database to READ ONLY mid-run buys you
+nothing until the process restarts.
 
 | verdict | meaning | what to do |
 |---|---|---|
@@ -111,10 +113,19 @@ What holds after boot, and what does not:
 
 `MNEMIQ_ACK_ADVISORIES` silences a **boot** verdict you have assessed and accepted, keyed
 `<advisory>:<verdict>` — for example `read-only-basis:gate_only`. It is keyed by verdict on
-purpose: if the state at boot is worse than the one you acknowledged, the new verdict is not covered
-and warns again.
+purpose: the match is on the exact key, so **any** change of verdict falls outside the
+acknowledgement and warns — including an improvement. Acknowledge `read-only-basis:gate_only`, narrow
+the principal as §3 advises, and the resulting `unverifiable` warns at boot. That is the intended
+behaviour, not a regression: you acknowledged a state you had assessed, and this is a different one.
 
-**A lapse is not acknowledgeable.** The re-probe reports through the log directly and consults no
+Two verdicts cannot be silenced at all, and setting a key for either is worse than not setting one.
+
+**`source-enforcement:bypassing` is refused.** Acknowledging it produces the original warning *and* a
+second warning saying the acknowledgement was refused. A principal holding `EXEMPT ACCESS POLICY`
+bypasses every row policy in the database; that is not a deployment shape to accept quietly, and the
+engine declines to let you.
+
+**A lapse is not acknowledgeable either.** The re-probe reports through the log directly and consults no
 acknowledgement set, so there is no `read-only-basis:lapsed` key and setting one silences nothing.
 That is deliberate in effect if not by design — an acknowledgement records a judgement about a
 deployment you inspected, and a database that has *changed open mode underneath you* is not that
