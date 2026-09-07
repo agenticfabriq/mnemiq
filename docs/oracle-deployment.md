@@ -3,7 +3,7 @@
 This is the operator's half of the read plane. mnemiq's Oracle adapter refuses writes, but
 **that refusal is a property of your deployment, not of this process**, and the difference is
 measurable. This page says exactly what the engine enforces, what only the database can enforce,
-and how to tell at boot which one you have.
+and how to tell which one you have — at boot, and while the process runs.
 
 Everything asserted here was measured against Oracle Database 23ai Free. Where a claim was *not*
 measured, it says so.
@@ -80,9 +80,10 @@ in the governed schema. This removes every *direct* write path and is worth doin
 make the connection unable to cause a write, for the definer's-rights reason in §2. Do not treat it
 as the control.
 
-## 4. Telling at boot which deployment you have
+## 4. Telling which deployment you have — at boot, and after
 
-`assert_read_only()` runs at startup and reports one of three verdicts.
+`assert_read_only()` runs at startup and reports one of three verdicts. The open-mode half of
+that verdict is then re-probed while the process runs; the rest are boot samples.
 
 | verdict | meaning | what to do |
 |---|---|---|
@@ -93,7 +94,7 @@ as the control.
 `assert_enforcing()` separately reports whether VPD is attached to what this connection can see:
 `bypassing` (the principal holds `EXEMPT ACCESS POLICY`), `partial`, `attached`, or `unverifiable`.
 
-Two honest limits on all of this:
+What holds after boot, and what does not:
 
 - **`constrained` is re-probed; the others are boot samples.** The database's open mode is
   re-checked on a bounded TTL, on the connection already leased for the query, so a database
@@ -108,10 +109,16 @@ Two honest limits on all of this:
   boot would take down a working deployment over a control that is not yet load-bearing. When
   enforcement is delegated to the database, this must become fail-closed.
 
-`MNEMIQ_ACK_ADVISORIES` silences a verdict you have assessed and accepted, keyed
+`MNEMIQ_ACK_ADVISORIES` silences a **boot** verdict you have assessed and accepted, keyed
 `<advisory>:<verdict>` — for example `read-only-basis:gate_only`. It is keyed by verdict on
-purpose: if the state later worsens, the new verdict is not covered by the acknowledgement and
-warns again.
+purpose: if the state at boot is worse than the one you acknowledged, the new verdict is not covered
+and warns again.
+
+**A lapse is not acknowledgeable.** The re-probe reports through the log directly and consults no
+acknowledgement set, so there is no `read-only-basis:lapsed` key and setting one silences nothing.
+That is deliberate in effect if not by design — an acknowledgement records a judgement about a
+deployment you inspected, and a database that has *changed open mode underneath you* is not that
+deployment any more.
 
 ## 5. Connecting
 
