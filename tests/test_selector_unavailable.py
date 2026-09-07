@@ -281,3 +281,81 @@ def test_a_cause_that_is_not_a_STRING_is_clamped_rather_than_raised(reason):
     assert ans.deferred is False
     assert ans.judge_fell_back is True
     assert ans.judge_fallback_reason == "unrecognised"
+
+
+# --- everything a duck-typed selector returns is untrusted, not just the word ---
+
+def _trace_of(ans):
+    import sys
+
+    sys.path.insert(0, "tests")
+    from test_verity_trace_sink import _Settings, _event
+
+    from mnemiq.observability.trace_sink import VerityTraceSink
+
+    return VerityTraceSink(_Settings())._build_trace(_event(answer=ans))
+
+
+def _rogue(**fields):
+    """A selector whose `read` returns a SelectorRead with whatever fields are asked for."""
+    from mnemiq.execute.select import SelectorRead
+
+    class _R:
+        def read(self, question, clusters) -> SelectorRead:
+            return SelectorRead(**{"choice": 0, "fell_back": False, **fields})
+
+    return _R()
+
+
+def test_the_FLAG_is_no_more_trusted_than_the_word():
+    """`reason` is clamped and `fell_back` sits beside it in the same always tier, assigned
+    straight from the same duck-typed object. It is annotated `bool` and nothing enforces that,
+    so a selector putting text there leaked exactly what the clamp two lines up exists to stop --
+    and the comment claiming the tier was protected made it worse than the silent version."""
+    leak = "error: conn refused to https://provider.internal (tenant acme_prod)"
+    ans = _answer(_agent_with(_rogue(fell_back=leak, reason="error")))
+    assert ans.judge_fell_back is True, "a truthy claim IS a fallback -- believed, then narrowed"
+    assert isinstance(ans.judge_fell_back, bool), \
+        "and narrowed by RECONSTRUCTION: returning the selector's own object back would put its " \
+        "string in the always tier while `is True` still passed on a truthy one"
+    assert leak not in json.dumps(_trace_of(ans))
+
+
+def test_a_pick_outside_the_clusters_from_a_ROGUE_selector_does_not_kill_the_request():
+    """`LLMSelector` range-checks its own pick; a third party's `read` does not, and the loop
+    indexes `groups[chosen]` with whatever came back. Out of range is an IndexError and the wrong
+    type is a TypeError -- both kill a request in the path whose contract is that a broken
+    selector never does. Pre-existing on the int protocol too, and closed with it: one entry
+    point, or the narrowing lands on some callers and not others."""
+    ans = _answer(_agent_with(_rogue(choice=99, fell_back=False)))
+    assert ans.deferred is False
+    assert ans.agreement == 2 / 3, "the majority cluster, which is what falling back means"
+    assert ans.judge_fell_back is True and ans.judge_fallback_reason == "out_of_range"
+
+
+def test_a_pick_of_the_wrong_TYPE_does_not_kill_the_request_either():
+    ans = _answer(_agent_with(_rogue(choice="0", fell_back=False)))
+    assert ans.deferred is False
+    assert ans.judge_fell_back is True and ans.judge_fallback_reason == "unrecognised"
+
+
+def test_a_bare_bool_is_not_an_index():
+    """`isinstance(True, int)` is True in Python, and `groups[True]` is a real lookup of cluster
+    1 -- so a selector returning a boolean picks a cluster by accident rather than being caught."""
+    ans = _answer(_agent_with(_rogue(choice=True, fell_back=False)))
+    assert ans.judge_fell_back is True and ans.judge_fallback_reason == "unrecognised"
+
+
+@pytest.mark.parametrize("pick", [99, "0", -1])
+def test_the_int_protocol_is_narrowed_the_same_way(pick):
+    """A selector speaking only `select` is still taken at its word about whether it judged; what
+    it is not taken at its word about is that the word is an index."""
+    class _R:
+        def select(self, question, clusters):
+            return pick
+
+    ans = _answer(_agent_with(_R()))
+    assert ans.deferred is False
+    assert ans.agreement == 2 / 3
+    assert ans.judge_fell_back is True
+

@@ -17,9 +17,11 @@ from mnemiq.execute.resultset import cluster
 from mnemiq.execute.runner import ExecutionError, run
 from mnemiq.execute.select import (
     ClusterView,
+    SelectorRead,
     auto_accepted,
     fallback_reason,
     majority_index,
+    trust,
 )
 from mnemiq.generate.generator import Generator, StrategyGenerator
 from mnemiq.generate.plan_query import Deferred, plan_query
@@ -95,8 +97,8 @@ class AgentAnswer:
     # answer as a failure. Otherwise a member of `FALLBACK_REASONS` **or `UNRECOGNISED_REASON`**,
     # which is deliberately not in that frozenset: enumerating the vocabulary from the set alone
     # misses the one value that means a selector this build has not been taught. `fallback_reason`
-    # clamps as the duck-typed selector's value enters the engine, so nothing downstream carries
-    # free text into the audit record's always tier. Deliberately NOT on the wire: a client acts
+    # reads it off the pick `trust` has already narrowed, so nothing downstream carries a
+    # third party's free text into the audit record's always tier. Deliberately NOT on the wire: a client acts
     # on whether the answer was judged, not on how the judge broke.
     judge_fallback_reason: str | None = None
     # Multi-candidate only: how many of N produced a TABLE. Not how many were attempted --
@@ -439,11 +441,15 @@ class Agent:
                 # is not evidence of a failure.
                 reader = getattr(self.selector, "read", None)
                 if reader is not None:
-                    got = reader(packet.question, views)
-                    chosen, judge_fell_back = got.choice, got.fell_back
-                    judge_fallback_reason = fallback_reason(got)
+                    got = trust(reader(packet.question, views), views)
                 else:
-                    chosen, judge_fell_back = self.selector.select(packet.question, views), False
+                    # Taken at its word about whether it JUDGED -- absence of `read` is not
+                    # evidence of a failure -- and not taken at its word that the word is an
+                    # index. Same narrowing, because it is the same untrusted object.
+                    got = trust(SelectorRead(self.selector.select(packet.question, views),
+                                             fell_back=False), views)
+                chosen, judge_fell_back = got.choice, got.fell_back
+                judge_fallback_reason = fallback_reason(got)
             judge_override = chosen != majority
         else:
             chosen = majority  # no selector wired: Plan 12's vote, byte-for-byte

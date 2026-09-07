@@ -65,6 +65,39 @@ FALLBACK_REASONS = frozenset({"error", "unparsed", "out_of_range"})
 UNRECOGNISED_REASON = "unrecognised"
 
 
+def trust(read: "SelectorRead", clusters: list[ClusterView]) -> "SelectorRead":
+    """Whatever a selector returned, narrowed to something the loop can act on.
+
+    A `Selector` is a Protocol: any object with the method, written by whoever wrote it. The
+    ATTRIBUTES are the protocol and a missing one is a programming error that should fail loudly
+    -- but their VALUES come from a model over a network, and every one of them is consumed
+    somewhere that assumes a type nothing enforces. `choice` indexes a list, so an out-of-range
+    int is an IndexError and a string is a TypeError, both killing a request in the path whose
+    whole contract is that a broken selector never does. `fell_back` is annotated `bool` and
+    lands in the audit record's always tier, so text put there ships to a deployment that
+    deliberately kept text off -- the leak the `reason` clamp exists to stop, one field over.
+
+    Applied at the ONE point an untrusted pick enters the engine, and to both protocols. A
+    narrowing threaded to some callers and not others is worse than none: it reads as a
+    guarantee while the unguarded path carries the same value.
+    """
+    # Narrowed by RECONSTRUCTION, not by coercing fields: every path below returns a freshly
+    # built `SelectorRead`, so `fell_back` is a literal `bool` and `reason` a vocabulary word
+    # whatever the selector put there. A `bool()` call here was measurably dead -- no mutation
+    # could see it -- because the reconstruction already does the work, and a coercion that
+    # cannot be observed to matter reads as though the guarantee lives in it.
+    choice, fell_back = read.choice, read.fell_back
+    # `isinstance(True, int)` is True, and `groups[True]` is a real lookup of cluster 1 -- so a
+    # boolean would pick a cluster by accident rather than be caught.
+    if isinstance(choice, bool) or not isinstance(choice, int):
+        return SelectorRead(majority_index(clusters), fell_back=True, reason=UNRECOGNISED_REASON)
+    if not 0 <= choice < len(clusters):
+        return SelectorRead(majority_index(clusters), fell_back=True, reason="out_of_range")
+    if not fell_back:
+        return SelectorRead(choice, fell_back=False)
+    return SelectorRead(choice, fell_back=True, reason=_clamped(read.reason))
+
+
 def fallback_reason(read: "SelectorRead") -> str | None:
     """The cause to record for one pick: a member of `FALLBACK_REASONS`, `UNRECOGNISED_REASON`,
     or None when there is no fallback to explain. Those three cases ARE the recorded vocabulary,
@@ -76,17 +109,22 @@ def fallback_reason(read: "SelectorRead") -> str | None:
     filtering an audit store on IS NOT NULL must not count every judged answer as a failure.
     `fell_back` already carries whether a judgement happened.
     """
-    if not read.fell_back:
-        return None
-    # `isinstance` BEFORE the membership test, because `in` on a frozenset is a hash lookup and a
-    # duck-typed selector is under no obligation to put a string there -- a structured cause is
-    # the natural thing for a third party to return. An unhashable one raises `TypeError` out of
-    # here, out of the selector call (which sits under no `except` on this path) and out of the
-    # request: a guard against free text that turns a fallback into a killed request, in the one
-    # function whose contract is that it never kills one.
-    if not isinstance(read.reason, str) or read.reason not in FALLBACK_REASONS:
+    return _clamped(read.reason) if read.fell_back else None
+
+
+def _clamped(reason: object) -> str:
+    """One cause, narrowed to this engine's vocabulary.
+
+    `isinstance` BEFORE the membership test, because `in` on a frozenset is a hash lookup and a
+    duck-typed selector is under no obligation to put a string there -- a structured cause is the
+    natural thing for a third party to return. An unhashable one raises `TypeError` out of here,
+    out of the selector call (which sits under no `except` on this path) and out of the request:
+    a guard against free text that turns a fallback into a killed request, in the one function
+    whose contract is that it never kills one.
+    """
+    if not isinstance(reason, str) or reason not in FALLBACK_REASONS:
         return UNRECOGNISED_REASON
-    return read.reason
+    return reason
 
 
 def majority_index(clusters: list[ClusterView]) -> int:
