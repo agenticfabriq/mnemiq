@@ -32,10 +32,19 @@ passes; the harness reports both exact-match and got-the-facts accuracy.
 | corpus | exact-match | got-the-facts | run |
 |---|---|---|---|
 | ACME (in-domain, 25 answerable of 30) | 88.0% | 100.0% | `plan15/enrichment-on.json` ([one case flips](#a-note-on-the-acme-row)) |
-| BIRD mini-dev (487 answerable, 11 unseen schemas) | 42.3% | 63.2% | `gpt55-duckdb-pg.jsonl` |
+| BIRD mini-dev (487 answerable, 11 unseen schemas) | 40.5% | 61.8% | `gpt55-duckdb-pg.regraded-2026-09-06.jsonl` |
 | Spider 2.0-lite (135 local of 547, 30 schemas) | 37.0% | 58.5% | `spider2-full-k24.jsonl` |
 
 <a id="a-note-on-the-acme-row"></a>**A note on the ACME row.** That run is a favourable sample of a corpus with one unstable case. Across the twelve CI runs of the nightly gate that produced a comparison, `fire-count` is answered wrongly in eight of them, and the level the project actually gates on is 96.0% got-the-facts / 84.0% exact-match (`evals/trend.json`; both are compared, and the failure names which moved). The row above is not false — it names its run, and that run really scored it — but the reproducible number is one case lower, and a reader comparing the headline against the gate deserves to be told which is which.
+
+**A number names its grader, not only its run.** The grading rule changed on 2026-08-06 (a 1%
+relative numeric band replaced by explicit bounds; column order made to count for exact match), and
+nothing in a stored result says which rule labelled it — the outcome is just a word. So all three
+rows were recomputed against the current rule rather than dated. **BIRD moved** (12 of 487 labels;
+the row read 42.3% / 63.2% under the old rule). **Spider and ACME did not** — Spider re-grades to
+the same 50 of 135 with no label changed, and ACME's figures come from the live gate. Re-grade the
+whole table or none of it: one row on the new rule beside two on the old looks like-for-like and
+is not.
 
 Each row names ONE run, and every number comes from that run alone — but not all of them are
 READ from it: BIRD's exact-match is a probe replayed against the gold engine, described below,
@@ -65,11 +74,11 @@ exact-match and kept in got-the-facts, which is why the two columns differ by mo
 elsewhere.
 
 Neither BIRD run stored that probe, so it was **replayed** for this page: every case each run
-graded CORRECT was re-executed against the Postgres gold engine. The frontier run loses 32 of 238
-(48.9% raw → **42.3%**), the local run 10 of 247 (50.7% raw → **48.7%**). An earlier version of
+graded CORRECT was re-executed against the Postgres gold engine. The frontier run loses 29 of 226
+(46.4% raw → **40.5%**), the local run 9 of 241 (49.5% raw → **47.6%**). An earlier version of
 this section put the gap at "about 2.4 points" from a fleet-wide average. In cases rather than points, which is
 how the counts read without rounding: it predicts about 12 per run against 487 answerable; the local
-run lost 10 and the frontier run 32. Right to within two cases for one, short by twenty for the
+run lost 9 and the frontier run 29. Right to within three cases for one, short by seventeen for the
 other -- a fleet average is not a per-run estimate. What drives that is
 not isolated here — the local run also used constrained decoding, which is a plausible direct
 cause of fewer `QUALIFY`s reaching the gold engine — so treat it as a property of the RUN, not of
@@ -92,10 +101,11 @@ unseen schemas, no glossary, no examples. Spider 2.0 is the hard one by design �
 data-application schemas, often more than a thousand columns.
 
 On BIRD, **the table's row** sits in the range of BIRD's own reported single-shot baselines
-(GPT-4o 34.4, Claude 3.7 41.1, o3-mini 42.6): at 42.3% it is level with the top of that range, not
-past it.
+(GPT-4o 34.4, Claude 3.7 41.1, o3-mini 42.6): at 40.5% it sits inside that range and below its top
+two, not past it. An earlier version of this page put it at 42.3% and called it level with the top;
+that figure was graded under the pre-2026-08-06 rule.
 
-The 48.7% reported further down is not a counter-example to that, and the difference is
+The 47.6% reported further down is not a counter-example to that, and the difference is
 configuration rather than a contradiction. That run executes up to five candidates per question
 and five on 339 of 487, so it is not a single-shot number and does not belong beside a single-shot
 baseline. The table's run reads as single-shot: its candidate count and
@@ -109,17 +119,17 @@ task-specific fine-tuning, not a difference in the core.
 
 **On local models, the honest result** — and these are two different runs, not one configuration
 measured twice. On BIRD, a 24 GB Qwen2.5-Coder-14B with constrained decoding and 5-sample
-self-consistency reaches **48.7% exact-match** (54.4% got-the-facts,
-`minidev-pg-14b-guided-sc5.jsonl`).
+self-consistency reaches **47.6% exact-match** (53.6% got-the-facts,
+`minidev-pg-14b-guided-sc5.regraded-2026-09-06.jsonl`).
 
-On that metric it is **above** the frontier run in the table — 48.7% against 42.3%, and note that
+On that metric it is **above** the frontier run in the table — 47.6% against 40.5%, and note that
 those two are not like for like: five candidates against one, which is why the baselines paragraph
 compares only the table's row. What separates them here is portability rather than answers: on raw CORRECT the local run is
-already slightly ahead (247 against 238, nine cases), and the frontier run then loses three times
-as many to SQL Postgres will not parse (32 against 10). Read it as one run each, and as a statement about which dialect these two RUNS emitted -- not
+already ahead (241 against 226, fifteen cases), and the frontier run then loses three times
+as many to SQL Postgres will not parse (29 against 9). Read it as one run each, and as a statement about which dialect these two RUNS emitted -- not
 about which model reasons better, and not about the models either: the runs differ in candidate
 count (five against one) and in decoding, so the model is one of at least three variables. On got-the-facts, where portability is not excluded, the order is the
-usual one: 63.2% against 54.4%. That does not settle the question either -- the same run
+usual one: 61.8% against 53.6%. That does not settle the question either -- the same run
 differences sit under both metrics -- it just shows the reversal is specific to what exact-match
 excludes. On Spider 2.0-lite the same model
 single-shot reaches **5.9%** (6.7% got-the-facts, `spider2-qwen2.5-coder-14b.jsonl`), where the
@@ -135,7 +145,7 @@ constrained decoding on Spider is not something these runs can settle.
 The one durable observation is the size of the remaining gap: no local arm exceeds 8 of 135
 exact-match, against 50 of 135 for the frontier configuration. That is not a comparison between
 local arms, and it does not isolate a cause — the BIRD and Spider local figures use different
-configurations as well as different schemas, so the 48.7% / 5.9% contrast is not a schema effect
+configurations as well as different schemas, so the 47.6% / 5.9% contrast is not a schema effect
 on its own.
 
 Measure on your own schema before committing an architecture to it.
