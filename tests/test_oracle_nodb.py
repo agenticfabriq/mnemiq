@@ -604,20 +604,29 @@ def test_only_ONE_place_records_a_constrained_verdict():
 
 
 def test_the_first_reprobe_runs_on_a_freshly_booted_host(monkeypatch):
-    """`time.monotonic()` counts from host boot on Linux, so 0.0 is a real instant and not "never".
+    """`time.monotonic()` counts from an epoch that on Linux is HOST BOOT, so 0.0 is a real instant
+    and not "never". With `_ro_attempted_at` initialised to 0.0 the cadence gate
+    `now - attempted < ttl` held for the whole first TTL of the host's uptime: the adapter skipped
+    its very first re-probe, and the window bounding M66's PL/SQL write path was unbounded exactly
+    when a container starts with its host.
 
-    With `_ro_attempted_at` initialised to 0.0, the cadence gate `now - attempted < ttl` was true
-    for the whole first TTL of a host's uptime: the adapter skipped the very first re-probe, and
-    the window it exists to bound was unbounded exactly when a container starts with its host.
+    CI is the only place this could fail -- a runner boots fresh, a developer's machine has been up
+    for days -- so it arrived as a flake against a green local suite.
 
-    CI is the only place this could ever fail -- a runner boots fresh, a developer's machine has
-    been up for days -- which is why it arrived as a flake with a passing local suite. Pinned by
-    moving the clock rather than by waiting for one.
+    Two halves, and the first is the one that matters. `_constrained_adapter` builds through
+    `__new__` and assigns the sentinel itself, so a behavioural test alone would pass on the
+    fixture's value and never touch the defect, which lives in `__init__`.
     """
-    monkeypatch.setattr(mod.time, "monotonic", lambda: 41.0)
-    a = _constrained_adapter(ttl=60.0)
-    assert a._ro_attempted_at is None, "the sentinel must not be a point on the clock"
+    # 1. the constructor's own sentinel, reached without a database
+    import oracledb
+    monkeypatch.setattr(oracledb, "create_pool", lambda **kw: mock.Mock())
+    a = OracleAdapter("h:1521/X", "u", "p", read_only=True, read_only_ttl_s=60.0)
+    assert a._ro_attempted_at is None, "the initial sentinel is a point on the monotonic clock"
+    assert a._ro_checked_at is None, "the assurance clock starts at a real instant too"
 
+    # 2. and the behaviour that made it visible, with the host 41 seconds up
+    monkeypatch.setattr(mod.time, "monotonic", lambda: 41.0)
+    a._ro_state, a._probe_timeout_ms = "constrained", 30000
     con = _ProbeFails()
     a._recheck_read_only(con)
     assert con.closed == 1, "the first lease on a freshly-booted host did not probe"
