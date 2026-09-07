@@ -112,14 +112,14 @@ On BIRD, **the table's row** sits in the range of published single-shot baseline
 inside that range and below its top, not past it. An earlier version of this page put it at 42.3%
 and called it level with the top; that figure was graded under the pre-2026-08-06 rule.
 
-> **The three baselines this sentence used to name are withdrawn pending a source.** It cited
-> GPT-4o 34.4, Claude 3.7 41.1 and o3-mini 42.6 as *"BIRD's own reported"* figures. They are not in
-> `bird-bench/mini_dev`'s EX Evaluation table, which carries `gpt-4`, `gpt-4-32k` and `gpt-4-turbo`, and they
-> are not on BIRD's leaderboard; no commit records where they came from, and their
-> external-knowledge setting is therefore unknown — which, given the 20-point gap above, is the one
-> thing a comparison figure cannot leave open. The baseline that IS checkable is BIRD's own:
-> `bird-bench/mini_dev`, EX Evaluation table, PostgreSQL column. Read it there rather than from us,
-> and note our row is enriched where those are not, so it is not a model-against-model comparison.
+> **The three baselines this sentence used to name are withdrawn — wrong dialect.** It cited
+> GPT-4o 34.4, Claude 3.7 41.1 and o3-mini 42.6. Those are real BIRD mini-dev figures, but they are
+> **SQLite**, and the row above is **PostgreSQL**. That is not a detail: in BIRD's own EX Evaluation
+> table `gpt-4` scores **47.80 on SQLite and 35.80 on PostgreSQL** — a 12-point dialect gap, wider
+> than the spread the comparison was drawing. Reading a Postgres number against SQLite baselines is
+> not a comparison. The checkable like-for-like is that table's **PostgreSQL** column; read it at
+> the source rather than from us, and note our row is enriched where those are not, so it is not a
+> model-against-model result either.
 
 The 47.6% reported further down is not a counter-example to that, and the difference is
 configuration rather than a contradiction. That run executes up to five candidates per question
