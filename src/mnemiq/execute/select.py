@@ -66,7 +66,11 @@ UNRECOGNISED_REASON = "unrecognised"
 
 
 def fallback_reason(read: "SelectorRead") -> str | None:
-    """The cause to record for one pick, or None when there is no fallback to explain.
+    """The cause to record for one pick: a member of `FALLBACK_REASONS`, `UNRECOGNISED_REASON`,
+    or None when there is no fallback to explain. Those three cases ARE the recorded vocabulary,
+    and `UNRECOGNISED_REASON` is deliberately not a member of the frozenset -- so a reader
+    enumerating the audit column from the set alone misses the one value that means a selector
+    this build has not been taught.
 
     A judgement is not a fallback: the field is named for the event it explains, and an operator
     filtering an audit store on IS NOT NULL must not count every judged answer as a failure.
@@ -74,7 +78,15 @@ def fallback_reason(read: "SelectorRead") -> str | None:
     """
     if not read.fell_back:
         return None
-    return read.reason if read.reason in FALLBACK_REASONS else UNRECOGNISED_REASON
+    # `isinstance` BEFORE the membership test, because `in` on a frozenset is a hash lookup and a
+    # duck-typed selector is under no obligation to put a string there -- a structured cause is
+    # the natural thing for a third party to return. An unhashable one raises `TypeError` out of
+    # here, out of the selector call (which sits under no `except` on this path) and out of the
+    # request: a guard against free text that turns a fallback into a killed request, in the one
+    # function whose contract is that it never kills one.
+    if not isinstance(read.reason, str) or read.reason not in FALLBACK_REASONS:
+        return UNRECOGNISED_REASON
+    return read.reason
 
 
 def majority_index(clusters: list[ClusterView]) -> int:

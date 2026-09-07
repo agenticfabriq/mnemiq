@@ -92,10 +92,12 @@ class AgentAnswer:
     #
     # `None` whenever there is no fallback to explain -- INCLUDING a successful judgement, which
     # is not a fallback and whose "ok" would make an operator's `IS NOT NULL` count every judged
-    # answer as a failure. The values are `FALLBACK_REASONS`, clamped by `fallback_reason` as the
-    # duck-typed selector's string enters the engine, so nothing downstream carries free text
-    # into the audit record's always tier. Deliberately NOT on the wire: a client acts on whether
-    # the answer was judged, not on how the judge broke.
+    # answer as a failure. Otherwise a member of `FALLBACK_REASONS` **or `UNRECOGNISED_REASON`**,
+    # which is deliberately not in that frozenset: enumerating the vocabulary from the set alone
+    # misses the one value that means a selector this build has not been taught. `fallback_reason`
+    # clamps as the duck-typed selector's value enters the engine, so nothing downstream carries
+    # free text into the audit record's always tier. Deliberately NOT on the wire: a client acts
+    # on whether the answer was judged, not on how the judge broke.
     judge_fallback_reason: str | None = None
     # Multi-candidate only: how many of N produced a TABLE. Not how many were attempted --
     # a candidate that deferred, or that ran and hit an ExecutionError, is dropped by _execute and

@@ -259,3 +259,25 @@ def test_a_fallback_reported_as_ok_is_not_recorded_as_ok():
     ans = _answer(_agent_with(_Rogue()))
     assert ans.judge_fell_back is True
     assert ans.judge_fallback_reason == "unrecognised"
+
+
+@pytest.mark.parametrize("reason", [["error", "boom"], {"cause": "error"}, None, 42, b"error"])
+def test_a_cause_that_is_not_a_STRING_is_clamped_rather_than_raised(reason):
+    """`in FALLBACK_REASONS` is a hash lookup, and a duck-typed selector is under no obligation to
+    put a string there -- a structured cause is the natural thing to return. An unhashable one
+    raises `TypeError` out of the clamp, out of the selector call (which sits under no `except`
+    on this path), and out of the request: a guard against free text that turns a fallback into
+    a killed request, in the one function whose contract is that it never kills one.
+
+    The fact is still believed; only the word is refused.
+    """
+    from mnemiq.execute.select import SelectorRead
+
+    class _Rogue:
+        def read(self, question, clusters) -> SelectorRead:
+            return SelectorRead(0, fell_back=True, reason=reason)
+
+    ans = _answer(_agent_with(_Rogue()))
+    assert ans.deferred is False
+    assert ans.judge_fell_back is True
+    assert ans.judge_fallback_reason == "unrecognised"

@@ -246,7 +246,9 @@ class VerityTraceSink(TraceSink):
                 # cannot ask again later (M11).
                 "judge_fell_back": getattr(answer, "judge_fell_back", None),
                 # ...and which way. `judge_fell_back` alone makes an outage, a model that cannot
-                # emit the format and a pick outside the clusters one event.
+                # emit the format and a pick outside the clusters one event. A fourth value,
+                # `unrecognised`, means a selector reported a cause this build has not been
+                # taught -- clamped in the loop, so no third party's free text reaches this tier.
                 "judge_fallback_reason": getattr(answer, "judge_fallback_reason", None),
                 "agreement": getattr(answer, "agreement", None),
                 "cached": getattr(answer, "cached", None),
