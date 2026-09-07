@@ -49,11 +49,18 @@ def test_an_unreadable_reply_falls_back_and_says_so():
     assert got.reason == "unparsed"
 
 
-def test_a_pick_outside_the_clusters_falls_back_and_says_so():
+# 9 is far outside; 2 is the value ONE PAST the last cluster, which is what separates `<` from
+# `<=`. `trust` re-checks the range downstream, so an off-by-one here is invisible from the loop
+# -- and this method is public protocol that anything may call without `trust`, so it has to hold
+# its own contract rather than lean on a caller's.
+@pytest.mark.parametrize("choice", [9, 2])
+def test_a_pick_outside_the_clusters_falls_back_and_says_so(choice):
     """Distinct from `unparsed`: the model answered in the right SHAPE and named a cluster that
     does not exist. A model that cannot emit the format and one that miscounted the candidates
     are different problems, and only one of them is fixed by a better prompt."""
-    got = LLMSelector(_Client('{"choice": 9}')).read("q", _views(2, 3))
+    views = _views(2, 3)
+    assert choice >= len(views), "both cases must actually be out of range for this fixture"
+    got = LLMSelector(_Client('{"choice": %d}' % choice)).read("q", views)
     assert got.choice == 1 and got.fell_back is True
     assert got.reason == "out_of_range"
 
@@ -358,4 +365,38 @@ def test_the_int_protocol_is_narrowed_the_same_way(pick):
     assert ans.deferred is False
     assert ans.agreement == 2 / 3
     assert ans.judge_fell_back is True
+
+
+def test_a_FALSY_non_bool_flag_becomes_False_and_not_None():
+    """The other branch of the reconstruction, and the one no rogue fixture reached: they all
+    pass a literal `fell_back=False`, so handing the selector's own object back down this path
+    stayed green. A `read` returning `fell_back=None` would then set `judge_fell_back=None`,
+    which the wire ships uncoerced and which the field documents as "no judgement was attempted"
+    -- the opposite of what happened."""
+    ans = _answer(_agent_with(_rogue(choice=0, fell_back=None)))
+    assert ans.judge_fell_back is False
+    assert isinstance(ans.judge_fell_back, bool)
+    assert ans.judge_fallback_reason is None
+
+
+def test_the_pick_ONE_PAST_the_last_cluster_is_refused():
+    """The upper bound at its boundary. `-1` pins the lower one and 99 pins nothing in
+    particular; `choice == len(clusters)` is the value that separates `<` from `<=`, and getting
+    that wrong puts an IndexError into `groups[chosen]` -- the request the guard exists to save.
+    Read off the clusters the selector is handed, so the fixture can grow a candidate without
+    quietly stopping testing the boundary."""
+    from mnemiq.execute.select import SelectorRead
+
+    seen = {}
+
+    class _R:
+        def read(self, question, clusters) -> SelectorRead:
+            seen["n"] = len(clusters)
+            return SelectorRead(len(clusters), fell_back=False)
+
+    ans = _answer(_agent_with(_R()))
+    assert seen["n"] == 2, "the fixture still has two clusters, so the pick really is one past"
+    assert ans.deferred is False
+    assert ans.agreement == 2 / 3, "the majority cluster"
+    assert ans.judge_fell_back is True and ans.judge_fallback_reason == "out_of_range"
 
