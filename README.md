@@ -108,18 +108,23 @@ field and 34.88% without — and BIRD's leaderboard has a column for declaring i
 quoted from either suite has to say which side of that 20-point line it sits on. Every number on
 this page is **with** it.
 
-On BIRD, **the table's row** sits in the range of published single-shot baselines: at 40.5% it is
-inside that range and below its top, not past it. An earlier version of this page put it at 42.3%
-and called it level with the top; that figure was graded under the pre-2026-08-06 rule.
+On BIRD, **the table's row is 40.5% on PostgreSQL.** For scale, every model in BIRD mini-dev's own
+EX Evaluation table scores lower in that same PostgreSQL column — `gpt-4-turbo` **36.0**, `gpt-4`
+**35.8**, `gpt-4-32k` **35.0**, `llama3-70b-instruct` **29.4**.
 
-> **The three baselines this sentence used to name are withdrawn — wrong dialect.** It cited
-> GPT-4o 34.4, Claude 3.7 41.1 and o3-mini 42.6. Those are real BIRD mini-dev figures, but they are
-> **SQLite**, and the row above is **PostgreSQL**. That is not a detail: in BIRD's own EX Evaluation
-> table `gpt-4` scores **47.80 on SQLite and 35.80 on PostgreSQL** — a 12-point dialect gap, wider
-> than the spread the comparison was drawing. Reading a Postgres number against SQLite baselines is
-> not a comparison. The checkable like-for-like is that table's **PostgreSQL** column; read it at
-> the source rather than from us, and note our row is enriched where those are not, so it is not a
-> model-against-model result either.
+**Read that as a pipeline difference, not a model result.** Those runs are unenriched, see only a
+column listing (name, type, nullability — no keys, no sample rows), and use an earlier generation of
+models; ours is enriched and uses a current frontier model. Two of those three differences would
+move the number on their own. The dialect is the one thing held fixed, and it is the thing most
+often got wrong: the same `gpt-4` scores **47.8 on SQLite** against **35.8 on PostgreSQL**, so a
+Postgres figure compared against SQLite baselines is off by more than the gap being discussed.
+
+> **What this paragraph used to say, and why it was wrong.** It cited GPT-4o 34.4, Claude 3.7 41.1
+> and o3-mini 42.6, and concluded our row was *"inside that range and below its top."* Those are
+> real BIRD mini-dev figures — but **SQLite** ones, where the row is PostgreSQL. Against the correct
+> column the conclusion inverts, which is exactly how much a dialect mix-up is worth. It also put
+> the row at 42.3% under the pre-2026-08-06 grading rule. Both halves of the old sentence were
+> wrong, and they were wrong in opposite directions.
 
 The 47.6% reported further down is not a counter-example to that, and the difference is
 configuration rather than a contradiction. That run executes up to five candidates per question
