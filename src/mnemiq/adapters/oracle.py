@@ -152,8 +152,15 @@ class OracleAdapter:
         self._closed = False
         # `constrained` expires: see `_recheck_read_only`.
         self._ro_ttl_s = read_only_ttl_s
-        self._ro_checked_at = 0.0
-        self._ro_attempted_at = 0.0
+        # `None`, not 0.0, and the distinction is the control. `time.monotonic()` counts from an
+        # unspecified epoch that on Linux is HOST BOOT, so 0.0 is not "never" -- it is a real
+        # instant, and for the first TTL seconds of a host's uptime "never probed" and "probed at
+        # boot" are the same number. MEASURED: with the host up 41s and `ttl=60`, the first
+        # re-probe was skipped entirely; the process that exists to bound M66's window silently
+        # did not, for up to `oracle_read_only_ttl_s` (default 300s) after boot -- exactly when a
+        # container starting with its host is coming up.
+        self._ro_checked_at: float | None = None
+        self._ro_attempted_at: float | None = None
         self._ro_state = "unknown"
         self._ro_unverified = False
         self._ro_unverified_since = 0.0
@@ -215,8 +222,8 @@ class OracleAdapter:
         a._session_schema = None
         a._closed = False
         a._ro_ttl_s = 0.0  # a borrowed connection is not ours to re-probe on a timer
-        a._ro_checked_at = 0.0
-        a._ro_attempted_at = 0.0
+        a._ro_checked_at = None
+        a._ro_attempted_at = None
         a._ro_state = "unknown"
         a._ro_unverified = False
         a._ro_unverified_since = 0.0
@@ -384,7 +391,7 @@ class OracleAdapter:
         # probe timeout, so on a wedged session that is thirty seconds of hang per operation while
         # holding a pooled connection: the exact exhaustion this method's own commit was fixing,
         # reached from the fix for the fix.
-        if now - self._ro_attempted_at < self._ro_ttl_s:
+        if self._ro_attempted_at is not None and now - self._ro_attempted_at < self._ro_ttl_s:
             return
         self._ro_attempted_at = now
 
@@ -506,8 +513,8 @@ class OracleAdapter:
         # a lapse of one TTL is a blip, a lapse of hours is an unattended read plane resting on a
         # stale statement. A clock nothing reads would not be a clock, and an age reported once
         # would not be an age.
-        age = now - self._ro_checked_at
-        standing = f"a check {age:.0f}s old" if self._ro_checked_at else "no successful check at all"
+        standing = ("no successful check at all" if self._ro_checked_at is None
+                    else f"a check {now - self._ro_checked_at:.0f}s old")
         logger.warning(
             "read-only basis can no longer be VERIFIED for %.0fs: the open-mode probe did not "
             "complete (%s), so `constrained` is standing on %s rather than on a current one. It "

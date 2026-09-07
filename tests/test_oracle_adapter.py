@@ -1585,7 +1585,7 @@ def test_a_probe_that_FAILS_is_not_evidence_the_database_opened():
     a = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, read_only_ttl_s=0.01)
     try:
         a._ro_state = "constrained"   # as `assert_read_only` would have left it
-        a._ro_checked_at = 0.0        # already stale
+        a._ro_checked_at = None       # never verified
 
         # Point the probe at a table that does not exist: ORA-00942 is a DatabaseError and is
         # emphatically not ORA-16000, which is the whole distinction under test.
