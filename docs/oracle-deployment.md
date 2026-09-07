@@ -122,9 +122,13 @@ acknowledgement. Whether that is audible depends on the new verdict, not on the 
 acknowledge `read-only-basis:gate_only` and narrow the principal as §3 advises, and the resulting
 `unverifiable` **warns** at boot — you acknowledged a state you assessed and this is a different one.
 Reopen the database read-only instead and the resulting `constrained` is **quiet**, because it is a
-verdict that needs no action; at the default WARNING level the read-only line goes quiet. The VPD advisory is
-scored separately, so a  deployment whose enforcement verdict is `partial`,
-`unverifiable` or `bypassing` still warns on that line.
+verdict that needs no action; at the default WARNING level the read-only line goes quiet.
+
+That silence covers one advisory of the two. The VPD advisory is scored and acknowledged
+separately, under the `source-enforcement` key, so a `constrained` deployment whose enforcement
+verdict is `partial` or `unverifiable` still warns on that line until you acknowledge that verdict
+too — `source-enforcement:partial`. `bypassing` warns whether or not you acknowledge it, for the
+reason below.
 
 Two verdicts cannot be silenced at all, and setting a key for either is worse than not setting one.
 
