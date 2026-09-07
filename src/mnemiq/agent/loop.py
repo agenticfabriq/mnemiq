@@ -81,6 +81,13 @@ class AgentAnswer:
     # Non-None exactly when `judge_engaged` is True, and a selector speaking only the int protocol
     # is taken at its word rather than assumed broken.
     judge_fell_back: bool | None = None
+    # ...and which way it broke. An outage, a model that cannot emit the format and a pick naming
+    # a cluster that does not exist want three different responses, and the audit record is where
+    # that is asked after the fact by someone who cannot re-run the request. `None` when no
+    # judgement was attempted, and when the selector speaks only the int protocol and has no
+    # cause to report. Deliberately NOT on the wire: a client acts on whether the answer was
+    # judged, not on how the judge broke.
+    judge_fallback_reason: str | None = None
     # Multi-candidate only: how many of N produced a TABLE. Not how many were attempted --
     # a candidate that deferred, or that ran and hit an ExecutionError, is dropped by _execute and
     # never counted. The looser "how many of N ran" left that ambiguous at the definition site.
@@ -407,7 +414,7 @@ class Agent:
                     narrowed=_narrowed_of(executed),
                 )
 
-        judge_engaged = judge_override = judge_fell_back = None
+        judge_engaged = judge_override = judge_fell_back = judge_fallback_reason = None
         if self.selector is not None:
             judge_engaged = not auto_accepted(views)
             if not judge_engaged:
@@ -423,6 +430,7 @@ class Agent:
                 if reader is not None:
                     got = reader(packet.question, views)
                     chosen, judge_fell_back = got.choice, got.fell_back
+                    judge_fallback_reason = got.reason
                 else:
                     chosen, judge_fell_back = self.selector.select(packet.question, views), False
             judge_override = chosen != majority
@@ -453,6 +461,7 @@ class Agent:
             judge_engaged=judge_engaged,
             judge_override=judge_override,
             judge_fell_back=judge_fell_back,
+            judge_fallback_reason=judge_fallback_reason,
             candidates_executed=len(executed),
             preview=base.preview,
             # Carried from `base`: this branch rebuilds the answer to append the agreement

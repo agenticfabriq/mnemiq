@@ -118,9 +118,19 @@ class LLMSelector:
         except Exception:
             return SelectorRead(majority_index(clusters), fell_back=True, reason="error")
         match = _INT.search(raw or "")
-        if match is None:
+        # `int()` is guarded, not just the search: CPython refuses a conversion above 4300 digits
+        # and a 2000-token reply has room for several times that, so a degenerate repetition
+        # raises where the regex matched happily. Before this was a `read`, the parse sat inside
+        # the try that catches the endpoint and fell back with everything else; pulling the client
+        # call out of that try to tell an outage from an unreadable reply took the parse with it,
+        # and turned a fallback into a killed request in the one function whose contract is that
+        # it never kills one.
+        try:
+            choice = int(match.group(0)) if match is not None else None
+        except ValueError:
+            choice = None
+        if choice is None:
             return SelectorRead(majority_index(clusters), fell_back=True, reason="unparsed")
-        choice = int(match.group(0))
         if not 0 <= choice < len(clusters):
             return SelectorRead(majority_index(clusters), fell_back=True, reason="out_of_range")
         return SelectorRead(choice, fell_back=False)

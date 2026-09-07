@@ -64,6 +64,17 @@ def test_a_judge_that_picked_the_majority_ANYWAY_is_a_judgement():
     assert got.reason == "ok"
 
 
+def test_a_reply_of_pure_digits_falls_back_instead_of_raising():
+    """CPython refuses `int()` above 4300 digits, and a 2000-token reply has room for far more.
+    The regression this pins is a REFACTOR's: the parse used to sit inside the try that catches
+    the endpoint, and pulling the call out of it took the parse with it -- so a degenerate reply
+    stopped falling back and started killing the request, in the function whose whole contract is
+    that it never does."""
+    got = LLMSelector(_Client("9" * 4301)).read("q", _views(2, 3))
+    assert got.choice == 1 and got.fell_back is True
+    assert got.reason == "unparsed"
+
+
 def test_select_still_speaks_the_int_protocol():
     """`Selector` is a Protocol and anyone's stub implements `select`. Changing that contract
     would break every caller to fix a telemetry field."""
@@ -93,6 +104,18 @@ def test_a_selector_that_answered_reports_a_judged_pick():
     assert ans.judge_override is False, "it agreed with the majority -- and that is now sayable"
 
 
+def test_the_judged_pick_actually_wins():
+    """The `read` branch is the one every production selector now takes, and every other test
+    here feeds it `{"choice": 0}` -- which IS the majority index for this fixture. So the branch
+    could stop using the judge's pick entirely and stay green: `judge_engaged=True,
+    judge_override=False` beside a vote-chosen answer is precisely the lie this change closes,
+    reintroduced one line over. This is the case where the two indices differ."""
+    ans = _answer(_agent_with(LLMSelector(_Client('{"choice": 1}'))))
+    assert ans.judge_override is True
+    assert ans.judge_fell_back is False
+    assert ans.agreement == 1 / 3, "the 1-candidate cluster the judge picked, not the 2 that voted"
+
+
 def test_a_selector_never_consulted_has_nothing_to_report():
     agent = _vote_agent([_sql("count(*)")] * 3, 3)   # unanimous: selection is vacuous
     agent.selector = FakeSelector([0])
@@ -113,6 +136,8 @@ def test_a_selector_without_read_is_taken_at_its_word():
     ans = _answer(_agent_with(FakeSelector([1])))
     assert ans.judge_engaged is True and ans.judge_fell_back is False
     assert ans.judge_override is True
+    assert ans.judge_fallback_reason is None, \
+        "taken at its word is not the same as reporting `ok`: this selector reported nothing"
 
 
 @pytest.mark.parametrize("reply,fell_back", [('{"choice": 0}', False),
@@ -147,3 +172,30 @@ def test_the_fact_reaches_the_trace():
     record = VerityTraceSink(_Settings())._build_trace(_event(answer=ans))
     assert record["resolved_intent"]["judge_engaged"] is True
     assert record["resolved_intent"]["judge_fell_back"] is True
+
+
+def test_the_audit_record_says_WHY_the_judge_fell_back():
+    """The cause is the operator's question and the audit store is where it is asked, after the
+    fact, by someone who cannot re-run the request. An outage, a model that cannot emit the
+    format and a pick outside the clusters want three different responses; `judge_fell_back`
+    alone makes them one event. Deliberately not on the wire -- a client acts on whether the
+    answer was judged, not on which way the judge broke."""
+    import sys
+
+    sys.path.insert(0, "tests")
+    from test_verity_trace_sink import _Settings, _event
+
+    from mnemiq.observability.trace_sink import VerityTraceSink
+
+    for reply, reason in ((RuntimeError("down"), "error"), ("no idea", "unparsed"),
+                          ('{"choice": 9}', "out_of_range"), ('{"choice": 0}', "ok")):
+        ans = _answer(_agent_with(LLMSelector(_Client(reply))))
+        record = VerityTraceSink(_Settings())._build_trace(_event(answer=ans))
+        assert record["resolved_intent"]["judge_fallback_reason"] == reason, reply
+
+    # Never consulted, and never asked: a reason would invent an event that did not happen.
+    from mnemiq.execute.select import FakeSelector
+    agent = _vote_agent([_sql("count(*)")] * 3, 3)
+    agent.selector = FakeSelector([0])
+    record = VerityTraceSink(_Settings())._build_trace(_event(answer=_answer(agent)))
+    assert record["resolved_intent"]["judge_fallback_reason"] is None

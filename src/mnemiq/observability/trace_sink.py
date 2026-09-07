@@ -245,6 +245,9 @@ class VerityTraceSink(TraceSink):
                 # from a judgement without this, and the audit store is the reader that
                 # cannot ask again later (M11).
                 "judge_fell_back": getattr(answer, "judge_fell_back", None),
+                # ...and which way. `judge_fell_back` alone makes an outage, a model that cannot
+                # emit the format and a pick outside the clusters one event.
+                "judge_fallback_reason": getattr(answer, "judge_fallback_reason", None),
                 "agreement": getattr(answer, "agreement", None),
                 "cached": getattr(answer, "cached", None),
             },
