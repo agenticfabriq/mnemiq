@@ -47,7 +47,6 @@ _STANDALONE = {
 
 # A record whose envelope will not yield an identity either. Named rather than dropped: a count
 # with no name is worse than a name, and better than the silence this replaced.
-
 _UNIDENTIFIED = "<unidentified record>"
 
 # How much of a refusal body to read at all, and how much of it to log. The first bound is
@@ -148,7 +147,7 @@ def fetch_certified_records(settings) -> CertifiedSet:
         # the local digest produced and never asked Verity for anything.
         return CertifiedSet([], available=True)
 
-    if not url.rstrip("/").endswith(CERTIFIED_RECORDS_PATH):
+    if not _serves_the_open_endpoint(url):
         # Said once, before the pull, because the symptom otherwise is either a 400 on every page
         # or -- worse -- a pull that drains and has quietly stopped being incremental. A WARNING
         # and not a refusal: the path is the operator's to choose and a proxy in front of Verity
@@ -243,6 +242,20 @@ def apply_certified_set(snapshot: Snapshot, certified: CertifiedSet
     protected = frozenset(r.envelope.object_id for r in certified.records
                           if r.envelope.object_type == "column")
     return snapshot, protected
+
+
+def _serves_the_open_endpoint(url: str) -> bool:
+    """Does this URL address the endpoint the incremental pull needs?
+
+    The PATH, parsed -- not the whole string. `_page_url` appends `since`/`cursor`/`limit` with
+    `"&" if "?" in url else "?"`, so a records URL that already carries a query string is a shape
+    this module explicitly supports, and `endswith` on the raw URL called every one of them
+    misconfigured. A correct deployment told once per run that its pull "is not incremental" is
+    the boy who cried wolf, in the warning added to stop a silent misconfiguration.
+    """
+    from urllib.parse import urlsplit
+
+    return urlsplit(url).path.rstrip("/").endswith(CERTIFIED_RECORDS_PATH)
 
 
 def _record_identity(item: dict) -> tuple[str, str]:

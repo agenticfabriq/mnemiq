@@ -158,13 +158,17 @@ def test_the_endpoint_this_pull_needs_is_a_VALUE_not_a_sentence():
     how prose goes wrong is prose. So the endpoint an operator is told to set is a constant the
     description is BUILT from, and this checks the constant.
     """
-    from mnemiq.config import Settings
     from mnemiq.enrichment.certified import CERTIFIED_RECORDS_PATH
 
-    assert CERTIFIED_RECORDS_PATH.endswith("/open"), (
-        "only `/open` accepts `since`; the sibling silently stops being incremental"
+    assert CERTIFIED_RECORDS_PATH.startswith("/") and CERTIFIED_RECORDS_PATH.endswith(
+        "/records/open"), (
+        f"{CERTIFIED_RECORDS_PATH!r} is not the path Verity serves the incremental pull on. Only "
+        "that one accepts `since`; the sibling silently stops being incremental. `/open` alone "
+        "passes a suffix check and is not a configurable path"
     )
-    assert CERTIFIED_RECORDS_PATH in (Settings.model_fields["verity_records_url"].description or "")
+    # NOT "the description contains the constant": the description is an f-string built FROM the
+    # constant, so that assertion cannot fail, and a guard that cannot fail is worse than none.
+    # What the constant is worth is checked by the two behaviour tests below.
 
 
 def test_a_url_that_is_not_the_open_endpoint_is_called_out_before_the_pull(tmp_path, monkeypatch,
@@ -198,17 +202,12 @@ def test_the_open_endpoint_is_not_second_guessed(tmp_path, monkeypatch, caplog):
     assert "since" not in caplog.text
 
 
-def test_the_page_size_setting_warns_where_the_operator_turns_it():
-    """The `nor to 0` warning went on the field an operator is told NOT to change, while the knob
-    they actually reach for after a 400 still advertised 0 as a plain supported mode."""
-    from mnemiq.config import Settings
-
-    text = Settings.model_fields["verity_page_size"].description or ""
-    assert "0 = " in text, "it still has to say what 0 does"
-    assert "/open" in text and "since" in text, (
-        "and say why 0 is not a way to make the other endpoint work: it sends no `limit` at all, "
-        "so that endpoint drains happily and ignores `since` forever"
-    )
+# `verity_page_size`'s description also warns that 0 is not a way to make the sibling endpoint
+# work -- deliberately NOT asserted here. It is prose, and a substring check over prose is the
+# thing three rounds of review just took apart: `"0 = send no limit at all, which is how you make
+# the sibling serve a pull"` satisfies every keyword such a check could name while prescribing the
+# misconfiguration. The behaviour that actually catches it is the warning below, which fires on
+# the URL regardless of page size.
 
 
 @pytest.mark.parametrize("body,expected,absent", [
@@ -266,4 +265,28 @@ def test_a_huge_error_page_is_not_read_into_memory_to_be_thrown_away():
         f"read {stream.tell()} bytes; the cap this module declares is {_REFUSAL_BODY_BYTES}"
     )
     assert "verity said" in detail, "and it still says what it managed to read"
+
+
+@pytest.mark.parametrize("url,quiet", [
+    ("https://v/api/semantic/records/open", True),
+    ("https://v/api/semantic/records/open/", True),
+    # A records URL that already carries a query string is a shape `_page_url` supports -- it
+    # picks its separator with `"&" if "?" in url else "?"` -- so comparing the whole URL called
+    # every correct deployment of that shape misconfigured, once per run.
+    ("https://v/api/semantic/records/open?tenant=acme", True),
+    ("https://v/api/semantic/records/open#frag", True),
+    ("https://v/api/semantic/records", False),
+    ("https://v/api/semantic/records?limit=200", False),
+])
+def test_the_warning_reads_the_PATH_and_not_the_whole_url(tmp_path, monkeypatch, caplog,
+                                                         url, quiet):
+    from mnemiq.config import Settings
+    from mnemiq.enrichment import certified as mod
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", _serving({
+        "records": [], "watermark": "t1", "next_cursor": None}))
+    with caplog.at_level("WARNING"):
+        mod.fetch_certified_records(Settings(
+            verity_records_url=url, verity_watermark_path=str(tmp_path / "wm.json")))
+    assert ("does not end in" in caplog.text) is not quiet
 
