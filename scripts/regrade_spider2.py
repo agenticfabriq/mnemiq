@@ -50,10 +50,14 @@ def main() -> int:
         changed = failed = no_gold = 0
         for r in records:
             if r["outcome"] not in _GRADED:
+                # A deferral or an error has no gold comparison to redo, so it is not "skipped"
+                # either. Saying so beats a missing field, which a reader has to guess at.
+                r["regrade"] = "not-graded"
                 continue
             alternatives = gold_alternatives(args.spider2_dir, r["case_id"])
             if not alternatives:
                 no_gold += 1
+                r["regrade"] = "skipped:no-gold"
                 continue
             # Opening the database is NOT inside the try. A missing or unopenable file is an
             # environment fault, and counting it as an unrunnable candidate would be this script's
@@ -70,8 +74,14 @@ def main() -> int:
                 candidate = adapter.execute_arrow(r["sql"], timeout_s=60)
             except Exception:  # noqa: BLE001 -- an unrunnable candidate keeps the label it has
                 failed += 1
+                r["regrade"] = "skipped:unrunnable"
                 continue
             new = _NAME[grade_alternatives(candidate, alternatives)]
+            # Every re-checked record says so, not only the ones that moved. The filename claims the
+            # whole file was re-graded; without this, a record that was SKIPPED is byte-identical to
+            # one re-checked and confirmed, and a downstream reader counting `outcome_as_run` markers
+            # learns how many changed while assuming the rest were verified.
+            r["regrade"] = "changed" if new != r["outcome"] else "confirmed"
             if new != r["outcome"]:
                 r["outcome_as_run"], r["outcome"] = r["outcome"], new
                 changed += 1
@@ -80,6 +90,8 @@ def main() -> int:
               f"{changed} labels changed, {failed} unrunnable, {no_gold} without gold")
         if changed:
             out = run.replace(".jsonl", f".{args.suffix}.jsonl")
+            print(f"  per-record `regrade`: {sum(1 for r in records if r.get('regrade') == 'confirmed')} "
+                  f"confirmed, {changed} changed, {failed + no_gold} skipped")
             with open(out, "w") as fh:
                 for r in records:
                     fh.write(json.dumps(r) + "\n")
