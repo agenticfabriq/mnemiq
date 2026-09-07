@@ -117,9 +117,9 @@ and called it level with the top; that figure was graded under the pre-2026-08-0
 > `bird-bench/mini_dev`'s EX table, which carries `gpt-4`, `gpt-4-32k` and `gpt-4-turbo`, and they
 > are not on BIRD's leaderboard; no commit records where they came from, and their
 > external-knowledge setting is therefore unknown — which, given the 20-point gap above, is the one
-> thing a comparison figure cannot leave open. The sourced comparison is in the technical report:
-> `bird-bench/mini_dev` at `b3d4bcb`, PostgreSQL column, **with** the knowledge field on both
-> sides.
+> thing a comparison figure cannot leave open. The baseline that IS checkable is BIRD's own:
+> `bird-bench/mini_dev`, EX Evaluation table, PostgreSQL column. Read it there rather than from us,
+> and note our row is enriched where those are not, so it is not a model-against-model comparison.
 
 The 47.6% reported further down is not a counter-example to that, and the difference is
 configuration rather than a contradiction. That run executes up to five candidates per question
