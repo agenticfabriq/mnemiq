@@ -274,9 +274,15 @@ def test_a_huge_error_page_is_not_read_into_memory_to_be_thrown_away():
     # picks its separator with `"&" if "?" in url else "?"` -- so comparing the whole URL called
     # every correct deployment of that shape misconfigured, once per run.
     ("https://v/api/semantic/records/open?tenant=acme", True),
-    ("https://v/api/semantic/records/open#frag", True),
     ("https://v/api/semantic/records", False),
     ("https://v/api/semantic/records?limit=200", False),
+    # The full path, not a `/open` suffix: nothing else here separates the two, so the check
+    # could accept any path ending that way while the constant's own assertion stayed green.
+    ("https://v/api/semantic/definitions/open", False),
+    # MEASURED: `_page_url` appends after the `#` and urllib cuts the request line there, so this
+    # shape requests every page with no `since`, `cursor` or `limit` at all. The correct path is
+    # not enough to make it a working pull, and the first version of this check called it quiet.
+    ("https://v/api/semantic/records/open#frag", False),
 ])
 def test_the_warning_reads_the_PATH_and_not_the_whole_url(tmp_path, monkeypatch, caplog,
                                                          url, quiet):
@@ -288,5 +294,16 @@ def test_the_warning_reads_the_PATH_and_not_the_whole_url(tmp_path, monkeypatch,
     with caplog.at_level("WARNING"):
         mod.fetch_certified_records(Settings(
             verity_records_url=url, verity_watermark_path=str(tmp_path / "wm.json")))
-    assert ("does not end in" in caplog.text) is not quiet
+    assert ("verity_records_url" in caplog.text) is not quiet
+
+
+def test_the_fragment_and_the_wrong_path_are_told_apart():
+    """One warning with two causes is the shape this register keeps closing. An operator whose
+    path is right and whose URL is unusable must not be told to change the path."""
+    from mnemiq.enrichment.certified import _url_complaint
+
+    assert _url_complaint("https://v/api/semantic/records/open") is None
+    assert "fragment" in _url_complaint("https://v/api/semantic/records/open#f")
+    assert "path" in _url_complaint("https://v/api/semantic/records")
+    assert "fragment" not in _url_complaint("https://v/api/semantic/records")
 

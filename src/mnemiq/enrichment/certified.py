@@ -147,16 +147,13 @@ def fetch_certified_records(settings) -> CertifiedSet:
         # the local digest produced and never asked Verity for anything.
         return CertifiedSet([], available=True)
 
-    if not _serves_the_open_endpoint(url):
+    complaint = _url_complaint(url)
+    if complaint:
         # Said once, before the pull, because the symptom otherwise is either a 400 on every page
         # or -- worse -- a pull that drains and has quietly stopped being incremental. A WARNING
-        # and not a refusal: the path is the operator's to choose and a proxy in front of Verity
-        # may legitimately serve it elsewhere.
-        logger.warning(
-            "verity_records_url %r does not end in %s; only that endpoint accepts `since`, so a "
-            "pull against any other one is not incremental however well it appears to work",
-            url, CERTIFIED_RECORDS_PATH,
-        )
+        # and not a refusal: the URL is the operator's to choose and a proxy in front of Verity
+        # may legitimately serve this endpoint elsewhere.
+        logger.warning("verity_records_url %r %s", url, complaint)
 
     cache_path = _watermark_path(settings)
     cached, watermark, synced_at = _read_cache(cache_path, url)
@@ -244,18 +241,37 @@ def apply_certified_set(snapshot: Snapshot, certified: CertifiedSet
     return snapshot, protected
 
 
-def _serves_the_open_endpoint(url: str) -> bool:
-    """Does this URL address the endpoint the incremental pull needs?
+def _url_complaint(url: str) -> str | None:
+    """What is wrong with this records URL for an INCREMENTAL pull, if anything.
 
-    The PATH, parsed -- not the whole string. `_page_url` appends `since`/`cursor`/`limit` with
-    `"&" if "?" in url else "?"`, so a records URL that already carries a query string is a shape
-    this module explicitly supports, and `endswith` on the raw URL called every one of them
-    misconfigured. A correct deployment told once per run that its pull "is not incremental" is
-    the boy who cried wolf, in the warning added to stop a silent misconfiguration.
+    Two different problems, and only one of them is about the path:
+
+    * **the wrong endpoint.** Compared on the parsed PATH, not the whole string: `_page_url`
+      appends its parameters with `"&" if "?" in url else "?"`, so a records URL that already
+      carries a query string is a shape this module supports, and an `endswith` over the raw URL
+      called every one of them misconfigured.
+    * **a fragment.** MEASURED, not reasoned: `_page_url` appends `?since=...&limit=...` AFTER
+      the `#`, and `urllib` cuts the request line at the first `#` -- so
+      `.../records/open#frag` requests `/api/semantic/records/open` with no parameters at all,
+      on every page. That is the silent full-dump-merged-as-a-delta this warning exists to
+      announce, wearing the correct path, and the first version of this check called it fine.
     """
     from urllib.parse import urlsplit
 
-    return urlsplit(url).path.rstrip("/").endswith(CERTIFIED_RECORDS_PATH)
+    parts = urlsplit(url)
+    if parts.fragment:
+        return (
+            "carries a URL fragment; the pull appends `since`, `cursor` and `limit` after it and "
+            "urllib drops everything from the `#`, so every page is requested unparameterised "
+            "and the pull is a full dump wearing the shape of a delta"
+        )
+    if not parts.path.rstrip("/").endswith(CERTIFIED_RECORDS_PATH):
+        return (
+            f"has the path {parts.path!r}, not {CERTIFIED_RECORDS_PATH}; only that endpoint "
+            "accepts `since`, so a pull against any other one is not incremental however well "
+            "it appears to work"
+        )
+    return None
 
 
 def _record_identity(item: dict) -> tuple[str, str]:
