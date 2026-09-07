@@ -399,7 +399,8 @@ def test_the_pick_ONE_PAST_the_last_cluster_is_refused():
     assert ans.judge_fell_back is True and ans.judge_fallback_reason == "out_of_range"
 
 
-def test_the_fallback_goes_to_the_MAJORITY_and_not_to_the_first_cluster():
+@pytest.mark.parametrize("pick,reason", [(99, "out_of_range"), ("0", "unrecognised")])
+def test_the_fallback_goes_to_the_MAJORITY_and_not_to_the_first_cluster(pick, reason):
     """Every other loop-level case here shares one fixture, and that fixture's majority IS
     cluster 0 -- so `majority_index(clusters)` and a hardcoded `0` are the same integer, and
     replacing the fallback destination with a literal left the whole suite green. This is the
@@ -408,6 +409,10 @@ def test_the_fallback_goes_to_the_MAJORITY_and_not_to_the_first_cluster():
     fallback.
 
     The candidates are ordered so the majority is cluster 1: one `sum` (5) then two `count`s (7).
+
+    BOTH rejection branches, because they call `majority_index` at two sites and a test that
+    exercises one leaves the other free to be a literal -- which is how this hole survived the
+    first version of this test.
     """
     from mnemiq.execute.select import SelectorRead
 
@@ -416,13 +421,13 @@ def test_the_fallback_goes_to_the_MAJORITY_and_not_to_the_first_cluster():
     class _R:
         def read(self, question, clusters) -> SelectorRead:
             sizes["by_index"] = [c.size for c in clusters]
-            return SelectorRead(99, fell_back=False)      # rejected: out of range
+            return SelectorRead(pick, fell_back=False)    # rejected, one way or the other
 
     agent = _vote_agent([_sql("sum(n)"), _sql("count(*)"), _sql("count(*)")], 3)
     agent.selector = _R()
     ans = _answer(agent)
 
     assert sizes["by_index"] == [1, 2], "the fixture must put the majority at index 1, not 0"
-    assert ans.judge_fell_back is True and ans.judge_fallback_reason == "out_of_range"
+    assert ans.judge_fell_back is True and ans.judge_fallback_reason == reason
     assert ans.agreement == 2 / 3, "the 2-candidate cluster at index 1 -- not the first one"
 
