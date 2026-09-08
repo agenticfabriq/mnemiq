@@ -134,8 +134,15 @@ def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str]) 
 # Facts/examples default OFF (settings.enrich_facts/enrich_examples): the plan-20 A/B measured both
 # phases as regressions on a strong frontier model (facts -2.9, facts+examples -8.0 strict). Parked
 # as opt-in plumbing; set MNEMIQ_ENRICH_FACTS/EXAMPLES=1 (a weaker/local model may need scaffolding).
-def _enrich_cache_suffix(settings: Settings, certified_digest: str = "") -> str:
-    parts = []
+def _enrich_cache_suffix(
+    settings: Settings, certified_digest: str = "", semantic: bool = True
+) -> str:
+    # `semantic` belongs in the KEY, not just in the caller's choice of directory. The
+    # structural and semantic snapshots of one database differ only in whether the
+    # descriptions are LLM-written, so a tier-1 run pointed at a tier-2 cache silently
+    # inherits tier-2's descriptions and reports a tier-1 number that never happened.
+    # Separate directories prevent that by convention; this prevents it by construction.
+    parts = [] if semantic else ["structural"]
     if settings.enrich_facts:
         parts.append("facts")
     if settings.enrich_examples:
@@ -166,6 +173,7 @@ def enrich_bird_db(
     cache_dir: str | None = None,
     refresh: bool = False,
     semantic: bool = True,
+    db_path_fn: Callable[[str, str], str] = bird_db_path,
 ) -> Snapshot:
     """Enrich one BIRD database. Cached to disk: BIRD DBs never change, so (db_id, model)
     is the key -- the enriched snapshot depends on the model, so switching models must not
@@ -184,7 +192,7 @@ def enrich_bird_db(
     model_slug = (settings.llm_model or "default").replace("/", "_")
     cache_path = (
         os.path.join(cache_dir,
-                     f"{db_id}__{model_slug}{_enrich_cache_suffix(settings, _cert_digest)}.json")
+                     f"{db_id}__{model_slug}{_enrich_cache_suffix(settings, _cert_digest, semantic)}.json")
         if cache_dir else None
     )
     if cache_path and not refresh and os.path.isfile(cache_path):
@@ -196,7 +204,7 @@ def enrich_bird_db(
     from mnemiq.enrichment.pipeline import content_version
     from mnemiq.ontology.records import load_records
 
-    adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
+    adapter = SQLiteAdapter(db_path_fn(minidev_dir, db_id))
     snapshot = enrich_structural(adapter, db_id)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
@@ -298,6 +306,8 @@ def run_bird(
     results_path: str | None = None,
     workers: int = 1,
     candidates: int = 1,
+    semantic: bool = True,
+    db_path_fn: Callable[[str, str], str] = bird_db_path,
 ) -> tuple[list[CaseResult], dict]:
     """Run BIRD cases grouped by database. Resumable: with results_path, each result is
     checkpointed as it completes and a re-run skips everything already answered -- a long
@@ -318,14 +328,17 @@ def run_bird(
         if not remaining:
             continue  # whole DB already done in a prior segment -- no enrichment, no client
 
-        snapshot = enrich_bird_db(minidev_dir, db_id, settings, cache_dir=cache_dir)
+        snapshot = enrich_bird_db(
+            minidev_dir, db_id, settings, cache_dir=cache_dir,
+            semantic=semantic, db_path_fn=db_path_fn,
+        )
 
         def _build():  # each worker builds its own isolated engine (thread-safe connections)
             # BIRD grades single-engine on native SQLite: the engine generates + executes
             # SQLite and gold runs on the same engine, so a wrong answer is a real error,
             # never a cross-engine artifact (parity measured 1.5% otherwise). DuckDB is the
             # executor in the product path (DuckDBAdapter); the benchmark stays apples-to-apples.
-            adapter = SQLiteAdapter(bird_db_path(minidev_dir, db_id))
+            adapter = SQLiteAdapter(db_path_fn(minidev_dir, db_id))
             ask, client = build_engine(snapshot, adapter, settings, candidates=candidates)
             return ask, adapter, adapter, client  # engine + gold: same native SQLite executor
 

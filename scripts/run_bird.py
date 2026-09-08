@@ -29,7 +29,11 @@ def main() -> int:
     p.add_argument("--db", action="append", dest="dbs")
     p.add_argument("--difficulty", choices=["simple", "moderate", "challenging"])
     p.add_argument("--no-evidence", action="store_true")
-    p.add_argument("--cache", default="eval-reports/bird-cache")
+    p.add_argument("--cache", default=None,
+                   help="enrichment cache dir; defaults per tier so the two never mix")
+    p.add_argument("--no-semantic", action="store_true",
+                   help="tier 1: declared keys and structural profiling only, no "
+                        "LLM-written descriptions -- the rung comparable to a bare vendor space")
     p.add_argument("--report")
     p.add_argument(
         "--results",
@@ -76,7 +80,11 @@ def main() -> int:
         cases,
         args.minidev,
         settings,
-        cache_dir=args.cache,
+        cache_dir=args.cache or (
+            "eval-reports/bird-cache" if not args.no_semantic
+            else "eval-reports/bird-cache-tier1"
+        ),
+        semantic=not args.no_semantic,
         on_case=progress,
         results_path=args.results,
         workers=args.workers,

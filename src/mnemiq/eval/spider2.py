@@ -245,6 +245,7 @@ def run_spider2(
     workers: int = 1,
     candidates: int = 1,
     on_case: Callable[[int, int, CaseResult], None] | None = None,
+    semantic: bool = True,
 ) -> tuple[list[CaseResult], dict]:
     """Run local Spider 2.0-lite cases grouped by database. Resumable exactly like
     run_bird: every result is checkpointed as it lands and a re-run skips what is done."""
@@ -266,7 +267,9 @@ def run_spider2(
         if not remaining:
             continue
 
-        snapshot = enrich_bird_db(shim_root, db_id, settings, cache_dir=cache_dir)
+        snapshot = enrich_bird_db(
+            shim_root, db_id, settings, cache_dir=cache_dir, semantic=semantic
+        )
         alternatives = {c.id: gold_alternatives(spider2_dir, c.id) for c in remaining}
 
         local = threading.local()

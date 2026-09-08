@@ -8,6 +8,23 @@
 *.duckdb.wal
 eval-reports/
 
+# Benchmark Parquet exports written by bird_to_parquet.py -- ~700 MB of derived data
+# regenerable from the source SQLite in one command. `/out/` was in this file and was lost
+# in a merge; it is restored with its siblings because an unignored 400 MB directory is one
+# `git add -A` away from being permanent in a public history.
+/out/
+/out-spider/
+/out-spider2/
+
+# Local demo scaffolding for the walkthrough: a copied SQLite database, a source manifest
+# and an authz policy that both carry absolute paths from one machine. `.demo-env` is not
+# covered by the `.env*` rules above (it does not match `.env` or `.env.*`) and it sources
+# the real .env, so it is named explicitly rather than left to a near-miss pattern.
+/demo-data/
+/demo-sources.json
+/demo-grants.json
+.demo-env
+
 # The workbench bundle. Built by `pnpm build` in workbench/, it lands inside the
 # Python package so a wheel picks it up -- the repo carries the source, not the bundle.
 src/mnemiq/server/static/

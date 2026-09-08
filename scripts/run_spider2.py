@@ -29,7 +29,10 @@ def main() -> int:
     p.add_argument("--db", action="append", dest="dbs")
     p.add_argument("--no-knowledge", action="store_true",
                    help="drop the per-question reference docs (13 cases carry one)")
-    p.add_argument("--cache", default="eval-reports/spider2-cache")
+    p.add_argument("--cache", default=None,
+                   help="enrichment cache dir; defaults per tier so the two never mix")
+    p.add_argument("--no-semantic", action="store_true",
+                   help="tier 1: structural enrichment only, no LLM-written descriptions")
     p.add_argument(
         "--results",
         default="eval-reports/spider2-results.jsonl",
@@ -62,8 +65,13 @@ def main() -> int:
     os.makedirs(os.path.dirname(args.results) or ".", exist_ok=True)
     results, meta = run_spider2(
         cases, args.spider2, settings,
-        cache_dir=args.cache, results_path=args.results,
+        cache_dir=args.cache or (
+            "eval-reports/spider2-cache" if not args.no_semantic
+            else "eval-reports/spider2-cache-tier1"
+        ),
+        results_path=args.results,
         workers=args.workers, candidates=args.candidates, on_case=on_case,
+        semantic=not args.no_semantic,
     )
 
     report = summarize(results, tokens=meta["tokens"], llm_calls=meta["llm_calls"])

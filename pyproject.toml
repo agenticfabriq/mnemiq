@@ -27,6 +27,19 @@ server = ["fastapi>=0.115", "uvicorn>=0.30"]
 # Oracle is a v1 target and an OPTIONAL extra, not a core dependency: only an Oracle
 # deployment needs the driver, and `oracledb` in thin mode needs no Oracle client libraries.
 oracle = ["oracledb>=2"]
+# The warehouse benchmark path (scripts/grade_warehouse.py, load_databricks.py, run_genie.py,
+# run_ai_query.py, capture_rows.py). Extras rather than core dependencies: only someone
+# reproducing the vendor comparison needs a Databricks or Snowflake driver. They are declared
+# because these scripts produced published numbers, and a `uv sync` that quietly prunes a
+# driver turns every one of them into a ModuleNotFoundError at the first connect.
+databricks = ["databricks-sdk>=0.30", "databricks-sql-connector>=3"]
+snowflake = ["snowflake-connector-python>=3"]
+warehouse = [
+    "databricks-sdk>=0.30",
+    "databricks-sql-connector>=3",
+    "snowflake-connector-python>=3",
+    "sqlglot>=25",
+]
 ontology = [
     "rdflib>=7",
 ]
