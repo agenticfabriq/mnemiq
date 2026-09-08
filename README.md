@@ -1,175 +1,118 @@
 # mnemiq
 
-An open-source engine that answers natural-language questions over your database — and is
-built to be *trusted*: it defers rather than guess, and every answer carries an auditable trace.
+**Text-to-SQL you can tune to your database.** */NEM-ik/ — the "m" is silent, as in mnemonic.*
 
-## The idea
+An open-source engine that answers natural-language questions over your database, built so that
+every stage between the question and the SQL is a setting you can read, change, and measure.
 
-A trustworthy data agent is a systems problem, not a model problem. mnemiq pairs a **stochastic
-proposer** (an LLM writes candidate SQL) with a **deterministic decider** (shape, authorization,
-transpile, and `EXPLAIN` against the real source). If the data can't answer the question, the
-engine says so instead of inventing a number.
+![The mnemiq workbench answering two questions and declining a third. Each answer shows the SQL
+that produced it, the tables it read, and how many candidate queries agreed. The declined question
+asks for ticket revenue; the engine states that the tables hold concert years and stadium capacity
+but no ticket price, tickets sold, or revenue column.](docs/workbench.png)
 
-## Why trust it
+Two answers and a refusal. The third question asks for revenue the database does not hold, and the
+engine says so — naming the columns it would have needed — instead of returning a number that looks
+right. That distinction is the whole design.
 
-- **It refuses rather than guesses.** When the data cannot answer a question, the engine states the
-  reason instead of inventing a number — every unanswerable ACME case, and 26 of 30 results on an
-  adversarial refusal set built to tempt it. The residual is instructive: the case it answers is
-  *"the lifetime value of our average customer"*, where a plausible-looking derivation exists over
-  the columns and the business definition does not. Refusal is measured here, not asserted.
-- **Two independent locks on access.** The model is never *shown* a table the caller may not see
-  (access-scoped retrieval), and the decider re-checks every referenced object against grants
-  before anything runs. The database's own permission error is never the control.
-- **Fail-closed everywhere.** No policy, no grants, no snapshot → no data.
-- **Every answer is auditable.** The engine emits a stable trace — the tables used, the
-  enrichment version, timing — alongside the SQL it ran.
+**Read more** · [Launch article](https://agenticfabriq.com/blog/mnemiq/launch) ·
+[Technical report (PDF)](docs/mnemiq-technical-report.pdf) ·
+[Paper (PDF)](docs/mnemiq-paper.pdf)
 
-## What the numbers say
+## Why mnemiq exists
 
-Measured, not asserted. Grading is result-based: a different query that returns the right facts
-passes; the harness reports both exact-match and got-the-facts accuracy.
+Every text-to-SQL product has an accuracy number. Almost none of them were measured on a database
+that looks like yours.
 
-| corpus | exact-match | got-the-facts | run |
-|---|---|---|---|
-| ACME (in-domain, 25 answerable of 30) | 88.0% | 100.0% | `plan15/enrichment-on.json` ([one case flips](#a-note-on-the-acme-row)) |
-| BIRD mini-dev (487 answerable, 11 unseen schemas) | 40.5% | 61.8% | `gpt55-duckdb-pg.regraded-2026-09-06.jsonl` |
-| Spider 2.0-lite (135 local of 547, 30 schemas) | 37.0% | 58.5% | `spider2-full-k24.jsonl` |
+A system can do well on a benchmark and then struggle on your warehouse because the schema is
+larger, the naming is different, the business definitions live in people's heads, or the
+configuration that suited the benchmark simply doesn't suit your data. When it underperforms, a
+closed system gives you no way to find out why, and nothing to change.
 
-<a id="a-note-on-the-acme-row"></a>**A note on the ACME row.** That run is a favourable sample of a corpus with one unstable case. Across the twelve CI runs of the nightly gate that produced a comparison, `fire-count` is answered wrongly in eight of them, and the level the project actually gates on is 96.0% got-the-facts / 84.0% exact-match (`evals/trend.json`; both are compared, and the failure names which moved). The row above is not false — it names its run, and that run really scored it — but the reproducible number is one case lower, and a reader comparing the headline against the gate deserves to be told which is which.
+So the question worth asking isn't *how accurate is it*. It's:
 
-**A number names its grader, not only its run.** The grading rule changed on 2026-08-06 (a 1%
-relative numeric band replaced by explicit bounds; column order made to count for exact match), and
-nothing in a stored result says which rule labelled it — the outcome is just a word. So all three
-rows were recomputed against the current rule rather than dated. **BIRD moved** (12 of 487 labels;
-the row read 42.3% / 63.2% under the old rule). **Spider and ACME did not** — Spider re-grades to
-the same 50 of 135 with no label changed, and ACME's figures come from the live gate. Re-grade the
-whole table or none of it: one row on the new rule beside two on the old looks like-for-like and
-is not.
+> How well will this work on my database — and what can I change if it doesn't?
 
-Each row names ONE run, and every number comes from that run alone — but not all of them are
-READ from it: BIRD's exact-match is a probe replayed against the gold engine, described below,
-because the run predates that accounting. Those artifacts are not distributed — `eval-reports/`
-is gitignored — so the names identify a run in our records rather than a file you can open, and
-reproducing the BIRD replay needs the artifact plus a Postgres holding mini-dev.
+mnemiq is built to make both halves answerable. It is Apache-2.0, runs inside your own environment
+on models you choose, and exposes the major parts of the pipeline as settings rather than
+internals. No accuracy number applies to your database until you have run it on your database;
+mnemiq is the engine and the evaluation harness for doing that.
 
-**The denominators differ by row, and for different reasons.** Both rates are taken over the
-*answerable* cases (`correct + correct_facts + wrong + deferred_wrongly + error`), but what falls
-outside that is not one thing:
+## How it works
 
-- **ACME** — 25 of 30. The five missing are cases the engine correctly declined; a correct
-  deferral is not scored as an attempt.
-- **BIRD** — 487 of mini-dev's 500. The thirteen missing were never measured: the harness drops a
-  case whose *gold* result set exceeds its row cap, before the engine sees it. They are not
-  refusals.
-- **Spider** — all 135 attempted, but 135 is not the benchmark. Spider 2.0-lite ships 547
-  instances; the engine runs the 135 **local (SQLite)** ones and filters out 412 that need
-  BigQuery or Snowflake adapters and credentials it does not have. Those are not failures, and
-  they are not attempts either — the row covers a quarter of the suite.
+mnemiq separates writing SQL from deciding to run it. A model proposes a query. A deterministic
+layer then rules on it before anything touches the database. The query has to be read-only, may
+only reference objects the caller is allowed to see, has to compile in the source's own SQL
+dialect, and has to survive an `EXPLAIN`. Fail any of those and you get a refusal with a stated
+reason rather than a plausible number.
 
-**Exact-match on BIRD excludes answers that are right but not portable.** BIRD grades one engine
-against itself; mnemiq answers over DuckDB and the gold runs on Postgres, so an answer can be
-correct and still use SQL the gold engine will not parse — `DOUBLE` for `DOUBLE PRECISION`,
-`YEAR(d)`, `QUALIFY`, or a quoted `"Match"` where Postgres holds `match`. Those are excluded from
-exact-match and kept in got-the-facts, which is why the two columns differ by more on BIRD than
-elsewhere.
+Two properties fall out of that ordering. Permissions apply *before* schema retrieval, so the model
+is never shown a table the caller may not see — naming it is useless rather than refused. And every
+answer carries a trace: the SQL that ran, the tables it touched, the enrichment version behind it.
 
-Neither BIRD run stored that probe, so it was **replayed** for this page: every case each run
-graded CORRECT was re-executed against the Postgres gold engine. The frontier run loses 29 of 226
-(46.4% raw → **40.5%**), the local run 9 of 241 (49.5% raw → **47.6%**). An earlier version of
-this section put the gap at "about 2.4 points" from a fleet-wide average. In cases rather than points, which is
-how the counts read without rounding: it predicts about 12 per run against 487 answerable; the local
-run lost 9 and the frontier run 29. Right to within three cases for one, short by seventeen for the
-other -- a fleet average is not a per-run estimate. What drives that is
-not isolated here — the local run also used constrained decoding, which is a plausible direct
-cause of fewer `QUALIFY`s reaching the gold engine — so treat it as a property of the RUN, not of
-the model. The Spider and ACME rates are unaffected, and for
-two DIFFERENT reasons, neither of which is a check that passed. Spider records the flag on every
-case, but from the adapter — `dialect == "sqlite"` — so on this SQLite slice it is `True` whatever
-SQL was emitted; run the same slice through a DuckDB attachment and it flips `False` for every
-case and the printed exact-match becomes 0.0%. ACME never records it at all: portability is probed
-only when gold runs on a different adapter than the answer, and ACME passes one. Neither is a ceiling the way the BIRD
-figures are, though: on a single-engine run there is genuinely nothing to subtract, so the zero is
-right rather than missing. What is absent is the check, not the correction.
+![The nine stages of a mnemiq answer: knowledge sources, enrichment, the semantic contract,
+retrieval, generation, the decider, execution, verification, and the answer with its trace.
+Deterministic stages run first and last; the model proposes only in the middle.](docs/pipeline.png)
 
-The Spider row is the retrieval `k=24` configuration. Across the three hosted Spider runs
-exact-match spans 34.8–37.0% and got-the-facts 51.1–58.5%, so read it as one point in that spread
-rather than as a stable rate.
+Read the diagram left to right, top to bottom. The stages in red are the ones that can stop an
+answer: the decider refuses or repairs, execution runs under policy, and verification can defer.
+The model appears once, at stage 05, and everything around it is deterministic.
 
-Those are three different questions, not three attempts at one. ACME is in-domain — one enriched
-schema with a golden set, the regime a real deployment is in. BIRD and Spider are **cold start** in
-the sense that matters for schemas — unseen, with no glossary of ours and no examples. Spider 2.0
-is the hard one by design — real data-application schemas, often more than a thousand columns.
+### The pipeline is settings, not internals
 
-**They are not cold on the question, and that is the one caveat to read before comparing these
-rows to anything.** Both suites ship a human-written hint with the question, and the harness passes
-it through: **485 of the 487** BIRD cases carry one, and 13 of the 135 Spider cases. **No deployment
-gets this.** It is the largest effect BIRD reports about itself — GPT-4 scores 54.89% with that
-field and 34.88% without (BIRD, arXiv 2305.03111) — and BIRD's leaderboard has a column for declaring it, so any number
-quoted from either suite has to say which side of that 20-point line it sits on. Every number on
-this page is **with** it.
+The parts people usually can't reach are the parts mnemiq puts in your hands:
 
-On BIRD, **the table's row is 40.5% on PostgreSQL.** For scale, every model in BIRD mini-dev's own
-EX Evaluation table scores lower in that same PostgreSQL column — `gpt-4-turbo` **36.0**, `gpt-4`
-**35.8**, `gpt-4-32k` **35.0**, `llama3-70b-instruct` **29.4**.
+- **Which model writes the SQL** — hosted or local, one candidate or several.
+- **How much schema context is retrieved**, and how it is ranked.
+- **How much semantic enrichment is built**, and whether a human certifies it.
+- **How aggressively the system refuses** — the verifier and its threshold.
+- **What the decider enforces**, including row and column policy applied to the query tree rather
+  than requested of the model.
 
-**Read that as a pipeline difference, not a model result.** Those runs are unenriched, see only a
-column listing (name, type, nullability — no keys, no sample rows), and use an earlier generation of
-models; ours is enriched and uses a current frontier model. Two of those three differences would
-move the number on their own. The dialect is the one thing held fixed, and it is the thing most
-often got wrong: the same `gpt-4` scores **47.8 on SQLite** against **35.8 on PostgreSQL**, so a
-Postgres figure compared against SQLite baselines is off by more than the gap being discussed.
+Each of those is a dial with a cost on the other side, which is why they are dials and not
+defaults. More context is not free. More compute is not automatically better. The right setting
+depends on your data, and the point of the harness is that you can find out rather than guess.
 
-> **What this paragraph used to say, and why it was wrong.** It cited GPT-4o 34.4, Claude 3.7 41.1
-> and o3-mini 42.6, and concluded our row was *"inside that range and below its top."* Those are
-> real BIRD mini-dev figures — but **SQLite** ones, where the row is PostgreSQL. Against the correct
-> column the conclusion inverts, which is exactly how much a dialect mix-up is worth. It also put
-> the row at 42.3% under the pre-2026-08-06 grading rule. Both halves of the old sentence were
-> wrong, and they were wrong in opposite directions.
+### The semantic layer has tiers
 
-The 47.6% reported further down is not a counter-example to that, and the difference is
-configuration rather than a contradiction. That run executes up to five candidates per question
-and five on 339 of 487, so it is not a single-shot number and does not belong beside a single-shot
-baseline. The table's run reads as single-shot: its candidate count and
-inter-candidate agreement score are unset on all 487 cases, where the five-candidate run populates
-both on most of its own. Read that as strong evidence rather than proof — several code paths write
-a blank pair, so the signature is not unique to a single-shot run, and neither artifact ships here
-for anyone to re-check.
+Before any question is asked, mnemiq can inspect the database and build context around the schema:
 
-The distance to leaderboard pipelines is added machinery — candidate selection, verification — and
-task-specific fine-tuning, not a difference in the core.
+- **Tier 0** — tables and columns only.
+- **Tier 1** — adds structural information: primary and foreign keys, profiling, value
+  distributions.
+- **Tier 2** — adds meaning an LLM proposes: table and column descriptions, grain, glossary terms,
+  coded-value meanings.
 
-**On local models, the honest result** — and these are two different runs, not one configuration
-measured twice. On BIRD, a 24 GB Qwen2.5-Coder-14B with constrained decoding and 5-sample
-self-consistency reaches **47.6% exact-match** (53.6% got-the-facts,
-`minidev-pg-14b-guided-sc5.regraded-2026-09-06.jsonl`).
+Enrichment is a multiplier on meaning that isn't already in the schema. Where column names already
+say what they hold, richer cards add length without adding signal. Where three columns are all
+called *revenue* by three different teams, the meaning is in a person, not the schema — and that is
+exactly what a certified definition captures. For production use, definitions can be reviewed and
+certified by a named owner, and the operator's dictionary overrides everything the model proposed.
 
-On that metric it is **above** the frontier run in the table — 47.6% against 40.5%, and note that
-those two are not like for like: five candidates against one, which is why the baselines paragraph
-compares only the table's row. What separates them here is portability rather than answers: on raw CORRECT the local run is
-already ahead (241 against 226, fifteen cases), and the frontier run then loses three times
-as many to SQL Postgres will not parse (29 against 9). Read it as one run each, and as a statement about which dialect these two RUNS emitted -- not
-about which model reasons better, and not about the models either: the runs differ in candidate
-count (five against one) and in decoding, so the model is one of at least three variables. On got-the-facts, where portability is not excluded, the order is the
-usual one: 61.8% against 53.6%. That does not settle the question either -- the same run
-differences sit under both metrics -- it just shows the reversal is specific to what exact-match
-excludes. On Spider 2.0-lite the same model
-single-shot reaches **5.9%** (6.7% got-the-facts, `spider2-qwen2.5-coder-14b.jsonl`), where the
-frontier configuration holds at 37.0% and 58.5%.
+Codes are grounded or left bare, never guessed. `E11` or `NC-17` take their meaning from the data
+itself, from a standard code system (TTL/SKOS/OWL), or from a hand-written dictionary, with the
+source recorded. No evidence, no meaning. See [docs/grounding.md](docs/grounding.md).
 
-**These local runs do not support comparisons between them, and the counts are why.** On a
-135-case slice, the 32B moves 3 correct cases to 7 with constrained decoding; the 14B moves 8 to
-6, across runs 311 engine commits apart with a `-dirty` baseline. Two hosted runs of the frontier
-configuration differ by 3 cases from each other. Every difference among the LOCAL arms is the same
-handful of cases, so no ordering among those is claimed here, and the effect of
-constrained decoding on Spider is not something these runs can settle.
+## Measure it on your own database
 
-The one durable observation is the size of the remaining gap: no local arm exceeds 8 of 135
-exact-match, against 50 of 135 for the frontier configuration. That is not a comparison between
-local arms, and it does not isolate a cause — the BIRD and Spider local figures use different
-configurations as well as different schemas, so the 47.6% / 5.9% contrast is not a schema effect
-on its own.
+The evaluation harness is part of the engine, not a separate research project. It runs a question
+set against a configuration, grades results by the data returned rather than by string-matching the
+SQL, and reports right, refused, and wrong as three separate numbers — because a system can buy
+accuracy by answering less often, and a single figure hides that.
 
-Measure on your own schema before committing an architecture to it.
+A useful first pass, on your data:
+
+- Take one meaningful slice of your schema, not the whole warehouse.
+- Write 20–30 questions people actually ask, and tag each one: *answerable from column names*,
+  *needs a definition*, *should be refused*.
+- Run it with enrichment on and off, a local model and a hosted one, the verifier at two
+  thresholds.
+- Read the result by tag. The tags are the diagnosis: if the definition-band questions fail while
+  the schema-band questions pass, you have a glossary problem and documentation will pay for
+  itself. If both already pass, you were about to spend a quarter on something worth very little.
+
+The same harness runs the public benchmarks (BIRD mini-dev, Spider 1.0, Spider 2.0-lite) and the
+warehouse comparison scripts under `scripts/`, so the setup you use on your data is the setup the
+published numbers came from.
 
 ## Quickstart
 
@@ -182,8 +125,9 @@ uv run mnemiq build       # index it for retrieval
 uv run mnemiq ask "how many claims are there?"
 ```
 
-Access is fail-closed: set `MNEMIQ_AUTHZ_PATH` to a policy file granting objects to roles, and
-pass `--roles analyst`. Without a policy, the engine grants nothing and defers.
+Access is fail-closed: set `MNEMIQ_AUTHZ_PATH` to a policy file granting objects to roles, and pass
+`--roles analyst`. Without a policy the engine grants nothing and defers. No policy, no grants, no
+snapshot — no data.
 
 ## Use it from a browser (workbench)
 
@@ -192,11 +136,11 @@ cd workbench && pnpm install && pnpm build
 uv run mnemiq serve --http     # http://127.0.0.1:8080
 ```
 
-One process serves both the workbench and the HTTP API — `POST /v1/ask` (JSON),
-`POST /v1/chat` (SSE, [AG-UI](https://github.com/ag-ui-protocol/ag-ui) event
-vocabulary), `GET /v1/schema`. Every answer shows the SQL that produced it and the
-tables it read; a question the data cannot support comes back as a stated reason,
-not a guess. See [`workbench/README.md`](workbench/README.md).
+One process serves both the workbench and the HTTP API — `POST /v1/ask` (JSON), `POST /v1/chat`
+(SSE, [AG-UI](https://github.com/ag-ui-protocol/ag-ui) event vocabulary), `GET /v1/schema`. Every
+answer shows the SQL that produced it and the tables it read; a question the data cannot support
+comes back as a stated reason, not a guess — that is the interface pictured at the top of this
+file. See [`workbench/README.md`](workbench/README.md).
 
 ## Use it from an AI agent (MCP)
 
@@ -207,42 +151,34 @@ not a guess. See [`workbench/README.md`](workbench/README.md).
 { "mcpServers": { "mnemiq": { "command": "mnemiq", "args": ["serve"] } } }
 ```
 
-## Architecture
+## Sources
 
-```
-source → enrichment (profiling + LLM descriptions + foreign keys + glossary)
-       → access-scoped retrieval → generation
-       → deterministic decider (shape / access / transpile / EXPLAIN)
-       → execution → synthesis → trace
-```
+Postgres, SQLite, DuckDB, Oracle, Snowflake and Databricks, with DuckDB as the universal executor.
+The semantic model (`mnemiq-contract`) is open, and dbt-semantic-interfaces import/export ships
+with it.
 
-## Grounding code columns
-
-Short codes like `E11` or `NC-17` mean nothing on their own. mnemiq grounds them from the data
-itself, from a standard code system (an ontology in TTL/SKOS/OWL), or from a hand-written operator
-dictionary — always **grounded-or-bare**, never guessed. See [docs/grounding.md](docs/grounding.md).
-
-## Deploying against Oracle
+### Deploying against Oracle
 
 The Oracle read plane refuses writes, but that refusal is partly a property of your **deployment**
 rather than of the engine: a `SELECT` can reach an `AUTONOMOUS_TRANSACTION` function through a
 view, and restricting the caller does not close it, because a view resolves its references with the
 view owner's rights. Pointing the read plane at a database that is open read-only does close it,
-measured, and mnemiq reports at boot whether you are in that deployment or resting on the engine's gate alone. See
-[docs/oracle-deployment.md](docs/oracle-deployment.md) before connecting a production source.
+measured, and mnemiq reports at boot whether you are in that deployment or resting on the engine's
+gate alone. See [docs/oracle-deployment.md](docs/oracle-deployment.md) before connecting a
+production source.
 
 ## Open core
 
-The engine is Apache-2.0 and stands alone. Two commercial planes build on it and are **not**
-open source: **Verity** (trust, grading, drift) and **Agentic Fabriq** (governance, per-group
+The engine is Apache-2.0 and stands alone. Two commercial planes build on it and are **not** open
+source: **Verity** (trust, grading, drift) and **Agentic Fabriq** (governance, per-group
 authorization, audit). They align to the open contract (`mnemiq-contract`) by reference; no paid
 capability lives in the open core.
 
 ## Status
 
 v0.1: the full read path — enrichment, retrieval, the decider, execution, trace — evaluated on
-ACME, BIRD mini-dev and Spider 2.0-lite, with a local-model program alongside. Tiered modes
-(`instant` / `thinking` / `deep`), row- and column-level security, the governed write path,
+ACME, BIRD mini-dev, Spider 1.0 and Spider 2.0-lite, with a local-model program alongside. Tiered
+modes (`instant` / `thinking` / `deep`), row- and column-level security, the governed write path,
 cross-source federation and multi-replica deployment are built and wired behind the same
 interfaces. Next: additional source adapters, the self-maintaining loops, and hardening the write
 plane against a production source.
