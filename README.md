@@ -16,7 +16,8 @@ right. That distinction is the whole design.
 
 **Read more** · [Launch article](https://agenticfabriq.com/blog/mnemiq/launch) ·
 [Technical report (PDF)](docs/mnemiq-technical-report.pdf) ·
-[Paper (PDF)](docs/mnemiq-paper.pdf)
+[Paper (PDF)](docs/mnemiq-paper.pdf) ·
+[beacon](https://github.com/agenticfabriq/beacon) — the grader and results tracker
 
 ## Why mnemiq exists
 
@@ -113,6 +114,13 @@ A useful first pass, on your data:
 The same harness runs the public benchmarks (BIRD mini-dev, Spider 1.0, Spider 2.0-lite) and the
 warehouse comparison scripts under `scripts/`, so the setup you use on your data is the setup the
 published numbers came from.
+
+Grading itself lives in **[beacon](https://github.com/agenticfabriq/beacon)**, a separate
+Apache-2.0 repository: the grader that decides what counts as correct, and the tracker that holds
+every run behind the published figures. Keeping it out of the engine is deliberate — a system
+should not mark its own homework, and the same grader scores mnemiq, Snowflake Cortex Analyst and
+Databricks Genie in the comparison. Per-question results are published there, so a number in the
+launch article can be traced to the SQL and the rows that produced it.
 
 ## Quickstart
 
