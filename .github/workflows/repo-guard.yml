@@ -6,10 +6,10 @@ on:
   # be taken back. Narrowing would leave the window between pushing a branch and opening a PR
   # scanned by nothing: the local hook is opt-in per clone and `--no-verify` skips it.
   #
-  # The second run is close to free for a maintainer's branch, which is the case being defended
-  # here. It is NOT free for an outside contributor: secrets are withheld from fork PRs, so this
-  # currently fails closed on theirs for a reason they cannot act on. That is PR #6's subject,
-  # not this trigger's -- noting it so the two are not confused.
+  # For a maintainer's branch the extra run is close to free, and that is the case defended
+  # here. An outside contributor gets no extra run at all -- the PR run is their only one, and
+  # it currently fails closed, because secrets are withheld from fork PRs. That is PR #6's
+  # subject, not this trigger's -- noting it so the two are not confused.
   #
   # Scope worth knowing: `--all` scans the checked-out tree, not the history behind it, so a
   # secret added and then removed within a branch passes. See M97.
@@ -25,6 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # Full history, though the scan reads only the tree (see the scope note above and
+          # M97). Kept because the fix for M97 needs the commits a push adds; today it fetches
+          # what nothing opens, which is precisely the mismatch that finding is about.
           fetch-depth: 0
       - name: Scan for proprietary names and secrets
         env:
