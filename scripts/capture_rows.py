@@ -7,7 +7,10 @@ case_id, db_id, question, sql, columns (ordered, from cursor.description), rows
 No model calls; execution only.
 """
 from __future__ import annotations
-import argparse, json, os, time
+import argparse
+import json
+import os
+import time
 from pathlib import Path
 
 from mnemiq.eval.warehouse import databricks_sql_connection, databricks_workspace, schema_for
@@ -39,7 +42,7 @@ def main() -> None:
     done = set()
     out = Path(args.out)
     if out.exists():  # resume
-        done = {json.loads(l)["case_id"] for l in out.open() if l.strip()}
+        done = {json.loads(line)["case_id"] for line in out.open() if line.strip()}
     n = 0
     with out.open("a") as fh:
         for line in open(args.results):
@@ -69,7 +72,8 @@ def main() -> None:
                     rec["exec_ms"] = int((time.time() - t0) * 1000)
                 except Exception as e:  # capture, don't die
                     rec["error"] = f"capture: {type(e).__name__}: {e}"[:400]
-            fh.write(json.dumps(rec, default=str) + "\n"); fh.flush()
+            fh.write(json.dumps(rec, default=str) + "\n")
+            fh.flush()
             n += 1
             if n % 25 == 0:
                 print(f"captured {n}", flush=True)
