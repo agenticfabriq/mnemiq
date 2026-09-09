@@ -1,7 +1,12 @@
 name: repo-guard
 on:
   push:
+    branches: [main]
   pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   guard:
     runs-on: ubuntu-latest
