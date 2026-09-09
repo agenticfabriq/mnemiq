@@ -124,18 +124,52 @@ launch article can be traced to the SQL and the rows that produced it.
 
 ## Quickstart
 
+Runs on a clean clone with no database of your own and no Docker. The seed step writes a small
+SQLite database plus its source manifest and access policy under `demo/`.
+
 ```
 uv sync
-export MNEMIQ_LLM_BASE_URL=... MNEMIQ_LLM_API_KEY=... MNEMIQ_LLM_MODEL=...
-export MNEMIQ_PG_DSN=postgresql://user:pass@host:5432/db
-uv run mnemiq enrich      # profile + describe the schema, save a snapshot
-uv run mnemiq build       # index it for retrieval
-uv run mnemiq ask "how many claims are there?"
+uv run python scripts/seed_demo.py
+
+export MNEMIQ_LLM_BASE_URL=...  MNEMIQ_LLM_API_KEY=...  MNEMIQ_LLM_MODEL=...
+export MNEMIQ_SOURCES_PATH=demo/sources.json
+export MNEMIQ_AUTHZ_PATH=demo/authz.json
+export MNEMIQ_STORE_PATH=demo/store.duckdb
+
+uv run mnemiq enrich      # profile + describe the schema  (~30 s on the demo's 4 tables)
+uv run mnemiq build       # index it for retrieval          (~2 s)
+uv run mnemiq ask "how many customers are there by country?" --roles analyst
 ```
 
-Access is fail-closed: set `MNEMIQ_AUTHZ_PATH` to a policy file granting objects to roles, and pass
-`--roles analyst`. Without a policy the engine grants nothing and defers. No policy, no grants, no
-snapshot — no data.
+`mnemiq enrich` is the only slow step: it profiles every column and makes one LLM pass over the
+schema, so expect **roughly 30 seconds for the demo's four tables** and longer in proportion to
+your own. It prints nothing until each table completes — it is working, not hung. The result is
+cached, so you pay it once per schema rather than per question.
+
+Two more worth trying, because they show the parts that aren't the model:
+
+```
+uv run mnemiq ask "how many enterprise customers are there?" --roles analyst
+uv run mnemiq ask "what was our total revenue last quarter?"   --roles analyst
+```
+
+The first joins through a lookup table to resolve a coded column — `segment_cd` holds `A`/`B`/`C`
+and nothing in the name says "enterprise". The second is refused: the demo schema has no price or
+revenue column, and the engine says so instead of returning a number.
+
+Access is fail-closed. `--roles analyst` is required — without a role the engine grants nothing
+and defers, which is the correct behaviour and the first thing people mistake for a bug. No policy,
+no grants, no snapshot — no data.
+
+### Which LLM endpoints work
+
+**Any OpenAI-compatible `/v1` endpoint.** mnemiq talks to `MNEMIQ_LLM_BASE_URL` through the
+standard OpenAI client, so vLLM, Ollama, llama.cpp's server, LM Studio, vendor gateways and the
+hosted APIs all work — set the base URL, a key (any non-empty string for local servers that
+ignore it) and a model name. Nothing about the engine assumes a hosted provider, which is what
+"runs inside your perimeter" means in practice: point it at a local server and no schema, no
+question and no row ever leaves your network. Embeddings follow the same setting, or their own
+via `MNEMIQ_EMBED_*`.
 
 ## Use it from a browser (workbench)
 
@@ -175,12 +209,33 @@ measured, and mnemiq reports at boot whether you are in that deployment or resti
 gate alone. See [docs/oracle-deployment.md](docs/oracle-deployment.md) before connecting a
 production source.
 
-## Open core
+## What's commercial
 
-The engine is Apache-2.0 and stands alone. Two commercial planes build on it and are **not** open
-source: **Verity** (trust, grading, drift) and **Agentic Fabriq** (governance, per-group
-authorization, audit). They align to the open contract (`mnemiq-contract`) by reference; no paid
-capability lives in the open core.
+**The engine is Apache-2.0 and always will be — enrichment included.** Nothing here is a
+time-limited or feature-gated build, and no capability is stubbed out pending a licence key.
+
+Specifically open, because these are the parts people assume are held back: the enrichment
+pipeline including the LLM pass and coded-value grounding (`src/mnemiq/enrichment/`), the verifier
+and its judge (`src/mnemiq/verify/`), the access checks (`src/mnemiq/authz/`, `src/mnemiq/sql/`),
+the result grader (`src/mnemiq/eval/grade.py`), and the benchmark harness that produced the
+published numbers (`scripts/`).
+
+Commercial are two things that sit *around* the engine rather than inside it: **Verity**, a managed
+grading and drift service, and the **Agentic Fabriq control plane** — identity, vaulted
+credentials, per-group grants and audit across many sources. Both talk to the engine through the
+open contract (`mnemiq-contract`), so a self-hosted deployment is not a degraded one; it is the
+same read path without a managed service in front of it.
+
+Read the code rather than taking this on trust — that is the point of shipping it.
+
+## Known weaknesses
+
+Filed as open issues rather than left to be discovered, because they are readable in the source
+either way: the [verifier fails open when its judge is unreachable](https://github.com/agenticfabriq/mnemiq/issues/2),
+[verification is off by default](https://github.com/agenticfabriq/mnemiq/issues/3) despite being the
+only lever measured to reduce the wrong-rate, [`MNEMIQ_ROLES` is ignored by the CLI](https://github.com/agenticfabriq/mnemiq/issues/4),
+and [lineage reports `unconfirmed-function-identity`](https://github.com/agenticfabriq/mnemiq/issues/5)
+on ordinary queries. Contributions and arguments welcome on all four.
 
 ## Status
 
