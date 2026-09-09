@@ -99,7 +99,8 @@ def test_the_sources_words_are_kept_out_of_the_callers_half_of_a_refusal():
     assert verdict.code == RefusalCode.EXPLAIN_FAILED
     for secret in ("payroll_salary", "hr_prod", "svc_mnemiq", "10.2.0.7", "postgresql://"):
         assert secret not in verdict.message, f"the caller-facing message disclosed {secret!r}"
-    # The model is the one consumer that should see it -- it already holds the schema.
+    # The model is the consumer this half is FOR -- the repair loop is corrected by it. That is
+    # not the same as the prompt being a safe place: see the residual at `Refusal.source_detail`.
     assert leaky in verdict.source_detail
     assert leaky in verdict.repair_text
 

@@ -353,7 +353,12 @@ class Agent:
             return from_ipc(hit)
         try:
             result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
-        except ExecutionError:
+        except ExecutionError as exc:
+            # This candidate drops out of the vote. Logged for the same reason the single-answer
+            # path logs: when three of five candidates are rejected by the source and two
+            # succeed, the answer reports `candidates_executed=2` and the three rejections are
+            # otherwise recorded nowhere -- a source half-refusing looks like a narrower vote.
+            logger.warning("a candidate's execution failed; the source said: %s", exc.repair_text)
             return None
         self.cache.put(key, to_ipc(result.table))
         return result.table

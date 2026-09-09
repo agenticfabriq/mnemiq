@@ -171,8 +171,12 @@ def test_the_source_error_is_still_fed_back_to_the_planner():
     """Withholding it from the caller must not withhold it from the repair loop.
 
     The database's complaint is the retry's whole input -- it is what a second attempt is
-    corrected *by*. The model already holds the schema this text is made of, so the boundary
-    that matters is the wire, not the prompt.
+    corrected *by*, so withholding it from the caller must not withhold it from the planner.
+
+    That is the whole claim here. The prompt is NOT a safe destination -- the model may never
+    have been shown the object a rejection names, and it can quote its feedback back into an
+    answer -- which is why this asserts the repair loop still works rather than that feeding
+    the model is harmless. See the residual recorded at `Refusal.source_detail`.
     """
     # Both plans are ones the decider ACCEPTS, so the only feedback that can appear is the
     # source's. A plan the decider rejects would be repaired inside `plan_query` against its
