@@ -18,7 +18,7 @@ from mnemiq.agent.synthesize import FakeSynthesizer
 from mnemiq.authz.grants import EMPTY, FileAuthzProvider, GrantSet
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.contract import Column, IdentityContext, Snapshot
-from mnemiq.generate.generator import FakeGenerator
+from mnemiq.generate.generator import FakeGenerator, SqlProposal
 from mnemiq.observability.metrics import AnswerRecord, aggregate
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
 
@@ -243,3 +243,69 @@ def test_deferral_rate_is_computed_over_answers_that_were_actually_decided():
     assert metrics.errors == 1
     assert metrics.deferrals == 1
     assert metrics.deferral_rate == 0.5, "1 deferral out of the 2 requests we actually decided"
+
+
+# --------------------------------------------------------------------------------------------
+# M94 -- the model is shown the source's words, and its own words reach the caller
+# --------------------------------------------------------------------------------------------
+
+
+class _QuotesItsFeedback:
+    """A model that explains itself by repeating what it was told. Not a strawman: 'say why you
+    could not' is ordinary prompting, and the feedback is the most relevant thing in context."""
+
+    def __init__(self):
+        self.calls: list[str | None] = []
+
+    def propose(self, packet, feedback=None, strategy=None):
+        self.calls.append(feedback)
+        if feedback is None:
+            return SqlProposal(sql="SELECT n FROM claim")
+        return SqlProposal(sql=None, reason=f"I could not: the database said: {feedback}")
+
+
+def _quoting_agent(adapter, budget=None):
+    return Agent(generator=_QuotesItsFeedback(), synthesizer=FakeSynthesizer("There are 7."),
+                 adapter=adapter, cache=TwoTierCache(L1Cache()), budget=budget or Budget())
+
+
+def test_a_model_that_quotes_its_feedback_cannot_carry_the_source_out():
+    """The withheld half reaches the model on purpose; the model's own words reach the caller.
+
+    Those two facts compose into a path back out, and no amount of care at the direct sites
+    closes it. Withholding from the prompt is not the answer either -- a rejection is the whole
+    input a retry is corrected by. What breaks the chain is knowing we put source words in this
+    prompt, which is a fact about provenance and not a guess about the text.
+    """
+    leaky = ('permission denied for table hr_prod.payroll_salary; '
+             'connection postgresql://svc_mnemiq@10.2.0.7:5432/hr_prod')
+    agent = _quoting_agent(_FakeAdapter(errors=99, message=leaky), Budget(max_attempts=2))
+
+    result = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+
+    for secret in ("payroll_salary", "hr_prod", "svc_mnemiq", "10.2.0.7", "postgresql://"):
+        assert secret not in result.answer, f"the model carried {secret!r} back to the caller"
+    # The repair loop must not have been paid for with the fix.
+    assert any(leaky in (c or "") for c in agent.generator.calls), (
+        "closing the exit by starving the model is the wrong fix -- the words are the repair's input"
+    )
+
+
+def test_a_model_that_was_told_nothing_by_the_source_still_speaks_for_itself():
+    """The narrowing must be exactly as wide as the risk.
+
+    A model's stated reason is genuinely useful -- "there is no date column on these tables" is
+    the difference between a caller rephrasing and a caller giving up. It is suppressed only on
+    the turn where the source's words were in the prompt, so a first-attempt refusal, which no
+    source has spoken into, still reaches the caller whole.
+    """
+    generator = FakeGenerator(['{"reason": "no date column on these tables"}'])
+    agent = Agent(generator=generator, synthesizer=FakeSynthesizer("x"),
+                  adapter=_FakeAdapter(), cache=TwoTierCache(L1Cache()), budget=Budget())
+
+    result = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+
+    assert result.deferred is True
+    assert "no date column" in result.answer, (
+        "suppressing every model reason would cost the caller the one thing it can act on"
+    )

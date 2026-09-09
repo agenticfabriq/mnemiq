@@ -1,3 +1,5 @@
+import logging
+
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.generate.generator import FakeGenerator
@@ -237,3 +239,42 @@ def test_decide_never_sets_corrected_because_the_decider_does_not_repair():
     verdict = decide("SELECT claim_identifier FROM claim", {"claim": {"claim_identifier"}},
                      dialect="duckdb", target="duckdb")
     assert isinstance(verdict, Approved) and verdict.corrected is False
+
+
+def test_an_explain_refusal_also_marks_the_feedback_as_the_sources(caplog):
+    """The other way source words enter a prompt: `prove` refuses, and its detail is fed back.
+
+    `plan_query`'s own repair loop is the shorter path -- no execution needed, so an EXPLAIN
+    refusal reaches the model on attempt two of a single ask. The suppression has to key off
+    the refusal that carried the words, not only off the agent's outer loop (M94).
+    """
+    leaky = 'permission denied for table hr_prod.payroll_salary; postgresql://svc:pw@10.2.0.7/x'
+
+    class _RefusingExplain:
+        dialect = "duckdb"
+
+        def execute(self, sql):
+            raise RuntimeError(leaky)
+
+    class _Quoting:
+        def __init__(self):
+            self.calls = []
+
+        def propose(self, packet, feedback=None, strategy=None):
+            from mnemiq.generate.generator import SqlProposal
+            self.calls.append(feedback)
+            if feedback is None:
+                return SqlProposal(sql="SELECT claim_identifier FROM claim")
+            return SqlProposal(sql=None, reason=f"the database said: {feedback}")
+
+    generator = _Quoting()
+    with caplog.at_level(logging.WARNING, logger="mnemiq.sql.prove"):
+        outcome = plan_query(_packet(), _snapshot(), _GRANTS, generator,
+                             adapter=_RefusingExplain(), target="duckdb", max_attempts=2)
+
+    assert isinstance(outcome, Deferred)
+    for secret in ("payroll_salary", "hr_prod", "10.2.0.7", "postgresql://"):
+        assert secret not in outcome.reason, f"the model carried {secret!r} out through prove"
+    # Still fed to the model, and still recorded for the operator.
+    assert any(leaky in (c or "") for c in generator.calls)
+    assert leaky in caplog.text

@@ -39,6 +39,7 @@ def plan_query(
     dialect: str = "duckdb",
     target: str = "postgres",
     feedback: str | None = None,
+    feedback_carries_source_words: bool = False,
     corrector=None,
     values=None,
     guard_undefined_terms: bool = False,
@@ -84,6 +85,17 @@ def plan_query(
                         code=DeferralReason.NO_TABLES)
 
     last: Refusal | None = None
+    # Whether the feedback in hand carries words the SOURCE wrote rather than words this engine
+    # wrote. The model is shown those words on purpose -- a rejection is the repair's whole input
+    # -- but `proposal.reason` is model-authored free text that this function forwards to the
+    # caller verbatim, so a model that quotes its feedback carries the source's words back out.
+    # Measured: a generator answering "the database said: <feedback>" returns a DSN through
+    # `AgentAnswer.answer`.
+    #
+    # This tracks the PROVENANCE of the string, not a guess about its content. There is no
+    # pattern to match and so no false-positive rate to measure, and it stays correct when a
+    # source starts phrasing its errors differently or a DSN turns up in a shape nobody listed.
+    carries_source_words = feedback_carries_source_words
 
     for _attempt in range(max_attempts):
         proposal = generator.propose(packet, feedback)
@@ -139,8 +151,14 @@ def plan_query(
             )
 
         if proposal.sql is None:
+            # The model's own words, EXCEPT when it was shown the source's. Then they are the
+            # one thing it might be repeating, and this is the path they would leave by.
             return Deferred(
-                reason=proposal.reason or "The model could not answer from these tables.",
+                reason=(
+                    "The model could not answer from these tables."
+                    if carries_source_words
+                    else (proposal.reason or "The model could not answer from these tables.")
+                ),
                 code=DeferralReason.UNANSWERABLE,
             )
 
@@ -187,6 +205,7 @@ def plan_query(
 
         last = verdict
         feedback = verdict.repair_text
+        carries_source_words = verdict.source_detail is not None
 
     reason = last.message if last else "The query could not be made valid."
     return Deferred(

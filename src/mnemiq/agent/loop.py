@@ -246,6 +246,10 @@ class Agent:
         emit: Emit | None = None,
     ) -> AgentAnswer:
         feedback: str | None = None
+        # Travels with `feedback`: whether it holds the source's words or only ours. `plan_query`
+        # needs it because the model is shown the feedback and its stated reason is forwarded to
+        # the caller, so the two together form a path back out for whatever the source said.
+        feedback_from_source = False
         failure: ExecutionError | None = None
 
         for _attempt in range(self.budget.max_attempts):
@@ -263,6 +267,7 @@ class Agent:
                     dialect=self.dialect,
                     target=self.dialect,
                     feedback=feedback,
+                    feedback_carries_source_words=feedback_from_source,
                     corrector=self.corrector,
                     values=self.values,
                     guard_undefined_terms=self.guard_undefined_terms,
@@ -298,6 +303,7 @@ class Agent:
                                _attempt + 1, exc.repair_text)
                 failure = exc
                 feedback = exc.repair_text
+                feedback_from_source = exc.source_detail is not None
                 continue
 
             self.cache.put(key, to_ipc(result.table))
