@@ -29,6 +29,20 @@ Outcome = Approved | Deferred
 CORRECTABLE = frozenset({RefusalCode.LOGIC_LINT, RefusalCode.VALUE_GROUNDING})
 
 
+@dataclass(frozen=True)
+class Feedback:
+    """Text fed back to the model, and whether the SOURCE wrote any of it.
+
+    One value rather than two parameters, and `from_source` has no default, because the unsafe
+    setting is the one a caller reaches by forgetting. A bare string plus an optional bool lets
+    a future caller seed the feedback, omit the flag, and silently reopen the exit this closes --
+    with every existing test still green, because they pin the caller that remembers.
+    """
+
+    text: str
+    from_source: bool
+
+
 def plan_query(
     packet: ContextPacket,
     snapshot: Snapshot,
@@ -38,8 +52,7 @@ def plan_query(
     max_attempts: int = 3,
     dialect: str = "duckdb",
     target: str = "postgres",
-    feedback: str | None = None,
-    feedback_carries_source_words: bool = False,
+    feedback: Feedback | None = None,
     corrector=None,
     values=None,
     guard_undefined_terms: bool = False,
@@ -95,10 +108,10 @@ def plan_query(
     # This tracks the PROVENANCE of the string, not a guess about its content. There is no
     # pattern to match and so no false-positive rate to measure, and it stays correct when a
     # source starts phrasing its errors differently or a DSN turns up in a shape nobody listed.
-    carries_source_words = feedback_carries_source_words
+    carries_source_words = feedback.from_source if feedback else False
 
     for _attempt in range(max_attempts):
-        proposal = generator.propose(packet, feedback)
+        proposal = generator.propose(packet, feedback.text if feedback else None)
 
         # M35, and OFF BY DEFAULT -- withdrawn on its own pre-registered criterion.
         #
@@ -140,11 +153,16 @@ def plan_query(
             else []
         )
         if missing:
+            # `missing` is model-authored too -- the terms come from `proposal.assumed_terms`,
+            # parsed straight out of the reply -- so this exit needs the same check as the
+            # stated-reason one below, and it runs FIRST. A model that echoes its feedback into
+            # the term list rather than into `reason` leaves through here.
+            named = ", ".join(repr(t) for t in missing)
             return Deferred(
                 reason=(
-                    "No certified definition for "
-                    + ", ".join(repr(t) for t in missing)
-                    + ". The data does not say how to compute it, so any answer would be a guess "
+                    (f"No certified definition for {named}. " if not carries_source_words
+                     else "A term in this question has no certified definition. ")
+                    + "The data does not say how to compute it, so any answer would be a guess "
                     "at your business rule rather than a reading of your data."
                 ),
                 code=DeferralReason.UNDEFINED_TERM,
@@ -204,8 +222,8 @@ def plan_query(
             )
 
         last = verdict
-        feedback = verdict.repair_text
         carries_source_words = verdict.source_detail is not None
+        feedback = Feedback(verdict.repair_text, from_source=carries_source_words)
 
     reason = last.message if last else "The query could not be made valid."
     return Deferred(

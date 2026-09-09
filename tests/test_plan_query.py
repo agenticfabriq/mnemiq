@@ -278,3 +278,44 @@ def test_an_explain_refusal_also_marks_the_feedback_as_the_sources(caplog):
     # Still fed to the model, and still recorded for the operator.
     assert any(leaky in (c or "") for c in generator.calls)
     assert leaky in caplog.text
+
+
+def test_the_undefined_term_exit_does_not_carry_the_source_out_either():
+    """`assumed_terms` is model-authored, and its exit runs BEFORE the stated-reason one.
+
+    A model that echoes its feedback into the term list rather than into `reason` leaves
+    through here, twelve lines earlier. Same rule, same provenance check (M94).
+    """
+    from mnemiq.generate.generator import SqlProposal
+    from mnemiq.generate.plan_query import Feedback
+
+    leaky = 'permission denied for table hr_prod.payroll_salary; postgresql://svc:pw@10.2.0.7/x'
+
+    class _EchoesIntoTerms:
+        def propose(self, packet, feedback=None, strategy=None):
+            return SqlProposal(sql=None, reason="n/a", assumed_terms=[feedback or "x"])
+
+    outcome = plan_query(_packet(), _snapshot(), _GRANTS, _EchoesIntoTerms(), target="duckdb",
+                         feedback=Feedback(leaky, from_source=True), max_attempts=1,
+                         guard_undefined_terms=True)
+
+    assert isinstance(outcome, Deferred)
+    for secret in ("payroll_salary", "hr_prod", "10.2.0.7", "postgresql://"):
+        assert secret not in outcome.reason, f"the term list carried {secret!r} out"
+
+
+def test_a_term_the_source_never_spoke_into_is_still_named():
+    """The narrowing stays as narrow as the risk: naming the term is the point of this deferral."""
+    from mnemiq.generate.generator import SqlProposal
+    from mnemiq.generate.plan_query import Feedback
+
+    class _Declares:
+        def propose(self, packet, feedback=None, strategy=None):
+            return SqlProposal(sql=None, reason="n/a", assumed_terms=["lifetime value"])
+
+    outcome = plan_query(_packet(), _snapshot(), _GRANTS, _Declares(), target="duckdb",
+                         feedback=Feedback("SELECT * is not allowed.", from_source=False),
+                         max_attempts=1, guard_undefined_terms=True)
+
+    assert isinstance(outcome, Deferred)
+    assert "lifetime value" in outcome.reason

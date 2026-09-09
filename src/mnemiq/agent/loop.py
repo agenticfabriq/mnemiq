@@ -25,7 +25,7 @@ from mnemiq.execute.select import (
     trust,
 )
 from mnemiq.generate.generator import Generator, StrategyGenerator
-from mnemiq.generate.plan_query import Deferred, plan_query
+from mnemiq.generate.plan_query import Deferred, Feedback, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
 
@@ -245,11 +245,10 @@ class Agent:
         deadline,
         emit: Emit | None = None,
     ) -> AgentAnswer:
-        feedback: str | None = None
-        # Travels with `feedback`: whether it holds the source's words or only ours. `plan_query`
-        # needs it because the model is shown the feedback and its stated reason is forwarded to
-        # the caller, so the two together form a path back out for whatever the source said.
-        feedback_from_source = False
+        # `Feedback` carries its own provenance: whether the SOURCE wrote any of it. `plan_query`
+        # needs that because the model is shown the feedback and its own words reach the caller,
+        # so the two together form a path back out for whatever the source said.
+        feedback: Feedback | None = None
         failure: ExecutionError | None = None
 
         for _attempt in range(self.budget.max_attempts):
@@ -267,7 +266,6 @@ class Agent:
                     dialect=self.dialect,
                     target=self.dialect,
                     feedback=feedback,
-                    feedback_carries_source_words=feedback_from_source,
                     corrector=self.corrector,
                     values=self.values,
                     guard_undefined_terms=self.guard_undefined_terms,
@@ -302,8 +300,7 @@ class Agent:
                 logger.warning("execution attempt %d failed; the source said: %s",
                                _attempt + 1, exc.repair_text)
                 failure = exc
-                feedback = exc.repair_text
-                feedback_from_source = exc.source_detail is not None
+                feedback = Feedback(exc.repair_text, from_source=exc.source_detail is not None)
                 continue
 
             self.cache.put(key, to_ipc(result.table))

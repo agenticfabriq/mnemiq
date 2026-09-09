@@ -76,14 +76,12 @@ class Refusal:
     # database's complaint (the cheapest accuracy lever there is) without the wire keeping
     # it too.
     #
-    # This narrows the channel rather than closing it. The prompt is not a safe destination
-    # either: retrieval scoping means the model may never have been shown the object a
-    # rejection names, and a DSN is not schema at all -- and because a model's stated reason
-    # for producing no SQL is forwarded to the caller verbatim, a model that quotes its
-    # feedback puts the text back on the wire. Measured, not assumed: a generator that
-    # answers "the database said: <feedback>" returns the DSN through `Deferred.reason`.
-    # Withholding it from the caller's direct path is worth doing on its own; treating the
-    # prompt as private is the part that does not hold.
+    # The prompt is NOT a safe destination, and this field does not pretend otherwise:
+    # retrieval scoping means the model may never have been shown the object a rejection
+    # names, and a DSN is not schema at all. What makes the split hold is that `plan_query`
+    # treats every model-authored string as unforwardable on a turn it fed source words into
+    # -- see `Feedback`, which carries that provenance and has no default for it. Withholding
+    # here is one half; the other is refusing to let the model hand it back.
     source_detail: str | None = None
 
     @property
