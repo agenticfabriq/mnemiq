@@ -31,7 +31,11 @@ rough order of how seriously we take them:
   read-only deployment, a row filter or column mask not applied, a repair loop producing
   an approved statement the original would have been refused for.
 - **Credential or configuration exposure** — a DSN, key or wallet path reaching a
-  response, a log, or a published artifact.
+  response, a trace or audit record, or a published artifact. The deployment's own server
+  log is the exception, and deliberately so: it is where the engine puts what it withholds
+  from the caller, and it already sits inside the boundary that holds the connection
+  settings. A secret written somewhere it was not configured to go — a key in a trace that
+  ships off-host — is in scope wherever it lands.
 
 Both halves of an access control count. The engine scoping what a model is *shown* and
 the decider re-checking what a query *names* are separate mechanisms, and a bypass of

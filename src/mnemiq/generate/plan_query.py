@@ -158,7 +158,7 @@ def plan_query(
             # one surgical pass: fix only the flagged problem, then re-decide (which re-runs
             # shape/access/lint/values/EXPLAIN, so a bad edit cannot slip through)
             verdict = decide(
-                corrector.correct(proposal.sql, verdict.message),
+                corrector.correct(proposal.sql, verdict.repair_text),
                 visible,
                 adapter=adapter,
                 dialect=dialect,
@@ -186,7 +186,7 @@ def plan_query(
             )
 
         last = verdict
-        feedback = verdict.message
+        feedback = verdict.repair_text
 
     reason = last.message if last else "The query could not be made valid."
     return Deferred(

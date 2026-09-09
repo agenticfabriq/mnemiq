@@ -51,12 +51,16 @@ logger = logging.getLogger(__name__)
 # What a caller may be told when the run fails, keyed by exception TYPE.
 #
 # Every value is a constant. Nothing is interpolated from the exception, because the
-# thing being kept off the wire is its text: `ExecutionError` wraps the source's own
-# error, which on a governed deployment names tables and columns this identity was
-# never shown, quotes the statement, and can carry a DSN fragment. Sending `str(exc)`
-# hands the caller a description of the schema they were refused -- the disclosure the
-# retrieval scoping and `check_access` exist to prevent, arriving through the error
-# path instead of the answer path.
+# thing being kept off the wire is its text. What reaches this handler is whatever the
+# agent did NOT convert to an answer -- a store error from `retrieve` naming the DuckDB
+# path, an authz provider failing open on a file it can name, an embedder or provider
+# transport error carrying an endpoint and its request headers. Those strings are made
+# of deployment configuration, and `str(exc)` puts them in front of whoever asked a
+# question. The engine refusing to answer must not become a way to read the engine.
+#
+# Note this is the narrower half. A source rejection never arrives here: `ExecutionError`
+# is caught in the agent loop and turned into a failed `AgentAnswer`, so it leaves through
+# the answer path, which `/v1/ask` shares -- see the fall-through in `Agent._answer`.
 #
 # The default is deliberately uninformative TO THE CALLER and fully informative to the
 # operator: the traceback is logged against the run id, which the client already has

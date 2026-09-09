@@ -42,6 +42,7 @@ def prove(adapter: Any, target_sql: str) -> Refusal | None:
     except Exception as exc:
         return Refusal(
             code=RefusalCode.EXPLAIN_FAILED,
-            message=f"The source rejected this query: {exc}",
+            message="The source rejected this query.",
+            source_detail=str(exc),
         )
     return None

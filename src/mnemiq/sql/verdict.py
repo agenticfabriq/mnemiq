@@ -69,10 +69,22 @@ class Refusal:
     code: RefusalCode
     message: str  # written for the model to repair against, not for a log
     subject: str | None = None
+    # The source's own words, when a refusal has any. Deliberately NOT in `message`:
+    # `plan_query` forwards `message` to the caller as a deferral reason, and a source's
+    # exception is made of the caller's schema -- it names the relation and the column it
+    # refused and can carry a DSN. Splitting it out is what lets the repair loop keep the
+    # database's complaint (the cheapest accuracy lever there is) without the wire keeping
+    # it too. The model already holds the schema, so the boundary is the wire, not the prompt.
+    source_detail: str | None = None
 
     @property
     def repairable(self) -> bool:
         return self.code in REPAIRABLE
+
+    @property
+    def repair_text(self) -> str:
+        """What the model repairs against: our refusal, plus the source's own words."""
+        return f"{self.message} {self.source_detail}" if self.source_detail else self.message
 
 
 @dataclass

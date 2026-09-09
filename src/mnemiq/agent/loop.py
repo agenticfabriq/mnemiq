@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from mnemiq.agent.budget import Budget
@@ -27,6 +28,8 @@ from mnemiq.generate.generator import Generator, StrategyGenerator
 from mnemiq.generate.plan_query import Deferred, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
+
+logger = logging.getLogger(__name__)
 
 # Cycled across candidates in multi-candidate mode: engineered disagreement, so the
 # selector has something real to select over (uniform resampling measured 56% unanimous).
@@ -243,7 +246,7 @@ class Agent:
         emit: Emit | None = None,
     ) -> AgentAnswer:
         feedback: str | None = None
-        failure: str | None = None
+        failure: ExecutionError | None = None
 
         for _attempt in range(self.budget.max_attempts):
             # Two nested repair loops, answering two different judges. plan_query repairs what the
@@ -289,8 +292,8 @@ class Agent:
             except ExecutionError as exc:
                 # The database is the one authority that cannot be wrong about itself: its
                 # complaint is the cheapest accuracy lever we have. Feed it back and retry.
-                failure = str(exc)
-                feedback = failure
+                failure = exc
+                feedback = exc.repair_text
                 continue
 
             self.cache.put(key, to_ipc(result.table))
@@ -313,10 +316,26 @@ class Agent:
 
         # NOT a deferral. We did not decline to answer -- the source refused to serve us, and
         # counting that as abstention is what let an outage look like the engine working (M6).
+        #
+        # Our half of the failure goes to the caller; the source's half does not. A rejection
+        # in the database's own words is made of the caller's schema -- it names the table and
+        # the column and often quotes the statement -- so an identity denied a table would
+        # learn the table exists by being told why it could not read it -- the side-channel
+        # disclosure SECURITY.md names, and it arrives through the ANSWER, which means
+        # `/v1/ask` carried it as readily as the stream's error frame.
+        #
+        # Not by dropping the text, though: `message` is the sentence this engine wrote, and
+        # it is often the useful one -- a timeout says to ask something cheaper. Only
+        # `source_detail` is withheld, and it goes to the log, where the schema is already
+        # known and the whole retry can be read.
+        logger.warning(
+            "every execution attempt failed; last source error: %s",
+            failure.repair_text if failure is not None else "(no attempt was made)",
+        )
         return AgentAnswer(
             answer=(
                 "Could not answer this question: the database rejected every attempt. "
-                f"Last error: {failure}"
+                + (failure.message if failure is not None else "No attempt was made.")
             ),
             failed=True,
             reason_code=DeferralReason.EXECUTION_FAILED,

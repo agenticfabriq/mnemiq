@@ -55,16 +55,20 @@ def test_an_adapter_with_validate_is_never_sent_explain():
 
 
 def test_a_rejection_becomes_explain_failed_carrying_the_sources_own_message():
-    """The message is not decoration: the correction loop reads it to repair the SQL."""
+    """The message is not decoration: the correction loop reads it to repair the SQL.
+
+    It reaches the loop through `repair_text` rather than `message`, because `message` is
+    also what the caller is told and the source's words are made of the caller's schema.
+    """
     r = prove(_Explains(fail='relation "ghost" does not exist'), "SELECT 1 FROM ghost")
     assert isinstance(r, Refusal) and r.code is RefusalCode.EXPLAIN_FAILED
-    assert 'relation "ghost" does not exist' in r.message
+    assert 'relation "ghost" does not exist' in r.repair_text
 
 
 def test_a_validate_rejection_takes_the_same_path():
     r = prove(_Validates(fail="ORA-00942: table or view does not exist"), "SELECT 1 FROM ghost")
     assert isinstance(r, Refusal) and r.code is RefusalCode.EXPLAIN_FAILED
-    assert "ORA-00942" in r.message
+    assert "ORA-00942" in r.repair_text
 
 
 def test_the_seam_is_optional_rather_than_required():
@@ -76,3 +80,38 @@ def test_the_seam_is_optional_rather_than_required():
             return []
 
     assert prove(_Bare(), "SELECT 1") is None
+
+
+def test_the_sources_words_are_kept_out_of_the_callers_half_of_a_refusal():
+    """`message` is forwarded to the caller; the source's exception must not ride in it.
+
+    `plan_query` ends an exhausted repair loop with `reason = last.message`, and that reason
+    becomes `AgentAnswer.answer`. So anything `prove` interpolates into `message` is shipped
+    to whoever asked -- and a source rejection names the relation and column it refused and
+    can carry a DSN. The repair loop still needs those words, which is why they move to
+    `source_detail` rather than being dropped.
+    """
+    leaky = ('permission denied for table hr_prod.payroll_salary; '
+             'connection postgresql://svc_mnemiq@10.2.0.7:5432/hr_prod')
+    verdict = prove(_Explains(fail=leaky), "SELECT n FROM claim")
+
+    assert isinstance(verdict, Refusal)
+    assert verdict.code == RefusalCode.EXPLAIN_FAILED
+    for secret in ("payroll_salary", "hr_prod", "svc_mnemiq", "10.2.0.7", "postgresql://"):
+        assert secret not in verdict.message, f"the caller-facing message disclosed {secret!r}"
+    # The model is the one consumer that should see it -- it already holds the schema.
+    assert leaky in verdict.source_detail
+    assert leaky in verdict.repair_text
+
+
+def test_a_refusal_we_authored_still_reaches_the_caller_whole():
+    """The split must not silence the refusals that are useful to read.
+
+    Only `prove` interpolates a source exception. Every other refusal is text this engine
+    wrote for a person, so `repair_text` and `message` stay the same string and the caller
+    keeps the explanation.
+    """
+    ours = Refusal(code=RefusalCode.SELECT_STAR, message="SELECT * is not allowed.")
+
+    assert ours.source_detail is None
+    assert ours.repair_text == ours.message == "SELECT * is not allowed."

@@ -27,15 +27,16 @@ _RESULT = pa.table({"n": [7]})
 
 
 class _FakeAdapter:
-    def __init__(self, errors: int = 0):
+    def __init__(self, errors: int = 0, message: str = 'column "typo" does not exist'):
         self.errors = errors
+        self.message = message
         self.queries: list[str] = []
 
     def execute_arrow(self, sql, timeout_s=None):
         self.queries.append(sql)
         if self.errors > 0:
             self.errors -= 1
-            raise Exception('column "typo" does not exist')
+            raise Exception(self.message)
         return _RESULT
 
     def execute(self, sql):
@@ -137,6 +138,52 @@ def test_a_database_that_rejects_every_attempt_is_a_failure_not_a_deferral():
         "counting a source outage as a deferral is what let an outage look like abstention"
     )
     assert result.reason_code == DeferralReason.EXECUTION_FAILED
+
+
+def test_the_sources_own_error_text_does_not_reach_the_caller():
+    """The answer used to carry `Last error: {failure}` -- the database's verbatim complaint.
+
+    A source rejection is made of the caller's schema. Postgres names the relation and the
+    column it refused, and a connection failure names the host and the user. An identity
+    denied a table would therefore learn the table exists by being told why it could not
+    read it, which is the first disclosure class SECURITY.md claims is in scope. It reaches
+    `AgentAnswer.answer`, so `/v1/ask` carried it too, not only the stream's error frame.
+    """
+    leaky = (
+        'permission denied for table hr_prod.payroll_salary; '
+        'connection postgresql://svc_mnemiq@10.2.0.7:5432/hr_prod'
+    )
+    adapter = _FakeAdapter(errors=99, message=leaky)
+    agent = _agent(['{"sql": "SELECT n FROM claim"}'] * 9, adapter=adapter,
+                   budget=Budget(max_attempts=2))
+
+    result = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+
+    for secret in ("payroll_salary", "hr_prod", "svc_mnemiq", "10.2.0.7", "postgresql://",
+                   "permission denied"):
+        assert secret not in result.answer, f"the answer disclosed {secret!r}"
+    # The state still has to be legible, or hiding the cause would have cost the caller M6.
+    assert result.failed is True
+    assert result.reason_code == DeferralReason.EXECUTION_FAILED
+
+
+def test_the_source_error_is_still_fed_back_to_the_planner():
+    """Withholding it from the caller must not withhold it from the repair loop.
+
+    The database's complaint is the retry's whole input -- it is what a second attempt is
+    corrected *by*. The model already holds the schema this text is made of, so the boundary
+    that matters is the wire, not the prompt.
+    """
+    adapter = _FakeAdapter(errors=1, message='column "typo" does not exist')
+    agent = _agent(['{"sql": "SELECT typo FROM claim"}', '{"sql": "SELECT n FROM claim"}'],
+                   adapter=adapter, budget=Budget(max_attempts=2))
+
+    result = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+
+    assert result.failed is False
+    assert any("typo" in (feedback or "") for feedback in agent.generator.calls[1:]), (
+        "the second attempt was planned without being told what the first one got wrong"
+    )
 
 
 def test_an_outage_cannot_raise_the_deferral_rate():
