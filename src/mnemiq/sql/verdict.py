@@ -78,10 +78,16 @@ class Refusal:
     #
     # The prompt is NOT a safe destination, and this field does not pretend otherwise:
     # retrieval scoping means the model may never have been shown the object a rejection
-    # names, and a DSN is not schema at all. What makes the split hold is that `plan_query`
-    # treats every model-authored string as unforwardable on a turn it fed source words into
-    # -- see `Feedback`, which carries that provenance and has no default for it. Withholding
-    # here is one half; the other is refusing to let the model hand it back.
+    # names, and a DSN is not schema at all. So `plan_query` withholds its model-authored
+    # DEFERRAL text on a turn it fed source words into -- the stated reason, the declared
+    # terms, the unauthorized subject -- keyed off `Feedback`, which carries that provenance
+    # and has no default for it. Withholding here is one half; the other is refusing to let
+    # the model hand it back.
+    #
+    # Bounded claim, deliberately. The approved SQL is model-authored too and ships to the
+    # caller as `trace.target_sql`, so a model can still launder text through a string
+    # literal. Suppressing that would cost the transparency the SQL surface exists for, and
+    # a partial-containment check is a guard with a false-positive rate nobody has measured.
     source_detail: str | None = None
 
     @property

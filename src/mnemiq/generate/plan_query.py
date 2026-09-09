@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass, replace
 
 from mnemiq.authz.grants import GrantSet
@@ -12,6 +14,8 @@ from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -158,6 +162,9 @@ def plan_query(
             # stated-reason one below, and it runs FIRST. A model that echoes its feedback into
             # the term list rather than into `reason` leaves through here.
             named = ", ".join(repr(t) for t in missing)
+            # Which term is the one fact this deferral exists to carry, so when it cannot be
+            # said to the caller it still has to be said somewhere.
+            logger.warning("undefined terms refused: %s", named)
             return Deferred(
                 reason=(
                     (f"No certified definition for {named}. " if not carries_source_words
@@ -213,10 +220,18 @@ def plan_query(
 
         if verdict.code == RefusalCode.UNAUTHORIZED_TABLE:
             # Do not retry. A guard that can be retried is a puzzle, not a guard.
+            #
+            # `subject` is model-authored: `authz_guard` reads it off the table name in the
+            # model's own SQL, so a model handed the source's words can name a "table" spelled
+            # out of them. Third exit of the same kind, and the naming is what makes this one
+            # worth keeping when it is safe -- a caller told WHICH table it lacks can ask for it.
+            logger.warning("unauthorized table refused: %r", verdict.subject)
             return Deferred(
                 reason=(
                     f"Answering this would require access to {verdict.subject!r}, "
                     "which you do not have."
+                    if not carries_source_words
+                    else "Answering this would require access you do not have."
                 ),
                 code=DeferralReason.AUTHORIZATION,
             )
