@@ -141,6 +141,10 @@ uv run mnemiq build       # index it for retrieval          (~2 s)
 uv run mnemiq ask "how many customers are there by country?" --roles analyst
 ```
 
+`uv sync` pulls about **230 MB** of dependencies on a first run — DuckDB, PyArrow and the OpenAI
+client are the bulk of it — so give it a minute on a normal connection. It is near-instant on any
+subsequent checkout, since uv caches wheels globally.
+
 `mnemiq enrich` is the only slow step: it profiles every column and makes one LLM pass over the
 schema, so expect **roughly 30 seconds for the demo's four tables** and longer in proportion to
 your own. It prints nothing until each table completes — it is working, not hung. The result is
