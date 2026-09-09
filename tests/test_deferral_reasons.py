@@ -176,6 +176,11 @@ def test_the_sources_own_error_text_does_not_reach_the_caller(caplog):
                    if r.getMessage().startswith("execution attempt")]
     assert len(per_attempt) == 2, per_attempt  # the closing summary opens with "every"
     assert all(leaky in m for m in per_attempt)
+    # And the summary itself, which the filter above excludes by construction. It is a separate
+    # line carrying the same words, so it needs its own assertion or it is pinned by nothing.
+    summary = [r.getMessage() for r in caplog.records if r.getMessage().startswith("every")]
+    assert len(summary) == 1, summary
+    assert leaky in summary[0]
 
 
 def test_the_source_error_is_still_fed_back_to_the_planner():
