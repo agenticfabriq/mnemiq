@@ -18,11 +18,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 
 import pyarrow as pa
 
-from mnemiq.adapters.sqlite import SQLiteAdapter
 from mnemiq.eval.bird import bird_db_path
 from mnemiq.eval.grade import results_match
 from mnemiq.eval.spider import spider_db_path
@@ -107,7 +105,6 @@ def main() -> int:
 
     for path in args.results:
         rows = [json.loads(line) for line in open(path) if line.strip()]
-        adapters: dict[str, SQLiteAdapter] = {}
         counts = {"correct": 0, "correct_facts": 0, "wrong": 0, "other": 0, "ungradable": 0}
         changed = 0
         out = []
@@ -122,10 +119,6 @@ def main() -> int:
                 counts["other"] += 1
                 out.append({**rec, "regraded": was})
                 continue
-
-            if db_id not in adapters:
-                adapters[db_id] = SQLiteAdapter(db_path(root, db_id))
-            adapter = adapters[db_id]
 
             try:
                 gold_rows, gold_names = _run(
