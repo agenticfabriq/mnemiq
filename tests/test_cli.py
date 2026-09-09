@@ -1,4 +1,5 @@
 from mnemiq.cli import build_parser, main
+from mnemiq.config import Settings
 
 
 def _fake_settings():
@@ -122,3 +123,121 @@ def test_digest_ontology_writes_records(tmp_path):
     payload = json.loads(out.read_text())
     assert payload["version"]
     assert any(s["label"] == "Colour Codes" for s in payload["schemes"])
+
+
+# ---------------------------------------------------------------------------
+# Issue #4: MNEMIQ_ROLES (and MNEMIQ_PRINCIPAL) must be honoured by the CLI
+# when --roles / --principal is not explicitly passed.
+# ---------------------------------------------------------------------------
+
+
+def test_roles_default_from_env_when_flag_omitted(monkeypatch, capsys):
+    """The defect: MNEMIQ_ROLES=analyst was ignored because --roles defaulted to empty,
+    producing no grants. The identity should carry the env var's roles when the flag is absent."""
+    import mnemiq.cli as cli
+    from mnemiq.agent.loop import AgentAnswer
+
+    captured = {}
+
+    class _RT:
+        def ask(self, q, identity, mode=None):
+            captured["identity"] = identity
+            return AgentAnswer(answer="ok", trace=None, deferred=False)
+
+    settings = Settings(
+        llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d",
+        roles="analyst,viewer",
+    )
+    monkeypatch.setattr(cli, "build_runtime", lambda s: _RT())
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: settings))
+    assert main(["ask", "q"]) == 0
+    assert captured["identity"].roles == ["analyst", "viewer"]
+
+
+def test_roles_flag_overrides_env_var(monkeypatch, capsys):
+    """An explicit --roles flag must override MNEMIQ_ROLES, not merge with it."""
+    import mnemiq.cli as cli
+    from mnemiq.agent.loop import AgentAnswer
+
+    captured = {}
+
+    class _RT:
+        def ask(self, q, identity, mode=None):
+            captured["identity"] = identity
+            return AgentAnswer(answer="ok", trace=None, deferred=False)
+
+    settings = Settings(
+        llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d",
+        roles="analyst",
+    )
+    monkeypatch.setattr(cli, "build_runtime", lambda s: _RT())
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: settings))
+    assert main(["ask", "q", "--roles", "admin"]) == 0
+    assert captured["identity"].roles == ["admin"]
+
+
+def test_principal_defaults_from_env_when_flag_omitted(monkeypatch, capsys):
+    """Same fallback for --principal: MNEMIQ_PRINCIPAL should be honoured."""
+    import mnemiq.cli as cli
+    from mnemiq.agent.loop import AgentAnswer
+
+    captured = {}
+
+    class _RT:
+        def ask(self, q, identity, mode=None):
+            captured["identity"] = identity
+            return AgentAnswer(answer="ok", trace=None, deferred=False)
+
+    settings = Settings(
+        llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d",
+        principal="alice@corp.com",
+    )
+    monkeypatch.setattr(cli, "build_runtime", lambda s: _RT())
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: settings))
+    assert main(["ask", "q"]) == 0
+    assert captured["identity"].principal_id == "alice@corp.com"
+
+
+def test_write_honours_roles_from_env(monkeypatch, capsys):
+    """The write path had the same gap: --roles defaulted to empty, ignoring MNEMIQ_ROLES."""
+    import mnemiq.cli as cli
+    from mnemiq.runtime import WriteResult
+
+    captured = {}
+
+    class _RT:
+        def write(self, sql, identity):
+            captured["identity"] = identity
+            return WriteResult(approved=False, refusal="denied")
+
+    settings = Settings(
+        llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d",
+        roles="writer",
+    )
+    monkeypatch.setattr(cli, "build_runtime", lambda s: _RT())
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: settings))
+    assert main(["write", "INSERT INTO t (id) VALUES (1)"]) == 0
+    assert captured["identity"].roles == ["writer"]
+
+
+def test_tenant_defaults_from_env(monkeypatch, capsys):
+    """MNEMIQ_TENANT was hardcoded to 'local' in _identity. Now that we delegate to
+    identity_from_settings, tenant is honoured the same way as principal and roles."""
+    import mnemiq.cli as cli
+    from mnemiq.agent.loop import AgentAnswer
+
+    captured = {}
+
+    class _RT:
+        def ask(self, q, identity, mode=None):
+            captured["identity"] = identity
+            return AgentAnswer(answer="ok", trace=None, deferred=False)
+
+    settings = Settings(
+        llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d",
+        tenant="acme",
+    )
+    monkeypatch.setattr(cli, "build_runtime", lambda s: _RT())
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: settings))
+    assert main(["ask", "q"]) == 0
+    assert captured["identity"].tenant_id == "acme"

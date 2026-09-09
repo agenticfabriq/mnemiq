@@ -28,16 +28,16 @@ def build_parser() -> argparse.ArgumentParser:
     a = sub.add_parser("ask", help="ask a question in natural language")
     a.add_argument("question")
     a.add_argument("--json", action="store_true", help="emit the machine record")
-    a.add_argument("--principal", default="local")
-    a.add_argument("--roles", default="", help="comma-separated")
+    a.add_argument("--principal", default=None, help="identity principal (defaults to MNEMIQ_PRINCIPAL)")
+    a.add_argument("--roles", default=None, help="comma-separated (defaults to MNEMIQ_ROLES)")
     a.add_argument("--mode", choices=sorted(MODES), default=None,
                    help="instant (cheapest) | thinking (default) | deep (highest precision)")
 
     w = sub.add_parser("write", help="execute a single INSERT/UPDATE/DELETE (governed)")
     w.add_argument("sql")
     w.add_argument("--json", action="store_true", help="emit the WriteResult")
-    w.add_argument("--principal", default="local")
-    w.add_argument("--roles", default="", help="comma-separated")
+    w.add_argument("--principal", default=None, help="identity principal (defaults to MNEMIQ_PRINCIPAL)")
+    w.add_argument("--roles", default=None, help="comma-separated (defaults to MNEMIQ_ROLES)")
 
     f = sub.add_parser("feedback", help="record a fixed failure as a golden case + example")
     f.add_argument("--question", required=True)
@@ -69,11 +69,25 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _identity(args) -> IdentityContext:
+def _identity(args, settings: Settings | None = None) -> IdentityContext:
+    # The CLI built its own IdentityContext instead of reusing `identity_from_settings`, so every
+    # field it hardcoded drifted: `--roles` defaulted to `""`, `--principal` to `"local"`, and
+    # `tenant_id` was unconditionally `"local"`. MCP and `/v1` both called `identity_from_settings`
+    # and honoured the env vars; the CLI was the only surface that ignored them. The failure was
+    # invisible: an empty role set grants nothing, and the engine's refusal is accurate, so a
+    # first-time user with MNEMIQ_ROLES=analyst in their .env reads a working engine as broken.
+    #
+    # Delegating to `identity_from_settings` for the base removes the drift at the root. The CLI
+    # flags override when explicitly passed (`default=None` distinguishes "the user said nothing"
+    # from "the user passed a value"), which matches how the rest of the configuration resolves.
+    from mnemiq.config import identity_from_settings
+
+    base = identity_from_settings(settings)
+    roles_raw = getattr(args, "roles", None)
     return IdentityContext(
-        tenant_id="local",
-        principal_id=getattr(args, "principal", "local"),
-        roles=[r for r in getattr(args, "roles", "").split(",") if r],
+        tenant_id=base.tenant_id,
+        principal_id=getattr(args, "principal", None) or base.principal_id,
+        roles=[r for r in roles_raw.split(",") if r] if roles_raw is not None else base.roles,
     )
 
 
@@ -342,7 +356,7 @@ def _cmd_ask(settings: Settings, args) -> int:
     except SnapshotMissing as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    ans = rt.ask(args.question, _identity(args), mode=args.mode)
+    ans = rt.ask(args.question, _identity(args, settings), mode=args.mode)
     if args.json:
         import json
 
@@ -396,7 +410,7 @@ def _cmd_write(settings: Settings, args) -> int:
     except SnapshotMissing as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    res = rt.write(args.sql, _identity(args))
+    res = rt.write(args.sql, _identity(args, settings))
     if args.json:
         import json
 

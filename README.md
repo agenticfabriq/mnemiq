@@ -161,9 +161,10 @@ The first joins through a lookup table to resolve a coded column — `segment_cd
 and nothing in the name says "enterprise". The second is refused: the demo schema has no price or
 revenue column, and the engine says so instead of returning a number.
 
-Access is fail-closed. `--roles analyst` is required — without a role the engine grants nothing
-and defers, which is the correct behaviour and the first thing people mistake for a bug. No policy,
-no grants, no snapshot — no data.
+Access is fail-closed. A role is required — pass `--roles analyst` on the command line, or set
+`MNEMIQ_ROLES=analyst` in your `.env`. Without a role the engine grants nothing and defers, which
+is the correct behaviour and the first thing people mistake for a bug. No policy, no grants, no
+snapshot — no data.
 
 ### Which LLM endpoints work
 
@@ -236,9 +237,8 @@ Read the code rather than taking this on trust — that is the point of shipping
 
 Filed as open issues rather than left to be discovered, because they are readable in the source
 either way: [verification is off by default](https://github.com/agenticfabriq/mnemiq/issues/3)
-despite being the only lever measured to reduce the wrong-rate, and
-[`MNEMIQ_ROLES` is ignored by the CLI](https://github.com/agenticfabriq/mnemiq/issues/4).
-Contributions and arguments welcome on both.
+despite being the only lever measured to reduce the wrong-rate.
+Contributions and arguments welcome.
 
 Two of the four this list opened with are now closed. An unreachable judge withholds the answer
 instead of passing it ([#2](https://github.com/agenticfabriq/mnemiq/issues/2)), and lineage stopped
