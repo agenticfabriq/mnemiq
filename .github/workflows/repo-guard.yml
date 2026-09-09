@@ -1,7 +1,12 @@
 name: repo-guard
 on:
+  # Deliberately NOT narrowed to `main`, unlike ci.yml. This repo is public, so a branch is
+  # world-readable the moment it is pushed, and this is the job whose whole premise is that
+  # such a push cannot be taken back. Narrowing it would leave the window between pushing a
+  # branch and opening a PR unscanned -- and the local hook does not cover that window either,
+  # being opt-in per clone and skippable with `--no-verify`. Running it twice on a PR costs
+  # about nine seconds; the double run on ci.yml was worth removing, this one is not.
   push:
-    branches: [main]
   pull_request:
 
 permissions:
