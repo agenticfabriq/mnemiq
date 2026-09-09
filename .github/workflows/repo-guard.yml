@@ -9,7 +9,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Scan for proprietary names and secrets
-        env:
-          REPO_GUARD_NAME_PATTERNS: ${{ secrets.REPO_GUARD_NAME_PATTERNS }}
+      - name: Scan for secret shapes and machine home paths
+        # Not proprietary names. That check is local-only and `--all` refuses to run it,
+        # so this job needs no repository secret. Supplying one would leak the list by
+        # enforcing it -- a flagged word in a public log tells every reader that word is
+        # on the blocklist -- and a pull request from a fork could not receive it anyway.
         run: bash scripts/repo-guard.sh --all
