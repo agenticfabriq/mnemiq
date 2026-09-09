@@ -244,13 +244,17 @@ def test_write_executes_on_approval():
     assert any(not s.startswith("EXPLAIN") for s in adapter.ran)  # the write actually ran
 
 
-def test_a_source_that_refuses_a_write_does_not_say_why_to_the_caller():
+def test_a_source_that_refuses_a_write_does_not_say_why_to_the_caller(caplog):
     """`WriteResult.refusal` is handed to an MCP agent verbatim by `db_write`.
 
-    The backstop this fires on is the read-only attach rejecting the statement, so the
-    exception is a permission or connection error -- exactly the kind that names the table it
-    refused and carries the DSN it refused it on. The read path withholds those words; this
-    surface is the one an external agent actually reads.
+    Any refusal from the source reaches here -- a permission error, a failed connection, a
+    read-only deployment rejecting the statement -- and those name the table they refused and
+    carry the DSN they refused it on. The read path withholds those words; this surface is the
+    one an external agent actually reads.
+
+    Both halves are asserted. Withholding from the caller is only defensible because the
+    operator still gets it, so a test that checks the caller alone would go green on a change
+    that disclosed the words to nobody at all.
     """
     from mnemiq.contract import Column, Snapshot
     from mnemiq.runtime import Runtime
@@ -274,12 +278,14 @@ def test_a_source_that_refuses_a_write_does_not_say_why_to_the_caller():
 
     rt = Runtime(con=None, snapshot=snap, adapter=_RefusingAdapter(), agent=None, embedder=None,
                  authz=_WriteAuthz("claim"), settings=_WritesEnabled())
-    res = rt.write("INSERT INTO claim (id) VALUES (1)", _identity())
+    with caplog.at_level(logging.WARNING, logger="mnemiq.runtime"):
+        res = rt.write("INSERT INTO claim (id) VALUES (1)", _identity())
 
     assert res.approved is False
     assert res.refusal, "the caller must still be told it was refused"
     for secret in ("payroll_salary", "hr_prod", "svc_mnemiq", "10.2.0.7", "postgresql://"):
         assert secret not in res.refusal, f"the write refusal disclosed {secret!r}"
+    assert leaky in caplog.text, "withheld from the caller AND from the operator is not the trade"
 
 
 def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):

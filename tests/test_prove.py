@@ -8,6 +8,8 @@ adapters that speak EXPLAIN. The failure lived in the gap between two well-teste
 
 from __future__ import annotations
 
+import logging
+
 from mnemiq.sql.prove import prove
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
@@ -82,7 +84,7 @@ def test_the_seam_is_optional_rather_than_required():
     assert prove(_Bare(), "SELECT 1") is None
 
 
-def test_the_sources_words_are_kept_out_of_the_callers_half_of_a_refusal():
+def test_the_sources_words_are_kept_out_of_the_callers_half_of_a_refusal(caplog):
     """`message` is forwarded to the caller; the source's exception must not ride in it.
 
     `plan_query` ends an exhausted repair loop with `reason = last.message`, and that reason
@@ -93,7 +95,8 @@ def test_the_sources_words_are_kept_out_of_the_callers_half_of_a_refusal():
     """
     leaky = ('permission denied for table hr_prod.payroll_salary; '
              'connection postgresql://svc_mnemiq@10.2.0.7:5432/hr_prod')
-    verdict = prove(_Explains(fail=leaky), "SELECT n FROM claim")
+    with caplog.at_level(logging.WARNING, logger="mnemiq.sql.prove"):
+        verdict = prove(_Explains(fail=leaky), "SELECT n FROM claim")
 
     assert isinstance(verdict, Refusal)
     assert verdict.code == RefusalCode.EXPLAIN_FAILED
@@ -103,6 +106,9 @@ def test_the_sources_words_are_kept_out_of_the_callers_half_of_a_refusal():
     # not the same as the prompt being a safe place: see the residual at `Refusal.source_detail`.
     assert leaky in verdict.source_detail
     assert leaky in verdict.repair_text
+    # And the operator's half: an EXPLAIN refusal a later attempt repairs is logged here or
+    # nowhere, since `plan_query` keeps only the last one.
+    assert leaky in caplog.text
 
 
 def test_a_refusal_we_authored_still_reaches_the_caller_whole():

@@ -8,6 +8,7 @@ request deferred, and `aggregate` hardcoded `errors=0` -- a total authorization 
 """
 
 import json
+import logging
 
 import pyarrow as pa
 
@@ -140,7 +141,7 @@ def test_a_database_that_rejects_every_attempt_is_a_failure_not_a_deferral():
     assert result.reason_code == DeferralReason.EXECUTION_FAILED
 
 
-def test_the_sources_own_error_text_does_not_reach_the_caller():
+def test_the_sources_own_error_text_does_not_reach_the_caller(caplog):
     """The answer used to carry `Last error: {failure}` -- the database's verbatim complaint.
 
     A source rejection is made of the caller's schema. Postgres names the relation and the
@@ -157,7 +158,8 @@ def test_the_sources_own_error_text_does_not_reach_the_caller():
     agent = _agent(['{"sql": "SELECT n FROM claim"}'] * 9, adapter=adapter,
                    budget=Budget(max_attempts=2))
 
-    result = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+    with caplog.at_level(logging.WARNING, logger="mnemiq.agent.loop"):
+        result = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
 
     for secret in ("payroll_salary", "hr_prod", "svc_mnemiq", "10.2.0.7", "postgresql://",
                    "permission denied"):
@@ -165,6 +167,15 @@ def test_the_sources_own_error_text_does_not_reach_the_caller():
     # The state still has to be legible, or hiding the cause would have cost the caller M6.
     assert result.failed is True
     assert result.reason_code == DeferralReason.EXECUTION_FAILED
+    # The other half of the trade. Withheld from the caller is defensible only because the
+    # operator has it; withheld from both is the outage-looks-like-working shape M6 is about.
+    #
+    # Per ATTEMPT, not just the closing summary: `failure` is overwritten each time round, so
+    # asserting on `caplog.text` alone would stay green with the per-attempt line gutted.
+    per_attempt = [r.getMessage() for r in caplog.records
+                   if r.getMessage().startswith("execution attempt")]
+    assert len(per_attempt) == 2, per_attempt  # the closing summary opens with "every"
+    assert all(leaky in m for m in per_attempt)
 
 
 def test_the_source_error_is_still_fed_back_to_the_planner():
