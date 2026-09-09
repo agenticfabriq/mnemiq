@@ -1,11 +1,18 @@
 name: repo-guard
 on:
-  # Deliberately NOT narrowed to `main`, unlike ci.yml. This repo is public, so a branch is
-  # world-readable the moment it is pushed, and this is the job whose whole premise is that
-  # such a push cannot be taken back. Narrowing it would leave the window between pushing a
-  # branch and opening a PR unscanned -- and the local hook does not cover that window either,
-  # being opt-in per clone and skippable with `--no-verify`. Running it twice on a PR costs
-  # about nine seconds; the double run on ci.yml was worth removing, this one is not.
+  # Deliberately NOT narrowed to `main`, unlike ci.yml. This repo is public, so a branch pushed
+  # HERE is world-readable at once (a fork's own branch fires nothing in this repo -- for those,
+  # the PR run is the first look), and this is the job whose premise is that such a push cannot
+  # be taken back. Narrowing would leave the window between pushing a branch and opening a PR
+  # scanned by nothing: the local hook is opt-in per clone and `--no-verify` skips it.
+  #
+  # The second run is close to free for a maintainer's branch, which is the case being defended
+  # here. It is NOT free for an outside contributor: secrets are withheld from fork PRs, so this
+  # currently fails closed on theirs for a reason they cannot act on. That is PR #6's subject,
+  # not this trigger's -- noting it so the two are not confused.
+  #
+  # Scope worth knowing: `--all` scans the checked-out tree, not the history behind it, so a
+  # secret added and then removed within a branch passes. See M97.
   push:
   pull_request:
 
