@@ -74,7 +74,16 @@ class Refusal:
     # exception is made of the caller's schema -- it names the relation and the column it
     # refused and can carry a DSN. Splitting it out is what lets the repair loop keep the
     # database's complaint (the cheapest accuracy lever there is) without the wire keeping
-    # it too. The model already holds the schema, so the boundary is the wire, not the prompt.
+    # it too.
+    #
+    # This narrows the channel rather than closing it. The prompt is not a safe destination
+    # either: retrieval scoping means the model may never have been shown the object a
+    # rejection names, and a DSN is not schema at all -- and because a model's stated reason
+    # for producing no SQL is forwarded to the caller verbatim, a model that quotes its
+    # feedback puts the text back on the wire. Measured, not assumed: a generator that
+    # answers "the database said: <feedback>" returns the DSN through `Deferred.reason`.
+    # Withholding it from the caller's direct path is worth doing on its own; treating the
+    # prompt as private is the part that does not hold.
     source_detail: str | None = None
 
     @property

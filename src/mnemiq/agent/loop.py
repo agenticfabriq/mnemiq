@@ -292,6 +292,10 @@ class Agent:
             except ExecutionError as exc:
                 # The database is the one authority that cannot be wrong about itself: its
                 # complaint is the cheapest accuracy lever we have. Feed it back and retry.
+                # Every attempt, not just the last: `failure` is overwritten each time round,
+                # so an error that a later attempt repaired would otherwise be recorded nowhere.
+                logger.warning("execution attempt %d failed; the source said: %s",
+                               _attempt + 1, exc.repair_text)
                 failure = exc
                 feedback = exc.repair_text
                 continue
@@ -326,8 +330,8 @@ class Agent:
         #
         # Not by dropping the text, though: `message` is the sentence this engine wrote, and
         # it is often the useful one -- a timeout says to ask something cheaper. Only
-        # `source_detail` is withheld, and it goes to the log, where the schema is already
-        # known and the whole retry can be read.
+        # `source_detail` is withheld, and each attempt logs its own as it happens, so the
+        # log holds the whole retry rather than just whichever error came last.
         logger.warning(
             "every execution attempt failed; last source error: %s",
             failure.repair_text if failure is not None else "(no attempt was made)",

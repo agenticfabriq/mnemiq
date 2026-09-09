@@ -174,15 +174,20 @@ def test_the_source_error_is_still_fed_back_to_the_planner():
     corrected *by*. The model already holds the schema this text is made of, so the boundary
     that matters is the wire, not the prompt.
     """
-    adapter = _FakeAdapter(errors=1, message='column "typo" does not exist')
-    agent = _agent(['{"sql": "SELECT typo FROM claim"}', '{"sql": "SELECT n FROM claim"}'],
+    # Both plans are ones the decider ACCEPTS, so the only feedback that can appear is the
+    # source's. A plan the decider rejects would be repaired inside `plan_query` against its
+    # own refusal text, and asserting on that would pass without `run` ever being called.
+    # The message is one no guard could produce, for the same reason.
+    adapter = _FakeAdapter(errors=1, message='relation "claim" is being vacuumed, retry later')
+    agent = _agent(['{"sql": "SELECT n FROM claim"}'] * 2,
                    adapter=adapter, budget=Budget(max_attempts=2))
 
     result = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
 
-    assert result.failed is False
-    assert any("typo" in (feedback or "") for feedback in agent.generator.calls[1:]), (
-        "the second attempt was planned without being told what the first one got wrong"
+    assert result.failed is False, result.answer
+    assert any("is being vacuumed" in (feedback or "") for feedback in agent.generator.calls), (
+        "the retry was planned without being told what the source said -- only `repair_text` "
+        "carries those words, so `message` alone would leave the repair loop blind"
     )
 
 

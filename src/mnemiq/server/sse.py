@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 #
 # Note this is the narrower half. A source rejection never arrives here: `ExecutionError`
 # is caught in the agent loop and turned into a failed `AgentAnswer`, so it leaves through
-# the answer path, which `/v1/ask` shares -- see the fall-through in `Agent._answer`.
+# the answer path, which `/v1/ask` shares -- see the fall-through in `_answer_single`.
 #
 # The default is deliberately uninformative TO THE CALLER and fully informative to the
 # operator: the traceback is logged against the run id, which the client already has

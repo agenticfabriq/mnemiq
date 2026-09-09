@@ -246,7 +246,13 @@ class Runtime:
         except Exception as exc:  # the read-only attach backstop rejects the write here
             # The decision was evaluated even though the source refused the statement, so the
             # narrowing is a fact about this attempt and travels with it.
-            return WriteResult(approved=False, refusal=f"the source rejected the write: {exc}",
+            #
+            # `refusal` is returned to the MCP caller by `db_write`, so the source's own words
+            # cannot ride in it -- the backstop this fires on is a permission or connection
+            # error, which is precisely the kind that names what it refused. Same split the
+            # read path makes: our sentence to the caller, the source's to the log.
+            logger.warning("the source refused a write; it said: %s", exc)
+            return WriteResult(approved=False, refusal="the source rejected the write",
                                target=verdict.target, plan_sql=verdict.plan_sql,
                                target_sql=verdict.target_sql,
                                narrowed=getattr(verdict, "narrowed", None))
