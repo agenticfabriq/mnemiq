@@ -1,3 +1,42 @@
 #!/usr/bin/env bash
 # Enable with: git config core.hooksPath .githooks
-exec "$(git rev-parse --show-toplevel)/scripts/repo-guard.sh" --staged
+#
+# Two gates, cheapest first. Both must pass; neither is allowed to be the only one.
+#
+# Lint is here because it was NOT, and five ruff errors reached `main` and kept CI red for two
+# days (PR #7). The hook ran repo-guard and stopped, so a commit could be blessed locally and
+# fail the very first thing CI does. A gate that checks less than CI teaches people its green
+# means something it does not.
+set -uo pipefail
+cd "$(git rev-parse --show-toplevel)" || exit 1
+
+"./scripts/repo-guard.sh" --staged || exit $?
+
+# `uv run` and not the ambient `ruff`: CI runs `uv run ruff check .`, and a hook that resolves a
+# DIFFERENT ruff than CI recreates the disagreement it exists to prevent -- passing locally and
+# failing on the same commit, which is the shape that is hardest to debug because both sides look
+# right. `--frozen` reads the lockfile without re-resolving, so this cannot drift from what
+# CI installs either. It RECONCILES the venv to the lock as a side effect -- measured: one
+# package version swapped, every extra left in place. That is the point rather than a cost.
+# A venv drifted from the lock is exactly how a local gate comes to disagree with CI on the
+# same commit and the same tool version, which is the hardest shape to debug because both
+# sides look right.
+#
+# The whole tree, not the staged files, for the same reason: CI checks `.`, so anything narrower
+# can be green here and red there.
+if ! command -v uv >/dev/null 2>&1; then
+  echo "pre-commit: BLOCKED [config]: uv is not on PATH, so lint could not run."
+  echo "Install uv (https://docs.astral.sh/uv/), or commit with --no-verify if you accept CI"
+  echo "finding what this would have. Failing closed, the same way repo-guard does: a gate that"
+  echo "waves a commit through when it could not check it is worse than no gate."
+  exit 1
+fi
+
+if ! uv run --frozen ruff check . ; then
+  echo
+  echo "pre-commit: BLOCKED [lint]: this is the first thing CI runs, and it would fail."
+  echo "Fix, or 'uv run ruff check --fix .' for the mechanical ones."
+  exit 1
+fi
+
+echo "pre-commit: clean (repo-guard, ruff)."
