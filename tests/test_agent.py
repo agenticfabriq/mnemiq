@@ -1,3 +1,5 @@
+import logging
+
 import pyarrow as pa
 
 from mnemiq.agent.budget import Budget
@@ -239,6 +241,38 @@ def test_plurality_result_wins_and_agreement_is_reported():
     assert ans.agreement == 0.6  # 3 of 5
     assert "3/5" in ans.answer
     assert "There are 7." in ans.answer
+
+
+def test_a_candidate_the_source_refuses_is_dropped_loudly_not_silently(caplog):
+    """`_execute` drops a rejected candidate with `return None`, and the vote just gets smaller.
+
+    With 3 of 5 refused and 2 surviving, the answer reports `candidates_executed=2` and reads
+    exactly like a narrower vote the engine chose. Self-consistency then decides on a sample
+    the SOURCE truncated. The log is the only thing that tells those apart, so it is the log
+    this pins -- and it must carry the source's words, since our half is the same sentence for
+    every refusal (M95).
+    """
+    leaky = 'permission denied for table hr_prod.payroll_salary'
+
+    class _RefusesSum(_VotingAdapter):
+        def execute_arrow(self, sql, timeout_s=None):
+            if "SUM" in sql.upper():
+                raise ExecutionError("The source rejected this query.", source_detail=leaky)
+            return super().execute_arrow(sql, timeout_s=timeout_s)
+
+    agent = Agent(
+        generator=FakeGenerator([_sql("count(*)"), _sql("count(*)"), _sql("sum(n)")]),
+        synthesizer=FakeSynthesizer("There are 7."),
+        adapter=_RefusesSum(), cache=TwoTierCache(L1Cache()), candidates=3,
+    )
+    with caplog.at_level(logging.WARNING, logger="mnemiq.agent.loop"):
+        ans = _answer(agent)
+
+    assert not ans.deferred
+    dropped = [r.getMessage() for r in caplog.records
+               if r.getMessage().startswith("a candidate's execution failed")]
+    assert len(dropped) == 1, dropped
+    assert leaky in dropped[0], "our sentence alone cannot tell one refusal from another"
 
 
 def test_a_tie_breaks_to_the_earliest_cluster():

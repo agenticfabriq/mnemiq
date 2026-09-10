@@ -20,9 +20,13 @@ offers one; the rest keep the behaviour they already had, unchanged.
 
 from __future__ import annotations
 
+import logging
+
 from typing import Any
 
 from mnemiq.sql.verdict import Refusal, RefusalCode
+
+logger = logging.getLogger(__name__)
 
 
 def prove(adapter: Any, target_sql: str) -> Refusal | None:
@@ -40,8 +44,14 @@ def prove(adapter: Any, target_sql: str) -> Refusal | None:
             # `EXPLAIN` plans without executing on Postgres, DuckDB and SQLite.
             adapter.execute(f"EXPLAIN {target_sql}")
     except Exception as exc:
+        # Logged here rather than where the loop gives up, because a refusal on an attempt that
+        # a later one repairs is exactly the one an operator wants to read, and by then it has
+        # been overwritten. This is the only record of it: `source_detail` is withheld from the
+        # caller, so without this line an EXPLAIN failure would be visible nowhere at all.
+        logger.warning("EXPLAIN refused a plan; the source said: %s", exc)
         return Refusal(
             code=RefusalCode.EXPLAIN_FAILED,
-            message=f"The source rejected this query: {exc}",
+            message="The source rejected this query.",
+            source_detail=str(exc),
         )
     return None

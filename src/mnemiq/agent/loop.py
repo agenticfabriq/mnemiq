@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from mnemiq.agent.budget import Budget
@@ -24,9 +25,11 @@ from mnemiq.execute.select import (
     trust,
 )
 from mnemiq.generate.generator import Generator, StrategyGenerator
-from mnemiq.generate.plan_query import Deferred, plan_query
+from mnemiq.generate.plan_query import Deferred, Feedback, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
+
+logger = logging.getLogger(__name__)
 
 # Cycled across candidates in multi-candidate mode: engineered disagreement, so the
 # selector has something real to select over (uniform resampling measured 56% unanimous).
@@ -242,8 +245,11 @@ class Agent:
         deadline,
         emit: Emit | None = None,
     ) -> AgentAnswer:
-        feedback: str | None = None
-        failure: str | None = None
+        # `Feedback` carries its own provenance: whether the SOURCE wrote any of it. `plan_query`
+        # needs that because the model is shown the feedback and its own words reach the caller,
+        # so the two together form a path back out for whatever the source said.
+        feedback: Feedback | None = None
+        failure: ExecutionError | None = None
 
         for _attempt in range(self.budget.max_attempts):
             # Two nested repair loops, answering two different judges. plan_query repairs what the
@@ -289,8 +295,12 @@ class Agent:
             except ExecutionError as exc:
                 # The database is the one authority that cannot be wrong about itself: its
                 # complaint is the cheapest accuracy lever we have. Feed it back and retry.
-                failure = str(exc)
-                feedback = failure
+                # Every attempt, not just the last: `failure` is overwritten each time round,
+                # so an error that a later attempt repaired would otherwise be recorded nowhere.
+                logger.warning("execution attempt %d failed; the source said: %s",
+                               _attempt + 1, exc.repair_text)
+                failure = exc
+                feedback = Feedback(exc.repair_text, from_source=exc.source_detail is not None)
                 continue
 
             self.cache.put(key, to_ipc(result.table))
@@ -313,10 +323,26 @@ class Agent:
 
         # NOT a deferral. We did not decline to answer -- the source refused to serve us, and
         # counting that as abstention is what let an outage look like the engine working (M6).
+        #
+        # Our half of the failure goes to the caller; the source's half does not. A rejection
+        # in the database's own words is made of the caller's schema -- it names the table and
+        # the column and often quotes the statement -- so an identity denied a table would
+        # learn the table exists by being told why it could not read it -- the side-channel
+        # disclosure SECURITY.md names, and it arrives through the ANSWER, which means
+        # `/v1/ask` carried it as readily as the stream's error frame.
+        #
+        # Not by dropping the text, though: `message` is the sentence this engine wrote, and
+        # it is often the useful one -- a timeout says to ask something cheaper. Only
+        # `source_detail` is withheld, and each attempt logs its own as it happens, so the
+        # log holds the whole retry rather than just whichever error came last.
+        logger.warning(
+            "every execution attempt failed; last source error: %s",
+            failure.repair_text if failure is not None else "(no attempt was made)",
+        )
         return AgentAnswer(
             answer=(
                 "Could not answer this question: the database rejected every attempt. "
-                f"Last error: {failure}"
+                + (failure.message if failure is not None else "No attempt was made.")
             ),
             failed=True,
             reason_code=DeferralReason.EXECUTION_FAILED,
@@ -330,7 +356,12 @@ class Agent:
             return from_ipc(hit)
         try:
             result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
-        except ExecutionError:
+        except ExecutionError as exc:
+            # This candidate drops out of the vote. Logged for the same reason the single-answer
+            # path logs: when three of five candidates are rejected by the source and two
+            # succeed, the answer reports `candidates_executed=2` and the three rejections are
+            # otherwise recorded nowhere -- a source half-refusing looks like a narrower vote.
+            logger.warning("a candidate's execution failed; the source said: %s", exc.repair_text)
             return None
         self.cache.put(key, to_ipc(result.table))
         return result.table

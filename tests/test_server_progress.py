@@ -77,9 +77,15 @@ def test_a_step_that_raised_says_so():
     rt = _RT(raises=RuntimeError("boom"), stages=[Stage.RETRIEVE])
     events = _events(_post(rt).text)
 
-    # The stage itself succeeded; the run failed after it.
+    # The stage itself succeeded; the run failed after it. Both halves are the point,
+    # so the completed step must still be reported rather than swallowed by the error.
     assert [e["type"] for e in events][-1] == "RUN_ERROR"
-    assert "boom" in events[-1]["message"]
+    assert [e for e in events if e["type"] == "STEP_FINISHED"][-1]["ok"] is True
+    # The failure is signalled by the frame, not by its prose: the exception's text is
+    # kept off the wire (see tests/test_server_chat.py), so asserting on it here would
+    # pin the disclosure rather than the behaviour.
+    assert events[-1]["runId"]
+    assert "boom" not in _post(rt).text
 
 
 def test_extra_step_fields_survive_to_the_client():

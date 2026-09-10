@@ -1,3 +1,5 @@
+import logging
+
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.generate.generator import FakeGenerator
@@ -237,3 +239,126 @@ def test_decide_never_sets_corrected_because_the_decider_does_not_repair():
     verdict = decide("SELECT claim_identifier FROM claim", {"claim": {"claim_identifier"}},
                      dialect="duckdb", target="duckdb")
     assert isinstance(verdict, Approved) and verdict.corrected is False
+
+
+def test_an_explain_refusal_also_marks_the_feedback_as_the_sources(caplog):
+    """The other way source words enter a prompt: `prove` refuses, and its detail is fed back.
+
+    `plan_query`'s own repair loop is the shorter path -- no execution needed, so an EXPLAIN
+    refusal reaches the model on attempt two of a single ask. The suppression has to key off
+    the refusal that carried the words, not only off the agent's outer loop (M94).
+    """
+    leaky = 'permission denied for table hr_prod.payroll_salary; postgresql://svc:pw@10.2.0.7/x'
+
+    class _RefusingExplain:
+        dialect = "duckdb"
+
+        def execute(self, sql):
+            raise RuntimeError(leaky)
+
+    class _Quoting:
+        def __init__(self):
+            self.calls = []
+
+        def propose(self, packet, feedback=None, strategy=None):
+            from mnemiq.generate.generator import SqlProposal
+            self.calls.append(feedback)
+            if feedback is None:
+                return SqlProposal(sql="SELECT claim_identifier FROM claim")
+            return SqlProposal(sql=None, reason=f"the database said: {feedback}")
+
+    generator = _Quoting()
+    with caplog.at_level(logging.WARNING, logger="mnemiq.sql.prove"):
+        outcome = plan_query(_packet(), _snapshot(), _GRANTS, generator,
+                             adapter=_RefusingExplain(), target="duckdb", max_attempts=2)
+
+    assert isinstance(outcome, Deferred)
+    for secret in ("payroll_salary", "hr_prod", "10.2.0.7", "postgresql://"):
+        assert secret not in outcome.reason, f"the model carried {secret!r} out through prove"
+    # Still fed to the model, and still recorded for the operator.
+    assert any(leaky in (c or "") for c in generator.calls)
+    assert leaky in caplog.text
+
+
+def test_the_undefined_term_exit_does_not_carry_the_source_out_either():
+    """`assumed_terms` is model-authored, and its exit runs BEFORE the stated-reason one.
+
+    A model that echoes its feedback into the term list rather than into `reason` leaves
+    through here, twelve lines earlier. Same rule, same provenance check (M94).
+    """
+    from mnemiq.generate.generator import SqlProposal
+    from mnemiq.generate.plan_query import Feedback
+
+    leaky = 'permission denied for table hr_prod.payroll_salary; postgresql://svc:pw@10.2.0.7/x'
+
+    class _EchoesIntoTerms:
+        def propose(self, packet, feedback=None, strategy=None):
+            return SqlProposal(sql=None, reason="n/a", assumed_terms=[feedback or "x"])
+
+    outcome = plan_query(_packet(), _snapshot(), _GRANTS, _EchoesIntoTerms(), target="duckdb",
+                         feedback=Feedback(leaky, from_source=True), max_attempts=1,
+                         guard_undefined_terms=True)
+
+    assert isinstance(outcome, Deferred)
+    for secret in ("payroll_salary", "hr_prod", "10.2.0.7", "postgresql://"):
+        assert secret not in outcome.reason, f"the term list carried {secret!r} out"
+
+
+def test_a_term_the_source_never_spoke_into_is_still_named():
+    """The narrowing stays as narrow as the risk: naming the term is the point of this deferral."""
+    from mnemiq.generate.generator import SqlProposal
+    from mnemiq.generate.plan_query import Feedback
+
+    class _Declares:
+        def propose(self, packet, feedback=None, strategy=None):
+            return SqlProposal(sql=None, reason="n/a", assumed_terms=["lifetime value"])
+
+    outcome = plan_query(_packet(), _snapshot(), _GRANTS, _Declares(), target="duckdb",
+                         feedback=Feedback("SELECT * is not allowed.", from_source=False),
+                         max_attempts=1, guard_undefined_terms=True)
+
+    assert isinstance(outcome, Deferred)
+    assert "lifetime value" in outcome.reason
+
+
+def test_the_unauthorized_table_exit_does_not_carry_the_source_out_either(caplog):
+    """`subject` is read off the model's own SQL, so it is model-authored like the rest.
+
+    Third exit of the same kind. The caller normally SHOULD be told which table it lacks --
+    that is what makes the refusal actionable -- so this is suppressed only on a turn fed the
+    source's words, and the name still reaches the operator (M94).
+    """
+    from mnemiq.generate.generator import SqlProposal
+    from mnemiq.generate.plan_query import Feedback
+
+    leaky = 'permission denied for table hr_prod.payroll_salary; postgresql://svc:pw@10.2.0.7/x'
+
+    class _NamesItAsATable:
+        def propose(self, packet, feedback=None, strategy=None):
+            return SqlProposal(sql=f'SELECT claim_identifier FROM "{feedback}"')
+
+    with caplog.at_level(logging.WARNING, logger="mnemiq.generate.plan_query"):
+        outcome = plan_query(_packet(), _snapshot(), _GRANTS, _NamesItAsATable(), target="duckdb",
+                             feedback=Feedback(leaky, from_source=True), max_attempts=1)
+
+    assert isinstance(outcome, Deferred)
+    for secret in ("payroll_salary", "hr_prod", "10.2.0.7", "postgresql://"):
+        assert secret not in outcome.reason, f"the refused subject carried {secret!r} out"
+    assert leaky in caplog.text, "the operator still has to be able to see what was refused"
+
+
+def test_a_table_the_source_never_named_is_still_named_to_the_caller():
+    """A caller told which table it lacks can ask for it; one told nothing cannot."""
+    from mnemiq.generate.generator import SqlProposal
+    from mnemiq.generate.plan_query import Feedback
+
+    class _AsksForPerson:
+        def propose(self, packet, feedback=None, strategy=None):
+            return SqlProposal(sql="SELECT last_name FROM person")
+
+    outcome = plan_query(_packet(), _snapshot(), _GRANTS, _AsksForPerson(), target="duckdb",
+                         feedback=Feedback("SELECT * is not allowed.", from_source=False),
+                         max_attempts=1)
+
+    assert isinstance(outcome, Deferred)
+    assert "person" in outcome.reason

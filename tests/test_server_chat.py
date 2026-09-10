@@ -46,7 +46,48 @@ def test_chat_engine_failure_ends_in_run_error():
     r = TestClient(build_app(rt, _identity())).post("/v1/chat", json={"question": "q"})
     types = [e["type"] for e in _events(r.text)]
     assert types == ["RUN_STARTED", "RUN_ERROR"]
-    assert "boom" in _events(r.text)[-1]["message"]
+    err = _events(r.text)[-1]
+    # The frame carries the run id, which is the handle a caller quotes and an operator
+    # greps for. It does NOT carry the exception -- see the test below.
+    assert err["runId"]
+    assert err["message"] == "The engine could not complete this request."
+
+
+def test_chat_failure_does_not_put_the_sources_error_on_the_wire():
+    """An engine failure used to yield `str(exc)`, and on a governed deployment that is
+    a description of the schema the caller was refused.
+
+    The exception here is shaped like what actually reaches this handler: the source's
+    own message, naming a table this identity was never shown, quoting the statement,
+    and carrying a DSN. Retrieval scoping and `check_access` keep all three out of the
+    ANSWER path; the error path must not be the way around them."""
+    leaky = RuntimeError(
+        'relation "payroll_salary" does not exist\n'
+        'LINE 1: SELECT employee_id, base_salary FROM payroll_salary\n'
+        "connection: postgresql://svc_mnemiq@10.2.0.7:5432/hr_prod"
+    )
+    r = TestClient(build_app(_RT(raises=leaky), _identity())).post(
+        "/v1/chat", json={"question": "q"}
+    )
+    err = _events(r.text)[-1]
+    assert err["type"] == "RUN_ERROR"
+    for secret in ("payroll_salary", "base_salary", "SELECT", "postgresql://",
+                   "10.2.0.7", "hr_prod", "svc_mnemiq"):
+        assert secret not in r.text, f"{secret!r} reached the client"
+
+
+def test_a_mode_the_deployment_does_not_offer_is_still_told_to_the_caller():
+    """Opaque by default, not opaque always. `UnknownMode` is a message the PRODUCT
+    wrote about the caller's own input, so withholding it would turn a fixable request
+    into a mystery -- and it is a constant here, not the exception's text."""
+    from mnemiq.agent.route import UnknownMode
+
+    r = TestClient(build_app(_RT(raises=UnknownMode("nope")), _identity())).post(
+        "/v1/chat", json={"question": "q"}
+    )
+    err = _events(r.text)[-1]
+    assert err["message"] == "That mode is not one this deployment offers."
+    assert "nope" not in r.text
 
 
 def test_chat_emits_keepalive_comments_while_the_engine_works():

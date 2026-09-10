@@ -8,6 +8,7 @@ request deferred, and `aggregate` hardcoded `errors=0` -- a total authorization 
 """
 
 import json
+import logging
 
 import pyarrow as pa
 
@@ -17,7 +18,7 @@ from mnemiq.agent.synthesize import FakeSynthesizer
 from mnemiq.authz.grants import EMPTY, FileAuthzProvider, GrantSet
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.contract import Column, IdentityContext, Snapshot
-from mnemiq.generate.generator import FakeGenerator
+from mnemiq.generate.generator import FakeGenerator, SqlProposal
 from mnemiq.observability.metrics import AnswerRecord, aggregate
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
 
@@ -27,15 +28,16 @@ _RESULT = pa.table({"n": [7]})
 
 
 class _FakeAdapter:
-    def __init__(self, errors: int = 0):
+    def __init__(self, errors: int = 0, message: str = 'column "typo" does not exist'):
         self.errors = errors
+        self.message = message
         self.queries: list[str] = []
 
     def execute_arrow(self, sql, timeout_s=None):
         self.queries.append(sql)
         if self.errors > 0:
             self.errors -= 1
-            raise Exception('column "typo" does not exist')
+            raise Exception(self.message)
         return _RESULT
 
     def execute(self, sql):
@@ -139,6 +141,76 @@ def test_a_database_that_rejects_every_attempt_is_a_failure_not_a_deferral():
     assert result.reason_code == DeferralReason.EXECUTION_FAILED
 
 
+def test_the_sources_own_error_text_does_not_reach_the_caller(caplog):
+    """The answer used to carry `Last error: {failure}` -- the database's verbatim complaint.
+
+    A source rejection is made of the caller's schema. Postgres names the relation and the
+    column it refused, and a connection failure names the host and the user. An identity
+    denied a table would therefore learn the table exists by being told why it could not
+    read it, which is the first disclosure class SECURITY.md claims is in scope. It reaches
+    `AgentAnswer.answer`, so `/v1/ask` carried it too, not only the stream's error frame.
+    """
+    leaky = (
+        'permission denied for table hr_prod.payroll_salary; '
+        'connection postgresql://svc_mnemiq@10.2.0.7:5432/hr_prod'
+    )
+    adapter = _FakeAdapter(errors=99, message=leaky)
+    agent = _agent(['{"sql": "SELECT n FROM claim"}'] * 9, adapter=adapter,
+                   budget=Budget(max_attempts=2))
+
+    with caplog.at_level(logging.WARNING, logger="mnemiq.agent.loop"):
+        result = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+
+    for secret in ("payroll_salary", "hr_prod", "svc_mnemiq", "10.2.0.7", "postgresql://",
+                   "permission denied"):
+        assert secret not in result.answer, f"the answer disclosed {secret!r}"
+    # The state still has to be legible, or hiding the cause would have cost the caller M6.
+    assert result.failed is True
+    assert result.reason_code == DeferralReason.EXECUTION_FAILED
+    # The other half of the trade. Withheld from the caller is defensible only because the
+    # operator has it; withheld from both is the outage-looks-like-working shape M6 is about.
+    #
+    # Per ATTEMPT, not just the closing summary: `failure` is overwritten each time round, so
+    # asserting on `caplog.text` alone would stay green with the per-attempt line gutted.
+    per_attempt = [r.getMessage() for r in caplog.records
+                   if r.getMessage().startswith("execution attempt")]
+    assert len(per_attempt) == 2, per_attempt  # the closing summary opens with "every"
+    assert all(leaky in m for m in per_attempt)
+    # And the summary itself, which the filter above excludes by construction. It is a separate
+    # line carrying the same words, so it needs its own assertion or it is pinned by nothing.
+    summary = [r.getMessage() for r in caplog.records if r.getMessage().startswith("every")]
+    assert len(summary) == 1, summary
+    assert leaky in summary[0]
+
+
+def test_the_source_error_is_still_fed_back_to_the_planner():
+    """Withholding it from the caller must not withhold it from the repair loop.
+
+    The database's complaint is the retry's whole input -- it is what a second attempt is
+    corrected *by*, so withholding it from the caller must not withhold it from the planner.
+
+    That is the whole claim here. The prompt is NOT a safe destination -- the model may never
+    have been shown the object a rejection names, and it can quote its feedback back into an
+    answer -- which is why this asserts the repair loop still works rather than that feeding
+    the model is harmless. See the residual recorded at `Refusal.source_detail`.
+    """
+    # Both plans are ones the decider ACCEPTS, so the only feedback that can appear is the
+    # source's. A plan the decider rejects would be repaired inside `plan_query` against its
+    # own refusal text, and asserting on that would pass without `run` ever being called.
+    # The message is one no guard could produce, for the same reason.
+    adapter = _FakeAdapter(errors=1, message='relation "claim" is being vacuumed, retry later')
+    agent = _agent(['{"sql": "SELECT n FROM claim"}'] * 2,
+                   adapter=adapter, budget=Budget(max_attempts=2))
+
+    result = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+
+    assert result.failed is False, result.answer
+    assert any("is being vacuumed" in (feedback or "") for feedback in agent.generator.calls), (
+        "the retry was planned without being told what the source said -- only `repair_text` "
+        "carries those words, so `message` alone would leave the repair loop blind"
+    )
+
+
 def test_an_outage_cannot_raise_the_deferral_rate():
     outage = [
         AnswerRecord(deferred=False, failed=True, cached=False, total_ms=1.0, mode="fast",
@@ -171,3 +243,69 @@ def test_deferral_rate_is_computed_over_answers_that_were_actually_decided():
     assert metrics.errors == 1
     assert metrics.deferrals == 1
     assert metrics.deferral_rate == 0.5, "1 deferral out of the 2 requests we actually decided"
+
+
+# --------------------------------------------------------------------------------------------
+# M94 -- the model is shown the source's words, and its own words reach the caller
+# --------------------------------------------------------------------------------------------
+
+
+class _QuotesItsFeedback:
+    """A model that explains itself by repeating what it was told. Not a strawman: 'say why you
+    could not' is ordinary prompting, and the feedback is the most relevant thing in context."""
+
+    def __init__(self):
+        self.calls: list[str | None] = []
+
+    def propose(self, packet, feedback=None, strategy=None):
+        self.calls.append(feedback)
+        if feedback is None:
+            return SqlProposal(sql="SELECT n FROM claim")
+        return SqlProposal(sql=None, reason=f"I could not: the database said: {feedback}")
+
+
+def _quoting_agent(adapter, budget=None):
+    return Agent(generator=_QuotesItsFeedback(), synthesizer=FakeSynthesizer("There are 7."),
+                 adapter=adapter, cache=TwoTierCache(L1Cache()), budget=budget or Budget())
+
+
+def test_a_model_that_quotes_its_feedback_cannot_carry_the_source_out():
+    """The withheld half reaches the model on purpose; the model's own words reach the caller.
+
+    Those two facts compose into a path back out, and no amount of care at the direct sites
+    closes it. Withholding from the prompt is not the answer either -- a rejection is the whole
+    input a retry is corrected by. What breaks the chain is knowing we put source words in this
+    prompt, which is a fact about provenance and not a guess about the text.
+    """
+    leaky = ('permission denied for table hr_prod.payroll_salary; '
+             'connection postgresql://svc_mnemiq@10.2.0.7:5432/hr_prod')
+    agent = _quoting_agent(_FakeAdapter(errors=99, message=leaky), Budget(max_attempts=2))
+
+    result = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+
+    for secret in ("payroll_salary", "hr_prod", "svc_mnemiq", "10.2.0.7", "postgresql://"):
+        assert secret not in result.answer, f"the model carried {secret!r} back to the caller"
+    # The repair loop must not have been paid for with the fix.
+    assert any(leaky in (c or "") for c in agent.generator.calls), (
+        "closing the exit by starving the model is the wrong fix -- the words are the repair's input"
+    )
+
+
+def test_a_model_that_was_told_nothing_by_the_source_still_speaks_for_itself():
+    """The narrowing must be exactly as wide as the risk.
+
+    A model's stated reason is genuinely useful -- "there is no date column on these tables" is
+    the difference between a caller rephrasing and a caller giving up. It is suppressed only on
+    the turn where the source's words were in the prompt, so a first-attempt refusal, which no
+    source has spoken into, still reaches the caller whole.
+    """
+    generator = FakeGenerator(['{"reason": "no date column on these tables"}'])
+    agent = Agent(generator=generator, synthesizer=FakeSynthesizer("x"),
+                  adapter=_FakeAdapter(), cache=TwoTierCache(L1Cache()), budget=Budget())
+
+    result = agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY)
+
+    assert result.deferred is True
+    assert "no date column" in result.answer, (
+        "suppressing every model reason would cost the caller the one thing it can act on"
+    )
