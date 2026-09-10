@@ -88,7 +88,8 @@ fi
 #    so it re-resolves a stale lock and lints with whatever it gets. Asking uv is exact and
 #    costs ~70ms; comparing a version range by hand would not be.
 lockcheck="$(uv lock --check --project "$staged" 2>&1)"
-if [ $? -ne 0 ]; then
+lock_rc=$?   # named, like every other exit capture here: a line inserted above a bare `$?`
+if [ "$lock_rc" -ne 0 ]; then
   printf '%s\n' "${lockcheck//$staged\//}"
   echo
   # uv's own message is printed above and is left to speak for itself. Two attempts at
