@@ -119,6 +119,30 @@ class DuckDBAdapter:
             return []
         return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
+    def user_functions(self) -> list[str]:
+        """Function names this database defines itself, from `duckdb_functions()`.
+
+        `internal` is the discriminator, and it is the whole reason this is answerable here:
+        DuckDB marks its own 945 builtins `internal = true`, and anything a deployment adds --
+        a macro, a table macro -- comes back false. Measured on a fresh connection: `count` and
+        `median` are internal, a `CREATE MACRO` is not.
+
+        That settles the question parsing cannot. sqlglot types `median` as a builtin before the
+        source binds it, so a UDF wearing that name is invisible to the decider (M43's residual)
+        and forces lineage to decline certification on every call (issue #5).
+
+        Names only, unqualified, because both callers ask "is this name bound to something this
+        source defines" and a schema-qualified call resolves through the search path anyway.
+        Duplicates collapse: DuckDB lists one row per overload.
+
+        A failure RAISES, like `view_definitions`. Returning `[]` would tell the caller this
+        source defines nothing, which is a different claim from being unable to look.
+        """
+        rows = self._con.execute(
+            "SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE NOT internal"
+        ).fetchall()
+        return [r[0] for r in rows]
+
     def view_definitions(self) -> list[tuple[str, str, str]]:
         """(view, body, dialect) for every view in the source. A failure RAISES.
 
