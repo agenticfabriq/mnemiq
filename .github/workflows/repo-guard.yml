@@ -7,9 +7,11 @@ on:
   # scanned by nothing: the local hook is opt-in per clone and `--no-verify` skips it.
   #
   # For a maintainer's branch the extra run is close to free, and that is the case defended
-  # here. An outside contributor gets no extra run at all -- the PR run is their only one, and
-  # it currently fails closed, because secrets are withheld from fork PRs. That is PR #6's
-  # subject, not this trigger's -- noting it so the two are not confused.
+  # here. An outside contributor gets no extra run at all -- a fork's own branch pushes fire
+  # nothing here, so the PR run is their only one. It used to fail closed for them, because
+  # repository secrets are withheld from fork PRs and the name check needed one; #6 moved that
+  # check to local-only, so the PR run now works for a fork. Recorded because this trigger and
+  # that fix look like the same subject and are not.
   #
   # Scope worth knowing: `--all` scans the checked-out tree, not the history behind it, so a
   # secret added and then removed within a branch passes. See M97.
