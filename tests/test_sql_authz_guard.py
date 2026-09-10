@@ -167,7 +167,7 @@ def test_a_stale_snapshot_is_refused_before_execution_not_leaked():
     assert isinstance(verdict, Refusal)
     assert verdict.code == RefusalCode.EXPLAIN_FAILED, verdict.code
     # The refusal must be the BINDER refusing the qualified name, not the double falling over.
-    assert "does not have a column named" in verdict.message, verdict.message
+    assert "does not have a column named" in verdict.repair_text, verdict.repair_text
 
     # And a plainly valid query through the same adapter is approved, so the double is not simply
     # refusing everything -- which is exactly what the broken one did.

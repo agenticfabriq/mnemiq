@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass, replace
 
 from mnemiq.authz.grants import GrantSet
@@ -12,6 +14,8 @@ from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -29,6 +33,20 @@ Outcome = Approved | Deferred
 CORRECTABLE = frozenset({RefusalCode.LOGIC_LINT, RefusalCode.VALUE_GROUNDING})
 
 
+@dataclass(frozen=True)
+class Feedback:
+    """Text fed back to the model, and whether the SOURCE wrote any of it.
+
+    One value rather than two parameters, and `from_source` has no default, because the unsafe
+    setting is the one a caller reaches by forgetting. A bare string plus an optional bool lets
+    a future caller seed the feedback, omit the flag, and silently reopen the exit this closes --
+    with every existing test still green, because they pin the caller that remembers.
+    """
+
+    text: str
+    from_source: bool
+
+
 def plan_query(
     packet: ContextPacket,
     snapshot: Snapshot,
@@ -38,7 +56,7 @@ def plan_query(
     max_attempts: int = 3,
     dialect: str = "duckdb",
     target: str = "postgres",
-    feedback: str | None = None,
+    feedback: Feedback | None = None,
     corrector=None,
     values=None,
     guard_undefined_terms: bool = False,
@@ -84,9 +102,20 @@ def plan_query(
                         code=DeferralReason.NO_TABLES)
 
     last: Refusal | None = None
+    # Whether the feedback in hand carries words the SOURCE wrote rather than words this engine
+    # wrote. The model is shown those words on purpose -- a rejection is the repair's whole input
+    # -- but `proposal.reason` is model-authored free text that this function forwards to the
+    # caller verbatim, so a model that quotes its feedback carries the source's words back out.
+    # Measured: a generator answering "the database said: <feedback>" returns a DSN through
+    # `AgentAnswer.answer`.
+    #
+    # This tracks the PROVENANCE of the string, not a guess about its content. There is no
+    # pattern to match and so no false-positive rate to measure, and it stays correct when a
+    # source starts phrasing its errors differently or a DSN turns up in a shape nobody listed.
+    carries_source_words = feedback.from_source if feedback else False
 
     for _attempt in range(max_attempts):
-        proposal = generator.propose(packet, feedback)
+        proposal = generator.propose(packet, feedback.text if feedback else None)
 
         # M35, and OFF BY DEFAULT -- withdrawn on its own pre-registered criterion.
         #
@@ -128,19 +157,33 @@ def plan_query(
             else []
         )
         if missing:
+            # `missing` is model-authored too -- the terms come from `proposal.assumed_terms`,
+            # parsed straight out of the reply -- so this exit needs the same check as the
+            # stated-reason one below, and it runs FIRST. A model that echoes its feedback into
+            # the term list rather than into `reason` leaves through here.
+            named = ", ".join(repr(t) for t in missing)
+            # Which term is the one fact this deferral exists to carry, so when it cannot be
+            # said to the caller it still has to be said somewhere.
+            logger.warning("undefined terms refused: %s", named)
             return Deferred(
                 reason=(
-                    "No certified definition for "
-                    + ", ".join(repr(t) for t in missing)
-                    + ". The data does not say how to compute it, so any answer would be a guess "
+                    (f"No certified definition for {named}. " if not carries_source_words
+                     else "A term in this question has no certified definition. ")
+                    + "The data does not say how to compute it, so any answer would be a guess "
                     "at your business rule rather than a reading of your data."
                 ),
                 code=DeferralReason.UNDEFINED_TERM,
             )
 
         if proposal.sql is None:
+            # The model's own words, EXCEPT when it was shown the source's. Then they are the
+            # one thing it might be repeating, and this is the path they would leave by.
             return Deferred(
-                reason=proposal.reason or "The model could not answer from these tables.",
+                reason=(
+                    "The model could not answer from these tables."
+                    if carries_source_words
+                    else (proposal.reason or "The model could not answer from these tables.")
+                ),
                 code=DeferralReason.UNANSWERABLE,
             )
 
@@ -158,7 +201,7 @@ def plan_query(
             # one surgical pass: fix only the flagged problem, then re-decide (which re-runs
             # shape/access/lint/values/EXPLAIN, so a bad edit cannot slip through)
             verdict = decide(
-                corrector.correct(proposal.sql, verdict.message),
+                corrector.correct(proposal.sql, verdict.repair_text),
                 visible,
                 adapter=adapter,
                 dialect=dialect,
@@ -177,16 +220,25 @@ def plan_query(
 
         if verdict.code == RefusalCode.UNAUTHORIZED_TABLE:
             # Do not retry. A guard that can be retried is a puzzle, not a guard.
+            #
+            # `subject` is model-authored: `authz_guard` reads it off the table name in the
+            # model's own SQL, so a model handed the source's words can name a "table" spelled
+            # out of them. Third exit of the same kind, and the naming is what makes this one
+            # worth keeping when it is safe -- a caller told WHICH table it lacks can ask for it.
+            logger.warning("unauthorized table refused: %r", verdict.subject)
             return Deferred(
                 reason=(
                     f"Answering this would require access to {verdict.subject!r}, "
                     "which you do not have."
+                    if not carries_source_words
+                    else "Answering this would require access you do not have."
                 ),
                 code=DeferralReason.AUTHORIZATION,
             )
 
         last = verdict
-        feedback = verdict.message
+        carries_source_words = verdict.source_detail is not None
+        feedback = Feedback(verdict.repair_text, from_source=carries_source_words)
 
     reason = last.message if last else "The query could not be made valid."
     return Deferred(

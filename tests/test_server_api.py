@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from mnemiq.agent.loop import AgentAnswer
+from mnemiq.agent.modes import MODES
 from mnemiq.agent.route import UnknownMode
 from mnemiq.contract import IdentityContext
 from mnemiq.server.app import build_app
@@ -49,6 +50,25 @@ def test_unknown_mode_is_422():
     rt = _RT(raises=UnknownMode("no such mode"))
     r = _client(rt).post("/v1/ask", json={"question": "q", "mode": "warp"})
     assert r.status_code == 422
+
+
+def test_the_422_is_composed_here_not_taken_from_the_exception():
+    """The `detail` used to be `str(exc)`, which is what CodeQL flagged as reaching a caller.
+
+    `UnknownMode`'s own text is harmless today. The point is that the handler must not depend
+    on that staying true -- an exception gaining a field, or another type reaching this
+    `except`, would put words on the wire that nobody chose to send. So the response is built
+    from the mode registry, and this pins that by raising one whose message must not appear.
+    """
+    rt = _RT(raises=UnknownMode("MNEMIQ_MODE='deep' invalid; store=/srv/mnemiq/acme.duckdb"))
+    r = _client(rt).post("/v1/ask", json={"question": "q", "mode": "warp"})
+
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    for leaked in ("/srv/mnemiq", "acme.duckdb", "MNEMIQ_MODE"):
+        assert leaked not in detail, f"the 422 disclosed {leaked!r}"
+    # From the registry, so this cannot drift from the modes the deployment actually offers.
+    assert all(m in detail for m in MODES), "the caller must still learn what it may ask for"
 
 
 def test_schema_and_healthz():

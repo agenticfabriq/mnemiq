@@ -33,7 +33,11 @@ def test_an_aggregate_comes_back_typed():
 def test_a_bad_query_raises_an_error_the_model_can_repair():
     with pytest.raises(ExecutionError) as excinfo:
         run(_adapter(), "SELECT no_such_column FROM claim")
-    assert "no_such_column" in str(excinfo.value)
+    # `repair_text`, not `str(exc)`: the source's words are the repairable part and they are
+    # deliberately not in the default string, because that is the one a caller-facing message
+    # gets written from by accident.
+    assert "no_such_column" in excinfo.value.repair_text
+    assert "no_such_column" not in str(excinfo.value)
 
 
 def test_a_runaway_query_is_interrupted():

@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from mnemiq.agent.modes import MODES
 from mnemiq.agent.route import UnknownMode
 from mnemiq.contract import HistoryTurn
 from mnemiq.server.serialize import answer_payload
@@ -76,7 +77,16 @@ def build_app(
                 runtime.ask(body.question, identity, mode=body.mode, history=body.history)
             )
         except UnknownMode as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
+            # Built from the mode registry, not from `str(exc)`. The text this particular
+            # exception carries happens to be safe -- the caller's own override and a fixed list
+            # -- but "safe because this exception is safe" is the reasoning that puts an error's
+            # words on the wire, and it stops holding the moment the message gains a field or
+            # another exception reaches this handler. Same rule as the stream's error frame:
+            # what the caller is told is composed here, from what this layer already knows.
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown mode; this deployment offers: {sorted(MODES)}",
+            ) from exc
 
     @app.post("/v1/chat")
     def chat(body: AskBody) -> StreamingResponse:
