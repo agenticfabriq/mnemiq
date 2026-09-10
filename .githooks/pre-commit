@@ -113,46 +113,57 @@ fi
 #    staged lock can keep the version string and point somewhere else entirely. On a public repo
 #    taking outside contributions that is a supply-chain shape, not a nit. The version is still
 #    parsed out afterwards, but only to say WHICH kind of mismatch it is.
-ruff_entry() {  # ruff's IDENTITY from $1: version, registry, artifact urls, sha256 hashes
-  # The identity fields only, not the raw block. Byte-comparing the block flags differences that
-  # are not differences: uv writes `upload-time` and `size` alongside each artifact, and a
-  # contributor on an older uv produces an entry with identical registry and identical sha256s
-  # that still differs textually. Accusing them of swapping a binary because their serializer
-  # is older is the crying-wolf failure this file objects to further down -- and it would land
-  # on outside contributors first, who are exactly the case this guard exists for.
+ruff_identity() {  # prints ruff's identity from $1; non-zero if it cannot be established
+  # Identity is the version, the WHOLE source clause, and every artifact as a url PAIRED with
+  # its hash. The pairing is inside one token because extracting the fields separately and
+  # sorting yields a soup in which two wheels' hashes can be transposed with no change to the
+  # multiset -- measured: that passed.
   #
-  # What "the same ruff" means: the version, the registry, and every artifact as a URL PAIRED
-  # WITH its hash. The pairing is the point -- pulling the fields out separately and sorting
-  # them yields a token soup in which two wheels' hashes can be transposed with no change to
-  # the multiset (measured: that edit passed). So url and hash are extracted as ONE token.
+  # An allowlist, so a field uv adds later is ignored rather than read as tampering. But an
+  # allowlist silently matches NOTHING when the shape it names is absent, which is the failure
+  # mode this whole file is about, so the shape is asserted instead of assumed:
   #
-  # An ALLOWLIST, deliberately. Keeping whole lines and stripping the volatile fields is the
-  # obvious alternative and it is backwards: it tolerates only the fields someone remembered to
-  # name, so the first time uv adds a field, every contributor whose lock has it is told their
-  # binary was swapped. That field set moves -- this repo's first uv.lock had no `upload-time`
-  # at all and today's has one per artifact. Naming what identity IS survives the serializer
-  # changing around it; naming what to ignore does not.
-  awk 'BEGIN{RS="";FS="\n"} /(^|\n)name = "ruff"($|\n)/{print; exit}' "$1" 2>/dev/null \
-    | grep -oE 'version = "[^"]+"|registry = "[^"]+"|url = "[^"]+", hash = "sha256:[0-9a-f]{64}"' \
-    | sort
+  #   * `source = {...}` whole, not `registry = "..."`. A git- or path-pinned ruff has no
+  #     registry, so a registry-only pattern reduced the identity to the version alone -- two
+  #     different git refs at 0.15.21 compared EQUAL and passed.
+  #   * the number of url+hash tokens must equal the number of artifact lines. The pair pattern
+  #     hardcodes `", hash = "`, so if uv ever writes the fields in another order every pair
+  #     drops out and what is left compares equal even with every hash rewritten.
+  #
+  # Either way this refuses to answer rather than answering "identical".
+  local block tokens want_arts got_arts
+  block="$(awk 'BEGIN{RS="";FS="\n"} /(^|\n)name = "ruff"($|\n)/{print; exit}' "$1" 2>/dev/null)"
+  [ -n "$block" ] || return 1
+  want_arts="$(printf '%s\n' "$block" | grep -c 'url = ')"
+  tokens="$(printf '%s\n' "$block" \
+    | grep -oE 'version = "[^"]+"|source = \{[^}]*\}|url = "[^"]+", hash = "sha256:[0-9a-f]{64}"' \
+    | sort)"
+  got_arts="$(printf '%s\n' "$tokens" | grep -c '^url = ')"
+  [ "$want_arts" -eq "$got_arts" ] || return 2
+  printf '%s\n' "$tokens" | grep -q '^version = ' || return 3
+  printf '%s\n' "$tokens" | grep -q '^source = ' || return 4
+  printf '%s\n' "$tokens"
 }
-want_entry="$(ruff_entry "$staged/uv.lock")"
-have_entry="$(ruff_entry uv.lock)"
+want_entry="$(ruff_identity "$staged/uv.lock")"; want_rc=$?
+have_entry="$(ruff_identity uv.lock)"; have_rc=$?
 
 # Fails CLOSED when either side cannot be read, because a guard that could not run must not read
 # as a guard that passed -- the collapse this file exists to refuse. Note this does not make the
 # extraction itself safe: a lockfile format change could return the wrong block rather than
 # nothing, and that would block loudly on a bogus mismatch. Loud and wrong beats silent and
 # wrong, and is not the same as correct.
-if [ -z "$want_entry" ] || [ -z "$have_entry" ]; then
-  # `${v:+ok}${v:-unreadable}` looked like a status but is not one: `:-` substitutes the VALUE
-  # when the variable is non-empty, so the readable side printed "ok" followed by the whole
-  # 24-line entry.
-  [ -n "$want_entry" ] && ws="ok" || ws="unreadable"
-  [ -n "$have_entry" ] && hs="ok" || hs="unreadable"
-  echo "pre-commit: BLOCKED [config]: could not read ruff's identity from both lockfiles"
-  echo "(staged: $ws, working tree: $hs), so the check that this commit's tool is the tool CI"
-  echo "installs could not be made. Not a lint failure."
+if [ "$want_rc" -ne 0 ] || [ "$have_rc" -ne 0 ]; then
+  case "$((want_rc > have_rc ? want_rc : have_rc))" in
+    1) why="ruff has no entry in one of the lockfiles" ;;
+    2) why="an artifact's url and hash are not in the shape this check knows how to read" ;;
+    3) why="an entry carries no version" ;;
+    4) why="an entry carries no source clause" ;;
+    *) why="unknown" ;;
+  esac
+  echo "pre-commit: BLOCKED [config]: could not establish ruff's identity from both lockfiles"
+  echo "(staged rc=$want_rc, working tree rc=$have_rc): $why. The check that this commit's tool"
+  echo "is the tool CI installs could not be made, so it is not reported as passed. Not a lint"
+  echo "failure."
   exit 1
 fi
 
