@@ -106,30 +106,59 @@ if [ "$lock_rc" -ne 0 ]; then
 fi
 
 # 2. The staged lock disagreeing with the working tree's, which is the one `uv run` above will
-#    actually use. Compared on the VERSION rather than on whether the files differ, so editing
-#    pyproject.toml without staging it does not block a commit it cannot affect.
-want_ruff="$(awk '/^name = "ruff"$/{f=1;next} f&&/^version = /{gsub(/"/,"",$3); print $3; exit}' "$staged/uv.lock")"
-have_ruff="$(uv run --frozen --extra dev -- ruff --version | awk '{print $2}')"
-# Fails CLOSED on either side coming back empty, because a guard that could not run must not
-# read as a guard that passed -- the collapse this file exists to refuse.
+#    actually use.
 #
-# Narrower than it looks, and worth being honest about: guard 1 already exits on a lock uv
-# cannot read, so in practice this catches a failing `uv run`. It does NOT make the awk safe --
-# a format change that keeps the `name = "ruff"` anchor but moves the version key would return
-# the NEXT package's version, which is wrong and non-empty, so the comparison below would block
-# loudly on a bogus mismatch rather than skip. Loud and wrong beats silent and wrong, but it is
-# not the same as correct.
-if [ -z "$want_ruff" ] || [ -z "$have_ruff" ]; then
-  echo "pre-commit: BLOCKED [config]: could not determine the ruff version on both sides"
-  echo "(staged lock: '${want_ruff:-unreadable}', running: '${have_ruff:-unreadable}'), so the"
-  echo "check that the tool matches CI's could not be made. Not a lint failure."
+#    Compared on the whole lock ENTRY, not on the version. Two locks can both say 0.15.21 and
+#    mean different artifacts -- uv records `source` (which registry) and a sha256 per wheel,
+#    so a staged lock can keep the version string and point at another index entirely. On a
+#    public repo taking outside contributions that is a supply-chain shape, not a nit, and the
+#    exact answer costs one more `awk`. The version is still parsed out afterwards, but only to
+#    say WHICH kind of mismatch it is.
+ruff_entry() {  # the [[package]] block for ruff, whole, from the lockfile named in $1
+  awk 'BEGIN{RS="";FS="\n"} /(^|\n)name = "ruff"($|\n)/{print; exit}' "$1" 2>/dev/null
+}
+want_entry="$(ruff_entry "$staged/uv.lock")"
+have_entry="$(ruff_entry uv.lock)"
+
+# Fails CLOSED when either side cannot be read, because a guard that could not run must not read
+# as a guard that passed -- the collapse this file exists to refuse. Note this does not make the
+# extraction itself safe: a lockfile format change could return the wrong block rather than
+# nothing, and that would block loudly on a bogus mismatch. Loud and wrong beats silent and
+# wrong, and is not the same as correct.
+if [ -z "$want_entry" ] || [ -z "$have_entry" ]; then
+  echo "pre-commit: BLOCKED [config]: could not read ruff's entry from both lockfiles"
+  echo "(staged: ${want_entry:+ok}${want_entry:-unreadable}, working tree:"
+  echo "${have_entry:+ok}${have_entry:-unreadable}), so the check that this commit's tool is"
+  echo "the tool CI installs could not be made. Not a lint failure."
   exit 1
 fi
-if [ "$want_ruff" != "$have_ruff" ]; then
-  echo "pre-commit: BLOCKED [config]: this commit stages ruff $want_ruff, but the ruff resolved"
-  echo "here is $have_ruff -- taken from the WORKING TREE's lockfile, which is not what CI will"
-  echo "install. 'git add' uv.lock and pyproject.toml together so the tool that checks this"
-  echo "commit is the tool that checks it in CI."
+
+lock_version() { printf '%s\n' "$1" | awk -F'"' '/^version = /{print $2; exit}'; }
+want_ruff="$(lock_version "$want_entry")"
+have_ruff="$(lock_version "$have_entry")"
+
+if [ "$want_entry" != "$have_entry" ]; then
+  if [ "$want_ruff" != "$have_ruff" ]; then
+    echo "pre-commit: BLOCKED [config]: this commit stages ruff $want_ruff, but the ruff resolved"
+    echo "here is $have_ruff -- taken from the WORKING TREE's lockfile, which is not what CI will"
+    echo "install."
+  else
+    echo "pre-commit: BLOCKED [config]: both lockfiles say ruff $want_ruff, but they resolve it"
+    echo "to DIFFERENT artifacts -- the staged entry differs in source registry or wheel hashes"
+    echo "from the one just used. Same number, different binary."
+  fi
+  echo "'git add' uv.lock and pyproject.toml together so the tool that checks this commit is the"
+  echo "tool that checks it in CI."
+  exit 1
+fi
+
+# And the binary that actually ran is the one that entry describes -- otherwise the comparison
+# above comes out clean while something else did the linting.
+ran_ruff="$(uv run --frozen --extra dev -- ruff --version | awk '{print $2}')"
+if [ -z "$ran_ruff" ] || [ "$ran_ruff" != "$have_ruff" ]; then
+  echo "pre-commit: BLOCKED [config]: the ruff that ran reports '${ran_ruff:-nothing}', but the"
+  echo "lockfile pins $have_ruff. The environment is not the one the lock describes; try"
+  echo "'uv sync --extra dev'. Not a lint failure."
   exit 1
 fi
 
