@@ -87,12 +87,23 @@ fi
 # 1. The staged lock disagreeing with the staged pyproject. CI runs `uv sync` WITHOUT --frozen,
 #    so it re-resolves a stale lock and lints with whatever it gets. Asking uv is exact and
 #    costs ~70ms; comparing a version range by hand would not be.
-if ! lockcheck="$(uv lock --check --project "$staged" 2>&1)"; then
+lockcheck="$(uv lock --check --project "$staged" 2>&1)"
+lock_rc=$?
+if [ "$lock_rc" -ne 0 ]; then
   printf '%s\n' "${lockcheck//$staged\//}"
   echo
-  echo "pre-commit: BLOCKED [config]: the staged uv.lock does not match the staged"
-  echo "pyproject.toml. CI syncs without --frozen, so it would re-resolve and lint with a"
-  echo "toolchain this gate never saw. Run 'uv lock' and stage the result."
+  # uv separates "stale" (1) from "could not read or resolve at all" (2), and only the first is
+  # fixed by re-locking. Telling someone to run `uv lock` at a corrupt lockfile sends them at a
+  # command that cannot succeed -- the same crying-wolf failure the lint branches below avoid.
+  if [ "$lock_rc" -eq 1 ]; then
+    echo "pre-commit: BLOCKED [config]: the staged uv.lock is stale against the staged"
+    echo "pyproject.toml. CI syncs without --frozen, so it would re-resolve and lint with a"
+    echo "toolchain this gate never saw. Run 'uv lock' and stage the result."
+  else
+    echo "pre-commit: BLOCKED [config]: the staged project could not be resolved at all"
+    echo "(uv exit $lock_rc) -- see above. Re-locking will not fix this one; the lockfile or"
+    echo "pyproject.toml in this commit is unreadable or has no valid resolution."
+  fi
   exit 1
 fi
 
@@ -101,9 +112,15 @@ fi
 #    pyproject.toml without staging it does not block a commit it cannot affect.
 want_ruff="$(awk '/^name = "ruff"$/{f=1;next} f&&/^version = /{gsub(/"/,"",$3); print $3; exit}' "$staged/uv.lock")"
 have_ruff="$(uv run --frozen --extra dev -- ruff --version | awk '{print $2}')"
-# Fails CLOSED on either side coming back empty. An unreadable lock or a lockfile format change
-# would otherwise silently skip the comparison, and a guard that cannot run must not read as a
-# guard that passed -- which is the collapse this file exists to refuse.
+# Fails CLOSED on either side coming back empty, because a guard that could not run must not
+# read as a guard that passed -- the collapse this file exists to refuse.
+#
+# Narrower than it looks, and worth being honest about: guard 1 already exits on a lock uv
+# cannot read, so in practice this catches a failing `uv run`. It does NOT make the awk safe --
+# a format change that keeps the `name = "ruff"` anchor but moves the version key would return
+# the NEXT package's version, which is wrong and non-empty, so the comparison below would block
+# loudly on a bogus mismatch rather than skip. Loud and wrong beats silent and wrong, but it is
+# not the same as correct.
 if [ -z "$want_ruff" ] || [ -z "$have_ruff" ]; then
   echo "pre-commit: BLOCKED [config]: could not determine the ruff version on both sides"
   echo "(staged lock: '${want_ruff:-unreadable}', running: '${have_ruff:-unreadable}'), so the"
