@@ -14,6 +14,28 @@ cd "$top" || exit 1
 
 "./scripts/repo-guard.sh" --staged || exit $?
 
+# Whitespace damage in the STAGED content, before anything more expensive runs. `ruff` covers
+# Python only, so every shell script, workflow and Markdown file in this repo -- this hook
+# included -- had no check at all. Demonstrated the hard way: the commit that added the lint
+# gate put a trailing space inside the gate, and nothing noticed until a reviewer ran
+# `git diff --check` by hand.
+#
+# `--cached` for the same reason the lint uses the materialised index: the commit is what is
+# staged. Against the empty tree when there is no HEAD, so the first commit in a clone is
+# checked too rather than erroring.
+if git rev-parse --verify -q HEAD >/dev/null; then
+  ws_base=HEAD
+else
+  ws_base="$(git hash-object -t tree /dev/null)"
+fi
+if ! ws="$(git diff --check --cached "$ws_base" 2>&1)"; then
+  printf '%s\n' "$ws"
+  echo
+  echo "pre-commit: BLOCKED [whitespace]: trailing whitespace, a space before a tab, or a"
+  echo "conflict marker in the staged content. 'git diff --check --cached' lists them."
+  exit 1
+fi
+
 if ! command -v uv >/dev/null 2>&1; then
   echo "pre-commit: BLOCKED [config]: uv is not on PATH, so lint could not run."
   echo "Install uv (https://docs.astral.sh/uv/), or commit with --no-verify if you accept CI"
@@ -132,7 +154,7 @@ ruff_identity() {  # prints ruff's identity from $1; non-zero if it cannot be es
   #
   # Either way this refuses to answer rather than answering "identical".
   local block tokens want_arts got_arts nl
-  nl=$'\n' 
+  nl=$'\n'
   block="$(awk 'BEGIN{RS="";FS="\n"} /(^|\n)name = "ruff"($|\n)/{print; exit}' "$1" 2>/dev/null)"
   [ -n "$block" ] || return 1
   # Every line carrying a url EXCEPT the source clause -- a direct-URL pin
@@ -228,7 +250,7 @@ rc=$?
 output="${output//$staged\//}"   # report repo-relative paths, not the temp copy's
 
 case "$rc" in
-  0) echo "pre-commit: clean (repo-guard, ruff)." ;;
+  0) echo "pre-commit: clean (repo-guard, whitespace, ruff)." ;;
   # ruff exits 1 for violations and 2 for its own errors; anything else came from uv. Only the
   # first is a lint failure, and sending someone to hunt for a diagnostic that was never printed
   # is how a gate earns a reputation for crying wolf.
