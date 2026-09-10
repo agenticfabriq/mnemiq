@@ -39,19 +39,37 @@ if ! git checkout-index --all --ignore-skip-worktree-bits --prefix="$staged/"; t
   exit 1
 fi
 
-# "Nothing was wrong" and "nothing was linted" are the same exit code from ruff -- it returns 0
-# with a `No Python files found` warning. That makes an empty materialisation look like a pass,
-# which is the exact collapse this gate exists to prevent, one level up. So the count is checked
-# rather than assumed: this repo cannot legitimately reach zero.
-# Against the EXACT expected count, not against zero. Testing for zero catches only a total
-# wipe; any proper subset -- which is what a partial materialisation actually produces -- passes
-# while half the tree goes unlinted. The index knows the number, so ask it.
-want="$(git ls-files '*.py' | wc -l | tr -d ' ')"
-got="$(find "$staged" -name '*.py' -type f | wc -l | tr -d ' ')"
-if [ "$got" -ne "$want" ]; then
-  echo "pre-commit: BLOCKED [config]: materialised $got of $want Python files, so ruff would"
-  echo "have reported on part of the commit and returned success. That is not a pass -- the"
-  echo "files it never saw are exactly the ones whose lint failures would ship."
+# "Nothing was wrong" and "nothing was linted" are the same exit code from ruff: 0, with a
+# `No Python files found` warning the rc=0 branch would discard. So ask ruff what it is about to
+# check, and refuse if the answer is nothing.
+#
+# Deliberately NOT a count comparison against the index. I tried that and it was wrong three
+# ways: `[tool.ruff]` excludes mean the file count and the LINTED count are different numbers,
+# a tracked symlink or a case-folded pair makes them differ forever, and a second command whose
+# failure leaves the variable empty fails the check open under `set -u` without `-e`. Detecting
+# a PARTIAL materialisation by counting is not worth that; it is prevented at the source, by
+# `--all --ignore-skip-worktree-bits` and a checked exit code. This catches the collapse that
+# actually reads as success.
+show_out="$(uv run --frozen --extra dev -- ruff check --show-files "$staged" 2>&1)"
+show_rc=$?
+if [ "$show_rc" -ne 0 ]; then
+  # Keep the diagnostic. Swallowing stderr here would leave stdout empty and send the operator
+  # to hunt a materialisation problem when the real fault is an environment that cannot run
+  # ruff at all -- the crying-wolf failure this file objects to two branches down.
+  printf '%s\n' "${show_out//$staged\//}"
+  echo
+  echo "pre-commit: BLOCKED [config]: could not determine what ruff would check (exit $show_rc)."
+  echo "NOT a lint failure -- usually an unresolvable environment; try 'uv sync --extra dev'."
+  exit 1
+fi
+# Only Python files count. `--show-files` also lists `pyproject.toml`, so a bare line count is
+# >=1 whenever the config was materialised, even with zero Python files next to it -- which
+# would have made this guard weaker than the one it replaced (verified: a directory holding
+# only this repo's pyproject.toml prints one line and lints clean).
+linted="$(printf '%s\n' "$show_out" | grep -cE '\.pyi?$')"
+if [ "${linted:-0}" -eq 0 ]; then
+  echo "pre-commit: BLOCKED [config]: ruff found no Python files to check in the materialised"
+  echo "index, so it would have reported success having linted nothing. That is not a pass."
   exit 1
 fi
 
