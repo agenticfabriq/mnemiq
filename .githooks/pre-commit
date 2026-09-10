@@ -32,8 +32,22 @@ fi
 # resolves the same settings CI will. Measured at 445 files: ~0.2s to copy, ~0.3s to lint.
 staged="$(mktemp -d)" || { echo "pre-commit: BLOCKED [config]: could not create a temp dir."; exit 1; }
 trap 'rm -rf "$staged"' EXIT
-if ! git checkout-index --all --prefix="$staged/"; then
+# `--ignore-skip-worktree-bits` because checkout-index silently SKIPS those entries otherwise,
+# so under a sparse checkout the gate would lint the cone and wave the rest through.
+if ! git checkout-index --all --ignore-skip-worktree-bits --prefix="$staged/"; then
   echo "pre-commit: BLOCKED [config]: could not materialise the index for linting."
+  exit 1
+fi
+
+# "Nothing was wrong" and "nothing was linted" are the same exit code from ruff -- it returns 0
+# with a `No Python files found` warning. That makes an empty materialisation look like a pass,
+# which is the exact collapse this gate exists to prevent, one level up. So the count is checked
+# rather than assumed: this repo cannot legitimately reach zero.
+count="$(find "$staged" -name '*.py' -type f | wc -l | tr -d ' ')"
+if [ "$count" -eq 0 ]; then
+  echo "pre-commit: BLOCKED [config]: the index materialised 0 Python files, so ruff would have"
+  echo "reported success having checked nothing. That is not a pass -- it means checkout-index"
+  echo "wrote nothing, and every lint failure in this commit would ship."
   exit 1
 fi
 
@@ -54,8 +68,11 @@ case "$rc" in
   # is how a gate earns a reputation for crying wolf.
   1) echo "$output"
      echo
-     echo "pre-commit: BLOCKED [lint]: this is the first thing CI runs, and it would fail."
-     echo "Fix, or 'uv run --extra dev ruff check --fix .' for the mechanical ones."
+     echo "pre-commit: BLOCKED [lint]: the STAGED content fails ruff, which is the first thing"
+     echo "CI runs. Those paths are repo-relative but describe what is staged, NOT what is on"
+     echo "disk -- if you have already fixed it in your working tree, the fix is 'git add', and"
+     echo "running ruff yourself will confusingly say everything passes. Otherwise:"
+     echo "  uv run --extra dev ruff check --fix .   (then stage the result)"
      exit 1 ;;
   *) echo "$output"
      echo
