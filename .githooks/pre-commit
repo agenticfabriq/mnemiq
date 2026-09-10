@@ -114,8 +114,19 @@ fi
 #    public repo taking outside contributions that is a supply-chain shape, not a nit, and the
 #    exact answer costs one more `awk`. The version is still parsed out afterwards, but only to
 #    say WHICH kind of mismatch it is.
-ruff_entry() {  # the [[package]] block for ruff, whole, from the lockfile named in $1
-  awk 'BEGIN{RS="";FS="\n"} /(^|\n)name = "ruff"($|\n)/{print; exit}' "$1" 2>/dev/null
+ruff_entry() {  # ruff's IDENTITY from the lockfile named in $1: version, registry, hashes
+  # The identity fields only, not the raw block. Byte-comparing the block flags differences that
+  # are not differences: uv writes `upload-time` and `size` alongside each artifact, and a
+  # contributor on an older uv produces an entry with identical registry and identical sha256s
+  # that still differs textually. Accusing them of swapping a binary because their serializer
+  # is older is the crying-wolf failure this file objects to further down -- and it would land
+  # on outside contributors first, who are exactly the case this guard exists for.
+  #
+  # A sha256 identifies the artifact; the registry says where it is fetched from. Those two plus
+  # the version are what "the same ruff" means. Sorted, so ordering is not a difference either.
+  awk 'BEGIN{RS="";FS="\n"} /(^|\n)name = "ruff"($|\n)/{print; exit}' "$1" 2>/dev/null \
+    | grep -oE 'version = "[^"]+"|registry = "[^"]+"|sha256:[0-9a-f]{64}' \
+    | sort
 }
 want_entry="$(ruff_entry "$staged/uv.lock")"
 have_entry="$(ruff_entry uv.lock)"
@@ -126,10 +137,14 @@ have_entry="$(ruff_entry uv.lock)"
 # nothing, and that would block loudly on a bogus mismatch. Loud and wrong beats silent and
 # wrong, and is not the same as correct.
 if [ -z "$want_entry" ] || [ -z "$have_entry" ]; then
-  echo "pre-commit: BLOCKED [config]: could not read ruff's entry from both lockfiles"
-  echo "(staged: ${want_entry:+ok}${want_entry:-unreadable}, working tree:"
-  echo "${have_entry:+ok}${have_entry:-unreadable}), so the check that this commit's tool is"
-  echo "the tool CI installs could not be made. Not a lint failure."
+  # `${v:+ok}${v:-unreadable}` looked like a status but is not one: `:-` substitutes the VALUE
+  # when the variable is non-empty, so the readable side printed "ok" followed by the whole
+  # 24-line entry.
+  [ -n "$want_entry" ] && ws="ok" || ws="unreadable"
+  [ -n "$have_entry" ] && hs="ok" || hs="unreadable"
+  echo "pre-commit: BLOCKED [config]: could not read ruff's identity from both lockfiles"
+  echo "(staged: $ws, working tree: $hs), so the check that this commit's tool is the tool CI"
+  echo "installs could not be made. Not a lint failure."
   exit 1
 fi
 
@@ -144,16 +159,18 @@ if [ "$want_entry" != "$have_entry" ]; then
     echo "install."
   else
     echo "pre-commit: BLOCKED [config]: both lockfiles say ruff $want_ruff, but they resolve it"
-    echo "to DIFFERENT artifacts -- the staged entry differs in source registry or wheel hashes"
-    echo "from the one just used. Same number, different binary."
+    echo "to a DIFFERENT artifact -- the registry or a wheel hash differs from the one just"
+    echo "used. Same number, different binary. Compare the ruff entries in the two lockfiles."
   fi
   echo "'git add' uv.lock and pyproject.toml together so the tool that checks this commit is the"
   echo "tool that checks it in CI."
   exit 1
 fi
 
-# And the binary that actually ran is the one that entry describes -- otherwise the comparison
-# above comes out clean while something else did the linting.
+# And the binary that ran reports the VERSION its lock entry pins. Deliberately a weaker claim
+# than the comparison above: this cannot tell one 0.15.21 build from another, so a substituted
+# binary of the right version passes here. It catches the environment simply not being the one
+# the lock describes, which is the failure that actually happens.
 ran_ruff="$(uv run --frozen --extra dev -- ruff --version | awk '{print $2}')"
 if [ -z "$ran_ruff" ] || [ "$ran_ruff" != "$have_ruff" ]; then
   echo "pre-commit: BLOCKED [config]: the ruff that ran reports '${ran_ruff:-nothing}', but the"
