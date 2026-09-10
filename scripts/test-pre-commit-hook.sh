@@ -67,8 +67,10 @@ reset_index() {
     exit 1
   fi
   if [ "$(GIT_INDEX_FILE="$tmpidx" git ls-files | wc -l | tr -d ' ')" -eq 0 ]; then
-    printf 'FATAL: the temporary index came back empty; the hook would refuse every check\n' >&2
-    printf '       for having nothing to lint, and the failures would look like hook bugs\n' >&2
+    # States the condition and stops. Two attempts to describe the downstream consequence were
+    # both wrong -- "the suite would test nothing" and "the hook would refuse every check" --
+    # and a setup abort does not need to predict what it prevented.
+    printf 'FATAL: read-tree produced an empty index; setup is broken, not the hook\n' >&2
     exit 1
   fi
 }
