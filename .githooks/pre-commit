@@ -121,14 +121,21 @@ ruff_entry() {  # ruff's IDENTITY from $1: version, registry, artifact urls, sha
   # is older is the crying-wolf failure this file objects to further down -- and it would land
   # on outside contributors first, who are exactly the case this guard exists for.
   #
-  # What "the same ruff" means: the version, the registry, every artifact URL, and every sha256.
-  # `url` is included because it is the actual fetch location -- `source = { registry = ... }`
-  # is not, so leaving urls out would let a lock keep its registry line and its hashes while
-  # pointing every wheel at another host. The hashes would still bind the bytes and CI's `uv
-  # sync` would reject a swapped artifact, but it should not take install-time hash verification
-  # to notice an edit this guard is here to see. Sorted, so ordering is not a difference either.
+  # What "the same ruff" means: the version, the registry, and every artifact as a URL PAIRED
+  # WITH its hash. The pairing is the point. Pulling the fields out individually and sorting
+  # them yields a token soup in which two wheels' hashes can be transposed with no change to
+  # the multiset -- measured: that edit passed. uv would reject it at install time when the
+  # downloaded bytes missed the hash, but a guard that says "identical" about a lockfile
+  # somebody edited is not doing its job, and next time the permutation may be one uv accepts.
+  #
+  # So each artifact stays one line and only the volatile fields are normalised away. `size`
+  # and `upload-time` are serializer metadata -- an older uv omits them -- and dropping them is
+  # what keeps an outside contributor's lockfile from reading as a swapped binary. `url` is
+  # kept because it is the actual fetch location, which `source = { registry = ... }` is not.
   awk 'BEGIN{RS="";FS="\n"} /(^|\n)name = "ruff"($|\n)/{print; exit}' "$1" 2>/dev/null \
-    | grep -oE 'version = "[^"]+"|registry = "[^"]+"|url = "[^"]+"|sha256:[0-9a-f]{64}' \
+    | sed -E 's/,?[[:space:]]*upload-time = "[^"]*"//g; s/,?[[:space:]]*size = [0-9]+//g' \
+    | grep -E '^version = |^source = |url = ' \
+    | sed -E 's/^[[:space:]]+//; s/[[:space:]]*,?[[:space:]]*$//' \
     | sort
 }
 want_entry="$(ruff_entry "$staged/uv.lock")"
