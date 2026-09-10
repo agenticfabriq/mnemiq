@@ -79,13 +79,14 @@ export GIT_INDEX_FILE="$tmpidx"
 reset_index
 ENVV=()
 
-# `repo-guard: clean.` is repo-guard's own line. The obvious assertion -- `clean (repo-guard` --
-# is the HOOK's summary literal, printed whether or not the guard ran: deleting the invocation
-# left every check green. That is the property this file exists to defend, so it is asserted on
-# the guard's own output, and then again on its behaviour below.
-# `repo-guard: clean` without the period: #6 made the guard enumerate what it checked
-# ("clean (names, secrets, home paths)"), and pinning the trailing period broke on that. Still
-# the guard's OWN output rather than the hook's summary, which is the property being asserted.
+# Asserted on `repo-guard: clean`, which is the GUARD's own line. The obvious assertion --
+# `clean (repo-guard` -- is the HOOK's summary literal, printed whether or not the guard ran:
+# deleting the invocation left every check green. That is the property this file exists to
+# defend, so it is asserted here on the guard's output and again on its behaviour below.
+#
+# No trailing period, because the guard enumerates what it checked and that list grows: it
+# reads "clean (names, secrets, home paths)." today, and pinning the period broke the moment
+# #6 changed it. The prefix is the stable part.
 check "clean index passes"                        0 "repo-guard: clean"
 
 # Composed, not written literally: a trailing space in THIS file is whitespace damage the hook
