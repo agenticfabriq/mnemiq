@@ -5,7 +5,7 @@ from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import ViewDefinition
-from mnemiq.sql.authz_guard import check_access
+from mnemiq.sql.authz_guard import check_access, check_unmodelled_calls
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove
@@ -211,6 +211,15 @@ def decide_write(
     refusal = check_access(shaped, visible, target)  # every referenced table readable, cols exist
     if refusal is not None:
         return refusal
+
+    # The read path's M43 fix, on the write path, because the premise is identical and a write
+    # is the worse place to lose it: measured before this line existed, `UPDATE claim SET
+    # amount = pg_read_file('/etc/passwd') WHERE id = 1` and `INSERT INTO claim (id, amount)
+    # SELECT customer_rows(), 1` were both APPROVED with tables=['claim'] -- the same audit lie,
+    # and here it persists what it read into a table.
+    opaque = check_unmodelled_calls(shaped)
+    if opaque is not None:
+        return opaque
 
     # A write needs RAW access: a masked column is treated as denied for writes.
     write_cls = check_cls(shaped, AccessPolicy(denied=policy.denied | policy.masked), target)

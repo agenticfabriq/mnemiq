@@ -1,7 +1,8 @@
+import pytest
 import sqlglot
 
 from mnemiq.sql.authz_guard import check_access
-from mnemiq.sql.verdict import RefusalCode
+from mnemiq.sql.verdict import Refusal, RefusalCode
 
 VISIBLE = {
     "claim": {"claim_identifier", "status", "party_identifier"},
@@ -182,3 +183,129 @@ def test_a_stale_snapshot_is_refused_before_execution_not_leaked():
                      adapter=_Adapter(con), target="duckdb")
     assert isinstance(unstale, Refusal)
     assert unstale.code == RefusalCode.SELECT_STAR, unstale.code
+
+
+# --------------------------------------------------------------------------------------------
+# M43 -- a function in projection position produces no exp.Table, so both the access check
+# and the RLS rewrite walk past it
+# --------------------------------------------------------------------------------------------
+
+
+_M43_VISIBLE = {"claim": {"id", "amount", "created_at", "ssn"}}
+
+
+# Both, always. The first version of this guard tested `isinstance(node, exp.Anonymous)`,
+# which asks whether the ONE dialect being parsed models the name -- and these tests pinned
+# `postgres`, the dialect where the control held. Production parses as `duckdb`, where sqlglot
+# leaves `now` and `date_part` Anonymous, so the shipped guard refused
+# `WHERE created_at < now()` while its own control test said it did not.
+_DIALECTS = ("duckdb", "postgres")   # duckdb FIRST: it is the production default
+
+
+def _decide(sql, dialect):
+    from mnemiq.sql.decide import decide
+
+    return decide(sql, _M43_VISIBLE, dialect=dialect, target=dialect)
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize("sql", [
+    "SELECT customer_rows() AS x",                                  # a UDF that reads
+    "SELECT pg_read_file('/etc/passwd')",                           # not even a table read
+    "SELECT public.customer_rows() AS x",                           # schema-qualified
+    "SELECT id FROM claim WHERE amount > (SELECT max_amount())",    # buried in a predicate
+])
+def test_an_opaque_call_cannot_be_decided(sql, dialect):
+    """Measured before the fix: every one of these was APPROVED with `tables=[]` for a caller
+    granted only `claim`. `check_access` re-checks each `exp.Table`; a call in projection
+    position is not one, so nothing looked at it and the RLS rewrite had nothing to wrap.
+
+    The refusal does not claim the function is dangerous -- there is no list of dangerous
+    functions here, deliberately. It claims the decider cannot tell what the query reads, which
+    makes its own premise false.
+    """
+    v = _decide(sql, dialect)
+    assert isinstance(v, Refusal), f"{sql!r} was approved under {dialect}"
+    assert v.code == RefusalCode.UNMODELLED_CALL
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize("sql", [
+    "SELECT id FROM claim",
+    "SELECT sum(amount), count(*), upper(ssn) FROM claim",
+    "SELECT date_trunc('month', created_at) FROM claim",
+    "SELECT CAST(id AS TEXT) FROM claim",
+    "SELECT id FROM claim WHERE created_at < now()",
+    "SELECT current_timestamp FROM claim",
+    "SELECT date_part('year', created_at) FROM claim",
+])
+def test_a_modelled_call_is_untouched(sql, dialect):
+    """The degeneracy control, and it is the whole reason this is a whitelist rather than a
+    blocklist of names. sqlglot's typed function classes ARE the allowlist: sum, count, upper,
+    cast and date_trunc parse to Sum, Count, Upper, Cast and DateTrunc, so they never reach
+    this guard. `now()` is here because the lineage layer measured it as `Anonymous` on a bare
+    parse -- through the decider it is not, and a guard that refused `WHERE created_at < now()`
+    would be useless whatever it caught.
+    """
+    assert not isinstance(_decide(sql, dialect), Refusal), f"{sql!r} refused under {dialect}"
+
+
+def test_the_refusal_is_repairable_so_a_false_positive_costs_a_retry():
+    """The measured cost of this guard, over 459 SELECTs in this suite, under both dialects, was Postgres `age()`:
+    a pure scalar function sqlglot does not model. Every other refusal was an attack fixture,
+    a case another guard already refused, or SQL that never reaches the decider.
+
+    That one case is why UNMODELLED_CALL is repairable. The loop can rewrite `age(x)` into
+    arithmetic the engine does model, so a false positive costs an attempt rather than an
+    answer -- which is what keeps a fail-closed guard from being the thing people route around.
+    """
+    v = _decide("SELECT age(created_at) FROM claim", "duckdb")
+    assert isinstance(v, Refusal) and v.code == RefusalCode.UNMODELLED_CALL
+    assert v.repairable is True
+    assert "age" in v.message, "the model cannot repair what the refusal does not name"
+
+
+# --------------------------------------------------------------------------------------------
+# M43 on the WRITE path. Same premise, worse consequence: the write persists what it read.
+# --------------------------------------------------------------------------------------------
+
+
+def _decide_write(sql, dialect):
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.sql.decide import AccessPolicy
+    from mnemiq.sql.decide_write import decide_write
+
+    return decide_write(
+        sql, {"claim": {"id", "amount"}},
+        GrantSet(frozenset({"claim"}), writable=frozenset({"claim"})),
+        policy=AccessPolicy(), dialect=dialect, target=dialect, writes_enabled=True,
+    )
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize("sql", [
+    "UPDATE claim SET amount = 1 WHERE id = 1",
+    "UPDATE claim SET amount = amount + 1 WHERE id = 1",
+    "INSERT INTO claim (id, amount) VALUES (1, 2)",
+])
+def test_an_ordinary_write_is_still_approved(sql, dialect):
+    """The passing control. Without it the refusals below prove only that everything refuses --
+    the first run of that probe used a read-only grant and every case came back
+    `unauthorized_write`, which looks exactly like the guard working."""
+    assert not isinstance(_decide_write(sql, dialect), Refusal), f"{sql!r} refused under {dialect}"
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize("sql", [
+    "UPDATE claim SET amount = pg_read_file('/etc/passwd') WHERE id = 1",
+    "UPDATE claim SET amount = 1 WHERE id = (SELECT secret_max_id())",
+    "INSERT INTO claim (id, amount) SELECT customer_rows(), 1",
+])
+def test_an_opaque_call_cannot_be_decided_on_the_write_path_either(sql, dialect):
+    """`decide_write` called `check_access` and not this guard, so the read path's fix left the
+    write path open. Measured before it was wired: all three returned ApprovedWrite with
+    `tables=['claim']` -- the same audit lie, except a write persists what it read into a table
+    that a later plain SELECT returns forever (the M30 shape)."""
+    v = _decide_write(sql, dialect)
+    assert isinstance(v, Refusal), f"{sql!r} was approved under {dialect}"
+    assert v.code == RefusalCode.UNMODELLED_CALL

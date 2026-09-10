@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from sqlglot import exp
+from sqlglot.dialects.dialect import Dialect
 
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import base_tables, column_tables
@@ -82,4 +83,78 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
                 subject=column.name,
             )
 
+    return None
+
+
+def _known_function_names() -> frozenset[str]:
+    """Every function name sqlglot can model, in ANY dialect.
+
+    Not `exp.Func` subclasses alone: those carry `sql_names()` for 623 names and miss `now`
+    and `date_part`, which live in each dialect's PARSER table rather than on a class. Missing
+    them is not academic -- see the guard below for what it cost.
+    """
+    names: set[str] = set()
+
+    def walk(cls: type) -> None:
+        for sub in cls.__subclasses__():
+            try:
+                names.update(n.upper() for n in sub.sql_names())
+            except Exception:  # a class that does not declare names is simply not a source
+                pass
+            walk(sub)
+
+    walk(exp.Func)
+    for dialect in Dialect.classes.values():
+        try:
+            names.update(k.upper() for k in dialect.parser_class.FUNCTIONS)
+        except Exception:
+            continue
+    return frozenset(names)
+
+
+_KNOWN_FUNCTIONS = _known_function_names()
+
+
+def check_unmodelled_calls(ast: exp.Expression) -> Refusal | None:
+    """Refuse a call this engine cannot model, because it cannot say what such a call reads.
+
+    `check_access` re-checks every `exp.Table` against the identity's visible set, and the RLS
+    rewrite wraps each one. A function in PROJECTION position produces no `exp.Table` at all,
+    so both walk past it: measured, `SELECT customer_rows() AS x` and
+    `SELECT pg_read_file('/etc/passwd')` were APPROVED with `tables=[]` for a caller granted
+    only `claim`, while `SELECT id FROM customer` was correctly refused in the same run (M43).
+
+    A **whitelist**, the same inversion `unrecognised_source` took for source shapes, and for
+    the reason its docstring gives: enumerate dangerous functions and an unlisted one passes,
+    with every review round finding another nobody thought of.
+
+    The allowlist is sqlglot's whole function vocabulary, ACROSS DIALECTS, and that detail is
+    the guard. The first version tested `isinstance(node, exp.Anonymous)`, which asks whether
+    the ONE dialect being parsed happens to model the name. Production parses as `duckdb`
+    (`Agent.dialect` from the adapter), sqlglot models `now` and `date_part` only under
+    postgres, and so the first version refused `SELECT id FROM claim WHERE created_at < now()`
+    -- measured through `decide`, on the shipped default. Its control test asserted the
+    opposite while pinning `dialect="postgres"`, the one dialect where the claim held.
+
+    Not a claim that an unknown call reads data. It is a claim that the decider cannot tell,
+    and the decider's premise is that it sees every table a query reads. An opaque call makes
+    that premise false, so the honest verdict is that this query cannot be decided.
+
+    Names, not identities: a UDF named `median` is modelled by sqlglot and passes here. That is
+    the acknowledged limit of any name-based allowlist, and it is bounded by the same
+    per-identity execution that dissolves M43 and M65 in v2.
+    """
+    for call in ast.find_all(exp.Anonymous):
+        name = str(call.this)
+        if name.upper() in _KNOWN_FUNCTIONS:
+            continue
+        return Refusal(
+            code=RefusalCode.UNMODELLED_CALL,
+            message=(
+                f"{name}() is a function this engine cannot model, so it cannot confirm what "
+                "the query reads. Answer using only the listed tables and columns and "
+                "standard SQL functions."
+            ),
+            subject=name,
+        )
     return None

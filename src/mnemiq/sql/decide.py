@@ -4,7 +4,7 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.contract import ViewDefinition
-from mnemiq.sql.authz_guard import check_access
+from mnemiq.sql.authz_guard import check_access, check_unmodelled_calls
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.guard import MAX_ROWS, check_shape
 from mnemiq.sql.lint import lint
@@ -51,6 +51,15 @@ def decide(
     refusal = check_access(shaped, visible, target)
     if refusal is not None:
         return refusal
+
+    # Beside `check_access` because it defends the same premise: that the decider sees every
+    # table the query reads. `check_access` walks `exp.Table` nodes, and a function in
+    # projection position is not one -- so an opaque call slipped past both it and the RLS
+    # rewrite (M43). This does not decide whether such a call is dangerous; it says the query
+    # cannot be decided, which is the true thing.
+    opaque = check_unmodelled_calls(shaped)
+    if opaque is not None:
+        return opaque
 
     cls = check_cls(shaped, policy, target)  # column deny / mask-in-predicate
     if cls is not None:

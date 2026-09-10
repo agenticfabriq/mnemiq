@@ -13,6 +13,9 @@ class RefusalCode(StrEnum):
     UNKNOWN_TABLE = "unknown_table"
     UNKNOWN_COLUMN = "unknown_column"
     EXPLAIN_FAILED = "explain_failed"
+    # A call this engine cannot model, so it cannot say what the query reads. Not
+    # "a forbidden function" -- there is no list of those, and that is the point (M43).
+    UNMODELLED_CALL = "unmodelled_call"
     LOGIC_LINT = "logic_lint"
     VALUE_GROUNDING = "value_grounding"
     NOT_A_WRITE = "not_a_write"
@@ -58,6 +61,11 @@ REPAIRABLE = frozenset(
         RefusalCode.UNKNOWN_TABLE,
         RefusalCode.UNKNOWN_COLUMN,
         RefusalCode.EXPLAIN_FAILED,
+        # Repairable on purpose. The measured cost of this guard is a legitimate scalar
+        # function sqlglot does not model -- Postgres `age()` was the one case in 459 --
+        # and the repair loop can rewrite that into arithmetic the engine does model.
+        # Without this the guard's false positives become deferrals instead of retries.
+        RefusalCode.UNMODELLED_CALL,
         RefusalCode.LOGIC_LINT,
         RefusalCode.VALUE_GROUNDING,
     }
