@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Enable with: git config core.hooksPath .githooks
 #
-# Two gates, cheapest first. Both must pass; neither is allowed to be the only one.
+# Three gates, cheapest first. All must pass; none is allowed to be the only one.
 #
 # Lint is here because it was NOT, and five ruff errors reached `main` and kept CI red for two
 # days (PR #7). The hook ran repo-guard and `exec`'d away, so a commit could be blessed locally
@@ -17,12 +17,38 @@ cd "$top" || exit 1
 # Whitespace damage in the STAGED content, before anything more expensive runs. `ruff` covers
 # Python only, so every shell script, workflow and Markdown file in this repo -- this hook
 # included -- had no check at all. Demonstrated the hard way: the commit that added the lint
-# gate put a trailing space inside the gate, and nothing noticed until a reviewer ran
-# `git diff --check` by hand.
+# gate later put a trailing space inside the gate (af0a176), and nothing noticed until a
+# reviewer ran `git diff --check` by hand.
 #
 # `--cached` for the same reason the lint uses the materialised index: the commit is what is
 # staged. Against the empty tree when there is no HEAD, so the first commit in a clone is
 # checked too rather than erroring.
+# Both ways this check can be switched off, refused rather than ignored. `git diff --check`
+# honours `core.whitespace` and `.gitattributes`, so `-blank-at-eol` or `* -whitespace` makes it
+# exit 0 in silence -- measured: rc=2 by default, rc=0 with either. Every other guard here fails
+# closed and says so; this one would have been the exception, announcing "whitespace" in the
+# success line for a check that never ran.
+ws_off=""
+case ",$(git config --get core.whitespace 2>/dev/null)," in
+  *,-blank-at-eol,*|*,-space-before-tab,*|*,-blank-at-eof,*|*,-trailing-space,*)
+    ws_off="core.whitespace" ;;
+esac
+ws_files="$(git diff --cached --name-only --diff-filter=ACM)"
+if [ -n "$ws_files" ]; then
+  # Captured, not piped into `grep -q`: under pipefail that exits early, check-attr takes
+  # SIGPIPE, the pipeline returns 141, and the test reads as "not disabled" -- fail-open again.
+  ws_attrs="$(printf '%s\n' "$ws_files" | git check-attr --stdin whitespace 2>/dev/null)"
+  case "$ws_attrs" in
+    *": whitespace: unset"*) ws_off="${ws_off:+$ws_off and }.gitattributes" ;;
+  esac
+fi
+if [ -n "$ws_off" ]; then
+  echo "pre-commit: BLOCKED [config]: the whitespace check is disabled by $ws_off, so"
+  echo "'git diff --check' would exit 0 without looking. Not reported as passed: re-enable it,"
+  echo "or commit with --no-verify if you meant to turn it off."
+  exit 1
+fi
+
 if git rev-parse --verify -q HEAD >/dev/null; then
   ws_base=HEAD
 else
@@ -31,8 +57,9 @@ fi
 if ! ws="$(git diff --check --cached "$ws_base" 2>&1)"; then
   printf '%s\n' "$ws"
   echo
-  echo "pre-commit: BLOCKED [whitespace]: trailing whitespace, a space before a tab, or a"
-  echo "conflict marker in the staged content. 'git diff --check --cached' lists them."
+  echo "pre-commit: BLOCKED [whitespace]: trailing whitespace, a blank line at end of file, a"
+  echo "space before a tab, or a leftover conflict marker in the staged content -- git's own"
+  echo "report is above, and 'git diff --check --cached' lists them."
   exit 1
 fi
 
