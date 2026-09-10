@@ -67,7 +67,8 @@ reset_index() {
     exit 1
   fi
   if [ "$(GIT_INDEX_FILE="$tmpidx" git ls-files | wc -l | tr -d ' ')" -eq 0 ]; then
-    printf 'FATAL: the temporary index came back empty; the suite would test nothing\n' >&2
+    printf 'FATAL: the temporary index came back empty; the hook would refuse every check\n' >&2
+    printf '       for having nothing to lint, and the failures would look like hook bugs\n' >&2
     exit 1
   fi
 }
