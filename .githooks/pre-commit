@@ -1,3 +1,415 @@
 #!/usr/bin/env bash
 # Enable with: git config core.hooksPath .githooks
-exec "$(git rev-parse --show-toplevel)/scripts/repo-guard.sh" --staged
+#
+# Three gates, cheapest first. All must pass; none is allowed to be the only one.
+#
+# Lint is here because it was NOT, and five ruff errors reached `main` and kept CI red for two
+# days (PR #7). The hook ran repo-guard and `exec`'d away, so a commit could be blessed locally
+# and fail the very first thing CI does. A gate that checks less than CI teaches people its
+# green means something it does not.
+set -uo pipefail
+
+top="$(git rev-parse --show-toplevel)" || exit 1
+cd "$top" || exit 1
+
+"./scripts/repo-guard.sh" --staged || exit $?
+
+# Per-check escapes, because the alternative is `--no-verify` and that is not an escape from
+# ONE check -- it skips the whole hook, repo-guard included. repo-guard is the secrets and
+# proprietary-name scan on a public clean-room repo, and a public push cannot be taken back.
+# Telling someone to reach for `--no-verify` because ruff is unavailable or their whitespace
+# config is off trades the cheapest check in the file for the most important one. This file
+# argued that twice in comments and then printed the advice anyway, in two messages.
+#
+# So each skippable check has its own switch, and using one never touches repo-guard. Anything
+# skipped is named in the success line: the point was never to force the check, it was to stop
+# reporting a pass nobody established.
+switch_on() {  # a switch is OFF when unset or set to a falsey word, not merely when empty --
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    ''|0|false|no|off) return 1 ;;   # MNEMIQ_SKIP_LINT=0 must not skip the lint
+    *) return 0 ;;
+  esac
+}
+SKIP_WS=""; switch_on "${MNEMIQ_SKIP_WHITESPACE:-}" && SKIP_WS=1
+SKIP_LINT=""; switch_on "${MNEMIQ_SKIP_LINT:-}" && SKIP_LINT=1
+skipped=""
+# Declared up here, not inside the branch that fills it: the summary reads it unconditionally,
+# and under `set -u` an unset one aborts the hook AFTER printing "clean". Measured -- with
+# MNEMIQ_SKIP_WHITESPACE=1 the hook printed its success line, then `ws_exempt: unbound
+# variable`, and exited 1. The escape hatch blocked every commit that used it, and the message
+# offering the hatch was the one that had just told the operator to run it.
+ws_exempt=""
+
+# The whole section is skippable as a unit, so the switch does what its name says rather
+# than only applying when the config happens to be disabled.
+if [ -n "$SKIP_WS" ]; then
+  skipped="$skipped whitespace"
+else
+  # Whitespace damage in the STAGED content, before anything more expensive runs. `ruff` covers
+  # Python only, so every shell script, workflow and Markdown file in this repo -- this hook
+  # included -- had no check at all. Demonstrated the hard way: the commit that added the lint
+  # gate (f9d847b) was itself later edited to carry a trailing space (af0a176), and nothing
+  # noticed until a reviewer ran `git diff --check` by hand.
+  #
+  # `--cached` for the same reason the lint uses the materialised index: the commit is what is
+  # staged. Against the empty tree when there is no HEAD, so the first commit in a clone is
+  # checked too rather than erroring.
+  # `git diff --check` honours `core.whitespace` and `.gitattributes`, so it can be switched off
+  # and then exits 0 in silence -- measured: rc=2 by default, rc=0 with either. The two are not
+  # the same kind of thing, and get different answers.
+  #
+  # Is the check actually running? ASKED, not derived from `core.whitespace`.
+  #
+  # I modelled that config three times and got it wrong three times: git separates on commas
+  # only (so splitting on spaces falsely refused `-blank-at-eol -tab-in-indent`, which disables
+  # nothing), and it tolerates whitespace only BEFORE a token (so trimming the trailing side
+  # falsely refused `-blank-at-eol `, which also disables nothing). Each wrong guess refused a
+  # commit and offered `--no-verify`, which skips repo-guard. Every one was a parser disagreeing
+  # with git about git, so git is asked instead.
+  #
+  # One probe PER CLASS, because a single trailing-space probe says nothing about the others:
+  # `-space-before-tab,-blank-at-eof` leaves it detected, the guard passes, and damage of the
+  # other two classes then lands under a "clean (whitespace)" line. That is a silent pass, and
+  # the `case` this replaced did cover it.
+  #
+  # Run from the probe directory with `core.attributesFile` neutralised, because git applies the
+  # REPO's attributes to files outside it: with `* -whitespace` the probe reads as off and the
+  # operator is refused with "see core.whitespace" while core.whitespace is unset. A per-path
+  # attribute opt-out is disclosed below, not refused -- these two must not be confused.
+  ws_dir="$(mktemp -d)" || {
+    echo "pre-commit: BLOCKED [config]: could not create a temp dir to probe the whitespace check."
+    exit 1; }
+  printf 'x\n'              > "$ws_dir/a"
+  printf 'x\ntrail \n'      > "$ws_dir/b_eol"
+  printf 'x\n \tindented\n' > "$ws_dir/b_sbt"
+  printf 'x\nlast\n\n'      > "$ws_dir/b_eof"
+  # The config has to be carried ACROSS the isolation, not left behind: `core.whitespace` set
+  # with `git config` lives in .git/config, so a probe run from outside the repo stops seeing it
+  # and every value reads as "enabled" -- measured, the probe passed with `-blank-at-eol` set.
+  # It is passed through verbatim, so git still does the parsing; nothing here interprets it.
+  #
+  # As an ARRAY. `${cfg:+-c core.whitespace=$cfg}` unquoted word-splits a value containing a
+  # space, so `-blank-at-eol -tab-in-indent` reached git as a stray `-tab-in-indent` option and
+  # it exited 129 -- which has bit 2 clear and would have been read as "check disabled".
+  ws_cfg="$(git config --get core.whitespace 2>/dev/null || true)"
+  ws_cfg_args=()
+  [ -n "$ws_cfg" ] && ws_cfg_args=(-c "core.whitespace=$ws_cfg")
+  ws_sees() {  # 0 if git flags the defect in probe file $1
+    local rc
+    ( cd "$ws_dir" && git -c core.attributesFile=/dev/null \
+        ${ws_cfg_args[@]+"${ws_cfg_args[@]}"} \
+        diff --check --no-index a "$1" >/dev/null 2>&1 )
+    rc=$?
+    # bit 2 is "whitespace error found". Anything else -- 129 from a usage error, say -- is not
+    # a clean "no defect", so it is treated as the check not working rather than as a pass.
+    [ "$((rc & 2))" -ne 0 ]
+  }
+  ws_off=""
+  ws_sees b_eol || ws_off="$ws_off trailing-whitespace"
+  ws_sees b_sbt || ws_off="$ws_off space-before-tab"
+  ws_sees b_eof || ws_off="$ws_off blank-line-at-EOF"
+  rm -rf "$ws_dir"
+  if [ -n "$ws_off" ]; then
+    echo "pre-commit: BLOCKED [config]: git does not flag these defects under this"
+    echo "configuration, so the check below would pass without seeing them:$ws_off"
+    echo "Re-enable them (see core.whitespace), or if that is deliberate:"
+    echo "  MNEMIQ_SKIP_WHITESPACE=1 git commit ...    (repo-guard still runs)"
+    exit 1
+  fi
+
+  # A `.gitattributes` opt-out is PER PATH and often legitimate -- `*.md -whitespace` is the
+  # standard way to keep Markdown's two-space hard break. Refusing those commits would make the
+  # only escape `--no-verify`, which also skips repo-guard, and pushing people past the secrets
+  # gate on a clean-room public repo to satisfy a whitespace check is a bad trade. So they are
+  # DISCLOSED instead: those paths go unchecked, and the success line names them rather than
+  # claiming a check that did not cover them.
+  #
+  # `R` in the filter because rename detection is on by default, so a `git mv`'d path would
+  # otherwise never be asked. Both attribute forms count: Unset (`-whitespace`) and a String
+  # value carrying negations (`whitespace=-blank-at-eol`), the second verified in a scratch repo
+  # to print its value rather than `unset`.
+  ws_exempt=""
+  ws_files="$(git diff --cached --name-only --diff-filter=ACMR)"
+  if [ -n "$ws_files" ]; then
+    ws_attrs="$(printf '%s\n' "$ws_files" | git check-attr --stdin whitespace 2>/dev/null)"
+    ws_exempt="$(printf '%s\n' "$ws_attrs" \
+      | awk -F': whitespace: ' 'NF==2 && ($2=="unset" || $2 ~ /(^|,)-/) {print $1}')"
+  fi
+
+  if git rev-parse --verify -q HEAD >/dev/null; then
+    ws_base=HEAD
+  else
+    ws_base="$(git hash-object -t tree /dev/null)"
+  fi
+  if ! ws="$(git diff --check --cached "$ws_base" 2>&1)"; then
+    printf '%s\n' "$ws"
+    echo
+    echo "pre-commit: BLOCKED [whitespace]: trailing whitespace, a blank line at end of file, a"
+    echo "space before a tab, or a leftover conflict marker in the staged content -- git's own"
+    echo "report is above, and 'git diff --check --cached' lists them."
+    exit 1
+  fi
+fi
+
+if [ -n "$SKIP_LINT" ]; then
+  skipped="$skipped lint"
+elif ! command -v uv >/dev/null 2>&1; then
+  echo "pre-commit: BLOCKED [config]: uv is not on PATH, so lint could not run."
+  echo "Install uv (https://docs.astral.sh/uv/), or if you accept CI finding what this would"
+  echo "have:"
+  echo "  MNEMIQ_SKIP_LINT=1 git commit ...            (repo-guard still runs)"
+  echo "Failing closed otherwise, the same way repo-guard does: a gate that waves a commit"
+  echo "through when it could not check it is worse than no gate."
+  exit 1
+fi
+
+if [ -z "$SKIP_LINT" ]; then
+# Lint the INDEX, not the working tree. `ruff check .` would read the files on disk, which are
+# not what is being committed: stage a violation and fix it without `git add`, or stage a subset
+# with `git add -p`, and a working-tree lint passes while CI fails on the content that landed.
+# This repo stages explicitly and partially by convention, so that is the common case, not the
+# exotic one -- and it is the same "green locally, red in CI" shape the gate exists to close.
+#
+# `checkout-index` materialises exactly the committed tree, config files included, so ruff
+# resolves the same settings CI will. Measured at 445 files: ~0.2s to copy, ~0.3s to lint.
+staged="$(mktemp -d)" || { echo "pre-commit: BLOCKED [config]: could not create a temp dir."; exit 1; }
+trap 'rm -rf "$staged"' EXIT
+# `--ignore-skip-worktree-bits` because checkout-index silently SKIPS those entries otherwise,
+# so under a sparse checkout the gate would lint the cone and wave the rest through.
+if ! git checkout-index --all --ignore-skip-worktree-bits --prefix="$staged/"; then
+  echo "pre-commit: BLOCKED [config]: could not materialise the index for linting."
+  exit 1
+fi
+
+# "Nothing was wrong" and "nothing was linted" are the same exit code from ruff: 0, with a
+# `No Python files found` warning the rc=0 branch would discard. So ask ruff what it is about to
+# check, and refuse if the answer is nothing.
+#
+# Deliberately NOT a count comparison against the index. I tried that and it was wrong three
+# ways: `[tool.ruff]` excludes mean the file count and the LINTED count are different numbers,
+# a tracked symlink or a case-folded pair makes them differ forever, and a second command whose
+# failure leaves the variable empty fails the check open under `set -u` without `-e`. Detecting
+# a PARTIAL materialisation by counting is not worth that; it is prevented at the source, by
+# `--all --ignore-skip-worktree-bits` and a checked exit code. This catches the collapse that
+# actually reads as success.
+show_out="$(uv run --frozen --extra dev -- ruff check --show-files "$staged" 2>&1)"
+show_rc=$?
+if [ "$show_rc" -ne 0 ]; then
+  # Keep the diagnostic. Swallowing stderr here would leave stdout empty and send the operator
+  # to hunt a materialisation problem when the real fault is an environment that cannot run
+  # ruff at all -- the crying-wolf failure this file objects to two branches down.
+  printf '%s\n' "${show_out//$staged\//}"
+  echo
+  echo "pre-commit: BLOCKED [config]: could not determine what ruff would check (exit $show_rc)."
+  echo "NOT a lint failure -- usually an unresolvable environment; try 'uv sync --extra dev'."
+  exit 1
+fi
+# Only Python files count. `--show-files` also lists `pyproject.toml`, so a bare line count is
+# >=1 whenever the config was materialised, even with zero Python files next to it -- which
+# would have made this guard weaker than the one it replaced (verified: a directory holding
+# only this repo's pyproject.toml prints one line and lints clean).
+linted="$(printf '%s\n' "$show_out" | grep -cE '\.pyi?$')"
+if [ "${linted:-0}" -eq 0 ]; then
+  echo "pre-commit: BLOCKED [config]: ruff found no Python files to check in the materialised"
+  echo "index, so it would have reported success having linted nothing. That is not a pass."
+  exit 1
+fi
+
+# `--extra dev` is load-bearing: ruff is declared ONLY in that extra, so without it `uv run`
+# neither installs nor version-checks ruff -- it leaves whatever is in .venv alone and, if
+# nothing is there, silently falls back to any `ruff` on PATH. A plain `uv sync` prunes ruff
+# (verified: it appears in the 11 packages that sync would uninstall), so the fallback is not
+# hypothetical. With the extra, this is the exact version the lockfile pins, which is the whole
+# point of running lint here rather than trusting the developer's environment.
+# The CONFIG ruff applies comes from the staged tree -- verified with `--show-settings`, whose
+# `project_root` is the temp copy. The BINARY does not: `uv run` executes here, at the working
+# tree root, so it resolves ruff from THIS uv.lock. Two ways that diverges from CI, and both are
+# checked, because the whole point of this gate is that what it checks is what lands.
+#
+# 1. The staged lock disagreeing with the staged pyproject. CI runs `uv sync` WITHOUT --frozen,
+#    so it re-resolves a stale lock and lints with whatever it gets. Asking uv is exact and
+#    costs ~70ms; comparing a version range by hand would not be.
+lockcheck="$(uv lock --check --project "$staged" 2>&1)"
+lock_rc=$?   # named, like every other exit capture here: a line inserted above a bare `$?`
+if [ "$lock_rc" -ne 0 ]; then
+  printf '%s\n' "${lockcheck//$staged\//}"
+  echo
+  # uv's own message is printed above and is left to speak for itself. Two attempts at
+  # classifying its exit codes here were wrong in opposite directions -- 1 turned out to cover
+  # both "stale" and "no valid resolution", and 2 covers both "unreadable" and "missing", where
+  # re-locking IS the fix. Each wrong guess sent the operator at a command that could not work,
+  # which is the exact failure a helpful-sounding message is supposed to prevent. uv already
+  # names the cause and the remedy in every one of those cases; paraphrasing it added nothing
+  # but a second, less accurate voice.
+  echo "pre-commit: BLOCKED [config]: the staged project does not resolve cleanly, so CI --"
+  echo "which syncs WITHOUT --frozen -- could install a different toolchain than this gate"
+  echo "just linted with. uv's diagnosis is above; whatever it fixes, stage the result."
+  exit 1
+fi
+
+# 2. The staged lock disagreeing with the working tree's, which is the one `uv run` above will
+#    actually use.
+#
+#    Compared on ruff's IDENTITY, not on its version. Two locks can both say 0.15.21 and mean
+#    different artifacts -- uv records where each one is fetched from and a sha256 for it, so a
+#    staged lock can keep the version string and point somewhere else entirely. On a public repo
+#    taking outside contributions that is a supply-chain shape, not a nit. The version is still
+#    parsed out afterwards, but only to say WHICH kind of mismatch it is.
+ruff_identity() {  # prints ruff's identity from $1; non-zero if it cannot be established
+  # Identity is the version, the WHOLE source clause, and every artifact as a url PAIRED with
+  # its hash. The pairing is inside one token because extracting the fields separately and
+  # sorting yields a soup in which two wheels' hashes can be transposed with no change to the
+  # multiset -- measured: that passed.
+  #
+  # An allowlist, so a field uv adds later is ignored rather than read as tampering. But an
+  # allowlist silently matches NOTHING when the shape it names is absent, which is the failure
+  # mode this whole file is about, so the shape is asserted instead of assumed:
+  #
+  #   * `source = {...}` whole, not `registry = "..."`. A git- or path-pinned ruff has no
+  #     registry, so a registry-only pattern reduced the identity to the version alone -- two
+  #     different git refs at 0.15.21 compared EQUAL and passed.
+  #   * the number of url+hash tokens must equal the number of artifact lines. The pair pattern
+  #     hardcodes `", hash = "`, so if uv ever writes the fields in another order every pair
+  #     drops out and what is left compares equal even with every hash rewritten.
+  #
+  # Either way this refuses to answer rather than answering "identical".
+  local block tokens want_arts got_arts nl
+  nl=$'\n'
+  block="$(awk 'BEGIN{RS="";FS="\n"} /(^|\n)name = "ruff"($|\n)/{print; exit}' "$1" 2>/dev/null)"
+  [ -n "$block" ] || return 1
+  # Every line carrying a url EXCEPT the source clause -- a direct-URL pin
+  # (`source = { url = "..." }`) would otherwise count as an artifact and inflate this, blocking
+  # every commit with a message about artifact shape while the artifacts were fine.
+  #
+  # Excluding that one line rather than anchoring to `{ url = ` at the start, which is the
+  # obvious narrowing and is wrong: it requires `url` to be the FIRST key, so a reordered
+  # `{ hash = ..., url = ... }` counts zero here AND zero below, the cross-check compares 0 to 0
+  # and passes, and the identity quietly loses all eighteen pairs. That is the precise mutation
+  # this count exists to catch, defeated by the fix for the direct-URL case. The two concerns
+  # stay independent: this line decides what an artifact IS, the pattern below decides whether
+  # its shape is readable.
+  want_arts="$(printf '%s\n' "$block" | grep -v '^source = ' | grep -c 'url = ')"
+  tokens="$(printf '%s\n' "$block" \
+    | grep -oE 'version = "[^"]+"|source = \{[^}]*\}|url = "[^"]+", hash = "sha256:[0-9a-f]{64}"' \
+    | sort)"
+  got_arts="$(printf '%s\n' "$tokens" | grep -c '^url = ')"
+  [ "$want_arts" -eq "$got_arts" ] || return 2
+  # Pattern-matched in the shell rather than piped to `grep -q`. Under `pipefail`, grep -q exits
+  # at the first match without draining, printf takes SIGPIPE, and the pipeline returns 141 --
+  # so the check would REPORT THE FIELD MISSING on a block that has it. Measured: ~19KB of
+  # tokens returns 0 and ~190KB returns 141, the crossover being the 64KB pipe buffer. Today's
+  # identity is 4.5KB, 14x under, so it cannot fire yet; it is a false block waiting on the
+  # wheel list growing, and `source` sorts first so it is the one that would hit it.
+  case "$tokens" in "version = "*|*"${nl}version = "*) : ;; *) return 3 ;; esac
+  case "$tokens" in "source = "*|*"${nl}source = "*) : ;; *) return 4 ;; esac
+  printf '%s\n' "$tokens"
+}
+want_entry="$(ruff_identity "$staged/uv.lock")"; want_rc=$?
+have_entry="$(ruff_identity uv.lock)"; have_rc=$?
+
+# Fails CLOSED when either side cannot be read, because a guard that could not run must not read
+# as a guard that passed -- the collapse this file exists to refuse. Note this does not make the
+# extraction itself safe: a lockfile format change could return the wrong block rather than
+# nothing, and that would block loudly on a bogus mismatch. Loud and wrong beats silent and
+# wrong, and is not the same as correct.
+if [ "$want_rc" -ne 0 ] || [ "$have_rc" -ne 0 ]; then
+  why() {
+    case "$1" in
+      0) echo "ok" ;;
+      1) echo "ruff has no entry there" ;;
+      2) echo "an artifact's url and hash are not in a shape this check can read" ;;
+      3) echo "the entry carries no version" ;;
+      4) echo "the entry carries no source clause" ;;
+      *) echo "unknown ($1)" ;;
+    esac
+  }
+  echo "pre-commit: BLOCKED [config]: could not establish ruff's identity."
+  echo "  staged lockfile:       $(why "$want_rc")"
+  echo "  working tree lockfile: $(why "$have_rc")"
+  echo "The check that this commit's tool is the tool CI installs could not be made, so it is"
+  echo "not reported as passed. Not a lint failure."
+  exit 1
+fi
+
+lock_version() { printf '%s\n' "$1" | awk -F'"' '/^version = /{print $2; exit}'; }
+want_ruff="$(lock_version "$want_entry")"
+have_ruff="$(lock_version "$have_entry")"
+
+if [ "$want_entry" != "$have_entry" ]; then
+  if [ "$want_ruff" != "$have_ruff" ]; then
+    echo "pre-commit: BLOCKED [config]: this commit stages ruff $want_ruff, but the ruff resolved"
+    echo "here is $have_ruff -- taken from the WORKING TREE's lockfile, which is not what CI will"
+    echo "install."
+  else
+    echo "pre-commit: BLOCKED [config]: both lockfiles say ruff $want_ruff, but they resolve it"
+    echo "to a DIFFERENT artifact. Diff the ruff entries in the two lockfiles on the source"
+    echo "clause (registry, git ref or path -- whichever this project uses),"
+    echo "and on each url TOGETHER WITH its hash -- the mismatch can be in the pairing alone,"
+    echo "with every url and every hash present on both sides, so checking the two lists"
+    echo "separately will show you nothing."
+  fi
+  echo "'git add' uv.lock and pyproject.toml together so the tool that checks this commit is the"
+  echo "tool that checks it in CI."
+  exit 1
+fi
+
+# And the binary that ran reports the VERSION its lock entry pins. Deliberately a weaker claim
+# than the comparison above: this cannot tell one 0.15.21 build from another, so a substituted
+# binary of the right version passes here. It catches the environment simply not being the one
+# the lock describes, which is the failure that actually happens.
+ran_ruff="$(uv run --frozen --extra dev -- ruff --version | awk '{print $2}')"
+if [ -z "$ran_ruff" ] || [ "$ran_ruff" != "$have_ruff" ]; then
+  echo "pre-commit: BLOCKED [config]: the ruff that ran reports '${ran_ruff:-nothing}', but the"
+  echo "lockfile pins $have_ruff. The environment is not the one the lock describes; try"
+  echo "'uv sync --extra dev'. Not a lint failure."
+  exit 1
+fi
+
+output="$(uv run --frozen --extra dev -- ruff check "$staged" 2>&1)"
+rc=$?
+output="${output//$staged\//}"   # report repo-relative paths, not the temp copy's
+
+case "$rc" in
+  0) : ;;   # reported below, once, so a skipped lint still gets a summary
+  # ruff exits 1 for violations and 2 for its own errors; anything else came from uv. Only the
+  # first is a lint failure, and sending someone to hunt for a diagnostic that was never printed
+  # is how a gate earns a reputation for crying wolf.
+  1) echo "$output"
+     echo
+     echo "pre-commit: BLOCKED [lint]: the STAGED content fails ruff, which is the first thing"
+     echo "CI runs. Those paths are repo-relative but describe what is staged, NOT what is on"
+     echo "disk -- if you have already fixed it in your working tree, the fix is 'git add', and"
+     echo "running ruff yourself will confusingly say everything passes. Otherwise:"
+     echo "  uv run --extra dev ruff check --fix .   (then stage the result)"
+     exit 1 ;;
+  *) echo "$output"
+     echo
+     echo "pre-commit: BLOCKED [config]: lint could not run (exit $rc) -- this is NOT a lint"
+     echo "failure. Usually a missing or unresolvable environment; 'uv sync --extra dev' first."
+     exit 1 ;;
+esac
+fi   # SKIP_LINT
+
+# One summary, naming only what actually ran. A check that was skipped is not reported as
+# passed -- that distinction is the whole reason the skips exist rather than `--no-verify`,
+# which would have made the whole hook silent.
+summary="repo-guard"
+case " $skipped " in *" whitespace"*) ;; *) summary="$summary, whitespace" ;; esac
+case " $skipped " in *" lint"*) ;; *) summary="$summary, ruff" ;; esac
+echo "pre-commit: clean ($summary)."
+if [ -n "$skipped" ]; then
+  echo "  NOT CHECKED:$skipped"
+fi
+if [ -n "$ws_exempt" ]; then
+  echo "  .gitattributes turns off some or all whitespace checks for these staged paths, so"
+  echo "  they are not fully covered:"
+  # Read, not `printf '  %s\n' $ws_exempt`. Unquoted, bash word-splits and GLOBS it: a path
+  # with a space printed as two lines, and `star[AB].md` expanded to starA.md and starB.md --
+  # naming two files that WERE checked while hiding the one that was not.
+  printf '%s\n' "$ws_exempt" | while IFS= read -r ws_path; do
+    [ -n "$ws_path" ] && printf '    %s\n' "$ws_path"
+  done
+fi
+
+# Explicit, so a clean commit's status never rides on whichever line ran last.
+exit 0
