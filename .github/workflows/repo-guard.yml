@@ -1,13 +1,35 @@
 name: repo-guard
 on:
+  # Deliberately NOT narrowed to `main`, unlike ci.yml. This repo is public, so a branch pushed
+  # HERE is world-readable at once (a fork's own branch fires nothing in this repo -- for those,
+  # the PR run is the first look), and this is the job whose premise is that such a push cannot
+  # be taken back. Narrowing would leave the window between pushing a branch and opening a PR
+  # scanned by nothing: the local hook is opt-in per clone and `--no-verify` skips it.
+  #
+  # For a maintainer's branch the extra run is close to free, and that is the case defended
+  # here. An outside contributor gets no extra run at all -- a fork's own branch pushes fire
+  # nothing here, so the PR run is their only one. It used to fail closed for them, because
+  # repository secrets are withheld from fork PRs and the name check needed one; #6 moved that
+  # check to local-only, so the PR run now works for a fork. Recorded because this trigger and
+  # that fix look like the same subject and are not.
+  #
+  # Scope worth knowing: `--all` scans the checked-out tree, not the history behind it, so a
+  # secret added and then removed within a branch passes. See M97.
   push:
   pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   guard:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
+          # Full history, though the scan reads only the tree (see the scope note above and
+          # M97). Kept because the fix for M97 needs the commits a push adds; today it fetches
+          # what nothing opens, which is precisely the mismatch that finding is about.
           fetch-depth: 0
       - name: Scan for secret shapes and machine home paths
         # Not proprietary names. That check is local-only and `--all` refuses to run it,

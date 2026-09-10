@@ -71,6 +71,9 @@ env:
   ACME_DATASET_REPO: dbt-labs/semantic-layer-llm-benchmarking
   ACME_DATASET_REF: ac20c9292fa88ec44d30aeeae61ee41a51e31748
 
+permissions:
+  contents: read
+
 jobs:
   acme:
     runs-on: ubuntu-latest

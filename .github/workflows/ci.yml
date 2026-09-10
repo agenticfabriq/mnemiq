@@ -1,5 +1,21 @@
 name: ci
-on: [push, pull_request]
+on:
+  # `pull_request` alone would leave `main` itself unbuilt; `push` alone would skip PRs from
+  # forks, which is where the checks matter most. Both, but `push` is narrowed to `main` --
+  # unnarrowed, a branch in this repo fired BOTH events and every job ran twice, which is
+  # what made a green PR cost double and read as two conflicting sets of checks.
+  push:
+    branches: [main]
+  pull_request:
+
+# This repo's default is already `read`, so today this changes nothing at runtime. It is here
+# because that default is a REPO SETTING -- one checkbox in a UI, changeable by anyone with
+# admin, invisible in review, and silently applied to every workflow at once. Declared here it
+# is version-controlled, diffed, and cannot be widened without a commit. Top level, so a job
+# added later inherits the floor instead of whatever the setting happens to be that week.
+permissions:
+  contents: read
+
 jobs:
   unit:
     runs-on: ubuntu-latest
