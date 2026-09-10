@@ -88,22 +88,19 @@ fi
 #    so it re-resolves a stale lock and lints with whatever it gets. Asking uv is exact and
 #    costs ~70ms; comparing a version range by hand would not be.
 lockcheck="$(uv lock --check --project "$staged" 2>&1)"
-lock_rc=$?
-if [ "$lock_rc" -ne 0 ]; then
+if [ $? -ne 0 ]; then
   printf '%s\n' "${lockcheck//$staged\//}"
   echo
-  # uv separates "stale" (1) from "could not read or resolve at all" (2), and only the first is
-  # fixed by re-locking. Telling someone to run `uv lock` at a corrupt lockfile sends them at a
-  # command that cannot succeed -- the same crying-wolf failure the lint branches below avoid.
-  if [ "$lock_rc" -eq 1 ]; then
-    echo "pre-commit: BLOCKED [config]: the staged uv.lock is stale against the staged"
-    echo "pyproject.toml. CI syncs without --frozen, so it would re-resolve and lint with a"
-    echo "toolchain this gate never saw. Run 'uv lock' and stage the result."
-  else
-    echo "pre-commit: BLOCKED [config]: the staged project could not be resolved at all"
-    echo "(uv exit $lock_rc) -- see above. Re-locking will not fix this one; the lockfile or"
-    echo "pyproject.toml in this commit is unreadable or has no valid resolution."
-  fi
+  # uv's own message is printed above and is left to speak for itself. Two attempts at
+  # classifying its exit codes here were wrong in opposite directions -- 1 turned out to cover
+  # both "stale" and "no valid resolution", and 2 covers both "unreadable" and "missing", where
+  # re-locking IS the fix. Each wrong guess sent the operator at a command that could not work,
+  # which is the exact failure a helpful-sounding message is supposed to prevent. uv already
+  # names the cause and the remedy in every one of those cases; paraphrasing it added nothing
+  # but a second, less accurate voice.
+  echo "pre-commit: BLOCKED [config]: the staged project does not resolve cleanly, so CI --"
+  echo "which syncs WITHOUT --frozen -- could install a different toolchain than this gate"
+  echo "just linted with. uv's diagnosis is above; whatever it fixes, stage the result."
   exit 1
 fi
 
