@@ -79,6 +79,25 @@ fi
 # (verified: it appears in the 11 packages that sync would uninstall), so the fallback is not
 # hypothetical. With the extra, this is the exact version the lockfile pins, which is the whole
 # point of running lint here rather than trusting the developer's environment.
+# The CONFIG ruff applies comes from the staged tree -- verified with `--show-settings`, whose
+# `project_root` is the temp copy. The BINARY does not: `uv run` executes here, at the working
+# tree root, so it resolves ruff from THIS uv.lock. Stage a lockfile that moves ruff and leave
+# the working tree on the old one and the gate lints with a different tool than CI installs --
+# the same index-vs-worktree split as the content bug, one level up in the toolchain.
+#
+# Compared rather than assumed, and compared on the thing that matters (the version) instead of
+# on whether the files differ at all, so an unrelated edit to pyproject.toml does not block a
+# commit it cannot affect.
+want_ruff="$(awk '/^name = "ruff"$/{f=1;next} f&&/^version = /{gsub(/"/,"",$3); print $3; exit}' "$staged/uv.lock" 2>/dev/null)"
+have_ruff="$(uv run --frozen --extra dev -- ruff --version 2>/dev/null | awk '{print $2}')"
+if [ -n "$want_ruff" ] && [ -n "$have_ruff" ] && [ "$want_ruff" != "$have_ruff" ]; then
+  echo "pre-commit: BLOCKED [config]: this commit stages ruff $want_ruff, but the lint just run"
+  echo "used $have_ruff -- resolved from the WORKING TREE's lockfile, which is not what CI will"
+  echo "install. Stage uv.lock and pyproject.toml together, or 'git add' them, so the tool that"
+  echo "checks this commit is the tool that checks it in CI."
+  exit 1
+fi
+
 output="$(uv run --frozen --extra dev -- ruff check "$staged" 2>&1)"
 rc=$?
 output="${output//$staged\//}"   # report repo-relative paths, not the temp copy's
