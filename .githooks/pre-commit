@@ -28,10 +28,15 @@ cd "$top" || exit 1
 # and then exits 0 in silence -- measured: rc=2 by default, rc=0 with either. The two are not
 # the same kind of thing, and get different answers.
 #
-# `core.whitespace` turns the check off for EVERYTHING, so it is refused. Split on commas,
-# spaces and tabs, because git accepts all three and a comma-anchored match missed
-# `tab-in-indent, -blank-at-eol` (measured: rc=0, and the pattern saw nothing).
-ws_cfg="$(git config --get core.whitespace 2>/dev/null | tr ', \t' '\n\n\n')"
+# `core.whitespace` turns the check off for EVERYTHING, so it is refused. Split on COMMAS and
+# trim each field, which is what git does -- it separates on commas and tolerates whitespace
+# beside them. Measured all three forms: `-blank-at-eol` and `tab-in-indent, -blank-at-eol`
+# both disable it (rc=0), while `-blank-at-eol -tab-in-indent` with no comma does NOT (rc=2,
+# still checking). Splitting on spaces too would block that last one for disabling a check it
+# does not disable -- a false refusal whose only escape is `--no-verify`, which skips
+# repo-guard, and that is the trade this file argues against fifteen lines down.
+ws_cfg="$(git config --get core.whitespace 2>/dev/null \
+  | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 case "$nl$ws_cfg$nl" in
   *"${nl}-blank-at-eol${nl}"*|*"${nl}-space-before-tab${nl}"*|*"${nl}-blank-at-eof${nl}"*|*"${nl}-trailing-space${nl}"*)
     echo "pre-commit: BLOCKED [config]: core.whitespace disables this check for every path, so"
@@ -288,9 +293,16 @@ output="${output//$staged\//}"   # report repo-relative paths, not the temp copy
 
 case "$rc" in
   0) if [ -n "$ws_exempt" ]; then
-       echo "pre-commit: clean (repo-guard, whitespace, ruff) -- but .gitattributes exempts"
-       echo "these staged paths from the whitespace check, so they were NOT covered:"
-       printf '  %s\n' $ws_exempt
+       echo "pre-commit: clean (repo-guard, whitespace, ruff) -- but .gitattributes turns off"
+       echo "some or all whitespace checks for these staged paths, so they are not fully"
+       echo "covered by the line above:"
+       # Read, not `printf '  %s\n' $ws_exempt`. Unquoted, bash word-splits and GLOBS it: a
+       # path with a space printed as two lines, and `star[AB].md` expanded to starA.md and
+       # starB.md -- naming two files that WERE checked while hiding the one that was not.
+       # A disclosure that misreports which paths it is disclosing is worse than none.
+       printf '%s\n' "$ws_exempt" | while IFS= read -r ws_path; do
+         [ -n "$ws_path" ] && printf '  %s\n' "$ws_path"
+       done
      else
        echo "pre-commit: clean (repo-guard, whitespace, ruff)."
      fi ;;
