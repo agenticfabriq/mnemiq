@@ -14,118 +14,156 @@ cd "$top" || exit 1
 
 "./scripts/repo-guard.sh" --staged || exit $?
 
-# Whitespace damage in the STAGED content, before anything more expensive runs. `ruff` covers
-# Python only, so every shell script, workflow and Markdown file in this repo -- this hook
-# included -- had no check at all. Demonstrated the hard way: the commit that added the lint
-# gate (f9d847b) was itself later edited to carry a trailing space (af0a176), and nothing
-# noticed until a reviewer ran `git diff --check` by hand.
+# Per-check escapes, because the alternative is `--no-verify` and that is not an escape from
+# ONE check -- it skips the whole hook, repo-guard included. repo-guard is the secrets and
+# proprietary-name scan on a public clean-room repo, and a public push cannot be taken back.
+# Telling someone to reach for `--no-verify` because ruff is unavailable or their whitespace
+# config is off trades the cheapest check in the file for the most important one. This file
+# argued that twice in comments and then printed the advice anyway, in two messages.
 #
-# `--cached` for the same reason the lint uses the materialised index: the commit is what is
-# staged. Against the empty tree when there is no HEAD, so the first commit in a clone is
-# checked too rather than erroring.
-# `git diff --check` honours `core.whitespace` and `.gitattributes`, so it can be switched off
-# and then exits 0 in silence -- measured: rc=2 by default, rc=0 with either. The two are not
-# the same kind of thing, and get different answers.
-#
-# Is the check actually running? ASKED, not derived from `core.whitespace`.
-#
-# I modelled that config three times and got it wrong three times: git separates on commas
-# only (so splitting on spaces falsely refused `-blank-at-eol -tab-in-indent`, which disables
-# nothing), and it tolerates whitespace only BEFORE a token (so trimming the trailing side
-# falsely refused `-blank-at-eol `, which also disables nothing). Each wrong guess refused a
-# commit and offered `--no-verify`, which skips repo-guard. Every one was a parser disagreeing
-# with git about git, so git is asked instead.
-#
-# One probe PER CLASS, because a single trailing-space probe says nothing about the others:
-# `-space-before-tab,-blank-at-eof` leaves it detected, the guard passes, and damage of the
-# other two classes then lands under a "clean (whitespace)" line. That is a silent pass, and
-# the `case` this replaced did cover it.
-#
-# Run from the probe directory with `core.attributesFile` neutralised, because git applies the
-# REPO's attributes to files outside it: with `* -whitespace` the probe reads as off and the
-# operator is refused with "see core.whitespace" while core.whitespace is unset. A per-path
-# attribute opt-out is disclosed below, not refused -- these two must not be confused.
-ws_dir="$(mktemp -d)" || {
-  echo "pre-commit: BLOCKED [config]: could not create a temp dir to probe the whitespace check."
-  exit 1; }
-printf 'x\n'              > "$ws_dir/a"
-printf 'x\ntrail \n'      > "$ws_dir/b_eol"
-printf 'x\n \tindented\n' > "$ws_dir/b_sbt"
-printf 'x\nlast\n\n'      > "$ws_dir/b_eof"
-# The config has to be carried ACROSS the isolation, not left behind: `core.whitespace` set
-# with `git config` lives in .git/config, so a probe run from outside the repo stops seeing it
-# and every value reads as "enabled" -- measured, the probe passed with `-blank-at-eol` set.
-# It is passed through verbatim, so git still does the parsing; nothing here interprets it.
-#
-# As an ARRAY. `${cfg:+-c core.whitespace=$cfg}` unquoted word-splits a value containing a
-# space, so `-blank-at-eol -tab-in-indent` reached git as a stray `-tab-in-indent` option and
-# it exited 129 -- which has bit 2 clear and would have been read as "check disabled".
-ws_cfg="$(git config --get core.whitespace 2>/dev/null || true)"
-ws_cfg_args=()
-[ -n "$ws_cfg" ] && ws_cfg_args=(-c "core.whitespace=$ws_cfg")
-ws_sees() {  # 0 if git flags the defect in probe file $1
-  local rc
-  ( cd "$ws_dir" && git -c core.attributesFile=/dev/null \
-      ${ws_cfg_args[@]+"${ws_cfg_args[@]}"} \
-      diff --check --no-index a "$1" >/dev/null 2>&1 )
-  rc=$?
-  # bit 2 is "whitespace error found". Anything else -- 129 from a usage error, say -- is not
-  # a clean "no defect", so it is treated as the check not working rather than as a pass.
-  [ "$((rc & 2))" -ne 0 ]
+# So each skippable check has its own switch, and using one never touches repo-guard. Anything
+# skipped is named in the success line: the point was never to force the check, it was to stop
+# reporting a pass nobody established.
+switch_on() {  # a switch is OFF when unset or set to a falsey word, not merely when empty --
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    ''|0|false|no|off) return 1 ;;   # MNEMIQ_SKIP_LINT=0 must not skip the lint
+    *) return 0 ;;
+  esac
 }
-ws_off=""
-ws_sees b_eol || ws_off="$ws_off trailing-whitespace"
-ws_sees b_sbt || ws_off="$ws_off space-before-tab"
-ws_sees b_eof || ws_off="$ws_off blank-line-at-EOF"
-rm -rf "$ws_dir"
-if [ -n "$ws_off" ]; then
-  echo "pre-commit: BLOCKED [config]: git does not flag these defects under this configuration,"
-  echo "so the check below would pass without seeing them:$ws_off"
-  echo "Re-enable them (see core.whitespace), or commit with --no-verify if that is deliberate."
-  exit 1
-fi
-
-# A `.gitattributes` opt-out is PER PATH and often legitimate -- `*.md -whitespace` is the
-# standard way to keep Markdown's two-space hard break. Refusing those commits would make the
-# only escape `--no-verify`, which also skips repo-guard, and pushing people past the secrets
-# gate on a clean-room public repo to satisfy a whitespace check is a bad trade. So they are
-# DISCLOSED instead: those paths go unchecked, and the success line names them rather than
-# claiming a check that did not cover them.
-#
-# `R` in the filter because rename detection is on by default, so a `git mv`'d path would
-# otherwise never be asked. Both attribute forms count: Unset (`-whitespace`) and a String
-# value carrying negations (`whitespace=-blank-at-eol`), the second verified in a scratch repo
-# to print its value rather than `unset`.
+SKIP_WS=""; switch_on "${MNEMIQ_SKIP_WHITESPACE:-}" && SKIP_WS=1
+SKIP_LINT=""; switch_on "${MNEMIQ_SKIP_LINT:-}" && SKIP_LINT=1
+skipped=""
+# Declared up here, not inside the branch that fills it: the summary reads it unconditionally,
+# and under `set -u` an unset one aborts the hook AFTER printing "clean". Measured -- with
+# MNEMIQ_SKIP_WHITESPACE=1 the hook printed its success line, then `ws_exempt: unbound
+# variable`, and exited 1. The escape hatch blocked every commit that used it, and the message
+# offering the hatch was the one that had just told the operator to run it.
 ws_exempt=""
-ws_files="$(git diff --cached --name-only --diff-filter=ACMR)"
-if [ -n "$ws_files" ]; then
-  ws_attrs="$(printf '%s\n' "$ws_files" | git check-attr --stdin whitespace 2>/dev/null)"
-  ws_exempt="$(printf '%s\n' "$ws_attrs" \
-    | awk -F': whitespace: ' 'NF==2 && ($2=="unset" || $2 ~ /(^|,)-/) {print $1}')"
-fi
 
-if git rev-parse --verify -q HEAD >/dev/null; then
-  ws_base=HEAD
+# The whole section is skippable as a unit, so the switch does what its name says rather
+# than only applying when the config happens to be disabled.
+if [ -n "$SKIP_WS" ]; then
+  skipped="$skipped whitespace"
 else
-  ws_base="$(git hash-object -t tree /dev/null)"
-fi
-if ! ws="$(git diff --check --cached "$ws_base" 2>&1)"; then
-  printf '%s\n' "$ws"
-  echo
-  echo "pre-commit: BLOCKED [whitespace]: trailing whitespace, a blank line at end of file, a"
-  echo "space before a tab, or a leftover conflict marker in the staged content -- git's own"
-  echo "report is above, and 'git diff --check --cached' lists them."
-  exit 1
+  # Whitespace damage in the STAGED content, before anything more expensive runs. `ruff` covers
+  # Python only, so every shell script, workflow and Markdown file in this repo -- this hook
+  # included -- had no check at all. Demonstrated the hard way: the commit that added the lint
+  # gate (f9d847b) was itself later edited to carry a trailing space (af0a176), and nothing
+  # noticed until a reviewer ran `git diff --check` by hand.
+  #
+  # `--cached` for the same reason the lint uses the materialised index: the commit is what is
+  # staged. Against the empty tree when there is no HEAD, so the first commit in a clone is
+  # checked too rather than erroring.
+  # `git diff --check` honours `core.whitespace` and `.gitattributes`, so it can be switched off
+  # and then exits 0 in silence -- measured: rc=2 by default, rc=0 with either. The two are not
+  # the same kind of thing, and get different answers.
+  #
+  # Is the check actually running? ASKED, not derived from `core.whitespace`.
+  #
+  # I modelled that config three times and got it wrong three times: git separates on commas
+  # only (so splitting on spaces falsely refused `-blank-at-eol -tab-in-indent`, which disables
+  # nothing), and it tolerates whitespace only BEFORE a token (so trimming the trailing side
+  # falsely refused `-blank-at-eol `, which also disables nothing). Each wrong guess refused a
+  # commit and offered `--no-verify`, which skips repo-guard. Every one was a parser disagreeing
+  # with git about git, so git is asked instead.
+  #
+  # One probe PER CLASS, because a single trailing-space probe says nothing about the others:
+  # `-space-before-tab,-blank-at-eof` leaves it detected, the guard passes, and damage of the
+  # other two classes then lands under a "clean (whitespace)" line. That is a silent pass, and
+  # the `case` this replaced did cover it.
+  #
+  # Run from the probe directory with `core.attributesFile` neutralised, because git applies the
+  # REPO's attributes to files outside it: with `* -whitespace` the probe reads as off and the
+  # operator is refused with "see core.whitespace" while core.whitespace is unset. A per-path
+  # attribute opt-out is disclosed below, not refused -- these two must not be confused.
+  ws_dir="$(mktemp -d)" || {
+    echo "pre-commit: BLOCKED [config]: could not create a temp dir to probe the whitespace check."
+    exit 1; }
+  printf 'x\n'              > "$ws_dir/a"
+  printf 'x\ntrail \n'      > "$ws_dir/b_eol"
+  printf 'x\n \tindented\n' > "$ws_dir/b_sbt"
+  printf 'x\nlast\n\n'      > "$ws_dir/b_eof"
+  # The config has to be carried ACROSS the isolation, not left behind: `core.whitespace` set
+  # with `git config` lives in .git/config, so a probe run from outside the repo stops seeing it
+  # and every value reads as "enabled" -- measured, the probe passed with `-blank-at-eol` set.
+  # It is passed through verbatim, so git still does the parsing; nothing here interprets it.
+  #
+  # As an ARRAY. `${cfg:+-c core.whitespace=$cfg}` unquoted word-splits a value containing a
+  # space, so `-blank-at-eol -tab-in-indent` reached git as a stray `-tab-in-indent` option and
+  # it exited 129 -- which has bit 2 clear and would have been read as "check disabled".
+  ws_cfg="$(git config --get core.whitespace 2>/dev/null || true)"
+  ws_cfg_args=()
+  [ -n "$ws_cfg" ] && ws_cfg_args=(-c "core.whitespace=$ws_cfg")
+  ws_sees() {  # 0 if git flags the defect in probe file $1
+    local rc
+    ( cd "$ws_dir" && git -c core.attributesFile=/dev/null \
+        ${ws_cfg_args[@]+"${ws_cfg_args[@]}"} \
+        diff --check --no-index a "$1" >/dev/null 2>&1 )
+    rc=$?
+    # bit 2 is "whitespace error found". Anything else -- 129 from a usage error, say -- is not
+    # a clean "no defect", so it is treated as the check not working rather than as a pass.
+    [ "$((rc & 2))" -ne 0 ]
+  }
+  ws_off=""
+  ws_sees b_eol || ws_off="$ws_off trailing-whitespace"
+  ws_sees b_sbt || ws_off="$ws_off space-before-tab"
+  ws_sees b_eof || ws_off="$ws_off blank-line-at-EOF"
+  rm -rf "$ws_dir"
+  if [ -n "$ws_off" ]; then
+    echo "pre-commit: BLOCKED [config]: git does not flag these defects under this"
+    echo "configuration, so the check below would pass without seeing them:$ws_off"
+    echo "Re-enable them (see core.whitespace), or if that is deliberate:"
+    echo "  MNEMIQ_SKIP_WHITESPACE=1 git commit ...    (repo-guard still runs)"
+    exit 1
+  fi
+
+  # A `.gitattributes` opt-out is PER PATH and often legitimate -- `*.md -whitespace` is the
+  # standard way to keep Markdown's two-space hard break. Refusing those commits would make the
+  # only escape `--no-verify`, which also skips repo-guard, and pushing people past the secrets
+  # gate on a clean-room public repo to satisfy a whitespace check is a bad trade. So they are
+  # DISCLOSED instead: those paths go unchecked, and the success line names them rather than
+  # claiming a check that did not cover them.
+  #
+  # `R` in the filter because rename detection is on by default, so a `git mv`'d path would
+  # otherwise never be asked. Both attribute forms count: Unset (`-whitespace`) and a String
+  # value carrying negations (`whitespace=-blank-at-eol`), the second verified in a scratch repo
+  # to print its value rather than `unset`.
+  ws_exempt=""
+  ws_files="$(git diff --cached --name-only --diff-filter=ACMR)"
+  if [ -n "$ws_files" ]; then
+    ws_attrs="$(printf '%s\n' "$ws_files" | git check-attr --stdin whitespace 2>/dev/null)"
+    ws_exempt="$(printf '%s\n' "$ws_attrs" \
+      | awk -F': whitespace: ' 'NF==2 && ($2=="unset" || $2 ~ /(^|,)-/) {print $1}')"
+  fi
+
+  if git rev-parse --verify -q HEAD >/dev/null; then
+    ws_base=HEAD
+  else
+    ws_base="$(git hash-object -t tree /dev/null)"
+  fi
+  if ! ws="$(git diff --check --cached "$ws_base" 2>&1)"; then
+    printf '%s\n' "$ws"
+    echo
+    echo "pre-commit: BLOCKED [whitespace]: trailing whitespace, a blank line at end of file, a"
+    echo "space before a tab, or a leftover conflict marker in the staged content -- git's own"
+    echo "report is above, and 'git diff --check --cached' lists them."
+    exit 1
+  fi
 fi
 
-if ! command -v uv >/dev/null 2>&1; then
+if [ -n "$SKIP_LINT" ]; then
+  skipped="$skipped lint"
+elif ! command -v uv >/dev/null 2>&1; then
   echo "pre-commit: BLOCKED [config]: uv is not on PATH, so lint could not run."
-  echo "Install uv (https://docs.astral.sh/uv/), or commit with --no-verify if you accept CI"
-  echo "finding what this would have. Failing closed, the same way repo-guard does: a gate that"
-  echo "waves a commit through when it could not check it is worse than no gate."
+  echo "Install uv (https://docs.astral.sh/uv/), or if you accept CI finding what this would"
+  echo "have:"
+  echo "  MNEMIQ_SKIP_LINT=1 git commit ...            (repo-guard still runs)"
+  echo "Failing closed otherwise, the same way repo-guard does: a gate that waves a commit"
+  echo "through when it could not check it is worse than no gate."
   exit 1
 fi
 
+if [ -z "$SKIP_LINT" ]; then
 # Lint the INDEX, not the working tree. `ruff check .` would read the files on disk, which are
 # not what is being committed: stage a violation and fix it without `git add`, or stage a subset
 # with `git add -p`, and a working-tree lint passes while CI fails on the content that landed.
@@ -332,20 +370,7 @@ rc=$?
 output="${output//$staged\//}"   # report repo-relative paths, not the temp copy's
 
 case "$rc" in
-  0) if [ -n "$ws_exempt" ]; then
-       echo "pre-commit: clean (repo-guard, whitespace, ruff) -- but .gitattributes turns off"
-       echo "some or all whitespace checks for these staged paths, so they are not fully"
-       echo "covered by the line above:"
-       # Read, not `printf '  %s\n' $ws_exempt`. Unquoted, bash word-splits and GLOBS it: a
-       # path with a space printed as two lines, and `star[AB].md` expanded to starA.md and
-       # starB.md -- naming two files that WERE checked while hiding the one that was not.
-       # A disclosure that misreports which paths it is disclosing is worse than none.
-       printf '%s\n' "$ws_exempt" | while IFS= read -r ws_path; do
-         [ -n "$ws_path" ] && printf '  %s\n' "$ws_path"
-       done
-     else
-       echo "pre-commit: clean (repo-guard, whitespace, ruff)."
-     fi ;;
+  0) : ;;   # reported below, once, so a skipped lint still gets a summary
   # ruff exits 1 for violations and 2 for its own errors; anything else came from uv. Only the
   # first is a lint failure, and sending someone to hunt for a diagnostic that was never printed
   # is how a gate earns a reputation for crying wolf.
@@ -363,6 +388,28 @@ case "$rc" in
      echo "failure. Usually a missing or unresolvable environment; 'uv sync --extra dev' first."
      exit 1 ;;
 esac
+fi   # SKIP_LINT
+
+# One summary, naming only what actually ran. A check that was skipped is not reported as
+# passed -- that distinction is the whole reason the skips exist rather than `--no-verify`,
+# which would have made the whole hook silent.
+summary="repo-guard"
+case " $skipped " in *" whitespace"*) ;; *) summary="$summary, whitespace" ;; esac
+case " $skipped " in *" lint"*) ;; *) summary="$summary, ruff" ;; esac
+echo "pre-commit: clean ($summary)."
+if [ -n "$skipped" ]; then
+  echo "  NOT CHECKED:$skipped"
+fi
+if [ -n "$ws_exempt" ]; then
+  echo "  .gitattributes turns off some or all whitespace checks for these staged paths, so"
+  echo "  they are not fully covered:"
+  # Read, not `printf '  %s\n' $ws_exempt`. Unquoted, bash word-splits and GLOBS it: a path
+  # with a space printed as two lines, and `star[AB].md` expanded to starA.md and starB.md --
+  # naming two files that WERE checked while hiding the one that was not.
+  printf '%s\n' "$ws_exempt" | while IFS= read -r ws_path; do
+    [ -n "$ws_path" ] && printf '    %s\n' "$ws_path"
+  done
+fi
 
 # Explicit, so a clean commit's status never rides on whichever line ran last.
 exit 0
