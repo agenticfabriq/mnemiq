@@ -135,21 +135,25 @@ class DuckDBAdapter:
         source defines" and a schema-qualified call resolves through the search path anyway.
         Duplicates collapse: DuckDB lists one row per overload.
 
+        DuckDB's catalogue is the right one even for a Postgres attachment, which is not
+        obvious and was measured rather than assumed. Queries execute on `self._con`, and
+        DuckDB's binder resolves calls against its own catalogue: against a Postgres source
+        holding `CREATE FUNCTION median(int) RETURNS int AS $$ SELECT 99 $$`, `SELECT median(1)`
+        returned 1.0 from DuckDB's aggregate, and both `public.median(1)` and
+        `src.public.median(1)` failed to bind. A Postgres UDF is simply not reachable from a
+        generated query, so reporting DuckDB's non-internal names answers the question both
+        callers ask. An earlier version raised here on the theory that this catalogue was the
+        wrong one; it was throwing away a correct answer.
+
+        What that does NOT cover is a Postgres VIEW BODY. Reading `src.public.v_med`, whose body
+        calls that same function, returned 99 -- the function ran server-side, inside Postgres,
+        where DuckDB's binder never looked. Lineage walking view bodies is asking a different
+        question of a different catalogue, and wants `pg_proc`. Naming the gap here so the two
+        do not get conflated.
+
         A failure RAISES, like `view_definitions`. Returning `[]` would tell the caller this
         source defines nothing, which is a different claim from being unable to look.
         """
-        if self._fk_via_postgres:
-            # The source is Postgres, reached through the attachment, and `duckdb_functions()`
-            # answers for DUCKDB. It would return no user functions and a caller would read that
-            # as a confident "this source defines none" -- a fail-open, on the one path where a
-            # Postgres UDF shadowing a modelled name is exactly what we are looking for. The two
-            # sibling discovery methods branch here and go through `postgres_query` for the same
-            # reason; the `pg_proc` query belongs beside them and is not written yet, so this
-            # says so instead of answering wrongly.
-            raise NotImplementedError(
-                "user_functions is not implemented for a Postgres attachment: duckdb_functions() "
-                "describes DuckDB, not the attached source. Needs a pg_proc query via postgres_query."
-            )
         rows = self._con.execute(
             "SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE NOT internal"
         ).fetchall()

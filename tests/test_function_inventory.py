@@ -42,6 +42,19 @@ def test_an_empty_answer_is_not_a_failed_lookup():
     assert (nobody_asked.available, nobody_asked.asked) == (True, False)
 
 
+def test_both_constructors_normalise():
+    """The plain constructor is handed out whether or not you meant to expose it, and it used to
+    build a broken instance: `FunctionInventory({"MEDIAN"}).defines("median")` was False and
+    `hash()` raised on the unfrozen set, while `of()` did the right thing. Two constructors with
+    different semantics is a bug nobody looks for, and this one failed in the direction that
+    matters -- a UDF named like a builtin read as the builtin."""
+    assert FunctionInventory({"MEDIAN"}).defines("median")
+    assert FunctionInventory(["a"]) == FunctionInventory.of(["a"])
+    assert hash(FunctionInventory({"MEDIAN"}))
+    # `of("median")` must not splay a bare string into single characters.
+    assert FunctionInventory.of("median").names == frozenset({"median"})
+
+
 def test_names_match_regardless_of_case():
     """SQL folds case and the catalogue does not agree with itself across engines, so a set of
     raw strings would answer `defines('MEDIAN')` differently from `defines('median')`."""
@@ -88,3 +101,26 @@ def test_a_lookup_failure_raises_rather_than_reporting_none(duckdb_source):
 
     with pytest.raises(Exception):
         adapter.user_functions()
+
+
+@pytest.mark.integration
+def test_a_postgres_attachment_reports_duckdbs_catalogue_and_that_is_correct():
+    """Measured, because it is not obvious and an earlier version raised here instead.
+
+    Queries run on the DuckDB connection and its binder resolves against its own catalogue. On
+    a Postgres source defining `median(int) RETURNS 99`, `SELECT median(1)` returns DuckDB's
+    aggregate and the qualified forms do not bind at all, so a Postgres UDF is unreachable from
+    a generated query. Reporting DuckDB's non-internal names is therefore the right answer, and
+    the Postgres function must NOT appear.
+
+    A Postgres view body is the other question. Reading a view whose body calls that function
+    returns 99, because it runs server-side where DuckDB's binder never looked. That wants
+    `pg_proc` and is not what this method answers.
+    """
+    import os
+
+    dsn = os.getenv("MNEMIQ_PG_DSN", "postgresql://mnemiq:mnemiq@localhost:5433/acme")
+    fns = DuckDBAdapter.postgres(dsn, read_only=True).user_functions()
+
+    assert "median" not in fns, "a Postgres UDF is not callable here and must not be reported"
+    assert all(isinstance(f, str) for f in fns)

@@ -23,8 +23,8 @@ class FunctionInventory:
     produces the same empty result and means "we do not know what it defines", and no control
     may read the second as the first. That is another instance of the absence-and-failure
     collapse this codebase keeps finding (see `ViewInventory` and `authz/grants.py`'s
-    EMPTY/UNAVAILABLE, and the register for the running list -- no count is written here,
-    because a typed count is one more thing to go stale).
+    EMPTY/UNAVAILABLE for the same shape). No ordinal is written here: this codebase keeps
+    finding new ones and a typed count is one more thing to go stale.
 
     `available` is whether the source answered. `asked` is whether anyone put the question,
     which `available` cannot carry: an adapter with no inventory method and one whose query
@@ -48,14 +48,26 @@ class FunctionInventory:
     asked: bool = True
     reason: str = ""   # declared for every constructor, not only the failing one
 
+    def __post_init__(self) -> None:
+        # Normalised HERE, not only in `of()`. A dataclass hands out its plain constructor
+        # whether or not you meant to, and that one built a broken instance:
+        # `FunctionInventory({"MEDIAN"}).defines("median")` was False and `hash()` raised on the
+        # unfrozen set, while `of()` a few lines down did the right thing. Two constructors with
+        # different semantics is the shape of a bug nobody looks for, and the case-sensitive one
+        # fails in the direction that matters -- a UDF named like a builtin read as the builtin.
+        object.__setattr__(self, "names", frozenset(n.lower() for n in self.names))
+
     @classmethod
     def of(cls, names, **kw) -> "FunctionInventory":
         """Build from any iterable of names, folded to lower case.
 
-        SQL folds case and catalogues disagree across engines, so raw strings would answer
-        `defines('MEDIAN')` differently from `defines('median')`.
+        A convenience over the constructor for the common "I have an iterable" case; both
+        normalise. Guards against `of("median")`, which would otherwise splay a bare string
+        into single characters.
         """
-        return cls(frozenset(n.lower() for n in (names or ())), **kw)
+        if isinstance(names, str):
+            names = [names]
+        return cls(frozenset(names or ()), **kw)
 
     @classmethod
     def unavailable(cls, reason: str = "") -> "FunctionInventory":
