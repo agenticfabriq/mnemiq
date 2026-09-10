@@ -240,12 +240,20 @@ def test_an_opaque_call_cannot_be_decided(sql, dialect):
     "SELECT date_part('year', created_at) FROM claim",
 ])
 def test_a_modelled_call_is_untouched(sql, dialect):
-    """The degeneracy control, and it is the whole reason this is a whitelist rather than a
-    blocklist of names. sqlglot's typed function classes ARE the allowlist: sum, count, upper,
-    cast and date_trunc parse to Sum, Count, Upper, Cast and DateTrunc, so they never reach
-    this guard. `now()` is here because the lineage layer measured it as `Anonymous` on a bare
-    parse -- through the decider it is not, and a guard that refused `WHERE created_at < now()`
-    would be useless whatever it caught.
+    """The degeneracy control, and the reason this is a whitelist rather than a blocklist.
+
+    Two different things keep these approved, and conflating them is how the first version of
+    this guard shipped broken:
+
+      * sqlglot models the name IN THE DIALECT BEING PARSED, so it never becomes an
+        `exp.Anonymous` and the guard never sees it -- `sum`, `count`, `upper`, `cast`.
+      * it DOES become `Anonymous` and the cross-dialect allowlist lets it through by name --
+        `now()` and `date_part()` under duckdb, which sqlglot models only under postgres.
+
+    The second case is the one that matters here. The first version had no allowlist and tested
+    `isinstance(node, exp.Anonymous)`, so it refused `WHERE created_at < now()` on the
+    production dialect -- useless whatever else it caught -- while these tests, pinned to
+    postgres, said otherwise. Hence `_DIALECTS`, duckdb first.
     """
     assert not isinstance(_decide(sql, dialect), Refusal), f"{sql!r} refused under {dialect}"
 
