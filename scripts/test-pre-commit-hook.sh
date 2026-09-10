@@ -84,9 +84,12 @@ ENVV=()
 # deleting the invocation left every check green. That is the property this file exists to
 # defend, so it is asserted here on the guard's output and again on its behaviour below.
 #
-# No trailing period, because the guard enumerates what it checked and that list grows: it
-# reads "clean (names, secrets, home paths)." today, and pinning the period broke the moment
-# #6 changed it. The prefix is the stable part.
+# The PREFIX only. The guard enumerates what it checked, and that suffix differs per machine,
+# not merely over time: a maintainer with a real blocklist sees "clean (names, secrets, home
+# paths)." while a contributor whose .env says `off` sees "clean (secrets, home paths; names
+# are checked locally)." Pinning either would pass for whoever wrote it and fail for everyone
+# else -- the asymmetry #6 exists to remove. Pinning the trailing period already broke once
+# when #6 changed the line.
 check "clean index passes"                        0 "repo-guard: clean"
 
 # Composed, not written literally: a trailing space in THIS file is whitespace damage the hook
