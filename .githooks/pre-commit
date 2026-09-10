@@ -43,11 +43,15 @@ fi
 # with a `No Python files found` warning. That makes an empty materialisation look like a pass,
 # which is the exact collapse this gate exists to prevent, one level up. So the count is checked
 # rather than assumed: this repo cannot legitimately reach zero.
-count="$(find "$staged" -name '*.py' -type f | wc -l | tr -d ' ')"
-if [ "$count" -eq 0 ]; then
-  echo "pre-commit: BLOCKED [config]: the index materialised 0 Python files, so ruff would have"
-  echo "reported success having checked nothing. That is not a pass -- it means checkout-index"
-  echo "wrote nothing, and every lint failure in this commit would ship."
+# Against the EXACT expected count, not against zero. Testing for zero catches only a total
+# wipe; any proper subset -- which is what a partial materialisation actually produces -- passes
+# while half the tree goes unlinted. The index knows the number, so ask it.
+want="$(git ls-files '*.py' | wc -l | tr -d ' ')"
+got="$(find "$staged" -name '*.py' -type f | wc -l | tr -d ' ')"
+if [ "$got" -ne "$want" ]; then
+  echo "pre-commit: BLOCKED [config]: materialised $got of $want Python files, so ruff would"
+  echo "have reported on part of the commit and returned success. That is not a pass -- the"
+  echo "files it never saw are exactly the ones whose lint failures would ship."
   exit 1
 fi
 
