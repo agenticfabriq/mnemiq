@@ -11,6 +11,22 @@ jobs:
       - run: uv sync --extra dev --extra ontology --extra oracle
       - run: uv run ruff check .
       - run: uv run pytest -m "not integration and not live_llm" -v
+      # The commit hook is not installed in CI and never runs here, but it is the one gate in
+      # this repo that nothing else exercises -- and it shipped two broken paths because of it,
+      # including an escape hatch that aborted on an unbound variable after printing "clean".
+      # Running its suite here is what keeps "someone remembered to run it by hand" from being
+      # the coverage.
+      #
+      # The placeholder is load-bearing and is NOT the real blocklist. The hook calls
+      # `repo-guard --staged`, which fails closed when REPO_GUARD_NAME_PATTERNS is unset, so
+      # without this every check would see `BLOCKED [config]` and `ci` would be red on every
+      # push. A repo secret would fix that for branches here and NOT for fork pull requests,
+      # which receive no secrets -- the same trap that currently breaks repo-guard on fork PRs.
+      # A literal that matches nothing works everywhere, and costs nothing: this suite exercises
+      # the hook's structure and repo-guard's SECRET scan, neither of which needs the real list.
+      - run: bash scripts/test-pre-commit-hook.sh
+        env:
+          REPO_GUARD_NAME_PATTERNS: zzz_placeholder_matches_nothing_zzz
 
   workbench:
     runs-on: ubuntu-latest
