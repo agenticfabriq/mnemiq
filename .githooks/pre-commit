@@ -8,7 +8,6 @@
 # and fail the very first thing CI does. A gate that checks less than CI teaches people its
 # green means something it does not.
 set -uo pipefail
-nl=$'\n'
 
 top="$(git rev-parse --show-toplevel)" || exit 1
 cd "$top" || exit 1
@@ -28,22 +27,63 @@ cd "$top" || exit 1
 # and then exits 0 in silence -- measured: rc=2 by default, rc=0 with either. The two are not
 # the same kind of thing, and get different answers.
 #
-# `core.whitespace` turns the check off for EVERYTHING, so it is refused. Split on COMMAS and
-# trim each field, which is what git does -- it separates on commas and tolerates whitespace
-# beside them. Measured all three forms: `-blank-at-eol` and `tab-in-indent, -blank-at-eol`
-# both disable it (rc=0), while `-blank-at-eol -tab-in-indent` with no comma does NOT (rc=2,
-# still checking). Splitting on spaces too would block that last one for disabling a check it
-# does not disable -- a false refusal whose only escape is `--no-verify`, which skips
-# repo-guard, and that is the trade this file argues against fifteen lines down.
-ws_cfg="$(git config --get core.whitespace 2>/dev/null \
-  | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-case "$nl$ws_cfg$nl" in
-  *"${nl}-blank-at-eol${nl}"*|*"${nl}-space-before-tab${nl}"*|*"${nl}-blank-at-eof${nl}"*|*"${nl}-trailing-space${nl}"*)
-    echo "pre-commit: BLOCKED [config]: core.whitespace disables this check for every path, so"
-    echo "'git diff --check' would exit 0 without looking. Not reported as passed: re-enable it,"
-    echo "or commit with --no-verify if you meant to turn it off."
-    exit 1 ;;
-esac
+# Is the check actually running? ASKED, not derived from `core.whitespace`.
+#
+# I modelled that config three times and got it wrong three times: git separates on commas
+# only (so splitting on spaces falsely refused `-blank-at-eol -tab-in-indent`, which disables
+# nothing), and it tolerates whitespace only BEFORE a token (so trimming the trailing side
+# falsely refused `-blank-at-eol `, which also disables nothing). Each wrong guess refused a
+# commit and offered `--no-verify`, which skips repo-guard. Every one was a parser disagreeing
+# with git about git, so git is asked instead.
+#
+# One probe PER CLASS, because a single trailing-space probe says nothing about the others:
+# `-space-before-tab,-blank-at-eof` leaves it detected, the guard passes, and damage of the
+# other two classes then lands under a "clean (whitespace)" line. That is a silent pass, and
+# the `case` this replaced did cover it.
+#
+# Run from the probe directory with `core.attributesFile` neutralised, because git applies the
+# REPO's attributes to files outside it: with `* -whitespace` the probe reads as off and the
+# operator is refused with "see core.whitespace" while core.whitespace is unset. A per-path
+# attribute opt-out is disclosed below, not refused -- these two must not be confused.
+ws_dir="$(mktemp -d)" || {
+  echo "pre-commit: BLOCKED [config]: could not create a temp dir to probe the whitespace check."
+  exit 1; }
+printf 'x\n'              > "$ws_dir/a"
+printf 'x\ntrail \n'      > "$ws_dir/b_eol"
+printf 'x\n \tindented\n' > "$ws_dir/b_sbt"
+printf 'x\nlast\n\n'      > "$ws_dir/b_eof"
+# The config has to be carried ACROSS the isolation, not left behind: `core.whitespace` set
+# with `git config` lives in .git/config, so a probe run from outside the repo stops seeing it
+# and every value reads as "enabled" -- measured, the probe passed with `-blank-at-eol` set.
+# It is passed through verbatim, so git still does the parsing; nothing here interprets it.
+#
+# As an ARRAY. `${cfg:+-c core.whitespace=$cfg}` unquoted word-splits a value containing a
+# space, so `-blank-at-eol -tab-in-indent` reached git as a stray `-tab-in-indent` option and
+# it exited 129 -- which has bit 2 clear and would have been read as "check disabled".
+ws_cfg="$(git config --get core.whitespace 2>/dev/null || true)"
+ws_cfg_args=()
+[ -n "$ws_cfg" ] && ws_cfg_args=(-c "core.whitespace=$ws_cfg")
+ws_sees() {  # 0 if git flags the defect in probe file $1
+  local rc
+  ( cd "$ws_dir" && git -c core.attributesFile=/dev/null \
+      ${ws_cfg_args[@]+"${ws_cfg_args[@]}"} \
+      diff --check --no-index a "$1" >/dev/null 2>&1 )
+  rc=$?
+  # bit 2 is "whitespace error found". Anything else -- 129 from a usage error, say -- is not
+  # a clean "no defect", so it is treated as the check not working rather than as a pass.
+  [ "$((rc & 2))" -ne 0 ]
+}
+ws_off=""
+ws_sees b_eol || ws_off="$ws_off trailing-whitespace"
+ws_sees b_sbt || ws_off="$ws_off space-before-tab"
+ws_sees b_eof || ws_off="$ws_off blank-line-at-EOF"
+rm -rf "$ws_dir"
+if [ -n "$ws_off" ]; then
+  echo "pre-commit: BLOCKED [config]: git does not flag these defects under this configuration,"
+  echo "so the check below would pass without seeing them:$ws_off"
+  echo "Re-enable them (see core.whitespace), or commit with --no-verify if that is deliberate."
+  exit 1
+fi
 
 # A `.gitattributes` opt-out is PER PATH and often legitimate -- `*.md -whitespace` is the
 # standard way to keep Markdown's two-space hard break. Refusing those commits would make the
@@ -323,3 +363,6 @@ case "$rc" in
      echo "failure. Usually a missing or unresolvable environment; 'uv sync --extra dev' first."
      exit 1 ;;
 esac
+
+# Explicit, so a clean commit's status never rides on whichever line ran last.
+exit 0
