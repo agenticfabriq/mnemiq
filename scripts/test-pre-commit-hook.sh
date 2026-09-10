@@ -83,7 +83,10 @@ ENVV=()
 # is the HOOK's summary literal, printed whether or not the guard ran: deleting the invocation
 # left every check green. That is the property this file exists to defend, so it is asserted on
 # the guard's own output, and then again on its behaviour below.
-check "clean index passes"                        0 "repo-guard: clean."
+# `repo-guard: clean` without the period: #6 made the guard enumerate what it checked
+# ("clean (names, secrets, home paths)"), and pinning the trailing period broke on that. Still
+# the guard's OWN output rather than the hook's summary, which is the property being asserted.
+check "clean index passes"                        0 "repo-guard: clean"
 
 # Composed, not written literally: a trailing space in THIS file is whitespace damage the hook
 # would refuse, and a test whose fixture cannot be committed is not a test.
