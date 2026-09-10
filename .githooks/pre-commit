@@ -4,26 +4,16 @@
 # Two gates, cheapest first. Both must pass; neither is allowed to be the only one.
 #
 # Lint is here because it was NOT, and five ruff errors reached `main` and kept CI red for two
-# days (PR #7). The hook ran repo-guard and stopped, so a commit could be blessed locally and
-# fail the very first thing CI does. A gate that checks less than CI teaches people its green
-# means something it does not.
+# days (PR #7). The hook ran repo-guard and `exec`'d away, so a commit could be blessed locally
+# and fail the very first thing CI does. A gate that checks less than CI teaches people its
+# green means something it does not.
 set -uo pipefail
-cd "$(git rev-parse --show-toplevel)" || exit 1
+
+top="$(git rev-parse --show-toplevel)" || exit 1
+cd "$top" || exit 1
 
 "./scripts/repo-guard.sh" --staged || exit $?
 
-# `uv run` and not the ambient `ruff`: CI runs `uv run ruff check .`, and a hook that resolves a
-# DIFFERENT ruff than CI recreates the disagreement it exists to prevent -- passing locally and
-# failing on the same commit, which is the shape that is hardest to debug because both sides look
-# right. `--frozen` reads the lockfile without re-resolving, so this cannot drift from what
-# CI installs either. It RECONCILES the venv to the lock as a side effect -- measured: one
-# package version swapped, every extra left in place. That is the point rather than a cost.
-# A venv drifted from the lock is exactly how a local gate comes to disagree with CI on the
-# same commit and the same tool version, which is the hardest shape to debug because both
-# sides look right.
-#
-# The whole tree, not the staged files, for the same reason: CI checks `.`, so anything narrower
-# can be green here and red there.
 if ! command -v uv >/dev/null 2>&1; then
   echo "pre-commit: BLOCKED [config]: uv is not on PATH, so lint could not run."
   echo "Install uv (https://docs.astral.sh/uv/), or commit with --no-verify if you accept CI"
@@ -32,11 +22,44 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! uv run --frozen ruff check . ; then
-  echo
-  echo "pre-commit: BLOCKED [lint]: this is the first thing CI runs, and it would fail."
-  echo "Fix, or 'uv run ruff check --fix .' for the mechanical ones."
+# Lint the INDEX, not the working tree. `ruff check .` would read the files on disk, which are
+# not what is being committed: stage a violation and fix it without `git add`, or stage a subset
+# with `git add -p`, and a working-tree lint passes while CI fails on the content that landed.
+# This repo stages explicitly and partially by convention, so that is the common case, not the
+# exotic one -- and it is the same "green locally, red in CI" shape the gate exists to close.
+#
+# `checkout-index` materialises exactly the committed tree, config files included, so ruff
+# resolves the same settings CI will. Measured at 445 files: ~0.2s to copy, ~0.3s to lint.
+staged="$(mktemp -d)" || { echo "pre-commit: BLOCKED [config]: could not create a temp dir."; exit 1; }
+trap 'rm -rf "$staged"' EXIT
+if ! git checkout-index --all --prefix="$staged/"; then
+  echo "pre-commit: BLOCKED [config]: could not materialise the index for linting."
   exit 1
 fi
 
-echo "pre-commit: clean (repo-guard, ruff)."
+# `--extra dev` is load-bearing: ruff is declared ONLY in that extra, so without it `uv run`
+# neither installs nor version-checks ruff -- it leaves whatever is in .venv alone and, if
+# nothing is there, silently falls back to any `ruff` on PATH. A plain `uv sync` prunes ruff
+# (verified: it appears in the 11 packages that sync would uninstall), so the fallback is not
+# hypothetical. With the extra, this is the exact version the lockfile pins, which is the whole
+# point of running lint here rather than trusting the developer's environment.
+output="$(uv run --frozen --extra dev -- ruff check "$staged" 2>&1)"
+rc=$?
+output="${output//$staged\//}"   # report repo-relative paths, not the temp copy's
+
+case "$rc" in
+  0) echo "pre-commit: clean (repo-guard, ruff)." ;;
+  # ruff exits 1 for violations and 2 for its own errors; anything else came from uv. Only the
+  # first is a lint failure, and sending someone to hunt for a diagnostic that was never printed
+  # is how a gate earns a reputation for crying wolf.
+  1) echo "$output"
+     echo
+     echo "pre-commit: BLOCKED [lint]: this is the first thing CI runs, and it would fail."
+     echo "Fix, or 'uv run --extra dev ruff check --fix .' for the mechanical ones."
+     exit 1 ;;
+  *) echo "$output"
+     echo
+     echo "pre-commit: BLOCKED [config]: lint could not run (exit $rc) -- this is NOT a lint"
+     echo "failure. Usually a missing or unresolvable environment; 'uv sync --extra dev' first."
+     exit 1 ;;
+esac
