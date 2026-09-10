@@ -138,6 +138,18 @@ class DuckDBAdapter:
         A failure RAISES, like `view_definitions`. Returning `[]` would tell the caller this
         source defines nothing, which is a different claim from being unable to look.
         """
+        if self._fk_via_postgres:
+            # The source is Postgres, reached through the attachment, and `duckdb_functions()`
+            # answers for DUCKDB. It would return no user functions and a caller would read that
+            # as a confident "this source defines none" -- a fail-open, on the one path where a
+            # Postgres UDF shadowing a modelled name is exactly what we are looking for. The two
+            # sibling discovery methods branch here and go through `postgres_query` for the same
+            # reason; the `pg_proc` query belongs beside them and is not written yet, so this
+            # says so instead of answering wrongly.
+            raise NotImplementedError(
+                "user_functions is not implemented for a Postgres attachment: duckdb_functions() "
+                "describes DuckDB, not the attached source. Needs a pg_proc query via postgres_query."
+            )
         rows = self._con.execute(
             "SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE NOT internal"
         ).fetchall()

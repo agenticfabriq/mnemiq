@@ -12,52 +12,66 @@ Both want the same fact from the same place: which names on THIS source are not 
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 
-class FunctionInventory(frozenset):
+
+@dataclass(frozen=True)
+class FunctionInventory:
     """User-defined function names on a source, plus whether the source could be ASKED.
 
-    A plain empty set asserts "this source defines no functions of its own". A failed lookup
-    produces the same empty set and means "we do not know what it defines", and no control may
-    read the second as the first. That distinction is the whole reason this is a type rather
-    than a `set[str]`, and it is the twelfth instance in this codebase of an absence and a
-    failure sharing one value -- `ViewInventory` and `authz/grants.py`'s EMPTY/UNAVAILABLE are
-    the same shape, deliberately, so the three read alike.
+    An empty answer asserts "this source defines no functions of its own". A failed lookup
+    produces the same empty result and means "we do not know what it defines", and no control
+    may read the second as the first. That is another instance of the absence-and-failure
+    collapse this codebase keeps finding (see `ViewInventory` and `authz/grants.py`'s
+    EMPTY/UNAVAILABLE, and the register for the running list -- no count is written here,
+    because a typed count is one more thing to go stale).
 
     `available` is whether the source answered. `asked` is whether anyone put the question,
-    which `available` cannot carry: an adapter that has no inventory method and one whose query
-    failed both produce an empty set that is available by default, and the two want different
-    responses. Refusing every function because a hand-built fixture never asked would be harsh;
-    declining to CERTIFY lineage in the same case costs nothing.
+    which `available` cannot carry: an adapter with no inventory method and one whose query
+    failed both produce nothing, and they deserve different responses. Declining to CERTIFY
+    lineage costs nothing in either case; refusing every function because a fixture never asked
+    would be harsh.
 
-    A frozenset subclass so a caller holding a bare set keeps meaning what it meant.
+    Deliberately NOT a `frozenset` subclass, unlike `ViewInventory`'s `dict`. That inheritance
+    buys back-compat for callers holding a bare mapping, and this type has no such callers to
+    keep. It costs the thing the type exists for: measured on the subclassing version,
+    `FunctionInventory(()) == FunctionInventory.unavailable()` was True with equal hashes, so a
+    memo keyed on one returned the other, and `unavailable | other` produced a plain frozenset
+    whose missing flags read as available under the codebase's `getattr(x, "available", True)`
+    idiom. A federated caller unioning per-source inventories would have certified lineage over
+    a source whose lookup failed, and the only sign would be a reason absent from an audit
+    record. Names are reached through `defines()`, which is what both callers actually want.
     """
 
-    available: bool
-    asked: bool
+    names: frozenset[str] = field(default_factory=frozenset)
+    available: bool = True
+    asked: bool = True
+    reason: str = ""   # declared for every constructor, not only the failing one
 
-    def __new__(cls, names=None, available: bool = True, asked: bool = True):
-        self = super().__new__(cls, {n.lower() for n in (names or ())})
-        self.available = available
-        self.asked = asked
-        return self
+    @classmethod
+    def of(cls, names, **kw) -> "FunctionInventory":
+        """Build from any iterable of names, folded to lower case.
+
+        SQL folds case and catalogues disagree across engines, so raw strings would answer
+        `defines('MEDIAN')` differently from `defines('median')`.
+        """
+        return cls(frozenset(n.lower() for n in (names or ())), **kw)
 
     @classmethod
     def unavailable(cls, reason: str = "") -> "FunctionInventory":
-        """The source was asked and could not answer. Denies certification, never an answer."""
-        inv = cls((), available=False, asked=True)
-        inv.reason = reason
-        return inv
+        """Asked and could not answer. Denies certification, never an answer."""
+        return cls(available=False, asked=True, reason=reason)
 
     @classmethod
     def never_asked(cls) -> "FunctionInventory":
-        """No one put the question. Distinct from an empty answer, per the class docstring."""
-        return cls((), available=True, asked=False)
+        """Nobody put the question -- an adapter without the method, or a bare fixture."""
+        return cls(available=True, asked=False)
 
     def defines(self, name: str) -> bool:
         """True when THIS source is known to define `name` itself."""
-        return name.lower() in self
+        return name.lower() in self.names
 
     @property
     def certain(self) -> bool:
-        """Whether a caller may treat a name absent from this set as a builtin."""
+        """Whether a caller may treat a name absent from `names` as a builtin."""
         return self.available and self.asked
