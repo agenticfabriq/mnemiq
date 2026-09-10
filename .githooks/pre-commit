@@ -135,11 +135,18 @@ ruff_identity() {  # prints ruff's identity from $1; non-zero if it cannot be es
   nl=$'\n' 
   block="$(awk 'BEGIN{RS="";FS="\n"} /(^|\n)name = "ruff"($|\n)/{print; exit}' "$1" 2>/dev/null)"
   [ -n "$block" ] || return 1
-  # Anchored to the artifact shapes -- `sdist = { url = ...` and the indented wheel entries --
-  # because a `source = { url = "..." }` clause (a direct-URL pin) also contains `url = ` and
-  # would inflate the count, blocking every commit with a message about artifact shape while
-  # the artifacts were fine.
-  want_arts="$(printf '%s\n' "$block" | grep -cE '^(sdist = )?[[:space:]]*\{ url = ')"
+  # Every line carrying a url EXCEPT the source clause -- a direct-URL pin
+  # (`source = { url = "..." }`) would otherwise count as an artifact and inflate this, blocking
+  # every commit with a message about artifact shape while the artifacts were fine.
+  #
+  # Excluding that one line rather than anchoring to `{ url = ` at the start, which is the
+  # obvious narrowing and is wrong: it requires `url` to be the FIRST key, so a reordered
+  # `{ hash = ..., url = ... }` counts zero here AND zero below, the cross-check compares 0 to 0
+  # and passes, and the identity quietly loses all eighteen pairs. That is the precise mutation
+  # this count exists to catch, defeated by the fix for the direct-URL case. The two concerns
+  # stay independent: this line decides what an artifact IS, the pattern below decides whether
+  # its shape is readable.
+  want_arts="$(printf '%s\n' "$block" | grep -v '^source = ' | grep -c 'url = ')"
   tokens="$(printf '%s\n' "$block" \
     | grep -oE 'version = "[^"]+"|source = \{[^}]*\}|url = "[^"]+", hash = "sha256:[0-9a-f]{64}"' \
     | sort)"
