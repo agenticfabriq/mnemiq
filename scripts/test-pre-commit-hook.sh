@@ -19,7 +19,12 @@ cd "$(git rev-parse --show-toplevel)" || exit 1
 
 HOOK=.githooks/pre-commit
 pass=0; fail=0
-tmpidx="$(mktemp)"
+# mktemp for a safe unique NAME, then removed: a 0-byte file is not a valid index, and git
+# says so -- `fatal: index file smaller than expected` from ls-files and add. An ABSENT index
+# file is valid and reads as empty, which is what `read-tree` then fills. Only `read-tree`
+# tolerates the 0-byte form, which is why truncating and immediately re-reading appeared to
+# work; anything else touching the index in that window would have died.
+tmpidx="$(mktemp)"; rm -f "$tmpidx"
 # Probe files live in the real working tree, so they go in the trap too. Cleaned only on the
 # success path, an interrupted run left `_probe_lint.py` (containing `import sys`) untracked in
 # src/, after which a manual `ruff check .` reports an F401 in a file nobody wrote.
@@ -53,7 +58,18 @@ stage() {  # stage <path> with <content>, into the temp index only
   GIT_INDEX_FILE="$tmpidx" git add -- "$1"
 }
 reset_index() {
-  : > "$tmpidx"; GIT_INDEX_FILE="$tmpidx" git read-tree HEAD
+  rm -f "$tmpidx"
+  # Checked, not assumed. A failed read-tree used to leave an unusable index and every check
+  # after it would have reported the hook broken -- a suite that blames its subject for its own
+  # setup failure is worse than no suite.
+  if ! GIT_INDEX_FILE="$tmpidx" git read-tree HEAD; then
+    printf 'FATAL: could not initialise the temporary index from HEAD\n' >&2
+    exit 1
+  fi
+  if [ "$(GIT_INDEX_FILE="$tmpidx" git ls-files | wc -l | tr -d ' ')" -eq 0 ]; then
+    printf 'FATAL: the temporary index came back empty; the suite would test nothing\n' >&2
+    exit 1
+  fi
 }
 
 export GIT_INDEX_FILE="$tmpidx"
