@@ -122,20 +122,18 @@ ruff_entry() {  # ruff's IDENTITY from $1: version, registry, artifact urls, sha
   # on outside contributors first, who are exactly the case this guard exists for.
   #
   # What "the same ruff" means: the version, the registry, and every artifact as a URL PAIRED
-  # WITH its hash. The pairing is the point. Pulling the fields out individually and sorting
+  # WITH its hash. The pairing is the point -- pulling the fields out separately and sorting
   # them yields a token soup in which two wheels' hashes can be transposed with no change to
-  # the multiset -- measured: that edit passed. uv would reject it at install time when the
-  # downloaded bytes missed the hash, but a guard that says "identical" about a lockfile
-  # somebody edited is not doing its job, and next time the permutation may be one uv accepts.
+  # the multiset (measured: that edit passed). So url and hash are extracted as ONE token.
   #
-  # So each artifact stays one line and only the volatile fields are normalised away. `size`
-  # and `upload-time` are serializer metadata -- an older uv omits them -- and dropping them is
-  # what keeps an outside contributor's lockfile from reading as a swapped binary. `url` is
-  # kept because it is the actual fetch location, which `source = { registry = ... }` is not.
+  # An ALLOWLIST, deliberately. Keeping whole lines and stripping the volatile fields is the
+  # obvious alternative and it is backwards: it tolerates only the fields someone remembered to
+  # name, so the first time uv adds a field, every contributor whose lock has it is told their
+  # binary was swapped. That field set moves -- this repo's first uv.lock had no `upload-time`
+  # at all and today's has one per artifact. Naming what identity IS survives the serializer
+  # changing around it; naming what to ignore does not.
   awk 'BEGIN{RS="";FS="\n"} /(^|\n)name = "ruff"($|\n)/{print; exit}' "$1" 2>/dev/null \
-    | sed -E 's/,?[[:space:]]*upload-time = "[^"]*"//g; s/,?[[:space:]]*size = [0-9]+//g' \
-    | grep -E '^version = |^source = |url = ' \
-    | sed -E 's/^[[:space:]]+//; s/[[:space:]]*,?[[:space:]]*$//' \
+    | grep -oE 'version = "[^"]+"|registry = "[^"]+"|url = "[^"]+", hash = "sha256:[0-9a-f]{64}"' \
     | sort
 }
 want_entry="$(ruff_entry "$staged/uv.lock")"
@@ -169,10 +167,10 @@ if [ "$want_entry" != "$have_entry" ]; then
     echo "install."
   else
     echo "pre-commit: BLOCKED [config]: both lockfiles say ruff $want_ruff, but they resolve it"
-    echo "to a DIFFERENT artifact -- the registry, an artifact url or a sha256 differs from the"
-    echo "one just used. Same number, different binary. Diff the ruff entries in the two"
-    echo "lockfiles across all three of those; a url-only change looks identical if you"
-    echo "check the registry and hashes alone."
+    echo "to a DIFFERENT artifact. Diff the ruff entries in the two lockfiles on the registry,"
+    echo "and on each url TOGETHER WITH its hash -- the mismatch can be in the pairing alone,"
+    echo "with every url and every hash present on both sides, so checking the two lists"
+    echo "separately will show you nothing."
   fi
   echo "'git add' uv.lock and pyproject.toml together so the tool that checks this commit is the"
   echo "tool that checks it in CI."
