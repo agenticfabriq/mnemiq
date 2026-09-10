@@ -8,6 +8,7 @@
 # and fail the very first thing CI does. A gate that checks less than CI teaches people its
 # green means something it does not.
 set -uo pipefail
+nl=$'\n'
 
 top="$(git rev-parse --show-toplevel)" || exit 1
 cd "$top" || exit 1
@@ -17,36 +18,45 @@ cd "$top" || exit 1
 # Whitespace damage in the STAGED content, before anything more expensive runs. `ruff` covers
 # Python only, so every shell script, workflow and Markdown file in this repo -- this hook
 # included -- had no check at all. Demonstrated the hard way: the commit that added the lint
-# gate later put a trailing space inside the gate (af0a176), and nothing noticed until a
-# reviewer ran `git diff --check` by hand.
+# gate (f9d847b) was itself later edited to carry a trailing space (af0a176), and nothing
+# noticed until a reviewer ran `git diff --check` by hand.
 #
 # `--cached` for the same reason the lint uses the materialised index: the commit is what is
 # staged. Against the empty tree when there is no HEAD, so the first commit in a clone is
 # checked too rather than erroring.
-# Both ways this check can be switched off, refused rather than ignored. `git diff --check`
-# honours `core.whitespace` and `.gitattributes`, so `-blank-at-eol` or `* -whitespace` makes it
-# exit 0 in silence -- measured: rc=2 by default, rc=0 with either. Every other guard here fails
-# closed and says so; this one would have been the exception, announcing "whitespace" in the
-# success line for a check that never ran.
-ws_off=""
-case ",$(git config --get core.whitespace 2>/dev/null)," in
-  *,-blank-at-eol,*|*,-space-before-tab,*|*,-blank-at-eof,*|*,-trailing-space,*)
-    ws_off="core.whitespace" ;;
+# `git diff --check` honours `core.whitespace` and `.gitattributes`, so it can be switched off
+# and then exits 0 in silence -- measured: rc=2 by default, rc=0 with either. The two are not
+# the same kind of thing, and get different answers.
+#
+# `core.whitespace` turns the check off for EVERYTHING, so it is refused. Split on commas,
+# spaces and tabs, because git accepts all three and a comma-anchored match missed
+# `tab-in-indent, -blank-at-eol` (measured: rc=0, and the pattern saw nothing).
+ws_cfg="$(git config --get core.whitespace 2>/dev/null | tr ', \t' '\n\n\n')"
+case "$nl$ws_cfg$nl" in
+  *"${nl}-blank-at-eol${nl}"*|*"${nl}-space-before-tab${nl}"*|*"${nl}-blank-at-eof${nl}"*|*"${nl}-trailing-space${nl}"*)
+    echo "pre-commit: BLOCKED [config]: core.whitespace disables this check for every path, so"
+    echo "'git diff --check' would exit 0 without looking. Not reported as passed: re-enable it,"
+    echo "or commit with --no-verify if you meant to turn it off."
+    exit 1 ;;
 esac
-ws_files="$(git diff --cached --name-only --diff-filter=ACM)"
+
+# A `.gitattributes` opt-out is PER PATH and often legitimate -- `*.md -whitespace` is the
+# standard way to keep Markdown's two-space hard break. Refusing those commits would make the
+# only escape `--no-verify`, which also skips repo-guard, and pushing people past the secrets
+# gate on a clean-room public repo to satisfy a whitespace check is a bad trade. So they are
+# DISCLOSED instead: those paths go unchecked, and the success line names them rather than
+# claiming a check that did not cover them.
+#
+# `R` in the filter because rename detection is on by default, so a `git mv`'d path would
+# otherwise never be asked. Both attribute forms count: Unset (`-whitespace`) and a String
+# value carrying negations (`whitespace=-blank-at-eol`), the second verified in a scratch repo
+# to print its value rather than `unset`.
+ws_exempt=""
+ws_files="$(git diff --cached --name-only --diff-filter=ACMR)"
 if [ -n "$ws_files" ]; then
-  # Captured, not piped into `grep -q`: under pipefail that exits early, check-attr takes
-  # SIGPIPE, the pipeline returns 141, and the test reads as "not disabled" -- fail-open again.
   ws_attrs="$(printf '%s\n' "$ws_files" | git check-attr --stdin whitespace 2>/dev/null)"
-  case "$ws_attrs" in
-    *": whitespace: unset"*) ws_off="${ws_off:+$ws_off and }.gitattributes" ;;
-  esac
-fi
-if [ -n "$ws_off" ]; then
-  echo "pre-commit: BLOCKED [config]: the whitespace check is disabled by $ws_off, so"
-  echo "'git diff --check' would exit 0 without looking. Not reported as passed: re-enable it,"
-  echo "or commit with --no-verify if you meant to turn it off."
-  exit 1
+  ws_exempt="$(printf '%s\n' "$ws_attrs" \
+    | awk -F': whitespace: ' 'NF==2 && ($2=="unset" || $2 ~ /(^|,)-/) {print $1}')"
 fi
 
 if git rev-parse --verify -q HEAD >/dev/null; then
@@ -277,7 +287,13 @@ rc=$?
 output="${output//$staged\//}"   # report repo-relative paths, not the temp copy's
 
 case "$rc" in
-  0) echo "pre-commit: clean (repo-guard, whitespace, ruff)." ;;
+  0) if [ -n "$ws_exempt" ]; then
+       echo "pre-commit: clean (repo-guard, whitespace, ruff) -- but .gitattributes exempts"
+       echo "these staged paths from the whitespace check, so they were NOT covered:"
+       printf '  %s\n' $ws_exempt
+     else
+       echo "pre-commit: clean (repo-guard, whitespace, ruff)."
+     fi ;;
   # ruff exits 1 for violations and 2 for its own errors; anything else came from uv. Only the
   # first is a lint failure, and sending someone to hunt for a diagnostic that was never printed
   # is how a gate earns a reputation for crying wolf.
