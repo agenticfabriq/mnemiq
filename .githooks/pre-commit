@@ -164,7 +164,7 @@ if [ "$want_entry" != "$have_entry" ]; then
     echo "pre-commit: BLOCKED [config]: both lockfiles say ruff $want_ruff, but they resolve it"
     echo "to a DIFFERENT artifact -- the registry, an artifact url or a sha256 differs from the"
     echo "one just used. Same number, different binary. Diff the ruff entries in the two"
-    echo "lockfiles across all four of those fields; a url-only change looks identical if you"
+    echo "lockfiles across all three of those; a url-only change looks identical if you"
     echo "check the registry and hashes alone."
   fi
   echo "'git add' uv.lock and pyproject.toml together so the tool that checks this commit is the"
