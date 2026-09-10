@@ -108,12 +108,11 @@ fi
 # 2. The staged lock disagreeing with the working tree's, which is the one `uv run` above will
 #    actually use.
 #
-#    Compared on the whole lock ENTRY, not on the version. Two locks can both say 0.15.21 and
-#    mean different artifacts -- uv records `source` (which registry) and a sha256 per wheel,
-#    so a staged lock can keep the version string and point at another index entirely. On a
-#    public repo taking outside contributions that is a supply-chain shape, not a nit, and the
-#    exact answer costs one more `awk`. The version is still parsed out afterwards, but only to
-#    say WHICH kind of mismatch it is.
+#    Compared on ruff's IDENTITY, not on its version. Two locks can both say 0.15.21 and mean
+#    different artifacts -- uv records where each one is fetched from and a sha256 for it, so a
+#    staged lock can keep the version string and point somewhere else entirely. On a public repo
+#    taking outside contributions that is a supply-chain shape, not a nit. The version is still
+#    parsed out afterwards, but only to say WHICH kind of mismatch it is.
 ruff_entry() {  # ruff's IDENTITY from the lockfile named in $1: version, registry, hashes
   # The identity fields only, not the raw block. Byte-comparing the block flags differences that
   # are not differences: uv writes `upload-time` and `size` alongside each artifact, and a
@@ -122,10 +121,14 @@ ruff_entry() {  # ruff's IDENTITY from the lockfile named in $1: version, regist
   # is older is the crying-wolf failure this file objects to further down -- and it would land
   # on outside contributors first, who are exactly the case this guard exists for.
   #
-  # A sha256 identifies the artifact; the registry says where it is fetched from. Those two plus
-  # the version are what "the same ruff" means. Sorted, so ordering is not a difference either.
+  # What "the same ruff" means: the version, the registry, every artifact URL, and every sha256.
+  # `url` is included because it is the actual fetch location -- `source = { registry = ... }`
+  # is not, so leaving urls out would let a lock keep its registry line and its hashes while
+  # pointing every wheel at another host. The hashes would still bind the bytes and CI's `uv
+  # sync` would reject a swapped artifact, but it should not take install-time hash verification
+  # to notice an edit this guard is here to see. Sorted, so ordering is not a difference either.
   awk 'BEGIN{RS="";FS="\n"} /(^|\n)name = "ruff"($|\n)/{print; exit}' "$1" 2>/dev/null \
-    | grep -oE 'version = "[^"]+"|registry = "[^"]+"|sha256:[0-9a-f]{64}' \
+    | grep -oE 'version = "[^"]+"|registry = "[^"]+"|url = "[^"]+"|sha256:[0-9a-f]{64}' \
     | sort
 }
 want_entry="$(ruff_entry "$staged/uv.lock")"
