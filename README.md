@@ -241,6 +241,28 @@ only lever measured to reduce the wrong-rate, [`MNEMIQ_ROLES` is ignored by the 
 and [lineage reports `unconfirmed-function-identity`](https://github.com/agenticfabriq/mnemiq/issues/5)
 on ordinary queries. Contributions and arguments welcome on all four.
 
+## Contributing
+
+Issues and pull requests are welcome. Fork, branch, and open a PR against `main`.
+
+```
+uv sync --extra dev --extra ontology --extra oracle
+uv run pytest -m "not integration and not live_llm"
+git config core.hooksPath .githooks     # optional: runs the same checks before each commit
+```
+
+**What `repo-guard` checks, and what a green tick means.** It blocks credential shapes and
+hardcoded `/Users/<name>` machine paths — both run in CI on every push and pull request, and both
+are what your PR has to pass. It also blocks a private list of proprietary names, and that one runs
+*only on the maintainer's machine*: enforcing it in CI would publish the list it protects, since a
+flagged word in a public log tells every reader that word is on the blocklist. Your clone has no
+such list and does not need one — you cannot leak names you have never seen.
+
+The hook reads that setting from `.env`, so copy `.env.example` before installing it: the copy
+ships `REPO_GUARD_NAME_PATTERNS=off`, which is how you say *this machine holds no list*, and the
+hook then runs the two checks that matter to you. With no `.env` at all it stops and asks, rather
+than guess whether a missing list means "contributor" or "maintainer whose config broke".
+
 ## Status
 
 v0.1: the full read path — enrichment, retrieval, the decider, execution, trace — evaluated on

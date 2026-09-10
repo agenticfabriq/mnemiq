@@ -336,7 +336,7 @@ def test_the_tracked_env_example_matches_the_renderer():
     silently undid the change. Thirteen other settings were missing too.
 
     Only the generated PREFIX is compared: everything past the marker is hand-written
-    (REPO_GUARD_NAME_PATTERNS is CI configuration, not a Settings field) and regenerating
+    (REPO_GUARD_NAME_PATTERNS is local-only guard configuration, not a Settings field) and regenerating
     blindly deletes it -- which disarms the guard keeping proprietary names out of a
     public repo.
     """
@@ -355,7 +355,12 @@ def test_the_hand_written_tail_survives():
     tracked = (pathlib.Path(__file__).resolve().parents[1] / ".env.example").read_text()
 
     assert HAND_WRITTEN_MARKER in tracked, "the boundary marker is what protects the tail"
-    assert "REPO_GUARD_NAME_PATTERNS=" in tracked
+    # The VALUE is load-bearing, not just the key: `.env.example` says "Copy to .env",
+    # and `off` is what makes that copy work for a contributor. Blank it and the
+    # pre-commit hook fails closed on every commit they make.
+    assert "REPO_GUARD_NAME_PATTERNS=off" in tracked, (
+        "the example must ship `off` -- a copied .env is a contributor's whole setup"
+    )
     assert "REPO_GUARD_NAME_PATTERNS" not in Settings_env_example_fields(), (
         "if it ever becomes a Settings field, delete this test rather than have two sources"
     )
