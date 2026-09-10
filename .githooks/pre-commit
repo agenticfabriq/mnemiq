@@ -113,7 +113,7 @@ fi
 #    staged lock can keep the version string and point somewhere else entirely. On a public repo
 #    taking outside contributions that is a supply-chain shape, not a nit. The version is still
 #    parsed out afterwards, but only to say WHICH kind of mismatch it is.
-ruff_entry() {  # ruff's IDENTITY from the lockfile named in $1: version, registry, hashes
+ruff_entry() {  # ruff's IDENTITY from $1: version, registry, artifact urls, sha256 hashes
   # The identity fields only, not the raw block. Byte-comparing the block flags differences that
   # are not differences: uv writes `upload-time` and `size` alongside each artifact, and a
   # contributor on an older uv produces an entry with identical registry and identical sha256s
@@ -162,8 +162,10 @@ if [ "$want_entry" != "$have_entry" ]; then
     echo "install."
   else
     echo "pre-commit: BLOCKED [config]: both lockfiles say ruff $want_ruff, but they resolve it"
-    echo "to a DIFFERENT artifact -- the registry or a wheel hash differs from the one just"
-    echo "used. Same number, different binary. Compare the ruff entries in the two lockfiles."
+    echo "to a DIFFERENT artifact -- the registry, an artifact url or a sha256 differs from the"
+    echo "one just used. Same number, different binary. Diff the ruff entries in the two"
+    echo "lockfiles across all four of those fields; a url-only change looks identical if you"
+    echo "check the registry and hashes alone."
   fi
   echo "'git add' uv.lock and pyproject.toml together so the tool that checks this commit is the"
   echo "tool that checks it in CI."
