@@ -231,9 +231,9 @@ def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -
     """Nothing here can be attributed, so nothing here can be decided.
 
     Several ways to arrive, and each gets its OWN SENTENCE, because a refusal that sends the
-    reader to the wrong place is worse than a vague one. Two of them share an owner and still
-    read differently, since "no such method" and "the method raised" are found in different
-    places even when the same person goes looking:
+    reader to the wrong place is worse than a vague one. Sharing an owner is not enough to
+    share a sentence: two of these are the source failing, and "it would not name its builtins"
+    and "it would not name its own functions" are found by looking in different places.
 
       * the source defines a name it also lists as a builtin -- the DEPLOYER renames it
       * the adapter has no `builtin_functions` -- its AUTHOR implements it

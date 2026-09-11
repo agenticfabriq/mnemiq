@@ -648,8 +648,17 @@ def test_a_source_that_could_not_be_asked_is_not_a_source_that_defines_nothing()
     ast = sqlglot.parse_one("SELECT median(id) FROM claim", read="duckdb")
     refused = check_unmodelled_calls(ast, FunctionInventory.unavailable("RuntimeError"), "duckdb")
     assert refused is not None and refused.code.value == "unresolvable_calls"
-    assert "could not say" in refused.message
     assert "RuntimeError" not in refused.message, "the reason is for the trace, not the model"
+
+    # Distinguished from the OTHER source failure, not merely non-empty. Both sentences begin
+    # "could not say", so asserting that substring alone let the two be swapped: a source that
+    # would not list its builtins and one that would not list its own functions are found by
+    # looking in different places, and the sentence is the only thing that says which.
+    could_not_name_builtins = check_unmodelled_calls(
+        ast, FunctionInventory.of(["median"], builtins_asked=True), "duckdb")
+    assert "which functions it defines" in refused.message
+    assert "which names are its builtins" in could_not_name_builtins.message
+    assert refused.message != could_not_name_builtins.message
 
     assert check_unmodelled_calls(ast, FunctionInventory.never_asked(), "duckdb") is None
 
