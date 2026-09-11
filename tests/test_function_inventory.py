@@ -208,10 +208,11 @@ def test_a_postgres_udf_is_unreachable_from_a_query_and_absent_from_the_answer()
         assert adapter.execute(f"SELECT m FROM src.{schema}.v_fn_probe")[0][0] == 99
     finally:
         # Only what this test actually created. `DROP ... IF EXISTS` ran unconditionally before,
-        # including when `CREATE SCHEMA` had FAILED -- and the way it fails is "already exists",
-        # so the one case that reaches the drop without having made anything is the one where
-        # something else owns that name, and CASCADE would take it and everything in it. The
-        # uuid makes that improbable; the code should not be relying on improbable.
+        # including when `CREATE SCHEMA` had FAILED. Several failures land here having created
+        # nothing -- no CREATE privilege on the database, a dropped connection -- and they are
+        # harmless. The dangerous one is a name collision: the schema exists, this test does not
+        # own it, and CASCADE takes it and everything in it. The uuid makes that improbable; the
+        # code should not be relying on improbable.
         #
         # No `IF EXISTS` either: past this flag the schema is known to exist, so its absence is
         # something to surface rather than swallow.
