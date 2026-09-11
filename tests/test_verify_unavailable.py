@@ -7,8 +7,9 @@ happened for every reasoning model until the token budget was fixed, and what wi
 whenever the endpoint is down.
 
 The first fix changed only the claim and let the answer go out, which left `deep` -- the one mode
-that wires a judge -- handing back results stamped *not checked*. It now defers by default
-(issue #2), as a FAILURE rather than a deferral, because an outage in the deferral rate is M6.
+that wires a judge -- handing back results stamped *not checked*. The answer is withheld by
+default now (issue #2), and recorded as a FAILURE rather than a deferral, because an outage in
+the deferral rate is M6.
 """
 import pyarrow as pa
 import pytest
@@ -76,8 +77,8 @@ def test_whether_a_dead_judge_stops_an_answer_is_the_deployments_call(fail_close
     """It used to be unconditionally False, and the comment saying so read as settled. It was not:
     the judge is wired only where a mode asks for it -- `deep` alone out of the box -- so the one
     mode a caller picks FOR assurance was handing back answers stamped "not checked" and handing
-    them back anyway. Deferring is the default now (issue #2); an operator trading assurance for
-    availability during a provider outage sets `MNEMIQ_VERIFY_FAIL_CLOSED=0`.
+    them back anyway. Withholding is the default now (issue #2); an operator trading assurance
+    for availability during a provider outage sets `MNEMIQ_VERIFY_FAIL_CLOSED=0`.
 
     Both positions, because pinning one leaves the switch free to be ignored. The reasons differ
     too: a deferral's text is read by whoever asked the question, and "this answer was not
@@ -321,6 +322,8 @@ def test_the_two_fell_open_causes_do_not_share_a_sentence(why, blames):
     # The non-stopping branch too. Composing these from a shared clause produced "The verifier
     # it could not be reached", which no test read because only the stopping branch was checked
     # -- and that is the branch a caller sees when an operator has turned fail-closed off.
+    # Nothing renders this one today -- `loop` reads `reason` only off a verdict that stops the
+    # answer -- which is exactly why it went unread while being ungrammatical.
     open_v = _verify(_Judge(1.0, falls_open=True, why=why), fail_closed=False)
     assert blames in open_v.reason
     assert "verifier it" not in open_v.reason and "verifier its" not in open_v.reason

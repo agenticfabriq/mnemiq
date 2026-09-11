@@ -15,8 +15,13 @@ def _cards_text(packet: ContextPacket) -> str:
 
 # Written out rather than composed from a clause, because composing them produced "The verifier
 # it could not be reached" -- a sentence no test read, since the only parametrised case checked a
-# substring of the other branch. These reach the CALLER: `loop` sends `reason` back as the answer
-# text and the workbench renders it.
+# substring of the other branch.
+#
+# Only the STOPPING pair reaches a caller today: `loop` sends `reason` back as the answer text
+# when the verdict defers, and reads nothing off a verdict that does not. The other two are the
+# field's value on a verdict that lets the answer through, where the wire says `verified:
+# "unavailable"` and this sentence is not shown. Kept honest anyway -- a string that is wrong
+# only because nothing renders it is a trap for whoever renders it next.
 _UNAVAILABLE_REASON = {
     ("error", True): "I could not check this answer: the verifier could not be reached. "
                      "I am not giving you a result I cannot stand behind.",
