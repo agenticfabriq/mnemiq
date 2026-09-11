@@ -750,7 +750,9 @@ class OracleAdapter:
         116 ms even restricted to this schema, since each iteration rejoins a 7,869-row view with
         no useful access path. Reading that view once is 23.8 ms, and `user_functions` as a
         whole -- these reads, the walks, and two other dictionary queries through `_rows` --
-        settles around 40 ms against DuckDB's 13, on this container's 7,869 synonyms.
+        settles around 40 ms against DuckDB's 13, on this container's 7,869 synonyms. Selecting
+        `db_link` alongside is free: 53.8 ms median against 52.1 reverted, over 15 runs on the
+        same 7,869 rows, which is inside the spread of either.
 
         The WALK is linear in the graph and no longer the thing to worry about: the first
         version stored a reachable set per alias and was quadratic, measured on a synthetic
@@ -787,27 +789,45 @@ class OracleAdapter:
         ORA-32044 from the recursive query, so a cycle is a real shape; a depth cap on top of
         `seen` adds nothing to termination and silently drops a chain longer than the cap.
 
-        What this still does not reach is a synonym over a DB-LINK object: it has no local
-        `all_objects` row, so no walk from here can tell whether it ends at a function.
+        A synonym over a DB-LINK object has no local `all_objects` row, so no walk from here
+        can tell whether it ends at a function -- and it is REPORTED for exactly that reason
+        rather than dropped. Skipping it was a measured fail-open (M102): a call through such
+        an alias returned an ungranted SSN and `decide` approved the statement.
         """
         edges: dict[tuple[str, str], tuple[str, str]] = {}
-        for owner, name, target_owner, target_name in self._rows(
+        over_a_link: set[tuple[str, str]] = set()
+        for owner, name, target_owner, target_name, db_link in self._rows(
             "SELECT lower(s.owner), lower(s.synonym_name), "
-            "       lower(s.table_owner), lower(s.table_name) FROM all_synonyms s"
+            "       lower(s.table_owner), lower(s.table_name), s.db_link FROM all_synonyms s"
         ):
-            # A NULL target owner is real -- an unqualified DB-link synonym has one -- and it
-            # used to reach `sorted()` and raise TypeError, which `inventory_from` turns into
-            # `unavailable` and the guard turns into refusing EVERY statement on the source. One
-            # such synonym anywhere in the dictionary would have stopped the whole deployment.
-            # Skipped rather than resolved, and that trades an outage for a FAIL-OPEN (M102):
-            # Oracle resolves a call through such a synonym to the remote function, and an alias
-            # absent from `names` is cleared. Bounded by the same allowlist as everything else --
-            # only an alias sqlglot MODELS gets that far -- and there is no local answer, since a
-            # DB-link target has no `all_objects` row to resolve against.
+            # A DB-LINK target cannot be resolved from here at all, so the alias is assumed to
+            # reach a function rather than dropped (M102). Dropping it was a MEASURED fail-open:
+            # `CREATE SYNONYM add_days FOR m102_udf@zz_loop` over a function reading an
+            # ungranted table, `SELECT add_days(1)` returned the SSN through the link, and
+            # `decide` APPROVED `SELECT add_days(1) FROM m102_claim` because the alias was
+            # missing from `names`.
+            #
+            # BOTH remote shapes are wrong to follow, which is why this branches on the link and
+            # not on the NULL owner it used to test. `ADD_DAYS -> (None, M102_UDF, ZZ_LOOP)` is
+            # the unqualified one and has no owner to join on; `ZZ_LINK_SYN2 -> (APPUSER,
+            # WEST_F, ZZ_LOOP)` names an owner, and joining on it resolves against the LOCAL
+            # `appuser.west_f`, a different object in a different database -- right by accident
+            # when a local function shares the name, fail-open when none does.
+            #
+            # The cost is a refusal for any query spelling such an alias, and only such a query:
+            # `may_shadow_a_builtin` is already inert here (`binder_prefers_builtins`), so no
+            # coarse whole-source refusal follows from a wider `names`.
+            if db_link is not None:
+                over_a_link.add((owner, name))
+                continue
+            # Defensive, and no longer the DB-link case above. A NULL here used to reach
+            # `sorted()` and raise TypeError, which `inventory_from` turns into `unavailable`
+            # and the guard turns into refusing EVERY statement on the source -- one such row
+            # anywhere in the dictionary would have stopped the whole deployment.
             if target_owner is None or target_name is None:
                 continue
             edges[(owner, name)] = (target_owner, target_name)
-        if not edges:
+        if not edges and not over_a_link:
             return set()
         oracle_owned = {
             r[0] for r in self._rows(
@@ -851,8 +871,8 @@ class OracleAdapter:
             {owner for owner, _ in mine_reaches}
             | {owner for owner, _ in edges.values() if owner not in oracle_owned}
         )
-        if not owners:
-            return set()
+        # No early-out on an empty `owners`: the chunked loop below simply does not run, and
+        # the link aliases still have to be reported without any `all_objects` read at all.
         # Chunked, because an Oracle IN list is capped at 1,000 items (ORA-01795) and this one
         # grows with every non-Oracle owner any synonym targets -- a schema-per-tenant instance
         # passes that mark. 900 leaves room without needing a second measurement.
@@ -870,24 +890,34 @@ class OracleAdapter:
                     **binds,
                 )
             )
-        if not functions:
-            return set()
-
         # BACKWARDS from the functions, instead of forwards from every alias. An earlier version
         # stored a reachable set per candidate and was quadratic: measured on a synthetic
         # chain, 3.6 ms at 200 synonyms, 63.2 at 800 and 239.3 at 1,600, which is the wrong shape
         # for the dictionaries M101 is about. Each node is visited once here.
-        reaches_any = spread(functions & nodes, backwards)
+        #
+        # A link alias seeds the walk as ITSELF, since there is no local node standing for its
+        # target: unprovable, therefore assumed to reach a function. `via_public_link` is the
+        # same assumption one hop earlier -- `a -> b` where this schema holds no `b` and the
+        # PUBLIC `b` is a link alias, which the `forward`/`backwards` fallback below cannot
+        # carry because a link alias contributes no edge to follow.
+        unprovable = over_a_link | {at for at in nodes if ("public", at[1]) in over_a_link}
+        reaches_any = spread((functions & nodes) | unprovable, backwards)
         # PUBLIC aliases count only where the chain ends outside Oracle's own schemas, so that
-        # question is asked of its own smaller target set rather than filtered afterwards.
-        reaches_free = spread({f for f in functions & nodes if f[0] not in oracle_owned},
-                              backwards)
+        # question is asked of its own smaller target set rather than filtered afterwards. A
+        # link alias counts for this arm too: a remote target cannot sit in an Oracle-maintained
+        # schema of THIS database, which is the only thing the arm excludes.
+        reaches_free = spread(
+            {f for f in functions & nodes if f[0] not in oracle_owned} | unprovable, backwards)
 
+        # Keyed on the ALIAS rather than on its target, because a link alias has no target node
+        # to test. Equivalent for every other row: an alias reaches a function exactly when its
+        # target does, and a synonym cannot share owner-and-name with a function -- Oracle puts
+        # both in one namespace.
         return {
             name
-            for (owner, name), target in edges.items()
-            if (owner == mine and target in reaches_any)
-            or (owner == "public" and target in reaches_free)
+            for owner, name in set(edges) | over_a_link
+            if (owner == mine and (owner, name) in reaches_any)
+            or (owner == "public" and (owner, name) in reaches_free)
         }
 
     def virtual_columns(self) -> list[tuple[str, str, str]]:
