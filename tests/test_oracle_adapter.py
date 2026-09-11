@@ -28,7 +28,7 @@ failing without it:
 
 It is a separate line because it widens what APPUSER can do, which is the container's whole
 point of comparison for the access tests around it. The same assertions run database-free in
-`tests/test_oracle_nodb.py`, so skipping here does not leave the fail-open unguarded.
+`tests/test_function_inventory.py`, so skipping here does not leave the fail-open unguarded.
 """
 
 from __future__ import annotations
@@ -2017,7 +2017,7 @@ def test_a_synonym_over_a_db_link_is_a_route_to_a_udf_this_engine_cannot_resolve
     sqlglot does not know is refused as `exp.Anonymous` whatever the inventory holds, which is
     how an earlier version of that test passed with its fix reverted.
 
-    `tests/test_oracle_nodb.py` carries the same assertions over a fake dictionary, because this
+    `tests/test_function_inventory.py` carries the same assertions over a fake dictionary, because this
     one needs a privilege the container does not grant by default and would otherwise be a
     regression guarded only by a machine that happens to have it.
     """

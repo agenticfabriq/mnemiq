@@ -13,7 +13,7 @@ import duckdb
 import pytest
 
 from mnemiq.adapters.duckdb import DuckDBAdapter
-from mnemiq.sql.functions import FunctionInventory
+from mnemiq.sql.functions import FunctionInventory, calls_are_confirmable
 
 
 def test_an_empty_answer_is_not_a_failed_lookup():
@@ -1073,6 +1073,45 @@ def test_a_chain_reaching_a_PUBLIC_db_link_synonym_reports_both():
         ("app", "via_pub", "app", "pub_link"),
         ("public", "pub_link", None, "remote_f", "DBL_LOOP"),
     ], []) == {"via_pub", "pub_link"}
+
+
+def test_reporting_a_link_alias_downgrades_completeness_on_a_schema_that_defines_nothing():
+    """The COST of the M102 fix, pinned rather than described, because the comment describing
+    it was wrong twice.
+
+    `calls_are_confirmable` is `licensed and not inventory.names`, so any name at all makes it
+    false. The first note on the fix argued the cost was bounded to queries spelling the alias,
+    on the grounds that a schema defining a function is already downgraded -- true, and silent
+    about the schema that defines NONE, which is the case this measures. A link over a remote
+    TABLE is the common enterprise shape and produces a name here regardless, because nothing
+    local can tell a remote table from a remote function.
+
+    Same issue-#5 downgrade the PUBLIC/Oracle-maintained filter exists to avoid, accepted here
+    because the alternative is approving a call that returns an ungranted row.
+    """
+    names = _oracle_walk([("public", "orders", None, "orders", "ERP_LINK")], [])
+    assert names == {"orders"}, "a remote table is indistinguishable from a remote function"
+
+    downgraded = FunctionInventory(names=frozenset(names))
+    assert calls_are_confirmable(downgraded, in_view_body=False) is False
+    # The control: without the link alias this source certifies, so the flip is the alias's.
+    assert calls_are_confirmable(FunctionInventory(names=frozenset()), in_view_body=False) is True
+
+
+def test_keying_the_report_on_the_alias_over_reports_through_the_public_fallback():
+    """Keying the return on the ALIAS rather than its target is not equivalent, and the comment
+    that said it was has been corrected.
+
+    `backwards` carries the PUBLIC same-bare-name fallback, so `app.d` collects the PUBLIC `d`'s
+    edge to a function even though Oracle resolves `d` through the private synonym and never
+    consults the PUBLIC one. Target-keyed this was `set()`.
+
+    Asserted because it is OVER-reporting -- fail-closed -- and an assertion is what would catch
+    it turning into the other direction. Nothing here is over a link: the divergence is in the
+    keying, not in M102.
+    """
+    assert _oracle_walk([("app", "d", "sys", "c"), ("public", "d", "sys", "sys_udf")],
+                        [("sys", "sys_udf")]) == {"d"}
 
 
 def test_a_synonym_over_a_LOCAL_non_function_is_still_not_reported():

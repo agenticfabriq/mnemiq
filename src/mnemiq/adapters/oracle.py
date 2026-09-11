@@ -814,9 +814,24 @@ class OracleAdapter:
             # `appuser.west_f`, a different object in a different database -- right by accident
             # when a local function shares the name, fail-open when none does.
             #
-            # The cost is a refusal for any query spelling such an alias, and only such a query:
-            # `may_shadow_a_builtin` is already inert here (`binder_prefers_builtins`), so no
-            # coarse whole-source refusal follows from a wider `names`.
+            # THE COST IS NOT ONLY A REFUSAL ON QUERIES SPELLING THE ALIAS. An earlier version
+            # of this comment claimed that, reasoning that `calls_are_confirmable` is already
+            # false wherever a schema defines a function -- true, and irrelevant to the schema
+            # that defines NONE. Measured: a schema defining nothing, plus one
+            # `PUBLIC orders FOR orders@ERP_LINK` over a remote TABLE, gives
+            # `user_functions() == ['orders']` and flips `calls_are_confirmable` from True to
+            # False, so every answer carrying any call is labelled `completeness='unknown'`.
+            # A link to a table is the COMMON enterprise shape, and this is the same issue-#5
+            # downgrade the PUBLIC/Oracle-maintained filter below exists to avoid.
+            #
+            # Taken anyway, because the two costs are not comparable: the downgrade is an
+            # honest label on an answer, and the alternative is handing back an ungranted SSN.
+            # Narrowing it means separating "must refuse a call" from "is evidence this source
+            # defines functions", which is a third category `FunctionInventory` does not model
+            # -- filed rather than built here, so this diff stays the security fix.
+            #
+            # `may_shadow_a_builtin` IS inert here (`binder_prefers_builtins`), so no coarse
+            # whole-source refusal follows from a wider `names`.
             if db_link is not None:
                 over_a_link.add((owner, name))
                 continue
@@ -910,9 +925,18 @@ class OracleAdapter:
             {f for f in functions & nodes if f[0] not in oracle_owned} | unprovable, backwards)
 
         # Keyed on the ALIAS rather than on its target, because a link alias has no target node
-        # to test. Equivalent for every other row: an alias reaches a function exactly when its
-        # target does, and a synonym cannot share owner-and-name with a function -- Oracle puts
-        # both in one namespace.
+        # to test. NOT equivalent for every other row, which an earlier version of this comment
+        # claimed: `backwards` also carries the PUBLIC same-bare-name fallback, so an alias can
+        # land in `reaches_any` by a link its own target does not have. Measured on
+        # `[("app","d","sys","c"), ("public","d","sys","sys_udf")]` with `sys_udf` a function --
+        # target-keyed returns `set()`, alias-keyed returns `{"d"}`, because `app.d` collects
+        # the PUBLIC `d`'s edge even though Oracle would resolve `d` through the private synonym
+        # and never consult the PUBLIC one.
+        #
+        # Over-reporting, so fail-closed, and a 6,000-graph randomised comparison found 9
+        # divergences all in that direction. Kept because the alternative is special-casing the
+        # link aliases at the return, and a second code path for the shape this function most
+        # recently got wrong is the worse trade.
         return {
             name
             for owner, name in set(edges) | over_a_link
