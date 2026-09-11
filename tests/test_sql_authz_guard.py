@@ -377,7 +377,7 @@ def test_a_statement_that_will_not_render_refuses_rather_than_passes():
 
     inventory = FunctionInventory.of(["commission_rate"], builtins=["count_star"])
     refusal = check_unmodelled_calls(WillNotRender(), inventory, "duckdb")
-    assert refusal.code == RefusalCode.SHADOWED_FUNCTION
+    assert refusal.code == RefusalCode.UNRESOLVABLE_CALLS
 
 
 def test_without_an_inventory_the_guard_is_the_allowlist_it_was():
@@ -390,11 +390,11 @@ def test_without_an_inventory_the_guard_is_the_allowlist_it_was():
     assert check_unmodelled_calls(ast) is None
 
 
-def test_a_shadowed_source_is_not_repaired_into_an_answer():
+def test_an_unresolvable_source_is_not_repaired_into_an_answer():
     """UNMODELLED_CALL is repairable because a model can route around one named function.
-    SHADOWED_FUNCTION cannot be: its repair is "use no functions at all", which no aggregate
-    question has, so a loop would spend every attempt to arrive where it started."""
+    UNRESOLVABLE_CALLS cannot be: it condemns every statement against the source, so there is
+    nothing for a rewrite to avoid and a loop would spend every attempt where it started."""
     from mnemiq.sql.verdict import REPAIRABLE
 
     assert RefusalCode.UNMODELLED_CALL in REPAIRABLE
-    assert RefusalCode.SHADOWED_FUNCTION not in REPAIRABLE
+    assert RefusalCode.UNRESOLVABLE_CALLS not in REPAIRABLE

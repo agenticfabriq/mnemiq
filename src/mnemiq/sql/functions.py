@@ -177,7 +177,8 @@ def inventory_from(adapter) -> FunctionInventory:
     snapshot holds the body governance was reasoned about, and a body that drifted since is a
     governance change worth noticing. A function list is not policy, it is what names mean --
     and a UDF created since the snapshot would read as a builtin, failing open in exactly the
-    direction M43 is about. Measured at ~6ms against queries that take seconds.
+    direction M43 is about. Measured at ~13ms against queries that take seconds -- two scans of
+    `duckdb_functions()`, one per half.
 
     Three answers, matching the three the type keeps apart. An adapter with no `user_functions`
     was never asked. One that raises was asked and could not answer. Anything else is an answer,

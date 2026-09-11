@@ -177,20 +177,33 @@ def check_unmodelled_calls(
         )
 
     inventory = inventory if inventory is not None else FunctionInventory.never_asked()
-    if not inventory.names or next(ast.find_all(exp.Func), None) is None:
-        # Nothing defined, or nothing called. The second half is what keeps a source with one
-        # helper from refusing `SELECT id FROM claim`.
+    if inventory.asked and not inventory.available:
+        # Asked and could not answer, which is not the same as answering "none" -- and the
+        # empty `names` an `unavailable` inventory carries would otherwise fall through every
+        # test below and clear the statement. The collapse this type exists to prevent, in the
+        # guard written to use it: measured, a raising `user_functions()` on a source holding a
+        # `median` macro left `SELECT median(id) FROM claim` approved.
+        return _cannot_resolve(inventory)
+    if not inventory.names:
         return None
 
     if inventory.may_shadow_a_builtin:
-        return _shadowed(inventory)
+        # No `exp.Func` test in front of this, deliberately, and that absence is the fix for a
+        # leak this function's first version had. `exp.Add`, `exp.DPipe` and `exp.AtTimeZone`
+        # are not `exp.Func` subclasses, while DuckDB lists `+`, `||` and `timezone` as
+        # internal functions a macro can shadow -- measured, `SELECT id + 1 FROM claim` was
+        # APPROVED and returned an SSN with a `"+"` macro in the source. Enumerating the node
+        # types that bind to a catalogue entry is the blocklist this codebase keeps refusing to
+        # write; proving a statement CALL-FREE is as hard as naming its calls, so a source
+        # whose names cannot be trusted answers nothing.
+        return _cannot_resolve(inventory)
 
     try:
         called = called_names(ast, *dialects)
     except UnreadableCalls:
         # Cannot enumerate, so cannot clear. The same answer as shadowing, and for the same
         # reason: an empty set read as "no calls" would clear all of them.
-        return _shadowed(inventory)
+        return _cannot_resolve(inventory)
 
     for name in sorted(called & inventory.names):
         return Refusal(
@@ -205,29 +218,32 @@ def check_unmodelled_calls(
     return None
 
 
-def _shadowed(inventory: FunctionInventory) -> Refusal:
-    """No call on this source can be read off the text, so none of them can be decided.
+def _cannot_resolve(inventory: FunctionInventory) -> Refusal:
+    """Nothing on this source can be attributed, so nothing on it can be decided.
 
-    Two ways to arrive, kept apart in the message because they need different fixes. The source
-    defines a name it also calls a builtin, which the deployer resolves by renaming it. Or the
-    source never said what its builtins are, which the ADAPTER resolves by implementing
-    `builtin_functions` -- a missing method should not read in a trace like a hostile database.
+    Three ways to arrive, kept apart in the message because each has a different owner. The
+    source defines a name it also lists as a builtin, which the DEPLOYER resolves by renaming
+    it. The source never said what its builtins are, which the ADAPTER resolves by implementing
+    `builtin_functions`. Or the source could not be asked at all, which is the source's own
+    problem and may be transient -- a missing method and a hostile database should not read
+    alike in a trace.
     """
-    shadowed = sorted(inventory.names & inventory.builtins) if inventory.builtins else []
-    if shadowed:
+    if not inventory.available:
+        detail = "This source could not say which functions it defines"
+        shadowed = []
+    else:
+        shadowed = sorted(inventory.names & inventory.builtins) if inventory.builtins else []
         detail = (
             f"This source defines {shadowed[0]!r} under a name it also lists as a builtin"
-        )
-    else:
-        detail = (
+            if shadowed else
             "This source defines functions of its own and did not report which names are "
             "builtins"
         )
     return Refusal(
-        code=RefusalCode.SHADOWED_FUNCTION,
+        code=RefusalCode.UNRESOLVABLE_CALLS,
         message=(
-            f"{detail}, so this engine cannot confirm what any call in this query executes. "
-            "No query using a function can be decided against this source."
+            f"{detail}, so this engine cannot confirm what this query executes against it. "
+            "No query can be decided against this source."
         ),
         subject=shadowed[0] if shadowed else None,
     )

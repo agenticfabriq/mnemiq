@@ -16,11 +16,11 @@ class RefusalCode(StrEnum):
     # A call this engine cannot model, so it cannot say what the query reads. Not
     # "a forbidden function" -- there is no list of those, and that is the point (M43).
     UNMODELLED_CALL = "unmodelled_call"
-    # The source defines a function under a name the source ALSO calls a builtin, so no call
-    # here can be read off the text. Kept apart from UNMODELLED_CALL because the two have
-    # opposite repairs: that one names a function to avoid, this one condemns every call in
-    # every query against this source until the source stops shadowing (M43's residual).
-    SHADOWED_FUNCTION = "shadowed_function"
+    # Nothing in this statement can be attributed, because this source's name resolution
+    # cannot be reproduced here: it defines a name a builtin also has, or it could not say.
+    # Kept apart from UNMODELLED_CALL because the two have opposite repairs -- that one names a
+    # function to avoid, this one condemns every query against this source (M43's residual).
+    UNRESOLVABLE_CALLS = "unresolvable_calls"
     LOGIC_LINT = "logic_lint"
     VALUE_GROUNDING = "value_grounding"
     NOT_A_WRITE = "not_a_write"
@@ -71,8 +71,8 @@ REPAIRABLE = frozenset(
         # and the repair loop can rewrite that into arithmetic the engine does model.
         # Without this the guard's false positives become deferrals instead of retries.
         RefusalCode.UNMODELLED_CALL,
-        # SHADOWED_FUNCTION is deliberately absent. Its repair would be "write a query with no
-        # function calls", which is impossible for any aggregate question, so a retry loop
+        # UNRESOLVABLE_CALLS is deliberately absent. It condemns every statement against the
+        # source, not one function, so there is nothing for a rewrite to avoid and a retry loop
         # would spend every attempt to reach the deferral it starts at. The fix belongs to the
         # deployer, who sees this in the trace, not to the model.
         RefusalCode.LOGIC_LINT,
