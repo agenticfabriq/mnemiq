@@ -675,7 +675,16 @@ class OracleAdapter:
     # That is the opposite of DuckDB, where `count(*)` binds a macro named `count_star` and
     # `length(x)` binds a macro named `length`. The difference is the whole reason this is a
     # per-engine fact rather than a rule: the coarse "this source cannot be decided at all"
-    # refusal exists for a name the query never says, and on Oracle there is no such name.
+    # refusal exists for a FUNCTION name the query never says, and Oracle's binder never
+    # substitutes one.
+    #
+    # It is NOT a claim that no unnamed user code can run. A virtual column carries an
+    # expression, and `SELECT id, leaked FROM t` over `leaked AS (udf(id))` returned an SSN from
+    # an ungranted table with no function named anywhere in the statement -- measured here, and
+    # filed as M100. Nothing in this guard sees that on any engine, and the coarse rule would
+    # not have caught it either: it fires on a name shared with a builtin, and a virtual
+    # column's UDF has whatever name its author chose. So this property changes what the guard
+    # costs Oracle, not what it protects Oracle from.
     #
     # So Oracle needs no builtin catalogue here. `V$SQLFN_METADATA` would supply one -- 1276
     # names, and readable in the container -- but only through `DB_DEVELOPER_ROLE`, not a direct

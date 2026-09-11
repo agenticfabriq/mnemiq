@@ -107,9 +107,13 @@ class FunctionInventory:
     #             a macro named `length`. The builtin loses, so a name the query never says can
     #             collect the call, and only the coarse rule can catch that.
     #   Oracle  -- with a `LENGTH` function owned by the caller, `SELECT length('abc')` returns
-    #             3, the builtin. The UDF answers only to `appuser.length(...)`. A name the
-    #             query never says cannot reach it, so there is nothing for the coarse rule to
+    #             3, the builtin. The UDF answers only to `appuser.length(...)`. No FUNCTION
+    #             name the query omits can reach it, so there is nothing for the coarse rule to
     #             catch and refusing the whole source would be pure cost.
+    #
+    # Read narrowly: this is about names a BINDER substitutes, not about every way user code
+    # runs. An Oracle virtual column executes a UDF that the statement never names at all, which
+    # no setting of this flag affects and this guard does not see (M100).
     #
     # Defaults FALSE: an engine nobody measured is assumed to behave like DuckDB, which is the
     # conservative half. Forgetting yields a refusal, not a leak.
