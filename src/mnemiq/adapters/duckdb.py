@@ -201,8 +201,8 @@ class DuckDBAdapter:
 
         A failure RAISES, like its sibling, and `inventory_from` turns that into "builtins not
         known". Know what that costs before omitting this method: a source with any user
-        function at all then has every read AND every write against it refused, under a code
-        that is not repairable. It is the conservative reading and it is not a soft one.
+        function at all then has every read AND every write against it refused. It is the
+        conservative reading and it is not a soft one.
         """
         rows = self._con.execute(
             "SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE internal"

@@ -230,14 +230,17 @@ def check_unmodelled_calls(
 def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -> Refusal:
     """Nothing here can be attributed, so nothing here can be decided.
 
-    Four ways to arrive, kept apart in the message because each has a DIFFERENT OWNER, and a
-    refusal that sends the reader to the wrong one is worse than a vague refusal. The source
-    defines a name it also lists as a builtin, which the deployer resolves by renaming it. The
-    source never said what its builtins are, which the adapter author resolves by implementing
-    `builtin_functions`. The source could not be asked at all, which is the source's own
-    problem and may be transient. Or this one statement would not render, which is about the
-    statement and not the source at all -- it reached the shared message once, and told a
-    deployer with a working catalogue that their adapter was incomplete.
+    Five ways to arrive, kept apart in the message because each has a DIFFERENT OWNER, and a
+    refusal that sends the reader to the wrong one is worse than a vague refusal:
+
+      * the source defines a name it also lists as a builtin -- the DEPLOYER renames it
+      * the adapter has no `builtin_functions` -- its AUTHOR implements it
+      * it has one and the call raised -- the SOURCE is the problem, and it may be transient
+      * `user_functions` itself raised -- likewise, and earlier
+      * this one statement would not render -- about the STATEMENT, not the source at all
+
+    The last three each borrowed one of the first two's sentences at some point, and each time
+    the effect was to send someone to fix working code.
     """
     if unreadable:
         return Refusal(
@@ -253,12 +256,18 @@ def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -
         shadowed = []
     else:
         shadowed = sorted(inventory.names & inventory.builtins) if inventory.builtins else []
-        detail = (
-            f"This source defines {shadowed[0]!r} under a name it also lists as a builtin"
-            if shadowed else
-            "This source defines functions of its own and did not report which names are "
-            "builtins"
-        )
+        if shadowed:
+            detail = f"This source defines {shadowed[0]!r} under a name it also lists as a builtin"
+        elif inventory.builtins_asked:
+            detail = (
+                "This source defines functions of its own and could not say which names are "
+                "its builtins"
+            )
+        else:
+            detail = (
+                "This source defines functions of its own and was never asked which names are "
+                "its builtins"
+            )
     return Refusal(
         code=RefusalCode.UNRESOLVABLE_CALLS,
         message=(

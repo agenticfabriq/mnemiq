@@ -84,6 +84,12 @@ class FunctionInventory:
     # assert "this source shadows nothing", which is the absence-and-failure collapse in the
     # one place it would fail open. Defaulting to None makes forgetting conservative.
     builtins: frozenset[str] | None = None
+    # Whether anyone PUT the builtin question, which `builtins is None` cannot carry: an
+    # adapter with no `builtin_functions` and one whose call raised both leave it None. The
+    # same split as `available` and `asked` above, one level down, and it exists for the same
+    # reason -- the refusal names a different owner for each, and telling an adapter author to
+    # implement a method they already implemented sends them to fix working code.
+    builtins_asked: bool = False
 
     def __post_init__(self) -> None:
         # Normalised HERE, not only in `of()`. A dataclass hands out its plain constructor
@@ -192,32 +198,36 @@ def inventory_from(adapter) -> FunctionInventory:
         # The TYPE, not the message. A source's exception text is made of the caller's schema
         # and can carry a DSN, and this reason reaches an audit record (M94).
         return FunctionInventory.unavailable(type(exc).__name__)
+    builtins, builtins_asked = _builtins_from(adapter)
     return FunctionInventory.of(
         names,
         covers_view_bodies=getattr(adapter, "functions_cover_view_bodies", False),
-        builtins=_builtins_from(adapter),
+        builtins=builtins,
+        builtins_asked=builtins_asked,
     )
 
 
-def _builtins_from(adapter) -> frozenset[str] | None:
+def _builtins_from(adapter) -> tuple[frozenset[str] | None, bool]:
     """The source's own builtin catalogue, or None when it did not supply one.
 
     Separate from `user_functions` because a consumer that never asks still gets the
     conservative answer out of `may_shadow_a_builtin` -- soundness does not depend on it. What
     depends on it is whether the source can answer anything at all: without this, a source
-    holding one macro has every read and every write against it refused, under a code that is
-    not repairable. Optional in the sense that omitting it cannot open a hole, not in the sense
-    that omitting it is cheap.
+    holding one macro has every read and every write against it refused. Optional in the sense
+    that omitting it cannot open a hole, not in the sense that omitting it is cheap -- the
+    refusal is classified unrepairable, and until something reads `REPAIRABLE` that costs the
+    caller three model calls and a deferral rather than one clean refusal.
     """
     if adapter is None or not hasattr(adapter, "builtin_functions"):
-        return None
+        return None, False
     try:
-        return frozenset(n.lower() for n in adapter.builtin_functions())
+        return frozenset(n.lower() for n in adapter.builtin_functions()), True
     except Exception:
-        # No reason recorded, unlike the `user_functions` failure. The two are not symmetric:
-        # that one changes what the inventory MEANS, while this one lands on the default the
-        # field already has. Loud enough on its own -- the source then answers nothing.
-        return None
+        # No reason string, unlike the `user_functions` failure -- that one changes what the
+        # inventory MEANS, while this lands on the default the field already has. The fact that
+        # it was ASKED is kept, though: it is the difference between an adapter that has not
+        # implemented this and one whose source would not answer, and the refusal says which.
+        return None, True
 
 
 def calls_are_confirmable(inventory: FunctionInventory, *, in_view_body: bool) -> bool:

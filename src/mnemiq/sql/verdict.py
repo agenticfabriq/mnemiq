@@ -16,10 +16,12 @@ class RefusalCode(StrEnum):
     # A call this engine cannot model, so it cannot say what the query reads. Not
     # "a forbidden function" -- there is no list of those, and that is the point (M43).
     UNMODELLED_CALL = "unmodelled_call"
-    # Nothing in this statement can be attributed, because this source's name resolution
-    # cannot be reproduced here: it defines a name a builtin also has, or it could not say.
-    # Kept apart from UNMODELLED_CALL because the two have opposite repairs -- that one names a
-    # function to avoid, this one condemns every query against this source (M43's residual).
+    # Nothing here can be attributed, because this source's name resolution cannot be
+    # reproduced: it defines a name a builtin also has, it could not say, or -- once -- the
+    # statement would not render, which is the one arrival that is about the statement rather
+    # than the source. Kept apart from UNMODELLED_CALL because the two have opposite repairs:
+    # that one names a function to avoid, this one usually condemns every query against the
+    # source (M43's residual). `_cannot_resolve` is where the five arrivals are told apart.
     UNRESOLVABLE_CALLS = "unresolvable_calls"
     LOGIC_LINT = "logic_lint"
     VALUE_GROUNDING = "value_grounding"
@@ -75,6 +77,11 @@ REPAIRABLE = frozenset(
         # source, not one function, so there is nothing for a rewrite to avoid and a retry loop
         # would spend every attempt to reach the deferral it starts at. The fix belongs to the
         # deployer, who sees this in the trace, not to the model.
+        #
+        # That is the INTENT. Nothing reads this set yet: `plan_query` retries every refusal but
+        # UNAUTHORIZED_TABLE, so today an unrepairable code still costs three model calls and
+        # arrives as INVALID_QUERY rather than as itself. Recorded rather than fixed here --
+        # wiring it changes the outcome of every code in the set, which wants its own measurement.
         RefusalCode.LOGIC_LINT,
         RefusalCode.VALUE_GROUNDING,
     }

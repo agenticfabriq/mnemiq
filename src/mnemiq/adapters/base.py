@@ -34,8 +34,8 @@ class SourceAdapter(Protocol):
     # spells only if that name is a builtin. Declaring it cannot ENFORCE the pairing, and the
     # objection recorded under the flag below applies here too: no adapter but DuckDB's has
     # either method. It is here to be read, not to bind, and what it says is what omitting it
-    # costs -- every source holding one macro refuses every query against it, under a code
-    # that is not repairable. Reached through `hasattr` at the call site. A failure RAISES.
+    # costs -- every source holding one macro refuses every query against it. Reached through
+    # `hasattr` at the call site. A failure RAISES, and raising is told apart from absence.
     def builtin_functions(self) -> list[str]: ...
 
     # Whether `user_functions()` also answers for a VIEW BODY on this source. Read through

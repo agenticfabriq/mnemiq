@@ -610,6 +610,20 @@ def test_an_adapter_that_cannot_say_what_a_builtin_is_gets_the_conservative_answ
     assert inventory_from(Angry()).may_shadow_a_builtin is True
     assert inventory_from(Plain()).may_shadow_a_builtin is False
 
+    # ...and the two are told apart, because the refusal names a different owner for each.
+    # Both leave `builtins` None, so without this flag an adapter whose catalogue call RAISED
+    # is told to implement the method it already implemented.
+    assert inventory_from(HalfAnswering()).builtins_asked is False
+    assert inventory_from(Angry()).builtins_asked is True
+
+    from mnemiq.sql.authz_guard import check_unmodelled_calls
+
+    ast = __import__("sqlglot").parse_one("SELECT count(*) FROM claim", read="duckdb")
+    assert "never asked" in check_unmodelled_calls(
+        ast, inventory_from(HalfAnswering()), "duckdb").message
+    assert "could not say which names" in check_unmodelled_calls(
+        ast, inventory_from(Angry()), "duckdb").message
+
 
 def test_a_source_that_could_not_be_asked_is_not_a_source_that_defines_nothing():
     """`unavailable` carries empty `names`, which every test in the guard below it would read
