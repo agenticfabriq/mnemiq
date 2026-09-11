@@ -1034,8 +1034,10 @@ def test_a_synonym_over_a_db_link_is_reported_rather_than_dropped():
 
     A remote target cannot be resolved from here at all, so the alias is ASSUMED to reach a
     function. Dropping one that turns out to be a function costs the row; reporting one that
-    turns out to be a table costs a refusal on any query spelling it AND, on a schema that
-    defines nothing else, the source's whole completeness label -- which is M104, and which
+    turns out to be a table costs a refusal on a query CALLING it -- `SELECT * FROM orders`
+    still reads the remote table, since the refusal path scans for an identifier before an open
+    paren -- AND, on a schema that defines nothing else, the source's whole completeness
+    label, which is M104 and which
     `test_reporting_a_link_alias_downgrades_completeness_on_a_schema_that_defines_nothing`
     measures. An earlier version of this docstring claimed the refusal was the whole cost.
     """
