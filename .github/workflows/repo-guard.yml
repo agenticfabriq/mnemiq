@@ -14,7 +14,9 @@ on:
   # that fix look like the same subject and are not.
   #
   # Scope worth knowing: `--all` scans the checked-out tree, not the history behind it, so a
-  # secret added and then removed within a branch passes. See M97.
+  # secret added and then removed within a branch passes it. The step below closes that (M97) by
+  # scanning the commits a push adds; `--all` is kept beside it because the two see different
+  # things -- the tree as it stands, and everything that was ever introduced to reach it.
   push:
   pull_request:
 
@@ -27,10 +29,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history, though the scan reads only the tree (see the scope note above and
-          # M97). Kept because the fix for M97 needs the commits a push adds; today it fetches
-          # what nothing opens, which is precisely the mismatch that finding is about.
+          # Full history, and now something reads it: the range step below scans the commits a
+          # push adds. This fetch predated that step and existed for it -- for a while it fetched
+          # what nothing opened, which was precisely the mismatch M97 named.
           fetch-depth: 0
+      - name: Scan the commits this push ADDS, not just the tree it leaves
+        # M97: `--all` resolves to `git ls-files`, so a branch whose commit N adds a secret and
+        # commit N+1 removes it scans clean while the secret stays permanently readable in the
+        # pushed public history. This is what the `fetch-depth: 0` above was always for; until now
+        # it fetched what nothing opened, which is precisely the mismatch that finding names.
+        #
+        # `github.event.before` is all-zeros for a new branch and absent on a pull_request, so the
+        # fallback is every commit this ref adds to main. Broader than the push, never narrower --
+        # re-scanning a commit costs seconds and missing one cannot be taken back.
+        run: |
+          before="${{ github.event.before }}"
+          if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            git fetch -q --no-tags origin main || true
+            range="origin/main..HEAD"
+          else
+            range="${before}..${{ github.sha }}"
+          fi
+          if [ -z "$(git rev-list --count "$range" 2>/dev/null || echo 0)" ] \
+             || [ "$(git rev-list --count "$range" 2>/dev/null || echo 0)" = "0" ]; then
+            echo "repo-guard: no new commits in $range -- nothing to scan."
+            exit 0
+          fi
+          echo "repo-guard: scanning $(git rev-list --count "$range") commit(s) in $range"
+          bash scripts/repo-guard.sh --range "$range"
+
       - name: Scan for secret shapes and machine home paths
         # Not proprietary names. That check is local-only and `--all` refuses to run it,
         # so this job needs no repository secret. Supplying one would leak the list by

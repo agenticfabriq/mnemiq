@@ -43,6 +43,13 @@ jobs:
       - run: bash scripts/test-pre-commit-hook.sh
         env:
           REPO_GUARD_NAME_PATTERNS: zzz_placeholder_matches_nothing_zzz
+      # Runs on the CI awk, which is the point: `--range` matches in awk, and its secret pattern
+      # needs interval expressions this machine has and mawk historically did not. The suite's
+      # cases that EXPECT a catch are what turn red there: on such a runner they get the
+      # control's exit 2 instead of 1 or 0. (The control case itself still passes -- it expects
+      # 2 and gets 2 -- so it is not the one that reports the problem.) No env: `--range` skips the
+      # name check by design, and the one case that uses `--all` sets the value inline.
+      - run: bash scripts/test-repo-guard-range.sh
 
   workbench:
     runs-on: ubuntu-latest
