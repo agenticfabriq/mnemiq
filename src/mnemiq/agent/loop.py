@@ -135,9 +135,10 @@ class AgentAnswer:
     verify_confidence: float | None = None
     # EVERY value here is mapped on the wire, by `verified_state` in `server/serialize.py` --
     # a new layer added below is not inert there, it ships as `unknown`. `judge_unavailable`
-    # means the judge was configured and could not be reached, so the score is the fail-open
-    # constant and not a judgement. `None` is not "no verifier": a deferral or an execution
-    # failure also leaves it unset, because the verifier never saw a table.
+    # means the judge was configured and did not answer, so `verify_confidence` beside it is
+    # None: there was no judgement, and no float says that. `None` on the LAYER is not "no
+    # verifier" either -- a deferral or an execution failure also leaves it unset, because the
+    # verifier never saw a table.
     verify_layer: str | None = None  # sanity | grounding | judge | judge_unavailable | pass
 
 
@@ -530,8 +531,15 @@ class Agent:
             return None, None
         verdict = self.verifier.verify(packet, approved, table)
         if verdict.defer:
-            return AgentAnswer(answer=verdict.reason, deferred=True,
-                               reason_code=DeferralReason.VERIFICATION,
+            # `failed`, not `deferred`, when the check did not HAPPEN. Same call as the
+            # `ModelUnavailable` branch above and for the same reason: something happened TO us,
+            # so it is a stated failure and must stay out of the deferral rate (M6). A judge
+            # outage stopping the answer and the judge scoring it low both arrive here, and
+            # grading them alike would put an infrastructure blip in the column that measures
+            # whether the engine abstains well.
+            return AgentAnswer(answer=verdict.reason,
+                               deferred=not verdict.failed, failed=verdict.failed,
+                               reason_code=verdict.code,
                                verify_confidence=verdict.confidence,
                                verify_layer=verdict.layer,
                                # The query RAN before the verifier saw it, so the decision is a

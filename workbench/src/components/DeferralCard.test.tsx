@@ -28,13 +28,20 @@ describe("DeferralCard", () => {
     expect(screen.getByText(code)).toBeInTheDocument();
   });
 
-  it("labels a deferral and a source failure differently", () => {
+  it("labels a deferral and a failure differently, and does not blame the source for either", () => {
     const { unmount } = render(<DeferralCard answer={withReason("unanswerable")} />);
     expect(screen.getByLabelText("Deferral")).toBeInTheDocument();
     unmount();
 
-    render(<DeferralCard answer={withReason("execution_failed", true)} />);
-    expect(screen.getByLabelText("Source failure")).toBeInTheDocument();
+    // Three codes ride `failed` and only one of them IS the source. The label said
+    // "Source failure" over a model-provider outage before a verifier outage could reach it
+    // too, so the region is named for the kind and the heading names which one broke.
+    for (const code of ["execution_failed", "model_unavailable", "verifier_unavailable"] as const) {
+      const view = render(<DeferralCard answer={withReason(code, true)} />);
+      expect(screen.getByLabelText("Failure")).toBeInTheDocument();
+      expect(screen.queryByLabelText("Source failure")).toBeNull();
+      view.unmount();
+    }
   });
 
   it("still renders when the engine sends no reason code", () => {

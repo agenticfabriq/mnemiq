@@ -22,7 +22,10 @@ export function disposition(turn: Turn): Disposition {
 export const DISPOSITION_LABEL: Record<Disposition, string> = {
   answered: "Answered",
   declined: "Declined",
-  failed: "Source failed",
+  // Three codes reach this disposition and only one of them is the source. It said
+  // "Source failed" over a model-provider outage before a verifier outage could reach
+  // it too; the card below names which one broke.
+  failed: "Could not answer",
   working: "Working",
   broken: "Stream failed",
 };
@@ -71,6 +74,18 @@ export const REASONS: Record<DeferralReason, { title: string; next: string }> = 
   model_unavailable: {
     title: "The model provider did not respond",
     next: "An outage, not a judgement about your data. Try again.",
+  },
+  // Third code riding `failed: true`, and the third thing that can break. The engine ran the
+  // query and could not get the answer CHECKED, which is why it is not `verification` -- that
+  // one means a judge read the result and declined to stand behind it.
+  verifier_unavailable: {
+    title: "The answer could not be verified",
+    // Covers both causes without naming either, because the body above already does. The engine
+    // sends this code when the judge endpoint was unreachable AND when it replied with something
+    // no confidence could be read out of -- and the second is deterministic for a model that
+    // cannot emit the JSON, so "an outage, try again" is advice that cannot work. What both
+    // cases share is that nothing was judged, which is the part the operator needs.
+    next: "The query ran; the verifier gave no usable answer, so the result was withheld rather than returned unchecked. Nothing here is a judgement about your data — check the verifier endpoint and its model.",
   },
 };
 

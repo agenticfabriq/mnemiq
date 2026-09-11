@@ -45,10 +45,10 @@ def test_build_verifier_layers():
     from mnemiq.verify.judge import FakeJudge
 
     judge = FakeJudge(0.9)
-    assert _build_verifier("off", threshold=0.5, grounding=False, judge=judge) is None
-    sanity_only = _build_verifier("sanity", threshold=0.5, grounding=False, judge=judge)
+    assert _build_verifier("off", threshold=0.5, grounding=False, judge=judge, fail_closed=True) is None
+    sanity_only = _build_verifier("sanity", threshold=0.5, grounding=False, judge=judge, fail_closed=True)
     assert sanity_only is not None and sanity_only.judge is None
-    full = _build_verifier("full", threshold=0.5, grounding=False, judge=judge)
+    full = _build_verifier("full", threshold=0.5, grounding=False, judge=judge, fail_closed=True)
     assert full is not None and full.judge is judge
 
 
@@ -89,3 +89,21 @@ def test_mode_verifiers_judge_endpoint_override():
 
     vs, jc = _build_mode_verifiers(_base_settings(verify_model="judge-model"), client=object())
     assert vs["deep"].judge is not None and jc == 1
+
+
+def test_the_deployment_switch_reaches_the_verifier_the_product_uses():
+    """`_build_verifier` taking the argument proves nothing about the runtime passing it. Dropping
+    `fail_closed=settings.verify_fail_closed` at the call site leaves every unit test above green
+    and puts the deployment back on the constructor default, which is the shape of a setting that
+    exists in the config, is documented in `.env.example`, and does nothing (issue #2).
+
+    Both positions, because pinning only the default is satisfied by hardcoding it.
+    """
+    from mnemiq.runtime import _build_mode_verifiers
+
+    for configured in (True, False):
+        verifiers, _ = _build_mode_verifiers(
+            _base_settings(verify_fail_closed=configured), client=object())
+        built = [v for v in verifiers.values() if v is not None]
+        assert built, "no verifier was built, so this asserts nothing"
+        assert all(v.fail_closed is configured for v in built), configured

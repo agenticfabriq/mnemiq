@@ -38,10 +38,11 @@ class _RetryingJudge:
     """Retry a judge call that FAILED, which its score alone cannot distinguish from one that
     scored 1.0.
 
-    The product's judge fails open on the first error, deliberately -- a dead judge must not stop
-    an answer. A MEASUREMENT wants the opposite: a fail-open score is not a judgement, and one
-    flaky call should not become a data point. This sits between the cache and the judge and tries
-    again with backoff.
+    `SemanticJudge` returns the constant on the first error rather than raising, so the float
+    protocol keeps working; the product then withholds the answer by default (issue #2). A MEASUREMENT
+    wants neither: a fail-open score is not a judgement and a deferral is not a data point, and
+    one flaky call should be retried rather than recorded. This sits between the cache and the
+    judge and tries again with backoff.
 
     It learns what happened from `JudgeRead`, which the inner judge returns WITH the score. An
     earlier design read the inner judge's `errors`/`unparsed` counters before and after each call

@@ -69,6 +69,21 @@ class RunCost:
         return sum(c.total_tokens for c in self._clients)
 
 
+def verifier_from(settings, judge) -> Verifier:
+    """The eval path's verifier, in one named place.
+
+    Extracted so the wiring can be tested. Inline, the only way to reach it was to stand up a
+    whole engine -- an adapter, a connection, an LLM client -- so `fail_closed=` could be dropped
+    here and every test stay green while a sweep silently ran on the constructor default. Review
+    found exactly that. `runtime._build_verifier` is the read path's equivalent and is tested the
+    same way; the two are separate because their inputs are, mode levels there and flat settings
+    here.
+    """
+    return Verifier(threshold=settings.verify_threshold, sanity=settings.verify_sanity,
+                    grounding=settings.verify_grounding, judge=judge,
+                    fail_closed=settings.verify_fail_closed)
+
+
 def build_engine(
     snapshot: Snapshot,
     adapter,
@@ -149,8 +164,7 @@ def build_engine(
                 "llm_base_url": base, "llm_api_key": key,
                 "llm_model": settings.verify_model or settings.llm_model}))
             judge = SemanticJudge(judge_client)
-        verifier = Verifier(threshold=settings.verify_threshold, sanity=settings.verify_sanity,
-                            grounding=settings.verify_grounding, judge=judge)
+        verifier = verifier_from(settings, judge)
 
     # Every client the engine actually uses, so "the run's cost" is the run's cost.
     client = RunCost(kit.client, judge_client)
