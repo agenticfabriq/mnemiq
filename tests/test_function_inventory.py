@@ -75,6 +75,9 @@ def test_the_view_body_licence_is_separate_and_defaults_to_denied():
     blind = FunctionInventory.unavailable("permission denied")
     assert blind.certain is False and blind.certain_for_view_bodies is False
     assert FunctionInventory(covers_view_bodies=True, available=False).certain_for_view_bodies is False
+    # ...and the `asked` half too, or a property reading `available and covers_view_bodies`
+    # would grant the licence to an inventory nobody ever asked for.
+    assert FunctionInventory(covers_view_bodies=True, asked=False).certain_for_view_bodies is False
 
 
 def test_names_match_regardless_of_case():
@@ -151,6 +154,12 @@ def test_a_postgres_udf_is_unreachable_from_a_query_and_absent_from_the_answer()
     con.execute("CALL postgres_execute('pg', 'DROP FUNCTION IF EXISTS fn_probe(int)')")
     con.execute("CALL postgres_execute('pg', "
                 "'CREATE FUNCTION fn_probe(int) RETURNS int AS $x$ SELECT 99 $x$ LANGUAGE sql')")
+    # Both objects exist BEFORE the adapter connects. Created afterwards, resolving
+    # `src.public.v_fn_probe` would depend on the postgres extension re-querying a schema cache
+    # populated by the adapter's own `USE src.public`, and the extension documents
+    # `pg_clear_cache()` for exactly that. The test would then be measuring cache behaviour.
+    con.execute("CALL postgres_execute('pg', "
+                "'CREATE VIEW v_fn_probe AS SELECT fn_probe(1) AS m')")
     try:
         adapter = DuckDBAdapter.postgres(dsn, read_only=True)
         fns = adapter.user_functions()
@@ -160,12 +169,14 @@ def test_a_postgres_udf_is_unreachable_from_a_query_and_absent_from_the_answer()
         with pytest.raises(_duckdb.CatalogException):
             adapter.execute("SELECT fn_probe(1)")
 
-        # The other half. Through a view, the same function DOES run, server-side, so an
-        # inventory built from this answer must not license view bodies.
-        con.execute("CALL postgres_execute('pg', "
-                    "'CREATE VIEW v_fn_probe AS SELECT fn_probe(1) AS m')")
+        # The other half, and the reason the two licences are separate: through a view the same
+        # function DOES run, server-side, and returns its value.
+        #
+        # No assertion on `FunctionInventory.of(fns)` here. It would read as Postgres coverage
+        # and prove nothing -- the answer comes from the field's default, which the unit test
+        # already pins, so it holds for any `fns`. The guarantee that matters is that a PRODUCER
+        # never sets `covers_view_bodies=True` for this attachment, and no producer exists yet.
         assert adapter.execute("SELECT m FROM src.public.v_fn_probe")[0][0] == 99
-        assert FunctionInventory.of(fns).certain_for_view_bodies is False
     finally:
         con.execute("CALL postgres_execute('pg', 'DROP VIEW IF EXISTS v_fn_probe')")
         con.execute("CALL postgres_execute('pg', 'DROP FUNCTION IF EXISTS fn_probe(int)')")
