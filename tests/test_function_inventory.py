@@ -1018,7 +1018,8 @@ def test_the_owner_read_is_chunked_under_oracles_in_list_cap():
     """An Oracle IN list is capped at 1,000 items (ORA-01795), and this one grows with every
     non-Oracle owner any synonym targets -- a schema-per-tenant instance passes that mark.
 
-    The stub counts the reads rather than the binds, because the cap is on one statement.
+    The stub records how many owners each READ binds and asserts on the largest, because the cap
+    is per statement rather than per call.
     """
     synonyms = [("app", f"a{i}", f"own{i}", "udf") for i in range(2500)]
     reads: list[int] = []

@@ -799,8 +799,11 @@ class OracleAdapter:
             # used to reach `sorted()` and raise TypeError, which `inventory_from` turns into
             # `unavailable` and the guard turns into refusing EVERY statement on the source. One
             # such synonym anywhere in the dictionary would have stopped the whole deployment.
-            # Skipped rather than resolved: the docstring already says a DB-link target has no
-            # local `all_objects` row to resolve against.
+            # Skipped rather than resolved, and that trades an outage for a FAIL-OPEN (M102):
+            # Oracle resolves a call through such a synonym to the remote function, and an alias
+            # absent from `names` is cleared. Bounded by the same allowlist as everything else --
+            # only an alias sqlglot MODELS gets that far -- and there is no local answer, since a
+            # DB-link target has no `all_objects` row to resolve against.
             if target_owner is None or target_name is None:
                 continue
             edges[(owner, name)] = (target_owner, target_name)
