@@ -616,6 +616,12 @@ def test_an_adapter_that_cannot_say_what_a_builtin_is_gets_the_conservative_answ
     assert inventory_from(HalfAnswering()).builtins_asked is False
     assert inventory_from(Angry()).builtins_asked is True
 
+    # An answer implies the question, whoever built the instance. Nothing in the product can
+    # reach the contradictory state today, which is exactly why it would survive unnoticed
+    # until something could.
+    assert FunctionInventory.of(["x"], builtins=[]).builtins_asked is True
+    assert FunctionInventory.of(["x"], builtins=[], builtins_asked=False).builtins_asked is True
+
     from mnemiq.sql.authz_guard import check_unmodelled_calls
 
     ast = __import__("sqlglot").parse_one("SELECT count(*) FROM claim", read="duckdb")

@@ -230,8 +230,10 @@ def check_unmodelled_calls(
 def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -> Refusal:
     """Nothing here can be attributed, so nothing here can be decided.
 
-    Several ways to arrive, kept apart in the message because each has a DIFFERENT OWNER, and a
-    refusal that sends the reader to the wrong one is worse than a vague refusal:
+    Several ways to arrive, and each gets its OWN SENTENCE, because a refusal that sends the
+    reader to the wrong place is worse than a vague one. Two of them share an owner and still
+    read differently, since "no such method" and "the method raised" are found in different
+    places even when the same person goes looking:
 
       * the source defines a name it also lists as a builtin -- the DEPLOYER renames it
       * the adapter has no `builtin_functions` -- its AUTHOR implements it

@@ -379,8 +379,8 @@ def test_a_statement_that_will_not_render_refuses_rather_than_passes():
     refusal = check_unmodelled_calls(WillNotRender(), inventory, "duckdb")
     assert refusal.code == RefusalCode.UNRESOLVABLE_CALLS
     # ...and says whose problem it is. This source's catalogue answered both halves, so any of
-    # the source-level sentences would send a deployer to fix something that is working. Each
-    # arrival at this code has a different owner.
+    # the source-level sentences would send a deployer to fix something that is working. Two
+    # arrivals can share an owner; none of them shares a sentence.
     assert "could not be rendered" in refusal.message
     assert "builtins" not in refusal.message
 
