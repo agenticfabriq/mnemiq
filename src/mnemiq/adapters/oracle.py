@@ -828,7 +828,7 @@ class OracleAdapter:
             # honest label on an answer, and the alternative is handing back an ungranted SSN.
             # Narrowing it means separating "must refuse a call" from "is evidence this source
             # defines functions", which is a third category `FunctionInventory` does not model
-            # -- filed rather than built here, so this diff stays the security fix.
+            # -- M104, filed rather than built here so this stays the security fix.
             #
             # `may_shadow_a_builtin` IS inert here (`binder_prefers_builtins`), so no coarse
             # whole-source refusal follows from a wider `names`.

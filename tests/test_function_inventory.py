@@ -1033,8 +1033,11 @@ def test_a_synonym_over_a_db_link_is_reported_rather_than_dropped():
     cross-dialect allowlist waves it through and only the inventory can catch it.
 
     A remote target cannot be resolved from here at all, so the alias is ASSUMED to reach a
-    function. Reporting a name that turns out to be a table costs one refusal on a query
-    spelling it; dropping one that turns out to be a function costs the row.
+    function. Dropping one that turns out to be a function costs the row; reporting one that
+    turns out to be a table costs a refusal on any query spelling it AND, on a schema that
+    defines nothing else, the source's whole completeness label -- which is M104, and which
+    `test_reporting_a_link_alias_downgrades_completeness_on_a_schema_that_defines_nothing`
+    measures. An earlier version of this docstring claimed the refusal was the whole cost.
     """
     assert _oracle_walk([("app", "add_days", None, "m102_udf", "DBL_LOOP")], []) == {"add_days"}
 
