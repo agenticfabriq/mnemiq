@@ -1937,3 +1937,58 @@ def test_a_virtual_column_runs_a_udf_the_statement_never_names():
         con.commit()
         adapter._pool.release(con)
         adapter.close()
+
+
+def test_a_write_cannot_store_what_a_virtual_column_computed():
+    """The M98 divergence, recreated for columns and caught by review before it shipped: the
+    read path got the guard and the write path did not.
+
+    A write is the worse place to lose it. `INSERT INTO notes SELECT id, leaked FROM vc_t`
+    stores the UDF's output -- an SSN, here -- into a table the caller may read forever, which
+    is the M30 shape. The ordinary insert beside it is the control: without one this passes by
+    refusing every write.
+    """
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.sql.decide_write import decide_write
+    from mnemiq.sql.policy import AccessPolicy
+
+    adapter = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD,
+                            schema=USER.upper(), read_only=False)
+    con = adapter._pool.acquire()
+    cur = con.cursor()
+    drops = ("DROP TABLE vc_notes", "DROP TABLE vc_t", "DROP FUNCTION vc_udf",
+             "DROP TABLE vc_sec")
+    try:
+        for ddl in drops:
+            with contextlib.suppress(Exception):
+                cur.execute(ddl)
+        cur.execute("CREATE TABLE vc_sec(ssn VARCHAR2(20))")
+        cur.execute("INSERT INTO vc_sec VALUES ('123-45-6789')")
+        cur.execute("CREATE OR REPLACE FUNCTION vc_udf(x NUMBER) RETURN VARCHAR2 DETERMINISTIC "
+                    "IS v VARCHAR2(20); BEGIN SELECT ssn INTO v FROM vc_sec WHERE ROWNUM = 1; "
+                    "RETURN v; END;")
+        cur.execute("CREATE TABLE vc_t(id NUMBER, leaked AS (vc_udf(id)))")
+        cur.execute("INSERT INTO vc_t(id) VALUES (1)")
+        cur.execute("CREATE TABLE vc_notes(id NUMBER, note VARCHAR2(40))")
+        con.commit()
+
+        visible = {"vc_t": {"id", "leaked"}, "vc_notes": {"id", "note"}}
+        grants = GrantSet(frozenset({"vc_t", "vc_notes"}), writable=frozenset({"vc_notes"}))
+
+        def write(sql):
+            return decide_write(sql, visible, grants, policy=AccessPolicy(), adapter=adapter,
+                                dialect="oracle", target="oracle", writes_enabled=True)
+
+        refused = write("INSERT INTO vc_notes (id, note) SELECT id, leaked FROM vc_t")
+        assert refused.code.value == "unresolvable_calls", refused
+        assert refused.subject == "leaked"
+
+        ordinary = write("INSERT INTO vc_notes (id, note) SELECT id, 'ok' FROM vc_t")
+        assert not hasattr(ordinary, "code"), ordinary
+    finally:
+        for ddl in drops:
+            with contextlib.suppress(Exception):
+                cur.execute(ddl)
+        con.commit()
+        adapter._pool.release(con)
+        adapter.close()

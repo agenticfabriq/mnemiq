@@ -259,6 +259,37 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
         return None
     referenced = {object_key(t): t.alias_or_name for t in base_tables(ast, dialect)}
     by_alias = {alias: table for table, alias in referenced.items()}
+
+    def refuse(name: str, why: str) -> Refusal:
+        return Refusal(
+            code=RefusalCode.UNRESOLVABLE_CALLS,
+            message=(
+                f"{name!r} is computed by an expression this source stores and this engine "
+                f"cannot attribute, so it cannot confirm what {why} executes. Answer without "
+                "that column."
+            ),
+            subject=name,
+            repairable_override=True,
+        )
+
+    # A JOIN KEY is not an `exp.Column`, and it reads the column all the same. `USING (leaked)`
+    # names it as a bare identifier, and a NATURAL join names nothing at all -- both evaluate the
+    # expression per row, and whether rows match leaks its value a bit at a time. Measured: both
+    # passed a guard that walked only column nodes, while `WHERE leaked = 'x'` was refused, which
+    # is the same channel one syntax over.
+    for join in ast.find_all(exp.Join):
+        for key in join.args.get("using") or ():
+            name = key.name.lower() if hasattr(key, "name") else str(key).lower()
+            for table in referenced:
+                if (table.lower(), name) in opaque:
+                    return refuse(name, "joining on it")
+        if (join.args.get("method") or "").upper() == "NATURAL":
+            # It names no column, so there is nothing to check against: the keys are whatever the
+            # two tables share. Any opaque column on a table in this statement could be one.
+            for table, column in sorted(opaque):
+                if table in referenced:
+                    return refuse(column, "a NATURAL join on this table")
+
     for column in ast.find_all(exp.Column):
         name = column.name.lower()
         # A qualifier names the table directly; without one, any table in scope could own it,
@@ -269,16 +300,7 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
             owners = list(referenced)
         for table in owners:
             if (table.lower(), name) in opaque:
-                return Refusal(
-                    code=RefusalCode.UNRESOLVABLE_CALLS,
-                    message=(
-                        f"{name!r} is computed by an expression this source stores and this "
-                        "engine cannot attribute, so it cannot confirm what reading it "
-                        "executes. Answer without that column."
-                    ),
-                    subject=name,
-                    repairable_override=True,
-                )
+                return refuse(name, "reading it")
     return None
 
 

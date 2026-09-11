@@ -1125,3 +1125,37 @@ def test_the_guard_catches_the_column_qualified_or_not():
     clean = check_opaque_columns(
         sqlglot.parse_one("SELECT id, total FROM vc_t", read="oracle"), opaque, "oracle")
     assert clean is None
+
+
+@pytest.mark.parametrize("sql, why", [
+    ("SELECT vc_t.id FROM vc_t JOIN other USING (leaked)", "USING names it as a bare identifier"),
+    ("SELECT id FROM vc_t NATURAL JOIN other", "NATURAL names no column at all"),
+])
+def test_a_join_key_reads_the_column_without_being_a_column_node(sql, why):
+    """Both passed a guard that walked only `exp.Column`, while `WHERE leaked = 'x'` was refused
+    -- the same channel one syntax over. A join evaluates the expression per row, and whether
+    rows match leaks its value a bit at a time.
+
+    NATURAL has nothing to check against, since the keys are whatever the two tables share, so
+    any opaque column on a table in the statement is one it could be joining on.
+    """
+    import sqlglot
+
+    from mnemiq.sql.authz_guard import check_opaque_columns
+
+    refusal = check_opaque_columns(sqlglot.parse_one(sql, read="oracle"),
+                                   frozenset({("vc_t", "leaked")}), "oracle")
+    assert refusal is not None, why
+    assert refusal.subject == "leaked"
+
+
+def test_a_join_on_an_ordinary_column_still_answers():
+    """The control. Without it the pair above is satisfied by refusing every join."""
+    import sqlglot
+
+    from mnemiq.sql.authz_guard import check_opaque_columns
+
+    clean = check_opaque_columns(
+        sqlglot.parse_one("SELECT vc_t.id FROM vc_t JOIN other USING (id)", read="oracle"),
+        frozenset({("vc_t", "leaked")}), "oracle")
+    assert clean is None

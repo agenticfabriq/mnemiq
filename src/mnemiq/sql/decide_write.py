@@ -5,8 +5,8 @@ from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import ViewDefinition
-from mnemiq.sql.authz_guard import check_access, check_unmodelled_calls
-from mnemiq.sql.functions import inventory_from
+from mnemiq.sql.authz_guard import check_access, check_opaque_columns, check_unmodelled_calls
+from mnemiq.sql.functions import inventory_from, opaque_columns
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove
@@ -223,9 +223,17 @@ def decide_write(
     # that stores what it read into a granted table. Both dialects, as on the read path: the
     # guard renders to find the names the source will be asked for, and `target` has already
     # been defaulted to `dialect` at the top of this function.
-    opaque = check_unmodelled_calls(shaped, inventory_from(adapter), dialect, target)
+    functions = inventory_from(adapter)
+    opaque = check_unmodelled_calls(shaped, functions, dialect, target)
     if opaque is not None:
         return opaque
+
+    # And the column form, for the reason above stated once more: a write is the worse place to
+    # lose it. `INSERT INTO notes SELECT id, leaked FROM vc_t` stores what the virtual column's
+    # expression returned into a table the caller may read forever (M100, the M30 shape).
+    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target)
+    if computed is not None:
+        return computed
 
     # A write needs RAW access: a masked column is treated as denied for writes.
     write_cls = check_cls(shaped, AccessPolicy(denied=policy.denied | policy.masked), target)
