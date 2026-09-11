@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # repo-guard: block commits that leak proprietary names, personal identity, or
-# secrets into this repo. Pre-commit hook (--staged) and CI (--all).
+# secrets into this repo. Pre-commit hook (--staged), CI over the tree (--all), and CI over
+# the commits a push adds (--range <rev-range>), which is the only one that sees a secret
+# added and removed within a branch (M97).
 #
 # THREE CHECKS, TWO AUDIENCES, and the split is deliberate.
 #
@@ -27,13 +29,41 @@
 set -uo pipefail
 
 MODE="${1:---staged}"
+RANGE="${2:-}"
+if [ "$MODE" = "--range" ] && [ -z "$RANGE" ]; then
+  echo "repo-guard: --range needs a rev-range, e.g. --range origin/main..HEAD" >&2
+  exit 2
+fi
 
 list_files() {
   if [ "$MODE" = "--all" ]; then
     git ls-files
+  elif [ "$MODE" = "--range" ]; then
+    :   # --range does not scan paths; see scan_range
   else
     git diff --cached --name-only --diff-filter=ACM
   fi
+}
+
+# `--range <rev-range>`: content INTRODUCED by the commits a push adds, which is the one thing
+# neither other mode can see. `--all` resolves to `git ls-files` -- the working TREE -- so a branch
+# whose commit N adds a secret and commit N+1 removes it scans clean, while the secret stays
+# permanently readable in the pushed public history, recoverable from the commit object long after
+# the tip looks fine (M97). `--staged` has the same blind spot from the other end: it sees each
+# commit as it is made, and a `--no-verify` or an amend-and-force skips it entirely.
+#
+# Reads ADDED LINES from a patch rather than each commit's whole tree. `git grep` over every
+# commit is O(commits x tree) and re-reads unchanged files thousands of times; a secret has to
+# arrive as an added line at some commit, so one pass over the patches sees every introduction and
+# nothing twice.
+#
+# The scanner excludes ITSELF by pathspec, for the reason the tree scan does: its patterns can
+# match their own spelling. Measured on mnemiq's history -- 1,399 commits -- the only file that
+# ever matched a secret shape was this one, 1,089 times, matching the literal `AF_SECRET_KEY` in
+# its own pattern list.
+scan_range() {
+  git log -p -U0 --no-color --diff-filter=AMR --format='__COMMIT__ %H' "$RANGE" \
+      -- . ":(exclude)$EXCLUDE_PATH"
 }
 
 # Resolve the blocklist: environment first (CI), then the gitignored .env.
@@ -66,7 +96,11 @@ fi
 NAMES_SETTING="$(printf '%s' "${REPO_GUARD_NAME_PATTERNS:-}" \
   | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 CHECK_NAMES=1
-if [ "$MODE" = "--all" ]; then
+# `--range` joins `--all` here, and for the identical reason rather than by analogy: both run in
+# CI, whose log is public on a public repo, and enforcing the list there would LEAK it -- a
+# flagged word in a public log tells every reader that word is on the blocklist. A fork's pull
+# request could not receive the secret that carries it anyway.
+if [ "$MODE" = "--all" ] || [ "$MODE" = "--range" ]; then
   CHECK_NAMES=0
   echo "repo-guard: proprietary-name check SKIPPED -- it runs locally only, by design."
   echo "  Secret shapes and home paths are checked below; neither needs configuration."
@@ -95,9 +129,62 @@ HOME_PATH_PATTERNS='/(Users|home)/[A-Za-z0-9._-]+'
 
 # The scanner itself: free of name tokens now, but its secret-shape patterns
 # can match their own spelling. Never scan it.
-EXCLUDE_REGEX='^scripts/repo-guard\.sh$'
+EXCLUDE_PATH='scripts/repo-guard.sh'
+EXCLUDE_REGEX="^$(printf '%s' "$EXCLUDE_PATH" | sed 's/\./\\./g')\$"
 
 fail=0
+
+if [ "$MODE" = "--range" ]; then
+  # POSITIVE CONTROL, before trusting a clean result. The matching below runs in `awk`, and the
+  # secret pattern leans on interval expressions (`{16,}`) that not every awk implements -- BSD
+  # awk here, mawk on the CI runner. An awk that ignores intervals reports every range clean and
+  # says nothing, which is the failure mode this whole finding is about: a scanner that passes
+  # because it cannot see. So prove the engine matches a known sample and REFUSE if it cannot,
+  # rather than emit a green tick a reader would trust.
+  control='+KEY = "sk-abcdefghijklmnopqrstuvwx"'
+  if ! printf '%s\n' "$control" \
+       | awk -v secret="$SECRET_PATTERNS" '/^\+/ { if (substr($0,2) ~ secret) found=1 }
+                                           END { exit found ? 0 : 1 }'; then
+    echo "repo-guard: BLOCKED [instrument]: this awk does not match the secret pattern" >&2
+    echo "  (interval expressions such as {16,} are the usual cause). A scanner that cannot" >&2
+    echo "  detect its own positive control must not report a range clean." >&2
+    exit 2
+  fi
+
+  # ONE awk pass, not a shell loop. The first version ran two `grep`s per added line through a
+  # `printf` pipe -- two process spawns per line -- and measured 45s for 50 commits and 293s for
+  # 300, about a second each. A CI step that costs a second per commit is one somebody narrows
+  # later for speed, which is how the tree-only scan got here. This is the same matching in one
+  # process.
+  #
+  # The matched TEXT is never printed: this mode runs in CI, whose log is public on a public repo,
+  # so the shape and its location are the finding and the value is not.
+  # git's own failure must not read as "nothing found". Sending stderr to /dev/null and taking
+  # the empty output made an unresolvable range -- a typo, a missing object, a shallow clone --
+  # exit 0 and report the push clean. CI builds this range from `github.event.before`, which is
+  # exactly where an unresolvable ref comes from.
+  if ! range_raw="$(scan_range)"; then
+    echo "repo-guard: BLOCKED [instrument]: git could not read the range '$RANGE'." >&2
+    echo "  A range this scanner cannot walk is not a range with nothing in it." >&2
+    exit 2
+  fi
+  range_out="$(printf '%s\n' "$range_raw" | awk -v secret="$SECRET_PATTERNS" -v home="$HOME_PATH_PATTERNS" '
+    # 12, not 13. `__COMMIT__` is ten characters and the space is the eleventh, so 13 dropped
+    # the first hex digit and every SHA this printed was one an operator could not look up.
+    /^__COMMIT__ / { commit = substr($0, 12, 12); next }
+    /^\+\+\+ b\// { file = substr($0, 7); next }
+    /^\+/ {
+      body = substr($0, 2)
+      if (body ~ secret) print "BLOCKED [secret]: " file " introduced at " commit " (matched a secret pattern)"
+      else if (body ~ home) print "BLOCKED [home-path]: " file " introduced at " commit
+    }
+  ' | sort -u)"
+  if [ -n "$range_out" ]; then
+    printf '%s\n' "$range_out"
+    fail=1
+  fi
+fi
+
 while IFS= read -r f; do
   [ -z "$f" ] && continue
   if printf '%s\n' "$f" | grep -qE "$EXCLUDE_REGEX"; then continue; fi
