@@ -779,3 +779,33 @@ def test_an_adapter_that_cannot_scope_its_catalogue_counts_every_name_as_reachab
     assert inventory_from(Scoped()).may_shadow_a_builtin is False
     # ...and the full list is untouched either way, so a qualified call is still caught.
     assert inventory_from(Scoped()).names == frozenset({"median"})
+
+
+def test_every_adapter_the_resolver_hands_out_can_answer_the_inventory():
+    """M99 was that one adapter could and the others could not, and nothing said so.
+
+    `resolve.py` returns `OracleAdapter` or the DuckDB family, and `runtime.py` builds a
+    `FederatedAdapter` for a multi-source deployment. All three are checked here because the gap
+    was invisible exactly where it mattered: federation IS DuckDB, so every argument written for
+    the DuckDB adapter read as though it already applied.
+
+    The unused `pg`/`sqlite` classes are deliberately not asserted -- nothing hands them out, and
+    requiring the methods there would be a test defending code no deployment reaches.
+    """
+    from mnemiq.adapters.duckdb import DuckDBAdapter, DuckDBPostgresAdapter
+    from mnemiq.adapters.federated import FederatedAdapter
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    for cls in (DuckDBAdapter, DuckDBPostgresAdapter, FederatedAdapter):
+        assert hasattr(cls, "user_functions"), cls
+        assert hasattr(cls, "builtin_functions"), cls
+        assert hasattr(cls, "reachable_user_functions"), cls
+        assert getattr(cls, "binder_prefers_builtins", False) is False, (
+            f"{cls.__name__} binds a macro over a builtin -- `count(*)` reaches `count_star`"
+        )
+
+    # Oracle answers the same question with a different shape, and the difference is measured
+    # in `tests/test_oracle_adapter.py`: its binder settles an unqualified call on its own
+    # builtin, so it needs no builtin catalogue and never takes the whole-source refusal.
+    assert hasattr(OracleAdapter, "user_functions")
+    assert OracleAdapter.binder_prefers_builtins is True

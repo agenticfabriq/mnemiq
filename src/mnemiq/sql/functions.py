@@ -99,6 +99,21 @@ class FunctionInventory:
     # None falls back to `names`, which is what an adapter that cannot scope its catalogue gets
     # -- the same shape as `builtins`, and conservative in the same direction.
     reachable: frozenset[str] | None = None
+    # Whether this SOURCE'S BINDER resolves a builtin before a schema object of the same name.
+    # Measured per engine, because the two live engines disagree and the disagreement decides
+    # whether the coarse rule is needed at all:
+    #
+    #   DuckDB  -- `count(*)` binds a macro named `count_star`, and `SELECT length('abc')` binds
+    #             a macro named `length`. The builtin loses, so a name the query never says can
+    #             collect the call, and only the coarse rule can catch that.
+    #   Oracle  -- with a `LENGTH` function owned by the caller, `SELECT length('abc')` returns
+    #             3, the builtin. The UDF answers only to `appuser.length(...)`. A name the
+    #             query never says cannot reach it, so there is nothing for the coarse rule to
+    #             catch and refusing the whole source would be pure cost.
+    #
+    # Defaults FALSE: an engine nobody measured is assumed to behave like DuckDB, which is the
+    # conservative half. Forgetting yields a refusal, not a leak.
+    binder_prefers_builtins: bool = False
 
     def __post_init__(self) -> None:
         # Normalised HERE, not only in `of()`. A dataclass hands out its plain constructor
@@ -191,6 +206,13 @@ class FunctionInventory:
         macro in a schema off the search path is invisible to `COUNT(*)`; counting it condemned
         whole sources that were answering correctly.
         """
+        if self.binder_prefers_builtins:
+            # Nothing to catch: this engine hands an unqualified call to its own builtin, so a
+            # user function of that name is reachable only by a query that SPELLS the
+            # qualification -- which `called_names` reads off the rendered text. Checked before
+            # `builtins`, so an engine whose catalogue of builtins is unreadable still gets this
+            # answer instead of a whole-source refusal it does not need.
+            return False
         # The names a query could have called unqualified, which is the only way a BINDER
         # rename can land on a user function. Scoped, because the unscoped version condemned a
         # whole source over a macro in a schema nothing on the search path can reach.
@@ -232,6 +254,7 @@ def inventory_from(adapter) -> FunctionInventory:
         builtins=builtins,
         builtins_asked=builtins_asked,
         reachable=_reachable_from(adapter),
+        binder_prefers_builtins=getattr(adapter, "binder_prefers_builtins", False),
     )
 
 
