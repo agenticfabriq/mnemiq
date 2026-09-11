@@ -814,30 +814,28 @@ class OracleAdapter:
             # `appuser.west_f`, a different object in a different database -- right by accident
             # when a local function shares the name, fail-open when none does.
             #
-            # THE COST IS NOT ONLY A REFUSAL ON STATEMENTS THAT SPELL THE ALIAS BEFORE AN OPEN
-            # PAREN -- which is the whole refusal, since `may_shadow_a_builtin` is inert here
-            # and the remaining rule intersects `names` with exactly that lexical scan. Reading
-            # the remote table by name is untouched: for the `orders` example a few lines down,
-            # `SELECT * FROM orders` is still answered and only `orders(...)` is refused. Said
-            # as a scan rather than as "a call" because it IS a scan, and over-collects on
-            # purpose -- `FROM customer AS c(id, name)` yields `c`. An earlier version
-            # of this comment claimed that, reasoning that `calls_are_confirmable` is already
-            # false wherever a schema defines a function -- true, and irrelevant to the schema
-            # that defines NONE. Measured: a schema defining nothing, plus one
-            # `PUBLIC orders FOR orders@ERP_LINK` over a remote TABLE, gives
-            # `user_functions() == ['orders']` and flips `calls_are_confirmable` from True to
-            # False, so every answer carrying any call is labelled `completeness='unknown'`.
-            # A link to a table is the COMMON enterprise shape, and this is the same issue-#5
-            # downgrade the PUBLIC/Oracle-maintained filter below exists to avoid.
+            # WHAT REPORTING AN ALIAS COSTS, in the two places `names` is read:
             #
-            # Taken anyway, because the two costs are not comparable: the downgrade is an
-            # honest label on an answer, and the alternative is handing back an ungranted SSN.
-            # Narrowing it means separating "must refuse a call" from "is evidence this source
-            # defines functions", which is a third category `FunctionInventory` does not model
-            # -- M104, filed rather than built here so this stays the security fix.
+            #   the refusal -- `may_shadow_a_builtin` is inert on this adapter
+            #     (`binder_prefers_builtins`), so `called & names` is the only rule left, and
+            #     `called` is a LEXICAL scan for an identifier before an open paren. So
+            #     `SELECT * FROM orders` through `PUBLIC orders FOR orders@ERP_LINK` is still
+            #     answered and only `orders(...)` is refused. A scan, not a parse: it
+            #     over-collects on purpose, and `FROM customer AS c(id, name)` yields `c`.
             #
-            # That inertness is `binder_prefers_builtins`, and it is why no coarse
-            # whole-source refusal follows from a wider `names`.
+            #   the label -- `calls_are_confirmable` is `not names`, so ONE alias downgrades
+            #     the whole source. Measured on that same `orders` row against a schema
+            #     defining nothing of its own: `user_functions() == ['orders']` and the flag
+            #     goes True -> False, `completeness='unknown'` on every answer carrying a call.
+            #     A link to a TABLE is the common enterprise shape and nothing local tells it
+            #     from a link to a function, so this is the issue-#5 blanket downgrade that the
+            #     PUBLIC/Oracle-maintained filter below exists to avoid, by another route.
+            #
+            # The second is the one worth arguing about, and it is taken anyway: a downgraded
+            # label is honest about an answer, and the alternative is handing back an ungranted
+            # SSN. Narrowing it means a name that must refuse without being evidence the source
+            # defines functions -- a third category `FunctionInventory` does not model, filed
+            # as M104 so this stays the security fix.
             if db_link is not None:
                 over_a_link.add((owner, name))
                 continue
