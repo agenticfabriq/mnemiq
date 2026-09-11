@@ -814,21 +814,29 @@ class OracleAdapter:
             # `appuser.west_f`, a different object in a different database -- right by accident
             # when a local function shares the name, fail-open when none does.
             #
-            # WHAT REPORTING AN ALIAS COSTS, in the two places `names` is read:
+            # WHAT REPORTING AN ALIAS COSTS, in the three places a non-empty `names` is read:
             #
             #   the refusal -- `may_shadow_a_builtin` is inert on this adapter
-            #     (`binder_prefers_builtins`), so `called & names` is the only rule left, and
+            #     (`binder_prefers_builtins`), so `called & names` is the rule that fires, and
             #     `called` is a LEXICAL scan for an identifier before an open paren. So
             #     `SELECT * FROM orders` through `PUBLIC orders FOR orders@ERP_LINK` is still
             #     answered and only `orders(...)` is refused. A scan, not a parse: it
             #     over-collects on purpose, and `FROM customer AS c(id, name)` yields `c`.
             #
-            #   the label -- `calls_are_confirmable` is `not names`, so ONE alias downgrades
-            #     the whole source. Measured on that same `orders` row against a schema
-            #     defining nothing of its own: `user_functions() == ['orders']` and the flag
-            #     goes True -> False, `completeness='unknown'` on every answer carrying a call.
-            #     A link to a TABLE is the common enterprise shape and nothing local tells it
-            #     from a link to a function, so this is the issue-#5 blanket downgrade that the
+            #   the gate in front of it -- `check_unmodelled_calls` returns early while `names`
+            #     is EMPTY, so a first alias also switches on the arm behind that gate: a
+            #     statement the scan cannot read at all (`UnreadableCalls`) is now refused
+            #     whole, not just one whose text spells the alias. Fail-closed and arguably
+            #     right -- an unreadable statement against unknown functions cannot be cleared
+            #     -- but it is not bounded by the scan, and an earlier note here said it was.
+            #
+            #   the label -- `calls_are_confirmable` is `licensed and not names`, so where
+            #     `licensed` holds ONE alias downgrades the whole source. Measured on that same
+            #     `orders` row against a schema defining nothing of its own:
+            #     `user_functions() == ['orders']` and the flag goes True -> False,
+            #     `completeness='unknown'` on every answer carrying a call. A link to a TABLE is
+            #     the common enterprise shape and nothing local tells it from a link to a
+            #     function, so this is the issue-#5 blanket downgrade that the
             #     PUBLIC/Oracle-maintained filter below exists to avoid, by another route.
             #
             # The second is the one worth arguing about, and it is taken anyway: a downgraded
