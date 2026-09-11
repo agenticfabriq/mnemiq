@@ -238,6 +238,77 @@ def check_unmodelled_calls(
     return None
 
 
+def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None) -> Refusal | None:
+    """Refuse a column whose stored expression this engine cannot attribute.
+
+    A virtual column runs user code on read, and the statement never names it. MEASURED on
+    Oracle: `leaked AS (vc_udf(id))` over a function reading another table, and
+    `SELECT id, leaked FROM vc_t` returned an SSN from a table the identity was never granted.
+    `check_unmodelled_calls` walks call nodes and sees none; `called_names` reads the rendered
+    text and sees none; `check_access` sees a column the snapshot lists and passes it.
+
+    Third time this codebase has met code reached with no call in the text -- after `count(*)`
+    binding a macro named `count_star`, and `SELECT id + 1` binding one named `+`. The first two
+    were answered by asking the source a different question rather than enumerating shapes, and
+    so is this: `opaque` comes from the source's own dictionary.
+
+    REPAIRABLE, unlike the other arrivals at this code. Selecting a different column is a real
+    rewrite, and the message names the one to avoid.
+    """
+    if not opaque:
+        return None
+    referenced = {object_key(t): t.alias_or_name for t in base_tables(ast, dialect)}
+    by_alias = {alias: table for table, alias in referenced.items()}
+
+    def refuse(name: str, why: str, repair: str) -> Refusal:
+        return Refusal(
+            code=RefusalCode.UNRESOLVABLE_CALLS,
+            message=(
+                f"{name!r} is computed by an expression this source stores and this engine "
+                f"cannot attribute, so it cannot confirm what {why} executes. {repair}"
+            ),
+            subject=name,
+            repairable_override=True,
+        )
+
+    # A JOIN KEY is not an `exp.Column`, and it reads the column all the same. `USING (leaked)`
+    # names it as a bare identifier, and a NATURAL join names nothing at all -- both evaluate the
+    # expression per row, and whether rows match leaks its value a bit at a time. Measured: both
+    # passed a guard that walked only column nodes, while `WHERE leaked = 'x'` was refused, which
+    # is the same channel one syntax over.
+    for join in ast.find_all(exp.Join):
+        for key in join.args.get("using") or ():
+            name = key.name.lower() if hasattr(key, "name") else str(key).lower()
+            for table in referenced:
+                if (table.lower(), name) in opaque:
+                    return refuse(name, "joining on it", "Join on a different column.")
+        if (join.args.get("method") or "").upper() == "NATURAL":
+            # It names no column, so there is nothing to check against: the keys are whatever the
+            # two tables share. Any opaque column on a table in this statement could be one.
+            # Lowercased, like the USING arm and the column loop. `opaque` keys arrive
+            # lowercase from the adapter and an Oracle query naturally writes `FROM VC_T`, so
+            # comparing raw let the uppercase spelling through -- the case that source actually
+            # produces, while the lowercase one was refused.
+            lowered = {t.lower() for t in referenced}
+            for table, column in sorted(opaque):
+                if table.lower() in lowered:
+                    return refuse(column, "a NATURAL join on this table",
+                                  "Join with an explicit ON or USING naming the columns.")
+
+    for column in ast.find_all(exp.Column):
+        name = column.name.lower()
+        # A qualifier names the table directly; without one, any table in scope could own it,
+        # and an opaque column anywhere in scope is one this statement may be reading.
+        if column.table:
+            owners = [by_alias.get(column.table.lower(), column.table.lower())]
+        else:
+            owners = list(referenced)
+        for table in owners:
+            if (table.lower(), name) in opaque:
+                return refuse(name, "reading it", "Answer without that column.")
+    return None
+
+
 def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -> Refusal:
     """Nothing here can be attributed, so nothing here can be decided.
 

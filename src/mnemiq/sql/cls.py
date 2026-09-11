@@ -58,6 +58,50 @@ def check_cls(ast: exp.Expression, policy: AccessPolicy,
     local = {cte.alias_or_name for cte in ast.find_all(exp.CTE)}
     aliased = local | {s.alias_or_name for s in ast.find_all(exp.Subquery) if s.alias_or_name}
 
+    # A JOIN KEY is not an `exp.Column`, and it reads the column all the same. Measured with
+    # `denied={("claim","ssn")}`: `ON c.ssn = p.ssn` was refused and both `USING (ssn)` and
+    # `NATURAL JOIN person` were APPROVED -- a denied column used as a join key, and a masked one
+    # filtered through one, where whether rows match leaks the value a row at a time. The same
+    # hole `check_opaque_columns` was written around; found there and then looked for here.
+    for join in ast.find_all(exp.Join):
+        for key in join.args.get("using") or ():
+            name = key.name if hasattr(key, "name") else str(key)
+            # DENY across every candidate table before MASK, the order the column loop below
+            # uses. Asking both per table inside one loop made the verdict depend on set
+            # iteration order: with one table masking `ssn` and another denying it, the same
+            # query returned the repairable `masked_column_in_predicate` in some processes and
+            # the unrepairable `unauthorized_column` in others.
+            if any(policy.denies(table, name) for table in referenced):
+                return Refusal(
+                    code=RefusalCode.UNAUTHORIZED_COLUMN,
+                    message=f"You may not read the column {name!r}.",
+                    subject=name,
+                )
+            if any(policy.masks(table, name) for table in referenced):
+                return Refusal(
+                    code=RefusalCode.MASKED_COLUMN_IN_PREDICATE,
+                    message=(
+                        f"{name!r} is masked for you; joining on it is a filter, so it may "
+                        "only be selected."
+                    ),
+                    subject=name,
+                )
+        if (join.args.get("method") or "").upper() == "NATURAL":
+            # It names no column: the keys are whatever the tables share, so any denied or
+            # masked column on a referenced table could be one. The repair is an explicit ON.
+            for table in sorted(referenced):
+                for owner, name in sorted(policy.denied | policy.masked):
+                    if owner == table:
+                        return Refusal(
+                            code=RefusalCode.UNAUTHORIZED_COLUMN,
+                            message=(
+                                "A NATURAL join reads whatever columns these tables share, and "
+                                f"{table!r} has one this identity may not read that way. Join "
+                                "with an explicit ON or USING naming the columns."
+                            ),
+                            subject=table,
+                        )
+
     for column in ast.find_all(exp.Column):
         cands = _candidate_tables(column, resolved, referenced, aliased)
         name = column.name

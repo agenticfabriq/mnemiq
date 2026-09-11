@@ -4,8 +4,8 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.contract import ViewDefinition
-from mnemiq.sql.functions import inventory_from
-from mnemiq.sql.authz_guard import check_access, check_unmodelled_calls
+from mnemiq.sql.functions import inventory_from, opaque_columns
+from mnemiq.sql.authz_guard import check_access, check_opaque_columns, check_unmodelled_calls
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.guard import MAX_ROWS, check_shape
 from mnemiq.sql.lint import lint
@@ -67,6 +67,15 @@ def decide(
     opaque = check_unmodelled_calls(shaped, functions, dialect, target)
     if opaque is not None:
         return opaque
+
+    # A COLUMN can be the call. A virtual column runs its stored expression on read, so
+    # `SELECT id, leaked FROM t` executes a UDF that the statement never names -- measured on
+    # Oracle, returning an SSN from an ungranted table while every check above passed it (M100).
+    # Third shape of the same thing, after `count(*)` reaching `count_star` and `id + 1`
+    # reaching a macro named `+`, and answered the same way: ask the source, do not enumerate.
+    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target)
+    if computed is not None:
+        return computed
 
     cls = check_cls(shaped, policy, target)  # column deny / mask-in-predicate
     if cls is not None:

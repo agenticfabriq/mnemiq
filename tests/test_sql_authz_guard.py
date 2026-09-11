@@ -453,3 +453,74 @@ def test_one_code_two_answers_about_whether_to_try_again():
         assert refusal.repairable is False, inventory
         assert "No query can be decided against this source." in refusal.message, inventory
         assert "Try again." not in refusal.message, inventory
+
+
+@pytest.mark.parametrize("sql, code", [
+    ("SELECT c.id FROM claim c JOIN person p USING (ssn)", "unauthorized_column"),
+    ("SELECT c.id FROM claim c NATURAL JOIN person p", "unauthorized_column"),
+])
+def test_a_denied_column_cannot_be_used_as_a_join_key(sql, code):
+    """Pre-existing, and found only because the same hole had just been closed one guard over.
+
+    Measured with `denied={("claim","ssn")}`: `ON c.ssn = p.ssn` was refused and both of these
+    were APPROVED. A join key is not an `exp.Column` -- `USING` names it as a bare identifier
+    and NATURAL names nothing -- and the join reads the column all the same, leaking whether
+    rows match a row at a time.
+    """
+    from mnemiq.sql.cls import check_cls
+    from mnemiq.sql.policy import AccessPolicy
+
+    refusal = check_cls(sqlglot.parse_one(sql, read="duckdb"),
+                        AccessPolicy(denied={("claim", "ssn")}), "duckdb")
+    assert refusal is not None and refusal.code.value == code, sql
+
+
+def test_a_masked_column_cannot_be_joined_on_either():
+    """Joining on a masked column is a filter on it, which is what
+    `masked_column_in_predicate` exists to refuse -- the mask would silently change the answer.
+    """
+    from mnemiq.sql.cls import check_cls
+    from mnemiq.sql.policy import AccessPolicy
+
+    policy = AccessPolicy(masked={("claim", "ssn")})
+    joined = check_cls(sqlglot.parse_one(
+        "SELECT c.id FROM claim c JOIN person p USING (ssn)", read="duckdb"), policy, "duckdb")
+    assert joined.code.value == "masked_column_in_predicate"
+
+    # ...and a bare projection of the same column is still fine, which is the whole point of
+    # masking rather than denying it.
+    assert check_cls(sqlglot.parse_one("SELECT ssn FROM claim", read="duckdb"),
+                     policy, "duckdb") is None
+
+
+def test_an_ordinary_join_key_is_untouched():
+    """The control, and it covers BOTH arms: the tests above are satisfied by refusing every
+    join, and the NATURAL arm specifically by refusing every natural join whatever the policy
+    covers."""
+    from mnemiq.sql.cls import check_cls
+    from mnemiq.sql.policy import AccessPolicy
+
+    policy = AccessPolicy(denied={("claim", "ssn")})
+    assert check_cls(
+        sqlglot.parse_one("SELECT c.id FROM claim c JOIN person p USING (id)", read="duckdb"),
+        policy, "duckdb") is None
+    # A NATURAL join between tables the policy says nothing about is an ordinary join.
+    assert check_cls(
+        sqlglot.parse_one("SELECT p.id FROM person p NATURAL JOIN policy q", read="duckdb"),
+        policy, "duckdb") is None
+
+
+def test_a_join_key_that_is_denied_on_one_table_and_masked_on_another_is_not_a_coin_flip():
+    """Asking deny and mask per table inside one loop over a SET made the verdict depend on
+    iteration order: the repairable `masked_column_in_predicate` in some processes and the
+    unrepairable `unauthorized_column` in others, for the same query.
+
+    Deny is checked across every candidate first, which is the order the column loop already
+    used -- and the stricter of the two is the right answer when both apply.
+    """
+    from mnemiq.sql.cls import check_cls
+    from mnemiq.sql.policy import AccessPolicy
+
+    policy = AccessPolicy(denied={("claim", "ssn")}, masked={("person", "ssn")})
+    ast = sqlglot.parse_one("SELECT c.id FROM claim c JOIN person p USING (ssn)", read="duckdb")
+    assert check_cls(ast, policy, "duckdb").code.value == "unauthorized_column"

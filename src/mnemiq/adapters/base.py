@@ -45,6 +45,17 @@ class SourceAdapter(Protocol):
     # off the rendered statement is what catches that. A failure RAISES.
     def reachable_user_functions(self) -> list[str]: ...
 
+    # (table, column, stored expression) for every VIRTUAL column -- one whose expression runs
+    # on read, so the statement never names the call. Read through `hasattr`; an adapter that
+    # omits it reports nothing and the decider learns nothing, which is where every adapter
+    # shipped. The EXPRESSION comes back rather than a verdict: whether it is opaque depends on
+    # this source's function inventory, and that judgement belongs in the decider. A failure
+    # RAISES, and `opaque_columns` reads a raise as "nothing known" rather than "none exist" --
+    # the one place in this family where the permissive reading is right, because `check_access`
+    # still stands over the same column. DuckDB needs none: a generated column whose expression
+    # holds a subquery is refused at bind time, so a macro reachable there cannot read a table.
+    def virtual_columns(self) -> list[tuple[str, str, str]]: ...
+
     # Whether `user_functions()` also answers for a VIEW BODY on this source. Read through
     # `getattr(adapter, ..., False)`, so an adapter that says nothing is taken not to cover them
     # -- forgetting yields the conservative answer. Deliberately NOT declared as a member here:
