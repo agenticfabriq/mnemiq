@@ -819,14 +819,21 @@ def test_every_adapter_the_resolver_hands_out_can_answer_the_inventory():
 # --------------------------------------------------------------------------------------------
 
 
-def _oracle_walk(synonyms, functions, oracle_owned=("sys",), schema="APP"):
-    """`_synonyms_reaching_functions` over a stubbed data dictionary."""
+def _oracle_walk(synonyms, functions, oracle_owned=("sys",), schema="APP", asked=None):
+    """`_synonyms_reaching_functions` over a stubbed data dictionary.
+
+    `asked` collects the owners the object read binds, because WHICH owners it asks about is
+    where the cost lives and no stub can time it.
+    """
     from mnemiq.adapters.oracle import OracleAdapter
 
+    asked = set() if asked is None else asked
     adapter = OracleAdapter.__new__(OracleAdapter)
     adapter._schema = schema
 
     def rows(sql, **binds):
+        if "all_objects" in sql:
+            asked.update(binds.values())
         if "all_synonyms" in sql:
             # The WHOLE graph, asserted here because a stub cannot honour a WHERE clause and
             # would silently pass a version that narrowed the read before walking it -- which is
@@ -930,3 +937,108 @@ def test_the_public_link_is_followed_when_the_named_schema_has_no_such_object():
         ("public", "calc", "app2", "calc"),   # ...so Oracle takes the PUBLIC link
     ]
     assert "add_days" in _oracle_walk(synonyms, [("app2", "calc")])
+
+
+def test_the_synonym_walk_is_linear_in_the_graph():
+    """It was quadratic: a reachable set stored per alias, measured on a synthetic chain at
+    3.6 ms for 200 synonyms, 13.9 for 400, 63.2 for 800 and 239.3 for 1,600. A dictionary of the
+    size M101 is about would not have finished.
+
+    Walking BACKWARDS from the functions visits each node once. The assertion is a ratio rather
+    than a wall-clock number, because a timing test pinned to a machine is a flaky test: doubling
+    the graph must not quadruple the work.
+    """
+    import time
+
+    def elapsed(n):
+        synonyms = [("app", f"c{i}", "app", f"c{i + 1}") for i in range(n)]
+        synonyms += [("app", f"a{j}", "app", "c0") for j in range(n)]
+        start = time.perf_counter()
+        _oracle_walk(synonyms, [("app", f"c{n}")])
+        return time.perf_counter() - start
+
+    small = min(elapsed(500) for _ in range(3))
+    large = min(elapsed(2000) for _ in range(3))
+    # Quadratic would be ~16x for a 4x graph. Linear is ~4x; the ceiling leaves room for noise
+    # without leaving room for the defect.
+    assert large < small * 9, f"{small * 1000:.1f} ms -> {large * 1000:.1f} ms looks superlinear"
+
+
+def test_a_public_chain_that_leaves_oracles_schemas_on_a_later_hop_still_counts():
+    """The candidate prefilter skipped a PUBLIC alias whose IMMEDIATE target was
+    Oracle-maintained, purely to bound a quadratic walk. Dropping it is a behaviour change: a
+    fuzz over random graphs found 68 differences and every one was this gain.
+
+    `public.later -> sys.hop -> app2.udf` ends outside Oracle's schemas, so the alias is a route
+    a deployment created and belongs in the inventory -- the first hop passing through SYS says
+    nothing about where it ends.
+    """
+    synonyms = [("public", "later", "sys", "hop"), ("sys", "hop", "app2", "udf")]
+    assert _oracle_walk(synonyms, [("app2", "udf")], oracle_owned=("sys",)) == {"later"}
+
+    # ...and the mirror: a chain that ENDS in an Oracle schema stays out however it got there.
+    ends_inside = [("public", "inside", "app2", "hop2"), ("app2", "hop2", "sys", "dbms_output")]
+    assert _oracle_walk(ends_inside, [("sys", "dbms_output")], oracle_owned=("sys",)) == set()
+
+
+def test_the_object_read_does_not_ask_about_oracles_own_schemas():
+    """Which owners the object read binds is where the cost lives, and no stub can time it.
+
+    Taking every owner named by an edge pulled SYS in, and `all_objects` for SYS alone is 107 ms
+    against 3.5 ms for the app schema -- `user_functions` went from 30 ms to 157 ms that way.
+    Only two sets can decide anything: what THIS schema's aliases reach, and every owner Oracle
+    does not maintain, because a PUBLIC alias counts only where its chain ends outside Oracle's
+    schemas.
+    """
+    asked: set[str] = set()
+    synonyms = [
+        ("public", "dbms_output", "sys", "dbms_output"),   # Oracle's own: cannot decide anything
+        ("app", "mine", "app2", "udf"),                    # this schema's: must be asked about
+    ]
+    _oracle_walk(synonyms, [("app2", "udf")], oracle_owned=("sys",), asked=asked)
+
+    assert "app2" in asked, "this schema's chain endpoints have to be resolved"
+    assert "sys" not in asked, "SYS cannot decide either arm, and asking costs 107 ms"
+
+
+def test_a_synonym_with_no_target_owner_does_not_take_the_source_down():
+    """An unqualified DB-link synonym has a NULL `TABLE_OWNER`, and it used to reach `sorted()`
+    and raise TypeError. `inventory_from` turns a raise into `unavailable`, which the guard turns
+    into refusing EVERY statement on the source -- so one such row anywhere in the dictionary
+    would have stopped the deployment, including queries that call nothing.
+
+    Skipped, not resolved: a DB-link target has no local `all_objects` row to resolve against,
+    which the adapter's docstring already names as the limit.
+    """
+    synonyms = [("other", "remote_s", None, "emp"), ("app", "x", "app", "udf")]
+    assert _oracle_walk(synonyms, [("app", "udf")]) == {"x"}
+
+
+def test_the_owner_read_is_chunked_under_oracles_in_list_cap():
+    """An Oracle IN list is capped at 1,000 items (ORA-01795), and this one grows with every
+    non-Oracle owner any synonym targets -- a schema-per-tenant instance passes that mark.
+
+    The stub records how many owners each READ binds and asserts on the largest, because the cap
+    is per statement rather than per call.
+    """
+    synonyms = [("app", f"a{i}", f"own{i}", "udf") for i in range(2500)]
+    reads: list[int] = []
+
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    adapter = OracleAdapter.__new__(OracleAdapter)
+    adapter._schema = "APP"
+
+    def rows(sql, **binds):
+        if "all_synonyms" in sql:
+            return list(synonyms)
+        if "oracle_maintained" in sql:
+            return [("sys",)]
+        reads.append(len(binds))
+        return [(o, "udf") for o in binds.values()]
+
+    adapter._rows = rows
+    got = adapter._synonyms_reaching_functions()
+
+    assert len(got) == 2500
+    assert reads and max(reads) <= 900, f"one read bound {max(reads)} owners"
