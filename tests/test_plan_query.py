@@ -3,7 +3,7 @@ import logging
 import pytest
 
 from mnemiq.authz.grants import GrantSet
-from mnemiq.contract import Column, Snapshot
+from mnemiq.contract import Column, DeferralReason, Snapshot
 from mnemiq.generate.generator import FakeGenerator
 from mnemiq.generate.plan_query import Deferred, plan_query
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
@@ -478,7 +478,10 @@ def test_a_denied_columns_name_is_withheld_once_source_words_are_in_play():
 # reading it (M98), and until then a wrong entry cost nothing and so was never checked. Deleting
 # `UNGOVERNED_VIEW` from the set has to fail something.
 #
-# True = the model is asked again. False = the caller is answered at once.
+# True = the model is asked again. Otherwise the DeferralReason the caller is answered with at
+# once, because "it deferred" is not the claim -- routing a code to the wrong reason sends the
+# operator to the wrong place, and `policy_unavailable` over an invalid row filter would tell
+# them the policy could not be read when it was read and one predicate in it is invalid.
 _RETRIED = {
     # The model's own SQL, and the message says what to change.
     RefusalCode.PARSE_ERROR: True,
@@ -500,21 +503,21 @@ _RETRIED = {
     RefusalCode.UNRESOLVABLE_VIEW: True,
     # Grants. A guard that can be retried is a puzzle, not a guard, and a route the model FINDS
     # answers a subtly different question than the one that was asked.
-    RefusalCode.UNAUTHORIZED_TABLE: False,
-    RefusalCode.UNAUTHORIZED_COLUMN: False,
+    RefusalCode.UNAUTHORIZED_TABLE: DeferralReason.AUTHORIZATION,
+    RefusalCode.UNAUTHORIZED_COLUMN: DeferralReason.AUTHORIZATION,
     # Properties of the source or the policy. No rewrite is a rewrite of anything.
-    RefusalCode.UNRESOLVABLE_CALLS: False,
-    RefusalCode.VIEW_INVENTORY_UNAVAILABLE: False,
-    RefusalCode.INVALID_ROW_FILTER: False,
+    RefusalCode.UNRESOLVABLE_CALLS: DeferralReason.UNGOVERNABLE,
+    RefusalCode.VIEW_INVENTORY_UNAVAILABLE: DeferralReason.UNGOVERNABLE,
+    RefusalCode.INVALID_ROW_FILTER: DeferralReason.UNGOVERNABLE,
     # Write-path codes. `decide_write` is called from the runtime, not through this loop, so
     # none of these can arrive here -- listed so a future caller that routes writes through
     # `plan_query` finds a decision already made rather than a default.
-    RefusalCode.NOT_A_WRITE: False,
-    RefusalCode.UNBOUNDED_WRITE: False,
-    RefusalCode.UNAUTHORIZED_WRITE: False,
-    RefusalCode.WRITES_DISABLED: False,
-    RefusalCode.AMBIGUOUS_WRITE_TARGET: False,
-    RefusalCode.UNSCOPED_CTE: False,
+    RefusalCode.NOT_A_WRITE: DeferralReason.UNGOVERNABLE,
+    RefusalCode.UNBOUNDED_WRITE: DeferralReason.UNGOVERNABLE,
+    RefusalCode.UNAUTHORIZED_WRITE: DeferralReason.UNGOVERNABLE,
+    RefusalCode.WRITES_DISABLED: DeferralReason.UNGOVERNABLE,
+    RefusalCode.AMBIGUOUS_WRITE_TARGET: DeferralReason.UNGOVERNABLE,
+    RefusalCode.UNSCOPED_CTE: DeferralReason.UNGOVERNABLE,
 }
 
 
@@ -542,20 +545,42 @@ def _attempts_for(code, monkeypatch):
     return outcome, generator.calls
 
 
-@pytest.mark.parametrize("code, retried", sorted(_RETRIED.items(), key=lambda kv: kv[0].value))
-def test_the_loop_retries_exactly_what_the_classification_says(code, retried, monkeypatch):
+@pytest.mark.parametrize("code, expected", sorted(_RETRIED.items(), key=lambda kv: kv[0].value))
+def test_the_loop_retries_exactly_what_the_classification_says(code, expected, monkeypatch):
     outcome, calls = _attempts_for(code, monkeypatch)
 
-    if retried:
+    if expected is True:
         assert isinstance(outcome, Approved), f"{code.value} was not retried"
         assert len(calls) == 2
     else:
         assert isinstance(outcome, Deferred), f"{code.value} was retried"
         assert len(calls) == 1
         assert "attempts" not in outcome.reason, "it made one attempt, not three"
+        assert outcome.code is expected, f"{code.value} deferred as {outcome.code}"
 
 
 def test_every_refusal_code_has_a_row_above():
     """A new code otherwise inherits `not repairable` from the set's default and is answered at
     once, which is the safe direction and still a decision somebody should make on purpose."""
     assert set(_RETRIED) == set(RefusalCode), set(_RETRIED) ^ set(RefusalCode)
+
+
+def test_the_denied_column_is_written_where_the_caller_cannot_see_it(caplog):
+    """When the name is withheld from the caller, the deployment's log is the only place it is
+    written. The table branch pins the same rule, which is what made its absence here a gap
+    rather than a preference: an operator asked "why did this defer" has nothing otherwise.
+
+    The server log is the right destination and deliberately so -- it already sits inside the
+    boundary that holds the connection settings.
+    """
+    from mnemiq.generate.plan_query import Feedback
+
+    generator = FakeGenerator(['{"sql": "SELECT ssn FROM claim"}'])
+    with caplog.at_level(logging.WARNING):
+        outcome = plan_query(
+            _packet(), _pii_snapshot(), _GRANTS, generator, target="duckdb",
+            feedback=Feedback("the source said: no column 'ssn'", from_source=True))
+
+    assert "ssn" not in outcome.reason
+    assert "ssn" in caplog.text, "the operator still has to be able to see what was refused"
+    assert "unauthorized_column" in caplog.text

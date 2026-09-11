@@ -433,9 +433,15 @@ def test_one_code_two_answers_about_whether_to_try_again():
     assert check_unmodelled_calls(
         ast, FunctionInventory.unavailable("RuntimeError"), "duckdb").repairable is True
 
+    # ...and so is the OTHER catalogue call that raised. `builtins_asked` with no builtins is
+    # `builtin_functions()` having thrown, which the next attempt makes again -- leaving it out
+    # while retrying its sibling was a contradiction, not a nuance.
+    raised = FunctionInventory.of(["commission_rate"], builtins_asked=True)
+    assert check_unmodelled_calls(ast, raised, "duckdb").repairable is True
+
     shadowing = FunctionInventory.of(["median"], builtins=["median"])
-    never_asked_builtins = FunctionInventory.of(["commission_rate"])
-    for inventory in (shadowing, never_asked_builtins):
+    no_such_method = FunctionInventory.of(["commission_rate"])   # builtins_asked stays False
+    for inventory in (shadowing, no_such_method):
         refusal = check_unmodelled_calls(ast, inventory, "duckdb")
         assert refusal.code is RefusalCode.UNRESOLVABLE_CALLS
         assert refusal.repairable is False, inventory

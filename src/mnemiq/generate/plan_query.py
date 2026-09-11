@@ -50,8 +50,10 @@ class Feedback:
 # What a caller is told when the decider refuses in a way no rewrite can fix: the deferral code,
 # and a sentence to use INSTEAD of the refusal's own when that one would echo source words back.
 # `UNGOVERNABLE` is the default and says the true thing -- the engine cannot establish that this
-# query is governed -- for the source and policy failures that make up the rest, whose subjects
-# are the engine's own (a view name from the snapshot, a function name from the catalogue).
+# query is governed -- for the source and policy failures that make up the rest, whose subject
+# is the engine's own where they have one at all: today a shadowed function name read off the
+# source's catalogue, and nothing else. Every view code with a subject is repairable, and
+# VIEW_INVENTORY_UNAVAILABLE carries none and is caught by the fast path above this loop.
 #
 # INVALID_ROW_FILTER is deliberately NOT mapped to `policy_unavailable`, which was the first
 # answer and reads well until an operator sees the card: that code's title is "The access policy
