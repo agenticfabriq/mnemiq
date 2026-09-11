@@ -168,6 +168,17 @@ def check_unmodelled_calls(
     answered "none", and reaches `_cannot_resolve` for it. `never_asked` does not, because that
     is every fixture and the state the engine shipped in -- without an inventory this is the
     allowlist alone, which is where it started.
+
+    **WHICH SOURCES THAT ACTUALLY COVERS, because the paragraphs above read as if it were all of
+    them.** Only an adapter implementing `user_functions` is asked, and today that is the DuckDB
+    family alone -- `resolve.py` hands out one other live adapter, `OracleAdapter`, which
+    implements neither method and therefore gets `never_asked` and the bare allowlist. So an
+    Oracle schema function named `median` still passes here, exactly as every source did before
+    the inventory existed. Nothing regressed; one adapter moved and the rest did not, and an
+    asymmetry nobody wrote down is one a reader assumes away (M99). The Oracle exposure itself
+    is older and filed as deployment preconditions M66 and M71, which `adapters/oracle.py`
+    documents at length; closing it wants Oracle-side catalogue discovery, not a fail-closed
+    default here, which would refuse every call-bearing query on the adapters that cannot answer.
     """
     for call in ast.find_all(exp.Anonymous):
         name = str(call.this)
