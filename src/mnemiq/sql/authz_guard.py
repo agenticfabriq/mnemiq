@@ -285,8 +285,13 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
         if (join.args.get("method") or "").upper() == "NATURAL":
             # It names no column, so there is nothing to check against: the keys are whatever the
             # two tables share. Any opaque column on a table in this statement could be one.
+            # Lowercased, like the USING arm and the column loop. `opaque` keys arrive
+            # lowercase from the adapter and an Oracle query naturally writes `FROM VC_T`, so
+            # comparing raw let the uppercase spelling through -- the case that source actually
+            # produces, while the lowercase one was refused.
+            lowered = {t.lower() for t in referenced}
             for table, column in sorted(opaque):
-                if table in referenced:
+                if table.lower() in lowered:
                     return refuse(column, "a NATURAL join on this table",
                                   "Join with an explicit ON or USING naming the columns.")
 

@@ -1170,3 +1170,18 @@ def test_a_join_that_cannot_touch_the_opaque_column_still_answers():
         sqlglot.parse_one("SELECT id FROM vc_t NATURAL JOIN other", read="oracle"),
         opaque, "oracle")
     assert "explicit ON or USING" in natural.message
+
+
+def test_the_natural_arm_matches_the_case_an_oracle_query_actually_writes():
+    """`opaque` keys arrive lowercase from the adapter and an Oracle query naturally writes
+    `FROM VC_T`, so an un-lowercased comparison let the uppercase spelling through while
+    refusing the lowercase one -- the wrong way round from what the source produces."""
+    import sqlglot
+
+    from mnemiq.sql.authz_guard import check_opaque_columns
+
+    opaque = frozenset({("vc_t", "leaked")})
+    for sql in ("SELECT id FROM VC_T NATURAL JOIN other",
+                "SELECT id FROM vc_t NATURAL JOIN other"):
+        assert check_opaque_columns(sqlglot.parse_one(sql, read="oracle"),
+                                    opaque, "oracle") is not None, sql

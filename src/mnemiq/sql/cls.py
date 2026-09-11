@@ -66,22 +66,26 @@ def check_cls(ast: exp.Expression, policy: AccessPolicy,
     for join in ast.find_all(exp.Join):
         for key in join.args.get("using") or ():
             name = key.name if hasattr(key, "name") else str(key)
-            for table in referenced:
-                if policy.denies(table, name):
-                    return Refusal(
-                        code=RefusalCode.UNAUTHORIZED_COLUMN,
-                        message=f"You may not read the column {name!r}.",
-                        subject=name,
-                    )
-                if policy.masks(table, name):
-                    return Refusal(
-                        code=RefusalCode.MASKED_COLUMN_IN_PREDICATE,
-                        message=(
-                            f"{name!r} is masked for you; joining on it is a filter, so it may "
-                            "only be selected."
-                        ),
-                        subject=name,
-                    )
+            # DENY across every candidate table before MASK, the order the column loop below
+            # uses. Asking both per table inside one loop made the verdict depend on set
+            # iteration order: with one table masking `ssn` and another denying it, the same
+            # query returned the repairable `masked_column_in_predicate` in some processes and
+            # the unrepairable `unauthorized_column` in others.
+            if any(policy.denies(table, name) for table in referenced):
+                return Refusal(
+                    code=RefusalCode.UNAUTHORIZED_COLUMN,
+                    message=f"You may not read the column {name!r}.",
+                    subject=name,
+                )
+            if any(policy.masks(table, name) for table in referenced):
+                return Refusal(
+                    code=RefusalCode.MASKED_COLUMN_IN_PREDICATE,
+                    message=(
+                        f"{name!r} is masked for you; joining on it is a filter, so it may "
+                        "only be selected."
+                    ),
+                    subject=name,
+                )
         if (join.args.get("method") or "").upper() == "NATURAL":
             # It names no column: the keys are whatever the tables share, so any denied or
             # masked column on a referenced table could be one. The repair is an explicit ON.

@@ -508,3 +508,19 @@ def test_an_ordinary_join_key_is_untouched():
     assert check_cls(
         sqlglot.parse_one("SELECT p.id FROM person p NATURAL JOIN policy q", read="duckdb"),
         policy, "duckdb") is None
+
+
+def test_a_join_key_that_is_denied_on_one_table_and_masked_on_another_is_not_a_coin_flip():
+    """Asking deny and mask per table inside one loop over a SET made the verdict depend on
+    iteration order: the repairable `masked_column_in_predicate` in some processes and the
+    unrepairable `unauthorized_column` in others, for the same query.
+
+    Deny is checked across every candidate first, which is the order the column loop already
+    used -- and the stricter of the two is the right answer when both apply.
+    """
+    from mnemiq.sql.cls import check_cls
+    from mnemiq.sql.policy import AccessPolicy
+
+    policy = AccessPolicy(denied={("claim", "ssn")}, masked={("person", "ssn")})
+    ast = sqlglot.parse_one("SELECT c.id FROM claim c JOIN person p USING (ssn)", read="duckdb")
+    assert check_cls(ast, policy, "duckdb").code.value == "unauthorized_column"
