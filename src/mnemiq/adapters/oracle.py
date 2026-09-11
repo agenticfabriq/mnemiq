@@ -705,12 +705,26 @@ class OracleAdapter:
         `list_columns` is: an engine asking the data dictionary about the source it governs has
         no business enumerating schemas the caller was never given.
 
-        PUBLIC synonyms are deliberately not followed. They ARE an unqualified route to another
-        schema's function, and measured here every one resolving to a FUNCTION belongs to SYS,
-        LBACSYS, DVSYS or XDB -- Oracle's own, already builtin-shaped. A deployment that creates
-        a public synonym over a user function opens a hole this does not see; it is named here
-        rather than papered over, because the alternative is a join across `ALL_SYNONYMS` whose
-        cost and privilege surface nobody has measured.
+        Synonyms in THIS schema are followed. The first version reasoned about PUBLIC synonyms,
+        measured that every existing one belongs to SYS, LBACSYS, DVSYS or XDB, and wrote the gap
+        down as acceptable -- while the reachable route was a private synonym in the caller's own
+        schema, needing only `CREATE SYNONYM`. The ALIAS is what a query spells, so the alias is
+        what has to be here.
+
+        It only matters for an alias sqlglot MODELS, and the measurement had to be redone to say
+        so. `CREATE SYNONYM add_days FOR real_udf` over a function reading an ungranted table:
+        `decide` APPROVED `SELECT add_days(1)` without this arm and refuses it with it, because
+        `add_days` is in the cross-dialect allowlist. An alias sqlglot does not know -- `syn_leak`
+        -- was never approvable, since the `exp.Anonymous` check refuses an unlisted name whatever
+        the inventory holds. The first version of this note claimed that one as the leak.
+
+        PUBLIC synonyms are NOT followed, and this time the reason is measured on both sides.
+        They add 368 names, all Oracle-maintained, and none is in sqlglot's vocabulary, so the
+        decider already refuses every one of them as an unmodelled call. What they would change
+        is `lineage`: `calls_are_confirmable` is false whenever the inventory holds ANY name, so
+        368 of them turn every Oracle answer containing any call into `completeness='unknown'`
+        with `unconfirmed-function-identity` -- issue #5 back, on a schema that defines nothing.
+        They also cost 48 ms a query against 2.3 ms for this one.
 
         A failure RAISES, like `view_definitions` and its DuckDB sibling. Returning `[]` would
         say this schema defines nothing, which is a different claim from being unable to look.
@@ -723,7 +737,13 @@ class OracleAdapter:
                 "UNION "
                 "SELECT DISTINCT lower(procedure_name) FROM all_procedures "
                 "WHERE owner = :owner AND object_type = 'PACKAGE' "
-                "  AND procedure_name IS NOT NULL",
+                "  AND procedure_name IS NOT NULL "
+                "UNION "
+                "SELECT DISTINCT lower(s.synonym_name) FROM all_synonyms s "
+                "  JOIN all_objects o "
+                "    ON o.owner = s.table_owner AND o.object_name = s.table_name "
+                " WHERE s.owner = :owner "
+                "   AND o.object_type IN ('FUNCTION', 'PACKAGE')",
                 owner=self._schema,
             )
         ]
