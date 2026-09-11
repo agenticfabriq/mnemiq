@@ -19,14 +19,23 @@ class Verifier:
 
     Grounding is OFF by default: measured on saved runs it caught 28 wrong but lost 16 correct
     (a real EX cost), where sanity caught 31 wrong for only 2 lost. Grounding is a dial position
-    (safety-first) and a soft signal the judge subsumes -- not a free default."""
+    (safety-first) and a soft signal the judge subsumes -- not a free default.
+
+    `fail_closed` decides what an UNREACHABLE judge means, and it defaults to deferring. The
+    judge is only ever wired where a mode asks for it -- `deep` alone, out of the box -- so this
+    changes nothing for a deployment that did not ask to be checked, and for one that did, the
+    old behaviour was to hand back an answer stamped *this was not checked* and hand it back
+    anyway. An operator trading assurance for availability during a provider outage sets
+    `MNEMIQ_VERIFY_FAIL_CLOSED=0`; that is a decision worth making on purpose rather than a
+    default nobody chose."""
 
     def __init__(self, *, threshold: float = 0.5, sanity: bool = True,
-                 grounding: bool = False, judge=None) -> None:
+                 grounding: bool = False, judge=None, fail_closed: bool = True) -> None:
         self.threshold = threshold
         self.sanity = sanity
         self.grounding = grounding
         self.judge = judge
+        self.fail_closed = fail_closed
 
     def verify(self, packet: ContextPacket, approved: Approved, table) -> VerifyVerdict:
         if self.sanity:
@@ -58,11 +67,15 @@ class Verifier:
                     render_result(table, max_rows=5)
                 ), False
             if fell_open:
-                # Answer anyway -- that is the product's decision and it is unchanged -- but stop
-                # calling it verified. This is the shape M89 was: the verifier switched off against
-                # every reasoning model and every answer still read as confidently checked.
-                return VerifyVerdict(c, False,
-                                     "The verifier could not be reached; this answer was not checked.",
-                                     "judge_unavailable")
+                # No score, because there was no judgement. The fail-open constant used to travel
+                # in this field and it reads as a confident pass -- M89's shape one field over,
+                # where the record said `judge_unavailable` and the number beside it said 1.0.
+                return VerifyVerdict(
+                    None, self.fail_closed,
+                    "I could not check this answer -- the verifier was unreachable, so I am not "
+                    "giving you a result I cannot stand behind."
+                    if self.fail_closed else
+                    "The verifier could not be reached; this answer was not checked.",
+                    "judge_unavailable")
             return VerifyVerdict(c, c < self.threshold, "The result may not correctly answer the question.", "judge")
         return VerifyVerdict.passed()

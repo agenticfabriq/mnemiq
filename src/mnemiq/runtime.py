@@ -444,12 +444,17 @@ def _resolve_verify_level(mode_verify: str, override: str | None) -> str:
     return mode_verify
 
 
-def _build_verifier(level: str, *, threshold: float, grounding: bool, judge):
-    """None when off; else a Verifier with sanity always on and the judge only at 'full'."""
+def _build_verifier(level: str, *, threshold: float, grounding: bool, judge, fail_closed: bool):
+    """None when off; else a Verifier with sanity always on and the judge only at 'full'.
+
+    `fail_closed` is passed to every level even though only 'full' can reach an unavailable
+    judge. Passing it conditionally would make the mode table decide a deployment's policy, and
+    a mode promoted to 'full' later would silently arrive at the wrong one.
+    """
     if level == "off":
         return None
     return Verifier(threshold=threshold, sanity=True, grounding=grounding,
-                    judge=judge if level == "full" else None)
+                    judge=judge if level == "full" else None, fail_closed=fail_closed)
 
 
 def _build_mode_verifiers(settings: Settings, *, client):
@@ -472,7 +477,8 @@ def _build_mode_verifiers(settings: Settings, *, client):
         judge_calls = 1
     verifiers = {
         name: _build_verifier(levels[name], threshold=settings.verify_threshold,
-                              grounding=settings.verify_grounding, judge=judge)
+                              grounding=settings.verify_grounding, judge=judge,
+                              fail_closed=settings.verify_fail_closed)
         for name in MODES
     }
     return verifiers, judge_calls

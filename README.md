@@ -235,11 +235,15 @@ Read the code rather than taking this on trust — that is the point of shipping
 ## Known weaknesses
 
 Filed as open issues rather than left to be discovered, because they are readable in the source
-either way: the [verifier fails open when its judge is unreachable](https://github.com/agenticfabriq/mnemiq/issues/2),
-[verification is off by default](https://github.com/agenticfabriq/mnemiq/issues/3) despite being the
-only lever measured to reduce the wrong-rate, [`MNEMIQ_ROLES` is ignored by the CLI](https://github.com/agenticfabriq/mnemiq/issues/4),
-and [lineage reports `unconfirmed-function-identity`](https://github.com/agenticfabriq/mnemiq/issues/5)
-on ordinary queries. Contributions and arguments welcome on all four.
+either way: [verification is off by default](https://github.com/agenticfabriq/mnemiq/issues/3)
+despite being the only lever measured to reduce the wrong-rate, and
+[`MNEMIQ_ROLES` is ignored by the CLI](https://github.com/agenticfabriq/mnemiq/issues/4).
+Contributions and arguments welcome on both.
+
+Two of the four this list opened with are now closed. An unreachable judge defers the answer
+instead of passing it ([#2](https://github.com/agenticfabriq/mnemiq/issues/2)), and lineage stopped
+reporting `unconfirmed-function-identity` on ordinary queries
+([#5](https://github.com/agenticfabriq/mnemiq/issues/5)).
 
 ## Contributing
 

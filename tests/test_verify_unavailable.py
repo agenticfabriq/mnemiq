@@ -43,18 +43,55 @@ class _NoCounters:
         return 0.9
 
 
-def _verify(judge, threshold=0.5):
+def _verify(judge, threshold=0.5, fail_closed=True):
     packet = ContextPacket(question="q", cards=[], grant_fingerprint="", enrichment_version=None)
     approved = Approved(plan_sql="SELECT 1", target_sql="SELECT 1")
     table = pa.table({"n": [1]})
-    return Verifier(threshold=threshold, sanity=False, judge=judge).verify(packet, approved, table)
+    return Verifier(threshold=threshold, sanity=False, judge=judge,
+                    fail_closed=fail_closed).verify(packet, approved, table)
 
 
 def test_a_judge_that_fell_open_is_reported_as_unavailable_not_as_a_pass():
     v = _verify(_Judge(1.0, falls_open=True))
     assert v.layer == "judge_unavailable"
-    assert v.defer is False, "a dead judge must not stop an answer -- that decision is unchanged"
     assert v.reason, "the reason must be sayable to whoever reads the answer"
+
+
+def test_no_judgement_carries_no_score():
+    """The second half of the same defect. `layer` said `judge_unavailable` and the number beside
+    it said 1.0, so a reader who took the score without the discriminator saw a confident pass --
+    which is M89's shape one field over. No float is honest: 1.0 reads as a confident pass and 0.0
+    as a confident failure, and what happened was neither."""
+    assert _verify(_Judge(1.0, falls_open=True)).confidence is None
+    assert _verify(_Judge(1.0, falls_open=False)).confidence == 1.0
+
+
+@pytest.mark.parametrize("fail_closed, defers", [(True, True), (False, False)])
+def test_whether_a_dead_judge_stops_an_answer_is_the_deployments_call(fail_closed, defers):
+    """It used to be unconditionally False, and the comment saying so read as settled. It was not:
+    the judge is wired only where a mode asks for it -- `deep` alone out of the box -- so the one
+    mode a caller picks FOR assurance was handing back answers stamped "not checked" and handing
+    them back anyway. Deferring is the default now (issue #2); an operator trading assurance for
+    availability during a provider outage sets `MNEMIQ_VERIFY_FAIL_CLOSED=0`.
+
+    Both positions, because pinning one leaves the switch free to be ignored. The reasons differ
+    too: a deferral's text is read by whoever asked the question, and "this answer was not
+    checked" describes an answer they are not getting.
+    """
+    v = _verify(_Judge(1.0, falls_open=True), fail_closed=fail_closed)
+    assert v.layer == "judge_unavailable" and v.defer is defers
+    assert ("not giving you a result" in v.reason) is defers
+
+
+def test_the_default_is_the_one_the_deployment_did_not_have_to_choose():
+    """A `Verifier` built without the argument must fail closed. Every other conservative default
+    in this codebase is written this way -- `writes_enabled`, `covers_view_bodies`,
+    `unrecognised_source` -- because forgetting has to yield the safe answer, and this one is
+    reached by any caller constructing a verifier directly."""
+    from mnemiq.config import Settings
+
+    assert Verifier(judge=None).fail_closed is True
+    assert Settings().verify_fail_closed is True
 
 
 def test_a_real_approval_scoring_the_same_1_point_0_is_still_a_pass():
@@ -63,7 +100,7 @@ def test_a_real_approval_scoring_the_same_1_point_0_is_still_a_pass():
     v = _verify(_Judge(1.0, falls_open=False))
     assert v.layer == "judge"
     assert v.defer is False
-    assert v.confidence == 1.0          # identical value, different verdict
+    assert v.confidence == 1.0          # the value a fell-open read no longer carries
 
 
 def test_a_real_low_score_still_defers():

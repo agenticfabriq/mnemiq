@@ -116,6 +116,7 @@ class Settings(BaseSettings):
     verify_sanity: bool = Field(default=True, description="deterministic empty/null defer layer")
     verify_grounding: bool = Field(default=False, description="question-literal grounding layer (opt-in)")
     verify_judge: bool = Field(default=False, description="LLM judge layer (eval path)")
+    verify_fail_closed: bool = Field(default=True, description="an unreachable judge defers the answer instead of returning it unchecked; 0 restores the fail-open behaviour")
     verify_base_url: str | None = Field(default=None, description="judge endpoint (defaults to chat)")
     verify_model: str | None = Field(default=None, description="judge model (defaults to chat)")
     verify_api_key: str | None = Field(default=None, description="judge API key (defaults to chat)")

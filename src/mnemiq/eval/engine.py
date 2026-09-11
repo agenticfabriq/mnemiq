@@ -150,7 +150,8 @@ def build_engine(
                 "llm_model": settings.verify_model or settings.llm_model}))
             judge = SemanticJudge(judge_client)
         verifier = Verifier(threshold=settings.verify_threshold, sanity=settings.verify_sanity,
-                            grounding=settings.verify_grounding, judge=judge)
+                            grounding=settings.verify_grounding, judge=judge,
+                            fail_closed=settings.verify_fail_closed)
 
     # Every client the engine actually uses, so "the run's cost" is the run's cost.
     client = RunCost(kit.client, judge_client)
