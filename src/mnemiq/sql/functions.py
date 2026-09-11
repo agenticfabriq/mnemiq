@@ -55,7 +55,13 @@ class FunctionInventory:
     # view-body question not at all, and a consumer walking view bodies must know which it has.
     # Without this field the Postgres path returns an empty list that reads as `certain`, which
     # would certify a server-side UDF as a builtin. Prose in a docstring cannot carry that.
-    covers_view_bodies: bool = True
+    #
+    # Defaults FALSE. The first version defaulted True, so the obvious wiring --
+    # `FunctionInventory.of(adapter.user_functions())` -- produced exactly the certification the
+    # field was added to prevent, and the guard failed open on arrival. A producer that knows
+    # its catalogue covers view bodies says so; forgetting yields the conservative answer, which
+    # is the inversion `writes_enabled` took in M3 and `unrecognised_source` took for shapes.
+    covers_view_bodies: bool = False
 
     def __post_init__(self) -> None:
         # Normalised HERE, not only in `of()`. A dataclass hands out its plain constructor
@@ -78,7 +84,9 @@ class FunctionInventory:
         """Build from any iterable of names, folded to lower case.
 
         A convenience over the constructor for the common "I have an iterable" case. Both
-        normalise identically, in `__post_init__`, so neither can be the trap.
+        normalise the NAMES identically, in `__post_init__`, so neither can be the trap that
+        one of them was. They still differ on empty input: `of()` maps a falsey argument to
+        `()`, so `of(None)` is an empty inventory where the constructor would raise.
         """
         # Passed straight through: freezing here would splay a bare string into characters
         # BEFORE `__post_init__` could guard it, which is how the two constructors kept

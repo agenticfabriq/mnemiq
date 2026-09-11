@@ -55,6 +55,28 @@ def test_both_constructors_normalise():
     assert FunctionInventory.of("median").names == frozenset({"median"})
 
 
+def test_the_view_body_licence_is_separate_and_defaults_to_denied():
+    """Two questions, two answers, and forgetting must give the conservative one.
+
+    `duckdb_functions()` answers completely for a generated query and not at all for a Postgres
+    view body, whose calls run server-side. The first version of this field defaulted True, so
+    `FunctionInventory.of(adapter.user_functions())` -- the wiring anyone would write --
+    certified view bodies on a source where that is false. The guard failed open on arrival.
+    """
+    plain = FunctionInventory.of(["my_udf"])
+    assert plain.certain is True, "the top-level question is answered"
+    assert plain.certain_for_view_bodies is False, "and the view-body one is not, unless said"
+
+    covering = FunctionInventory.of(["my_udf"], covers_view_bodies=True)
+    assert covering.certain_for_view_bodies is True
+
+    # The two licences are independent: a source that could not be asked grants neither, and
+    # `covers_view_bodies` alone must not resurrect the first.
+    blind = FunctionInventory.unavailable("permission denied")
+    assert blind.certain is False and blind.certain_for_view_bodies is False
+    assert FunctionInventory(covers_view_bodies=True, available=False).certain_for_view_bodies is False
+
+
 def test_names_match_regardless_of_case():
     """SQL folds case and the catalogue does not agree with itself across engines, so a set of
     raw strings would answer `defines('MEDIAN')` differently from `defines('median')`."""
@@ -112,10 +134,10 @@ def test_a_postgres_udf_is_unreachable_from_a_query_and_absent_from_the_answer()
     exists NOT to use would have kept it green. It creates the function now, and checks the
     behaviour the claim is about rather than only the absence.
 
-    Two halves, and they differ. A generated query cannot reach a Postgres UDF -- DuckDB's
-    binder resolves against its own catalogue -- so `duckdb_functions()` answers that question
-    completely. A Postgres VIEW BODY calling the same UDF runs it server-side, which this
-    answer does not cover and `covers_view_bodies` is how the inventory says so.
+    Both halves are exercised, because they disagree. A generated query cannot reach a Postgres
+    UDF, since DuckDB's binder resolves against its own catalogue. A Postgres VIEW BODY calling
+    the same UDF runs it server-side and returns its value, which is why this answer must not be
+    read as covering view bodies.
     """
     import os
 
@@ -135,8 +157,16 @@ def test_a_postgres_udf_is_unreachable_from_a_query_and_absent_from_the_answer()
 
         assert "fn_probe" not in fns, "a Postgres UDF is not callable here and must not be listed"
         # ...and the reason it must not be listed: the query cannot reach it at all.
-        with pytest.raises(Exception):
+        with pytest.raises(_duckdb.CatalogException):
             adapter.execute("SELECT fn_probe(1)")
+
+        # The other half. Through a view, the same function DOES run, server-side, so an
+        # inventory built from this answer must not license view bodies.
+        con.execute("CALL postgres_execute('pg', "
+                    "'CREATE VIEW v_fn_probe AS SELECT fn_probe(1) AS m')")
+        assert adapter.execute("SELECT m FROM src.public.v_fn_probe")[0][0] == 99
+        assert FunctionInventory.of(fns).certain_for_view_bodies is False
     finally:
+        con.execute("CALL postgres_execute('pg', 'DROP VIEW IF EXISTS v_fn_probe')")
         con.execute("CALL postgres_execute('pg', 'DROP FUNCTION IF EXISTS fn_probe(int)')")
         con.close()
