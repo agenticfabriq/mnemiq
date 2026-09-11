@@ -299,6 +299,40 @@ def _builtins_from(adapter) -> tuple[frozenset[str] | None, bool]:
         return None, True
 
 
+def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str, str]]:
+    """(table, column) pairs whose stored expression this engine cannot attribute.
+
+    A virtual column is a route to user code with no call in the statement, which is the third
+    shape of that this codebase has found -- after `count(*)` binding a macro named `count_star`
+    and `SELECT id + 1` binding one named `+`. Each time the answer was to stop enumerating
+    shapes and ask the source a different question; this is that question for columns.
+
+    Opaque means the expression NAMES something this source defines. Arithmetic does not --
+    `"QTY"*"PRICE"` calls nothing -- and refusing every virtual column would cost a legitimate
+    modelling feature to close a route that needs a function to be a route at all.
+
+    An adapter that cannot report virtual columns yields nothing, which is the state every
+    adapter shipped in, and an inventory that is not `certain` yields every virtual column,
+    because then no name in an expression can be cleared.
+    """
+    if adapter is None or not hasattr(adapter, "virtual_columns"):
+        return frozenset()
+    try:
+        columns = adapter.virtual_columns()
+    except Exception:
+        # The same reading `inventory_from` gives a failed lookup: asked and could not answer is
+        # not "there are none". Every virtual column would be unknown, and none is known, so the
+        # honest answer is that the caller learns nothing here -- `check_access` still stands.
+        return frozenset()
+    if not inventory.certain:
+        return frozenset((t, c) for t, c, _ in columns)
+    return frozenset(
+        (table, column)
+        for table, column, expression in columns
+        if names_called_in(expression) & inventory.names
+    )
+
+
 def calls_are_confirmable(inventory: FunctionInventory, *, in_view_body: bool) -> bool:
     """Whether a call in this statement can be taken for a builtin.
 
@@ -339,6 +373,18 @@ _CALLED = re.compile(r"([A-Za-z_][A-Za-z_0-9$]*)\s*\(")
 
 class UnreadableCalls(Exception):
     """The statement could not be rendered, so its call names could not be enumerated."""
+
+
+def names_called_in(expression: str) -> frozenset[str]:
+    """Every name called in a stored expression, over-collected on purpose.
+
+    The same crude scan `called_names` runs over a rendered statement, on a fragment the source
+    stored rather than one this engine rendered -- a virtual column's `DATA_DEFAULT`, which
+    arrives quoted: `"APPUSER"."VC_UDF"("ID")`. The quotes are stripped first, because an
+    identifier followed by `"` followed by `(` matches nothing otherwise, and a scan that
+    silently finds no calls in a fragment full of them is worse than no scan.
+    """
+    return frozenset(m.lower() for m in _CALLED.findall(expression.replace('"', "")))
 
 
 def called_names(ast: exp.Expression, *dialects: str) -> frozenset[str]:

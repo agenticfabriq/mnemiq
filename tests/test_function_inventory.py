@@ -1042,3 +1042,86 @@ def test_the_owner_read_is_chunked_under_oracles_in_list_cap():
 
     assert len(got) == 2500
     assert reads and max(reads) <= 900, f"one read bound {max(reads)} owners"
+
+
+# --------------------------------------------------------------------------------------------
+# M100. A virtual column runs its stored expression on read, so the statement never names the
+# call. Third shape of that here, after `count(*)` reaching a macro named `count_star` and
+# `SELECT id + 1` reaching one named `+`.
+# --------------------------------------------------------------------------------------------
+
+
+def _opaque(virtual, defines, certain=True):
+    from mnemiq.sql.functions import FunctionInventory, opaque_columns
+
+    class Source:
+        def virtual_columns(self):
+            return list(virtual)
+
+    inventory = (FunctionInventory.of(defines) if certain
+                 else FunctionInventory.unavailable("RuntimeError"))
+    return opaque_columns(Source(), inventory)
+
+
+def test_only_a_virtual_column_that_names_a_user_function_is_opaque():
+    """Arithmetic calls nothing. Refusing every virtual column would cost a legitimate modelling
+    feature to close a route that needs a function to be a route at all -- measured on the
+    container, `total AS (qty * price)` stores `"QTY"*"PRICE"` and `leaked AS (vc_udf(id))`
+    stores `"APPUSER"."VC_UDF"("ID")`.
+    """
+    virtual = [("vc_t", "total", '"QTY"*"PRICE"'),
+               ("vc_t", "leaked", '"APPUSER"."VC_UDF"("ID")')]
+    assert _opaque(virtual, ["vc_udf"]) == frozenset({("vc_t", "leaked")})
+
+
+def test_a_virtual_column_calling_something_this_source_does_not_define_is_left_alone():
+    """A builtin in a virtual column is still a builtin. `UPPER("NAME")` names nothing this
+    source defines, and the name-based question is the same one the call guard asks."""
+    assert _opaque([("t", "shouty", 'UPPER("NAME")')], ["vc_udf"]) == frozenset()
+
+
+def test_an_uncertain_inventory_makes_every_virtual_column_opaque():
+    """If no name in an expression can be cleared, none of them is cleared. The empty `names` an
+    `unavailable` inventory carries would otherwise read as "this source defines nothing", which
+    is the collapse `FunctionInventory` exists to prevent."""
+    virtual = [("t", "a", '"X"*"Y"'), ("t", "b", 'F("X")')]
+    assert _opaque(virtual, [], certain=False) == frozenset({("t", "a"), ("t", "b")})
+
+
+def test_an_adapter_that_cannot_report_virtual_columns_changes_nothing():
+    """Every adapter shipped in that state, so it must stay the permissive one -- the same
+    posture `never_asked` takes for functions."""
+    from mnemiq.sql.functions import FunctionInventory, opaque_columns
+
+    class Silent:
+        pass
+
+    class Angry:
+        def virtual_columns(self):
+            raise RuntimeError("no dictionary for you")
+
+    assert opaque_columns(Silent(), FunctionInventory.of(["f"])) == frozenset()
+    assert opaque_columns(Angry(), FunctionInventory.of(["f"])) == frozenset()
+    assert opaque_columns(None, FunctionInventory.of(["f"])) == frozenset()
+
+
+def test_the_guard_catches_the_column_qualified_or_not():
+    """`check_access` sees a column the snapshot lists and passes it, so this is the only thing
+    between the caller and the expression. A qualifier must not be a way around it."""
+    import sqlglot
+
+    from mnemiq.sql.authz_guard import check_opaque_columns
+
+    opaque = frozenset({("vc_t", "leaked")})
+    for sql in ("SELECT id, leaked FROM vc_t",
+                "SELECT vc_t.leaked FROM vc_t",
+                "SELECT t.leaked FROM vc_t AS t",
+                "SELECT id FROM vc_t WHERE leaked = 'x'"):
+        refusal = check_opaque_columns(sqlglot.parse_one(sql, read="oracle"), opaque, "oracle")
+        assert refusal is not None, sql
+        assert refusal.subject == "leaked"
+        assert refusal.repairable is True, "selecting another column is a real rewrite"
+
+    clean = check_opaque_columns(
+        sqlglot.parse_one("SELECT id, total FROM vc_t", read="oracle"), opaque, "oracle")
+    assert clean is None

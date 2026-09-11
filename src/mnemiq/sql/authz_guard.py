@@ -238,6 +238,50 @@ def check_unmodelled_calls(
     return None
 
 
+def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None) -> Refusal | None:
+    """Refuse a column whose stored expression this engine cannot attribute.
+
+    A virtual column runs user code on read, and the statement never names it. MEASURED on
+    Oracle: `leaked AS (vc_udf(id))` over a function reading another table, and
+    `SELECT id, leaked FROM vc_t` returned an SSN from a table the identity was never granted.
+    `check_unmodelled_calls` walks call nodes and sees none; `called_names` reads the rendered
+    text and sees none; `check_access` sees a column the snapshot lists and passes it.
+
+    Third time this codebase has met code reached with no call in the text -- after `count(*)`
+    binding a macro named `count_star`, and `SELECT id + 1` binding one named `+`. The first two
+    were answered by asking the source a different question rather than enumerating shapes, and
+    so is this: `opaque` comes from the source's own dictionary.
+
+    REPAIRABLE, unlike the other arrivals at this code. Selecting a different column is a real
+    rewrite, and the message names the one to avoid.
+    """
+    if not opaque:
+        return None
+    referenced = {object_key(t): t.alias_or_name for t in base_tables(ast, dialect)}
+    by_alias = {alias: table for table, alias in referenced.items()}
+    for column in ast.find_all(exp.Column):
+        name = column.name.lower()
+        # A qualifier names the table directly; without one, any table in scope could own it,
+        # and an opaque column anywhere in scope is one this statement may be reading.
+        if column.table:
+            owners = [by_alias.get(column.table.lower(), column.table.lower())]
+        else:
+            owners = list(referenced)
+        for table in owners:
+            if (table.lower(), name) in opaque:
+                return Refusal(
+                    code=RefusalCode.UNRESOLVABLE_CALLS,
+                    message=(
+                        f"{name!r} is computed by an expression this source stores and this "
+                        "engine cannot attribute, so it cannot confirm what reading it "
+                        "executes. Answer without that column."
+                    ),
+                    subject=name,
+                    repairable_override=True,
+                )
+    return None
+
+
 def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -> Refusal:
     """Nothing here can be attributed, so nothing here can be decided.
 

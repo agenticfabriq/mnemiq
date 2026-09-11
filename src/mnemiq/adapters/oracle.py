@@ -890,6 +890,35 @@ class OracleAdapter:
             or (owner == "public" and target in reaches_free)
         }
 
+    def virtual_columns(self) -> list[tuple[str, str, str]]:
+        """(table, column, expression) for every VIRTUAL column in this schema.
+
+        A virtual column runs its expression on read, so it is a route to user code the
+        statement never names. MEASURED: `leaked AS (vc_udf(id))` over a function reading
+        another table, and `SELECT id, leaked FROM vc_t` returned an SSN with no function named
+        anywhere in the SQL (M100). `check_unmodelled_calls` walks call nodes, `called_names`
+        reads the rendered text, and `check_access` sees a column the snapshot lists -- all
+        three pass it.
+
+        The EXPRESSION comes back, not a verdict, because which of them is opaque is a question
+        about this source's function inventory and that belongs in the decider rather than here.
+        `ALL_TAB_COLS.DATA_DEFAULT` is a LONG and arrives quoted: `"APPUSER"."VC_UDF"("ID")` for
+        the dangerous one, `"QTY"*"PRICE"` for arithmetic, which is exactly the distinction the
+        caller needs to draw.
+
+        0.5 ms on this container, and scoped to `self._schema` for the reason `list_columns` is.
+
+        A failure RAISES, like its siblings.
+        """
+        return [
+            (table, column, expression or "")
+            for table, column, expression in self._rows(
+                "SELECT lower(table_name), lower(column_name), data_default "
+                "FROM all_tab_cols WHERE owner = :owner AND virtual_column = 'YES'",
+                owner=self._schema,
+            )
+        ]
+
     def foreign_keys(self) -> list[tuple[str, str, str, str, str]]:
         """Declared FKs: (from_table, from_col, to_table, to_col, constraint_id).
 
