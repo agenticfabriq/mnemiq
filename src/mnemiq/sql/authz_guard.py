@@ -170,17 +170,26 @@ def check_unmodelled_calls(
     allowlist alone, which is where it started.
 
     **WHICH SOURCES THAT ACTUALLY COVERS, because the paragraphs above read as if it were all of
-    them.** Only an adapter implementing `user_functions` is asked. When this paragraph was
-    written that was the DuckDB family alone, and it named `OracleAdapter` as the live adapter
-    implementing neither method, so an Oracle schema function called `median` passed here
-    exactly as every source did before the inventory existed (M99). **That stopped being true
-    at `ce4e16a`**: Oracle answers `user_functions` now, and `virtual_columns` too, so every
-    `names`-driven rule below applies to it -- and since `binder_prefers_builtins` is True
-    there, `called & names` is the arm that fires rather than the coarse shadow rule. An
-    adapter still implementing neither gets `never_asked` and the bare allowlist, which remains
-    the reason this is not fail-closed by default: that would refuse every call-bearing query
-    on the adapters that cannot answer. The older Oracle exposure is filed as deployment
-    preconditions M66 and M71, which `adapters/oracle.py` documents at length.
+    them.** Only an adapter implementing `user_functions` is asked -- that method alone decides
+    `never_asked`; `virtual_columns` is a separate path, and an adapter missing it yields an
+    empty opaque set rather than landing here. When this paragraph was written the DuckDB
+    family was the only one asked, and it named `OracleAdapter` as the live adapter
+    implementing neither, so an Oracle schema function called `median` passed here exactly as
+    every source did before the inventory existed (M99).
+
+    **Oracle answers both now**, at different times: `user_functions` at `ce4e16a`,
+    `virtual_columns` three commits later at `77d24b0`. So every `names`-driven rule below
+    applies to it. `binder_prefers_builtins` is True there, which rules out the coarse shadow
+    arm and leaves two: `called & names`, and -- for any statement the scan cannot read at all
+    -- the `UnreadableCalls` refusal, which fires whatever the scan returns. `adapters/oracle.py`
+    records that second arm as the correction to a note of its own that framed the first as the
+    only one.
+
+    An adapter still implementing `user_functions` gets asked; one that does not gets
+    `never_asked` and the bare allowlist, which remains the reason this is not fail-closed by
+    default: that would refuse every call-bearing query on the adapters that cannot answer. The
+    older Oracle exposure is filed as deployment preconditions M66 and M71, which
+    `adapters/oracle.py` documents at length.
     """
     for call in ast.find_all(exp.Anonymous):
         name = str(call.this)
