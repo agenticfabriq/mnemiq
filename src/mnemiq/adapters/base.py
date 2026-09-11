@@ -38,6 +38,13 @@ class SourceAdapter(Protocol):
     # `hasattr` at the call site. A failure RAISES, and raising is told apart from absence.
     def builtin_functions(self) -> list[str]: ...
 
+    # The subset of `user_functions()` an unqualified call can reach -- on this source's search
+    # path. Read through `hasattr`; omitting it means every name counts as reachable, which is
+    # conservative and expensive: one macro in one unused schema then condemns the whole source.
+    # `user_functions()` stays the FULL list, because a query may qualify and the bare name read
+    # off the rendered statement is what catches that. A failure RAISES.
+    def reachable_user_functions(self) -> list[str]: ...
+
     # Whether `user_functions()` also answers for a VIEW BODY on this source. Read through
     # `getattr(adapter, ..., False)`, so an adapter that says nothing is taken not to cover them
     # -- forgetting yields the conservative answer. Deliberately NOT declared as a member here:

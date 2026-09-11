@@ -694,3 +694,88 @@ def test_the_write_path_asks_the_same_source_the_same_question():
     leak = write("UPDATE claim SET name = add_days(id) WHERE id = 1", named)
     assert _code(leak) == "unmodelled_call", leak
     assert not hasattr(write("UPDATE claim SET id = 2 WHERE id = 1", named), "code")
+
+
+# --------------------------------------------------------------------------------------------
+# Reachability. `duckdb_functions()` carries `database_name` and `schema_name` and the first
+# version threw both away, so a macro in a schema nothing can reach counted as a shadowed
+# builtin and the source answered NOTHING. Found by adversarial review, reproduced before fixing.
+# --------------------------------------------------------------------------------------------
+
+
+def _multi_schema_source(name="multi.duckdb"):
+    """A macro named after a builtin, in a schema that is not on the search path."""
+    path = os.path.join(tempfile.mkdtemp(), name)
+    con = duckdb.connect(path)
+    con.execute("CREATE TABLE claim(id INTEGER)")
+    con.execute("INSERT INTO claim VALUES (1), (2)")
+    con.execute("CREATE SCHEMA other")
+    con.execute("CREATE MACRO other.median(x) AS (SELECT 999)")
+    con.close()
+    return DuckDBAdapter.duckdb(path)
+
+
+def test_a_macro_nothing_can_reach_does_not_condemn_the_source():
+    """Measured on the source below: `SELECT median(id) FROM claim` returns **1.5**, DuckDB's
+    builtin, because `other` is not on the search path -- and `other.median(1)` returns 999. So
+    the macro exists and no unqualified call can collect it.
+
+    The unscoped version read `median` as a shadowed builtin and refused everything, `SELECT id
+    FROM claim` included. One unrelated macro in one unused schema made a legitimate source
+    answer nothing, which is a worse failure than the leak the rule was added for, because it is
+    silent about being wrong.
+    """
+    adapter = _multi_schema_source()
+    assert adapter.user_functions() == ["median"]
+    assert adapter.reachable_user_functions() == [], "nothing on the search path defines it"
+
+    assert not hasattr(_verdict("SELECT id FROM claim", adapter), "code")
+    assert not hasattr(_verdict("SELECT count(*) AS n FROM claim", adapter), "code")
+
+
+def test_but_a_qualified_call_to_that_same_macro_is_still_refused():
+    """The other half, and the reason `names` stays whole while only the COARSE rule is scoped.
+    A query may qualify, and `other.median(1)` reaches the macro -- so the bare name read off the
+    rendered statement has to keep matching it."""
+    adapter = _multi_schema_source(name="qualified.duckdb")
+    refused = _verdict("SELECT other.median(1) AS m", adapter)
+    assert _code(refused) == "unmodelled_call", refused
+
+
+def test_the_same_name_on_the_search_path_still_condemns_the_source():
+    """The contrast that makes the scoping meaningful rather than a way to switch the rule off.
+    `main` IS the search path, so this macro can collect an unqualified call and the engine
+    cannot say which call is which."""
+    path = os.path.join(tempfile.mkdtemp(), "onpath.duckdb")
+    con = duckdb.connect(path)
+    con.execute("CREATE TABLE claim(id INTEGER)")
+    con.execute("CREATE MACRO main.median(x) AS (SELECT 999)")
+    con.close()
+    adapter = DuckDBAdapter.duckdb(path)
+
+    assert adapter.reachable_user_functions() == ["median"]
+    assert _code(_verdict("SELECT id FROM claim", adapter)) == "unresolvable_calls"
+
+
+def test_an_adapter_that_cannot_scope_its_catalogue_counts_every_name_as_reachable():
+    """`reachable` is optional in the same direction as `builtins`: omitting it costs answers,
+    never soundness. An adapter offering only `user_functions` gets the behaviour that shipped
+    before scoping existed."""
+    from mnemiq.sql.functions import inventory_from
+
+    class Unscoped:
+        def user_functions(self):
+            return ["median"]
+
+        def builtin_functions(self):
+            return ["median", "count_star"]
+
+    class Scoped(Unscoped):
+        def reachable_user_functions(self):
+            return []
+
+    assert inventory_from(Unscoped()).reachable is None
+    assert inventory_from(Unscoped()).may_shadow_a_builtin is True
+    assert inventory_from(Scoped()).may_shadow_a_builtin is False
+    # ...and the full list is untouched either way, so a qualified call is still caught.
+    assert inventory_from(Scoped()).names == frozenset({"median"})
