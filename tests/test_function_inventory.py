@@ -304,9 +304,16 @@ def test_inventory_from_carries_the_failure_and_the_licence_through():
     assert inventory_from(Grants()).certain_for_view_bodies is True
 
     denied = inventory_from(Denies())
-    assert denied.certain is True and denied.certain_for_view_bodies is False, (
-        "the licence comes from the adapter, not from the default"
-    )
+    assert denied.certain is True and denied.certain_for_view_bodies is False
+
+    # The DEFAULT, which `Denies` cannot pin because it sets the same value. An adapter that
+    # implements `user_functions` and omits the property is the normal case per the protocol,
+    # and defaulting that to True would fail open for every one of them.
+    class Silent:
+        def user_functions(self):
+            return []
+
+    assert inventory_from(Silent()).certain_for_view_bodies is False
 
     assert inventory_from(object()).asked is False, "an adapter without the method was never asked"
 
