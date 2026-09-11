@@ -38,8 +38,9 @@ class SemanticJudge:
 
     Fail-open HERE, and only here: an unreadable reply or a dead endpoint returns 1.0 with
     `fell_open` set, so the float protocol the eval wrappers speak keeps working. What the
-    product then DOES about it is the `Verifier`'s call and the deployment's -- it defers by
-    default (issue #2). This class reports; it does not decide."""
+    product then DOES about it is the `Verifier`'s call and the deployment's -- it withholds the
+    answer by default, as a failure rather than a deferral (issue #2). This class reports; it
+    does not decide."""
 
     def __init__(self, client, max_tokens: int = 200) -> None:
         self._client = client

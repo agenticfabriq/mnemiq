@@ -240,7 +240,7 @@ despite being the only lever measured to reduce the wrong-rate, and
 [`MNEMIQ_ROLES` is ignored by the CLI](https://github.com/agenticfabriq/mnemiq/issues/4).
 Contributions and arguments welcome on both.
 
-Two of the four this list opened with are now closed. An unreachable judge defers the answer
+Two of the four this list opened with are now closed. An unreachable judge withholds the answer
 instead of passing it ([#2](https://github.com/agenticfabriq/mnemiq/issues/2)), and lineage stopped
 reporting `unconfirmed-function-identity` on ordinary queries
 ([#5](https://github.com/agenticfabriq/mnemiq/issues/5)).

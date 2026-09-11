@@ -26,7 +26,9 @@ export function DeferralCard({ answer }: { answer: AnswerPayload }) {
   return (
     <section
       className={`border-l-2 ${edge} ${wash} px-3.5 py-3`}
-      aria-label={failed ? "Source failure" : "Deferral"}
+      // Not "Source failure": three codes ride `failed` and only one of them is the source.
+      // The heading below names which.
+      aria-label={failed ? "Failure" : "Deferral"}
     >
       <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-1">
         <h3 className={`text-[13px] font-medium ${accent}`}>{copy.title}</h3>

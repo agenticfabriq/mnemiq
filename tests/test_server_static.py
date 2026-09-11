@@ -65,3 +65,40 @@ def test_the_mount_never_shadows_the_api(tmp_path):
         "tables": [{"object_id": "claim", "card": "..."}],
         "starters": [],
     }
+
+
+def test_the_workbench_mirrors_every_deferral_reason():
+    """The enum is Python's and the workbench keeps a copy, so a new code drifts silently until
+    an operator meets it. Measured twice now: M35's `undefined_term` fell through to "the engine
+    declined without a recognised reason code" in exactly the case a code had just been added
+    for, and `verifier_unavailable` did the same under an aria-label of "Source failure".
+
+    The check lives HERE, on the producer's side, because that is the side that changes first.
+    A workbench test cannot fail for a code that does not exist in it yet -- `DeferralCard.test`
+    builds its cases from `Object.keys(REASONS)`, so it enumerates the copy and never the
+    original.
+
+    Both files, because they go stale independently: the union in `types.ts` is what TypeScript
+    checks, and the `REASONS` map in `verdict.ts` is what the card actually reads.
+    """
+    import pathlib
+    import re
+
+    from mnemiq.contract.seams import DeferralReason
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "workbench" / "src" / "lib"
+    union = (root / "types.ts").read_text()
+    reasons = (root / "verdict.ts").read_text()
+
+    block = re.search(r"export type DeferralReason =\n((?:\s*\|\s*\"[a-z_]+\"\n?)+)", union)
+    assert block, "the DeferralReason union could not be parsed -- this check just went blind"
+    declared = set(re.findall(r'"([a-z_]+)"', block.group(1)))
+    mapped = set(re.findall(r"^  ([a-z_]+): \{$", reasons, re.M))
+
+    # Controls. Without them a regex that stops matching passes this test on two empty sets.
+    assert len(declared) >= 8, f"parsed only {declared} from the union"
+    assert len(mapped) >= 8, f"parsed only {mapped} from REASONS"
+
+    expected = {c.value for c in DeferralReason}
+    assert declared == expected, f"types.ts union drifted: {expected ^ declared}"
+    assert mapped == expected, f"verdict.ts REASONS drifted: {expected ^ mapped}"

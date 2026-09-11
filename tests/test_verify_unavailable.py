@@ -308,7 +308,7 @@ def test_the_engine_records_the_outage_as_a_failure():
 
 
 @pytest.mark.parametrize("why, blames", [("error", "could not be reached"),
-                                         ("unparsed", "reply could not be read")])
+                                         ("unparsed", "a reply I could not read")])
 def test_the_two_fell_open_causes_do_not_share_a_sentence(why, blames):
     """`JudgeRead.reason` splits them and the verifier flattened them back. `unparsed` is the
     endpoint ANSWERING with a reply holding no confidence -- a model or a token budget, not
@@ -317,6 +317,13 @@ def test_the_two_fell_open_causes_do_not_share_a_sentence(why, blames):
     model silently disabled the verifier for every answer."""
     v = _verify(_Judge(1.0, falls_open=True, why=why))
     assert blames in v.reason
+
+    # The non-stopping branch too. Composing these from a shared clause produced "The verifier
+    # it could not be reached", which no test read because only the stopping branch was checked
+    # -- and that is the branch a caller sees when an operator has turned fail-closed off.
+    open_v = _verify(_Judge(1.0, falls_open=True, why=why), fail_closed=False)
+    assert blames in open_v.reason
+    assert "verifier it" not in open_v.reason and "verifier its" not in open_v.reason
 
 
 def test_the_eval_path_reads_the_same_switch():

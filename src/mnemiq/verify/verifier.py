@@ -13,6 +13,21 @@ def _cards_text(packet: ContextPacket) -> str:
     return "\n".join(c.card for c in packet.cards)
 
 
+# Written out rather than composed from a clause, because composing them produced "The verifier
+# it could not be reached" -- a sentence no test read, since the only parametrised case checked a
+# substring of the other branch. These reach the CALLER: `loop` sends `reason` back as the answer
+# text and the workbench renders it.
+_UNAVAILABLE_REASON = {
+    ("error", True): "I could not check this answer: the verifier could not be reached. "
+                     "I am not giving you a result I cannot stand behind.",
+    ("error", False): "The verifier could not be reached; this answer was not checked.",
+    ("unparsed", True): "I could not check this answer: the verifier answered with a reply I "
+                        "could not read. I am not giving you a result I cannot stand behind.",
+    ("unparsed", False): "The verifier answered with a reply I could not read; this answer was "
+                         "not checked.",
+}
+
+
 def _unavailable_reason(why: str, stopping: bool) -> str:
     """Say which failure it was, because the two send an operator to different places.
 
@@ -21,13 +36,12 @@ def _unavailable_reason(why: str, stopping: bool) -> str:
     could read -- a model or a token budget, not connectivity. Blaming the network for the
     second is the shape `test_llm_reasoning_budget` exists for, where a starved reasoning model
     silently disabled the verifier for every answer.
+
+    An unrecognised `why` falls back to the connectivity wording rather than raising: a reason
+    string this has not been taught is a reporting gap, and taking down an answer path over it
+    would be worse than one imprecise sentence.
     """
-    cause = ("its reply could not be read" if why == "unparsed"
-             else "it could not be reached")
-    if stopping:
-        return (f"I could not check this answer -- {cause}, so I am not giving you a result "
-                "I cannot stand behind.")
-    return f"The verifier {cause}; this answer was not checked."
+    return _UNAVAILABLE_REASON.get((why, stopping), _UNAVAILABLE_REASON[("error", stopping)])
 
 
 class Verifier:
@@ -39,7 +53,8 @@ class Verifier:
     (a real EX cost), where sanity caught 31 wrong for only 2 lost. Grounding is a dial position
     (safety-first) and a soft signal the judge subsumes -- not a free default.
 
-    `fail_closed` decides what an UNREACHABLE judge means, and it defaults to deferring. The
+    `fail_closed` decides what an UNREACHABLE judge means, and it defaults to STOPPING the
+    answer -- as a failure, not a deferral, since nothing was judged (see `VerifyVerdict`). The
     judge is only ever wired where a mode asks for it -- `deep` alone, out of the box -- so this
     changes nothing for a deployment that did not ask to be checked, and for one that did, the
     old behaviour was to hand back an answer stamped *this was not checked* and hand it back

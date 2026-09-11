@@ -39,7 +39,7 @@ class _RetryingJudge:
     scored 1.0.
 
     `SemanticJudge` returns the constant on the first error rather than raising, so the float
-    protocol keeps working; the product then defers on it by default (issue #2). A MEASUREMENT
+    protocol keeps working; the product then withholds the answer by default (issue #2). A MEASUREMENT
     wants neither: a fail-open score is not a judgement and a deferral is not a data point, and
     one flaky call should be retried rather than recorded. This sits between the cache and the
     judge and tries again with backoff.
