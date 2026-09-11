@@ -68,8 +68,10 @@ cd / || exit 1; rm -rf "$REPO"
 #    a shape, so its source matches it -- on mnemiq's real history that token in this scanner was
 #    1,089 of the only matches there were. Naming the token here would trip the guard on THIS
 #    file, which is the same lesson one level down.
+#    The edit has to ADD A MATCHING LINE. The first version appended `# touched`, which matches
+#    nothing, so the case passed with the exclusion removed and guarded it not at all.
 scratch
-sed -i.bak 's/^set -uo pipefail/set -uo pipefail\n# touched/' scripts/repo-guard.sh && rm -f scripts/repo-guard.sh.bak
+printf '# sample for the exclusion test: %s\n' "$FAKE_KEY" >> scripts/repo-guard.sh
 git add scripts/repo-guard.sh && git commit -qm "edit the guard"
 bash scripts/repo-guard.sh --range "$BASE..HEAD" >/dev/null 2>&1
 check "the scanner does not flag its own pattern list" 0 "$?"

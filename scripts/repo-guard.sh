@@ -22,8 +22,8 @@
 # name they have never heard.
 #
 # So the list comes from REPO_GUARD_NAME_PATTERNS (environment, or the gitignored
-# .env), the check fails closed without it under --staged, and --all skips it and says
-# so. Install the hook or the local half never runs:
+# .env), the check fails closed without it under --staged, and the two CI modes -- --all and
+# --range -- skip it and say so. Install the hook or the local half never runs:
 #
 #     git config core.hooksPath .githooks
 set -uo pipefail
