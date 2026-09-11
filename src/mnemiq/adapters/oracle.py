@@ -748,7 +748,11 @@ class OracleAdapter:
         Walked HERE rather than in SQL because the recursive form costs what the answer is not
         worth: `WITH ... UNION ALL ... CYCLE` over `ALL_SYNONYMS` measured **141 ms** a call, and
         116 ms even restricted to this schema, since each iteration rejoins a 7,869-row view with
-        no useful access path. Reading that view once is 23.8 ms.
+        no useful access path. Reading that view once is 23.8 ms, and `user_functions` as a
+        whole -- this read, the walk, and three other dictionary queries through `_rows` --
+        settles at 32 ms against DuckDB's 13. Both figures are on the container's stock
+        dictionary of 7,869 synonyms; see the note on the prefilter for what a much larger
+        one is not known to cost.
 
         **Keyed by (owner, name), not by name.** The first version keyed the walk on the target's
         bare name, so when a private and a PUBLIC synonym shared one, which link the walk took
@@ -819,10 +823,17 @@ class OracleAdapter:
         # A PUBLIC alias is a candidate only when its IMMEDIATE target already leaves Oracle's
         # own furniture, which is the same test the reporting filter applies at the end. Without
         # it the walk runs from all ~7,800 PUBLIC synonyms on a stock instance and
-        # `user_functions` costs 167 ms instead of 14; with it, every one that survives is a
+        # `user_functions` costs 167 ms instead of 32; with it, every one that survives is a
         # route a deployment created. What it gives up is a PUBLIC alias whose chain leaves an
         # Oracle-maintained schema on a LATER hop -- an Oracle synonym pointing into a user
         # schema, which none of the 7,869 here does.
+        #
+        # Both figures are this container's. A dictionary two orders larger -- an EBS-shaped
+        # instance runs to six figures of synonyms -- has not been measured, and the read is
+        # bounded only by the probe timeout: if it expires the inventory is `unavailable` and
+        # every statement on the source is refused, including ones that call nothing. Recorded
+        # as M101 rather than guessed at, because a number nobody ran is what this file keeps
+        # being wrong about.
         candidates = {
             (o, n): reachable_from(edges[(o, n)])
             for (o, n) in edges
