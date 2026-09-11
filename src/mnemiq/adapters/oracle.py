@@ -705,28 +705,161 @@ class OracleAdapter:
         `list_columns` is: an engine asking the data dictionary about the source it governs has
         no business enumerating schemas the caller was never given.
 
-        PUBLIC synonyms are deliberately not followed. They ARE an unqualified route to another
-        schema's function, and measured here every one resolving to a FUNCTION belongs to SYS,
-        LBACSYS, DVSYS or XDB -- Oracle's own, already builtin-shaped. A deployment that creates
-        a public synonym over a user function opens a hole this does not see; it is named here
-        rather than papered over, because the alternative is a join across `ALL_SYNONYMS` whose
-        cost and privilege surface nobody has measured.
+        Synonyms in THIS schema are followed. The first version reasoned about PUBLIC synonyms,
+        measured that every existing one belongs to SYS, LBACSYS, DVSYS or XDB, and wrote the gap
+        down as acceptable -- while the reachable route was a private synonym in the caller's own
+        schema, needing only `CREATE SYNONYM`. The ALIAS is what a query spells, so the alias is
+        what has to be here.
+
+        It only matters for an alias sqlglot MODELS, and the measurement had to be redone to say
+        so. `CREATE SYNONYM add_days FOR real_udf` over a function reading an ungranted table:
+        `decide` APPROVED `SELECT add_days(1)` without this arm and refuses it with it, because
+        `add_days` is in the cross-dialect allowlist. An alias sqlglot does not know -- `syn_leak`
+        -- was never approvable, since the `exp.Anonymous` check refuses an unlisted name whatever
+        the inventory holds. The first version of this note claimed that one as the leak.
+
+        Chains and PUBLIC synonyms are handled in `_synonyms_reaching_functions`, which is where
+        the reasoning about which of them to REPORT lives. The short version: a PUBLIC synonym
+        counts when its ultimate target belongs to an owner Oracle does not maintain, and the 368
+        that reach Oracle's own packages stay out -- reporting those turns `calls_are_confirmable`
+        false for every Oracle source, which is issue #5 on a schema that defines nothing.
 
         A failure RAISES, like `view_definitions` and its DuckDB sibling. Returning `[]` would
         say this schema defines nothing, which is a different claim from being unable to look.
         """
-        return [
-            r[0]
-            for r in self._rows(
-                "SELECT DISTINCT lower(object_name) AS name FROM all_objects "
-                "WHERE owner = :owner AND object_type = 'FUNCTION' "
-                "UNION "
-                "SELECT DISTINCT lower(procedure_name) FROM all_procedures "
-                "WHERE owner = :owner AND object_type = 'PACKAGE' "
-                "  AND procedure_name IS NOT NULL",
-                owner=self._schema,
+        direct = self._rows(
+            "SELECT DISTINCT lower(object_name) AS name FROM all_objects "
+            "WHERE owner = :owner AND object_type = 'FUNCTION' "
+            "UNION "
+            "SELECT DISTINCT lower(procedure_name) FROM all_procedures "
+            "WHERE owner = :owner AND object_type = 'PACKAGE' "
+            "  AND procedure_name IS NOT NULL",
+            owner=self._schema,
+        )
+        return sorted({r[0] for r in direct} | self._synonyms_reaching_functions())
+
+    def _synonyms_reaching_functions(self) -> set[str]:
+        """Aliases that end at a function, following chains, keyed by full identity.
+
+        Oracle resolves `a -> b -> udf` at call time: measured, all three of `chain_udf(1)`,
+        `chain_b(1)` and `chain_a(1)` returned 42. A join on the IMMEDIATE target sees only the
+        last hop, so a chained alias was missed.
+
+        Walked HERE rather than in SQL because the recursive form costs what the answer is not
+        worth: `WITH ... UNION ALL ... CYCLE` over `ALL_SYNONYMS` measured **141 ms** a call, and
+        116 ms even restricted to this schema, since each iteration rejoins a 7,869-row view with
+        no useful access path. Reading that view once is 23.8 ms, and `user_functions` as a
+        whole -- this read, the walk, and three other dictionary queries through `_rows` --
+        settles at 32 ms against DuckDB's 13. Both figures are on the container's stock
+        dictionary of 7,869 synonyms; see the note on the prefilter for what a much larger
+        one is not known to cost.
+
+        **Keyed by (owner, name), not by name.** The first version keyed the walk on the target's
+        bare name, so when a private and a PUBLIC synonym shared one, which link the walk took
+        depended on set iteration order -- reached under PYTHONHASHSEED 0, 1, 4 and 7, missed
+        under 2, 3, 5 and 6. A control whose verdict moves with the hash seed is not a control.
+
+        The second version kept a by-name fallback to PUBLIC as the ONLY alternative to the
+        exact lookup, which read the commonest shape of all -- alias and target sharing a name,
+        `PUBLIC add_days FOR app2.add_days` -- as a link from the synonym back to itself, and
+        dropped it. The third claimed a target names exactly one object and dropped the fallback;
+        that was wrong too, and measured wrong: Oracle takes the PUBLIC synonym when the named
+        schema holds no such object. Both links are followed now and neither is preferred.
+
+        The WHOLE graph is read, and only the REPORTING is filtered. A chain may hop through a
+        schema this connection does not own, and an edge set narrowed first cannot follow it.
+        What comes back is an alias this schema owns, or a PUBLIC one whose ULTIMATE target
+        belongs to an owner Oracle does not maintain -- every PUBLIC synonym reaching a function
+        on this container is Oracle's own, 368 of them, and putting those in the inventory turns
+        `calls_are_confirmable` false for every Oracle source, which is issue #5 on a schema that
+        defines nothing.
+
+        Termination is `seen` over a set of visited objects, not a hop count. A planted `loop_a -> loop_b -> loop_a` raised
+        ORA-32044 from the recursive query, so a cycle is a real shape; a depth cap on top of
+        `seen` adds nothing to termination and silently drops a chain longer than the cap.
+
+        What this still does not reach is a synonym over a DB-LINK object: it has no local
+        `all_objects` row, so no walk from here can tell whether it ends at a function.
+        """
+        edges: dict[tuple[str, str], tuple[str, str]] = {}
+        for owner, name, target_owner, target_name in self._rows(
+            "SELECT lower(s.owner), lower(s.synonym_name), "
+            "       lower(s.table_owner), lower(s.table_name) FROM all_synonyms s"
+        ):
+            edges[(owner, name)] = (target_owner, target_name)
+        if not edges:
+            return set()
+        oracle_owned = {
+            r[0] for r in self._rows(
+                "SELECT lower(username) FROM all_users WHERE oracle_maintained = 'Y'")
+        }
+        mine = self._schema.lower()
+
+        def reachable_from(start: tuple[str, str]) -> set[tuple[str, str]]:
+            """Every object a chain from `start` can name.
+
+            BOTH links are followed -- the exact one and PUBLIC-by-name -- because Oracle takes
+            the PUBLIC one when the named schema holds no such object. Measured:
+            `CREATE SYNONYM zz FOR appuser.dbms_random` with no `APPUSER.DBMS_RANDOM` present,
+            and `SELECT zz.value FROM dual` returned 0.41 through `PUBLIC.DBMS_RANDOM`.
+
+            Which link applies depends on whether the named object exists, and that is the very
+            list this walk is computing an input to. So the order is not modelled at all: both
+            are collected and the alias counts if ANY of them is a function. Over-inclusive, and
+            over-inclusion here costs a refusal while under-inclusion costs an approval.
+            """
+            seen: set[tuple[str, str]] = set()
+            stack = [start]
+            while stack:
+                at = stack.pop()
+                if at in seen:
+                    continue
+                seen.add(at)
+                for step in (edges.get(at), edges.get(("public", at[1]))):
+                    if step is not None and step not in seen:
+                        stack.append(step)
+            return seen
+
+        # A PUBLIC alias is a candidate only when its IMMEDIATE target already leaves Oracle's
+        # own furniture, which is the same test the reporting filter applies at the end. Without
+        # it the walk runs from all ~7,800 PUBLIC synonyms on a stock instance and
+        # `user_functions` costs 167 ms instead of 32; with it, every one that survives is a
+        # route a deployment created. What it gives up is a PUBLIC alias whose chain leaves an
+        # Oracle-maintained schema on a LATER hop -- an Oracle synonym pointing into a user
+        # schema, which none of the 7,869 here does.
+        #
+        # Both figures are this container's. A dictionary two orders larger -- an EBS-shaped
+        # instance runs to six figures of synonyms -- has not been measured, and the read is
+        # bounded only by the probe timeout: if it expires the inventory is `unavailable` and
+        # every statement on the source is refused, including ones that call nothing. Recorded
+        # as M101 rather than guessed at, because a number nobody ran is what this file keeps
+        # being wrong about.
+        candidates = {
+            (o, n): reachable_from(edges[(o, n)])
+            for (o, n) in edges
+            if o == mine or (o == "public" and edges[(o, n)][0] not in oracle_owned)
+        }
+        ends = {end for reached in candidates.values() for end in reached}
+        if not ends:
+            return set()
+        owners = sorted({owner for owner, _ in ends})
+        binds = {f"o{i}": owner for i, owner in enumerate(owners)}
+        placeholders = ", ".join(f":{k}" for k in binds)
+        functions = {
+            (owner, name)
+            for owner, name in self._rows(
+                "SELECT lower(owner), lower(object_name) FROM all_objects "
+                "WHERE object_type IN ('FUNCTION', 'PACKAGE') "
+                f"  AND lower(owner) IN ({placeholders})",
+                **binds,
             )
-        ]
+        }
+        return {
+            name
+            for (owner, name), reached in candidates.items()
+            if any(end in functions and (owner == mine or end[0] not in oracle_owned)
+                   for end in reached)
+        }
 
     def foreign_keys(self) -> list[tuple[str, str, str, str, str]]:
         """Declared FKs: (from_table, from_col, to_table, to_col, constraint_id).

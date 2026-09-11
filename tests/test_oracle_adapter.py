@@ -1736,3 +1736,146 @@ def test_a_udf_that_reads_an_ungranted_table_is_refused_and_the_builtins_are_not
                 assert not hasattr(verdict(clean), "code"), clean
     finally:
         adapter.close()
+
+
+def test_a_synonym_is_a_route_to_a_udf_and_the_alias_is_what_the_query_spells():
+    """A synonym named after something sqlglot MODELS is the reachable case, and the first
+    version of this test used one that was not.
+
+    `syn_leak` was never approvable: an alias sqlglot does not know reaches
+    `check_unmodelled_calls` as `exp.Anonymous`, and the cross-dialect allowlist refuses it
+    whatever the inventory holds -- so those assertions passed with the fix reverted and proved
+    nothing at all. `add_days` IS in that allowlist and is NOT an Oracle builtin, so Oracle binds
+    the synonym and the allowlist waves it through; only the inventory can catch it.
+
+    Measured both ways against this container: `decide` APPROVED `SELECT add_days(1)` with the
+    synonym arm removed from `user_functions`, and refuses it with the arm in place.
+    """
+    from mnemiq.sql.decide import decide
+
+    adapter = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, schema=USER.upper())
+    con = adapter._pool.acquire()
+    cur = con.cursor()
+    drops = ("DROP SYNONYM add_days", "DROP FUNCTION syn_udf",
+             "DROP TABLE syn_secret", "DROP TABLE syn_claim")
+    try:
+        for ddl in drops:
+            with contextlib.suppress(Exception):
+                cur.execute(ddl)
+        cur.execute("CREATE TABLE syn_secret(ssn VARCHAR2(20))")
+        cur.execute("INSERT INTO syn_secret VALUES ('123-45-6789')")
+        cur.execute("CREATE TABLE syn_claim(id NUMBER)")
+        cur.execute("INSERT INTO syn_claim VALUES (1)")
+        cur.execute("CREATE OR REPLACE FUNCTION syn_udf(x NUMBER) RETURN VARCHAR2 IS "
+                    "v VARCHAR2(20); BEGIN SELECT ssn INTO v FROM syn_secret WHERE ROWNUM = 1; "
+                    "RETURN v; END;")
+        cur.execute("CREATE SYNONYM add_days FOR syn_udf")
+        con.commit()
+
+        cur.execute("SELECT add_days(1) FROM dual")
+        assert cur.fetchone()[0] == "123-45-6789", "no leak, so nothing below proves anything"
+
+        # The ALIAS, which is what a query spells. Listing only the target was the bug.
+        names = set(adapter.user_functions())
+        assert "add_days" in names and "syn_udf" in names
+
+        def verdict(sql):
+            return decide(sql, {"syn_claim": {"id"}}, adapter=adapter,
+                          dialect="oracle", target="oracle")
+
+        refused = verdict("SELECT add_days(1) AS x FROM syn_claim")
+        assert refused.code.value == "unmodelled_call", refused
+        # ...from the INVENTORY branch, not the allowlist. They share a code and differ in what
+        # they say, and asserting only the code is how the first version passed while reverted.
+        assert "defined by this source itself" in refused.message, refused.message
+
+        for clean in ("SELECT count(*) AS n FROM syn_claim", "SELECT id FROM syn_claim"):
+            assert not hasattr(verdict(clean), "code"), clean
+    finally:
+        for ddl in drops:
+            with contextlib.suppress(Exception):
+                cur.execute(ddl)
+        con.commit()
+        adapter._pool.release(con)
+        adapter.close()
+
+
+def test_oracles_own_public_synonyms_do_not_reach_this_containers_inventory():
+    """368 PUBLIC synonyms resolve to a FUNCTION or PACKAGE here, every one Oracle-maintained,
+    and none of them may be reported: `calls_are_confirmable` is false whenever the inventory
+    holds ANY name, so they would turn every Oracle answer containing any call into
+    `completeness='unknown'` -- issue #5 again, on a schema that defines nothing of its own.
+
+    This asserts the container's actual state. The FILTER that produces it -- ultimate target
+    owner, not synonym owner, so a deployment's own PUBLIC synonym still counts -- is pinned in
+    `tests/test_function_inventory.py`, because `CREATE PUBLIC SYNONYM` is ORA-01031 here.
+    """
+    from mnemiq.sql.functions import FunctionInventory, calls_are_confirmable
+
+    adapter = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, schema=USER.upper())
+    try:
+        names = set(adapter.user_functions())
+        assert not [n for n in names if n.startswith("dbms_")], "a PUBLIC synonym got in"
+
+        # ...and the consequence, asserted where it bites rather than left to inference.
+        assert calls_are_confirmable(
+            FunctionInventory.of([], covers_view_bodies=True), in_view_body=False)
+        assert not calls_are_confirmable(
+            FunctionInventory.of(["dbms_advisor"], covers_view_bodies=True), in_view_body=False)
+    finally:
+        adapter.close()
+
+
+def test_a_synonym_chain_is_followed_and_a_cycle_does_not_stop_it():
+    """Oracle resolves `a -> b -> udf` at call time: measured, all three of `ch_udf(1)`,
+    `hop_mid(1)` and `add_days(1)` return the UDF. A join on the IMMEDIATE target sees only the
+    last hop, so a chained alias was missed -- and `add_days` is the reachable shape, since
+    sqlglot models it and the allowlist would otherwise wave it through.
+
+    The cycle is planted on purpose. The SQL form of this resolution needs a CYCLE clause or
+    Oracle raises ORA-32044, and a deployment can hold `loop_a -> loop_b -> loop_a` by accident;
+    the walk has to survive one whatever form it takes.
+    """
+    from mnemiq.sql.decide import decide
+
+    adapter = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, schema=USER.upper())
+    con = adapter._pool.acquire()
+    cur = con.cursor()
+    drops = ("DROP SYNONYM add_days", "DROP SYNONYM hop_mid", "DROP SYNONYM loop_a",
+             "DROP SYNONYM loop_b", "DROP FUNCTION ch_udf", "DROP TABLE ch_secret",
+             "DROP TABLE ch_claim")
+    try:
+        for ddl in drops:
+            with contextlib.suppress(Exception):
+                cur.execute(ddl)
+        cur.execute("CREATE TABLE ch_secret(ssn VARCHAR2(20))")
+        cur.execute("INSERT INTO ch_secret VALUES ('123-45-6789')")
+        cur.execute("CREATE TABLE ch_claim(id NUMBER)")
+        cur.execute("INSERT INTO ch_claim VALUES (1)")
+        cur.execute("CREATE OR REPLACE FUNCTION ch_udf(x NUMBER) RETURN VARCHAR2 IS "
+                    "v VARCHAR2(20); BEGIN SELECT ssn INTO v FROM ch_secret WHERE ROWNUM = 1; "
+                    "RETURN v; END;")
+        cur.execute("CREATE SYNONYM hop_mid FOR ch_udf")
+        cur.execute("CREATE SYNONYM add_days FOR hop_mid")
+        cur.execute("CREATE SYNONYM loop_a FOR loop_b")
+        cur.execute("CREATE SYNONYM loop_b FOR loop_a")
+        con.commit()
+
+        cur.execute("SELECT add_days(1) FROM dual")
+        assert cur.fetchone()[0] == "123-45-6789", "two hops must reach the UDF, or this proves nothing"
+
+        names = set(adapter.user_functions())
+        assert "add_days" in names, "the chained alias is what the query spells"
+        assert "hop_mid" in names
+
+        refused = decide("SELECT add_days(1) AS x FROM ch_claim", {"ch_claim": {"id"}},
+                         adapter=adapter, dialect="oracle", target="oracle")
+        assert refused.code.value == "unmodelled_call"
+        assert "defined by this source itself" in refused.message
+    finally:
+        for ddl in drops:
+            with contextlib.suppress(Exception):
+                cur.execute(ddl)
+        con.commit()
+        adapter._pool.release(con)
+        adapter.close()

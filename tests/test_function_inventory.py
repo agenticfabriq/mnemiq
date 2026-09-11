@@ -809,3 +809,124 @@ def test_every_adapter_the_resolver_hands_out_can_answer_the_inventory():
     # builtin, so it needs no builtin catalogue and never takes the whole-source refusal.
     assert hasattr(OracleAdapter, "user_functions")
     assert OracleAdapter.binder_prefers_builtins is True
+
+
+# --------------------------------------------------------------------------------------------
+# Oracle's synonym walk, driven through a fake `_rows` so it needs no database. The shapes below
+# cannot be built on the test container at all -- `CREATE PUBLIC SYNONYM` is ORA-01031 for the
+# app user -- and the one that matters is a collision whose outcome USED to depend on the hash
+# seed, which is not something an integration test would have caught reliably either.
+# --------------------------------------------------------------------------------------------
+
+
+def _oracle_walk(synonyms, functions, oracle_owned=("sys",), schema="APP"):
+    """`_synonyms_reaching_functions` over a stubbed data dictionary."""
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    adapter = OracleAdapter.__new__(OracleAdapter)
+    adapter._schema = schema
+
+    def rows(sql, **binds):
+        if "all_synonyms" in sql:
+            # The WHOLE graph, asserted here because a stub cannot honour a WHERE clause and
+            # would silently pass a version that narrowed the read before walking it -- which is
+            # the bug that stopped a chain at the first hop into another schema.
+            assert "where" not in sql.lower(), "the synonym graph must be read unfiltered"
+            return list(synonyms)
+        if "oracle_maintained" in sql:
+            return [(o,) for o in oracle_owned]
+        wanted = set(binds.values())
+        return [(o, n) for o, n in functions if o in wanted]
+
+    adapter._rows = rows
+    return adapter._synonyms_reaching_functions()
+
+
+def test_a_name_shared_by_a_private_and_a_public_synonym_resolves_the_same_way_every_time():
+    """The walk keyed on the target's bare NAME, so this resolved differently under different
+    hash seeds -- reached under PYTHONHASHSEED 0, 1, 4 and 7, missed under 2, 3, 5 and 6.
+
+    A control whose verdict moves with the hash seed is not a control. Both links are keyed by
+    (owner, name) and BOTH are followed, so nothing "wins" and nothing depends on iteration
+    order -- an alias counts if any object its chain can name is a function.
+    """
+    synonyms = [
+        ("app", "add_days", "app", "x"),     # the alias a query would spell
+        ("app", "x", "app", "udf"),          # private: reaches a function
+        ("public", "x", "app2", "some_tbl"),  # public: a red herring of the same name
+    ]
+    functions = [("app", "udf")]
+    assert _oracle_walk(synonyms, functions) == {"add_days", "x"}
+
+
+def test_a_chain_through_a_schema_this_connection_does_not_own_is_still_followed():
+    """The edge set used to be narrowed to this schema before the walk, so a hop through another
+    owner's synonym ended it. The whole graph is read and only the REPORTING is filtered."""
+    synonyms = [
+        ("app", "add_days", "shared", "mid"),
+        ("shared", "mid", "app", "udf"),
+    ]
+    assert "add_days" in _oracle_walk(synonyms, [("app", "udf")])
+
+
+def test_a_cycle_names_nothing_and_does_not_hang():
+    """`loop_a -> loop_b -> loop_a` raised ORA-32044 from the recursive SQL form, so it is a real
+    shape a deployment can hold. Termination is `seen`, and a cycle reaches no function, so
+    neither alias may be reported as one."""
+    synonyms = [("app", "loop_a", "app", "loop_b"), ("app", "loop_b", "app", "loop_a")]
+    assert _oracle_walk(synonyms, [("app", "udf")]) == set()
+
+
+def test_a_chain_longer_than_any_fixed_cap_still_resolves():
+    """A hop count on top of `seen` adds nothing to termination and silently drops a real chain:
+    with a cap of 8, a nine-hop chain left its first two aliases out of the inventory."""
+    synonyms = [("app", f"s{i}", "app", f"s{i+1}") for i in range(12)]
+    synonyms.append(("app", "s12", "app", "udf"))
+    assert "s0" in _oracle_walk(synonyms, [("app", "udf")])
+
+
+def test_oracles_own_public_synonyms_stay_out_so_lineage_survives():
+    """368 PUBLIC synonyms reach a function on the test container, every one Oracle-maintained.
+    Reporting them turns `calls_are_confirmable` false for every Oracle source -- issue #5 on a
+    schema that defines nothing of its own -- and they protect nothing, since none is in
+    sqlglot's vocabulary and the allowlist already refuses each as an unmodelled call.
+
+    The filter is on the ULTIMATE TARGET's owner, not the synonym's, which is what lets a PUBLIC
+    synonym over a deployment's own function back in.
+    """
+    oracle_side = [("public", "dbms_output", "sys", "dbms_output")]
+    deployment_side = [("public", "add_days", "app2", "udf")]
+    functions = [("sys", "dbms_output"), ("app2", "udf")]
+
+    assert _oracle_walk(oracle_side + deployment_side, functions,
+                        oracle_owned=("sys",)) == {"add_days"}
+
+
+def test_an_alias_and_its_target_may_share_a_name():
+    """`CREATE PUBLIC SYNONYM add_days FOR app2.add_days` is the commonest synonym of all, and a
+    by-name fallback to PUBLIC read it as a link from the synonym back to itself -- the walk then
+    ended on `seen` having found nothing, and the alias was dropped.
+
+    A target carries its owner, so there is no search order to model: the lookup is exact.
+    """
+    assert _oracle_walk([("public", "add_days", "app2", "add_days")],
+                        [("app2", "add_days")], oracle_owned=("sys",)) == {"add_days"}
+    # ...and the same shape privately owned.
+    assert _oracle_walk([("app", "udf", "app2", "udf")],
+                        [("app2", "udf")]) == {"udf"}
+
+
+def test_the_public_link_is_followed_when_the_named_schema_has_no_such_object():
+    """Oracle falls back to PUBLIC when the qualified target does not exist. Measured on the
+    container: `CREATE SYNONYM zz FOR appuser.dbms_random` with no `APPUSER.DBMS_RANDOM`, and
+    `SELECT zz.value FROM dual` returned a number through `PUBLIC.DBMS_RANDOM`.
+
+    An exact-only lookup dropped the alias, which is an approval. Which link applies depends on
+    whether the named object exists -- the very list this walk feeds -- so the order is not
+    modelled: both are followed, and over-inclusion costs a refusal rather than an approval.
+    """
+    synonyms = [
+        ("app", "add_days", "app", "calc"),   # app.calc does not exist...
+        ("public", "calc", "app2", "calc"),   # ...so Oracle takes the PUBLIC link
+    ]
+    assert "add_days" in _oracle_walk(synonyms, [("app2", "calc")])
