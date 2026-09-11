@@ -260,13 +260,12 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
     referenced = {object_key(t): t.alias_or_name for t in base_tables(ast, dialect)}
     by_alias = {alias: table for table, alias in referenced.items()}
 
-    def refuse(name: str, why: str) -> Refusal:
+    def refuse(name: str, why: str, repair: str) -> Refusal:
         return Refusal(
             code=RefusalCode.UNRESOLVABLE_CALLS,
             message=(
                 f"{name!r} is computed by an expression this source stores and this engine "
-                f"cannot attribute, so it cannot confirm what {why} executes. Answer without "
-                "that column."
+                f"cannot attribute, so it cannot confirm what {why} executes. {repair}"
             ),
             subject=name,
             repairable_override=True,
@@ -282,13 +281,14 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
             name = key.name.lower() if hasattr(key, "name") else str(key).lower()
             for table in referenced:
                 if (table.lower(), name) in opaque:
-                    return refuse(name, "joining on it")
+                    return refuse(name, "joining on it", "Join on a different column.")
         if (join.args.get("method") or "").upper() == "NATURAL":
             # It names no column, so there is nothing to check against: the keys are whatever the
             # two tables share. Any opaque column on a table in this statement could be one.
             for table, column in sorted(opaque):
                 if table in referenced:
-                    return refuse(column, "a NATURAL join on this table")
+                    return refuse(column, "a NATURAL join on this table",
+                                  "Join with an explicit ON or USING naming the columns.")
 
     for column in ast.find_all(exp.Column):
         name = column.name.lower()
@@ -300,7 +300,7 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
             owners = list(referenced)
         for table in owners:
             if (table.lower(), name) in opaque:
-                return refuse(name, "reading it")
+                return refuse(name, "reading it", "Answer without that column.")
     return None
 
 

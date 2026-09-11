@@ -1149,13 +1149,24 @@ def test_a_join_key_reads_the_column_without_being_a_column_node(sql, why):
     assert refusal.subject == "leaked"
 
 
-def test_a_join_on_an_ordinary_column_still_answers():
-    """The control. Without it the pair above is satisfied by refusing every join."""
+def test_a_join_that_cannot_touch_the_opaque_column_still_answers():
+    """The control, and it has to cover BOTH arms: the pair above is satisfied by refusing every
+    join, and the NATURAL arm specifically by refusing every natural join on any source that has
+    an opaque column anywhere."""
     import sqlglot
 
     from mnemiq.sql.authz_guard import check_opaque_columns
 
-    clean = check_opaque_columns(
-        sqlglot.parse_one("SELECT vc_t.id FROM vc_t JOIN other USING (id)", read="oracle"),
-        frozenset({("vc_t", "leaked")}), "oracle")
-    assert clean is None
+    opaque = frozenset({("vc_t", "leaked")})
+    for sql in ("SELECT vc_t.id FROM vc_t JOIN other USING (id)",
+                # NATURAL over tables that do NOT include the opaque column's table.
+                "SELECT id FROM other NATURAL JOIN third"):
+        assert check_opaque_columns(sqlglot.parse_one(sql, read="oracle"),
+                                    opaque, "oracle") is None, sql
+
+    # ...and the message tells the caller something they can act on. "Answer without that
+    # column" is useless for a NATURAL join, which never names one.
+    natural = check_opaque_columns(
+        sqlglot.parse_one("SELECT id FROM vc_t NATURAL JOIN other", read="oracle"),
+        opaque, "oracle")
+    assert "explicit ON or USING" in natural.message
