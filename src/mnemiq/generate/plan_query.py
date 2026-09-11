@@ -47,6 +47,34 @@ class Feedback:
     from_source: bool
 
 
+# What a caller is told when the decider refuses in a way no rewrite can fix: the deferral code,
+# and a sentence to use INSTEAD of the refusal's own when that one would echo source words back.
+# `UNGOVERNABLE` is the default and says the true thing -- the engine cannot establish that this
+# query is governed -- for the source and policy failures that make up the rest, whose subjects
+# are the engine's own (a view name from the snapshot, a function name from the catalogue).
+#
+# INVALID_ROW_FILTER is deliberately NOT mapped to `policy_unavailable`, which was the first
+# answer and reads well until an operator sees the card: that code's title is "The access policy
+# could not be read", and here it was read and one predicate in it is invalid. UNGOVERNABLE is
+# what this codebase already calls that, and the contract enum lists this case under it.
+#
+# UNAUTHORIZED_TABLE is absent because it keeps its own branch, the one that logs and suppresses
+# its subject: its sentence is worded for the caller's next move rather than the model's.
+_UNREPAIRABLE: dict[RefusalCode, tuple[DeferralReason, str | None]] = {
+    # Grants, exactly like the table case, and it used to spend three attempts inviting the model
+    # to find another route to a column this identity may not read -- one it FINDS answers a
+    # subtly different question than the one that was asked.
+    #
+    # And the subject is MODEL-AUTHORED, read off `exp.Column` in the model's own SQL, so a model
+    # handed the source's words can name a "column" spelled out of them. Same provenance as the
+    # table branch's subject and the same suppression, which is the third exit of that kind.
+    RefusalCode.UNAUTHORIZED_COLUMN: (
+        DeferralReason.AUTHORIZATION,
+        "Answering this would require access to a column you do not have.",
+    ),
+}
+
+
 def plan_query(
     packet: ContextPacket,
     snapshot: Snapshot,
@@ -234,6 +262,31 @@ def plan_query(
                     else "Answering this would require access you do not have."
                 ),
                 code=DeferralReason.AUTHORIZATION,
+            )
+
+        if not verdict.repairable:
+            # The generalisation of the branch above, and it took until M98 to notice the branch
+            # WAS one. `REPAIRABLE` existed with ten codes and `Refusal.repairable` read it, and
+            # nothing else did: every other refusal was retried whatever the classification said,
+            # so an unrepairable one cost three model calls to reach the verdict the first one
+            # already had, and arrived as INVALID_QUERY -- "could not produce a valid query after
+            # 3 attempts", which claims an attempt that could not have worked.
+            #
+            # The message goes back whole, because these refusals are the ones that say what an
+            # OPERATOR must change, and burying that under a retry count is what made the useful
+            # sentence look like a footnote to a failure.
+            # The subject too, and that is not decoration: when it is withheld from the caller
+            # below, the deployment's own log is the only place the denied name is written. Same
+            # rule the table branch follows -- what cannot be said to the caller still has to be
+            # said somewhere -- and the server log is inside the boundary that holds the DSN.
+            logger.warning("unrepairable refusal, not retried: %s (%r)",
+                           verdict.code.value, verdict.subject)
+            code, without_subject = _UNREPAIRABLE.get(
+                verdict.code, (DeferralReason.UNGOVERNABLE, None))
+            return Deferred(
+                reason=(without_subject if without_subject and carries_source_words
+                        else verdict.message),
+                code=code,
             )
 
         last = verdict

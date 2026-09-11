@@ -403,3 +403,39 @@ def test_an_unresolvable_source_is_not_repaired_into_an_answer():
 
     assert RefusalCode.UNMODELLED_CALL in REPAIRABLE
     assert RefusalCode.UNRESOLVABLE_CALLS not in REPAIRABLE
+
+
+def test_one_code_two_answers_about_whether_to_try_again():
+    """`UNRESOLVABLE_CALLS` is reached by arrivals that disagree about retrying, so the CODE
+    cannot decide it and `repairable_override` says which (M98).
+
+    Two are worth another attempt. A statement that would not render is about the statement, and
+    its message asks for a rewrite. A source whose `user_functions` raised may be having a blip,
+    and `decide` re-asks it live on every attempt, so the loop resolves that by itself. The rest
+    are properties of the source that no attempt of ours changes -- retrying them spends the
+    caller's budget to arrive where the first refusal already was, under a card telling them
+    rephrasing will not help.
+    """
+    from mnemiq.sql.authz_guard import check_unmodelled_calls
+    from mnemiq.sql.functions import FunctionInventory
+
+    class WillNotRender(sqlglot.exp.Expression):
+        def sql(self, *a, **kw):
+            raise ValueError("no")
+
+        def find_all(self, *types):
+            yield sqlglot.exp.Anonymous(this="count")
+
+    defines_something = FunctionInventory.of(["commission_rate"], builtins=["count_star"])
+    ast = sqlglot.parse_one("SELECT median(id) FROM claim", read="duckdb")
+
+    assert check_unmodelled_calls(WillNotRender(), defines_something, "duckdb").repairable is True
+    assert check_unmodelled_calls(
+        ast, FunctionInventory.unavailable("RuntimeError"), "duckdb").repairable is True
+
+    shadowing = FunctionInventory.of(["median"], builtins=["median"])
+    never_asked_builtins = FunctionInventory.of(["commission_rate"])
+    for inventory in (shadowing, never_asked_builtins):
+        refusal = check_unmodelled_calls(ast, inventory, "duckdb")
+        assert refusal.code is RefusalCode.UNRESOLVABLE_CALLS
+        assert refusal.repairable is False, inventory

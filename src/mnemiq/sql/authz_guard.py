@@ -241,6 +241,11 @@ def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -
       * `user_functions` itself raised -- likewise, and earlier
       * this one statement would not render -- about the STATEMENT, not the source at all
 
+    The last two are also the two worth RETRYING, and they say so with
+    `repairable_override`: a rewrite can fix the statement, and `decide` re-asks the source on
+    every attempt, so a blip resolves itself. The first three are properties of the source that
+    no attempt of ours changes, and the retry loop stops on them (M98).
+
     Two of them were caught borrowing another's sentence, and both times the effect was to send
     someone to fix working code. That is the failure this list is arranged against.
     """
@@ -252,24 +257,33 @@ def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -
                 "functions it asks the source for, and this source defines functions of its "
                 "own. Answer using only the listed tables and columns and standard SQL."
             ),
+            # The one arrival that is about the STATEMENT, so the one a rewrite can fix -- and
+            # the message asks for one. The code alone would send it to the no-retry path with
+            # the other arrivals, under a card saying rephrasing will not help.
+            repairable_override=True,
         )
     if not inventory.available:
-        detail = "This source could not say which functions it defines"
-        shadowed = []
+        # Retried, because it may be transient and `decide` re-asks the source on every attempt
+        # (`inventory_from` reads LIVE, not from the snapshot). A single blip should not tell a
+        # caller to page an operator. If it is not a blip the attempts run out and it says so.
+        return Refusal(
+            code=RefusalCode.UNRESOLVABLE_CALLS,
+            message=(
+                "This source could not say which functions it defines, so this engine cannot "
+                "confirm what this query executes against it."
+            ),
+            repairable_override=True,
+        )
+    # What is left is a property of the SOURCE, which no attempt of ours changes.
+    shadowed = sorted(inventory.names & inventory.builtins) if inventory.builtins else []
+    if shadowed:
+        detail = f"This source defines {shadowed[0]!r} under a name it also lists as a builtin"
+    elif inventory.builtins_asked:
+        detail = ("This source defines functions of its own and could not say which names are "
+                  "its builtins")
     else:
-        shadowed = sorted(inventory.names & inventory.builtins) if inventory.builtins else []
-        if shadowed:
-            detail = f"This source defines {shadowed[0]!r} under a name it also lists as a builtin"
-        elif inventory.builtins_asked:
-            detail = (
-                "This source defines functions of its own and could not say which names are "
-                "its builtins"
-            )
-        else:
-            detail = (
-                "This source defines functions of its own and was never asked which names are "
-                "its builtins"
-            )
+        detail = ("This source defines functions of its own and was never asked which names are "
+                  "its builtins")
     return Refusal(
         code=RefusalCode.UNRESOLVABLE_CALLS,
         message=(

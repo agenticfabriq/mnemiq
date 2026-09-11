@@ -1,11 +1,13 @@
 import logging
 
+import pytest
+
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
 from mnemiq.generate.generator import FakeGenerator
 from mnemiq.generate.plan_query import Deferred, plan_query
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
-from mnemiq.sql.verdict import Approved
+from mnemiq.sql.verdict import Approved, RefusalCode
 
 
 def _snapshot() -> Snapshot:
@@ -362,3 +364,198 @@ def test_a_table_the_source_never_named_is_still_named_to_the_caller():
 
     assert isinstance(outcome, Deferred)
     assert "person" in outcome.reason
+
+
+# --------------------------------------------------------------------------------------------
+# M98. `REPAIRABLE` classified ten codes and nothing read it: every refusal but
+# UNAUTHORIZED_TABLE was retried, so an unrepairable one cost `max_attempts` model calls to reach
+# the verdict the first one already had, and arrived as INVALID_QUERY -- "could not produce a
+# valid query after 3 attempts", claiming an attempt that could not have worked.
+# --------------------------------------------------------------------------------------------
+
+
+def _pii_snapshot() -> Snapshot:
+    """A column the identity's clearance denies, so `check_cls` refuses on it."""
+    return Snapshot(
+        version="v1", source_id="acme", created_at="2026-07-13T00:00:00Z",
+        columns=[
+            Column(id="claim.claim_identifier", object_id="claim", name="claim_identifier"),
+            Column(id="claim.ssn", object_id="claim", name="ssn", pii_level="direct"),
+        ],
+    )
+
+
+def test_a_denied_column_is_not_a_puzzle_to_solve_with_another_attempt():
+    """The same argument the table branch makes, on the code beside it. Retrying spent three
+    calls inviting the model to find another route to a column this identity may not read, and
+    a route it FINDS answers a subtly different question than the one that was asked."""
+    from mnemiq.contract import DeferralReason
+
+    generator = FakeGenerator([
+        '{"sql": "SELECT ssn FROM claim"}',
+        '{"sql": "SELECT claim_identifier FROM claim"}',   # must never be reached
+    ])
+    outcome = plan_query(_packet(), _pii_snapshot(), _GRANTS, generator, target="duckdb")
+
+    assert isinstance(outcome, Deferred)
+    assert outcome.code is DeferralReason.AUTHORIZATION
+    assert len(generator.calls) == 1
+    assert "3 attempts" not in outcome.reason, "it did not make three attempts"
+
+
+def test_a_source_the_engine_cannot_govern_is_not_retried_either():
+    """The default arm of the mapping, and the reason the new code exists. A source that
+    redefines a builtin's name cannot be decided at all, so no rewrite is a rewrite of anything
+    -- and the refusal names what an OPERATOR must change, which three retries buried under a
+    count of attempts that were never made."""
+    import os
+    import tempfile
+
+    import duckdb
+
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+    from mnemiq.contract import DeferralReason
+
+    path = os.path.join(tempfile.mkdtemp(), "shadow.duckdb")
+    con = duckdb.connect(path)
+    con.execute("CREATE TABLE claim(claim_identifier INTEGER, status VARCHAR)")
+    con.execute("CREATE MACRO count_star() AS (SELECT 1)")
+    con.close()
+
+    generator = FakeGenerator([
+        '{"sql": "SELECT count(*) AS n FROM claim"}',
+        '{"sql": "SELECT claim_identifier FROM claim"}',   # must never be reached
+    ])
+    outcome = plan_query(_packet(), _snapshot(), _GRANTS, generator,
+                         adapter=DuckDBAdapter.duckdb(path), dialect="duckdb", target="duckdb")
+
+    assert isinstance(outcome, Deferred)
+    assert outcome.code is DeferralReason.UNGOVERNABLE
+    assert len(generator.calls) == 1
+    assert "count_star" in outcome.reason, "the sentence an operator needs, not a retry count"
+
+
+def test_a_repairable_refusal_is_still_retried():
+    """The control, and the half that could quietly break. Reading `REPAIRABLE` where nothing
+    read it before turns every membership decision into behaviour, and a code wrongly left out
+    of the set now costs an answer rather than a retry."""
+    outcome, generator = _plan([
+        '{"sql": "SELECT * FROM claim"}',
+        '{"sql": "SELECT claim_identifier FROM claim"}',
+    ])
+    assert isinstance(outcome, Approved) and len(generator.calls) == 2
+
+
+def test_a_denied_columns_name_is_withheld_once_source_words_are_in_play():
+    """`check_cls` reads the subject off `exp.Column` in the model's own SQL, so a model handed
+    the source's words can name a "column" spelled out of them -- the same provenance as the
+    table branch's subject, and the same suppression. The generic path would otherwise print
+    whatever the model wrote.
+
+    The seeded `Feedback` is how the agent hands back what the DATABASE said, which is the way
+    source words enter this loop in production.
+    """
+    from mnemiq.contract import DeferralReason
+    from mnemiq.generate.plan_query import Feedback
+
+    generator = FakeGenerator(['{"sql": "SELECT ssn FROM claim"}'])
+    outcome = plan_query(_packet(), _pii_snapshot(), _GRANTS, generator, target="duckdb",
+                         feedback=Feedback("the source said: no column 'ssn'", from_source=True))
+
+    assert isinstance(outcome, Deferred) and outcome.code is DeferralReason.AUTHORIZATION
+    assert "ssn" not in outcome.reason, "the subject is model-authored and source words are live"
+
+    # ...and it IS named when nothing source-derived reached the model, because a caller told
+    # which column they lack can ask for it. Withholding it always would cost that for nothing.
+    plain = FakeGenerator(['{"sql": "SELECT ssn FROM claim"}'])
+    named = plan_query(_packet(), _pii_snapshot(), _GRANTS, plain, target="duckdb")
+    assert "ssn" in named.reason
+
+
+# The loop's contract, one row per refusal code, written out INDEPENDENTLY of `REPAIRABLE`.
+# Reading the set here would make the test agree with the code by construction, which is exactly
+# what it must not do: the set's membership only became behaviour when `plan_query` started
+# reading it (M98), and until then a wrong entry cost nothing and so was never checked. Deleting
+# `UNGOVERNED_VIEW` from the set has to fail something.
+#
+# True = the model is asked again. False = the caller is answered at once.
+_RETRIED = {
+    # The model's own SQL, and the message says what to change.
+    RefusalCode.PARSE_ERROR: True,
+    RefusalCode.NOT_A_SINGLE_STATEMENT: True,
+    RefusalCode.NOT_SELECT_ONLY: True,
+    RefusalCode.SELECT_STAR: True,
+    RefusalCode.UNKNOWN_TABLE: True,
+    RefusalCode.UNKNOWN_COLUMN: True,
+    RefusalCode.EXPLAIN_FAILED: True,
+    RefusalCode.UNMODELLED_CALL: True,
+    RefusalCode.LOGIC_LINT: True,
+    RefusalCode.VALUE_GROUNDING: True,
+    # "may only be selected, not used in a filter" / "Query the table directly." Both name a
+    # different query, which is the test for belonging here.
+    RefusalCode.MASKED_COLUMN_IN_PREDICATE: True,
+    RefusalCode.UNGOVERNED_VIEW: True,
+    # The weakest of the three: the model chose to use the view, and the messages name it
+    # without saying to avoid it. Retried because the safe direction changes no behaviour.
+    RefusalCode.UNRESOLVABLE_VIEW: True,
+    # Grants. A guard that can be retried is a puzzle, not a guard, and a route the model FINDS
+    # answers a subtly different question than the one that was asked.
+    RefusalCode.UNAUTHORIZED_TABLE: False,
+    RefusalCode.UNAUTHORIZED_COLUMN: False,
+    # Properties of the source or the policy. No rewrite is a rewrite of anything.
+    RefusalCode.UNRESOLVABLE_CALLS: False,
+    RefusalCode.VIEW_INVENTORY_UNAVAILABLE: False,
+    RefusalCode.INVALID_ROW_FILTER: False,
+    # Write-path codes. `decide_write` is called from the runtime, not through this loop, so
+    # none of these can arrive here -- listed so a future caller that routes writes through
+    # `plan_query` finds a decision already made rather than a default.
+    RefusalCode.NOT_A_WRITE: False,
+    RefusalCode.UNBOUNDED_WRITE: False,
+    RefusalCode.UNAUTHORIZED_WRITE: False,
+    RefusalCode.WRITES_DISABLED: False,
+    RefusalCode.AMBIGUOUS_WRITE_TARGET: False,
+    RefusalCode.UNSCOPED_CTE: False,
+}
+
+
+def _attempts_for(code, monkeypatch):
+    """Drive the loop with a refusal of `code`, then an approval. Returns the generator calls.
+
+    The refusal is INJECTED rather than provoked: what is under test is the loop's response to a
+    code, not the twenty different fixtures it takes to make `decide` emit each one -- several of
+    which (an invalid row filter, a self-referential view) need a snapshot shaped for that one
+    case and would say nothing about the branch that reads them.
+    """
+    from mnemiq.sql.verdict import Refusal
+
+    calls = {"n": 0}
+
+    def fake_decide(sql, *a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Refusal(code=code, message="refused for a test", subject="thing")
+        return Approved(plan_sql=sql, target_sql=sql)
+
+    monkeypatch.setattr("mnemiq.generate.plan_query.decide", fake_decide)
+    generator = FakeGenerator(['{"sql": "SELECT claim_identifier FROM claim"}'] * 3)
+    outcome = plan_query(_packet(), _snapshot(), _GRANTS, generator, target="duckdb")
+    return outcome, generator.calls
+
+
+@pytest.mark.parametrize("code, retried", sorted(_RETRIED.items(), key=lambda kv: kv[0].value))
+def test_the_loop_retries_exactly_what_the_classification_says(code, retried, monkeypatch):
+    outcome, calls = _attempts_for(code, monkeypatch)
+
+    if retried:
+        assert isinstance(outcome, Approved), f"{code.value} was not retried"
+        assert len(calls) == 2
+    else:
+        assert isinstance(outcome, Deferred), f"{code.value} was retried"
+        assert len(calls) == 1
+        assert "attempts" not in outcome.reason, "it made one attempt, not three"
+
+
+def test_every_refusal_code_has_a_row_above():
+    """A new code otherwise inherits `not repairable` from the set's default and is answered at
+    once, which is the safe direction and still a decision somebody should make on purpose."""
+    assert set(_RETRIED) == set(RefusalCode), set(_RETRIED) ^ set(RefusalCode)

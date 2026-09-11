@@ -24,7 +24,8 @@ export type DeferralReason =
   | "disagreement"
   | "execution_failed"
   | "model_unavailable"
-  | "verifier_unavailable";
+  | "verifier_unavailable"
+  | "ungovernable";
 
 /** Postgres numerics arrive as strings; nulls stay null rather than becoming "". */
 export type Cell = string | number | boolean | null;

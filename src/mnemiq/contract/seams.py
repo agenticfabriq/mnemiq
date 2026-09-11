@@ -43,6 +43,16 @@ class DeferralReason(StrEnum):
     # them together is M6 exactly, and a flaky judge would raise the measured deferral rate while
     # the cause stayed readable only in `verify_layer`, case by case.
     VERIFIER_UNAVAILABLE = "verifier_unavailable"
+    # The decider refused for a reason that is about the SOURCE or the POLICY rather than the
+    # question, and no rewrite can change it: a source that redefines a builtin's name so no
+    # call on it can be resolved, or a row filter that is not a valid predicate. NOT a source
+    # that will not list its views -- `plan_query`'s own fast path catches that one first and
+    # calls it `policy_unavailable`, which is worth knowing before adding it to this list. Distinct
+    # from `policy_unavailable`, which means the policy could not be READ, and from
+    # `invalid_query`, which claims the engine tried and failed to write valid SQL -- it did
+    # not try, because trying could not have worked. The caller's move is to page an operator,
+    # and telling them to rephrase would waste their time as well as the model's.
+    UNGOVERNABLE = "ungovernable"
 
 
 class IdentityContext(BaseModel):

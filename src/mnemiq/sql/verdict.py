@@ -73,15 +73,29 @@ REPAIRABLE = frozenset(
         # and the repair loop can rewrite that into arithmetic the engine does model.
         # Without this the guard's false positives become deferrals instead of retries.
         RefusalCode.UNMODELLED_CALL,
+        # The three below were absent while nothing read this set, so nothing had checked them
+        # against the loop that ignored it. Each says what to do differently, in its own
+        # message, which is the test for belonging here:
+        #
+        #   MASKED_COLUMN_IN_PREDICATE -- "may only be selected, not used in a filter"
+        #   UNGOVERNED_VIEW            -- "Query the table directly."
+        #   UNRESOLVABLE_VIEW          -- the view is the problem, and the model chose to use it
+        #
+        # The last is the weakest of the three: its messages name the view without saying to
+        # avoid it, and a self-referential view is the source's DDL rather than anything the
+        # model did. Listed anyway, because the safe direction here is the one that changes no
+        # behaviour, and a wasted retry costs a model call while a wrong refusal costs an answer.
+        RefusalCode.MASKED_COLUMN_IN_PREDICATE,
+        RefusalCode.UNGOVERNED_VIEW,
+        RefusalCode.UNRESOLVABLE_VIEW,
         # UNRESOLVABLE_CALLS is deliberately absent. It condemns every statement against the
         # source, not one function, so there is nothing for a rewrite to avoid and a retry loop
         # would spend every attempt to reach the deferral it starts at. The fix belongs to the
         # deployer, who sees this in the trace, not to the model.
         #
-        # That is the INTENT. Nothing reads this set yet: `plan_query` retries every refusal but
-        # UNAUTHORIZED_TABLE, so today an unrepairable code is retried until the attempts run
-        # out and usually arrives as something else. Recorded rather than fixed here --
-        # wiring it changes the outcome of every code in the set, which wants its own measurement.
+        # `plan_query` reads this now (M98). It used to retry every refusal but
+        # UNAUTHORIZED_TABLE, so an unrepairable code was retried until the attempts ran out and
+        # arrived as INVALID_QUERY -- three model calls to reach a verdict the first one had.
         RefusalCode.LOGIC_LINT,
         RefusalCode.VALUE_GROUNDING,
     }
@@ -114,8 +128,16 @@ class Refusal:
     # a partial-containment check is a guard with a false-positive rate nobody has measured.
     source_detail: str | None = None
 
+    # When the CODE is not enough to say. One code can be reached by arrivals that differ on
+    # this: `UNRESOLVABLE_CALLS` condemns the whole source when it defines a name a builtin also
+    # has, and is about this one statement when the statement would not render -- whose message
+    # asks for a rewrite. Left None, the code decides, which is what every other refusal wants.
+    repairable_override: bool | None = None
+
     @property
     def repairable(self) -> bool:
+        if self.repairable_override is not None:
+            return self.repairable_override
         return self.code in REPAIRABLE
 
     @property
