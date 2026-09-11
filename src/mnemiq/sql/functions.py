@@ -108,6 +108,10 @@ class FunctionInventory:
         object.__setattr__(self, "names", frozenset(n.lower() for n in names))
         builtins = self.builtins
         if builtins is not None:
+            # An answer implies the question. Without this the constructor can build "the
+            # catalogue answered, but nobody asked", which the field's own comment forbids and
+            # which a later reader would take at face value.
+            object.__setattr__(self, "builtins_asked", True)
             if isinstance(builtins, str):
                 builtins = [builtins]
             object.__setattr__(self, "builtins", frozenset(b.lower() for b in builtins))
@@ -208,15 +212,15 @@ def inventory_from(adapter) -> FunctionInventory:
 
 
 def _builtins_from(adapter) -> tuple[frozenset[str] | None, bool]:
-    """The source's own builtin catalogue, or None when it did not supply one.
+    """The source's own builtin catalogue and whether the question was put at all.
 
     Separate from `user_functions` because a consumer that never asks still gets the
     conservative answer out of `may_shadow_a_builtin` -- soundness does not depend on it. What
     depends on it is whether the source can answer anything at all: without this, a source
     holding one macro has every read and every write against it refused. Optional in the sense
     that omitting it cannot open a hole, not in the sense that omitting it is cheap -- the
-    refusal is classified unrepairable, and until something reads `REPAIRABLE` that costs the
-    caller three model calls and a deferral rather than one clean refusal.
+    refusal is classified unrepairable, and until something reads `REPAIRABLE` the caller pays
+    for retries that cannot succeed rather than getting one clean refusal.
     """
     if adapter is None or not hasattr(adapter, "builtin_functions"):
         return None, False

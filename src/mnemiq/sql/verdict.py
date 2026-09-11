@@ -21,7 +21,7 @@ class RefusalCode(StrEnum):
     # statement would not render, which is the one arrival that is about the statement rather
     # than the source. Kept apart from UNMODELLED_CALL because the two have opposite repairs:
     # that one names a function to avoid, this one usually condemns every query against the
-    # source (M43's residual). `_cannot_resolve` is where the five arrivals are told apart.
+    # source (M43's residual). `_cannot_resolve` is where the arrivals are told apart.
     UNRESOLVABLE_CALLS = "unresolvable_calls"
     LOGIC_LINT = "logic_lint"
     VALUE_GROUNDING = "value_grounding"
@@ -79,8 +79,8 @@ REPAIRABLE = frozenset(
         # deployer, who sees this in the trace, not to the model.
         #
         # That is the INTENT. Nothing reads this set yet: `plan_query` retries every refusal but
-        # UNAUTHORIZED_TABLE, so today an unrepairable code still costs three model calls and
-        # arrives as INVALID_QUERY rather than as itself. Recorded rather than fixed here --
+        # UNAUTHORIZED_TABLE, so today an unrepairable code is retried until the attempts run
+        # out and usually arrives as something else. Recorded rather than fixed here --
         # wiring it changes the outcome of every code in the set, which wants its own measurement.
         RefusalCode.LOGIC_LINT,
         RefusalCode.VALUE_GROUNDING,

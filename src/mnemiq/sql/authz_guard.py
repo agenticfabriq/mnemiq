@@ -230,7 +230,7 @@ def check_unmodelled_calls(
 def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -> Refusal:
     """Nothing here can be attributed, so nothing here can be decided.
 
-    Five ways to arrive, kept apart in the message because each has a DIFFERENT OWNER, and a
+    Several ways to arrive, kept apart in the message because each has a DIFFERENT OWNER, and a
     refusal that sends the reader to the wrong one is worse than a vague refusal:
 
       * the source defines a name it also lists as a builtin -- the DEPLOYER renames it
@@ -239,8 +239,8 @@ def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -
       * `user_functions` itself raised -- likewise, and earlier
       * this one statement would not render -- about the STATEMENT, not the source at all
 
-    The last three each borrowed one of the first two's sentences at some point, and each time
-    the effect was to send someone to fix working code.
+    Two of them were caught borrowing another's sentence, and both times the effect was to send
+    someone to fix working code. That is the failure this list is arranged against.
     """
     if unreadable:
         return Refusal(
