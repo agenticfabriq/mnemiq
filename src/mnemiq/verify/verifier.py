@@ -19,7 +19,8 @@ def _cards_text(packet: ContextPacket) -> str:
 #
 # Only the STOPPING pair reaches a caller today: `loop` sends `reason` back as the answer text
 # when the verdict defers, and reads no `reason` off one that does not -- it still stamps
-# `confidence` and `layer`, which is where the wire's `verified: "unavailable"` comes from. So
+# `confidence` and `layer`, and the LAYER is where the wire's `verified: "unavailable"` comes
+# from -- the score is kept off the wire on purpose. So
 # the other two are the field's value on an answer that goes out with that stamp and this
 # sentence unshown. Kept honest anyway: a string that is wrong only because nothing renders it
 # is a trap for whoever renders it next.
