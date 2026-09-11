@@ -28,12 +28,14 @@ class SourceAdapter(Protocol):
     # look" into "there are none", which is the distinction FunctionInventory exists to keep.
     def user_functions(self) -> list[str]: ...
 
-    # The other half of the same catalogue: names this source considers its OWN builtins. Read
-    # through `hasattr`, so an adapter may omit it -- but an adapter that implements
-    # `user_functions` should implement this too. Their INTERSECTION is what the decider needs:
-    # a call can be reached under a name the query never spells only if that name is a builtin,
-    # so without this every source holding one macro has every query against it refused, under
-    # a code that is not repairable. A failure RAISES, like its sibling.
+    # The other half of the same catalogue: names this source considers its OWN builtins.
+    # Declared, like `user_functions` and unlike the flag below, because an adapter that
+    # implements one of the pair should implement both -- their INTERSECTION is what the
+    # decider needs. A call can be reached under a name the query never spells only if that
+    # name is a builtin, so an adapter offering the first method alone has every source holding
+    # one macro refuse every query against it, under a code that is not repairable. Reached
+    # through `hasattr` at the call site all the same, since a Protocol binds nothing at
+    # runtime. A failure RAISES, like its sibling.
     def builtin_functions(self) -> list[str]: ...
 
     # Whether `user_functions()` also answers for a VIEW BODY on this source. Read through

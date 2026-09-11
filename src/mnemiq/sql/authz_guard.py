@@ -156,11 +156,18 @@ def check_unmodelled_calls(
     no spelling of that query, because it is DuckDB's binder name for `COUNT(*)`.
 
     `inventory` closes that, in the two shapes the leak comes in. A call reachable under its
-    OWN name must be spelled, so `called_names` finds it however sqlglot rewrote the node. A
-    call reachable under a BUILTIN's name is not derivable at all, and cannot happen unless the
-    source defines something a builtin is also called -- so that case condemns every call here
-    rather than pretending to pick one. Without an inventory this is the allowlist alone, which
-    is where it started.
+    OWN name must be spelled, so `called_names` finds it however sqlglot rewrote the node, and
+    the refusal names it. A call reachable under a BUILTIN's name is not derivable at all, and
+    cannot happen unless the source defines a name a builtin also has -- so that case condemns
+    the whole SOURCE, every statement against it, whether or not anything here looks like a
+    call. `SELECT id + 1 FROM claim` was the measurement: no `exp.Func` node in it, `+` shadowed
+    by a macro, and an SSN in the result.
+
+    A third arrival, and it is the one that has to be written down rather than inferred: an
+    inventory that was ASKED and could not answer carries the same empty `names` as one that
+    answered "none", and reaches `_cannot_resolve` for it. `never_asked` does not, because that
+    is every fixture and the state the engine shipped in -- without an inventory this is the
+    allowlist alone, which is where it started.
     """
     for call in ast.find_all(exp.Anonymous):
         name = str(call.this)

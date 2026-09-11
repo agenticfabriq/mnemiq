@@ -220,9 +220,10 @@ def decide_write(
     # and here it persists what it read into a table.
     # The inventory too, or the two paths diverge on the same source: without it this is the
     # allowlist alone, so a macro named `length` or `count_star` could feed an approved UPDATE
-    # that stores what it read into a granted table. `target or dialect` because a write's
-    # target defaults to the parse dialect a few lines above and this runs before that.
-    opaque = check_unmodelled_calls(shaped, inventory_from(adapter), dialect, target or dialect)
+    # that stores what it read into a granted table. Both dialects, as on the read path: the
+    # guard renders to find the names the source will be asked for, and `target` has already
+    # been defaulted to `dialect` at the top of this function.
+    opaque = check_unmodelled_calls(shaped, inventory_from(adapter), dialect, target)
     if opaque is not None:
         return opaque
 

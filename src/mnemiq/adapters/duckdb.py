@@ -199,10 +199,10 @@ class DuckDBAdapter:
         them is the same staleness a single query already has against a source someone is
         editing.
 
-        A failure RAISES, like its sibling. `inventory_from` turns that into "not asked", which
-        makes every call on a source with any user function unconfirmable -- the conservative
-        reading, and the reason this method may be omitted entirely by an adapter that has
-        nothing to say.
+        A failure RAISES, like its sibling, and `inventory_from` turns that into "builtins not
+        known". Know what that costs before omitting this method: a source with any user
+        function at all then has every read AND every write against it refused, under a code
+        that is not repairable. It is the conservative reading and it is not a soft one.
         """
         rows = self._con.execute(
             "SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE internal"
