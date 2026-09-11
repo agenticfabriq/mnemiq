@@ -119,6 +119,20 @@ class DuckDBAdapter:
             return []
         return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
+    @property
+    def functions_cover_view_bodies(self) -> bool:
+        """Whether `user_functions()` also answers for what a VIEW BODY here may call.
+
+        For a DuckDB file it does: bodies are DuckDB views and run against this catalogue. For a
+        Postgres attachment it does not -- measured, a Postgres view body calling a Postgres UDF
+        runs server-side and returns its value, where DuckDB's binder never looked.
+
+        A property rather than a field set in `__init__`, so a test can read the real derivation
+        off a bare instance. Set as a field, the only way to check it without a live Postgres was
+        to restate `not fk_via_postgres` in the test -- which passes whatever `__init__` does.
+        """
+        return not self._fk_via_postgres
+
     def user_functions(self) -> list[str]:
         """Function names this database defines itself, from `duckdb_functions()`.
 

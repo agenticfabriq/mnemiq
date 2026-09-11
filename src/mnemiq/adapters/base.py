@@ -28,6 +28,12 @@ class SourceAdapter(Protocol):
     # look" into "there are none", which is the distinction FunctionInventory exists to keep.
     def user_functions(self) -> list[str]: ...
 
+    # Whether `user_functions()` also answers for a VIEW BODY on this source. Read through
+    # `getattr(adapter, ..., False)`, so an adapter that says nothing is taken not to cover them
+    # -- forgetting yields the conservative answer. Deliberately NOT declared as a member here:
+    # most adapters omit it, and a required member they do not have would make none of them
+    # structurally match this Protocol.
+
     def execute(self, sql: str) -> list[tuple]: ...
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table: ...
