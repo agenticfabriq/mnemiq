@@ -583,9 +583,10 @@ def test_the_two_catalogue_halves_are_one_query_split_on_internal():
 
 
 def test_an_adapter_that_cannot_say_what_a_builtin_is_gets_the_conservative_answer():
-    """`builtin_functions` is optional, and forgetting it must cost precision rather than
-    soundness. An adapter offering the cheap half alone still has every call on it declined,
-    because a binder rename it cannot rule out is exactly the leak this is about.
+    """`builtin_functions` may be omitted, and omitting it must cost answers rather than
+    soundness. An adapter offering the other half alone has every statement against such a
+    source declined, because a binder rename it cannot rule out is exactly the leak this is
+    about -- expensive, and in the safe direction.
 
     A source that defines NOTHING is untouched either way, which is what keeps the conservative
     default off every ordinary database.

@@ -202,9 +202,12 @@ def inventory_from(adapter) -> FunctionInventory:
 def _builtins_from(adapter) -> frozenset[str] | None:
     """The source's own builtin catalogue, or None when it did not supply one.
 
-    Separate from `user_functions` because it is optional in a way that one is not: a consumer
-    that never asks still gets the conservative answer out of `may_shadow_a_builtin`, so an
-    adapter can implement the cheap half alone and lose precision rather than soundness.
+    Separate from `user_functions` because a consumer that never asks still gets the
+    conservative answer out of `may_shadow_a_builtin` -- soundness does not depend on it. What
+    depends on it is whether the source can answer anything at all: without this, a source
+    holding one macro has every read and every write against it refused, under a code that is
+    not repairable. Optional in the sense that omitting it cannot open a hole, not in the sense
+    that omitting it is cheap.
     """
     if adapter is None or not hasattr(adapter, "builtin_functions"):
         return None
@@ -212,8 +215,8 @@ def _builtins_from(adapter) -> frozenset[str] | None:
         return frozenset(n.lower() for n in adapter.builtin_functions())
     except Exception:
         # No reason recorded, unlike the `user_functions` failure. The two are not symmetric:
-        # that one changes what the inventory MEANS and has to reach a trace, while this one
-        # only costs precision -- the fail-closed reading is already the default here.
+        # that one changes what the inventory MEANS, while this one lands on the default the
+        # field already has. Loud enough on its own -- the source then answers nothing.
         return None
 
 

@@ -29,13 +29,13 @@ class SourceAdapter(Protocol):
     def user_functions(self) -> list[str]: ...
 
     # The other half of the same catalogue: names this source considers its OWN builtins.
-    # Declared, like `user_functions` and unlike the flag below, because an adapter that
-    # implements one of the pair should implement both -- their INTERSECTION is what the
-    # decider needs. A call can be reached under a name the query never spells only if that
-    # name is a builtin, so an adapter offering the first method alone has every source holding
-    # one macro refuse every query against it, under a code that is not repairable. Reached
-    # through `hasattr` at the call site all the same, since a Protocol binds nothing at
-    # runtime. A failure RAISES, like its sibling.
+    # Declared beside `user_functions` because the two are one question -- their INTERSECTION
+    # is what the decider needs, since a call can be reached under a name the query never
+    # spells only if that name is a builtin. Declaring it cannot ENFORCE the pairing, and the
+    # objection recorded under the flag below applies here too: no adapter but DuckDB's has
+    # either method. It is here to be read, not to bind, and what it says is what omitting it
+    # costs -- every source holding one macro refuses every query against it, under a code
+    # that is not repairable. Reached through `hasattr` at the call site. A failure RAISES.
     def builtin_functions(self) -> list[str]: ...
 
     # Whether `user_functions()` also answers for a VIEW BODY on this source. Read through

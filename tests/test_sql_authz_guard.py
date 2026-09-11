@@ -378,6 +378,11 @@ def test_a_statement_that_will_not_render_refuses_rather_than_passes():
     inventory = FunctionInventory.of(["commission_rate"], builtins=["count_star"])
     refusal = check_unmodelled_calls(WillNotRender(), inventory, "duckdb")
     assert refusal.code == RefusalCode.UNRESOLVABLE_CALLS
+    # ...and says whose problem it is. This source's catalogue answered both halves, so the
+    # shared "did not report which names are builtins" text would send a deployer to fix an
+    # adapter that is working. Four causes reach this code and each has a different owner.
+    assert "could not be rendered" in refusal.message
+    assert "builtins" not in refusal.message
 
 
 def test_without_an_inventory_the_guard_is_the_allowlist_it_was():

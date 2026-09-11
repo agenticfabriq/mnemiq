@@ -208,9 +208,11 @@ def check_unmodelled_calls(
     try:
         called = called_names(ast, *dialects)
     except UnreadableCalls:
-        # Cannot enumerate, so cannot clear. The same answer as shadowing, and for the same
-        # reason: an empty set read as "no calls" would clear all of them.
-        return _cannot_resolve(inventory)
+        # Cannot enumerate, so cannot clear. The same verdict as shadowing, and for the same
+        # reason -- an empty set read as "no calls" would clear all of them -- but its own
+        # sentence: this one is about THIS statement, and blaming the adapter for it would
+        # send the deployer to fix a catalogue method that is working.
+        return _cannot_resolve(inventory, unreadable=True)
 
     for name in sorted(called & inventory.names):
         return Refusal(
@@ -225,16 +227,27 @@ def check_unmodelled_calls(
     return None
 
 
-def _cannot_resolve(inventory: FunctionInventory) -> Refusal:
-    """Nothing on this source can be attributed, so nothing on it can be decided.
+def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -> Refusal:
+    """Nothing here can be attributed, so nothing here can be decided.
 
-    Three ways to arrive, kept apart in the message because each has a different owner. The
-    source defines a name it also lists as a builtin, which the DEPLOYER resolves by renaming
-    it. The source never said what its builtins are, which the ADAPTER resolves by implementing
-    `builtin_functions`. Or the source could not be asked at all, which is the source's own
-    problem and may be transient -- a missing method and a hostile database should not read
-    alike in a trace.
+    Four ways to arrive, kept apart in the message because each has a DIFFERENT OWNER, and a
+    refusal that sends the reader to the wrong one is worse than a vague refusal. The source
+    defines a name it also lists as a builtin, which the deployer resolves by renaming it. The
+    source never said what its builtins are, which the adapter author resolves by implementing
+    `builtin_functions`. The source could not be asked at all, which is the source's own
+    problem and may be transient. Or this one statement would not render, which is about the
+    statement and not the source at all -- it reached the shared message once, and told a
+    deployer with a working catalogue that their adapter was incomplete.
     """
+    if unreadable:
+        return Refusal(
+            code=RefusalCode.UNRESOLVABLE_CALLS,
+            message=(
+                "This query could not be rendered, so this engine cannot confirm which "
+                "functions it asks the source for, and this source defines functions of its "
+                "own. Answer using only the listed tables and columns and standard SQL."
+            ),
+        )
     if not inventory.available:
         detail = "This source could not say which functions it defines"
         shadowed = []
