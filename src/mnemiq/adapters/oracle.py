@@ -667,6 +667,67 @@ class OracleAdapter:
             )
         ]
 
+    # Oracle resolves a BUILT-IN SQL function before a schema object of the same name, so a UDF
+    # cannot collect a call the query did not qualify. MEASURED on Oracle AI Database 26ai Free,
+    # with a `LENGTH` function owned by the connecting user: `SELECT length('abc') FROM dual`
+    # returned **3**, and `SELECT appuser.length('abc') FROM dual` returned the UDF's 999.
+    #
+    # That is the opposite of DuckDB, where `count(*)` binds a macro named `count_star` and
+    # `length(x)` binds a macro named `length`. The difference is the whole reason this is a
+    # per-engine fact rather than a rule: the coarse "this source cannot be decided at all"
+    # refusal exists for a FUNCTION name the query never says, and Oracle's binder never
+    # substitutes one.
+    #
+    # It is NOT a claim that no unnamed user code can run. A virtual column carries an
+    # expression, and `SELECT id, leaked FROM t` over `leaked AS (udf(id))` returned an SSN from
+    # an ungranted table with no function named anywhere in the statement -- measured here, and
+    # filed as M100. Nothing in this guard sees that on any engine, and the coarse rule would
+    # not have caught it either: it fires on a name shared with a builtin, and a virtual
+    # column's UDF has whatever name its author chose. So this property changes what the guard
+    # costs Oracle, not what it protects Oracle from.
+    #
+    # So Oracle needs no builtin catalogue here. `V$SQLFN_METADATA` would supply one -- 1276
+    # names, and readable in the container -- but only through `DB_DEVELOPER_ROLE`, not a direct
+    # grant, and hanging the guard on it would turn a missing privilege in a locked-down
+    # deployment into "refuse every query that calls anything".
+    binder_prefers_builtins = True
+
+    def user_functions(self) -> list[str]:
+        """Function names this schema defines itself, standalone and inside packages.
+
+        Both, because both are routes to a UDF even though only one is reachable unqualified.
+        MEASURED: `SELECT pkg_fn(1) FROM dual` is ORA-00904 and `SELECT pkg1.pkg_fn(1) FROM dual`
+        returns 555, so a package member answers only when the query spells the package -- and
+        `called_names` reads `pkg_fn` off that rendered text, which is why the bare member name
+        has to be in this list for the match to land.
+
+        Scoped to `self._schema`, the owner the adapter was pointed at, for the reason
+        `list_columns` is: an engine asking the data dictionary about the source it governs has
+        no business enumerating schemas the caller was never given.
+
+        PUBLIC synonyms are deliberately not followed. They ARE an unqualified route to another
+        schema's function, and measured here every one resolving to a FUNCTION belongs to SYS,
+        LBACSYS, DVSYS or XDB -- Oracle's own, already builtin-shaped. A deployment that creates
+        a public synonym over a user function opens a hole this does not see; it is named here
+        rather than papered over, because the alternative is a join across `ALL_SYNONYMS` whose
+        cost and privilege surface nobody has measured.
+
+        A failure RAISES, like `view_definitions` and its DuckDB sibling. Returning `[]` would
+        say this schema defines nothing, which is a different claim from being unable to look.
+        """
+        return [
+            r[0]
+            for r in self._rows(
+                "SELECT DISTINCT lower(object_name) AS name FROM all_objects "
+                "WHERE owner = :owner AND object_type = 'FUNCTION' "
+                "UNION "
+                "SELECT DISTINCT lower(procedure_name) FROM all_procedures "
+                "WHERE owner = :owner AND object_type = 'PACKAGE' "
+                "  AND procedure_name IS NOT NULL",
+                owner=self._schema,
+            )
+        ]
+
     def foreign_keys(self) -> list[tuple[str, str, str, str, str]]:
         """Declared FKs: (from_table, from_col, to_table, to_col, constraint_id).
 

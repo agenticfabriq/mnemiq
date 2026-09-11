@@ -31,6 +31,37 @@ _PG_VIEW_QUERY = (
 )
 
 
+def duckdb_user_functions(con) -> list[str]:
+    """Function names a DuckDB connection defines itself, anywhere in any attached catalog.
+
+    `internal` is the discriminator and the whole reason this is answerable: DuckDB marks its own
+    945 builtins `internal = true`, and anything a deployment adds comes back false.
+
+    Module-level because `FederatedAdapter` is a DuckDB connection too -- ATTACH per source into
+    one connection -- and a second copy of these three queries is a second thing to keep true.
+    """
+    return [r[0] for r in con.execute(
+        "SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE NOT internal"
+    ).fetchall()]
+
+
+def duckdb_builtin_functions(con) -> list[str]:
+    """The other half of the same catalogue, split on the same flag."""
+    return [r[0] for r in con.execute(
+        "SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE internal"
+    ).fetchall()]
+
+
+def duckdb_reachable_user_functions(con) -> list[str]:
+    """Those an unqualified call can reach: the ones whose schema is on the search path."""
+    path = con.execute("SELECT current_setting('search_path')").fetchall()[0][0]
+    entries = {e.strip().strip('"').lower() for e in str(path).split(",") if e.strip()}
+    return [fn for db, schema, fn in con.execute(
+        "SELECT DISTINCT lower(database_name), lower(schema_name), lower(function_name) "
+        "FROM duckdb_functions() WHERE NOT internal").fetchall()
+        if f"{db}.{schema}" in entries or schema in entries]
+
+
 class DuckDBAdapter:
     """DuckDB as the universal executor: ATTACH a source and read it via DuckDB's scanner.
 
@@ -177,10 +208,7 @@ class DuckDBAdapter:
         A failure RAISES, like `view_definitions`. Returning `[]` would tell the caller this
         source defines nothing, which is a different claim from being unable to look.
         """
-        rows = self._con.execute(
-            "SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE NOT internal"
-        ).fetchall()
-        return [r[0] for r in rows]
+        return duckdb_user_functions(self._con)
 
     def reachable_user_functions(self) -> list[str]:
         """The subset of `user_functions()` a query can call WITHOUT qualifying it.
@@ -202,14 +230,7 @@ class DuckDBAdapter:
         unreachable. `database.schema` and a bare `schema` are both accepted because the setting
         holds either.
         """
-        path = self._con.execute("SELECT current_setting('search_path')").fetchall()[0][0]
-        entries = {e.strip().strip('"').lower() for e in str(path).split(",") if e.strip()}
-        rows = self._con.execute(
-            "SELECT DISTINCT lower(database_name), lower(schema_name), lower(function_name) "
-            "FROM duckdb_functions() WHERE NOT internal"
-        ).fetchall()
-        return [fn for db, schema, fn in rows
-                if f"{db}.{schema}" in entries or schema in entries]
+        return duckdb_reachable_user_functions(self._con)
 
     def builtin_functions(self) -> list[str]:
         """The other half of `duckdb_functions()`: names this engine considers its own.
@@ -233,10 +254,7 @@ class DuckDBAdapter:
         function at all then has every read AND every write against it refused. It is the
         conservative reading and it is not a soft one.
         """
-        rows = self._con.execute(
-            "SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE internal"
-        ).fetchall()
-        return [r[0] for r in rows]
+        return duckdb_builtin_functions(self._con)
 
     def view_definitions(self) -> list[tuple[str, str, str]]:
         """(view, body, dialect) for every view in the source. A failure RAISES.

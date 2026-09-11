@@ -878,7 +878,14 @@ def test_the_decider_proof_path_approves_a_valid_oracle_plan():
 
     assert prove(_adapter(), "SELECT id FROM t_region") is None
     refused = prove(_adapter(), "SELECT id FROM ghost_table")
-    assert refused is not None and "ORA-00942" in refused.message
+    assert refused is not None
+    # `source_detail`, not `message`. The source's own words moved out of the caller-facing
+    # sentence when M94 split them: `plan_query` forwards `message` as a deferral reason, and an
+    # Oracle exception is made of the caller's schema. This assertion kept naming `message` and
+    # went red the day that landed, because no CI job has an Oracle to run it against -- the
+    # first time it ran after the split was here, months later.
+    assert "ORA-00942" in refused.source_detail
+    assert "ORA-00942" not in refused.message, "the source's words stay out of the wire text"
 
 
 def test_concurrent_reads_through_one_adapter_do_not_corrupt_each_other():
@@ -1599,3 +1606,133 @@ def test_a_probe_that_FAILS_is_not_evidence_the_database_opened():
         assert a._ro_state == "constrained", "a failed probe must not change the recorded state"
     finally:
         a.close()
+
+
+# --------------------------------------------------------------------------------------------
+# M99. `check_unmodelled_calls` gained an inventory in PR #19 and only the DuckDB family could
+# supply one, so M43's residual fix reached Oracle not at all. What this schema defines, and
+# which of it an unqualified call can reach, is the whole question -- and Oracle answers it
+# differently from DuckDB, which is why the answer is measured here rather than assumed.
+# --------------------------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _m99_fixtures(adapter):
+    """A UDF that reads a table the identity is never granted, plus the table it reads."""
+    con = adapter._pool.acquire()
+    cur = con.cursor()
+    for ddl in ("DROP FUNCTION m99_leak", "DROP TABLE m99_secret", "DROP TABLE m99_claim"):
+        with contextlib.suppress(Exception):
+            cur.execute(ddl)
+    cur.execute("CREATE TABLE m99_secret(ssn VARCHAR2(20))")
+    cur.execute("INSERT INTO m99_secret VALUES ('123-45-6789')")
+    cur.execute("CREATE TABLE m99_claim(id NUMBER)")
+    cur.execute("INSERT INTO m99_claim VALUES (1)")
+    cur.execute("CREATE OR REPLACE FUNCTION m99_leak(x NUMBER) RETURN VARCHAR2 IS "
+                "v VARCHAR2(20); BEGIN SELECT ssn INTO v FROM m99_secret WHERE ROWNUM = 1; "
+                "RETURN v; END;")
+    con.commit()
+    try:
+        yield cur
+    finally:
+        for ddl in ("DROP FUNCTION m99_leak", "DROP TABLE m99_secret", "DROP TABLE m99_claim"):
+            with contextlib.suppress(Exception):
+                cur.execute(ddl)
+        con.commit()
+        adapter._pool.release(con)
+
+
+def test_oracle_resolves_a_builtin_before_a_udf_of_the_same_name():
+    """The measurement the whole design rests on, and it is the OPPOSITE of DuckDB's.
+
+    DuckDB binds `count(*)` to a macro named `count_star` and `length(x)` to a macro named
+    `length` -- the builtin loses, so a name the query never says can collect the call, and only
+    a whole-source refusal can catch that. Oracle hands the call to its own builtin, so the UDF
+    answers only when the query spells the qualification.
+
+    Asserted against the live source rather than trusted, because `binder_prefers_builtins`
+    turns the coarse rule off for every Oracle deployment and a wrong reading of Oracle's name
+    resolution would be a silent leak, not a visible refusal.
+    """
+    adapter = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, schema=USER.upper())
+    con = adapter._pool.acquire()
+    cur = con.cursor()
+    try:
+        cur.execute("CREATE OR REPLACE FUNCTION length(x VARCHAR2) RETURN NUMBER IS "
+                    "BEGIN RETURN 999; END;")
+        con.commit()
+        cur.execute("SELECT length('abc') FROM dual")
+        assert cur.fetchone()[0] == 3, "the builtin must win an unqualified call"
+        cur.execute(f"SELECT {USER}.length('abc') FROM dual")
+        assert cur.fetchone()[0] == 999, "...and the UDF must still answer when qualified"
+    finally:
+        with contextlib.suppress(Exception):
+            cur.execute("DROP FUNCTION length")
+            con.commit()
+        adapter._pool.release(con)
+        adapter.close()
+
+
+def test_the_inventory_names_what_this_schema_defines_standalone_and_in_packages():
+    """A package member is not reachable unqualified -- `pkg_fn(1)` is ORA-00904 -- but
+    `pkg1.pkg_fn(1)` answers, and `called_names` reads `pkg_fn` off that rendered text. So the
+    bare member name has to be in the list or the match never lands."""
+    adapter = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, schema=USER.upper())
+    con = adapter._pool.acquire()
+    cur = con.cursor()
+    try:
+        cur.execute("CREATE OR REPLACE FUNCTION m99_standalone(x NUMBER) RETURN NUMBER IS "
+                    "BEGIN RETURN 1; END;")
+        cur.execute("CREATE OR REPLACE PACKAGE m99_pkg AS "
+                    "FUNCTION m99_member(x NUMBER) RETURN NUMBER; END;")
+        cur.execute("CREATE OR REPLACE PACKAGE BODY m99_pkg AS "
+                    "FUNCTION m99_member(x NUMBER) RETURN NUMBER IS BEGIN RETURN 2; END; END;")
+        con.commit()
+        names = set(adapter.user_functions())
+        assert "m99_standalone" in names
+        assert "m99_member" in names, "a package member is a route to a UDF, qualified"
+    finally:
+        for ddl in ("DROP FUNCTION m99_standalone", "DROP PACKAGE m99_pkg"):
+            with contextlib.suppress(Exception):
+                cur.execute(ddl)
+        con.commit()
+        adapter._pool.release(con)
+        adapter.close()
+
+
+def test_a_udf_that_reads_an_ungranted_table_is_refused_and_the_builtins_are_not():
+    """M43's residual, on Oracle, end to end.
+
+    The leak is real first: `m99_leak(1)` returns an SSN out of a table the identity was never
+    granted. `decide` refuses it by name -- and refuses NOTHING else, because Oracle's binder
+    settles every unqualified call on its own builtin, so there is no whole-source doubt to
+    raise. That contrast is the point: the same fix on DuckDB refuses every call on a source
+    that shadows one builtin, and doing that to Oracle would be pure cost.
+    """
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.functions import inventory_from
+
+    adapter = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, schema=USER.upper())
+    try:
+        with _m99_fixtures(adapter) as cur:
+            cur.execute("SELECT m99_leak(1) FROM dual")
+            assert cur.fetchone()[0] == "123-45-6789", "no leak, so nothing below proves anything"
+
+            inventory = inventory_from(adapter)
+            assert "m99_leak" in inventory.names
+            assert inventory.may_shadow_a_builtin is False
+
+            def verdict(sql):
+                return decide(sql, {"m99_claim": {"id"}}, adapter=adapter,
+                              dialect="oracle", target="oracle")
+
+            refused = verdict("SELECT m99_leak(1) AS x FROM m99_claim")
+            assert refused.code.value == "unmodelled_call", refused
+            assert refused.subject == "m99_leak"
+
+            for clean in ("SELECT length('abc') AS n FROM m99_claim",
+                          "SELECT count(*) AS n FROM m99_claim",
+                          "SELECT id FROM m99_claim"):
+                assert not hasattr(verdict(clean), "code"), clean
+    finally:
+        adapter.close()

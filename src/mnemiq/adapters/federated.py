@@ -5,6 +5,11 @@ import threading
 import duckdb
 import pyarrow as pa
 
+from mnemiq.adapters.duckdb import (
+    duckdb_builtin_functions,
+    duckdb_reachable_user_functions,
+    duckdb_user_functions,
+)
 from mnemiq.config import SourceSpec
 
 _EXT = {"postgres": ("postgres", "POSTGRES"), "sqlite": ("sqlite", "SQLITE")}
@@ -47,6 +52,24 @@ class FederatedAdapter:
             clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
             self._con.execute(f"ATTACH '{spec.target}' AS {spec.catalog} {clause}")
         # No single USE: every query is catalog-qualified (catalog.schema.table).
+
+    # The same three catalogue reads the single-source DuckDB path uses, on the same kind of
+    # connection. Without them a federated deployment got `never_asked` and M43's residual fix
+    # reached it not at all (M99) -- and the gap was invisible, because federation is DuckDB and
+    # every argument written for the DuckDB adapter reads as if it applied here.
+    #
+    # `reachable` is usually empty in this shape and that is correct rather than a shortcut:
+    # every query here is catalog-qualified and nothing issues a `USE`, so an attached source's
+    # schema is not on the search path and its macros answer only to a spelled qualification --
+    # which `called_names` reads off the rendered statement.
+    def user_functions(self) -> list[str]:
+        return duckdb_user_functions(self._con)
+
+    def builtin_functions(self) -> list[str]:
+        return duckdb_builtin_functions(self._con)
+
+    def reachable_user_functions(self) -> list[str]:
+        return duckdb_reachable_user_functions(self._con)
 
     def execute(self, sql: str) -> list[tuple]:
         return self._con.execute(sql).fetchall()
