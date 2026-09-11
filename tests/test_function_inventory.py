@@ -1088,9 +1088,16 @@ def test_an_uncertain_inventory_makes_every_virtual_column_opaque():
     assert _opaque(virtual, [], certain=False) == frozenset({("t", "a"), ("t", "b")})
 
 
-def test_an_adapter_that_cannot_report_virtual_columns_changes_nothing():
-    """Every adapter shipped in that state, so it must stay the permissive one -- the same
-    posture `never_asked` takes for functions."""
+def test_never_asked_and_could_not_answer_are_different_answers():
+    """An adapter with no such method is permissive -- every adapter shipped that way. One that
+    was ASKED and RAISED is not, and the first version made them the same.
+
+    Measured on it: with `virtual_columns()` raising, `SELECT leaked FROM vc_t` was APPROVED, so
+    a catalogue outage switched the control off. The comment defending that said `check_access`
+    still stands, which is exactly backwards -- `check_access` passes a column the snapshot
+    lists, and that is the whole reason this function exists.
+    """
+    from mnemiq.sql.authz_guard import check_opaque_columns
     from mnemiq.sql.functions import FunctionInventory, opaque_columns
 
     class Silent:
@@ -1101,8 +1108,17 @@ def test_an_adapter_that_cannot_report_virtual_columns_changes_nothing():
             raise RuntimeError("no dictionary for you")
 
     assert opaque_columns(Silent(), FunctionInventory.of(["f"])) == frozenset()
-    assert opaque_columns(Angry(), FunctionInventory.of(["f"])) == frozenset()
     assert opaque_columns(None, FunctionInventory.of(["f"])) == frozenset()
+    assert opaque_columns(Angry(), FunctionInventory.of(["f"])) is None
+
+    # ...and the guard refuses on that, rather than treating it as "no opaque columns".
+    import sqlglot
+
+    refusal = check_opaque_columns(
+        sqlglot.parse_one("SELECT id FROM vc_t", read="oracle"), None, "oracle")
+    assert refusal is not None and refusal.code.value == "unresolvable_calls"
+    # Retried, because `decide` re-reads the catalogue on every attempt and this may be a blip.
+    assert refusal.repairable is True
 
 
 def test_the_guard_catches_the_column_qualified_or_not():
@@ -1185,3 +1201,23 @@ def test_the_natural_arm_matches_the_case_an_oracle_query_actually_writes():
                 "SELECT id FROM vc_t NATURAL JOIN other"):
         assert check_opaque_columns(sqlglot.parse_one(sql, read="oracle"),
                                     opaque, "oracle") is not None, sql
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT Q.leaked FROM vc_t Q",                                    # uppercase alias
+    "SELECT q.leaked FROM vc_t q",                                    # lowercase
+    "SELECT x.leaked FROM vc_t x UNION ALL SELECT x.id FROM other x",  # one alias, two tables
+])
+def test_an_alias_cannot_spell_its_way_past_the_guard(sql):
+    """The guard kept its own flat alias map keyed on the WRITTEN case while looking up
+    lowercase, so `SELECT Q.leaked FROM vc_t Q` was APPROVED and the lowercase spelling refused
+    -- and one alias meaning two tables across UNION branches changed the verdict with branch
+    order, which is the flat-map defect `column_tables` already existed to solve.
+    """
+    import sqlglot
+
+    from mnemiq.sql.authz_guard import check_opaque_columns
+
+    refusal = check_opaque_columns(sqlglot.parse_one(sql, read="oracle"),
+                                   frozenset({("vc_t", "leaked")}), "oracle")
+    assert refusal is not None, sql

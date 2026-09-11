@@ -283,3 +283,33 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
             if column.table == target.alias_or_name and id(column) not in out:
                 out[id(column)] = key
     return out
+
+
+def candidate_tables(
+    column: exp.Column, resolved: dict[int, str] | None, referenced: set[str], aliased: set[str]
+) -> set[str]:
+    """The base table(s) a column could belong to.
+
+    Lives here, with the other scope resolution, because three guards need the same answer:
+    `check_cls`, `check_access`'s column half, and `check_opaque_columns`. The last one had its
+    own flat alias map for one commit, keyed on the written case, and let `SELECT Q.leaked FROM
+    vc_t Q` through while refusing the lowercase spelling.
+
+    Qualified -> the table its alias names IN ITS OWN SCOPE, which is why this takes a
+    per-node map rather than a name->table dictionary: one alias can mean two tables in one
+    statement, and a flat map kept whichever was seen last (Codex review, 2026-08-12).
+
+    Unqualified -> every referenced base table, fail-closed. An alias the resolver could not
+    place is treated the same way rather than as "no table": unresolvable is not permission.
+    """
+    if not column.table or resolved is None:
+        # `resolved is None` -> the scopes could not be read, so nothing here is known to be a
+        # local alias. Every referenced base table is a candidate; an unreadable statement is
+        # not an argument for permission.
+        return referenced
+    table = resolved.get(id(column))
+    if table is not None:
+        return {table}
+    # A qualifier naming a CTE or derived table owns no base column -- but only when we are
+    # sure that is what it is. Otherwise fall back to every table.
+    return set() if column.table in aliased else referenced

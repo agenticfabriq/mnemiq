@@ -134,20 +134,19 @@ def test_an_UNATTRIBUTABLE_reference_is_unmeasurable_not_green():
 
 
 def test_candidate_tables_would_have_called_that_reference_attributable():
-    """Keying on `_candidate_tables` instead is the mutation the classifier rules out: it is
+    """Keying on `candidate_tables` instead is the mutation the classifier rules out: it is
     fail-CLOSED, built for refusing, and answers with a definite single object here."""
-    from mnemiq.sql.cls import _candidate_tables
-    from mnemiq.sql.scope import column_tables
+    from mnemiq.sql.scope import candidate_tables, column_tables
 
     ast = sqlglot.parse_one("SELECT bogus.ssn FROM claim", read="duckdb")
     column = next(c for c in ast.find_all(sqlglot.exp.Column) if c.name == "ssn")
     # called exactly as `check_cls` calls it, so this measures the real helper
-    cands = _candidate_tables(column, column_tables(ast), {"claim"}, set())
+    cands = candidate_tables(column, column_tables(ast), {"claim"}, set())
 
     assert cands == {"claim"}, "a definite single object -- which is why it looks attributable"
     assert column_tables(ast).get(id(column)) is None, "while the instrument records nothing"
     assert touched(ast, AccessPolicy(masked={("claim", "ssn")})).unattributable, (
-        "so keying on _candidate_tables would score this answer green, unmeasured")
+        "so keying on candidate_tables would score this answer green, unmeasured")
 
 
 def test_an_unmeasurable_answer_does_not_count_as_agreeing():

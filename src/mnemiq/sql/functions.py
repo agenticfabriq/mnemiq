@@ -299,7 +299,7 @@ def _builtins_from(adapter) -> tuple[frozenset[str] | None, bool]:
         return None, True
 
 
-def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str, str]]:
+def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str, str]] | None:
     """(table, column) pairs whose stored expression this engine cannot attribute.
 
     A virtual column is a route to user code with no call in the statement, which is the third
@@ -311,19 +311,26 @@ def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str
     `"QTY"*"PRICE"` calls nothing -- and refusing every virtual column would cost a legitimate
     modelling feature to close a route that needs a function to be a route at all.
 
-    An adapter that cannot report virtual columns yields nothing, which is the state every
-    adapter shipped in, and an inventory that is not `certain` yields every virtual column,
-    because then no name in an expression can be cleared.
+    Three answers, not two. An adapter that cannot report virtual columns yields an empty set,
+    which is the state every adapter shipped in. One that was ASKED and could not answer yields
+    **None**, and the guard refuses on it.
+
+    The first version returned an empty set for both, with a comment arguing that the permissive
+    reading was safe because `check_access` still stands. That is exactly backwards:
+    `check_access` sees a column the snapshot lists and passes it, which is the whole reason
+    this function exists. Measured on the first version -- with `virtual_columns()` raising,
+    `SELECT leaked FROM vc_t` was APPROVED, so a catalogue outage switched the control off. The
+    absence-and-failure collapse, argued for in a comment.
+
+    An inventory that is not `certain` yields every virtual column, because then no name in an
+    expression can be cleared.
     """
     if adapter is None or not hasattr(adapter, "virtual_columns"):
         return frozenset()
     try:
         columns = adapter.virtual_columns()
     except Exception:
-        # The same reading `inventory_from` gives a failed lookup: asked and could not answer is
-        # not "there are none". Every virtual column would be unknown, and none is known, so the
-        # honest answer is that the caller learns nothing here -- `check_access` still stands.
-        return frozenset()
+        return None
     if not inventory.certain:
         return frozenset((t, c) for t, c, _ in columns)
     return frozenset(
