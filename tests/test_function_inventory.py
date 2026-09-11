@@ -203,9 +203,12 @@ def test_decide_actually_asks_the_adapter(source_defining_nothing):
 def test_a_shadowing_macro_is_caught_however_the_call_is_spelled(sql, source_with_a_shadowing_macro):
     """Three shapes that each returned `complete` while reading an SSN from another table.
 
-    All three are M56 -- read something, record nothing -- and all three were introduced by the
-    change meant to sharpen this marker. Names come per NODE now, rendered in the dialect that
-    will execute, so a column list is not a call and the executed spelling is the one looked up.
+    All three are M56, and all three were introduced by successive attempts to name the call:
+    the written spelling, then the rendered one, then a count cross-check that read a column
+    list as a call. They are kept as a regression set rather than as a spelling test -- nothing
+    is looked up by name now, so what they demonstrate is that a source defining anything
+    downgrades whatever the query says. Renaming the macros would leave them green, which is
+    the point: the rule no longer depends on the spelling that defeated three versions.
     """
     lineage = _lineage_through_decide(sql, DuckDBAdapter.duckdb(source_with_a_shadowing_macro))
     assert "unconfirmed-function-identity" in lineage.reasons
@@ -261,6 +264,53 @@ def test_a_view_bodys_calls_are_judged_by_the_view_licence_not_the_query_one():
     )
 
 
+def test_inventory_from_carries_the_failure_and_the_licence_through():
+    """The handoff, which nothing exercised. Two mutations of it went unnoticed.
+
+    A lookup that RAISES must not become "defines nothing": that reading approves every call,
+    and it is the absence-versus-failure collapse this whole type exists for. And the licence
+    has to be read from the adapter rather than assumed, or a Postgres view body gets certified
+    from DuckDB's catalogue -- the thing the licence is for.
+    """
+    from mnemiq.sql.functions import inventory_from
+
+    class Raises:
+        functions_cover_view_bodies = True
+
+        def user_functions(self):
+            raise RuntimeError("dsn=postgresql://u:p@h/db refused")
+
+    class Denies:
+        functions_cover_view_bodies = False
+
+        def user_functions(self):
+            return []
+
+    failed = inventory_from(Raises())
+    assert failed.available is False and failed.certain is False, (
+        "a failed lookup must not read as an empty answer"
+    )
+    assert "postgresql://" not in failed.reason, "the reason must not carry the source's words (M94)"
+
+    class Grants:
+        functions_cover_view_bodies = True
+
+        def user_functions(self):
+            return []
+
+    # BOTH directions. Checking only the denying adapter leaves `getattr(...)` replaceable by a
+    # literal `False`, which fails closed and silently: a DuckDB file's view bodies would take
+    # the issue #5 downgrade again with nothing to notice.
+    assert inventory_from(Grants()).certain_for_view_bodies is True
+
+    denied = inventory_from(Denies())
+    assert denied.certain is True and denied.certain_for_view_bodies is False, (
+        "the licence comes from the adapter, not from the default"
+    )
+
+    assert inventory_from(object()).asked is False, "an adapter without the method was never asked"
+
+
 def test_only_a_source_whose_catalogue_governs_its_views_grants_the_view_licence():
     """`functions_cover_view_bodies` is what stops a Postgres view body being certified from
     DuckDB's catalogue. Flipping it, or passing `in_view_body=False`, would do exactly that and
@@ -274,13 +324,17 @@ def test_only_a_source_whose_catalogue_governs_its_views_grants_the_view_licence
     assert DuckDBAdapter.duckdb(path).functions_cover_view_bodies is True, (
         "a DuckDB file's views are DuckDB views and run against this catalogue"
     )
-    # The Postgres attachment is constructed without connecting, so the flag can be read from a
-    # bare instance -- it comes from the attachment kind, not from the source.
-    # A bare instance, so the real derivation runs. Restating `not fk_via_postgres` here would
-    # pass whatever `__init__` did, which is what let a mutation flipping it go unnoticed.
-    pg = DuckDBAdapter.__new__(DuckDBAdapter)
-    pg._fk_via_postgres = True
-    assert pg.functions_cover_view_bodies is False
+    assert DuckDBAdapter.sqlite(path).functions_cover_view_bodies is False, (
+        "SQLite got the licence from the old FK-flag derivation, harmlessly and by accident"
+    )
+    # Bare instances, so the real derivation runs. Restating it here would pass whatever
+    # `__init__` did, which is what let a mutation flipping it go unnoticed. Every attachment
+    # kind except DUCKDB must be denied, not just Postgres: the licence used to key on the
+    # foreign-key flag, which gave it to SQLite and would give it to any future kind.
+    for attach_type in ("POSTGRES", "SQLITE", "MYSQL"):
+        other = DuckDBAdapter.__new__(DuckDBAdapter)
+        other._attach_type = attach_type
+        assert other.functions_cover_view_bodies is False, attach_type
 
 
 @pytest.mark.integration

@@ -24,8 +24,7 @@ therefore cannot tell a pure builtin from a table-reading UDF BY PARSING, in eit
 which is the pattern `views.py` already uses because an unlisted shape must not pass.
 
 Both halves dissolve when the source is ASKED, and it is now: `FunctionInventory` carries the
-names a source defines itself, and a call clears when the source does not define the name it
-renders to. That is why `count(*)` no longer downgrades an otherwise plain query (issue #5) and
+names a source defines itself, and a call clears when the source defines no functions at all. That is why `count(*)` no longer downgrades an otherwise plain query (issue #5) and
 why a UDF named `median` does. Without an inventory the old rule stands unchanged -- any call
 downgrades -- so the ask is what buys the precision, not a relaxed default.
 """
@@ -245,7 +244,6 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=No
     # READ and whose reach we can point at, versus a function whose body we cannot see at all.
     reaching_views: list[str] = []
     unclassified: list[str] = []
-    saw_any_call = False
     reasons: list[str] = []
     # The two comparisons here
     # have opposite polarity, which is the trap: widening the VIEW lookup adds matches and every
@@ -374,7 +372,6 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=No
         body_fns, body_saw_call = _functions_in(parsed)
         for fn in body_fns:
             _add(unclassified, fn)
-        saw_any_call = saw_any_call or body_saw_call
         # A body's own text is in hand, so its calls can be named. `in_view_body` because a
         # Postgres view body runs server-side, where the adapter's catalogue does not reach.
         # A body's calls are judged by the VIEW licence: a Postgres body runs server-side,
@@ -397,17 +394,32 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=No
     caller_fns, caller_saw_call = _functions_in(ast)
     for fn in caller_fns:
         _add(unclassified, fn)
-    if caller_saw_call:
-        saw_any_call = True
     if caller_saw_call and not calls_are_confirmable(inventory, in_view_body=False):
         unconfirmed_calls.append("statement")
+
+    if unconfirmed_calls:
+        # WHY, not just that. All of them landed on one marker, so a source whose `user_functions`
+        # fails on every request looked identical to one that simply defines a helper -- the
+        # issue #5 fix silently not applying, with nothing in the trace to say so. The view
+        # inventory keeps its cases apart for the same reason.
+        if not inventory.available:
+            reasons.append("function-inventory-unavailable")
+        elif not inventory.asked:
+            reasons.append("function-inventory-never-asked")
+        elif not inventory.names and not inventory.covers_view_bodies:
+            # The FOURTH cause, which the first version of this block miscounted as three: the
+            # source defines nothing and the licence still does not reach a VIEW BODY, because
+            # its calls run where this catalogue never looked. Without this, a Postgres source
+            # with no UDFs at all reads as one that defines a function.
+            reasons.append("function-inventory-covers-no-view-bodies")
 
     if unconfirmed_calls:
         # Without an inventory this fires on ANY call, which is where it started: `count(*)`
         # downgraded the lineage of an otherwise plain query, so the marker appeared on nearly
         # every real answer and stopped meaning anything (issue #5). With one, it fires only on
-        # a name the source actually defines -- which is the case it was always trying to name,
-        # and the one `log` parsing as a typed builtin made invisible.
+        # a source this engine cannot clear: one that defines functions of its own, one that
+        # could not be asked, or a view body the answer does not cover. The sub-reason below
+        # says which -- see `calls_are_confirmable` for the three leaks behind the coarseness.
         reasons.append("unconfirmed-function-identity")
 
     if not getattr(views, "available", True):
