@@ -241,6 +241,12 @@ def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -
       * `user_functions` itself raised -- likewise, and earlier
       * this one statement would not render -- about the STATEMENT, not the source at all
 
+    Worth RETRYING, and saying so with `repairable_override`: the statement that would not
+    render, since a rewrite can fix it, and both catalogue calls that RAISED, since `decide`
+    re-asks the source on every attempt and a blip resolves itself. Not worth retrying: a source
+    that redefines a builtin's name, and an adapter with no `builtin_functions` at all. Neither
+    is a thing an attempt of ours changes, and the loop stops on them (M98).
+
     Two of them were caught borrowing another's sentence, and both times the effect was to send
     someone to fix working code. That is the failure this list is arranged against.
     """
@@ -252,29 +258,46 @@ def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -
                 "functions it asks the source for, and this source defines functions of its "
                 "own. Answer using only the listed tables and columns and standard SQL."
             ),
+            # The one arrival that is about the STATEMENT, so the one a rewrite can fix -- and
+            # the message asks for one. The code alone would send it to the no-retry path with
+            # the other arrivals, under a card saying rephrasing will not help.
+            repairable_override=True,
         )
     if not inventory.available:
-        detail = "This source could not say which functions it defines"
-        shadowed = []
+        # Retried, because it may be transient and `decide` re-asks the source on every attempt
+        # (`inventory_from` reads LIVE, not from the snapshot). A single blip should not tell a
+        # caller to page an operator. If it is not a blip the attempts run out and it says so.
+        return Refusal(
+            code=RefusalCode.UNRESOLVABLE_CALLS,
+            message=(
+                "This source could not say which functions it defines, so this engine cannot "
+                "confirm what this query executes against it."
+            ),
+            repairable_override=True,
+        )
+    shadowed = sorted(inventory.names & inventory.builtins) if inventory.builtins else []
+    if shadowed:
+        # The source's own configuration. Every attempt lands here until someone renames it.
+        detail = f"This source defines {shadowed[0]!r} under a name it also lists as a builtin"
+        retry = False
+    elif inventory.builtins_asked:
+        # ASKED and failed, so the same call that raised is made again next attempt -- the same
+        # argument as the `user_functions` arrival above, which is why leaving this one out was
+        # a contradiction rather than a nuance.
+        detail = ("This source defines functions of its own and could not say which names are "
+                  "its builtins")
+        retry = True
     else:
-        shadowed = sorted(inventory.names & inventory.builtins) if inventory.builtins else []
-        if shadowed:
-            detail = f"This source defines {shadowed[0]!r} under a name it also lists as a builtin"
-        elif inventory.builtins_asked:
-            detail = (
-                "This source defines functions of its own and could not say which names are "
-                "its builtins"
-            )
-        else:
-            detail = (
-                "This source defines functions of its own and was never asked which names are "
-                "its builtins"
-            )
+        # The adapter has no such method, which is not a thing an attempt changes.
+        detail = ("This source defines functions of its own and was never asked which names are "
+                  "its builtins")
+        retry = False
     return Refusal(
         code=RefusalCode.UNRESOLVABLE_CALLS,
         message=(
             f"{detail}, so this engine cannot confirm what this query executes against it. "
-            "No query can be decided against this source."
+            + ("Try again." if retry else "No query can be decided against this source.")
         ),
         subject=shadowed[0] if shadowed else None,
+        repairable_override=True if retry else None,
     )

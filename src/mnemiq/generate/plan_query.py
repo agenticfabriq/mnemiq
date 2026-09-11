@@ -13,7 +13,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import visible_schema
-from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
+from mnemiq.sql.verdict import REPAIRABLE, Approved, Refusal, RefusalCode
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,36 @@ class Feedback:
 
     text: str
     from_source: bool
+
+
+# What a caller is told when the decider refuses in a way no rewrite can fix: the deferral code,
+# and a sentence to use INSTEAD of the refusal's own when that one would echo source words back.
+# `UNGOVERNABLE` is the default and says the true thing -- the engine cannot establish that this
+# query is governed -- for the source and policy failures that make up the rest, whose subject
+# is the engine's own where they have one at all: today a shadowed function name read off the
+# source's catalogue, and nothing else. Every view code with a subject is repairable, and
+# VIEW_INVENTORY_UNAVAILABLE carries none and is caught by the fast path above this loop.
+#
+# INVALID_ROW_FILTER is deliberately NOT mapped to `policy_unavailable`, which was the first
+# answer and reads well until an operator sees the card: that code's title is "The access policy
+# could not be read", and here it was read and one predicate in it is invalid. UNGOVERNABLE is
+# what this codebase already calls that, and the contract enum lists this case under it.
+#
+# UNAUTHORIZED_TABLE is absent because it keeps its own branch, the one that logs and suppresses
+# its subject: its sentence is worded for the caller's next move rather than the model's.
+_UNREPAIRABLE: dict[RefusalCode, tuple[DeferralReason, str | None]] = {
+    # Grants, exactly like the table case, and it used to spend three attempts inviting the model
+    # to find another route to a column this identity may not read -- one it FINDS answers a
+    # subtly different question than the one that was asked.
+    #
+    # And the subject is MODEL-AUTHORED, read off `exp.Column` in the model's own SQL, so a model
+    # handed the source's words can name a "column" spelled out of them. Same provenance as the
+    # table branch's subject and the same suppression, which is the third exit of that kind.
+    RefusalCode.UNAUTHORIZED_COLUMN: (
+        DeferralReason.AUTHORIZATION,
+        "Answering this would require access to a column you do not have.",
+    ),
+}
 
 
 def plan_query(
@@ -236,12 +266,61 @@ def plan_query(
                 code=DeferralReason.AUTHORIZATION,
             )
 
+        if not verdict.repairable:
+            # The generalisation of the branch above, and it took until M98 to notice the branch
+            # WAS one. `REPAIRABLE` existed with ten codes and `Refusal.repairable` read it, and
+            # nothing else did: every other refusal was retried whatever the classification said,
+            # so an unrepairable one cost three model calls to reach the verdict the first one
+            # already had, and arrived as INVALID_QUERY -- "could not produce a valid query after
+            # 3 attempts", which claims an attempt that could not have worked.
+            #
+            # The message goes back whole, because these refusals are the ones that say what an
+            # OPERATOR must change, and burying that under a retry count is what made the useful
+            # sentence look like a footnote to a failure.
+            # The subject too, and that is not decoration: when it is withheld from the caller
+            # below, the deployment's own log is the only place the denied name is written. Same
+            # rule the table branch follows -- what cannot be said to the caller still has to be
+            # said somewhere -- and the server log is inside the boundary that holds the DSN.
+            logger.warning("unrepairable refusal, not retried: %s (%r)",
+                           verdict.code.value, verdict.subject)
+            return _not_our_sql(verdict, carries_source_words)
+
         last = verdict
         carries_source_words = verdict.source_detail is not None
         feedback = Feedback(verdict.repair_text, from_source=carries_source_words)
+
+    if last is not None and last.code not in REPAIRABLE:
+        # Retried only because the INSTANCE said to -- a source whose catalogue call raised is
+        # worth asking again, and `decide` re-asks it live every attempt. After the last one the
+        # CODE's judgment stands, and reporting this as INVALID_QUERY would be the thing M98 set
+        # out to retire: "could not produce a valid query after 3 attempts" over a query that was
+        # never the problem, hiding the sentence naming what an operator has to fix.
+        logger.warning("unrepairable refusal survived %d attempts: %s (%r)",
+                       max_attempts, last.code.value, last.subject)
+        return _not_our_sql(last, carries_source_words)
 
     reason = last.message if last else "The query could not be made valid."
     return Deferred(
         reason=f"Could not produce a valid query after {max_attempts} attempts. {reason}",
         code=DeferralReason.INVALID_QUERY,
+    )
+
+
+def _not_our_sql(verdict, carries_source_words: bool) -> Deferred:
+    """Answer with a refusal no rewrite can fix, under the code that says whose problem it is.
+
+    Both exits above land here, and they have to agree: one gives up at once and the other after
+    the attempts run out, and a caller cannot tell those apart from the answer -- nor should the
+    reason change because the engine happened to try first.
+
+    The message goes back whole, because these refusals are the ones that say what an OPERATOR
+    must change, and burying that under a retry count is what made the useful sentence look like
+    a footnote to a failure.
+    """
+    code, without_subject = _UNREPAIRABLE.get(verdict.code,
+                                              (DeferralReason.UNGOVERNABLE, None))
+    return Deferred(
+        reason=(without_subject if without_subject and carries_source_words
+                else verdict.message),
+        code=code,
     )

@@ -219,8 +219,8 @@ def _builtins_from(adapter) -> tuple[frozenset[str] | None, bool]:
     depends on it is whether the source can answer anything at all: without this, a source
     holding one macro has every read and every write against it refused. Optional in the sense
     that omitting it cannot open a hole, not in the sense that omitting it is cheap -- the
-    refusal is classified unrepairable, and until something reads `REPAIRABLE` the caller pays
-    for retries that cannot succeed rather than getting one clean refusal.
+    refusal is classified unrepairable, so the caller gets it at once (M98) rather than after a
+    round of retries that cannot succeed -- one clean refusal naming what to change.
     """
     if adapter is None or not hasattr(adapter, "builtin_functions"):
         return None, False

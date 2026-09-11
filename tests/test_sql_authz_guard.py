@@ -403,3 +403,53 @@ def test_an_unresolvable_source_is_not_repaired_into_an_answer():
 
     assert RefusalCode.UNMODELLED_CALL in REPAIRABLE
     assert RefusalCode.UNRESOLVABLE_CALLS not in REPAIRABLE
+
+
+def test_one_code_two_answers_about_whether_to_try_again():
+    """`UNRESOLVABLE_CALLS` is reached by arrivals that disagree about retrying, so the CODE
+    cannot decide it and `repairable_override` says which (M98).
+
+    Worth another attempt: the statement that would not render, whose message asks for a
+    rewrite, and every catalogue call that RAISED, since `decide` re-asks the source live on
+    each attempt and a blip resolves itself. Not worth it: a source that redefines a builtin's
+    name, and an adapter with no `builtin_functions` at all. Retrying those spends the caller's
+    budget to arrive where the first refusal already was, under a card telling them rephrasing
+    will not help.
+
+    And the closing SENTENCE has to match, because it is the one the caller reads: telling
+    someone whose query is being retried that no query can be decided against this source is
+    the same defect one surface out.
+    """
+    from mnemiq.sql.authz_guard import check_unmodelled_calls
+    from mnemiq.sql.functions import FunctionInventory
+
+    class WillNotRender(sqlglot.exp.Expression):
+        def sql(self, *a, **kw):
+            raise ValueError("no")
+
+        def find_all(self, *types):
+            yield sqlglot.exp.Anonymous(this="count")
+
+    defines_something = FunctionInventory.of(["commission_rate"], builtins=["count_star"])
+    ast = sqlglot.parse_one("SELECT median(id) FROM claim", read="duckdb")
+
+    assert check_unmodelled_calls(WillNotRender(), defines_something, "duckdb").repairable is True
+    assert check_unmodelled_calls(
+        ast, FunctionInventory.unavailable("RuntimeError"), "duckdb").repairable is True
+
+    # ...and so is the OTHER catalogue call that raised. `builtins_asked` with no builtins is
+    # `builtin_functions()` having thrown, which the next attempt makes again -- leaving it out
+    # while retrying its sibling was a contradiction, not a nuance.
+    raised = FunctionInventory.of(["commission_rate"], builtins_asked=True)
+    retried = check_unmodelled_calls(ast, raised, "duckdb")
+    assert retried.repairable is True
+    assert "Try again." in retried.message
+
+    shadowing = FunctionInventory.of(["median"], builtins=["median"])
+    no_such_method = FunctionInventory.of(["commission_rate"])   # builtins_asked stays False
+    for inventory in (shadowing, no_such_method):
+        refusal = check_unmodelled_calls(ast, inventory, "duckdb")
+        assert refusal.code is RefusalCode.UNRESOLVABLE_CALLS
+        assert refusal.repairable is False, inventory
+        assert "No query can be decided against this source." in refusal.message, inventory
+        assert "Try again." not in refusal.message, inventory

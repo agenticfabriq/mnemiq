@@ -87,6 +87,14 @@ export const REASONS: Record<DeferralReason, { title: string; next: string }> = 
     // cases share is that nothing was judged, which is the part the operator needs.
     next: "The query ran; the verifier gave no usable answer, so the result was withheld rather than returned unchecked. Nothing here is a judgement about your data — check the verifier endpoint and its model.",
   },
+  // A deferral, NOT one of the three above that ride `failed: true`. The engine could not
+  // establish that the query is governed -- a source that redefines a builtin's name, a row
+  // filter that is not a valid predicate -- so rephrasing is the one thing that will not help.
+  // It is not retried either (M98): trying could not have worked.
+  ungovernable: {
+    title: "The engine cannot confirm this query is governed",
+    next: "Page an operator. Rephrasing will not help — the reason is in the source or the policy, not in your question.",
+  },
 };
 
 /** 412 ms / 8.5 s / 2 m 04 s -- always legible, never more precision than is useful. */
