@@ -129,55 +129,85 @@ def test_a_lookup_failure_raises_rather_than_reporting_none(duckdb_source):
 
 
 @pytest.mark.integration
+@pytest.mark.skipif(not os.getenv("MNEMIQ_PG_DSN"), reason="no ACME Postgres configured")
 def test_a_postgres_udf_is_unreachable_from_a_query_and_absent_from_the_answer():
     """The claim this design rests on, checked rather than asserted.
 
-    The previous version of this test asserted `"median" not in fns` against a database that
-    defines no `median`, so it could not fail: swapping the method for the `pg_proc` query it
-    exists NOT to use would have kept it green. It creates the function now, and checks the
-    behaviour the claim is about rather than only the absence.
+    An earlier version asserted `"median" not in fns` against a database defining no `median`,
+    so it could not fail. This one creates the function and checks the behaviour.
 
     Both halves are exercised, because they disagree. A generated query cannot reach a Postgres
     UDF, since DuckDB's binder resolves against its own catalogue. A Postgres VIEW BODY calling
     the same UDF runs it server-side and returns its value, which is why this answer must not be
     read as covering view bodies.
+
+    EVERYTHING IT CREATES LIVES IN A THROWAWAY SCHEMA WITH A UNIQUE NAME, dropped with one
+    CASCADE. The first version put `fn_probe` and `v_fn_probe` in `public` and opened with
+    unconditional `DROP ... IF EXISTS` on both, against whatever `MNEMIQ_PG_DSN` names -- so a
+    database that happened to hold those objects would have lost them, and the test's own
+    fixtures were visible to anything else reading that schema meanwhile. Its DDL also sat
+    outside the `try`, so a failure between the two CREATEs orphaned the function.
+
+    The adapter under test is read-only. So is the engine's by default, though not when
+    `MNEMIQ_WRITE_ENABLED` is set. Setup goes through a separate connection on purpose: a
+    fixture needs write access that the thing being tested must not have.
+
+    A run killed before the `finally` (SIGKILL, a timeout) leaves its schema behind. They are
+    invisible to the engine, which introspects `public` only, and the unique names make them
+    identifiable, but nothing sweeps them.
     """
-    import os
+    import uuid
 
     import duckdb as _duckdb
 
-    dsn = os.getenv("MNEMIQ_PG_DSN", "postgresql://mnemiq:mnemiq@localhost:5433/acme")
-    con = _duckdb.connect()
-    con.execute("INSTALL postgres; LOAD postgres")
-    con.execute(f"ATTACH '{dsn}' AS pg (TYPE POSTGRES)")
-    con.execute("CALL postgres_execute('pg', 'DROP VIEW IF EXISTS v_fn_probe')")
-    con.execute("CALL postgres_execute('pg', 'DROP FUNCTION IF EXISTS fn_probe(int)')")
-    con.execute("CALL postgres_execute('pg', "
-                "'CREATE FUNCTION fn_probe(int) RETURNS int AS $x$ SELECT 99 $x$ LANGUAGE sql')")
-    # Both objects exist BEFORE the adapter connects. Created afterwards, resolving
-    # `src.public.v_fn_probe` would depend on the postgres extension re-querying a schema cache
-    # populated by the adapter's own `USE src.public`, and the extension documents
-    # `pg_clear_cache()` for exactly that. The test would then be measuring cache behaviour.
-    con.execute("CALL postgres_execute('pg', "
-                "'CREATE VIEW v_fn_probe AS SELECT fn_probe(1) AS m')")
+    dsn = os.environ["MNEMIQ_PG_DSN"]
+    schema = f"mnemiq_probe_{uuid.uuid4().hex[:12]}"
+
+    # Not wrapped in a skip. A DSN that is set but wrong, refused or pointing at a stopped
+    # server is a broken configuration, and the siblings fail on it rather than reporting a
+    # pass-shaped SKIPPED. The module-level skipif above covers the only case that is not an
+    # error: nobody configured a database at all.
+    admin = _duckdb.connect()
+    admin.execute("INSTALL postgres; LOAD postgres")
+    admin.execute(f"ATTACH '{dsn}' AS pg (TYPE POSTGRES)")
+
+    def pg(stmt: str) -> None:
+        admin.execute(f"CALL postgres_execute('pg', '{stmt}')")
+
     try:
-        adapter = DuckDBAdapter.postgres(dsn, read_only=True)
+        # Created before the adapter connects, so resolving the view cannot depend on the
+        # postgres extension re-querying a schema cache the adapter's own `USE` had populated.
+        pg(f"CREATE SCHEMA {schema}")
+        pg(f"CREATE FUNCTION {schema}.fn_probe(int) RETURNS int AS $x$ SELECT 99 $x$ LANGUAGE sql")
+        pg(f"CREATE VIEW {schema}.v_fn_probe AS SELECT {schema}.fn_probe(1) AS m")
+
+        adapter = DuckDBAdapter.postgres(dsn, schema="src", read_only=True)
         fns = adapter.user_functions()
 
         assert "fn_probe" not in fns, "a Postgres UDF is not callable here and must not be listed"
-        # ...and the reason it must not be listed: the query cannot reach it at all.
-        with pytest.raises(_duckdb.CatalogException):
-            adapter.execute("SELECT fn_probe(1)")
 
-        # The other half, and the reason the two licences are separate: through a view the same
+        # ...and the reason: the query cannot reach it. QUALIFIED, which matters. The function
+        # lives in the throwaway schema and the adapter's search path is `src.public`, so an
+        # UNqualified call raises CatalogException for being off the path whether or not a
+        # Postgres function is reachable -- the assertion would hold against a future extension
+        # whose binder does resolve them, which is precisely the case that would make
+        # `user_functions()` under-report. Qualified is also the form measured in the
+        # `user_functions` docstring.
+        with pytest.raises(_duckdb.CatalogException):
+            adapter.execute(f"SELECT src.{schema}.fn_probe(1)")
+
+        # The other half, and why the two licences are separate: through a view the same
         # function DOES run, server-side, and returns its value.
         #
         # No assertion on `FunctionInventory.of(fns)` here. It would read as Postgres coverage
         # and prove nothing -- the answer comes from the field's default, which the unit test
-        # already pins, so it holds for any `fns`. The guarantee that matters is that a PRODUCER
-        # never sets `covers_view_bodies=True` for this attachment, and no producer exists yet.
-        assert adapter.execute("SELECT m FROM src.public.v_fn_probe")[0][0] == 99
+        # already pins. The guarantee that matters is that a PRODUCER never sets
+        # `covers_view_bodies=True` for this attachment, and no producer exists yet.
+        assert adapter.execute(f"SELECT m FROM src.{schema}.v_fn_probe")[0][0] == 99
     finally:
-        con.execute("CALL postgres_execute('pg', 'DROP VIEW IF EXISTS v_fn_probe')")
-        con.execute("CALL postgres_execute('pg', 'DROP FUNCTION IF EXISTS fn_probe(int)')")
-        con.close()
+        # One statement, and it can only reach what this test made: the schema name is unique
+        # per run, so a leftover from a crashed run cannot be confused with a real object.
+        try:
+            pg(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        finally:
+            admin.close()
