@@ -313,7 +313,13 @@ def test_inventory_from_carries_the_failure_and_the_licence_through():
         def user_functions(self):
             return []
 
-    assert inventory_from(Silent()).certain_for_view_bodies is False
+    # Paired, like `Denies`. `certain_for_view_bodies is False` alone is also what a
+    # fail-closed read produces: move the attribute inside the `try` without a default and
+    # `Silent` raises AttributeError, becomes `unavailable`, and this still passes -- taking
+    # the downgrade with a false `function-inventory-unavailable` for every adapter that
+    # omits the property, which the protocol says is most of them.
+    silent = inventory_from(Silent())
+    assert silent.certain is True and silent.certain_for_view_bodies is False
 
     assert inventory_from(object()).asked is False, "an adapter without the method was never asked"
 

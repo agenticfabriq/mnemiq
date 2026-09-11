@@ -418,8 +418,10 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=No
         # downgraded the lineage of an otherwise plain query, so the marker appeared on nearly
         # every real answer and stopped meaning anything (issue #5). With one, it fires only on
         # a source this engine cannot clear: one that defines functions of its own, one that
-        # could not be asked, or a view body the answer does not cover. The sub-reason below
-        # is named just above -- see `calls_are_confirmable` for the leaks behind the coarseness.
+        # could not be asked, or a view body the answer does not cover. A `function-inventory-*`
+        # code accompanies this marker for every one of those but the first: a source that
+        # simply defines a helper carries this marker alone, because there is no second thing
+        # to say. See `calls_are_confirmable` for the leaks behind the coarseness.
         reasons.append("unconfirmed-function-identity")
 
     if not getattr(views, "available", True):

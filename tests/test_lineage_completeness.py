@@ -986,8 +986,9 @@ def test_the_trace_says_why_it_could_not_confirm():
     # A source that simply defines a helper gets the bare marker: nothing failed, nothing was
     # unasked, and the licence is not the reason.
     # `covers_view_bodies=False` on purpose. With True the fourth code's `not inventory.names`
-    # half is never consulted, so dropping it would leave the suite green -- and an attachment
-    # that defines a helper AND cannot cover bodies would then blame view bodies for the helper.
+    # half never decides the outcome -- the licence half is false either way -- so dropping it
+    # would leave the suite green, and an attachment that defines a helper AND cannot cover
+    # bodies would then blame view bodies for the helper.
     plain = _reasons(sql, inventory=FunctionInventory.of(["helper"], covers_view_bodies=False))
     assert "unconfirmed-function-identity" in plain
     assert not [r for r in plain if r.startswith("function-inventory-")]
