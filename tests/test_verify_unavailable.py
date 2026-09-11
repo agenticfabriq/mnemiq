@@ -4,7 +4,11 @@ The defect this closes is M89's product half. `SemanticJudge.score` fails open: 
 judge returns 1.0, and 1.0 is exactly what a judge returns when it APPROVES. So a verifier that was
 switched off produced answers indistinguishable from confidently-checked ones -- which is what
 happened for every reasoning model until the token budget was fixed, and what will happen again
-whenever the endpoint is down. The answer still goes out; only the claim about it changes.
+whenever the endpoint is down.
+
+The first fix changed only the claim and let the answer go out, which left `deep` -- the one mode
+that wires a judge -- handing back results stamped *not checked*. It now defers by default
+(issue #2), as a FAILURE rather than a deferral, because an outage in the deferral rate is M6.
 """
 import pyarrow as pa
 import pytest
@@ -18,8 +22,8 @@ from mnemiq.verify.verifier import Verifier
 class _Judge:
     """A SemanticJudge-shaped stub: it answers `read`, so the fact travels with the score."""
 
-    def __init__(self, score: float, falls_open: bool = False) -> None:
-        self._score, self._falls_open = score, falls_open
+    def __init__(self, score: float, falls_open: bool = False, why: str = "error") -> None:
+        self._score, self._falls_open, self._why = score, falls_open, why
         self.errors = self.unparsed = 0
 
     @property
@@ -29,7 +33,8 @@ class _Judge:
     def read(self, question, schema, sql, preview) -> JudgeRead:
         if self._falls_open:
             self.errors += 1
-            return JudgeRead(1.0, fell_open=True)   # the constant, identical in value to approval
+            # the constant, identical in value to approval
+            return JudgeRead(1.0, fell_open=True, reason=self._why)
         return JudgeRead(self._score, fell_open=False)
 
     def score(self, *a, **k) -> float:
@@ -253,3 +258,76 @@ def test_a_concurrent_request_failing_does_not_mislabel_one_that_was_judged():
     assert out["judged-but-slow"].layer == "judge", out["judged-but-slow"]
     assert out["judged-but-slow"].confidence == 0.95
     assert out["other"].layer == "judge_unavailable"
+
+
+def test_a_judge_outage_is_a_failure_and_not_a_deferral():
+    """M6, for the third time, and the enum marks the first two: `EXECUTION_FAILED` and
+    `MODEL_UNAVAILABLE` both say *NOT a deferral* where they are defined. A fail-closed verifier
+    is the third way something can happen TO us and be recorded as the engine abstaining.
+
+    The cost of getting it wrong is not abstract. `harness` grades a deferral on an answerable
+    case DEFERRED_WRONGLY, so a flaky judge would raise the measured deferral rate and lower EX
+    with nothing in the totals to say why -- readable only in `verify_layer`, case by case. And
+    on the wire `verification` means *the verifier declined to stand behind it*, a judgement
+    about the data, which an outage is not.
+    """
+    from mnemiq.contract.seams import DeferralReason
+
+    v = _verify(_Judge(1.0, falls_open=True))
+    assert v.defer is True and v.failed is True
+    assert v.code is DeferralReason.VERIFIER_UNAVAILABLE
+
+    scored_low = _verify(_Judge(0.1))
+    assert scored_low.defer is True and scored_low.failed is False
+    assert scored_low.code is DeferralReason.VERIFICATION
+
+
+def test_the_engine_records_the_outage_as_a_failure():
+    """The verdict carrying `failed` proves nothing about the engine reading it. This drives the
+    branch that builds the answer, because the mapping is where the two could come apart."""
+    from mnemiq.agent.loop import Agent
+    from mnemiq.contract.seams import DeferralReason
+
+    def run(judge):
+        agent = Agent.__new__(Agent)
+        agent.verifier = Verifier(threshold=0.5, sanity=False, judge=judge, fail_closed=True)
+        packet = ContextPacket(question="q", cards=[], grant_fingerprint="",
+                               enrichment_version=None)
+        answer, _ = agent._verified(packet=packet,
+                                    approved=Approved(plan_sql="SELECT 1", target_sql="SELECT 1"),
+                                    table=pa.table({"n": [1]}))
+        return answer
+
+    outage = run(_Judge(1.0, falls_open=True))
+    assert outage.failed is True and outage.deferred is False
+    assert outage.reason_code is DeferralReason.VERIFIER_UNAVAILABLE
+
+    judged = run(_Judge(0.1))
+    assert judged.failed is False and judged.deferred is True
+    assert judged.reason_code is DeferralReason.VERIFICATION
+
+
+@pytest.mark.parametrize("why, blames", [("error", "could not be reached"),
+                                         ("unparsed", "reply could not be read")])
+def test_the_two_fell_open_causes_do_not_share_a_sentence(why, blames):
+    """`JudgeRead.reason` splits them and the verifier flattened them back. `unparsed` is the
+    endpoint ANSWERING with a reply holding no confidence -- a model or a token budget, not
+    connectivity -- and telling an operator the judge was unreachable sends them to check the
+    network. That is the shape `test_llm_reasoning_budget` exists for, where a starved reasoning
+    model silently disabled the verifier for every answer."""
+    v = _verify(_Judge(1.0, falls_open=True, why=why))
+    assert blames in v.reason
+
+
+def test_the_eval_path_reads_the_same_switch():
+    """Two call sites build a verifier from settings and only one had a test. Dropping
+    `fail_closed=` in `eval/engine` left a sweep on the constructor default whatever the
+    deployment set, and nothing noticed, because reaching that line meant standing up an
+    adapter, a connection and an LLM client."""
+    from mnemiq.config import Settings
+    from mnemiq.eval.engine import verifier_from
+
+    for configured in (True, False):
+        s = Settings(llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d",
+                     acme_data_dir="a", verify_fail_closed=configured)
+        assert verifier_from(s, judge=None).fail_closed is configured

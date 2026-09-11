@@ -37,6 +37,12 @@ class DeferralReason(StrEnum):
     DISAGREEMENT = "disagreement"  # candidates diverged too much to pick one
     EXECUTION_FAILED = "execution_failed"  # the source rejected every attempt -- NOT a deferral
     MODEL_UNAVAILABLE = "model_unavailable"  # the model provider did not answer -- NOT a deferral
+    # The answer was produced and executed and then could not be CHECKED -- NOT a deferral, and
+    # kept apart from VERIFICATION for the reason that one exists: "the verifier declined to
+    # stand behind it" is a judgement about the data, and this is an outage on our side. Folding
+    # them together is M6 exactly, and a flaky judge would raise the measured deferral rate while
+    # the cause stayed readable only in `verify_layer`, case by case.
+    VERIFIER_UNAVAILABLE = "verifier_unavailable"
 
 
 class IdentityContext(BaseModel):

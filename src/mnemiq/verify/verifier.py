@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from mnemiq.contract.seams import DeferralReason
 from mnemiq.execute.render import render_result
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
@@ -10,6 +11,23 @@ from mnemiq.verify.verdict import VerifyVerdict
 
 def _cards_text(packet: ContextPacket) -> str:
     return "\n".join(c.card for c in packet.cards)
+
+
+def _unavailable_reason(why: str, stopping: bool) -> str:
+    """Say which failure it was, because the two send an operator to different places.
+
+    `JudgeRead` splits them and this used to flatten them back: `error` is the endpoint not
+    answering, and `unparsed` is the endpoint answering with a reply holding no confidence it
+    could read -- a model or a token budget, not connectivity. Blaming the network for the
+    second is the shape `test_llm_reasoning_budget` exists for, where a starved reasoning model
+    silently disabled the verifier for every answer.
+    """
+    cause = ("its reply could not be read" if why == "unparsed"
+             else "it could not be reached")
+    if stopping:
+        return (f"I could not check this answer -- {cause}, so I am not giving you a result "
+                "I cannot stand behind.")
+    return f"The verifier {cause}; this answer was not checked."
 
 
 class Verifier:
@@ -60,22 +78,19 @@ class Verifier:
             if reader is not None:
                 got = reader(packet.question, _cards_text(packet), approved.plan_sql,
                              render_result(table, max_rows=5))
-                c, fell_open = got.score, got.fell_open
+                c, fell_open, why = got.score, got.fell_open, got.reason
             else:
-                c, fell_open = self.judge.score(
+                c, fell_open, why = self.judge.score(
                     packet.question, _cards_text(packet), approved.plan_sql,
                     render_result(table, max_rows=5)
-                ), False
+                ), False, "ok"
             if fell_open:
                 # No score, because there was no judgement. The fail-open constant used to travel
                 # in this field and it reads as a confident pass -- M89's shape one field over,
                 # where the record said `judge_unavailable` and the number beside it said 1.0.
-                return VerifyVerdict(
-                    None, self.fail_closed,
-                    "I could not check this answer -- the verifier was unreachable, so I am not "
-                    "giving you a result I cannot stand behind."
-                    if self.fail_closed else
-                    "The verifier could not be reached; this answer was not checked.",
-                    "judge_unavailable")
+                return VerifyVerdict(None, self.fail_closed, _unavailable_reason(why,
+                                     self.fail_closed), "judge_unavailable",
+                                     failed=self.fail_closed,
+                                     code=DeferralReason.VERIFIER_UNAVAILABLE)
             return VerifyVerdict(c, c < self.threshold, "The result may not correctly answer the question.", "judge")
         return VerifyVerdict.passed()

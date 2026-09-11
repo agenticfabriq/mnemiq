@@ -34,14 +34,17 @@ def _prompt(question: str, schema: str, sql: str, preview: str) -> str:
 
 
 class SemanticJudge:
-    """One judge call scoring correctness confidence. Fail-open: an unreadable reply or a dead
-    endpoint returns 1.0, so the verifier degrades to today's answer-anyway behavior rather than
-    deferring everything."""
+    """One judge call scoring correctness confidence.
+
+    Fail-open HERE, and only here: an unreadable reply or a dead endpoint returns 1.0 with
+    `fell_open` set, so the float protocol the eval wrappers speak keeps working. What the
+    product then DOES about it is the `Verifier`'s call and the deployment's -- it defers by
+    default (issue #2). This class reports; it does not decide."""
 
     def __init__(self, client, max_tokens: int = 200) -> None:
         self._client = client
         self._max_tokens = max_tokens
-        # Fail-open is right for the product and ruinous for a MEASUREMENT: a dead endpoint scores
+        # Fail-open is the reporting default here and ruinous for a MEASUREMENT: a dead endpoint scores
         # every case 1.0, which is indistinguishable BY VALUE from a judge that approved everything
         # (`min(1.0, ...)` below clamps a real reply to the same number). These counters are a
         # running tally the eval harness reads at the end of a sweep, and nothing more: everything

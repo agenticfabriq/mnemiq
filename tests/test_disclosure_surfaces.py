@@ -145,11 +145,14 @@ def test_the_VERIFIER_DEFERRAL_carries_the_decision_it_has_no_trace_for():
 
     from mnemiq.agent.loop import Agent
     from mnemiq.contract.seams import Narrowed
+    from mnemiq.verify.verdict import VerifyVerdict
 
     approved = SimpleNamespace(narrowed=[Narrowed(object="claim", rows=True, columns=False)])
+    # A real verdict, not a namespace: this is a judge that SCORED LOW, and the fields that
+    # separate that from a judge that could not be reached carry defaults a stub would invent.
     deferring = SimpleNamespace(
-        verify=lambda packet, approved, table: SimpleNamespace(
-            defer=True, reason="not confident", confidence=0.1, layer="judge"))
+        verify=lambda packet, approved, table: VerifyVerdict(
+            0.1, True, "not confident", "judge"))
     agent = Agent.__new__(Agent)
     agent.verifier = deferring
 
