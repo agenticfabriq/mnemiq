@@ -119,6 +119,46 @@ class DuckDBAdapter:
             return []
         return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
 
+    def user_functions(self) -> list[str]:
+        """Function names this database defines itself, from `duckdb_functions()`.
+
+        `internal` is the discriminator, and it is the whole reason this is answerable here:
+        DuckDB marks its own 945 builtins `internal = true`, and anything a deployment adds --
+        a macro, a table macro -- comes back false. Measured on a fresh connection: `count` and
+        `median` are internal, a `CREATE MACRO` is not.
+
+        That settles the question parsing cannot. sqlglot types `median` as a builtin before the
+        source binds it, so a UDF wearing that name is invisible to the decider (M43's residual)
+        and forces lineage to decline certification on every call (issue #5).
+
+        Names only, unqualified, because both callers ask "is this name bound to something this
+        source defines" and a schema-qualified call resolves through the search path anyway.
+        Duplicates collapse: DuckDB lists one row per overload.
+
+        DuckDB's catalogue is the right one even for a Postgres attachment, which is not
+        obvious and was measured rather than assumed. Queries execute on `self._con`, and
+        DuckDB's binder resolves calls against its own catalogue: against a Postgres source
+        holding `CREATE FUNCTION median(int) RETURNS int AS $$ SELECT 99 $$`, `SELECT median(1)`
+        returned 1.0 from DuckDB's aggregate, and both `public.median(1)` and
+        `src.public.median(1)` failed to bind. A Postgres UDF is simply not reachable from a
+        generated query, so reporting DuckDB's non-internal names answers the question both
+        callers ask. An earlier version raised here on the theory that this catalogue was the
+        wrong one; it was throwing away a correct answer.
+
+        What that does NOT cover is a Postgres VIEW BODY. Reading `src.public.v_med`, whose body
+        calls that same function, returned 99 -- the function ran server-side, inside Postgres,
+        where DuckDB's binder never looked. Lineage walking view bodies is asking a different
+        question of a different catalogue, and wants `pg_proc`. Naming the gap here so the two
+        do not get conflated.
+
+        A failure RAISES, like `view_definitions`. Returning `[]` would tell the caller this
+        source defines nothing, which is a different claim from being unable to look.
+        """
+        rows = self._con.execute(
+            "SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE NOT internal"
+        ).fetchall()
+        return [r[0] for r in rows]
+
     def view_definitions(self) -> list[tuple[str, str, str]]:
         """(view, body, dialect) for every view in the source. A failure RAISES.
 
