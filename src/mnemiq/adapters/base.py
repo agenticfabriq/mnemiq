@@ -28,6 +28,16 @@ class SourceAdapter(Protocol):
     # look" into "there are none", which is the distinction FunctionInventory exists to keep.
     def user_functions(self) -> list[str]: ...
 
+    # The other half of the same catalogue: names this source considers its OWN builtins.
+    # Declared beside `user_functions` because the two are one question -- their INTERSECTION
+    # is what the decider needs, since a call can be reached under a name the query never
+    # spells only if that name is a builtin. Declaring it cannot ENFORCE the pairing, and the
+    # objection recorded under the flag below applies here too: no adapter but DuckDB's has
+    # either method. It is here to be read, not to bind, and what it says is what omitting it
+    # costs -- every source holding one macro refuses every query against it. Reached through
+    # `hasattr` at the call site. A failure RAISES, and raising is told apart from absence.
+    def builtin_functions(self) -> list[str]: ...
+
     # Whether `user_functions()` also answers for a VIEW BODY on this source. Read through
     # `getattr(adapter, ..., False)`, so an adapter that says nothing is taken not to cover them
     # -- forgetting yields the conservative answer. Deliberately NOT declared as a member here:

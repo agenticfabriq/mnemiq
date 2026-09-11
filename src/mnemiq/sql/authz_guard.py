@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
+from mnemiq.sql.functions import FunctionInventory, UnreadableCalls, called_names
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import base_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -86,6 +87,9 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     return None
 
 
+
+
+
 def _known_function_names() -> frozenset[str]:
     """Every function name sqlglot can model, in ANY dialect.
 
@@ -115,7 +119,11 @@ def _known_function_names() -> frozenset[str]:
 _KNOWN_FUNCTIONS = _known_function_names()
 
 
-def check_unmodelled_calls(ast: exp.Expression) -> Refusal | None:
+def check_unmodelled_calls(
+    ast: exp.Expression,
+    inventory: FunctionInventory | None = None,
+    *dialects: str,
+) -> Refusal | None:
     """Refuse a call this engine cannot model, because it cannot say what such a call reads.
 
     `check_access` re-checks every `exp.Table` against the identity's visible set, and the RLS
@@ -140,9 +148,26 @@ def check_unmodelled_calls(ast: exp.Expression) -> Refusal | None:
     and the decider's premise is that it sees every table a query reads. An opaque call makes
     that premise false, so the honest verdict is that this query cannot be decided.
 
-    Names, not identities: a UDF named `median` is modelled by sqlglot and passes here. That is
-    the acknowledged limit of any name-based allowlist, and it is bounded by the same
-    per-identity execution that dissolves M43 and M65 in v2.
+    The allowlist alone was names, not identities: a UDF named `median` is modelled by sqlglot
+    and passed. Measured through this function on the shipped default, with a macro in an
+    attached read-only DuckDB file, `SELECT median(id) FROM claim` was APPROVED with
+    `tables=['claim']` and returned an SSN from a table the identity was never granted. So did
+    `SELECT count(*) FROM claim`, against a macro named `count_star` -- a name that appears in
+    no spelling of that query, because it is DuckDB's binder name for `COUNT(*)`.
+
+    `inventory` closes that, in the two shapes the leak comes in. A call reachable under its
+    OWN name must be spelled, so `called_names` finds it however sqlglot rewrote the node, and
+    the refusal names it. A call reachable under a BUILTIN's name is not derivable at all, and
+    cannot happen unless the source defines a name a builtin also has -- so that case condemns
+    the whole SOURCE, every statement against it, whether or not anything here looks like a
+    call. `SELECT id + 1 FROM claim` was the measurement: no `exp.Func` node in it, `+` shadowed
+    by a macro, and an SSN in the result.
+
+    A third arrival, and it is the one that has to be written down rather than inferred: an
+    inventory that was ASKED and could not answer carries the same empty `names` as one that
+    answered "none", and reaches `_cannot_resolve` for it. `never_asked` does not, because that
+    is every fixture and the state the engine shipped in -- without an inventory this is the
+    allowlist alone, which is where it started.
     """
     for call in ast.find_all(exp.Anonymous):
         name = str(call.this)
@@ -157,4 +182,99 @@ def check_unmodelled_calls(ast: exp.Expression) -> Refusal | None:
             ),
             subject=name,
         )
+
+    inventory = inventory if inventory is not None else FunctionInventory.never_asked()
+    if inventory.asked and not inventory.available:
+        # Asked and could not answer, which is not the same as answering "none" -- and the
+        # empty `names` an `unavailable` inventory carries would otherwise fall through every
+        # test below and clear the statement. The collapse this type exists to prevent, in the
+        # guard written to use it: measured, a raising `user_functions()` on a source holding a
+        # `median` macro left `SELECT median(id) FROM claim` approved.
+        return _cannot_resolve(inventory)
+    if not inventory.names:
+        return None
+
+    if inventory.may_shadow_a_builtin:
+        # No `exp.Func` test in front of this, deliberately, and that absence is the fix for a
+        # leak this function's first version had. `exp.Add`, `exp.DPipe` and `exp.AtTimeZone`
+        # are not `exp.Func` subclasses, while DuckDB lists `+`, `||` and `timezone` as
+        # internal functions a macro can shadow -- measured, `SELECT id + 1 FROM claim` was
+        # APPROVED and returned an SSN with a `"+"` macro in the source. Enumerating the node
+        # types that bind to a catalogue entry is the blocklist this codebase keeps refusing to
+        # write; proving a statement CALL-FREE is as hard as naming its calls, so a source
+        # whose names cannot be trusted answers nothing.
+        return _cannot_resolve(inventory)
+
+    try:
+        called = called_names(ast, *dialects)
+    except UnreadableCalls:
+        # Cannot enumerate, so cannot clear. The same verdict as shadowing, and for the same
+        # reason -- an empty set read as "no calls" would clear all of them -- but its own
+        # sentence: this one is about THIS statement, and blaming the adapter for it would
+        # send the deployer to fix a catalogue method that is working.
+        return _cannot_resolve(inventory, unreadable=True)
+
+    for name in sorted(called & inventory.names):
+        return Refusal(
+            code=RefusalCode.UNMODELLED_CALL,
+            message=(
+                f"{name}() is defined by this source itself, so this engine cannot confirm "
+                "what the query reads. Answer using only the listed tables and columns and "
+                "standard SQL functions."
+            ),
+            subject=name,
+        )
     return None
+
+
+def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -> Refusal:
+    """Nothing here can be attributed, so nothing here can be decided.
+
+    Several ways to arrive, and each gets its OWN SENTENCE, because a refusal that sends the
+    reader to the wrong place is worse than a vague one. Sharing an owner is not enough to
+    share a sentence: two of these are the source failing, and "it would not name its builtins"
+    and "it would not name its own functions" are found by looking in different places.
+
+      * the source defines a name it also lists as a builtin -- the DEPLOYER renames it
+      * the adapter has no `builtin_functions` -- its AUTHOR implements it
+      * it has one and the call raised -- the SOURCE is the problem, and it may be transient
+      * `user_functions` itself raised -- likewise, and earlier
+      * this one statement would not render -- about the STATEMENT, not the source at all
+
+    Two of them were caught borrowing another's sentence, and both times the effect was to send
+    someone to fix working code. That is the failure this list is arranged against.
+    """
+    if unreadable:
+        return Refusal(
+            code=RefusalCode.UNRESOLVABLE_CALLS,
+            message=(
+                "This query could not be rendered, so this engine cannot confirm which "
+                "functions it asks the source for, and this source defines functions of its "
+                "own. Answer using only the listed tables and columns and standard SQL."
+            ),
+        )
+    if not inventory.available:
+        detail = "This source could not say which functions it defines"
+        shadowed = []
+    else:
+        shadowed = sorted(inventory.names & inventory.builtins) if inventory.builtins else []
+        if shadowed:
+            detail = f"This source defines {shadowed[0]!r} under a name it also lists as a builtin"
+        elif inventory.builtins_asked:
+            detail = (
+                "This source defines functions of its own and could not say which names are "
+                "its builtins"
+            )
+        else:
+            detail = (
+                "This source defines functions of its own and was never asked which names are "
+                "its builtins"
+            )
+    return Refusal(
+        code=RefusalCode.UNRESOLVABLE_CALLS,
+        message=(
+            f"{detail}, so this engine cannot confirm what this query executes against it. "
+            "No query can be decided against this source."
+        ),
+        subject=shadowed[0] if shadowed else None,
+    )

@@ -16,6 +16,13 @@ class RefusalCode(StrEnum):
     # A call this engine cannot model, so it cannot say what the query reads. Not
     # "a forbidden function" -- there is no list of those, and that is the point (M43).
     UNMODELLED_CALL = "unmodelled_call"
+    # Nothing here can be attributed, because this source's name resolution cannot be
+    # reproduced: it defines a name a builtin also has, it could not say, or -- once -- the
+    # statement would not render, which is the one arrival that is about the statement rather
+    # than the source. Kept apart from UNMODELLED_CALL because the two have opposite repairs:
+    # that one names a function to avoid, this one usually condemns every query against the
+    # source (M43's residual). `_cannot_resolve` is where the arrivals are told apart.
+    UNRESOLVABLE_CALLS = "unresolvable_calls"
     LOGIC_LINT = "logic_lint"
     VALUE_GROUNDING = "value_grounding"
     NOT_A_WRITE = "not_a_write"
@@ -66,6 +73,15 @@ REPAIRABLE = frozenset(
         # and the repair loop can rewrite that into arithmetic the engine does model.
         # Without this the guard's false positives become deferrals instead of retries.
         RefusalCode.UNMODELLED_CALL,
+        # UNRESOLVABLE_CALLS is deliberately absent. It condemns every statement against the
+        # source, not one function, so there is nothing for a rewrite to avoid and a retry loop
+        # would spend every attempt to reach the deferral it starts at. The fix belongs to the
+        # deployer, who sees this in the trace, not to the model.
+        #
+        # That is the INTENT. Nothing reads this set yet: `plan_query` retries every refusal but
+        # UNAUTHORIZED_TABLE, so today an unrepairable code is retried until the attempts run
+        # out and usually arrives as something else. Recorded rather than fixed here --
+        # wiring it changes the outcome of every code in the set, which wants its own measurement.
         RefusalCode.LOGIC_LINT,
         RefusalCode.VALUE_GROUNDING,
     }

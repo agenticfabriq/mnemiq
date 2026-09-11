@@ -207,11 +207,20 @@ def test_a_shadowing_macro_is_caught_however_the_call_is_spelled(sql, source_wit
     the written spelling, then the rendered one, then a count cross-check that read a column
     list as a call. They are kept as a regression set rather than as a spelling test -- nothing
     is looked up by name now, so what they demonstrate is that a source defining anything
-    downgrades whatever the query says. Renaming the macros would leave them green, which is
-    the point: the rule no longer depends on the spelling that defeated three versions.
+    stops the call being cleared, whatever the query says. Renaming the macros would leave them
+    green, which is the point: the rule no longer depends on the spelling that defeated three
+    versions.
+
+    They used to be APPROVED and carry a lineage marker, which reported the doubt and then ran
+    the query anyway. Both macros here are named after builtins, so the decider now refuses.
     """
-    lineage = _lineage_through_decide(sql, DuckDBAdapter.duckdb(source_with_a_shadowing_macro))
-    assert "unconfirmed-function-identity" in lineage.reasons
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.verdict import RefusalCode
+
+    verdict = decide(sql, {"customer": {"id", "name"}},
+                     adapter=DuckDBAdapter.duckdb(source_with_a_shadowing_macro),
+                     dialect="duckdb", target="duckdb")
+    assert getattr(verdict, "code", None) is RefusalCode.UNRESOLVABLE_CALLS, verdict
 
 
 @pytest.mark.parametrize("sql", [
@@ -444,3 +453,244 @@ def test_a_postgres_udf_is_unreachable_from_a_query_and_absent_from_the_answer()
                 pg(f"DROP SCHEMA {schema} CASCADE")
         finally:
             admin.close()
+
+
+# --------------------------------------------------------------------------------------------
+# The DECIDER half. Lineage reports doubt and the query still runs; this is the gate. Everything
+# below was measured as a leak first: on a source with a macro reading an ungranted table, both
+# `SELECT count(*) FROM claim` and `SELECT median(id) FROM claim` were APPROVED with
+# `tables=['claim']` and returned an SSN.
+# --------------------------------------------------------------------------------------------
+
+
+def _source(*macros, name="src.duckdb", read_only=True):
+    path = os.path.join(tempfile.mkdtemp(), name)
+    con = duckdb.connect(path)
+    con.execute("CREATE TABLE secret(ssn VARCHAR)")
+    con.execute("INSERT INTO secret VALUES ('123-45-6789')")
+    con.execute("CREATE TABLE claim(id INTEGER, name VARCHAR, ts TIMESTAMP)")
+    con.execute("INSERT INTO claim VALUES (1, 'a', TIMESTAMP '2020-01-01'), (2, 'b', NULL)")
+    for macro in macros:
+        con.execute(macro)
+    con.close()
+    return DuckDBAdapter.duckdb(path, read_only=read_only)
+
+
+def _verdict(sql, adapter):
+    from mnemiq.sql.decide import decide
+
+    return decide(sql, {"claim": {"id", "name", "ts"}}, adapter=adapter,
+                  dialect="duckdb", target="duckdb")
+
+
+def _code(verdict):
+    return getattr(getattr(verdict, "code", None), "value", None)
+
+
+def test_a_macro_named_after_a_builtin_stops_the_source_being_decided_at_all():
+    """`count_star` is DuckDB's binder name for `COUNT(*)`, and it appears in no spelling of
+    `SELECT count(*) FROM claim` under any dialect. Measured before this: that query was
+    approved and returned an SSN from `secret`.
+
+    The refusal covers the whole SOURCE, not the calls anything can find in the statement. The
+    first version stopped at `find_all(exp.Func)`, which reads a plain `SELECT id FROM claim`
+    as call-free and is right, and reads `SELECT id + 1 FROM claim` as call-free and is wrong:
+    `exp.Add` is not an `exp.Func`, DuckDB lists `+` as an internal function, and with a `"+"`
+    macro that query was APPROVED and returned the SSN. Enumerating the node types that reach
+    the catalogue is the blocklist this codebase refuses to write, so the coarse answer is the
+    honest one -- a source whose names cannot be trusted answers nothing.
+    """
+    adapter = _source("CREATE MACRO count_star() AS (SELECT max(ssn) FROM secret)")
+
+    leak = _verdict("SELECT count(*) AS n FROM claim", adapter)
+    assert _code(leak) == "unresolvable_calls", leak
+    assert "count_star" in leak.message
+
+    assert _code(_verdict("SELECT median(id) AS m FROM claim", adapter)) == "unresolvable_calls"
+    assert _code(_verdict("SELECT id FROM claim", adapter)) == "unresolvable_calls"
+
+
+@pytest.mark.parametrize("sql, macro", [
+    ("SELECT id + 1 AS x FROM claim", 'CREATE MACRO "+"(a, b) AS (SELECT max(ssn) FROM secret)'),
+    ("SELECT name || 'x' AS x FROM claim", 'CREATE MACRO "||"(a, b) AS (SELECT max(ssn) FROM secret)'),
+    ("SELECT ts AT TIME ZONE 'UTC' AS t FROM claim",
+     "CREATE MACRO timezone(a, b) AS (SELECT max(ssn) FROM secret)"),
+])
+def test_an_operator_is_a_catalogue_call_too(sql, macro):
+    """Three shapes with no `exp.Func` node anywhere, each APPROVED and each returning an SSN.
+
+    `exp.Add`, `exp.DPipe` and `exp.AtTimeZone` are not function nodes, and `+`, `||` and
+    `timezone` are all `internal` in `duckdb_functions()`, so all three are shadowable. They
+    are the measurement behind refusing per-source rather than per-call: three node types were
+    found by looking, which says nothing about how many are left.
+    """
+    adapter = _source(macro, name="ops.duckdb")
+    assert _code(_verdict(sql, adapter)) == "unresolvable_calls", sql
+
+
+def test_a_macro_the_engine_actually_binds_is_refused_by_the_name_it_binds():
+    """The other half, and the one that keeps the first from swallowing it.
+
+    `add_days` is a name sqlglot models -- so the cross-dialect allowlist passes it -- and NOT a
+    DuckDB builtin, so nothing shadows and the coarse rule stays quiet. It survives rendering,
+    which is what makes it reachable: measured, `SELECT add_days(id) FROM claim` returned an SSN
+    on this source. 440 names sqlglot knows are reachable this way.
+
+    `count(*)` against the same source is approved, which is the whole reason both rules exist
+    instead of the coarse one alone.
+    """
+    adapter = _source("CREATE MACRO add_days(x) AS (SELECT max(ssn) FROM secret)")
+
+    refusal = _verdict("SELECT add_days(id) AS n FROM claim", adapter)
+    assert _code(refusal) == "unmodelled_call", refusal
+    assert "defined by this source itself" in refusal.message
+    assert refusal.subject == "add_days"
+
+    assert not hasattr(_verdict("SELECT count(*) AS n FROM claim", adapter), "code")
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT count(*) AS n FROM claim",
+    "SELECT median(id) AS m FROM claim",
+    "SELECT date_trunc('day', CURRENT_DATE) AS d",
+    "SELECT CAST(id AS VARCHAR) AS s FROM claim",
+])
+def test_a_helper_that_shadows_nothing_costs_nothing(sql):
+    """The degeneracy control. A source with a macro of its own, named after nothing, keeps
+    answering every ordinary question.
+
+    This is what fails if `builtin_functions` reads the wrong half of `duckdb_functions()`:
+    the user names would then intersect themselves, every source with any macro would look
+    like a shadowing one, and all four of these would be refused.
+    """
+    adapter = _source("CREATE MACRO commission_rate(x) AS (x * 0.05)")
+    assert not hasattr(_verdict(sql, adapter), "code"), sql
+
+
+def test_the_two_catalogue_halves_are_one_query_split_on_internal():
+    """`builtin_functions` is `user_functions` with the predicate flipped, and the intersection
+    of the two is the whole question. Asserting the flag on the adapter is not enough -- what
+    matters is that the macro lands on one side and DuckDB's own names on the other."""
+    adapter = _source("CREATE MACRO commission_rate(x) AS (x * 0.05)")
+    user, builtin = set(adapter.user_functions()), set(adapter.builtin_functions())
+
+    assert user == {"commission_rate"}
+    assert {"count_star", "median", "length"} <= builtin
+    assert not user & builtin
+
+    shadowing = _source("CREATE MACRO median(x) AS (SELECT max(ssn) FROM secret)")
+    assert set(shadowing.user_functions()) & set(shadowing.builtin_functions()) == {"median"}
+
+
+def test_an_adapter_that_cannot_say_what_a_builtin_is_gets_the_conservative_answer():
+    """`builtin_functions` may be omitted, and omitting it must cost answers rather than
+    soundness. An adapter offering the other half alone has every statement against such a
+    source declined, because a binder rename it cannot rule out is exactly the leak this is
+    about -- expensive, and in the safe direction.
+
+    A source that defines NOTHING is untouched either way, which is what keeps the conservative
+    default off every ordinary database.
+    """
+    from mnemiq.sql.functions import inventory_from
+
+    class HalfAnswering:
+        def user_functions(self):
+            return ["commission_rate"]
+
+    class Angry(HalfAnswering):
+        def builtin_functions(self):
+            raise RuntimeError("no catalogue for you")
+
+    class Plain:
+        def user_functions(self):
+            return []
+
+    assert inventory_from(HalfAnswering()).builtins is None
+    assert inventory_from(HalfAnswering()).may_shadow_a_builtin is True
+    assert inventory_from(Angry()).may_shadow_a_builtin is True
+    assert inventory_from(Plain()).may_shadow_a_builtin is False
+
+    # ...and the two are told apart, because the refusal names a different owner for each.
+    # Both leave `builtins` None, so without this flag an adapter whose catalogue call RAISED
+    # is told to implement the method it already implemented.
+    assert inventory_from(HalfAnswering()).builtins_asked is False
+    assert inventory_from(Angry()).builtins_asked is True
+
+    # An answer implies the question, whoever built the instance. Nothing in the product can
+    # reach the contradictory state today, which is exactly why it would survive unnoticed
+    # until something could.
+    assert FunctionInventory.of(["x"], builtins=[]).builtins_asked is True
+    assert FunctionInventory.of(["x"], builtins=[], builtins_asked=False).builtins_asked is True
+
+    from mnemiq.sql.authz_guard import check_unmodelled_calls
+
+    ast = __import__("sqlglot").parse_one("SELECT count(*) FROM claim", read="duckdb")
+    assert "never asked" in check_unmodelled_calls(
+        ast, inventory_from(HalfAnswering()), "duckdb").message
+    assert "could not say which names" in check_unmodelled_calls(
+        ast, inventory_from(Angry()), "duckdb").message
+
+
+def test_a_source_that_could_not_be_asked_is_not_a_source_that_defines_nothing():
+    """`unavailable` carries empty `names`, which every test in the guard below it would read
+    as "defines nothing" and clear. Measured on the first version: with a raising
+    `user_functions()`, `SELECT median(id) FROM claim` came back approved on a source holding a
+    `median` macro -- the collapse `FunctionInventory` exists to prevent, in the guard written
+    to use it.
+
+    `never_asked` is the other empty answer and must stay permissive: no adapter, or an adapter
+    without the method, is every fixture in this suite and the state the engine shipped in.
+    """
+    import sqlglot
+
+    from mnemiq.sql.authz_guard import check_unmodelled_calls
+
+    ast = sqlglot.parse_one("SELECT median(id) FROM claim", read="duckdb")
+    refused = check_unmodelled_calls(ast, FunctionInventory.unavailable("RuntimeError"), "duckdb")
+    assert refused is not None and refused.code.value == "unresolvable_calls"
+    assert "RuntimeError" not in refused.message, "the reason is for the trace, not the model"
+
+    # Distinguished from the OTHER source failure, not merely non-empty. Both sentences begin
+    # "could not say", so asserting that substring alone let the two be swapped: a source that
+    # would not list its builtins and one that would not list its own functions are found by
+    # looking in different places, and the sentence is the only thing that says which.
+    could_not_name_builtins = check_unmodelled_calls(
+        ast, FunctionInventory.of(["median"], builtins_asked=True), "duckdb")
+    assert "which functions it defines" in refused.message
+    assert "which names are its builtins" in could_not_name_builtins.message
+    assert refused.message != could_not_name_builtins.message
+
+    assert check_unmodelled_calls(ast, FunctionInventory.never_asked(), "duckdb") is None
+
+
+def test_the_write_path_asks_the_same_source_the_same_question():
+    """`decide_write` called the guard without an inventory, so the two paths disagreed about
+    the same source in the same deployment: a read of `median(id)` was refused while an UPDATE
+    computing the same value was approved, and a write persists what it read into a granted
+    table that every later plain SELECT returns.
+
+    The ordinary write beside it is the control. Without one this asserts only that the write
+    path refuses everything, which is what a wrong grant set looks like.
+    """
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.sql.decide_write import decide_write
+    from mnemiq.sql.policy import AccessPolicy
+
+    def write(sql, adapter):
+        return decide_write(
+            sql, {"claim": {"id", "name", "ts"}},
+            GrantSet(frozenset({"claim"}), writable=frozenset({"claim"})),
+            policy=AccessPolicy(), adapter=adapter, dialect="duckdb", target="duckdb",
+            writes_enabled=True,
+        )
+
+    shadowing = _source("CREATE MACRO count_star() AS (SELECT max(ssn) FROM secret)")
+    assert _code(write("UPDATE claim SET id = 2 WHERE id = 1", shadowing)) == "unresolvable_calls"
+
+    # Writable, because the control has to reach `prove`, and EXPLAIN on a write is refused by
+    # a read-only attach -- which would make it pass for the wrong reason.
+    named = _source("CREATE MACRO add_days(x) AS (SELECT max(ssn) FROM secret)",
+                    name="w.duckdb", read_only=False)
+    leak = write("UPDATE claim SET name = add_days(id) WHERE id = 1", named)
+    assert _code(leak) == "unmodelled_call", leak
+    assert not hasattr(write("UPDATE claim SET id = 2 WHERE id = 1", named), "code")

@@ -182,6 +182,33 @@ class DuckDBAdapter:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def builtin_functions(self) -> list[str]:
+        """The other half of `duckdb_functions()`: names this engine considers its own.
+
+        Only ever used to intersect with `user_functions()`, and that intersection is the set of
+        names a call can reach WITHOUT the query spelling them. Measured on an attached
+        read-only DuckDB file holding `CREATE MACRO count_star() AS (SELECT ssn FROM secret)`:
+        `SELECT count(*) FROM claim` returned the SSN. `count_star` is DuckDB's binder name for
+        `COUNT(*)` and appears in no spelling of that query, in any dialect -- and it could only
+        be reached because `count_star` is a builtin. A macro named `safe_helper` has no such
+        route, which is why the intersection and not the mere presence of macros is the test.
+
+        The same catalogue query as `user_functions`, so the two partitions are of one table and
+        cannot disagree about what `internal` means. Two round trips rather than one because
+        `user_functions` shipped first and its callers do not all want this; the window between
+        them is the same staleness a single query already has against a source someone is
+        editing.
+
+        A failure RAISES, like its sibling, and `inventory_from` turns that into "builtins not
+        known". Know what that costs before omitting this method: a source with any user
+        function at all then has every read AND every write against it refused. It is the
+        conservative reading and it is not a soft one.
+        """
+        rows = self._con.execute(
+            "SELECT DISTINCT lower(function_name) FROM duckdb_functions() WHERE internal"
+        ).fetchall()
+        return [r[0] for r in rows]
+
     def view_definitions(self) -> list[tuple[str, str, str]]:
         """(view, body, dialect) for every view in the source. A failure RAISES.
 

@@ -6,6 +6,7 @@ from sqlglot import exp
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import ViewDefinition
 from mnemiq.sql.authz_guard import check_access, check_unmodelled_calls
+from mnemiq.sql.functions import inventory_from
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove
@@ -217,7 +218,12 @@ def decide_write(
     # amount = pg_read_file('/etc/passwd') WHERE id = 1` and `INSERT INTO claim (id, amount)
     # SELECT customer_rows(), 1` were both APPROVED with tables=['claim'] -- the same audit lie,
     # and here it persists what it read into a table.
-    opaque = check_unmodelled_calls(shaped)
+    # The inventory too, or the two paths diverge on the same source: without it this is the
+    # allowlist alone, so a macro named `length` or `count_star` could feed an approved UPDATE
+    # that stores what it read into a granted table. Both dialects, as on the read path: the
+    # guard renders to find the names the source will be asked for, and `target` has already
+    # been defaulted to `dialect` at the top of this function.
+    opaque = check_unmodelled_calls(shaped, inventory_from(adapter), dialect, target)
     if opaque is not None:
         return opaque
 

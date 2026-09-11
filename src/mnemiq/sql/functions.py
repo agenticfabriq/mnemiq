@@ -2,17 +2,26 @@
 
 The engine cannot tell a builtin from a same-named user-defined function by parsing. sqlglot
 types `log` as a builtin before the source binds it, so a UDF called `log` is invisible, and two
-separate controls settle for less because of it: `lineage` marks ANY call unconfirmable (issue
-#5, which makes the marker fire on `count(*)` and so on nearly every real query), and
-`check_unmodelled_calls` allows any name sqlglot models, so a UDF called `median` passes (M43's
-open residual).
+separate controls settled for less because of it: `lineage` marked ANY call unconfirmable (issue
+#5, which made the marker fire on `count(*)` and so on nearly every real query), and
+`check_unmodelled_calls` allowed any name sqlglot models, so a UDF called `median` passed and
+returned an SSN from an ungranted table (M43's residual).
 
-Both want the same fact from the same place: which names on THIS source are not builtins.
+Both want the same fact from the same place: which names on THIS source are not builtins. They
+then ask it differently, and the difference is not an inconsistency. Lineage REPORTS, so the
+cheapest sound rule is right for it: any user function at all means no call is confirmable.
+The decider REFUSES, so the same rule would end the product on a source with one macro -- it
+splits the question instead, into the names a statement is written to ask for
+(`called_names`) and the names a binder can substitute without being asked
+(`may_shadow_a_builtin`).
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+
+from sqlglot import exp
 
 
 @dataclass(frozen=True)
@@ -62,6 +71,25 @@ class FunctionInventory:
     # its catalogue covers view bodies says so; forgetting yields the conservative answer, which
     # is the inversion `writes_enabled` took in M3 and `unrecognised_source` took for shapes.
     covers_view_bodies: bool = False
+    # What the source calls a BUILTIN, or None for "never asked". Only used to answer one
+    # question -- whether any name in `names` shadows one -- and that question is what makes a
+    # call's true binding underivable from the text. Measured: with a macro named `count_star`
+    # in an attached read-only DuckDB file, `SELECT count(*) FROM claim` returned an SSN from an
+    # ungranted table. `count_star` appears in no spelling of that query, in no dialect, because
+    # it is the BINDER's name for `COUNT(*)`. A macro can only be reached that way if its name
+    # is a builtin, so the intersection is exactly the set of sources where names cannot be
+    # trusted at all.
+    #
+    # `None`, not an empty frozenset, for the reason the type exists: an empty answer would
+    # assert "this source shadows nothing", which is the absence-and-failure collapse in the
+    # one place it would fail open. Defaulting to None makes forgetting conservative.
+    builtins: frozenset[str] | None = None
+    # Whether anyone PUT the builtin question, which `builtins is None` cannot carry: an
+    # adapter with no `builtin_functions` and one whose call raised both leave it None. The
+    # same split as `available` and `asked` above, one level down, and it exists for the same
+    # reason -- the refusal names a different owner for each, and telling an adapter author to
+    # implement a method they already implemented sends them to fix working code.
+    builtins_asked: bool = False
 
     def __post_init__(self) -> None:
         # Normalised HERE, not only in `of()`. A dataclass hands out its plain constructor
@@ -78,6 +106,15 @@ class FunctionInventory:
         if isinstance(names, str):
             names = [names]
         object.__setattr__(self, "names", frozenset(n.lower() for n in names))
+        builtins = self.builtins
+        if builtins is not None:
+            # An answer implies the question. Without this the constructor can build "the
+            # catalogue answered, but nobody asked", which the field's own comment forbids and
+            # which a later reader would take at face value.
+            object.__setattr__(self, "builtins_asked", True)
+            if isinstance(builtins, str):
+                builtins = [builtins]
+            object.__setattr__(self, "builtins", frozenset(b.lower() for b in builtins))
 
     @classmethod
     def of(cls, names, **kw) -> "FunctionInventory":
@@ -120,6 +157,27 @@ class FunctionInventory:
         """The same licence, for a call found inside a view body rather than the query."""
         return self.certain and self.covers_view_bodies
 
+    @property
+    def may_shadow_a_builtin(self) -> bool:
+        """Whether some call here could bind to a user function under a name the SQL never says.
+
+        A user function is reachable in two ways. Under its own name, which the statement must
+        then spell, so enumerating the names a statement calls finds it. Or under a builtin's
+        name, where the engine's binder supplies a name the statement never contains -- DuckDB
+        turns `COUNT(*)` into `count_star`, and a macro called `count_star` collects the call.
+        Only the second is underivable, and only a name that IS a builtin can be reached that
+        way. So this is the whole question of whether names can be trusted on this source.
+
+        Three answers rather than two. Nothing defined, nothing to shadow. Builtins never
+        asked, so assume the worst -- but only for a source that defines something, which keeps
+        the conservative default off every source that has no user functions at all.
+        """
+        if not self.names:
+            return False
+        if self.builtins is None:
+            return True
+        return bool(self.names & self.builtins)
+
 
 def inventory_from(adapter) -> FunctionInventory:
     """Ask an adapter what it defines, in the one place, so two callers cannot drift.
@@ -129,7 +187,8 @@ def inventory_from(adapter) -> FunctionInventory:
     snapshot holds the body governance was reasoned about, and a body that drifted since is a
     governance change worth noticing. A function list is not policy, it is what names mean --
     and a UDF created since the snapshot would read as a builtin, failing open in exactly the
-    direction M43 is about. Measured at ~6ms against queries that take seconds.
+    direction M43 is about. Measured at ~13ms against queries that take seconds -- two scans of
+    `duckdb_functions()`, one per half.
 
     Three answers, matching the three the type keeps apart. An adapter with no `user_functions`
     was never asked. One that raises was asked and could not answer. Anything else is an answer,
@@ -143,9 +202,36 @@ def inventory_from(adapter) -> FunctionInventory:
         # The TYPE, not the message. A source's exception text is made of the caller's schema
         # and can carry a DSN, and this reason reaches an audit record (M94).
         return FunctionInventory.unavailable(type(exc).__name__)
+    builtins, builtins_asked = _builtins_from(adapter)
     return FunctionInventory.of(
-        names, covers_view_bodies=getattr(adapter, "functions_cover_view_bodies", False)
+        names,
+        covers_view_bodies=getattr(adapter, "functions_cover_view_bodies", False),
+        builtins=builtins,
+        builtins_asked=builtins_asked,
     )
+
+
+def _builtins_from(adapter) -> tuple[frozenset[str] | None, bool]:
+    """The source's own builtin catalogue and whether the question was put at all.
+
+    Separate from `user_functions` because a consumer that never asks still gets the
+    conservative answer out of `may_shadow_a_builtin` -- soundness does not depend on it. What
+    depends on it is whether the source can answer anything at all: without this, a source
+    holding one macro has every read and every write against it refused. Optional in the sense
+    that omitting it cannot open a hole, not in the sense that omitting it is cheap -- the
+    refusal is classified unrepairable, and until something reads `REPAIRABLE` the caller pays
+    for retries that cannot succeed rather than getting one clean refusal.
+    """
+    if adapter is None or not hasattr(adapter, "builtin_functions"):
+        return None, False
+    try:
+        return frozenset(n.lower() for n in adapter.builtin_functions()), True
+    except Exception:
+        # No reason string, unlike the `user_functions` failure -- that one changes what the
+        # inventory MEANS, while this lands on the default the field already has. The fact that
+        # it was ASKED is kept, though: it is the difference between an adapter that has not
+        # implemented this and one whose source would not answer, and the refusal says which.
+        return None, True
 
 
 def calls_are_confirmable(inventory: FunctionInventory, *, in_view_body: bool) -> bool:
@@ -176,3 +262,53 @@ def calls_are_confirmable(inventory: FunctionInventory, *, in_view_body: bool) -
     """
     licensed = inventory.certain_for_view_bodies if in_view_body else inventory.certain
     return licensed and not inventory.names
+
+
+# An identifier immediately before an open paren. Deliberately crude: it over-collects, and
+# over-collecting is the safe direction for the one use it has. `FROM customer AS c(id, name)`
+# yields `c`, which costs nothing unless the source also defines a function called `c` -- in
+# which case refusing is right anyway. An earlier attempt used a scan like this to CLEAR calls
+# by counting them, where the same over-collection was a leak (M56).
+_CALLED = re.compile(r"([A-Za-z_][A-Za-z_0-9$]*)\s*\(")
+
+
+class UnreadableCalls(Exception):
+    """The statement could not be rendered, so its call names could not be enumerated."""
+
+
+def called_names(ast: exp.Expression, *dialects: str) -> frozenset[str]:
+    """Every function name the SOURCE will see when this statement runs.
+
+    Read off the RENDERED statement, not the tree and not the model's text, because rendering
+    is what the source is handed: `decide` approves an AST and `target_sql` is generated from
+    it. Three earlier attempts got this wrong in the other direction and each leaked an SSN --
+    the written spelling is not what executes, `len(name)` arrives as `LENGTH(name)`.
+
+    Not the tree, because a node loses the word. `date_trunc(...)` parses to
+    `exp.TimestampTrunc`, whose declared names are `timestamp_trunc` and `trunc`, and renders
+    back to `DATE_TRUNC(...)`. Only the text has the name the binder will resolve.
+
+    A weaker question than the one those attempts failed at, and that is what makes it safe.
+    They asked which name a call BINDS to, so a missing spelling cleared a UDF. This asks which
+    names the source is asked for, so a missing spelling can only over-refuse -- and the one
+    thing text cannot show, the binder's own renames (`COUNT(*)` to `count_star`, `EXTRACT` to
+    `date_part`), is covered by `may_shadow_a_builtin` instead, because a rename can only ever
+    land on a builtin's name.
+
+    Rendered once per dialect given: the parse dialect and the execution target can spell the
+    same node differently, and more names can only over-refuse. Raises `UnreadableCalls` when
+    none of them renders, rather than returning an empty set -- a caller reading that as "no
+    calls" would clear every one of them.
+    """
+    found: set[str] = set()
+    rendered = False
+    for dialect in dialects or (None,):
+        try:
+            text = ast.sql(dialect=dialect) if dialect else ast.sql()
+        except Exception:
+            continue
+        rendered = True
+        found.update(m.lower() for m in _CALLED.findall(text))
+    if not rendered:
+        raise UnreadableCalls(type(ast).__name__)
+    return frozenset(found)
