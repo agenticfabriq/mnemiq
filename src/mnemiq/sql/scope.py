@@ -290,10 +290,12 @@ def candidate_tables(
 ) -> set[str]:
     """The base table(s) a column could belong to.
 
-    Lives here, with the other scope resolution, because three guards need the same answer:
-    `check_cls`, `check_access`'s column half, and `check_opaque_columns`. The last one had its
-    own flat alias map for one commit, keyed on the written case, and let `SELECT Q.leaked FROM
-    vc_t Q` through while refusing the lowercase spelling.
+    Lives here, with the other scope resolution, because two guards need the same answer --
+    `check_cls` and `check_opaque_columns` -- and the second had its own flat alias map for one
+    commit, keyed on the written case, which let `SELECT Q.leaked FROM vc_t Q` through while
+    refusing the lowercase spelling. `check_access` resolves columns from `column_tables`
+    directly rather than through this, which is a third copy of the same idea and worth knowing
+    about before a fourth is written.
 
     Qualified -> the table its alias names IN ITS OWN SCOPE, which is why this takes a
     per-node map rather than a name->table dictionary: one alias can mean two tables in one

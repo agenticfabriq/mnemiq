@@ -50,9 +50,12 @@ class SourceAdapter(Protocol):
     # omits it reports nothing and the decider learns nothing, which is where every adapter
     # shipped. The EXPRESSION comes back rather than a verdict: whether it is opaque depends on
     # this source's function inventory, and that judgement belongs in the decider. A failure
-    # RAISES, and `opaque_columns` reads a raise as "nothing known" rather than "none exist" --
-    # the one place in this family where the permissive reading is right, because `check_access`
-    # still stands over the same column. DuckDB needs none: a generated column whose expression
+    # RAISES, and `opaque_columns` turns that into None -- asked and could not answer -- which
+    # the guard REFUSES on. It read a raise as "none exist" for one commit, on the argument that
+    # `check_access` still stands over the same column; that is backwards, since `check_access`
+    # passes a column the snapshot lists and that is the whole reason the guard exists. Measured
+    # on that version: with the method raising, `SELECT leaked FROM vc_t` was approved.
+    # DuckDB needs none: a generated column whose expression
     # holds a subquery is refused at bind time, so a macro reachable there cannot read a table.
     def virtual_columns(self) -> list[tuple[str, str, str]]: ...
 
