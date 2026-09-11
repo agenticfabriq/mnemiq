@@ -119,3 +119,60 @@ class FunctionInventory:
     def certain_for_view_bodies(self) -> bool:
         """The same licence, for a call found inside a view body rather than the query."""
         return self.certain and self.covers_view_bodies
+
+
+def inventory_from(adapter) -> FunctionInventory:
+    """Ask an adapter what it defines, in the one place, so two callers cannot drift.
+
+    LIVE, not from the snapshot, which is where `inventory_for(views)` reads. The two differ
+    because their staleness fails in opposite directions. A view body is policy content: the
+    snapshot holds the body governance was reasoned about, and a body that drifted since is a
+    governance change worth noticing. A function list is not policy, it is what names mean --
+    and a UDF created since the snapshot would read as a builtin, failing open in exactly the
+    direction M43 is about. Measured at ~6ms against queries that take seconds.
+
+    Three answers, matching the three the type keeps apart. An adapter with no `user_functions`
+    was never asked. One that raises was asked and could not answer. Anything else is an answer,
+    including an empty one.
+    """
+    if adapter is None or not hasattr(adapter, "user_functions"):
+        return FunctionInventory.never_asked()
+    try:
+        names = adapter.user_functions()
+    except Exception as exc:
+        # The TYPE, not the message. A source's exception text is made of the caller's schema
+        # and can carry a DSN, and this reason reaches an audit record (M94).
+        return FunctionInventory.unavailable(type(exc).__name__)
+    return FunctionInventory.of(
+        names, covers_view_bodies=getattr(adapter, "functions_cover_view_bodies", False)
+    )
+
+
+def calls_are_confirmable(inventory: FunctionInventory, *, in_view_body: bool) -> bool:
+    """Whether a call in this statement can be taken for a builtin.
+
+    ONE question about the SOURCE, not one per call, and that is the whole design. Three earlier
+    attempts tried to name each call and match it against the catalogue. Each leaked, because a
+    call's bound name is not recoverable from the text or the tree:
+
+      * as WRITTEN misses what executes -- `len(name)` reaches the source as `LENGTH(name)` and
+        bound a macro named `length`
+      * as RENDERED misses what the engine itself renames -- DuckDB binds `count(*)` to
+        `count_star`, `EXTRACT(...)` to `date_part` and `CURRENT_DATE` to `current_date()`, none
+        of which appear in sqlglot's output
+      * and a VIEW BODY binds as WRITTEN, since the source stored that text, so the rendering
+        argument inverts for bodies
+
+    Each returned COMPLETE over a macro reading another table. M56, three times, from one wrong
+    assumption -- which is why this stopped being patched and changed shape instead.
+
+    The question is not "which name is this call" but "could any call here be a UDF". If the
+    source defines no functions of its own, no call can be one, however it is spelled. If it
+    defines any, this engine cannot say which call is which, and says so.
+
+    Cruder than per-call matching, and sound, which the precise version was not. The cost is
+    that a source defining one unrelated helper downgrades every answer. The benefit is that no
+    spelling, rename or dialect quirk can make a UDF read as a builtin.
+    """
+    licensed = inventory.certain_for_view_bodies if in_view_body else inventory.certain
+    return licensed and not inventory.names

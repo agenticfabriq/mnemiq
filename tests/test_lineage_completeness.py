@@ -179,7 +179,7 @@ def test_a_udf_named_after_a_builtin_no_longer_certifies_completeness():
     called affirmatively false.
 
     It is not closed by identifying the function. It is closed by no longer claiming what depends
-    on identifying it: ANY call now downgrades COMPLETE, so a shadowing UDF cannot ride in on a
+    on identifying it: a call the inventory cannot clear downgrades COMPLETE, so a shadowing UDF cannot ride in on a
     COMPLETE it did not earn. The name is still unresolvable and the audit record says so.
     """
     lineage = lineage_for(_ast("SELECT log(x) FROM claim"), ["claim"],
@@ -893,3 +893,112 @@ def test_an_ambiguous_pair_with_an_unparseable_body_is_not_a_demonstrated_gap():
                           inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
     assert lineage.completeness == UNKNOWN, "an unreadable body cannot demonstrate a gap"
     assert "V" not in lineage.unresolved
+
+
+# --------------------------------------------------------------------------------------------
+# Issue #5 -- the marker fired on `count(*)`, so it appeared on nearly every real answer
+# --------------------------------------------------------------------------------------------
+
+
+def _reasons(sql, *, inventory, dialect="duckdb"):
+    import sqlglot
+
+    from mnemiq.sql.lineage import lineage_for
+    from mnemiq.sql.views import ViewInventory
+
+    return list(lineage_for(sqlglot.parse_one(sql, read=dialect), ["customer"], ViewInventory(),
+                            functions=inventory).reasons)
+
+
+def test_an_aggregate_no_longer_downgrades_lineage():
+    """Issue #5: every answer carried `unconfirmed-function-identity`, `count(*)` included.
+
+    A source that defines no functions of its own cannot have a UDF in the query, whatever the
+    call is spelled, so the calls clear.
+    """
+    from mnemiq.sql.functions import FunctionInventory
+
+    defines_nothing = FunctionInventory.of([], covers_view_bodies=True)
+    for sql in ("SELECT country, count(*) AS n FROM customer GROUP BY country",
+                "SELECT date_trunc('month', created_at) FROM customer",
+                "SELECT CASE WHEN id > 1 THEN 'a' ELSE 'b' END FROM customer"):
+        assert "unconfirmed-function-identity" not in _reasons(sql, inventory=defines_nothing)
+
+
+def test_a_source_that_defines_anything_downgrades_every_call():
+    """Deliberately coarse, and the reason is three leaks.
+
+    Naming each call and matching it against the catalogue failed three different ways: the
+    written name is not what executes, the rendered name is not what DuckDB binds (`count(*)`
+    becomes `count_star`), and a view body binds as written. Each version certified a macro that
+    read another table. The engine cannot say WHICH call is a UDF, so if the source defines any
+    function it declines for all of them.
+    """
+    from mnemiq.sql.functions import FunctionInventory
+
+    defines_one = FunctionInventory.of(["helper"], covers_view_bodies=True)
+    assert "unconfirmed-function-identity" in _reasons(
+        "SELECT count(*) AS n FROM customer", inventory=defines_one)
+
+
+def test_without_an_inventory_nothing_changes():
+    """The regression guard. The old behaviour is this function's behaviour with no inventory --
+    the change is what asking BUYS, not a relaxed default."""
+    from mnemiq.sql.functions import FunctionInventory
+
+    for blind in (FunctionInventory.never_asked(), FunctionInventory.unavailable("denied")):
+        assert "unconfirmed-function-identity" in _reasons(
+            "SELECT country, count(*) AS n FROM customer GROUP BY country", inventory=blind)
+
+
+def test_a_statement_with_no_call_at_all_never_needed_an_inventory():
+    """The floor: nothing to confirm means nothing to withhold, whatever the source defines."""
+    from mnemiq.sql.functions import FunctionInventory
+
+    assert "unconfirmed-function-identity" not in _reasons(
+        "SELECT id FROM customer", inventory=FunctionInventory.never_asked())
+
+
+def test_the_trace_says_why_it_could_not_confirm():
+    """Four causes used to write one marker, so a source whose `user_functions` fails on every
+    request read exactly like one that defines a helper -- the issue #5 fix quietly not
+    applying, with nothing in the audit record saying so.
+
+    These reach `Trace.lineage_reasons` and the HTTP and MCP payloads, so swapping or dropping
+    one changes what an auditor is told.
+    """
+    import sqlglot
+
+    from mnemiq.contract.semantic import ViewDefinition
+    from mnemiq.sql.functions import FunctionInventory
+    from mnemiq.sql.lineage import lineage_for
+    from mnemiq.sql.views import ViewInventory
+
+    sql = "SELECT count(*) AS n FROM customer"
+    for code, inventory in {
+        "function-inventory-unavailable": FunctionInventory.unavailable("denied"),
+        "function-inventory-never-asked": FunctionInventory.never_asked(),
+    }.items():
+        reasons = _reasons(sql, inventory=inventory)
+        assert "unconfirmed-function-identity" in reasons
+        assert code in reasons, f"{code} missing from {reasons}"
+
+    # A source that simply defines a helper gets the bare marker: nothing failed, nothing was
+    # unasked, and the licence is not the reason.
+    # `covers_view_bodies=False` on purpose. With True the fourth code's `not inventory.names`
+    # half never decides the outcome -- the licence half is false either way -- so dropping it
+    # would leave the suite green, and an attachment that defines a helper AND cannot cover
+    # bodies would then blame view bodies for the helper.
+    plain = _reasons(sql, inventory=FunctionInventory.of(["helper"], covers_view_bodies=False))
+    assert "unconfirmed-function-identity" in plain
+    assert not [r for r in plain if r.startswith("function-inventory-")]
+
+    # The fourth cause needs an actual view body, since that is the only place the licence is
+    # consulted. A Postgres source with NO functions of its own still cannot certify a body,
+    # and without this code that trace reads as "this source defines a function".
+    views = ViewInventory({"v": ViewDefinition(
+        object_id="v", definition="SELECT count(*) AS n FROM customer", dialect="duckdb")})
+    body = lineage_for(sqlglot.parse_one("SELECT n FROM v", read="duckdb"), ["v"], views,
+                       functions=FunctionInventory.of([], covers_view_bodies=False))
+    assert "unconfirmed-function-identity" in body.reasons
+    assert "function-inventory-covers-no-view-bodies" in body.reasons

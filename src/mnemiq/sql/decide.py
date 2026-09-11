@@ -4,6 +4,7 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.contract import ViewDefinition
+from mnemiq.sql.functions import inventory_from
 from mnemiq.sql.authz_guard import check_access, check_unmodelled_calls
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.guard import MAX_ROWS, check_shape
@@ -113,7 +114,10 @@ def decide(
     # with genuinely no views is FALSY and `or` would swap an inventory that knows it was asked for
     # a bare `{}` that knows nothing -- M52's defect in one operator, inside the artifact built to
     # prevent it.
+    # LIVE from the adapter, not the snapshot -- see `inventory_from` for why the two sources
+    # differ.
     lineage = lineage_for(shaped, tables, {} if views is None else views,
+                          functions=inventory_from(adapter),
                           scope_resolved=scope_resolved(shaped))
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 

@@ -55,6 +55,7 @@ class DuckDBAdapter:
         self._catalog = catalog
         self._table_schema = table_schema
         self._fk_via_postgres = fk_via_postgres
+        self._attach_type = attach_type.upper()
         self._con = duckdb.connect()
         # A DuckDB file needs no extension: the engine already speaks its own format. INSTALLing a
         # nonexistent "duckdb" extension would fail, so the empty string means "nothing to load".
@@ -118,6 +119,28 @@ class DuckDBAdapter:
         except Exception:
             return []
         return [(r[0], r[1], r[2], r[3], r[4]) for r in rows]
+
+    @property
+    def functions_cover_view_bodies(self) -> bool:
+        """Whether `user_functions()` also answers for what a VIEW BODY here may call.
+
+        For a DuckDB file it does: bodies are DuckDB views and run against this catalogue. For a
+        Postgres attachment it does not -- measured, a Postgres view body calling a Postgres UDF
+        runs server-side and returns its value, where DuckDB's binder never looked.
+
+        Keyed on the ATTACH TYPE, and only `DUCKDB` grants it. It used to read
+        `not self._fk_via_postgres`, which is a flag named for foreign-key discovery: SQLite got
+        the licence (harmless only because SQLite stores no user functions, an argument nothing
+        wrote down), and a future `mysql()` classmethod would naturally pass
+        `fk_via_postgres=False` and silently certify server-side bodies calling MySQL stored
+        functions. An allowlist of one, so a new attachment kind gets the conservative answer
+        without anyone having to notice.
+
+        A property rather than a field, so a test can read the real derivation off a bare
+        instance. As a field the only way to check it without a live Postgres was to restate the
+        derivation in the test, which passes whatever `__init__` does.
+        """
+        return self._attach_type == "DUCKDB"
 
     def user_functions(self) -> list[str]:
         """Function names this database defines itself, from `duckdb_functions()`.

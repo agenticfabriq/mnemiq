@@ -19,11 +19,14 @@ recorded eleven instances of an absence and a failure sharing one value:
 **Functions are UNKNOWN rather than INCOMPLETE, and that is measured rather than chosen.** sqlglot
 types a function from a NAME registry, so `now()` and `age()` land in `Anonymous` beside a genuine
 UDF while `coalesce`, `round`, `substr`, `md5` and a dozen others parse to typed nodes. The engine
-therefore cannot tell a pure builtin from a table-reading UDF, in either direction. `_PURE`
-below is a whitelist for the false-positive half -- an unlisted function is unresolved, which is
-the pattern `views.py` already uses because an unlisted shape must not pass -- and the
-false-negative half, a UDF named after a typed builtin, is pinned as a strict xfail. Both dissolve
-when a function inventory exists, which is the same shape as the view inventory and v2.
+therefore cannot tell a pure builtin from a table-reading UDF BY PARSING, in either direction.
+`_PURE` below is a whitelist for the false-positive half -- an unlisted function is unresolved,
+which is the pattern `views.py` already uses because an unlisted shape must not pass.
+
+Both halves dissolve when the source is ASKED, and it is now: `FunctionInventory` carries the
+names a source defines itself, and a call clears when the source defines no functions at all. That is why `count(*)` no longer downgrades an otherwise plain query (issue #5) and
+why a UDF named `median` does. Without an inventory the old rule stands unchanged -- any call
+downgrades -- so the ask is what buys the precision, not a relaxed default.
 """
 
 from __future__ import annotations
@@ -155,10 +158,11 @@ def _functions_in(ast) -> tuple[list[str], bool]:
     """Callables this engine cannot resolve to a source identity, and whether ANY call was seen.
 
     Two returns because the two facts are different. A name is worth RECORDING when it is not a
-    known builtin; but *any* call at all -- builtin-looking or not -- means completeness cannot be
-    confirmed, because sqlglot classifies a name like `log` as a typed builtin before the source
-    binds it, so a source UDF called `log` is invisible to `find_all(exp.Anonymous)`. That was a
-    documented false negative sitting as a strict xfail while COMPLETE was emitted beside it.
+    known builtin; separately, whether ANY call was seen is what gates the identity question at
+    all. It used to decide it outright -- any call downgraded, because sqlglot classifies a name
+    like `log` as a typed builtin before the source binds it, so a source UDF called `log` is
+    invisible to `find_all(exp.Anonymous)`. With a `FunctionInventory` the engine can ask the
+    source instead, and `saw_call` only decides whether there is anything to ask about.
 
     So `_PURE` no longer licenses COMPLETE; it only spares a builtin from being NAMED as an
     unaccounted object, which would be noise. The same reasoning that stopped a view's lexical
@@ -215,7 +219,7 @@ def _functions_in(ast) -> tuple[list[str], bool]:
     return out, saw_call
 
 
-def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
+def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=None) -> Lineage:
     """The objects an answer read, and whether that list is the whole story.
 
     Order matters only in that UNKNOWN is not allowed to mask a demonstrable INCOMPLETE: a
@@ -223,16 +227,23 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
     naming the view is more use to an auditor than recording that something was unclear.
     """
 
+
+    from mnemiq.sql.functions import FunctionInventory, calls_are_confirmable
     from mnemiq.sql.qualify import object_key
     from mnemiq.sql.scope import base_tables
     from mnemiq.sql.views import body_of, spellings, unrecognised_source
+
+    # `never_asked` when nobody supplied one, which denies certification exactly as before. The
+    # marker's old behaviour is this function's behaviour with no inventory, deliberately: the
+    # change is what an inventory BUYS, not a new default.
+    inventory = functions if functions is not None else FunctionInventory.never_asked()
+    unconfirmed_calls: list[str] = []
 
     tables = list(tables)
     # Two lists, because the two states are decided by different evidence: a view whose body we
     # READ and whose reach we can point at, versus a function whose body we cannot see at all.
     reaching_views: list[str] = []
     unclassified: list[str] = []
-    saw_any_call = False
     reasons: list[str] = []
     # The two comparisons here
     # have opposite polarity, which is the trap: widening the VIEW lookup adds matches and every
@@ -361,7 +372,12 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
         body_fns, body_saw_call = _functions_in(parsed)
         for fn in body_fns:
             _add(unclassified, fn)
-        saw_any_call = saw_any_call or body_saw_call
+        # A body's own text is in hand, so its calls can be named. `in_view_body` because a
+        # Postgres view body runs server-side, where the adapter's catalogue does not reach.
+        # A body's calls are judged by the VIEW licence: a Postgres body runs server-side,
+        # where the adapter's catalogue never looked.
+        if body_saw_call and not calls_are_confirmable(inventory, in_view_body=True):
+            unconfirmed_calls.append(f"view-body:{name}")
         if reaches_past_the_list:
             _add(reaching_views, name)
 
@@ -378,12 +394,34 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True) -> Lineage:
     caller_fns, caller_saw_call = _functions_in(ast)
     for fn in caller_fns:
         _add(unclassified, fn)
-    if caller_saw_call:
-        saw_any_call = True
-    if saw_any_call:
-        # ANY call downgrades COMPLETE, named or not. Without a function inventory the engine
-        # cannot bind a callable to a source identity, and `log` parsing as a typed builtin is
-        # exactly the case where a lexical answer looks confident and is not.
+    if caller_saw_call and not calls_are_confirmable(inventory, in_view_body=False):
+        unconfirmed_calls.append("statement")
+
+    if unconfirmed_calls:
+        # WHY, not just that. All of them landed on one marker, so a source whose `user_functions`
+        # fails on every request looked identical to one that simply defines a helper -- the
+        # issue #5 fix silently not applying, with nothing in the trace to say so. The view
+        # inventory keeps its cases apart for the same reason.
+        if not inventory.available:
+            reasons.append("function-inventory-unavailable")
+        elif not inventory.asked:
+            reasons.append("function-inventory-never-asked")
+        elif not inventory.names and not inventory.covers_view_bodies:
+            # The FOURTH cause, which the first version of this block miscounted as three: the
+            # source defines nothing and the licence still does not reach a VIEW BODY, because
+            # its calls run where this catalogue never looked. Without this, a Postgres source
+            # with no UDFs at all reads as one that defines a function.
+            reasons.append("function-inventory-covers-no-view-bodies")
+
+    if unconfirmed_calls:
+        # Without an inventory this fires on ANY call, which is where it started: `count(*)`
+        # downgraded the lineage of an otherwise plain query, so the marker appeared on nearly
+        # every real answer and stopped meaning anything (issue #5). With one, it fires only on
+        # a source this engine cannot clear: one that defines functions of its own, one that
+        # could not be asked, or a view body the answer does not cover. A `function-inventory-*`
+        # code accompanies this marker for every one of those but the first: a source that
+        # simply defines a helper carries this marker alone, because there is no second thing
+        # to say. See `calls_are_confirmable` for the leaks behind the coarseness.
         reasons.append("unconfirmed-function-identity")
 
     if not getattr(views, "available", True):
