@@ -174,10 +174,12 @@ def test_a_postgres_udf_is_unreachable_from_a_query_and_absent_from_the_answer()
     def pg(stmt: str) -> None:
         admin.execute(f"CALL postgres_execute('pg', '{stmt}')")
 
+    created = False
     try:
         # Created before the adapter connects, so resolving the view cannot depend on the
         # postgres extension re-querying a schema cache the adapter's own `USE` had populated.
         pg(f"CREATE SCHEMA {schema}")
+        created = True
         pg(f"CREATE FUNCTION {schema}.fn_probe(int) RETURNS int AS $x$ SELECT 99 $x$ LANGUAGE sql")
         pg(f"CREATE VIEW {schema}.v_fn_probe AS SELECT {schema}.fn_probe(1) AS m")
 
@@ -205,9 +207,16 @@ def test_a_postgres_udf_is_unreachable_from_a_query_and_absent_from_the_answer()
         # `covers_view_bodies=True` for this attachment, and no producer exists yet.
         assert adapter.execute(f"SELECT m FROM src.{schema}.v_fn_probe")[0][0] == 99
     finally:
-        # One statement, and it can only reach what this test made: the schema name is unique
-        # per run, so a leftover from a crashed run cannot be confused with a real object.
+        # Only what this test actually created. `DROP ... IF EXISTS` ran unconditionally before,
+        # including when `CREATE SCHEMA` had FAILED -- and the way it fails is "already exists",
+        # so the one case that reaches the drop without having made anything is the one where
+        # something else owns that name, and CASCADE would take it and everything in it. The
+        # uuid makes that improbable; the code should not be relying on improbable.
+        #
+        # No `IF EXISTS` either: past this flag the schema is known to exist, so its absence is
+        # something to surface rather than swallow.
         try:
-            pg(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            if created:
+                pg(f"DROP SCHEMA {schema} CASCADE")
         finally:
             admin.close()
