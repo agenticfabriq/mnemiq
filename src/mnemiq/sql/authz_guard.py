@@ -170,15 +170,17 @@ def check_unmodelled_calls(
     allowlist alone, which is where it started.
 
     **WHICH SOURCES THAT ACTUALLY COVERS, because the paragraphs above read as if it were all of
-    them.** Only an adapter implementing `user_functions` is asked, and today that is the DuckDB
-    family alone -- `resolve.py` hands out one other live adapter, `OracleAdapter`, which
-    implements neither method and therefore gets `never_asked` and the bare allowlist. So an
-    Oracle schema function named `median` still passes here, exactly as every source did before
-    the inventory existed. Nothing regressed; one adapter moved and the rest did not, and an
-    asymmetry nobody wrote down is one a reader assumes away (M99). The Oracle exposure itself
-    is older and filed as deployment preconditions M66 and M71, which `adapters/oracle.py`
-    documents at length; closing it wants Oracle-side catalogue discovery, not a fail-closed
-    default here, which would refuse every call-bearing query on the adapters that cannot answer.
+    them.** Only an adapter implementing `user_functions` is asked. When this paragraph was
+    written that was the DuckDB family alone, and it named `OracleAdapter` as the live adapter
+    implementing neither method, so an Oracle schema function called `median` passed here
+    exactly as every source did before the inventory existed (M99). **That stopped being true
+    at `ce4e16a`**: Oracle answers `user_functions` now, and `virtual_columns` too, so every
+    `names`-driven rule below applies to it -- and since `binder_prefers_builtins` is True
+    there, `called & names` is the arm that fires rather than the coarse shadow rule. An
+    adapter still implementing neither gets `never_asked` and the bare allowlist, which remains
+    the reason this is not fail-closed by default: that would refuse every call-bearing query
+    on the adapters that cannot answer. The older Oracle exposure is filed as deployment
+    preconditions M66 and M71, which `adapters/oracle.py` documents at length.
     """
     for call in ast.find_all(exp.Anonymous):
         name = str(call.this)
