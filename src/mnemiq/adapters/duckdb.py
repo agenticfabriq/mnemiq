@@ -182,6 +182,35 @@ class DuckDBAdapter:
         ).fetchall()
         return [r[0] for r in rows]
 
+    def reachable_user_functions(self) -> list[str]:
+        """The subset of `user_functions()` a query can call WITHOUT qualifying it.
+
+        `duckdb_functions()` carries `database_name` and `schema_name` and the first version of
+        `user_functions` threw both away, which made every name look reachable. Measured on an
+        attached file holding `CREATE MACRO other.median(x)`: `SELECT median(id) FROM claim`
+        returned **1.5**, DuckDB's builtin, because `other` is not on the search path -- and the
+        engine refused the whole source, `SELECT id FROM claim` included, on the theory that
+        `median` was shadowed. One unrelated macro in one unused schema made a legitimate source
+        answer nothing.
+
+        Only the coarse rule wants this. `names` stays the full list, because a query MAY
+        qualify -- `other.median(1)` returns 999 -- and the bare name read off the rendered text
+        is what catches that.
+
+        The search path, not `current_schema()`: DuckDB resolves an unqualified function against
+        every entry, and reading only the current one would call an entry further down the path
+        unreachable. `database.schema` and a bare `schema` are both accepted because the setting
+        holds either.
+        """
+        path = self._con.execute("SELECT current_setting('search_path')").fetchall()[0][0]
+        entries = {e.strip().strip('"').lower() for e in str(path).split(",") if e.strip()}
+        rows = self._con.execute(
+            "SELECT DISTINCT lower(database_name), lower(schema_name), lower(function_name) "
+            "FROM duckdb_functions() WHERE NOT internal"
+        ).fetchall()
+        return [fn for db, schema, fn in rows
+                if f"{db}.{schema}" in entries or schema in entries]
+
     def builtin_functions(self) -> list[str]:
         """The other half of `duckdb_functions()`: names this engine considers its own.
 

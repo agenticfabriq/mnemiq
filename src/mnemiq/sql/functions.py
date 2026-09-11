@@ -90,6 +90,15 @@ class FunctionInventory:
     # reason -- the refusal names a different owner for each, and telling an adapter author to
     # implement a method they already implemented sends them to fix working code.
     builtins_asked: bool = False
+    # The subset of `names` a query can call WITHOUT qualifying it, or None for "not known".
+    # Only `may_shadow_a_builtin` reads it, and only because that rule is the coarse one: a
+    # binder rename can only reach a function the query could have called unqualified, so a
+    # macro in a schema off the search path cannot collect `COUNT(*)`. `names` stays whole,
+    # because a query may still qualify and the bare name read off the rendered text catches it.
+    #
+    # None falls back to `names`, which is what an adapter that cannot scope its catalogue gets
+    # -- the same shape as `builtins`, and conservative in the same direction.
+    reachable: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         # Normalised HERE, not only in `of()`. A dataclass hands out its plain constructor
@@ -106,6 +115,11 @@ class FunctionInventory:
         if isinstance(names, str):
             names = [names]
         object.__setattr__(self, "names", frozenset(n.lower() for n in names))
+        reachable = self.reachable
+        if reachable is not None:
+            if isinstance(reachable, str):
+                reachable = [reachable]
+            object.__setattr__(self, "reachable", frozenset(r.lower() for r in reachable))
         builtins = self.builtins
         if builtins is not None:
             # An answer implies the question. Without this the constructor can build "the
@@ -171,12 +185,21 @@ class FunctionInventory:
         Three answers rather than two. Nothing defined, nothing to shadow. Builtins never
         asked, so assume the worst -- but only for a source that defines something, which keeps
         the conservative default off every source that has no user functions at all.
+
+        And the question is asked of the REACHABLE names, not all of them, because a binder
+        rename can only ever land on a function the query could have called unqualified. A
+        macro in a schema off the search path is invisible to `COUNT(*)`; counting it condemned
+        whole sources that were answering correctly.
         """
-        if not self.names:
+        # The names a query could have called unqualified, which is the only way a BINDER
+        # rename can land on a user function. Scoped, because the unscoped version condemned a
+        # whole source over a macro in a schema nothing on the search path can reach.
+        candidates = self.names if self.reachable is None else self.reachable
+        if not candidates:
             return False
         if self.builtins is None:
             return True
-        return bool(self.names & self.builtins)
+        return bool(candidates & self.builtins)
 
 
 def inventory_from(adapter) -> FunctionInventory:
@@ -208,7 +231,22 @@ def inventory_from(adapter) -> FunctionInventory:
         covers_view_bodies=getattr(adapter, "functions_cover_view_bodies", False),
         builtins=builtins,
         builtins_asked=builtins_asked,
+        reachable=_reachable_from(adapter),
     )
+
+
+def _reachable_from(adapter) -> frozenset[str] | None:
+    """Which of the source's own functions answer to an unqualified call, or None if unasked.
+
+    Optional like `builtin_functions`, and it costs precision rather than soundness in the same
+    direction: without it every user function counts as reachable, which is where this started.
+    """
+    if adapter is None or not hasattr(adapter, "reachable_user_functions"):
+        return None
+    try:
+        return frozenset(n.lower() for n in adapter.reachable_user_functions())
+    except Exception:
+        return None
 
 
 def _builtins_from(adapter) -> tuple[frozenset[str] | None, bool]:
