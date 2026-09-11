@@ -13,7 +13,7 @@ import duckdb
 import pytest
 
 from mnemiq.adapters.duckdb import DuckDBAdapter
-from mnemiq.sql.functions import FunctionInventory
+from mnemiq.sql.functions import FunctionInventory, calls_are_confirmable
 
 
 def test_an_empty_answer_is_not_a_failed_lookup():
@@ -839,7 +839,12 @@ def _oracle_walk(synonyms, functions, oracle_owned=("sys",), schema="APP", asked
             # would silently pass a version that narrowed the read before walking it -- which is
             # the bug that stopped a chain at the first hop into another schema.
             assert "where" not in sql.lower(), "the synonym graph must be read unfiltered"
-            return list(synonyms)
+            # `db_link` is the fifth column and defaults to None, so every 4-tuple case above
+            # keeps its shape and only a DB-link case has to spell it. The 4-column slice is
+            # what the walk asked for before M102, and answering what was ASKED is what makes a
+            # revert of that fix fail the link tests on BEHAVIOUR rather than on unpacking.
+            padded = [tuple(r) + (None,) * (5 - len(r)) for r in synonyms]
+            return padded if "db_link" in sql else [r[:4] for r in padded]
         if "oracle_maintained" in sql:
             return [(o,) for o in oracle_owned]
         wanted = set(binds.values())
@@ -1014,6 +1019,126 @@ def test_a_synonym_with_no_target_owner_does_not_take_the_source_down():
     assert _oracle_walk(synonyms, [("app", "udf")]) == {"x"}
 
 
+def test_a_synonym_over_a_db_link_is_reported_rather_than_dropped():
+    """M102, the fail-open this closes, measured live before it was written.
+
+    `CREATE SYNONYM add_days FOR m102_udf@zz_loop` over a function reading an ungranted table:
+    `SELECT add_days(1)` returned `'123-45-6789'` through a loopback link and `decide` APPROVED
+    `SELECT add_days(1) FROM m102_claim`, because the walk dropped every row whose `table_owner`
+    was NULL and the alias never reached `names`. The register had this shape down as "not
+    reproducible here: 0 `db_link` synonyms out of 7,869", so it was documented rather than
+    measured; a loopback link into the same PDB reproduces it exactly.
+
+    `add_days` for the same reason the other synonym tests use it -- sqlglot models it, so the
+    cross-dialect allowlist waves it through and only the inventory can catch it.
+
+    A remote target cannot be resolved from here at all, so the alias is ASSUMED to reach a
+    function. Dropping one that turns out to be a function costs the row; reporting one that
+    turns out to be a table costs a refusal on any statement whose TEXT spells it before an
+    open paren -- `SELECT * FROM orders` is still answered, and the rule is a lexical scan
+    rather than a parse, so it over-collects on purpose -- AND, on a schema that defines
+    nothing else, the source's whole completeness
+    label, which is M104 and which
+    `test_reporting_a_link_alias_downgrades_completeness_on_a_schema_that_defines_nothing`
+    measures. An earlier version of this docstring claimed the refusal was the whole cost.
+    """
+    assert _oracle_walk([("app", "add_days", None, "m102_udf", "DBL_LOOP")], []) == {"add_days"}
+
+
+def test_a_QUALIFIED_db_link_synonym_is_not_resolved_against_the_local_object_of_that_name():
+    """The second remote shape, and why the branch tests the link and not the NULL owner.
+
+    Both were read off the container: `(None, 'WEST_F', 'ZZ_LOOP')` for `west_f@zz_loop` and
+    `('APPUSER', 'WEST_F', 'ZZ_LOOP')` for `appuser.west_f@zz_loop`. The second names an owner,
+    so the old code joined on it and answered from the LOCAL `app.west_f` -- a different object
+    in a different database. Right by accident whenever a local function shares the name, and
+    fail-open whenever none does, which is what this asserts: `functions` is empty here.
+    """
+    assert _oracle_walk([("app", "qual_syn", "app", "west_f", "DBL_LOOP")], []) == {"qual_syn"}
+
+
+def test_a_chain_ENDING_at_a_db_link_synonym_reports_every_hop():
+    """Oracle resolves `hop -> add_days -> m102_udf@zz_loop` at call time, so `hop(1)` runs the
+    remote function too. A link alias contributes no edge to follow, so it has to seed the
+    backward walk as ITSELF or every hop in front of it is lost with it."""
+    assert _oracle_walk([
+        ("app", "hop", "app", "add_days"),
+        ("app", "add_days", None, "m102_udf", "DBL_LOOP"),
+    ], []) == {"hop", "add_days"}
+
+
+def test_a_chain_reaching_a_PUBLIC_db_link_synonym_reports_both():
+    """`via_pub -> pub_link` where this schema holds no `pub_link` and the PUBLIC one is a link
+    alias. The `forward`/`backwards` PUBLIC fallback cannot carry that hop, because a link alias
+    contributes no edge for the fallback to find -- which is what `via_public_link` is for.
+
+    The PUBLIC arm normally excludes chains ending in Oracle's own schemas; a remote target
+    cannot be in one of THIS database's, so a link alias counts for it.
+    """
+    assert _oracle_walk([
+        ("app", "via_pub", "app", "pub_link"),
+        ("public", "pub_link", None, "remote_f", "DBL_LOOP"),
+    ], []) == {"via_pub", "pub_link"}
+
+
+def test_reporting_a_link_alias_downgrades_completeness_on_a_schema_that_defines_nothing():
+    """The COST of the M102 fix, pinned rather than described, because the comment describing
+    it was wrong twice.
+
+    `calls_are_confirmable` is `licensed and not inventory.names`, so any name at all makes it
+    false. The first note on the fix argued the cost was bounded to queries spelling the alias,
+    on the grounds that a schema defining a function is already downgraded -- true, and silent
+    about the schema that defines NONE, which is the case this measures. A link over a remote
+    TABLE is the common enterprise shape and produces a name here regardless, because nothing
+    local can tell a remote table from a remote function.
+
+    Same issue-#5 downgrade the PUBLIC/Oracle-maintained filter exists to avoid, accepted here
+    because the alternative is approving a call that returns an ungranted row.
+    """
+    names = _oracle_walk([("public", "orders", None, "orders", "ERP_LINK")], [])
+    assert names == {"orders"}, "a remote table is indistinguishable from a remote function"
+
+    downgraded = FunctionInventory(names=frozenset(names))
+    assert calls_are_confirmable(downgraded, in_view_body=False) is False
+    # The control: without the link alias this source certifies, so the flip is the alias's.
+    assert calls_are_confirmable(FunctionInventory(names=frozenset()), in_view_body=False) is True
+
+
+def test_keying_the_report_on_the_alias_over_reports_through_the_public_fallback():
+    """Keying the return on the ALIAS rather than its target is not equivalent, and the comment
+    that said it was has been corrected.
+
+    `backwards` carries the PUBLIC same-bare-name fallback, so `app.d` collects the PUBLIC `d`'s
+    edge to a function even though Oracle resolves `d` through the private synonym and never
+    consults the PUBLIC one. Target-keyed this was `set()`.
+
+    Asserted because it is OVER-reporting -- fail-closed -- and an assertion is what would catch
+    it turning into the other direction. Nothing here is over a link: the divergence is in the
+    keying, not in M102.
+    """
+    assert _oracle_walk([("app", "d", "sys", "c"), ("public", "d", "sys", "sys_udf")],
+                        [("sys", "sys_udf")]) == {"d"}
+
+
+def test_a_synonym_over_a_LOCAL_non_function_is_still_not_reported():
+    """The control. Without it every DB-link assertion above passes on a walk that reports every
+    synonym it sees, which is a different bug rather than a fix -- and it has to pass with the
+    fix REVERTED too, which is why the stub answers the four columns the old query asked for."""
+    assert _oracle_walk([("app", "tbl_syn", "app", "some_table")],
+                        [("app", "a_real_function")]) == set()
+
+
+def test_a_NULL_target_with_no_db_link_is_skipped_without_raising():
+    """The defensive arm the DB-link branch left behind. A NULL reaching `sorted()` raised
+    TypeError, which `inventory_from` turns into `unavailable` and the guard turns into refusing
+    EVERY statement on the source -- one such row anywhere in the dictionary, a whole deployment
+    stopped."""
+    assert _oracle_walk([
+        ("app", "odd", None, None),
+        ("app", "good", "app", "a_real_function"),
+    ], [("app", "a_real_function")]) == {"good"}
+
+
 def test_the_owner_read_is_chunked_under_oracles_in_list_cap():
     """An Oracle IN list is capped at 1,000 items (ORA-01795), and this one grows with every
     non-Oracle owner any synonym targets -- a schema-per-tenant instance passes that mark.
@@ -1031,7 +1156,12 @@ def test_the_owner_read_is_chunked_under_oracles_in_list_cap():
 
     def rows(sql, **binds):
         if "all_synonyms" in sql:
-            return list(synonyms)
+            # Padded to the walk's five columns, as in `_oracle_walk`; none of these 2,500
+            # rows is over a link, so the column is None throughout. Answering what the query
+            # ASKED for keeps this test out of the M102 revert control -- returning 5-tuples
+            # unconditionally made it fail on unpacking, which reads as collateral damage from
+            # a fix it has nothing to do with.
+            return [tuple(r) + (None,) if "db_link" in sql else tuple(r) for r in synonyms]
         if "oracle_maintained" in sql:
             return [("sys",)]
         reads.append(len(binds))

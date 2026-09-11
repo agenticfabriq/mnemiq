@@ -20,6 +20,15 @@ Run against the container the spike used:
       -e APP_USER=appuser -e APP_USER_PASSWORD=apppw gvenzl/oracle-free:23-slim-faststart
     MNEMIQ_ORACLE_TEST_DSN=127.0.0.1:1522/FREEPDB1 MNEMIQ_ORACLE_TEST_USER=appuser \\
       MNEMIQ_ORACLE_TEST_PASSWORD=apppw uv run pytest tests/test_oracle_adapter.py -m integration
+
+One test needs a privilege that container does not grant, and SKIPS with a reason rather than
+failing without it:
+
+    GRANT CREATE DATABASE LINK TO appuser;   -- as SYSTEM; for the M102 loopback-link test
+
+It is a separate line because it widens what APPUSER can do, which is the container's whole
+point of comparison for the access tests around it. The same assertions run database-free in
+`tests/test_function_inventory.py`, so skipping here does not leave the fail-open unguarded.
 """
 
 from __future__ import annotations
@@ -1985,6 +1994,86 @@ def test_a_write_cannot_store_what_a_virtual_column_computed():
 
         ordinary = write("INSERT INTO vc_notes (id, note) SELECT id, 'ok' FROM vc_t")
         assert not hasattr(ordinary, "code"), ordinary
+    finally:
+        for ddl in drops:
+            with contextlib.suppress(Exception):
+                cur.execute(ddl)
+        con.commit()
+        adapter._pool.release(con)
+        adapter.close()
+
+
+def test_a_synonym_over_a_db_link_is_a_route_to_a_udf_this_engine_cannot_resolve():
+    """M102 against a real link, which is how the fail-open was found rather than reasoned about.
+
+    The register row said the shape was "not reproducible here: the container holds 0 `db_link`
+    synonyms out of 7,869", so the behaviour was documented instead of measured. A LOOPBACK link
+    into the same PDB reproduces it exactly, and the measurement contradicted nothing but did
+    settle it: `SELECT add_days(1)` returned `'123-45-6789'` through the link, `add_days` was
+    absent from `user_functions()`, and `decide` APPROVED the statement.
+
+    `add_days` for the same reason the local synonym test uses it -- sqlglot models it, so the
+    cross-dialect allowlist waves it through and only the inventory can catch it. An alias
+    sqlglot does not know is refused as `exp.Anonymous` whatever the inventory holds, which is
+    how an earlier version of that test passed with its fix reverted.
+
+    `tests/test_function_inventory.py` carries the same assertions over a fake dictionary, because this
+    one needs a privilege the container does not grant by default and would otherwise be a
+    regression guarded only by a machine that happens to have it.
+    """
+    from mnemiq.sql.decide import decide
+
+    adapter = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, schema=USER.upper())
+    con = adapter._pool.acquire()
+    cur = con.cursor()
+    have = cur.execute("SELECT COUNT(*) FROM session_privs "
+                       "WHERE privilege = 'CREATE DATABASE LINK'").fetchone()[0]
+    if not have:
+        adapter._pool.release(con)
+        adapter.close()
+        pytest.skip("needs CREATE DATABASE LINK; see this module's docstring for the grant")
+
+    drops = ("DROP SYNONYM add_days", "DROP DATABASE LINK dbl_loop",
+             "DROP FUNCTION dbl_udf", "DROP TABLE dbl_secret", "DROP TABLE dbl_claim")
+    try:
+        for ddl in drops:
+            with contextlib.suppress(Exception):
+                cur.execute(ddl)
+        cur.execute("CREATE TABLE dbl_secret(ssn VARCHAR2(20))")
+        cur.execute("INSERT INTO dbl_secret VALUES ('123-45-6789')")
+        cur.execute("CREATE TABLE dbl_claim(id NUMBER)")
+        cur.execute("INSERT INTO dbl_claim VALUES (1)")
+        cur.execute("CREATE OR REPLACE FUNCTION dbl_udf(x NUMBER) RETURN VARCHAR2 IS "
+                    "v VARCHAR2(20); BEGIN SELECT ssn INTO v FROM dbl_secret WHERE ROWNUM = 1; "
+                    "RETURN v; END;")
+        con.commit()
+        # Back into this same PDB. The link is resolved by the SERVER, so the address is the
+        # container's own listener -- the host-side mapped port is ORA-12541 from in here.
+        cur.execute(f"CREATE DATABASE LINK dbl_loop CONNECT TO {USER} "
+                    f'IDENTIFIED BY "{PASSWORD}" USING \'localhost:1521/FREEPDB1\'')
+        cur.execute("CREATE SYNONYM add_days FOR dbl_udf@dbl_loop")
+        con.commit()
+
+        row = cur.execute("SELECT table_owner, db_link FROM user_synonyms "
+                          "WHERE synonym_name = 'ADD_DAYS'").fetchone()
+        assert row == (None, "DBL_LOOP"), f"not the shape under test: {row}"
+
+        cur.execute("SELECT add_days(1) FROM dual")
+        assert cur.fetchone()[0] == "123-45-6789", "no leak, so nothing below proves anything"
+
+        assert "add_days" in set(adapter.user_functions()), "the alias a query would spell"
+
+        refused = decide("SELECT add_days(1) AS x FROM dbl_claim", {"dbl_claim": {"id"}},
+                         adapter=adapter, dialect="oracle", target="oracle")
+        assert refused.code.value == "unmodelled_call", refused
+        # From the INVENTORY branch, not the allowlist. They share a code and differ in what
+        # they say, and asserting only the code is how the sibling test passed while reverted.
+        assert "defined by this source itself" in refused.message, refused.message
+
+        for clean in ("SELECT count(*) AS n FROM dbl_claim", "SELECT id FROM dbl_claim"):
+            v = decide(clean, {"dbl_claim": {"id"}}, adapter=adapter,
+                       dialect="oracle", target="oracle")
+            assert not hasattr(v, "code"), clean
     finally:
         for ddl in drops:
             with contextlib.suppress(Exception):
