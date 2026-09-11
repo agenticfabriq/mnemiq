@@ -814,7 +814,13 @@ class OracleAdapter:
             # `appuser.west_f`, a different object in a different database -- right by accident
             # when a local function shares the name, fail-open when none does.
             #
-            # THE COST IS NOT ONLY A REFUSAL ON QUERIES SPELLING THE ALIAS. An earlier version
+            # THE COST IS NOT ONLY A REFUSAL ON STATEMENTS THAT SPELL THE ALIAS BEFORE AN OPEN
+            # PAREN -- which is the whole refusal, since `may_shadow_a_builtin` is inert here
+            # and the remaining rule intersects `names` with exactly that lexical scan. Reading
+            # the remote table by name is untouched: for the `orders` example a few lines down,
+            # `SELECT * FROM orders` is still answered and only `orders(...)` is refused. Said
+            # as a scan rather than as "a call" because it IS a scan, and over-collects on
+            # purpose -- `FROM customer AS c(id, name)` yields `c`. An earlier version
             # of this comment claimed that, reasoning that `calls_are_confirmable` is already
             # false wherever a schema defines a function -- true, and irrelevant to the schema
             # that defines NONE. Measured: a schema defining nothing, plus one
@@ -830,7 +836,7 @@ class OracleAdapter:
             # defines functions", which is a third category `FunctionInventory` does not model
             # -- M104, filed rather than built here so this stays the security fix.
             #
-            # `may_shadow_a_builtin` IS inert here (`binder_prefers_builtins`), so no coarse
+            # That inertness is `binder_prefers_builtins`, and it is why no coarse
             # whole-source refusal follows from a wider `names`.
             if db_link is not None:
                 over_a_link.add((owner, name))
