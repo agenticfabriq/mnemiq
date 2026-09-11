@@ -320,10 +320,9 @@ def test_the_two_fell_open_causes_do_not_share_a_sentence(why, blames):
     assert blames in v.reason
 
     # The non-stopping branch too. Composing these from a shared clause produced "The verifier
-    # it could not be reached", which no test read because only the stopping branch was checked
-    # -- and that is the branch a caller sees when an operator has turned fail-closed off.
-    # Nothing renders this one today -- `loop` reads `reason` only off a verdict that stops the
-    # answer -- which is exactly why it went unread while being ungrammatical.
+    # it could not be reached", which no test read because only the stopping branch was checked.
+    # Nothing renders this one today either -- `loop` reads `reason` only off a verdict that
+    # stops the answer -- which is exactly how it stayed ungrammatical.
     open_v = _verify(_Judge(1.0, falls_open=True, why=why), fail_closed=False)
     assert blames in open_v.reason
     assert "verifier it" not in open_v.reason and "verifier its" not in open_v.reason

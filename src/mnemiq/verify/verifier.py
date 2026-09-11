@@ -18,10 +18,11 @@ def _cards_text(packet: ContextPacket) -> str:
 # substring of the other branch.
 #
 # Only the STOPPING pair reaches a caller today: `loop` sends `reason` back as the answer text
-# when the verdict defers, and reads nothing off a verdict that does not. The other two are the
-# field's value on a verdict that lets the answer through, where the wire says `verified:
-# "unavailable"` and this sentence is not shown. Kept honest anyway -- a string that is wrong
-# only because nothing renders it is a trap for whoever renders it next.
+# when the verdict defers, and reads no `reason` off one that does not -- it still stamps
+# `confidence` and `layer`, which is where the wire's `verified: "unavailable"` comes from. So
+# the other two are the field's value on an answer that goes out with that stamp and this
+# sentence unshown. Kept honest anyway: a string that is wrong only because nothing renders it
+# is a trap for whoever renders it next.
 _UNAVAILABLE_REASON = {
     ("error", True): "I could not check this answer: the verifier could not be reached. "
                      "I am not giving you a result I cannot stand behind.",

@@ -80,11 +80,12 @@ export const REASONS: Record<DeferralReason, { title: string; next: string }> = 
   // one means a judge read the result and declined to stand behind it.
   verifier_unavailable: {
     title: "The answer could not be verified",
-    // "no usable answer", not "did not answer": the engine sends this code both when the judge
-    // endpoint was unreachable and when it replied with something no confidence could be read
-    // out of. The body above says which, and saying "did not answer" over the second sends the
-    // operator to check connectivity when the cause is a model or a token budget.
-    next: "The query ran; the verifier gave no usable answer, so the result was withheld rather than returned unchecked. An outage, not a judgement about your data.",
+    // Covers both causes without naming either, because the body above already does. The engine
+    // sends this code when the judge endpoint was unreachable AND when it replied with something
+    // no confidence could be read out of -- and the second is deterministic for a model that
+    // cannot emit the JSON, so "an outage, try again" is advice that cannot work. What both
+    // cases share is that nothing was judged, which is the part the operator needs.
+    next: "The query ran; the verifier gave no usable answer, so the result was withheld rather than returned unchecked. Nothing here is a judgement about your data — check the verifier endpoint and its model.",
   },
 };
 
