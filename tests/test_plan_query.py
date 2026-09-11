@@ -76,6 +76,12 @@ def test_the_loop_is_bounded():
     outcome, generator = _plan(['{"sql": "SELECT * FROM claim"}'] * 5, max_attempts=3)
     assert isinstance(outcome, Deferred)
     assert len(generator.calls) == 3
+    # ...and a model that never writes valid SQL is exactly what INVALID_QUERY is for. The
+    # exhaustion exit hands a SOURCE fault to `_not_our_sql` instead, and dropping the guard
+    # that tells the two apart would report this one as ungovernable -- blaming the deployment
+    # for three attempts at `SELECT *`.
+    assert outcome.code is DeferralReason.INVALID_QUERY
+    assert "3 attempts" in outcome.reason
 
 
 def test_a_model_deferral_is_passed_through():
@@ -584,3 +590,46 @@ def test_the_denied_column_is_written_where_the_caller_cannot_see_it(caplog):
     assert "ssn" not in outcome.reason
     assert "ssn" in caplog.text, "the operator still has to be able to see what was refused"
     assert "unauthorized_column" in caplog.text
+
+
+def test_a_source_fault_that_survives_every_attempt_is_still_a_source_fault():
+    """The exhaustion exit is the one M98 was about, and retrying an override-marked refusal put
+    it back: a catalogue call that fails on all three attempts used to leave as INVALID_QUERY --
+    "could not produce a valid query after 3 attempts" over a query that was never the problem,
+    with the sentence naming what an operator must fix demoted to a trailing clause.
+
+    Both endings are pinned, because the retry only earns its cost if recovery is real: the
+    source that answers on the second attempt gets an answer, and the one that never answers
+    gets the same code it would have got without the attempts.
+    """
+    from mnemiq.contract import DeferralReason
+    from mnemiq.sql.verdict import Refusal
+
+    def blips(n_failures):
+        calls = {"n": 0}
+
+        def fake_decide(sql, *a, **kw):
+            calls["n"] += 1
+            if calls["n"] <= n_failures:
+                return Refusal(code=RefusalCode.UNRESOLVABLE_CALLS,
+                               message="This source could not say. Try again.",
+                               repairable_override=True)
+            return Approved(plan_sql=sql, target_sql=sql)
+        return fake_decide
+
+    import pytest as _pytest
+    for failures, check in ((1, "recovers"), (9, "exhausts")):
+        mp = _pytest.MonkeyPatch()
+        mp.setattr("mnemiq.generate.plan_query.decide", blips(failures))
+        generator = FakeGenerator(['{"sql": "SELECT claim_identifier FROM claim"}'] * 5)
+        outcome = plan_query(_packet(), _snapshot(), _GRANTS, generator, target="duckdb")
+        mp.undo()
+
+        if check == "recovers":
+            assert isinstance(outcome, Approved), "the retry has to be able to succeed"
+            assert len(generator.calls) == 2
+        else:
+            assert isinstance(outcome, Deferred)
+            assert outcome.code is DeferralReason.UNGOVERNABLE, outcome.code
+            assert "attempts" not in outcome.reason
+            assert len(generator.calls) == 3, "it did use the whole budget"

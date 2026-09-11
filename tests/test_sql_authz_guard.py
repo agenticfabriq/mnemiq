@@ -409,12 +409,16 @@ def test_one_code_two_answers_about_whether_to_try_again():
     """`UNRESOLVABLE_CALLS` is reached by arrivals that disagree about retrying, so the CODE
     cannot decide it and `repairable_override` says which (M98).
 
-    Two are worth another attempt. A statement that would not render is about the statement, and
-    its message asks for a rewrite. A source whose `user_functions` raised may be having a blip,
-    and `decide` re-asks it live on every attempt, so the loop resolves that by itself. The rest
-    are properties of the source that no attempt of ours changes -- retrying them spends the
-    caller's budget to arrive where the first refusal already was, under a card telling them
-    rephrasing will not help.
+    Worth another attempt: the statement that would not render, whose message asks for a
+    rewrite, and every catalogue call that RAISED, since `decide` re-asks the source live on
+    each attempt and a blip resolves itself. Not worth it: a source that redefines a builtin's
+    name, and an adapter with no `builtin_functions` at all. Retrying those spends the caller's
+    budget to arrive where the first refusal already was, under a card telling them rephrasing
+    will not help.
+
+    And the closing SENTENCE has to match, because it is the one the caller reads: telling
+    someone whose query is being retried that no query can be decided against this source is
+    the same defect one surface out.
     """
     from mnemiq.sql.authz_guard import check_unmodelled_calls
     from mnemiq.sql.functions import FunctionInventory
@@ -437,7 +441,9 @@ def test_one_code_two_answers_about_whether_to_try_again():
     # `builtin_functions()` having thrown, which the next attempt makes again -- leaving it out
     # while retrying its sibling was a contradiction, not a nuance.
     raised = FunctionInventory.of(["commission_rate"], builtins_asked=True)
-    assert check_unmodelled_calls(ast, raised, "duckdb").repairable is True
+    retried = check_unmodelled_calls(ast, raised, "duckdb")
+    assert retried.repairable is True
+    assert "Try again." in retried.message
 
     shadowing = FunctionInventory.of(["median"], builtins=["median"])
     no_such_method = FunctionInventory.of(["commission_rate"])   # builtins_asked stays False
@@ -445,3 +451,5 @@ def test_one_code_two_answers_about_whether_to_try_again():
         refusal = check_unmodelled_calls(ast, inventory, "duckdb")
         assert refusal.code is RefusalCode.UNRESOLVABLE_CALLS
         assert refusal.repairable is False, inventory
+        assert "No query can be decided against this source." in refusal.message, inventory
+        assert "Try again." not in refusal.message, inventory

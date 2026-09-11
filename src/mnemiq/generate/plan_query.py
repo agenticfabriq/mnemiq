@@ -13,7 +13,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import visible_schema
-from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
+from mnemiq.sql.verdict import REPAIRABLE, Approved, Refusal, RefusalCode
 
 logger = logging.getLogger(__name__)
 
@@ -283,20 +283,44 @@ def plan_query(
             # said somewhere -- and the server log is inside the boundary that holds the DSN.
             logger.warning("unrepairable refusal, not retried: %s (%r)",
                            verdict.code.value, verdict.subject)
-            code, without_subject = _UNREPAIRABLE.get(
-                verdict.code, (DeferralReason.UNGOVERNABLE, None))
-            return Deferred(
-                reason=(without_subject if without_subject and carries_source_words
-                        else verdict.message),
-                code=code,
-            )
+            return _not_our_sql(verdict, carries_source_words)
 
         last = verdict
         carries_source_words = verdict.source_detail is not None
         feedback = Feedback(verdict.repair_text, from_source=carries_source_words)
 
+    if last is not None and last.code not in REPAIRABLE:
+        # Retried only because the INSTANCE said to -- a source whose catalogue call raised is
+        # worth asking again, and `decide` re-asks it live every attempt. After the last one the
+        # CODE's judgment stands, and reporting this as INVALID_QUERY would be the thing M98 set
+        # out to retire: "could not produce a valid query after 3 attempts" over a query that was
+        # never the problem, hiding the sentence naming what an operator has to fix.
+        logger.warning("unrepairable refusal survived %d attempts: %s (%r)",
+                       max_attempts, last.code.value, last.subject)
+        return _not_our_sql(last, carries_source_words)
+
     reason = last.message if last else "The query could not be made valid."
     return Deferred(
         reason=f"Could not produce a valid query after {max_attempts} attempts. {reason}",
         code=DeferralReason.INVALID_QUERY,
+    )
+
+
+def _not_our_sql(verdict, carries_source_words: bool) -> Deferred:
+    """Answer with a refusal no rewrite can fix, under the code that says whose problem it is.
+
+    Both exits above land here, and they have to agree: one gives up at once and the other after
+    the attempts run out, and a caller cannot tell those apart from the answer -- nor should the
+    reason change because the engine happened to try first.
+
+    The message goes back whole, because these refusals are the ones that say what an OPERATOR
+    must change, and burying that under a retry count is what made the useful sentence look like
+    a footnote to a failure.
+    """
+    code, without_subject = _UNREPAIRABLE.get(verdict.code,
+                                              (DeferralReason.UNGOVERNABLE, None))
+    return Deferred(
+        reason=(without_subject if without_subject and carries_source_words
+                else verdict.message),
+        code=code,
     )
