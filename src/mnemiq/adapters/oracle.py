@@ -749,10 +749,14 @@ class OracleAdapter:
         worth: `WITH ... UNION ALL ... CYCLE` over `ALL_SYNONYMS` measured **141 ms** a call, and
         116 ms even restricted to this schema, since each iteration rejoins a 7,869-row view with
         no useful access path. Reading that view once is 23.8 ms, and `user_functions` as a
-        whole -- this read, the walk, and three other dictionary queries through `_rows` --
-        settles at 32 ms against DuckDB's 13. Both figures are on the container's stock
-        dictionary of 7,869 synonyms; see the note on the prefilter for what a much larger
-        one is not known to cost.
+        whole -- these reads, the walks, and two other dictionary queries through `_rows` --
+        settles around 40 ms against DuckDB's 13, on this container's 7,869 synonyms.
+
+        The WALK is linear in the graph and no longer the thing to worry about: the first
+        version stored a reachable set per alias and was quadratic, measured on a synthetic
+        chain at 3.6 ms for 200 synonyms, 63.2 for 800 and 239.3 for 1,600. Backwards from the
+        functions it is 33.9 ms at 40,000. What remains unmeasured is the dictionary READ on an
+        instance that size (M101), not the resolution.
 
         **Keyed by (owner, name), not by name.** The first version keyed the walk on the target's
         bare name, so when a private and a PUBLIC synonym shared one, which link the walk took
@@ -766,13 +770,18 @@ class OracleAdapter:
         that was wrong too, and measured wrong: Oracle takes the PUBLIC synonym when the named
         schema holds no such object. Both links are followed now and neither is preferred.
 
-        The WHOLE graph is read, and only the REPORTING is filtered. A chain may hop through a
-        schema this connection does not own, and an edge set narrowed first cannot follow it.
-        What comes back is an alias this schema owns, or a PUBLIC one whose ULTIMATE target
-        belongs to an owner Oracle does not maintain -- every PUBLIC synonym reaching a function
-        on this container is Oracle's own, 368 of them, and putting those in the inventory turns
-        `calls_are_confirmable` false for every Oracle source, which is issue #5 on a schema that
-        defines nothing.
+        The WHOLE graph is read and walked, and only the REPORTING is filtered. A chain may hop
+        through a schema this connection does not own, and an edge set narrowed first cannot
+        follow it. What comes back is an alias this schema owns, or a PUBLIC one whose chain ends
+        outside Oracle's own schemas -- every PUBLIC synonym reaching a function on this
+        container is Oracle's own, 368 of them, and reporting those turns `calls_are_confirmable`
+        false for every Oracle source, which is issue #5 on a schema that defines nothing.
+
+        That filter is asked as its own reverse walk rather than applied afterwards, which is
+        also why no candidate prefilter is needed: an earlier version skipped PUBLIC aliases
+        whose IMMEDIATE target was Oracle-maintained, purely to bound a quadratic walk, and gave
+        up a chain that leaves Oracle's schemas on a later hop. A fuzz over random graphs found
+        68 differences between the two and every one was that gain.
 
         Termination is `seen` over a set of visited objects, not a hop count. A planted `loop_a -> loop_b -> loop_a` raised
         ORA-32044 from the recursive query, so a cycle is a real shape; a depth cap on top of
@@ -795,54 +804,44 @@ class OracleAdapter:
         }
         mine = self._schema.lower()
 
-        def reachable_from(start: tuple[str, str]) -> set[tuple[str, str]]:
-            """Every object a chain from `start` can name.
+        # Forward and backward both, because each answers a question the other cannot.
+        nodes = set(edges) | set(edges.values())
+        forward: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        backwards: dict[tuple[str, str], list[tuple[str, str]]] = {}
+        for at in nodes:
+            for step in (edges.get(at), edges.get(("public", at[1]))):
+                if step is not None:
+                    forward.setdefault(at, []).append(step)
+                    backwards.setdefault(step, []).append(at)
 
-            BOTH links are followed -- the exact one and PUBLIC-by-name -- because Oracle takes
-            the PUBLIC one when the named schema holds no such object. Measured:
-            `CREATE SYNONYM zz FOR appuser.dbms_random` with no `APPUSER.DBMS_RANDOM` present,
-            and `SELECT zz.value FROM dual` returned 0.41 through `PUBLIC.DBMS_RANDOM`.
-
-            Which link applies depends on whether the named object exists, and that is the very
-            list this walk is computing an input to. So the order is not modelled at all: both
-            are collected and the alias counts if ANY of them is a function. Over-inclusive, and
-            over-inclusion here costs a refusal while under-inclusion costs an approval.
-            """
-            seen: set[tuple[str, str]] = set()
-            stack = [start]
+        def spread(seeds, adjacency) -> set[tuple[str, str]]:
+            """Everything `seeds` reaches. `seen` is what makes a cycle terminate."""
+            seen = set(seeds)
+            stack = list(seen)
             while stack:
-                at = stack.pop()
-                if at in seen:
-                    continue
-                seen.add(at)
-                for step in (edges.get(at), edges.get(("public", at[1]))):
-                    if step is not None and step not in seen:
-                        stack.append(step)
+                for nxt in adjacency.get(stack.pop(), ()):
+                    if nxt not in seen:
+                        seen.add(nxt)
+                        stack.append(nxt)
             return seen
 
-        # A PUBLIC alias is a candidate only when its IMMEDIATE target already leaves Oracle's
-        # own furniture, which is the same test the reporting filter applies at the end. Without
-        # it the walk runs from all ~7,800 PUBLIC synonyms on a stock instance and
-        # `user_functions` costs 167 ms instead of 32; with it, every one that survives is a
-        # route a deployment created. What it gives up is a PUBLIC alias whose chain leaves an
-        # Oracle-maintained schema on a LATER hop -- an Oracle synonym pointing into a user
-        # schema, which none of the 7,869 here does.
+        # WHICH OWNERS TO ASK ABOUT, and this is where the cost lives rather than in the walk.
+        # Taking every owner named by an edge pulls SYS in, and `all_objects` for SYS alone is
+        # 107 ms against 3.5 ms for the app schema -- `user_functions` went from 30 ms to 157 ms
+        # that way, which is the same regression the removed prefilter had been hiding, moved
+        # from the walk into the read.
         #
-        # Both figures are this container's. A dictionary two orders larger -- an EBS-shaped
-        # instance runs to six figures of synonyms -- has not been measured, and the read is
-        # bounded only by the probe timeout: if it expires the inventory is `unavailable` and
-        # every statement on the source is refused, including ones that call nothing. Recorded
-        # as M101 rather than guessed at, because a number nobody ran is what this file keeps
-        # being wrong about.
-        candidates = {
-            (o, n): reachable_from(edges[(o, n)])
-            for (o, n) in edges
-            if o == mine or (o == "public" and edges[(o, n)][0] not in oracle_owned)
-        }
-        ends = {end for reached in candidates.values() for end in reached}
-        if not ends:
+        # Only two sets can matter. What THIS schema's aliases reach, which is a small forward
+        # walk. And every non-Oracle-maintained owner named anywhere, since a PUBLIC alias counts
+        # only where its chain ends outside Oracle's own schemas, so SYS functions can never
+        # decide that arm.
+        mine_reaches = spread({t for (o, _), t in edges.items() if o == mine}, forward)
+        owners = sorted(
+            {owner for owner, _ in mine_reaches}
+            | {owner for owner, _ in edges.values() if owner not in oracle_owned}
+        )
+        if not owners:
             return set()
-        owners = sorted({owner for owner, _ in ends})
         binds = {f"o{i}": owner for i, owner in enumerate(owners)}
         placeholders = ", ".join(f":{k}" for k in binds)
         functions = {
@@ -854,11 +853,24 @@ class OracleAdapter:
                 **binds,
             )
         }
+        if not functions:
+            return set()
+
+        # BACKWARDS from the functions, instead of forwards from every alias. The forward
+        # version stored a reachable set per candidate and was quadratic: measured on a synthetic
+        # chain, 3.6 ms at 200 synonyms, 63.2 at 800 and 239.3 at 1,600, which is the wrong shape
+        # for the dictionaries M101 is about. Each node is visited once here.
+        reaches_any = spread(functions & nodes, backwards)
+        # PUBLIC aliases count only where the chain ends outside Oracle's own schemas, so that
+        # question is asked of its own smaller target set rather than filtered afterwards.
+        reaches_free = spread({f for f in functions & nodes if f[0] not in oracle_owned},
+                              backwards)
+
         return {
             name
-            for (owner, name), reached in candidates.items()
-            if any(end in functions and (owner == mine or end[0] not in oracle_owned)
-                   for end in reached)
+            for (owner, name), target in edges.items()
+            if (owner == mine and target in reaches_any)
+            or (owner == "public" and target in reaches_free)
         }
 
     def foreign_keys(self) -> list[tuple[str, str, str, str, str]]:
