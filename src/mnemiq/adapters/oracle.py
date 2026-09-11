@@ -795,6 +795,14 @@ class OracleAdapter:
             "SELECT lower(s.owner), lower(s.synonym_name), "
             "       lower(s.table_owner), lower(s.table_name) FROM all_synonyms s"
         ):
+            # A NULL target owner is real -- an unqualified DB-link synonym has one -- and it
+            # used to reach `sorted()` and raise TypeError, which `inventory_from` turns into
+            # `unavailable` and the guard turns into refusing EVERY statement on the source. One
+            # such synonym anywhere in the dictionary would have stopped the whole deployment.
+            # Skipped rather than resolved: the docstring already says a DB-link target has no
+            # local `all_objects` row to resolve against.
+            if target_owner is None or target_name is None:
+                continue
             edges[(owner, name)] = (target_owner, target_name)
         if not edges:
             return set()
@@ -842,22 +850,28 @@ class OracleAdapter:
         )
         if not owners:
             return set()
-        binds = {f"o{i}": owner for i, owner in enumerate(owners)}
-        placeholders = ", ".join(f":{k}" for k in binds)
-        functions = {
-            (owner, name)
-            for owner, name in self._rows(
-                "SELECT lower(owner), lower(object_name) FROM all_objects "
-                "WHERE object_type IN ('FUNCTION', 'PACKAGE') "
-                f"  AND lower(owner) IN ({placeholders})",
-                **binds,
+        # Chunked, because an Oracle IN list is capped at 1,000 items (ORA-01795) and this one
+        # grows with every non-Oracle owner any synonym targets -- a schema-per-tenant instance
+        # passes that mark. 900 leaves room without needing a second measurement.
+        functions: set[tuple[str, str]] = set()
+        for start in range(0, len(owners), 900):
+            chunk = owners[start:start + 900]
+            binds = {f"o{i}": owner for i, owner in enumerate(chunk)}
+            placeholders = ", ".join(f":{k}" for k in binds)
+            functions.update(
+                (owner, name)
+                for owner, name in self._rows(
+                    "SELECT lower(owner), lower(object_name) FROM all_objects "
+                    "WHERE object_type IN ('FUNCTION', 'PACKAGE') "
+                    f"  AND lower(owner) IN ({placeholders})",
+                    **binds,
+                )
             )
-        }
         if not functions:
             return set()
 
-        # BACKWARDS from the functions, instead of forwards from every alias. The forward
-        # version stored a reachable set per candidate and was quadratic: measured on a synthetic
+        # BACKWARDS from the functions, instead of forwards from every alias. An earlier version
+        # stored a reachable set per candidate and was quadratic: measured on a synthetic
         # chain, 3.6 ms at 200 synonyms, 63.2 at 800 and 239.3 at 1,600, which is the wrong shape
         # for the dictionaries M101 is about. Each node is visited once here.
         reaches_any = spread(functions & nodes, backwards)

@@ -999,3 +999,45 @@ def test_the_object_read_does_not_ask_about_oracles_own_schemas():
 
     assert "app2" in asked, "this schema's chain endpoints have to be resolved"
     assert "sys" not in asked, "SYS cannot decide either arm, and asking costs 107 ms"
+
+
+def test_a_synonym_with_no_target_owner_does_not_take_the_source_down():
+    """An unqualified DB-link synonym has a NULL `TABLE_OWNER`, and it used to reach `sorted()`
+    and raise TypeError. `inventory_from` turns a raise into `unavailable`, which the guard turns
+    into refusing EVERY statement on the source -- so one such row anywhere in the dictionary
+    would have stopped the deployment, including queries that call nothing.
+
+    Skipped, not resolved: a DB-link target has no local `all_objects` row to resolve against,
+    which the adapter's docstring already names as the limit.
+    """
+    synonyms = [("other", "remote_s", None, "emp"), ("app", "x", "app", "udf")]
+    assert _oracle_walk(synonyms, [("app", "udf")]) == {"x"}
+
+
+def test_the_owner_read_is_chunked_under_oracles_in_list_cap():
+    """An Oracle IN list is capped at 1,000 items (ORA-01795), and this one grows with every
+    non-Oracle owner any synonym targets -- a schema-per-tenant instance passes that mark.
+
+    The stub counts the reads rather than the binds, because the cap is on one statement.
+    """
+    synonyms = [("app", f"a{i}", f"own{i}", "udf") for i in range(2500)]
+    reads: list[int] = []
+
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    adapter = OracleAdapter.__new__(OracleAdapter)
+    adapter._schema = "APP"
+
+    def rows(sql, **binds):
+        if "all_synonyms" in sql:
+            return list(synonyms)
+        if "oracle_maintained" in sql:
+            return [("sys",)]
+        reads.append(len(binds))
+        return [(o, "udf") for o in binds.values()]
+
+    adapter._rows = rows
+    got = adapter._synonyms_reaching_functions()
+
+    assert len(got) == 2500
+    assert reads and max(reads) <= 900, f"one read bound {max(reads)} owners"
