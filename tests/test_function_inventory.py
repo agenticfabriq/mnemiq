@@ -207,11 +207,20 @@ def test_a_shadowing_macro_is_caught_however_the_call_is_spelled(sql, source_wit
     the written spelling, then the rendered one, then a count cross-check that read a column
     list as a call. They are kept as a regression set rather than as a spelling test -- nothing
     is looked up by name now, so what they demonstrate is that a source defining anything
-    downgrades whatever the query says. Renaming the macros would leave them green, which is
-    the point: the rule no longer depends on the spelling that defeated three versions.
+    stops the call being cleared, whatever the query says. Renaming the macros would leave them
+    green, which is the point: the rule no longer depends on the spelling that defeated three
+    versions.
+
+    They used to be APPROVED and carry a lineage marker, which reported the doubt and then ran
+    the query anyway. Both macros here are named after builtins, so the decider now refuses.
     """
-    lineage = _lineage_through_decide(sql, DuckDBAdapter.duckdb(source_with_a_shadowing_macro))
-    assert "unconfirmed-function-identity" in lineage.reasons
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.verdict import RefusalCode
+
+    verdict = decide(sql, {"customer": {"id", "name"}},
+                     adapter=DuckDBAdapter.duckdb(source_with_a_shadowing_macro),
+                     dialect="duckdb", target="duckdb")
+    assert getattr(verdict, "code", None) is RefusalCode.SHADOWED_FUNCTION, verdict
 
 
 @pytest.mark.parametrize("sql", [
@@ -444,3 +453,135 @@ def test_a_postgres_udf_is_unreachable_from_a_query_and_absent_from_the_answer()
                 pg(f"DROP SCHEMA {schema} CASCADE")
         finally:
             admin.close()
+
+
+# --------------------------------------------------------------------------------------------
+# The DECIDER half. Lineage reports doubt and the query still runs; this is the gate. Everything
+# below was measured as a leak first: on a source with a macro reading an ungranted table, both
+# `SELECT count(*) FROM claim` and `SELECT median(id) FROM claim` were APPROVED with
+# `tables=['claim']` and returned an SSN.
+# --------------------------------------------------------------------------------------------
+
+
+def _source(*macros, name="src.duckdb"):
+    path = os.path.join(tempfile.mkdtemp(), name)
+    con = duckdb.connect(path)
+    con.execute("CREATE TABLE secret(ssn VARCHAR)")
+    con.execute("INSERT INTO secret VALUES ('123-45-6789')")
+    con.execute("CREATE TABLE claim(id INTEGER)")
+    con.execute("INSERT INTO claim VALUES (1), (2), (3)")
+    for macro in macros:
+        con.execute(macro)
+    con.close()
+    return DuckDBAdapter.duckdb(path)
+
+
+def _verdict(sql, adapter):
+    from mnemiq.sql.decide import decide
+
+    return decide(sql, {"claim": {"id"}}, adapter=adapter, dialect="duckdb", target="duckdb")
+
+
+def _code(verdict):
+    return getattr(getattr(verdict, "code", None), "value", None)
+
+
+def test_a_macro_named_after_a_builtin_stops_every_call_being_decided():
+    """`count_star` is DuckDB's binder name for `COUNT(*)`, and it appears in no spelling of
+    `SELECT count(*) FROM claim` under any dialect. Measured before this: that query was
+    approved and returned an SSN from `secret`.
+
+    So the refusal covers EVERY call rather than the one it can name, which is the only sound
+    answer once a name the query never says can collect the call. A call-free query is
+    untouched, which is what keeps this from being "refuse everything on this source".
+    """
+    adapter = _source("CREATE MACRO count_star() AS (SELECT max(ssn) FROM secret)")
+
+    leak = _verdict("SELECT count(*) AS n FROM claim", adapter)
+    assert _code(leak) == "shadowed_function", leak
+    assert "count_star" in leak.message
+
+    assert _code(_verdict("SELECT median(id) AS m FROM claim", adapter)) == "shadowed_function"
+    assert not hasattr(_verdict("SELECT id FROM claim", adapter), "code")
+
+
+def test_a_macro_the_engine_actually_binds_is_refused_by_the_name_it_binds():
+    """The other half, and the one that keeps the first from swallowing it.
+
+    `add_days` is a name sqlglot models -- so the cross-dialect allowlist passes it -- and NOT a
+    DuckDB builtin, so nothing shadows and the coarse rule stays quiet. It survives rendering,
+    which is what makes it reachable: measured, `SELECT add_days(id) FROM claim` returned an SSN
+    on this source. 440 names sqlglot knows are reachable this way.
+
+    `count(*)` against the same source is approved, which is the whole reason both rules exist
+    instead of the coarse one alone.
+    """
+    adapter = _source("CREATE MACRO add_days(x) AS (SELECT max(ssn) FROM secret)")
+
+    refusal = _verdict("SELECT add_days(id) AS n FROM claim", adapter)
+    assert _code(refusal) == "unmodelled_call", refusal
+    assert "defined by this source itself" in refusal.message
+    assert refusal.subject == "add_days"
+
+    assert not hasattr(_verdict("SELECT count(*) AS n FROM claim", adapter), "code")
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT count(*) AS n FROM claim",
+    "SELECT median(id) AS m FROM claim",
+    "SELECT date_trunc('day', CURRENT_DATE) AS d",
+    "SELECT CAST(id AS VARCHAR) AS s FROM claim",
+])
+def test_a_helper_that_shadows_nothing_costs_nothing(sql):
+    """The degeneracy control. A source with a macro of its own, named after nothing, keeps
+    answering every ordinary question.
+
+    This is what fails if `builtin_functions` reads the wrong half of `duckdb_functions()`:
+    the user names would then intersect themselves, every source with any macro would look
+    like a shadowing one, and all four of these would be refused.
+    """
+    adapter = _source("CREATE MACRO commission_rate(x) AS (x * 0.05)")
+    assert not hasattr(_verdict(sql, adapter), "code"), sql
+
+
+def test_the_two_catalogue_halves_are_one_query_split_on_internal():
+    """`builtin_functions` is `user_functions` with the predicate flipped, and the intersection
+    of the two is the whole question. Asserting the flag on the adapter is not enough -- what
+    matters is that the macro lands on one side and DuckDB's own names on the other."""
+    adapter = _source("CREATE MACRO commission_rate(x) AS (x * 0.05)")
+    user, builtin = set(adapter.user_functions()), set(adapter.builtin_functions())
+
+    assert user == {"commission_rate"}
+    assert {"count_star", "median", "length"} <= builtin
+    assert not user & builtin
+
+    shadowing = _source("CREATE MACRO median(x) AS (SELECT max(ssn) FROM secret)")
+    assert set(shadowing.user_functions()) & set(shadowing.builtin_functions()) == {"median"}
+
+
+def test_an_adapter_that_cannot_say_what_a_builtin_is_gets_the_conservative_answer():
+    """`builtin_functions` is optional, and forgetting it must cost precision rather than
+    soundness. An adapter offering the cheap half alone still has every call on it declined,
+    because a binder rename it cannot rule out is exactly the leak this is about.
+
+    A source that defines NOTHING is untouched either way, which is what keeps the conservative
+    default off every ordinary database.
+    """
+    from mnemiq.sql.functions import inventory_from
+
+    class HalfAnswering:
+        def user_functions(self):
+            return ["commission_rate"]
+
+    class Angry(HalfAnswering):
+        def builtin_functions(self):
+            raise RuntimeError("no catalogue for you")
+
+    class Plain:
+        def user_functions(self):
+            return []
+
+    assert inventory_from(HalfAnswering()).builtins is None
+    assert inventory_from(HalfAnswering()).may_shadow_a_builtin is True
+    assert inventory_from(Angry()).may_shadow_a_builtin is True
+    assert inventory_from(Plain()).may_shadow_a_builtin is False

@@ -58,7 +58,13 @@ def decide(
     # projection position is not one -- so an opaque call slipped past both it and the RLS
     # rewrite (M43). This does not decide whether such a call is dangerous; it says the query
     # cannot be decided, which is the true thing.
-    opaque = check_unmodelled_calls(shaped)
+    # One inventory for the whole decision. `lineage_for` reads it too, and asking twice would
+    # let the gate and the report disagree about the same source in the same statement.
+    functions = inventory_from(adapter)
+    # Both dialects, because `called_names` renders to find what the tree does not carry, and
+    # more spellings can only over-refuse. `dialect` is what this was parsed as, `target` what
+    # will run it.
+    opaque = check_unmodelled_calls(shaped, functions, dialect, target)
     if opaque is not None:
         return opaque
 
@@ -117,7 +123,7 @@ def decide(
     # LIVE from the adapter, not the snapshot -- see `inventory_from` for why the two sources
     # differ.
     lineage = lineage_for(shaped, tables, {} if views is None else views,
-                          functions=inventory_from(adapter),
+                          functions=functions,
                           scope_resolved=scope_resolved(shaped))
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 

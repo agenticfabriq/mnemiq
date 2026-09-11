@@ -317,3 +317,84 @@ def test_an_opaque_call_cannot_be_decided_on_the_write_path_either(sql, dialect)
     v = _decide_write(sql, dialect)
     assert isinstance(v, Refusal), f"{sql!r} was approved under {dialect}"
     assert v.code == RefusalCode.UNMODELLED_CALL
+
+
+# --------------------------------------------------------------------------------------------
+# What the source is asked for, versus what the model wrote. Three earlier attempts at this
+# question read the written spelling or the tree and each cleared a UDF that then returned an
+# SSN (M56). `called_names` reads the RENDERED statement, because that is what the source gets.
+# --------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_a_call_is_named_by_what_the_source_receives_not_by_what_was_written(dialect):
+    """`len(name)` reaches the source as `LENGTH(name)`, so `length` is the name that binds and
+    `len` is not. Reading the written word cleared a macro named `length` and returned an SSN.
+    """
+    from mnemiq.sql.functions import called_names
+
+    written_len = sqlglot.parse_one("SELECT len(name) FROM claim", read=dialect)
+    assert "length" in called_names(written_len, dialect)
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_a_name_the_tree_does_not_carry_is_still_found(dialect):
+    """`date_trunc` parses to `exp.TimestampTrunc`, which declares `timestamp_trunc` and
+    `trunc` and has forgotten the word by the time anything can walk it. Rendering puts it
+    back, which is why the scan is over text rather than over nodes."""
+    from mnemiq.sql.functions import called_names
+
+    assert "DATE_TRUNC" not in sqlglot.exp.TimestampTrunc.sql_names()
+    ast = sqlglot.parse_one("SELECT date_trunc('day', created_at) FROM claim", read=dialect)
+    assert "date_trunc" in called_names(ast, dialect)
+
+
+def test_a_statement_that_will_not_render_is_not_read_as_call_free():
+    """The absence-and-failure collapse, in the place it would fail open: an empty set of names
+    intersects nothing, so a caller reading a render failure as "no calls" clears all of them.
+    """
+    from mnemiq.sql.functions import UnreadableCalls, called_names
+
+    class WillNotRender(sqlglot.exp.Expression):
+        def sql(self, *a, **kw):
+            raise ValueError("no")
+
+    with pytest.raises(UnreadableCalls):
+        called_names(WillNotRender(), "duckdb")
+
+
+def test_a_statement_that_will_not_render_refuses_rather_than_passes():
+    """And the guard takes that the same way it takes shadowing, for the same reason."""
+    from mnemiq.sql.authz_guard import check_unmodelled_calls
+    from mnemiq.sql.functions import FunctionInventory
+
+    class WillNotRender(sqlglot.exp.Expression):
+        def sql(self, *a, **kw):
+            raise ValueError("no")
+
+        def find_all(self, *types):
+            yield sqlglot.exp.Anonymous(this="count")
+
+    inventory = FunctionInventory.of(["commission_rate"], builtins=["count_star"])
+    refusal = check_unmodelled_calls(WillNotRender(), inventory, "duckdb")
+    assert refusal.code == RefusalCode.SHADOWED_FUNCTION
+
+
+def test_without_an_inventory_the_guard_is_the_allowlist_it_was():
+    """The default has to be the old behaviour exactly. Every caller that does not pass an
+    inventory -- fixtures, the write path, a source with no adapter -- would otherwise change
+    verdict, and a conservative default here would refuse every call in the suite."""
+    from mnemiq.sql.authz_guard import check_unmodelled_calls
+
+    ast = sqlglot.parse_one("SELECT count(*), median(id) FROM claim", read="duckdb")
+    assert check_unmodelled_calls(ast) is None
+
+
+def test_a_shadowed_source_is_not_repaired_into_an_answer():
+    """UNMODELLED_CALL is repairable because a model can route around one named function.
+    SHADOWED_FUNCTION cannot be: its repair is "use no functions at all", which no aggregate
+    question has, so a loop would spend every attempt to arrive where it started."""
+    from mnemiq.sql.verdict import REPAIRABLE
+
+    assert RefusalCode.UNMODELLED_CALL in REPAIRABLE
+    assert RefusalCode.SHADOWED_FUNCTION not in REPAIRABLE

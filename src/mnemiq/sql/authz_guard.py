@@ -3,6 +3,7 @@ from __future__ import annotations
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
+from mnemiq.sql.functions import FunctionInventory, UnreadableCalls, called_names
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import base_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -86,6 +87,9 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     return None
 
 
+
+
+
 def _known_function_names() -> frozenset[str]:
     """Every function name sqlglot can model, in ANY dialect.
 
@@ -115,7 +119,11 @@ def _known_function_names() -> frozenset[str]:
 _KNOWN_FUNCTIONS = _known_function_names()
 
 
-def check_unmodelled_calls(ast: exp.Expression) -> Refusal | None:
+def check_unmodelled_calls(
+    ast: exp.Expression,
+    inventory: FunctionInventory | None = None,
+    *dialects: str,
+) -> Refusal | None:
     """Refuse a call this engine cannot model, because it cannot say what such a call reads.
 
     `check_access` re-checks every `exp.Table` against the identity's visible set, and the RLS
@@ -140,9 +148,19 @@ def check_unmodelled_calls(ast: exp.Expression) -> Refusal | None:
     and the decider's premise is that it sees every table a query reads. An opaque call makes
     that premise false, so the honest verdict is that this query cannot be decided.
 
-    Names, not identities: a UDF named `median` is modelled by sqlglot and passes here. That is
-    the acknowledged limit of any name-based allowlist, and it is bounded by the same
-    per-identity execution that dissolves M43 and M65 in v2.
+    The allowlist alone was names, not identities: a UDF named `median` is modelled by sqlglot
+    and passed. Measured through this function on the shipped default, with a macro in an
+    attached read-only DuckDB file, `SELECT median(id) FROM claim` was APPROVED with
+    `tables=['claim']` and returned an SSN from a table the identity was never granted. So did
+    `SELECT count(*) FROM claim`, against a macro named `count_star` -- a name that appears in
+    no spelling of that query, because it is DuckDB's binder name for `COUNT(*)`.
+
+    `inventory` closes that, in the two shapes the leak comes in. A call reachable under its
+    OWN name must be spelled, so `called_names` finds it however sqlglot rewrote the node. A
+    call reachable under a BUILTIN's name is not derivable at all, and cannot happen unless the
+    source defines something a builtin is also called -- so that case condemns every call here
+    rather than pretending to pick one. Without an inventory this is the allowlist alone, which
+    is where it started.
     """
     for call in ast.find_all(exp.Anonymous):
         name = str(call.this)
@@ -157,4 +175,59 @@ def check_unmodelled_calls(ast: exp.Expression) -> Refusal | None:
             ),
             subject=name,
         )
+
+    inventory = inventory if inventory is not None else FunctionInventory.never_asked()
+    if not inventory.names or next(ast.find_all(exp.Func), None) is None:
+        # Nothing defined, or nothing called. The second half is what keeps a source with one
+        # helper from refusing `SELECT id FROM claim`.
+        return None
+
+    if inventory.may_shadow_a_builtin:
+        return _shadowed(inventory)
+
+    try:
+        called = called_names(ast, *dialects)
+    except UnreadableCalls:
+        # Cannot enumerate, so cannot clear. The same answer as shadowing, and for the same
+        # reason: an empty set read as "no calls" would clear all of them.
+        return _shadowed(inventory)
+
+    for name in sorted(called & inventory.names):
+        return Refusal(
+            code=RefusalCode.UNMODELLED_CALL,
+            message=(
+                f"{name}() is defined by this source itself, so this engine cannot confirm "
+                "what the query reads. Answer using only the listed tables and columns and "
+                "standard SQL functions."
+            ),
+            subject=name,
+        )
     return None
+
+
+def _shadowed(inventory: FunctionInventory) -> Refusal:
+    """No call on this source can be read off the text, so none of them can be decided.
+
+    Two ways to arrive, kept apart in the message because they need different fixes. The source
+    defines a name it also calls a builtin, which the deployer resolves by renaming it. Or the
+    source never said what its builtins are, which the ADAPTER resolves by implementing
+    `builtin_functions` -- a missing method should not read in a trace like a hostile database.
+    """
+    shadowed = sorted(inventory.names & inventory.builtins) if inventory.builtins else []
+    if shadowed:
+        detail = (
+            f"This source defines {shadowed[0]!r} under a name it also lists as a builtin"
+        )
+    else:
+        detail = (
+            "This source defines functions of its own and did not report which names are "
+            "builtins"
+        )
+    return Refusal(
+        code=RefusalCode.SHADOWED_FUNCTION,
+        message=(
+            f"{detail}, so this engine cannot confirm what any call in this query executes. "
+            "No query using a function can be decided against this source."
+        ),
+        subject=shadowed[0] if shadowed else None,
+    )
