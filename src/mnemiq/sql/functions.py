@@ -47,6 +47,15 @@ class FunctionInventory:
     available: bool = True
     asked: bool = True
     reason: str = ""   # declared for every constructor, not only the failing one
+    # Whether this answer also covers what a VIEW BODY on this source may invoke. It does not,
+    # for a Postgres attachment: measured, `SELECT median(1)` binds to DuckDB's aggregate and a
+    # Postgres UDF is unreachable from a generated query, but reading a Postgres view whose body
+    # calls that same UDF returns its value -- it ran server-side, where DuckDB's binder never
+    # looked. So `duckdb_functions()` answers the top-level question completely and the
+    # view-body question not at all, and a consumer walking view bodies must know which it has.
+    # Without this field the Postgres path returns an empty list that reads as `certain`, which
+    # would certify a server-side UDF as a builtin. Prose in a docstring cannot carry that.
+    covers_view_bodies: bool = True
 
     def __post_init__(self) -> None:
         # Normalised HERE, not only in `of()`. A dataclass hands out its plain constructor
@@ -55,19 +64,26 @@ class FunctionInventory:
         # unfrozen set, while `of()` a few lines down did the right thing. Two constructors with
         # different semantics is the shape of a bug nobody looks for, and the case-sensitive one
         # fails in the direction that matters -- a UDF named like a builtin read as the builtin.
-        object.__setattr__(self, "names", frozenset(n.lower() for n in self.names))
+        names = self.names
+        # A bare string is an iterable of characters, so `FunctionInventory("median")` produced
+        # {a,d,e,i,m,n} and `defines("median")` was False -- failing in the direction that
+        # matters, a UDF named like a builtin read as the builtin. The guard was in `of()` only,
+        # which left the two constructors disagreeing about the same input.
+        if isinstance(names, str):
+            names = [names]
+        object.__setattr__(self, "names", frozenset(n.lower() for n in names))
 
     @classmethod
     def of(cls, names, **kw) -> "FunctionInventory":
         """Build from any iterable of names, folded to lower case.
 
-        A convenience over the constructor for the common "I have an iterable" case; both
-        normalise. Guards against `of("median")`, which would otherwise splay a bare string
-        into single characters.
+        A convenience over the constructor for the common "I have an iterable" case. Both
+        normalise identically, in `__post_init__`, so neither can be the trap.
         """
-        if isinstance(names, str):
-            names = [names]
-        return cls(frozenset(names or ()), **kw)
+        # Passed straight through: freezing here would splay a bare string into characters
+        # BEFORE `__post_init__` could guard it, which is how the two constructors kept
+        # disagreeing after the guard moved.
+        return cls(names or (), **kw)
 
     @classmethod
     def unavailable(cls, reason: str = "") -> "FunctionInventory":
@@ -85,5 +101,13 @@ class FunctionInventory:
 
     @property
     def certain(self) -> bool:
-        """Whether a caller may treat a name absent from `names` as a builtin."""
+        """Whether a caller may treat a name absent from `names` as a builtin.
+
+        Top-level calls only. A consumer walking view bodies wants `certain_for_view_bodies`.
+        """
         return self.available and self.asked
+
+    @property
+    def certain_for_view_bodies(self) -> bool:
+        """The same licence, for a call found inside a view body rather than the query."""
+        return self.certain and self.covers_view_bodies

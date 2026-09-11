@@ -104,23 +104,39 @@ def test_a_lookup_failure_raises_rather_than_reporting_none(duckdb_source):
 
 
 @pytest.mark.integration
-def test_a_postgres_attachment_reports_duckdbs_catalogue_and_that_is_correct():
-    """Measured, because it is not obvious and an earlier version raised here instead.
+def test_a_postgres_udf_is_unreachable_from_a_query_and_absent_from_the_answer():
+    """The claim this design rests on, checked rather than asserted.
 
-    Queries run on the DuckDB connection and its binder resolves against its own catalogue. On
-    a Postgres source defining `median(int) RETURNS 99`, `SELECT median(1)` returns DuckDB's
-    aggregate and the qualified forms do not bind at all, so a Postgres UDF is unreachable from
-    a generated query. Reporting DuckDB's non-internal names is therefore the right answer, and
-    the Postgres function must NOT appear.
+    The previous version of this test asserted `"median" not in fns` against a database that
+    defines no `median`, so it could not fail: swapping the method for the `pg_proc` query it
+    exists NOT to use would have kept it green. It creates the function now, and checks the
+    behaviour the claim is about rather than only the absence.
 
-    A Postgres view body is the other question. Reading a view whose body calls that function
-    returns 99, because it runs server-side where DuckDB's binder never looked. That wants
-    `pg_proc` and is not what this method answers.
+    Two halves, and they differ. A generated query cannot reach a Postgres UDF -- DuckDB's
+    binder resolves against its own catalogue -- so `duckdb_functions()` answers that question
+    completely. A Postgres VIEW BODY calling the same UDF runs it server-side, which this
+    answer does not cover and `covers_view_bodies` is how the inventory says so.
     """
     import os
 
-    dsn = os.getenv("MNEMIQ_PG_DSN", "postgresql://mnemiq:mnemiq@localhost:5433/acme")
-    fns = DuckDBAdapter.postgres(dsn, read_only=True).user_functions()
+    import duckdb as _duckdb
 
-    assert "median" not in fns, "a Postgres UDF is not callable here and must not be reported"
-    assert all(isinstance(f, str) for f in fns)
+    dsn = os.getenv("MNEMIQ_PG_DSN", "postgresql://mnemiq:mnemiq@localhost:5433/acme")
+    con = _duckdb.connect()
+    con.execute("INSTALL postgres; LOAD postgres")
+    con.execute(f"ATTACH '{dsn}' AS pg (TYPE POSTGRES)")
+    con.execute("CALL postgres_execute('pg', 'DROP VIEW IF EXISTS v_fn_probe')")
+    con.execute("CALL postgres_execute('pg', 'DROP FUNCTION IF EXISTS fn_probe(int)')")
+    con.execute("CALL postgres_execute('pg', "
+                "'CREATE FUNCTION fn_probe(int) RETURNS int AS $x$ SELECT 99 $x$ LANGUAGE sql')")
+    try:
+        adapter = DuckDBAdapter.postgres(dsn, read_only=True)
+        fns = adapter.user_functions()
+
+        assert "fn_probe" not in fns, "a Postgres UDF is not callable here and must not be listed"
+        # ...and the reason it must not be listed: the query cannot reach it at all.
+        with pytest.raises(Exception):
+            adapter.execute("SELECT fn_probe(1)")
+    finally:
+        con.execute("CALL postgres_execute('pg', 'DROP FUNCTION IF EXISTS fn_probe(int)')")
+        con.close()
