@@ -4,33 +4,8 @@ from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables, column_tables
+from mnemiq.sql.scope import base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
-
-
-def _candidate_tables(
-    column: exp.Column, resolved: dict[int, str] | None, referenced: set[str], aliased: set[str]
-) -> set[str]:
-    """The base table(s) a column could belong to.
-
-    Qualified -> the table its alias names IN ITS OWN SCOPE, which is why this takes a
-    per-node map rather than a name->table dictionary: one alias can mean two tables in one
-    statement, and a flat map kept whichever was seen last (Codex review, 2026-08-12).
-
-    Unqualified -> every referenced base table, fail-closed. An alias the resolver could not
-    place is treated the same way rather than as "no table": unresolvable is not permission.
-    """
-    if not column.table or resolved is None:
-        # `resolved is None` -> the scopes could not be read, so nothing here is known to be a
-        # local alias. Every referenced base table is a candidate; an unreadable statement is
-        # not an argument for permission.
-        return referenced
-    table = resolved.get(id(column))
-    if table is not None:
-        return {table}
-    # A qualifier naming a CTE or derived table owns no base column -- but only when we are
-    # sure that is what it is. Otherwise fall back to every table.
-    return set() if column.table in aliased else referenced
 
 
 def _is_bare_projection(column: exp.Column) -> bool:
@@ -103,7 +78,7 @@ def check_cls(ast: exp.Expression, policy: AccessPolicy,
                         )
 
     for column in ast.find_all(exp.Column):
-        cands = _candidate_tables(column, resolved, referenced, aliased)
+        cands = candidate_tables(column, resolved, referenced, aliased)
         name = column.name
         if any(policy.denies(t, name) for t in cands):
             return Refusal(

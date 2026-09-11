@@ -5,7 +5,7 @@ from sqlglot.dialects.dialect import Dialect
 
 from mnemiq.sql.functions import FunctionInventory, UnreadableCalls, called_names
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables, column_tables
+from mnemiq.sql.scope import base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -255,10 +255,27 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
     REPAIRABLE, unlike the other arrivals at this code. Selecting a different column is a real
     rewrite, and the message names the one to avoid.
     """
+    if opaque is None:
+        # ASKED and could not answer. Every column could be computed by an expression nobody can
+        # read, and `check_access` passes a listed column, so there is nothing else looking.
+        # Retried rather than final: `decide` re-reads the catalogue on every attempt.
+        return Refusal(
+            code=RefusalCode.UNRESOLVABLE_CALLS,
+            message=(
+                "This source could not say which of its columns are computed, so this engine "
+                "cannot confirm what reading them executes. Try again."
+            ),
+            repairable_override=True,
+        )
     if not opaque:
         return None
-    referenced = {object_key(t): t.alias_or_name for t in base_tables(ast, dialect)}
-    by_alias = {alias: table for table, alias in referenced.items()}
+    referenced = {object_key(t) for t in base_tables(ast, dialect)}
+    # Scope-aware, like `check_access` and `check_cls`. A flat alias map keyed on the written
+    # case let `SELECT Q.leaked FROM vc_t Q` through while refusing the lowercase spelling, and
+    # one alias meaning two tables across UNION branches changed the verdict with branch order.
+    resolved = column_tables(ast, dialect)
+    local = {cte.alias_or_name for cte in ast.find_all(exp.CTE)}
+    aliased = local | {s.alias_or_name for s in ast.find_all(exp.Subquery) if s.alias_or_name}
 
     def refuse(name: str, why: str, repair: str) -> Refusal:
         return Refusal(
@@ -299,10 +316,7 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
         name = column.name.lower()
         # A qualifier names the table directly; without one, any table in scope could own it,
         # and an opaque column anywhere in scope is one this statement may be reading.
-        if column.table:
-            owners = [by_alias.get(column.table.lower(), column.table.lower())]
-        else:
-            owners = list(referenced)
+        owners = candidate_tables(column, resolved, referenced, aliased)
         for table in owners:
             if (table.lower(), name) in opaque:
                 return refuse(name, "reading it", "Answer without that column.")

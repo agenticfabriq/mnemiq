@@ -131,7 +131,7 @@ def touched(ast: exp.Expression, policy: AccessPolicy, schema=None, dialect=None
         masked_cols.setdefault(obj.lower(), set()).add(col.lower())
     every_masked_name = {c for cols in masked_cols.values() for c in cols}
 
-    # Attribution is keyed on `column_tables` AND ON NOTHING ELSE. `_candidate_tables` must not be
+    # Attribution is keyed on `column_tables` AND ON NOTHING ELSE. `candidate_tables` must not be
     # the instrument: it is a fail-CLOSED helper built for REFUSING, and fail-closed is the wrong
     # shape for measuring -- refusing wants a superset of what might be touched, measuring wants
     # exactly what was. On `SELECT bogus.ssn FROM claim` it answers `{claim}`, a definite single
