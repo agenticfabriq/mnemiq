@@ -192,5 +192,6 @@ def identity_from_settings(settings: "Settings | None"):
         # role named " viewer" -- which matches nothing in the policy, grants nothing, and produces
         # the same accurate-sounding "no tables are available" that #4 was filed about. Every
         # surface resolves roles here, so the CLI, MCP and `/v1` all had it.
-        roles=[r.strip() for r in ((settings.roles if settings else "") or "").split(",") if r.strip()],
+        roles=[r.strip() for r in ((settings.roles if settings else "") or "").split(",")
+               if r.strip()],
     )

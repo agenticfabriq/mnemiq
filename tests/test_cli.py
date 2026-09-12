@@ -261,12 +261,13 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
         set. Making an empty parse fall through (`parsed or base.roles`) fails this line alone.
       * bare `ask q` -> `["analyst"]` guards the opposite direction, that an ABSENT flag falls
         through to settings. Returning `[]` there fails this and the env-fallback tests above.
-      * `--roles "a, b"` holds TWO, and is the only guard for either. It is the sole assertion
-        anywhere reading the per-element `.strip()`: change the element expression from
-        `r.strip()` to `r` while KEEPING the `if r.strip()` filter, and this line fails alone --
-        the whitespace-only case above survives on the filter. Dropping both strips fails both. It is also what
-        fails first if the flag is ignored entirely. Do not simplify it to `--roles "a,b"` -- that
-        still satisfies the second property and silently retires the first.
+      * `--roles "a, b"` holds TWO properties and is the only guard for either. It is the sole
+        assertion anywhere reading the per-element `.strip()`: change the element expression
+        from `r.strip()` to `r` while KEEPING the `if r.strip()` filter and this line fails
+        alone, since `--roles "a, ,b"` survives on the filter. (Dropping both strips fails
+        both.) It is also what fails first if the flag is ignored entirely. Do NOT simplify it
+        to `--roles "a,b"`: that still satisfies the second property and silently retires the
+        first.
     """
     import mnemiq.cli as cli
 
