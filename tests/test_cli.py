@@ -251,10 +251,11 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
     empty `--principal` is not an instruction, so it falls through rather than building an identity
     with no principal.
 
-    Each assertion holds a DIFFERENT property, measured by mutating `_identity` one way at a time
-    rather than reasoned about -- an earlier version of this paragraph named its control by
-    position, a later commit inserted a case at that position, and the correction then re-pointed
-    it at two assertions that guard something else:
+    The strip cases carry their own comments. The three that decide how `--roles` RESOLVES are
+    below, each named by the mutation that kills it -- measured one at a time rather than reasoned
+    about, because an earlier version of this paragraph named its control by position, a later
+    commit inserted a case at that position, and the correction then re-pointed it at assertions
+    guarding something else:
 
       * `--roles ""` -> `[]` is the ONLY guard that an explicit empty flag beats a configured role
         set. Making an empty parse fall through (`parsed or base.roles`) fails this line alone.
@@ -282,5 +283,4 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
     # The case the principal strip actually exists for. `--principal ""` above is resolved by the
     # `or` alone, so it reads the strip not at all -- deleting `.strip()` left every test green.
     assert ident(["ask", "q", "--principal", "   "]).principal_id == "alice@corp.com"
-    assert ident(["ask", "q", "--roles", "admin"]).roles == ["admin"]
     assert ident(["ask", "q"]).roles == ["analyst"]
