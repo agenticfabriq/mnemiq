@@ -89,21 +89,33 @@ def unique_non_null(cur, database: str, schema: str, table: str, column: str) ->
     return total > 0 and non_null == total and distinct == total
 
 
-def align_column(cur, database: str, schema: str, table: str, column: str, target: str) -> bool:
-    """Rebuild `table` with `column` cast to `target`, if the cast is lossless.
+def cast_is_lossless(
+    cur, database: str, schema: str, table: str, column: str, target: str
+) -> bool:
+    """True when casting `column` to `target` loses NOTHING. WRITES NOTHING itself.
+
+    Separate from the rewrite because the caller aligns TWO sides of a join and must know
+    both answers before touching either. When this was one function that probed and rewrote
+    together, `all(align_column(...) for s in sides)` short-circuited AFTER the first side's
+    CREATE OR REPLACE had already run: the lossy second side aborted the pair, the first
+    stayed rewritten, and the `types` entry recording it never executed -- so the next target
+    recomputed `sides` from the stale type and rewrote that same table a second time. A FLOAT
+    that had become NUMBER(38,0) was re-rendered as VARCHAR holding the NUMBER spelling
+    (1.0 -> 1 -> '1') while the other side kept its original text, so the pair still
+    mismatched and the printed count reported one column for two rewrites.
 
     SQLite stores integers and their text spellings interchangeably, so one side of a join
     lands as NUMBER and the other as TEXT. Snowflake refuses a FOREIGN KEY across a type
     mismatch, and a missing relationship is the difference between an answer and a refusal.
-    The cast is checked for loss first -- a column that does not convert cleanly is left
-    alone and its relationship is simply not declared.
+    A column that does not convert cleanly is left alone and its relationship is simply not
+    declared.
     """
     # TO_VARCHAR around every source. Snowflake's TRY_CAST takes a STRING expression, and a
     # numeric source reaches here whenever the two sides differ and neither is TEXT --
     # `_CHILD_TYPES` admits FLOAT/REAL/DOUBLE, so a FLOAT child against a NUMBER parent picks
-    # the FLOAT side for a NUMBER(38,0) target. The raise is swallowed by the caller's
-    # `except Exception: continue`, so the only visible effect is a foreign key that never
-    # gets declared, for a reason nothing prints.
+    # the FLOAT side for a NUMBER(38,0) target. `align_pairs` catches the raise and moves on
+    # to the text target, so the only visible effect is a foreign key that never gets
+    # declared, for a reason nothing prints.
     #
     # The sibling `align_fk_types_snowflake` was fixed for exactly this and this file was not:
     # the same defect in two places, corrected in one. It must match the projection below --
@@ -124,7 +136,18 @@ def align_column(cur, database: str, schema: str, table: str, column: str, targe
     # "cleanly" and silently change its values. An identifier has no fractional part.
     if target.startswith("NUMBER") and fractional:
         return False
+    return True
 
+
+def rewrite_column(
+    cur, database: str, schema: str, table: str, column: str, target: str
+) -> None:
+    """Rebuild `table` with `column` cast to `target`. CALL ONLY AFTER `cast_is_lossless`.
+
+    The cast expression MUST match the one that function probes with -- a probe certifying
+    `TRY_CAST(TO_VARCHAR(x) AS t)` while `TRY_CAST(x AS t)` executes has verified something
+    adjacent to what runs. `tests/test_infer_keys_align_column.py` compares the two.
+    """
     cur.execute(
         f"""SELECT column_name FROM {database}.INFORMATION_SCHEMA.COLUMNS
             WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position""",
@@ -139,6 +162,14 @@ def align_column(cur, database: str, schema: str, table: str, column: str, targe
         f'CREATE OR REPLACE TABLE {database}."{schema}"."{table}" AS '
         f'SELECT {projection} FROM {database}."{schema}"."{table}"'
     )
+
+
+def align_column(cur, database: str, schema: str, table: str, column: str, target: str) -> bool:
+    """Probe then rewrite, for a caller aligning ONE column. A caller aligning a PAIR must
+    use the two halves separately -- see `cast_is_lossless`."""
+    if not cast_is_lossless(cur, database, schema, table, column, target):
+        return False
+    rewrite_column(cur, database, schema, table, column, target)
     return True
 
 
@@ -178,6 +209,78 @@ def contained(
     if not non_null:
         return False
     return orphans / non_null <= max_orphan_rate
+
+
+def align_pairs(cur, database: str, schema: str, foreign: list[tuple], types: dict) -> int:
+    """Bring both sides of every mismatched join pair to one type. Returns columns rewritten.
+
+    DECIDE BOTH SIDES BEFORE WRITING EITHER. `align_column` probes and rewrites in one call,
+    so the earlier form -- `all(align_column(...) for s in sides)` -- short-circuited after
+    the first side's CREATE OR REPLACE had already run. The lossy second side then aborted
+    the pair with the first already rewritten, `types[s]` never recorded it, and the VARCHAR
+    pass recomputed `sides` from the stale type and rewrote that same table AGAIN: a FLOAT
+    that had become NUMBER(38,0) came back as VARCHAR holding the NUMBER spelling
+    (1.0 -> 1 -> '1') while the other side kept its original text. The pair still mismatched,
+    and `aligned` counted one column for two rewrites.
+
+    Extracted from `main` so that is reachable by a test. It was found by review and deferred
+    twice as needing a live warehouse, which stopped being true once the module could be
+    imported without the driver.
+
+    A rewrite that fails AFTER its probe passed still leaves the pair half-written. That is a
+    server error rather than a property of the data, and undoing it would need the original
+    types kept and a compensating rewrite. Not handled; the pair is ABANDONED rather than
+    retried against the next target, because retrying reselects the side already written.
+    """
+    aligned = 0
+    for child_table, child_column, parent_table, parent_column in foreign:
+        child_type = types.get((child_table, child_column))
+        parent_type = types.get((parent_table, parent_column))
+        if child_type == parent_type:
+            continue
+        # Bring both sides to one type: numeric where the values allow it, text otherwise.
+        # Whichever side already holds the target is left untouched.
+        for target, label in (("NUMBER(38,0)", "NUMBER"), ("VARCHAR", "TEXT")):
+            sides = [
+                s for s, t in (
+                    ((child_table, child_column), child_type),
+                    ((parent_table, parent_column), parent_type),
+                )
+                if t != label
+            ]
+            # TWO failure modes, and they must not share a handler. A PROBE raise has
+            # written nothing, so the text fallback is still worth trying; a REWRITE raise
+            # has half-written the pair, and `sides` is computed from the
+            # `child_type`/`parent_type` locals read before any write -- never from the
+            # updated `types` -- so trying the next target would reselect the side already
+            # written and re-render it. That is the same double rewrite the two-phase split
+            # removed from the short-circuit path, surviving on the exception path.
+            #
+            # One `try` around both gave the probe raise the rewrite raise's treatment and
+            # cost every such pair its VARCHAR fallback.
+            try:
+                lossless = all(
+                    cast_is_lossless(cur, database, schema, s[0], s[1], target)
+                    for s in sides
+                )
+            except Exception:
+                continue  # nothing written; the next target is still worth asking about
+            if not lossless:
+                continue
+            try:
+                for s in sides:
+                    rewrite_column(cur, database, schema, s[0], s[1], target)
+                    types[s] = label
+                    # Counted AS IT HAPPENS, not after the loop: a raise part-way through
+                    # skipped the whole increment, so a pair that half-wrote reported zero
+                    # and `main` printed no "(N columns retyped)" suffix at all -- the
+                    # operator's only sign that anything had been rebuilt.
+                    aligned += 1
+            except Exception:
+                break  # half-written; this pair is in a state this function cannot reason
+                       # about, and the remaining PAIRS still get their chance
+            break
+    return aligned
 
 
 def infer(cur, database: str, schema: str) -> tuple[list[tuple[str, str]], list[tuple]]:
@@ -297,33 +400,7 @@ def main() -> int:
                 for t, cols in fetch_columns(cur, args.database, schema).items()
                 for c, d in cols
             }
-            aligned = 0
-            for child_table, child_column, parent_table, parent_column in foreign:
-                child_type = types.get((child_table, child_column))
-                parent_type = types.get((parent_table, parent_column))
-                if child_type == parent_type:
-                    continue
-                # Bring both sides to one type: numeric where the values allow it, text
-                # otherwise. Whichever side already holds the target is left untouched.
-                for target, label in (("NUMBER(38,0)", "NUMBER"), ("VARCHAR", "TEXT")):
-                    sides = [
-                        s for s, t in (
-                            ((child_table, child_column), child_type),
-                            ((parent_table, parent_column), parent_type),
-                        )
-                        if t != label
-                    ]
-                    try:
-                        if all(
-                            align_column(cur, args.database, schema, s[0], s[1], target)
-                            for s in sides
-                        ):
-                            for s in sides:
-                                types[s] = label
-                            aligned += len(sides)
-                            break
-                    except Exception:
-                        continue
+            aligned = align_pairs(cur, args.database, schema, foreign, types)
 
             drop_existing(cur, args.database, schema)
             pk_done = 0
