@@ -241,3 +241,30 @@ def test_tenant_defaults_from_env(monkeypatch, capsys):
     monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: settings))
     assert main(["ask", "q"]) == 0
     assert captured["identity"].tenant_id == "acme"
+
+
+def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypatch):
+    """The `--roles` path strips like the environment path, and the two flags keep falling back by
+    different rules on purpose.
+
+    `--roles ""` is a real instruction -- grant nothing -- so it beats a configured role set; an
+    empty `--principal` is not an instruction, so it falls through rather than building an identity
+    with no principal. The second assertion is the control for the first: without it, "strip the
+    flag" could be satisfied by a change that dropped the flag's precedence entirely.
+    """
+    import mnemiq.cli as cli
+
+    settings = Settings(
+        llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d",
+        roles="analyst", principal="alice@corp.com",
+    )
+
+    def ident(argv):
+        return cli._identity(cli.build_parser().parse_args(argv), settings)
+
+    assert ident(["ask", "q", "--roles", "a, b"]).roles == ["a", "b"]
+    assert ident(["ask", "q", "--roles", ""]).roles == []
+    assert ident(["ask", "q", "--principal", ""]).principal_id == "alice@corp.com"
+    # Controls: the flag still wins when given, and absence still falls through to settings.
+    assert ident(["ask", "q", "--roles", "admin"]).roles == ["admin"]
+    assert ident(["ask", "q"]).roles == ["analyst"]

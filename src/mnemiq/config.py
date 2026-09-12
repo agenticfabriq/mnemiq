@@ -188,5 +188,9 @@ def identity_from_settings(settings: "Settings | None"):
     return IdentityContext(
         tenant_id=(settings.tenant if settings else None) or "local",
         principal_id=(settings.principal if settings else None) or "local",
-        roles=[r for r in ((settings.roles if settings else "") or "").split(",") if r],
+        # STRIPPED, because `MNEMIQ_ROLES=analyst, viewer` is what a person writes and it yielded a
+        # role named " viewer" -- which matches nothing in the policy, grants nothing, and produces
+        # the same accurate-sounding "no tables are available" that #4 was filed about. Every
+        # surface resolves roles here, so the CLI, MCP and `/v1` all had it.
+        roles=[r.strip() for r in ((settings.roles if settings else "") or "").split(",") if r.strip()],
     )

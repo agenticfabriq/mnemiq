@@ -370,3 +370,32 @@ def Settings_env_example_fields() -> str:
     from mnemiq.config import Settings
 
     return Settings.env_example()
+
+
+def test_role_names_are_stripped_so_a_space_after_a_comma_is_not_a_role():
+    """`MNEMIQ_ROLES=analyst, viewer` is what a person writes, and it used to yield a role named
+    `" viewer"`.
+
+    That role matches nothing in the policy, so it grants nothing, and the engine's "no tables are
+    available" is accurate -- the same invisible failure #4 was filed about, one comma-space later.
+    Every surface resolves roles through this function, so the CLI, MCP and `/v1` all had it.
+
+    The direction is worth naming: stripping GRANTS more than before, because a name that matched
+    no policy role now matches one. That is the deployer's stated intent -- they wrote two role
+    names -- and the previous behaviour honoured the whitespace rather than the intent.
+    """
+    from mnemiq.config import identity_from_settings
+
+    def roles_for(raw):
+        return identity_from_settings(
+            Settings(llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d", roles=raw)
+        ).roles
+
+    assert roles_for("analyst, viewer") == ["analyst", "viewer"]
+    assert roles_for("  analyst  ,viewer ") == ["analyst", "viewer"]
+    # Controls: neither the ordinary spelling nor the empty cases move.
+    assert roles_for("analyst,viewer") == ["analyst", "viewer"]
+    assert roles_for("analyst,") == ["analyst"]
+    assert roles_for("") == []
+    # A name that is nothing BUT whitespace is not a role, where before it was.
+    assert roles_for("analyst, ,viewer") == ["analyst", "viewer"]

@@ -82,12 +82,21 @@ def _identity(args, settings: Settings | None = None) -> IdentityContext:
     # from "the user passed a value"), which matches how the rest of the configuration resolves.
     from mnemiq.config import identity_from_settings
 
+    # THE TWO FLAGS FALL BACK BY DIFFERENT RULES, deliberately, because empty means something
+    # different for each. `--roles ""` is a real instruction -- grant nothing -- so it is honoured
+    # over the environment and only an ABSENT flag falls through. An empty principal is not an
+    # instruction, so a blank one falls through as if unset rather than building an identity with
+    # no principal at all.
     base = identity_from_settings(settings)
     roles_raw = getattr(args, "roles", None)
     return IdentityContext(
         tenant_id=base.tenant_id,
-        principal_id=getattr(args, "principal", None) or base.principal_id,
-        roles=[r for r in roles_raw.split(",") if r] if roles_raw is not None else base.roles,
+        principal_id=(getattr(args, "principal", None) or "").strip() or base.principal_id,
+        # Stripped for the same reason `identity_from_settings` strips: `--roles "analyst, viewer"`
+        # is what a person types, and an unstripped " viewer" matches no policy role, grants
+        # nothing, and reads as the engine being broken.
+        roles=([r.strip() for r in roles_raw.split(",") if r.strip()]
+               if roles_raw is not None else base.roles),
     )
 
 
