@@ -787,11 +787,15 @@ server = [
     { name = "uvicorn" },
 ]
 snowflake = [
+    { name = "cryptography" },
+    { name = "requests" },
     { name = "snowflake-connector-python" },
 ]
 warehouse = [
+    { name = "cryptography" },
     { name = "databricks-sdk" },
     { name = "databricks-sql-connector" },
+    { name = "requests" },
     { name = "snowflake-connector-python" },
     { name = "sqlglot" },
 ]
@@ -799,6 +803,8 @@ warehouse = [
 [package.metadata]
 requires-dist = [
     { name = "cachetools", specifier = ">=5" },
+    { name = "cryptography", marker = "extra == 'snowflake'", specifier = ">=42" },
+    { name = "cryptography", marker = "extra == 'warehouse'", specifier = ">=42" },
     { name = "databricks-sdk", marker = "extra == 'databricks'", specifier = ">=0.30" },
     { name = "databricks-sdk", marker = "extra == 'warehouse'", specifier = ">=0.30" },
     { name = "databricks-sql-connector", marker = "extra == 'databricks'", specifier = ">=3" },
@@ -818,6 +824,8 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8" },
     { name = "pytz" },
     { name = "rdflib", marker = "extra == 'ontology'", specifier = ">=7" },
+    { name = "requests", marker = "extra == 'snowflake'", specifier = ">=2.31" },
+    { name = "requests", marker = "extra == 'warehouse'", specifier = ">=2.31" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "snowflake-connector-python", marker = "extra == 'snowflake'", specifier = ">=3" },
     { name = "snowflake-connector-python", marker = "extra == 'warehouse'", specifier = ">=3" },
