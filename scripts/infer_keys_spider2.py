@@ -29,10 +29,14 @@ import re
 import sys
 from collections import defaultdict
 
-import snowflake.connector
-
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fix_keys_snowflake import drop_existing  # noqa: E402
+
+# BOTH deferred into `main()`. `snowflake.connector` obviously, and `drop_existing` because
+# importing it pulls the driver in transitively. Between them they made this module
+# unloadable without the warehouse extra, so `align_column` -- which decides whether a
+# CREATE OR REPLACE runs over a live table -- could not be tested. The commit that changed
+# its SQL applied this same convention to `add_relationships_spider2` and not to the file it
+# had actually changed the behaviour of.
 
 # Types that can plausibly carry a key. Floats and booleans are excluded: a float join key
 # is a coincidence, not a relationship.
@@ -94,10 +98,23 @@ def align_column(cur, database: str, schema: str, table: str, column: str, targe
     The cast is checked for loss first -- a column that does not convert cleanly is left
     alone and its relationship is simply not declared.
     """
+    # TO_VARCHAR around every source. Snowflake's TRY_CAST takes a STRING expression, and a
+    # numeric source reaches here whenever the two sides differ and neither is TEXT --
+    # `_CHILD_TYPES` admits FLOAT/REAL/DOUBLE, so a FLOAT child against a NUMBER parent picks
+    # the FLOAT side for a NUMBER(38,0) target. The raise is swallowed by the caller's
+    # `except Exception: continue`, so the only visible effect is a foreign key that never
+    # gets declared, for a reason nothing prints.
+    #
+    # The sibling `align_fk_types_snowflake` was fixed for exactly this and this file was not:
+    # the same defect in two places, corrected in one. It must match the projection below --
+    # a probe that certifies `TRY_CAST(TO_VARCHAR(x) AS t)` while `TRY_CAST(x AS t)` executes
+    # has verified something adjacent to what runs.
     cur.execute(
-        f'SELECT COUNT("{column}"), COUNT(TRY_CAST("{column}" AS {target})), '
-        f'COUNT_IF(TRY_CAST("{column}" AS FLOAT) IS NOT NULL '
-        f'         AND TRY_CAST("{column}" AS FLOAT) <> TRUNC(TRY_CAST("{column}" AS FLOAT))) '
+        f'SELECT COUNT("{column}"), '
+        f'COUNT(TRY_CAST(TO_VARCHAR("{column}") AS {target})), '
+        f'COUNT_IF(TRY_CAST(TO_VARCHAR("{column}") AS FLOAT) IS NOT NULL AND '
+        f'  TRY_CAST(TO_VARCHAR("{column}") AS FLOAT) '
+        f'  <> TRUNC(TRY_CAST(TO_VARCHAR("{column}") AS FLOAT))) '
         f'FROM {database}."{schema}"."{table}"'
     )
     non_null, converted, fractional = cur.fetchone()
@@ -115,7 +132,8 @@ def align_column(cur, database: str, schema: str, table: str, column: str, targe
     )
     names = [r[0] for r in cur.fetchall()]
     projection = ", ".join(
-        f'TRY_CAST("{n}" AS {target}) AS "{n}"' if n == column else f'"{n}"' for n in names
+        f'TRY_CAST(TO_VARCHAR("{n}") AS {target}) AS "{n}"' if n == column else f'"{n}"'
+        for n in names
     )
     cur.execute(
         f'CREATE OR REPLACE TABLE {database}."{schema}"."{table}" AS '
@@ -236,6 +254,9 @@ def main() -> int:
     p.add_argument("--all-schemas", dest="only_keyless", action="store_false")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
+
+    import snowflake.connector
+    from fix_keys_snowflake import drop_existing
 
     con = snowflake.connector.connect(connection_name=args.connection)
     cur = con.cursor()

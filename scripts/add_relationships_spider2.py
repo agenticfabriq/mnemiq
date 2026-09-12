@@ -21,8 +21,6 @@ import os
 import re
 from collections import defaultdict
 
-import snowflake.connector
-
 
 def declared_keys(cur, database: str) -> tuple[dict, dict]:
     """({schema: {table: pk_column}}, {schema: [(child, col, parent, col), ...]})"""
@@ -133,6 +131,13 @@ def main() -> int:
     p.add_argument("--schema", action="append", dest="schemas")
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
+
+    # Deferred so this module imports without the warehouse extra, which is what lets
+    # `splice` be tested: it is sixty lines of regex splicing, key narrowing and
+    # cycle-breaking whose output is replayed verbatim as CREATE OR REPLACE against a live
+    # semantic view, and it had no test because the import stopped the file being loaded.
+    # `strip_sample_values` and `grade_warehouse` defer it the same way.
+    import snowflake.connector
 
     con = snowflake.connector.connect(connection_name=args.connection)
     cur = con.cursor()
