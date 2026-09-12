@@ -251,11 +251,17 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
     empty `--principal` is not an instruction, so it falls through rather than building an identity
     with no principal.
 
-    The `--roles admin` and bare `ask q` cases are the CONTROLS, named rather than pointed at by
-    position: without them "strip the flag" could be satisfied by a change that dropped the flag's
-    precedence entirely. An earlier version of this sentence said "the second assertion", and a
-    later commit inserted a strip case in that position -- so the sentence then told a maintainer
-    that the coverage this test exists for was redundant.
+    Each assertion holds a DIFFERENT property, measured by mutating `_identity` one way at a time
+    rather than reasoned about -- an earlier version of this paragraph named its control by
+    position, a later commit inserted a case at that position, and the correction then re-pointed
+    it at two assertions that guard something else:
+
+      * `--roles ""` -> `[]` is the ONLY guard that an explicit empty flag beats a configured role
+        set. Making an empty parse fall through (`parsed or base.roles`) fails this line alone.
+      * bare `ask q` -> `["analyst"]` guards the opposite direction, that an ABSENT flag falls
+        through to settings. Returning `[]` there fails this and the env-fallback tests above.
+      * `--roles "a, b"` guards that the flag is consulted at all; ignoring it entirely fails here
+        first.
     """
     import mnemiq.cli as cli
 
