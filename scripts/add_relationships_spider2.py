@@ -19,7 +19,11 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from exc_reason import reason  # noqa: E402
 
 
 def declared_keys(cur, database: str) -> tuple[dict, dict]:
@@ -184,7 +188,7 @@ def main() -> int:
             try:
                 cur.execute(patched)
             except Exception as exc:
-                print(f"{schema:30} {'FAILED':>13}  {str(exc).splitlines()[-1][:90]}")
+                print(f"{schema:30} {'FAILED':>13}  {reason(exc, 90)}")
                 continue
             changed += 1
             print(f"{schema:30} {count:13}")

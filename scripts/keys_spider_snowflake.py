@@ -19,6 +19,7 @@ import sys
 import snowflake.connector
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from exc_reason import reason  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from fix_keys_snowflake import drop_existing  # noqa: E402
@@ -73,7 +74,7 @@ def main() -> int:
                 except Exception as exc:
                     unapplied.append(
                         f"{schema}: PRIMARY KEY {table}({', '.join(columns)}): "
-                        f"{str(exc).splitlines()[-1][:60]}"
+                        f"{reason(exc, 60)}"
                     )
 
             targets = {
@@ -89,7 +90,7 @@ def main() -> int:
                 except Exception as exc:
                     unapplied.append(
                         f"{schema}: UNIQUE {ref_table}.{ref_column}: "
-                        f"{str(exc).splitlines()[-1][:60]}"
+                        f"{reason(exc, 60)}"
                     )
 
             fk_done = 0
@@ -105,7 +106,7 @@ def main() -> int:
                 except Exception as exc:
                     missing.append(
                         f"{schema}: {table}.{column} -> {ref_table}.{ref_column}: "
-                        f"{str(exc).splitlines()[-1][:60]}"
+                        f"{reason(exc, 60)}"
                     )
 
             flag = "" if fk_done == len(foreign) else "  <-- incomplete"

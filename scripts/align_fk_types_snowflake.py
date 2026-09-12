@@ -20,6 +20,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from exc_reason import reason  # noqa: E402
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
 from mnemiq.eval.spider import load_keys, load_spider  # noqa: E402
@@ -185,25 +186,13 @@ def probe_component(cur, database: str, schema: str, component: dict) -> list[st
                 )
                 non_null, converted, fractional = cur.fetchone()
             except Exception as exc:
-                lossy.append(f"{table}.{name} (probe failed: {str(exc).splitlines()[-1][:50]})")
+                lossy.append(f"{table}.{name} (probe failed: {reason(exc)})")
                 continue
             if non_null != converted:
                 lossy.append(f"{table}.{name} ({non_null - converted} would become NULL)")
             elif target.upper().startswith("NUMBER") and fractional:
                 lossy.append(f"{table}.{name} ({fractional} fractional, TRY_CAST would round)")
     return lossy
-
-
-def _reason(exc: Exception) -> str:
-    """One short line from an exception, safely.
-
-    `str(exc).splitlines()[-1]` raises IndexError on an empty message -- `"".splitlines()` is
-    `[]` -- and every use of that idiom here sits inside a handler whose whole purpose is to
-    stop a failure from ending the run. The IndexError would propagate past both loops and do
-    exactly that.
-    """
-    lines = str(exc).splitlines()
-    return (lines[-1] if lines else exc.__class__.__name__)[:70]
 
 
 def apply_component(cur, database: str, schema: str, component: dict) -> dict:
@@ -225,7 +214,7 @@ def apply_component(cur, database: str, schema: str, component: dict) -> dict:
     try:
         rewrites = build_rewrites(cur, database, schema, component)
     except Exception as exc:
-        return {"unreadable": _reason(exc), "written": [], "failed": None, "unattempted": []}
+        return {"unreadable": reason(exc), "written": [], "failed": None, "unattempted": []}
 
     written: list[str] = []
     for i, (table, sql, columns) in enumerate(rewrites):
@@ -236,7 +225,7 @@ def apply_component(cur, database: str, schema: str, component: dict) -> dict:
             return {
                 "unreadable": None,
                 "written": written,
-                "failed": (table, _reason(exc)),
+                "failed": (table, reason(exc)),
                 # Everything after the failure is never attempted, and disagrees with what
                 # WAS rewritten just as much as the failed table does. Naming only the failure
                 # reads as one unlucky rewrite.
@@ -328,8 +317,11 @@ def main() -> int:
                     target = next(iter(columns.values()))
                     print(f"  {schema}.{table}: {', '.join(columns)} -> {target}")
                 if outcome["failed"]:
-                    table, reason = outcome["failed"]
-                    failed.append(f"{schema}.{table}: {reason}")
+                    # NOT `reason`: that name is the imported helper, and binding it here
+                    # makes it a local for the whole of `main` -- every later call would be
+                    # an UnboundLocalError waiting for someone to add one.
+                    table, why = outcome["failed"]
+                    failed.append(f"{schema}.{table}: {why}")
                     if outcome["written"]:
                         left = [t for t, _ in outcome["written"]]
                         behind = [table, *outcome["unattempted"]]

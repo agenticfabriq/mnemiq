@@ -25,6 +25,7 @@ import sys
 import snowflake.connector
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from exc_reason import reason  # noqa: E402
 from bird_to_parquet import _INTERNAL_PREFIXES, sqlite_dbs  # noqa: E402
 
 _DEFAULT_MINIDEV = os.environ.get(
@@ -98,7 +99,7 @@ def main() -> int:
             cur.execute(sql)
             return True
         except Exception as exc:
-            skipped.append(f"{sql[:90]}... -> {str(exc).splitlines()[-1][:80]}")
+            skipped.append(f"{sql[:90]}... -> {reason(exc, 80)}")
             return False
 
     total_pk = total_fk = 0

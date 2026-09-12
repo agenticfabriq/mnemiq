@@ -63,6 +63,28 @@ def test_a_probe_that_RAISES_condemns_the_component_rather_than_the_run():
     assert any("P.K (probe failed:" in line for line in lossy), lossy
 
 
+def test_a_probe_exception_with_an_EMPTY_message_does_not_end_the_run():
+    """The probe handler exists so an unreadable column does not stop the run, and it built
+    its message with `str(exc).splitlines()[-1]` -- which raises IndexError on an empty
+    message, since `"".splitlines()` is `[]`. The IndexError then escaped the handler, the
+    component loop and the schema loop, ending exactly what the handler was written to
+    protect.
+
+    A commit message claimed this idiom had already been routed through `_reason` everywhere.
+    It had not: `apply_component` was converted and this one was left, so the claim was
+    checkable and wrong.
+    """
+
+    class EmptyMessage(FakeCursor):
+        def execute(self, sql, params=None):
+            self.sql.append(sql)
+            raise RuntimeError("")
+
+    lossy = probe_component(EmptyMessage(), "DB", "SCH", COMPONENT)
+    assert len(lossy) == 2, lossy
+    assert all("probe failed:" in line for line in lossy), lossy
+
+
 def test_a_fractional_source_is_refused_for_a_NUMBER_target():
     """TRY_CAST rounds 3.5 to 4 rather than failing, so a fractional column converts
     `cleanly` while changing every value. An identifier has no fractional part."""
