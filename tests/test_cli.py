@@ -282,6 +282,6 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
     # The case the principal strip actually exists for. `--principal ""` above is resolved by the
     # `or` alone, so it reads the strip not at all -- deleting `.strip()` left every test green.
     assert ident(["ask", "q", "--principal", "   "]).principal_id == "alice@corp.com"
-    # Controls: the flag still wins when given, and absence still falls through to settings.
+    # The flag is used when given; an absent one falls through to settings (see above).
     assert ident(["ask", "q", "--roles", "admin"]).roles == ["admin"]
     assert ident(["ask", "q"]).roles == ["analyst"]
