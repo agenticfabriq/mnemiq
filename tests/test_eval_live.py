@@ -2,6 +2,8 @@ import os
 
 import pytest
 
+from acme_dsn import acme_dsn, requires_acme
+
 from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 from mnemiq.config import Settings
 from mnemiq.enrichment.enricher import LLMEnricher
@@ -17,9 +19,10 @@ pytestmark = [
     pytest.mark.integration,
     pytest.mark.live_llm,
     pytest.mark.skipif(not os.getenv("MNEMIQ_LLM_API_KEY"), reason="no live LLM configured"),
+    requires_acme,
 ]
 
-_DSN = "postgresql://mnemiq:mnemiq@localhost:5433/acme"
+_DSN = acme_dsn()
 
 
 @pytest.fixture(scope="module")

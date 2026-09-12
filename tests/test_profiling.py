@@ -2,13 +2,15 @@ import os
 
 import pytest
 
+from acme_dsn import acme_dsn, requires_acme
+
 from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 from mnemiq.catalog import introspect
 from mnemiq.enrichment.profiling import profile_column, profile_table
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, requires_acme]
 
-_DSN = "postgresql://mnemiq:mnemiq@localhost:5433/acme"
+_DSN = acme_dsn()
 
 
 def _adapter():

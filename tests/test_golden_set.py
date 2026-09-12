@@ -2,10 +2,12 @@ import os
 
 import pytest
 
+from acme_dsn import acme_dsn, requires_acme
+
 from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 from mnemiq.eval.golden import load_cases
 
-_DSN = "postgresql://mnemiq:mnemiq@localhost:5433/acme"
+_DSN = acme_dsn()
 _PATH = "evals/acme.json"
 
 
@@ -29,6 +31,7 @@ def test_answerable_cases_have_gold_sql_and_unanswerable_ones_do_not():
 
 
 @pytest.mark.integration
+@requires_acme
 def test_every_gold_query_runs_and_returns_rows():
     """Ground truth must actually be true. A golden set nobody ran is a wish list."""
     adapter = DuckDBPostgresAdapter(os.getenv("MNEMIQ_PG_DSN", _DSN))

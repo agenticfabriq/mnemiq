@@ -7,6 +7,7 @@ import pytest
 
 from mnemiq.adapters.duckdb import DuckDBPostgresAdapter
 from mnemiq.authz.grants import GrantSet
+from mnemiq.config import Settings
 from mnemiq.contract import Column, IdentityContext, Snapshot
 from mnemiq.runtime import Runtime
 
@@ -36,8 +37,16 @@ def test_write_inserts_a_row_end_to_end():
             Column(id=f"{_TABLE}.id", object_id=_TABLE, name="id"),
             Column(id=f"{_TABLE}.note", object_id=_TABLE, name="note"),
         ])
+        # SETTINGS WITH WRITES ENABLED, not None. `Runtime.write` passes
+        # `writes_enabled=bool(self.settings and self.settings.write_enabled)` to the decider
+        # (M3: the deployment switch reaches the decider so a disabled deployment refuses in
+        # our vocabulary). With `settings=None` that is always False, so this test could not
+        # pass -- and nothing noticed, because it is gated on MNEMIQ_PG_DSN and that gate had
+        # never been opened in a local run. Written, and broken the moment it ran.
         rt = Runtime(con=None, snapshot=snap, adapter=DuckDBPostgresAdapter(dsn, read_only=False),
-                     agent=None, embedder=None, authz=_WriteAuthz(_TABLE), settings=None)
+                     agent=None, embedder=None, authz=_WriteAuthz(_TABLE),
+                     settings=Settings(llm_base_url="x", llm_api_key="k", llm_model="m",
+                                       pg_dsn=dsn, write_enabled=True))
         identity = IdentityContext(tenant_id="t", principal_id="u", roles=["writer"])
 
         res = rt.write(f"INSERT INTO {_TABLE} (id, note) VALUES (1, 'hello')", identity)

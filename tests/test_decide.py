@@ -2,12 +2,14 @@ import os
 
 import pytest
 
+from acme_dsn import acme_dsn, requires_acme
+
 from mnemiq.sql.decide import decide
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 
 VISIBLE = {"claim": {"claim_identifier", "claim_open_date"}, "policy": {"policy_identifier"}}
 
-_DSN = "postgresql://mnemiq:mnemiq@localhost:5433/acme"
+_DSN = acme_dsn()
 
 
 def test_an_approved_query_carries_both_dialects_and_its_references():
@@ -63,6 +65,7 @@ def test_transpiling_targets_the_source_dialect():
 
 
 @pytest.mark.integration
+@requires_acme
 def test_explain_proves_the_query_against_the_real_source():
     from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 
@@ -76,6 +79,7 @@ def test_explain_proves_the_query_against_the_real_source():
 
 
 @pytest.mark.integration
+@requires_acme
 def test_a_query_the_snapshot_believes_but_the_source_denies_is_refused():
     # the snapshot says claim.ghost_column exists; the source disagrees. Only EXPLAIN knows.
     from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter

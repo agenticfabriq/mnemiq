@@ -1,14 +1,15 @@
-import os
 
 import pytest
 
+from acme_dsn import acme_dsn, requires_acme
+
 from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, requires_acme]
 
 
 def _dsn():
-    return os.getenv("MNEMIQ_PG_DSN", "postgresql://mnemiq:mnemiq@localhost:5432/acme")
+    return acme_dsn()
 
 
 def test_introspect_sees_acme_tables():

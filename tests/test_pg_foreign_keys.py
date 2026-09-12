@@ -2,11 +2,13 @@ import os
 
 import pytest
 
+from acme_dsn import acme_dsn, requires_acme
+
 from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, requires_acme]
 
-_DSN = "postgresql://mnemiq:mnemiq@localhost:5433/acme"
+_DSN = acme_dsn()
 
 
 def test_foreign_keys_runs_and_returns_a_list():
