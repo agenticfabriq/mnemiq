@@ -263,8 +263,14 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
         return cli._identity(cli.build_parser().parse_args(argv), settings)
 
     assert ident(["ask", "q", "--roles", "a, b"]).roles == ["a", "b"]
+    # An element that is nothing but whitespace is not a role. Without this the filter could go
+    # back to `if r` and stay green, letting `--roles "a, ,b"` carry a "" role.
+    assert ident(["ask", "q", "--roles", "a, ,b"]).roles == ["a", "b"]
     assert ident(["ask", "q", "--roles", ""]).roles == []
     assert ident(["ask", "q", "--principal", ""]).principal_id == "alice@corp.com"
+    # The case the principal strip actually exists for. `--principal ""` above is resolved by the
+    # `or` alone, so it reads the strip not at all -- deleting `.strip()` left every test green.
+    assert ident(["ask", "q", "--principal", "   "]).principal_id == "alice@corp.com"
     # Controls: the flag still wins when given, and absence still falls through to settings.
     assert ident(["ask", "q", "--roles", "admin"]).roles == ["admin"]
     assert ident(["ask", "q"]).roles == ["analyst"]
