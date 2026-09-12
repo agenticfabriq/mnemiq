@@ -57,14 +57,26 @@ def _rank(rows: list[tuple[str, float]]) -> dict[str, int]:
     return {object_id: rank for rank, (object_id, _score) in enumerate(rows, start=1)}
 
 
-def _attach_facts(cards: list[RetrievedCard], table_facts: Sequence[TableFacts]) -> None:
-    """Insert each retrieved table's structural-facts block right after its TABLE line. Facts
-    live here, NOT in the indexed card, so they never perturb retrieval top-k."""
+def _attach_facts(cards: list[RetrievedCard], table_facts: Sequence[TableFacts],
+                  card_style: str = "cards") -> None:
+    """Attach each retrieved table's structural-facts block. Facts live here, NOT in the
+    indexed card, so they never perturb retrieval top-k.
+
+    Where the block goes depends on the card form. Splicing after the first line is right
+    for `TABLE x` and WRONG for `CREATE TABLE x (` -- it drops `GRAIN:`/`GOTCHAS:` between
+    the header and the first column and hands the generator malformed DDL, which is the one
+    thing the ddl form exists to avoid. In ddl style the block follows the closing paren,
+    commented, so it is legal SQL either way.
+    """
     by_id = {tf.object_id: tf for tf in table_facts}
     for c in cards:
         tf = by_id.get(c.object_id)
         block = render_facts_block(tf) if tf else ""
         if not block:
+            continue
+        if card_style == "ddl":
+            commented = "\n".join(f"-- {line}" if line else "--" for line in block.split("\n"))
+            c.card = f"{c.card}\n{commented}"
             continue
         head, _, rest = c.card.partition("\n")
         c.card = f"{head}\n{block}\n{rest}" if rest else f"{head}\n{block}"
@@ -127,6 +139,7 @@ def retrieve(
     columns: Sequence[Column] = (),
     ontology_index=None,
     snapshot=None,
+    card_style: str = "cards",
 ) -> ContextPacket:
     """Hybrid retrieval, scoped to the identity's grants *before* anything is ranked.
 
@@ -206,9 +219,13 @@ def retrieve(
         from mnemiq.semantic.cards import build_cards
         from mnemiq.sql.policy import build_access_policy
 
+        # `card_style` reaches only THIS re-render, the identity-scoped copy handed to the
+        # generator. `build_index` keeps the default, so the embedded card stays the form
+        # top-k was measured on and retrieval is untouched by the generator's preference.
         scoped = {
             card.object_id: card.text
-            for card in build_cards(snapshot, policy=build_access_policy(snapshot, grants))
+            for card in build_cards(
+                snapshot, policy=build_access_policy(snapshot, grants), style=card_style)
         }
     packet.cards = [
         RetrievedCard(
@@ -220,7 +237,7 @@ def retrieve(
         if object_id in cards
     ]
     packet.enrichment_version = next(iter(cards.values()))[1] if cards else None
-    _attach_facts(packet.cards, table_facts)
+    _attach_facts(packet.cards, table_facts, card_style)
     # After the cards are chosen, because a certified measure rides with its table -- see
     # `semantic.measures` for why that rule differs from the glossary's word-matching one.
     table_ids = [c.object_id for c in packet.cards]

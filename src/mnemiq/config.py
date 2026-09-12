@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from typing import Literal
+
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -76,6 +78,13 @@ class Settings(BaseSettings):
                                      description="default answer mode: instant|thinking|deep")
     write_enabled: bool = Field(default=False, description="attach the source read-write (governed writes)")
     # --- behavior levers / MCP standalone identity ---
+    # Validated, not free text: `style != "ddl"` in the renderer means `DDL` or `ddl ` would
+    # silently select the OTHER form, and the run record would not say which one produced the
+    # score -- a 35.7% form and a 50.5% form told apart only by shell history.
+    card_style: Literal["cards", "ddl"] = Field(default="cards",
+                            description="schema card form for the GENERATOR: cards|ddl. "
+                                        "`ddl` renders CREATE TABLE for a model fine-tuned "
+                                        "on DDL; the retrieval index always embeds `cards`.")
     guided_sql: bool = Field(default=False, description="constrained decoding: force non-empty sql (response_format json_schema; works on vLLM and OpenAI-compatible endpoints)")
     assertive_sql: bool = Field(default=False, description="assertive prompt: attempt an answer instead of deferring")
     # M35, off by default: withdrawn on its own pre-registered criterion. Beacon's answerable band
