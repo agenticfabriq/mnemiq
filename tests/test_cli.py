@@ -249,8 +249,13 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
 
     `--roles ""` is a real instruction -- grant nothing -- so it beats a configured role set; an
     empty `--principal` is not an instruction, so it falls through rather than building an identity
-    with no principal. The second assertion is the control for the first: without it, "strip the
-    flag" could be satisfied by a change that dropped the flag's precedence entirely.
+    with no principal.
+
+    The `--roles admin` and bare `ask q` cases are the CONTROLS, named rather than pointed at by
+    position: without them "strip the flag" could be satisfied by a change that dropped the flag's
+    precedence entirely. An earlier version of this sentence said "the second assertion", and a
+    later commit inserted a strip case in that position -- so the sentence then told a maintainer
+    that the coverage this test exists for was redundant.
     """
     import mnemiq.cli as cli
 
