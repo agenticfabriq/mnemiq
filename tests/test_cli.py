@@ -252,8 +252,8 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
     with no principal.
 
     Where an assertion is load-bearing in a way reading it does not show, a comment on that
-    assertion says which mutation of `_identity`'s `roles=` argument kills it -- measured, one
-    at a time. Deliberately per-assertion and not a map: every earlier version of this paragraph
+    assertion says which mutation of `_identity` kills it -- measured, one at a time, and each
+    kills its own assertion alone. Deliberately per-assertion and not a map: every earlier version of this paragraph
     tried to state the whole mapping in one place and was wrong about part of it each time.
     """
     import mnemiq.cli as cli
