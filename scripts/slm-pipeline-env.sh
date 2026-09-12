@@ -16,12 +16,22 @@
 # runs it in a CHILD shell -- it prints all three confirmation lines, exits 0, and the
 # parent's MNEMIQ_LLM_* stay on the hosted model. The operator then runs the "local SLM"
 # arm against the hosted endpoint holding a receipt that says otherwise. Refuse that.
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+# `BASH_SOURCE` is undefined in zsh, and the operator's login shell IS zsh -- the first
+# version of this guard passed under `zsh ./slm-pipeline-env.sh` and printed the false
+# receipt it exists to refuse. Detect sourcing in both shells.
+_sourced=0
+if [ -n "${ZSH_VERSION:-}" ]; then
+  case "${ZSH_EVAL_CONTEXT:-}" in *:file*) _sourced=1 ;; esac
+elif [ -n "${BASH_VERSION:-}" ]; then
+  (return 0 2>/dev/null) && _sourced=1
+fi
+if [ "$_sourced" -ne 1 ]; then
   echo "slm-pipeline-env.sh must be SOURCED, not executed:" >&2
-  echo "  source ${BASH_SOURCE[0]} <base-url> <model-name>" >&2
+  echo "  source scripts/slm-pipeline-env.sh <base-url> <model-name>" >&2
   echo "Executing it changes nothing in your shell." >&2
   exit 64
 fi
+unset _sourced
 
 # `set -u` is deliberately NOT used: this file is sourced, and leaving nounset on would
 # persist into the operator's interactive shell for the rest of the session.
@@ -30,6 +40,10 @@ _base="${1:?usage: source slm-pipeline-env.sh <base-url> <model-name>}"
 _model="${2:?usage: source slm-pipeline-env.sh <base-url> <model-name>}"
 
 : "${MNEMIQ_LLM_BASE_URL:?source .env first}"
+# The key is propagated by all three pins below and was never checked: unset, embed/enrich
+# export empty, fall through to the `local` placeholder, and hit the hosted URL with the
+# vLLM key -- a 401 under a line that has just printed "hosted (unchanged)".
+: "${MNEMIQ_LLM_API_KEY:?source .env first}"
 
 # 1. hold embeddings where they already work
 export MNEMIQ_EMBED_BASE_URL="${MNEMIQ_EMBED_BASE_URL:-$MNEMIQ_LLM_BASE_URL}"
