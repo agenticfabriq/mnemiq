@@ -251,23 +251,10 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
     empty `--principal` is not an instruction, so it falls through rather than building an identity
     with no principal.
 
-    The strip cases carry their own comments. The three that decide how `--roles` RESOLVES are
-    below, each named by the mutation that kills it -- measured one at a time rather than reasoned
-    about, because an earlier version of this paragraph named its control by position, a later
-    commit inserted a case at that position, and the correction then re-pointed it at assertions
-    guarding something else:
-
-      * `--roles ""` -> `[]` is the ONLY guard that an explicit empty flag beats a configured role
-        set. Making an empty parse fall through (`parsed or base.roles`) fails this line alone.
-      * bare `ask q` -> `["analyst"]` guards the opposite direction, that an ABSENT flag falls
-        through to settings. Returning `[]` there fails this and the env-fallback tests above.
-      * `--roles "a, b"` holds TWO properties and is the only guard for either. It is the sole
-        assertion anywhere reading the per-element `.strip()`: change the element expression
-        from `r.strip()` to `r` while KEEPING the `if r.strip()` filter and this line fails
-        alone, since `--roles "a, ,b"` survives on the filter. (Dropping both strips fails
-        both.) It is also what fails first if the flag is ignored entirely. Do NOT simplify it
-        to `--roles "a,b"`: that still satisfies the second property and silently retires the
-        first.
+    Two of the assertions are load-bearing in a way that is not obvious from reading them, so
+    each says which mutation of `_identity`'s `roles=` argument kills it -- measured, one at a
+    time. The rest of the mutation map lives in this commit rather than here: every earlier
+    version of this paragraph tried to state the whole thing and was wrong about part of it.
     """
     import mnemiq.cli as cli
 
@@ -279,10 +266,16 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
     def ident(argv):
         return cli._identity(cli.build_parser().parse_args(argv), settings)
 
+    # The only assertion reading the per-element `.strip()` in the CLI's own comprehension
+    # (`roles_raw.split(",")`). Change that element expression to `r`, keeping the
+    # `if r.strip()` filter, and this line fails while the "a, ,b" case below survives. Do not
+    # simplify it to "a,b": that keeps the test passing and retires the guard.
     assert ident(["ask", "q", "--roles", "a, b"]).roles == ["a", "b"]
     # An element that is nothing but whitespace is not a role. Without this the filter could go
     # back to `if r` and stay green, letting `--roles "a, ,b"` carry a "" role.
     assert ident(["ask", "q", "--roles", "a, ,b"]).roles == ["a", "b"]
+    # The only guard that an explicit EMPTY flag beats a configured role set: making an empty
+    # parse fall through (`parsed or base.roles`) fails here alone.
     assert ident(["ask", "q", "--roles", ""]).roles == []
     assert ident(["ask", "q", "--principal", ""]).principal_id == "alice@corp.com"
     # The case the principal strip actually exists for. `--principal ""` above is resolved by the
