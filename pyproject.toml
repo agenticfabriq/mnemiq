@@ -27,17 +27,29 @@ server = ["fastapi>=0.115", "uvicorn>=0.30"]
 # Oracle is a v1 target and an OPTIONAL extra, not a core dependency: only an Oracle
 # deployment needs the driver, and `oracledb` in thin mode needs no Oracle client libraries.
 oracle = ["oracledb>=2"]
-# The warehouse benchmark path (scripts/grade_warehouse.py, load_databricks.py, run_genie.py,
-# run_ai_query.py, capture_rows.py). Extras rather than core dependencies: only someone
-# reproducing the vendor comparison needs a Databricks or Snowflake driver. They are declared
-# because these scripts produced published numbers, and a `uv sync` that quietly prunes a
-# driver turns every one of them into a ModuleNotFoundError at the first connect.
+# The warehouse benchmark path: any script under `scripts/` that connects to Snowflake or
+# Databricks. Stated as a RULE rather than a list or a count, both of which this comment has
+# already got wrong -- it named five scripts when far more needed the drivers, because every
+# batch that added one had to remember to come back and edit prose. To see the current set:
+#
+#   grep -lE '\b(snowflake|databricks)' scripts/*.py
+#
+# Extras rather than core dependencies: only someone reproducing the vendor comparison needs a
+# Databricks or Snowflake driver. They are declared because these scripts produced published
+# numbers, and a `uv sync` that quietly prunes a driver turns every one of them into a
+# ModuleNotFoundError at the first connect.
+#
+# `cryptography` and `requests` are DIRECT imports of `run_cortex.py` -- key-pair auth and the
+# Cortex REST call. The connector happens to pull both today, which is exactly the reliance the
+# paragraph above says not to take: a transitive dependency is not a promise.
 databricks = ["databricks-sdk>=0.30", "databricks-sql-connector>=3"]
-snowflake = ["snowflake-connector-python>=3"]
+snowflake = ["snowflake-connector-python>=3", "cryptography>=42", "requests>=2.31"]
 warehouse = [
     "databricks-sdk>=0.30",
     "databricks-sql-connector>=3",
     "snowflake-connector-python>=3",
+    "cryptography>=42",
+    "requests>=2.31",
     "sqlglot>=25",
 ]
 ontology = [
