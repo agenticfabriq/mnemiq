@@ -150,6 +150,76 @@ def test_attach_facts_inserts_block_after_table_line():
     assert other.card == "TABLE party\nCOLUMNS:"
 
 
+def test_attach_facts_keeps_ddl_parseable():
+    """The block cannot go after the FIRST line when the first line is `CREATE TABLE x (`.
+
+    That splice put `GRAIN:`/`GOTCHAS:` between the header and the first column and handed
+    the generator malformed DDL -- the one thing the ddl form exists to avoid. Review caught
+    it before it landed; no TEST could have, because the default-style assertion in
+    `test_attach_facts_inserts_block_after_table_line` was the only fact assertion here.
+    """
+    import sqlite3
+
+    from mnemiq.contract import TableFacts
+    from mnemiq.semantic.retrieval import RetrievedCard, _attach_facts
+
+    ddl = 'CREATE TABLE frpm (\n    cdscode text,\n    "Enrollment (K-12)" real\n);'
+    card = RetrievedCard(object_id="frpm", card=ddl, score=1.0)
+    _attach_facts(
+        [card],
+        [TableFacts(object_id="frpm", grain="one row per school-year",
+                    gotchas=["nulls in enrollment"])],
+        card_style="ddl",
+    )
+
+    assert "GRAIN" in card.card, "the facts have to arrive at all, or this proves nothing"
+    header, _, body = card.card.partition("\n")
+    assert header == "CREATE TABLE frpm ("
+    assert body.startswith("    cdscode text,"), "facts spliced ahead of the first column"
+    # The strongest available check: SQLite is the authority on whether it is legal DDL.
+    sqlite3.connect(":memory:").executescript(card.card)
+
+
+def test_retrieve_hands_attach_facts_the_style_it_rendered_with(tmp_path):
+    """`retrieve` is the only thing that can reach `_attach_facts` in a deployment.
+
+    Asserting the helper leaves the wiring open: dropping the third argument at the call
+    site sends every ddl card back down the splice path, and the helper's own guard stays
+    green because it passes `card_style` itself. Two things have to agree here -- the form
+    `build_cards` rendered and the placement `_attach_facts` chose -- and only the real
+    function decides both.
+    """
+    import sqlite3
+
+    from mnemiq.contract import TableFacts
+
+    con, snapshot = _con(tmp_path), _snapshot()
+    facts = [TableFacts(object_id="claim", grain="one row per claim",
+                        gotchas=["settled claims are excluded"])]
+
+    def claim_card(**kwargs):
+        packet = retrieve(con, "claim_identifier", _identity(),
+                          _StaticAuthz("claim", "policy"), FakeEmbedder(),
+                          table_facts=facts, snapshot=snapshot, **kwargs)
+        return next(c.card for c in packet.cards if c.object_id == "claim")
+
+    ddl = claim_card(card_style="ddl")
+    assert ddl.startswith("CREATE TABLE claim ("), "the ddl style did not reach the render"
+    assert "GRAIN" in ddl, "the facts did not arrive, so placement proves nothing"
+    sqlite3.connect(":memory:").executescript(ddl)
+
+    # The negative half. Without it, hardcoding either side to "ddl" satisfies everything
+    # above: the two halves agree, on a form nobody asked for, and the default operator is
+    # served it with nothing on screen saying so. No number belongs in this comment -- the
+    # 50.5%/35.7% pair was measured for one external model, and which form is BETTER is not
+    # what is wrong with serving the form that was not configured.
+    cards = claim_card()
+    assert "CREATE TABLE" not in cards
+    # `in cards` would pass on `-- GRAIN: ...` too, so it cannot tell spliced from commented
+    # -- the exact thing this half exists to pin. Anchor it to the position instead.
+    assert cards.startswith("TABLE claim\nGRAIN: one row per claim")
+
+
 def test_retrieve_examples_by_question_similarity_and_access_scope(tmp_path):
     from mnemiq.contract import Column, Example, Snapshot
     from mnemiq.llm.embeddings import FakeEmbedder

@@ -210,6 +210,11 @@ def build_engine(
         # reached this door and not the product's -- which is why the test that guards it compares
         # the two call sites rather than either one alone.
         packet = retrieve(con, question, IDENTITY, authz, embedder, k=k,
+                          # Same Settings field the product door reads, not a second env
+                          # lookup: MNEMIQ_CARD_STYLE resolves through Settings, which
+                          # validates it, so `DDL` or a stray space cannot silently select
+                          # the other form.
+                          card_style=settings.card_style,
                           definitions=definitions, table_facts=snapshot.table_facts,
                           metrics=snapshot.metrics, dimensions=snapshot.dimensions,
                           columns=snapshot.columns, ontology_index=ontology_index,

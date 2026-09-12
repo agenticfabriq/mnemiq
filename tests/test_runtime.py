@@ -302,7 +302,7 @@ def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
 
     def fake_retrieve(con, question, identity, authz, embedder, k=5, table_facts=(),
                       definitions=(), metrics=(), dimensions=(), columns=(), ontology_index=None,
-                      snapshot=None):
+                      snapshot=None, card_style="cards"):
         seen["definitions"] = list(definitions)
         # Certified metrics and dimensions were the next pair to reach the snapshot and stop
         # there -- five of the fs corpus's records, carrying the certified SQL for settled, gross
@@ -316,6 +316,7 @@ def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
         # retrieve cannot re-render a card against the caller's column policy and silently
         # serves the unscoped one. That is the same gap this test was written for.
         seen["snapshot"] = snapshot
+        seen["card_style"] = card_style
         from mnemiq.semantic.retrieval import ContextPacket
 
         return ContextPacket(question=question, cards=[], grant_fingerprint="f",
@@ -350,6 +351,9 @@ def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
     assert [d.term for d in seen["definitions"]] == ["ICD-10-CM"]  # glossary seam fed
     assert seen["metrics"] == ["patient_count"]      # ...and the certified measures
     assert seen["dimensions"] == ["patient.icd10_cd"]
+    # The card FORM is the same kind of thing: settable for eval, and the product path has
+    # to be able to reach the same value or the flag measures a prompt `ask` cannot emit.
+    assert seen["card_style"] == "cards"
 
 
 def test_the_eval_door_and_the_product_door_ground_identically():
@@ -403,7 +407,45 @@ def test_the_eval_door_and_the_product_door_ground_identically():
     # Named explicitly as well as compared, because two doors that BOTH stopped passing the
     # certified measures would agree with each other and ground nothing -- the equality above
     # cannot tell that from two doors that are both right.
-    assert {"metrics", "dimensions", "snapshot", "definitions", "ontology_index"} <= eval_door
+    assert {
+        "metrics", "dimensions", "snapshot", "definitions", "ontology_index", "card_style",
+    } <= eval_door
+
+
+def test_ask_hands_retrieval_the_configured_card_style(monkeypatch, tmp_path):
+    """The equality above only proves both doors pass the keyword, not that a value arrives.
+
+    `card_style` is the settable one: an eval measuring `ddl` is measuring a prompt form the
+    product must be able to emit, and `Runtime.ask` reads it off `Settings`. Passing a
+    hardcoded `"cards"` at the product door satisfies the scan and grounds nothing.
+    """
+    import mnemiq.runtime as rt_mod
+    from mnemiq.agent.loop import AgentAnswer
+    from mnemiq.contract import Snapshot
+    from mnemiq.semantic.retrieval import ContextPacket
+
+    seen = {}
+
+    def fake_retrieve(con, question, identity, authz, embedder, **kwargs):
+        seen["card_style"] = kwargs.get("card_style")
+        return ContextPacket(question=question, cards=[], grant_fingerprint="fp",
+                             enrichment_version=None)
+
+    class _Agent:
+        def answer(self, packet, snapshot, grants, identity, emit=None):
+            return AgentAnswer(answer="A")
+
+    monkeypatch.setattr(rt_mod, "retrieve", fake_retrieve)
+    settings = Settings(
+        llm_base_url=None, llm_api_key=None, llm_model=None, pg_dsn="x", acme_data_dir=None,
+        store_path=str(tmp_path / "s.duckdb"), card_style="ddl",
+    )
+    rt = Runtime(con=None, snapshot=Snapshot(version="v", source_id="s", created_at="t"),
+                 adapter=None, agent=_Agent(), embedder=None, authz=_StaticAuthz("claim"),
+                 settings=settings)
+    rt.ask("q", _identity())
+
+    assert seen["card_style"] == "ddl"
 
 
 def test_allow_all_clears_the_pii_levels_the_snapshot_tags():

@@ -128,6 +128,9 @@ class Runtime:
                 # to 24 -- a second copy of a number is a second thing to forget.
                 k=self.settings.retrieval_k if self.settings else DEFAULT_RETRIEVAL_K,
                 table_facts=self.snapshot.table_facts if self.snapshot else (),
+                # Both doors pass this or the eval measures a prompt form `ask` cannot emit
+                # -- the M81 shape the two-doors guard exists to catch, which it did.
+                card_style=self.settings.card_style if self.settings else "cards",
                 # Definitions ride with the snapshot: the glossary channel had no runtime
                 # producer until the ontology digest, so this stayed unfed from Plan 08 until SP1.
                 definitions=self.snapshot.definitions if self.snapshot else (),

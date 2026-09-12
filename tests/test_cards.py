@@ -205,3 +205,63 @@ def test_card_names_the_code_scheme():
     card = build_cards(snap)[0].text
     assert "ICD-10-CM" in card
     assert "E11 = Type 2 diabetes" in card
+
+
+def test_ddl_style_renders_the_same_card_as_create_table():
+    """`style="ddl"` exists because a DDL-trained generator reads shape, not only content.
+
+    Measured: one such model scored 50.5% on mini-dev through a DDL-and-examples prompt
+    and 35.7% on identical content through the TABLE/COLUMNS: form.
+    """
+    card = next(c for c in build_cards(_snapshot(), style="ddl") if c.object_id == "claim")
+
+    assert card.text.startswith("CREATE TABLE claim (")
+    assert card.text.rstrip().endswith(";") or "\n-- " in card.text
+    assert "TABLE claim\nCOLUMNS:" not in card.text
+    assert "claim_identifier integer" in card.text
+
+
+def test_ddl_style_quotes_identifiers_that_need_it():
+    """`Enrollment (K-12)` is a real mini-dev column: its NAME contains parentheses.
+
+    The first version of this renderer parsed the prose card back apart and split on the
+    first " (", which landed inside the name and produced `"Enrollment" K-12`.
+    """
+    snapshot = Snapshot(
+        version="v1", source_id="acme", created_at="2026-07-13T00:00:00Z",
+        source_bindings=[SourceBinding(
+            id="sb:frpm", source_id="acme", object_id="frpm",
+            source_object="frpm", binding_type="table")],
+        columns=[
+            Column(id="frpm.cdscode", object_id="frpm", name="cdscode", data_type="text"),
+            Column(id="frpm.enr", object_id="frpm", name="Enrollment (K-12)",
+                   data_type="real", description="K-12 enrollment count"),
+        ],
+    )
+    text = build_cards(snapshot, style="ddl")[0].text
+
+    assert '"Enrollment (K-12)" real' in text
+    assert "cdscode text," in text          # bare lowercase stays unquoted
+    assert '"Enrollment" K-12' not in text  # the parsing defect
+
+
+def test_build_index_embeds_the_cards_form(tmp_path):
+    """Top-k stays the form it was measured on, whatever the generator is handed.
+
+    The first version of this guard asserted on `build_cards(_snapshot())` and never
+    reached `build_index`: mutating that call to `style="ddl"` left it green, because
+    `claim_identifier integer` still contains every substring the retrieval tests look
+    for. Reading the stored card back is what makes the mutation fail.
+    """
+    from mnemiq.llm.embeddings import FakeEmbedder
+    from mnemiq.semantic.store import build_index
+    from mnemiq.store.bootstrap import init_store
+
+    con = init_store(str(tmp_path / "s.duckdb"))
+    assert build_index(con, _snapshot(), FakeEmbedder()) == 2
+
+    stored = [r[0] for r in con.execute("SELECT card FROM semantic_object").fetchall()]
+    assert stored, "nothing indexed, so the assertions below prove nothing"
+    for card in stored:
+        assert card.startswith("TABLE ")
+        assert "CREATE TABLE" not in card
