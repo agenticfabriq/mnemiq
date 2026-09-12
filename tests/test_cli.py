@@ -251,10 +251,10 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
     empty `--principal` is not an instruction, so it falls through rather than building an identity
     with no principal.
 
-    Two of the assertions are load-bearing in a way that is not obvious from reading them, so
-    each says which mutation of `_identity`'s `roles=` argument kills it -- measured, one at a
-    time. The rest of the mutation map lives in this commit rather than here: every earlier
-    version of this paragraph tried to state the whole thing and was wrong about part of it.
+    Where an assertion is load-bearing in a way reading it does not show, a comment on that
+    assertion says which mutation of `_identity`'s `roles=` argument kills it -- measured, one
+    at a time. Deliberately per-assertion and not a map: every earlier version of this paragraph
+    tried to state the whole mapping in one place and was wrong about part of it each time.
     """
     import mnemiq.cli as cli
 
