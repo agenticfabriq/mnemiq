@@ -2,14 +2,21 @@ import os
 
 import pytest
 
+from acme_dsn import (
+    acme_dsn,
+    assert_acme_seeded,
+    requires_acme,
+    source_table_count,
+)
+
 from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 from mnemiq.enrichment.pipeline import enrich_structural
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.snapshot_store import current_version, load_snapshot, save_snapshot
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, requires_acme]
 
-_DSN = "postgresql://mnemiq:mnemiq@localhost:5433/acme"
+_DSN = acme_dsn()
 
 
 def _adapter():
@@ -22,8 +29,16 @@ def snap():
 
 
 def test_pipeline_covers_the_whole_source(snap):
-    assert len(snap.source_bindings) == 29
-    assert len(snap.columns) > 29
+    adapter = _adapter()
+    # One binding per table the SOURCE has, which is what "covers the whole source" means.
+    # It was `== 29` against a catalogue that now reports 32.
+    # FIRST, so an unseeded database says so. Reached with MNEMIQ_PG_DSN set and nothing
+    # seeded -- a supported state, since `conftest._seed_acme` no-ops without the CSV
+    # directory -- a later `0 > 0` fails with a bare AssertionError instead.
+    assert_acme_seeded(adapter)
+    tables = source_table_count(adapter)
+    assert len(snap.source_bindings) == tables
+    assert len(snap.columns) > tables
     assert snap.relationships, "ACME has foreign keys"
     assert all(j.status in {"done", "failed"} for j in snap.jobs)
 

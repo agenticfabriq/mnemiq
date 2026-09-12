@@ -3,12 +3,14 @@ import os
 import pyarrow as pa
 import pytest
 
+from acme_dsn import acme_dsn, requires_acme
+
 from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 from mnemiq.execute.runner import ExecutionError, run
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, requires_acme]
 
-_DSN = "postgresql://mnemiq:mnemiq@localhost:5433/acme"
+_DSN = acme_dsn()
 
 
 def _adapter():

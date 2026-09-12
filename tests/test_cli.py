@@ -101,10 +101,17 @@ def test_write_reports_a_refusal_and_exits_zero(monkeypatch, capsys):
     assert "may not write" in capsys.readouterr().out
 
 
-def test_cmd_enrich_lazy_imports_resolve(capsys):
+def test_cmd_enrich_lazy_imports_resolve(capsys, monkeypatch):
     # Regression (plan-29): _cmd_enrich's import block runs BEFORE the pg_dsn check, so a
     # no-DSN Settings still exercises every lazy import. Folding bird_runner._flag into
     # settings.enrich_facts/examples broke `import _flag` here until enrich was updated.
+    #
+    # The DSN is cleared explicitly. `Settings()` reads `os.environ`, so this unit test
+    # depended on MNEMIQ_PG_DSN being ABSENT from the shell -- with it exported, the check
+    # this test is built on passes, execution falls through to the LLM check, and the test
+    # fails with "LLM base_url/api_key not configured" for a reason that has nothing to do
+    # with lazy imports. A test whose premise is that a setting is missing has to remove it.
+    monkeypatch.delenv("MNEMIQ_PG_DSN", raising=False)
     from mnemiq.cli import _cmd_enrich
     from mnemiq.config import Settings
     assert _cmd_enrich(Settings()) == 1  # no pg_dsn -> 1, but only after imports resolve
