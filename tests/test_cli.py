@@ -241,3 +241,44 @@ def test_tenant_defaults_from_env(monkeypatch, capsys):
     monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: settings))
     assert main(["ask", "q"]) == 0
     assert captured["identity"].tenant_id == "acme"
+
+
+def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypatch):
+    """The `--roles` path strips like the environment path, and the two flags keep falling back by
+    different rules on purpose.
+
+    `--roles ""` is a real instruction -- grant nothing -- so it beats a configured role set; an
+    empty `--principal` is not an instruction, so it falls through rather than building an identity
+    with no principal.
+
+    Where an assertion is load-bearing in a way reading it does not show, a comment on that
+    assertion says which mutation of `_identity` kills it -- measured, one at a time, and each
+    kills its own assertion alone. Deliberately per-assertion and not a map: every earlier version of this paragraph
+    tried to state the whole mapping in one place and was wrong about part of it each time.
+    """
+    import mnemiq.cli as cli
+
+    settings = Settings(
+        llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d",
+        roles="analyst", principal="alice@corp.com",
+    )
+
+    def ident(argv):
+        return cli._identity(cli.build_parser().parse_args(argv), settings)
+
+    # The only assertion reading the per-element `.strip()` in the CLI's own comprehension
+    # (`roles_raw.split(",")`). Change that element expression to `r`, keeping the
+    # `if r.strip()` filter, and this line fails while the "a, ,b" case below survives. Do not
+    # simplify it to "a,b": that keeps the test passing and retires the guard.
+    assert ident(["ask", "q", "--roles", "a, b"]).roles == ["a", "b"]
+    # An element that is nothing but whitespace is not a role. Without this the filter could go
+    # back to `if r` and stay green, letting `--roles "a, ,b"` carry a "" role.
+    assert ident(["ask", "q", "--roles", "a, ,b"]).roles == ["a", "b"]
+    # The only guard that an explicit EMPTY flag beats a configured role set: making an empty
+    # parse fall through (`parsed or base.roles`) fails here alone.
+    assert ident(["ask", "q", "--roles", ""]).roles == []
+    assert ident(["ask", "q", "--principal", ""]).principal_id == "alice@corp.com"
+    # The case the principal strip actually exists for. `--principal ""` above is resolved by the
+    # `or` alone, so it reads the strip not at all -- deleting `.strip()` left every test green.
+    assert ident(["ask", "q", "--principal", "   "]).principal_id == "alice@corp.com"
+    assert ident(["ask", "q"]).roles == ["analyst"]
