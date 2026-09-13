@@ -15,8 +15,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 import snowflake.connector
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from exc_reason import reason  # noqa: E402
 
 
 def main() -> int:
@@ -58,7 +62,7 @@ def main() -> int:
             except Exception as exc:
                 # Two columns differing only by case cannot both become the same upper-case
                 # name -- worth reporting rather than silently losing one.
-                clashes.append(f"{schema}.{table}.{column}: {str(exc).splitlines()[-1][:80]}")
+                clashes.append(f"{schema}.{table}.{column}: {reason(exc, 80)}")
     finally:
         cur.close()
         con.close()

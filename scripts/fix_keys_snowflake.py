@@ -20,6 +20,7 @@ import sys
 import snowflake.connector
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from exc_reason import reason  # noqa: E402
 from add_keys_snowflake import keys_for  # noqa: E402
 from bird_to_parquet import sqlite_dbs  # noqa: E402
 
@@ -127,7 +128,7 @@ def main() -> int:
                 except Exception as exc:
                     missing.append(
                         f"{schema}: {table}.{column} -> {ref_table}.{ref_column}: "
-                        f"{str(exc).splitlines()[-1][:70]}"
+                        f"{reason(exc, 70)}"
                     )
 
             total_missing += missing
