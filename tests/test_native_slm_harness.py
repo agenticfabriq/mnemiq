@@ -139,3 +139,49 @@ class TestCell:
 
     def test_plain_values_pass_through(self):
         assert (slm._cell(1), slm._cell("a"), slm._cell(None)) == (1, "a", None)
+
+
+class TestBuildMessages:
+    """The arctic style is only worth running if it is THEIR prompt, byte for byte.
+
+    Verified once against their own `bird_eval/infer.py` by executing their source and
+    diffing the result; these pin the strings so a later edit cannot quietly paraphrase
+    what the model was RL-trained against.
+    """
+
+    def test_omnisql_is_one_user_turn_and_no_transport_extras(self):
+        msgs, extra = slm.build_messages("omnisql", "SQLite", "CREATE TABLE t (a int);", "q?")
+        assert [m["role"] for m in msgs] == ["user"]
+        assert extra == {}
+        assert "Task Overview:" in msgs[0]["content"]
+
+    def test_arctic_moves_the_task_text_to_a_system_turn(self):
+        msgs, _ = slm.build_messages("arctic", "SQLite", "CREATE TABLE t (a int);", "q?")
+        assert [m["role"] for m in msgs] == ["system", "user", "assistant"]
+        assert msgs[0]["content"].startswith("You are a data science expert.")
+        # the two things their prompt DROPS -- their absence is the change being measured
+        assert "Task Overview:" not in msgs[1]["content"]
+        assert "deep breath" not in msgs[1]["content"]
+
+    def test_the_prefill_is_exact(self):
+        # The space before the newline is theirs. `.strip()` anywhere near this string, or a
+        # "tidy" reflow, silently changes the tokens the assistant turn opens with.
+        msgs, _ = slm.build_messages("arctic", "SQLite", "s", "q")
+        assert msgs[2]["content"] == "Let me solve this step by step. \n<think>"
+
+    def test_arctic_asks_the_server_to_continue_the_turn_not_start_one(self):
+        # Without BOTH flags the server closes the assistant turn and the prefill becomes a
+        # stray user-visible line instead of the opening of the model's own reasoning.
+        _, extra = slm.build_messages("arctic", "SQLite", "s", "q")
+        assert extra == {"continue_final_message": True, "add_generation_prompt": False}
+
+    def test_the_envelope_states_both_budgets(self):
+        msgs, _ = slm.build_messages("arctic", "SQLite", "s", "q")
+        assert "[Limited by 4K tokens]" in msgs[1]["content"]
+        assert "[Limited by 1K tokens]" in msgs[1]["content"]
+
+    def test_an_unknown_style_raises_rather_than_falling_back(self):
+        # A typo must not silently select the other prompt: the two score ~15 points apart
+        # on a DDL-trained model, and the report would name neither.
+        with pytest.raises(ValueError):
+            slm.build_messages("Arctic", "SQLite", "s", "q")

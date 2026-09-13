@@ -99,6 +99,78 @@ In your answer, please enclose the generated SQL query in a code block:
 
 Take a deep breath and think step by step to find the correct SQL query."""
 
+# Verbatim from their bird_eval/infer.py, and under the same rule as PROMPT above: these are
+# the strings the model was RL-trained against, so a paraphrase measures a different prompt.
+# Three things differ from the OmniSQL original we ran, and the paper (§4.2, Table 5) credits
+# the combination with +2.6: the task text is a SYSTEM message, the output format is a
+# think/answer envelope with stated budgets, and the assistant turn is PREFILLED so the model
+# opens in reasoning mode rather than being asked to.
+ARCTIC_SYSTEM = (
+    "You are a data science expert. Below, you are provided with a database schema and a natural"
+    " language question. Your task is to understand the schema and generate a valid SQL query to"
+    " answer the question."
+)
+
+ARCTIC_INSTRUCT = """Please provide a detailed chain-of-thought reasoning process and include your thought process within `<think>` tags. Your final answer should be enclosed within `<answer>` tags.
+
+Ensure that your SQL query follows the correct syntax and is formatted as follows:
+
+```sql
+-- Your SQL query here
+```
+
+Example format:
+<think> Step-by-step reasoning, including self-reflection and corrections if necessary. [Limited by 4K tokens] </think>
+<answer> Summary of the thought process leading to the final SQL query. [Limited by 1K tokens]
+
+```sql
+Correct SQL query here
+```
+</answer>"""
+
+# Their infer.py hardcodes SQLite here; `{engine}` is a deliberate divergence so the same
+# style can be run against Postgres, and the run header records which was used.
+ARCTIC_USER = """Database Engine:
+{engine}
+
+Database Schema:
+{schema}
+This schema describes the database's structure, including tables, columns, primary keys, foreign keys, and any relevant relationships or constraints.
+
+Question:
+{question}
+
+Instructions:
+- Make sure you only output the information that is asked in the question. If the question asks for a specific column, make sure to only include that column in the SELECT clause, nothing more.
+- The generated query should return all of the information asked in the question without any missing or extra information.
+- Before generating the final SQL query, please think through the steps of how to write the query.
+
+Output Format:
+{instruct}"""
+
+# They append this AFTER apply_chat_template(add_generation_prompt=True), which opens the
+# assistant turn mid-sentence. Over the OpenAI chat API the equivalent is a trailing assistant
+# message with `continue_final_message`; `add_generation_prompt` must be False or the server
+# closes the turn we are trying to continue. Verified against the live server: the completion
+# resumes inside the thought and emits the closing `</think>`.
+ARCTIC_PREFILL = "Let me solve this step by step. \n<think>"
+
+
+def build_messages(style: str, engine: str, schema: str, question: str):
+    """The request's messages and any transport-level extras. Pure, so it is testable."""
+    if style == "omnisql":
+        return [{"role": "user", "content": PROMPT.format(
+            engine=engine, schema=schema, question=question)}], {}
+    if style == "arctic":
+        return [
+            {"role": "system", "content": ARCTIC_SYSTEM},
+            {"role": "user", "content": ARCTIC_USER.format(
+                engine=engine, schema=schema, question=question,
+                instruct=ARCTIC_INSTRUCT)},
+            {"role": "assistant", "content": ARCTIC_PREFILL},
+        ], {"continue_final_message": True, "add_generation_prompt": False}
+    raise ValueError(f"unknown prompt style {style!r}")
+
 
 def bird_dsn(base: str, db: str = "bird_dev") -> str:
     return up.urlparse(base)._replace(path=f"/{db}").geturl()
@@ -223,18 +295,23 @@ class TransportFailed(Exception):
     """
 
 
-def generate(base_url: str, model: str, prompt: str, timeout: float, max_tokens: int,
-             attempts: int = 4, n: int = 1, temperature: float = 0.0) -> list[str]:
+def generate(base_url: str, model: str, messages: list, timeout: float, max_tokens: int,
+             attempts: int = 4, n: int = 1, temperature: float = 0.0,
+             extra: dict | None = None) -> tuple[list[str], list[str]]:
     """`n` completions in ONE request, so the prompt is prefilled once and only decode scales.
 
-    Returns a list so the caller cannot silently read a single answer out of a vote.
+    Returns lists so the caller cannot silently read a single answer out of a vote, and
+    the finish reasons alongside them: a generation stopped at the token cap is a
+    TRUNCATION, not a wrong answer, and `extract_sql`'s last-SELECT fallback will happily
+    turn one into a plausible query that grades as an error the model did not make.
     """
     body = json.dumps({
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "n": n,
+        **(extra or {}),
     }).encode()
     last: Exception | None = None
     for attempt in range(attempts):
@@ -244,7 +321,8 @@ def generate(base_url: str, model: str, prompt: str, timeout: float, max_tokens:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 choices = json.loads(r.read())["choices"]
-                return [c["message"]["content"] for c in choices]
+                return ([c["message"]["content"] for c in choices],
+                        [c.get("finish_reason") or "" for c in choices])
         except urllib.error.HTTPError as exc:
             # 4xx is the server understanding us and refusing -- a context-length 400 is a
             # prompt problem, and retrying it four times then reporting "fix the transport"
@@ -396,6 +474,9 @@ def main() -> int:
     ap.add_argument("--db", action="append", dest="dbs")
     ap.add_argument("--timeout", type=float, default=180.0)
     ap.add_argument("--max-tokens", type=int, default=2048)
+    ap.add_argument("--prompt-style", choices=["omnisql", "arctic"], default="omnisql",
+                    help="omnisql: the original single-turn prompt. arctic: their bird_eval "
+                         "prompt -- system role, think/answer envelope, prefilled <think>.")
     ap.add_argument("--candidates", type=int, default=1,
                     help="samples per question; >1 enables execution-based majority voting")
     ap.add_argument("--temperature", type=float, default=None,
@@ -448,17 +529,29 @@ def main() -> int:
             schema_cache[db] = (build_schema_sqlite(conns[db]) if sqlite_mode
                                 else build_schema(conn, per_db.get(db, [])))
 
+    # A generation cut off at the token cap is not a wrong answer, and nothing downstream
+    # can tell the difference: `extract_sql` falls back to the last SELECT, so a truncated
+    # chain of thought yields a plausible query. Measured before this mattered -- Arctic's
+    # median completion is ~500 tokens against a 2048 cap -- but a longer-CoT model or a
+    # wider schema would cross it silently, which is the whole defect class this file exists
+    # to avoid. `list.append` is atomic under the GIL, so the worker threads can share it.
+    truncated: list[str] = []
+
     # GENERATION is parallel (~15s each, and the server batches happily); EXECUTION and
     # GRADING stay sequential on the single connection. Splitting them this way keeps the
     # concurrency entirely inside HTTP calls that share no state -- a pool of threads all
     # issuing psycopg on one connection is a data race, not a speedup.
     def gen_one(case):
-        prompt = PROMPT.format(
-            engine=args.engine, schema=schema_cache[case.db_id or ""], question=case.question)
+        messages, extra = build_messages(
+            args.prompt_style, args.engine, schema_cache[case.db_id or ""], case.question)
         t0 = time.time()
         try:
-            raws = generate(args.base_url, args.model, prompt, args.timeout, args.max_tokens,
-                            n=args.candidates, temperature=args.temperature)
+            raws, reasons = generate(args.base_url, args.model, messages, args.timeout,
+                                     args.max_tokens, n=args.candidates,
+                                     temperature=args.temperature, extra=extra)
+            for why in reasons:
+                if why == "length":
+                    truncated.append(case.id)
         except RequestRejected as exc:
             # The server answered and refused. Not a transport fault, so it does not void
             # the run -- but it is not an answer either, so it grades as no SQL.
@@ -538,7 +631,12 @@ def main() -> int:
                 print(f"  [{i}/{len(cases)}] EX={ex:.2f}%  {counts}", flush=True)
 
     n = len(cases)
-    print(f"\nmodel={args.model} engine={args.engine} n={n}")
+    print(f"\nmodel={args.model} engine={args.engine} n={n} "
+          f"prompt_style={args.prompt_style} max_tokens={args.max_tokens}")
+    if truncated:
+        print(f"TRUNCATED at the token cap: {len(truncated)} generation(s) -- "
+              f"these are NOT wrong answers, they are unfinished ones. "
+              f"First few: {truncated[:5]}")
     if args.candidates > 1:
         graded = max(1, n - n_transport)
         print(f"voting: {args.candidates} samples @ T={args.temperature}  "
