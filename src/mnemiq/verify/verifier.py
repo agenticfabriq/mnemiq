@@ -62,10 +62,15 @@ class Verifier:
 
     `fail_closed` decides what an UNREACHABLE judge means, and it defaults to STOPPING the
     answer -- as a failure, not a deferral, since nothing was judged (see `VerifyVerdict`). The
-    judge is only ever wired where a mode asks for it -- `deep` alone, out of the box -- so this
-    changes nothing for a deployment that did not ask to be checked, and for one that did, the
-    old behaviour was to hand back an answer stamped *this was not checked* and hand it back
-    anyway. An operator trading assurance for availability during a provider outage sets
+    judge is wired where a mode asks for it, which is now `thinking` and `deep` -- so this
+    reaches the DEFAULT mode and not only a caller who opted into assurance. That widening is
+    deliberate and it raises the stakes of this flag: an unreachable judge withholds ordinary
+    answers, where before it withheld only `deep` ones. Out of the box the judge is the
+    generation model on the generation endpoint, so the outage that silences it is usually the
+    one that has already stopped the engine answering at all; a deployment that points
+    `MNEMIQ_VERIFY_BASE_URL` somewhere else has given itself a second thing that can fail, and
+    should choose this flag on purpose. The alternative it replaced was worse: hand back an
+    answer stamped *this was not checked* and hand it back anyway. An operator trading assurance for availability during a provider outage sets
     `MNEMIQ_VERIFY_FAIL_CLOSED=0`; that is a decision worth making on purpose rather than a
     default nobody chose."""
 

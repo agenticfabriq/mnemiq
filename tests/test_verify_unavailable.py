@@ -75,10 +75,14 @@ def test_no_judgement_carries_no_score():
 @pytest.mark.parametrize("fail_closed, defers", [(True, True), (False, False)])
 def test_whether_a_dead_judge_stops_an_answer_is_the_deployments_call(fail_closed, defers):
     """It used to be unconditionally False, and the comment saying so read as settled. It was not:
-    the judge is wired only where a mode asks for it -- `deep` alone out of the box -- so the one
-    mode a caller picks FOR assurance was handing back answers stamped "not checked" and handing
-    them back anyway. Withholding is the default now (issue #2); an operator trading assurance
-    for availability during a provider outage sets `MNEMIQ_VERIFY_FAIL_CLOSED=0`.
+    the judge is wired where a mode asks for it, and the mode a caller picks FOR assurance was
+    handing back answers stamped "not checked" and handing them back anyway. Withholding is the
+    default now (issue #2); an operator trading assurance for availability during a provider
+    outage sets `MNEMIQ_VERIFY_FAIL_CLOSED=0`.
+
+    This matters more than it did when it was written. The judge then ran in `deep` alone; it
+    now runs in `thinking` too (issue #3), so fail-closed governs the DEFAULT path and an
+    unreachable judge withholds ordinary answers.
 
     Both positions, because pinning one leaves the switch free to be ignored. The reasons differ
     too: a deferral's text is read by whoever asked the question, and "this answer was not
