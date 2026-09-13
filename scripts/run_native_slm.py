@@ -560,11 +560,12 @@ def main() -> int:
             # The server answered and refused. Not a transport fault, so it does not void
             # the run -- but it is not an answer either, so it grades as no SQL.
             print(f"  REQUEST REJECTED for {case.id}: {exc}", file=sys.stderr)
-            return [""], (time.time() - t0) * 1000.0
+            return [""], (time.time() - t0) * 1000.0, [], []
         except TransportFailed as exc:
             print(f"  TRANSPORT FAILED for {case.id}: {exc}", file=sys.stderr)
-            return None, (time.time() - t0) * 1000.0   # None != [] : unreached, not unanswered
-        return [extract_sql(r) for r in raws], (time.time() - t0) * 1000.0
+            # None != [] : unreached, not unanswered
+            return None, (time.time() - t0) * 1000.0, [], []
+        return [extract_sql(r) for r in raws], (time.time() - t0) * 1000.0, reasons, raws
 
     print(f"generating {len(cases)} with {args.concurrency} workers ...", flush=True)
     t_gen = time.time()
@@ -575,12 +576,14 @@ def main() -> int:
     # it away. Persist it first: a crash after this point costs minutes, not GPU hours.
     gen_path = args.out + ".generations.json"
     with open(gen_path, "w") as gh:
-        json.dump([{"case_id": c.id, "sql": g[0], "ms": g[1]}
+        json.dump([{"case_id": c.id, "sql": g[0], "ms": g[1],
+                    "finish_reasons": g[2], "raw": g[3]}
                    for c, g in zip(cases, generated)], gh)
     print(f"generations saved to {gen_path}", flush=True)
 
     with open(args.out, "w") as out:
-        for i, (case, (sql, ms)) in enumerate(zip(cases, generated), 1):
+        for i, (case, (sql, ms, reasons, _raw)) in enumerate(zip(cases, generated), 1):
+            was_truncated = any(r == "length" for r in reasons)
             db = case.db_id or ""
             if sql is not None:
                 # Execute EVERY candidate, then vote on results. With --candidates 1 this is
@@ -594,7 +597,7 @@ def main() -> int:
                 out.write(json.dumps({
                     "case_id": case.id, "outcome": "error", "sql": "",
                     "db_id": db, "ms": round(ms, 1), "error": "transport",
-                    "prompt_style": args.prompt_style,
+                    "prompt_style": args.prompt_style, "truncated": was_truncated,
                 }) + "\n")
                 counts["error"] = counts.get("error", 0) + 1
                 continue
@@ -625,7 +628,7 @@ def main() -> int:
 
             out.write(json.dumps({
                 "case_id": case.id, "outcome": outcome, "sql": sql,
-                "prompt_style": args.prompt_style,
+                "prompt_style": args.prompt_style, "truncated": was_truncated,
                 "db_id": db, "ms": round(ms, 1),
                 "engine_rows": rows_preview, "engine_row_count": row_count,
             }) + "\n")
