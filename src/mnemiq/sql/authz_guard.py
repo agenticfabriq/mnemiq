@@ -213,7 +213,7 @@ def check_unmodelled_calls(
         # guard written to use it: measured, a raising `user_functions()` on a source holding a
         # `median` macro left `SELECT median(id) FROM claim` approved.
         return _cannot_resolve(inventory)
-    if not inventory.names:
+    if not (inventory.names or inventory.unresolvable):
         return None
 
     if inventory.may_shadow_a_builtin:
@@ -235,6 +235,20 @@ def check_unmodelled_calls(
         # sentence: this one is about THIS statement, and blaming the adapter for it would
         # send the deployer to fix a catalogue method that is working.
         return _cannot_resolve(inventory, unreadable=True)
+
+    # UNRESOLVABLE FIRST, and with its own sentence. "Defined by this source itself" is false
+    # of a synonym over a database link -- the source cannot see the target either -- and a
+    # deployer told to rename their function will look for one that is not there.
+    for name in sorted(called & inventory.unresolvable):
+        return Refusal(
+            code=RefusalCode.UNMODELLED_CALL,
+            message=(
+                f"{name}() reaches this source through a synonym it cannot resolve, so this "
+                "engine cannot confirm what the query reads. Answer using only the listed "
+                "tables and columns and standard SQL functions."
+            ),
+            subject=name,
+        )
 
     for name in sorted(called & inventory.names):
         return Refusal(
@@ -358,12 +372,23 @@ def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -
     someone to fix working code. That is the failure this list is arranged against.
     """
     if unreadable:
+        # "defines functions of its own" is FALSE where only `unresolvable` is populated -- a
+        # synonym over a database link is not the source's function, and the source cannot see
+        # its target either. Widening the gate to `names or unresolvable` made this arm
+        # reachable in that state, and a deployer reading it goes looking for a UDF that does
+        # not exist. The same argument the sibling arm's own sentence rests on.
+        has_own = bool(inventory.names)
+        why = (
+            "this source defines functions of its own"
+            if has_own
+            else "this source has names this engine cannot resolve"
+        )
         return Refusal(
             code=RefusalCode.UNRESOLVABLE_CALLS,
             message=(
                 "This query could not be rendered, so this engine cannot confirm which "
-                "functions it asks the source for, and this source defines functions of its "
-                "own. Answer using only the listed tables and columns and standard SQL."
+                f"functions it asks the source for, and {why}. "
+                "Answer using only the listed tables and columns and standard SQL."
             ),
             # The one arrival that is about the STATEMENT, so the one a rewrite can fix -- and
             # the message asks for one. The code alone would send it to the no-retry path with

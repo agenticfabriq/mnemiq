@@ -13,7 +13,11 @@ import duckdb
 import pytest
 
 from mnemiq.adapters.duckdb import DuckDBAdapter
-from mnemiq.sql.functions import FunctionInventory, calls_are_confirmable
+from mnemiq.sql.functions import (
+    FunctionInventory,
+    calls_are_confirmable,
+    inventory_from,
+)
 
 
 def test_an_empty_answer_is_not_a_failed_lookup():
@@ -819,8 +823,8 @@ def test_every_adapter_the_resolver_hands_out_can_answer_the_inventory():
 # --------------------------------------------------------------------------------------------
 
 
-def _oracle_walk(synonyms, functions, oracle_owned=("sys",), schema="APP", asked=None):
-    """`_synonyms_reaching_functions` over a stubbed data dictionary.
+def _oracle_adapter(synonyms, functions, oracle_owned=("sys",), schema="APP", asked=None):
+    """An OracleAdapter over a stubbed data dictionary. NO DATABASE.
 
     `asked` collects the owners the object read binds, because WHICH owners it asks about is
     where the cost lives and no stub can time it.
@@ -851,7 +855,28 @@ def _oracle_walk(synonyms, functions, oracle_owned=("sys",), schema="APP", asked
         return [(o, n) for o, n in functions if o in wanted]
 
     adapter._rows = rows
-    return adapter._synonyms_reaching_functions()
+    return adapter
+
+
+def _oracle_walk(*a, **kw) -> set[str]:
+    """The UNION -- which aliases get reported at all, what nearly every test here asks.
+
+    `_oracle_walk_split` returns the two halves, for the tests about which side a name lands
+    on (M104).
+    """
+    resolvable, links = _oracle_adapter(*a, **kw)._synonyms_reaching_functions()
+    return resolvable | links
+
+
+def _oracle_walk_split(*a, **kw) -> tuple[set[str], set[str]]:
+    """(reported as functions, reported as unresolvable link aliases).
+
+    Calls the method DIRECTLY rather than swapping it on the class and letting `_oracle_walk`
+    invoke it. That version left the captured pair unset whenever anything inside the walk
+    raised -- the stub's own `assert "where" not in sql.lower()` among them -- so a real
+    failure came back as a KeyError from the capture dict and said nothing about the cause.
+    """
+    return _oracle_adapter(*a, **kw)._synonyms_reaching_functions()
 
 
 def test_a_name_shared_by_a_private_and_a_public_synonym_resolves_the_same_way_every_time():
@@ -1081,27 +1106,42 @@ def test_a_chain_reaching_a_PUBLIC_db_link_synonym_reports_both():
     ], []) == {"via_pub", "pub_link"}
 
 
-def test_reporting_a_link_alias_downgrades_completeness_on_a_schema_that_defines_nothing():
-    """The COST of the M102 fix, pinned rather than described, because the comment describing
-    it was wrong twice.
+def test_a_link_alias_no_longer_downgrades_a_schema_that_defines_nothing():
+    """M104 CLOSED. The same measurement that opened it, now the other way round.
 
-    `calls_are_confirmable` is `licensed and not inventory.names`, so any name at all makes it
-    false. The first note on the fix argued the cost was bounded to queries spelling the alias,
-    on the grounds that a schema defining a function is already downgraded -- true, and silent
-    about the schema that defines NONE, which is the case this measures. A link over a remote
-    TABLE is the common enterprise shape and produces a name here regardless, because nothing
-    local can tell a remote table from a remote function.
+    `calls_are_confirmable` is `licensed and not names`, so any name there downgrades the
+    whole source. A schema defining nothing of its own, plus one
+    `PUBLIC orders FOR orders@ERP_LINK` over a remote TABLE, used to put `orders` in `names`
+    and flip that flag from True to False -- `completeness='unknown'` on every answer carrying
+    any call, for what is the common enterprise shape.
 
-    Same issue-#5 downgrade the PUBLIC/Oracle-maintained filter exists to avoid, accepted here
-    because the alternative is approving a call that returns an ungranted row.
+    The alias is reported as UNRESOLVABLE now: it still refuses a call spelling it, because
+    nothing local can tell a remote table from a remote function, but it no longer asserts
+    that this source defines functions. That was two claims wearing one name.
     """
-    names = _oracle_walk([("public", "orders", None, "orders", "ERP_LINK")], [])
-    assert names == {"orders"}, "a remote table is indistinguishable from a remote function"
+    resolvable, links = _oracle_walk_split([("public", "orders", None, "orders", "ERP_LINK")], [])
+    assert resolvable == set(), "a link alias is not evidence of a function"
+    assert links == {"orders"}
 
-    downgraded = FunctionInventory(names=frozenset(names))
-    assert calls_are_confirmable(downgraded, in_view_body=False) is False
-    # The control: without the link alias this source certifies, so the flip is the alias's.
-    assert calls_are_confirmable(FunctionInventory(names=frozenset()), in_view_body=False) is True
+    downgraded = FunctionInventory(names=frozenset(resolvable), unresolvable=frozenset(links))
+    assert calls_are_confirmable(downgraded, in_view_body=False) is True
+    # The control: a REAL function still downgrades, which is the behaviour being preserved.
+    assert calls_are_confirmable(
+        FunctionInventory(names=frozenset({"udf"})), in_view_body=False
+    ) is False
+
+
+def test_an_alias_that_resolves_to_a_function_still_counts_as_one():
+    """The other half. Splitting the two categories must not quietly move a real function into
+    the harmless bucket -- an alias whose chain ends at a FUNCTION is evidence, and downgrades
+    completeness exactly as it did."""
+    resolvable, links = _oracle_walk_split(
+        [("app", "add_days", "app", "udf")], [("app", "udf")]
+    )
+    assert resolvable == {"add_days"} and links == set()
+    assert calls_are_confirmable(
+        FunctionInventory(names=frozenset(resolvable)), in_view_body=False
+    ) is False
 
 
 def test_keying_the_report_on_the_alias_over_reports_through_the_public_fallback():
@@ -1168,7 +1208,8 @@ def test_the_owner_read_is_chunked_under_oracles_in_list_cap():
         return [(o, "udf") for o in binds.values()]
 
     adapter._rows = rows
-    got = adapter._synonyms_reaching_functions()
+    resolvable, links = adapter._synonyms_reaching_functions()
+    got = resolvable | links
 
     assert len(got) == 2500
     assert reads and max(reads) <= 900, f"one read bound {max(reads)} owners"
@@ -1351,3 +1392,181 @@ def test_an_alias_cannot_spell_its_way_past_the_guard(sql):
     refusal = check_opaque_columns(sqlglot.parse_one(sql, read="oracle"),
                                    frozenset({("vc_t", "leaked")}), "oracle")
     assert refusal is not None, sql
+
+
+def test_an_unresolvable_alias_still_refuses_a_call_that_spells_it():
+    """The refusal is the half M104 must NOT relax. Nothing local can tell a remote table from
+    a remote function, so a statement calling the alias is still unconfirmable -- only the
+    claim that the source defines functions was withdrawn."""
+    import sqlglot
+
+    from mnemiq.sql.authz_guard import check_unmodelled_calls
+
+    inventory = FunctionInventory(names=frozenset(), unresolvable=frozenset({"add_days"}))
+    refusal = check_unmodelled_calls(
+        sqlglot.parse_one("SELECT add_days(1) AS x FROM claim", read="oracle"),
+        inventory, "oracle",
+    )
+    assert refusal is not None, "a call through an unresolvable alias was cleared"
+    assert refusal.subject == "add_days"
+    # Its OWN sentence: "defined by this source itself" is false of a synonym over a link --
+    # the source cannot see the target either -- and would send a deployer looking for a
+    # function that is not there.
+    assert "cannot resolve" in refusal.message, refusal.message
+    assert "defined by this source itself" not in refusal.message
+
+
+def test_a_statement_calling_nothing_is_cleared_even_with_an_unresolvable_alias():
+    """The early return reads the UNION now. Widening it must not start refusing statements
+    that spell no alias at all -- that is the blast radius M104 exists to bound."""
+    import sqlglot
+
+    from mnemiq.sql.authz_guard import check_unmodelled_calls
+
+    inventory = FunctionInventory(names=frozenset(), unresolvable=frozenset({"orders"}))
+    assert check_unmodelled_calls(
+        sqlglot.parse_one("SELECT id FROM orders", read="oracle"), inventory, "oracle"
+    ) is None
+
+
+# --------------------------------------------------------------------------------------------
+# The WIRING from adapter to decision. Rebinding `_unresolvable_from` to return empty left the
+# whole suite green while `decide` APPROVED the statement M102 measured returning an ungranted
+# SSN -- the security property had moved to a seam nothing runnable crossed. These stubs need
+# no database, so they run wherever the suite does.
+# --------------------------------------------------------------------------------------------
+
+
+class _LinkAliasSource:
+    """An Oracle-shaped source that defines no functions and has one unresolvable alias."""
+
+    dialect = "oracle"
+    binder_prefers_builtins = True
+
+    def __init__(self, aliases=("add_days",), raise_aliases=False):
+        self._aliases = aliases
+        self._raise = raise_aliases
+
+    def user_functions(self):
+        return []
+
+    def unresolvable_aliases(self):
+        if self._raise:
+            raise RuntimeError("ORA-03113: end-of-file on communication channel")
+        return list(self._aliases)
+
+    def list_columns(self):
+        return [("dbl_claim", "id", "NUMBER")]
+
+
+def test_an_unresolvable_alias_reaches_the_DECISION_not_just_the_inventory():
+    """The seam the mutation crossed. `inventory_from` -> `FunctionInventory.unresolvable` ->
+    `check_unmodelled_calls` is what stops the call, and the only assertion on
+    `unresolvable_aliases()` before this one was inside an integration-gated Oracle test."""
+    from mnemiq.sql.decide import decide
+
+    source = _LinkAliasSource()
+    inv = inventory_from(source)
+    assert inv.names == frozenset() and inv.unresolvable == frozenset({"add_days"})
+
+    verdict = decide("SELECT add_days(1) AS x FROM dbl_claim", {"dbl_claim": {"id"}},
+                     adapter=source, dialect="oracle", target="oracle")
+    assert getattr(verdict, "code", None) is not None, f"APPROVED the call: {verdict}"
+    assert verdict.code.value == "unmodelled_call", verdict
+    # And completeness is NOT downgraded, which is the whole of M104.
+    assert calls_are_confirmable(inv, in_view_body=False) is True
+
+
+def test_a_source_that_CANNOT_SAY_refuses_rather_than_clearing():
+    """FAIL CLOSED. `unresolvable_aliases()` raising used to return an empty set, and since
+    the alias had also left `user_functions` it was then in NEITHER set: measured, `decide`
+    APPROVED `SELECT add_days(1) FROM dbl_claim` with no completeness marker.
+
+    A raise on either live dictionary read now yields the same `unavailable` inventory, so one
+    outage decides one way."""
+    from mnemiq.sql.decide import decide
+
+    source = _LinkAliasSource(raise_aliases=True)
+    inv = inventory_from(source)
+    assert inv.asked and not inv.available, inv
+    assert inv.reason == "RuntimeError", inv.reason  # the TYPE, never the message (M94)
+
+    verdict = decide("SELECT add_days(1) AS x FROM dbl_claim", {"dbl_claim": {"id"}},
+                     adapter=source, dialect="oracle", target="oracle")
+    # THE SPECIFIC CODE. `_LinkAliasSource` has no `execute`, so a statement the inventory
+    # CLEARS still ends in `explain_failed` -- measured. Asserting only "some refusal" was
+    # therefore satisfied by a mechanism this test is not about, and would have passed with
+    # the fail-open restored.
+    assert verdict.code.value == "unresolvable_calls", verdict
+
+    # The control that proves the assertion above discriminates: with nothing unresolvable the
+    # inventory clears the call and the stub's missing `execute` is what refuses instead.
+    cleared = decide("SELECT add_days(1) AS x FROM dbl_claim", {"dbl_claim": {"id"}},
+                     adapter=_LinkAliasSource(aliases=()), dialect="oracle", target="oracle")
+    assert cleared.code.value == "explain_failed", cleared
+
+
+def test_an_adapter_without_the_method_is_unaffected():
+    """Absence is not failure. An adapter with no concept of an unresolvable alias has
+    everything it knows in `names` already, so empty is right and must not refuse."""
+    class NoAliases:
+        dialect = "duckdb"
+
+        def user_functions(self):
+            return ["udf"]
+
+    inv = inventory_from(NoAliases())
+    assert inv.unresolvable == frozenset()
+    assert inv.available and inv.asked and inv.names == frozenset({"udf"})
+
+
+def test_a_name_that_is_BOTH_a_function_and_a_link_alias_counts_as_the_function():
+    """These are sets of bare NAMES drawn from (owner, name) pairs, so one name can be both:
+    `app.orders` resolving to a function while `PUBLIC orders` goes over a link. The split
+    returned `orders` in both halves, and because the guard checks `unresolvable` first a
+    deployer who owns a real `app.orders` was told it "reaches this source through a synonym
+    it cannot resolve" -- the wrong-object message this split exists to stop sending."""
+    resolvable, links = _oracle_walk_split(
+        [("app", "orders", "app", "udf"),
+         ("public", "orders", None, "orders", "ERP_LINK")],
+        [("app", "udf")],
+    )
+    assert "orders" in resolvable
+    assert "orders" not in links, "one name in both halves; the guard reports the wrong one"
+
+
+def test_the_unreadable_refusal_does_not_claim_functions_the_source_lacks():
+    """Widening the gate to `names or unresolvable` made this arm reachable with an empty
+    `names`, where "this source defines functions of its own" is false twice -- of a link
+    synonym, and of the inventory's own data."""
+    from mnemiq.sql.authz_guard import _cannot_resolve
+
+    only_links = FunctionInventory(names=frozenset(), unresolvable=frozenset({"orders"}))
+    assert "cannot resolve" in _cannot_resolve(only_links, unreadable=True).message
+    assert "defines functions of its own" not in _cannot_resolve(
+        only_links, unreadable=True).message
+
+    # The control: a source that DOES define functions still says so.
+    own = FunctionInventory(names=frozenset({"udf"}))
+    assert "defines functions of its own" in _cannot_resolve(own, unreadable=True).message
+
+
+def test_a_virtual_column_reaching_a_link_alias_is_still_opaque():
+    """`opaque_columns` intersects the stored expression's names with the inventory, and a link
+    alias left `names` when M104 split the categories -- so a `DATA_DEFAULT` of
+    `"ORDERS"("ID")` reaching `orders@ERP_LINK` stopped being flagged, giving the M100
+    no-call-in-the-text route back for that shape.
+
+    MEASURED on the container: Oracle refuses `GENERATED ALWAYS AS (link_syn(id))` with
+    ORA-02069 while the same DDL over a LOCAL function is accepted, so no such column exists
+    on a default instance. That error names a SETTING (`global_names`), so the union costs
+    nothing where the DDL is refused and closes it where it is not.
+    """
+    from mnemiq.sql.functions import opaque_columns
+
+    class Source:
+        def virtual_columns(self):
+            return [("orders_t", "c", '"ORDERS"("ID")')]
+
+    inv = FunctionInventory(names=frozenset(), unresolvable=frozenset({"orders"}))
+    assert opaque_columns(Source(), inv) == frozenset({("orders_t", "c")})
