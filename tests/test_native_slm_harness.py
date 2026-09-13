@@ -175,6 +175,29 @@ class TestBuildMessages:
         _, extra = slm.build_messages("arctic", "SQLite", "s", "q")
         assert extra == {"continue_final_message": True, "add_generation_prompt": False}
 
+    def test_the_schema_and_question_actually_reach_the_prompt(self):
+        """Pinning the literal strings proves nothing about the two values that vary.
+
+        `str.format` ignores an unused kwarg, so deleting `{schema}` from the template, or
+        swapping the two kwargs, left every other test here green -- and the run would send
+        a schema-less or role-swapped prompt, execute cleanly, and report the near-zero EX
+        as a model result.
+        """
+        for style in ("omnisql", "arctic"):
+            msgs, _ = slm.build_messages(style, "SQLite", "CREATE TABLE zz (q int);", "HOWMANY?")
+            user = next(m["content"] for m in msgs if m["role"] == "user")
+            assert "CREATE TABLE zz (q int);" in user, f"{style}: schema missing"
+            assert "HOWMANY?" in user, f"{style}: question missing"
+            # ...and not transposed: the schema must precede the question, under its header
+            assert user.index("CREATE TABLE zz") < user.index("HOWMANY?"), f"{style}: swapped"
+            assert "Database Schema:\nCREATE TABLE zz" in user, f"{style}: schema misplaced"
+            assert "Question:\nHOWMANY?" in user, f"{style}: question misplaced"
+
+    def test_the_engine_line_is_the_one_asked_for(self):
+        msgs, _ = slm.build_messages("arctic", "PostgreSQL", "s", "q")
+        user = next(m["content"] for m in msgs if m["role"] == "user")
+        assert "Database Engine:\nPostgreSQL" in user
+
     def test_the_envelope_states_both_budgets(self):
         msgs, _ = slm.build_messages("arctic", "SQLite", "s", "q")
         assert "[Limited by 4K tokens]" in msgs[1]["content"]
@@ -185,3 +208,62 @@ class TestBuildMessages:
         # on a DDL-trained model, and the report would name neither.
         with pytest.raises(ValueError):
             slm.build_messages("Arctic", "SQLite", "s", "q")
+
+
+class TestGenerateReportsWhyItStopped:
+    """`generate` must hand back the finish reasons, not just the text.
+
+    A generation cut off at the token cap is an unfinished answer; `extract_sql`'s
+    last-SELECT fallback turns one into a plausible query that grades as a model error.
+    Nothing else in this suite reaches `generate`, so without this the detector could be
+    deleted and every test would still pass -- silently restoring the state the detector
+    was added to end.
+    """
+
+    def _stub(self, monkeypatch, choices):
+        import contextlib
+        import io
+        import json as _json
+
+        @contextlib.contextmanager
+        def fake_urlopen(req, timeout=None):
+            yield io.BytesIO(_json.dumps({"choices": choices}).encode())
+
+        monkeypatch.setattr(slm.urllib.request, "urlopen", fake_urlopen)
+
+    def test_finish_reasons_come_back_alongside_the_text(self, monkeypatch):
+        self._stub(monkeypatch, [
+            {"message": {"content": "a"}, "finish_reason": "stop"},
+            {"message": {"content": "b"}, "finish_reason": "length"},
+        ])
+        texts, reasons = slm.generate("http://x/v1", "m", [{"role": "user", "content": "q"}],
+                                      timeout=1, max_tokens=10, n=2)
+        assert texts == ["a", "b"]
+        assert reasons == ["stop", "length"]
+
+    def test_a_missing_finish_reason_is_empty_not_None(self, monkeypatch):
+        # `None` would compare unequal to "length" too, but it also reads as "not truncated"
+        # when the truth is "the server did not say" -- the absence/failure collapse again.
+        self._stub(monkeypatch, [{"message": {"content": "a"}}])
+        _, reasons = slm.generate("http://x/v1", "m", [{"role": "user", "content": "q"}],
+                                  timeout=1, max_tokens=10)
+        assert reasons == [""]
+
+    def test_the_extras_reach_the_request_body(self, monkeypatch):
+        # Without these the server closes the assistant turn and the prefilled `<think>`
+        # becomes a completed message, so the arctic arm silently measures another prompt.
+        seen = {}
+
+        import contextlib
+        import io
+        import json as _json
+
+        @contextlib.contextmanager
+        def fake_urlopen(req, timeout=None):
+            seen["body"] = _json.loads(req.data)
+            yield io.BytesIO(b'{"choices": [{"message": {"content": "x"}, "finish_reason": "stop"}]}')
+
+        monkeypatch.setattr(slm.urllib.request, "urlopen", fake_urlopen)
+        slm.generate("http://x/v1", "m", [{"role": "user", "content": "q"}], timeout=1,
+                     max_tokens=10, extra={"continue_final_message": True})
+        assert seen["body"]["continue_final_message"] is True

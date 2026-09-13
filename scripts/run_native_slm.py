@@ -33,7 +33,11 @@ re-grades every row independently and prints the disagreement table.
 Usage:
     source .env                      # MNEMIQ_PG_DSN etc.; Settings reads os.environ only
     .venv/bin/python scripts/run_native_slm.py \\
-        --base-url http://HOST:8000/v1 --model arctic --limit 20
+        --base-url http://HOST:8000/v1 --model arctic --limit 20 \\
+        --prompt-style arctic --max-tokens 8192
+
+    `--prompt-style` defaults to `omnisql`, which is NOT arctic's own prompt: the model
+    name and the prompt style are independent, and the two prompts do not score alike.
 """
 
 from __future__ import annotations
@@ -590,6 +594,7 @@ def main() -> int:
                 out.write(json.dumps({
                     "case_id": case.id, "outcome": "error", "sql": "",
                     "db_id": db, "ms": round(ms, 1), "error": "transport",
+                    "prompt_style": args.prompt_style,
                 }) + "\n")
                 counts["error"] = counts.get("error", 0) + 1
                 continue
@@ -620,6 +625,7 @@ def main() -> int:
 
             out.write(json.dumps({
                 "case_id": case.id, "outcome": outcome, "sql": sql,
+                "prompt_style": args.prompt_style,
                 "db_id": db, "ms": round(ms, 1),
                 "engine_rows": rows_preview, "engine_row_count": row_count,
             }) + "\n")
@@ -634,9 +640,11 @@ def main() -> int:
     print(f"\nmodel={args.model} engine={args.engine} n={n} "
           f"prompt_style={args.prompt_style} max_tokens={args.max_tokens}")
     if truncated:
-        print(f"TRUNCATED at the token cap: {len(truncated)} generation(s) -- "
-              f"these are NOT wrong answers, they are unfinished ones. "
-              f"First few: {truncated[:5]}")
+        print(f"TRUNCATED at the token cap: {len(truncated)} generation(s). These are "
+              f"unfinished answers, but the EX below COUNTS THEM AS WRONG -- it divides by "
+              f"every case asked -- so that figure understates the model by at most "
+              f"{len(truncated)}/{n} = {len(truncated) / n:.2%}. Raise --max-tokens and "
+              f"re-run to remove the doubt. First few: {truncated[:5]}")
     if args.candidates > 1:
         graded = max(1, n - n_transport)
         print(f"voting: {args.candidates} samples @ T={args.temperature}  "
