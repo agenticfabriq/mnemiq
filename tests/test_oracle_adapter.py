@@ -2061,14 +2061,22 @@ def test_a_synonym_over_a_db_link_is_a_route_to_a_udf_this_engine_cannot_resolve
         cur.execute("SELECT add_days(1) FROM dual")
         assert cur.fetchone()[0] == "123-45-6789", "no leak, so nothing below proves anything"
 
-        assert "add_days" in set(adapter.user_functions()), "the alias a query would spell"
+        # UNRESOLVABLE, not `user_functions` (M104). The alias must still refuse a call --
+        # nothing local can tell a remote table from a remote function -- but it is not
+        # evidence this schema defines functions, and `calls_are_confirmable` is
+        # `licensed and not names`, so putting it there downgraded every answer's completeness
+        # on a schema that defines nothing else.
+        assert "add_days" in set(adapter.unresolvable_aliases()), "the alias a query spells"
+        assert "add_days" not in set(adapter.user_functions()), "back in the wrong bucket"
 
         refused = decide("SELECT add_days(1) AS x FROM dbl_claim", {"dbl_claim": {"id"}},
                          adapter=adapter, dialect="oracle", target="oracle")
         assert refused.code.value == "unmodelled_call", refused
         # From the INVENTORY branch, not the allowlist. They share a code and differ in what
         # they say, and asserting only the code is how the sibling test passed while reverted.
-        assert "defined by this source itself" in refused.message, refused.message
+        # Its own sentence: "defined by this source itself" is false of a link synonym.
+        assert "cannot resolve" in refused.message, refused.message
+        assert "defined by this source itself" not in refused.message
 
         for clean in ("SELECT count(*) AS n FROM dbl_claim", "SELECT id FROM dbl_claim"):
             v = decide(clean, {"dbl_claim": {"id"}}, adapter=adapter,

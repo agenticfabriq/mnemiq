@@ -736,10 +736,31 @@ class OracleAdapter:
             "  AND procedure_name IS NOT NULL",
             owner=self._schema,
         )
-        return sorted({r[0] for r in direct} | self._synonyms_reaching_functions())
+        resolvable, _links = self._synonyms_reaching_functions()
+        return sorted({r[0] for r in direct} | resolvable)
 
-    def _synonyms_reaching_functions(self) -> set[str]:
-        """Aliases that end at a function, following chains, keyed by full identity.
+    def unresolvable_aliases(self) -> list[str]:
+        """Aliases over a DB LINK: they must refuse a call, and prove nothing about functions.
+
+        Kept out of `user_functions` because `calls_are_confirmable` is `licensed and not
+        names`, so any name there downgrades the whole source. Measured (M104): a schema
+        defining nothing of its own, plus one `PUBLIC orders FOR orders@ERP_LINK` over a
+        remote TABLE, flipped that flag from True to False -- `completeness='unknown'` on every
+        answer carrying a call. A link to a table is the common enterprise shape.
+
+        The alias still refuses a call spelling it, through `FunctionInventory.unresolvable`:
+        nothing local can tell a remote table from a remote function, so the refusal stands
+        and only the completeness claim is withdrawn.
+        """
+        _resolvable, links = self._synonyms_reaching_functions()
+        return sorted(links)
+
+    def _synonyms_reaching_functions(self) -> tuple[set[str], set[str]]:
+        """(aliases that end at a function, aliases over a DB LINK), following chains.
+
+        TWO sets because they answer different questions -- see `unresolvable_aliases`.
+        Both refuse a call spelling them; only the first is evidence this schema defines
+        functions, and only that claim reaches `calls_are_confirmable`.
 
         Oracle resolves `a -> b -> udf` at call time: measured, all three of `chain_udf(1)`,
         `chain_b(1)` and `chain_a(1)` returned 42. A join on the IMMEDIATE target sees only the
@@ -855,7 +876,7 @@ class OracleAdapter:
                 continue
             edges[(owner, name)] = (target_owner, target_name)
         if not edges and not over_a_link:
-            return set()
+            return set(), set()
         oracle_owned = {
             r[0] for r in self._rows(
                 "SELECT lower(username) FROM all_users WHERE oracle_maintained = 'Y'")
@@ -949,12 +970,28 @@ class OracleAdapter:
         # divergences all in that direction. Kept because the alternative is special-casing the
         # link aliases at the return, and a second code path for the shape this function most
         # recently got wrong is the worse trade.
-        return {
-            name
+        reported = {
+            (owner, name)
             for owner, name in set(edges) | over_a_link
             if (owner == mine and (owner, name) in reaches_any)
             or (owner == "public" and (owner, name) in reaches_free)
         }
+        # SPLIT, because the two answer different questions (M104). An alias that resolves to
+        # a function is evidence this schema defines functions; one over a DB LINK is evidence
+        # of nothing -- the target may be a table, and nothing local can tell. Both must refuse
+        # a call spelling them; only the first may downgrade the source's completeness.
+        resolvable = {name for owner, name in reported if (owner, name) not in over_a_link}
+        links = {name for owner, name in reported if (owner, name) in over_a_link}
+        # `names` WINS an overlap. These are sets of bare NAMES drawn from (owner, name)
+        # pairs, so one name can be both -- `app.orders` resolving to a function while
+        # `PUBLIC orders` goes over a link. Verified: the split returned `orders` in both
+        # halves. The guard checks `unresolvable` first, so a deployer who owns a real
+        # `app.orders` was told it "reaches this source through a synonym it cannot resolve",
+        # which is the wrong-object message this split was made to stop sending.
+        #
+        # Completeness is unaffected either way: the name is in `names`, which is what
+        # `calls_are_confirmable` reads.
+        return resolvable, links - resolvable
 
     def virtual_columns(self) -> list[tuple[str, str, str]]:
         """(table, column, expression) for every VIRTUAL column in this schema.

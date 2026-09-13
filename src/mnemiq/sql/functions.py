@@ -118,6 +118,21 @@ class FunctionInventory:
     # Defaults FALSE: an engine nobody measured is assumed to behave like DuckDB, which is the
     # conservative half. Forgetting yields a refusal, not a leak.
     binder_prefers_builtins: bool = False
+    # Names that must REFUSE A CALL without being evidence this source defines functions.
+    # The third category, and `names` was doing both jobs: `calls_are_confirmable` is
+    # `licensed and not names`, so ANY name downgrades the whole source's completeness.
+    #
+    # M104, measured: an Oracle schema defining nothing of its own, plus one
+    # `PUBLIC orders FOR orders@ERP_LINK` over a remote TABLE, put `orders` in `names` and
+    # flipped `calls_are_confirmable` from True to False -- `completeness='unknown'` on every
+    # answer carrying any call. A link to a table is the common enterprise shape and nothing
+    # local can tell it from a link to a function, so the alias must still refuse a call; what
+    # it must not do is assert the source has functions, which is a different claim.
+    #
+    # Not read by `may_shadow_a_builtin`: an unresolvable alias cannot be reached by a binder
+    # rename, because the binder would have to resolve it to do that, and the one engine that
+    # produces these sets `binder_prefers_builtins` anyway.
+    unresolvable: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
         # Normalised HERE, not only in `of()`. A dataclass hands out its plain constructor
@@ -134,6 +149,12 @@ class FunctionInventory:
         if isinstance(names, str):
             names = [names]
         object.__setattr__(self, "names", frozenset(n.lower() for n in names))
+        # Same normalisation, same reasons: a bare string splayed into characters, and a
+        # case-sensitive set reading a UDF as a builtin.
+        unresolvable = self.unresolvable
+        if isinstance(unresolvable, str):
+            unresolvable = [unresolvable]
+        object.__setattr__(self, "unresolvable", frozenset(n.lower() for n in unresolvable))
         reachable = self.reachable
         if reachable is not None:
             if isinstance(reachable, str):
@@ -247,6 +268,10 @@ def inventory_from(adapter) -> FunctionInventory:
         return FunctionInventory.never_asked()
     try:
         names = adapter.user_functions()
+        # SAME try, so one outage decides one way. Both are live dictionary reads carrying the
+        # same security property, and handling them separately let a raise on this one fall
+        # through to an empty set while the same raise on the other refused every statement.
+        unresolvable = _unresolvable_from(adapter)
     except Exception as exc:
         # The TYPE, not the message. A source's exception text is made of the caller's schema
         # and can carry a DSN, and this reason reaches an audit record (M94).
@@ -259,6 +284,7 @@ def inventory_from(adapter) -> FunctionInventory:
         builtins_asked=builtins_asked,
         reachable=_reachable_from(adapter),
         binder_prefers_builtins=getattr(adapter, "binder_prefers_builtins", False),
+        unresolvable=unresolvable,
     )
 
 
@@ -274,6 +300,30 @@ def _reachable_from(adapter) -> frozenset[str] | None:
         return frozenset(n.lower() for n in adapter.reachable_user_functions())
     except Exception:
         return None
+
+
+def _unresolvable_from(adapter) -> frozenset[str]:
+    """Aliases this source can neither resolve nor rule out. RAISES if the source cannot say.
+
+    Absence and FAILURE are opposite here, and an earlier version of this collapsed them into
+    an empty set with the justification that "forgetting it only means such names stay in
+    `names`, where they already refuse a call". That was disproven by the same diff: the
+    Oracle adapter stopped putting link aliases in `user_functions`, so an empty return leaves
+    such a name in NEITHER set and the guard clears the call. Measured with a stub whose
+    `unresolvable_aliases()` raised ORA-03113: `decide` APPROVED
+    `SELECT add_days(1) FROM dbl_claim` -- the exact statement M102 measured returning an
+    ungranted SSN, re-approved through the new door.
+
+    So a raise PROPAGATES, and `inventory_from` turns it into `unavailable` exactly as it does
+    for `user_functions`. Two live dictionary reads deciding opposite ways on one outage was
+    the asymmetry that made this unsafe.
+
+    ABSENCE still means empty, and that stays safe: an adapter without the method has no
+    concept of an unresolvable alias, so whatever it knows is already in `names`.
+    """
+    if adapter is None or not hasattr(adapter, "unresolvable_aliases"):
+        return frozenset()
+    return frozenset(n.lower() for n in adapter.unresolvable_aliases())
 
 
 def _builtins_from(adapter) -> tuple[frozenset[str] | None, bool]:
@@ -336,7 +386,16 @@ def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str
     return frozenset(
         (table, column)
         for table, column, expression in columns
-        if names_called_in(expression) & inventory.names
+        # BOTH sets. A link alias left `names` when M104 split the two categories, so a
+        # virtual column whose stored expression reaches one stopped being flagged -- the
+        # M100 route back, for that one shape, in the same diff that moved the name.
+        #
+        # MEASURED: Oracle refuses `GENERATED ALWAYS AS (link_syn(id))` with ORA-02069,
+        # "global_names parameter must be set to TRUE for this operation", while the same DDL
+        # over a LOCAL function is accepted -- so the refusal is about the link and no such
+        # column can exist on a default instance. But that error names a SETTING, so with
+        # `global_names=TRUE` it may be permitted, and the union costs nothing where it is not.
+        if names_called_in(expression) & (inventory.names | inventory.unresolvable)
     )
 
 
