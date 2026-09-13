@@ -55,9 +55,12 @@ def test_build_agent_wires_knobs_per_mode():
 
 
 def test_modes_carry_verify_levels():
-    # sanity (free deterministic net) everywhere; the LLM judge only in deep.
+    # Sanity (the free deterministic net) everywhere. The LLM judge in `thinking` and `deep`
+    # but NOT `instant`, whose contract is "cheapest, no retries" -- a mode that buys an LLM
+    # call per answer is not that mode any more. `thinking` is the default, so a fresh install
+    # is judged; the measured trade is in the table's own comment.
     assert MODES["instant"].verify == "sanity"
-    assert MODES["thinking"].verify == "sanity"
+    assert MODES["thinking"].verify == "full"
     assert MODES["deep"].verify == "full"
 
 

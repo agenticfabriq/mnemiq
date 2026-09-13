@@ -62,10 +62,38 @@ def test_mode_verifiers_default_policy():
     from mnemiq.runtime import _build_mode_verifiers
 
     vs, judge_calls = _build_mode_verifiers(_base_settings(), client=object())
-    assert vs["instant"].judge is None          # sanity only
-    assert vs["thinking"].judge is None          # sanity only
-    assert vs["deep"].judge is not None          # sanity + judge
+    assert vs["instant"].judge is None           # cheapest mode: sanity only
+    assert vs["thinking"].judge is not None      # judged, and it is the default
+    assert vs["deep"].judge is not None
     assert judge_calls == 1                       # judge built exactly once (shared)
+
+
+def test_the_DEFAULT_mode_is_judged_out_of_the_box():
+    """The property issue #3 was about, keyed on DEFAULT_MODE rather than on the name.
+
+    Asserting `vs["thinking"]` pins the mode that happens to be the default today. If
+    DEFAULT_MODE ever moves to a mode whose table row still says `sanity`, that assertion
+    stays green while a fresh install silently stops being judged -- which is the shape the
+    issue reported in the first place. This reads the same constant the runtime routes on.
+    """
+    from mnemiq.agent.modes import DEFAULT_MODE
+    from mnemiq.runtime import _build_mode_verifiers
+
+    vs, _ = _build_mode_verifiers(_base_settings(), client=object())
+    assert vs[DEFAULT_MODE] is not None, "the default mode runs no verifier at all"
+    assert vs[DEFAULT_MODE].judge is not None, "the default mode is not judged"
+    assert vs[DEFAULT_MODE].sanity is True, "sanity must stay in front of the judge"
+
+
+def test_sanity_stays_in_front_of_the_judge():
+    """Not decoration: `Verifier.verify` returns on the first layer that produces a verdict,
+    so the cases sanity defers never reach the judge -- 17% of answers skip the LLM call.
+    Dropping sanity when the judge arrived would have cost that with no accuracy gain, since
+    the two together catch 95 against the judge's own 94."""
+    from mnemiq.runtime import _build_mode_verifiers
+
+    vs, _ = _build_mode_verifiers(_base_settings(), client=object())
+    assert all(v.sanity is True for v in vs.values() if v is not None)
 
 
 def test_mode_verifiers_force_off():

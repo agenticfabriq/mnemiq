@@ -236,13 +236,16 @@ Read the code rather than taking this on trust — that is the point of shipping
 ## Known weaknesses
 
 Filed as open issues rather than left to be discovered, because they are readable in the source
-either way: [verification is off by default](https://github.com/agenticfabriq/mnemiq/issues/3)
-despite being the only lever measured to reduce the wrong-rate.
-Contributions and arguments welcome.
+either way. Contributions and arguments welcome.
 
-Three of the four this list opened with are now closed. An unreachable judge withholds the answer
-instead of passing it ([#2](https://github.com/agenticfabriq/mnemiq/issues/2)), lineage stopped
-reporting `unconfirmed-function-identity` on ordinary queries
+All four this list opened with are now closed. The default mode is judged
+([#3](https://github.com/agenticfabriq/mnemiq/issues/3)) — that issue read `Settings.verify`, which
+governs the eval door and not `Runtime.ask`, and concluded a fresh install ran unverified. It did
+not: the product path resolves each mode's own `verify` level, and the deterministic sanity layer
+has always run in all three. What was missing was the LLM judge, which now runs in `thinking` as
+well as `deep`. An unreachable judge withholds the answer instead of passing it
+([#2](https://github.com/agenticfabriq/mnemiq/issues/2)), lineage stopped reporting
+`unconfirmed-function-identity` on ordinary queries
 ([#5](https://github.com/agenticfabriq/mnemiq/issues/5)), and the CLI honours `MNEMIQ_ROLES` like
 every other surface ([#4](https://github.com/agenticfabriq/mnemiq/issues/4)).
 
