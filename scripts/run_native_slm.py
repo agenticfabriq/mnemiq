@@ -640,11 +640,14 @@ def main() -> int:
     print(f"\nmodel={args.model} engine={args.engine} n={n} "
           f"prompt_style={args.prompt_style} max_tokens={args.max_tokens}")
     if truncated:
-        print(f"TRUNCATED at the token cap: {len(truncated)} generation(s). These are "
-              f"unfinished answers, but the EX below COUNTS THEM AS WRONG -- it divides by "
-              f"every case asked -- so that figure understates the model by at most "
-              f"{len(truncated)}/{n} = {len(truncated) / n:.2%}. Raise --max-tokens and "
-              f"re-run to remove the doubt. First few: {truncated[:5]}")
+        bound = (f" Each is scored `wrong` below, so the EX understates the model by at "
+                 f"most {len(truncated)}/{n} = {len(truncated) / n:.2%}."
+                 if args.candidates == 1 else
+                 " With --candidates > 1 the score is the majority RESULT, so a case with a "
+                 "truncated candidate may still be correct and no bound is stated.")
+        print(f"TRUNCATED at the token cap: {len(truncated)} generation(s), unfinished "
+              f"rather than wrong.{bound} Raise --max-tokens and re-run to remove the "
+              f"doubt. First few: {truncated[:5]}")
     if args.candidates > 1:
         graded = max(1, n - n_transport)
         print(f"voting: {args.candidates} samples @ T={args.temperature}  "

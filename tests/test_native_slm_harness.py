@@ -194,9 +194,12 @@ class TestBuildMessages:
             assert "Question:\nHOWMANY?" in user, f"{style}: question misplaced"
 
     def test_the_engine_line_is_the_one_asked_for(self):
-        msgs, _ = slm.build_messages("arctic", "PostgreSQL", "s", "q")
-        user = next(m["content"] for m in msgs if m["role"] == "user")
-        assert "Database Engine:\nPostgreSQL" in user
+        # Both templates: `{engine}` is interpolated separately in each, and a test that
+        # reads only one leaves the other's kwarg deletable -- `str.format` ignores it.
+        for style in ("omnisql", "arctic"):
+            msgs, _ = slm.build_messages(style, "PostgreSQL", "s", "q")
+            user = next(m["content"] for m in msgs if m["role"] == "user")
+            assert "Database Engine:\nPostgreSQL" in user, f"{style}: engine line wrong"
 
     def test_the_envelope_states_both_budgets(self):
         msgs, _ = slm.build_messages("arctic", "SQLite", "s", "q")
@@ -215,9 +218,10 @@ class TestGenerateReportsWhyItStopped:
 
     A generation cut off at the token cap is an unfinished answer; `extract_sql`'s
     last-SELECT fallback turns one into a plausible query that grades as a model error.
-    Nothing else in this suite reaches `generate`, so without this the detector could be
-    deleted and every test would still pass -- silently restoring the state the detector
-    was added to end.
+    This covers `generate` handing the reasons back. It does NOT cover main()'s consumer:
+    flipping `if why == "length"` to `"stop"`, or deleting that block, still leaves every
+    test here green, because nothing in this suite runs `gen_one`. That half is untested
+    and is recorded as untested rather than implied to be covered.
     """
 
     def _stub(self, monkeypatch, choices):
