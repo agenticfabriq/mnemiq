@@ -103,3 +103,55 @@ def test_db_write_reports_rows_on_approval():
 
     out = _db_write(_RT(), _identity(), "INSERT INTO claim (id) VALUES (1)")
     assert out["approved"] is True and out["target"] == "claim" and out["rows_affected"] == 1
+
+
+# ---------------------------------------------------------------------------
+# The `narrowed` field tells a governing agent that an access decision scoped the result.
+# Without it, `rows_affected=3` on a DELETE of 47 reads as an ordinary success — there is
+# nothing saying why, and 3 of 47 deleted reads as correct.  These tests pin the field on
+# both the write and read MCP surfaces, which had no coverage for it at all.
+# ---------------------------------------------------------------------------
+
+
+def test_db_write_carries_narrowed_when_scoped():
+    """A governed write that was scoped down must surface what was narrowed, not just the count."""
+    from mnemiq.contract.seams import Narrowed
+    from mnemiq.mcp.server import _db_write
+    from mnemiq.runtime import WriteResult
+
+    class _RT:
+        def write(self, sql, identity):
+            return WriteResult(
+                approved=True, target="claim", rows_affected=3,
+                target_sql="DELETE FROM claim WHERE ...",
+                narrowed=[Narrowed(object="claim", rows=True, columns=False)],
+            )
+
+    out = _db_write(_RT(), _identity(), "DELETE FROM claim WHERE status = 'closed'")
+    assert out["narrowed"] == [{"object": "claim", "rows": True, "columns": False}]
+
+
+def test_db_write_narrowed_is_none_when_not_evaluated():
+    """None means the decision was not evaluated — distinct from [] which means nothing was scoped."""
+    from mnemiq.mcp.server import _db_write
+    from mnemiq.runtime import WriteResult
+
+    class _RT:
+        def write(self, sql, identity):
+            return WriteResult(approved=False, refusal="denied", narrowed=None)
+
+    out = _db_write(_RT(), _identity(), "DELETE FROM claim")
+    assert out["narrowed"] is None
+
+
+def test_db_read_carries_narrowed_from_trace():
+    """The read path had the same gap: narrowed sits on the trace and must reach the MCP consumer."""
+    from mnemiq.contract.seams import Narrowed
+
+    trace = _trace()
+    trace = trace.model_copy(update={
+        "narrowed": [Narrowed(object="claim", rows=True, columns=False)],
+    })
+    rt = _RT(AgentAnswer(answer="3 claims.", trace=trace, deferred=False), [])
+    out = _db_read(rt, _identity(), "how many claims?")
+    assert out["trace"]["narrowed"] == [{"object": "claim", "rows": True, "columns": False}]
