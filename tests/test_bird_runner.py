@@ -359,3 +359,80 @@ def test_the_results_meta_records_which_rule_graded_the_run():
         _save_meta(path, 1, 1, [])
         assert json.load(open(_meta_path(path)))["duplicate_rows_insignificant"] is None, \
             "an unstated rule must not read as `false`"
+
+
+# ---------------------------------------------------------------------------
+# M105: a resumable file can span a change of grading rule. `_load_done`
+# restores earlier outcomes verbatim and the meta is rewritten whole, so the
+# artifact would claim ONE rule over rows decided two ways.
+# ---------------------------------------------------------------------------
+
+
+def _meta_with(tmp, rule):
+    from mnemiq.eval.bird_runner import _save_meta
+
+    path = f"{tmp}/results.jsonl"
+    _save_meta(path, 0, 0, [], rule)
+    return path
+
+
+def test_resuming_under_the_same_rule_is_fine():
+    import tempfile
+
+    from mnemiq.eval.bird_runner import assert_grading_rule_unchanged
+
+    with tempfile.TemporaryDirectory() as d:
+        assert_grading_rule_unchanged(_meta_with(d, True), True, restored=5)
+
+
+def test_resuming_under_a_DIFFERENT_rule_refuses():
+    import tempfile
+
+    import pytest
+
+    from mnemiq.eval.bird_runner import MixedGradingRules, assert_grading_rule_unchanged
+
+    with tempfile.TemporaryDirectory() as d:
+        with pytest.raises(MixedGradingRules) as exc:
+            assert_grading_rule_unchanged(_meta_with(d, False), True, restored=5)
+    assert "mix two rules" in str(exc.value)
+
+
+def test_a_file_that_never_stated_its_rule_cannot_be_confirmed():
+    """`None` is not a match. A pre-M105 file's rows are unknowable either way, and assuming
+    the convenient answer is the absence-versus-failure collapse this repo keeps paying for."""
+    import tempfile
+
+    import pytest
+
+    from mnemiq.eval.bird_runner import MixedGradingRules, assert_grading_rule_unchanged
+
+    with tempfile.TemporaryDirectory() as d:
+        with pytest.raises(MixedGradingRules) as exc:
+            assert_grading_rule_unchanged(_meta_with(d, None), True, restored=5)
+    assert "not recorded" in str(exc.value)
+
+
+def test_nothing_restored_means_nothing_to_mix():
+    """A stale meta beside an empty or absent results file must not block a fresh run."""
+    import tempfile
+
+    from mnemiq.eval.bird_runner import assert_grading_rule_unchanged
+
+    with tempfile.TemporaryDirectory() as d:
+        assert_grading_rule_unchanged(_meta_with(d, False), True, restored=0)
+
+
+def test_the_operator_can_override_deliberately():
+    import os
+    import tempfile
+
+    from mnemiq.eval.bird_runner import assert_grading_rule_unchanged
+
+    with tempfile.TemporaryDirectory() as d:
+        path = _meta_with(d, False)
+        os.environ["MNEMIQ_ALLOW_MIXED_GRADING"] = "1"
+        try:
+            assert_grading_rule_unchanged(path, True, restored=5)
+        finally:
+            os.environ.pop("MNEMIQ_ALLOW_MIXED_GRADING", None)

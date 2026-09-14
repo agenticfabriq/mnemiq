@@ -58,6 +58,55 @@ def _load_meta(results_path: str) -> tuple[int, int, list[str]]:
     return m.get("tokens", 0), m.get("llm_calls", 0), m.get("excluded", [])
 
 
+class MixedGradingRules(RuntimeError):
+    """A resumed results file was graded under a different rule than this run uses."""
+
+
+def assert_grading_rule_unchanged(
+    results_path: str | None, duplicate_rows_insignificant: bool, restored: int
+) -> None:
+    """Refuse to resume a results file whose stored rows were graded under another rule.
+
+    `_load_done` restores earlier outcomes VERBATIM, so a file resumed across a change of
+    grading rule holds rows decided two ways while the meta -- rewritten whole on each save --
+    records only the last invocation's. The number that comes out is not one metric, and
+    nothing in the artifact says so. That is the shape M34 already cost this project once: a
+    gate that could not fail while still ratcheting.
+
+    Recording the rule made this WORSE before it made it better. Silence at least said
+    nothing; a meta stamped `true` over rows graded multiset is a confident false claim.
+
+    Three states, and the third is the one worth spelling out:
+
+      * stored == current -- resume, nothing mixed
+      * stored != current -- REFUSE
+      * stored is None -- a file written before the rule was recorded. Its rows CANNOT BE
+        CONFIRMED either way, which is not the same as matching, so it refuses too rather
+        than assuming the convenient answer.
+
+    Only when rows would actually be restored: an empty or absent results file has nothing to
+    mix, and a fresh run must not be blocked by a stale meta beside it.
+    """
+    if not results_path or restored == 0:
+        return
+    if not os.path.isfile(_meta_path(results_path)):
+        return
+    with open(_meta_path(results_path)) as fh:
+        stored = json.load(fh).get("duplicate_rows_insignificant")
+    if stored is duplicate_rows_insignificant:
+        return
+    if os.environ.get("MNEMIQ_ALLOW_MIXED_GRADING") == "1":
+        return
+    was = "not recorded" if stored is None else f"duplicate_rows_insignificant={stored}"
+    raise MixedGradingRules(
+        f"{results_path} holds {restored} results graded with {was}, and this run grades with "
+        f"duplicate_rows_insignificant={duplicate_rows_insignificant}. Resuming would mix two "
+        f"rules into one number. Use a fresh --results path, delete the file to regrade from "
+        f"scratch, or set MNEMIQ_ALLOW_MIXED_GRADING=1 if you know the difference cannot "
+        f"reach these cases."
+    )
+
+
 def source_rev() -> str:
     """The mnemiq revision that produced a run, for a consumer's provenance record.
 
@@ -341,6 +390,8 @@ def run_bird(
         by_db.setdefault(case.db_id, []).append(case)
 
     done_results = _load_done(results_path) if results_path else {}
+    assert_grading_rule_unchanged(results_path, duplicate_rows_insignificant,
+                                  len(done_results))
     tokens, calls, excluded = _load_meta(results_path) if results_path else (0, 0, [])
     skip = set(done_results) | set(excluded)
 

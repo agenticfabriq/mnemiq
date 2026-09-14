@@ -42,6 +42,7 @@ from mnemiq.contract import EvaluationCase
 from mnemiq.eval.bird_runner import (
     _append_result,
     _load_done,
+    assert_grading_rule_unchanged,
     _load_meta,
     _save_meta,
     enrich_bird_db,
@@ -257,6 +258,9 @@ def run_spider2(
     _bird_layout_shim(spider2_dir, shim_root, sorted(by_db))
 
     done = _load_done(results_path) if results_path else {}
+    # Spider 2.0-lite always grades multiset, so a file carrying BIRD-rule rows is a
+    # mismatch here exactly as the reverse is there.
+    assert_grading_rule_unchanged(results_path, False, len(done))
     tokens, calls, excluded = _load_meta(results_path) if results_path else (0, 0, [])
     results: list[CaseResult] = list(done.values())
     processed = len(done)
