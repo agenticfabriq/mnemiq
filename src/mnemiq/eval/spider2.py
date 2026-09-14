@@ -41,8 +41,7 @@ from mnemiq.config import Settings
 from mnemiq.contract import EvaluationCase
 from mnemiq.eval.bird_runner import (
     _append_result,
-    _load_done,
-    _load_meta,
+    resume_state,
     _save_meta,
     enrich_bird_db,
 )
@@ -256,8 +255,9 @@ def run_spider2(
     shim_root = os.path.join(cache_dir or spider2_dir, "_bird-layout-shim")
     _bird_layout_shim(spider2_dir, shim_root, sorted(by_db))
 
-    done = _load_done(results_path) if results_path else {}
-    tokens, calls, excluded = _load_meta(results_path) if results_path else (0, 0, [])
+    # `False`: Spider 2.0-lite always grades multiset, so a file carrying BIRD-rule rows is a
+    # mismatch here exactly as the reverse is in the BIRD runners.
+    done, tokens, calls, excluded = resume_state(results_path, False)
     results: list[CaseResult] = list(done.values())
     processed = len(done)
     _outages = 0
@@ -314,6 +314,11 @@ def run_spider2(
             tokens += client.total_tokens
             calls += client.calls
         if results_path is not None:
-            _save_meta(results_path, tokens, calls, excluded)
+            # Explicit `False`, not silence: Spider 2.0-lite does not declare BIRD's
+            # `set(rows)` rule, so this run IS multiset-graded. `None` would say the
+            # runner did not state a rule, which is what a pre-M105 file looks like.
+            _save_meta(results_path, tokens, calls, excluded,
+                       duplicate_rows_insignificant=False,
+                       results_rows=len(results))
 
     return results, {"tokens": tokens, "llm_calls": calls, "excluded": excluded}

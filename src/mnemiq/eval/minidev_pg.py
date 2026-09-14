@@ -17,8 +17,7 @@ from mnemiq.config import Settings
 from mnemiq.contract import EvaluationCase
 from mnemiq.eval.bird_runner import (
     _append_result,
-    _load_done,
-    _load_meta,
+    resume_state,
     _process_db,
     _save_meta,
     enrich_bird_db,
@@ -41,6 +40,12 @@ def run_minidev_pg(
     workers: int = 1,
     candidates: int = 1,
     semantic: bool = True,
+    # Defaults TRUE, unlike `run_bird`'s, and the asymmetry is the point: that runner is
+    # shared with Spider 1.0, so it cannot assume a benchmark, while this one IS BIRD
+    # mini-dev and has no second caller to serve. A caller who omits it here should get
+    # the rule the leaderboard publishes rather than a number understated against it
+    # with nothing at the call site to notice (M105).
+    duplicate_rows_insignificant: bool = True,
 ) -> tuple[list[CaseResult], dict]:
     """Grouped-by-db, resumable mini-dev PG run. Enrichment is per-db (cached, from the SQLite
     dev_databases -- dialect-agnostic); execution is against `bird_dev` (pg_dsn) via DuckDB;
@@ -54,8 +59,8 @@ def run_minidev_pg(
     for case in cases:
         by_db.setdefault(case.db_id, []).append(case)
 
-    done_results = _load_done(results_path) if results_path else {}
-    tokens, calls, excluded = _load_meta(results_path) if results_path else (0, 0, [])
+    done_results, tokens, calls, excluded = resume_state(
+        results_path, duplicate_rows_insignificant)
     skip = set(done_results) | set(excluded)
 
     results: list[CaseResult] = list(done_results.values())
@@ -76,7 +81,11 @@ def run_minidev_pg(
             gold_adapter = PostgresAdapter(pg_dsn)  # gold PG SQL on native Postgres
             return ask, engine_adapter, gold_adapter, client
 
-        out, clients = _process_db(remaining, _build, max_rows_cap, workers)
+        # Declared, or this run grades BIRD under a different rule from the SQLite one
+        # and the repo reports two BIRD numbers (M105). Positional args here are what
+        # let it default silently when `_process_db` gained the parameter.
+        out, clients = _process_db(remaining, _build, max_rows_cap, workers,
+                                   duplicate_rows_insignificant)
 
         for kind, payload in out:
             processed += 1
@@ -93,6 +102,8 @@ def run_minidev_pg(
             tokens += client.total_tokens
             calls += client.calls
         if results_path is not None:
-            _save_meta(results_path, tokens, calls, excluded)
+            _save_meta(results_path, tokens, calls, excluded,
+                       duplicate_rows_insignificant,
+                       results_rows=len(results))
 
     return results, {"tokens": tokens, "llm_calls": calls, "excluded": excluded}

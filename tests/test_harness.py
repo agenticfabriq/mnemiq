@@ -278,3 +278,36 @@ def test_run_case_gold_adapter_defaults_to_the_engine_adapter():
     adapter = _GoldAdapter(candidate=pa.table({"total": [820]}))  # serves both GOLD and CANDIDATE
     result = run_case(_case(), lambda q: _answered(), adapter)     # no gold_adapter passed
     assert result.outcome is Outcome.CORRECT
+
+
+# ---------------------------------------------------------------------------
+# M105: `run_case` passes the benchmark's duplicate-row declaration through to
+# the grader. Tested HERE, at the seam, because tests/test_grade.py calls
+# `results_match` directly -- so replacing the pass-through with a literal
+# False left the whole suite green, which is the wiring gap this closes.
+# ---------------------------------------------------------------------------
+
+
+class _DupeAdapter:
+    """Gold repeats a row; the candidate states each distinct row once."""
+
+    def execute_arrow(self, sql, timeout_s=None):
+        if sql == "GOLD":
+            return pa.table({"n": [1, 1, 2]})
+        return pa.table({"n": [1, 2]})
+
+
+def _dupe_engine():
+    return lambda q, identity=None: _answered(sql="CANDIDATE")
+
+
+def test_run_case_keeps_the_multiset_reading_when_nothing_declares_otherwise():
+    r = run_case(_case(), _dupe_engine(), _DupeAdapter())
+    assert r.outcome is Outcome.WRONG, "duplicates collapsed without a declaration"
+
+
+def test_run_case_honours_a_benchmarks_duplicate_declaration():
+    """The wiring. BIRD declares it, so the same rows grade CORRECT -- the number the
+    leaderboard publishes rather than one understated by multiplicity."""
+    r = run_case(_case(), _dupe_engine(), _DupeAdapter(), duplicate_rows_insignificant=True)
+    assert r.outcome is Outcome.CORRECT, "the declaration did not reach the grader"
