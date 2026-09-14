@@ -60,8 +60,8 @@ def _load_meta(results_path: str, restored: int) -> tuple[int, int, list[str]]:
     reported a denominator quietly missing them.
 
     ITS ONE CALLER NO LONGER REACHES THAT CASE: `resume_state` calls `_claim_meta` first,
-    which replaces a stale meta with this run's own zeroed one, so by the time this reads
-    the file the totals are already zero. The branch stays for the contract rather than the
+    which replaces a stale meta with this run's own zeroed one -- zero totals AND an empty
+    `excluded`, so no stale exclusion survives the claim either. The branch stays for the contract rather than the
     path -- it is what makes this function safe to call directly, and it is the invariant
     `_claim_meta` would otherwise be the only thing holding. Removing it still fails a test,
     because that test calls this function directly.
