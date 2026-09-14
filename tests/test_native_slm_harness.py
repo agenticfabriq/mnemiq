@@ -420,8 +420,10 @@ class TestRunStatesEndToEnd:
         # ...and the cause list must not name a fault that did not occur. Hoisting the
         # gold-failure counter out of its branch made this run blame the corpus, which is
         # the same misattribution as before pointing the other way.
-        assert "raise --max-tokens" in outp, outp
+        assert "produced no FINISHED candidate" in outp, outp   # the cause's own phrase
+        assert "raise --max-tokens" in outp, outp                  # ...and its remedy
         assert "GOLD query that did not run" not in outp, outp
+        assert "returned no extractable SQL" not in outp, outp
 
     def test_a_partly_truncated_case_is_not_reported_as_truncated(self, tmp_path):
         """`all` not `any`: the two counters send the operator to different fixes.
@@ -453,7 +455,10 @@ class TestRunStatesEndToEnd:
         # "Cause: unknown" here with the suite green.
         assert "returned no extractable SQL" in outp, outp
         assert "check the prompt and the extractor" in outp, outp
-        assert "raise --max-tokens" not in outp, outp
+        # NOT `"raise --max-tokens" not in outp`: the SUMMARY prints "Raise --max-tokens"
+        # for this run, so that assertion passed on letter case alone and a copy-edit
+        # lowercasing the summary would have failed it for an unrelated reason.
+        assert "produced no FINISHED candidate" not in outp, outp
         assert code == 1 and "RUN VOID" in outp, outp
 
     def test_a_refused_run_voids_and_says_the_request_was_refused(self, tmp_path):
@@ -483,7 +488,7 @@ class TestRunStatesEndToEnd:
         assert "GOLD query that did not run" in outp, outp
         assert "check the corpus and the dialect" in outp, outp   # the actionable half
         assert "returned no extractable SQL" not in outp, outp
-        assert "raise --max-tokens" not in outp, outp
+        assert "produced no FINISHED candidate" not in outp, outp
         assert code == 1 and "NATIVE_CONTROL_EXIT=1" in outp, outp
 
     def test_a_filter_that_selects_no_cases_publishes_no_number(self, tmp_path):
@@ -496,9 +501,10 @@ class TestRunStatesEndToEnd:
         # `load_bird` exits 1 with neither string and used to pass this.
         assert "RUN VOID" in outp and "NATIVE_CONTROL_EXIT=1" in outp, outp
         assert "no cases were loaded at all" in outp, outp
-        # The REMEDY as well as the phrase. Every cause in the void's list is pinned
-        # both ways; the count is deliberately not written here, because two earlier
-        # versions of this comment claimed a coverage that did not hold -- first for two
-        # siblings when one was pinned, then for three causes when there are four.
+        # The REMEDY as well as the phrase. No coverage claim is written here: three
+        # successive versions of this comment asserted one -- two siblings when one was
+        # pinned, three causes when there are four, then all four when the truncated
+        # cause's phrase was still unpinned. The property is checkable by swapping each
+        # cause's phrase for another's; the comment was not the place to record it.
         assert "check --db" in outp, outp
         assert "GOLD query that did not run" not in outp, outp
