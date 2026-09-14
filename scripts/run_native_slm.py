@@ -586,7 +586,8 @@ def main() -> int:
         # read-modify-write on an int can lose one, which would make every later line
         # under-report. `list.append` is atomic for the same reason, as with `truncated`.
         counter = itertools.count(1)
-        failed: list[str] = []
+        unreached: list[str] = []   # never generated: transport fault or a refused request
+        no_sql: list[str] = []      # generated, but nothing extractable came out
 
         def gen_one_counted(case):
             result = None
@@ -594,20 +595,38 @@ def main() -> int:
                 result = gen_one(case)
                 return result
             finally:
-                if result is None or not result[2]:
-                    failed.append(case.id)   # no finish reasons: nothing was generated
+                # The counter FIRST, so the line can never report more failures than
+                # completions -- with 8 workers refused at once it read "1/500, 5 FAILED".
                 i = next(counter)
+                if result is None or not result[2]:
+                    unreached.append(case.id)
+                elif not any((q or "").strip() for q in (result[0] or [])):
+                    # A 200 carrying no fence and no SELECT is the OTHER way this meter can
+                    # reassure about a run that produced nothing: finish reasons are present,
+                    # so the unreached check above passes it. Keying on the extracted SQL
+                    # already in hand is what distinguishes the two.
+                    no_sql.append(case.id)
                 # i == 1 as well as every 25th: the first line must not wait for 25
                 # completions, because per-case latency is exactly what goes pathological
                 # when something is wrong. At the default 180s timeout and 4 attempts, 25
                 # completions can be 45 minutes away -- the same silence this is fixing.
                 if i == 1 or i % 25 == 0 or i == len(cases):
                     el = time.time() - t_gen
-                    rate = i / el if el else 0
-                    left = (len(cases) - i) / rate / 60 if rate else 0
-                    bad = f", {len(failed)} FAILED" if failed else ""
-                    print(f"  generated {i}/{len(cases)}{bad} in {el:.0f}s "
-                          f"(~{left:.0f} min left)", flush=True)
+                    bad = "".join([f", {len(unreached)} UNREACHED" if unreached else "",
+                                   f", {len(no_sql)} NO-SQL" if no_sql else ""])
+                    if i < args.concurrency:
+                        # No ETA yet: `i / elapsed` divides by wall time during which
+                        # `--concurrency` cases ran in PARALLEL, so it understates the rate
+                        # by about the worker count -- at concurrency 8 the first line
+                        # projected ~125 min for a run that finished in ~16.
+                        print(f"  generated {i}/{len(cases)}{bad} in {el:.0f}s "
+                              f"(rate not yet meaningful: {args.concurrency} in flight)",
+                              flush=True)
+                    else:
+                        rate = i / el if el else 0
+                        left = (len(cases) - i) / rate / 60 if rate else 0
+                        print(f"  generated {i}/{len(cases)}{bad} in {el:.0f}s "
+                              f"(~{left:.0f} min left)", flush=True)
 
         generated = list(pool.map(gen_one_counted, cases))  # map preserves input order
     print(f"generation done in {time.time() - t_gen:.0f}s; executing and grading ...", flush=True)
