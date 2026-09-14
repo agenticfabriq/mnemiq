@@ -80,9 +80,12 @@ def assert_grading_rule_unchanged(
 
       * stored == current -- resume, nothing mixed
       * stored != current -- REFUSE
-      * stored is None -- a file written before the rule was recorded. Its rows CANNOT BE
-        CONFIRMED either way, which is not the same as matching, so it refuses too rather
-        than assuming the convenient answer.
+      * stored is None -- REFUSE, and this covers TWO provenances. Either the meta predates
+        the field, or there is no meta file at all: results are appended per case and the
+        meta written after, so a killed run leaves one, and so does deleting the meta by
+        hand, which this refusal tells operators to do. Both mean the stored rows cannot be
+        confirmed either way, which is not the same as matching, so neither may assume the
+        convenient answer. The message names which of the two it found.
 
     Only when rows would actually be restored: an empty or absent results file has nothing to
     mix, and a fresh run must not be blocked by a stale meta beside it.
@@ -94,7 +97,8 @@ def assert_grading_rule_unchanged(
     # exactly this state; so does deleting the meta by hand, which the refusal below tells
     # operators to do. Returning early here let the guard go silent on the one file shape
     # its own advice can produce.
-    if os.path.isfile(_meta_path(results_path)):
+    has_meta = os.path.isfile(_meta_path(results_path))
+    if has_meta:
         with open(_meta_path(results_path)) as fh:
             stored = json.load(fh).get("duplicate_rows_insignificant")
     else:
@@ -103,9 +107,10 @@ def assert_grading_rule_unchanged(
         return
     if os.environ.get("MNEMIQ_ALLOW_MIXED_GRADING") == "1":
         return
-    was = ("not recorded" if os.path.isfile(_meta_path(results_path))
-           else "no metadata file at all") if stored is None \
-        else f"duplicate_rows_insignificant={stored}"
+    if stored is not None:
+        was = f"duplicate_rows_insignificant={stored}"
+    else:
+        was = "not recorded" if has_meta else "no metadata file at all"
     raise MixedGradingRules(
         f"{results_path} holds {restored} results graded with {was}, and this run grades with "
         f"duplicate_rows_insignificant={duplicate_rows_insignificant}. Resuming would mix two "
