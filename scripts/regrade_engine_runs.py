@@ -134,9 +134,16 @@ def main() -> int:
 
             gold = to_table(gold_rows, gold_names)
             cand = to_table(cand_rows, cand_names)
-            if results_match(gold, cand, allow_extra_columns=False):
+            # BIRD declares duplicate_rows_insignificant and Spider does not (M105). It has
+            # to be the same declaration the live runner makes, or this script reintroduces
+            # the very divergence it exists to detect: a regrade under a different rule is
+            # not "the current grader", it is a third one.
+            dupes_ok = args.benchmark == "bird"
+            if results_match(gold, cand, allow_extra_columns=False,
+                             duplicate_rows_insignificant=dupes_ok):
                 now = "correct"
-            elif results_match(gold, cand, allow_extra_columns=True):
+            elif results_match(gold, cand, allow_extra_columns=True,
+                               duplicate_rows_insignificant=dupes_ok):
                 now = "correct_facts"
             else:
                 now = "wrong"

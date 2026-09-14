@@ -25,8 +25,12 @@ The prompt format is taken verbatim from OmniSQL's own worked example
 carries per-column example VALUES -- the model's native input is a
 value-grounded schema, which is the profiling step under another name.
 
-Grading reuses `mnemiq.eval.grade.results_match(..., allow_extra_columns=False)`,
-the BIRD execution-accuracy reading of the contract agreed with beacon. Output
+Grading reuses `mnemiq.eval.grade.results_match(..., allow_extra_columns=False,
+duplicate_rows_insignificant=True)` -- the strict reading WITH BIRD's published
+`set(pred) == set(gold)` collapse, which BIRD items declare under the contract agreed
+with beacon. It is still not `calculate_ex`: the strict reading is more tolerant on
+float noise and on cell normalisation, so report which rule produced a figure rather
+than calling it BIRD execution accuracy (register M105). Output
 is the JSONL shape `beacon/scripts/load_eval_reports.py` ingests, so beacon
 re-grades every row independently and prints the disagreement table.
 
@@ -511,8 +515,14 @@ def main() -> int:
             elif cand is None:
                 outcome = "wrong"          # model produced nothing runnable
             else:
+                # BIRD, and BIRD declares duplicate_rows_insignificant -- the same
+                # declaration `run_bird` makes. Without it this script reports BIRD
+                # exact-match under a different rule from the rest of the repo, and the
+                # disagreement table it exists to keep empty fills with duplicate-row
+                # cases by construction (M105).
                 outcome = "correct" if results_match(
-                    gold, cand, allow_extra_columns=False) else "wrong"
+                    gold, cand, allow_extra_columns=False,
+                    duplicate_rows_insignificant=True) else "wrong"
             counts[outcome] = counts.get(outcome, 0) + 1
 
             # beacon GRADES BY COMPARISON and never executes SQL, so a push that carries

@@ -75,7 +75,8 @@ def _preview(table: pa.Table) -> list[dict]:
     ]
 
 
-def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None) -> CaseResult:
+def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None, *,
+             duplicate_rows_insignificant: bool = False) -> CaseResult:
     """Ask the engine, then check its answer against the gold query's result set.
 
     `adapter` executes the engine's SQL (the same executor the engine used); `gold_adapter`
@@ -183,9 +184,16 @@ def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None) -
             result.portable_to_gold_engine = False
             result.dialect_error = str(exc)
 
-    if results_match(gold, candidate, allow_extra_columns=False):
+    # `duplicate_rows_insignificant` is the BENCHMARK's declaration, not this runner's
+    # policy, which is why it arrives as an argument and defaults to off. BIRD declares it --
+    # its published EX compares `set(rows)` -- and a benchmark that does not keeps the multiset
+    # reading, where the same rows at a different multiplicity are not obviously the same
+    # answer. See `results_match` and register M105.
+    if results_match(gold, candidate, allow_extra_columns=False,
+                     duplicate_rows_insignificant=duplicate_rows_insignificant):
         result.outcome = Outcome.CORRECT
-    elif results_match(gold, candidate, allow_extra_columns=True):
+    elif results_match(gold, candidate, allow_extra_columns=True,
+                       duplicate_rows_insignificant=duplicate_rows_insignificant):
         result.outcome = Outcome.CORRECT_FACTS
     else:
         result.outcome = Outcome.WRONG

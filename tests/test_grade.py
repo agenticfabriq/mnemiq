@@ -215,3 +215,93 @@ def test_exact_match_still_ignores_row_order():
     gold = pa.table({"n": [1, 2]})
 
     assert results_match(gold, pa.table({"n": [2, 1]}), allow_extra_columns=False)
+
+
+# ---------------------------------------------------------------------------
+# M105: the strict reading refused on row MULTIPLICITY where BIRD's own rule
+# collapses duplicates -- a violation of the shared grading contract, not a
+# product choice. beacon's docs/grading.md has BIRD items declare
+# `duplicate_rows_insignificant` "so that exact on BIRD is the number the
+# leaderboard publishes", measured there at 24 cases in 2,899 (0.83 points).
+# ---------------------------------------------------------------------------
+
+
+def _dupes():
+    """Same distinct rows, different multiplicity -- wrong under a multiset rule, right
+    under `set(pred) == set(gold)`."""
+    return pa.table({"n": [1, 1, 2]}), pa.table({"n": [1, 2]})
+
+
+def test_duplicates_still_differ_when_the_benchmark_does_not_declare_it():
+    """The DEFAULT is unchanged, and deliberately so: absent a declaration, the same rows at
+    a different multiplicity are not obviously the same answer."""
+    gold, cand = _dupes()
+    assert not results_match(gold, cand, allow_extra_columns=False)
+    assert not results_match(gold, cand, allow_extra_columns=True)
+
+
+def test_a_benchmark_that_declares_it_grades_the_way_its_leaderboard_does():
+    gold, cand = _dupes()
+    assert results_match(gold, cand, allow_extra_columns=False,
+                         duplicate_rows_insignificant=True)
+
+
+def test_duplicates_collapse_on_the_CANDIDATE_side_too():
+    """beacon's contract says duplicates collapse "in either direction", and a fixture with
+    the repetition only on the gold side never reaches the candidate branch.
+
+    Caught by mutation: disabling the candidate-side collapse left every other test in this
+    file green, because `_dupes()` puts the duplicate rows in gold alone.
+    """
+    gold, cand = pa.table({"n": [1, 2]}), pa.table({"n": [1, 1, 2]})
+    assert not results_match(gold, cand, allow_extra_columns=False)
+    assert results_match(gold, cand, allow_extra_columns=False,
+                         duplicate_rows_insignificant=True)
+
+
+def test_the_collapse_reaches_both_metrics_as_the_contract_says():
+    """beacon honours the flag "in both metrics", so got-facts collapses too. Pinning only
+    the exact path would let the two repos diverge on the got-facts column."""
+    gold, cand = _dupes()
+    assert results_match(gold, cand, allow_extra_columns=True,
+                         duplicate_rows_insignificant=True)
+
+
+def test_collapsing_duplicates_does_not_make_a_wrong_answer_right():
+    """The flag removes multiplicity from the comparison and nothing else. A candidate
+    missing one of the DISTINCT rows is still wrong, which is what stops this being a
+    blanket loosening."""
+    gold = pa.table({"n": [1, 1, 2]})
+    assert not results_match(gold, pa.table({"n": [1, 1]}), allow_extra_columns=False,
+                             duplicate_rows_insignificant=True)
+    assert not results_match(gold, pa.table({"n": [1, 3]}), allow_extra_columns=False,
+                             duplicate_rows_insignificant=True)
+
+
+def test_the_engines_own_comparator_is_untouched():
+    """THE POINT OF PUTTING THE FLAG IN results_match AND NOT IN _match_rows.
+
+    `results_equal` and `cluster` share `_match_rows` with grading, and `agent/loop.py` votes
+    with `cluster`. A dedupe added inside `_match_rows` would change which candidates count as
+    agreeing -- every grading test would stay green while the engine silently picked a
+    different answer. `grade_cells_match`'s docstring warns about exactly this coupling.
+    """
+    from mnemiq.execute.resultset import results_equal
+
+    gold, cand = _dupes()
+    assert not results_equal(gold, cand), "self-consistency clustering started collapsing rows"
+
+
+def test_the_cell_sorted_retry_recollapses_what_it_makes_identical():
+    """The got-facts branch canonicalises each row's cell order and can turn two distinct
+    rows into one, so a dedupe done only before the loop leaves duplicates this branch
+    created -- and "collapses in BOTH metrics" then fails on exactly this path.
+
+    Gold states one fact in two column orders; the candidate states it once. Column order is
+    presentation to got-facts, so after sorting they are the same single row.
+    """
+    gold = pa.table({"a": [1, 2], "b": [2, 1]})
+    cand = pa.table({"a": [1], "b": [2]})
+    assert not results_match(gold, cand, allow_extra_columns=True), "control: no declaration"
+    assert results_match(gold, cand, allow_extra_columns=True,
+                         duplicate_rows_insignificant=True)

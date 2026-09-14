@@ -236,6 +236,7 @@ def _run_grouped(
     cases: list[EvaluationCase],
     build: Callable[[str], tuple[Callable, object]],
     gold_sql_sentinel: str | None = None,
+    dupes_ok: bool = False,
 ) -> list[CaseResult]:
     """Route each case to its DB's engine+adapter (built once per DB). Pure: engine injected."""
     by_db: dict[str, list[EvaluationCase]] = {}
@@ -248,11 +249,13 @@ def _run_grouped(
         for case in db_cases:
             if gold_sql_sentinel is not None:  # test hook: fake adapter keys off a sentinel
                 case = case.model_copy(update={"gold_sql": gold_sql_sentinel})
-            results.append(run_case(case, ask, adapter))
+            results.append(run_case(case, ask, adapter,
+                                    duplicate_rows_insignificant=dupes_ok))
     return results
 
 
-def _process_db(cases, build_engine_fn, max_rows_cap: int, workers: int):
+def _process_db(cases, build_engine_fn, max_rows_cap: int, workers: int,
+                dupes_ok: bool = False):
     """Run one database's cases, optionally across worker threads.
 
     Thread safety: each worker builds its OWN engine on first use (thread-local) -- its own
@@ -277,7 +280,8 @@ def _process_db(cases, build_engine_fn, max_rows_cap: int, workers: int):
         ask, engine_adapter, gold_adapter = engine()
         if _gold_too_big(gold_adapter, case.gold_sql, max_rows_cap):
             return ("excluded", case.id)
-        return ("result", run_case(case, ask, engine_adapter, gold_adapter))
+        return ("result", run_case(case, ask, engine_adapter, gold_adapter,
+                                   duplicate_rows_insignificant=dupes_ok))
 
     if workers <= 1:
         out = [work(case) for case in cases]
@@ -308,10 +312,19 @@ def run_bird(
     candidates: int = 1,
     semantic: bool = True,
     db_path_fn: Callable[[str, str], str] = bird_db_path,
+    duplicate_rows_insignificant: bool = False,
 ) -> tuple[list[CaseResult], dict]:
     """Run BIRD cases grouped by database. Resumable: with results_path, each result is
     checkpointed as it completes and a re-run skips everything already answered -- a long
-    live run survives a kill without re-paying for the questions it already got through."""
+    live run survives a kill without re-paying for the questions it already got through.
+
+    `duplicate_rows_insignificant` is the BENCHMARK's declaration and defaults OFF, because
+    despite the name THIS RUNNER IS NOT BIRD-ONLY -- `scripts/run_spider.py` drives Spider 1.0
+    through it with `db_path_fn=spider_db_path`. BIRD publishes `set(pred) == set(gold)` and
+    declares it; Spider does not. Hardcoding it here graded every Spider run under a rule
+    Spider does not publish, and `regrade_engine_runs.py --benchmark spider` would then have
+    reported those cases as verdicts changed, blaming grader drift for a runner's hardcode.
+    See register M105."""
     by_db: dict[str, list[EvaluationCase]] = {}
     for case in cases:
         by_db.setdefault(case.db_id, []).append(case)
@@ -342,7 +355,8 @@ def run_bird(
             ask, client = build_engine(snapshot, adapter, settings, candidates=candidates)
             return ask, adapter, adapter, client  # engine + gold: same native SQLite executor
 
-        out, clients = _process_db(remaining, _build, max_rows_cap, workers)
+        out, clients = _process_db(remaining, _build, max_rows_cap, workers,
+                                   duplicate_rows_insignificant)
 
         # collection is single-threaded here -> checkpoint append needs no lock
         for kind, payload in out:

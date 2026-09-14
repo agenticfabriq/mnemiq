@@ -151,6 +151,9 @@ def main() -> int:
     )
     p.add_argument("--report", default="eval-reports/cortex-graded.jsonl")
     args = p.parse_args()
+    # The benchmark's declaration, resolved once. BIRD publishes `set(rows)`; Spider
+    # does not (M105).
+    dupes_ok = args.benchmark == "bird"
     args.dialect = args.dialect or args.engine
     if args.database is None:
         args.database = "BENCH" if args.engine == "snowflake" else "bench"
@@ -247,9 +250,16 @@ def main() -> int:
                         # columns. Reporting only the strict number and comparing it to
                         # mnemiq's got-the-facts figure would pit two different rules
                         # against each other.
-                        if results_match(gold, candidate, allow_extra_columns=False):
+                        # Per BENCHMARK, not per script: BIRD publishes
+                        # `set(pred) == set(gold)` and declares it, Spider does not, and
+                        # this script grades both (`--benchmark`). Collapsing duplicates
+                        # for Spider would inflate `exact-match` under a rule Spider never
+                        # published, with nothing in the JSONL saying so (M105).
+                        if results_match(gold, candidate, allow_extra_columns=False,
+                                         duplicate_rows_insignificant=dupes_ok):
                             bucket = "correct"
-                        elif results_match(gold, candidate, allow_extra_columns=True):
+                        elif results_match(gold, candidate, allow_extra_columns=True,
+                                           duplicate_rows_insignificant=dupes_ok):
                             bucket = "correct_facts"
                         else:
                             bucket = "wrong"

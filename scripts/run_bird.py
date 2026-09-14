@@ -89,6 +89,11 @@ def main() -> int:
         results_path=args.results,
         workers=args.workers,
         candidates=args.candidates,
+        # BIRD publishes `set(pred) == set(gold)`, so exact here is the number the
+        # leaderboard publishes rather than one understated by multiplicity (M105).
+        # Declared at the CALLER: `run_bird` is the shared runner and Spider 1.0 drives
+        # it too, without this rule.
+        duplicate_rows_insignificant=True,
     )
     report = summarize(results, tokens=use["tokens"], llm_calls=use["llm_calls"])
 

@@ -105,6 +105,9 @@ def main() -> int:
         workers=args.workers,
         candidates=args.candidates,
         db_path_fn=spider_db_path,
+        # NOT declared: Spider does not publish BIRD's `set(rows)` rule, so exact stays
+        # the multiset reading here even though the runner is BIRD's (M105).
+        duplicate_rows_insignificant=False,
     )
     report = summarize(results, tokens=use["tokens"], llm_calls=use["llm_calls"])
 
