@@ -117,7 +117,17 @@ def untracked_count() -> int:
     return len([ln for ln in done.stdout.splitlines() if ln.strip()]) if done.returncode == 0 else 0
 
 
-def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str]) -> None:
+def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str],
+               duplicate_rows_insignificant: bool | None = None) -> None:
+    """Write the run's metadata beside its results.
+
+    `duplicate_rows_insignificant` is recorded because the results file is RESUMABLE and the
+    grading rule can change between segments: `_load_done` restores earlier outcomes verbatim,
+    so a file resumed across the M105 change holds multiset-graded rows beside set-graded ones
+    with nothing saying so. `source_rev` does not cover it -- only the last segment's rev
+    survives. `None` means the runner did not say, which is what an older meta file looks like
+    and is not the same claim as `false`.
+    """
     with open(_meta_path(results_path), "w") as fh:
         json.dump(
             {
@@ -126,6 +136,7 @@ def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str]) 
                 "excluded": excluded,
                 "source_rev": source_rev(),
                 "untracked_files": untracked_count(),
+                "duplicate_rows_insignificant": duplicate_rows_insignificant,
             },
             fh,
         )
@@ -374,6 +385,7 @@ def run_bird(
             tokens += client.total_tokens
             calls += client.calls
         if results_path is not None:
-            _save_meta(results_path, tokens, calls, excluded)
+            _save_meta(results_path, tokens, calls, excluded,
+                       duplicate_rows_insignificant)
 
     return results, {"tokens": tokens, "llm_calls": calls, "excluded": excluded}

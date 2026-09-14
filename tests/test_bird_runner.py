@@ -321,3 +321,41 @@ def test_run_grouped_passes_a_declaration_through_to_the_grader():
     results = _run_grouped([_case(1, "shop", "simple")], _dupe_build,
                            gold_sql_sentinel="GOLD", dupes_ok=True)
     assert results[0].outcome is Outcome.CORRECT, "the declaration did not reach run_case"
+
+
+def test_a_BIRD_only_runner_defaults_to_BIRDs_rule():
+    """`run_minidev_pg` is mini-dev on Postgres and has no second benchmark to serve, so
+    omitting the declaration must not quietly produce a number understated against the
+    leaderboard. `run_bird` is the opposite case -- shared with Spider 1.0 -- and its default
+    stays False on purpose. Pinning both, because the asymmetry is the design and a reader
+    who flips either one to 'make them consistent' should go red.
+    """
+    import inspect
+
+    from mnemiq.eval.bird_runner import run_bird
+    from mnemiq.eval.minidev_pg import run_minidev_pg
+
+    pg = inspect.signature(run_minidev_pg).parameters["duplicate_rows_insignificant"]
+    assert pg.default is True, "a BIRD-only runner must default to BIRD's rule"
+
+    shared = inspect.signature(run_bird).parameters["duplicate_rows_insignificant"]
+    assert shared.default is False, "a runner shared with Spider cannot assume a benchmark"
+
+
+def test_the_results_meta_records_which_rule_graded_the_run():
+    """A resumable file can span a rule change -- `_load_done` restores earlier outcomes
+    verbatim -- and `source_rev` only survives for the last segment. Without this the
+    artifact cannot say which reading produced its numbers, which is the thing M105 asks for.
+    """
+    import json
+    import tempfile
+
+    from mnemiq.eval.bird_runner import _meta_path, _save_meta
+
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/results.jsonl"
+        _save_meta(path, 1, 1, [], True)
+        assert json.load(open(_meta_path(path)))["duplicate_rows_insignificant"] is True
+        _save_meta(path, 1, 1, [])
+        assert json.load(open(_meta_path(path)))["duplicate_rows_insignificant"] is None, \
+            "an unstated rule must not read as `false`"
