@@ -488,4 +488,7 @@ class TestRunStatesEndToEnd:
         # `load_bird` exits 1 with neither string and used to pass this.
         assert "RUN VOID" in outp and "NATIVE_CONTROL_EXIT=1" in outp, outp
         assert "no cases were loaded at all" in outp, outp
+        # The REMEDY, as the two sibling tests pin theirs: asserting only the leading
+        # phrase let the actionable half be rewritten freely.
+        assert "check --db" in outp, outp
         assert "GOLD query that did not run" not in outp, outp
