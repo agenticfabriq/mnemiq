@@ -532,6 +532,27 @@ def test_resume_state_is_the_seam_all_three_runners_share():
 
         from mnemiq.eval.bird_runner import MixedGradingRules
 
+        # Starting over under the OTHER rule must be allowed -- it is what the refusal's own
+        # advice tells the operator to do. This pins `len(done)` for the REFUSAL, which the
+        # blocks above do not: a nonzero literal there leaves them green and locks the
+        # operator out forever with no escape but MNEMIQ_ALLOW_MIXED_GRADING=1.
+        assert resume_state(path, False) == ({}, 0, 0, []), \
+            "refused a fresh run that restored nothing"
+
         _append_result(path, _mk("bird-1", Outcome.CORRECT, "simple", "shop"))
         with pytest.raises(MixedGradingRules):
             resume_state(path, False)
+
+
+def test_resume_state_handles_a_run_with_no_results_path():
+    """Every run without `--results`, and nothing else covered it.
+
+    What holds this up is NOT the `if results_path` ternary, which is belt-and-braces:
+    measured by deleting it, and this test still passes. With no results path `done` is
+    always empty, so `restored` is 0 and `_load_meta` returns before it builds a meta path
+    -- `os.path.isfile(None)` does raise TypeError, but nothing reaches it. The ternary
+    earns its place only if that early return is ever reordered, so keep both and do not
+    read this test as pinning the ternary."""
+    from mnemiq.eval.bird_runner import resume_state
+
+    assert resume_state(None, True) == ({}, 0, 0, [])
