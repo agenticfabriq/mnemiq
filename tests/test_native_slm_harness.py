@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime
 import decimal
 import importlib.util
+import os
 import pathlib
 import sqlite3
 import sys
@@ -303,69 +304,145 @@ class TestUsableCandidates:
         assert kept == ["SELECT 1"]
 
 
-@pytest.mark.skipif(not (pathlib.Path(slm.MINIDEV) / "mini_dev_sqlite.json").exists(),
-                    reason="needs the BIRD mini-dev tree")
-class TestTruncationEndToEnd:
-    """The FILTER's join, which unit tests cannot reach.
+class TestRunStatesEndToEnd:
+    """The states the harness must not publish a number for, exercised through the script.
 
-    `usable_candidates` is covered directly, and that proved nothing about whether anyone
-    calls it: reverting `gen_one` to return the unfiltered list bypassed the filter with
-    every other test green. This runs the script against a server that returns the case's
-    own GOLD query, twice, changing only `finish_reason` -- so the SQL is byte-identical
-    and the grade is the only thing that can differ.
+    Every one of these was unasserted: the state distinctions live in `main()`, which no
+    unit test reaches, so inverting the rejected/transport ternary or swapping `all` for
+    `any` on the truncation check left the whole suite green. The earlier version of this
+    class needed the real BIRD tree and therefore SKIPPED in CI -- `.github/workflows/ci.yml`
+    fetches no dataset -- so the mutation it was written for landed green on every PR. This
+    one builds its own two-row corpus and runs anywhere.
     """
 
-    def _serve(self, payload, finish_reason, port):
-        import http.server
+    def _corpus(self, tmp_path):
+        """A mini-dev tree with one table, one row, and two questions."""
         import json as _json
+        import sqlite3 as _sq
+
+        root = tmp_path / "MINIDEV"
+        (root / "dev_databases" / "toy").mkdir(parents=True)
+        con = _sq.connect(root / "dev_databases" / "toy" / "toy.sqlite")
+        con.execute("CREATE TABLE t (a integer, b text)")
+        con.execute("INSERT INTO t VALUES (1, 'x')")
+        con.commit()
+        con.close()
+        (root / "dev_tables.json").write_text(_json.dumps(
+            [{"db_id": "toy", "table_names_original": ["t"]}]))
+        (root / "mini_dev_sqlite.json").write_text(_json.dumps([
+            {"question_id": 1, "db_id": "toy", "question": "how many rows?",
+             "SQL": "SELECT count(*) FROM t", "difficulty": "simple", "evidence": ""},
+            {"question_id": 2, "db_id": "toy", "question": "what is b?",
+             "SQL": "SELECT b FROM t", "difficulty": "simple", "evidence": ""},
+        ]))
+        return root
+
+    def _serve(self, handler_body):
+        import http.server
         import threading
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 self.rfile.read(int(self.headers.get("Content-Length", 0)))
-                body = _json.dumps({"choices": [
-                    {"message": {"content": f"```sql\n{payload}\n```"},
-                     "finish_reason": finish_reason}]}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                handler_body(self)
 
             def log_message(self, *a):
                 pass
 
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)  # port 0: no collisions
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        return srv
+        return srv, srv.server_address[1]
 
-    def _run(self, finish_reason, port, tmp_path):
+    @staticmethod
+    def _completion(sql, finish_reason):
+        import json as _json
+
+        def body(h):
+            payload = _json.dumps({"choices": [
+                {"message": {"content": f"```sql\n{sql}\n```"},
+                 "finish_reason": finish_reason}]}).encode()
+            h.send_response(200)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(payload)))
+            h.end_headers()
+            h.wfile.write(payload)
+        return body
+
+    @staticmethod
+    def _refuse(h):
+        h.send_response(400)
+        h.send_header("Content-Length", "2")
+        h.end_headers()
+        h.wfile.write(b"{}")
+
+    def _run(self, handler_body, tmp_path, extra=()):
         import json as _json
         import subprocess
 
-        qs = _json.loads((pathlib.Path(slm.MINIDEV) / "mini_dev_sqlite.json").read_text())
-        gold = qs[0]["SQL"].replace("\n", " ")
-        srv = self._serve(gold, finish_reason, port)
-        out = tmp_path / f"{finish_reason}.jsonl"
+        root = self._corpus(tmp_path)
+        srv, port = self._serve(handler_body)
+        out = tmp_path / "run.jsonl"
+        env = {**os.environ, "MNEMIQ_MINIDEV_DIR": str(root)}
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 [sys.executable, str(_PATH), "--base-url", f"http://127.0.0.1:{port}/v1",
                  "--model", "m", "--backend", "sqlite", "--engine", "SQLite",
-                 "--prompt-style", "arctic", "--limit", "1", "--concurrency", "1",
-                 "--timeout", "20", "--out", str(out)],
-                capture_output=True, text=True, timeout=180, check=False)
+                 "--prompt-style", "arctic", "--concurrency", "1", "--timeout", "20",
+                 "--out", str(out), *extra],
+                capture_output=True, text=True, timeout=240, check=False, env=env)
         finally:
             srv.shutdown()
-        rows = [_json.loads(x) for x in out.read_text().splitlines() if x.strip()]
-        assert len(rows) == 1, f"expected one graded row, got {rows}"
-        return rows[0]
+        combined = proc.stdout + proc.stderr
+        rows = ([_json.loads(x) for x in out.read_text().splitlines() if x.strip()]
+                if out.exists() else [])
+        # The captured output is the diagnosis; asserting before returning it threw it away.
+        return proc.returncode, combined, rows
 
-    def test_the_gold_query_grades_correct_when_it_finished(self, tmp_path):
-        # The positive control. Without it, "length grades wrong" could mean the harness
-        # simply cannot grade this case correct under any circumstances.
-        assert self._run("stop", 8781, tmp_path)["outcome"] == "correct"
+    def test_a_finished_gold_answer_scores_and_exits_clean(self, tmp_path):
+        """The positive control. Without it every assertion below could pass because the
+        harness cannot score this corpus at all."""
+        code, outp, rows = self._run(self._completion("SELECT count(*) FROM t", "stop"),
+                                     tmp_path)
+        assert code == 0, outp
+        assert [r["outcome"] for r in rows] == ["correct", "wrong"], outp
+        assert "NATIVE_CONTROL_EXIT=0" in outp
 
-    def test_the_same_gold_query_grades_wrong_when_truncated(self, tmp_path):
-        row = self._run("length", 8782, tmp_path)
-        assert row["truncated"] is True
-        assert row["outcome"] == "wrong", "an unfinished answer graded as a right one"
+    def test_an_all_truncated_run_publishes_no_number(self, tmp_path):
+        code, outp, rows = self._run(self._completion("SELECT count(*) FROM t", "length"),
+                                     tmp_path)
+        assert all(r["truncated"] for r in rows), outp
+        assert all(r["outcome"] != "correct" for r in rows), "unfinished graded as right"
+        assert "RUN VOID" in outp and "no-finished-candidate=2" in outp, outp
+        assert code == 1 and "NATIVE_CONTROL_EXIT=1" in outp, outp
+
+    def test_a_partly_truncated_case_is_not_reported_as_truncated(self, tmp_path):
+        """`all` not `any`: the two counters send the operator to different fixes.
+
+        Needs MIXED finish reasons to distinguish, which needs more than one candidate --
+        with every candidate alike the two are the same expression. Here one candidate
+        finished but carried no SQL and the other was cut off: the case produced no SQL,
+        but not BECAUSE of the cap, so `--max-tokens` is the wrong advice.
+        """
+        import json as _json
+
+        def body(h):
+            payload = _json.dumps({"choices": [
+                {"message": {"content": "I cannot answer that."}, "finish_reason": "stop"},
+                {"message": {"content": "```sql\nSELECT 1\n```"}, "finish_reason": "length"},
+            ]}).encode()
+            h.send_response(200)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(payload)))
+            h.end_headers()
+            h.wfile.write(payload)
+
+        _code, outp, _rows = self._run(body, tmp_path, extra=("--candidates", "2",
+                                                              "--temperature", "0.8"))
+        assert "empty-sql=2" in outp, outp
+        assert "no-finished-candidate=0" in outp, outp
+
+    def test_a_refused_run_voids_and_says_the_request_was_refused(self, tmp_path):
+        code, outp, rows = self._run(self._refuse, tmp_path)
+        assert [r.get("error") for r in rows] == ["rejected", "rejected"], outp
+        assert "REFUSED" in outp and "RUN VOID" in outp, outp
+        assert code == 1, outp

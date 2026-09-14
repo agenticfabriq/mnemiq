@@ -551,6 +551,10 @@ def main() -> int:
     counts = {"correct": 0, "wrong": 0, "error": 0}
     n_empty_sql = 0
     n_truncated_only = 0
+    # Cases where a real comparison happened: gold ran AND the model returned a finished
+    # candidate. Invalid SQL counts -- "the model wrote something that does not run" is a
+    # measurement. An unfinished generation is not, and neither is a gold that failed.
+    n_scored = 0
     n_transport = 0
     n_votes_for_winner = n_groups_total = 0
 
@@ -622,6 +626,7 @@ def main() -> int:
         # under-report. `list.append` is atomic for the same reason, as with `truncated`.
         counter = itertools.count(1)
         rejected: list[str] = []    # the server understood and refused (4xx, not 408/429)
+        trunc_only: list[str] = []  # generated, but every candidate hit the token cap
         unreached: list[str] = []   # never generated: transport fault or a refused request
         no_sql: list[str] = []      # generated, but nothing extractable came out
 
@@ -637,7 +642,11 @@ def main() -> int:
                 if result is None or not result[2]:
                     unreached.append(case.id)
                 elif all(r == "length" for r in result[2]):
-                    pass    # counted in `truncated`; NOT no_sql, whose fix is a different one
+                    # Its own bucket, not `no_sql`: same symptom, different remedy. It must
+                    # still reach the meter -- taking it out of `no_sql` without adding it
+                    # here left an all-truncating run printing a clean `generated 30/30`,
+                    # which is the silence two earlier commits were written to remove.
+                    trunc_only.append(case.id)
                 elif not any((q or "").strip() for q in (result[0] or [])):
                     # A 200 carrying no fence and no SELECT is the OTHER way this meter can
                     # reassure about a run that produced nothing: finish reasons are present,
@@ -653,6 +662,7 @@ def main() -> int:
                 if i == 1 or i % 25 == 0 or i == len(cases):
                     el = time.time() - t_gen
                     bad = "".join([f", {len(unreached)} UNREACHED" if unreached else "",
+                                   f", {len(trunc_only)} TRUNCATED" if trunc_only else "",
                                    f", {len(no_sql)} NO-SQL" if no_sql else ""])
                     if i < args.concurrency:
                         # No ETA yet: `i / elapsed` divides by wall time during which
@@ -704,8 +714,9 @@ def main() -> int:
                 out.write(json.dumps({
                     "case_id": case.id, "outcome": "error", "sql": "",
                     "db_id": db, "ms": round(ms, 1),
-                    # beacon ingests this row: a 4xx labelled "transport" sends whoever
-                    # reads it at the network instead of at the request.
+                    # For whoever reads this JSONL directly. (NOT for beacon: its
+                    # `load_eval_reports.py` declares no `error` field and never reads one,
+                    # so the distinction does not survive into beacon's item rows.)
                     "error": "rejected" if case.id in rejected else "transport",
                     "prompt_style": args.prompt_style, "truncated": was_truncated,
                 }) + "\n")
@@ -731,6 +742,8 @@ def main() -> int:
                 outcome = "correct" if results_match(
                     gold, cand, allow_extra_columns=False) else "wrong"
             counts[outcome] = counts.get(outcome, 0) + 1
+            if gold is not None and sql:
+                n_scored += 1
 
             # beacon GRADES BY COMPARISON and never executes SQL, so a push that carries
             # only the query is refused. Ship the rows this run actually returned, bounded,
@@ -785,6 +798,19 @@ def main() -> int:
             why += (f" ({len(rejected)} of them REFUSED by the server with a 4xx -- check "
                     f"context length and the model name, e.g. {rejected[:3]})")
         print(f"\nRUN VOID: {why}. No accuracy is reported. Fix it and re-run.",
+              file=sys.stderr)
+        print("NATIVE_CONTROL_EXIT=1")
+        return 1
+
+    # A run in which NO question produced a gradeable answer has no accuracy either, and
+    # the previous rule only caught the unanswered case: 30 of 30 generations cut off at the
+    # token cap printed `EX=0.00%` and exited 0. An all-truncated, all-gold-failed or
+    # all-empty run measures its own configuration, not the model.
+    if n_scored == 0 and n:
+        print(f"\nRUN VOID: no question produced a finished answer to grade "
+              f"(no-finished-candidate={n_truncated_only}, empty-sql={n_empty_sql}, "
+              f"error={counts['error']}). `wrong={counts['wrong']}` is not a score: those "
+              f"cases returned no SQL, so nothing was compared. No accuracy is reported.",
               file=sys.stderr)
         print("NATIVE_CONTROL_EXIT=1")
         return 1
