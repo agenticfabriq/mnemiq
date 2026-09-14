@@ -565,6 +565,7 @@ def main() -> int:
     # candidate. Invalid SQL counts -- "the model wrote something that does not run" is a
     # measurement. An unfinished generation is not, and neither is a gold that failed.
     n_scored = 0
+    n_gold_failed = 0
     n_transport = 0
     n_votes_for_winner = n_groups_total = 0
 
@@ -746,6 +747,7 @@ def main() -> int:
 
             if gold is None:
                 outcome = "error"          # our gold did not run: not the model's fault
+                n_gold_failed += 1
             elif cand is None:
                 outcome = "wrong"          # model produced nothing runnable
             else:
@@ -817,12 +819,26 @@ def main() -> int:
     # token cap printed `EX=0.00%` and exited 0. An all-truncated, all-gold-failed or
     # all-empty run measures its own configuration, not the model.
     if n_scored == 0:
-        print(f"\nRUN VOID: no question produced a finished answer to grade "
-              f"(no-finished-candidate={n_truncated_only}, empty-sql={n_empty_sql}, "
-              f"error={counts['error']}). `wrong={counts['wrong']}` is not a score: those "
-              f"cases returned no SQL, so nothing was compared. No FINAL accuracy is "
-              f"reported; the per-batch `EX=` lines above are provisional and this run has "
-              f"no result. Do not scrape them.", file=sys.stderr)
+        # Name the cause, because the remedies are unrelated and three of these are OURS,
+        # not the model's. A single blanket sentence blamed the model for a gold query that
+        # could not run against our own fixture.
+        causes = []
+        if not n:
+            causes.append("the case filter selected 0 questions (check --db / --limit)")
+        if n_truncated_only:
+            causes.append(f"{n_truncated_only} produced no FINISHED candidate "
+                          f"(raise --max-tokens)")
+        if n_empty_sql:
+            causes.append(f"{n_empty_sql} returned no extractable SQL "
+                          f"(check the prompt and the extractor)")
+        if n_gold_failed:
+            causes.append(f"{n_gold_failed} had a GOLD query that did not run -- our "
+                          f"fixture, not the model (check the corpus and the dialect)")
+        print("\nRUN VOID: no question produced a finished answer that could be compared "
+              "with a gold result. Cause: " + "; ".join(causes or ["unknown"]) + ". "
+              f"`wrong={counts['wrong']}` is not a score. No FINAL accuracy is reported; "
+              "the per-batch `EX=` lines above are provisional and this run has no result. "
+              "Do not scrape them.", file=sys.stderr)
         print("NATIVE_CONTROL_EXIT=1")
         return 1
 

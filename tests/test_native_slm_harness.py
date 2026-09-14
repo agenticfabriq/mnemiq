@@ -329,7 +329,7 @@ class TestRunStatesEndToEnd:
         con.close()
         (root / "dev_tables.json").write_text(_json.dumps(
             [{"db_id": "toy", "table_names_original": ["t"]}]))
-        (root / "mini_dev_sqlite.json").write_text(_json.dumps(questions or [
+        (root / "mini_dev_sqlite.json").write_text(_json.dumps(questions if questions is not None else [
             {"question_id": 1, "db_id": "toy", "question": "how many rows?",
              "SQL": "SELECT count(*) FROM t", "difficulty": "simple", "evidence": ""},
             {"question_id": 2, "db_id": "toy", "question": "what is b?",
@@ -464,12 +464,21 @@ class TestRunStatesEndToEnd:
         code, outp, rows = self._run(self._completion("SELECT count(*) FROM t", "stop"),
                                      tmp_path, questions=broken)
         assert [r["outcome"] for r in rows] == ["error"], outp
-        assert "RUN VOID" in outp and "no question produced a finished answer" in outp, outp
-        assert code == 1, outp
+        assert "RUN VOID" in outp, outp
+        # The cause must name OUR fixture. The old message said the cases "returned no SQL",
+        # which was false here: the model answered with runnable SQL and the gold is what
+        # failed, so a reader was sent to the prompt instead of to the corpus.
+        assert "GOLD query that did not run" in outp, outp
+        assert "returned no extractable SQL" not in outp, outp
+        assert code == 1 and "NATIVE_CONTROL_EXIT=1" in outp, outp
 
     def test_a_filter_that_selects_no_cases_publishes_no_number(self, tmp_path):
         """`and n` exempted this: a `--db` typo measured nothing and printed EX over all 0."""
         code, outp, _rows = self._run(self._completion("SELECT count(*) FROM t", "stop"),
                                       tmp_path, extra=("--db", "nosuchdb"))
         assert "EX=0.00% over all 0" not in outp, outp
-        assert code == 1, outp
+        # Exit 1 alone is also what a crash or a silent bail gives, so assert the void's own
+        # output the way the sibling tests do -- `if not cases: return 1` inserted after
+        # `load_bird` exits 1 with neither string and used to pass this.
+        assert "RUN VOID" in outp and "NATIVE_CONTROL_EXIT=1" in outp, outp
+        assert "selected 0 questions" in outp, outp
