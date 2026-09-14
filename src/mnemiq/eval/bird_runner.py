@@ -101,9 +101,13 @@ def assert_grading_rule_unchanged(
     raise MixedGradingRules(
         f"{results_path} holds {restored} results graded with {was}, and this run grades with "
         f"duplicate_rows_insignificant={duplicate_rows_insignificant}. Resuming would mix two "
-        f"rules into one number. Use a fresh --results path, delete the file to regrade from "
-        f"scratch, or set MNEMIQ_ALLOW_MIXED_GRADING=1 if you know the difference cannot "
-        f"reach these cases."
+        f"rules into one number.\n"
+        f"Use a fresh --results path, or delete BOTH {results_path} and "
+        f"{_meta_path(results_path)} to regrade from scratch -- the meta survives a delete of "
+        f"the results file alone, and `_load_meta` would then fold the old run's token totals "
+        f"into the new one and pre-skip its excluded case ids.\n"
+        f"MNEMIQ_ALLOW_MIXED_GRADING=1 overrides this if you know the difference cannot reach "
+        f"these cases."
     )
 
 
