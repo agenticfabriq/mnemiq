@@ -46,6 +46,7 @@ import argparse
 import concurrent.futures as cf
 import datetime
 import decimal
+import itertools
 import json
 import os
 import re
@@ -570,7 +571,27 @@ def main() -> int:
     print(f"generating {len(cases)} with {args.concurrency} workers ...", flush=True)
     t_gen = time.time()
     with cf.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        generated = list(pool.map(gen_one, cases))  # map preserves input order
+        # Generation is 90% of the wall clock and used to print NOTHING until it finished,
+        # so a run and a hung run looked identical for an hour -- observed: the operator
+        # asked whether it was running at all, and a crash mid-generation would have read
+        # the same way. `itertools.count` rather than `n += 1`: the increment happens on
+        # worker threads, and read-modify-write on an int can lose one, which would make
+        # the progress line under-report for the rest of the run.
+        counter = itertools.count(1)
+
+        def gen_one_counted(case):
+            try:
+                return gen_one(case)
+            finally:
+                i = next(counter)
+                if i % 25 == 0 or i == len(cases):
+                    el = time.time() - t_gen
+                    rate = i / el if el else 0
+                    left = (len(cases) - i) / rate / 60 if rate else 0
+                    print(f"  generated {i}/{len(cases)} in {el:.0f}s "
+                          f"(~{left:.0f} min left)", flush=True)
+
+        generated = list(pool.map(gen_one_counted, cases))  # map preserves input order
     print(f"generation done in {time.time() - t_gen:.0f}s; executing and grading ...", flush=True)
     # Generation is the expensive half and lived only in memory until a grading stall threw
     # it away. Persist it first: a crash after this point costs minutes, not GPU hours.
