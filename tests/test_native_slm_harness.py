@@ -444,10 +444,17 @@ class TestRunStatesEndToEnd:
             h.end_headers()
             h.wfile.write(payload)
 
-        _code, outp, _rows = self._run(body, tmp_path, extra=("--candidates", "2",
-                                                              "--temperature", "0.8"))
+        code, outp, _rows = self._run(body, tmp_path, extra=("--candidates", "2",
+                                                             "--temperature", "0.8"))
         assert "empty-sql=2" in outp, outp
         assert "no-finished-candidate=0" in outp, outp
+        # The fourth cause and its remedy. This state was reached by a test that read the
+        # summary counters only, so deleting the whole `if n_empty_sql:` branch printed
+        # "Cause: unknown" here with the suite green.
+        assert "returned no extractable SQL" in outp, outp
+        assert "check the prompt and the extractor" in outp, outp
+        assert "raise --max-tokens" not in outp, outp
+        assert code == 1 and "RUN VOID" in outp, outp
 
     def test_a_refused_run_voids_and_says_the_request_was_refused(self, tmp_path):
         code, outp, rows = self._run(self._refuse, tmp_path)
@@ -489,9 +496,9 @@ class TestRunStatesEndToEnd:
         # `load_bird` exits 1 with neither string and used to pass this.
         assert "RUN VOID" in outp and "NATIVE_CONTROL_EXIT=1" in outp, outp
         assert "no cases were loaded at all" in outp, outp
-        # The REMEDY, as both sibling tests now pin theirs: asserting only the leading
-        # phrase left the actionable half freely rewritable. (It was one sibling, not two,
-        # when this comment first claimed otherwise -- the gold case's remedy was
-        # unasserted, so the convention described here did not exist.)
-        assert "check the case filters" in outp, outp
+        # The REMEDY as well as the phrase. Every cause in the void's list is pinned
+        # both ways; the count is deliberately not written here, because two earlier
+        # versions of this comment claimed a coverage that did not hold -- first for two
+        # siblings when one was pinned, then for three causes when there are four.
+        assert "check --db" in outp, outp
         assert "GOLD query that did not run" not in outp, outp
