@@ -60,8 +60,10 @@ def _load_meta(results_path: str, restored: int) -> tuple[int, int, list[str]]:
     that run's reasons, under that run's row cap. The new run then reports a denominator
     quietly missing them.
 
-    Deleting the results file and leaving the meta is the ordinary way to reach this, and the
-    grading-rule refusal used to recommend exactly that, so it is not a corner.
+    Deleting the results file and leaving the meta is the ordinary way to reach this, and it is
+    what the grading-rule refusal RECOMMENDS -- safe precisely because of this check, and not
+    safe without it. Anyone weakening the `restored == 0` branch should read that message
+    first.
     """
     if restored == 0:
         return 0, 0, []
@@ -98,9 +100,9 @@ def assert_grading_rule_unchanged(
       * stored is None -- REFUSE, and this covers TWO provenances. Either the meta predates
         the field, or there is no meta file at all: results are appended per case and the
         meta written after, so a killed run leaves one, and so does deleting the meta by
-        hand, which this refusal tells operators to do. Both mean the stored rows cannot be
-        confirmed either way, which is not the same as matching, so neither may assume the
-        convenient answer. The message names which of the two it found.
+        hand. Both mean the stored rows cannot be confirmed either way, which is not the
+        same as matching, so neither may assume the convenient answer. The message names
+        which of the two it found.
 
     Only when rows would actually be restored: an empty or absent results file has nothing to
     mix, and a fresh run must not be blocked by a stale meta beside it.

@@ -393,16 +393,21 @@ def test_resuming_under_a_DIFFERENT_rule_refuses():
     from mnemiq.eval.bird_runner import MixedGradingRules, assert_grading_rule_unchanged
 
     with tempfile.TemporaryDirectory() as d:
+        path = _meta_with(d, False)
         with pytest.raises(MixedGradingRules) as exc:
-            assert_grading_rule_unchanged(_meta_with(d, False), True, restored=5)
-    assert "mix two rules" in str(exc.value)
-    # Deleting the results file alone is NOT clean: the meta survives, and `_load_meta`
-    # folds its token totals and excluded ids into the next run. The advice has to say so.
+            assert_grading_rule_unchanged(path, True, restored=5)
     msg = str(exc.value)
-    # The advice has to match what `_load_meta` actually does. It once said to delete the
-    # meta too, which was right while a stale meta could still reach a fresh run and became
-    # wrong the moment that was fixed -- so pin the claim, not just the filename.
-    assert "delete" in msg and "ignored" in msg, "the refusal's advice does not match _load_meta"
+    assert "mix two rules" in msg
+    # Tie the deletion target to the RESULTS path, and say the meta must NOT be named.
+    # Two traps here, both hit: "delete" plus "ignored" was satisfied by advice naming the
+    # meta instead, and so was `f"delete {path}"` alone -- the meta path is the results path
+    # plus a suffix, so it prefix-matches. Either wording sends the operator to the state
+    # this very guard refuses on: results with no metadata file at all.
+    from mnemiq.eval.bird_runner import _meta_path
+
+    assert f"delete {path}" in msg, "the advice does not name the results file"
+    assert _meta_path(path) not in msg, "the advice names the meta file as a deletion target"
+    assert "ignored" in msg, "the advice does not say the leftover meta is harmless"
     assert "BOTH" not in msg, "still telling operators to delete a file that no longer matters"
 
 
@@ -447,9 +452,8 @@ def test_the_operator_can_override_deliberately():
 
 
 def test_a_results_file_with_no_meta_at_all_cannot_be_confirmed():
-    """The shape the guard's own advice produces. Results are appended per case and the meta
-    is written after, so a kill in between leaves results with no meta -- and the refusal
-    tells operators to delete the meta, so deleting only that one lands here too.
+    """Results are appended per case and the meta is written after, so a run killed in
+    between leaves results with no meta; deleting the meta by hand lands here too.
 
     Returning early on a missing meta let the guard go silent on exactly that file.
     """
