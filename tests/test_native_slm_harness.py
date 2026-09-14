@@ -471,7 +471,7 @@ class TestRunStatesEndToEnd:
 
         Every other fixture here has one cause whose count equals the number of cases, so
         `{n_truncated_only}` -> `{n}` left them all green -- and a real mixed run would
-        then print both causes with the same total and weight the two remedies wrongly.
+        then print every cause with the same total, weighting the remedies wrongly.
         This corpus is 6 questions: 2 cut off at the cap, 3 answering with no SQL, and 1
         answering fine against a gold that cannot run. So the three counts are 2, 3 and 1
         -- distinct from each other and none equal to `n` -- which is what makes `{n}`,
