@@ -247,3 +247,32 @@ def test_enrich_bird_db_cache_key_reflects_phase_toggles(monkeypatch):
     monkeypatch.setenv("MNEMIQ_ENRICH_FACTS", "0")
     monkeypatch.setenv("MNEMIQ_ENRICH_EXAMPLES", "0")
     assert _enrich_cache_suffix(Settings.from_env()) == ""
+
+
+# ---------------------------------------------------------------------------
+# M105: `_run_grouped` and `_process_db` pass the benchmark's duplicate-row
+# declaration down to `run_case`. Every other fixture in this file returns gold
+# and candidate at the SAME multiplicity, so `dupes_ok` cannot change an
+# asserted outcome there and the pass-through would be free to be dropped.
+# ---------------------------------------------------------------------------
+
+
+def _dupe_build(db_id):
+    """Gold repeats a row; the candidate states each distinct row once."""
+    adapter = _Adapter({"n": [1, 1, 2]}, {"n": [1, 2]})
+
+    def ask(_q):
+        return AgentAnswer(answer="1,2", trace=_trace(), deferred=False)
+
+    return ask, adapter
+
+
+def test_run_grouped_defaults_to_the_multiset_reading():
+    results = _run_grouped([_case(1, "shop", "simple")], _dupe_build, gold_sql_sentinel="GOLD")
+    assert results[0].outcome is Outcome.WRONG, "collapsed without a declaration"
+
+
+def test_run_grouped_passes_a_declaration_through_to_the_grader():
+    results = _run_grouped([_case(1, "shop", "simple")], _dupe_build,
+                           gold_sql_sentinel="GOLD", dupes_ok=True)
+    assert results[0].outcome is Outcome.CORRECT, "the declaration did not reach run_case"
