@@ -571,24 +571,42 @@ def main() -> int:
     print(f"generating {len(cases)} with {args.concurrency} workers ...", flush=True)
     t_gen = time.time()
     with cf.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-        # Generation is 90% of the wall clock and used to print NOTHING until it finished,
-        # so a run and a hung run looked identical for an hour -- observed: the operator
-        # asked whether it was running at all, and a crash mid-generation would have read
-        # the same way. `itertools.count` rather than `n += 1`: the increment happens on
-        # worker threads, and read-modify-write on an int can lose one, which would make
-        # the progress line under-report for the rest of the run.
+        # Generation is 90% of the wall clock and a HEALTHY run used to print nothing while
+        # it ran, so a working run and a hung one looked identical for an hour -- observed:
+        # the operator asked whether it was going at all. (Per-case failures already went to
+        # stderr; what was missing was any sign of progress.)
+        #
+        # The count has to separate attempts from ANSWERS. Counting in `finally` alone counts
+        # attempts, and every request 400ing finishes generation in seconds and prints
+        # `generated 500/500 in 3s (~0 min left)` -- the most reassuring line this meter can
+        # emit, for a run that produced no SQL whatsoever. Both error paths in `gen_one`
+        # return no finish reasons, which is the signal used here.
+        #
+        # `itertools.count` rather than `n += 1`: the increment happens on worker threads, and
+        # read-modify-write on an int can lose one, which would make every later line
+        # under-report. `list.append` is atomic for the same reason, as with `truncated`.
         counter = itertools.count(1)
+        failed: list[str] = []
 
         def gen_one_counted(case):
+            result = None
             try:
-                return gen_one(case)
+                result = gen_one(case)
+                return result
             finally:
+                if result is None or not result[2]:
+                    failed.append(case.id)   # no finish reasons: nothing was generated
                 i = next(counter)
-                if i % 25 == 0 or i == len(cases):
+                # i == 1 as well as every 25th: the first line must not wait for 25
+                # completions, because per-case latency is exactly what goes pathological
+                # when something is wrong. At the default 180s timeout and 4 attempts, 25
+                # completions can be 45 minutes away -- the same silence this is fixing.
+                if i == 1 or i % 25 == 0 or i == len(cases):
                     el = time.time() - t_gen
                     rate = i / el if el else 0
                     left = (len(cases) - i) / rate / 60 if rate else 0
-                    print(f"  generated {i}/{len(cases)} in {el:.0f}s "
+                    bad = f", {len(failed)} FAILED" if failed else ""
+                    print(f"  generated {i}/{len(cases)}{bad} in {el:.0f}s "
                           f"(~{left:.0f} min left)", flush=True)
 
         generated = list(pool.map(gen_one_counted, cases))  # map preserves input order
