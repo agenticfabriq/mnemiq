@@ -662,3 +662,38 @@ def test_every_runner_checkpoint_records_the_row_count_it_stands_beside():
         for call in checkpoints:
             assert "results_rows=" in call, \
                 f"{mod.__name__} checkpoints without results_rows: {call}"
+
+
+def test_inheriting_exclusion_only_state_is_announced_not_silent():
+    """The one case the files cannot decide, so the operator has to be told.
+
+    A meta with state and no result rows is an exclusion-only run mid-flight AND a finished
+    one someone may have meant to restart, and nothing on disk separates them -- an excluded
+    case writes no row, so there is no results file to delete as a signal. Inheriting is the
+    right default; inheriting SILENTLY is what hides the wrong case, because `excluded` is
+    computed against `max_rows_cap` and a re-run under a different cap would skip those cases
+    without ever probing them.
+    """
+    import tempfile
+    import warnings
+
+    from mnemiq.eval.bird_runner import _save_meta, resume_state
+
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/results.jsonl"
+        _save_meta(path, 500, 3, ["bird-4"], True, results_rows=0)
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            assert resume_state(path, True)[1:] == (500, 3, ["bird-4"])
+        assert caught, "inherited prior state without saying so"
+        msg = str(caught[0].message)
+        assert "fresh --results path" in msg, "no route to starting clean"
+        assert "max-rows" in msg, "does not flag that exclusions were capped elsewhere"
+
+        # And no noise when there is nothing to inherit.
+        _save_meta(path, 0, 0, [], True, results_rows=0)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            resume_state(path, True)
+        assert not caught, "warned about inheriting nothing"

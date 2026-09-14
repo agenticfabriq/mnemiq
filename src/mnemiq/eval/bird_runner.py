@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import warnings
 import subprocess
 import threading
 from collections.abc import Callable
@@ -158,6 +159,25 @@ def resume_state(
         else:
             _restamp_rule(results_path, duplicate_rows_insignificant)
     tokens, calls, excluded = _load_meta(results_path) if results_path else (0, 0, [])
+    if not done and (tokens or calls or excluded):
+        # SAY SO. This is the one case the file cannot decide: a meta with state and no
+        # result rows is an exclusion-only run mid-flight AND a finished one the operator
+        # may have meant to start over from, and nothing on disk tells them apart -- an
+        # excluded case writes no row, so there is no results file to delete as a signal.
+        # Inheriting is the right default (it is usually the same run), but inheriting in
+        # SILENCE is what makes the wrong case invisible: `excluded` is computed against
+        # `max_rows_cap`, so a re-run under a different cap would skip those cases without
+        # ever probing them.
+        warnings.warn(
+            f"resuming {results_path} with no result rows but prior state from its meta: "
+            f"{tokens} tokens, {calls} calls, {len(excluded)} excluded "
+            f"({', '.join(excluded[:3])}{'...' if len(excluded) > 3 else ''}). "
+            f"That is an exclusion-only run continuing. To start clean instead, use a fresh "
+            f"--results path -- deleting the results file does nothing here, because an "
+            f"excluded case never wrote one. Note `excluded` was computed against the "
+            f"earlier run's --max-rows.",
+            stacklevel=2,
+        )
     return done, tokens, calls, excluded
 
 
