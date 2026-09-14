@@ -271,3 +271,32 @@ class TestGenerateReportsWhyItStopped:
         slm.generate("http://x/v1", "m", [{"role": "user", "content": "q"}], timeout=1,
                      max_tokens=10, extra={"continue_final_message": True})
         assert seen["body"]["continue_final_message"] is True
+
+
+class TestUsableCandidates:
+    """A truncated generation must not be able to grade CORRECT.
+
+    It could, and did: the flag was metadata only, the unfinished text was executed like
+    any other, and 30 of 88 truncations graded correct on the 2026-09-13 envelope run
+    because `extract_sql` falls back to the last SELECT in a cut-off chain of thought.
+    """
+
+    def test_a_truncated_candidate_is_dropped(self):
+        assert slm.usable_candidates(["SELECT 1", "SELECT 2"], ["length", "stop"]) == ["SELECT 2"]
+
+    def test_all_truncated_yields_no_sql_not_no_candidates(self):
+        # `[]` would be indistinguishable from a transport fault, which `None` already means.
+        assert slm.usable_candidates(["SELECT 1"], ["length"]) == [""]
+
+    def test_a_finished_candidate_survives_untouched(self):
+        assert slm.usable_candidates(["SELECT 1"], ["stop"]) == ["SELECT 1"]
+
+    def test_no_reasons_changes_nothing(self):
+        # The error paths return no reasons; they must not be reinterpreted as truncation.
+        assert slm.usable_candidates(["SELECT 1"], []) == ["SELECT 1"]
+
+    def test_a_truncated_candidate_cannot_win_a_vote(self):
+        # Voting grades the majority RESULT, so an unfinished candidate that agrees with
+        # another could carry the case. Two truncated against one finished must not.
+        kept = slm.usable_candidates(["BAD", "BAD", "SELECT 1"], ["length", "length", "stop"])
+        assert kept == ["SELECT 1"]

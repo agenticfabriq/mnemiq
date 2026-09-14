@@ -161,6 +161,25 @@ Output Format:
 ARCTIC_PREFILL = "Let me solve this step by step. \n<think>"
 
 
+def usable_candidates(sqls: list[str], reasons: list[str]) -> list[str]:
+    """The candidates that may be executed, voted with and graded.
+
+    A generation stopped at the token cap is an UNFINISHED answer, and `extract_sql`'s
+    last-SELECT fallback pulls a runnable query out of a cut-off chain of thought often
+    enough to matter: 30 of 88 truncations graded CORRECT on the 2026-09-13 envelope run,
+    where the flag was metadata and the text was executed like any other. An unfinished
+    answer scoring as a right one is worse than it scoring as a wrong one.
+
+    Returning `[""]` rather than `[]` when nothing finished is deliberate: `[]` would make
+    `vote` see no candidates and the caller cannot distinguish that from a transport fault,
+    which is the value `None` already carries. `[""]` grades as no SQL, which is what it is.
+    """
+    if not reasons:                       # nothing generated, or a caller with no reasons
+        return list(sqls)
+    keep = [q for q, why in zip(sqls, reasons, strict=False) if why != "length"]
+    return keep if keep else [""]
+
+
 def build_messages(style: str, engine: str, schema: str, question: str):
     """The request's messages and any transport-level extras. Pure, so it is testable."""
     if style == "omnisql":
@@ -342,6 +361,14 @@ def generate(base_url: str, model: str, messages: list, timeout: float, max_toke
                 detail = exc.read().decode("utf-8", "replace")[:300] or exc.reason
             except Exception:  # noqa: BLE001 - a body we cannot read is not a second failure
                 pass
+            # 408 and 429 are the server saying "not now", not "no": they are transport
+            # conditions wearing a 4xx, and a rate-limited run that treats them as a
+            # refusal publishes a score for questions it never managed to ask.
+            if exc.code in (408, 429):
+                last = exc
+                if attempt < attempts - 1:
+                    time.sleep(2 ** attempt)
+                continue
             if 400 <= exc.code < 500:
                 raise RequestRejected(f"HTTP {exc.code}: {detail}") from exc
             last = exc
@@ -561,12 +588,18 @@ def main() -> int:
             # The server answered and refused. Not a transport fault, so it does not void
             # the run -- but it is not an answer either, so it grades as no SQL.
             print(f"  REQUEST REJECTED for {case.id}: {exc}", file=sys.stderr)
-            return [""], (time.time() - t0) * 1000.0, [], []
+            rejected.append(case.id)
+            # NOT `[""]`: that is indistinguishable from a model that answered nothing, and
+            # it graded as a wrong answer while `n_transport` stayed 0, so a run whose every
+            # request was refused printed a real-looking EX of 0%. The question was never
+            # asked; `None` is the value that already means unreached.
+            return None, (time.time() - t0) * 1000.0, [], []
         except TransportFailed as exc:
             print(f"  TRANSPORT FAILED for {case.id}: {exc}", file=sys.stderr)
             # None != [] : unreached, not unanswered
             return None, (time.time() - t0) * 1000.0, [], []
-        return [extract_sql(r) for r in raws], (time.time() - t0) * 1000.0, reasons, raws
+        extracted = [extract_sql(r) for r in raws]
+        return usable_candidates(extracted, reasons), (time.time() - t0) * 1000.0, reasons, raws
 
     print(f"generating {len(cases)} with {args.concurrency} workers ...", flush=True)
     t_gen = time.time()
@@ -586,6 +619,7 @@ def main() -> int:
         # read-modify-write on an int can lose one, which would make every later line
         # under-report. `list.append` is atomic for the same reason, as with `truncated`.
         counter = itertools.count(1)
+        rejected: list[str] = []    # the server understood and refused (4xx, not 408/429)
         unreached: list[str] = []   # never generated: transport fault or a refused request
         no_sql: list[str] = []      # generated, but nothing extractable came out
 
@@ -644,8 +678,16 @@ def main() -> int:
             was_truncated = any(r == "length" for r in reasons)
             db = case.db_id or ""
             if sql is not None:
-                # Execute EVERY candidate, then vote on results. With --candidates 1 this is
-                # one execution and the vote is a no-op, so the single-shot path is unchanged.
+                # Drop the candidates that never finished. `truncated` used to be metadata
+                # only: the unfinished text was executed and graded like any other, and
+                # `extract_sql`'s last-SELECT fallback pulls a runnable query out of a
+                # cut-off chain of thought often enough that 30 of 88 truncations graded
+                # CORRECT on the 2026-09-13 envelope run. An unfinished answer scoring as a
+                # right one is worse than it scoring as a wrong one, and it also made the
+                # printed "each is scored wrong" bound false in both directions.
+                # Already filtered by `gen_one`: unfinished candidates never arrive here.
+                # Execute EVERY candidate, then vote on results. With
+                # --candidates 1 this is one execution and the vote is a no-op.
                 executed = [(q, exec_sql(q, db) if q else None) for q in sql]
                 sql, cand_tbl, votes, groups = vote(executed)
                 n_votes_for_winner += votes
@@ -701,14 +743,10 @@ def main() -> int:
     print(f"\nmodel={args.model} engine={args.engine} n={n} "
           f"prompt_style={args.prompt_style} max_tokens={args.max_tokens}")
     if truncated:
-        bound = (f" Each is scored `wrong` below, so the EX understates the model by at "
-                 f"most {len(truncated)}/{n} = {len(truncated) / n:.2%}."
-                 if args.candidates == 1 else
-                 " With --candidates > 1 the score is the majority RESULT, so a case with a "
-                 "truncated candidate may still be correct and no bound is stated.")
-        print(f"TRUNCATED at the token cap: {len(truncated)} generation(s), unfinished "
-              f"rather than wrong.{bound} Raise --max-tokens and re-run to remove the "
-              f"doubt. First few: {truncated[:5]}")
+        print(f"TRUNCATED at the token cap: {len(truncated)} generation(s). Unfinished "
+              f"candidates are DISCARDED before execution, so they cannot vote and cannot "
+              f"grade correct; a case with no finished candidate grades `wrong`. Raise "
+              f"--max-tokens and re-run to remove the doubt. First few: {truncated[:5]}")
     if args.candidates > 1:
         graded = max(1, n - n_transport)
         print(f"voting: {args.candidates} samples @ T={args.temperature}  "
@@ -721,8 +759,15 @@ def main() -> int:
     # A run that could not reach the server for some of its questions has no score. Printing
     # one anyway is how 244 refused connections became "the model scored 15.20%".
     if n_transport:
-        print(f"\nRUN VOID: {n_transport}/{n} questions never reached the model. "
-              f"No accuracy is reported. Fix the transport and re-run.", file=sys.stderr)
+        # Rejections are counted here too: both mean the question was never answered, which
+        # is the condition this rule exists for. They are named apart because the fix
+        # differs -- a transport fault is the network, a 4xx is the request.
+        why = f"{n_transport}/{n} questions never reached the model"
+        if rejected:
+            why += (f" ({len(rejected)} of them REFUSED by the server with a 4xx -- check "
+                    f"context length and the model name, e.g. {rejected[:3]})")
+        print(f"\nRUN VOID: {why}. No accuracy is reported. Fix it and re-run.",
+              file=sys.stderr)
         print("NATIVE_CONTROL_EXIT=1")
         return 1
 
