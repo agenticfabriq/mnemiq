@@ -407,7 +407,7 @@ def test_resuming_under_a_DIFFERENT_rule_refuses():
 
     assert f"delete {path}" in msg, "the advice does not name the results file"
     assert _meta_path(path) not in msg, "the advice names the meta file as a deletion target"
-    assert "ignored" in msg, "the advice does not say the leftover meta is harmless"
+    assert "replaced" in msg, "the advice does not say what becomes of the leftover meta"
     assert "BOTH" not in msg, "still telling operators to delete a file that no longer matters"
 
 
@@ -493,55 +493,70 @@ def test_a_fresh_run_does_not_inherit_a_stale_metas_totals_or_exclusions():
 
 
 def test_resume_state_is_the_seam_all_three_runners_share():
-    """The JOIN, which is where this went wrong twice.
+    """The JOIN, which is where this went wrong three times.
 
     `_load_meta` is correct on its own and pinned on its own, and passing it a literal
     instead of `len(done)` restored the stale-metadata bug with the whole suite green. The
-    three runners each had the same four lines; now they call this, and this is held here.
+    three runners each had the same four lines; now they call this, and this holds it.
+
+    Walked as a sequence because the states only make sense in order.
     """
     import json
+    import os
     import tempfile
 
-    from mnemiq.eval.bird_runner import _append_result, _save_meta, resume_state
+    import pytest
+
+    from mnemiq.eval.bird_runner import (
+        MixedGradingRules,
+        _append_result,
+        _save_meta,
+        resume_state,
+    )
 
     with tempfile.TemporaryDirectory() as d:
         path = f"{d}/results.jsonl"
-        _append_result(path, _mk("bird-1", Outcome.CORRECT, "simple", "shop"))
-        _save_meta(path, 9999, 42, ["bird-7"], True)
+        meta = f"{path}.meta.json"
+        row = lambda cid: _mk(cid, Outcome.CORRECT, "simple", "shop")  # noqa: E731
 
-        # Resuming under the same rule: prior results and prior totals both come back.
+        # 1. A real resume under the same rule: results and totals both come back.
+        _append_result(path, row("bird-1"))
+        _save_meta(path, 9999, 42, ["bird-7"], True)
         done, tokens, calls, excluded = resume_state(path, True)
         assert set(done) == {"bird-1"}
         assert (tokens, calls, excluded) == (9999, 42, ["bird-7"])
 
-        # Fresh: results gone, meta left behind. Nothing may carry over -- not the totals,
-        # and above all not the exclusions, which would silently shrink the denominator.
-        import os
-
+        # 2. Starting over: results deleted, meta left behind. Nothing carries over -- not
+        #    the totals, and above all not the exclusions, which would shrink the denominator.
         os.remove(path)
+        assert resume_state(path, True) == ({}, 0, 0, []), "a fresh run inherited a stale meta"
+
+        # 3. The stale meta is REPLACED, not merely skipped, and the rule is stamped before
+        #    the first row. Skipping alone is temporary -- see `_claim_meta`.
+        claimed = json.load(open(meta))
+        assert claimed["excluded"] == [] and claimed["tokens"] == 0, "stale meta survived"
+        assert claimed["duplicate_rows_insignificant"] is True, "the rule was not claimed"
+
+        # 4. That fresh run answers one case and is killed. Resuming must stay clean AND must
+        #    not be refused: without the claim in step 3 these rows would have no recorded
+        #    rule, which `assert_grading_rule_unchanged` rejects as unconfirmable.
+        _append_result(path, row("bird-2"))
         done, tokens, calls, excluded = resume_state(path, True)
-        assert done == {}
-        assert (tokens, calls, excluded) == (0, 0, []), "a fresh run inherited a stale meta"
-        assert json.load(open(f"{path}.meta.json"))["excluded"] == ["bird-7"], \
-            "the meta itself should be untouched -- it is ignored, not rewritten here"
+        assert set(done) == {"bird-2"}
+        assert (tokens, calls, excluded) == (0, 0, []), "the stale meta reattached on resume"
 
-        # The seam's other job. Removing the rule check from it leaves the two assertions
-        # above green, so it has to be exercised here rather than only through
-        # `assert_grading_rule_unchanged` directly.
-        import pytest
-
-        from mnemiq.eval.bird_runner import MixedGradingRules
-
-        # Starting over under the OTHER rule must be allowed -- it is what the refusal's own
-        # advice tells the operator to do. This pins `len(done)` for the REFUSAL, which the
-        # blocks above do not: a nonzero literal there leaves them green and locks the
-        # operator out forever with no escape but MNEMIQ_ALLOW_MIXED_GRADING=1.
-        assert resume_state(path, False) == ({}, 0, 0, []), \
-            "refused a fresh run that restored nothing"
-
-        _append_result(path, _mk("bird-1", Outcome.CORRECT, "simple", "shop"))
+        # 5. Resuming THOSE rows under the other rule refuses.
         with pytest.raises(MixedGradingRules):
             resume_state(path, False)
+
+        # 6. But starting over under the other rule is allowed -- it is what the refusal's
+        #    own advice says to do. This pins `len(done)` for the REFUSAL, which steps 1-5 do
+        #    not: a nonzero literal there locks the operator out with no escape but
+        #    MNEMIQ_ALLOW_MIXED_GRADING=1.
+        os.remove(path)
+        assert resume_state(path, False) == ({}, 0, 0, []), \
+            "refused a fresh run that restored nothing"
+        assert json.load(open(meta))["duplicate_rows_insignificant"] is False
 
 
 def test_resume_state_handles_a_run_with_no_results_path():

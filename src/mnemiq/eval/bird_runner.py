@@ -131,8 +131,8 @@ def assert_grading_rule_unchanged(
         f"duplicate_rows_insignificant={duplicate_rows_insignificant}. Resuming would mix two "
         f"rules into one number.\n"
         f"Use a fresh --results path, or delete {results_path} to regrade from scratch -- a "
-        f"meta left beside a deleted results file is ignored, since nothing is restored from "
-        f"it.\n"
+        f"meta left beside a deleted results file is replaced, not read, so there is nothing "
+        f"else to clean up.\n"
         f"MNEMIQ_ALLOW_MIXED_GRADING=1 overrides this if you know the difference cannot reach "
         f"these cases."
     )
@@ -151,10 +151,38 @@ def resume_state(
     """
     done = _load_done(results_path) if results_path else {}
     assert_grading_rule_unchanged(results_path, duplicate_rows_insignificant, len(done))
+    if results_path and not done:
+        _claim_meta(results_path, duplicate_rows_insignificant)
     tokens, calls, excluded = (
         _load_meta(results_path, len(done)) if results_path else (0, 0, [])
     )
     return done, tokens, calls, excluded
+
+
+def _claim_meta(results_path: str, duplicate_rows_insignificant: bool) -> None:
+    """Stamp this run's rule into the meta BEFORE it grades anything, replacing any stale one.
+
+    Two problems, one write.
+
+    IGNORING A STALE META IS NOT ENOUGH, because the condition that makes it ignorable is
+    temporary. `_load_meta` skips it when nothing was restored, which is right for the fresh
+    run -- but the moment that run writes its first result and is interrupted, the resume
+    restores rows, `restored` is no longer zero, and the OLD meta reattaches with its token
+    totals and its exclusions. Reproduced: delete the results file, resume once (totals
+    correctly zero), answer one case, kill, resume again -- 9999 tokens and a stale excluded
+    id come back.
+
+    And DELETING it instead is not enough either, because results are appended per case while
+    the meta was only written at a checkpoint: an interrupted fresh run legitimately leaves
+    rows with no meta, which `assert_grading_rule_unchanged` then refuses as unconfirmable.
+    That refusal is right -- rows whose rule was never recorded ARE unconfirmable -- so the
+    fix is to leave no such window rather than to soften it.
+
+    Writing the rule before the first row closes both: a stale meta is gone, and every row
+    this run appends has its rule already on disk. Totals start at zero because this run has
+    spent nothing yet; the first checkpoint overwrites them.
+    """
+    _save_meta(results_path, 0, 0, [], duplicate_rows_insignificant)
 
 
 def source_rev() -> str:
