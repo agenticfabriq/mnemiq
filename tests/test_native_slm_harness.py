@@ -466,6 +466,47 @@ class TestRunStatesEndToEnd:
         assert "produced no FINISHED candidate" not in outp, outp
         assert code == 1 and "RUN VOID" in outp, outp
 
+    def test_two_causes_at_once_each_carry_their_own_count(self, tmp_path):
+        """The counts and the cause/remedy pairing, which a single-cause fixture cannot pin.
+
+        Every other fixture here has one cause whose count equals the number of cases, so
+        `{n_truncated_only}` -> `{n}` left them all green -- and a real mixed run would
+        then print both causes with the same total and weight the two remedies wrongly.
+        This corpus is 5 questions: 2 cut off at the cap, 3 answering with no SQL, so the
+        two counts differ from each other AND from `n`.
+        """
+        import json as _json
+        import threading
+
+        lock, seen = threading.Lock(), {"n": 0}
+
+        def body(h):
+            with lock:
+                seen["n"] += 1
+                nth = seen["n"]
+            if nth <= 2:      # cut off, with SQL that must be discarded unexecuted
+                content, why = "```sql\nSELECT count(*) FROM t\n```", "length"
+            else:             # finished, but nothing extractable
+                content, why = "I cannot answer that.", "stop"
+            payload = _json.dumps({"choices": [
+                {"message": {"content": content}, "finish_reason": why}]}).encode()
+            h.send_response(200)
+            h.send_header("Content-Type", "application/json")
+            h.send_header("Content-Length", str(len(payload)))
+            h.end_headers()
+            h.wfile.write(payload)
+
+        five = [{"question_id": i, "db_id": "toy", "question": f"q{i}",
+                 "SQL": "SELECT count(*) FROM t", "difficulty": "simple", "evidence": ""}
+                for i in range(1, 6)]
+        code, outp, rows = self._run(body, tmp_path, questions=five)
+
+        assert len(rows) == 5, outp
+        # Distinct counts, each beside its own cause -- neither is 5, so `{n}` cannot pass
+        assert "2 produced no FINISHED candidate (raise --max-tokens)" in outp, outp
+        assert "3 returned no extractable SQL (check the prompt and the extractor)" in outp, outp
+        assert code == 1 and "RUN VOID" in outp, outp
+
     def test_a_refused_run_voids_and_says_the_request_was_refused(self, tmp_path):
         code, outp, rows = self._run(self._refuse, tmp_path)
         assert [r.get("error") for r in rows] == ["rejected", "rejected"], outp
