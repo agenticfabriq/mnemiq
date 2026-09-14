@@ -127,9 +127,10 @@ def assert_grading_rule_unchanged(
         f"{results_path} holds {restored} results graded with {was}, and this run grades with "
         f"duplicate_rows_insignificant={duplicate_rows_insignificant}. Resuming would mix two "
         f"rules into one number.\n"
-        f"Use a fresh --results path, or delete {results_path} to regrade from scratch -- a "
-        f"meta left beside a deleted results file is replaced, not read, so there is nothing "
-        f"else to clean up.\n"
+        f"Use a fresh --results path -- always sufficient, and the only thing that is when a "
+        f"run's progress was exclusions, which write no results file to delete. Deleting "
+        f"{results_path} also works when it exists: the meta beside it is then replaced "
+        f"rather than read.\n"
         f"MNEMIQ_ALLOW_MIXED_GRADING=1 overrides this if you know the difference cannot reach "
         f"these cases."
     )

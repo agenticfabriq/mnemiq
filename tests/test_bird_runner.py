@@ -405,7 +405,8 @@ def test_resuming_under_a_DIFFERENT_rule_refuses():
     # this very guard refuses on: results with no metadata file at all.
     from mnemiq.eval.bird_runner import _meta_path
 
-    assert f"delete {path}" in msg, "the advice does not name the results file"
+    assert "fresh --results path" in msg, "no route that works when progress was exclusions"
+    assert f"Deleting {path}" in msg, "the advice does not name the results file"
     assert _meta_path(path) not in msg, "the advice names the meta file as a deletion target"
     assert "replaced" in msg, "the advice does not say what becomes of the leftover meta"
     assert "BOTH" not in msg, "still telling operators to delete a file that no longer matters"
