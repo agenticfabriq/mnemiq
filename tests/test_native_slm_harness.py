@@ -474,6 +474,7 @@ class TestRunStatesEndToEnd:
         # which was false here: the model answered with runnable SQL and the gold is what
         # failed, so a reader was sent to the prompt instead of to the corpus.
         assert "GOLD query that did not run" in outp, outp
+        assert "check the corpus and the dialect" in outp, outp   # the actionable half
         assert "returned no extractable SQL" not in outp, outp
         assert "raise --max-tokens" not in outp, outp
         assert code == 1 and "NATIVE_CONTROL_EXIT=1" in outp, outp
@@ -488,7 +489,9 @@ class TestRunStatesEndToEnd:
         # `load_bird` exits 1 with neither string and used to pass this.
         assert "RUN VOID" in outp and "NATIVE_CONTROL_EXIT=1" in outp, outp
         assert "no cases were loaded at all" in outp, outp
-        # The REMEDY, as the two sibling tests pin theirs: asserting only the leading
-        # phrase let the actionable half be rewritten freely.
-        assert "check --db" in outp, outp
+        # The REMEDY, as both sibling tests now pin theirs: asserting only the leading
+        # phrase left the actionable half freely rewritable. (It was one sibling, not two,
+        # when this comment first claimed otherwise -- the gold case's remedy was
+        # unasserted, so the convention described here did not exist.)
+        assert "check the case filters" in outp, outp
         assert "GOLD query that did not run" not in outp, outp

@@ -824,13 +824,14 @@ def main() -> int:
         # could not run against our own fixture.
         causes = []
         if not n:
-            # Deliberately does not claim which flag can or cannot cause this. An earlier
-            # version ruled out `--limit` on the grounds that `load_bird` applies its cap
-            # after appending -- true today, untested there, and a refactor moving the
-            # check to the top of the loop would make the claim false without a failing
-            # test anywhere. The message says what is observable: nothing loaded.
-            causes.append("no cases were loaded at all (check --db, --limit, and that the "
-                          "corpus file for this dialect has records)")
+            # Names no individual flag. One version ruled `--limit` out (`load_bird`
+            # applies its cap after appending, so `--limit 0` yields one case) -- true
+            # today, pinned nowhere, and false after any refactor moving that check to the
+            # top of the loop. The next version listed it, which put an unreachable cause
+            # in front of the operator instead. Both mistakes come from enumerating flags
+            # in a message that cannot know which one was passed.
+            causes.append("no cases were loaded at all (check the case filters and the "
+                          "corpus file for this dialect)")
         if n_truncated_only:
             causes.append(f"{n_truncated_only} produced no FINISHED candidate "
                           f"(raise --max-tokens)")
