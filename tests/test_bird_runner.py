@@ -471,7 +471,7 @@ def test_a_results_file_with_no_meta_at_all_cannot_be_confirmed():
 
 def test_a_fresh_run_does_not_inherit_a_stale_metas_totals_or_exclusions():
     """Deleting the results file and leaving the meta is the ordinary way to start over --
-    and the grading-rule refusal used to recommend exactly that.
+    and the grading-rule refusal RECOMMENDS exactly that -- safe only because of this check.
 
     The exclusions are the dangerous half: the caller computes `skip` as the union of the
     restored ids and the meta's `excluded`, so a fresh run would silently never execute cases
