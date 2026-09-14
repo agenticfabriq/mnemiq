@@ -824,7 +824,10 @@ def main() -> int:
         # could not run against our own fixture.
         causes = []
         if not n:
-            causes.append("the case filter selected 0 questions (check --db / --limit)")
+            # NOT `--limit`: `load_bird` applies the cap after appending, so `--limit 0`
+            # yields one case, never zero. `--db` and an empty corpus are the two routes.
+            causes.append("no cases were loaded at all (check --db, and that the corpus "
+                          "file for this dialect has records)")
         if n_truncated_only:
             causes.append(f"{n_truncated_only} produced no FINISHED candidate "
                           f"(raise --max-tokens)")

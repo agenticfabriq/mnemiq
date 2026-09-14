@@ -417,6 +417,11 @@ class TestRunStatesEndToEnd:
         # The live meter has to say so too, in its own words: the summary below says
         # TRUNCATED whatever the meter does, so a bare substring would not pin it.
         assert "2 TRUNCATED" in outp, "the progress meter gave no in-flight signal"
+        # ...and the cause list must not name a fault that did not occur. Hoisting the
+        # gold-failure counter out of its branch made this run blame the corpus, which is
+        # the same misattribution as before pointing the other way.
+        assert "raise --max-tokens" in outp, outp
+        assert "GOLD query that did not run" not in outp, outp
 
     def test_a_partly_truncated_case_is_not_reported_as_truncated(self, tmp_path):
         """`all` not `any`: the two counters send the operator to different fixes.
@@ -470,6 +475,7 @@ class TestRunStatesEndToEnd:
         # failed, so a reader was sent to the prompt instead of to the corpus.
         assert "GOLD query that did not run" in outp, outp
         assert "returned no extractable SQL" not in outp, outp
+        assert "raise --max-tokens" not in outp, outp
         assert code == 1 and "NATIVE_CONTROL_EXIT=1" in outp, outp
 
     def test_a_filter_that_selects_no_cases_publishes_no_number(self, tmp_path):
@@ -481,4 +487,5 @@ class TestRunStatesEndToEnd:
         # output the way the sibling tests do -- `if not cases: return 1` inserted after
         # `load_bird` exits 1 with neither string and used to pass this.
         assert "RUN VOID" in outp and "NATIVE_CONTROL_EXIT=1" in outp, outp
-        assert "selected 0 questions" in outp, outp
+        assert "no cases were loaded at all" in outp, outp
+        assert "GOLD query that did not run" not in outp, outp
