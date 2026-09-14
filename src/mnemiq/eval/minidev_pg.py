@@ -41,7 +41,12 @@ def run_minidev_pg(
     workers: int = 1,
     candidates: int = 1,
     semantic: bool = True,
-    duplicate_rows_insignificant: bool = False,
+    # Defaults TRUE, unlike `run_bird`'s, and the asymmetry is the point: that runner is
+    # shared with Spider 1.0, so it cannot assume a benchmark, while this one IS BIRD
+    # mini-dev and has no second caller to serve. A caller who omits it here should get
+    # the rule the leaderboard publishes rather than a number understated against it
+    # with nothing at the call site to notice (M105).
+    duplicate_rows_insignificant: bool = True,
 ) -> tuple[list[CaseResult], dict]:
     """Grouped-by-db, resumable mini-dev PG run. Enrichment is per-db (cached, from the SQLite
     dev_databases -- dialect-agnostic); execution is against `bird_dev` (pg_dsn) via DuckDB;
