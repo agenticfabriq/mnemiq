@@ -314,6 +314,10 @@ def run_spider2(
             tokens += client.total_tokens
             calls += client.calls
         if results_path is not None:
-            _save_meta(results_path, tokens, calls, excluded)
+            # Explicit `False`, not silence: Spider 2.0-lite does not declare BIRD's
+            # `set(rows)` rule, so this run IS multiset-graded. `None` would say the
+            # runner did not state a rule, which is what a pre-M105 file looks like.
+            _save_meta(results_path, tokens, calls, excluded,
+                       duplicate_rows_insignificant=False)
 
     return results, {"tokens": tokens, "llm_calls": calls, "excluded": excluded}
