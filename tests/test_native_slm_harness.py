@@ -420,8 +420,13 @@ class TestRunStatesEndToEnd:
         # ...and the cause list must not name a fault that did not occur. Hoisting the
         # gold-failure counter out of its branch made this run blame the corpus, which is
         # the same misattribution as before pointing the other way.
-        assert "produced no FINISHED candidate" in outp, outp   # the cause's own phrase
-        assert "raise --max-tokens" in outp, outp                  # ...and its remedy
+        # The COUNT too: swapping `{n_truncated_only}` for `{n_empty_sql}` between the
+        # two branches left every test green, and the operator would read a cause with a
+        # zero in front of it. And the remedy with its parentheses -- the bare string also
+        # appears in the summary as "Raise --max-tokens", so letter case was doing the
+        # pinning and a copy-edit there would have freed the cause's half silently.
+        assert "2 produced no FINISHED candidate" in outp, outp
+        assert "(raise --max-tokens)" in outp, outp
         assert "GOLD query that did not run" not in outp, outp
         assert "returned no extractable SQL" not in outp, outp
 
@@ -453,8 +458,8 @@ class TestRunStatesEndToEnd:
         # The fourth cause and its remedy. This state was reached by a test that read the
         # summary counters only, so deleting the whole `if n_empty_sql:` branch printed
         # "Cause: unknown" here with the suite green.
-        assert "returned no extractable SQL" in outp, outp
-        assert "check the prompt and the extractor" in outp, outp
+        assert "2 returned no extractable SQL" in outp, outp
+        assert "(check the prompt and the extractor)" in outp, outp
         # NOT `"raise --max-tokens" not in outp`: the SUMMARY prints "Raise --max-tokens"
         # for this run, so that assertion passed on letter case alone and a copy-edit
         # lowercasing the summary would have failed it for an unrelated reason.
@@ -485,8 +490,8 @@ class TestRunStatesEndToEnd:
         # The cause must name OUR fixture. The old message said the cases "returned no SQL",
         # which was false here: the model answered with runnable SQL and the gold is what
         # failed, so a reader was sent to the prompt instead of to the corpus.
-        assert "GOLD query that did not run" in outp, outp
-        assert "check the corpus and the dialect" in outp, outp   # the actionable half
+        assert "1 had a GOLD query that did not run" in outp, outp
+        assert "(check the corpus and the dialect)" in outp, outp   # the actionable half
         assert "returned no extractable SQL" not in outp, outp
         assert "produced no FINISHED candidate" not in outp, outp
         assert code == 1 and "NATIVE_CONTROL_EXIT=1" in outp, outp
