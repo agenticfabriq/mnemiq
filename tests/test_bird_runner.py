@@ -460,3 +460,27 @@ def test_a_results_file_with_no_meta_at_all_cannot_be_confirmed():
         with pytest.raises(MixedGradingRules) as exc:
             assert_grading_rule_unchanged(f"{d}/results.jsonl", True, restored=5)
     assert "no metadata file at all" in str(exc.value)
+
+
+def test_a_fresh_run_does_not_inherit_a_stale_metas_totals_or_exclusions():
+    """Deleting the results file and leaving the meta is the ordinary way to start over --
+    and the grading-rule refusal used to recommend exactly that.
+
+    The exclusions are the dangerous half: the caller computes `skip` as the union of the
+    restored ids and the meta's `excluded`, so a fresh run would silently never execute cases
+    the PREVIOUS run excluded, for that run's reasons and under that run's row cap, and then
+    report a denominator quietly missing them.
+    """
+    import tempfile
+
+    from mnemiq.eval.bird_runner import _load_meta, _save_meta
+
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/results.jsonl"
+        _save_meta(path, 9999, 42, ["bird-7", "bird-8"], True)
+
+        # Resuming: the file's own totals carry forward.
+        assert _load_meta(path, restored=5) == (9999, 42, ["bird-7", "bird-8"])
+
+        # Fresh: nothing was restored, so the meta describes a different run.
+        assert _load_meta(path, restored=0) == (0, 0, [])

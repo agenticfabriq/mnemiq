@@ -49,7 +49,22 @@ def _meta_path(results_path: str) -> str:
     return results_path + ".meta.json"
 
 
-def _load_meta(results_path: str) -> tuple[int, int, list[str]]:
+def _load_meta(results_path: str, restored: int) -> tuple[int, int, list[str]]:
+    """Carry forward a resumed run's totals -- and ONLY a resumed run's.
+
+    `restored` is how many results `_load_done` actually brought back. When it is zero the
+    meta is stale: the results file is gone or empty, so this is a fresh run and the meta
+    beside it describes a different one. Folding it in anyway inflated the new run's token
+    and call totals and, because the caller computes `skip` as the union of the restored ids
+    and the meta's `excluded`, SILENTLY SKIPPED cases the previous run had excluded -- for
+    that run's reasons, under that run's row cap. The new run then reports a denominator
+    quietly missing them.
+
+    Deleting the results file and leaving the meta is the ordinary way to reach this, and the
+    grading-rule refusal used to recommend exactly that, so it is not a corner.
+    """
+    if restored == 0:
+        return 0, 0, []
     path = _meta_path(results_path)
     if not os.path.isfile(path):
         return 0, 0, []
@@ -407,7 +422,8 @@ def run_bird(
     done_results = _load_done(results_path) if results_path else {}
     assert_grading_rule_unchanged(results_path, duplicate_rows_insignificant,
                                   len(done_results))
-    tokens, calls, excluded = _load_meta(results_path) if results_path else (0, 0, [])
+    tokens, calls, excluded = (_load_meta(results_path, len(done_results))
+                                if results_path else (0, 0, []))
     skip = set(done_results) | set(excluded)
 
     results: list[CaseResult] = list(done_results.values())

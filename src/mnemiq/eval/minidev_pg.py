@@ -64,7 +64,8 @@ def run_minidev_pg(
     done_results = _load_done(results_path) if results_path else {}
     assert_grading_rule_unchanged(results_path, duplicate_rows_insignificant,
                                   len(done_results))
-    tokens, calls, excluded = _load_meta(results_path) if results_path else (0, 0, [])
+    tokens, calls, excluded = (_load_meta(results_path, len(done_results))
+                                if results_path else (0, 0, []))
     skip = set(done_results) | set(excluded)
 
     results: list[CaseResult] = list(done_results.values())

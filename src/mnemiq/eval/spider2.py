@@ -261,7 +261,8 @@ def run_spider2(
     # Spider 2.0-lite always grades multiset, so a file carrying BIRD-rule rows is a
     # mismatch here exactly as the reverse is there.
     assert_grading_rule_unchanged(results_path, False, len(done))
-    tokens, calls, excluded = _load_meta(results_path) if results_path else (0, 0, [])
+    tokens, calls, excluded = (_load_meta(results_path, len(done))
+                                if results_path else (0, 0, []))
     results: list[CaseResult] = list(done.values())
     processed = len(done)
     _outages = 0
