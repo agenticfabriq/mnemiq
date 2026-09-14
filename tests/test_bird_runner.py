@@ -399,8 +399,11 @@ def test_resuming_under_a_DIFFERENT_rule_refuses():
     # Deleting the results file alone is NOT clean: the meta survives, and `_load_meta`
     # folds its token totals and excluded ids into the next run. The advice has to say so.
     msg = str(exc.value)
-    assert ".meta.json" in msg and "BOTH" in msg, \
-        "the refusal sends the operator to a half-clean state"
+    # The advice has to match what `_load_meta` actually does. It once said to delete the
+    # meta too, which was right while a stale meta could still reach a fresh run and became
+    # wrong the moment that was fixed -- so pin the claim, not just the filename.
+    assert "delete" in msg and "ignored" in msg, "the refusal's advice does not match _load_meta"
+    assert "BOTH" not in msg, "still telling operators to delete a file that no longer matters"
 
 
 def test_a_file_that_never_stated_its_rule_cannot_be_confirmed():
