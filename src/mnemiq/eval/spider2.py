@@ -318,6 +318,7 @@ def run_spider2(
             # `set(rows)` rule, so this run IS multiset-graded. `None` would say the
             # runner did not state a rule, which is what a pre-M105 file looks like.
             _save_meta(results_path, tokens, calls, excluded,
-                       duplicate_rows_insignificant=False)
+                       duplicate_rows_insignificant=False,
+                       results_rows=len(results))
 
     return results, {"tokens": tokens, "llm_calls": calls, "excluded": excluded}

@@ -103,6 +103,7 @@ def run_minidev_pg(
             calls += client.calls
         if results_path is not None:
             _save_meta(results_path, tokens, calls, excluded,
-                       duplicate_rows_insignificant)
+                       duplicate_rows_insignificant,
+                       results_rows=len(results))
 
     return results, {"tokens": tokens, "llm_calls": calls, "excluded": excluded}

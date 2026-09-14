@@ -49,25 +49,20 @@ def _meta_path(results_path: str) -> str:
     return results_path + ".meta.json"
 
 
-def _load_meta(results_path: str, restored: int) -> tuple[int, int, list[str]]:
-    """Carry forward a resumed run's totals -- and ONLY a resumed run's.
+def _load_meta(results_path: str) -> tuple[int, int, list[str]]:
+    """The totals and exclusions this results file's own run has accumulated.
 
-    `restored` is how many results `_load_done` actually brought back. When it is zero this
-    is a fresh run, so a meta beside it belongs to a different one. Folding it in inflated
-    the new run's token and call totals and, because the caller computes `skip` as the union
-    of the restored ids and the meta's `excluded`, SILENTLY SKIPPED cases the previous run
-    had excluded -- for that run's reasons, under that run's row cap. The new run then
-    reported a denominator quietly missing them.
+    NO staleness rule here. It used to carry one -- return zeros unless something was
+    restored -- and that conflated two states it could not tell apart: an EXCLUDED case
+    appends nothing to the results file, so a run whose progress is entirely exclusions has
+    real state in the meta and no result rows, and the zero-rows rule threw it away.
+    Measured: two exclusions and 500 tokens lost on resume, and those cases re-probed
+    against the gold to rediscover they are too big.
 
-    ITS ONE CALLER NO LONGER REACHES THAT CASE: `resume_state` calls `_claim_meta` first,
-    which replaces a stale meta with this run's own zeroed one -- zero totals AND an empty
-    `excluded`, so no stale exclusion survives the claim either. The branch stays for the contract rather than the
-    path -- it is what makes this function safe to call directly, and it is the invariant
-    `_claim_meta` would otherwise be the only thing holding. Removing it still fails a test,
-    because that test calls this function directly.
+    Staleness is `_meta_is_orphaned`'s single decision, against a recorded row count. When
+    it says the meta belongs to another run, `_claim_meta` replaces the file before this
+    reads it, so this returns that run's own zeros without a rule of its own.
     """
-    if restored == 0:
-        return 0, 0, []
     path = _meta_path(results_path)
     if not os.path.isfile(path):
         return 0, 0, []
@@ -153,10 +148,16 @@ def resume_state(
     done = _load_done(results_path) if results_path else {}
     assert_grading_rule_unchanged(results_path, duplicate_rows_insignificant, len(done))
     if results_path and not done:
-        _claim_meta(results_path, duplicate_rows_insignificant)
-    tokens, calls, excluded = (
-        _load_meta(results_path, len(done)) if results_path else (0, 0, [])
-    )
+        # TWO decisions, not one. Whether to DISCARD the meta's state is
+        # `_meta_is_orphaned`'s; whether to stamp THIS run's rule into it is separate and
+        # unconditional here, because nothing has been graded yet under the old one. An
+        # exclusion-only run keeps its exclusions -- they are gold-too-big verdicts and owe
+        # nothing to the grading rule -- while still recording the rule about to be used.
+        if _meta_is_orphaned(results_path, len(done)):
+            _claim_meta(results_path, duplicate_rows_insignificant)
+        else:
+            _restamp_rule(results_path, duplicate_rows_insignificant)
+    tokens, calls, excluded = _load_meta(results_path) if results_path else (0, 0, [])
     return done, tokens, calls, excluded
 
 
@@ -183,7 +184,64 @@ def _claim_meta(results_path: str, duplicate_rows_insignificant: bool) -> None:
     this run appends has its rule already on disk. Totals start at zero because this run has
     spent nothing yet; the first checkpoint overwrites them.
     """
-    _save_meta(results_path, 0, 0, [], duplicate_rows_insignificant)
+    _save_meta(results_path, 0, 0, [], duplicate_rows_insignificant, results_rows=0)
+
+
+def _restamp_rule(results_path: str, duplicate_rows_insignificant: bool) -> None:
+    """Record the rule this run will grade under, keeping the meta's accumulated state.
+
+    Reached when nothing was restored and the meta is NOT orphaned -- an exclusion-only run
+    mid-flight, or one whose rule was claimed and which has not produced a row yet. Its
+    totals and exclusions are real and stay; only the rule is this run's to set, and it is
+    safe to set because no row has been graded under the old one.
+
+    Without this, deleting the results file of an exclusion-only run and re-running under
+    the other rule left a meta claiming the rule that was NOT used.
+    """
+    path = _meta_path(results_path)
+    if not os.path.isfile(path):
+        # A brand-new --results path. Writing the rule here is the whole point of stamping
+        # before the first row: without it the run appends rows whose rule was never
+        # recorded, and `assert_grading_rule_unchanged` refuses that on the next resume.
+        # `run_bird` checkpoints only after a whole db group, so a single-db run or a kill
+        # inside the first group would be unresumable.
+        _save_meta(results_path, 0, 0, [], duplicate_rows_insignificant, results_rows=0)
+        return
+    with open(path) as fh:
+        m = json.load(fh)
+    _save_meta(results_path, m.get("tokens", 0), m.get("llm_calls", 0), m.get("excluded", []),
+               duplicate_rows_insignificant, results_rows=m.get("results_rows"))
+
+
+def _meta_is_orphaned(results_path: str, restored: int) -> bool:
+    """Whether the meta beside this results file belongs to a DIFFERENT run.
+
+    Emptiness cannot answer this, and reading it as if it could destroyed real state. An
+    EXCLUDED case appends nothing to the results file -- it lands only in the meta's
+    `excluded` -- so a run whose progress so far is entirely exclusions has a populated meta
+    and no result rows, which looks exactly like a fresh run beside a leftover meta.
+
+    So the meta records how many result rows it was written beside, and rows DISAPPEARING is
+    what makes it stale -- `recorded > restored`, not `!=`. The meta is written at checkpoint
+    boundaries while results are appended per case, so a meta that lags behind the file is
+    the ordinary mid-flight state, not evidence of anything: 5 recorded against 7 restored is
+    a run that progressed since its last checkpoint. 1 against 0 is a results file that was
+    deleted, and 0 against 0 is an exclusion-only run.
+
+    Getting this wrong as `!=` would have discarded the last checkpoint's totals and
+    exclusions on every resume of a run killed between a row and a checkpoint -- caught by
+    the seam test walking that exact sequence.
+
+    An older meta carries no such count, and unknown is not a match -- the same reading the
+    grading rule gets, for the same reason.
+    """
+    if not os.path.isfile(_meta_path(results_path)):
+        return False  # no meta to orphan; `_restamp_rule` writes the first one
+    with open(_meta_path(results_path)) as fh:
+        recorded = json.load(fh).get("results_rows")
+    if recorded is None:
+        return True
+    return recorded > restored
 
 
 def source_rev() -> str:
@@ -246,7 +304,8 @@ def untracked_count() -> int:
 
 
 def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str],
-               duplicate_rows_insignificant: bool | None = None) -> None:
+               duplicate_rows_insignificant: bool | None = None,
+               results_rows: int | None = None) -> None:
     """Write the run's metadata beside its results.
 
     `duplicate_rows_insignificant` is recorded because the results file is RESUMABLE and the
@@ -265,6 +324,12 @@ def _save_meta(results_path: str, tokens: int, calls: int, excluded: list[str],
                 "source_rev": source_rev(),
                 "untracked_files": untracked_count(),
                 "duplicate_rows_insignificant": duplicate_rows_insignificant,
+                # How many result ROWS stood beside this meta when it was written. It is
+                # what tells a stale meta from a live one whose progress is entirely
+                # EXCLUSIONS -- an excluded case appends nothing to the results file, so
+                # both look like "no results" and only this says which. `None` is an older
+                # file.
+                "results_rows": results_rows,
             },
             fh,
         )
@@ -514,6 +579,7 @@ def run_bird(
             calls += client.calls
         if results_path is not None:
             _save_meta(results_path, tokens, calls, excluded,
-                       duplicate_rows_insignificant)
+                       duplicate_rows_insignificant,
+                       results_rows=len(results))
 
     return results, {"tokens": tokens, "llm_calls": calls, "excluded": excluded}

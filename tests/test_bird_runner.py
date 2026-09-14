@@ -469,27 +469,65 @@ def test_a_results_file_with_no_meta_at_all_cannot_be_confirmed():
     assert "no metadata file at all" in str(exc.value)
 
 
-def test_a_fresh_run_does_not_inherit_a_stale_metas_totals_or_exclusions():
-    """Why this matters is `_load_meta`'s docstring, which is the one copy -- restating it
-    here is what let the two drift the first time.
+def test_an_exclusion_only_run_is_not_mistaken_for_a_fresh_one():
+    """The state emptiness could not see. An EXCLUDED case appends nothing to the results
+    file -- it lands only in the meta's `excluded` -- so a run whose progress so far is
+    entirely exclusions has real state in the meta and zero result rows, which looks exactly
+    like a fresh run beside a leftover meta.
 
-    What this test adds: the exclusions are the dangerous half. The caller computes `skip` as
-    the union of the restored ids and the meta's `excluded`, so a fresh run would silently
-    never execute cases the PREVIOUS run excluded and then report a denominator missing them.
+    Reading it as fresh threw the state away: measured, two exclusions and 500 tokens lost,
+    and those cases would then be re-probed against the gold to rediscover they are too big.
     """
     import tempfile
 
-    from mnemiq.eval.bird_runner import _load_meta, _save_meta
+    from mnemiq.eval.bird_runner import _meta_is_orphaned, _save_meta
 
     with tempfile.TemporaryDirectory() as d:
         path = f"{d}/results.jsonl"
-        _save_meta(path, 9999, 42, ["bird-7", "bird-8"], True)
 
-        # Resuming: the file's own totals carry forward.
-        assert _load_meta(path, restored=5) == (9999, 42, ["bird-7", "bird-8"])
+        # Written beside zero rows, and zero restored: the same run, mid-flight.
+        _save_meta(path, 500, 3, ["bird-4"], True, results_rows=0)
+        assert not _meta_is_orphaned(path, restored=0), "exclusion-only progress read as stale"
 
-        # Fresh: nothing was restored, so the meta describes a different run.
-        assert _load_meta(path, restored=0) == (0, 0, [])
+        # Written beside one row and none restored: the results file was deleted.
+        _save_meta(path, 500, 3, ["bird-4"], True, results_rows=1)
+        assert _meta_is_orphaned(path, restored=0), "a deleted results file read as live"
+
+        # An older meta records no count, and unknown is not a match.
+        _save_meta(path, 500, 3, ["bird-4"], True)
+        assert _meta_is_orphaned(path, restored=0)
+
+        # A meta LAGGING the file is the ordinary mid-flight state, not staleness: results
+        # are appended per case while the meta is written at checkpoints. Reading this as
+        # `!=` discarded the last checkpoint's totals and exclusions on every resume of a
+        # run killed between a row and a checkpoint.
+        _save_meta(path, 500, 3, ["bird-4"], True, results_rows=5)
+        assert not _meta_is_orphaned(path, restored=7), "a lagging meta read as stale"
+        assert _meta_is_orphaned(path, restored=4), "rows disappeared and it read as live"
+
+
+def test_an_exclusion_only_run_keeps_its_state_when_the_rule_changes():
+    """Discarding state and stamping the rule are separate decisions.
+
+    An exclusion-only run's `excluded` entries are gold-too-big verdicts that owe nothing to
+    the grading rule, so they survive a change of rule. The rule itself must still be
+    restamped -- nothing has been graded under the old one, and leaving it would have the
+    meta claim a rule the run does not use.
+    """
+    import json
+    import tempfile
+
+    from mnemiq.eval.bird_runner import _meta_path, _save_meta, resume_state
+
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/results.jsonl"
+        _save_meta(path, 500, 3, ["bird-4"], True, results_rows=0)
+
+        done, tokens, calls, excluded = resume_state(path, False)
+        assert (done, tokens, calls, excluded) == ({}, 500, 3, ["bird-4"]), \
+            "an exclusion-only run lost its state to a rule change"
+        assert json.load(open(_meta_path(path)))["duplicate_rows_insignificant"] is False, \
+            "the meta still claims a rule this run does not use"
 
 
 def test_resume_state_is_the_seam_all_three_runners_share():
@@ -521,7 +559,7 @@ def test_resume_state_is_the_seam_all_three_runners_share():
 
         # 1. A real resume under the same rule: results and totals both come back.
         _append_result(path, row("bird-1"))
-        _save_meta(path, 9999, 42, ["bird-7"], True)
+        _save_meta(path, 9999, 42, ["bird-7"], True, results_rows=1)
         done, tokens, calls, excluded = resume_state(path, True)
         assert set(done) == {"bird-1"}
         assert (tokens, calls, excluded) == (9999, 42, ["bird-7"])
@@ -536,6 +574,7 @@ def test_resume_state_is_the_seam_all_three_runners_share():
         claimed = json.load(open(meta))
         assert claimed["excluded"] == [] and claimed["tokens"] == 0, "stale meta survived"
         assert claimed["duplicate_rows_insignificant"] is True, "the rule was not claimed"
+        assert claimed["results_rows"] == 0, "the claim must record the rows it stands beside"
 
         # 4. That fresh run answers one case and is killed. Resuming must stay clean AND must
         #    not be refused: without the claim in step 3 these rows would have no recorded
@@ -562,17 +601,64 @@ def test_resume_state_is_the_seam_all_three_runners_share():
 def test_resume_state_handles_a_run_with_no_results_path():
     """Every run without `--results`, and nothing else covered it.
 
-    `resume_state` has TWO `if results_path` guards and they are not equally load-bearing.
-    Both measured by deleting each in turn:
+    `resume_state` has two `if results_path` guards and BOTH are load-bearing now. Measured
+    by deleting each in turn: the `_load_done` one raises `os.path.isfile(None)` TypeError,
+    and the `_load_meta` one raises on `None + str` when it builds a meta path, since
+    `_load_meta` no longer carries a restored-count early return to stop short of it.
 
-      * the `_load_done` one IS load-bearing -- dropping it fails this test, because
-        `os.path.isfile(None)` raises TypeError
-      * the `_load_meta` one is belt-and-braces -- dropping it leaves this test green, since
-        `done` is empty here so `restored` is 0 and `_load_meta` returns before it builds a
-        meta path
-
-    Keep both. The second earns its place only if that early return is ever reordered, and
-    this test does not pin it."""
+    That second half used to be belt-and-braces and this docstring said so. Moving the
+    staleness decision out of `_load_meta` inverted it, which is why the claim is
+    re-measured here rather than carried."""
     from mnemiq.eval.bird_runner import resume_state
 
     assert resume_state(None, True) == ({}, 0, 0, [])
+
+
+def test_a_fresh_results_path_gets_its_rule_recorded_before_the_first_row():
+    """No meta at all is the state a brand-new `--results` path starts in, and no test
+    entered `resume_state` that way -- every other one writes a meta by hand first.
+
+    It matters because `run_bird` checkpoints only after a whole db group: without the rule
+    on disk from the start, a single-db run, or a kill inside the first group, appends rows
+    whose rule was never recorded and cannot be resumed without deleting them.
+    """
+    import json
+    import os
+    import tempfile
+
+    from mnemiq.eval.bird_runner import _append_result, _meta_path, resume_state
+
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/results.jsonl"
+        assert resume_state(path, True) == ({}, 0, 0, [])
+        assert os.path.isfile(_meta_path(path)), "a fresh run recorded no rule"
+        m = json.load(open(_meta_path(path)))
+        assert m["duplicate_rows_insignificant"] is True and m["results_rows"] == 0
+
+        # And the row it then appends is resumable rather than unconfirmable.
+        _append_result(path, _mk("bird-1", Outcome.CORRECT, "simple", "shop"))
+        assert resume_state(path, True)[1:] == (0, 0, [])
+
+
+def test_every_runner_checkpoint_records_the_row_count_it_stands_beside():
+    """`_meta_is_orphaned` reads a missing `results_rows` as orphaned, so a checkpoint that
+    omits it makes every resume of that runner wipe the meta -- which is exactly what the
+    BIRD runner did until this was caught.
+
+    Asserted against the source because no test drives these runners: `run_bird`,
+    `run_minidev_pg` and `run_spider2` have no callers in the suite, so deleting the argument
+    from any of them otherwise goes unnoticed.
+    """
+    import inspect
+    import re
+
+    from mnemiq.eval import bird_runner, minidev_pg, spider2
+
+    for mod in (bird_runner, minidev_pg, spider2):
+        src = inspect.getsource(mod)
+        checkpoints = re.findall(r"_save_meta\(results_path, tokens, calls, excluded.*?\)",
+                                 src, re.S)
+        assert checkpoints, f"{mod.__name__}: no checkpoint call found -- has it been renamed?"
+        for call in checkpoints:
+            assert "results_rows=" in call, \
+                f"{mod.__name__} checkpoints without results_rows: {call}"
