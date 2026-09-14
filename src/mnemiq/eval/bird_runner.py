@@ -92,11 +92,8 @@ def assert_grading_rule_unchanged(
     """
     if not results_path or restored == 0:
         return
-    # A MISSING meta is the same claim as an unrecorded one -- not a match. Results are
-    # appended per case and the meta is written after, so a run killed in between leaves
-    # exactly this state; so does deleting the meta by hand, which the refusal below tells
-    # operators to do. Returning early here let the guard go silent on the one file shape
-    # its own advice can produce.
+    # A MISSING meta is the same claim as an unrecorded one -- see the third state above.
+    # Returning early here instead let the guard go silent on that file shape.
     has_meta = os.path.isfile(_meta_path(results_path))
     if has_meta:
         with open(_meta_path(results_path)) as fh:
