@@ -466,14 +466,18 @@ class TestRunStatesEndToEnd:
         assert "produced no FINISHED candidate" not in outp, outp
         assert code == 1 and "RUN VOID" in outp, outp
 
-    def test_two_causes_at_once_each_carry_their_own_count(self, tmp_path):
+    def test_three_causes_at_once_each_carry_their_own_count(self, tmp_path):
         """The counts and the cause/remedy pairing, which a single-cause fixture cannot pin.
 
         Every other fixture here has one cause whose count equals the number of cases, so
         `{n_truncated_only}` -> `{n}` left them all green -- and a real mixed run would
         then print both causes with the same total and weight the two remedies wrongly.
-        This corpus is 5 questions: 2 cut off at the cap, 3 answering with no SQL, so the
-        two counts differ from each other AND from `n`.
+        This corpus is 6 questions: 2 cut off at the cap, 3 answering with no SQL, and 1
+        answering fine against a gold that cannot run. So the three counts are 2, 3 and 1
+        -- distinct from each other and none equal to `n` -- which is what makes `{n}`,
+        and any swap between them, observable. The gold cause needed including here: its
+        own test loads one question, so `n_gold_failed == n == 1` there and the
+        substitution this fixture exists to catch stayed green for it.
         """
         import json as _json
         import threading
@@ -486,8 +490,10 @@ class TestRunStatesEndToEnd:
                 nth = seen["n"]
             if nth <= 2:      # cut off, with SQL that must be discarded unexecuted
                 content, why = "```sql\nSELECT count(*) FROM t\n```", "length"
-            else:             # finished, but nothing extractable
+            elif nth <= 5:    # finished, but nothing extractable
                 content, why = "I cannot answer that.", "stop"
+            else:             # finished with good SQL -- the GOLD is what fails here
+                content, why = "```sql\nSELECT count(*) FROM t\n```", "stop"
             payload = _json.dumps({"choices": [
                 {"message": {"content": content}, "finish_reason": why}]}).encode()
             h.send_response(200)
@@ -496,15 +502,20 @@ class TestRunStatesEndToEnd:
             h.end_headers()
             h.wfile.write(payload)
 
-        five = [{"question_id": i, "db_id": "toy", "question": f"q{i}",
-                 "SQL": "SELECT count(*) FROM t", "difficulty": "simple", "evidence": ""}
-                for i in range(1, 6)]
-        code, outp, rows = self._run(body, tmp_path, questions=five)
+        corpus = [{"question_id": i, "db_id": "toy", "question": f"q{i}",
+                   # the last one's gold names a table that does not exist
+                   "SQL": ("SELECT * FROM no_such_table" if i == 6
+                           else "SELECT count(*) FROM t"),
+                   "difficulty": "simple", "evidence": ""}
+                  for i in range(1, 7)]
+        code, outp, rows = self._run(body, tmp_path, questions=corpus)
 
-        assert len(rows) == 5, outp
-        # Distinct counts, each beside its own cause -- neither is 5, so `{n}` cannot pass
+        assert len(rows) == 6, outp
+        # 2, 3 and 1 -- each beside its own cause, none equal to 6, so `{n}` cannot pass
+        # and no two can be swapped without breaking an assertion.
         assert "2 produced no FINISHED candidate (raise --max-tokens)" in outp, outp
         assert "3 returned no extractable SQL (check the prompt and the extractor)" in outp, outp
+        assert "1 had a GOLD query that did not run" in outp, outp
         assert code == 1 and "RUN VOID" in outp, outp
 
     def test_a_refused_run_voids_and_says_the_request_was_refused(self, tmp_path):
