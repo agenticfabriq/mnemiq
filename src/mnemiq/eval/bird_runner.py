@@ -92,7 +92,8 @@ def assert_grading_rule_unchanged(
     """
     if not results_path or restored == 0:
         return
-    # A MISSING meta is the same claim as an unrecorded one -- see the third state above.
+    # A MISSING meta is the same claim as an unrecorded one: both land in `stored is None`,
+    # which this function's contract says must refuse.
     # Returning early here instead let the guard go silent on that file shape.
     has_meta = os.path.isfile(_meta_path(results_path))
     if has_meta:
