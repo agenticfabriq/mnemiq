@@ -398,7 +398,9 @@ def test_resuming_under_a_DIFFERENT_rule_refuses():
     assert "mix two rules" in str(exc.value)
     # Deleting the results file alone is NOT clean: the meta survives, and `_load_meta`
     # folds its token totals and excluded ids into the next run. The advice has to say so.
-    assert ".meta.json" in str(exc.value), "the refusal sends the operator to a half-clean state"
+    msg = str(exc.value)
+    assert ".meta.json" in msg and "BOTH" in msg, \
+        "the refusal sends the operator to a half-clean state"
 
 
 def test_a_file_that_never_stated_its_rule_cannot_be_confirmed():
