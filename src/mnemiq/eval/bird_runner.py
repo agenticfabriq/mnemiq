@@ -89,15 +89,23 @@ def assert_grading_rule_unchanged(
     """
     if not results_path or restored == 0:
         return
-    if not os.path.isfile(_meta_path(results_path)):
-        return
-    with open(_meta_path(results_path)) as fh:
-        stored = json.load(fh).get("duplicate_rows_insignificant")
+    # A MISSING meta is the same claim as an unrecorded one -- not a match. Results are
+    # appended per case and the meta is written after, so a run killed in between leaves
+    # exactly this state; so does deleting the meta by hand, which the refusal below tells
+    # operators to do. Returning early here let the guard go silent on the one file shape
+    # its own advice can produce.
+    if os.path.isfile(_meta_path(results_path)):
+        with open(_meta_path(results_path)) as fh:
+            stored = json.load(fh).get("duplicate_rows_insignificant")
+    else:
+        stored = None
     if stored is duplicate_rows_insignificant:
         return
     if os.environ.get("MNEMIQ_ALLOW_MIXED_GRADING") == "1":
         return
-    was = "not recorded" if stored is None else f"duplicate_rows_insignificant={stored}"
+    was = ("not recorded" if os.path.isfile(_meta_path(results_path))
+           else "no metadata file at all") if stored is None \
+        else f"duplicate_rows_insignificant={stored}"
     raise MixedGradingRules(
         f"{results_path} holds {restored} results graded with {was}, and this run grades with "
         f"duplicate_rows_insignificant={duplicate_rows_insignificant}. Resuming would mix two "

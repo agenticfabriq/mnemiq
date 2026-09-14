@@ -441,3 +441,22 @@ def test_the_operator_can_override_deliberately():
             assert_grading_rule_unchanged(path, True, restored=5)
         finally:
             os.environ.pop("MNEMIQ_ALLOW_MIXED_GRADING", None)
+
+
+def test_a_results_file_with_no_meta_at_all_cannot_be_confirmed():
+    """The shape the guard's own advice produces. Results are appended per case and the meta
+    is written after, so a kill in between leaves results with no meta -- and the refusal
+    tells operators to delete the meta, so deleting only that one lands here too.
+
+    Returning early on a missing meta let the guard go silent on exactly that file.
+    """
+    import tempfile
+
+    import pytest
+
+    from mnemiq.eval.bird_runner import MixedGradingRules, assert_grading_rule_unchanged
+
+    with tempfile.TemporaryDirectory() as d:
+        with pytest.raises(MixedGradingRules) as exc:
+            assert_grading_rule_unchanged(f"{d}/results.jsonl", True, restored=5)
+    assert "no metadata file at all" in str(exc.value)
