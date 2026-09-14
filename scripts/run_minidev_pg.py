@@ -88,6 +88,9 @@ def main() -> int:
         cache_dir=args.cache, on_case=progress, results_path=args.results,
         workers=args.workers, candidates=args.candidates,
         semantic=not args.no_semantic,
+        # BIRD mini-dev, so BIRD's published `set(pred) == set(gold)` applies here
+        # exactly as it does to the SQLite run (M105).
+        duplicate_rows_insignificant=True,
     )
     report = summarize(results, tokens=use["tokens"], llm_calls=use["llm_calls"])
 

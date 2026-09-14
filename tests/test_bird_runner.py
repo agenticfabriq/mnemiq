@@ -289,9 +289,12 @@ def _dupe_engine_fn():
 
 
 def test_process_db_defaults_to_the_multiset_reading():
-    """`_process_db` is the path a REAL run takes -- `run_bird` dispatches through it, while
-    `_run_grouped` is reached only from this file. Pinning the declaration on the test-only
-    helper would leave the production path free to drop it."""
+    """`_process_db` is the helper both production runners dispatch through -- `run_bird` and
+    `run_minidev_pg` -- while `_run_grouped` is reached only from this file.
+
+    What this does NOT reach is the join above it: deleting the argument from either
+    runner's `_process_db(...)` call leaves all of these green. That link is unpinned, and
+    naming it is cheaper than a test that would have to build a whole run."""
     from mnemiq.eval.bird_runner import _process_db
 
     case = _case(1, "shop", "simple").model_copy(update={"gold_sql": "GOLD"})

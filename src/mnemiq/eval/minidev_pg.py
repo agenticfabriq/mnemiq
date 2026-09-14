@@ -41,6 +41,7 @@ def run_minidev_pg(
     workers: int = 1,
     candidates: int = 1,
     semantic: bool = True,
+    duplicate_rows_insignificant: bool = False,
 ) -> tuple[list[CaseResult], dict]:
     """Grouped-by-db, resumable mini-dev PG run. Enrichment is per-db (cached, from the SQLite
     dev_databases -- dialect-agnostic); execution is against `bird_dev` (pg_dsn) via DuckDB;
@@ -76,7 +77,11 @@ def run_minidev_pg(
             gold_adapter = PostgresAdapter(pg_dsn)  # gold PG SQL on native Postgres
             return ask, engine_adapter, gold_adapter, client
 
-        out, clients = _process_db(remaining, _build, max_rows_cap, workers)
+        # Declared, or this run grades BIRD under a different rule from the SQLite one
+        # and the repo reports two BIRD numbers (M105). Positional args here are what
+        # let it default silently when `_process_db` gained the parameter.
+        out, clients = _process_db(remaining, _build, max_rows_cap, workers,
+                                   duplicate_rows_insignificant)
 
         for kind, payload in out:
             processed += 1
