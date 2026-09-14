@@ -138,6 +138,25 @@ def assert_grading_rule_unchanged(
     )
 
 
+def resume_state(
+    results_path: str | None, duplicate_rows_insignificant: bool
+) -> tuple[dict[str, CaseResult], int, int, list[str]]:
+    """Everything a resumed run restores, decided once: prior results, prior totals, prior
+    exclusions -- and the refusal when the stored rows were graded under another rule.
+
+    One function because the three runners had the same four lines each and the JOIN between
+    them is where this went wrong twice. `_load_meta` is correct on its own and was pinned on
+    its own, and passing it a literal instead of `len(done)` restored the stale-metadata bug
+    with all 2143 tests green. A helper the runners share is a seam a test can hold.
+    """
+    done = _load_done(results_path) if results_path else {}
+    assert_grading_rule_unchanged(results_path, duplicate_rows_insignificant, len(done))
+    tokens, calls, excluded = (
+        _load_meta(results_path, len(done)) if results_path else (0, 0, [])
+    )
+    return done, tokens, calls, excluded
+
+
 def source_rev() -> str:
     """The mnemiq revision that produced a run, for a consumer's provenance record.
 
@@ -420,11 +439,8 @@ def run_bird(
     for case in cases:
         by_db.setdefault(case.db_id, []).append(case)
 
-    done_results = _load_done(results_path) if results_path else {}
-    assert_grading_rule_unchanged(results_path, duplicate_rows_insignificant,
-                                  len(done_results))
-    tokens, calls, excluded = (_load_meta(results_path, len(done_results))
-                                if results_path else (0, 0, []))
+    done_results, tokens, calls, excluded = resume_state(
+        results_path, duplicate_rows_insignificant)
     skip = set(done_results) | set(excluded)
 
     results: list[CaseResult] = list(done_results.values())

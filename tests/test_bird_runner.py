@@ -490,3 +490,48 @@ def test_a_fresh_run_does_not_inherit_a_stale_metas_totals_or_exclusions():
 
         # Fresh: nothing was restored, so the meta describes a different run.
         assert _load_meta(path, restored=0) == (0, 0, [])
+
+
+def test_resume_state_is_the_seam_all_three_runners_share():
+    """The JOIN, which is where this went wrong twice.
+
+    `_load_meta` is correct on its own and pinned on its own, and passing it a literal
+    instead of `len(done)` restored the stale-metadata bug with the whole suite green. The
+    three runners each had the same four lines; now they call this, and this is held here.
+    """
+    import json
+    import tempfile
+
+    from mnemiq.eval.bird_runner import _append_result, _save_meta, resume_state
+
+    with tempfile.TemporaryDirectory() as d:
+        path = f"{d}/results.jsonl"
+        _append_result(path, _mk("bird-1", Outcome.CORRECT, "simple", "shop"))
+        _save_meta(path, 9999, 42, ["bird-7"], True)
+
+        # Resuming under the same rule: prior results and prior totals both come back.
+        done, tokens, calls, excluded = resume_state(path, True)
+        assert set(done) == {"bird-1"}
+        assert (tokens, calls, excluded) == (9999, 42, ["bird-7"])
+
+        # Fresh: results gone, meta left behind. Nothing may carry over -- not the totals,
+        # and above all not the exclusions, which would silently shrink the denominator.
+        import os
+
+        os.remove(path)
+        done, tokens, calls, excluded = resume_state(path, True)
+        assert done == {}
+        assert (tokens, calls, excluded) == (0, 0, []), "a fresh run inherited a stale meta"
+        assert json.load(open(f"{path}.meta.json"))["excluded"] == ["bird-7"], \
+            "the meta itself should be untouched -- it is ignored, not rewritten here"
+
+        # The seam's other job. Removing the rule check from it leaves the two assertions
+        # above green, so it has to be exercised here rather than only through
+        # `assert_grading_rule_unchanged` directly.
+        import pytest
+
+        from mnemiq.eval.bird_runner import MixedGradingRules
+
+        _append_result(path, _mk("bird-1", Outcome.CORRECT, "simple", "shop"))
+        with pytest.raises(MixedGradingRules):
+            resume_state(path, False)

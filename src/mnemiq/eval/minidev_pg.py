@@ -17,9 +17,7 @@ from mnemiq.config import Settings
 from mnemiq.contract import EvaluationCase
 from mnemiq.eval.bird_runner import (
     _append_result,
-    _load_done,
-    assert_grading_rule_unchanged,
-    _load_meta,
+    resume_state,
     _process_db,
     _save_meta,
     enrich_bird_db,
@@ -61,11 +59,8 @@ def run_minidev_pg(
     for case in cases:
         by_db.setdefault(case.db_id, []).append(case)
 
-    done_results = _load_done(results_path) if results_path else {}
-    assert_grading_rule_unchanged(results_path, duplicate_rows_insignificant,
-                                  len(done_results))
-    tokens, calls, excluded = (_load_meta(results_path, len(done_results))
-                                if results_path else (0, 0, []))
+    done_results, tokens, calls, excluded = resume_state(
+        results_path, duplicate_rows_insignificant)
     skip = set(done_results) | set(excluded)
 
     results: list[CaseResult] = list(done_results.values())
