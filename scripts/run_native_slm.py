@@ -550,6 +550,7 @@ def main() -> int:
     schema_cache: dict[str, str] = {}
     counts = {"correct": 0, "wrong": 0, "error": 0}
     n_empty_sql = 0
+    n_truncated_only = 0
     n_transport = 0
     n_votes_for_winner = n_groups_total = 0
 
@@ -585,8 +586,9 @@ def main() -> int:
                 if why == "length":
                     truncated.append(case.id)
         except RequestRejected as exc:
-            # The server answered and refused. Not a transport fault, so it does not void
-            # the run -- but it is not an answer either, so it grades as no SQL.
+            # The server answered and REFUSED. It is not a transport fault -- the network
+            # worked -- but the question still went unanswered, so it voids the run under
+            # the same rule, and is named apart in the summary because the fix differs.
             print(f"  REQUEST REJECTED for {case.id}: {exc}", file=sys.stderr)
             rejected.append(case.id)
             # NOT `[""]`: that is indistinguishable from a model that answered nothing, and
@@ -634,11 +636,15 @@ def main() -> int:
                 i = next(counter)
                 if result is None or not result[2]:
                     unreached.append(case.id)
+                elif all(r == "length" for r in result[2]):
+                    pass    # counted in `truncated`; NOT no_sql, whose fix is a different one
                 elif not any((q or "").strip() for q in (result[0] or [])):
                     # A 200 carrying no fence and no SELECT is the OTHER way this meter can
                     # reassure about a run that produced nothing: finish reasons are present,
                     # so the unreached check above passes it. Keying on the extracted SQL
-                    # already in hand is what distinguishes the two.
+                    # already in hand is what distinguishes the two. Kept apart from
+                    # truncation above because the operator's next move differs: extraction
+                    # or the prompt here, `--max-tokens` there.
                     no_sql.append(case.id)
                 # i == 1 as well as every 25th: the first line must not wait for 25
                 # completions, because per-case latency is exactly what goes pathological
@@ -676,6 +682,7 @@ def main() -> int:
     with open(args.out, "w") as out:
         for i, (case, (sql, ms, reasons, _raw)) in enumerate(zip(cases, generated), 1):
             was_truncated = any(r == "length" for r in reasons)
+            all_truncated = bool(reasons) and all(r == "length" for r in reasons)
             db = case.db_id or ""
             if sql is not None:
                 # Drop the candidates that never finished. `truncated` used to be metadata
@@ -696,13 +703,22 @@ def main() -> int:
                 n_transport += 1
                 out.write(json.dumps({
                     "case_id": case.id, "outcome": "error", "sql": "",
-                    "db_id": db, "ms": round(ms, 1), "error": "transport",
+                    "db_id": db, "ms": round(ms, 1),
+                    # beacon ingests this row: a 4xx labelled "transport" sends whoever
+                    # reads it at the network instead of at the request.
+                    "error": "rejected" if case.id in rejected else "transport",
                     "prompt_style": args.prompt_style, "truncated": was_truncated,
                 }) + "\n")
                 counts["error"] = counts.get("error", 0) + 1
                 continue
             if not sql:
-                n_empty_sql += 1
+                # A fully-truncated case arrives as [""] and would otherwise be reported as
+                # `empty-sql`, sending the operator to look at extraction when the fix is
+                # `--max-tokens`. Same value, two causes, different remedies.
+                if all_truncated:
+                    n_truncated_only += 1
+                else:
+                    n_empty_sql += 1
 
             cand = cand_tbl
             gold = exec_sql(case.gold_sql, db) if case.gold_sql else None
@@ -753,7 +769,9 @@ def main() -> int:
               f"mean winning votes {n_votes_for_winner / graded:.2f}/{args.candidates}  "
               f"mean distinct result groups {n_groups_total / graded:.2f}")
     print(f"correct={counts['correct']} wrong={counts['wrong']} "
-          f"error={counts['error']}  empty-sql={n_empty_sql}  transport-failed={n_transport}")
+          f"error={counts['error']}  empty-sql={n_empty_sql}  "
+          f"no-finished-candidate={n_truncated_only}  unanswered={n_transport}"
+          + (f" (of which {len(rejected)} refused 4xx)" if rejected else ""))
     print(f"wrote {args.out}")
 
     # A run that could not reach the server for some of its questions has no score. Printing
@@ -762,7 +780,7 @@ def main() -> int:
         # Rejections are counted here too: both mean the question was never answered, which
         # is the condition this rule exists for. They are named apart because the fix
         # differs -- a transport fault is the network, a 4xx is the request.
-        why = f"{n_transport}/{n} questions never reached the model"
+        why = f"{n_transport}/{n} questions went UNANSWERED"
         if rejected:
             why += (f" ({len(rejected)} of them REFUSED by the server with a 4xx -- check "
                     f"context length and the model name, e.g. {rejected[:3]})")

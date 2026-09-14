@@ -11,6 +11,7 @@ import decimal
 import importlib.util
 import pathlib
 import sqlite3
+import sys
 import time
 
 import pyarrow as pa
@@ -300,3 +301,71 @@ class TestUsableCandidates:
         # another could carry the case. Two truncated against one finished must not.
         kept = slm.usable_candidates(["BAD", "BAD", "SELECT 1"], ["length", "length", "stop"])
         assert kept == ["SELECT 1"]
+
+
+@pytest.mark.skipif(not (pathlib.Path(slm.MINIDEV) / "mini_dev_sqlite.json").exists(),
+                    reason="needs the BIRD mini-dev tree")
+class TestTruncationEndToEnd:
+    """The FILTER's join, which unit tests cannot reach.
+
+    `usable_candidates` is covered directly, and that proved nothing about whether anyone
+    calls it: reverting `gen_one` to return the unfiltered list bypassed the filter with
+    every other test green. This runs the script against a server that returns the case's
+    own GOLD query, twice, changing only `finish_reason` -- so the SQL is byte-identical
+    and the grade is the only thing that can differ.
+    """
+
+    def _serve(self, payload, finish_reason, port):
+        import http.server
+        import json as _json
+        import threading
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                body = _json.dumps({"choices": [
+                    {"message": {"content": f"```sql\n{payload}\n```"},
+                     "finish_reason": finish_reason}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+
+    def _run(self, finish_reason, port, tmp_path):
+        import json as _json
+        import subprocess
+
+        qs = _json.loads((pathlib.Path(slm.MINIDEV) / "mini_dev_sqlite.json").read_text())
+        gold = qs[0]["SQL"].replace("\n", " ")
+        srv = self._serve(gold, finish_reason, port)
+        out = tmp_path / f"{finish_reason}.jsonl"
+        try:
+            subprocess.run(
+                [sys.executable, str(_PATH), "--base-url", f"http://127.0.0.1:{port}/v1",
+                 "--model", "m", "--backend", "sqlite", "--engine", "SQLite",
+                 "--prompt-style", "arctic", "--limit", "1", "--concurrency", "1",
+                 "--timeout", "20", "--out", str(out)],
+                capture_output=True, text=True, timeout=180, check=False)
+        finally:
+            srv.shutdown()
+        rows = [_json.loads(x) for x in out.read_text().splitlines() if x.strip()]
+        assert len(rows) == 1, f"expected one graded row, got {rows}"
+        return rows[0]
+
+    def test_the_gold_query_grades_correct_when_it_finished(self, tmp_path):
+        # The positive control. Without it, "length grades wrong" could mean the harness
+        # simply cannot grade this case correct under any circumstances.
+        assert self._run("stop", 8781, tmp_path)["outcome"] == "correct"
+
+    def test_the_same_gold_query_grades_wrong_when_truncated(self, tmp_path):
+        row = self._run("length", 8782, tmp_path)
+        assert row["truncated"] is True
+        assert row["outcome"] == "wrong", "an unfinished answer graded as a right one"
