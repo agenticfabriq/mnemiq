@@ -547,12 +547,17 @@ def test_resume_state_is_the_seam_all_three_runners_share():
 def test_resume_state_handles_a_run_with_no_results_path():
     """Every run without `--results`, and nothing else covered it.
 
-    What holds this up is NOT the `if results_path` ternary, which is belt-and-braces:
-    measured by deleting it, and this test still passes. With no results path `done` is
-    always empty, so `restored` is 0 and `_load_meta` returns before it builds a meta path
-    -- `os.path.isfile(None)` does raise TypeError, but nothing reaches it. The ternary
-    earns its place only if that early return is ever reordered, so keep both and do not
-    read this test as pinning the ternary."""
+    `resume_state` has TWO `if results_path` guards and they are not equally load-bearing.
+    Both measured by deleting each in turn:
+
+      * the `_load_done` one IS load-bearing -- dropping it fails this test, because
+        `os.path.isfile(None)` raises TypeError
+      * the `_load_meta` one is belt-and-braces -- dropping it leaves this test green, since
+        `done` is empty here so `restored` is 0 and `_load_meta` returns before it builds a
+        meta path
+
+    Keep both. The second earns its place only if that early return is ever reordered, and
+    this test does not pin it."""
     from mnemiq.eval.bird_runner import resume_state
 
     assert resume_state(None, True) == ({}, 0, 0, [])
