@@ -52,18 +52,19 @@ def _meta_path(results_path: str) -> str:
 def _load_meta(results_path: str, restored: int) -> tuple[int, int, list[str]]:
     """Carry forward a resumed run's totals -- and ONLY a resumed run's.
 
-    `restored` is how many results `_load_done` actually brought back. When it is zero the
-    meta is stale: the results file is gone or empty, so this is a fresh run and the meta
-    beside it describes a different one. Folding it in anyway inflated the new run's token
-    and call totals and, because the caller computes `skip` as the union of the restored ids
-    and the meta's `excluded`, SILENTLY SKIPPED cases the previous run had excluded -- for
-    that run's reasons, under that run's row cap. The new run then reports a denominator
-    quietly missing them.
+    `restored` is how many results `_load_done` actually brought back. When it is zero this
+    is a fresh run, so a meta beside it belongs to a different one. Folding it in inflated
+    the new run's token and call totals and, because the caller computes `skip` as the union
+    of the restored ids and the meta's `excluded`, SILENTLY SKIPPED cases the previous run
+    had excluded -- for that run's reasons, under that run's row cap. The new run then
+    reported a denominator quietly missing them.
 
-    Deleting the results file and leaving the meta is the ordinary way to reach this, and it is
-    what the grading-rule refusal RECOMMENDS -- safe precisely because of this check, and not
-    safe without it. Anyone weakening the `restored == 0` branch should read that message
-    first.
+    ITS ONE CALLER NO LONGER REACHES THAT CASE: `resume_state` calls `_claim_meta` first,
+    which replaces a stale meta with this run's own zeroed one, so by the time this reads
+    the file the totals are already zero. The branch stays for the contract rather than the
+    path -- it is what makes this function safe to call directly, and it is the invariant
+    `_claim_meta` would otherwise be the only thing holding. Removing it still fails a test,
+    because that test calls this function directly.
     """
     if restored == 0:
         return 0, 0, []
