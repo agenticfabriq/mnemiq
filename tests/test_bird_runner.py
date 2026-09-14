@@ -267,12 +267,54 @@ def _dupe_build(db_id):
     return ask, adapter
 
 
-def test_run_grouped_defaults_to_the_multiset_reading():
-    results = _run_grouped([_case(1, "shop", "simple")], _dupe_build, gold_sql_sentinel="GOLD")
+def _dupe_engine_fn():
+    """The shape `_process_db` builds: (ask, engine_adapter, gold_adapter, client)."""
+
+    class _A:
+        def execute(self, sql):
+            return [(1,)]  # _gold_too_big probe: under any cap
+
+        def execute_arrow(self, sql, timeout_s=None):
+            return pa.table({"n": [1, 1, 2]} if sql == "GOLD" else {"n": [1, 2]})
+
+    def ask(_q):
+        return AgentAnswer(answer="1,2", trace=_trace(), deferred=False)
+
+    class _Client:
+        total_tokens = 7
+        calls = 1
+
+    a = _A()
+    return ask, a, a, _Client()
+
+
+def test_process_db_defaults_to_the_multiset_reading():
+    """`_process_db` is the path a REAL run takes -- `run_bird` dispatches through it, while
+    `_run_grouped` is reached only from this file. Pinning the declaration on the test-only
+    helper would leave the production path free to drop it."""
+    from mnemiq.eval.bird_runner import _process_db
+
+    case = _case(1, "shop", "simple").model_copy(update={"gold_sql": "GOLD"})
+    out, _ = _process_db([case], _dupe_engine_fn, max_rows_cap=1000, workers=1)
+    results = [r for kind, r in out if kind == "result"]
     assert results[0].outcome is Outcome.WRONG, "collapsed without a declaration"
 
 
+def test_process_db_passes_a_declaration_through_to_the_grader():
+    from mnemiq.eval.bird_runner import _process_db
+
+    case = _case(1, "shop", "simple").model_copy(update={"gold_sql": "GOLD"})
+    out, _ = _process_db([case], _dupe_engine_fn, max_rows_cap=1000, workers=1,
+                         dupes_ok=True)
+    results = [r for kind, r in out if kind == "result"]
+    assert results[0].outcome is Outcome.CORRECT, "the declaration did not reach run_case"
+
+
 def test_run_grouped_passes_a_declaration_through_to_the_grader():
+    """The sibling path, kept because `_run_grouped` takes the same argument and would
+    otherwise be the one place it could silently stop being threaded."""
+    results = _run_grouped([_case(1, "shop", "simple")], _dupe_build, gold_sql_sentinel="GOLD")
+    assert results[0].outcome is Outcome.WRONG, "collapsed without a declaration"
     results = _run_grouped([_case(1, "shop", "simple")], _dupe_build,
                            gold_sql_sentinel="GOLD", dupes_ok=True)
     assert results[0].outcome is Outcome.CORRECT, "the declaration did not reach run_case"
