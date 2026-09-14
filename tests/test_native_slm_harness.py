@@ -315,8 +315,8 @@ class TestRunStatesEndToEnd:
     one builds its own two-row corpus and runs anywhere.
     """
 
-    def _corpus(self, tmp_path):
-        """A mini-dev tree with one table, one row, and two questions."""
+    def _corpus(self, tmp_path, questions=None):
+        """A mini-dev tree with one table, one row, and (by default) two questions."""
         import json as _json
         import sqlite3 as _sq
 
@@ -329,7 +329,7 @@ class TestRunStatesEndToEnd:
         con.close()
         (root / "dev_tables.json").write_text(_json.dumps(
             [{"db_id": "toy", "table_names_original": ["t"]}]))
-        (root / "mini_dev_sqlite.json").write_text(_json.dumps([
+        (root / "mini_dev_sqlite.json").write_text(_json.dumps(questions or [
             {"question_id": 1, "db_id": "toy", "question": "how many rows?",
              "SQL": "SELECT count(*) FROM t", "difficulty": "simple", "evidence": ""},
             {"question_id": 2, "db_id": "toy", "question": "what is b?",
@@ -375,11 +375,11 @@ class TestRunStatesEndToEnd:
         h.end_headers()
         h.wfile.write(b"{}")
 
-    def _run(self, handler_body, tmp_path, extra=()):
+    def _run(self, handler_body, tmp_path, extra=(), questions=None):
         import json as _json
         import subprocess
 
-        root = self._corpus(tmp_path)
+        root = self._corpus(tmp_path, questions)
         srv, port = self._serve(handler_body)
         out = tmp_path / "run.jsonl"
         env = {**os.environ, "MNEMIQ_MINIDEV_DIR": str(root)}
@@ -414,6 +414,9 @@ class TestRunStatesEndToEnd:
         assert all(r["outcome"] != "correct" for r in rows), "unfinished graded as right"
         assert "RUN VOID" in outp and "no-finished-candidate=2" in outp, outp
         assert code == 1 and "NATIVE_CONTROL_EXIT=1" in outp, outp
+        # The live meter has to say so too, in its own words: the summary below says
+        # TRUNCATED whatever the meter does, so a bare substring would not pin it.
+        assert "2 TRUNCATED" in outp, "the progress meter gave no in-flight signal"
 
     def test_a_partly_truncated_case_is_not_reported_as_truncated(self, tmp_path):
         """`all` not `any`: the two counters send the operator to different fixes.
@@ -445,4 +448,28 @@ class TestRunStatesEndToEnd:
         code, outp, rows = self._run(self._refuse, tmp_path)
         assert [r.get("error") for r in rows] == ["rejected", "rejected"], outp
         assert "REFUSED" in outp and "RUN VOID" in outp, outp
+        assert code == 1, outp
+
+
+    def test_a_run_whose_gold_never_executes_publishes_no_number(self, tmp_path):
+        """The third state the void claims to cover, and the only one that was unreached.
+
+        Dropping `gold is not None` from the `n_scored` condition left every other test
+        green, and under that mutation a corpus whose gold SQL cannot run reports EX=0.00%
+        and exits 0 -- a number about the harness's own fixture, not the model.
+        """
+        broken = [{"question_id": 1, "db_id": "toy", "question": "q",
+                   "SQL": "SELECT * FROM no_such_table", "difficulty": "simple",
+                   "evidence": ""}]
+        code, outp, rows = self._run(self._completion("SELECT count(*) FROM t", "stop"),
+                                     tmp_path, questions=broken)
+        assert [r["outcome"] for r in rows] == ["error"], outp
+        assert "RUN VOID" in outp and "no question produced a finished answer" in outp, outp
+        assert code == 1, outp
+
+    def test_a_filter_that_selects_no_cases_publishes_no_number(self, tmp_path):
+        """`and n` exempted this: a `--db` typo measured nothing and printed EX over all 0."""
+        code, outp, _rows = self._run(self._completion("SELECT count(*) FROM t", "stop"),
+                                      tmp_path, extra=("--db", "nosuchdb"))
+        assert "EX=0.00% over all 0" not in outp, outp
         assert code == 1, outp

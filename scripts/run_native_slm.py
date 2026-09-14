@@ -161,6 +161,16 @@ Output Format:
 ARCTIC_PREFILL = "Let me solve this step by step. \n<think>"
 
 
+def all_truncated(reasons: list[str]) -> bool:
+    """Did EVERY candidate stop at the token cap?
+
+    One definition on purpose. This lived twice -- once in the progress meter, once in the
+    grading loop -- and a mutation of either copy left the other correct, so the two
+    counters it feeds could disagree and only one was pinned by a test.
+    """
+    return bool(reasons) and all(r == "length" for r in reasons)
+
+
 def usable_candidates(sqls: list[str], reasons: list[str]) -> list[str]:
     """The candidates that may be executed, voted with and graded.
 
@@ -641,7 +651,7 @@ def main() -> int:
                 i = next(counter)
                 if result is None or not result[2]:
                     unreached.append(case.id)
-                elif all(r == "length" for r in result[2]):
+                elif all_truncated(result[2]):
                     # Its own bucket, not `no_sql`: same symptom, different remedy. It must
                     # still reach the meter -- taking it out of `no_sql` without adding it
                     # here left an all-truncating run printing a clean `generated 30/30`,
@@ -692,7 +702,7 @@ def main() -> int:
     with open(args.out, "w") as out:
         for i, (case, (sql, ms, reasons, _raw)) in enumerate(zip(cases, generated), 1):
             was_truncated = any(r == "length" for r in reasons)
-            all_truncated = bool(reasons) and all(r == "length" for r in reasons)
+
             db = case.db_id or ""
             if sql is not None:
                 # Drop the candidates that never finished. `truncated` used to be metadata
@@ -726,7 +736,7 @@ def main() -> int:
                 # A fully-truncated case arrives as [""] and would otherwise be reported as
                 # `empty-sql`, sending the operator to look at extraction when the fix is
                 # `--max-tokens`. Same value, two causes, different remedies.
-                if all_truncated:
+                if all_truncated(reasons):
                     n_truncated_only += 1
                 else:
                     n_empty_sql += 1
@@ -806,12 +816,13 @@ def main() -> int:
     # the previous rule only caught the unanswered case: 30 of 30 generations cut off at the
     # token cap printed `EX=0.00%` and exited 0. An all-truncated, all-gold-failed or
     # all-empty run measures its own configuration, not the model.
-    if n_scored == 0 and n:
+    if n_scored == 0:
         print(f"\nRUN VOID: no question produced a finished answer to grade "
               f"(no-finished-candidate={n_truncated_only}, empty-sql={n_empty_sql}, "
               f"error={counts['error']}). `wrong={counts['wrong']}` is not a score: those "
-              f"cases returned no SQL, so nothing was compared. No accuracy is reported.",
-              file=sys.stderr)
+              f"cases returned no SQL, so nothing was compared. No FINAL accuracy is "
+              f"reported; the per-batch `EX=` lines above are provisional and this run has "
+              f"no result. Do not scrape them.", file=sys.stderr)
         print("NATIVE_CONTROL_EXIT=1")
         return 1
 
