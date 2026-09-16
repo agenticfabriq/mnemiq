@@ -6,6 +6,8 @@ injects a JWT-derived identity. The boundary is IdentityContext + AuthzProvider 
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from threading import Lock
 
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
@@ -85,10 +87,23 @@ def _identity_from_settings(settings: Settings | None) -> IdentityContext:
     return identity_from_settings(settings)
 
 
-def build_mcp(runtime: Runtime, identity: IdentityContext):
+def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContext):
+    """Register tools without opening the database when given a runtime factory.
+
+    Initialize on the first tool call and reuse the runtime. Failed initialization
+    remains a tool error and can be retried after the operator completes setup.
+    """
     from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP("mnemiq")
+    runtime_lock = Lock()
+
+    def get_runtime() -> Runtime:
+        nonlocal runtime
+        with runtime_lock:
+            if callable(runtime):
+                runtime = runtime()
+            return runtime
 
     @mcp.tool()
     def db_read(question: str, mode: str | None = None) -> dict:
@@ -96,7 +111,7 @@ def build_mcp(runtime: Runtime, identity: IdentityContext):
         answer, the SQL run, and an auditable trace; defers honestly when it cannot answer.
         mode: 'instant' (cheapest, no retries), 'thinking' (default, self-repairing), or
         'deep' (5 candidates + judge + agreement gate -- highest precision, ~6x cost)."""
-        return _db_read(runtime, identity, question, mode=mode)
+        return _db_read(get_runtime(), identity, question, mode=mode)
 
     @mcp.tool()
     def db_write(sql: str) -> dict:
@@ -104,17 +119,16 @@ def build_mcp(runtime: Runtime, identity: IdentityContext):
         Refused by default: a write runs only when the identity has a write grant AND the
         deployment enabled writes. DDL and multi-statement input are never executed. Returns
         {approved, target, rows_affected, refusal, sql}; a governance plane records the result."""
-        return _db_write(runtime, identity, sql)
+        return _db_write(get_runtime(), identity, sql)
 
     @mcp.tool()
     def get_schema() -> dict:
         """List the tables you are allowed to query."""
-        return _get_schema(runtime, identity)
+        return _get_schema(get_runtime(), identity)
 
     return mcp
 
 
 def serve(settings: Settings) -> None:
-    runtime = build_runtime(settings)
     identity = _identity_from_settings(settings)
-    build_mcp(runtime, identity).run()  # stdio
+    build_mcp(lambda: build_runtime(settings), identity).run()  # stdio
