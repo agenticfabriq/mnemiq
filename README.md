@@ -198,6 +198,12 @@ file. See [`workbench/README.md`](workbench/README.md).
 { "mcpServers": { "mnemiq": { "command": "mnemiq", "args": ["serve"] } } }
 ```
 
+MCP initialization and tool discovery work before database setup is complete. The runtime is
+loaded on the first tool call; configure the source and LLM, then run `mnemiq enrich` and
+`mnemiq build` before querying. Missing setup is returned as a tool error while the MCP
+connection stays open. With a `uv sync` installation, launch from the repository using
+`uv run mnemiq serve` so the command uses the project's environment.
+
 ## Sources
 
 Postgres, SQLite, DuckDB, Oracle, Snowflake and Databricks, with DuckDB as the universal executor.
