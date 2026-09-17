@@ -9,7 +9,11 @@ from mnemiq.agent.trace import build_trace
 from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.keys import cache_key
 from mnemiq.cache.store import Cache, from_ipc, to_ipc
-from mnemiq.contract.seams import disclosure_sentence
+from mnemiq.contract.seams import (
+    append_notes,
+    disclosure_sentence,
+    lineage_disclosure_sentence,
+)
 from mnemiq.contract import DeferralReason, IdentityContext, Snapshot, Trace
 from mnemiq.llm.client import ModelUnavailable
 from mnemiq.progress import Emit, Stage, step
@@ -580,9 +584,16 @@ class Agent:
         #
         # After the synthesizer and never through it: a governed fact must not pass a stochastic
         # step that can soften it, drop it, or attach it to the wrong object.
-        disclosure = disclosure_sentence(trace.narrowed)
-        if disclosure:
-            answer = f"{answer}\n\n{disclosure}"
+        # Both disclosures appended in one place, so a third cannot be added and forgotten.
+        # The lineage one is silent on a source-level `unknown`: that is a standing property of
+        # the database, said once at boot, not on every answer it will ever give.
+        answer = append_notes(
+            answer,
+            disclosure_sentence(trace.narrowed),
+            lineage_disclosure_sentence(trace.lineage_completeness,
+                                        list(trace.lineage_unresolved),
+                                        list(trace.lineage_reasons)),
+        )
         return AgentAnswer(answer=answer, trace=trace, deferred=False, cached=cached,
                            narrowed=getattr(approved, "narrowed", None),
                            preview=result_preview(table, self.preview_rows),

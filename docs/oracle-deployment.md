@@ -138,6 +138,21 @@ silent no-op that looks exactly like no acknowledgement at all. `bypassing` warn
 you acknowledge it, for the
 reason below.
 
+A THIRD advisory shares the setting: `functions`, which reports whether this source can confirm
+what a call is bound to. Its verdicts are `functions:defines` (the schema defines functions of its
+own, the normal state of a healthy schema), `functions:unavailable` (the source was asked and could
+not answer) and `functions:never-asked` (this adapter does not implement `user_functions`).
+
+Acknowledge `functions:defines` once you have read which functions it names. That verdict is not a
+fault, and it is the one worth silencing: while it holds, every answer carrying a call reports
+lineage `unknown`, because the engine cannot tell a builtin from a same-named function. How many
+answers that is depends on how many of your queries call a function at all, not on how many
+functions your schema defines: one is enough to turn it on. Measured at 92% of the BIRD and
+Spider corpora and 88% of the ACME demo set, which is why the fact is said once here and NOT on
+each answer. The other two verdicts are faults and are better fixed than silenced.
+
+Silencing is per verdict here too, so acknowledging `functions:defines` leaves an outage audible.
+
 Two verdicts cannot be silenced at all, and setting a key for either is worse than not setting one.
 
 **`source-enforcement:bypassing` is refused.** Acknowledging it produces the original warning
