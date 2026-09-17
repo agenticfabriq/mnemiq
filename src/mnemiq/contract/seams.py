@@ -170,8 +170,10 @@ def lineage_disclosure_sentence(
         return ""
     named = ", ".join(unresolved[:3]) + ("..." if len(unresolved) > 3 else "")
     if completeness == "incomplete":
-        return (f"This result reads through {named}, so the objects listed above are not "
-                f"necessarily all of them.")
+        # `unresolved` mixes object names with this engine's own tokens -- `view:sales`,
+        # `unmodelled-source:lateral`, `unnameable-function` -- so the sentence names them
+        # as unaccounted rather than calling them tables, which several are not.
+        return (f"This result reaches past the tables in its trace. Unaccounted: {named}.")
     if named:
         return f"Part of this result could not be accounted for: {named}."
     return "Part of this result could not be accounted for."

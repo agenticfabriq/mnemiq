@@ -301,7 +301,7 @@ def _acknowledged(settings: Settings) -> frozenset[str]:
     return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
 
 
-def _warn_unconfirmable_functions(adapter) -> None:
+def _warn_unconfirmable_functions(adapter, acknowledged: frozenset[str] = frozenset()) -> None:
     """Say, at boot, that this source can never confirm what a call is bound to.
 
     The fact is per-SOURCE, so it is said once. `calls_are_confirmable` is
@@ -319,6 +319,11 @@ def _warn_unconfirmable_functions(adapter) -> None:
     functions is working as designed and the operator may want to know which. One that could
     not be ASKED is a capability gap in the adapter. One that was asked and FAILED is an
     outage. Advisory throughout: it reports, it never refuses.
+
+    Acknowledgeable per verdict through `MNEMIQ_ACK_ADVISORIES`, like its sibling: the
+    defines-helpers case is the NORMAL state of a healthy schema, so an operator who has read
+    it once needs a way to stop reading it at every boot. Silencing is per verdict, so
+    acknowledging a schema's helpers does not also silence an outage.
     """
     from mnemiq.sql.functions import inventory_from
 
@@ -328,22 +333,40 @@ def _warn_unconfirmable_functions(adapter) -> None:
         logger.debug("function-inventory advisory failed", exc_info=True)
         return
     if not inventory.available:
-        logger.warning(
+        # INFO rather than silence when acknowledged: the setting is defined as "log at
+        # INFO instead of WARNING", and a verdict that vanishes is indistinguishable
+        # from one that never occurred.
+        log = logger.info if "functions:unavailable" in acknowledged else logger.warning
+        log(
             "source function inventory UNAVAILABLE: the source was asked and could not answer, "
             "so no answer can confirm what a call is bound to and every one carrying a call "
             "will report lineage 'unknown'")
         return
     if not inventory.asked:
-        logger.warning(
+        # INFO rather than silence when acknowledged: the setting is defined as "log at
+        # INFO instead of WARNING", and a verdict that vanishes is indistinguishable
+        # from one that never occurred.
+        log = logger.info if "functions:never-asked" in acknowledged else logger.warning
+        log(
             "source function inventory NEVER ASKED: this adapter does not implement "
             "`user_functions`, so no answer can confirm what a call is bound to and every one "
             "carrying a call will report lineage 'unknown'")
         return
     if inventory.names:
-        logger.warning(
+        # INFO rather than silence when acknowledged: the setting is defined as "log at
+        # INFO instead of WARNING", and a verdict that vanishes is indistinguishable
+        # from one that never occurred.
+        log = logger.info if "functions:defines" in acknowledged else logger.warning
+        log(
             "source defines %d function(s), so this engine cannot tell a builtin from a "
             "same-named one: every answer carrying a call reports lineage 'unknown'. "
             "Names: %s", len(inventory.names), ", ".join(sorted(inventory.names)[:10]))
+
+
+# Advisories that live in their OWN function and still share this setting's namespace,
+# so the validator inside `_warn_source_enforcement` does not call their keys unknown.
+# Names only; each advisory owns its own verdicts.
+_ACK_SIBLINGS = frozenset({"functions"})
 
 
 def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()) -> None:
@@ -410,7 +433,11 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
     # is definitely a mistake: an unknown ADVISORY name cannot be right, while an acknowledged
     # verdict that simply did not occur this boot is the normal case for a deployment whose state
     # improved, and warning about it would recreate the noise this setting exists to remove.
-    known = {label.replace(" ", "-").lower() for _, label, _ in advisories}
+    # Every advisory this setting accepts, not just this function's. Built from the local
+    # tuple alone, a key belonging to a SIBLING advisory reported as naming no advisory at
+    # all -- sending the operator to hunt a typo they did not make, which is the
+    # two-causes-one-observable collapse this very block exists to prevent.
+    known = {label.replace(" ", "-").lower() for _, label, _ in advisories} | _ACK_SIBLINGS
     for entry in sorted(acknowledged):
         if entry.split(":", 1)[0] not in known:
             logger.warning("MNEMIQ_ACK_ADVISORIES: %r names no advisory; known: %s. "
@@ -473,6 +500,8 @@ def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()
         advisory = entry.split(":", 1)[0]
         if advisory not in known:
             continue  # already warned about above, as an advisory that does not exist
+        if advisory in _ACK_SIBLINGS:
+            continue  # another function's advisory; only it can say whether the key applied
         if advisory not in assessed:
             logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply -- this source produced no "
                         "verdict for %r (not implemented here, or the assessment failed above), "
@@ -651,7 +680,7 @@ def build_runtime(settings: Settings) -> Runtime:
     _boot_authz = _authz(settings)
     _warn_policy_advisories(_boot_authz, snapshot)
     _warn_source_enforcement(adapter, _acknowledged(settings))
-    _warn_unconfirmable_functions(adapter)
+    _warn_unconfirmable_functions(adapter, _acknowledged(settings))
     return Runtime(
         con=con,
         snapshot=snapshot,

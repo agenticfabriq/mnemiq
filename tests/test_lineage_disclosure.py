@@ -57,7 +57,10 @@ def test_a_demonstrable_reach_past_the_list_reads_differently():
     """INCOMPLETE is not UNKNOWN: the engine can point at the view. The sentence says the list
     is not all of them, rather than that something was unclear."""
     out = sentence("incomplete", ["v_totals"], [])
-    assert "v_totals" in out and "not necessarily all of them" in out
+    assert "v_totals" in out and "reaches past the tables in its trace" in out
+    # And it must not call them tables: `unresolved` carries this engine's own tokens beside
+    # object names, so `unmodelled-source:lateral` would be announced as a table.
+    assert "Unaccounted:" in out
 
 
 def test_a_source_reason_does_not_suppress_a_statement_fact():
@@ -93,24 +96,140 @@ def test_the_answer_carries_it_so_every_surface_does():
     assert i < j, "the disclosure must be appended BEFORE the answer is returned"
 
 
-def test_the_boot_advisory_exists_and_keeps_its_three_states_apart():
-    """The other half of the split. A source that DEFINES functions, one that could not be
-    ASKED, and one that was asked and FAILED need different actions, and collapsing them is the
-    absence-versus-failure defect this register has already paid for twice (M102, M104)."""
+class _Inv:
+    """Enough of a FunctionInventory for the advisory to read."""
+
+    def __init__(self, available=True, asked=True, names=()):
+        self.available, self.asked, self.names = available, asked, frozenset(names)
+
+
+def _advise(monkeypatch, inv, acknowledged=frozenset()):
+    from mnemiq import runtime
+
+    monkeypatch.setattr("mnemiq.sql.functions.inventory_from", lambda _a: inv)
+    runtime._warn_unconfirmable_functions(object(), acknowledged)
+
+
+@pytest.mark.parametrize(
+    ("inv", "expected", "forbidden"),
+    [
+        (_Inv(available=False), "UNAVAILABLE", "does not implement"),
+        (_Inv(asked=False), "NEVER ASKED", "could not answer"),
+        (_Inv(names=["helper"]), "defines 1 function", "UNAVAILABLE"),
+    ],
+)
+def test_the_boot_advisory_keeps_its_three_states_apart(caplog, monkeypatch, inv, expected,
+                                                       forbidden):
+    """BEHAVIOURALLY, because asserting the three field names appear in the source passes even
+    with the message bodies SWAPPED -- an outage then tells the operator to go fix a working
+    adapter, which is the absence-versus-failure collapse M102 and M104 each cost.
+
+    Each case also asserts what must NOT be said, since that is what a swap breaks.
+    """
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        _advise(monkeypatch, inv)
+    assert expected in caplog.text
+    assert forbidden not in caplog.text
+
+
+def test_a_healthy_schema_with_no_helpers_says_nothing_at_boot():
+    """No verdict, no line. An advisory that fires on every boot regardless is the same
+    wallpaper problem one layer up."""
+    import logging
+
+    from mnemiq import runtime
+
+    import pytest as _pytest
+
+    mp = _pytest.MonkeyPatch()
+    try:
+        mp.setattr("mnemiq.sql.functions.inventory_from", lambda _a: _Inv())
+        import logging as _l
+
+        records = []
+        handler = _l.Handler()
+        handler.emit = records.append
+        logger = _l.getLogger("mnemiq.runtime")
+        logger.addHandler(handler)
+        try:
+            runtime._warn_unconfirmable_functions(object())
+        finally:
+            logger.removeHandler(handler)
+        assert not [r for r in records if r.levelno >= logging.WARNING]
+    finally:
+        mp.undo()
+
+
+def test_an_acknowledged_verdict_is_still_RECORDED_at_info(caplog, monkeypatch):
+    """`MNEMIQ_ACK_ADVISORIES` is defined as "log at INFO instead of WARNING", and the sibling
+    advisory does exactly that. Returning silently made an acknowledged verdict identical at
+    every level to one that never occurred, so an operator could not confirm their
+    acknowledgement had matched anything."""
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        _advise(monkeypatch, _Inv(names=["helper"]), frozenset({"functions:defines"}))
+    assert "defines 1 function" in caplog.text
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+        "an acknowledged verdict still warned")
+
+
+def test_the_sibling_validator_accepts_these_keys(caplog):
+    """THE BLOCKER. `known` was built from one function's local tuple, so `functions:defines`
+    was reported as naming no advisory -- false, since it does silence one -- and sent the
+    operator hunting a typo they did not make.
+
+    A real typo must still warn, or the fix would have traded one collapse for another.
+    """
+    import logging
+
+    from mnemiq import runtime
+
+    class _Attached:
+        def assert_enforcing(self):
+            return "attached", "ok"
+
+    with caplog.at_level(logging.WARNING):
+        runtime._warn_source_enforcement(_Attached(), frozenset({"functions:defines"}))
+    assert "names no advisory" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        runtime._warn_source_enforcement(_Attached(), frozenset({"bogus:x"}))
+    assert "names no advisory" in caplog.text and "functions" in caplog.text
+
+
+def test_each_verdict_is_silenced_separately(caplog, monkeypatch):
+    """Acknowledging a schema's helpers must not also silence an outage. Per verdict, like the
+    sibling advisory, because the defines-helpers case is the normal state of a healthy schema
+    and the other two are not."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        _advise(monkeypatch, _Inv(names=["helper"]), frozenset({"functions:defines"}))
+    assert not caplog.text
+
+    with caplog.at_level(logging.WARNING):
+        _advise(monkeypatch, _Inv(available=False), frozenset({"functions:defines"}))
+    assert "UNAVAILABLE" in caplog.text, "acknowledging helpers silenced an outage"
+
+
+def test_the_advisory_is_actually_called_at_boot():
+    """Wired at one end with a green suite is the M26 shape this repo has a row for."""
     import inspect
 
     from mnemiq import runtime
 
-    src = inspect.getsource(runtime._warn_unconfirmable_functions)
-    assert "inventory.available" in src, "an outage reads as a source that defines helpers"
-    assert "inventory.asked" in src, "an adapter that cannot answer reads as one that answered"
-    assert "inventory.names" in src
-    # The CALL, not the def -- a bare name count matches `def _warn_unconfirmable_functions(
-    # adapter)` too and passes on an advisory nothing invokes. Indentation is what separates
-    # them, and being wired at one end with a green suite is exactly the M26 shape.
-    calls = [ln for ln in inspect.getsource(runtime).splitlines()
-             if ln.strip() == "_warn_unconfirmable_functions(adapter)" and ln.startswith(" ")]
-    assert calls, "the advisory is defined and never called, which is the M26 shape"
+    calls = [ln.strip() for ln in inspect.getsource(runtime).splitlines()
+             if ln.strip().startswith("_warn_unconfirmable_functions(") and ln.startswith(" ")]
+    assert calls, "the advisory is defined and never called"
+    # The ARGUMENT too. Matching the name alone let the acknowledgement be dropped from the one
+    # product line this feature adds, with every acknowledgement test still green -- they call
+    # the function directly. M26 reopened one argument to the right.
+    assert all("_acknowledged(settings)" in c for c in calls), (
+        "the advisory is called without the acknowledgement, so the setting reaches nothing")
 
 
 def test_append_notes_is_the_join_and_it_executes():
