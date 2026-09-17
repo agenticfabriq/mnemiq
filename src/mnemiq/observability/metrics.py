@@ -75,14 +75,16 @@ class PostgresSink:
     _CREATE = (
         "CREATE TABLE IF NOT EXISTS mnemiq_answer_log ("
         "source_id TEXT, deferred BOOLEAN, cached BOOLEAN, total_ms DOUBLE PRECISION, mode TEXT, "
-        "failed BOOLEAN DEFAULT FALSE, reason_code TEXT)"
+        "failed BOOLEAN DEFAULT FALSE, reason_code TEXT, "
+        "created_at TIMESTAMPTZ DEFAULT now())"
     )
     # Existing deployments predate the two columns; without this their INSERT would fail and be
     # swallowed by the fail-soft handler below, i.e. observability would silently stop recording.
     _UPGRADE = (
         "ALTER TABLE mnemiq_answer_log "
         "ADD COLUMN IF NOT EXISTS failed BOOLEAN DEFAULT FALSE, "
-        "ADD COLUMN IF NOT EXISTS reason_code TEXT"
+        "ADD COLUMN IF NOT EXISTS reason_code TEXT, "
+        "ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now()"
     )
 
     def __init__(self, dsn: str) -> None:
@@ -114,7 +116,8 @@ class PostgresSink:
                 con.execute(self._UPGRADE)
                 rows = con.execute(
                     "SELECT deferred, cached, total_ms, mode, failed, reason_code "
-                    "FROM mnemiq_answer_log WHERE source_id = %s LIMIT %s",
+                    "FROM mnemiq_answer_log WHERE source_id = %s "
+                    "ORDER BY created_at DESC LIMIT %s",
                     (source_id, limit),
                 ).fetchall()
             return [AnswerRecord(deferred=r[0], cached=r[1], total_ms=r[2], mode=r[3],
