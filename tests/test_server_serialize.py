@@ -218,3 +218,13 @@ def test_narrowed_is_none_when_the_trace_has_no_decision():
     out = answer_payload(AgentAnswer(answer="3 claims.", trace=trace))
     assert out["narrowed"] is None
 
+
+def test_narrowed_empty_list_means_evaluated_and_nothing_scoped():
+    """[] means governance ran and withheld nothing -- distinct from None (not evaluated).
+    A consumer that renders 'some rows were withheld' must stay silent on both, but only
+    [] means the decision actually ran. If these two collapse, a result that was never
+    governed becomes indistinguishable from one that was governed and withheld nothing."""
+    trace = _trace().model_copy(update={"narrowed": []})
+    out = answer_payload(AgentAnswer(answer="3 claims.", trace=trace))
+    assert out["narrowed"] == []
+
