@@ -201,6 +201,27 @@ def test_the_sibling_validator_accepts_these_keys(caplog):
     assert "names no advisory" in caplog.text and "functions" in caplog.text
 
 
+def test_a_key_that_silenced_nothing_says_so(caplog, monkeypatch):
+    """The gap the sibling's skip opened. It stopped reporting on `functions:` keys, correctly,
+    because it cannot produce their verdicts -- and left them unmentioned by ANYONE, which is
+    the same silence an unset key produces.
+
+    Asserted at INFO on purpose: the earlier test's floor was WARNING, so a false diagnosis
+    here sat below it and deleting the skip left the suite green.
+    """
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        _advise(monkeypatch, _Inv(), frozenset({"functions:unavailable"}))
+    assert "did not apply" in caplog.text
+
+    # And the key that DID match must not be reported as unused.
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        _advise(monkeypatch, _Inv(names=["helper"]), frozenset({"functions:defines"}))
+    assert "did not apply" not in caplog.text
+
+
 def test_each_verdict_is_silenced_separately(caplog, monkeypatch):
     """Acknowledging a schema's helpers must not also silence an outage. Per verdict, like the
     sibling advisory, because the defines-helpers case is the normal state of a healthy schema

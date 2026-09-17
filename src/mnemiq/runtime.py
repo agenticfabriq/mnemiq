@@ -301,6 +301,22 @@ def _acknowledged(settings: Settings) -> frozenset[str]:
     return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
 
 
+def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None) -> None:
+    """Say, at INFO, that a `functions:` key was set and silenced nothing.
+
+    The sibling advisory stopped reporting on these keys because it cannot produce their
+    verdicts -- correct, and it left them unmentioned by anyone, which is the same silence an
+    unset key produces. A key that matched nothing has two readable causes and both are worth
+    separating from "you did not set it": a verdict that did not occur this boot (the healthy
+    case, a schema whose functions were removed), and a misspelled verdict half.
+    """
+    for entry in sorted(acknowledged):
+        if not entry.startswith("functions:") or entry == matched:
+            continue
+        logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply this boot -- either this source "
+                    "produced no such verdict, or the verdict half is misspelled", entry)
+
+
 def _warn_unconfirmable_functions(adapter, acknowledged: frozenset[str] = frozenset()) -> None:
     """Say, at boot, that this source can never confirm what a call is bound to.
 
@@ -336,31 +352,39 @@ def _warn_unconfirmable_functions(adapter, acknowledged: frozenset[str] = frozen
         # INFO rather than silence when acknowledged: the setting is defined as "log at
         # INFO instead of WARNING", and a verdict that vanishes is indistinguishable
         # from one that never occurred.
-        log = logger.info if "functions:unavailable" in acknowledged else logger.warning
+        verdict = "functions:unavailable"
+        log = logger.info if verdict in acknowledged else logger.warning
         log(
             "source function inventory UNAVAILABLE: the source was asked and could not answer, "
             "so no answer can confirm what a call is bound to and every one carrying a call "
             "will report lineage 'unknown'")
+        _ack_did_not_apply(acknowledged, verdict)
         return
     if not inventory.asked:
         # INFO rather than silence when acknowledged: the setting is defined as "log at
         # INFO instead of WARNING", and a verdict that vanishes is indistinguishable
         # from one that never occurred.
-        log = logger.info if "functions:never-asked" in acknowledged else logger.warning
+        verdict = "functions:never-asked"
+        log = logger.info if verdict in acknowledged else logger.warning
         log(
             "source function inventory NEVER ASKED: this adapter does not implement "
             "`user_functions`, so no answer can confirm what a call is bound to and every one "
             "carrying a call will report lineage 'unknown'")
+        _ack_did_not_apply(acknowledged, verdict)
         return
     if inventory.names:
         # INFO rather than silence when acknowledged: the setting is defined as "log at
         # INFO instead of WARNING", and a verdict that vanishes is indistinguishable
         # from one that never occurred.
-        log = logger.info if "functions:defines" in acknowledged else logger.warning
+        verdict = "functions:defines"
+        log = logger.info if verdict in acknowledged else logger.warning
         log(
             "source defines %d function(s), so this engine cannot tell a builtin from a "
             "same-named one: every answer carrying a call reports lineage 'unknown'. "
             "Names: %s", len(inventory.names), ", ".join(sorted(inventory.names)[:10]))
+        _ack_did_not_apply(acknowledged, verdict)
+        return
+    _ack_did_not_apply(acknowledged, None)
 
 
 # Advisories that live in their OWN function and still share this setting's namespace,
