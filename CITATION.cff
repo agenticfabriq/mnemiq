@@ -21,6 +21,7 @@ references:
     url: "https://www.agenticfabriq.com/blog/mnemiq/launch"
   - type: report
     title: "mnemiq technical report"
+    doi: "10.5281/zenodo.22806094"
     url: "https://www.agenticfabriq.com/mnemiq/mnemiq-technical-report.pdf"
   - type: software
     title: "Beacon"
