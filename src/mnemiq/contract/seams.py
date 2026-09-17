@@ -128,6 +128,73 @@ def disclosure_sentence(narrowed: "list[Narrowed] | None") -> str:
     return "Some columns were masked by policy."
 
 
+# Reason codes that describe the SOURCE, not the statement. Every one of them fires on almost
+# every answer once it fires at all, because `calls_are_confirmable` is a property of the source:
+# a schema defining one unrelated helper turns it false, and any statement calling COUNT or SUM
+# then carries the marker. Measured over three corpora -- BIRD/Spider 6% -> 92%, the ACME demo
+# 0% -> 88%, and the live Oracle container whose nine functions are all test detritus -- so a
+# per-answer sentence keyed on these is wallpaper, and wallpaper is what got M35's deferral
+# guard withdrawn. They are reported ONCE at boot instead; see `warn_unconfirmable_functions`.
+_SOURCE_LEVEL_LINEAGE_REASONS = frozenset({
+    "unconfirmed-function-identity",
+    "function-inventory-unavailable",
+    "function-inventory-never-asked",
+    "function-inventory-covers-no-view-bodies",
+    "view-inventory-unavailable",
+    "view-inventory-never-asked",
+})
+
+
+def lineage_disclosure_sentence(
+    completeness: str, unresolved: "list[str]", reasons: "list[str]"
+) -> str:
+    """The caller-facing sentence about what this answer could not account for.
+
+    Same contract as `disclosure_sentence` and for the same reason: a pure function of the
+    record, appended after synthesis, never phrased by the model. A governed fact must not pass
+    through a stochastic step that can soften it or attach it to the wrong object.
+
+    Silent unless the state supports a claim ABOUT THIS ANSWER. `complete` supports none. Nor
+    does an `unknown` whose only signals are source-level -- that says the engine can never
+    confirm function identity against this database, which is true of every answer it will ever
+    give and belongs in a boot advisory, not in each one.
+
+    What does support a claim: a DEMONSTRABLE reach past the table list (`incomplete`, a view
+    whose body reads further), an object this statement named that could not be resolved, or a
+    scope this statement defeated. Those are facts about the question that was asked.
+    """
+    if completeness == "complete":
+        return ""
+    statement_reasons = [r for r in reasons if r not in _SOURCE_LEVEL_LINEAGE_REASONS]
+    if not unresolved and not statement_reasons:
+        return ""
+    named = ", ".join(unresolved[:3]) + ("..." if len(unresolved) > 3 else "")
+    if completeness == "incomplete":
+        return (f"This result reads through {named}, so the objects listed above are not "
+                f"necessarily all of them.")
+    if named:
+        return f"Part of this result could not be accounted for: {named}."
+    return "Part of this result could not be accounted for."
+
+
+def append_notes(answer: str, *notes: str) -> str:
+    """Append each non-empty disclosure to the answer, in order, once.
+
+    A function rather than two `if` blocks in the loop so the JOIN is executable. A test that
+    asserts the call appears in `loop.py`'s source proves the call exists and not that its
+    result is used: disabling the append left every such test green, measured. This is the
+    part a mutation can reach.
+
+    Order is the order given, and it is the order the caller reads: what policy withheld comes
+    before what the engine could not account for, because the first is a decision made about
+    them and the second is a limit of the engine.
+    """
+    for note in notes:
+        if note:
+            answer = f"{answer}\n\n{note}"
+    return answer
+
+
 class Trace(BaseModel):
     question: str
     plan_sql: str

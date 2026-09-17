@@ -301,6 +301,51 @@ def _acknowledged(settings: Settings) -> frozenset[str]:
     return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
 
 
+def _warn_unconfirmable_functions(adapter) -> None:
+    """Say, at boot, that this source can never confirm what a call is bound to.
+
+    The fact is per-SOURCE, so it is said once. `calls_are_confirmable` is
+    `licensed and not inventory.names`: a schema defining a single unrelated helper turns it
+    false, and from then on every statement calling COUNT or SUM carries
+    `unconfirmed-function-identity` and reports lineage `unknown`. Measured over three corpora
+    -- BIRD/Spider 6% -> 92% of answers, the ACME demo 0% -> 88%, the live Oracle container
+    92% on nine functions that are all test leftovers.
+
+    Which is why this is a boot line and not a sentence on each answer. A caveat that fires on
+    nine answers in ten is wallpaper, and `lineage_disclosure_sentence` stays silent on it for
+    that reason; M35's deferral guard was withdrawn on exactly that failure at a lower rate.
+
+    Three states, kept apart because they need different actions. A source that DEFINES
+    functions is working as designed and the operator may want to know which. One that could
+    not be ASKED is a capability gap in the adapter. One that was asked and FAILED is an
+    outage. Advisory throughout: it reports, it never refuses.
+    """
+    from mnemiq.sql.functions import inventory_from
+
+    try:
+        inventory = inventory_from(adapter)
+    except Exception:  # noqa: BLE001 -- an advisory check must never stop a boot
+        logger.debug("function-inventory advisory failed", exc_info=True)
+        return
+    if not inventory.available:
+        logger.warning(
+            "source function inventory UNAVAILABLE: the source was asked and could not answer, "
+            "so no answer can confirm what a call is bound to and every one carrying a call "
+            "will report lineage 'unknown'")
+        return
+    if not inventory.asked:
+        logger.warning(
+            "source function inventory NEVER ASKED: this adapter does not implement "
+            "`user_functions`, so no answer can confirm what a call is bound to and every one "
+            "carrying a call will report lineage 'unknown'")
+        return
+    if inventory.names:
+        logger.warning(
+            "source defines %d function(s), so this engine cannot tell a builtin from a "
+            "same-named one: every answer carrying a call reports lineage 'unknown'. "
+            "Names: %s", len(inventory.names), ", ".join(sorted(inventory.names)[:10]))
+
+
 def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()) -> None:
     """Say, at boot, whether the SOURCE is actually enforcing row security -- when it can tell.
 
@@ -606,6 +651,7 @@ def build_runtime(settings: Settings) -> Runtime:
     _boot_authz = _authz(settings)
     _warn_policy_advisories(_boot_authz, snapshot)
     _warn_source_enforcement(adapter, _acknowledged(settings))
+    _warn_unconfirmable_functions(adapter)
     return Runtime(
         con=con,
         snapshot=snapshot,
