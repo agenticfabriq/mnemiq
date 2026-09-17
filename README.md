@@ -14,8 +14,9 @@ Two answers and a refusal. The third question asks for revenue the database does
 engine says so — naming the columns it would have needed — instead of returning a number that looks
 right. That distinction is the whole design.
 
-**Read more** · [Launch article](https://agenticfabriq.com/blog/mnemiq/launch) ·
-[Technical report (PDF)](docs/mnemiq-technical-report.pdf) ·
+**Read more** · [Product page](https://www.agenticfabriq.com/mnemiq) ·
+[Launch article](https://www.agenticfabriq.com/blog/mnemiq/launch) ·
+[Technical report (PDF, DOI 10.5281/zenodo.22806094)](docs/mnemiq-technical-report.pdf) ·
 [Paper (PDF)](docs/mnemiq-paper.pdf) ·
 [beacon](https://github.com/agenticfabriq/beacon) — the grader and results tracker
 
