@@ -256,6 +256,15 @@ well as `deep`. An unreachable judge withholds the answer instead of passing it
 ([#5](https://github.com/agenticfabriq/mnemiq/issues/5)), and the CLI honours `MNEMIQ_ROLES` like
 every other surface ([#4](https://github.com/agenticfabriq/mnemiq/issues/4)).
 
+## Related enterprise implementation
+
+Enterprise Data Agent Governance is an independently maintained, enterprise-focused
+governance framework built on Mnemiq. It explores identity, authorization, safe query
+handling, verification, refusal behavior, evaluation, and auditability for teams
+deploying governed AI data agents.
+
+[Explore Enterprise Data Agent Governance →](https://murraylovecode.github.io/enterprise-data-agent-governance/)
+
 ## Contributing
 
 Issues and pull requests are welcome. Fork, branch, and open a PR against `main`.
