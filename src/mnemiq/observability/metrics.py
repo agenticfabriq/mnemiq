@@ -70,7 +70,18 @@ class NullSink:
 
 
 class PostgresSink:
-    """Fail-soft answer log in the control Postgres."""
+    """Fail-soft answer log in the control Postgres.
+
+    Reuses a single connection with lazy reconnect, matching PostgresCache.  The DDL
+    (CREATE IF NOT EXISTS / ALTER ADD COLUMN IF NOT EXISTS) is idempotent and re-issued
+    by ``_ensure`` on every call, same as PostgresCache -- the win is eliminating the
+    TCP connect, TLS handshake and auth that the old per-call ``psycopg.connect`` paid
+    on every answer.
+
+    ``record()`` and ``recent()`` hold ``_lock`` for the duration of their query.  This
+    serialises concurrent answers on the threaded server, which is a deliberate trade-off:
+    the INSERT is small and the alternative is a connection per answer.
+    """
 
     _CREATE = (
         "CREATE TABLE IF NOT EXISTS mnemiq_answer_log ("
@@ -87,41 +98,70 @@ class PostgresSink:
         "ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT now()"
     )
 
-    def __init__(self, dsn: str) -> None:
-        self._dsn = dsn
+    def __init__(self, dsn: str, connect=None) -> None:
+        import threading
 
-    def record(self, source_id: str, rec: AnswerRecord) -> None:
-        try:
+        if connect is None:
             import psycopg
 
-            with psycopg.connect(self._dsn, autocommit=True) as con:
-                con.execute(self._CREATE)
-                con.execute(self._UPGRADE)
-                con.execute(
+            def connect():
+                return psycopg.connect(dsn, autocommit=True)
+
+        self._connect = connect
+        self._con = None
+        self._lock = threading.Lock()
+        with self._lock:
+            self._ensure()
+
+    def _reconnect(self) -> None:
+        try:
+            self._con = self._connect()
+        except Exception:
+            self._con = None
+
+    def _ensure(self) -> None:
+        if self._con is None:
+            self._reconnect()
+        if self._con is None:
+            return
+        try:
+            self._con.execute(self._CREATE)
+            self._con.execute(self._UPGRADE)
+        except Exception:
+            self._con = None  # degrade; a later call retries
+
+    def record(self, source_id: str, rec: AnswerRecord) -> None:
+        with self._lock:
+            self._ensure()
+            if self._con is None:
+                return  # fail-soft: observability never breaks a request
+            try:
+                self._con.execute(
                     "INSERT INTO mnemiq_answer_log "
                     "(source_id, deferred, cached, total_ms, mode, failed, reason_code) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                     (source_id, rec.deferred, rec.cached, rec.total_ms, rec.mode, rec.failed,
                      str(rec.reason_code) if rec.reason_code else None),
                 )
-        except Exception:
-            pass  # fail-soft: observability never breaks a request
+            except Exception:
+                self._con = None  # drop; next call reconnects
 
     def recent(self, source_id: str, limit: int) -> list[AnswerRecord]:
-        try:
-            import psycopg
-
-            with psycopg.connect(self._dsn, autocommit=True) as con:
-                con.execute(self._CREATE)
-                con.execute(self._UPGRADE)
-                rows = con.execute(
+        with self._lock:
+            self._ensure()
+            if self._con is None:
+                return []
+            try:
+                rows = self._con.execute(
                     "SELECT deferred, cached, total_ms, mode, failed, reason_code "
                     "FROM mnemiq_answer_log WHERE source_id = %s "
                     "ORDER BY created_at DESC LIMIT %s",
                     (source_id, limit),
                 ).fetchall()
-            return [AnswerRecord(deferred=r[0], cached=r[1], total_ms=r[2], mode=r[3],
-                                 failed=bool(r[4]), reason_code=r[5])
-                    for r in rows]
-        except Exception:
-            return []
+                return [AnswerRecord(deferred=r[0], cached=r[1], total_ms=r[2], mode=r[3],
+                                     failed=bool(r[4]), reason_code=r[5])
+                        for r in rows]
+            except Exception:
+                self._con = None
+                return []
+
