@@ -335,12 +335,10 @@ def _warn_view_inventory(snapshot, acknowledged: frozenset[str]) -> None:
     inventory -- and nesting this behind that advisory's returns ran it only for a source with
     no helpers at all, which is the one deployment shape that needs it least.
     """
-    if snapshot is None:
-        # Unreachable at boot -- `load_current_snapshot` raises `SnapshotMissing` rather than
-        # returning None -- and kept for a caller that passes one. Note it is the WRONG answer
-        # if that ever happens: `views.inventory_for` calls a missing snapshot definitively
-        # VIEWS_UNAVAILABLE, so silence here would suppress the one state it is sure about.
-        return
+    # No `snapshot is None` guard on purpose. `inventory_for` already calls a missing snapshot
+    # definitively VIEWS_UNAVAILABLE, so returning early here would suppress the one state it is
+    # SURE about -- and a comment saying "this branch is wrong if you reach it" is a worse
+    # guarantee than not having the branch.
     try:
         from mnemiq.sql.views import inventory_for
 

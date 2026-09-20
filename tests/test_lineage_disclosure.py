@@ -407,3 +407,16 @@ def test_both_advisories_are_called_at_boot_and_NEITHER_is_nested_in_the_other()
     assert "_warn_view_inventory(" not in fn_advisory, (
         "the view advisory is nested inside the function advisory, so it runs only when that "
         "one finds nothing to report -- the two degrade independently")
+
+
+def test_a_missing_snapshot_reports_rather_than_returning_quietly(caplog):
+    """`inventory_for` calls a missing snapshot definitively VIEWS_UNAVAILABLE, so an early
+    return here would suppress the one state it is sure about. Unreachable at boot today, and
+    pinned so the branch cannot come back as a convenience."""
+    import logging
+
+    from mnemiq import runtime
+
+    with caplog.at_level(logging.WARNING):
+        runtime._warn_view_inventory(None, frozenset())
+    assert "UNAVAILABLE" in caplog.text
