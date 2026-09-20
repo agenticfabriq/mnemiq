@@ -90,6 +90,12 @@ class Runtime:
         if versions != self.loaded_versions:
             self.snapshot = snapshot
             self.loaded_versions = versions
+            # Re-run the view advisory on the NEW snapshot. It is a property of the snapshot,
+            # and the snapshot is exactly what just changed: a replica that booted healthy and
+            # swapped to one whose view discovery failed would report lineage 'unknown' on every
+            # answer reading a view, under a boot log that said otherwise. Only on an actual
+            # swap, so this is as rare as a version change and silent when the new one is fine.
+            _warn_view_inventory(snapshot, _acknowledged(self.settings))
 
     def _source_id(self) -> str:
         """The id this runtime is actually answering FOR.

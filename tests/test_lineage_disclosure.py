@@ -420,3 +420,57 @@ def test_a_missing_snapshot_reports_rather_than_returning_quietly(caplog):
     with caplog.at_level(logging.WARNING):
         runtime._warn_view_inventory(None, frozenset())
     assert "UNAVAILABLE" in caplog.text
+
+
+def test_a_hot_swapped_snapshot_re_runs_the_view_advisory(caplog, monkeypatch):
+    """The advisory describes the SNAPSHOT, and `reload_if_stale` is what replaces it.
+
+    Running it only at `build_runtime` meant a replica that booted on a healthy snapshot and
+    hot-swapped to one whose view discovery failed reported lineage `unknown` on every answer
+    reading a view, under a boot log that said otherwise. The state it describes had changed
+    and the reader had not been told.
+    """
+    import logging
+
+    from mnemiq.runtime import Runtime
+
+    class _Settings:
+        control_dsn = "postgresql://x"
+        ack_advisories = ""
+
+    rt = Runtime.__new__(Runtime)
+    rt.settings, rt.con = _Settings(), object()
+    rt.snapshot, rt.loaded_versions = object(), {"src": "v1"}
+
+    monkeypatch.setattr("mnemiq.runtime.load_current_snapshot",
+                        lambda _s, _c: (object(), {"src": "v2"}))
+    monkeypatch.setattr("mnemiq.sql.views.inventory_for", lambda _s: _Views(available=False))
+
+    with caplog.at_level(logging.WARNING):
+        rt.reload_if_stale()
+    assert rt.loaded_versions == {"src": "v2"}, "the swap did not happen"
+    assert "view inventory UNAVAILABLE" in caplog.text, "the swap was silent"
+
+
+def test_an_unchanged_version_does_not_re_announce(caplog, monkeypatch):
+    """Only on an actual swap. `reload_if_stale` runs per ask, so warning on every call would
+    be the wallpaper this whole split exists to avoid."""
+    import logging
+
+    from mnemiq.runtime import Runtime
+
+    class _Settings:
+        control_dsn = "postgresql://x"
+        ack_advisories = ""
+
+    rt = Runtime.__new__(Runtime)
+    rt.settings, rt.con = _Settings(), object()
+    rt.snapshot, rt.loaded_versions = object(), {"src": "v1"}
+
+    monkeypatch.setattr("mnemiq.runtime.load_current_snapshot",
+                        lambda _s, _c: (object(), {"src": "v1"}))
+    monkeypatch.setattr("mnemiq.sql.views.inventory_for", lambda _s: _Views(available=False))
+
+    with caplog.at_level(logging.WARNING):
+        rt.reload_if_stale()
+    assert not caplog.text, "re-announced without a version change"
