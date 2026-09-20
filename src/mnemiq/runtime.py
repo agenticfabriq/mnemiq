@@ -104,11 +104,18 @@ class Runtime:
             # COST, stated rather than discovered: `_warn_policy_advisories` is boot-shaped
             # work and this puts it on a user request. `FileAuthzProvider.grants_for` re-reads
             # the policy file per declared role, and `warn_unfiltered_dependents` walks parents
-            # over `snapshot.relationships` for every granted table. Bounded and one-shot -- the
-            # single ask that observes a version change pays it, not the ones after -- and the
-            # alternative is a replica answering from a snapshot nobody assessed. If a swap ever
-            # becomes frequent enough for that to bite, this belongs on a background thread
-            # rather than deleted.
+            # over `snapshot.relationships` for every granted table. Paid by the ask that
+            # observes a version change, not by the ones after, and the alternative is a replica
+            # answering from a snapshot nobody assessed.
+            #
+            # NOT once per swap on the threaded server, and this is measured from the code
+            # rather than assumed: `/v1/ask` is a sync `def` over one shared runtime, FastAPI
+            # runs those on a worker threadpool, and this method takes no lock -- so N workers
+            # can each pass the version test above before any of them reaches the assignment,
+            # and each pays the full walk and emits its own advisory line. The race predates
+            # this call and the duplicate lines are new. Serialising the reload is the fix and
+            # it is a behaviour change on the ask path, so it is named here rather than smuggled
+            # into a change about advisories.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
             _warn_policy_advisories(self.authz, snapshot)
 
@@ -330,9 +337,9 @@ def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
     view one. One helper for both, because the reasoning is identical and two copies would
     drift.
 
-    It says "did not apply" rather than "did not apply this boot", unlike the sibling
-    diagnosis in `_warn_source_enforcement`, and the difference is not arbitrary: the view
-    advisory re-runs on a snapshot swap, so this line can print mid-run where naming the boot
+    It says "did not apply" rather than "did not apply this boot". `_warn_source_enforcement`
+    emits both phrasings, and the plain one is right here for a reason worth keeping: the view
+    advisory re-runs on a snapshot swap, so this line can print mid-run, where naming the boot
     would name the wrong event.
 
     The sibling advisory stopped reporting on these keys because it cannot produce their
@@ -356,10 +363,12 @@ def _warn_view_inventory(snapshot, acknowledged: frozenset[str]) -> None:
     boot line is the only reader left. A snapshot whose view discovery failed downgrades lineage
     on every statement reading a view.
 
-    CALLED FROM `build_runtime`, beside the function advisory and not inside it. View discovery
-    degrades independently -- `lineage_for` appends these codes without consulting the function
-    inventory -- and nesting this behind that advisory's returns ran it only for a source with
-    no helpers at all, which is the one deployment shape that needs it least.
+    TWO CALL SITES. `build_runtime`, beside the function advisory and not inside it -- view
+    discovery degrades independently, since `lineage_for` appends these codes without consulting
+    the function inventory, and nesting this behind that advisory's returns ran it only for a
+    source with no helpers at all, the one deployment shape that needs it least. And
+    `Runtime.reload_if_stale`, on an actual version swap, because the snapshot is the subject
+    and a hot swap is exactly when it changes.
     """
     # No `snapshot is None` guard on purpose. `inventory_for` already calls a missing snapshot
     # definitively VIEWS_UNAVAILABLE, so returning early here would suppress the one state it is
