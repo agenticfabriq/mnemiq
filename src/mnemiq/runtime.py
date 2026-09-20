@@ -303,7 +303,11 @@ def _acknowledged(settings: Settings) -> frozenset[str]:
 
 def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
                        prefix: str = "functions:") -> None:
-    """Say, at INFO, that a `functions:` key was set and silenced nothing.
+    """Say, at INFO, that an acknowledgement key was set and silenced nothing.
+
+    `prefix` selects the namespace: `functions:` for the inventory advisory, `views:` for the
+    view one. One helper for both, because the reasoning is identical and two copies would
+    drift.
 
     The sibling advisory stopped reporting on these keys because it cannot produce their
     verdicts -- correct, and it left them unmentioned by anyone, which is the same silence an
@@ -332,6 +336,10 @@ def _warn_view_inventory(snapshot, acknowledged: frozenset[str]) -> None:
     no helpers at all, which is the one deployment shape that needs it least.
     """
     if snapshot is None:
+        # Unreachable at boot -- `load_current_snapshot` raises `SnapshotMissing` rather than
+        # returning None -- and kept for a caller that passes one. Note it is the WRONG answer
+        # if that ever happens: `views.inventory_for` calls a missing snapshot definitively
+        # VIEWS_UNAVAILABLE, so silence here would suppress the one state it is sure about.
         return
     try:
         from mnemiq.sql.views import inventory_for

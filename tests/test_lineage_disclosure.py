@@ -298,54 +298,11 @@ def _advise_views(monkeypatch, views, acknowledged=frozenset()):
     runtime._warn_view_inventory(object(), acknowledged)
 
 
-# Every function-inventory state, because the view advisory must not depend on any of them.
-# Nesting it behind the function advisory's returns made it reachable ONLY from the last of
-# these -- a source with no helpers, no failure and a covering licence -- so a degraded view
-# inventory was silent on every real deployment. The fixture used to pin exactly that one
-# state, which is why the suite stayed green.
-_FN_STATES = [
-    _Inv(names=["helper"]),
-    _Inv(available=False),
-    _Inv(asked=False),
-    _Inv(),
-]
-
-
-@pytest.mark.parametrize("fn_state", _FN_STATES)
-def test_view_discovery_is_reported_whatever_the_function_inventory_says(
-    caplog, monkeypatch, fn_state
-):
-    """The two degrade INDEPENDENTLY: `lineage_for` appends the view codes without consulting
-    the function inventory, so a boot that reads healthy on views while every statement reading
-    a view reports `unknown` is exactly the silence this split exists to remove."""
-    import logging
-
-    from mnemiq import runtime
-
-    monkeypatch.setattr("mnemiq.sql.functions.inventory_from", lambda _a: fn_state)
-    monkeypatch.setattr("mnemiq.sql.views.inventory_for", lambda _s: _Views(available=False))
-    with caplog.at_level(logging.WARNING):
-        runtime._warn_unconfirmable_functions(object(), frozenset())
-        runtime._warn_view_inventory(object(), frozenset())
-    assert "view inventory UNAVAILABLE" in caplog.text
-
-
-@pytest.mark.parametrize("fn_state", _FN_STATES)
-def test_a_views_acknowledgement_is_diagnosable_whatever_the_functions_say(
-    caplog, monkeypatch, fn_state
-):
-    """And so is the acknowledgement. A misspelled `views:` key, a correct one, and an unset one
-    were one observable on four of five sources while the diagnosis sat behind the other
-    advisory's happy path."""
-    import logging
-
-    from mnemiq import runtime
-
-    monkeypatch.setattr("mnemiq.sql.functions.inventory_from", lambda _a: fn_state)
-    monkeypatch.setattr("mnemiq.sql.views.inventory_for", lambda _s: _Views())
-    with caplog.at_level(logging.INFO):
-        runtime._warn_view_inventory(object(), frozenset({"views:typo-half"}))
-    assert "did not apply" in caplog.text
+# The view advisory reads NO function inventory -- that independence is the whole point, and
+# it is why parametrising these over function-inventory states was inert: `fn_state` could not
+# reach the assertion. The property that the two do not depend on each other is structural and
+# belongs to `test_both_advisories_are_called_at_boot_and_NEITHER_is_nested_in_the_other`,
+# which is the only thing that detects the nesting. These pin the advisory's own behaviour.
 
 
 def test_every_source_level_reason_reaches_a_reader():
@@ -354,10 +311,11 @@ def test_every_source_level_reason_reaches_a_reader():
     The per-answer sentence suppresses all six source-level codes, correctly -- each holds for
     every answer the deployment will give. That is only sound if a boot line says each of them
     somewhere. It did not: the advisory branched on `available`, `asked` and `names`, so a
-    source whose licence does not cover view bodies, and either view-inventory state, were
-    silent at BOTH readers while every answer carrying a call reported `unknown`.
+    licence that misses view bodies and either view-inventory state were silent at BOTH readers
+    while every answer carrying a call reported `unknown`.
 
-    Enumerated rather than spot-checked, so a seventh code cannot be added and forgotten.
+    Enumerated against the frozenset, so a seventh code fails on set equality first rather than
+    slipping through with no entry.
     """
     import inspect
 
@@ -366,7 +324,6 @@ def test_every_source_level_reason_reaches_a_reader():
 
     advisories = (inspect.getsource(runtime._warn_unconfirmable_functions)
                   + inspect.getsource(runtime._warn_view_inventory))
-    # Each code names the inventory field or state its boot branch reads.
     covered = {
         "unconfirmed-function-identity": "inventory.names",
         "function-inventory-unavailable": "inventory.available",
@@ -383,15 +340,15 @@ def test_every_source_level_reason_reaches_a_reader():
 
 
 def test_a_licence_that_misses_view_bodies_is_announced(caplog, monkeypatch):
-    """The fourth function case. A source defining NOTHING still cannot certify a view body's
-    calls, so this is not covered by the defines/asked/available branches."""
+    """The FOURTH function case. A source defining nothing still cannot certify a view body's
+    calls, so none of the defines/asked/available branches covers it."""
     import logging
 
-    class _Inv2(_Inv):
+    class _NoViewBodies(_Inv):
         covers_view_bodies = False
 
     with caplog.at_level(logging.WARNING):
-        _advise(monkeypatch, _Inv2())
+        _advise(monkeypatch, _NoViewBodies())
     assert "VIEW BODIES" in caplog.text
 
 
@@ -400,13 +357,22 @@ def test_a_licence_that_misses_view_bodies_is_announced(caplog, monkeypatch):
     [(_Views(available=False), "UNAVAILABLE"), (_Views(asked=False), "NEVER ASKED")],
 )
 def test_the_view_inventory_states_are_announced(caplog, monkeypatch, views, expected):
-    """A snapshot whose view discovery failed downgrades every statement reading a view, and
-    the function advisory never looked at views at all."""
+    """A snapshot whose view discovery failed or never ran downgrades every statement reading a
+    view, and the function advisory never looked at views at all."""
     import logging
 
     with caplog.at_level(logging.WARNING):
         _advise_views(monkeypatch, views)
     assert expected in caplog.text
+
+
+def test_a_views_acknowledgement_is_diagnosable(caplog, monkeypatch):
+    """A misspelled `views:` key, a correct one, and an unset one must not be one observable."""
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        _advise_views(monkeypatch, _Views(), frozenset({"views:typo-half"}))
+    assert "did not apply" in caplog.text
 
 
 def test_a_healthy_view_inventory_is_quiet(caplog, monkeypatch):
