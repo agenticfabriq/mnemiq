@@ -109,8 +109,10 @@ class Runtime:
             # answering from a snapshot nobody assessed.
             #
             # NOT once per swap on the threaded server, and this is measured from the code
-            # rather than assumed: `/v1/ask` is a sync `def` over one shared runtime, FastAPI
-            # runs those on a worker threadpool, and this method takes no lock -- so N workers
+            # rather than assumed: `/v1/ask` is a sync `def` over one shared runtime and FastAPI
+            # runs those on a worker threadpool, `/v1/chat` reaches the same runtime through
+            # `run_in_executor`, and the MCP server is a third door. None of them locks, and
+            # neither does this method -- so N workers
             # can each pass the version test above before any of them reaches the assignment,
             # and each pays the full walk and emits its own advisory line. The race predates
             # this call and the duplicate lines are new. Serialising the reload is the fix and
@@ -299,12 +301,18 @@ def _authz(settings: Settings) -> AuthzProvider:
 
 
 def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> None:
-    """Say, at boot, the two ways a policy silently grants less than its author meant:
+    """Say the two ways a policy silently grants less than its author meant:
 
     a row filter that fails to reach every table hanging off its tenancy axis, and a
     `pii_clearance`/`pii_mask` value that names no PII level and so clears nothing (M40).
     Both faithfully apply what the policy said, so nothing downstream complains. Advisory:
     it reports, it never refuses. The operator's policy is the operator's.
+
+    TWO CALL SITES, not one. `build_runtime` at boot, and `Runtime.reload_if_stale` on an
+    actual version swap -- `warn_unfiltered_dependents` reads `snapshot.relationships`, so a
+    swap bringing new dependent tables off a role's tenancy axis would otherwise be reported
+    against the boot snapshot forever. See the cost note at the reload site: this is
+    boot-shaped work and the swap puts it on a user request.
     """
     from mnemiq.authz.coverage import warn_unfiltered_dependents, warn_unknown_pii_levels
     from mnemiq.contract import IdentityContext
