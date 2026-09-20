@@ -392,8 +392,9 @@ def test_both_advisories_are_called_at_boot_and_NEITHER_is_nested_in_the_other()
     for a source with no helpers, no failure and a covering licence, which is every deployment
     except the one that needs it least.
 
-    Source-level because nothing in the suite builds a Runtime, and structural rather than a
-    substring: the nesting check asks whether the call appears INSIDE the other function.
+    Structural rather than behavioural because the boot path assembles a Runtime from a live
+    store, and structural rather than a substring: the nesting check asks whether the call
+    appears INSIDE the other function.
     """
     import inspect
 
@@ -441,6 +442,7 @@ def test_a_hot_swapped_snapshot_re_runs_the_view_advisory(caplog, monkeypatch):
     rt = Runtime.__new__(Runtime)
     rt.settings, rt.con = _Settings(), object()
     rt.snapshot, rt.loaded_versions = object(), {"src": "v1"}
+    rt.authz = None  # `_warn_policy_advisories` returns on a provider with no roles
 
     monkeypatch.setattr("mnemiq.runtime.load_current_snapshot",
                         lambda _s, _c: (object(), {"src": "v2"}))
@@ -466,6 +468,7 @@ def test_an_unchanged_version_does_not_re_announce(caplog, monkeypatch):
     rt = Runtime.__new__(Runtime)
     rt.settings, rt.con = _Settings(), object()
     rt.snapshot, rt.loaded_versions = object(), {"src": "v1"}
+    rt.authz = None  # `_warn_policy_advisories` returns on a provider with no roles
 
     monkeypatch.setattr("mnemiq.runtime.load_current_snapshot",
                         lambda _s, _c: (object(), {"src": "v1"}))
@@ -474,3 +477,30 @@ def test_an_unchanged_version_does_not_re_announce(caplog, monkeypatch):
     with caplog.at_level(logging.WARNING):
         rt.reload_if_stale()
     assert not caplog.text, "re-announced without a version change"
+
+
+def test_the_policy_advisory_re_runs_on_a_swap_too(monkeypatch):
+    """`warn_unfiltered_dependents` reads `snapshot.relationships`, so it drifts exactly as the
+    view one did: a swap bringing new dependent tables off a role's tenancy axis would be
+    reported against the boot snapshot. Every advisory whose SUBJECT is the snapshot re-runs."""
+    from mnemiq import runtime
+    from mnemiq.runtime import Runtime
+
+    class _Settings:
+        control_dsn = "postgresql://x"
+        ack_advisories = ""
+
+    seen = []
+    rt = Runtime.__new__(Runtime)
+    rt.settings, rt.con, rt.authz = _Settings(), object(), None
+    rt.snapshot, rt.loaded_versions = object(), {"src": "v1"}
+
+    monkeypatch.setattr("mnemiq.runtime.load_current_snapshot",
+                        lambda _s, _c: (object(), {"src": "v2"}))
+    monkeypatch.setattr("mnemiq.sql.views.inventory_for", lambda _s: _Views())
+    monkeypatch.setattr(runtime, "_warn_policy_advisories",
+                        lambda _a, snap: seen.append(snap))
+
+    rt.reload_if_stale()
+    assert seen, "the policy advisory was not re-run on the swap"
+    assert seen[0] is rt.snapshot, "it was re-run against the OLD snapshot"

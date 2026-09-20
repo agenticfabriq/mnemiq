@@ -90,12 +90,18 @@ class Runtime:
         if versions != self.loaded_versions:
             self.snapshot = snapshot
             self.loaded_versions = versions
-            # Re-run the view advisory on the NEW snapshot. It is a property of the snapshot,
-            # and the snapshot is exactly what just changed: a replica that booted healthy and
-            # swapped to one whose view discovery failed would report lineage 'unknown' on every
-            # answer reading a view, under a boot log that said otherwise. Only on an actual
-            # swap, so this is as rare as a version change and silent when the new one is fine.
+            # Re-run every advisory whose SUBJECT is the snapshot, because the snapshot is
+            # exactly what just changed. A replica that booted healthy and swapped to one whose
+            # view discovery failed would report lineage 'unknown' on every answer reading a
+            # view, under a boot log that said otherwise; `warn_unfiltered_dependents` reads
+            # `snapshot.relationships` and drifts the same way, so a swap that brings new
+            # dependent tables off a role's tenancy axis is the same silence one advisory over.
+            # Only on an actual SWAP -- this method runs per ask, and announcing there would be
+            # the wallpaper the disclosure split exists to avoid. Both are silent when the new
+            # snapshot is fine. The function advisory needs no equivalent: its subject is the
+            # adapter, which a reload does not replace.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
+            _warn_policy_advisories(self.authz, snapshot)
 
     def _source_id(self) -> str:
         """The id this runtime is actually answering FOR.
@@ -324,8 +330,8 @@ def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
     for entry in sorted(acknowledged):
         if not entry.startswith(prefix) or entry == matched:
             continue
-        logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply this boot -- either this source "
-                    "produced no such verdict, or the verdict half is misspelled", entry)
+        logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply -- either this source produced "
+                    "no such verdict, or the verdict half is misspelled", entry)
 
 
 def _warn_view_inventory(snapshot, acknowledged: frozenset[str]) -> None:
