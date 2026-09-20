@@ -301,7 +301,8 @@ def _acknowledged(settings: Settings) -> frozenset[str]:
     return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
 
 
-def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None) -> None:
+def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
+                       prefix: str = "functions:") -> None:
     """Say, at INFO, that a `functions:` key was set and silenced nothing.
 
     The sibling advisory stopped reporting on these keys because it cannot produce their
@@ -311,10 +312,48 @@ def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None) -> Non
     case, a schema whose functions were removed), and a misspelled verdict half.
     """
     for entry in sorted(acknowledged):
-        if not entry.startswith("functions:") or entry == matched:
+        if not entry.startswith(prefix) or entry == matched:
             continue
         logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply this boot -- either this source "
                     "produced no such verdict, or the verdict half is misspelled", entry)
+
+
+def _warn_view_inventory(snapshot, acknowledged: frozenset[str]) -> None:
+    """The other two source-level reasons, which reached no reader either.
+
+    `view-inventory-unavailable` and `view-inventory-never-asked` are suppressed from the
+    per-answer sentence as source properties -- correctly, they hold for every answer -- so a
+    boot line is the only reader left. A snapshot whose view discovery failed downgrades lineage
+    on every statement reading a view.
+
+    CALLED FROM `build_runtime`, beside the function advisory and not inside it. View discovery
+    degrades independently -- `lineage_for` appends these codes without consulting the function
+    inventory -- and nesting this behind that advisory's returns ran it only for a source with
+    no helpers at all, which is the one deployment shape that needs it least.
+    """
+    if snapshot is None:
+        return
+    try:
+        from mnemiq.sql.views import inventory_for
+
+        views = inventory_for(snapshot)
+    except Exception:  # noqa: BLE001 -- an advisory check must never stop a boot
+        logger.debug("view-inventory advisory failed", exc_info=True)
+        return
+    if not getattr(views, "available", True):
+        verdict = "views:unavailable"
+        log = logger.info if verdict in acknowledged else logger.warning
+        log("view inventory UNAVAILABLE: view discovery failed for this snapshot, so a "
+            "statement reading a view cannot have its lineage confirmed and reports 'unknown'")
+        _ack_did_not_apply(acknowledged, verdict, prefix="views:")
+    elif not getattr(views, "asked", False):
+        verdict = "views:never-asked"
+        log = logger.info if verdict in acknowledged else logger.warning
+        log("view inventory NEVER ASKED: this snapshot carries no view-discovery job, so a "
+            "statement reading a view cannot have its lineage confirmed and reports 'unknown'")
+        _ack_did_not_apply(acknowledged, verdict, prefix="views:")
+    else:
+        _ack_did_not_apply(acknowledged, None, prefix="views:")
 
 
 def _warn_unconfirmable_functions(adapter, acknowledged: frozenset[str] = frozenset()) -> None:
@@ -372,6 +411,20 @@ def _warn_unconfirmable_functions(adapter, acknowledged: frozenset[str] = frozen
             "carrying a call will report lineage 'unknown'")
         _ack_did_not_apply(acknowledged, verdict)
         return
+    if not inventory.covers_view_bodies and not inventory.names:
+        # The FOURTH function case, and it reached NO reader. A source that defines nothing
+        # still cannot certify a VIEW BODY's calls when the licence does not cover them, so
+        # `unconfirmed-function-identity` fires on every answer reading a view -- suppressed
+        # from the per-answer sentence as source-level, and matched by none of the three
+        # branches above. Silent everywhere while the marker said `unknown`, which is the
+        # shape this split exists to avoid.
+        verdict = "functions:no-view-bodies"
+        log = logger.info if verdict in acknowledged else logger.warning
+        log("source function inventory does not cover VIEW BODIES: this source defines no "
+            "functions of its own, and calls inside a view body still cannot be confirmed, "
+            "so an answer reading a view reports lineage 'unknown'")
+        _ack_did_not_apply(acknowledged, verdict)
+        return
     if inventory.names:
         # INFO rather than silence when acknowledged: the setting is defined as "log at
         # INFO instead of WARNING", and a verdict that vanishes is indistinguishable
@@ -390,7 +443,7 @@ def _warn_unconfirmable_functions(adapter, acknowledged: frozenset[str] = frozen
 # Advisories that live in their OWN function and still share this setting's namespace,
 # so the validator inside `_warn_source_enforcement` does not call their keys unknown.
 # Names only; each advisory owns its own verdicts.
-_ACK_SIBLINGS = frozenset({"functions"})
+_ACK_SIBLINGS = frozenset({"functions", "views"})
 
 
 def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()) -> None:
@@ -705,6 +758,11 @@ def build_runtime(settings: Settings) -> Runtime:
     _warn_policy_advisories(_boot_authz, snapshot)
     _warn_source_enforcement(adapter, _acknowledged(settings))
     _warn_unconfirmable_functions(adapter, _acknowledged(settings))
+    # SIDE BY SIDE, not nested. View discovery degrades independently of the function
+    # inventory -- `lineage_for` appends the view codes without consulting it -- so
+    # calling this from inside the function advisory ran it only when that one found
+    # nothing to report, which is every deployment except a schema with no helpers.
+    _warn_view_inventory(snapshot, _acknowledged(settings))
     return Runtime(
         con=con,
         snapshot=snapshot,
