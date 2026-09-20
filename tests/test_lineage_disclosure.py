@@ -470,13 +470,22 @@ def test_an_unchanged_version_does_not_re_announce(caplog, monkeypatch):
     rt.snapshot, rt.loaded_versions = object(), {"src": "v1"}
     rt.authz = None  # `_warn_policy_advisories` returns on a provider with no roles
 
+    from mnemiq import runtime as _rt
+
+    policy_calls = []
     monkeypatch.setattr("mnemiq.runtime.load_current_snapshot",
                         lambda _s, _c: (object(), {"src": "v1"}))
     monkeypatch.setattr("mnemiq.sql.views.inventory_for", lambda _s: _Views(available=False))
+    # OBSERVABLE, not `authz=None`. The real `_warn_policy_advisories` returns immediately on a
+    # provider with no roles, so a version of this test that let it run could not tell "guarded
+    # by the version check" from "returned before it could log" -- and unindenting the call out
+    # of that check passed.
+    monkeypatch.setattr(_rt, "_warn_policy_advisories", lambda _a, s: policy_calls.append(s))
 
     with caplog.at_level(logging.WARNING):
         rt.reload_if_stale()
-    assert not caplog.text, "re-announced without a version change"
+    assert not caplog.text, "the view advisory re-announced without a version change"
+    assert not policy_calls, "the policy advisory ran without a version change"
 
 
 def test_the_policy_advisory_re_runs_on_a_swap_too(monkeypatch):

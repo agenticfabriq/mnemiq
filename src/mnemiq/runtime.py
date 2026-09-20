@@ -100,6 +100,15 @@ class Runtime:
             # the wallpaper the disclosure split exists to avoid. Both are silent when the new
             # snapshot is fine. The function advisory needs no equivalent: its subject is the
             # adapter, which a reload does not replace.
+            #
+            # COST, stated rather than discovered: `_warn_policy_advisories` is boot-shaped
+            # work and this puts it on a user request. `FileAuthzProvider.grants_for` re-reads
+            # the policy file per declared role, and `warn_unfiltered_dependents` walks parents
+            # over `snapshot.relationships` for every granted table. Bounded and one-shot -- the
+            # single ask that observes a version change pays it, not the ones after -- and the
+            # alternative is a replica answering from a snapshot nobody assessed. If a swap ever
+            # becomes frequent enough for that to bite, this belongs on a background thread
+            # rather than deleted.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
             _warn_policy_advisories(self.authz, snapshot)
 
@@ -320,6 +329,11 @@ def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
     `prefix` selects the namespace: `functions:` for the inventory advisory, `views:` for the
     view one. One helper for both, because the reasoning is identical and two copies would
     drift.
+
+    It says "did not apply" rather than "did not apply this boot", unlike the sibling
+    diagnosis in `_warn_source_enforcement`, and the difference is not arbitrary: the view
+    advisory re-runs on a snapshot swap, so this line can print mid-run where naming the boot
+    would name the wrong event.
 
     The sibling advisory stopped reporting on these keys because it cannot produce their
     verdicts -- correct, and it left them unmentioned by anyone, which is the same silence an
