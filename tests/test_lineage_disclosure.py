@@ -99,6 +99,8 @@ def test_the_answer_carries_it_so_every_surface_does():
 class _Inv:
     """Enough of a FunctionInventory for the advisory to read."""
 
+    covers_view_bodies = True
+
     def __init__(self, available=True, asked=True, names=()):
         self.available, self.asked, self.names = available, asked, frozenset(names)
 
@@ -281,3 +283,233 @@ def test_policy_comes_before_engine_limits_in_the_answer():
         sentence("incomplete", ["v_totals"], []),
     )
     assert out.index("withheld by policy") < out.index("v_totals")
+
+
+class _Views(dict):
+    def __init__(self, available=True, asked=True):
+        super().__init__()
+        self.available, self.asked = available, asked
+
+
+def _advise_views(monkeypatch, views, acknowledged=frozenset()):
+    from mnemiq import runtime
+
+    monkeypatch.setattr("mnemiq.sql.views.inventory_for", lambda _s: views)
+    runtime._warn_view_inventory(object(), acknowledged)
+
+
+# The view advisory reads NO function inventory -- that independence is the whole point, and
+# it is why parametrising these over function-inventory states was inert: `fn_state` could not
+# reach the assertion. The property that the two do not depend on each other is structural and
+# belongs to `test_both_advisories_are_called_at_boot_and_NEITHER_is_nested_in_the_other`,
+# which is the only thing that detects the nesting. These pin the advisory's own behaviour.
+
+
+def test_every_source_level_reason_reaches_a_reader():
+    """THE CLAIM THE SPLIT MAKES, and it was false for three of the six.
+
+    The per-answer sentence suppresses all six source-level codes, correctly -- each holds for
+    every answer the deployment will give. That is only sound if a boot line says each of them
+    somewhere. It did not: the advisory branched on `available`, `asked` and `names`, so a
+    licence that misses view bodies and either view-inventory state were silent at BOTH readers
+    while every answer carrying a call reported `unknown`.
+
+    Enumerated against the frozenset, so a seventh code fails on set equality first rather than
+    slipping through with no entry.
+    """
+    import inspect
+
+    from mnemiq import runtime
+    from mnemiq.contract.seams import _SOURCE_LEVEL_LINEAGE_REASONS
+
+    advisories = (inspect.getsource(runtime._warn_unconfirmable_functions)
+                  + inspect.getsource(runtime._warn_view_inventory))
+    covered = {
+        "unconfirmed-function-identity": "inventory.names",
+        "function-inventory-unavailable": "inventory.available",
+        "function-inventory-never-asked": "inventory.asked",
+        "function-inventory-covers-no-view-bodies": "inventory.covers_view_bodies",
+        "view-inventory-unavailable": 'views, "available"',
+        "view-inventory-never-asked": 'views, "asked"',
+    }
+    assert set(covered) == set(_SOURCE_LEVEL_LINEAGE_REASONS), (
+        "a source-level reason has no entry here; it is suppressed per-answer and may reach "
+        "no boot line either")
+    for reason, branch in covered.items():
+        assert branch in advisories, f"{reason} is suppressed per-answer and said by no advisory"
+
+
+def test_a_licence_that_misses_view_bodies_is_announced(caplog, monkeypatch):
+    """The FOURTH function case. A source defining nothing still cannot certify a view body's
+    calls, so none of the defines/asked/available branches covers it."""
+    import logging
+
+    class _NoViewBodies(_Inv):
+        covers_view_bodies = False
+
+    with caplog.at_level(logging.WARNING):
+        _advise(monkeypatch, _NoViewBodies())
+    assert "VIEW BODIES" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("views", "expected"),
+    [(_Views(available=False), "UNAVAILABLE"), (_Views(asked=False), "NEVER ASKED")],
+)
+def test_the_view_inventory_states_are_announced(caplog, monkeypatch, views, expected):
+    """A snapshot whose view discovery failed or never ran downgrades every statement reading a
+    view, and the function advisory never looked at views at all."""
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        _advise_views(monkeypatch, views)
+    assert expected in caplog.text
+
+
+def test_a_views_acknowledgement_is_diagnosable(caplog, monkeypatch):
+    """A misspelled `views:` key, a correct one, and an unset one must not be one observable."""
+    import logging
+
+    with caplog.at_level(logging.INFO):
+        _advise_views(monkeypatch, _Views(), frozenset({"views:typo-half"}))
+    assert "did not apply" in caplog.text
+
+
+def test_a_healthy_view_inventory_is_quiet(caplog, monkeypatch):
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        _advise_views(monkeypatch, _Views())
+    assert not caplog.text
+
+
+def test_both_advisories_are_called_at_boot_and_NEITHER_is_nested_in_the_other():
+    """The wiring, which no test can reach by calling the advisories itself.
+
+    Two mutations survived a suite that drove both functions directly: nesting
+    `_warn_view_inventory` back inside `_warn_unconfirmable_functions`, and deleting its boot
+    call outright. The first is the defect this change exists to fix -- nested, it runs only
+    for a source with no helpers, no failure and a covering licence, which is every deployment
+    except the one that needs it least.
+
+    Structural rather than behavioural because the boot path assembles a Runtime from a live
+    store, and structural rather than a substring: the nesting check asks whether the call
+    appears INSIDE the other function.
+    """
+    import inspect
+
+    from mnemiq import runtime
+
+    boot = inspect.getsource(runtime.build_runtime)
+    for name in ("_warn_unconfirmable_functions(", "_warn_view_inventory("):
+        assert name in boot, f"{name} is never called at boot"
+
+    fn_advisory = inspect.getsource(runtime._warn_unconfirmable_functions)
+    assert "_warn_view_inventory(" not in fn_advisory, (
+        "the view advisory is nested inside the function advisory, so it runs only when that "
+        "one finds nothing to report -- the two degrade independently")
+
+
+def test_a_missing_snapshot_reports_rather_than_returning_quietly(caplog):
+    """`inventory_for` calls a missing snapshot definitively VIEWS_UNAVAILABLE, so an early
+    return here would suppress the one state it is sure about. Unreachable at boot today, and
+    pinned so the branch cannot come back as a convenience."""
+    import logging
+
+    from mnemiq import runtime
+
+    with caplog.at_level(logging.WARNING):
+        runtime._warn_view_inventory(None, frozenset())
+    assert "UNAVAILABLE" in caplog.text
+
+
+def test_a_hot_swapped_snapshot_re_runs_the_view_advisory(caplog, monkeypatch):
+    """The advisory describes the SNAPSHOT, and `reload_if_stale` is what replaces it.
+
+    Running it only at `build_runtime` meant a replica that booted on a healthy snapshot and
+    hot-swapped to one whose view discovery failed reported lineage `unknown` on every answer
+    reading a view, under a boot log that said otherwise. The state it describes had changed
+    and the reader had not been told.
+    """
+    import logging
+
+    from mnemiq.runtime import Runtime
+
+    class _Settings:
+        control_dsn = "postgresql://x"
+        ack_advisories = ""
+
+    rt = Runtime.__new__(Runtime)
+    rt.settings, rt.con = _Settings(), object()
+    rt.snapshot, rt.loaded_versions = object(), {"src": "v1"}
+    rt.authz = None  # `_warn_policy_advisories` returns on a provider with no roles
+
+    monkeypatch.setattr("mnemiq.runtime.load_current_snapshot",
+                        lambda _s, _c: (object(), {"src": "v2"}))
+    monkeypatch.setattr("mnemiq.sql.views.inventory_for", lambda _s: _Views(available=False))
+
+    with caplog.at_level(logging.WARNING):
+        rt.reload_if_stale()
+    assert rt.loaded_versions == {"src": "v2"}, "the swap did not happen"
+    assert "view inventory UNAVAILABLE" in caplog.text, "the swap was silent"
+
+
+def test_an_unchanged_version_does_not_re_announce(caplog, monkeypatch):
+    """Only on an actual swap. `reload_if_stale` runs per ask, so warning on every call would
+    be the wallpaper this whole split exists to avoid."""
+    import logging
+
+    from mnemiq.runtime import Runtime
+
+    class _Settings:
+        control_dsn = "postgresql://x"
+        ack_advisories = ""
+
+    rt = Runtime.__new__(Runtime)
+    rt.settings, rt.con = _Settings(), object()
+    rt.snapshot, rt.loaded_versions = object(), {"src": "v1"}
+    rt.authz = None  # `_warn_policy_advisories` returns on a provider with no roles
+
+    from mnemiq import runtime as _rt
+
+    policy_calls = []
+    monkeypatch.setattr("mnemiq.runtime.load_current_snapshot",
+                        lambda _s, _c: (object(), {"src": "v1"}))
+    monkeypatch.setattr("mnemiq.sql.views.inventory_for", lambda _s: _Views(available=False))
+    # OBSERVABLE, not `authz=None`. The real `_warn_policy_advisories` returns immediately on a
+    # provider with no roles, so a version of this test that let it run could not tell "guarded
+    # by the version check" from "returned before it could log" -- and unindenting the call out
+    # of that check passed.
+    monkeypatch.setattr(_rt, "_warn_policy_advisories", lambda _a, s: policy_calls.append(s))
+
+    with caplog.at_level(logging.WARNING):
+        rt.reload_if_stale()
+    assert not caplog.text, "the view advisory re-announced without a version change"
+    assert not policy_calls, "the policy advisory ran without a version change"
+
+
+def test_the_policy_advisory_re_runs_on_a_swap_too(monkeypatch):
+    """`warn_unfiltered_dependents` reads `snapshot.relationships`, so it drifts exactly as the
+    view one did: a swap bringing new dependent tables off a role's tenancy axis would be
+    reported against the boot snapshot. Every advisory whose SUBJECT is the snapshot re-runs."""
+    from mnemiq import runtime
+    from mnemiq.runtime import Runtime
+
+    class _Settings:
+        control_dsn = "postgresql://x"
+        ack_advisories = ""
+
+    seen = []
+    rt = Runtime.__new__(Runtime)
+    rt.settings, rt.con, rt.authz = _Settings(), object(), None
+    rt.snapshot, rt.loaded_versions = object(), {"src": "v1"}
+
+    monkeypatch.setattr("mnemiq.runtime.load_current_snapshot",
+                        lambda _s, _c: (object(), {"src": "v2"}))
+    monkeypatch.setattr("mnemiq.sql.views.inventory_for", lambda _s: _Views())
+    monkeypatch.setattr(runtime, "_warn_policy_advisories",
+                        lambda _a, snap: seen.append(snap))
+
+    rt.reload_if_stale()
+    assert seen, "the policy advisory was not re-run on the swap"
+    assert seen[0] is rt.snapshot, "it was re-run against the OLD snapshot"

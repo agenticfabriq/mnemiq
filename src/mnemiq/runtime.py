@@ -90,6 +90,40 @@ class Runtime:
         if versions != self.loaded_versions:
             self.snapshot = snapshot
             self.loaded_versions = versions
+            # Re-run every advisory whose SUBJECT is the snapshot, because the snapshot is
+            # exactly what just changed. A replica that booted healthy and swapped to one whose
+            # view discovery failed would report lineage 'unknown' on every answer reading a
+            # view, under a boot log that said otherwise; `warn_unfiltered_dependents` reads
+            # `snapshot.relationships` and drifts the same way, so a swap that brings new
+            # dependent tables off a role's tenancy axis is the same silence one advisory over.
+            # Only on an actual SWAP -- this method runs per ask, and announcing there would be
+            # the wallpaper the disclosure split exists to avoid. Both are silent when the new
+            # snapshot is fine. The function advisory needs no equivalent: its subject is the
+            # adapter, which a reload does not replace.
+            #
+            # COST, stated rather than discovered: `_warn_policy_advisories` is boot-shaped
+            # work and this puts it on a user request. `FileAuthzProvider.grants_for` re-reads
+            # the policy file per declared role, and `warn_unfiltered_dependents` walks parents
+            # over `snapshot.relationships` for every granted table. Paid by the ask that
+            # observes a version change, not by the ones after, and the alternative is a replica
+            # answering from a snapshot nobody assessed.
+            #
+            # NOT once per swap on the threaded server, and this is measured from the code
+            # rather than assumed: `build_app` closes over ONE runtime and serves it through
+            # two doors, `/v1/ask` as a sync `def` and `/v1/chat` through `run_in_executor`.
+            # Neither locks, and neither does this method -- so N workers can each pass the
+            # version test above before any of them reaches the assignment, and each pays the
+            # full walk and emits its own advisory line. The race predates
+            # this call and the duplicate lines are new. Serialising the reload is the fix and
+            # it is a behaviour change on the ask path, so it is named here rather than smuggled
+            # into a change about advisories.
+            #
+            # The MCP server is not a third door AS THIS TREE RUNS IT: `serve` builds its own
+            # runtime in its own process over stdio, sharing nothing with these two. A host
+            # that fronts the same tools in-process alongside the HTTP app would be, and that
+            # is a deployment property this repo cannot see.
+            _warn_view_inventory(snapshot, _acknowledged(self.settings))
+            _warn_policy_advisories(self.authz, snapshot)
 
     def _source_id(self) -> str:
         """The id this runtime is actually answering FOR.
@@ -271,12 +305,18 @@ def _authz(settings: Settings) -> AuthzProvider:
 
 
 def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> None:
-    """Say, at boot, the two ways a policy silently grants less than its author meant:
+    """Say the two ways a policy silently grants less than its author meant:
 
     a row filter that fails to reach every table hanging off its tenancy axis, and a
     `pii_clearance`/`pii_mask` value that names no PII level and so clears nothing (M40).
     Both faithfully apply what the policy said, so nothing downstream complains. Advisory:
     it reports, it never refuses. The operator's policy is the operator's.
+
+    TWO CALL SITES, not one. `build_runtime` at boot, and `Runtime.reload_if_stale` on an
+    actual version swap -- `warn_unfiltered_dependents` reads `snapshot.relationships`, so a
+    swap bringing new dependent tables off a role's tenancy axis would otherwise be reported
+    against the boot snapshot forever. See the cost note at the reload site: this is
+    boot-shaped work and the swap puts it on a user request.
     """
     from mnemiq.authz.coverage import warn_unfiltered_dependents, warn_unknown_pii_levels
     from mnemiq.contract import IdentityContext
@@ -301,8 +341,18 @@ def _acknowledged(settings: Settings) -> frozenset[str]:
     return frozenset(part.strip().lower() for part in raw.split(",") if part.strip())
 
 
-def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None) -> None:
-    """Say, at INFO, that a `functions:` key was set and silenced nothing.
+def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
+                       prefix: str = "functions:") -> None:
+    """Say, at INFO, that an acknowledgement key was set and silenced nothing.
+
+    `prefix` selects the namespace: `functions:` for the inventory advisory, `views:` for the
+    view one. One helper for both, because the reasoning is identical and two copies would
+    drift.
+
+    It says "did not apply" rather than "did not apply this boot". `_warn_source_enforcement`
+    emits both phrasings, and the plain one is right here for a reason worth keeping: the view
+    advisory re-runs on a snapshot swap, so this line can print mid-run, where naming the boot
+    would name the wrong event.
 
     The sibling advisory stopped reporting on these keys because it cannot produce their
     verdicts -- correct, and it left them unmentioned by anyone, which is the same silence an
@@ -311,10 +361,52 @@ def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None) -> Non
     case, a schema whose functions were removed), and a misspelled verdict half.
     """
     for entry in sorted(acknowledged):
-        if not entry.startswith("functions:") or entry == matched:
+        if not entry.startswith(prefix) or entry == matched:
             continue
-        logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply this boot -- either this source "
-                    "produced no such verdict, or the verdict half is misspelled", entry)
+        logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply -- either this source produced "
+                    "no such verdict, or the verdict half is misspelled", entry)
+
+
+def _warn_view_inventory(snapshot, acknowledged: frozenset[str]) -> None:
+    """The other two source-level reasons, which reached no reader either.
+
+    `view-inventory-unavailable` and `view-inventory-never-asked` are suppressed from the
+    per-answer sentence as source properties -- correctly, they hold for every answer -- so a
+    boot line is the only reader left. A snapshot whose view discovery failed downgrades lineage
+    on every statement reading a view.
+
+    TWO CALL SITES. `build_runtime`, beside the function advisory and not inside it -- view
+    discovery degrades independently, since `lineage_for` appends these codes without consulting
+    the function inventory, and nesting this behind that advisory's returns ran it only for a
+    source with no helpers at all, the one deployment shape that needs it least. And
+    `Runtime.reload_if_stale`, on an actual version swap, because the snapshot is the subject
+    and a hot swap is exactly when it changes.
+    """
+    # No `snapshot is None` guard on purpose. `inventory_for` already calls a missing snapshot
+    # definitively VIEWS_UNAVAILABLE, so returning early here would suppress the one state it is
+    # SURE about -- and a comment saying "this branch is wrong if you reach it" is a worse
+    # guarantee than not having the branch.
+    try:
+        from mnemiq.sql.views import inventory_for
+
+        views = inventory_for(snapshot)
+    except Exception:  # noqa: BLE001 -- an advisory check must never stop a boot
+        logger.debug("view-inventory advisory failed", exc_info=True)
+        return
+    if not getattr(views, "available", True):
+        verdict = "views:unavailable"
+        log = logger.info if verdict in acknowledged else logger.warning
+        log("view inventory UNAVAILABLE: view discovery failed for this snapshot, so a "
+            "statement reading a view cannot have its lineage confirmed and reports 'unknown'")
+        _ack_did_not_apply(acknowledged, verdict, prefix="views:")
+    elif not getattr(views, "asked", False):
+        verdict = "views:never-asked"
+        log = logger.info if verdict in acknowledged else logger.warning
+        log("view inventory NEVER ASKED: this snapshot carries no view-discovery job, so a "
+            "statement reading a view cannot have its lineage confirmed and reports 'unknown'")
+        _ack_did_not_apply(acknowledged, verdict, prefix="views:")
+    else:
+        _ack_did_not_apply(acknowledged, None, prefix="views:")
 
 
 def _warn_unconfirmable_functions(adapter, acknowledged: frozenset[str] = frozenset()) -> None:
@@ -372,6 +464,20 @@ def _warn_unconfirmable_functions(adapter, acknowledged: frozenset[str] = frozen
             "carrying a call will report lineage 'unknown'")
         _ack_did_not_apply(acknowledged, verdict)
         return
+    if not inventory.covers_view_bodies and not inventory.names:
+        # The FOURTH function case, and it reached NO reader. A source that defines nothing
+        # still cannot certify a VIEW BODY's calls when the licence does not cover them, so
+        # `unconfirmed-function-identity` fires on every answer reading a view -- suppressed
+        # from the per-answer sentence as source-level, and matched by none of the three
+        # branches above. Silent everywhere while the marker said `unknown`, which is the
+        # shape this split exists to avoid.
+        verdict = "functions:no-view-bodies"
+        log = logger.info if verdict in acknowledged else logger.warning
+        log("source function inventory does not cover VIEW BODIES: this source defines no "
+            "functions of its own, and calls inside a view body still cannot be confirmed, "
+            "so an answer reading a view reports lineage 'unknown'")
+        _ack_did_not_apply(acknowledged, verdict)
+        return
     if inventory.names:
         # INFO rather than silence when acknowledged: the setting is defined as "log at
         # INFO instead of WARNING", and a verdict that vanishes is indistinguishable
@@ -390,7 +496,7 @@ def _warn_unconfirmable_functions(adapter, acknowledged: frozenset[str] = frozen
 # Advisories that live in their OWN function and still share this setting's namespace,
 # so the validator inside `_warn_source_enforcement` does not call their keys unknown.
 # Names only; each advisory owns its own verdicts.
-_ACK_SIBLINGS = frozenset({"functions"})
+_ACK_SIBLINGS = frozenset({"functions", "views"})
 
 
 def _warn_source_enforcement(adapter, acknowledged: frozenset[str] = frozenset()) -> None:
@@ -705,6 +811,11 @@ def build_runtime(settings: Settings) -> Runtime:
     _warn_policy_advisories(_boot_authz, snapshot)
     _warn_source_enforcement(adapter, _acknowledged(settings))
     _warn_unconfirmable_functions(adapter, _acknowledged(settings))
+    # SIDE BY SIDE, not nested. View discovery degrades independently of the function
+    # inventory -- `lineage_for` appends the view codes without consulting it -- so
+    # calling this from inside the function advisory ran it only when that one found
+    # nothing to report, which is every deployment except a schema with no helpers.
+    _warn_view_inventory(snapshot, _acknowledged(settings))
     return Runtime(
         con=con,
         snapshot=snapshot,
