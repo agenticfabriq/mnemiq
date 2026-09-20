@@ -190,3 +190,41 @@ def test_an_answer_that_never_planned_reports_neither_rather_than_zero():
 
     body = answer_payload(AgentAnswer(answer="No.", deferred=True))
     assert body["attempts"] is None and body["corrected"] is None
+
+
+# ---------------------------------------------------------------------------
+# The `narrowed` field on the wire tells a consumer what the access decision
+# scoped. The serializer reads it from the trace (not from `ans.narrowed`),
+# and no test verified the shape it produces or that None (not evaluated)
+# survives the round trip.
+# ---------------------------------------------------------------------------
+
+
+def test_narrowed_serializes_from_the_trace():
+    """A governed answer whose trace carries narrowed must expose it on the wire."""
+    from mnemiq.contract.seams import Narrowed
+
+    trace = _trace().model_copy(update={
+        "narrowed": [Narrowed(object="claim", rows=True, columns=False)],
+    })
+    out = answer_payload(AgentAnswer(answer="3 claims.", trace=trace))
+    assert out["narrowed"] == [{"object": "claim", "rows": True, "columns": False}]
+
+
+def test_narrowed_is_none_when_the_trace_has_no_decision():
+    """None means the access decision was not evaluated -- distinct from [] which means
+    nothing was scoped. A consumer that renders the field must tell the two apart."""
+    trace = _trace()  # narrowed defaults to None
+    out = answer_payload(AgentAnswer(answer="3 claims.", trace=trace))
+    assert out["narrowed"] is None
+
+
+def test_narrowed_empty_list_means_evaluated_and_nothing_scoped():
+    """[] means governance ran and withheld nothing -- distinct from None (not evaluated).
+    A consumer that renders 'some rows were withheld' must stay silent on both, but only
+    [] means the decision actually ran. If these two collapse, a result that was never
+    governed becomes indistinguishable from one that was governed and withheld nothing."""
+    trace = _trace().model_copy(update={"narrowed": []})
+    out = answer_payload(AgentAnswer(answer="3 claims.", trace=trace))
+    assert out["narrowed"] == []
+
