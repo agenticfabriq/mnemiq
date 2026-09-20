@@ -111,15 +111,17 @@ class Runtime:
             # NOT once per swap on the threaded server, and this is measured from the code
             # rather than assumed: `build_app` closes over ONE runtime and serves it through
             # two doors, `/v1/ask` as a sync `def` and `/v1/chat` through `run_in_executor`.
-            # Neither locks, and neither does this method -- so N workers
-            # can each pass the version test above before any of them reaches the assignment,
-            # and each pays the full walk and emits its own advisory line. The race predates
+            # Neither locks, and neither does this method -- so N workers can each pass the
+            # version test above before any of them reaches the assignment, and each pays the
+            # full walk and emits its own advisory line. The race predates
             # this call and the duplicate lines are new. Serialising the reload is the fix and
             # it is a behaviour change on the ask path, so it is named here rather than smuggled
             # into a change about advisories.
             #
-            # The MCP server is NOT a third door: `serve` builds its own runtime in its own
-            # process over stdio, so it shares nothing with these two.
+            # The MCP server is not a third door AS THIS TREE RUNS IT: `serve` builds its own
+            # runtime in its own process over stdio, sharing nothing with these two. A host
+            # that fronts the same tools in-process alongside the HTTP app would be, and that
+            # is a deployment property this repo cannot see.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
             _warn_policy_advisories(self.authz, snapshot)
 
