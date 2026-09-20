@@ -109,10 +109,13 @@ class Runtime:
             # answering from a snapshot nobody assessed.
             #
             # NOT once per swap on the threaded server, and this is measured from the code
-            # rather than assumed: `/v1/ask` is a sync `def` over one shared runtime and FastAPI
-            # runs those on a worker threadpool, `/v1/chat` reaches the same runtime through
-            # `run_in_executor`, and the MCP server is a third door. None of them locks, and
-            # neither does this method -- so N workers
+            # rather than assumed, and only where it could be: `/v1/ask` is a sync `def` over
+            # one shared runtime and FastAPI runs those on a worker threadpool, and `/v1/chat`
+            # reaches the same runtime through `run_in_executor`. Both confirmed here. Whether
+            # the MCP door adds a third depends on how FastMCP dispatches sync tools, which is
+            # not pinned in this tree -- its `runtime_lock` guards lazy construction only, not
+            # `ask`, so it would not serialise this either way. Neither confirmed door locks,
+            # and neither does this method -- so N workers
             # can each pass the version test above before any of them reaches the assignment,
             # and each pays the full walk and emits its own advisory line. The race predates
             # this call and the duplicate lines are new. Serialising the reload is the fix and
