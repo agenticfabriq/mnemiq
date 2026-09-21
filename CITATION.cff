@@ -1,0 +1,46 @@
+cff-version: 1.2.0
+message: "If you use mnemiq, please cite it as below."
+title: "mnemiq: text-to-SQL you can tune to your database"
+type: software
+authors:
+  - name: "Agentic Fabriq"
+    website: "https://www.agenticfabriq.com/"
+  - family-names: "Xu"
+    given-names: "Paulina"
+    affiliation: "Agentic Fabriq"
+  - family-names: "Xu"
+    given-names: "Matthew"
+    affiliation: "Agentic Fabriq"
+repository-code: "https://github.com/agenticfabriq/mnemiq"
+url: "https://www.agenticfabriq.com/mnemiq"
+license: Apache-2.0
+date-released: "2026-09-03"
+keywords: [text-to-sql, nl2sql, data-agents, semantic-layer, mcp-server, llm-evaluation]
+references:
+  - type: article
+    authors:
+      - family-names: "Xu"
+        given-names: "Paulina"
+        affiliation: "Agentic Fabriq"
+      - family-names: "Xu"
+        given-names: "Matthew"
+        affiliation: "Agentic Fabriq"
+    title: "mnemiq: text-to-SQL you can tune to your database"
+    url: "https://www.agenticfabriq.com/blog/mnemiq/launch"
+  - type: report
+    authors:
+      - family-names: "Xu"
+        given-names: "Paulina"
+        affiliation: "Agentic Fabriq"
+      - family-names: "Xu"
+        given-names: "Matthew"
+        affiliation: "Agentic Fabriq"
+    title: "mnemiq technical report"
+    doi: "10.5281/zenodo.22806094"
+    url: "https://www.agenticfabriq.com/mnemiq/mnemiq-technical-report.pdf"
+  - type: software
+    authors:
+      - name: "Agentic Fabriq"
+    title: "Beacon"
+    repository-code: "https://github.com/agenticfabriq/beacon"
+    license: Apache-2.0
