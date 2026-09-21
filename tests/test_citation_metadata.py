@@ -45,9 +45,20 @@ def test_every_reference_carries_the_keys_cff_requires():
 
 
 def test_no_reference_author_list_is_empty():
-    """An `authors:` key with nothing under it satisfies a key check and fails the schema."""
+    """An `authors:` key with nothing under it satisfies a key check and fails the schema.
+
+    Indentation-RELATIVE, not a fixed depth. Hardcoding the nesting made a differently but
+    validly indented file red with a message about an empty list it does not have, which is
+    the same wrong-thing failure the key scan above had.
+    """
     for block in _reference_blocks():
-        if "authors:" not in block:
-            continue
-        after = block.split("authors:", 1)[1]
-        assert re.match(r"\s*\n\s{6}- ", after), "an `authors:` key with no entries under it"
+        lines = block.splitlines()
+        for i, line in enumerate(lines):
+            if not line.strip().lstrip("- ").startswith("authors:"):
+                continue
+            depth = len(line) - len(line.lstrip())
+            rest = [ln for ln in lines[i + 1:] if ln.strip()]
+            assert rest, "an `authors:` key with nothing after it at all"
+            nxt = rest[0]
+            assert (len(nxt) - len(nxt.lstrip())) > depth and nxt.strip().startswith("- "), (
+                f"`authors:` has no list entries under it: next line was {nxt!r}")
