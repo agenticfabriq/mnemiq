@@ -35,7 +35,11 @@ def test_every_reference_carries_the_keys_cff_requires():
     assert blocks, "no references found; the parser or the file has changed shape"
     for block in blocks:
         kind = re.search(r"type:\s*(\S+)", block)
-        keys = set(re.findall(r"^\s{4}(\w[\w-]*):", block, re.M)) | {"type"}
+        # BOTH shapes: a key indented under the entry, and the one sharing the `- ` line.
+        # Matching only the first reported a valid `  - authors:` reordering as missing
+        # `authors` -- failing closed, and pointing at the wrong thing.
+        keys = (set(re.findall(r"^\s{4}(\w[\w-]*):", block, re.M))
+                | set(re.findall(r"^\s{2}- (\w[\w-]*):", block, re.M)))
         missing = [k for k in ("authors", "title", "type") if k not in keys]
         assert not missing, f"reference {kind.group(1) if kind else '?'} is missing {missing}"
 
