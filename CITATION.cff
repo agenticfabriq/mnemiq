@@ -7,8 +7,10 @@ authors:
     website: "https://www.agenticfabriq.com/"
   - family-names: "Xu"
     given-names: "Paulina"
+    affiliation: "Agentic Fabriq"
   - family-names: "Xu"
     given-names: "Matthew"
+    affiliation: "Agentic Fabriq"
 repository-code: "https://github.com/agenticfabriq/mnemiq"
 url: "https://www.agenticfabriq.com/mnemiq"
 license: Apache-2.0
