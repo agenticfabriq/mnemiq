@@ -52,13 +52,16 @@ def test_no_reference_author_list_is_empty():
     the same wrong-thing failure the key scan above had.
     """
     for block in _reference_blocks():
+        kind = re.search(r"type:\s*(\S+)", block)
+        named = kind.group(1) if kind else "?"
         lines = block.splitlines()
         for i, line in enumerate(lines):
             if not line.strip().lstrip("- ").startswith("authors:"):
                 continue
             depth = len(line) - len(line.lstrip())
             rest = [ln for ln in lines[i + 1:] if ln.strip()]
-            assert rest, "an `authors:` key with nothing after it at all"
+            assert rest, f"reference {named}: `authors:` has nothing after it at all"
             nxt = rest[0]
             assert (len(nxt) - len(nxt.lstrip())) > depth and nxt.strip().startswith("- "), (
-                f"`authors:` has no list entries under it: next line was {nxt!r}")
+                f"reference {named}: `authors:` has no list entries under it, "
+                f"next line was {nxt!r}")
