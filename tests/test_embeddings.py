@@ -38,3 +38,71 @@ def test_live_embedder_puts_related_text_closer():
         return sum(x * y for x, y in zip(a, b, strict=True))
 
     assert cosine(vectors[0], vectors[1]) > cosine(vectors[0], vectors[2])
+
+
+class _Recorder:
+    """Stands in for the OpenAI client, recording what each call was asked to embed."""
+
+    def __init__(self, fail_while_longer_than: int | None = None, error: str | None = None):
+        self.sent: list[list[str]] = []
+        self._fail_over = fail_while_longer_than
+        self._error = error or "maximum input length is 8192 tokens"
+        self.embeddings = self
+
+    def create(self, model, input):  # noqa: A002 - the provider's own parameter name
+        self.sent.append(list(input))
+        if self._fail_over is not None and max((len(t) for t in input), default=0) > self._fail_over:
+            raise RuntimeError(self._error)
+        return type("R", (), {"data": [
+            type("D", (), {"index": i, "embedding": [0.0] * EMBED_DIM})() for i in range(len(input))
+        ]})()
+
+
+def _embedder(monkeypatch, client, **kwargs):
+    from mnemiq.config import Settings
+    from mnemiq.llm import embeddings as mod
+
+    monkeypatch.setattr(mod, "OpenAI", lambda **_: client)
+    return mod.LLMEmbedder(
+        Settings(llm_base_url="http://x", llm_api_key="k"), **kwargs
+    )
+
+
+def test_an_over_long_card_is_trimmed_rather_than_failing_its_whole_batch(monkeypatch):
+    # The provider rejects the BATCH, not the offending input, so one 110-column fact table
+    # used to take down the index build for an entire source.
+    client = _Recorder()
+    emb = _embedder(monkeypatch, client, max_chars=100)
+    emb.embed(["a" * 5000, "short"])
+    assert [len(t) for t in client.sent[0]] == [100, 5]
+
+
+def test_a_provider_that_still_says_too_long_is_believed_over_the_character_guess(monkeypatch):
+    # No fixed chars-per-token ratio is safe -- a card of sampled UUIDs approaches 1 -- so the
+    # budget is only a first guess and the batch is retried at half until it fits.
+    client = _Recorder(fail_while_longer_than=1000)
+    emb = _embedder(monkeypatch, client, max_chars=8192)
+    emb.embed(["z" * 9000])
+    assert [len(t[0]) for t in client.sent] == [8192, 4096, 2048, 1024, 512]
+
+
+def test_halving_stops_at_the_floor_instead_of_indexing_noise(monkeypatch):
+    client = _Recorder(fail_while_longer_than=1)  # never satisfied
+    emb = _embedder(monkeypatch, client, max_chars=2048)
+    with pytest.raises(RuntimeError, match="maximum input length"):
+        emb.embed(["y" * 9000])
+    assert [len(t[0]) for t in client.sent] == [2048, 1024, 512]  # not 256, not forever
+
+
+def test_an_unrelated_provider_error_is_not_retried(monkeypatch):
+    client = _Recorder(fail_while_longer_than=1, error="invalid api key")
+    emb = _embedder(monkeypatch, client, max_chars=8192)
+    with pytest.raises(RuntimeError, match="invalid api key"):
+        emb.embed(["anything"])
+    assert len(client.sent) == 1
+
+
+def test_results_are_ordered_by_the_index_the_api_reports(monkeypatch):
+    client = _Recorder()
+    emb = _embedder(monkeypatch, client, max_chars=100)
+    assert len(emb.embed(["a", "b", "c"])) == 3
