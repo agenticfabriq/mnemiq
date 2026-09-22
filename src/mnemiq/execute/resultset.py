@@ -103,8 +103,17 @@ def facts_cells_match(a: object, b: object) -> bool:
 
 
 def _rows(table: pa.Table) -> list[list[object]]:
-    columns = table.schema.names
-    return [[normalize(row[c]) for c in columns] for row in table.to_pylist()]
+    """One normalized cell per column, BY POSITION.
+
+    Not through to_pylist(): that hands back a dict per row, so two columns sharing a name
+    collapse to a single key and every position holding that name reads the LAST column's
+    value. Measured: `SELECT a, a, b` over 10, 20, 30 came back [20, 20, 30] -- the 10 gone,
+    not reordered. Duplicate output names are ordinary SQL (a self-join, an expression
+    repeated), and both callers compare result sets for equality: grading, and the deep-mode
+    vote in cluster(), which could therefore call two disagreeing candidates identical.
+    """
+    columns = [column.to_pylist() for column in table.columns]
+    return [[normalize(column[i]) for column in columns] for i in range(table.num_rows)]
 
 
 def _match_rows(left: list[list], right: list[list], rel_tol: float, cell_match=None) -> bool:
