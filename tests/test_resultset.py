@@ -47,3 +47,18 @@ def test_cluster_groups_agreeing_results_in_first_appearance_order():
 def test_cluster_of_all_distinct_is_all_singletons():
     tables = [_t({"n": [1]}), _t({"n": [2]}), _t({"n": [3]})]
     assert cluster(tables) == [[0], [1], [2]]
+
+
+def test_two_columns_sharing_a_name_keep_their_own_values():
+    # `SELECT a, a, b` is ordinary SQL -- a self-join, a repeated expression -- and _rows read
+    # the row back out of a to_pylist() DICT, so both `a` positions returned the LAST one's
+    # value and the first column's data was dropped outright. Measured: [10, 20, 30] graded as
+    # [20, 20, 30]. results_equal feeds cluster(), the deep-mode vote, so the collapse could
+    # call two disagreeing candidates equal.
+    left = pa.Table.from_arrays(
+        [pa.array([10]), pa.array([20]), pa.array([30])], names=["a", "a", "b"]
+    )
+    right = pa.Table.from_arrays(
+        [pa.array([20]), pa.array([20]), pa.array([30])], names=["a", "a", "b"]
+    )
+    assert not results_equal(left, right)
