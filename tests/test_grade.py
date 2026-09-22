@@ -305,3 +305,39 @@ def test_the_cell_sorted_retry_recollapses_what_it_makes_identical():
     assert not results_match(gold, cand, allow_extra_columns=True), "control: no declaration"
     assert results_match(gold, cand, allow_extra_columns=True,
                          duplicate_rows_insignificant=True)
+
+
+def test_each_cell_is_normalized_once_not_once_per_column_projection(monkeypatch):
+    # The column choices are combinatorial -- C(candidate_cols, gold_cols) -- and the candidate
+    # used to be re-read, and so re-normalized, inside that loop. This asserts the call COUNT
+    # rather than a duration: the redundancy grows without bound in the column count while the
+    # wall-clock gain does not, so a timing assertion would measure the wrong thing and flake.
+    import mnemiq.execute.resultset as resultset
+
+    calls = 0
+    real = resultset.normalize
+
+    def counting(value):
+        nonlocal calls
+        calls += 1
+        return real(value)
+
+    monkeypatch.setattr(resultset, "normalize", counting)
+
+    rows, cand_cols, gold_cols = 20, 8, 3
+    candidate = _t({f"c{i}": list(range(rows)) for i in range(cand_cols)})
+    gold = _t({f"g{i}": [v + 1000 for v in range(rows)] for i in range(gold_cols)})
+
+    assert not results_match(gold, candidate)  # no projection matches, so ALL are tried
+    assert calls == rows * (cand_cols + gold_cols)
+
+
+def test_a_repeated_column_is_projected_from_its_own_values(monkeypatch):
+    # Index projection is only equal to select() projection because _rows reads positionally.
+    # If _rows ever goes back through a name-keyed dict, the duplicated name collapses and this
+    # candidate stops carrying a 1 in the column the gold wants.
+    candidate = pa.Table.from_arrays(
+        [pa.array([1]), pa.array([2]), pa.array([3])], names=["a", "a", "b"]
+    )
+    assert results_match(_t({"g": [1]}), candidate)
+    assert results_match(_t({"g": [2]}), candidate)
