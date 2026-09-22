@@ -25,17 +25,30 @@ class Cache(Protocol):
     def put(self, key: str, value: bytes) -> None: ...
 
 
-class L1Cache:
-    """In-process LRU. The only backend v0.1 ships -- a single node needs nothing shared."""
+_DEFAULT_MAX_BYTES = 256 * 1024 * 1024  # 256 MiB -- a bounded, predictable ceiling
 
-    def __init__(self, maxsize: int = 128) -> None:
-        self._cache: LRUCache = LRUCache(maxsize=maxsize)
+
+class L1Cache:
+    """In-process LRU, budgeted by bytes.
+
+    The cache stores IPC-serialised Arrow tables, so ``len(value)`` is the exact byte cost.
+    The old entry-count budget (``maxsize=128``) was unbounded in memory: 128 large result
+    sets could exhaust the process.  A byte ceiling keeps the footprint predictable regardless
+    of result-set size.
+    """
+
+    def __init__(self, maxsize: int = _DEFAULT_MAX_BYTES) -> None:
+        self._cache: LRUCache = LRUCache(maxsize=maxsize, getsizeof=len)
 
     def get(self, key: str) -> bytes | None:
         return self._cache.get(key)
 
     def put(self, key: str, value: bytes) -> None:
-        self._cache[key] = value
+        try:
+            self._cache[key] = value
+        except ValueError:
+            pass  # value exceeds the byte budget -- drop it; a miss is fine, a crash is not
+
 
 
 class NullCache:
