@@ -32,13 +32,21 @@ class L1Cache:
     """In-process LRU, budgeted by bytes.
 
     The cache stores IPC-serialised Arrow tables, so ``len(value)`` is the exact byte cost.
-    The old entry-count budget (``maxsize=128``) was unbounded in memory: 128 large result
+    The old entry-count budget was unbounded in memory: 128 large result
     sets could exhaust the process.  A byte ceiling keeps the footprint predictable regardless
     of result-set size.
     """
 
-    def __init__(self, maxsize: int = _DEFAULT_MAX_BYTES) -> None:
-        self._cache: LRUCache = LRUCache(maxsize=maxsize, getsizeof=len)
+    def __init__(self, *, max_bytes: int = _DEFAULT_MAX_BYTES) -> None:
+        """`max_bytes`, not `maxsize`, and keyword-only.
+
+        The budget changed from entries to bytes and the parameter kept its old name for one
+        release. Nothing broke -- no caller passes it -- but `L1Cache(maxsize=128)` written by
+        someone carrying the old meaning would have built a 128-BYTE cache: not an error, a
+        cache that silently never hits, presenting as a mystery miss rate rather than a
+        failure. Keyword-only so a positional `L1Cache(128)` cannot mean it either.
+        """
+        self._cache: LRUCache = LRUCache(maxsize=max_bytes, getsizeof=len)
 
     def get(self, key: str) -> bytes | None:
         return self._cache.get(key)

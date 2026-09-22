@@ -20,7 +20,11 @@ def test_l1_stores_and_returns():
 
 
 def test_l1_evicts_the_least_recently_used():
-    cache = L1Cache(maxsize=2)
+    # 2 BYTES, holding two 1-byte values, so the third evicts -- not two ENTRIES. It predates
+    # the byte budget and passed through that change unaltered, because at one byte per value
+    # entries and bytes coincide. It tests LRU ORDER, which is unaffected either way; sizes are
+    # spelled out here so nobody reads `2` as an entry count again.
+    cache = L1Cache(max_bytes=2)
     cache.put("a", b"1")
     cache.put("b", b"2")
     cache.get("a")  # a is now the most recently used
@@ -66,7 +70,7 @@ def test_two_tier_defaults_to_no_l2():
 
 def test_l1_evicts_by_byte_budget_not_entry_count():
     """A 10-byte budget holds two 5-byte values; a third must evict one."""
-    cache = L1Cache(maxsize=10)
+    cache = L1Cache(max_bytes=10)
     cache.put("a", b"aaaaa")  # 5 bytes, total 5
     cache.put("b", b"bbbbb")  # 5 bytes, total 10
     cache.put("c", b"ccccc")  # 5 bytes, total would be 15 -> evicts LRU ("a")
@@ -79,9 +83,26 @@ def test_l1_evicts_by_byte_budget_not_entry_count():
 def test_l1_drops_a_value_that_exceeds_the_byte_budget():
     """A value larger than the budget is silently dropped -- on the cache path a miss
     is acceptable and a crash is not.  The existing entries are unaffected."""
-    cache = L1Cache(maxsize=5)
+    cache = L1Cache(max_bytes=5)
     cache.put("small", b"ab")      # 2 bytes, fits
     cache.put("big", b"1234567")   # 7 bytes > 5 byte budget -> silently dropped
     assert cache.get("small") == b"ab"   # still there
     assert cache.get("big") is None      # was not cached
 
+
+
+def test_the_budget_is_named_and_passed_by_keyword():
+    """The rename is the point, so it is pinned.
+
+    `maxsize` meant entries and then meant bytes, under one name. Nothing broke -- no caller
+    passed it -- but `L1Cache(maxsize=128)` carrying the old meaning builds a 128-BYTE cache:
+    not an error, a cache that silently never hits. Keyword-only so a positional
+    `L1Cache(128)` cannot mean it either, which is the same mistake without the name.
+    """
+    import inspect
+
+    params = inspect.signature(L1Cache.__init__).parameters
+    assert "max_bytes" in params, "the budget is not named in bytes"
+    assert "maxsize" not in params, "the ambiguous name is back"
+    assert params["max_bytes"].kind is inspect.Parameter.KEYWORD_ONLY, (
+        "a positional budget can still be written with the old meaning")
