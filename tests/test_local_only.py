@@ -92,12 +92,24 @@ def test_an_ipv6_unique_local_address_is_allowed():
 
 def test_a_genuinely_public_ipv6_address_is_still_called_publicly_routable():
     # This does NOT exercise the ULA fix itself -- fd00::/8 and fc00::/7 are never refused now,
-    # so there is no refused-ULA case left to check the wording against. What this pins is the
-    # other half: widening the allowed ranges (here, and in any later change) must not make
-    # "publicly routable" a label a genuinely public address stops earning. Mutation-verified: a
-    # regression that made `in_ula` too broad would leave this test the one still catching it,
-    # since the allowed-ULA tests above pass either way as long as fd00::1 itself is allowed.
+    # so there is no refused-ULA case left to check the wording against. It only pins that a
+    # clearly public address keeps earning that label -- it does NOT, by itself, prove `in_ula`
+    # is exactly fc00::/7 and no wider: several ways to widen it (say to `addr.version == 6`, or
+    # to fc00::/6) would still refuse this specific address and leave this test green. The
+    # adjacent test below is the one that actually pins the boundary.
     s = _s(llm_base_url="http://[2001:4860:4860::8888]:8000/v1", llm_api_key="k")
+    with pytest.raises(RuntimeError) as exc:
+        s.assert_local_only()
+    assert "publicly routable" in str(exc.value)
+
+
+def test_the_address_immediately_above_the_ula_range_is_still_refused():
+    # fe00:: is the first address past fc00::/7 (which ends at fdff:ffff:...:ffff) -- the
+    # tightest available probe against `in_ula` being accidentally widened, e.g. to fc00::/6
+    # (which WOULD wrongly include fe00::) or to fc00::/8 alone (too narrow the other way, but
+    # not what this test is for). Neither the "ULA is allowed" tests above nor the
+    # genuinely-public test above them would catch a /6 widening; this one does.
+    s = _s(llm_base_url="http://[fe00::1]:8000/v1", llm_api_key="k")
     with pytest.raises(RuntimeError) as exc:
         s.assert_local_only()
     assert "publicly routable" in str(exc.value)

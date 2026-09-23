@@ -287,8 +287,8 @@ class Settings(BaseSettings):
                 "MNEMIQ_LOCAL_ONLY is set and these endpoints would leave this network:\n  "
                 + "\n  ".join(offenders)
                 + "\n\nFix: point each of these at a loopback address, an RFC1918 private range, "
-                  "or an RFC 4193 IPv6 unique-local address (fd00::/8, fc00::/7), or unset "
-                  "MNEMIQ_LOCAL_ONLY to disable this check.\n"
+                  "or an RFC 4193 IPv6 unique-local address (fc00::/7, in practice fd00::/8), "
+                  "or unset MNEMIQ_LOCAL_ONLY to disable this check.\n"
                   "Not checked here: pg_dsn and control_dsn. libpq accepts keyword form "
                   "(`host=... port=...`), multi-host URIs and unix-socket targets, none of "
                   "which `urlparse` can read as a hostname -- a fail-closed check on them would "
