@@ -105,11 +105,23 @@ def test_a_genuinely_public_ipv6_address_is_still_called_publicly_routable():
 
 def test_the_address_immediately_above_the_ula_range_is_still_refused():
     # fe00:: is the first address past fc00::/7 (which ends at fdff:ffff:...:ffff) -- the
-    # tightest available probe against `in_ula` being accidentally widened, e.g. to fc00::/6
-    # (which WOULD wrongly include fe00::) or to fc00::/8 alone (too narrow the other way, but
-    # not what this test is for). Neither the "ULA is allowed" tests above nor the
+    # tightest available probe against the UPPER edge of `in_ula` being accidentally widened,
+    # e.g. to fc00::/6 (which WOULD wrongly include fe00::). Pins the upper boundary only; see
+    # the sibling test below for the lower one. Neither the "ULA is allowed" tests above nor the
     # genuinely-public test above them would catch a /6 widening; this one does.
     s = _s(llm_base_url="http://[fe00::1]:8000/v1", llm_api_key="k")
+    with pytest.raises(RuntimeError) as exc:
+        s.assert_local_only()
+    assert "publicly routable" in str(exc.value)
+
+
+def test_the_address_immediately_below_the_ula_range_is_still_refused():
+    # fbff:ffff:...:ffff is the last address before fc00::/7 starts -- the tightest available
+    # probe against the LOWER edge, e.g. a hand-widened range starting earlier than fc00::. No
+    # other test in this file would catch that: the ULA-allowed tests use fd00::1/fc00::1234, the
+    # genuinely-public test uses a routable address far outside either edge, and the sibling test
+    # above only pins the upper edge.
+    s = _s(llm_base_url="http://[fbff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]:8000/v1", llm_api_key="k")
     with pytest.raises(RuntimeError) as exc:
         s.assert_local_only()
     assert "publicly routable" in str(exc.value)
