@@ -95,8 +95,8 @@ def test_a_genuinely_public_ipv6_address_is_still_called_publicly_routable():
     # so there is no refused-ULA case left to check the wording against. It only pins that a
     # clearly public address keeps earning that label -- it does NOT, by itself, prove `in_ula`
     # is exactly fc00::/7 and no wider: several ways to widen it (say to `addr.version == 6`, or
-    # to fc00::/6) would still refuse this specific address and leave this test green. The
-    # adjacent test below is the one that actually pins the boundary.
+    # to fc00::/6) would still refuse this specific address and leave this test green. The two
+    # boundary tests below are the ones that actually pin the range, one edge each.
     s = _s(llm_base_url="http://[2001:4860:4860::8888]:8000/v1", llm_api_key="k")
     with pytest.raises(RuntimeError) as exc:
         s.assert_local_only()
