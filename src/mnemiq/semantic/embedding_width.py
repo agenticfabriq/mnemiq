@@ -46,13 +46,13 @@ def refuse_if_mismatched(con: duckdb.DuckDBPyConnection, table: str, dim: int) -
 
     Two call shapes rely on this, for two different DuckDB exceptions it heads off:
 
-    - Before a destructive rebuild (build_index, build_example_index, definition_index): CREATE
-      TABLE IF NOT EXISTS no-ops against an existing table, so pointing an already-built store at
-      a differently-sized embedder (an air-gapped deployment switching to a local model, say
-      BGE-M3 at 1024 after a 1536-wide hosted build) leaves the OLD column type in place. The
-      next INSERT then fails with DuckDB's own ConversionException -- but only after the
-      per-source DELETE ahead of it has already run and autocommitted, emptying the index with no
-      guidance.
+    - Before a destructive rebuild (build_index, build_example_index, definition_index,
+      federated_build): CREATE TABLE IF NOT EXISTS no-ops against an existing table, so pointing
+      an already-built store at a differently-sized embedder (an air-gapped deployment switching
+      to a local model, say BGE-M3 at 1024 after a 1536-wide hosted build) leaves the OLD column
+      type in place. The next INSERT then fails with DuckDB's own ConversionException -- but only
+      after the per-source DELETE ahead of it has already run and autocommitted, emptying the
+      index with no guidance.
     - Before a read query (retrieve): `array_cosine_similarity(embedding, ?::FLOAT[n])` against
       a column of a different width fails with DuckDB's own BinderException, which names neither
       cause nor remedy -- an operator who runs `ask` without ever rebuilding would see only that

@@ -18,9 +18,11 @@ def test_declared_width_on_a_table_that_has_never_been_built_is_none(tmp_path):
 def test_declared_width_ignores_a_same_named_table_in_an_attached_catalog(tmp_path):
     """information_schema.columns spans every attached catalog and schema. The old query filtered
     it on table_name + column_name alone, with no table_schema/table_catalog, so `fetchone()`
-    picked ARBITRARILY (see below: deterministically, but on catalog NAME, not on which one is
-    actually in use) between this database's own semantic_object and an attached catalog's table
-    of the same name. A different bug from the "destructive statement runs before the check" one
+    picked ARBITRARILY between this database's own semantic_object and an attached catalog's
+    table of the same name -- arbitrarily from the caller's perspective, in that nothing in the
+    query says which one it wants; the ATTACH below is named to make that pick land on the wrong
+    one in THIS test deterministically, not by luck (see the comment on it). A different bug from
+    the "destructive statement runs before the check" one
     this module's own `refuse_if_mismatched` already closed elsewhere (build_index,
     build_example_index, definition_index, federated_build) -- this one is IN the check itself,
     and slipped past every one of those fixes because none of their tests attached a second
