@@ -48,6 +48,11 @@ def build_definition_index(records: OntologyRecords, snapshot: Snapshot,
     source: this source's existing rows are cleared whenever the function runs, even on a
     fail-soft path, so a stale definition never outlives the build that was meant to refresh it.
     Fail-soft: no embedder, empty corpus, or an embed error writes nothing new and returns 0."""
+    # Runs before the embed call on purpose, matching this function's original ordering: a
+    # transient embed failure (a timeout, a 5xx) clears this source rather than leaving it as
+    # it was. That trade favors "no grounding" over "possibly-stale grounding" on a failure,
+    # which is the existing behaviour this task is not the one to revisit -- it only matters
+    # once a caller keeps one connection across builds instead of the fresh one cli.py uses.
     try:
         con.execute("DELETE FROM definition_concept WHERE source_id = ?", [snapshot.source_id])
     except duckdb.CatalogException:

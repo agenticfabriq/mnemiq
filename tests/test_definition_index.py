@@ -60,14 +60,44 @@ def test_no_embedder_writes_nothing(tmp_path):
 
 def test_a_fail_soft_rebuild_still_clears_the_old_rows(tmp_path):
     # Delete-then-insert per source: a rebuild that turns up nothing new must not leave the
-    # PREVIOUS build's rows behind, since nearest() reads across every source with no filter --
-    # a stale definition would keep grounding answers on a term that has since changed.
+    # PREVIOUS build's rows behind, since nearest() reads across every source with no filter.
+    # Not a live bug today -- cli.py builds into a fresh connection every run -- but a contract
+    # a future caller that reuses a connection across builds needs to hold.
     con = duckdb.connect()
     snap = _snapshot([Definition(id="d1", term="Premium", domain="ins",
                                  definition="the amount paid for coverage")])
     assert build_definition_index(OntologyRecords(), snap, con, FakeEmbedder()) == 1
 
     assert build_definition_index(OntologyRecords(), snap, con, None) == 0
+    assert con.execute("SELECT count(*) FROM definition_concept").fetchone()[0] == 0
+
+
+def test_an_empty_corpus_rebuild_also_clears_the_old_rows(tmp_path):
+    # Same contract, the "real embedder but nothing to embed this time" branch: a source that
+    # dropped its last definition should not keep grounding on the one that used to be there.
+    con = duckdb.connect()
+    snap = _snapshot([Definition(id="d1", term="Premium", domain="ins",
+                                 definition="the amount paid for coverage")])
+    assert build_definition_index(OntologyRecords(), snap, con, FakeEmbedder()) == 1
+
+    assert build_definition_index(OntologyRecords(), _snapshot([]), con, FakeEmbedder()) == 0
+    assert con.execute("SELECT count(*) FROM definition_concept").fetchone()[0] == 0
+
+
+def test_an_embed_error_also_clears_the_old_rows(tmp_path):
+    # Same contract, the third fail-soft branch: an embedder that raises. This is the ordering
+    # this task deliberately kept from the function's original behaviour -- see the comment on
+    # the DELETE in build_definition_index for the trade it makes.
+    class _FailingEmbedder:
+        def embed(self, texts):
+            raise RuntimeError("down")
+
+    con = duckdb.connect()
+    snap = _snapshot([Definition(id="d1", term="Premium", domain="ins",
+                                 definition="the amount paid for coverage")])
+    assert build_definition_index(OntologyRecords(), snap, con, FakeEmbedder()) == 1
+
+    assert build_definition_index(OntologyRecords(), snap, con, _FailingEmbedder()) == 0
     assert con.execute("SELECT count(*) FROM definition_concept").fetchone()[0] == 0
 
 
