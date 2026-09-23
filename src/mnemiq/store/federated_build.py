@@ -5,6 +5,7 @@ import duckdb
 from mnemiq.config import Settings, SourceSpec
 from mnemiq.contract import Snapshot
 from mnemiq.llm.embeddings import Embedder
+from mnemiq.semantic.cards import build_cards
 from mnemiq.semantic.embedding_width import refuse_if_mismatched
 from mnemiq.semantic.federation import merge_snapshots
 from mnemiq.semantic.store import build_example_index, build_index
@@ -24,10 +25,16 @@ def build_federated_snapshot(
     # build_index/build_example_index reach their OWN width check would already have emptied
     # every per-source card and example. That is precisely the failure this branch removed from
     # the single-source path (see build_index) -- it was only ever fixed one call site lower,
-    # never here, where the federated rebuild has its own DELETE ahead of both of them. Gated on
-    # there being something to embed, matching build_index/build_example_index's own rule that
-    # embedder.dim (a network probe on LLMEmbedder) is never touched for empty input.
-    if fed.columns:
+    # never here, where the federated rebuild has its own DELETE ahead of both of them.
+    #
+    # Gated on there being something to embed, matching build_index/build_example_index's own
+    # rule that embedder.dim (a network probe on LLMEmbedder) is never touched for empty input.
+    # `build_cards(fed)`, not `fed.columns`: build_cards makes one card per source_bindings entry
+    # and falls back to columns only when there are no bindings, so gating on columns alone left
+    # a federated snapshot with bindings but no columns skipping this check while build_index
+    # still produced cards for it -- reopening the exact data-loss window this fix closes, just
+    # one binding shape narrower.
+    if build_cards(fed):
         refuse_if_mismatched(con, "semantic_object", embedder.dim)
     if fed.examples:
         refuse_if_mismatched(con, "example", embedder.dim)

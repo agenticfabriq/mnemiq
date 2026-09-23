@@ -1,9 +1,9 @@
 import pytest
 
 from mnemiq.config import SourceSpec
-from mnemiq.contract import Column, Snapshot
+from mnemiq.contract import Column, Example, Snapshot, SourceBinding
 from mnemiq.llm.embeddings import FakeEmbedder
-from mnemiq.semantic.store import build_index
+from mnemiq.semantic.store import build_example_index, build_index
 from mnemiq.store.bootstrap import init_store
 from mnemiq.store.federated_build import build_federated_snapshot
 
@@ -53,6 +53,69 @@ def test_federated_rebuild_refuses_a_width_mismatch_before_deleting_the_old_rows
     pairs = [
         (SourceSpec(id="a", kind="postgres", target="d", catalog="pg", schema="public"),
          _snap("a", "v1", "person")),
+    ]
+    with pytest.raises(RuntimeError) as exc_info:
+        build_federated_snapshot(con, pairs, FakeEmbedder(dim=1024))
+    message = str(exc_info.value)
+    assert "1536" in message and "1024" in message
+
+    # The point of the fix: the single-source build's rows must survive the refused rebuild.
+    assert con.execute("SELECT object_id FROM semantic_object").fetchall() == [("claim",)]
+
+
+def test_federated_rebuild_refuses_an_example_width_mismatch_too(tmp_path):
+    """The semantic_object and example checks are independent -- each guards its own DELETE.
+    Built so ONLY `example` mismatches (`semantic_object` is already at the width this federated
+    rebuild uses), isolating this from the test above: review caught that a version of this fix
+    covering just `semantic_object` left `example` unrefused, and the prior test could not have
+    caught that gap because its snapshot carries no examples at all.
+    """
+    path = str(tmp_path / "store.duckdb")
+    con = init_store(path)
+    build_index(con, _snap("acme", "v1", "claim"), FakeEmbedder(dim=1024))  # matches the dim below
+    snap_with_example = _snap("acme", "v1", "claim").model_copy(update={"examples": [
+        Example(question="q", sql="SELECT 1", tables=["claim"], object_id="claim"),
+    ]})
+    build_example_index(con, snap_with_example, FakeEmbedder(dim=1536))  # the one that mismatches
+    con.close()
+
+    con = init_store(path)
+    pairs = [
+        (SourceSpec(id="a", kind="postgres", target="d", catalog="pg", schema="public"),
+         Snapshot(version="v1", source_id="a", created_at="t",
+                  columns=[Column(id="person.id", object_id="person", name="id")],
+                  examples=[Example(question="q2", sql="SELECT 1", tables=["person"],
+                                     object_id="person")])),
+    ]
+    with pytest.raises(RuntimeError) as exc_info:
+        build_federated_snapshot(con, pairs, FakeEmbedder(dim=1024))
+    message = str(exc_info.value)
+    assert "example" in message  # names the mismatched table, not semantic_object
+    assert "1536" in message and "1024" in message
+
+    # The point of the fix: the earlier example row must survive the refused rebuild.
+    assert con.execute("SELECT object_id FROM example").fetchall() == [("claim",)]
+
+
+def test_federated_rebuild_still_refuses_when_the_snapshot_has_bindings_but_no_columns(tmp_path):
+    """`build_cards` makes one card per `source_bindings` entry, falling back to `columns` only
+    when there are NO bindings -- so a first version of this fix that gated on `fed.columns`
+    instead of `build_cards(fed)` skipped the width check for exactly this shape while
+    `build_index` still produced cards for it, reopening the data-loss window one binding shape
+    narrower than the fix that closed it everywhere else. Caught by review before it shipped.
+    """
+    path = str(tmp_path / "store.duckdb")
+    con = init_store(path)
+    build_index(con, _snap("acme", "v1", "claim"), FakeEmbedder())  # single-source, 1536-wide
+    con.close()
+
+    con = init_store(path)
+    pairs = [
+        (SourceSpec(id="a", kind="postgres", target="d", catalog="pg", schema="public"),
+         Snapshot(version="v1", source_id="a", created_at="t",
+                  source_bindings=[SourceBinding(id="sb:person", source_id="a",
+                                                  object_id="person", source_object="person",
+                                                  binding_type="table")])),  # bindings, no columns
     ]
     with pytest.raises(RuntimeError) as exc_info:
         build_federated_snapshot(con, pairs, FakeEmbedder(dim=1024))
