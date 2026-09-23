@@ -5,20 +5,22 @@ import logging
 import duckdb
 
 from mnemiq.contract import Snapshot
-from mnemiq.llm.embeddings import EMBED_DIM
 from mnemiq.ontology.records import OntologyRecords
+from mnemiq.semantic.embedding_width import refuse_if_mismatched
 
 logger = logging.getLogger(__name__)
 
 DEFINITION_INDEX_MAX_CONCEPTS = 500  # a scheme above this contributes only its scheme-level text
 
-_DDL = f"""
+
+def _ddl(dim: int) -> str:
+    return f"""
 CREATE TABLE IF NOT EXISTS definition_concept (
   source_id TEXT,
   object_id TEXT,
   term      TEXT,
   text      TEXT,
-  embedding FLOAT[{EMBED_DIM}]
+  embedding FLOAT[{dim}]
 )
 """
 
@@ -44,17 +46,43 @@ def build_definition_index(records: OntologyRecords, snapshot: Snapshot,
                            con: duckdb.DuckDBPyConnection, embedder,
                            max_concepts: int = DEFINITION_INDEX_MAX_CONCEPTS) -> int:
     """Embed the local meaning corpus into `con` for enrich-time grounding. Delete-then-insert per
-    source. Fail-soft: no embedder, empty corpus, or an embed error writes nothing and returns 0."""
-    con.execute(_DDL)
-    con.execute("DELETE FROM definition_concept WHERE source_id = ?", [snapshot.source_id])
+    source: this source's existing rows are cleared whenever the function runs, even on a
+    fail-soft path, so a stale definition never outlives the build that was meant to refresh it.
+    Fail-soft: no embedder, empty corpus, or an embed error writes nothing new and returns 0.
+
+    A width mismatch against an already-built table is refused (see refuse_if_mismatched)
+    instead of being wiped -- but only once the new width is knowable, which needs a successful
+    embed() call (the width comes from the vectors it returns, not a second probe). So the
+    fail-soft paths below still clear this source's rows on their way out -- a genuine "nothing
+    new to write" is not a width conflict, and cli.py's fresh connection per build means a
+    transient embed failure there favors "no grounding" over "possibly-stale grounding" -- while
+    the one path that actually has a new width to write checks it before clearing anything.
+    """
+    def _clear_stale() -> None:
+        try:
+            con.execute(
+                "DELETE FROM definition_concept WHERE source_id = ?", [snapshot.source_id]
+            )
+        except duckdb.CatalogException:
+            pass  # nothing built yet for any source -- nothing to clear
+
     rows = _corpus(records, snapshot, max_concepts)
     if not rows or embedder is None:
+        _clear_stale()
         return 0
     try:
         vectors = embedder.embed([text for _oid, _term, text in rows])
     except Exception as exc:  # degrade-to-local: grounding is optional, never fatal
         logger.warning("definition index embedding failed; grounding skipped: %s", exc)
+        _clear_stale()
         return 0
+
+    dim = len(vectors[0])
+    refuse_if_mismatched(con, "definition_concept", dim)
+    _clear_stale()
+    # Only creates the table the first time; refuse_if_mismatched above is what makes a later
+    # build at a different width safe rather than a silent no-op against the wrong width.
+    con.execute(_ddl(dim))
     con.executemany(
         "INSERT INTO definition_concept (source_id, object_id, term, text, embedding) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -65,12 +93,13 @@ def build_definition_index(records: OntologyRecords, snapshot: Snapshot,
 
 
 class DefinitionIndex:
-    """Read side. Ensures its table on construction so a store built before SP5b answers
-    'nothing indexed' rather than raising."""
+    """Read side. No embedder here to size a table with if one has never been built, so
+    construction does not create it -- `nearest`'s own explicit table-existence check treats a
+    missing table the same as an empty one and answers 'nothing indexed' rather than raising,
+    silently rather than logging a warning on every call."""
 
     def __init__(self, con: duckdb.DuckDBPyConnection) -> None:
         self._con = con
-        con.execute(_DDL)
 
     def nearest(self, query_text: str, embedder, k: int = 5,
                 floor: float = 0.0) -> list[tuple[str, str, float]]:
@@ -80,13 +109,32 @@ class DefinitionIndex:
             return []
         try:
             (embedding,) = embedder.embed([query_text])
+        except Exception as exc:  # embed error -> no grounding
+            logger.warning("definition index query failed; grounding skipped: %s", exc)
+            return []
+        try:
+            # Never built -- checked explicitly, by name, schema AND catalog (a same-named table
+            # in a different attached database must not pass this check while the unqualified
+            # query below can't actually resolve to it), rather than inferred from catching
+            # duckdb.CatalogException around the query: a missing TABLE and a missing FUNCTION
+            # both raise that exact exception type, so catching it there would also silently
+            # swallow a genuinely broken query (say, array_cosine_similarity gone after a
+            # DuckDB version change) instead of warning about it below. Both statements share
+            # this one try so a failure in the check itself -- not just "table absent" -- still
+            # reaches the warning rather than propagating uncaught.
+            table_exists = self._con.execute(
+                "SELECT 1 FROM information_schema.tables WHERE table_name = 'definition_concept' "
+                "AND table_schema = current_schema() AND table_catalog = current_database()"
+            ).fetchone()
+            if table_exists is None:
+                return []
             rows = self._con.execute(
                 f"SELECT term, text, "
                 f"array_cosine_similarity(embedding, ?::FLOAT[{len(embedding)}]) AS score "
                 f"FROM definition_concept ORDER BY score DESC LIMIT ?",
                 [embedding, k],
             ).fetchall()
-        except Exception as exc:  # embed error or an unavailable array function -> no grounding
+        except Exception as exc:  # an unavailable array function or similar -> no grounding
             logger.warning("definition index query failed; grounding skipped: %s", exc)
             return []
         return [(term, text, float(score)) for term, text, score in rows if score is not None

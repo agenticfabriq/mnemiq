@@ -173,9 +173,26 @@ no grants, no snapshot — no data.
 standard OpenAI client, so vLLM, Ollama, llama.cpp's server, LM Studio, vendor gateways and the
 hosted APIs all work — set the base URL, a key (any non-empty string for local servers that
 ignore it) and a model name. Nothing about the engine assumes a hosted provider, which is what
-"runs inside your perimeter" means in practice: point it at a local server and no schema, no
-question and no row ever leaves your network. Embeddings follow the same setting, or their own
-via `MNEMIQ_EMBED_*`.
+"runs inside your perimeter" means in practice: point it at a local server, and — as long as
+every configured endpoint is one you've verified stays on your network — no schema, no question
+and no row ever leaves it. Embeddings follow the same setting, or their own via `MNEMIQ_EMBED_*`.
+
+Set `MNEMIQ_LOCAL_ONLY=1` to make that verification the `mnemiq` command's job instead of yours
+(the standalone scripts under `scripts/` build their own `Settings` and don't call this check, so
+the guarantee below is for `mnemiq` commands specifically): it refuses to run if the chat,
+embedding, judge, or any Verity endpoint is not an IP literal inside loopback, an RFC1918 range,
+or its IPv6 analog (`fc00::/7`, in practice `fd00::/8`) — `localhost` and `localhost.localdomain`
+are trusted by name rather than checked as addresses, and every other DNS name is refused
+outright: this performs no lookups, so it cannot confirm where any name actually points.
+`MNEMIQ_PG_DSN` and `MNEMIQ_CONTROL_DSN` are deliberately **not** checked — libpq accepts keyword
+form (`host=... port=...`), multi-host URIs and Unix-socket targets, none of which a URL parser
+can read a hostname from, so a fail-closed
+check on them would refuse legitimate DSNs rather than catch anything; verify those by hand. Two
+more things worth knowing before an air-gapped run: any command that opens the store fetches
+DuckDB's `vss` and `fts` extensions from `extensions.duckdb.org` on first use, and attaching a
+Postgres or SQLite source fetches DuckDB's matching `postgres`/`sqlite` extension the same way —
+pre-seed DuckDB's extension cache, or vendor the extensions your source and store need, ahead of
+time.
 
 ## Use it from a browser (workbench)
 

@@ -5,41 +5,68 @@ import json
 import duckdb
 
 from mnemiq.contract import Snapshot
-from mnemiq.llm.embeddings import EMBED_DIM, Embedder
+from mnemiq.llm.embeddings import Embedder
 from mnemiq.semantic.cards import build_cards
+from mnemiq.semantic.embedding_width import refuse_if_mismatched
 
-_DDL = f"""
+
+def _ddl(dim: int) -> str:
+    return f"""
 CREATE TABLE IF NOT EXISTS semantic_object (
   object_id TEXT,
   source_id TEXT,
   version   TEXT,
   card      TEXT,
-  embedding FLOAT[{EMBED_DIM}]
+  embedding FLOAT[{dim}]
 )
 """
 
-_EXAMPLE_DDL = f"""
+
+def _example_ddl(dim: int) -> str:
+    return f"""
 CREATE TABLE IF NOT EXISTS example (
   question   TEXT,
   sql        TEXT,
   tables     TEXT,
   object_id  TEXT,
   source_id  TEXT,
-  embedding  FLOAT[{EMBED_DIM}]
+  embedding  FLOAT[{dim}]
 )
 """
 
 
 def build_index(con: duckdb.DuckDBPyConnection, snapshot: Snapshot, embedder: Embedder) -> int:
-    """Render, embed and index the snapshot's tables. One live index per source."""
-    cards = build_cards(snapshot)
-    con.execute(_DDL)
+    """Render, embed and index the snapshot's tables. One live index per source: this source's
+    existing rows are cleared whenever the function runs, even when the new build is empty, so a
+    stale card never outlives the build that was meant to refresh it -- at retrieval time a stale
+    card is indistinguishable from a fresh one.
 
-    # One live index per source: a stale card is worse than a missing one, because at
-    # retrieval time it is indistinguishable from a fresh one.
-    con.execute("DELETE FROM semantic_object WHERE source_id = ?", [snapshot.source_id])
+    Checked for empty input before anything else touches `embedder`: on LLMEmbedder, `.dim`
+    itself makes an embedding call to probe the endpoint, and a snapshot with nothing new to
+    write should never cost a network round trip for that -- the case that matters most in
+    exactly the air-gapped deployment this width-from-the-embedder design is for. The clearing
+    DELETE below needs no such width, so it still runs on this path.
+
+    Sizes the embedding column from embedder.dim, but only on first create: CREATE TABLE IF NOT
+    EXISTS is a no-op against a store already built at a different width, so a mismatch here is
+    refused (see refuse_if_mismatched) before the clearing DELETE, rather than letting the DELETE
+    run and then crashing on the INSERT.
+    """
+    def _clear_stale() -> None:
+        try:
+            con.execute("DELETE FROM semantic_object WHERE source_id = ?", [snapshot.source_id])
+        except duckdb.CatalogException:
+            pass  # nothing built yet for any source -- nothing to clear
+
+    cards = build_cards(snapshot)
     if not cards:
+        _clear_stale()
         return 0
+
+    dim = embedder.dim
+    refuse_if_mismatched(con, "semantic_object", dim)
+    _clear_stale()
+    con.execute(_ddl(dim))
 
     vectors = embedder.embed([c.text for c in cards])
     con.executemany(
@@ -72,12 +99,24 @@ def build_example_index(
     """Embed each validated example's QUESTION into its own index, so retrieval pulls the
     examples most similar to the asked question -- not whatever tables happened to rank.
 
-    Kept out of semantic_object so example text never perturbs table retrieval.
+    Kept out of semantic_object so example text never perturbs table retrieval. Same clearing,
+    empty-check-first, and width-mismatch-refused-before-clearing contract as build_index, above
+    -- see its docstring for the reasoning.
     """
-    con.execute(_EXAMPLE_DDL)
-    con.execute("DELETE FROM example WHERE source_id = ?", [snapshot.source_id])
+    def _clear_stale() -> None:
+        try:
+            con.execute("DELETE FROM example WHERE source_id = ?", [snapshot.source_id])
+        except duckdb.CatalogException:
+            pass  # nothing built yet for any source -- nothing to clear
+
     if not snapshot.examples:
+        _clear_stale()
         return 0
+
+    dim = embedder.dim
+    refuse_if_mismatched(con, "example", dim)
+    _clear_stale()
+    con.execute(_example_ddl(dim))
 
     vectors = embedder.embed([e.question for e in snapshot.examples])
     con.executemany(
@@ -92,8 +131,14 @@ def build_example_index(
 
 
 def indexed_version(con: duckdb.DuckDBPyConnection, source_id: str) -> str | None:
-    con.execute(_DDL)
-    row = con.execute(
-        "SELECT DISTINCT version FROM semantic_object WHERE source_id = ?", [source_id]
-    ).fetchone()
+    # No embedder here to size a column with, and none needed -- this only reads. Guessing a
+    # width to stand the table up on would risk fixing it at the wrong size before build_index
+    # ever runs with the real embedder, so a store that hasn't been built yet is just "nothing
+    # indexed" rather than a table created on a guess.
+    try:
+        row = con.execute(
+            "SELECT DISTINCT version FROM semantic_object WHERE source_id = ?", [source_id]
+        ).fetchone()
+    except duckdb.CatalogException:
+        return None
     return row[0] if row else None

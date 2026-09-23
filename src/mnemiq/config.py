@@ -32,6 +32,18 @@ DEFAULT_RETRIEVAL_K = 24
 
 _SECRET_HINTS = ("api_key", "dsn", "password", "secret")  # fields whose value is never printed in .env.example
 
+# Every `Settings` field `assert_local_only` checks, by name. Nothing enforces that a NEW field
+# whose name ends in `_url` gets added here -- a future verity_*_url (or any other) setting would
+# otherwise be silently exempt while the run still prints "verified". That is what
+# tests/test_local_only.py::test_every_url_field_is_checked_or_explicitly_exempted is for: it
+# fails on any `_url` field that is neither in this tuple nor in that test's own EXEMPTED set,
+# which is where a field would go instead of here if checking it were ever wrong (there are none
+# today; MNEMIQ_LOCAL_ONLY's whole premise is that every network-facing URL is accounted for).
+_LOCAL_ONLY_CHECKED_URL_FIELDS = (
+    "llm_base_url", "embed_base_url", "verify_base_url",
+    "verity_records_url", "verity_token_url", "verity_traces_url",
+)
+
 
 @dataclass(frozen=True)
 class SourceSpec:
@@ -50,6 +62,18 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="MNEMIQ_", extra="ignore", populate_by_name=True)
 
+    # --- safety ---
+    # Scoped to HTTP endpoints deliberately, not every network setting: llm/embed/verify_base_url
+    # and the three verity_* URLs are all ordinary URLs a hostname can be read from. pg_dsn and
+    # control_dsn are NOT checked -- libpq's keyword form, multi-host URIs and unix sockets are
+    # not URLs `urlparse` can read a hostname from, and the raised message says so explicitly
+    # rather than let its silence imply completeness. A libpq-aware DSN check is separate work.
+    local_only: bool = Field(
+        default=False,
+        description="refuse to start if a chat, embedding, judge or Verity endpoint would leave "
+                     "this machine or network (see assert_local_only for exactly what this checks "
+                     "and what it deliberately does not)",
+    )
     # --- connection ---
     llm_base_url: str | None = Field(default=None, description="chat/generation OpenAI-compat base URL")
     llm_api_key: str | None = Field(default=None, description="chat/generation API key")
@@ -152,6 +176,129 @@ class Settings(BaseSettings):
     @classmethod
     def from_env(cls) -> "Settings":
         return cls()
+
+    def assert_local_only(self) -> None:
+        """Refuse to run when a chat, embedding, judge or Verity endpoint would carry data off
+        the network.
+
+        For a deployment whose whole premise is that nothing leaves, a mistyped base URL is not
+        a misconfiguration that fails -- it is one that SUCCEEDS, quietly, having sent every
+        schema card to a third party. This turns that into a startup error.
+
+        Checked: llm_base_url, embed_base_url, verify_base_url, and the three verity_* endpoints
+        (verity_records_url, verity_token_url, verity_traces_url) -- trace_sink POSTs to
+        verity_traces_url on every ask/serve, and even with the text/rows disclosure opt-ins off
+        that body still carries question hashes, timings, policy hashes and identity, so leaving
+        it unchecked would be telemetry escaping under a flag named LOCAL_ONLY. NOT checked:
+        pg_dsn and control_dsn -- see the trailing line of the raised message for why, which is
+        the answer an operator actually needs, not a comment only a reader of this source sees.
+
+        Loopback, the RFC1918 private ranges, and their IPv6 counterparts pass, because a data
+        centre runs the model on another host on its own network -- fc00::/7 (RFC 4193's
+        "unique local address" range, which `fd00::/8` in practice always comes from) is
+        RFC1918's own IPv6 analog, not a narrower or looser thing, so an IPv6-only deployment
+        gets the same allowance an IPv4 one does. An IPv4-mapped IPv6 literal (`::ffff:10.0.0.1`)
+        is judged on the IPv4 address it maps to, for the same reason: it is that address, just
+        spelled by a resolver or proxy that prefers IPv6 syntax. This is deliberately narrower
+        than `ipaddress`'s own `is_private`, which also accepts several IANA special-purpose
+        ranges we do NOT want to wave through silently -- 169.254.169.254 above all, the
+        link-local address several cloud providers use to serve their metadata API, which is
+        exactly the kind of off-box hop this check exists to catch. Anything we cannot place
+        inside loopback, RFC1918 or its IPv6 analog is refused:
+        a URL `urlparse` itself cannot parse (a malformed IPv6 host literal raises INSIDE
+        `urlparse`, before `.hostname` is ever read -- not the same failure as `.hostname`
+        returning None, and both have to be caught, not just the second one), an unresolved DNS
+        name (public or internal -- this performs no lookup, so an internal name is refused for
+        the same reason a public one is, not because it looks suspicious), and every other IANA
+        special range are all refused the same way, because none of them is evidence of being on
+        this network. Every offender is collected and named together, and each is evaluated
+        independently of the others -- one endpoint's `urlparse` failure must not discard an
+        offender already found for an earlier one, which is exactly the bug an unguarded
+        `urlparse(url).hostname` produced. An operator who fixes one and reruns only to be told
+        about the next will conclude the check itself is flaky and disable it.
+
+        A passing, enforced check still writes one line to stderr naming what it verified.
+        Silence otherwise means two things that must not look alike: "enforced, verified clean"
+        and "MNEMIQ_LOCALONLY (no underscore) was typo'd, so `local_only` is False and this
+        method returned on its first line." A typo is inert in exactly the same way a correct,
+        clean run is, and only one of them is safe.
+        """
+        if not self.local_only:
+            return
+        import ipaddress
+        import sys
+        from urllib.parse import urlparse
+
+        rfc1918 = (
+            ipaddress.ip_network("10.0.0.0/8"),
+            ipaddress.ip_network("172.16.0.0/12"),
+            ipaddress.ip_network("192.168.0.0/16"),
+        )
+        # RFC 4193 unique-local addresses -- IPv6's own analog of RFC1918, not merely something
+        # `is_private` happens to also cover. fc00::/7 spans both the locally-assigned fd00::/8
+        # in practice and the (never yet used) centrally-assigned fc00::/8 half of the range.
+        ula = ipaddress.ip_network("fc00::/7")
+
+        offenders: list[str] = []
+        checked: list[str] = []
+        for name in _LOCAL_ONLY_CHECKED_URL_FIELDS:
+            url = getattr(self, name, None)
+            if not url:
+                continue
+            try:
+                host = urlparse(url).hostname
+            except ValueError as exc:
+                # `urlparse` raises for a malformed IPv6 host literal (e.g. an unterminated
+                # `[`) BEFORE `.hostname` is reached -- a different failure point than the
+                # `host is None` case below, and one an earlier version of this method let
+                # propagate uncaught, discarding every offender already collected for a field
+                # visited before this one in loop order.
+                offenders.append(f"{name}={url!r} (not a parseable URL: {exc})")
+                continue
+            if host is None:
+                offenders.append(f"{name}={url!r} (no host could be parsed)")
+                continue
+            if host in ("localhost", "localhost.localdomain"):
+                checked.append(name)
+                continue
+            try:
+                addr = ipaddress.ip_address(host)
+            except ValueError:
+                offenders.append(
+                    f"{name}={url!r} (host {host!r} is a DNS name; this check does not "
+                    "resolve names, so it cannot confirm one stays on this network)"
+                )
+                continue
+            # An IPv4-mapped IPv6 literal (`::ffff:10.0.0.1`) is IPv4's 10.0.0.1 by another
+            # spelling -- an IPv6-preferring resolver or proxy can hand one back for an ordinary
+            # RFC1918 host, and `addr.version` alone would read it as IPv6 and refuse it. Judge
+            # RFC1918 membership on the address it actually maps to; `ipv4_mapped` is None (and
+            # this is a no-op) for anything that is not one.
+            mapped = getattr(addr, "ipv4_mapped", None)
+            v4_equivalent = mapped if mapped is not None else addr
+            in_rfc1918 = v4_equivalent.version == 4 and any(v4_equivalent in net for net in rfc1918)
+            in_ula = addr.version == 6 and addr in ula
+            if not (v4_equivalent.is_loopback or in_rfc1918 or in_ula):
+                offenders.append(f"{name}={url!r} (host {host} is publicly routable)")
+                continue
+            checked.append(name)
+        if offenders:
+            raise RuntimeError(
+                "MNEMIQ_LOCAL_ONLY is set and these endpoints would leave this network:\n  "
+                + "\n  ".join(offenders)
+                + "\n\nFix: point each of these at a loopback address, an RFC1918 private range, "
+                  "or an RFC 4193 IPv6 unique-local address (fc00::/7, in practice fd00::/8), "
+                  "or unset MNEMIQ_LOCAL_ONLY to disable this check.\n"
+                  "Not checked here: pg_dsn and control_dsn. libpq accepts keyword form "
+                  "(`host=... port=...`), multi-host URIs and unix-socket targets, none of "
+                  "which `urlparse` can read as a hostname -- a fail-closed check on them would "
+                  "refuse every legitimate keyword DSN. Verify those separately."
+            )
+        cleared = ", ".join(checked) if checked else "(no chat/embedding/judge/verity endpoint configured)"
+        print(
+            f"MNEMIQ_LOCAL_ONLY verified: {cleared} -- pg_dsn/control_dsn are not checked here",
+            file=sys.stderr,
+        )
 
     def embed_endpoint(self) -> tuple[str | None, str | None]:
         """The endpoint embeddings use. Defaults to the chat endpoint; set MNEMIQ_EMBED_BASE_URL/KEY to

@@ -23,6 +23,16 @@ def test_fake_embedder_handles_empty_input():
     assert FakeEmbedder().embed([]) == []
 
 
+def test_the_protocol_carries_the_dimension():
+    # The index DDL is built from this, so an embedder that cannot state its width silently
+    # writes into a column of the wrong one.
+    from mnemiq.llm.embeddings import FakeEmbedder
+
+    assert FakeEmbedder().dim == EMBED_DIM
+    assert FakeEmbedder(dim=768).dim == 768
+    assert len(FakeEmbedder(dim=768).embed(["x"])[0]) == 768
+
+
 @pytest.mark.live_llm
 @pytest.mark.skipif(not os.getenv("MNEMIQ_LLM_API_KEY"), reason="no live LLM configured")
 def test_live_embedder_puts_related_text_closer():
@@ -43,10 +53,12 @@ def test_live_embedder_puts_related_text_closer():
 class _Recorder:
     """Stands in for the OpenAI client, recording what each call was asked to embed."""
 
-    def __init__(self, fail_while_longer_than: int | None = None, error: str | None = None):
+    def __init__(self, fail_while_longer_than: int | None = None, error: str | None = None,
+                 dim: int = EMBED_DIM):
         self.sent: list[list[str]] = []
         self._fail_over = fail_while_longer_than
         self._error = error or "maximum input length is 8192 tokens"
+        self._dim = dim
         self.embeddings = self
 
     def create(self, model, input):  # noqa: A002 - the provider's own parameter name
@@ -54,7 +66,7 @@ class _Recorder:
         if self._fail_over is not None and max((len(t) for t in input), default=0) > self._fail_over:
             raise RuntimeError(self._error)
         return type("R", (), {"data": [
-            type("D", (), {"index": i, "embedding": [0.0] * EMBED_DIM})() for i in range(len(input))
+            type("D", (), {"index": i, "embedding": [0.0] * self._dim})() for i in range(len(input))
         ]})()
 
 
@@ -66,6 +78,63 @@ def _embedder(monkeypatch, client, **kwargs):
     return mod.LLMEmbedder(
         Settings(llm_base_url="http://x", llm_api_key="k"), **kwargs
     )
+
+
+def test_llm_embedder_probes_the_endpoint_once_and_caches_the_width(monkeypatch):
+    # The endpoint is the only authority on its own width -- assuming EMBED_DIM would silently
+    # write into the wrong column for a local model that isn't 1536 wide.
+    client = _Recorder(dim=768)
+    emb = _embedder(monkeypatch, client)
+    assert emb.dim == 768
+    assert emb.dim == 768  # cached: a second access must not probe again
+    assert client.sent == [["dimension probe"]]
+
+
+def _captured_openai_kwargs(monkeypatch, mod, settings) -> dict:
+    """Builds an embedder/client with `OpenAI` replaced by a kwarg-recording fake, and returns
+    what it was constructed with. `_embedder`'s `lambda **_: client` (above) throws the kwargs
+    away, which is exactly what hides whether `http_client` was ever passed."""
+    captured: dict = {}
+
+    def fake_openai(**kwargs):
+        captured.update(kwargs)
+        return _Recorder()
+
+    monkeypatch.setattr(mod, "OpenAI", fake_openai)
+    mod.LLMEmbedder(settings)
+    return captured
+
+
+def test_llm_embedder_disables_redirects_when_local_only(monkeypatch):
+    # The OpenAI SDK's own _DefaultHttpxClient sets follow_redirects=True. assert_local_only only
+    # ever validated the CONFIGURED base_url; a compliant local endpoint that later answers with
+    # a 302 to a public host would have every subsequent request followed there and exfiltrate,
+    # with boot having already passed. Refusing that needs the transport itself to stop
+    # following redirects, not another check on a URL that was never wrong.
+    from mnemiq.config import Settings
+    from mnemiq.llm import embeddings as mod
+
+    settings = Settings(llm_base_url="http://127.0.0.1:8000/v1", llm_api_key="k", local_only=True)
+    kwargs = _captured_openai_kwargs(monkeypatch, mod, settings)
+    http_client = kwargs.get("http_client")
+    assert http_client is not None
+    assert http_client.follow_redirects is False
+
+
+def test_llm_embedder_keeps_default_redirects_when_not_local_only(monkeypatch):
+    # local_only defaults False: an existing hosted deployment must construct the client
+    # byte-identically to before this fix, i.e. no http_client override at all. Same environment
+    # leak as test_the_check_is_off_unless_asked_for (tests/test_local_only.py) applies here too:
+    # `Settings(...)` with no explicit `local_only=` still reads a real MNEMIQ_LOCAL_ONLY from
+    # the environment, so this failed under `MNEMIQ_LOCAL_ONLY=1 pytest` until this delenv was
+    # added -- caught by the review gate on the round that introduced this test.
+    monkeypatch.delenv("MNEMIQ_LOCAL_ONLY", raising=False)
+    from mnemiq.config import Settings
+    from mnemiq.llm import embeddings as mod
+
+    settings = Settings(llm_base_url="http://127.0.0.1:8000/v1", llm_api_key="k")
+    kwargs = _captured_openai_kwargs(monkeypatch, mod, settings)
+    assert kwargs.get("http_client") is None
 
 
 def test_an_over_long_card_is_trimmed_rather_than_failing_its_whole_batch(monkeypatch):

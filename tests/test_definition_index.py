@@ -1,4 +1,7 @@
+import logging
+
 import duckdb
+import pytest
 
 from mnemiq.contract import Definition, Snapshot
 from mnemiq.llm.embeddings import EMBED_DIM, FakeEmbedder
@@ -29,6 +32,21 @@ def test_indexes_definitions_and_in_scale_concepts(tmp_path):
     assert rows == [(4, EMBED_DIM)]
 
 
+def test_the_definition_index_is_built_at_the_embedder_s_width_not_1536(tmp_path):
+    # definition_concept has its own DDL, sized independently of semantic_object and example --
+    # a fix that only touched those two would leave this table still fixed at 1536.
+    con = duckdb.connect()
+    snap = _snapshot([Definition(id="d1", term="Premium", domain="ins",
+                                 definition="the amount paid for coverage")])
+    n = build_definition_index(OntologyRecords(), snap, con, FakeEmbedder(dim=64))
+    assert n == 1
+    (decl,) = con.execute(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name = 'definition_concept' AND column_name = 'embedding'"
+    ).fetchone()
+    assert "64" in decl and "1536" not in decl
+
+
 def test_oversized_scheme_concepts_are_skipped(tmp_path):
     con = duckdb.connect()
     records = OntologyRecords(schemes=[_scheme("big", 5)])
@@ -41,6 +59,139 @@ def test_no_embedder_writes_nothing(tmp_path):
     snap = _snapshot([Definition(id="d1", term="Premium", domain="ins", definition="x")])
     assert build_definition_index(OntologyRecords(), snap, con, None) == 0
     assert DefinitionIndex(con).nearest("premium", None) == []
+
+
+def test_a_fail_soft_rebuild_still_clears_the_old_rows(tmp_path):
+    # Delete-then-insert per source: a rebuild that turns up nothing new must not leave the
+    # PREVIOUS build's rows behind, since nearest() reads across every source with no filter.
+    # Not a live bug today -- cli.py builds into a fresh connection every run -- but a contract
+    # a future caller that reuses a connection across builds needs to hold.
+    con = duckdb.connect()
+    snap = _snapshot([Definition(id="d1", term="Premium", domain="ins",
+                                 definition="the amount paid for coverage")])
+    assert build_definition_index(OntologyRecords(), snap, con, FakeEmbedder()) == 1
+
+    assert build_definition_index(OntologyRecords(), snap, con, None) == 0
+    assert con.execute("SELECT count(*) FROM definition_concept").fetchone()[0] == 0
+
+
+def test_an_empty_corpus_rebuild_also_clears_the_old_rows(tmp_path):
+    # Same contract, the "real embedder but nothing to embed this time" branch: a source that
+    # dropped its last definition should not keep grounding on the one that used to be there.
+    con = duckdb.connect()
+    snap = _snapshot([Definition(id="d1", term="Premium", domain="ins",
+                                 definition="the amount paid for coverage")])
+    assert build_definition_index(OntologyRecords(), snap, con, FakeEmbedder()) == 1
+
+    assert build_definition_index(OntologyRecords(), _snapshot([]), con, FakeEmbedder()) == 0
+    assert con.execute("SELECT count(*) FROM definition_concept").fetchone()[0] == 0
+
+
+def test_an_embed_error_also_clears_the_old_rows(tmp_path):
+    # Same contract, the third fail-soft branch: an embedder that raises. See the comment on
+    # the DELETE in build_definition_index for the trade this ordering makes.
+    class _FailingEmbedder:
+        def embed(self, texts):
+            raise RuntimeError("down")
+
+    con = duckdb.connect()
+    snap = _snapshot([Definition(id="d1", term="Premium", domain="ins",
+                                 definition="the amount paid for coverage")])
+    assert build_definition_index(OntologyRecords(), snap, con, FakeEmbedder()) == 1
+
+    assert build_definition_index(OntologyRecords(), snap, con, _FailingEmbedder()) == 0
+    assert con.execute("SELECT count(*) FROM definition_concept").fetchone()[0] == 0
+
+
+def test_a_width_mismatch_against_an_existing_store_is_refused_not_wiped(tmp_path):
+    # Same exposure as build_index/build_example_index: CREATE TABLE IF NOT EXISTS no-ops
+    # against a store already built at a different width, so a naive rebuild's DELETE would run
+    # and autocommit before the INSERT's ConversionException -- an emptied index, no guidance.
+    from mnemiq.store.bootstrap import init_store
+
+    path = str(tmp_path / "s.duckdb")
+    snap = _snapshot([Definition(id="d1", term="Premium", domain="ins",
+                                 definition="the amount paid for coverage")])
+    con = init_store(path)
+    assert build_definition_index(OntologyRecords(), snap, con, FakeEmbedder()) == 1
+    con.close()
+
+    con = init_store(path)
+    with pytest.raises(RuntimeError) as exc_info:
+        build_definition_index(OntologyRecords(), snap, con, FakeEmbedder(dim=1024))
+    message = str(exc_info.value)
+    assert "1536" in message and "1024" in message
+
+    # The point of the fix: the original build's row must survive the refused rebuild.
+    assert con.execute("SELECT count(*) FROM definition_concept").fetchone()[0] == 1
+
+
+def test_nearest_on_a_never_built_index_is_silent(tmp_path, caplog):
+    # DefinitionIndex.__init__ no longer creates the table (no embedder there to size it with),
+    # so a query against a never-built index used to raise duckdb.CatalogException and fall into
+    # nearest's broad except, logging a WARNING on every single call -- reachable whenever
+    # build_definition_index fail-softs (empty corpus, embed error) and cli.py's enrich path
+    # still asks for grounding per table. A never-built index should answer "nothing indexed"
+    # exactly as cheaply and quietly as an empty one.
+    con = duckdb.connect()
+    with caplog.at_level(logging.WARNING):
+        hits = DefinitionIndex(con).nearest("premium", FakeEmbedder())
+    assert hits == []
+    assert caplog.records == []
+
+
+def test_nearest_still_warns_when_the_table_exists_but_the_query_fails(caplog):
+    # A missing table and a missing function raise the SAME duckdb.CatalogException type
+    # (confirmed directly: SELECT nosuchfn(1) also raises CatalogException). Catching that type
+    # around the query itself would silently swallow both, defeating the WARNING a genuinely
+    # broken query -- say, array_cosine_similarity missing after a DuckDB downgrade -- is meant
+    # to raise. "Never built" has to be checked explicitly, not inferred from the query's own
+    # exception type.
+    class _TableExistsButQueryFails:
+        def execute(self, sql, params=None):
+            if "information_schema.tables" in sql:
+                return self  # fetchone() below reports the table as present
+            raise duckdb.CatalogException(
+                "Scalar Function with name array_cosine_similarity does not exist!"
+            )
+
+        def fetchone(self):
+            return (1,)
+
+    with caplog.at_level(logging.WARNING):
+        hits = DefinitionIndex(_TableExistsButQueryFails()).nearest("premium", FakeEmbedder())
+    assert hits == []
+    assert any("query failed" in r.message for r in caplog.records)
+
+
+def test_nearest_warns_when_the_table_existence_check_itself_fails(caplog):
+    # The existence check runs before the real query, but a failure THERE (a closed or broken
+    # connection, say) must still warn rather than disappear -- it has to be inside the same
+    # try as the query, not a separate unguarded statement ahead of it.
+    class _BrokenConnection:
+        def execute(self, sql, params=None):
+            raise RuntimeError("connection closed")
+
+    with caplog.at_level(logging.WARNING):
+        hits = DefinitionIndex(_BrokenConnection()).nearest("premium", FakeEmbedder())
+    assert hits == []
+    assert any("query failed" in r.message for r in caplog.records)
+
+
+def test_nearest_ignores_a_same_named_table_in_a_different_attached_catalog(caplog):
+    # table_schema = current_schema() alone still lets a same-named table in a DIFFERENT
+    # attached catalog satisfy the existence check (both catalogs use the default "main"
+    # schema), so the check passes while the unqualified query below can't actually resolve to
+    # that other catalog's table and raises -- table_catalog must agree too, or this
+    # connection's own never-built index stops answering silently.
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS other")
+    con.execute("CREATE TABLE other.main.definition_concept "
+               "(source_id TEXT, object_id TEXT, term TEXT, text TEXT, embedding FLOAT[3])")
+    with caplog.at_level(logging.WARNING):
+        hits = DefinitionIndex(con).nearest("premium", FakeEmbedder(dim=3))
+    assert hits == []
+    assert caplog.records == []  # this connection's OWN definition_concept was never built
 
 
 def test_nearest_returns_k_scored_terms(tmp_path):

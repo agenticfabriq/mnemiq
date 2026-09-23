@@ -1,7 +1,22 @@
-from mnemiq.contract import Column, Snapshot, SourceBinding
+import pytest
+
+from mnemiq.contract import Column, Example, Snapshot, SourceBinding
 from mnemiq.llm.embeddings import EMBED_DIM, FakeEmbedder
-from mnemiq.semantic.store import build_index, indexed_version
+from mnemiq.semantic.store import build_example_index, build_index, indexed_version
 from mnemiq.store.bootstrap import init_store
+
+
+class _NoTouchEmbedder:
+    """Raises if its network-shaped surface is touched at all -- proves a caller checked for
+    empty input before reading `dim` or calling `embed`, the two calls a real LLMEmbedder turns
+    into an endpoint round trip (dim itself embeds a one-word probe)."""
+
+    @property
+    def dim(self) -> int:
+        raise AssertionError("embedder.dim must not be read for empty input")
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        raise AssertionError("embed() must not be called for empty input")
 
 
 def _snapshot(version="v1") -> Snapshot:
@@ -50,6 +65,119 @@ def test_a_new_version_replaces_the_old_one(tmp_path):
     versions = con.execute("SELECT DISTINCT version FROM semantic_object").fetchall()
     assert versions == [("v2",)]  # one live index per source; stale cards never linger
     assert indexed_version(con, "acme") == "v2"
+
+
+def test_an_index_is_built_at_the_embedder_s_width_not_1536(tmp_path):
+    # A local embedding model is rarely 1536 wide (BGE-M3 is 1024, nomic-embed 768). The DDL
+    # used to bake EMBED_DIM in at import time while every query cast to the real vector
+    # length, so a narrower embedder wrote into a column it could not be compared against.
+    con = init_store(str(tmp_path / "s.duckdb"))
+    n = build_index(con, _snapshot(), FakeEmbedder(dim=64))
+
+    assert n == 2  # same count the other tests assert
+    (decl,) = con.execute(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name = 'semantic_object' AND column_name = 'embedding'"
+    ).fetchone()
+    assert "64" in decl and "1536" not in decl
+
+
+def test_the_example_index_is_also_built_at_the_embedder_s_width(tmp_path):
+    # example has its own DDL, sized independently of semantic_object -- a fix that only
+    # touched one of the two would leave this table still fixed at 1536.
+    con = init_store(str(tmp_path / "s.duckdb"))
+    snap = _snapshot().model_copy(update={"examples": [
+        Example(question="how many claims?", sql="SELECT count(*) FROM claim",
+                tables=["claim"], object_id="claim"),
+    ]})
+    n = build_example_index(con, snap, FakeEmbedder(dim=64))
+
+    assert n == 1
+    (decl,) = con.execute(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name = 'example' AND column_name = 'embedding'"
+    ).fetchone()
+    assert "64" in decl and "1536" not in decl
+
+
+def test_a_width_mismatch_against_an_existing_store_is_refused_not_wiped(tmp_path):
+    # Reviewer-measured crash: CREATE TABLE IF NOT EXISTS no-ops against a store already built at
+    # a different width, so the per-source DELETE runs and autocommits before DuckDB's own
+    # ConversionException kills the INSERT on the width mismatch -- an emptied index, no
+    # guidance. The fix must catch this before that DELETE, not after.
+    path = str(tmp_path / "s.duckdb")
+    con = init_store(path)
+    build_index(con, _snapshot(), FakeEmbedder())  # 1536-wide, the hosted default
+    con.close()
+
+    con = init_store(path)
+    with pytest.raises(RuntimeError) as exc_info:
+        build_index(con, _snapshot(), FakeEmbedder(dim=1024))
+    message = str(exc_info.value)
+    assert "1536" in message and "1024" in message
+
+    # The point of the fix: the original build's rows must survive the refused rebuild.
+    rows = con.execute("SELECT count(*) FROM semantic_object").fetchone()[0]
+    assert rows == 2
+
+
+def test_an_example_index_width_mismatch_is_also_refused_not_wiped(tmp_path):
+    # example has its own DDL and its own DELETE, sized and guarded independently of
+    # semantic_object -- a fix that only touched one of the two would leave this table exposed.
+    path = str(tmp_path / "s.duckdb")
+    snap = _snapshot().model_copy(update={"examples": [
+        Example(question="how many claims?", sql="SELECT count(*) FROM claim",
+                tables=["claim"], object_id="claim"),
+    ]})
+    con = init_store(path)
+    build_example_index(con, snap, FakeEmbedder())
+    con.close()
+
+    con = init_store(path)
+    with pytest.raises(RuntimeError) as exc_info:
+        build_example_index(con, snap, FakeEmbedder(dim=1024))
+    message = str(exc_info.value)
+    assert "1536" in message and "1024" in message
+    assert con.execute("SELECT count(*) FROM example").fetchone()[0] == 1
+
+
+def test_build_index_skips_the_embedder_but_still_clears_stale_rows_for_an_empty_snapshot(
+    tmp_path,
+):
+    # Checking for empty input ahead of embedder.dim must not skip the clearing DELETE, which
+    # needs no width: a stale card is worse than a missing one, and _NoTouchEmbedder proves the
+    # network-shaped surface is untouched at the same time the row count proves nothing stale
+    # survives.
+    con = init_store(str(tmp_path / "s.duckdb"))
+    build_index(con, _snapshot(), FakeEmbedder())
+    assert con.execute("SELECT count(*) FROM semantic_object").fetchone()[0] == 2
+
+    empty = Snapshot(version="v2", source_id="acme", created_at="2026-07-13T00:00:00Z")
+    assert build_index(con, empty, _NoTouchEmbedder()) == 0
+    assert con.execute("SELECT count(*) FROM semantic_object").fetchone()[0] == 0
+    assert indexed_version(con, "acme") is None
+
+
+def test_build_example_index_skips_the_embedder_but_still_clears_stale_rows_with_no_examples(
+    tmp_path,
+):
+    con = init_store(str(tmp_path / "s.duckdb"))
+    snap = _snapshot().model_copy(update={"examples": [
+        Example(question="how many claims?", sql="SELECT count(*) FROM claim",
+                tables=["claim"], object_id="claim"),
+    ]})
+    build_example_index(con, snap, FakeEmbedder())
+    assert con.execute("SELECT count(*) FROM example").fetchone()[0] == 1
+
+    assert build_example_index(con, _snapshot(), _NoTouchEmbedder()) == 0
+    assert con.execute("SELECT count(*) FROM example").fetchone()[0] == 0
+
+
+def test_indexed_version_on_a_never_built_store_returns_none(tmp_path):
+    # Exercises the except-duckdb.CatalogException branch: no build_index call has ever run
+    # against this connection, so the table itself doesn't exist yet.
+    con = init_store(str(tmp_path / "s.duckdb"))
+    assert indexed_version(con, "acme") is None
 
 
 def test_the_full_text_index_is_queryable(tmp_path):
