@@ -7,6 +7,7 @@ import duckdb
 from mnemiq.contract import Snapshot
 from mnemiq.llm.embeddings import Embedder
 from mnemiq.semantic.cards import build_cards
+from mnemiq.semantic.embedding_width import refuse_if_mismatched
 
 
 def _ddl(dim: int) -> str:
@@ -38,12 +39,14 @@ def build_index(con: duckdb.DuckDBPyConnection, snapshot: Snapshot, embedder: Em
     """Render, embed and index the snapshot's tables. One live index per source.
 
     Sizes the embedding column from embedder.dim, but only on first create: CREATE TABLE IF NOT
-    EXISTS is a no-op against a store already built at a different width, so switching an
-    existing store to a differently-sized embedder needs the store rebuilt from empty, not just
-    re-run against -- there is no in-place migration yet.
+    EXISTS is a no-op against a store already built at a different width, so a mismatch here is
+    refused (see refuse_if_mismatched) before the per-source DELETE below, rather than letting
+    the DELETE run and then crashing on the INSERT.
     """
     cards = build_cards(snapshot)
-    con.execute(_ddl(embedder.dim))
+    dim = embedder.dim
+    refuse_if_mismatched(con, "semantic_object", dim)
+    con.execute(_ddl(dim))
 
     # One live index per source: a stale card is worse than a missing one, because at
     # retrieval time it is indistinguishable from a fresh one.
@@ -82,9 +85,13 @@ def build_example_index(
     """Embed each validated example's QUESTION into its own index, so retrieval pulls the
     examples most similar to the asked question -- not whatever tables happened to rank.
 
-    Kept out of semantic_object so example text never perturbs table retrieval.
+    Kept out of semantic_object so example text never perturbs table retrieval. A width
+    mismatch against an already-built table is refused before the per-source DELETE -- same
+    reasoning as build_index, above.
     """
-    con.execute(_example_ddl(embedder.dim))
+    dim = embedder.dim
+    refuse_if_mismatched(con, "example", dim)
+    con.execute(_example_ddl(dim))
     con.execute("DELETE FROM example WHERE source_id = ?", [snapshot.source_id])
     if not snapshot.examples:
         return 0

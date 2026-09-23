@@ -6,6 +6,7 @@ import duckdb
 
 from mnemiq.contract import Snapshot
 from mnemiq.ontology.records import OntologyRecords
+from mnemiq.semantic.embedding_width import refuse_if_mismatched
 
 logger = logging.getLogger(__name__)
 
@@ -47,28 +48,41 @@ def build_definition_index(records: OntologyRecords, snapshot: Snapshot,
     """Embed the local meaning corpus into `con` for enrich-time grounding. Delete-then-insert per
     source: this source's existing rows are cleared whenever the function runs, even on a
     fail-soft path, so a stale definition never outlives the build that was meant to refresh it.
-    Fail-soft: no embedder, empty corpus, or an embed error writes nothing new and returns 0."""
-    # Runs before the embed call on purpose: a transient embed failure (a timeout, a 5xx) clears
-    # this source rather than leaving it as it was. That trade favors "no grounding" over
-    # "possibly-stale grounding" on a failure. It only matters once a caller keeps one
-    # connection across builds instead of the fresh one cli.py opens per build.
-    try:
-        con.execute("DELETE FROM definition_concept WHERE source_id = ?", [snapshot.source_id])
-    except duckdb.CatalogException:
-        pass  # nothing built yet for any source -- nothing to clear
+    Fail-soft: no embedder, empty corpus, or an embed error writes nothing new and returns 0.
+
+    A width mismatch against an already-built table is refused (see refuse_if_mismatched)
+    instead of being wiped -- but only once the new width is knowable, which needs a successful
+    embed() call (the width comes from the vectors it returns, not a second probe). So the
+    fail-soft paths below still clear this source's rows on their way out -- a genuine "nothing
+    new to write" is not a width conflict, and cli.py's fresh connection per build means a
+    transient embed failure there favors "no grounding" over "possibly-stale grounding" -- while
+    the one path that actually has a new width to write checks it before clearing anything.
+    """
+    def _clear_stale() -> None:
+        try:
+            con.execute(
+                "DELETE FROM definition_concept WHERE source_id = ?", [snapshot.source_id]
+            )
+        except duckdb.CatalogException:
+            pass  # nothing built yet for any source -- nothing to clear
+
     rows = _corpus(records, snapshot, max_concepts)
     if not rows or embedder is None:
+        _clear_stale()
         return 0
     try:
         vectors = embedder.embed([text for _oid, _term, text in rows])
     except Exception as exc:  # degrade-to-local: grounding is optional, never fatal
         logger.warning("definition index embedding failed; grounding skipped: %s", exc)
+        _clear_stale()
         return 0
-    # Sized from the vectors just returned, not a second call to embedder.dim -- embed() already
-    # paid the one round trip a width needs, and it is the real one, not a probed guess. Only
-    # creates the table the first time; a later build at a different width still collides with
-    # an existing one (same limitation build_index has -- no migration path yet).
-    con.execute(_ddl(len(vectors[0])))
+
+    dim = len(vectors[0])
+    refuse_if_mismatched(con, "definition_concept", dim)
+    _clear_stale()
+    # Only creates the table the first time; refuse_if_mismatched above is what makes a later
+    # build at a different width safe rather than a silent no-op against the wrong width.
+    con.execute(_ddl(dim))
     con.executemany(
         "INSERT INTO definition_concept (source_id, object_id, term, text, embedding) "
         "VALUES (?, ?, ?, ?, ?)",

@@ -1,3 +1,5 @@
+import pytest
+
 from mnemiq.contract import Column, Example, Snapshot, SourceBinding
 from mnemiq.llm.embeddings import EMBED_DIM, FakeEmbedder
 from mnemiq.semantic.store import build_example_index, build_index, indexed_version
@@ -83,6 +85,47 @@ def test_the_example_index_is_also_built_at_the_embedder_s_width(tmp_path):
         "WHERE table_name = 'example' AND column_name = 'embedding'"
     ).fetchone()
     assert "64" in decl and "1536" not in decl
+
+
+def test_a_width_mismatch_against_an_existing_store_is_refused_not_wiped(tmp_path):
+    # Reviewer-measured crash: CREATE TABLE IF NOT EXISTS no-ops against a store already built at
+    # a different width, so the per-source DELETE runs and autocommits before DuckDB's own
+    # ConversionException kills the INSERT on the width mismatch -- an emptied index, no
+    # guidance. The fix must catch this before that DELETE, not after.
+    path = str(tmp_path / "s.duckdb")
+    con = init_store(path)
+    build_index(con, _snapshot(), FakeEmbedder())  # 1536-wide, the hosted default
+    con.close()
+
+    con = init_store(path)
+    with pytest.raises(RuntimeError) as exc_info:
+        build_index(con, _snapshot(), FakeEmbedder(dim=1024))
+    message = str(exc_info.value)
+    assert "1536" in message and "1024" in message
+
+    # The point of the fix: the original build's rows must survive the refused rebuild.
+    rows = con.execute("SELECT count(*) FROM semantic_object").fetchone()[0]
+    assert rows == 2
+
+
+def test_an_example_index_width_mismatch_is_also_refused_not_wiped(tmp_path):
+    # example has its own DDL and its own DELETE, sized and guarded independently of
+    # semantic_object -- a fix that only touched one of the two would leave this table exposed.
+    path = str(tmp_path / "s.duckdb")
+    snap = _snapshot().model_copy(update={"examples": [
+        Example(question="how many claims?", sql="SELECT count(*) FROM claim",
+                tables=["claim"], object_id="claim"),
+    ]})
+    con = init_store(path)
+    build_example_index(con, snap, FakeEmbedder())
+    con.close()
+
+    con = init_store(path)
+    with pytest.raises(RuntimeError) as exc_info:
+        build_example_index(con, snap, FakeEmbedder(dim=1024))
+    message = str(exc_info.value)
+    assert "1536" in message and "1024" in message
+    assert con.execute("SELECT count(*) FROM example").fetchone()[0] == 1
 
 
 def test_the_full_text_index_is_queryable(tmp_path):

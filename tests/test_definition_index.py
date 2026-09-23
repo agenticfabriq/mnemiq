@@ -1,4 +1,5 @@
 import duckdb
+import pytest
 
 from mnemiq.contract import Definition, Snapshot
 from mnemiq.llm.embeddings import EMBED_DIM, FakeEmbedder
@@ -98,6 +99,29 @@ def test_an_embed_error_also_clears_the_old_rows(tmp_path):
 
     assert build_definition_index(OntologyRecords(), snap, con, _FailingEmbedder()) == 0
     assert con.execute("SELECT count(*) FROM definition_concept").fetchone()[0] == 0
+
+
+def test_a_width_mismatch_against_an_existing_store_is_refused_not_wiped(tmp_path):
+    # Same exposure as build_index/build_example_index: CREATE TABLE IF NOT EXISTS no-ops
+    # against a store already built at a different width, so a naive rebuild's DELETE would run
+    # and autocommit before the INSERT's ConversionException -- an emptied index, no guidance.
+    from mnemiq.store.bootstrap import init_store
+
+    path = str(tmp_path / "s.duckdb")
+    snap = _snapshot([Definition(id="d1", term="Premium", domain="ins",
+                                 definition="the amount paid for coverage")])
+    con = init_store(path)
+    assert build_definition_index(OntologyRecords(), snap, con, FakeEmbedder()) == 1
+    con.close()
+
+    con = init_store(path)
+    with pytest.raises(RuntimeError) as exc_info:
+        build_definition_index(OntologyRecords(), snap, con, FakeEmbedder(dim=1024))
+    message = str(exc_info.value)
+    assert "1536" in message and "1024" in message
+
+    # The point of the fix: the original build's row must survive the refused rebuild.
+    assert con.execute("SELECT count(*) FROM definition_concept").fetchone()[0] == 1
 
 
 def test_nearest_returns_k_scored_terms(tmp_path):
