@@ -58,6 +58,19 @@ def test_no_embedder_writes_nothing(tmp_path):
     assert DefinitionIndex(con).nearest("premium", None) == []
 
 
+def test_a_fail_soft_rebuild_still_clears_the_old_rows(tmp_path):
+    # Delete-then-insert per source: a rebuild that turns up nothing new must not leave the
+    # PREVIOUS build's rows behind, since nearest() reads across every source with no filter --
+    # a stale definition would keep grounding answers on a term that has since changed.
+    con = duckdb.connect()
+    snap = _snapshot([Definition(id="d1", term="Premium", domain="ins",
+                                 definition="the amount paid for coverage")])
+    assert build_definition_index(OntologyRecords(), snap, con, FakeEmbedder()) == 1
+
+    assert build_definition_index(OntologyRecords(), snap, con, None) == 0
+    assert con.execute("SELECT count(*) FROM definition_concept").fetchone()[0] == 0
+
+
 def test_nearest_returns_k_scored_terms(tmp_path):
     con = duckdb.connect()
     defs = [Definition(id=f"d{i}", term=f"Term{i}", domain="d", definition=f"meaning {i}")

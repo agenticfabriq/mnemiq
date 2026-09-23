@@ -45,7 +45,13 @@ def build_definition_index(records: OntologyRecords, snapshot: Snapshot,
                            con: duckdb.DuckDBPyConnection, embedder,
                            max_concepts: int = DEFINITION_INDEX_MAX_CONCEPTS) -> int:
     """Embed the local meaning corpus into `con` for enrich-time grounding. Delete-then-insert per
-    source. Fail-soft: no embedder, empty corpus, or an embed error writes nothing and returns 0."""
+    source: this source's existing rows are cleared whenever the function runs, even on a
+    fail-soft path, so a stale definition never outlives the build that was meant to refresh it.
+    Fail-soft: no embedder, empty corpus, or an embed error writes nothing new and returns 0."""
+    try:
+        con.execute("DELETE FROM definition_concept WHERE source_id = ?", [snapshot.source_id])
+    except duckdb.CatalogException:
+        pass  # nothing built yet for any source -- nothing to clear
     rows = _corpus(records, snapshot, max_concepts)
     if not rows or embedder is None:
         return 0
@@ -55,9 +61,10 @@ def build_definition_index(records: OntologyRecords, snapshot: Snapshot,
         logger.warning("definition index embedding failed; grounding skipped: %s", exc)
         return 0
     # Sized from the vectors just returned, not a second call to embedder.dim -- embed() already
-    # paid the one round trip a width needs, and it is the real one, not a probed guess.
+    # paid the one round trip a width needs, and it is the real one, not a probed guess. Only
+    # creates the table the first time; a later build at a different width still collides with
+    # an existing one (same limitation build_index has -- no migration path yet).
     con.execute(_ddl(len(vectors[0])))
-    con.execute("DELETE FROM definition_concept WHERE source_id = ?", [snapshot.source_id])
     con.executemany(
         "INSERT INTO definition_concept (source_id, object_id, term, text, embedding) "
         "VALUES (?, ?, ?, ?, ?)",

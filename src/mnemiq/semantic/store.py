@@ -35,7 +35,13 @@ CREATE TABLE IF NOT EXISTS example (
 
 
 def build_index(con: duckdb.DuckDBPyConnection, snapshot: Snapshot, embedder: Embedder) -> int:
-    """Render, embed and index the snapshot's tables. One live index per source."""
+    """Render, embed and index the snapshot's tables. One live index per source.
+
+    Sizes the embedding column from embedder.dim, but only on first create: CREATE TABLE IF NOT
+    EXISTS is a no-op against a store already built at a different width, so switching an
+    existing store to a differently-sized embedder needs the store rebuilt from empty, not just
+    re-run against -- there is no in-place migration yet.
+    """
     cards = build_cards(snapshot)
     con.execute(_ddl(embedder.dim))
 
