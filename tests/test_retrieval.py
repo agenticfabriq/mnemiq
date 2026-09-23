@@ -1,3 +1,5 @@
+import pytest
+
 from mnemiq.authz.grants import DenyAll, GrantSet
 from mnemiq.contract import Column, Definition, IdentityContext, Snapshot, SourceBinding
 from mnemiq.llm.embeddings import FakeEmbedder
@@ -76,6 +78,23 @@ def test_an_unauthorized_table_is_invisible_even_when_it_is_the_best_match(tmp_p
     # and nothing about it leaks -- not the name, not its existence
     blob = " ".join(c.card for c in packet.cards)
     assert "layoff" not in blob and "headcount" not in blob
+
+
+def test_a_width_mismatch_on_the_read_path_is_named_not_a_raw_duckdb_crash(tmp_path):
+    """Reviewer-caught: `retrieve()` ran `array_cosine_similarity` unguarded, so an operator who
+    pointed MNEMIQ_EMBED_MODEL at a narrower local embedder -- with the store never rebuilt for
+    it, refused or otherwise -- got `duckdb.BinderException: Array arguments must be of the same
+    size` on every `ask`, with none of the write path's named remedy. `pytest.raises(RuntimeError)`
+    is itself the assertion that matters here: the unguarded crash is a duckdb.Error, not a
+    RuntimeError, so this fails outright (uncaught) if the guard is removed."""
+    con = _con(tmp_path)  # built at 1536, FakeEmbedder's default width
+    with pytest.raises(RuntimeError) as exc_info:
+        retrieve(
+            con, "claim_identifier", _identity(), _StaticAuthz("claim", "policy"),
+            FakeEmbedder(dim=1024),
+        )
+    message = str(exc_info.value)
+    assert "1536" in message and "1024" in message
 
 
 def test_no_grants_means_an_empty_packet(tmp_path):
@@ -252,6 +271,29 @@ def test_retrieve_examples_no_index_returns_empty(tmp_path):
 
     con = init_store(str(tmp_path / "s.duckdb"))  # no example table built
     (qvec,) = FakeEmbedder().embed(["q"])
+    assert _retrieve_examples(con, qvec, allowed={"claim"}, k=5) == []
+
+
+def test_retrieve_examples_width_mismatch_also_returns_empty_not_raised(tmp_path):
+    """The second cause folded into the same swallow (see the comment on the except clause):
+    an example table built at one width, queried with a differently-sized embedder, raises
+    duckdb.BinderException just like the no-table case above -- and degrades the same way,
+    since examples are never load-bearing for an answer."""
+    from mnemiq.contract import Example
+    from mnemiq.llm.embeddings import FakeEmbedder
+    from mnemiq.semantic.retrieval import _retrieve_examples
+    from mnemiq.semantic.store import build_example_index
+    from mnemiq.store.bootstrap import init_store
+
+    con = init_store(str(tmp_path / "s2.duckdb"))
+    snap = Snapshot(
+        version="v1", source_id="acme", created_at="t",
+        columns=[Column(id="claim.n", object_id="claim", name="n")],
+        examples=[Example(question="how many claims?", sql="SELECT count(*) FROM claim",
+                          tables=["claim"], object_id="claim")],
+    )
+    build_example_index(con, snap, FakeEmbedder())  # 1536-wide
+    (qvec,) = FakeEmbedder(dim=1024).embed(["q"])  # a differently-sized query vector
     assert _retrieve_examples(con, qvec, allowed={"claim"}, k=5) == []
 
 

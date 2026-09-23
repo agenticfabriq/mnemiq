@@ -13,6 +13,7 @@ from mnemiq.contract import (
 )
 from mnemiq.llm.embeddings import Embedder
 from mnemiq.semantic.cards import render_facts_block
+from mnemiq.semantic.embedding_width import refuse_if_mismatched
 from mnemiq.semantic.glossary import select_definitions
 from mnemiq.semantic.measures import select_dimensions, select_metrics
 
@@ -94,7 +95,17 @@ def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5) -> list[Ex
             [embedding, *allowed, k * 3],
         ).fetchall()
     except Exception:
-        return []  # no example index built for this store
+        # Two distinguishable causes collapse into the same empty result here: no example table
+        # was ever built for this store (duckdb.CatalogException), or one was, at a width that no
+        # longer matches the configured embedder (duckdb.BinderException) -- retrieve() only
+        # guards semantic_object's width before calling this, not example's, because the two
+        # tables are sized and refused independently (see refuse_if_mismatched). Swallowing is
+        # still right for both: examples are a supplementary few-shot enhancement, never load-
+        # bearing for an answer, so a caller that could not get its OWN table checked out clean
+        # already raised earlier and loudly in retrieve() -- what reaches here is only ever the
+        # narrower case of examples alone being stale, and returning none is the correct degrade,
+        # not a hidden failure of the request.
+        return []
     out: list[Example] = []
     for question, sql, tables_json, object_id, _s in rows:
         tables = json.loads(tables_json)
@@ -183,6 +194,13 @@ def retrieve(
     ).fetchall()
 
     (embedding,) = embedder.embed([question])
+    # The read-side twin of the check build_index/build_example_index run before their own
+    # destructive statement: an unguarded array_cosine_similarity below raises DuckDB's own
+    # duckdb.BinderException ("Array arguments must be of the same size") for the identical
+    # width mismatch, with none of the write path's named remedy -- an operator who never rebuilt
+    # would see only the crash, never told this store must be rebuilt for the embedder now
+    # configured. Reuses refuse_if_mismatched rather than a second copy of the wording.
+    refuse_if_mismatched(con, "semantic_object", len(embedding))
     semantic = con.execute(
         f"""
         SELECT object_id, array_cosine_similarity(embedding, ?::FLOAT[{len(embedding)}]) AS score
