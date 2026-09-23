@@ -85,9 +85,8 @@ def test_an_empty_corpus_rebuild_also_clears_the_old_rows(tmp_path):
 
 
 def test_an_embed_error_also_clears_the_old_rows(tmp_path):
-    # Same contract, the third fail-soft branch: an embedder that raises. This is the ordering
-    # this task deliberately kept from the function's original behaviour -- see the comment on
-    # the DELETE in build_definition_index for the trade it makes.
+    # Same contract, the third fail-soft branch: an embedder that raises. See the comment on
+    # the DELETE in build_definition_index for the trade this ordering makes.
     class _FailingEmbedder:
         def embed(self, texts):
             raise RuntimeError("down")
