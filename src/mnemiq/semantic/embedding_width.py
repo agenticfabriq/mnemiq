@@ -19,9 +19,10 @@ def declared_width(con: duckdb.DuckDBPyConnection, table: str) -> int | None:
     `table_schema`/`table_catalog` matches a same-named table anywhere among them, so
     `fetchone()` picked arbitrarily between this database's own table and an unrelated one
     attached alongside it. A different bug from the "destructive statement runs before the
-    check" one this module's own `refuse_if_mismatched` already closed at three call sites
-    (build_index, build_example_index, definition_index) -- this one is IN the check itself, and
-    slipped past all three because none of their tests attached a second catalog. `DESCRIBE`
+    check" one this module's own `refuse_if_mismatched` already closed at every call site that
+    has one (build_index, build_example_index, definition_index, and federated_build's own
+    pre-DELETE checks) -- this one is IN the check itself, and slipped past every one of them
+    because none of their tests attached a second catalog. `DESCRIBE`
     resolves the bare name through the same catalog/schema search path a real query against the
     table would use, so it cannot make that mistake, and it hands back the column type directly:
     no predicate to get wrong. A `SELECT ... LIMIT 0` probe was considered instead and rejected
