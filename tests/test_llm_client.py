@@ -33,7 +33,12 @@ def test_llm_client_disables_redirects_when_local_only(monkeypatch):
 
 def test_llm_client_keeps_default_redirects_when_not_local_only(monkeypatch):
     # local_only defaults False: an existing hosted deployment must construct the client
-    # byte-identically to before this fix, i.e. no http_client override at all.
+    # byte-identically to before this fix, i.e. no http_client override at all. Same environment
+    # leak as test_the_check_is_off_unless_asked_for (tests/test_local_only.py) applies here too:
+    # `Settings(...)` with no explicit `local_only=` still reads a real MNEMIQ_LOCAL_ONLY from
+    # the environment, so this failed under `MNEMIQ_LOCAL_ONLY=1 pytest` until this delenv was
+    # added -- caught by the review gate on the round that introduced this test.
+    monkeypatch.delenv("MNEMIQ_LOCAL_ONLY", raising=False)
     settings = Settings(llm_base_url="http://127.0.0.1:8000/v1", llm_api_key="k")
     kwargs = _captured_openai_kwargs(monkeypatch, settings)
     assert kwargs.get("http_client") is None
