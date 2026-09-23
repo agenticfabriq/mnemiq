@@ -32,6 +32,18 @@ DEFAULT_RETRIEVAL_K = 24
 
 _SECRET_HINTS = ("api_key", "dsn", "password", "secret")  # fields whose value is never printed in .env.example
 
+# Every `Settings` field `assert_local_only` checks, by name. Nothing enforces that a NEW field
+# whose name ends in `_url` gets added here -- a future verity_*_url (or any other) setting would
+# otherwise be silently exempt while the run still prints "verified". That is what
+# tests/test_local_only.py::test_every_url_field_is_checked_or_explicitly_exempted is for: it
+# fails on any `_url` field that is neither in this tuple nor in that test's own EXEMPTED set,
+# which is where a field would go instead of here if checking it were ever wrong (there are none
+# today; MNEMIQ_LOCAL_ONLY's whole premise is that every network-facing URL is accounted for).
+_LOCAL_ONLY_CHECKED_URL_FIELDS = (
+    "llm_base_url", "embed_base_url", "verify_base_url",
+    "verity_records_url", "verity_token_url", "verity_traces_url",
+)
+
 
 @dataclass(frozen=True)
 class SourceSpec:
@@ -181,12 +193,18 @@ class Settings(BaseSettings):
         pg_dsn and control_dsn -- see the trailing line of the raised message for why, which is
         the answer an operator actually needs, not a comment only a reader of this source sees.
 
-        Loopback and the RFC1918 private ranges pass, because a data centre runs the model on
-        another host on its own network. That is deliberately narrower than `ipaddress`'s own
-        `is_private`, which also accepts several IANA special-purpose ranges we do NOT want to
-        wave through silently -- 169.254.169.254 above all, the link-local address several cloud
-        providers use to serve their metadata API, which is exactly the kind of off-box hop this
-        check exists to catch. Anything we cannot place inside loopback or RFC1918 is refused:
+        Loopback, the RFC1918 private ranges, and their IPv6 counterparts pass, because a data
+        centre runs the model on another host on its own network -- fc00::/7 (RFC 4193's
+        "unique local address" range, which `fd00::/8` in practice always comes from) is
+        RFC1918's own IPv6 analog, not a narrower or looser thing, so an IPv6-only deployment
+        gets the same allowance an IPv4 one does. An IPv4-mapped IPv6 literal (`::ffff:10.0.0.1`)
+        is judged on the IPv4 address it maps to, for the same reason: it is that address, just
+        spelled by a resolver or proxy that prefers IPv6 syntax. This is deliberately narrower
+        than `ipaddress`'s own `is_private`, which also accepts several IANA special-purpose
+        ranges we do NOT want to wave through silently -- 169.254.169.254 above all, the
+        link-local address several cloud providers use to serve their metadata API, which is
+        exactly the kind of off-box hop this check exists to catch. Anything we cannot place
+        inside loopback, RFC1918 or its IPv6 analog is refused:
         a URL `urlparse` itself cannot parse (a malformed IPv6 host literal raises INSIDE
         `urlparse`, before `.hostname` is ever read -- not the same failure as `.hostname`
         returning None, and both have to be caught, not just the second one), an unresolved DNS
@@ -216,13 +234,14 @@ class Settings(BaseSettings):
             ipaddress.ip_network("172.16.0.0/12"),
             ipaddress.ip_network("192.168.0.0/16"),
         )
+        # RFC 4193 unique-local addresses -- IPv6's own analog of RFC1918, not merely something
+        # `is_private` happens to also cover. fc00::/7 spans both the locally-assigned fd00::/8
+        # in practice and the (never yet used) centrally-assigned fc00::/8 half of the range.
+        ula = ipaddress.ip_network("fc00::/7")
 
         offenders: list[str] = []
         checked: list[str] = []
-        for name in (
-            "llm_base_url", "embed_base_url", "verify_base_url",
-            "verity_records_url", "verity_token_url", "verity_traces_url",
-        ):
+        for name in _LOCAL_ONLY_CHECKED_URL_FIELDS:
             url = getattr(self, name, None)
             if not url:
                 continue
@@ -250,8 +269,16 @@ class Settings(BaseSettings):
                     "resolve names, so it cannot confirm one stays on this network)"
                 )
                 continue
-            in_rfc1918 = addr.version == 4 and any(addr in net for net in rfc1918)
-            if not (addr.is_loopback or in_rfc1918):
+            # An IPv4-mapped IPv6 literal (`::ffff:10.0.0.1`) is IPv4's 10.0.0.1 by another
+            # spelling -- an IPv6-preferring resolver or proxy can hand one back for an ordinary
+            # RFC1918 host, and `addr.version` alone would read it as IPv6 and refuse it. Judge
+            # RFC1918 membership on the address it actually maps to; `ipv4_mapped` is None (and
+            # this is a no-op) for anything that is not one.
+            mapped = getattr(addr, "ipv4_mapped", None)
+            v4_equivalent = mapped if mapped is not None else addr
+            in_rfc1918 = v4_equivalent.version == 4 and any(v4_equivalent in net for net in rfc1918)
+            in_ula = addr.version == 6 and addr in ula
+            if not (v4_equivalent.is_loopback or in_rfc1918 or in_ula):
                 offenders.append(f"{name}={url!r} (host {host} is publicly routable)")
                 continue
             checked.append(name)

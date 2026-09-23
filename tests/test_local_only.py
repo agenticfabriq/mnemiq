@@ -78,6 +78,45 @@ def test_ipv6_loopback_is_allowed():
     _s(llm_base_url="http://[::1]:8000/v1", llm_api_key="k").assert_local_only()
 
 
+# --- fix round 2, item 3: IPv6 unique-local addresses (RFC 4193, RFC1918's IPv6 analog) -----
+
+
+def test_an_ipv6_unique_local_address_is_allowed():
+    # fd00::/8 and fc00::/7 are RFC 4193's "unique local address" range -- the IPv6 equivalent
+    # of RFC1918. `in_rfc1918` used to be gated on `addr.version == 4`, so an IPv6-only data
+    # centre's own private host was refused AND told "is publicly routable", which is false:
+    # `ipaddress.ip_address("fd00::1").is_global` is False.
+    _s(llm_base_url="http://[fd00::1]:8000/v1", llm_api_key="k").assert_local_only()
+    _s(llm_base_url="http://[fc00::1234]:8000/v1", llm_api_key="k").assert_local_only()
+
+
+def test_an_ipv6_unique_local_address_is_never_called_publicly_routable():
+    # Even where a ULA WOULD be refused (outside this branch's allowed set, hypothetically), the
+    # specific claim "is publicly routable" must never be made about one -- it is a false
+    # statement, not just a stricter refusal. Asserted here on a public IPv6 address instead,
+    # which legitimately IS publicly routable, to pin the wording stays honest for the case it's
+    # meant for.
+    s = _s(llm_base_url="http://[2001:4860:4860::8888]:8000/v1", llm_api_key="k")
+    with pytest.raises(RuntimeError) as exc:
+        s.assert_local_only()
+    assert "publicly routable" in str(exc.value)
+
+
+def test_an_ipv4_mapped_ipv6_private_address_is_allowed():
+    # `::ffff:10.0.0.1` is RFC1918's 10.0.0.1 spelled as an IPv4-mapped IPv6 literal -- the kind
+    # of address an IPv6-preferring resolver or proxy can hand back for an ordinary private host.
+    # `ipaddress.ip_address("::ffff:10.0.0.1").is_private` is True and `.version` is 6, so the
+    # old `addr.version == 4` gate refused it exactly like a ULA.
+    _s(llm_base_url="http://[::ffff:10.0.0.1]:8000/v1", llm_api_key="k").assert_local_only()
+
+
+def test_an_ipv4_mapped_ipv6_public_address_is_still_refused():
+    s = _s(llm_base_url="http://[::ffff:8.8.8.8]:8000/v1", llm_api_key="k")
+    with pytest.raises(RuntimeError) as exc:
+        s.assert_local_only()
+    assert "llm_base_url" in str(exc.value)
+
+
 # --- fix round 1, item 1: `urlparse` itself can raise -------------------------------------
 #
 # `urlparse("http://[::1/v1")` (a malformed IPv6 host literal) raises ValueError from INSIDE
@@ -241,3 +280,28 @@ def test_the_cli_calls_the_assertion_before_any_command_does_work(monkeypatch, c
     assert rc == 2, "a refused startup is a clean exit code, not a raised exception out of main"
     assert call_order == ["assert_local_only"]
     assert "stopped-before-work" in capsys.readouterr().err
+
+
+# --- fix round 2, item 6: nothing keeps the checked-field tuple complete --------------------
+
+
+def test_every_url_field_is_checked_or_explicitly_exempted():
+    # Nothing in Settings' own definition forces a new `..._url` field to be added to
+    # `_LOCAL_ONLY_CHECKED_URL_FIELDS` -- a future `verity_something_url` would otherwise be
+    # silently exempt from MNEMIQ_LOCAL_ONLY while the run still prints "verified" for
+    # everything it DID check, which looks identical to a genuinely clean run. This test is the
+    # forcing function: adding a `_url` field without updating one of the two sets below fails it.
+    from mnemiq.config import Settings, _LOCAL_ONLY_CHECKED_URL_FIELDS
+
+    # Fields deliberately NOT checked, with why -- there are none today. A field would go here,
+    # commented, only if checking it were actively wrong (the way pg_dsn/control_dsn are wrong to
+    # check as URLs at all, were either of them ever renamed to end in `_url`).
+    EXEMPTED: set[str] = set()
+
+    all_url_fields = {name for name in Settings.model_fields if name.endswith("_url")}
+    accounted_for = set(_LOCAL_ONLY_CHECKED_URL_FIELDS) | EXEMPTED
+    unaccounted = all_url_fields - accounted_for
+    assert not unaccounted, (
+        f"new _url field(s) {unaccounted} are neither checked by assert_local_only "
+        "(_LOCAL_ONLY_CHECKED_URL_FIELDS) nor in this test's own EXEMPTED set"
+    )
