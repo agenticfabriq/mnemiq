@@ -25,10 +25,28 @@ INFLECTION_ANY = r"\w*"
 INFLECTION_PLURAL = r"(?:e?s)?"
 
 
+# CamelCase splits at two boundaries and only these two. `(?<=[a-z0-9])(?=[A-Z])` ends a word at
+# the capital that follows a lowercase letter or digit; `(?<=[A-Z])(?=[A-Z][a-z])` ends an ACRONYM
+# at the capital that begins a lowercase run. Together: `GrossPaymentAmount` -> three words,
+# `APRValue` -> two, and `APR` stays one. Splitting every capital instead would turn an acronym
+# into `a p r`, and a one-letter word matches noise -- the failure the id-tail width already
+# records in `_asked_for`.
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
 def normalized(spelling: str) -> str:
-    """One spelling in the form every matcher compares in: lowercase, underscores as spaces,
-    whitespace collapsed."""
-    return " ".join(spelling.replace("_", " ").split()).lower()
+    """One spelling in the form every matcher compares in: lowercase, underscores and CamelCase
+    boundaries as spaces, whitespace collapsed.
+
+    CamelCase is split because it is what the certified-records pipeline emits and no question
+    contains it. Every one of the 38 records in the fs_payments corpus is CamelCase, and before
+    this `GrossPaymentAmount` normalised to the single token `grosspaymentamount` -- reachable
+    only by a question saying "grosspaymentamount", which nobody types. 33 of those 38 public
+    definitions were therefore unreachable by term matching, while the bound-to-table rule went
+    on riding 5 into every packet and made the glossary look like it worked (M108).
+    """
+    spaced = _CAMEL_BOUNDARY.sub(" ", spelling.replace("_", " "))
+    return " ".join(spaced.split()).lower()
 
 
 def _last_word(word: str, inflection: str) -> str:

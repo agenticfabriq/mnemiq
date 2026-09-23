@@ -312,3 +312,49 @@ def test_sentence_punctuation_after_a_punctuation_term_still_matches():
     assert term_pattern("margin %").search("the margin %.")
     assert term_pattern("ROI (%)").search("our ROI (%) rose")
     assert term_pattern("revenue").search("our revenue.")
+
+
+@pytest.mark.parametrize(
+    "term, expected",
+    [
+        # The case this exists for: every certified record Verity emits is CamelCase, and a
+        # jammed `grosspaymentamount` matches only a question nobody types. 33 of the 38
+        # records in the fs_payments corpus were unreachable by term matching (M108).
+        ("GrossPaymentAmount", "gross payment amount"),
+        ("PaymentTip", "payment tip"),
+        ("NetPaymentAmount", "net payment amount"),
+        # An acronym is one word, not one word per letter. Splitting `APR` into `a p r` would
+        # trade this bug for a worse one -- every short capitalised token would match noise.
+        ("APR", "apr"),
+        ("EBITDA", "ebitda"),
+        # ...but an acronym followed by a word IS two words. The boundary is the capital that
+        # begins a lowercase run, not every capital.
+        ("APRValue", "apr value"),
+        ("EBITDAMargin", "ebitda margin"),
+        ("NetAPR", "net apr"),
+        # Digits end a word the same way a lowercase letter does.
+        ("Basel3Ratio", "basel3 ratio"),
+        # Unchanged shapes: these already worked and must keep working.
+        ("total_payment", "total payment"),
+        ("total payment", "total payment"),
+        ("TOTAL_PAYMENT", "total payment"),
+        ("revenue", "revenue"),
+        ("  spaced   out  ", "spaced out"),
+    ],
+)
+def test_a_term_is_normalized_to_the_words_a_person_would_type(term, expected):
+    from mnemiq.semantic.glossary import normalized
+
+    assert normalized(term) == expected
+
+
+def test_a_camelcase_term_is_matched_by_the_question_a_person_asks():
+    # The end of the chain the parametrised case starts: normalisation only matters because
+    # `_asked_for` compares against it. Before M108 this asked for `grosspaymentamount`.
+    from mnemiq.contract import Definition
+    from mnemiq.semantic.glossary import _asked_for
+
+    d = Definition(id="fspay:GrossPaymentAmount", term="GrossPaymentAmount",
+                   definition="Amount before deductions.", public=True, domain="fspay")
+    assert _asked_for(d, "what is the gross payment amount by channel")
+    assert not _asked_for(d, "how many rows are in payment_transaction")
