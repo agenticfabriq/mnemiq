@@ -516,6 +516,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "digest-ontology":  # likewise: TTL in, JSON out -- no source needed
         return _cmd_digest_ontology(args)
     settings = Settings.from_env()
+    # The one call site for every command that touches a source, a store or an endpoint --
+    # `config` and `digest-ontology` never reach this line, which is why they are dispatched
+    # above it instead of after. Placed here, before the command dispatch below, an operator's
+    # mistyped base URL is a startup error instead of a run that quietly succeeds having sent
+    # every schema card off the network. Caught and printed rather than left to surface as a raw
+    # traceback: the point of the check is to hand a security reviewer a clean refusal, not a
+    # stack trace they have to read past to find the same message.
+    try:
+        settings.assert_local_only()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if args.command == "enrich":
         return _cmd_enrich(settings)
     if args.command == "build":

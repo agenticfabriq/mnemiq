@@ -50,6 +50,20 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="MNEMIQ_", extra="ignore", populate_by_name=True)
 
+    # --- safety ---
+    # Scoped to the three LLM-facing endpoints deliberately, not every network setting: the
+    # local-baseline plan's own finding is that a Qcell-shaped deployment needs no hosted LLM at
+    # enrichment time at all, so llm/embed/verify_base_url are the one genuine remaining dependency
+    # and the only place a mistyped URL silently ships a schema card or a question off-network.
+    # pg_dsn/control_dsn point at the customer's OWN infrastructure, not a third party, and the
+    # verity_* telemetry endpoints already default closed behind their own opt-in disclosure tiers
+    # (verity_trace_send_text and friends) -- a second, differently-shaped gate on those belongs to
+    # that subsystem, not this one, if it is ever needed.
+    local_only: bool = Field(
+        default=False,
+        description="refuse to start if the chat, embedding or judge endpoint would leave this "
+                     "machine or network (see assert_local_only for exactly what this checks)",
+    )
     # --- connection ---
     llm_base_url: str | None = Field(default=None, description="chat/generation OpenAI-compat base URL")
     llm_api_key: str | None = Field(default=None, description="chat/generation API key")
@@ -152,6 +166,61 @@ class Settings(BaseSettings):
     @classmethod
     def from_env(cls) -> "Settings":
         return cls()
+
+    def assert_local_only(self) -> None:
+        """Refuse to run when the chat, embedding or judge endpoint would carry data off the network.
+
+        For a deployment whose whole premise is that nothing leaves, a mistyped base URL is not
+        a misconfiguration that fails -- it is one that SUCCEEDS, quietly, having sent every
+        schema card to a third party. This turns that into a startup error.
+
+        Loopback and the RFC1918 private ranges pass, because a data centre runs the model on
+        another host on its own network. That is deliberately narrower than `ipaddress`'s own
+        `is_private`, which also accepts several IANA special-purpose ranges we do NOT want to
+        wave through silently -- 169.254.169.254 above all, the link-local address several cloud
+        providers use to serve their metadata API, which is exactly the kind of off-box hop this
+        check exists to catch. Anything we cannot place inside loopback or RFC1918 is refused:
+        an unparseable URL, an unresolved DNS name (public or internal -- we do not perform a
+        lookup to find out) and every other IANA special range are all refused the same way,
+        because none of them is evidence of being on this network. Every offender is collected
+        and named together -- an operator who fixes one and reruns only to be told about the next
+        will conclude the check itself is flaky and disable it.
+        """
+        if not self.local_only:
+            return
+        import ipaddress
+        from urllib.parse import urlparse
+
+        rfc1918 = (
+            ipaddress.ip_network("10.0.0.0/8"),
+            ipaddress.ip_network("172.16.0.0/12"),
+            ipaddress.ip_network("192.168.0.0/16"),
+        )
+
+        offenders: list[str] = []
+        for name in ("llm_base_url", "embed_base_url", "verify_base_url"):
+            url = getattr(self, name, None)
+            if not url:
+                continue
+            host = urlparse(url).hostname
+            if host is None:
+                offenders.append(f"{name}={url!r} (no host could be parsed)")
+                continue
+            if host in ("localhost", "localhost.localdomain"):
+                continue
+            try:
+                addr = ipaddress.ip_address(host)
+            except ValueError:
+                offenders.append(f"{name}={url!r} (host {host!r} is a name, not a private address)")
+                continue
+            in_rfc1918 = addr.version == 4 and any(addr in net for net in rfc1918)
+            if not (addr.is_loopback or in_rfc1918):
+                offenders.append(f"{name}={url!r} (host {host} is publicly routable)")
+        if offenders:
+            raise RuntimeError(
+                "MNEMIQ_LOCAL_ONLY is set and these endpoints would leave this network:\n  "
+                + "\n  ".join(offenders)
+            )
 
     def embed_endpoint(self) -> tuple[str | None, str | None]:
         """The endpoint embeddings use. Defaults to the chat endpoint; set MNEMIQ_EMBED_BASE_URL/KEY to
