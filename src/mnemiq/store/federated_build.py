@@ -5,6 +5,7 @@ import duckdb
 from mnemiq.config import Settings, SourceSpec
 from mnemiq.contract import Snapshot
 from mnemiq.llm.embeddings import Embedder
+from mnemiq.semantic.embedding_width import refuse_if_mismatched
 from mnemiq.semantic.federation import merge_snapshots
 from mnemiq.semantic.store import build_example_index, build_index
 from mnemiq.store.snapshot_store import current_version, load_snapshot
@@ -18,6 +19,18 @@ def build_federated_snapshot(
     """Merge N per-source snapshots into one qualified snapshot and index it once. Also re-key
     value_index.object_id to the qualified form so value grounding still resolves."""
     fed = merge_snapshots(pairs)
+    # Refuse a width mismatch BEFORE the per-source DELETE below, not after: that DELETE runs
+    # and autocommits on its own, one statement per table, so a refusal raised only once
+    # build_index/build_example_index reach their OWN width check would already have emptied
+    # every per-source card and example. That is precisely the failure this branch removed from
+    # the single-source path (see build_index) -- it was only ever fixed one call site lower,
+    # never here, where the federated rebuild has its own DELETE ahead of both of them. Gated on
+    # there being something to embed, matching build_index/build_example_index's own rule that
+    # embedder.dim (a network probe on LLMEmbedder) is never touched for empty input.
+    if fed.columns:
+        refuse_if_mismatched(con, "semantic_object", embedder.dim)
+    if fed.examples:
+        refuse_if_mismatched(con, "example", embedder.dim)
     # Clear any stale per-source rows so the federated index is the only live one -- and so the
     # FTS rebuild inside build_index never sees two sources' bare (colliding) object_ids. The
     # tables may not exist yet on a fresh store, in which case there is nothing stale to clear.
