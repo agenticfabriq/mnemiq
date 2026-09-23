@@ -90,12 +90,13 @@ def test_an_ipv6_unique_local_address_is_allowed():
     _s(llm_base_url="http://[fc00::1234]:8000/v1", llm_api_key="k").assert_local_only()
 
 
-def test_an_ipv6_unique_local_address_is_never_called_publicly_routable():
-    # Even where a ULA WOULD be refused (outside this branch's allowed set, hypothetically), the
-    # specific claim "is publicly routable" must never be made about one -- it is a false
-    # statement, not just a stricter refusal. Asserted here on a public IPv6 address instead,
-    # which legitimately IS publicly routable, to pin the wording stays honest for the case it's
-    # meant for.
+def test_a_genuinely_public_ipv6_address_is_still_called_publicly_routable():
+    # This does NOT exercise the ULA fix itself -- fd00::/8 and fc00::/7 are never refused now,
+    # so there is no refused-ULA case left to check the wording against. What this pins is the
+    # other half: widening the allowed ranges (here, and in any later change) must not make
+    # "publicly routable" a label a genuinely public address stops earning. Mutation-verified: a
+    # regression that made `in_ula` too broad would leave this test the one still catching it,
+    # since the allowed-ULA tests above pass either way as long as fd00::1 itself is allowed.
     s = _s(llm_base_url="http://[2001:4860:4860::8888]:8000/v1", llm_api_key="k")
     with pytest.raises(RuntimeError) as exc:
         s.assert_local_only()
