@@ -79,9 +79,13 @@ def test_the_cli_calls_the_assertion_before_any_command_does_work(monkeypatch, c
     # config needed to reach its first line of work) and proves ORDER, not just that the method
     # ran: assert_local_only raises before returning, so if the call site in cli.main truly sits
     # immediately after `settings = Settings.from_env()` -- before the command dispatch -- nothing
-    # past it can execute. `init_store` is patched to raise its own, differently-typed error if
-    # reached, so a wiring regression that lets real work start surfaces as an UNCAUGHT
-    # AssertionError (cli.main only catches the local-only RuntimeError), not a silent pass.
+    # past it can execute. `init_store` is patched to raise its own, differently-typed error as a
+    # tripwire for a wiring regression that lets real work start. That tripwire does NOT surface as
+    # an uncaught exception, though: `_cmd_metrics` wraps its own init_store call in a broad
+    # `except Exception`, which catches the AssertionError, prints a warning and returns 0 -- so a
+    # regression here is caught by `rc == 2` and `call_order` below, not by pytest.raises. Verified
+    # by mutation: commenting out the real call site makes this test fail with `rc == 0` and
+    # `call_order == ["init_store"]`, never with an uncaught error.
     call_order: list[str] = []
 
     def fake_assert_local_only(self) -> None:

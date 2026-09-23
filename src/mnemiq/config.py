@@ -54,11 +54,15 @@ class Settings(BaseSettings):
     # Scoped to the three LLM-facing endpoints deliberately, not every network setting: the
     # local-baseline plan's own finding is that a Qcell-shaped deployment needs no hosted LLM at
     # enrichment time at all, so llm/embed/verify_base_url are the one genuine remaining dependency
-    # and the only place a mistyped URL silently ships a schema card or a question off-network.
-    # pg_dsn/control_dsn point at the customer's OWN infrastructure, not a third party, and the
-    # verity_* telemetry endpoints already default closed behind their own opt-in disclosure tiers
-    # (verity_trace_send_text and friends) -- a second, differently-shaped gate on those belongs to
-    # that subsystem, not this one, if it is ever needed.
+    # for THAT plan's goal. pg_dsn/control_dsn point at the customer's own infrastructure, not a
+    # third party, so they are out of scope on purpose. The verity_* endpoints are a real gap this
+    # does NOT close, named here rather than left for someone to discover by tracing call sites:
+    # verity_token_url carries verity_client_secret to a token exchange, verity_records_url pulls
+    # from it, and verity_traces_url can carry question text and result rows once
+    # verity_trace_send_text/_rows is opted in -- none of the three is checked, and the opt-in
+    # flags gate WHAT a trace contains, not WHERE verity_traces_url itself points. Closing that is
+    # a separate, differently-shaped task against that subsystem, not a reason to believe this
+    # flag already covers it.
     local_only: bool = Field(
         default=False,
         description="refuse to start if the chat, embedding or judge endpoint would leave this "
