@@ -55,7 +55,7 @@ class OracleAdapter:
         `config_dir` is a directory holding `tnsnames.ora` (and, for a TLS target, the wallet).
         It serves TWO deployments with one mechanism, which is why it is not called `wallet_dir`:
 
-          ON-PREM, the common case and the one Qcell runs. `tnsnames.ora` maps an alias to a
+          ON-PREM, which is the common enterprise case. `tnsnames.ora` maps an alias to a
           descriptor, so `dsn` becomes the alias and the connection details live in the file the
           DBA already maintains. No wallet, no TLS, nothing else changes.
 

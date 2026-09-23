@@ -1256,7 +1256,7 @@ def test_a_definer_rights_view_writes_for_a_principal_with_only_select():
 def test_a_tns_alias_resolves_through_the_config_dir(tmp_path):
     """The on-prem mechanism, and the same one Autonomous uses for mTLS.
 
-    Qcell runs Oracle on-prem, where a DBA maintains `tnsnames.ora` and applications connect by
+    Enterprises commonly run Oracle on-prem, where a DBA maintains `tnsnames.ora` and apps connect by
     ALIAS rather than by host and port. `config_dir` points the driver at that directory. The
     Autonomous case adds a wallet to the same directory and a password for its PEM; the alias
     machinery is identical, which is why this is not called `wallet_dir`.
