@@ -94,8 +94,9 @@ def build_definition_index(records: OntologyRecords, snapshot: Snapshot,
 
 class DefinitionIndex:
     """Read side. No embedder here to size a table with if one has never been built, so
-    construction does not create it -- `nearest`'s own except-all treats a missing table the
-    same as an empty one and answers 'nothing indexed' rather than raising."""
+    construction does not create it -- `nearest`'s own except-duckdb.CatalogException treats a
+    missing table the same as an empty one and answers 'nothing indexed' rather than raising,
+    silently rather than logging a warning on every call."""
 
     def __init__(self, con: duckdb.DuckDBPyConnection) -> None:
         self._con = con
@@ -108,13 +109,22 @@ class DefinitionIndex:
             return []
         try:
             (embedding,) = embedder.embed([query_text])
+        except Exception as exc:  # embed error -> no grounding
+            logger.warning("definition index query failed; grounding skipped: %s", exc)
+            return []
+        try:
             rows = self._con.execute(
                 f"SELECT term, text, "
                 f"array_cosine_similarity(embedding, ?::FLOAT[{len(embedding)}]) AS score "
                 f"FROM definition_concept ORDER BY score DESC LIMIT ?",
                 [embedding, k],
             ).fetchall()
-        except Exception as exc:  # embed error or an unavailable array function -> no grounding
+        except duckdb.CatalogException:
+            # Never built -- construction deliberately doesn't create this table (no embedder
+            # there to size it with), so "nothing indexed" is the expected, silent answer here,
+            # not a failure worth a WARNING on every call.
+            return []
+        except Exception as exc:  # an unavailable array function or similar -> no grounding
             logger.warning("definition index query failed; grounding skipped: %s", exc)
             return []
         return [(term, text, float(score)) for term, text, score in rows if score is not None

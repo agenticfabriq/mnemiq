@@ -6,6 +6,19 @@ from mnemiq.semantic.store import build_example_index, build_index, indexed_vers
 from mnemiq.store.bootstrap import init_store
 
 
+class _NoTouchEmbedder:
+    """Raises if its network-shaped surface is touched at all -- proves a caller checked for
+    empty input before reading `dim` or calling `embed`, the two calls a real LLMEmbedder turns
+    into an endpoint round trip (dim itself embeds a one-word probe)."""
+
+    @property
+    def dim(self) -> int:
+        raise AssertionError("embedder.dim must not be read for empty input")
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        raise AssertionError("embed() must not be called for empty input")
+
+
 def _snapshot(version="v1") -> Snapshot:
     return Snapshot(
         version=version,
@@ -126,6 +139,45 @@ def test_an_example_index_width_mismatch_is_also_refused_not_wiped(tmp_path):
     message = str(exc_info.value)
     assert "1536" in message and "1024" in message
     assert con.execute("SELECT count(*) FROM example").fetchone()[0] == 1
+
+
+def test_build_index_skips_the_embedder_but_still_clears_stale_rows_for_an_empty_snapshot(
+    tmp_path,
+):
+    # Checking for empty input ahead of embedder.dim must not skip the clearing DELETE, which
+    # needs no width: a stale card is worse than a missing one, and _NoTouchEmbedder proves the
+    # network-shaped surface is untouched at the same time the row count proves nothing stale
+    # survives.
+    con = init_store(str(tmp_path / "s.duckdb"))
+    build_index(con, _snapshot(), FakeEmbedder())
+    assert con.execute("SELECT count(*) FROM semantic_object").fetchone()[0] == 2
+
+    empty = Snapshot(version="v2", source_id="acme", created_at="2026-07-13T00:00:00Z")
+    assert build_index(con, empty, _NoTouchEmbedder()) == 0
+    assert con.execute("SELECT count(*) FROM semantic_object").fetchone()[0] == 0
+    assert indexed_version(con, "acme") is None
+
+
+def test_build_example_index_skips_the_embedder_but_still_clears_stale_rows_with_no_examples(
+    tmp_path,
+):
+    con = init_store(str(tmp_path / "s.duckdb"))
+    snap = _snapshot().model_copy(update={"examples": [
+        Example(question="how many claims?", sql="SELECT count(*) FROM claim",
+                tables=["claim"], object_id="claim"),
+    ]})
+    build_example_index(con, snap, FakeEmbedder())
+    assert con.execute("SELECT count(*) FROM example").fetchone()[0] == 1
+
+    assert build_example_index(con, _snapshot(), _NoTouchEmbedder()) == 0
+    assert con.execute("SELECT count(*) FROM example").fetchone()[0] == 0
+
+
+def test_indexed_version_on_a_never_built_store_returns_none(tmp_path):
+    # Exercises the except-duckdb.CatalogException branch: no build_index call has ever run
+    # against this connection, so the table itself doesn't exist yet.
+    con = init_store(str(tmp_path / "s.duckdb"))
+    assert indexed_version(con, "acme") is None
 
 
 def test_the_full_text_index_is_queryable(tmp_path):

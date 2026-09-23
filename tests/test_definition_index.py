@@ -1,3 +1,5 @@
+import logging
+
 import duckdb
 import pytest
 
@@ -122,6 +124,20 @@ def test_a_width_mismatch_against_an_existing_store_is_refused_not_wiped(tmp_pat
 
     # The point of the fix: the original build's row must survive the refused rebuild.
     assert con.execute("SELECT count(*) FROM definition_concept").fetchone()[0] == 1
+
+
+def test_nearest_on_a_never_built_index_is_silent(tmp_path, caplog):
+    # DefinitionIndex.__init__ no longer creates the table (no embedder there to size it with),
+    # so a query against a never-built index used to raise duckdb.CatalogException and fall into
+    # nearest's broad except, logging a WARNING on every single call -- reachable whenever
+    # build_definition_index fail-softs (empty corpus, embed error) and cli.py's enrich path
+    # still asks for grounding per table. A never-built index should answer "nothing indexed"
+    # exactly as cheaply and quietly as an empty one.
+    con = duckdb.connect()
+    with caplog.at_level(logging.WARNING):
+        hits = DefinitionIndex(con).nearest("premium", FakeEmbedder())
+    assert hits == []
+    assert caplog.records == []
 
 
 def test_nearest_returns_k_scored_terms(tmp_path):

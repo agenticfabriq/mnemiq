@@ -36,23 +36,37 @@ CREATE TABLE IF NOT EXISTS example (
 
 
 def build_index(con: duckdb.DuckDBPyConnection, snapshot: Snapshot, embedder: Embedder) -> int:
-    """Render, embed and index the snapshot's tables. One live index per source.
+    """Render, embed and index the snapshot's tables. One live index per source: this source's
+    existing rows are cleared whenever the function runs, even when the new build is empty, so a
+    stale card never outlives the build that was meant to refresh it -- at retrieval time a stale
+    card is indistinguishable from a fresh one.
+
+    Checked for empty input before anything else touches `embedder`: on LLMEmbedder, `.dim`
+    itself makes an embedding call to probe the endpoint, and a snapshot with nothing new to
+    write should never cost a network round trip for that -- the case that matters most in
+    exactly the air-gapped deployment this width-from-the-embedder design is for. The clearing
+    DELETE below needs no such width, so it still runs on this path.
 
     Sizes the embedding column from embedder.dim, but only on first create: CREATE TABLE IF NOT
     EXISTS is a no-op against a store already built at a different width, so a mismatch here is
-    refused (see refuse_if_mismatched) before the per-source DELETE below, rather than letting
-    the DELETE run and then crashing on the INSERT.
+    refused (see refuse_if_mismatched) before the clearing DELETE, rather than letting the DELETE
+    run and then crashing on the INSERT.
     """
+    def _clear_stale() -> None:
+        try:
+            con.execute("DELETE FROM semantic_object WHERE source_id = ?", [snapshot.source_id])
+        except duckdb.CatalogException:
+            pass  # nothing built yet for any source -- nothing to clear
+
     cards = build_cards(snapshot)
+    if not cards:
+        _clear_stale()
+        return 0
+
     dim = embedder.dim
     refuse_if_mismatched(con, "semantic_object", dim)
+    _clear_stale()
     con.execute(_ddl(dim))
-
-    # One live index per source: a stale card is worse than a missing one, because at
-    # retrieval time it is indistinguishable from a fresh one.
-    con.execute("DELETE FROM semantic_object WHERE source_id = ?", [snapshot.source_id])
-    if not cards:
-        return 0
 
     vectors = embedder.embed([c.text for c in cards])
     con.executemany(
@@ -85,16 +99,24 @@ def build_example_index(
     """Embed each validated example's QUESTION into its own index, so retrieval pulls the
     examples most similar to the asked question -- not whatever tables happened to rank.
 
-    Kept out of semantic_object so example text never perturbs table retrieval. A width
-    mismatch against an already-built table is refused before the per-source DELETE -- same
-    reasoning as build_index, above.
+    Kept out of semantic_object so example text never perturbs table retrieval. Same clearing,
+    empty-check-first, and width-mismatch-refused-before-clearing contract as build_index, above
+    -- see its docstring for the reasoning.
     """
+    def _clear_stale() -> None:
+        try:
+            con.execute("DELETE FROM example WHERE source_id = ?", [snapshot.source_id])
+        except duckdb.CatalogException:
+            pass  # nothing built yet for any source -- nothing to clear
+
+    if not snapshot.examples:
+        _clear_stale()
+        return 0
+
     dim = embedder.dim
     refuse_if_mismatched(con, "example", dim)
+    _clear_stale()
     con.execute(_example_ddl(dim))
-    con.execute("DELETE FROM example WHERE source_id = ?", [snapshot.source_id])
-    if not snapshot.examples:
-        return 0
 
     vectors = embedder.embed([e.question for e in snapshot.examples])
     con.executemany(
