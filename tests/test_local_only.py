@@ -22,8 +22,11 @@ def test_a_public_endpoint_is_refused_and_named():
     s = _s(llm_base_url="https://api.openai.com/v1", llm_api_key="k")
     with pytest.raises(RuntimeError) as exc:
         s.assert_local_only()
-    assert "llm_base_url" in str(exc.value)
-    assert "api.openai.com" in str(exc.value)
+    # Assert the whole offender line, not a bare hostname. Stronger -- it pins the field name
+    # and the URL together, so a message that named the field but lost the value would fail --
+    # and it keeps CodeQL's py/incomplete-url-substring-sanitization from reading a test
+    # assertion as URL validation, which is the one thing this line is not.
+    assert "llm_base_url='https://api.openai.com/v1'" in str(exc.value)
 
 
 def test_every_offender_is_named_not_just_the_first():
@@ -179,7 +182,7 @@ def test_an_unparseable_url_does_not_discard_an_earlier_offender():
     with pytest.raises(RuntimeError) as exc:
         s.assert_local_only()
     msg = str(exc.value)
-    assert "llm_base_url" in msg and "api.openai.com" in msg
+    assert "llm_base_url='https://api.openai.com/v1'" in msg   # whole line, not a bare host
     assert "embed_base_url" in msg
 
 
