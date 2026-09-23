@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -16,6 +17,8 @@ from mnemiq.semantic.cards import render_facts_block
 from mnemiq.semantic.embedding_width import refuse_if_mismatched
 from mnemiq.semantic.glossary import select_definitions
 from mnemiq.semantic.measures import select_dimensions, select_metrics
+
+logger = logging.getLogger(__name__)
 
 _RRF_K = 60  # the standard RRF constant (reciprocal-rank blending)
 
@@ -87,6 +90,20 @@ def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5) -> list[Ex
     """Top-k validated examples by QUESTION similarity to the asked question -- on-target
     few-shot, not per-table. Never surfaces an example touching a table outside the grants."""
     placeholders = ", ".join("?" for _ in allowed)
+    # Never built -- checked explicitly, by name, schema AND catalog (matching
+    # DefinitionIndex.nearest's identical check; a same-named table in a different attached
+    # catalog must not pass this, the mistake `declared_width` made before it was fixed to use
+    # DESCRIBE), rather than inferred from catching duckdb.CatalogException around the query
+    # below: a missing TABLE and a missing FUNCTION raise that same exception type, so catching
+    # it there would also silently swallow a genuinely broken query. This is the common,
+    # unremarkable state (examples were never built, or enrich_examples is off), so it is not
+    # logged -- every one of retrieve()'s callers would otherwise warn on every call.
+    table_exists = con.execute(
+        "SELECT 1 FROM information_schema.tables WHERE table_name = 'example' "
+        "AND table_schema = current_schema() AND table_catalog = current_database()"
+    ).fetchone()
+    if table_exists is None:
+        return []
     try:
         rows = con.execute(
             "SELECT question, sql, tables, object_id, "
@@ -94,17 +111,18 @@ def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5) -> list[Ex
             f"FROM example WHERE object_id IN ({placeholders}) ORDER BY s DESC LIMIT ?",
             [embedding, *allowed, k * 3],
         ).fetchall()
-    except Exception:
-        # Two distinguishable causes collapse into the same empty result here: no example table
-        # was ever built for this store (duckdb.CatalogException), or one was, at a width that no
-        # longer matches the configured embedder (duckdb.BinderException) -- retrieve() only
-        # guards semantic_object's width before calling this, not example's, because the two
-        # tables are sized and refused independently (see refuse_if_mismatched). Swallowing is
-        # still right for both: examples are a supplementary few-shot enhancement, never load-
-        # bearing for an answer, so a caller that could not get its OWN table checked out clean
-        # already raised earlier and loudly in retrieve() -- what reaches here is only ever the
-        # narrower case of examples alone being stale, and returning none is the correct degrade,
-        # not a hidden failure of the request.
+    except Exception as exc:
+        # The table exists but the query still failed. The case this branch is FOR is an
+        # embedding-width mismatch (duckdb.BinderException) -- example is sized and refused
+        # independently of semantic_object (see refuse_if_mismatched), so retrieve()'s own guard
+        # on semantic_object does not catch a mismatch confined to example alone -- but this also
+        # catches an unavailable array function or similar, same as DefinitionIndex.nearest's
+        # identical broad catch. Logged, unlike the missing-table case above: this is not the
+        # ordinary "not built yet" state, and the build path would refuse the identical mismatch
+        # loudly (build_example_index, federated_build). Still returns [] rather than raising --
+        # examples are a supplementary few-shot enhancement, never load-bearing for an answer, so
+        # losing them is the correct degrade even though it is worth a line in the log.
+        logger.warning("example retrieval failed; few-shot examples skipped: %s", exc)
         return []
     out: list[Example] = []
     for question, sql, tables_json, object_id, _s in rows:
@@ -194,8 +212,9 @@ def retrieve(
     ).fetchall()
 
     (embedding,) = embedder.embed([question])
-    # The read-side twin of the check build_index/build_example_index run before their own
-    # destructive statement: an unguarded array_cosine_similarity below raises DuckDB's own
+    # The read-side twin of the check every destructive rebuild runs before its own statement
+    # (build_index, build_example_index, definition_index, federated_build): an unguarded
+    # array_cosine_similarity below raises DuckDB's own
     # duckdb.BinderException ("Array arguments must be of the same size") for the identical
     # width mismatch, with none of the write path's named remedy -- an operator who never rebuilt
     # would see only the crash, never told this store must be rebuilt for the embedder now

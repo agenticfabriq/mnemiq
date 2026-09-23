@@ -264,7 +264,7 @@ def test_retrieve_examples_by_question_similarity_and_access_scope(tmp_path):
     assert [e.object_id for e in got] == ["claim"]
 
 
-def test_retrieve_examples_no_index_returns_empty(tmp_path):
+def test_retrieve_examples_no_index_returns_empty(tmp_path, caplog):
     from mnemiq.llm.embeddings import FakeEmbedder
     from mnemiq.semantic.retrieval import _retrieve_examples
     from mnemiq.store.bootstrap import init_store
@@ -272,13 +272,21 @@ def test_retrieve_examples_no_index_returns_empty(tmp_path):
     con = init_store(str(tmp_path / "s.duckdb"))  # no example table built
     (qvec,) = FakeEmbedder().embed(["q"])
     assert _retrieve_examples(con, qvec, allowed={"claim"}, k=5) == []
+    # This is the common, unremarkable state (examples were never built) -- unlike the width
+    # mismatch below, it must NOT log a warning on every retrieve() call.
+    assert caplog.text == ""
 
 
-def test_retrieve_examples_width_mismatch_also_returns_empty_not_raised(tmp_path):
-    """The second cause folded into the same swallow (see the comment on the except clause):
-    an example table built at one width, queried with a differently-sized embedder, raises
-    duckdb.BinderException just like the no-table case above -- and degrades the same way,
-    since examples are never load-bearing for an answer."""
+def test_retrieve_examples_width_mismatch_also_returns_empty_but_is_logged(tmp_path, caplog):
+    """The second cause folded into the same degrade, but NOT the same silence (see the comment
+    on _retrieve_examples): an example table built at one width, queried with a
+    differently-sized embedder, raises duckdb.BinderException -- a different exception than the
+    no-table case above (duckdb.CatalogException), and one _retrieve_examples now distinguishes
+    by checking table existence explicitly first. Asserting only `== []` here would pass just as
+    well if some unrelated exception were being swallowed silently; the log assertion is what
+    pins this test to the width-mismatch branch specifically, not the generic catch-all."""
+    import logging
+
     from mnemiq.contract import Example
     from mnemiq.llm.embeddings import FakeEmbedder
     from mnemiq.semantic.retrieval import _retrieve_examples
@@ -294,7 +302,9 @@ def test_retrieve_examples_width_mismatch_also_returns_empty_not_raised(tmp_path
     )
     build_example_index(con, snap, FakeEmbedder())  # 1536-wide
     (qvec,) = FakeEmbedder(dim=1024).embed(["q"])  # a differently-sized query vector
-    assert _retrieve_examples(con, qvec, allowed={"claim"}, k=5) == []
+    with caplog.at_level(logging.WARNING):
+        assert _retrieve_examples(con, qvec, allowed={"claim"}, k=5) == []
+    assert "example retrieval failed" in caplog.text
 
 
 def test_resolve_concepts_covers_only_bound_columns_on_shown_cards():
