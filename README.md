@@ -173,9 +173,20 @@ no grants, no snapshot — no data.
 standard OpenAI client, so vLLM, Ollama, llama.cpp's server, LM Studio, vendor gateways and the
 hosted APIs all work — set the base URL, a key (any non-empty string for local servers that
 ignore it) and a model name. Nothing about the engine assumes a hosted provider, which is what
-"runs inside your perimeter" means in practice: point it at a local server and no schema, no
-question and no row ever leaves your network. Embeddings follow the same setting, or their own
-via `MNEMIQ_EMBED_*`.
+"runs inside your perimeter" means in practice: point it at a local server, and — as long as
+every configured endpoint is one you've verified stays on your network — no schema, no question
+and no row ever leaves it. Embeddings follow the same setting, or their own via `MNEMIQ_EMBED_*`.
+
+Set `MNEMIQ_LOCAL_ONLY=1` to make that verification the engine's job instead of yours: it refuses
+to start if the chat, embedding, judge, or any Verity endpoint resolves to a host outside
+loopback or a private range (RFC1918, or its IPv6 equivalent). `MNEMIQ_PG_DSN` and
+`MNEMIQ_CONTROL_DSN` are deliberately **not** checked — libpq accepts keyword form
+(`host=... port=...`), multi-host URIs and Unix-socket targets, none of which a URL parser can
+read a hostname from, so a fail-closed check on them would refuse legitimate DSNs rather than
+catch anything; verify those by hand. One more thing worth knowing before an air-gapped run: the
+first `mnemiq build` on a machine with no DuckDB extension cache will try to fetch the `vss` and
+`fts` extensions from `extensions.duckdb.org` — pre-seed that cache, or vendor the two extension
+files, ahead of time.
 
 ## Use it from a browser (workbench)
 
