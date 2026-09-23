@@ -94,7 +94,7 @@ def build_definition_index(records: OntologyRecords, snapshot: Snapshot,
 
 class DefinitionIndex:
     """Read side. No embedder here to size a table with if one has never been built, so
-    construction does not create it -- `nearest`'s own except-duckdb.CatalogException treats a
+    construction does not create it -- `nearest`'s own explicit table-existence check treats a
     missing table the same as an empty one and answers 'nothing indexed' rather than raising,
     silently rather than logging a warning on every call."""
 
@@ -112,6 +112,16 @@ class DefinitionIndex:
         except Exception as exc:  # embed error -> no grounding
             logger.warning("definition index query failed; grounding skipped: %s", exc)
             return []
+        # Never built -- checked explicitly, ahead of the query, rather than inferred from
+        # catching duckdb.CatalogException around it: a missing TABLE and a missing FUNCTION
+        # both raise that exact exception type, so catching it there would also silently
+        # swallow a genuinely broken query (say, array_cosine_similarity gone after a DuckDB
+        # version change) instead of warning about it below.
+        table_exists = self._con.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = 'definition_concept'"
+        ).fetchone()
+        if table_exists is None:
+            return []
         try:
             rows = self._con.execute(
                 f"SELECT term, text, "
@@ -119,11 +129,6 @@ class DefinitionIndex:
                 f"FROM definition_concept ORDER BY score DESC LIMIT ?",
                 [embedding, k],
             ).fetchall()
-        except duckdb.CatalogException:
-            # Never built -- construction deliberately doesn't create this table (no embedder
-            # there to size it with), so "nothing indexed" is the expected, silent answer here,
-            # not a failure worth a WARNING on every call.
-            return []
         except Exception as exc:  # an unavailable array function or similar -> no grounding
             logger.warning("definition index query failed; grounding skipped: %s", exc)
             return []

@@ -140,6 +140,30 @@ def test_nearest_on_a_never_built_index_is_silent(tmp_path, caplog):
     assert caplog.records == []
 
 
+def test_nearest_still_warns_when_the_table_exists_but_the_query_fails(caplog):
+    # A missing table and a missing function raise the SAME duckdb.CatalogException type
+    # (confirmed directly: SELECT nosuchfn(1) also raises CatalogException). Catching that type
+    # around the query itself would silently swallow both, defeating the WARNING a genuinely
+    # broken query -- say, array_cosine_similarity missing after a DuckDB downgrade -- is meant
+    # to raise. "Never built" has to be checked explicitly, not inferred from the query's own
+    # exception type.
+    class _TableExistsButQueryFails:
+        def execute(self, sql, params=None):
+            if "information_schema.tables" in sql:
+                return self  # fetchone() below reports the table as present
+            raise duckdb.CatalogException(
+                "Scalar Function with name array_cosine_similarity does not exist!"
+            )
+
+        def fetchone(self):
+            return (1,)
+
+    with caplog.at_level(logging.WARNING):
+        hits = DefinitionIndex(_TableExistsButQueryFails()).nearest("premium", FakeEmbedder())
+    assert hits == []
+    assert any("query failed" in r.message for r in caplog.records)
+
+
 def test_nearest_returns_k_scored_terms(tmp_path):
     con = duckdb.connect()
     defs = [Definition(id=f"d{i}", term=f"Term{i}", domain="d", definition=f"meaning {i}")
