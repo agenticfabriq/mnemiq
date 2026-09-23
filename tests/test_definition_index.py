@@ -178,6 +178,22 @@ def test_nearest_warns_when_the_table_existence_check_itself_fails(caplog):
     assert any("query failed" in r.message for r in caplog.records)
 
 
+def test_nearest_ignores_a_same_named_table_in_a_different_attached_catalog(caplog):
+    # table_schema = current_schema() alone still lets a same-named table in a DIFFERENT
+    # attached catalog satisfy the existence check (both catalogs use the default "main"
+    # schema), so the check passes while the unqualified query below can't actually resolve to
+    # that other catalog's table and raises -- table_catalog must agree too, or this
+    # connection's own never-built index stops answering silently.
+    con = duckdb.connect()
+    con.execute("ATTACH ':memory:' AS other")
+    con.execute("CREATE TABLE other.main.definition_concept "
+               "(source_id TEXT, object_id TEXT, term TEXT, text TEXT, embedding FLOAT[3])")
+    with caplog.at_level(logging.WARNING):
+        hits = DefinitionIndex(con).nearest("premium", FakeEmbedder(dim=3))
+    assert hits == []
+    assert caplog.records == []  # this connection's OWN definition_concept was never built
+
+
 def test_nearest_returns_k_scored_terms(tmp_path):
     con = duckdb.connect()
     defs = [Definition(id=f"d{i}", term=f"Term{i}", domain="d", definition=f"meaning {i}")

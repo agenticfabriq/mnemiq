@@ -113,9 +113,9 @@ class DefinitionIndex:
             logger.warning("definition index query failed; grounding skipped: %s", exc)
             return []
         try:
-            # Never built -- checked explicitly, by name AND schema (a same-named table in a
-            # different attached catalog must not pass this check while the unqualified query
-            # below resolves to it instead), rather than inferred from catching
+            # Never built -- checked explicitly, by name, schema AND catalog (a same-named table
+            # in a different attached database must not pass this check while the unqualified
+            # query below can't actually resolve to it), rather than inferred from catching
             # duckdb.CatalogException around the query: a missing TABLE and a missing FUNCTION
             # both raise that exact exception type, so catching it there would also silently
             # swallow a genuinely broken query (say, array_cosine_similarity gone after a
@@ -123,8 +123,8 @@ class DefinitionIndex:
             # this one try so a failure in the check itself -- not just "table absent" -- still
             # reaches the warning rather than propagating uncaught.
             table_exists = self._con.execute(
-                "SELECT 1 FROM information_schema.tables "
-                "WHERE table_name = 'definition_concept' AND table_schema = current_schema()"
+                "SELECT 1 FROM information_schema.tables WHERE table_name = 'definition_concept' "
+                "AND table_schema = current_schema() AND table_catalog = current_database()"
             ).fetchone()
             if table_exists is None:
                 return []
