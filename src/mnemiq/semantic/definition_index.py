@@ -5,20 +5,21 @@ import logging
 import duckdb
 
 from mnemiq.contract import Snapshot
-from mnemiq.llm.embeddings import EMBED_DIM
 from mnemiq.ontology.records import OntologyRecords
 
 logger = logging.getLogger(__name__)
 
 DEFINITION_INDEX_MAX_CONCEPTS = 500  # a scheme above this contributes only its scheme-level text
 
-_DDL = f"""
+
+def _ddl(dim: int) -> str:
+    return f"""
 CREATE TABLE IF NOT EXISTS definition_concept (
   source_id TEXT,
   object_id TEXT,
   term      TEXT,
   text      TEXT,
-  embedding FLOAT[{EMBED_DIM}]
+  embedding FLOAT[{dim}]
 )
 """
 
@@ -45,8 +46,6 @@ def build_definition_index(records: OntologyRecords, snapshot: Snapshot,
                            max_concepts: int = DEFINITION_INDEX_MAX_CONCEPTS) -> int:
     """Embed the local meaning corpus into `con` for enrich-time grounding. Delete-then-insert per
     source. Fail-soft: no embedder, empty corpus, or an embed error writes nothing and returns 0."""
-    con.execute(_DDL)
-    con.execute("DELETE FROM definition_concept WHERE source_id = ?", [snapshot.source_id])
     rows = _corpus(records, snapshot, max_concepts)
     if not rows or embedder is None:
         return 0
@@ -55,6 +54,10 @@ def build_definition_index(records: OntologyRecords, snapshot: Snapshot,
     except Exception as exc:  # degrade-to-local: grounding is optional, never fatal
         logger.warning("definition index embedding failed; grounding skipped: %s", exc)
         return 0
+    # Sized from the vectors just returned, not a second call to embedder.dim -- embed() already
+    # paid the one round trip a width needs, and it is the real one, not a probed guess.
+    con.execute(_ddl(len(vectors[0])))
+    con.execute("DELETE FROM definition_concept WHERE source_id = ?", [snapshot.source_id])
     con.executemany(
         "INSERT INTO definition_concept (source_id, object_id, term, text, embedding) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -65,12 +68,12 @@ def build_definition_index(records: OntologyRecords, snapshot: Snapshot,
 
 
 class DefinitionIndex:
-    """Read side. Ensures its table on construction so a store built before SP5b answers
-    'nothing indexed' rather than raising."""
+    """Read side. No embedder here to size a table with if one has never been built, so
+    construction does not create it -- `nearest`'s own except-all treats a missing table the
+    same as an empty one and answers 'nothing indexed' rather than raising."""
 
     def __init__(self, con: duckdb.DuckDBPyConnection) -> None:
         self._con = con
-        con.execute(_DDL)
 
     def nearest(self, query_text: str, embedder, k: int = 5,
                 floor: float = 0.0) -> list[tuple[str, str, float]]:

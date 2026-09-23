@@ -5,6 +5,10 @@ from mnemiq.store.federated_build import build_federated_snapshot
 
 
 class _FakeEmbedder:
+    @property
+    def dim(self) -> int:
+        return 1536  # EMBED_DIM, matched to the vectors this stub returns below
+
     def embed(self, texts):
         return [[float(len(t) % 7)] * 1536 for t in texts]  # EMBED_DIM vectors, deterministic
 

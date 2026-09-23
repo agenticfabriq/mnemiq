@@ -5,27 +5,31 @@ import json
 import duckdb
 
 from mnemiq.contract import Snapshot
-from mnemiq.llm.embeddings import EMBED_DIM, Embedder
+from mnemiq.llm.embeddings import Embedder
 from mnemiq.semantic.cards import build_cards
 
-_DDL = f"""
+
+def _ddl(dim: int) -> str:
+    return f"""
 CREATE TABLE IF NOT EXISTS semantic_object (
   object_id TEXT,
   source_id TEXT,
   version   TEXT,
   card      TEXT,
-  embedding FLOAT[{EMBED_DIM}]
+  embedding FLOAT[{dim}]
 )
 """
 
-_EXAMPLE_DDL = f"""
+
+def _example_ddl(dim: int) -> str:
+    return f"""
 CREATE TABLE IF NOT EXISTS example (
   question   TEXT,
   sql        TEXT,
   tables     TEXT,
   object_id  TEXT,
   source_id  TEXT,
-  embedding  FLOAT[{EMBED_DIM}]
+  embedding  FLOAT[{dim}]
 )
 """
 
@@ -33,7 +37,7 @@ CREATE TABLE IF NOT EXISTS example (
 def build_index(con: duckdb.DuckDBPyConnection, snapshot: Snapshot, embedder: Embedder) -> int:
     """Render, embed and index the snapshot's tables. One live index per source."""
     cards = build_cards(snapshot)
-    con.execute(_DDL)
+    con.execute(_ddl(embedder.dim))
 
     # One live index per source: a stale card is worse than a missing one, because at
     # retrieval time it is indistinguishable from a fresh one.
@@ -74,7 +78,7 @@ def build_example_index(
 
     Kept out of semantic_object so example text never perturbs table retrieval.
     """
-    con.execute(_EXAMPLE_DDL)
+    con.execute(_example_ddl(embedder.dim))
     con.execute("DELETE FROM example WHERE source_id = ?", [snapshot.source_id])
     if not snapshot.examples:
         return 0
@@ -92,8 +96,14 @@ def build_example_index(
 
 
 def indexed_version(con: duckdb.DuckDBPyConnection, source_id: str) -> str | None:
-    con.execute(_DDL)
-    row = con.execute(
-        "SELECT DISTINCT version FROM semantic_object WHERE source_id = ?", [source_id]
-    ).fetchone()
+    # No embedder here to size a column with, and none needed -- this only reads. Guessing a
+    # width to stand the table up on would risk fixing it at the wrong size before build_index
+    # ever runs with the real embedder, so a store that hasn't been built yet is just "nothing
+    # indexed" rather than a table created on a guess.
+    try:
+        row = con.execute(
+            "SELECT DISTINCT version FROM semantic_object WHERE source_id = ?", [source_id]
+        ).fetchone()
+    except duckdb.CatalogException:
+        return None
     return row[0] if row else None

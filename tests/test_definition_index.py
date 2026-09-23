@@ -29,6 +29,21 @@ def test_indexes_definitions_and_in_scale_concepts(tmp_path):
     assert rows == [(4, EMBED_DIM)]
 
 
+def test_the_definition_index_is_built_at_the_embedder_s_width_not_1536(tmp_path):
+    # definition_concept has its own DDL, sized independently of semantic_object and example --
+    # a fix that only touched those two would leave this table still fixed at 1536.
+    con = duckdb.connect()
+    snap = _snapshot([Definition(id="d1", term="Premium", domain="ins",
+                                 definition="the amount paid for coverage")])
+    n = build_definition_index(OntologyRecords(), snap, con, FakeEmbedder(dim=64))
+    assert n == 1
+    (decl,) = con.execute(
+        "SELECT data_type FROM information_schema.columns "
+        "WHERE table_name = 'definition_concept' AND column_name = 'embedding'"
+    ).fetchone()
+    assert "64" in decl and "1536" not in decl
+
+
 def test_oversized_scheme_concepts_are_skipped(tmp_path):
     con = duckdb.connect()
     records = OntologyRecords(schemes=[_scheme("big", 5)])

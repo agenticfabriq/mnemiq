@@ -23,6 +23,16 @@ def test_fake_embedder_handles_empty_input():
     assert FakeEmbedder().embed([]) == []
 
 
+def test_the_protocol_carries_the_dimension():
+    # The index DDL is built from this, so an embedder that cannot state its width silently
+    # writes into a column of the wrong one.
+    from mnemiq.llm.embeddings import FakeEmbedder
+
+    assert FakeEmbedder().dim == EMBED_DIM
+    assert FakeEmbedder(dim=768).dim == 768
+    assert len(FakeEmbedder(dim=768).embed(["x"])[0]) == 768
+
+
 @pytest.mark.live_llm
 @pytest.mark.skipif(not os.getenv("MNEMIQ_LLM_API_KEY"), reason="no live LLM configured")
 def test_live_embedder_puts_related_text_closer():
@@ -43,10 +53,12 @@ def test_live_embedder_puts_related_text_closer():
 class _Recorder:
     """Stands in for the OpenAI client, recording what each call was asked to embed."""
 
-    def __init__(self, fail_while_longer_than: int | None = None, error: str | None = None):
+    def __init__(self, fail_while_longer_than: int | None = None, error: str | None = None,
+                 dim: int = EMBED_DIM):
         self.sent: list[list[str]] = []
         self._fail_over = fail_while_longer_than
         self._error = error or "maximum input length is 8192 tokens"
+        self._dim = dim
         self.embeddings = self
 
     def create(self, model, input):  # noqa: A002 - the provider's own parameter name
@@ -54,7 +66,7 @@ class _Recorder:
         if self._fail_over is not None and max((len(t) for t in input), default=0) > self._fail_over:
             raise RuntimeError(self._error)
         return type("R", (), {"data": [
-            type("D", (), {"index": i, "embedding": [0.0] * EMBED_DIM})() for i in range(len(input))
+            type("D", (), {"index": i, "embedding": [0.0] * self._dim})() for i in range(len(input))
         ]})()
 
 
@@ -66,6 +78,16 @@ def _embedder(monkeypatch, client, **kwargs):
     return mod.LLMEmbedder(
         Settings(llm_base_url="http://x", llm_api_key="k"), **kwargs
     )
+
+
+def test_llm_embedder_probes_the_endpoint_once_and_caches_the_width(monkeypatch):
+    # The endpoint is the only authority on its own width -- assuming EMBED_DIM would silently
+    # write into the wrong column for a local model that isn't 1536 wide.
+    client = _Recorder(dim=768)
+    emb = _embedder(monkeypatch, client)
+    assert emb.dim == 768
+    assert emb.dim == 768  # cached: a second access must not probe again
+    assert client.sent == [["dimension probe"]]
 
 
 def test_an_over_long_card_is_trimmed_rather_than_failing_its_whole_batch(monkeypatch):

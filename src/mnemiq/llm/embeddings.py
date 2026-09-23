@@ -30,6 +30,11 @@ _TOO_LONG = "maximum input length"
 
 
 class Embedder(Protocol):
+    @property
+    def dim(self) -> int:
+        """Vector width. The index DDL is built from this."""
+        ...
+
     def embed(self, texts: list[str]) -> list[list[float]]: ...
 
 
@@ -44,6 +49,20 @@ class LLMEmbedder:
         self._batch_size = batch_size
         self._max_chars = max_chars
         self._client = OpenAI(base_url=base_url, api_key=api_key)
+        self._dim: int | None = None
+
+    @property
+    def dim(self) -> int:
+        """Probed once from the endpoint, not assumed.
+
+        A served model's width is a property of the deployment, not of our config: the same
+        code points at a 1536-wide hosted endpoint and a 1024-wide local one. Probing costs one
+        embedding call per LLMEmbedder instance, which is nothing beside an index build, and it
+        is the only way to be right without a registry of model names we would have to maintain.
+        """
+        if self._dim is None:
+            self._dim = len(self.embed(["dimension probe"])[0])
+        return self._dim
 
     def _embed_batch(self, batch: list[str]) -> list[list[float]]:
         """One batch, halving the per-input budget until the provider accepts it.
@@ -82,6 +101,10 @@ class FakeEmbedder:
 
     def __init__(self, dim: int = EMBED_DIM) -> None:
         self._dim = dim
+
+    @property
+    def dim(self) -> int:
+        return self._dim
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         return [self._vector(t) for t in texts]
