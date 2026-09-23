@@ -164,6 +164,20 @@ def test_nearest_still_warns_when_the_table_exists_but_the_query_fails(caplog):
     assert any("query failed" in r.message for r in caplog.records)
 
 
+def test_nearest_warns_when_the_table_existence_check_itself_fails(caplog):
+    # The existence check runs before the real query, but a failure THERE (a closed or broken
+    # connection, say) must still warn rather than disappear -- it has to be inside the same
+    # try as the query, not a separate unguarded statement ahead of it.
+    class _BrokenConnection:
+        def execute(self, sql, params=None):
+            raise RuntimeError("connection closed")
+
+    with caplog.at_level(logging.WARNING):
+        hits = DefinitionIndex(_BrokenConnection()).nearest("premium", FakeEmbedder())
+    assert hits == []
+    assert any("query failed" in r.message for r in caplog.records)
+
+
 def test_nearest_returns_k_scored_terms(tmp_path):
     con = duckdb.connect()
     defs = [Definition(id=f"d{i}", term=f"Term{i}", domain="d", definition=f"meaning {i}")

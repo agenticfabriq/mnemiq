@@ -112,17 +112,22 @@ class DefinitionIndex:
         except Exception as exc:  # embed error -> no grounding
             logger.warning("definition index query failed; grounding skipped: %s", exc)
             return []
-        # Never built -- checked explicitly, ahead of the query, rather than inferred from
-        # catching duckdb.CatalogException around it: a missing TABLE and a missing FUNCTION
-        # both raise that exact exception type, so catching it there would also silently
-        # swallow a genuinely broken query (say, array_cosine_similarity gone after a DuckDB
-        # version change) instead of warning about it below.
-        table_exists = self._con.execute(
-            "SELECT 1 FROM information_schema.tables WHERE table_name = 'definition_concept'"
-        ).fetchone()
-        if table_exists is None:
-            return []
         try:
+            # Never built -- checked explicitly, by name AND schema (a same-named table in a
+            # different attached catalog must not pass this check while the unqualified query
+            # below resolves to it instead), rather than inferred from catching
+            # duckdb.CatalogException around the query: a missing TABLE and a missing FUNCTION
+            # both raise that exact exception type, so catching it there would also silently
+            # swallow a genuinely broken query (say, array_cosine_similarity gone after a
+            # DuckDB version change) instead of warning about it below. Both statements share
+            # this one try so a failure in the check itself -- not just "table absent" -- still
+            # reaches the warning rather than propagating uncaught.
+            table_exists = self._con.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_name = 'definition_concept' AND table_schema = current_schema()"
+            ).fetchone()
+            if table_exists is None:
+                return []
             rows = self._con.execute(
                 f"SELECT term, text, "
                 f"array_cosine_similarity(embedding, ?::FLOAT[{len(embedding)}]) AS score "
