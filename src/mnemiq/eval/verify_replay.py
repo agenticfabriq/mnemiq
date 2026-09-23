@@ -16,7 +16,32 @@ def _table(rows: list[dict]) -> pa.Table:
 
 
 def load_records(path: str) -> list[dict]:
-    return [json.loads(line) for line in open(path)]
+    """One record per case, last attempt wins -- the reading the runner itself grades.
+
+    A results checkpoint holds a row per ATTEMPT, not per case: the runner appends as it retries
+    and again when a resumed run re-reaches a case. Measured on the 2026-09-23 local run, 487
+    cases arrived as 896 rows, 78 with one and 409 with two. Taking every line graded those 409
+    twice, which both inflated the denominator and leaned it toward the hard cases -- retries
+    correlate with difficulty -- so every verifier trade computed from it was wrong in a
+    direction nobody could see. Deduping here rather than at each call site because there is no
+    caller for whom grading one case twice is correct.
+
+    A row with no `case_id` is kept as its own record: older checkpoints and hand-made fixtures
+    have none, and dropping them would silently shrink a run instead of deduping it.
+    """
+    out: dict[str, dict] = {}
+    anonymous: list[dict] = []
+    for line in open(path):
+        line = line.strip()
+        if not line:
+            continue
+        record = json.loads(line)
+        case_id = record.get("case_id")
+        if case_id is None:
+            anonymous.append(record)
+        else:
+            out[case_id] = record          # last attempt wins
+    return [*out.values(), *anonymous]
 
 
 def _render(rows: list[dict]) -> str:

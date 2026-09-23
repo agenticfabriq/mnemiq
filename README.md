@@ -2,6 +2,8 @@
 
 **Text-to-SQL you can tune to your database.** */NEM-ik/ — the "m" is silent, as in mnemonic.*
 
+*By [Agentic Fabriq](https://www.agenticfabriq.com) (YC W26) — made with love, from MIT.*
+
 An open-source engine that answers natural-language questions over your database, built so that
 every stage between the question and the SQL is a setting you can read, change, and measure.
 

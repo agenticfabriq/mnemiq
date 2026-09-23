@@ -80,3 +80,42 @@ def test_sanity_verdicts_all_defer():
     for t in tables:
         v = sanity_check("q", t)
         assert v is None or v.defer, "a non-deferring sanity verdict breaks the replay's OR"
+
+
+def test_a_case_written_twice_is_replayed_once(tmp_path):
+    # A results checkpoint holds a row per ATTEMPT, not per case: the runner appends as it
+    # retries and again on resume, so 487 cases arrived as 896 rows on the 2026-09-23 local run
+    # -- 78 with one row and 409 with two. load_records took every line, so a retried case was
+    # graded twice and the verifier trade was computed on an inflated denominator that leaned
+    # toward the hard cases. The runner itself grades last-per-case; this makes the replay agree.
+    import json
+
+    from mnemiq.eval.verify_replay import load_records
+
+    p = tmp_path / "run.jsonl"
+    p.write_text(
+        json.dumps({"case_id": "c1", "outcome": "wrong", "question": "q", "sql": "s"}) + "\n"
+        + json.dumps({"case_id": "c1", "outcome": "correct", "question": "q", "sql": "s2"}) + "\n"
+        + json.dumps({"case_id": "c2", "outcome": "correct", "question": "q2", "sql": "s3"}) + "\n"
+    )
+    recs = load_records(str(p))
+
+    assert len(recs) == 2, "one record per case, not per attempt"
+    by_id = {r["case_id"]: r for r in recs}
+    assert by_id["c1"]["outcome"] == "correct", "the LAST attempt is the graded one"
+    assert by_id["c1"]["sql"] == "s2"
+
+
+def test_a_row_without_a_case_id_is_still_replayed(tmp_path):
+    # Older checkpoints and hand-made fixtures may carry no case_id. Dropping those rows would
+    # silently shrink a run rather than dedupe it, so they are kept as distinct records.
+    import json
+
+    from mnemiq.eval.verify_replay import load_records
+
+    p = tmp_path / "run.jsonl"
+    p.write_text(
+        json.dumps({"outcome": "wrong", "question": "a"}) + "\n"
+        + json.dumps({"outcome": "correct", "question": "b"}) + "\n"
+    )
+    assert len(load_records(str(p))) == 2
