@@ -177,16 +177,21 @@ ignore it) and a model name. Nothing about the engine assumes a hosted provider,
 every configured endpoint is one you've verified stays on your network — no schema, no question
 and no row ever leaves it. Embeddings follow the same setting, or their own via `MNEMIQ_EMBED_*`.
 
-Set `MNEMIQ_LOCAL_ONLY=1` to make that verification the engine's job instead of yours: it refuses
-to start if the chat, embedding, judge, or any Verity endpoint resolves to a host outside
-loopback or a private range (RFC1918, or its IPv6 equivalent). `MNEMIQ_PG_DSN` and
-`MNEMIQ_CONTROL_DSN` are deliberately **not** checked — libpq accepts keyword form
-(`host=... port=...`), multi-host URIs and Unix-socket targets, none of which a URL parser can
-read a hostname from, so a fail-closed check on them would refuse legitimate DSNs rather than
-catch anything; verify those by hand. One more thing worth knowing before an air-gapped run: the
-first `mnemiq build` on a machine with no DuckDB extension cache will try to fetch the `vss` and
-`fts` extensions from `extensions.duckdb.org` — pre-seed that cache, or vendor the two extension
-files, ahead of time.
+Set `MNEMIQ_LOCAL_ONLY=1` to make that verification the `mnemiq` command's job instead of yours
+(the standalone scripts under `scripts/` build their own `Settings` and don't call this check, so
+the guarantee below is for `mnemiq` commands specifically): it refuses to run if the chat,
+embedding, judge, or any Verity endpoint is not an IP literal — or `localhost` — inside loopback,
+an RFC1918 range, or its IPv6 analog (`fc00::/7`, in practice `fd00::/8`). A DNS name is refused
+outright rather than resolved and checked, internal names included: this performs no lookups, so
+it cannot confirm where a name actually points. `MNEMIQ_PG_DSN` and `MNEMIQ_CONTROL_DSN` are
+deliberately **not** checked — libpq accepts keyword form (`host=... port=...`), multi-host URIs
+and Unix-socket targets, none of which a URL parser can read a hostname from, so a fail-closed
+check on them would refuse legitimate DSNs rather than catch anything; verify those by hand. Two
+more things worth knowing before an air-gapped run: any command that opens the store fetches
+DuckDB's `vss` and `fts` extensions from `extensions.duckdb.org` on first use, and attaching a
+Postgres or SQLite source fetches DuckDB's matching `postgres`/`sqlite` extension the same way —
+pre-seed DuckDB's extension cache, or vendor the extensions your source and store need, ahead of
+time.
 
 ## Use it from a browser (workbench)
 
