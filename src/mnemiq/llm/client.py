@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+import httpx
 from openai import APIError, OpenAI
 
 from mnemiq.config import Settings
@@ -66,7 +67,17 @@ class LLMClient:
             raise RuntimeError("LLM base_url/api_key not configured (set MNEMIQ_LLM_* env)")
         self._model = settings.llm_model
         self._seed = settings.llm_seed
-        self._client = OpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key)
+        # The SDK's own _DefaultHttpxClient sets follow_redirects=True, so a base_url that
+        # `assert_local_only` approved at boot could still 302 a live request off-network on
+        # every call after -- the boot check validates the CONFIGURED host once, not where a
+        # response's Location header points. Passing our own httpx.Client relies on ITS
+        # default, follow_redirects=False, to close that: openai.OpenAI(http_client=None) (the
+        # unset case) is what builds the redirect-following one, so this must be an explicit
+        # client, not a kwarg tweak on the default.
+        http_client = httpx.Client(follow_redirects=False) if settings.local_only else None
+        self._client = OpenAI(
+            base_url=settings.llm_base_url, api_key=settings.llm_api_key, http_client=http_client
+        )
         # A change that buys 1% accuracy for 3x the tokens is a trade to make on purpose.
         self.calls = 0
         self.prompt_tokens = 0

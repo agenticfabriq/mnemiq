@@ -41,7 +41,13 @@ def test_every_offender_is_named_not_just_the_first():
     assert "verify_base_url" in str(exc.value)
 
 
-def test_the_check_is_off_unless_asked_for():
+def test_the_check_is_off_unless_asked_for(monkeypatch):
+    # Fix round 1, item 6a: `Settings(...)` without an explicit `local_only=` still reads
+    # MNEMIQ_LOCAL_ONLY from the real environment (pydantic-settings, not just os.environ at
+    # `from_env()` time) -- so `MNEMIQ_LOCAL_ONLY=1 pytest tests/test_local_only.py` made this
+    # test fail on an unrelated public URL. Clearing the var is what actually asserts "off by
+    # default" instead of "off in whatever environment happened to run this".
+    monkeypatch.delenv("MNEMIQ_LOCAL_ONLY", raising=False)
     Settings(llm_base_url="https://api.openai.com/v1", llm_api_key="k").assert_local_only()
 
 
@@ -70,6 +76,136 @@ def test_the_third_rfc1918_block_is_allowed():
 
 def test_ipv6_loopback_is_allowed():
     _s(llm_base_url="http://[::1]:8000/v1", llm_api_key="k").assert_local_only()
+
+
+# --- fix round 1, item 1: `urlparse` itself can raise -------------------------------------
+#
+# `urlparse("http://[::1/v1")` (a malformed IPv6 host literal) raises ValueError from INSIDE
+# urlparse, before `.hostname` is ever touched -- the old code only wrapped the later
+# `ipaddress.ip_address(host)` call in try/except, so this exception was uncaught. It then did
+# two things wrong at once: it left `assert_local_only` as a raw traceback instead of the clean
+# RuntimeError the rest of this module promises, and -- worse -- it discarded every offender the
+# loop had already collected for an EARLIER field, because the exception unwound straight out of
+# the function before the final `if offenders: raise` ran.
+_UNPARSEABLE_URLS = [
+    "http://[::1/v1",                  # unterminated IPv6 bracket
+    "http://user:pass@[10.0.0.1]/v1",  # an IPv4 literal inside IPv6 brackets
+    "http://10.0.0.1]/v1",             # a stray close-bracket with none to open it
+    "http://a[b/v1",                   # a bare bracket in the host
+    "http://℀.com/v1",            # NFKC-hostile codepoint (U+2100 ACCOUNT OF)
+]
+
+
+@pytest.mark.parametrize("bad_url", _UNPARSEABLE_URLS)
+def test_a_url_urlparse_itself_rejects_is_refused_not_raised_uncaught(bad_url):
+    with pytest.raises(RuntimeError) as exc:
+        _s(llm_base_url=bad_url, llm_api_key="k").assert_local_only()
+    assert "llm_base_url" in str(exc.value)
+
+
+def test_an_unparseable_url_does_not_discard_an_earlier_offender():
+    # The concrete failure the review reported: MNEMIQ_LLM_BASE_URL pointed at a real public
+    # endpoint, MNEMIQ_EMBED_BASE_URL had a typo'd IPv6 literal, and the operator was told only
+    # about the crash -- never about the OpenAI endpoint that was ALSO wrong.
+    s = _s(
+        llm_base_url="https://api.openai.com/v1",
+        llm_api_key="k",
+        embed_base_url="http://[::1/v1",
+    )
+    with pytest.raises(RuntimeError) as exc:
+        s.assert_local_only()
+    msg = str(exc.value)
+    assert "llm_base_url" in msg and "api.openai.com" in msg
+    assert "embed_base_url" in msg
+
+
+# --- fix round 1, item 2: a passing check must say so ---------------------------------------
+
+
+def test_a_passing_check_names_the_endpoints_it_cleared(monkeypatch, capsys):
+    # MNEMIQ_LOCALONLY=1 (missing underscore) is silently ignored by extra="ignore", so
+    # local_only stays False and the run proceeds to a public endpoint with NO output at all --
+    # identical to a correctly-configured run that also printed nothing. A passing, ENFORCED
+    # check has to leave different evidence than a silently-inert one.
+    monkeypatch.delenv("MNEMIQ_LOCAL_ONLY", raising=False)
+    _s(llm_base_url="http://127.0.0.1:8000/v1", llm_api_key="k").assert_local_only()
+    err = capsys.readouterr().err
+    assert "llm_base_url" in err
+
+
+def test_a_disabled_check_prints_nothing(monkeypatch, capsys):
+    monkeypatch.delenv("MNEMIQ_LOCAL_ONLY", raising=False)
+    Settings(llm_base_url="https://api.openai.com/v1", llm_api_key="k").assert_local_only()
+    assert capsys.readouterr().err == ""
+
+
+# --- fix round 1, item 3: the verity_* endpoints are ordinary HTTP URLs ---------------------
+
+
+def test_a_public_verity_endpoint_is_refused_and_named():
+    # trace_sink POSTs to verity_traces_url on every ask/serve; even with the text/rows opt-ins
+    # off, that body carries question hashes, timings, policy hashes and identity. Telemetry
+    # leaving the data centre under a flag named LOCAL_ONLY is the false confidence this control
+    # exists to remove.
+    s = _s(
+        llm_base_url="http://127.0.0.1:8000/v1",
+        llm_api_key="k",
+        verity_traces_url="https://telemetry.example.com/api/traces/batch",
+    )
+    with pytest.raises(RuntimeError) as exc:
+        s.assert_local_only()
+    assert "verity_traces_url" in str(exc.value)
+
+
+def test_local_verity_endpoints_are_allowed():
+    _s(
+        llm_base_url="http://127.0.0.1:8000/v1",
+        llm_api_key="k",
+        verity_records_url="http://10.0.0.5/api/semantic/records/open",
+        verity_token_url="http://10.0.0.5/realms/x/protocol/openid-connect/token",
+        verity_traces_url="http://10.0.0.5/api/traces/batch",
+    ).assert_local_only()
+
+
+# --- fix round 1, item 4: pg_dsn/control_dsn must be named as NOT checked -------------------
+
+
+def test_the_refusal_names_the_dsns_it_does_not_check():
+    # libpq accepts keyword form (`host=... port=...`), multi-host URIs, unix sockets and
+    # `service=` files; `urlparse` returns hostname=None for keyword form, so a fail-closed
+    # check would refuse every legitimate keyword DSN and silently miss the second host of a
+    # multi-host URI. Rather than pretend to check these, the message has to say it does not.
+    s = _s(llm_base_url="https://api.openai.com/v1", llm_api_key="k")
+    with pytest.raises(RuntimeError) as exc:
+        s.assert_local_only()
+    msg = str(exc.value)
+    assert "pg_dsn" in msg and "control_dsn" in msg
+    assert "not checked" in msg.lower()
+
+
+# --- fix round 1, item 5: say the remedy, and stop reading as an accusation -----------------
+
+
+def test_the_refusal_names_the_remedy():
+    s = _s(llm_base_url="https://api.openai.com/v1", llm_api_key="k")
+    with pytest.raises(RuntimeError) as exc:
+        s.assert_local_only()
+    msg = str(exc.value)
+    assert "RFC1918" in msg or "loopback" in msg
+    assert "MNEMIQ_LOCAL_ONLY" in msg  # naming the escape hatch, not just the failure
+
+
+def test_an_internal_dns_name_explains_rather_than_accuses():
+    # `vllm.corp.internal` is a perfectly reasonable name for a DC's own LLM host. The old
+    # message -- "is a name, not a private address" -- reads as a rebuke of that choice. The
+    # actual reason it is refused is that this check does not resolve names at all, which is
+    # true of ANY name, internal or public, and the message should say that instead.
+    s = _s(llm_base_url="http://vllm.corp.internal:8000/v1", llm_api_key="k")
+    with pytest.raises(RuntimeError) as exc:
+        s.assert_local_only()
+    msg = str(exc.value)
+    assert "does not resolve" in msg
+    assert "not a private address" not in msg
 
 
 def test_the_cli_calls_the_assertion_before_any_command_does_work(monkeypatch, capsys):

@@ -5,6 +5,7 @@ import math
 import struct
 from typing import Protocol
 
+import httpx
 from openai import OpenAI
 
 from mnemiq.config import Settings
@@ -48,7 +49,13 @@ class LLMEmbedder:
         self._model = settings.embed_model
         self._batch_size = batch_size
         self._max_chars = max_chars
-        self._client = OpenAI(base_url=base_url, api_key=api_key)
+        # See LLMClient for the gotcha this closes: the SDK's own _DefaultHttpxClient sets
+        # follow_redirects=True, so a base_url `assert_local_only` approved at boot could still
+        # 302 a live embedding call off-network on every request after. httpx.Client's OWN
+        # default is follow_redirects=False, so passing one at all -- not a kwarg on the
+        # default client -- is what closes the gap.
+        http_client = httpx.Client(follow_redirects=False) if settings.local_only else None
+        self._client = OpenAI(base_url=base_url, api_key=api_key, http_client=http_client)
         self._dim: int | None = None
 
     @property

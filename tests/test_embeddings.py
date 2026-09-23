@@ -90,6 +90,48 @@ def test_llm_embedder_probes_the_endpoint_once_and_caches_the_width(monkeypatch)
     assert client.sent == [["dimension probe"]]
 
 
+def _captured_openai_kwargs(monkeypatch, mod, settings) -> dict:
+    """Builds an embedder/client with `OpenAI` replaced by a kwarg-recording fake, and returns
+    what it was constructed with. `_embedder`'s `lambda **_: client` (above) throws the kwargs
+    away, which is exactly what hides whether `http_client` was ever passed."""
+    captured: dict = {}
+
+    def fake_openai(**kwargs):
+        captured.update(kwargs)
+        return _Recorder()
+
+    monkeypatch.setattr(mod, "OpenAI", fake_openai)
+    mod.LLMEmbedder(settings)
+    return captured
+
+
+def test_llm_embedder_disables_redirects_when_local_only(monkeypatch):
+    # The OpenAI SDK's own _DefaultHttpxClient sets follow_redirects=True. assert_local_only only
+    # ever validated the CONFIGURED base_url; a compliant local endpoint that later answers with
+    # a 302 to a public host would have every subsequent request followed there and exfiltrate,
+    # with boot having already passed. Refusing that needs the transport itself to stop
+    # following redirects, not another check on a URL that was never wrong.
+    from mnemiq.config import Settings
+    from mnemiq.llm import embeddings as mod
+
+    settings = Settings(llm_base_url="http://127.0.0.1:8000/v1", llm_api_key="k", local_only=True)
+    kwargs = _captured_openai_kwargs(monkeypatch, mod, settings)
+    http_client = kwargs.get("http_client")
+    assert http_client is not None
+    assert http_client.follow_redirects is False
+
+
+def test_llm_embedder_keeps_default_redirects_when_not_local_only(monkeypatch):
+    # local_only defaults False: an existing hosted deployment must construct the client
+    # byte-identically to before this fix, i.e. no http_client override at all.
+    from mnemiq.config import Settings
+    from mnemiq.llm import embeddings as mod
+
+    settings = Settings(llm_base_url="http://127.0.0.1:8000/v1", llm_api_key="k")
+    kwargs = _captured_openai_kwargs(monkeypatch, mod, settings)
+    assert kwargs.get("http_client") is None
+
+
 def test_an_over_long_card_is_trimmed_rather_than_failing_its_whole_batch(monkeypatch):
     # The provider rejects the BATCH, not the offending input, so one 110-column fact table
     # used to take down the index build for an entire source.
