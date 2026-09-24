@@ -10,6 +10,7 @@ from mnemiq.generate.undefined_terms import ungrounded_terms
 from mnemiq.generate.generator import Generator
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.decide import decide
+from mnemiq.sql.fanout_check import key_facts
 from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import visible_schema
@@ -28,9 +29,11 @@ class Deferred:
 
 Outcome = Approved | Deferred
 
-# Refusals the corrector can fix with one surgical edit: both are silently-wrong SQL that
-# runs fine and answers wrong. A guard (unauthorized table) is never in this set.
-CORRECTABLE = frozenset({RefusalCode.LOGIC_LINT, RefusalCode.VALUE_GROUNDING})
+# Refusals the corrector can fix in one pass: each is silently-wrong SQL that runs fine and
+# answers wrong. A guard (unauthorized table) is never in this set. FAN_OUT's fix is a
+# restructure rather than a one-token edit, and its message says so; the corrector is told to
+# change only what the problem requires, which here is the aggregation.
+CORRECTABLE = frozenset({RefusalCode.LOGIC_LINT, RefusalCode.VALUE_GROUNDING, RefusalCode.FAN_OUT})
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,7 @@ def plan_query(
     corrector=None,
     values=None,
     guard_undefined_terms: bool = False,
+    guard_fanout: bool = False,
 ) -> Outcome:
     """Propose, decide, repair -- and defer rather than guess.
 
@@ -107,6 +111,8 @@ def plan_query(
     # from the snapshot rather than from the source at ask time: it is versioned content, and
     # a body that drifted from the one the policy was reasoned about is a governance change.
     views = inventory_for(snapshot)
+    # M109: key uniqueness from the profile, read once per question. None leaves the check off.
+    keys = key_facts(snapshot) if guard_fanout else None
     if not views.available and policy.row_filters:
         # Knowable before the first `generator.propose`, and unfixable by rephrasing: the refusal
         # fires ahead of the AST walk, so all `max_attempts` iterations would propose, be refused
@@ -219,7 +225,7 @@ def plan_query(
 
         verdict = decide(
             proposal.sql, visible, adapter=adapter, dialect=dialect, target=target,
-            values=values, policy=policy, registry=registry, views=views
+            values=values, policy=policy, registry=registry, views=views, keys=keys
         )
 
         corrected = False
@@ -240,6 +246,7 @@ def plan_query(
                 policy=policy,
                 registry=registry,
                 views=views,
+                keys=keys,
             )
             # Only when the repair is what carried it: a correction that still refuses is not
             # a corrected plan, it is a failed one, and reporting it would overstate the work.

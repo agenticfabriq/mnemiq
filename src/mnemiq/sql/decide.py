@@ -7,6 +7,7 @@ from mnemiq.contract import ViewDefinition
 from mnemiq.sql.functions import inventory_from, opaque_columns
 from mnemiq.sql.authz_guard import check_access, check_opaque_columns, check_unmodelled_calls
 from mnemiq.sql.cls import check_cls
+from mnemiq.sql.fanout_check import KeyFacts, check_fanout
 from mnemiq.sql.guard import MAX_ROWS, check_shape
 from mnemiq.sql.lint import lint
 from mnemiq.sql.policy import AccessPolicy
@@ -31,6 +32,7 @@ def decide(
     policy: AccessPolicy | None = None,
     registry: dict[str, str] | None = None,
     views: dict[str, ViewDefinition] | None = None,
+    keys: KeyFacts | None = None,
 ) -> Verdict:
     """The deterministic decider: shape, then access, then proof against the real source.
 
@@ -101,6 +103,14 @@ def decide(
         grounding = check_values(shaped, visible, values, row_filtered=set(policy.row_filters))
         if grounding is not None:
             return grounding
+
+    if keys is not None:
+        # An aggregate over rows a join has multiplied runs fine and answers inflated (M109) --
+        # the third silently-wrong class, and the one a literal fix cannot reach, so it goes last.
+        # `keys` comes from the snapshot's column profiles; None means the guard is off.
+        inflated = check_fanout(shaped, visible, keys)
+        if inflated is not None:
+            return inflated
 
     # Provenance is read from the query as ASKED, before either rewrite touches it.
     #
