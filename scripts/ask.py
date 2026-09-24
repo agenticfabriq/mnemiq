@@ -103,6 +103,7 @@ def main() -> int:
         adapter=adapter,
         target="duckdb",
         guard_undefined_terms=settings.guard_undefined_terms,
+        guard_fanout=settings.guard_fanout,
     )
 
     if isinstance(outcome, Deferred):

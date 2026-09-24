@@ -230,7 +230,8 @@ def _cmd_enrich(settings: Settings) -> int:
         snap = enrich_table_facts(snap, LLMFactsEnricher(LLMClient(settings)))
     if settings.enrich_examples:
         snap = enrich_examples(
-            snap, LLMExampleGenerator(LLMClient(settings)), adapter, dialect=adapter.dialect
+            snap, LLMExampleGenerator(LLMClient(settings)), adapter, dialect=adapter.dialect,
+            guard_fanout=settings.guard_fanout,
         )
     con = init_store(settings.store_path)
     save_snapshot(con, snap)

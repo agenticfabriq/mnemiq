@@ -52,3 +52,15 @@ def test_enrich_cache_suffix_separates_certified_record_sets():
     s = Settings(verity_records_url="https://v/api/semantic/records")
     assert _enrich_cache_suffix(s, certified_digest="") == _enrich_cache_suffix(s)
     assert _enrich_cache_suffix(s, certified_digest="aaa") != _enrich_cache_suffix(s, certified_digest="bbb")
+
+
+def test_enrich_cache_suffix_separates_fanout_guarded_examples():
+    """The guard decides which proposed examples survive, so a guard-off example set must not be
+    reused with the guard on. Without examples it decides nothing enrichment keeps."""
+    from mnemiq.config import Settings
+    from mnemiq.eval.bird_runner import _enrich_cache_suffix
+
+    off = _enrich_cache_suffix(Settings(enrich_examples=True))
+    on = _enrich_cache_suffix(Settings(enrich_examples=True, guard_fanout=True))
+    assert off != on
+    assert _enrich_cache_suffix(Settings(guard_fanout=True)) == _enrich_cache_suffix(Settings())

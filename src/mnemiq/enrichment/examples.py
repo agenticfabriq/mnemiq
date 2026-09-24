@@ -11,6 +11,7 @@ from mnemiq.enrichment.proposals import _clean_text, _extract_json
 from mnemiq.execute.runner import ExecutionError, run
 from mnemiq.semantic.cards import build_cards
 from mnemiq.sql.decide import decide
+from mnemiq.sql.fanout_check import key_facts
 from mnemiq.sql.verdict import Approved
 
 _MAX_QUESTION = 300
@@ -96,11 +97,17 @@ def _visible_for(snapshot: Snapshot, table: str) -> dict[str, set[str]]:
 
 def enrich_examples(
     snapshot: Snapshot, generator: ExampleGenerator, adapter, dialect: str = "duckdb",
-    per_table: int = 3,
+    per_table: int = 3, *, guard_fanout: bool = False,
 ) -> Snapshot:
     """Third LLM phase: verified worked examples. Keeps only decider-approved, executed,
-    rows>0 pairs. Fail-soft per table; re-versions."""
+    rows>0 pairs. Fail-soft per table; re-versions.
+
+    `guard_fanout` screens proposals with the fan-out check (M109), as `plan_query` does at ask
+    time. A kept example is shown to the model as a verified pattern, so without it an inflated
+    query the guard would refuse at ask time was taught as one.
+    """
     cards = {c.object_id: c.text for c in build_cards(snapshot)}
+    keys = key_facts(snapshot) if guard_fanout else None
 
     kept: list[Example] = []
     for table in cards:
@@ -113,7 +120,8 @@ def enrich_examples(
         for p in proposals:
             if n >= per_table:
                 break
-            verdict = decide(p.sql, visible, adapter=adapter, dialect=dialect, target=dialect)
+            verdict = decide(p.sql, visible, adapter=adapter, dialect=dialect, target=dialect,
+                             keys=keys)
             if not isinstance(verdict, Approved):
                 continue
             try:

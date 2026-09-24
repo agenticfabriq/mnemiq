@@ -693,9 +693,11 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     # callable -> the half of the guard it owes. Both halves, because either alone fails open.
     # The value is a TUPLE: a callable can owe more than one argument, and `retrieve` owes four.
     REQUIRED = {
-        "Agent": ("guard_undefined_terms",),
-        "build_agent": ("guard_undefined_terms",),
-        "plan_query": ("guard_undefined_terms",),
+        # `guard_fanout` (M109) crosses the same three hops, so it owes the same thing at the
+        # same sites. It has no prompt or corpus leg: the check reads the snapshot it is handed.
+        "Agent": ("guard_undefined_terms", "guard_fanout"),
+        "build_agent": ("guard_undefined_terms", "guard_fanout"),
+        "plan_query": ("guard_undefined_terms", "guard_fanout"),
         "LLMGenerator": ("declare_assumed_terms",),
         # The THIRD leg. `plan_query` checks declared terms against `packet.definitions`, and
         # `retrieve` defaults that to `()` -- so a caller that omits it feeds the guard an empty
@@ -720,6 +722,9 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
         # only value assertion on it accepts `[]` -- exactly what the omitted argument
         # defaults to. Every card would lose its GRAIN line and no guard would say so.
         "retrieve": ("definitions", "metrics", "dimensions", "snapshot", "table_facts"),
+        # Example enrichment runs the decider too, and keeps what it approves as a pattern the
+        # model is shown: without `guard_fanout` a fan-out example survived with the guard on.
+        "enrich_examples": ("guard_fanout",),
     }
     # (file, callable) -> HOW MANY calls. A count, because `agent/loop.py` calls `plan_query`
     # twice -- single-shot and the deep-mode candidate loop -- and a set keyed on the pair alone
@@ -738,6 +743,8 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
         ("scripts/ask.py", "plan_query"): 1,
         ("scripts/ask.py", "LLMGenerator"): 1,
         ("scripts/ask.py", "retrieve"): 1,
+        ("src/mnemiq/cli.py", "enrich_examples"): 1,
+        ("src/mnemiq/eval/bird_runner.py", "enrich_examples"): 1,
     }
 
     def _is_hardcoded(value: ast.expr) -> bool:

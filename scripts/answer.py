@@ -99,6 +99,7 @@ def main() -> int:
         adapter=DuckDBPostgresAdapter(settings.pg_dsn),
         cache=TwoTierCache(L1Cache()),
         guard_undefined_terms=settings.guard_undefined_terms,
+        guard_fanout=settings.guard_fanout,
     )
     result = agent.answer(packet, snapshot, authz.grants_for(identity), identity)
 
