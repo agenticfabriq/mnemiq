@@ -431,15 +431,30 @@ def _inflated(aliases: list[str], sources: dict[str, str], dup, select: exp.Sele
     grouped = _grouping(select)
     by_key = grouped is not None and any(
         g.split(".")[-1].lower() in {k.lower() for k in keys} for g in grouped)
+    group = select.args.get("group")
+    subtotals = group is not None and any(group.args.get(f) for f in ("rollup", "cube",
+                                                                       "grouping_sets"))
     if grouped is None:
         grain = "reduced to one overall total with no GROUP BY"
         combine = "then CROSS JOIN those one-row totals"
     else:
         columns = ", ".join(grouped) or "the columns your query groups by"
-        grain = (f"grouped by the answer's own columns ({columns}), joining in only the lookup "
-                 "table that supplies a column it lacks")
-        combine = (f"then FULL OUTER JOIN those per-group results on {columns} (an inner join "
-                   "drops any group present in only one table)")
+        # NULL-safe, because GROUP BY puts NULL keys in one group and `=` never matches NULL to
+        # NULL: a plain FULL OUTER JOIN returns a NULL group as two half-rows.
+        on = (f"joining on {columns} with IS NOT DISTINCT FROM and outputting COALESCE of the two "
+              "sides' values (an inner join, or plain =, drops a group present on one side only "
+              "or whose value is NULL)")
+        if subtotals:
+            # Flattened to its columns, a ROLLUP loses its subtotal and grand-total rows; kept
+            # whole, a subtotal row and a real NULL group are both NULL in the column, and only
+            # GROUPING() tells them apart.
+            grain = (f"grouped exactly as your query groups ({group.sql()}) with "
+                     f"GROUPING({columns}) kept as a column")
+            combine = f"then FULL OUTER JOIN those results on that GROUPING column too, {on}"
+        else:
+            grain = (f"grouped by the answer's own columns ({columns}), joining in only the lookup "
+                     "table that supplies a column it lacks")
+            combine = f"then FULL OUTER JOIN those per-group results, {on}"
     avoid = "" if by_key else f", not by the join key ({key})"
     warn = "" if by_key else (
         f" Grouping each table by {key} and inner-joining the results drops every "

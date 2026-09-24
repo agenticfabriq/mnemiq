@@ -638,8 +638,16 @@ def test_a_grouped_answer_is_told_to_aggregate_by_its_own_group_columns():
     assert "not by the join key (policy_id)" in message
 
 
+def test_grouped_results_are_joined_null_safely():
+    """GROUP BY puts NULL keys in one group; `=` never matches NULL to NULL, so a FULL OUTER JOIN
+    on plain equality returns a NULL region as two half-rows, each with half the ratio missing."""
+    message = _check(_BY_REGION + "d.region").message
+    assert "IS NOT DISTINCT FROM" in message
+    assert "COALESCE" in message
+
+
 @pytest.mark.parametrize("group_by", ["ALL", "ROLLUP (d.region)", "CUBE (d.region)",
-                                      "GROUPING SETS ((d.region))"])
+                                      "GROUPING SETS ((d.region), ())"])
 def test_every_grouping_form_gets_grouped_advice(group_by):
     """Reading only plain GROUP BY expressions sent these to the one-overall-total advice, and a
     repair that follows it returns one figure where the question asked for one per region --
@@ -647,6 +655,18 @@ def test_every_grouping_form_gets_grouped_advice(group_by):
     message = _check(_BY_REGION + group_by).message
     assert "no GROUP BY" not in message and "CROSS JOIN" not in message
     assert "d.region" in message
+
+
+@pytest.mark.parametrize("form", ["ROLLUP (d.region)", "CUBE (d.region)",
+                                  "GROUPING SETS ((d.region), ())"])
+def test_a_subtotal_grouping_is_kept_whole_and_matched_by_level(form):
+    """Flattening ROLLUP to its columns told the model to group by d.region alone, and a repair
+    that follows it drops the grand-total row -- a changed answer that no longer fans out. Keep the
+    query's own grouping in each part, and match rows by level as well as by value: a subtotal row
+    and a real NULL region are both NULL in d.region, and only GROUPING() tells them apart."""
+    message = _check(_BY_REGION + form).message
+    assert form.split(" (")[0] in message
+    assert "GROUPING(d.region)" in message
 
 
 def test_an_answer_grouped_by_the_join_key_is_not_told_to_avoid_it():
