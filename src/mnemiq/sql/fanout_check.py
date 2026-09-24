@@ -60,16 +60,6 @@ def _spelling(name: str, names) -> str | None:
     return hits[0] if len(hits) == 1 else None
 
 
-def value_columns(e: exp.Expression | None) -> list[exp.Column]:
-    """The columns an aggregate actually adds up: VALUE position only, never a condition.
-
-    `SUM(CASE WHEN p.region = 'east' THEN c.amount ELSE 0 END)` sums `c`'s values; `p` appears
-    only in the condition, and repeating `p` rows does not corrupt that sum. The prototype that
-    counted every column inside the aggregate fired on 14.6% of BIRD's own gold for this shape.
-    """
-    return list(dict.fromkeys(col for term in _terms(e) for col in term))
-
-
 def value_terms(e: exp.Expression | None) -> list[list[exp.Column]]:
     """An aggregate's argument split into additive terms, each as its value columns.
 
@@ -109,7 +99,9 @@ def _literal(e: exp.Literal) -> Terms:
 def _choice(e: exp.Expression, walk) -> Terms | None:
     # A choice -- IF, CASE, COALESCE, NULLIF -- is one of its value branches per row, each read by
     # `walk`; its conditions, a simple CASE's operand and NULLIF's comparand are never values.
-    # None when `e` is not a choice.
+    # `SUM(CASE WHEN p.region = 'east' THEN c.amount ELSE 0 END)` sums `c`; repeating `p` rows does
+    # not corrupt it. The prototype that counted every column inside the aggregate fired on 14.6%
+    # of BIRD's own gold for this shape. None when `e` is not a choice.
     if isinstance(e, exp.If):
         return walk(e.args.get("true")) + walk(e.args.get("false"))
     if isinstance(e, exp.Case):
@@ -349,6 +341,24 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
     # this scope -- counts as single: the pinned opaque limit.
     single = {a for a in sources if a not in dup and keyed_to_all(a)}
 
+    def of_this_row(col: exp.Column) -> bool:
+        # A nested scope's own columns -- `(SELECT MAX(rate) FROM fx)` -- are not values of this
+        # row: read as owners they resolved to None, and None excused the term. A CORRELATED
+        # reference to one of this scope's aliases is, and dropping it too left the subquery
+        # ownerless and approved an inflated sum. An alias a nested SELECT defines itself shadows
+        # ours. An unqualified nested column is dropped: SQL resolves it inside the nested scope
+        # first and reaches this row only when the inner tables lack it, which this does not
+        # look up -- so a BARE correlated reference is a known gap, as it was before.
+        inner = col.find_ancestor(exp.Select)
+        alias = col.table.lower() if col.table else None
+        if inner is not select and alias not in sources:
+            return False
+        while inner is not None and inner is not select:
+            if alias in _defines(inner):
+                return False
+            inner = inner.find_ancestor(exp.Select)
+        return inner is select
+
     summed: dict[str, None] = {}  # duplicated aliases whose values are aggregated, in order
     chasm: exp.Expression | None = None
     for agg in select.find_all(exp.Sum, exp.Avg, exp.Count):
@@ -362,11 +372,7 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
                 chasm = agg
             continue
         for term in terms:
-            # A column of a nested scope -- a scalar subquery, EXISTS -- is that scope's. Read as an
-            # owner here it resolved to None, and None excused the term.
-            owners = list(dict.fromkeys(
-                owner(col) for col in term if col.find_ancestor(exp.Select) is select
-            ))
+            owners = list(dict.fromkeys(owner(col) for col in term if of_this_row(col)))
             if any(o in dup for o in owners) and not any(o is None or o in single for o in owners):
                 summed.update(dict.fromkeys(o for o in owners if o in dup))
     if summed:
@@ -374,6 +380,13 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
     if chasm is not None:
         return _counted_chasm(chasm, sources)
     return None
+
+
+def _defines(select: exp.Select) -> set[str]:
+    """The aliases a SELECT's own FROM and JOINs introduce, lowercased."""
+    frm = select.args.get("from_")
+    nodes = ([frm.this] if frm else []) + [j.this for j in select.args.get("joins") or []]
+    return {n.alias_or_name.lower() for n in nodes}
 
 
 def _inflated(aliases: list[str], sources: dict[str, str], dup) -> Refusal:

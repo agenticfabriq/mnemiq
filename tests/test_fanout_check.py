@@ -227,6 +227,33 @@ def test_a_scalar_subquery_column_is_not_an_owner():
     assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
 
 
+_LINES = "FROM order_items li JOIN products p ON li.product_id = p.product_id"
+
+
+@pytest.mark.parametrize("sql, profile", [
+    ("SELECT SUM((SELECT MAX(x.rate) FROM fx x WHERE x.valid_from = c.settlement_days)) "
+     f"{_CHASM}", _WITH_FX),
+    ("SELECT SUM(li.quantity + (SELECT MAX(x.unit_price) FROM products x "
+     f"WHERE x.product_id = p.product_id)) {_LINES}", _RETAIL),
+    (f"SELECT SUM((SELECT MAX(t.discount) FROM tiers t WHERE t.lo = p.product_id)) {_LINES}",
+     _WITH_TIERS),
+], ids=["claim_rate", "line_price", "line_tier"])
+def test_a_correlated_reference_inside_a_subquery_is_still_an_owner(sql, profile):
+    """`c.settlement_days` inside the subquery is a value of the outer row, so the subquery repeats
+    with `c`. Dropped with the subquery's own columns, it left the term ownerless and an inflated
+    sum approved: 15 against a true 5 in DuckDB for the first case."""
+    verdict = _check_profile(sql, profile)
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_shadowed_alias_inside_a_subquery_is_not_the_outer_table():
+    """Inside the subquery `p` is `tiers`, not the outer `products`; read as the outer `p`, which
+    repeats per line item, it would refuse a sum of one constant subquery value."""
+    assert _check_profile(
+        f"SELECT SUM((SELECT MAX(p.discount) FROM tiers p)) {_LINES}", _WITH_TIERS
+    ) is None
+
+
 def test_a_range_joined_tier_cannot_excuse_a_repeated_price():
     """`p` repeats per line item, and nothing shows the range-joined tier appears once per line
     item, so the tier cannot carry `p.unit_price` at a grain of its own."""
