@@ -607,6 +607,69 @@ def test_the_message_names_the_tables_the_key_and_the_restructure():
         assert needed in verdict.message, needed
 
 
+_LOSS_RATIO = (
+    "SELECT SUM(c.paid_amount_cents) / SUM(p.earned_premium_cents) "
+    "FROM fact_claim c JOIN fact_premium p ON c.policy_id = p.policy_id"
+)
+
+
+def test_an_overall_total_is_told_to_total_each_table_and_cross_join():
+    """The first message said "grouped by the key you join or group on". The local 14B did exactly
+    that: one CTE per fact grouped by policy_id, inner-joined on policy_id -- which drops every
+    policy with premium but no claim, and scored 0 of 8 repairs. An overall answer has no grain
+    but the whole table, so the message has to say so."""
+    message = _check(_LOSS_RATIO).message
+    assert "no GROUP BY" in message
+    assert "CROSS JOIN" in message
+    assert "not by the join key (policy_id)" in message
+
+
+_BY_REGION = (_LOSS_RATIO.replace("FROM", ", d.region FROM", 1)
+              + " JOIN dim_policy d ON d.policy_id = c.policy_id GROUP BY ")
+
+
+def test_a_grouped_answer_is_told_to_aggregate_by_its_own_group_columns():
+    """And to combine the groups with a FULL OUTER JOIN: an inner join of per-region aggregates
+    drops a region with premium but no claims -- the same loss, one grain up."""
+    message = _check(_BY_REGION + "d.region").message
+    assert "(d.region)" in message
+    assert "FULL OUTER JOIN" in message
+    assert "CROSS JOIN" not in message
+    assert "not by the join key (policy_id)" in message
+
+
+@pytest.mark.parametrize("group_by", ["ALL", "ROLLUP (d.region)", "CUBE (d.region)",
+                                      "GROUPING SETS ((d.region))"])
+def test_every_grouping_form_gets_grouped_advice(group_by):
+    """Reading only plain GROUP BY expressions sent these to the one-overall-total advice, and a
+    repair that follows it returns one figure where the question asked for one per region --
+    a wrong answer that no longer fans out and so passes this check."""
+    message = _check(_BY_REGION + group_by).message
+    assert "no GROUP BY" not in message and "CROSS JOIN" not in message
+    assert "d.region" in message
+
+
+def test_an_answer_grouped_by_the_join_key_is_not_told_to_avoid_it():
+    """Per policy, the key IS the answer's grain; "not by the join key" would contradict the
+    group it just named. What still holds is how to combine them."""
+    message = _check("SELECT c.policy_id, SUM(c.paid_amount_cents) / SUM(p.earned_premium_cents) "
+                     "FROM fact_claim c JOIN fact_premium p ON c.policy_id = p.policy_id "
+                     "GROUP BY c.policy_id").message
+    assert "not by the join key" not in message
+    assert "FULL OUTER JOIN" in message
+
+
+def test_a_positional_group_by_is_named_by_its_column():
+    message = _check("SELECT d.region, SUM(c.paid_amount_cents) / SUM(p.earned_premium_cents) "
+                     "FROM fact_claim c JOIN fact_premium p ON c.policy_id = p.policy_id "
+                     "JOIN dim_policy d ON d.policy_id = c.policy_id GROUP BY 1").message
+    assert "(d.region)" in message
+
+
+def test_the_message_warns_what_an_inner_join_of_per_key_aggregates_loses():
+    assert "appears in only one table" in _check(_LOSS_RATIO).message
+
+
 def test_the_message_quotes_no_profile_number():
     """The profile is taken with no row filter, and this runs before the RLS rewrite -- the same
     position `check_values` is in (M5). The counts are never quoted. The refusal does disclose one

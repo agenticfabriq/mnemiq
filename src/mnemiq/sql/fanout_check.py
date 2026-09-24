@@ -376,7 +376,7 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
             if any(o in dup for o in owners) and not any(o is None or o in single for o in owners):
                 summed.update(dict.fromkeys(o for o in owners if o in dup))
     if summed:
-        return _inflated(list(summed), sources, dup)
+        return _inflated(list(summed), sources, dup, select)
     if chasm is not None:
         return _counted_chasm(chasm, sources)
     return None
@@ -389,21 +389,67 @@ def _defines(select: exp.Select) -> set[str]:
     return {n.alias_or_name.lower() for n in nodes}
 
 
-def _inflated(aliases: list[str], sources: dict[str, str], dup) -> Refusal:
-    because = []
+def _grouping(select: exp.Select) -> list[str] | None:
+    """The answer's grain as the query states it, or None when the query has no GROUP BY.
+
+    Every grouping form counts: plain expressions (`GROUP BY 1` named by its column), ROLLUP,
+    CUBE, GROUPING SETS, and DuckDB's `GROUP BY ALL` (every non-aggregate output). Reading only
+    the plain list sent those to the one-overall-total advice, whose repair returns one figure
+    where the question asked for one per group. A form this cannot name still comes back as []
+    -- grouped, unnamed -- never as None.
+    """
+    group = select.args.get("group")
+    if group is None:
+        return None
+    named = []
+    for e in group.expressions:
+        if isinstance(e, exp.Literal) and e.is_int and 1 <= int(e.this) <= len(select.expressions):
+            e = select.expressions[int(e.this) - 1].unalias()
+        named.append(e.sql())
+    for form in ("rollup", "cube", "grouping_sets"):
+        for node in group.args.get(form) or []:
+            named += [c.sql() for c in node.find_all(exp.Column)]
+    if group.args.get("all"):
+        named += [e.unalias().sql() for e in select.expressions if not e.find(exp.AggFunc)]
+    return list(dict.fromkeys(named))
+
+
+def _inflated(aliases: list[str], sources: dict[str, str], dup, select: exp.Select) -> Refusal:
+    because, keys = [], {}
     for a in aliases:
         entered, key = dup[a]
         t, w = sources[a], sources[entered]
         because.append(f"each {t} row is repeated once per matching {w} row "
                        f"({w}.{', '.join(key)} is not unique)")
+        keys.update(dict.fromkeys(key))
     tables = " and ".join(dict.fromkeys(sources[a] for a in aliases))
+    key = ", ".join(keys)
+    # The first wording said "grouped by the key you join or group on", and the local 14B did
+    # exactly that: a CTE per fact grouped by the join key, inner-joined on it, which drops every
+    # key present in only one table and repaired 0 of 8. So name the ANSWER's grain instead, and
+    # say how to combine without an inner join -- per region it drops a region, one grain up.
+    grouped = _grouping(select)
+    by_key = grouped is not None and any(
+        g.split(".")[-1].lower() in {k.lower() for k in keys} for g in grouped)
+    if grouped is None:
+        grain = "reduced to one overall total with no GROUP BY"
+        combine = "then CROSS JOIN those one-row totals"
+    else:
+        columns = ", ".join(grouped) or "the columns your query groups by"
+        grain = (f"grouped by the answer's own columns ({columns}), joining in only the lookup "
+                 "table that supplies a column it lacks")
+        combine = (f"then FULL OUTER JOIN those per-group results on {columns} (an inner join "
+                   "drops any group present in only one table)")
+    avoid = "" if by_key else f", not by the join key ({key})"
+    warn = "" if by_key else (
+        f" Grouping each table by {key} and inner-joining the results drops every "
+        f"{' or '.join(keys)} value that appears in only one table.")
     return Refusal(
         code=RefusalCode.FAN_OUT,
         message=(
             "This query aggregates across a join that multiplies rows, so the result is "
-            f"inflated: {'; '.join(because)}. Aggregate {tables} separately first -- one CTE or "
-            "subquery per table, grouped by the key you join or group on -- then join those "
-            "aggregated results instead of the raw tables."
+            f"inflated: {'; '.join(because)}. Aggregate each of {tables} in its own CTE or "
+            f"subquery, {grain}{avoid}; {combine}.{warn}"
         ),
     )
 
