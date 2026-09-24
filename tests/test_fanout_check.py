@@ -6,10 +6,11 @@ adds.
 """
 from __future__ import annotations
 
+import pytest
 import sqlglot
 
 from mnemiq.contract import Column, Snapshot
-from mnemiq.sql.fanout_check import check_fanout, key_facts
+from mnemiq.sql.fanout_check import check_fanout, key_facts, value_terms
 from mnemiq.sql.verdict import RefusalCode
 
 # The acme_syn shapes, profiled the way the glossary arm found them: 30,000 claims over 23,322
@@ -46,6 +47,19 @@ KEYS = key_facts(_snapshot())
 
 def _check(sql: str, keys=KEYS, visible=VISIBLE):
     return check_fanout(sqlglot.parse_one(sql, read="duckdb"), visible, keys)
+
+
+# A retail star: many line items per order and per product, one products row per product.
+_RETAIL = {
+    "order_items": {"order_id": (1000, 300, 0), "product_id": (1000, 50, 0),
+                    "quantity": (1000, 20, 0)},
+    "products": {"product_id": (50, 50, 0), "unit_price": (50, 40, 0), "category": (50, 5, 0)},
+}
+
+
+def _check_retail(sql: str):
+    return _check(sql, keys=key_facts(_snapshot(_RETAIL)),
+                  visible={t: set(c) for t, c in _RETAIL.items()})
 
 
 # -- key facts ------------------------------------------------------------------------------------
@@ -124,6 +138,101 @@ def test_a_conditional_sum_whose_value_comes_from_the_repeated_table_is_refused(
     assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
 
 
+def test_a_dimension_attribute_summed_alone_over_its_facts_is_refused():
+    """A term with one table behaves as it did before terms: `p` repeats, and it is all there is."""
+    verdict = _check_retail(
+        "SELECT SUM(p.unit_price) FROM order_items li JOIN products p "
+        "ON li.product_id = p.product_id"
+    )
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_product_of_two_repeated_tables_is_refused():
+    """Every table in the term repeats, so no grain counts each row once."""
+    verdict = _check(
+        "SELECT SUM(c.paid_amount_cents * p.earned_premium_cents) FROM fact_claim c "
+        "JOIN fact_premium p ON c.policy_id = p.policy_id"
+    )
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+@pytest.mark.parametrize("argument", [
+    "li.quantity + p.unit_price",
+    "li.quantity - p.unit_price",
+    "(li.quantity + p.unit_price)",
+    "IF(li.quantity > 10, li.quantity, p.unit_price)",
+    "IF(li.quantity > 10, 1, 0) * p.unit_price",
+    "CASE WHEN li.quantity > 10 THEN li.quantity ELSE p.unit_price END",
+    "COALESCE(li.quantity + p.unit_price, 0)",
+    "CAST(li.quantity + p.unit_price AS DOUBLE)",
+    "-(li.quantity + p.unit_price)",
+    "(li.quantity + p.unit_price) * 1.0",
+    "(li.quantity + p.unit_price) / 2",
+    "(li.quantity + 1) * p.unit_price",
+    "(li.quantity - 1) * p.unit_price",
+    "COALESCE(li.quantity, 1) * p.unit_price",
+    "NULLIF(li.quantity + p.unit_price, 0)",
+    "ROUND(li.quantity + p.unit_price, 2)",
+])
+def test_a_term_that_reads_only_the_repeated_table_is_refused_wherever_it_sits(argument):
+    """Added, in a branch, under a function, or multiplied out -- `(li.quantity + 1) *
+    p.unit_price` is `li.quantity * p.unit_price + p.unit_price` -- `p.unit_price` is summed on
+    its own and repeats. Read as one term with `li`, each of these would pass as a line total."""
+    verdict = _check_retail(
+        f"SELECT SUM({argument}) FROM order_items li JOIN products p "
+        "ON li.product_id = p.product_id"
+    )
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_join_key_repeated_in_where_is_still_one_key():
+    """Stated twice, the pair read as a two-column composite the profile cannot settle, and the
+    check went silent."""
+    verdict = _check(
+        "SELECT SUM(c.paid_amount_cents) FROM fact_claim c JOIN fact_premium p "
+        "ON c.policy_id = p.policy_id WHERE c.policy_id = p.policy_id"
+    )
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_sum_over_the_asof_right_side_is_still_refused():
+    """ASOF never repeats a left row, but one right row can meet many left rows: this premium is
+    counted once per claim that matched it."""
+    verdict = _check(
+        "SELECT SUM(p.earned_premium_cents) FROM fact_claim c ASOF JOIN fact_premium p "
+        "ON c.policy_id = p.policy_id"
+    )
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_semi_join_leaves_the_count_over_a_chasm_refused():
+    """The SEMI-joined table brings no row into the result. Kept as a table of the join, it could
+    never be repeated, and a COUNT refused only when every table is could never fire past it."""
+    verdict = _check(
+        "SELECT COUNT(*) FROM fact_claim c JOIN fact_premium p ON c.policy_id = p.policy_id "
+        "SEMI JOIN dim_policy d ON d.policy_id = c.policy_id"
+    )
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_type2_dimension_narrowed_by_a_flag_still_fires_known_limit():
+    """The accepted "a filter narrows the key" limit. `is_current` makes `customer_id` unique
+    among the rows that join, but uniqueness is read table-wide and the profile cannot see the
+    flag, so every order counts as repeated. Pinned so a change here is a decision, not a drift."""
+    profile = {
+        "orders": {"order_id": (1000, 1000, 0), "customer_id": (1000, 200, 0),
+                   "amount": (1000, 900, 0)},
+        "dim_customer": {"customer_id": (600, 200, 0), "is_current": (600, 2, 0),
+                         "segment": (600, 4, 0)},
+    }
+    verdict = _check(
+        "SELECT d.segment, SUM(o.amount) FROM orders o JOIN dim_customer d "
+        "ON d.customer_id = o.customer_id AND d.is_current GROUP BY d.segment",
+        keys=key_facts(_snapshot(profile)), visible={t: set(c) for t, c in profile.items()},
+    )
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
 def test_a_count_over_a_chasm_is_refused():
     """Every table repeated: the count is of combinations, not of claims or of premiums."""
     verdict = _check(
@@ -186,6 +295,66 @@ def test_a_plain_many_to_one_average_is_approved():
     ) is None
 
 
+def test_a_line_total_over_a_many_to_one_join_is_approved():
+    """The canonical revenue query. Each product row meets many line items, so `p` repeats -- but
+    the product is computed per line item, line items do not repeat, and the sum is right."""
+    revenue = ("SELECT {}SUM(li.quantity * p.unit_price) FROM order_items li "
+               "JOIN products p ON li.product_id = p.product_id{}")
+    assert _check_retail(revenue.format("", "")) is None
+    assert _check_retail(revenue.format("p.category, ", " GROUP BY p.category")) is None
+
+
+@pytest.mark.parametrize("argument", [
+    "li.quantity * (p.unit_price - 1)",
+    "p.unit_price / (li.quantity + 1)",
+    "ROUND(li.quantity * p.unit_price, 2)",
+    "CAST(li.quantity AS DOUBLE) * p.unit_price",
+    "COALESCE(li.quantity, 0) * p.unit_price",
+    "CASE WHEN li.quantity > 10 THEN li.quantity ELSE 0 END * p.unit_price",
+    "CASE WHEN li.quantity > 10 THEN li.quantity ELSE NULL END * p.unit_price",
+])
+def test_a_factor_that_does_not_repeat_reaches_every_term_it_multiplies(argument):
+    """Every term here has `li` in it, so each is right at the line-item grain: a discount
+    multiplied out, a denominator (which does not split), a function over a product, and a
+    parameter, a zero or a NULL that is no summand of its own."""
+    assert _check_retail(
+        f"SELECT SUM({argument}) FROM order_items li "
+        "JOIN products p ON li.product_id = p.product_id"
+    ) is None
+
+
+def test_a_deeply_nested_product_is_not_multiplied_out():
+    """Sixteen binomials multiplied out are 65,536 terms; past a bound, a product falls back to
+    one term per column -- which refuses what the rule did before terms."""
+    argument = " * ".join(["(li.quantity + p.unit_price)"] * 16)
+    assert len(value_terms(sqlglot.parse_one(argument, read="duckdb"))) < 1000
+    verdict = _check_retail(
+        f"SELECT SUM({argument}) FROM order_items li "
+        "JOIN products p ON li.product_id = p.product_id"
+    )
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_term_with_an_owner_it_cannot_resolve_does_not_fire_known_limit():
+    """Accepted limit: a column the check cannot place on a base table -- here a CTE's -- might be
+    the grain that makes the term right, and unknown never fires. So a real fan-out scaled by a
+    CTE column is approved. Pinned so a change here is a decision, not a drift."""
+    assert _check(
+        "WITH fx AS (SELECT 2 AS rate) SELECT SUM(c.paid_amount_cents * fx.rate) "
+        "FROM fact_claim c JOIN fact_premium p ON c.policy_id = p.policy_id CROSS JOIN fx"
+    ) is None
+
+
+def test_semi_anti_and_asof_joins_never_repeat_rows():
+    """SEMI and ANTI keep or drop each left row once; ASOF matches at most one right row. Whatever
+    the key, none of them repeats a left row."""
+    for join in ("SEMI JOIN", "ANTI JOIN", "ASOF JOIN"):
+        assert _check(
+            f"SELECT SUM(c.paid_amount_cents) FROM fact_claim c {join} fact_premium p "
+            "ON c.policy_id = p.policy_id"
+        ) is None, join
+
+
 def test_a_count_over_a_plain_one_to_many_is_approved():
     """It counts the finer table, which may be what was asked."""
     assert _check(
@@ -197,6 +366,14 @@ def test_a_conditional_sum_whose_condition_is_on_the_repeated_side_is_approved()
     """The shape that made the second prototype fire on 14.6% of BIRD's gold."""
     assert _check(
         "SELECT SUM(CASE WHEN p.region = 'east' THEN c.paid_amount_cents ELSE 0 END) "
+        "FROM fact_claim c JOIN dim_policy p ON p.policy_id = c.policy_id"
+    ) is None
+
+
+def test_a_simple_case_operand_is_a_condition():
+    """`CASE p.region WHEN ...` compares `p.region`; it never adds it up."""
+    assert _check(
+        "SELECT SUM(CASE p.region WHEN 'east' THEN c.paid_amount_cents ELSE 0 END) "
         "FROM fact_claim c JOIN dim_policy p ON p.policy_id = c.policy_id"
     ) is None
 
