@@ -7,11 +7,17 @@ from __future__ import annotations
 
 import json
 
+import pyarrow as pa
+
+from mnemiq.agent.modes import MODES, build_agent
+from mnemiq.agent.synthesize import FakeSynthesizer
 from mnemiq.authz.grants import GrantSet
-from mnemiq.contract import Column, DeferralReason, Snapshot
+from mnemiq.cache.store import L1Cache, TwoTierCache
+from mnemiq.config import Settings
+from mnemiq.contract import Column, DeferralReason, IdentityContext, Snapshot
 from mnemiq.generate.correct import FakeCorrector
 from mnemiq.generate.generator import FakeGenerator
-from mnemiq.generate.plan_query import Deferred, plan_query
+from mnemiq.generate.plan_query import plan_query
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
 from mnemiq.sql.decide import decide
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
@@ -140,13 +146,60 @@ def test_the_guard_is_off_unless_asked_for():
     assert isinstance(outcome, Approved), "the default approves it, as it did before M109"
 
 
-def test_in_instant_mode_a_fan_out_becomes_a_deferral():
-    """Instant mode has one attempt and no corrector, so there is nothing to repair with: the
-    inflated answer is withheld rather than returned. That converts a wrong answer into a
-    deferral -- and a false positive into one too, which is the cost the measurement counts."""
-    outcome = plan_query(_packet(), _snapshot(), _GRANTS, FakeGenerator([_reply(FANOUT_SQL)]),
-                         target="duckdb", max_attempts=1, guard_fanout=True)
-    assert isinstance(outcome, Deferred) and outcome.code == DeferralReason.INVALID_QUERY
+# -- instant mode -----------------------------------------------------------------------------------
+# Instant mode caps only the OUTER loop, the one that repairs what the database rejects; the
+# decider's own repair loop keeps its attempts. So a fan-out is re-planned like any repairable
+# refusal. What instant mode never does is return the inflated number.
+
+
+class _Adapter:
+    """Records every query it is asked to run, so a test can say what executed."""
+
+    dialect = "duckdb"
+
+    def __init__(self):
+        self.queries: list[str] = []
+
+    def execute_arrow(self, sql, timeout_s=None):
+        self.queries.append(sql)
+        return pa.table({"loss_ratio": [0.25]})
+
+    def execute(self, sql):
+        return []
+
+
+_IDENTITY = IdentityContext(tenant_id="t1", principal_id="u1", roles=["analyst"])
+
+
+def _instant(replies: list[str], adapter: _Adapter):
+    generator = FakeGenerator([_reply(sql) for sql in replies])
+    agent = build_agent(
+        MODES["instant"], generator=generator, synthesizer=FakeSynthesizer("ok"),
+        adapter=adapter, cache=TwoTierCache(L1Cache()), corrector=None, values=None,
+        selector=None, guard_fanout=True,
+    )
+    return agent.answer(_packet(), _snapshot(), _GRANTS, _IDENTITY), generator
+
+
+def test_instant_mode_re_plans_a_fan_out_with_the_refusal_as_feedback():
+    adapter = _Adapter()
+    answer, generator = _instant([FANOUT_SQL, PER_FACT_SQL], adapter)
+    assert not answer.deferred
+    assert len(generator.calls) == 2
+    assert "fact_premium" in generator.calls[1], "the second proposal must see why"
+    (ran,) = adapter.queries
+    assert "CROSS JOIN" in ran, "only the rewrite reaches the database"
+
+
+def test_instant_mode_withholds_a_fan_out_it_cannot_repair():
+    """Three proposals, all inflated: the answer is a deferral, and nothing ran. That converts a
+    wrong answer into a deferral -- and a false positive into one too, which is the cost the
+    measurement counts."""
+    adapter = _Adapter()
+    answer, generator = _instant([FANOUT_SQL] * 3, adapter)
+    assert answer.deferred and answer.reason_code == DeferralReason.INVALID_QUERY
+    assert len(generator.calls) == 3
+    assert adapter.queries == []
 
 
 # -- the setting --------------------------------------------------------------------------------------
@@ -156,9 +209,6 @@ def test_one_setting_reaches_the_agent_in_both_states():
     """Settings -> build_agent -> Agent. The Agent -> plan_query hop, and every other construction
     site, is held by the call-site scan in `test_undefined_term_guard.py`, which now owes
     `guard_fanout` at the same sites as `guard_undefined_terms`."""
-    from mnemiq.agent.modes import MODES, build_agent
-    from mnemiq.config import Settings
-
     assert Settings.model_fields["guard_fanout"].default is False, (
         "off until the pre-registered measurement flips it"
     )

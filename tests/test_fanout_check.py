@@ -476,8 +476,10 @@ def test_the_message_names_the_tables_the_key_and_the_restructure():
 
 def test_the_message_quotes_no_profile_number():
     """The profile is taken with no row filter, and this runs before the RLS rewrite -- the same
-    position `check_values` is in (M5). Uniqueness is disclosed as a yes/no about a key the
-    identity can already see; the counts behind it are not."""
+    position `check_values` is in (M5). The counts are never quoted. The refusal does disclose one
+    bit: whether the key repeats table-wide, which for a row-filtered identity includes rows
+    outside its slice. That is the posture `check_values` holds under M5, accepted because the
+    key's name is already in the identity's own query."""
     verdict = _check(
         "SELECT SUM(fact_claim.paid_amount_cents) / SUM(fact_premium.earned_premium_cents) "
         "FROM fact_claim JOIN fact_premium ON fact_claim.policy_id = fact_premium.policy_id"
