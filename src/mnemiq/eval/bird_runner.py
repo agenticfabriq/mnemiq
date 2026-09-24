@@ -371,7 +371,9 @@ def _enrich_cache_suffix(
     if settings.enrich_facts:
         parts.append("facts")
     if settings.enrich_examples:
-        parts.append("examples")
+        # the fan-out guard decides which proposed examples survive -> a guard-off example set
+        # must not be reused with the guard on (M109)
+        parts.append("examples_fanout" if settings.guard_fanout else "examples")
     if settings.dictionary_path:
         # a dictionary changes grounded meanings -> must not reuse a no-dict (or other-dict)
         # snapshot. Content edits to the same path still need --refresh (as grounding itself does).
@@ -443,7 +445,7 @@ def enrich_bird_db(
         if settings.enrich_examples:
             snapshot = enrich_examples(
                 snapshot, LLMExampleGenerator(LLMClient(settings)),
-                adapter, dialect=adapter.dialect,
+                adapter, dialect=adapter.dialect, guard_fanout=settings.guard_fanout,
             )
 
     if _dict:
