@@ -1,8 +1,8 @@
 """The fan-out check (register M109): refuse an aggregate whose rows a join has multiplied.
 
-Every fixture below is one of the eleven controls the rule was validated against before any
-number was read (mnemiq-internal `evals/fanout-guard/validate.py`), restated against a hand-built
-profile instead of a live database, plus the edges the engine port adds.
+The fixtures restate, against a hand-built profile instead of a live database, the controls the
+rule was validated against before any accuracy number was read, plus the edges the engine port
+adds.
 """
 from __future__ import annotations
 
@@ -241,6 +241,21 @@ def test_an_equality_inside_a_subquery_is_not_a_join_of_the_outer_scope():
         "SELECT SUM(c.paid_amount_cents) FROM fact_claim c JOIN dim_policy d "
         "ON c.policy_id = d.policy_id WHERE EXISTS (SELECT 1 FROM fact_premium p "
         "WHERE p.policy_id = c.policy_id)"
+    ) is None
+
+
+def test_a_subquery_alias_that_shadows_an_outer_table_adds_no_join():
+    """Inside the EXISTS, `b` is `x`, not the outer `b`. Reading `b.k = a.k` as a join of the outer
+    scope would invent a repeating a -> b edge and refuse a query that multiplies nothing."""
+    profile = {"a": {"id": (100, 100, 0), "k": (100, 10, 0), "v": (100, 90, 0)},
+               "b": {"id": (100, 100, 0), "k": (100, 10, 0)},
+               "c": {"id": (100, 100, 0)},
+               "x": {"k": (100, 10, 0)}}
+    visible = {t: set(c) for t, c in profile.items()}
+    assert _check(
+        "SELECT SUM(a.v) FROM a JOIN c ON a.id = c.id JOIN b ON b.id = c.id "
+        "WHERE EXISTS (SELECT 1 FROM x b WHERE b.k = a.k)",
+        keys=key_facts(_snapshot(profile)), visible=visible,
     ) is None
 
 
