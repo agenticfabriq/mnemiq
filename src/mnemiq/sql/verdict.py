@@ -25,6 +25,8 @@ class RefusalCode(StrEnum):
     UNRESOLVABLE_CALLS = "unresolvable_calls"
     LOGIC_LINT = "logic_lint"
     VALUE_GROUNDING = "value_grounding"
+    # An aggregate over rows a join has multiplied: runs fine, silently inflated (M109).
+    FAN_OUT = "fan_out"
     NOT_A_WRITE = "not_a_write"
     UNBOUNDED_WRITE = "unbounded_write"
     UNAUTHORIZED_WRITE = "unauthorized_write"
@@ -98,6 +100,9 @@ REPAIRABLE = frozenset(
         # arrived as INVALID_QUERY -- three model calls to reach a verdict the first one had.
         RefusalCode.LOGIC_LINT,
         RefusalCode.VALUE_GROUNDING,
+        # The message names the table the join repeats and says how to restructure: aggregate
+        # each table on its own, then join the aggregates.
+        RefusalCode.FAN_OUT,
     }
 )
 

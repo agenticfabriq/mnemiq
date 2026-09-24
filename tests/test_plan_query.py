@@ -500,6 +500,7 @@ _RETRIED = {
     RefusalCode.UNMODELLED_CALL: True,
     RefusalCode.LOGIC_LINT: True,
     RefusalCode.VALUE_GROUNDING: True,
+    RefusalCode.FAN_OUT: True,
     # "may only be selected, not used in a filter" / "Query the table directly." Both name a
     # different query, which is the test for belonging here.
     RefusalCode.MASKED_COLUMN_IN_PREDICATE: True,
