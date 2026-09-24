@@ -73,10 +73,10 @@ def value_columns(e: exp.Expression | None) -> list[exp.Column]:
 def value_terms(e: exp.Expression | None) -> list[list[exp.Column]]:
     """An aggregate's argument split into additive terms, each as its value columns.
 
-    A term is inflated only when EVERY table it reads is repeated. A table that is not repeated
-    appears at most once per join row, so a term computed per row sums each of its rows once:
-    `SUM(li.quantity * p.unit_price)` is right though `p` repeats per line item, and reading it as
-    two columns refused the canonical revenue query. Columns share a term only through a product
+    A term is inflated when it reads a repeated table and no table that appears once per join row.
+    Such a table gives the term its grain: join rows map one-to-one onto its rows, so a term
+    computed per row sums each of them once. `SUM(li.quantity * p.unit_price)` is right though `p`
+    repeats per line item, and reading it as two columns refused the canonical revenue query. Columns share a term only through a product
     or a quotient; any other function passes its arguments' terms through, so
     `ROUND(li.quantity + p.unit_price, 2)` still sums `p.unit_price` on its own. Splitting only at
     the operators it knows would approve every wrapper it does not.
@@ -145,10 +145,10 @@ def check_fanout(
     2. ask `facts` whether each side's key is unique;
     3. a table is DUPLICATED when a walk outward from it enters another table by a key that
        repeats there;
-    4. refuse SUM/AVG over a term whose tables are all duplicated (`value_terms`), or a
-       count-like aggregate (COUNT(x), COUNT(*), a SUM of constants) only when EVERY table is
-       duplicated -- a count over a plain one-to-many counts the finer table, which may be what
-       was asked.
+    4. refuse SUM/AVG over a term (`value_terms`) that reads a duplicated table and no table
+       shown to appear once per row, or a count-like aggregate (COUNT(x), COUNT(*), a SUM of
+       constants) only when EVERY table is duplicated -- a count over a plain one-to-many counts
+       the finer table, which may be what was asked.
 
     Never fires on MIN, MAX, or any DISTINCT aggregate (immune to repetition), on a join whose
     key uniqueness is unknown, or through a CTE or subquery: a derived source is opaque and
@@ -283,6 +283,22 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
     if not dup:
         return None
 
+    def keyed_to_all(t: str) -> bool:
+        seen, stack = {t}, [t]
+        while stack:
+            for w in adj[stack.pop()]:
+                if w not in seen:
+                    seen.add(w)
+                    stack.append(w)
+        return len(seen) == len(sources)
+
+    # A table carries a term at its own grain only if it appears at most once per join row:
+    # repeated by no walk AND keyed to every other table. Absence from `dup` alone proves nothing
+    # for a table no key reaches -- CROSS JOIN, a comma, a range or an expression join -- and read
+    # as proof, such a table excused an inflated term. An owner `owner()` cannot resolve (a CTE's
+    # or a derived table's column) is the pinned opaque limit, and counts as single.
+    single = {a for a in sources if a not in dup and keyed_to_all(a)}
+
     summed: dict[str, None] = {}  # duplicated aliases whose values are aggregated, in order
     chasm: exp.Expression | None = None
     for agg in select.find_all(exp.Sum, exp.Avg, exp.Count):
@@ -296,9 +312,13 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
                 chasm = agg
             continue
         for term in terms:
-            owners = list(dict.fromkeys(owner(col) for col in term))
-            if all(o in dup for o in owners):  # an unresolved owner (None) is never in `dup`
-                summed.update(dict.fromkeys(owners))
+            # A column of a nested scope -- a scalar subquery, EXISTS -- is that scope's. Read as an
+            # owner here it resolved to None, and None excused the term.
+            owners = list(dict.fromkeys(
+                owner(col) for col in term if col.find_ancestor(exp.Select) is select
+            ))
+            if any(o in dup for o in owners) and not any(o is None or o in single for o in owners):
+                summed.update(dict.fromkeys(o for o in owners if o in dup))
     if summed:
         return _inflated(list(summed), sources, dup)
     if chasm is not None:

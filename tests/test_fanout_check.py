@@ -57,9 +57,20 @@ _RETAIL = {
 }
 
 
+def _check_profile(sql: str, profile: dict):
+    return _check(sql, keys=key_facts(_snapshot(profile)),
+                  visible={t: set(c) for t, c in profile.items()})
+
+
 def _check_retail(sql: str):
-    return _check(sql, keys=key_facts(_snapshot(_RETAIL)),
-                  visible={t: set(c) for t, c in _RETAIL.items()})
+    return _check_profile(sql, _RETAIL)
+
+
+# Tables that join by no equi-key: a rates table beside the acme facts, and price tiers matched to
+# line items by a quantity range.
+_WITH_FX = {**_PROFILE, "fx": {"ccy": (10, 10, 0), "rate": (10, 8, 0), "valid_from": (10, 10, 0),
+                               "valid_to": (10, 10, 0)}}
+_WITH_TIERS = {**_RETAIL, "tiers": {"lo": (5, 5, 0), "hi": (5, 5, 0), "discount": (5, 5, 0)}}
 
 
 # -- key facts ------------------------------------------------------------------------------------
@@ -186,6 +197,43 @@ def test_a_term_that_reads_only_the_repeated_table_is_refused_wherever_it_sits(a
     verdict = _check_retail(
         f"SELECT SUM({argument}) FROM order_items li JOIN products p "
         "ON li.product_id = p.product_id"
+    )
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+_CHASM = "FROM fact_claim c JOIN fact_premium p ON c.policy_id = p.policy_id"
+
+
+@pytest.mark.parametrize("joined", [
+    f"{_CHASM} CROSS JOIN fx",
+    "FROM fact_claim c, fact_premium p, fx WHERE c.policy_id = p.policy_id",
+    f"{_CHASM} JOIN fx ON c.settlement_days BETWEEN fx.valid_from AND fx.valid_to",
+    f"{_CHASM} JOIN fx ON fx.ccy = UPPER(CAST(c.claim_id AS VARCHAR))",
+], ids=["cross", "comma", "range", "expression"])
+def test_a_cross_joined_table_cannot_excuse_an_inflated_term(joined):
+    """No walk marks `fx` repeated because no key reaches it -- which is not the same as `fx`
+    appearing once per row. Only a table keyed to every other one, and repeated by none, can carry
+    a term at its own grain; read as one, `fx` excused a claim total inflated by premiums."""
+    verdict = _check_profile(f"SELECT SUM(c.paid_amount_cents * fx.rate) {joined}", _WITH_FX)
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_scalar_subquery_column_is_not_an_owner():
+    """`rate` belongs to the subquery's scope. Read as an owner here it resolved to nothing, and an
+    unresolved owner excuses the term."""
+    verdict = _check_profile(
+        f"SELECT SUM(c.paid_amount_cents * (SELECT MAX(rate) FROM fx)) {_CHASM}", _WITH_FX
+    )
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_range_joined_tier_cannot_excuse_a_repeated_price():
+    """`p` repeats per line item, and nothing shows the range-joined tier appears once per line
+    item, so the tier cannot carry `p.unit_price` at a grain of its own."""
+    verdict = _check_profile(
+        "SELECT SUM(p.unit_price * t.discount) FROM order_items li JOIN products p "
+        "ON li.product_id = p.product_id JOIN tiers t ON li.quantity BETWEEN t.lo AND t.hi",
+        _WITH_TIERS,
     )
     assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
 
