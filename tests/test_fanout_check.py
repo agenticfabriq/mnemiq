@@ -238,6 +238,43 @@ def test_a_range_joined_tier_cannot_excuse_a_repeated_price():
     assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
 
 
+@pytest.mark.parametrize("argument, refused", [
+    ("p.unit_price / COALESCE(li.quantity, 1)", True),
+    ("p.unit_price / CASE WHEN li.quantity > 0 THEN li.quantity ELSE 1 END", True),
+    ("p.unit_price / NULLIF(li.quantity, 0)", False),
+    ("p.unit_price / li.quantity", False),
+    ("p.unit_price / (li.quantity + 1)", False),
+])
+def test_a_conditional_denominator_is_split_like_a_conditional_factor(argument, refused):
+    """Where `li.quantity` is null, `p.unit_price / COALESCE(li.quantity, 1)` divides by 1 and sums
+    `p.unit_price` alone -- as `p.unit_price * COALESCE(li.quantity, 1)` does, which was refused
+    while the quotient was approved. A sum is not split: 1 / (a + b) is not 1/a + 1/b."""
+    profile = {**_RETAIL, "order_items": {**_RETAIL["order_items"], "quantity": (1000, 20, 5)}}
+    verdict = _check_profile(
+        f"SELECT SUM({argument}) FROM order_items li JOIN products p "
+        "ON li.product_id = p.product_id", profile,
+    )
+    assert (verdict is not None and verdict.code == RefusalCode.FAN_OUT) is refused
+
+
+def test_a_capped_product_keeps_its_constant_term():
+    """Seven `(li.quantity + 1)` factors pass the expansion cap. The fallback dropped the constant
+    term, so `p.unit_price` alone -- refused with one factor -- merged into `li`'s terms and the
+    same sum was approved. It keeps only a constant the product had: with none in any factor,
+    every term still reads `li`."""
+    def check(factor: str, n: int):
+        factors = " * ".join([factor] * n)
+        return _check_retail(
+            f"SELECT SUM({factors} * p.unit_price) FROM order_items li "
+            "JOIN products p ON li.product_id = p.product_id"
+        )
+
+    for n in (1, 7):
+        verdict = check("(li.quantity + 1)", n)
+        assert verdict is not None and verdict.code == RefusalCode.FAN_OUT, n
+    assert check("(li.quantity + li.order_id)", 7) is None
+
+
 def test_a_join_key_repeated_in_where_is_still_one_key():
     """Stated twice, the pair read as a two-column composite the profile cannot settle, and the
     check went silent."""
@@ -431,6 +468,27 @@ def test_a_sqlite_iif_whose_condition_is_on_the_repeated_side_is_approved():
         "JOIN dim_policy p ON p.policy_id = c.policy_id", read="sqlite",
     )
     assert check_fanout(ast, VISIBLE, KEYS) is None
+
+
+def test_nullif_never_returns_its_second_argument():
+    """`NULLIF(li.quantity, p.unit_price)` is `li.quantity` or NULL: the price is compared, and
+    never summed."""
+    assert _check_retail(
+        "SELECT SUM(NULLIF(li.quantity, p.unit_price)) FROM order_items li "
+        "JOIN products p ON li.product_id = p.product_id"
+    ) is None
+
+
+def test_a_deeply_nested_quotient_computes_each_denominator_once():
+    """Recomputing the denominator for every numerator term cost width ** depth: this shape took
+    seconds. Each denominator's alternatives are now computed once."""
+    total = "(li.a0 + li.a1 + li.a2 + li.a3)"
+    nested = total
+    for _ in range(10):
+        nested = f"{total} / ({nested})"
+    assert _check_retail(
+        f"SELECT SUM({nested}) FROM order_items li JOIN products p ON li.product_id = p.product_id"
+    ) is None
 
 
 def test_a_simple_case_operand_is_a_condition():

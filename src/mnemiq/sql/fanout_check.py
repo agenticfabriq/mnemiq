@@ -76,50 +76,76 @@ def value_terms(e: exp.Expression | None) -> list[list[exp.Column]]:
     A term is inflated when it reads a repeated table and no table that appears once per join row.
     Such a table gives the term its grain: join rows map one-to-one onto its rows, so a term
     computed per row sums each of them once. `SUM(li.quantity * p.unit_price)` is right though `p`
-    repeats per line item, and reading it as two columns refused the canonical revenue query. Columns share a term only through a product
-    or a quotient; any other function passes its arguments' terms through, so
-    `ROUND(li.quantity + p.unit_price, 2)` still sums `p.unit_price` on its own. Splitting only at
-    the operators it knows would approve every wrapper it does not.
+    repeats per line item, and reading it as two columns refused the canonical revenue query.
+    Columns share a term only through a product or a quotient; any other function passes its
+    arguments' terms through, so `ROUND(li.quantity + p.unit_price, 2)` still sums `p.unit_price`
+    on its own. Splitting only at the operators it knows would approve every wrapper it does not.
     """
     return [term for term in _terms(e) if term]
 
 
-# Multiplying out is exponential in nesting depth; past this, a product falls back to reading
-# each column as its own term, which refuses whatever the rule before terms refused.
+# Multiplying out is exponential in nesting depth. Past this, a product falls back to one term per
+# column, plus the constant term if both sides had one: coarser, and it refuses whatever the full
+# expansion would -- every expanded term that fires contains a column that fires alone.
 _MAX_TERMS = 64
 
+Terms = list[list[exp.Column]]
 
-def _terms(e: exp.Expression | None) -> list[list[exp.Column]]:
+
+def _product(left: Terms, right: Terms) -> Terms:
+    if len(left) * len(right) <= _MAX_TERMS:
+        return [a + b for a in left for b in right]
+    # Dropping the constant term let an enclosing `* p.unit_price` merge back into `li`'s terms:
+    # seven `(li.quantity + 1)` factors approved what one refused.
+    columns = dict.fromkeys(c for term in left + right for c in term)
+    return [[c] for c in columns] + ([[]] if [] in left and [] in right else [])
+
+
+def _literal(e: exp.Literal) -> Terms:
+    # Zero is no term at all; any other constant is the EMPTY term.
+    return [] if e.is_number and not str(e.this).strip("0.") else [[]]
+
+
+def _choice(e: exp.Expression, walk) -> Terms | None:
+    # A choice -- IF, CASE, COALESCE, NULLIF -- is one of its value branches per row, each read by
+    # `walk`; its conditions, a simple CASE's operand and NULLIF's comparand are never values.
+    # None when `e` is not a choice.
+    if isinstance(e, exp.If):
+        return walk(e.args.get("true")) + walk(e.args.get("false"))
+    if isinstance(e, exp.Case):
+        out: Terms = []
+        for branch in e.args.get("ifs") or []:
+            out += walk(branch.args.get("true"))
+        return out + walk(e.args.get("default"))
+    if isinstance(e, exp.Coalesce):
+        out = walk(e.this)
+        for arg in e.expressions:
+            out += walk(arg)
+        return out
+    if isinstance(e, exp.Nullif):  # its first argument, or NULL
+        return walk(e.this)
+    return None
+
+
+def _terms(e: exp.Expression | None) -> Terms:
     # A non-zero constant is the EMPTY term: dropped at the top, but under a product it leaves the
     # other factor alone -- `(li.quantity + 1) * p.unit_price` sums `p.unit_price` per line item.
     # Zero and NULL are no term at all, so `IIF(x, li.quantity, 0) * p.unit_price` is one term.
     if e is None or isinstance(e, exp.Null):
         return []
     if isinstance(e, exp.Literal):
-        return [] if e.is_number and not str(e.this).strip("0.") else [[]]
+        return _literal(e)
     if isinstance(e, exp.Column):
         return [[e]]
     if isinstance(e, (exp.Add, exp.Sub)):
         return _terms(e.left) + _terms(e.right)
     if isinstance(e, exp.Mul):
-        left, right = _terms(e.left), _terms(e.right)
-        if len(left) * len(right) > _MAX_TERMS:
-            return [[col] for col in dict.fromkeys(c for term in left + right for c in term)]
-        return [a + b for a in left for b in right]
-    if isinstance(e, exp.Div):  # 1 / (a + b) does not split: the denominator is one factor
-        return [a + value_columns(e.right) for a in _terms(e.left)]
-    if isinstance(e, exp.If):
-        return _terms(e.args.get("true")) + _terms(e.args.get("false"))
-    if isinstance(e, exp.Case):
-        out: list[list[exp.Column]] = []
-        for branch in e.args.get("ifs") or []:
-            out += _terms(branch.args.get("true"))
-        return out + _terms(e.args.get("default"))
-    if isinstance(e, exp.Coalesce):  # it returns one of its arguments: each is a branch
-        out = _terms(e.this)
-        for arg in e.expressions:
-            out += _terms(arg)
-        return out
+        return _product(_terms(e.left), _terms(e.right))
+    if isinstance(e, exp.Div):
+        # Each side once: recomputing the denominator per numerator term cost width ** depth.
+        return _product(_terms(e.left), _alternatives(e.right))
+    if (branches := _choice(e, _terms)) is not None:
+        return branches
     # Any other node: its arguments' terms, side by side. An argument with no column in it -- a
     # precision, a CAST's type -- is a parameter, not a summand.
     out = []
@@ -128,6 +154,29 @@ def _terms(e: exp.Expression | None) -> list[list[exp.Column]]:
         if any(terms):
             out += terms
     return out or [[]]
+
+
+def _alternatives(e: exp.Expression | None) -> Terms:
+    # The values a denominator can take, each as the columns it reads. A choice is one alternative
+    # per branch, as in a product: dividing by `COALESCE(li.quantity, 1)` divides by 1 on some
+    # rows, and there the numerator is summed alone. Flattened into one factor, the denominator
+    # approved `p.unit_price / COALESCE(li.quantity, 1)` while the product was refused. A sum is
+    # NOT split -- 1 / (a + b) is not 1/a + 1/b -- so anything else is one factor per combination
+    # of its arguments' alternatives.
+    if e is None or isinstance(e, exp.Null):
+        return []
+    if isinstance(e, exp.Literal):
+        return _literal(e)
+    if isinstance(e, exp.Column):
+        return [[e]]
+    if (branches := _choice(e, _alternatives)) is not None:
+        return branches
+    out: Terms = [[]]
+    for child in e.iter_expressions():
+        alternatives = _alternatives(child)
+        if any(alternatives):
+            out = _product(out, alternatives)
+    return out
 
 
 def check_fanout(
@@ -295,8 +344,9 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
     # A table carries a term at its own grain only if it appears at most once per join row:
     # repeated by no walk AND keyed to every other table. Absence from `dup` alone proves nothing
     # for a table no key reaches -- CROSS JOIN, a comma, a range or an expression join -- and read
-    # as proof, such a table excused an inflated term. An owner `owner()` cannot resolve (a CTE's
-    # or a derived table's column) is the pinned opaque limit, and counts as single.
+    # as proof, such a table excused an inflated term. An owner `owner()` cannot resolve -- a CTE's
+    # or derived table's column, an ambiguous bare name, any qualifier that is not a base table of
+    # this scope -- counts as single: the pinned opaque limit.
     single = {a for a in sources if a not in dup and keyed_to_all(a)}
 
     summed: dict[str, None] = {}  # duplicated aliases whose values are aggregated, in order
