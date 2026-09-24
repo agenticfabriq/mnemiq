@@ -292,6 +292,43 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
     if not pairs:
         return None
 
+    # alias -> the columns an as-of filter in this scope narrows it by. Uniqueness is read
+    # table-wide, so a versioned table joined as of the fact's date (`o.day BETWEEN d.valid_from
+    # AND d.valid_to`) was refused, and every repair that kept the join was refused again until
+    # the question deferred. A BETWEEN whose bounds are two of the table's own columns, tested
+    # against another table's value, is that join: it MAY leave one version per key, unknown,
+    # and unknown never fires. Nothing wider: counting a flag (`is_current`), an equality or an
+    # IS NULL let an ordinary binary filter (`is_returned = 'N'`) switch the guard off for an
+    # inflated sum -- a silent wrong number where a refusal is a visible deferral -- and syntax
+    # cannot tell a current-row flag from one. So a current-row filter still refuses (known
+    # limit); telling them apart needs the data -- key uniqueness per flag value.
+    narrowed: dict[str, set[str]] = {}
+
+    def conjuncts(e: exp.Expression):
+        e = e.unnest()  # flatten() unwraps parentheses inside the AND chain itself
+        return e.flatten() if isinstance(e, exp.And) else [e]
+
+    for condition, _ in conditions:
+        for c in conjuncts(condition):
+            if not isinstance(c, exp.Between):
+                continue
+            bounds, tested = [c.args.get("low"), c.args.get("high")], c.this
+            if not all(isinstance(x, exp.Column) and x.find_ancestor(exp.Select) is select
+                       for x in [*bounds, tested]):
+                continue
+            owners = {owner(x) for x in bounds}
+            if len(owners) != 1 or None in owners or owner(tested) in owners | {None}:
+                continue
+            alias = owners.pop()
+            names = [_spelling(x.name, visible.get(sources[alias], ())) for x in bounds]
+            if None not in names:
+                narrowed.setdefault(alias, set()).update(n.lower() for n in names)
+
+    def repeats(alias: str, key: tuple[str, ...]) -> bool:
+        if _unique(facts, sources[alias], key) is not False:
+            return False
+        return not narrowed.get(alias, set()) - {k.lower() for k in key}
+
     adj: dict[str, list[str]] = {a: [] for a in sources}
     # a -> {b: b's key columns}: each `a` row meets MANY `b` rows, because b's key repeats
     fans_into: dict[str, dict[str, tuple[str, ...]]] = {a: {} for a in sources}
@@ -299,9 +336,9 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
         a_cols, b_cols = tuple(c[0] for c in cols), tuple(c[1] for c in cols)
         adj[a].append(b)
         adj[b].append(a)
-        if _unique(facts, sources[b], b_cols) is False and (a, b) not in at_most_one:
+        if repeats(b, b_cols) and (a, b) not in at_most_one:
             fans_into[a][b] = b_cols
-        if _unique(facts, sources[a], a_cols) is False and (b, a) not in at_most_one:
+        if repeats(a, a_cols) and (b, a) not in at_most_one:
             fans_into[b][a] = a_cols
 
     def multiplier(t: str) -> tuple[str, tuple[str, ...]] | None:
@@ -361,6 +398,7 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
 
     summed: dict[str, None] = {}  # duplicated aliases whose values are aggregated, in order
     chasm: exp.Expression | None = None
+    windowed = False
     for agg in select.find_all(exp.Sum, exp.Avg, exp.Count):
         if agg.find_ancestor(exp.Select) is not select:
             continue
@@ -375,8 +413,10 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
             owners = list(dict.fromkeys(owner(col) for col in term if of_this_row(col)))
             if any(o in dup for o in owners) and not any(o is None or o in single for o in owners):
                 summed.update(dict.fromkeys(o for o in owners if o in dup))
+                window = agg.find_ancestor(exp.Window)
+                windowed |= window is not None and window.find_ancestor(exp.Select) is select
     if summed:
-        return _inflated(list(summed), sources, dup, select)
+        return _inflated(list(summed), sources, dup, select, windowed)
     if chasm is not None:
         return _counted_chasm(chasm, sources)
     return None
@@ -414,7 +454,8 @@ def _grouping(select: exp.Select) -> list[str] | None:
     return list(dict.fromkeys(named))
 
 
-def _inflated(aliases: list[str], sources: dict[str, str], dup, select: exp.Select) -> Refusal:
+def _inflated(aliases: list[str], sources: dict[str, str], dup, select: exp.Select,
+              windowed: bool = False) -> Refusal:
     because, keys = [], {}
     for a in aliases:
         entered, key = dup[a]
@@ -424,6 +465,14 @@ def _inflated(aliases: list[str], sources: dict[str, str], dup, select: exp.Sele
         keys.update(dict.fromkeys(key))
     tables = " and ".join(dict.fromkeys(sources[a] for a in aliases))
     key = ", ".join(keys)
+    head = ("This query aggregates across a join that multiplies rows, so the result is "
+            f"inflated: {'; '.join(because)}.")
+    if windowed:
+        # A window keeps one output row per input row; the GROUP BY advice below would discard
+        # its partition and that row-level grain.
+        return Refusal(code=RefusalCode.FAN_OUT, message=(
+            f"{head} Compute the window on {tables}'s own rows in a CTE or subquery, keeping its "
+            "PARTITION BY, then join that result instead of the raw table."))
     # The first wording said "grouped by the key you join or group on", and the local 14B did
     # exactly that: a CTE per fact grouped by the join key, inner-joined on it, which drops every
     # key present in only one table and repaired 0 of 8. So name the ANSWER's grain instead, and
@@ -459,12 +508,16 @@ def _inflated(aliases: list[str], sources: dict[str, str], dup, select: exp.Sele
     warn = "" if by_key else (
         f" Grouping each table by {key} and inner-joining the results drops every "
         f"{' or '.join(keys)} value that appears in only one table.")
+    # An inner join can MEAN "only keys in both" (products that had returns); whole-table totals
+    # widen that cohort silently. Usually it is an accident -- the loss ratio's was -- so the
+    # restriction is kept only when the question sets it.
+    cohort = (" These totals count every key; only if the question itself limits the answer to "
+              "keys present in both tables, restrict each table with EXISTS on the other first.")
     return Refusal(
         code=RefusalCode.FAN_OUT,
         message=(
-            "This query aggregates across a join that multiplies rows, so the result is "
-            f"inflated: {'; '.join(because)}. Aggregate each of {tables} in its own CTE or "
-            f"subquery, {grain}{avoid}; {combine}.{warn}"
+            f"{head} Aggregate each of {tables} in its own CTE or subquery, {grain}{avoid}; "
+            f"{combine}.{warn}{cohort}"
         ),
     )
 

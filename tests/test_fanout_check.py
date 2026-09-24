@@ -332,22 +332,82 @@ def test_a_semi_join_leaves_the_count_over_a_chasm_refused():
     assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
 
 
-def test_a_type2_dimension_narrowed_by_a_flag_still_fires_known_limit():
-    """The accepted "a filter narrows the key" limit. `is_current` makes `customer_id` unique
-    among the rows that join, but uniqueness is read table-wide and the profile cannot see the
-    flag, so every order counts as repeated. Pinned so a change here is a decision, not a drift."""
-    profile = {
-        "orders": {"order_id": (1000, 1000, 0), "customer_id": (1000, 200, 0),
-                   "amount": (1000, 900, 0)},
-        "dim_customer": {"customer_id": (600, 200, 0), "is_current": (600, 2, 0),
-                         "segment": (600, 4, 0)},
-    }
-    verdict = _check(
-        "SELECT d.segment, SUM(o.amount) FROM orders o JOIN dim_customer d "
-        "ON d.customer_id = o.customer_id AND d.is_current GROUP BY d.segment",
-        keys=key_facts(_snapshot(profile)), visible={t: set(c) for t, c in profile.items()},
-    )
-    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+_SCD = {
+    "orders": {"order_id": (1000, 1000, 0), "customer_id": (1000, 200, 0),
+               "amount": (1000, 900, 0), "order_date": (1000, 300, 0)},
+    "dim_customer": {"customer_id": (600, 200, 0), "is_current": (600, 2, 0),
+                     "valid_from": (600, 500, 0), "valid_to": (600, 400, 200),
+                     "segment": (600, 4, 0)},
+}
+
+
+def _scd(sql):
+    return _check(sql, keys=key_facts(_snapshot(_SCD)),
+                  visible={t: set(c) for t, c in _SCD.items()})
+
+
+_SCD_JOIN = "SELECT d.segment, SUM(o.amount) FROM orders o JOIN dim_customer d ON d.customer_id = o.customer_id"
+
+
+_AS_OF = " AND o.order_date BETWEEN d.valid_from AND d.valid_to GROUP BY d.segment"
+
+
+@pytest.mark.parametrize("narrowing", [
+    _AS_OF,
+    " WHERE o.amount > 0 AND (o.order_date BETWEEN d.valid_from AND d.valid_to) GROUP BY d.segment",
+])
+def test_an_as_of_join_to_a_versioned_table_makes_its_key_unknown(narrowing):
+    """A type-2 dimension joined as of the fact's date is correct: one version per customer per
+    order. Uniqueness is read table-wide and the profile cannot see the dates, so this was
+    refused, and every repair that kept the join was refused again until the question deferred.
+    A BETWEEN on two of the table's own columns, tested against another table's value, MAY leave
+    one row per key; unknown, and unknown never fires."""
+    assert _scd(_SCD_JOIN + narrowing) is None
+
+
+@pytest.mark.parametrize("current_row", [
+    " AND d.is_current GROUP BY d.segment",
+    " AND d.is_current = 1 GROUP BY d.segment",
+    " AND d.is_current IS TRUE GROUP BY d.segment",
+    " AND d.valid_to IS NULL GROUP BY d.segment",
+])
+def test_a_current_row_filter_still_refuses_known_limit(current_row):
+    """Correct on a type-2 dimension, and still refused. Syntax cannot tell `is_current` from an
+    ordinary binary filter (`is_returned = 'N'`), nor `valid_to IS NULL` from `cancel_date IS
+    NULL`; reading them as narrowing let an ordinary filter switch the guard off for an inflated
+    sum -- a silent wrong number, where this is a visible deferral. Telling them apart needs the
+    data: key uniqueness per flag value. Pinned so a change here is a decision."""
+    assert _scd(_SCD_JOIN + current_row) is not None
+
+
+def test_a_two_valued_filter_on_the_only_repeating_table_still_refuses():
+    """Line items repeat each product, and `is_returned = 'N'` keeps many of them per product:
+    summing the product's price per kept line item is still inflated."""
+    profile = {**_RETAIL, "order_items": {**_RETAIL["order_items"], "is_returned": (1000, 2, 0)}}
+    assert _check_profile("SELECT SUM(p.unit_price) FROM order_items li JOIN products p "
+                          "ON li.product_id = p.product_id WHERE li.is_returned = 'N'",
+                          profile) is not None
+
+
+def test_a_between_tested_against_the_same_table_does_not_narrow():
+    """Only the as-of shape counts: bounds from the versioned table, value from another."""
+    assert _scd(_SCD_JOIN + " WHERE d.valid_from BETWEEN d.valid_from AND d.valid_to "
+                "GROUP BY d.segment") is not None
+
+
+def test_a_filter_on_the_join_key_itself_does_not_narrow_it():
+    """`d.customer_id = 7` pins the key, not the version: customer 7's history still repeats."""
+    assert _scd(_SCD_JOIN + " WHERE d.customer_id = 7 GROUP BY d.segment") is not None
+
+
+def test_a_range_filter_against_a_literal_does_not_narrow_a_key():
+    """A period filter keeps a slice of rows per key, not one row per key: the loss ratio for
+    premiums above a threshold still sums each claim once per matching premium."""
+    assert _check(_LOSS_RATIO + " WHERE p.earned_premium_cents > 0") is not None
+
+
+def test_a_filter_on_the_other_table_does_not_excuse_the_repeating_one():
+    assert _scd(_SCD_JOIN + " WHERE o.amount = 5 GROUP BY d.segment") is not None
 
 
 def test_a_count_over_a_chasm_is_refused():
@@ -688,6 +748,23 @@ def test_a_positional_group_by_is_named_by_its_column():
 
 def test_the_message_warns_what_an_inner_join_of_per_key_aggregates_loses():
     assert "appears in only one table" in _check(_LOSS_RATIO).message
+
+
+def test_the_message_keeps_a_cohort_only_when_the_question_asks_for_one():
+    """An inner join can mean "only products that had returns". Whole-table totals, CROSS JOINed,
+    silently widen that cohort; the model is told to keep the restriction, with EXISTS, only
+    when the question itself sets it -- the loss ratio's inner join was an accident, not a filter."""
+    message = _check(_LOSS_RATIO).message
+    assert "EXISTS" in message and "only if the question itself" in message
+
+
+def test_a_window_aggregate_is_told_to_keep_its_partition():
+    """SUM() OVER (PARTITION BY ...) got the one-overall-total advice, which discards the
+    partition and the row-level output the query asked for."""
+    message = _check("SELECT c.claim_id, SUM(c.paid_amount_cents) OVER (PARTITION BY c.policy_id) "
+                     "FROM fact_claim c JOIN fact_premium p ON c.policy_id = p.policy_id").message
+    assert "PARTITION BY" in message
+    assert "no GROUP BY" not in message and "CROSS JOIN" not in message
 
 
 def test_the_message_quotes_no_profile_number():
