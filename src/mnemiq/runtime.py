@@ -804,6 +804,7 @@ def build_runtime(settings: Settings) -> Runtime:
             selector=kit.selector,
             verifier=verifiers[name],
             guard_undefined_terms=settings.guard_undefined_terms,
+            guard_fanout=settings.guard_fanout,
         )
         for name, mode in MODES.items()
     }

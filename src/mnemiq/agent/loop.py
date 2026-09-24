@@ -186,9 +186,11 @@ class Agent:
         verifier=None,
         preview_rows: int = 100,
         guard_undefined_terms: bool = False,
+        guard_fanout: bool = False,
     ) -> None:
         self.generator = generator
         self.guard_undefined_terms = guard_undefined_terms
+        self.guard_fanout = guard_fanout
         self.synthesizer = synthesizer
         self.adapter = adapter
         self.cache = cache
@@ -274,6 +276,7 @@ class Agent:
                     corrector=self.corrector,
                     values=self.values,
                     guard_undefined_terms=self.guard_undefined_terms,
+                    guard_fanout=self.guard_fanout,
                 )
             if isinstance(outcome, Deferred):
                 return AgentAnswer(answer=outcome.reason, deferred=True,
@@ -400,6 +403,7 @@ class Agent:
                     corrector=self.corrector,
                     values=self.values,
                     guard_undefined_terms=self.guard_undefined_terms,
+                    guard_fanout=self.guard_fanout,
                 )
                 if not isinstance(outcome, Approved):
                     # M35: an UNDEFINED_TERM deferral is a finding about the QUESTION, not a

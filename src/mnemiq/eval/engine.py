@@ -186,6 +186,7 @@ def build_engine(
         # generator asks for it from the same setting -- and never read it, which is precisely the
         # harness the withdrawal says a revival has to be measured through.
         guard_undefined_terms=settings.guard_undefined_terms,
+        guard_fanout=settings.guard_fanout,
     )
 
     # k=12 measured +2.3 strict / +2.3 facts over k=6 (recall probe: k=12 -> 100% gold-table

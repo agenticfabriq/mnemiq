@@ -147,3 +147,26 @@ def test_in_instant_mode_a_fan_out_becomes_a_deferral():
     outcome = plan_query(_packet(), _snapshot(), _GRANTS, FakeGenerator([_reply(FANOUT_SQL)]),
                          target="duckdb", max_attempts=1, guard_fanout=True)
     assert isinstance(outcome, Deferred) and outcome.code == DeferralReason.INVALID_QUERY
+
+
+# -- the setting --------------------------------------------------------------------------------------
+
+
+def test_one_setting_reaches_the_agent_in_both_states():
+    """Settings -> build_agent -> Agent. The Agent -> plan_query hop, and every other construction
+    site, is held by the call-site scan in `test_undefined_term_guard.py`, which now owes
+    `guard_fanout` at the same sites as `guard_undefined_terms`."""
+    from mnemiq.agent.modes import MODES, build_agent
+    from mnemiq.config import Settings
+
+    assert Settings.model_fields["guard_fanout"].default is False, (
+        "off until the pre-registered measurement flips it"
+    )
+    for wanted in (True, False):
+        settings = Settings(guard_fanout=wanted,
+                            llm_base_url="http://localhost:1/v1", llm_api_key="unused")
+        agent = build_agent(
+            MODES["thinking"], generator=None, synthesizer=None, adapter=None, cache=None,
+            corrector=None, values=None, selector=None, guard_fanout=settings.guard_fanout,
+        )
+        assert agent.guard_fanout is wanted

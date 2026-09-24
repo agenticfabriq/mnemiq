@@ -693,9 +693,11 @@ def test_every_site_that_participates_in_the_guard_passes_its_half():
     # callable -> the half of the guard it owes. Both halves, because either alone fails open.
     # The value is a TUPLE: a callable can owe more than one argument, and `retrieve` owes four.
     REQUIRED = {
-        "Agent": ("guard_undefined_terms",),
-        "build_agent": ("guard_undefined_terms",),
-        "plan_query": ("guard_undefined_terms",),
+        # `guard_fanout` (M109) crosses the same three hops, so it owes the same thing at the
+        # same sites. It has no prompt or corpus leg: the check reads the snapshot it is handed.
+        "Agent": ("guard_undefined_terms", "guard_fanout"),
+        "build_agent": ("guard_undefined_terms", "guard_fanout"),
+        "plan_query": ("guard_undefined_terms", "guard_fanout"),
         "LLMGenerator": ("declare_assumed_terms",),
         # The THIRD leg. `plan_query` checks declared terms against `packet.definitions`, and
         # `retrieve` defaults that to `()` -- so a caller that omits it feeds the guard an empty
