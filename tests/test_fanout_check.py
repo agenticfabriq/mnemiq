@@ -74,13 +74,18 @@ def test_a_key_is_unique_when_every_non_null_value_is_distinct():
     assert key_facts(snap) == {("t", "a"): True, ("t", "b"): True, ("t", "c"): False}
 
 
-def test_an_unmeasured_column_is_absent_not_guessed():
+@pytest.mark.parametrize("counts", [
+    {"row_count": None, "distinct_count": 10, "null_count": 0},
+    {"row_count": 10, "distinct_count": None, "null_count": 0},
+    {"row_count": 10, "distinct_count": 10, "null_count": None},
+    {},
+], ids=["row_count", "distinct_count", "null_count", "none_measured"])
+def test_an_unmeasured_column_is_absent_not_guessed(counts):
     """`distinct_count=None` is what profiling writes for a column it could not count (a LOB, a
-    user-defined type). Reading that as either answer would make the guard guess."""
+    user-defined type). Any one count missing leaves uniqueness undecided, and reading that as
+    either answer would make the guard guess."""
     snap = Snapshot(version="v1", source_id="s", created_at="t", columns=[
-        Column(id="t.a", object_id="t", name="a", row_count=10, distinct_count=None,
-               null_count=None),
-        Column(id="t.b", object_id="t", name="b"),
+        Column(id="t.a", object_id="t", name="a", **counts),
     ])
     assert key_facts(snap) == {}
 
@@ -370,6 +375,16 @@ def test_a_conditional_sum_whose_condition_is_on_the_repeated_side_is_approved()
     ) is None
 
 
+def test_a_sqlite_iif_whose_condition_is_on_the_repeated_side_is_approved():
+    """SQLite spells the conditional `IIF`, and it reaches the rule as the same IF node: its
+    condition is never summed."""
+    ast = sqlglot.parse_one(
+        "SELECT SUM(IIF(p.region = 'east', c.paid_amount_cents, 0)) FROM fact_claim c "
+        "JOIN dim_policy p ON p.policy_id = c.policy_id", read="sqlite",
+    )
+    assert check_fanout(ast, VISIBLE, KEYS) is None
+
+
 def test_a_simple_case_operand_is_a_condition():
     """`CASE p.region WHEN ...` compares `p.region`; it never adds it up."""
     assert _check(
@@ -418,6 +433,17 @@ def test_an_equality_inside_a_subquery_is_not_a_join_of_the_outer_scope():
         "SELECT SUM(c.paid_amount_cents) FROM fact_claim c JOIN dim_policy d "
         "ON c.policy_id = d.policy_id WHERE EXISTS (SELECT 1 FROM fact_premium p "
         "WHERE p.policy_id = c.policy_id)"
+    ) is None
+
+
+def test_an_aggregate_inside_a_scalar_subquery_belongs_to_the_subquery():
+    """The outer SELECT aggregates nothing; the SUM is over `fact_claim` alone, in its own
+    scope. Charged to the outer scope, where `fact_claim` repeats per premium row, it would
+    refuse a per-claim share of the total."""
+    assert _check(
+        "SELECT c.claim_id, c.paid_amount_cents * 1.0 / (SELECT SUM(paid_amount_cents) "
+        "FROM fact_claim) FROM fact_claim c JOIN dim_policy d ON d.policy_id = c.policy_id "
+        "JOIN fact_premium p ON p.policy_id = c.policy_id"
     ) is None
 
 
