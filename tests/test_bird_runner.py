@@ -239,6 +239,9 @@ def test_enrich_bird_db_cache_key_reflects_phase_toggles(monkeypatch):
     from mnemiq.config import Settings
     from mnemiq.eval.bird_runner import _enrich_cache_suffix
 
+    # The fan-out guard forks the examples suffix too (its own test); pinned off here so this
+    # one reads the phase toggles alone, whatever the guard's default is.
+    monkeypatch.setenv("MNEMIQ_GUARD_FANOUT", "0")
     monkeypatch.setenv("MNEMIQ_ENRICH_FACTS", "1")
     monkeypatch.setenv("MNEMIQ_ENRICH_EXAMPLES", "0")
     assert _enrich_cache_suffix(Settings.from_env()) == "__facts"

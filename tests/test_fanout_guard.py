@@ -209,8 +209,8 @@ def test_one_setting_reaches_the_agent_in_both_states():
     """Settings -> build_agent -> Agent. The Agent -> plan_query hop, and every other construction
     site, is held by the call-site scan in `test_undefined_term_guard.py`, which now owes
     `guard_fanout` at the same sites as `guard_undefined_terms`."""
-    assert Settings.model_fields["guard_fanout"].default is False, (
-        "off until the pre-registered measurement flips it"
+    assert Settings.model_fields["guard_fanout"].default is True, (
+        "flipped by the pre-registered measurement"
     )
     for wanted in (True, False):
         settings = Settings(guard_fanout=wanted,

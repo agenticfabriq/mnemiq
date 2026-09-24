@@ -115,9 +115,10 @@ class Settings(BaseSettings):
     # deferred 12 of 24 against a prior of 0 in 144, where the threshold named in advance was 2-3%.
     # See `plan_query` for what the number decomposes into and what reviving it would take.
     guard_undefined_terms: bool = Field(default=False, description="M35: refuse a declared business term with no certified definition (withdrawn -- see plan_query)")
-    # M109. Off until the pre-registered paired measurement says otherwise; the default is
-    # pinned by a test.
-    guard_fanout: bool = Field(default=False, description="M109: refuse an aggregate over rows a join has multiplied, as a repairable refusal (key uniqueness from column profiles)")
+    # M109. On because the pre-registered paired measurement cleared its bar once the refusal
+    # named the answer's grain: repairs on a multi-fact schema, no correct answer lost on BIRD.
+    # The default is pinned by a test.
+    guard_fanout: bool = Field(default=True, description="M109: refuse an aggregate over rows a join has multiplied, as a repairable refusal (key uniqueness from column profiles)")
     answer_markdown: bool = Field(default=False, description="let the answer use markdown (lists, tables) when the result has structure")
     enrich_facts: bool = Field(default=False, description="eval: table-facts enrichment phase (plan-20, default off)")
     enrich_examples: bool = Field(default=False, description="eval: verified-example enrichment phase (plan-20, default off)")
