@@ -348,7 +348,7 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
         # ownerless and approved an inflated sum. An alias a nested SELECT defines itself shadows
         # ours. An unqualified nested column is dropped: SQL resolves it inside the nested scope
         # first and reaches this row only when the inner tables lack it, which this does not
-        # look up -- so a BARE correlated reference is a known gap, as it was before.
+        # look up -- so a BARE correlated reference is a known gap.
         inner = col.find_ancestor(exp.Select)
         alias = col.table.lower() if col.table else None
         if inner is not select and alias not in sources:
