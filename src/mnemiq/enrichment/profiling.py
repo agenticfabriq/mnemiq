@@ -92,6 +92,9 @@ class ColumnStats:
     # On a two-valued or nullable-date column: partition label -> the columns that repeat
     # table-wide but are unique within that partition (`_profile_partitions`). None: not measured.
     unique_within: dict[str, list[str]] | None = None
+    # The error when this column's partition query failed. Kept, not only logged: the snapshot's
+    # `profile:partitions` job must not claim a table's partitions were profiled when they were not.
+    partition_failure: str | None = None
 
 
 def _top_k(adapter: SourceAdapter, table: str, column: str, k: int) -> list[tuple]:
@@ -358,5 +361,6 @@ def _profile_partitions(adapter: SourceAdapter, table: TableInfo, stats: list[Co
                 within[label] = [c for c in within[label] if c in unique] if label in within else unique
         except Exception as exc:  # noqa: BLE001 -- one partition failing costs only itself
             logger.warning("partition profile of %r.%r failed: %s", table.name, part.column, exc)
+            part.partition_failure = str(exc)
             continue
         part.unique_within = within or None

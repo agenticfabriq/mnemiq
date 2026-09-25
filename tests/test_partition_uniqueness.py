@@ -329,3 +329,41 @@ def test_flag_values_past_float_precision_keep_their_own_facts(tmp_path):
     assert check(big) is not None, "customer 1 has two rows in this batch"
     assert check(big + 1) is None
     assert check(f"{big + 1}.0") is None, "the literal side spells it exactly too"
+
+
+def test_a_failed_partition_query_leaves_the_snapshot_unprofiled(tmp_path):
+    """The job must not claim partitions were profiled when a query for them failed: that table's
+    current-row joins cannot be shown unique, and auto would refuse them."""
+    from mnemiq.enrichment.pipeline import enrich_structural
+
+    adapter = _db(tmp_path)
+
+    class _Failing:
+        dialect = adapter.dialect
+
+        def __getattr__(self, name):
+            return getattr(adapter, name)
+
+        def execute(self, sql, *a, **kw):
+            if '"is_current" IS NOT NULL GROUP BY' in sql:
+                raise RuntimeError("temp space")
+            return adapter.execute(sql, *a, **kw)
+
+    snapshot = enrich_structural(_Failing(), "shop")
+    job = next(j for j in snapshot.jobs if j.id == PARTITIONS_JOB)
+    assert job.status == "failed" and "dim_customer.is_current: temp space" in job.detail
+    assert not partitions_profiled(snapshot)
+
+
+def test_one_profiled_source_does_not_vouch_for_a_federated_legacy_one(tmp_path):
+    from mnemiq.config import SourceSpec
+    from mnemiq.enrichment.pipeline import enrich_structural
+    from mnemiq.semantic.federation import merge_snapshots
+
+    fresh = enrich_structural(_db(tmp_path), "shop")
+
+    def spec(catalog):
+        return SourceSpec(id=catalog, kind="sqlite", target="x", catalog=catalog, schema="main")
+
+    assert partitions_profiled(merge_snapshots([(spec("a"), fresh), (spec("b"), fresh)]))
+    assert not partitions_profiled(merge_snapshots([(spec("a"), fresh), (spec("b"), _legacy(fresh))]))

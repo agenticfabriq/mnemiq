@@ -63,5 +63,7 @@ def test_enrich_cache_suffix_separates_fanout_guarded_examples():
     off = _enrich_cache_suffix(Settings(enrich_examples=True, guard_fanout=False))
     on = _enrich_cache_suffix(Settings(enrich_examples=True, guard_fanout=True))
     assert off != on
+    auto = _enrich_cache_suffix(Settings(enrich_examples=True, guard_fanout=None))
+    assert auto == on, "auto screens the examples a fresh enrichment proposes"
     assert (_enrich_cache_suffix(Settings(guard_fanout=True))
             == _enrich_cache_suffix(Settings(guard_fanout=False)))

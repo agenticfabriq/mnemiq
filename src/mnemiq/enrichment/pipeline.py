@@ -142,6 +142,7 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
     columns: list[Column] = []
     source_bindings: list[SourceBinding] = []
     jobs: list[Job] = []
+    partition_failures: list[str] = []
 
     # Declared-FK child columns are keys, not coded vocabularies -- even when their names
     # (CDSCode, ID) don't match the naming gate. Fail-soft: no catalog FKs -> the gate stands.
@@ -186,6 +187,8 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
             # `kind` is deliberately not "profile": `profile_outcome` and `_cmd_enrich` both
             # filter on that exact string to count TABLES, and a column job landing in that count
             # would report a table that does not exist.
+            partition_failures += [f"{table.name}.{st.column}: {st.partition_failure}"
+                                   for st in stats.values() if st.partition_failure]
             unmeasured = [st for st in stats.values() if st.measurement == FAILED]
             for st in unmeasured:
                 jobs.append(Job(id=f"profile:{table.name}.{st.column}", source_id=source_id,
@@ -237,10 +240,13 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
     jobs.append(Job(id="discover:views", source_id=source_id, kind="discover", status=status))
     # Per-partition key uniqueness ran inside `profile_table`, fail-soft per column. Recorded as
     # its own job because "profiled, found none" and "never profiled" carry the same facts, and
-    # the fan-out guard's auto setting must tell them apart (`guard_on`). Not kind "profile":
-    # that string counts tables.
+    # the fan-out guard's auto setting must tell them apart (`guard_on`). `failed` when any
+    # partition query failed: that table's current-row joins cannot be shown unique, so auto must
+    # not count the snapshot as profiled. A table that failed outright is not in the model at all.
+    # Not kind "profile": that string counts tables.
     jobs.append(Job(id=PARTITIONS_JOB, source_id=source_id, kind="profile:partitions",
-                    status="done"))
+                    status="failed" if partition_failures else "done",
+                    detail="; ".join(partition_failures)[:2000] or None))
 
     snapshot = Snapshot(
         version="",
