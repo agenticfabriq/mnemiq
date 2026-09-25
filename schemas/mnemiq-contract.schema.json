@@ -172,6 +172,24 @@
             ],
             "default": null,
             "title": "Semantic Type"
+          },
+          "unique_within": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Unique Within"
           }
         },
         "required": [
@@ -1141,6 +1159,24 @@
             ],
             "default": null,
             "title": "Semantic Type"
+          },
+          "unique_within": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Unique Within"
           }
         },
         "required": [
