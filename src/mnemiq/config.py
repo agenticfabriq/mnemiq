@@ -115,10 +115,11 @@ class Settings(BaseSettings):
     # deferred 12 of 24 against a prior of 0 in 144, where the threshold named in advance was 2-3%.
     # See `plan_query` for what the number decomposes into and what reviving it would take.
     guard_undefined_terms: bool = Field(default=False, description="M35: refuse a declared business term with no certified definition (withdrawn -- see plan_query)")
-    # M109. Off: the pre-registered paired measurement's no-harm bar on BIRD (at most one
-    # correct answer lost) was not met on the final code, though the repairs on a multi-fact
-    # schema cleared theirs. The default is pinned by a test.
-    guard_fanout: bool = Field(default=False, description="M109: refuse an aggregate over rows a join has multiplied, as a repairable refusal (key uniqueness from column profiles)")
+    # M109. On: a pre-registered three-run measurement cleared both bars -- repairs on a
+    # multi-fact schema (net +6, none broken, every run) and no harm on BIRD (mean broken 0.0
+    # against 1.0). A snapshot enriched before per-partition profiling refuses current-row SCD
+    # joins until re-enriched. The default is pinned by a test.
+    guard_fanout: bool = Field(default=True, description="M109: refuse an aggregate over rows a join has multiplied, as a repairable refusal (key uniqueness from column profiles)")
     answer_markdown: bool = Field(default=False, description="let the answer use markdown (lists, tables) when the result has structure")
     enrich_facts: bool = Field(default=False, description="eval: table-facts enrichment phase (plan-20, default off)")
     enrich_examples: bool = Field(default=False, description="eval: verified-example enrichment phase (plan-20, default off)")

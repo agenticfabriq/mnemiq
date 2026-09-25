@@ -209,8 +209,8 @@ def test_one_setting_reaches_the_agent_in_both_states():
     """Settings -> build_agent -> Agent. The Agent -> plan_query hop, and every other construction
     site, is held by the call-site scan in `test_undefined_term_guard.py`, which now owes
     `guard_fanout` at the same sites as `guard_undefined_terms`."""
-    assert Settings.model_fields["guard_fanout"].default is False, (
-        "off: the pre-registered measurement's BIRD no-harm bar was not met on the final code"
+    assert Settings.model_fields["guard_fanout"].default is True, (
+        "on: the pre-registered three-run measurement cleared both its bars"
     )
     for wanted in (True, False):
         settings = Settings(guard_fanout=wanted,
@@ -225,8 +225,9 @@ def test_one_setting_reaches_the_agent_in_both_states():
 def test_with_the_guard_on_an_as_of_dimension_join_is_answered():
     """The case that made default-on unsafe: a type-2 dimension joined as of the fact's date was
     refused, every repair that kept the join was refused again, and the question deferred. Through
-    `plan_query` with the guard on, it now plans. (Joined on a current-row flag it still refuses
-    -- a pinned known limit in test_fanout_check.)"""
+    `plan_query` with the guard on, it now plans. (Joined on a current-row flag it plans once the
+    profile records the flag's partitions -- test_partition_uniqueness -- and refuses on a snapshot
+    that has none.)"""
 
     profile = {
         "orders": {"customer_id": (1000, 200, 0), "amount": (1000, 900, 0),
