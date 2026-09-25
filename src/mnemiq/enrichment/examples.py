@@ -11,7 +11,7 @@ from mnemiq.enrichment.proposals import _clean_text, _extract_json
 from mnemiq.execute.runner import ExecutionError, run
 from mnemiq.semantic.cards import build_cards
 from mnemiq.sql.decide import decide
-from mnemiq.sql.fanout_check import key_facts
+from mnemiq.sql.fanout_check import guard_on, key_facts
 from mnemiq.sql.verdict import Approved
 
 _MAX_QUESTION = 300
@@ -97,7 +97,7 @@ def _visible_for(snapshot: Snapshot, table: str) -> dict[str, set[str]]:
 
 def enrich_examples(
     snapshot: Snapshot, generator: ExampleGenerator, adapter, dialect: str = "duckdb",
-    per_table: int = 3, *, guard_fanout: bool = False,
+    per_table: int = 3, *, guard_fanout: bool | None = False,
 ) -> Snapshot:
     """Third LLM phase: verified worked examples. Keeps only decider-approved, executed,
     rows>0 pairs. Fail-soft per table; re-versions.
@@ -107,7 +107,7 @@ def enrich_examples(
     query the guard would refuse at ask time was taught as one.
     """
     cards = {c.object_id: c.text for c in build_cards(snapshot)}
-    keys = key_facts(snapshot) if guard_fanout else None
+    keys = key_facts(snapshot) if guard_on(guard_fanout, snapshot) else None
 
     kept: list[Example] = []
     for table in cards:

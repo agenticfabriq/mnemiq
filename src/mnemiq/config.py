@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import field_validator, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The Verity endpoint the certified pull needs, as a VALUE. It is the one that accepts `since`
@@ -115,11 +115,13 @@ class Settings(BaseSettings):
     # deferred 12 of 24 against a prior of 0 in 144, where the threshold named in advance was 2-3%.
     # See `plan_query` for what the number decomposes into and what reviving it would take.
     guard_undefined_terms: bool = Field(default=False, description="M35: refuse a declared business term with no certified definition (withdrawn -- see plan_query)")
-    # M109. On: a pre-registered three-run measurement cleared both bars -- repairs on a
-    # multi-fact schema (net +6, none broken, every run) and no harm on BIRD (mean broken 0.0
-    # against 1.0). A snapshot enriched before per-partition profiling refuses current-row SCD
-    # joins until re-enriched. The default is pinned by a test.
-    guard_fanout: bool = Field(default=True, description="M109: refuse an aggregate over rows a join has multiplied, as a repairable refusal (key uniqueness from column profiles)")
+    # M109. Unset means auto: on for a snapshot whose partitions were profiled, off for one
+    # enriched before that, where current-row SCD joins would be refused until re-enrichment --
+    # so an upgrade changes nothing until the snapshot can support the guard. A pre-registered
+    # three-run measurement cleared both bars with it on: repairs on a multi-fact schema (net
+    # +6, none broken, every run) and no harm on BIRD (mean broken 0.0 against 1.0). An explicit
+    # 1 or 0 wins over auto. The default is pinned by a test.
+    guard_fanout: bool | None = Field(default=None, description="M109: refuse an aggregate over rows a join has multiplied, as a repairable refusal; unset or auto = on when the snapshot's partitions were profiled, 1 = always, 0 = never")
     answer_markdown: bool = Field(default=False, description="let the answer use markdown (lists, tables) when the result has structure")
     enrich_facts: bool = Field(default=False, description="eval: table-facts enrichment phase (plan-20, default off)")
     enrich_examples: bool = Field(default=False, description="eval: verified-example enrichment phase (plan-20, default off)")
@@ -325,6 +327,15 @@ class Settings(BaseSettings):
                                catalog=d["catalog"], schema=d["schema"]) for d in raw]
         return [SourceSpec(id=self.source_id or "acme", kind="postgres",
                            target=self.pg_dsn or "", catalog="src", schema="public")]
+
+    @field_validator("guard_fanout", mode="before")
+    @classmethod
+    def _auto_is_unset(cls, value):
+        # `.env.example` renders an unset default as `MNEMIQ_GUARD_FANOUT=`, and a sourced copy
+        # sets the variable to "" -- which a plain optional bool refuses, failing every boot.
+        if isinstance(value, str) and value.strip().lower() in ("", "auto"):
+            return None
+        return value
 
     @classmethod
     def env_example(cls) -> str:

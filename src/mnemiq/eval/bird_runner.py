@@ -372,8 +372,9 @@ def _enrich_cache_suffix(
         parts.append("facts")
     if settings.enrich_examples:
         # the fan-out guard decides which proposed examples survive -> a guard-off example set
-        # must not be reused with the guard on (M109)
-        parts.append("examples_fanout" if settings.guard_fanout else "examples")
+        # must not be reused with the guard on (M109). Auto (None) screens here: this runner
+        # always enriches afresh, and a fresh snapshot has its partitions profiled.
+        parts.append("examples_fanout" if settings.guard_fanout is not False else "examples")
     if settings.dictionary_path:
         # a dictionary changes grounded meanings -> must not reuse a no-dict (or other-dict)
         # snapshot. Content edits to the same path still need --refresh (as grounding itself does).

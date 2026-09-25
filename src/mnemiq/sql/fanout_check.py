@@ -29,6 +29,36 @@ class KeyFacts(dict):
     partitions: MappingProxyType = MappingProxyType({})  # read-only default; key_facts sets its own
 
 
+PARTITIONS_JOB = "profile:partitions"  # recorded by enrich_structural once partitions are profiled
+_warned: set[tuple[str, str]] = set()
+
+
+def partitions_profiled(snapshot) -> bool:
+    """Whether enrichment profiled key uniqueness per partition for this snapshot -- found or
+    not. A database can legitimately record none, so the job, not the facts, is the signal."""
+    return any(j.id == PARTITIONS_JOB and j.status == "done"
+               for j in getattr(snapshot, "jobs", None) or [])
+
+
+def guard_on(setting: bool | None, snapshot) -> bool:
+    """Whether the fan-out check runs for this snapshot. An explicit setting wins. Unset (auto),
+    it runs exactly when the snapshot's partitions were profiled: on an older snapshot a
+    current-row SCD join would be refused -- the join is correct, the key facts cannot yet show
+    it -- so auto leaves that snapshot as it was, and says so once."""
+    if setting is not None:
+        return setting
+    if partitions_profiled(snapshot):
+        return True
+    seen = (getattr(snapshot, "source_id", ""), getattr(snapshot, "version", ""))
+    if seen not in _warned:
+        _warned.add(seen)
+        logger.warning(
+            "fan-out guard off for snapshot %s of %r: it was enriched before per-partition "
+            "profiling, so current-row SCD joins would be refused. Re-enrich to turn it on, or "
+            "set MNEMIQ_GUARD_FANOUT=1 to force it.", seen[1], seen[0])
+    return False
+
+
 def partition_label(value) -> str:
     """How a value names a profiled partition -- the one spelling profiling and the check share.
 

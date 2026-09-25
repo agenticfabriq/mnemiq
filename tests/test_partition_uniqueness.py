@@ -8,6 +8,7 @@ inflated sum -- but one GROUP BY per two-valued (or nullable date) column at pro
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 from decimal import Decimal
 
@@ -18,7 +19,8 @@ from mnemiq.adapters.sqlite import SQLiteAdapter
 from mnemiq.catalog import introspect
 from mnemiq.contract import Column, Snapshot
 from mnemiq.enrichment.profiling import profile_table
-from mnemiq.sql.fanout_check import check_fanout, key_facts, partition_label
+from mnemiq.sql.fanout_check import (PARTITIONS_JOB, check_fanout, key_facts, partition_label,
+                                     partitions_profiled)
 from mnemiq.sql.schema import schema_map
 
 
@@ -215,30 +217,89 @@ def test_without_partition_facts_a_current_row_filter_still_refuses():
 # -- end to end --------------------------------------------------------------------------------------
 
 
-def test_a_current_row_join_plans_after_structural_enrichment(tmp_path):
-    from mnemiq.authz.grants import GrantSet
-    from mnemiq.enrichment.pipeline import enrich_structural
-    from mnemiq.generate.generator import FakeGenerator
-    from mnemiq.generate.plan_query import Deferred, plan_query
-    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
-    from mnemiq.sql.verdict import Approved
+_CURRENT = _JOIN + " AND d.is_current = 1 GROUP BY d.tier"
+_HISTORY = _JOIN + " AND d.is_current = 0 GROUP BY d.tier"
 
-    snapshot = enrich_structural(_db(tmp_path), "shop")
+
+def _plan(snapshot, sql, guard):
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.generate.generator import FakeGenerator
+    from mnemiq.generate.plan_query import plan_query
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+
     packet = ContextPacket(
         question="revenue by customer tier",
         cards=[RetrievedCard(object_id="orders", card="TABLE orders", score=1.0),
                RetrievedCard(object_id="dim_customer", card="TABLE dim_customer", score=1.0)],
         grant_fingerprint="fp", enrichment_version="v1")
-    grants = GrantSet(frozenset({"orders", "dim_customer"}))
+    return plan_query(packet, snapshot, GrantSet(frozenset({"orders", "dim_customer"})),
+                      FakeGenerator([f'{{"sql": "{sql}"}}']), target="sqlite", dialect="sqlite",
+                      max_attempts=1, guard_fanout=guard)
 
-    def plan(sql):
-        return plan_query(packet, snapshot, grants, FakeGenerator([f'{{"sql": "{sql}"}}']),
-                          target="sqlite", dialect="sqlite", max_attempts=1, guard_fanout=True)
 
-    current = plan(_JOIN + " AND d.is_current = 1 GROUP BY d.tier")
-    history = plan(_JOIN + " AND d.is_current = 0 GROUP BY d.tier")
-    assert isinstance(current, Approved)
-    assert isinstance(history, Deferred)
+def _legacy(snapshot):
+    """The same snapshot as one persisted before per-partition profiling: no partition facts and
+    no job saying they were profiled, round-tripped through JSON as a stored snapshot is."""
+    raw = json.loads(snapshot.model_dump_json())
+    for column in raw["columns"]:
+        column.pop("unique_within", None)
+    raw["jobs"] = [j for j in raw["jobs"] if j["id"] != PARTITIONS_JOB]
+    return Snapshot.model_validate(raw)
+
+
+def test_a_current_row_join_plans_after_structural_enrichment(tmp_path):
+    from mnemiq.enrichment.pipeline import enrich_structural
+    from mnemiq.generate.plan_query import Deferred
+    from mnemiq.sql.verdict import Approved
+
+    snapshot = enrich_structural(_db(tmp_path), "shop")
+    assert isinstance(_plan(snapshot, _CURRENT, True), Approved)
+    assert isinstance(_plan(snapshot, _HISTORY, True), Deferred)
+
+
+# -- rollout: auto is on exactly where the snapshot can support it ----------------------------------
+
+
+def test_enrichment_records_that_partitions_were_profiled(tmp_path):
+    from mnemiq.enrichment.pipeline import enrich_structural
+
+    snapshot = enrich_structural(_db(tmp_path), "shop")
+    job = next(j for j in snapshot.jobs if j.id == PARTITIONS_JOB)
+    assert job.status == "done" and job.kind != "profile", "kind 'profile' counts tables"
+    assert partitions_profiled(snapshot) and not partitions_profiled(_legacy(snapshot))
+
+
+def test_auto_on_a_freshly_enriched_snapshot_is_on(tmp_path):
+    from mnemiq.enrichment.pipeline import enrich_structural
+    from mnemiq.generate.plan_query import Deferred
+    from mnemiq.sql.verdict import Approved
+
+    snapshot = enrich_structural(_db(tmp_path), "shop")
+    assert isinstance(_plan(snapshot, _CURRENT, None), Approved)
+    assert isinstance(_plan(snapshot, _HISTORY, None), Deferred), "the guard is on"
+
+
+def test_auto_on_a_snapshot_enriched_before_partitions_changes_nothing(tmp_path, caplog,
+                                                                      monkeypatch):
+    """The upgrade: a stored snapshot has no partition facts, so with the guard on a correct
+    current-row join is refused until re-enrichment. Auto leaves such a snapshot as it was and
+    says so, once; an explicit setting still forces the guard."""
+    import logging
+
+    from mnemiq.enrichment.pipeline import enrich_structural
+    from mnemiq.generate.plan_query import Deferred
+    from mnemiq.sql.verdict import Approved
+
+    from mnemiq.sql import fanout_check
+
+    monkeypatch.setattr(fanout_check, "_warned", set())  # once per process: start this one clean
+    legacy = _legacy(enrich_structural(_db(tmp_path), "shop"))
+    with caplog.at_level(logging.WARNING, logger="mnemiq.sql.fanout_check"):
+        assert isinstance(_plan(legacy, _CURRENT, None), Approved)
+        assert isinstance(_plan(legacy, _HISTORY, None), Approved), "off: as before the upgrade"
+    warnings = [r for r in caplog.records if "enriched before per-partition" in r.getMessage()]
+    assert len(warnings) == 1, "said once per snapshot, not once per question"
+    assert isinstance(_plan(legacy, _CURRENT, True), Deferred), "explicit 1 forces it"
 
 
 def test_flag_values_past_float_precision_keep_their_own_facts(tmp_path):

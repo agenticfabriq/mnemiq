@@ -9,6 +9,7 @@ from mnemiq.catalog import introspect
 from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding, ViewDefinition
 from mnemiq.enrichment.joins import build_relationships
 from mnemiq.enrichment.profiling import FAILED, profile_table
+from mnemiq.sql.fanout_check import PARTITIONS_JOB
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +235,12 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
     except Exception:
         views, status = [], "failed"
     jobs.append(Job(id="discover:views", source_id=source_id, kind="discover", status=status))
+    # Per-partition key uniqueness ran inside `profile_table`, fail-soft per column. Recorded as
+    # its own job because "profiled, found none" and "never profiled" carry the same facts, and
+    # the fan-out guard's auto setting must tell them apart (`guard_on`). Not kind "profile":
+    # that string counts tables.
+    jobs.append(Job(id=PARTITIONS_JOB, source_id=source_id, kind="profile:partitions",
+                    status="done"))
 
     snapshot = Snapshot(
         version="",

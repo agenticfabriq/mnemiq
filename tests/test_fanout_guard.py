@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 import pyarrow as pa
+import pytest
 
 from mnemiq.agent.modes import MODES, build_agent
 from mnemiq.agent.synthesize import FakeSynthesizer
@@ -205,14 +206,15 @@ def test_instant_mode_withholds_a_fan_out_it_cannot_repair():
 # -- the setting --------------------------------------------------------------------------------------
 
 
-def test_one_setting_reaches_the_agent_in_both_states():
+def test_one_setting_reaches_the_agent_in_every_state():
     """Settings -> build_agent -> Agent. The Agent -> plan_query hop, and every other construction
     site, is held by the call-site scan in `test_undefined_term_guard.py`, which now owes
     `guard_fanout` at the same sites as `guard_undefined_terms`."""
-    assert Settings.model_fields["guard_fanout"].default is True, (
-        "on: the pre-registered three-run measurement cleared both its bars"
+    assert Settings.model_fields["guard_fanout"].default is None, (
+        "auto: on wherever the snapshot's partitions were profiled -- the pre-registered "
+        "three-run measurement cleared both its bars -- and unchanged on an older snapshot"
     )
-    for wanted in (True, False):
+    for wanted in (True, False, None):
         settings = Settings(guard_fanout=wanted,
                             llm_base_url="http://localhost:1/v1", llm_api_key="unused")
         agent = build_agent(
@@ -220,6 +222,20 @@ def test_one_setting_reaches_the_agent_in_both_states():
             corrector=None, values=None, selector=None, guard_fanout=settings.guard_fanout,
         )
         assert agent.guard_fanout is wanted
+
+
+@pytest.mark.parametrize("raw, parsed", [
+    (None, None), ("", None), ("auto", None), (" AUTO ", None),
+    ("1", True), ("true", True), ("0", False), ("false", False),
+])
+def test_the_setting_reads_unset_empty_and_auto_as_auto(monkeypatch, raw, parsed):
+    """`.env.example` renders the unset default as `MNEMIQ_GUARD_FANOUT=`; a sourced copy sets it
+    to "", which a plain optional bool refuses at every boot."""
+    if raw is None:
+        monkeypatch.delenv("MNEMIQ_GUARD_FANOUT", raising=False)
+    else:
+        monkeypatch.setenv("MNEMIQ_GUARD_FANOUT", raw)
+    assert Settings().guard_fanout is parsed
 
 
 def test_with_the_guard_on_an_as_of_dimension_join_is_answered():
