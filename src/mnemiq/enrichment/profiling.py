@@ -89,6 +89,9 @@ class ColumnStats:
     # the driver's error text for FAILED, and the standing reason for
     # UNSUPPORTED. `None` only on a column that measured.
     failure: str | None = None
+    # On a two-valued or nullable-date column: partition label -> the columns that repeat
+    # table-wide but are unique within that partition (`_profile_partitions`). None: not measured.
+    unique_within: dict[str, list[str]] | None = None
 
 
 def _top_k(adapter: SourceAdapter, table: str, column: str, k: int) -> list[tuple]:
@@ -286,4 +289,74 @@ def profile_table(
             # dictionary can never ground it and the model never sees it. Bounded by the cap.
             s.top_k = _top_k(adapter, table.name, c, code_max_distinct)
         stats.append(s)
+    _profile_partitions(adapter, table, stats)
     return stats
+
+
+# At most this many partition queries per table: each is one more scan, and a wide table can have
+# many two-valued columns. Flags first, then validity ends.
+_PARTITION_CAP = 8
+_DATE_TYPES = ("DATE", "TIMESTAMP", "DATETIME")
+
+
+def _profile_partitions(adapter: SourceAdapter, table: TableInfo, stats: list[ColumnStats],
+                        cap: int = _PARTITION_CAP) -> None:
+    """Record, per partition of a two-valued or nullable-date column, which repeating columns it
+    makes unique.
+
+    The fan-out guard reads key uniqueness table-wide, so a type-2 dimension joined on its current
+    row (`is_current = 1`, `valid_to IS NULL`) was refused: `customer_id` repeats across a
+    customer's history. Syntax cannot tell that filter from an ordinary binary one
+    (`is_returned = 0`), which narrows nothing; the rows can. One GROUP BY per candidate column
+    says which columns are unique among each partition's rows, and only those that repeat
+    table-wide are recorded -- the rest need no pinning. A query that fails costs its partition
+    and nothing else.
+    """
+    from mnemiq.sql.fanout_check import partition_label
+
+    types = {c.name: _base_type(c.data_type or "") for c in table.columns}
+    measured = [s for s in stats if s.measurement == MEASURED and s.distinct_count is not None]
+    repeating = [s.column for s in measured
+                 if s.distinct_count < s.row_count - (s.null_count or 0)]
+    if not repeating:
+        return
+    def is_date(s: ColumnStats) -> bool:
+        return any(types.get(s.column, "").startswith(t) for t in _DATE_TYPES)
+
+    # (column, "flag" | "end"). A date with two values is not a flag; a nullable date is a
+    # validity end whatever its count, so it gets its IS NULL partition.
+    candidates = [(s, "flag") for s in measured
+                  if 0 < s.distinct_count <= 2 and not is_date(s) and not is_sensitive_name(s.column)]
+    candidates += [(s, "end") for s in measured if is_date(s) and (s.null_count or 0) > 0]
+    if len(candidates) > cap:
+        logger.info("partition profile of %r capped at %d of %d columns", table.name, cap,
+                    len(candidates))
+    for part, kind in candidates[:cap]:
+        others = [c for c in repeating if c != part.column]
+        if not others:
+            continue
+        counts = ", ".join(f'count(DISTINCT "{c}"), count("{c}")' for c in others)
+        try:
+            if kind == "flag":
+                rows = adapter.execute(
+                    f'SELECT "{part.column}", count(*), {counts} FROM "{table.name}" '
+                    f'WHERE "{part.column}" IS NOT NULL GROUP BY "{part.column}"')
+                groups = [(partition_label(row[0]), row[1:]) for row in rows]
+            else:
+                rows = adapter.execute(
+                    f'SELECT count(*), {counts} FROM "{table.name}" WHERE "{part.column}" IS NULL')
+                groups = [("IS NULL", rows[0])]
+            within: dict[str, list[str]] = {}
+            for label, (size, *row) in groups:
+                # EVERY label is recorded, so the value set is known (a bare `F` resolves against
+                # it). A one-row partition makes every column unique by default -- true today, and
+                # the first new row can end it -- so it records no columns.
+                unique = [] if size < 2 else [
+                    c for i, c in enumerate(others) if row[2 * i + 1] and row[2 * i] == row[2 * i + 1]]
+                # Two values spelled alike would pool their facts under one label; keep only what
+                # holds in both, never the last group's word.
+                within[label] = [c for c in within[label] if c in unique] if label in within else unique
+        except Exception as exc:  # noqa: BLE001 -- one partition failing costs only itself
+            logger.warning("partition profile of %r.%r failed: %s", table.name, part.column, exc)
+            continue
+        part.unique_within = within or None

@@ -375,8 +375,9 @@ def test_a_current_row_filter_still_refuses_known_limit(current_row):
     """Correct on a type-2 dimension, and still refused. Syntax cannot tell `is_current` from an
     ordinary binary filter (`is_returned = 'N'`), nor `valid_to IS NULL` from `cancel_date IS
     NULL`; reading them as narrowing let an ordinary filter switch the guard off for an inflated
-    sum -- a silent wrong number, where this is a visible deferral. Telling them apart needs the
-    data: key uniqueness per flag value. Pinned so a change here is a decision."""
+    sum -- a silent wrong number, where this is a visible deferral. The data tells them apart --
+    key uniqueness per partition, profiled at enrichment (test_partition_uniqueness) -- but these
+    facts carry no partitions, as an older snapshot does not: then it refuses. Pinned."""
     assert _scd(_SCD_JOIN + current_row) is not None
 
 

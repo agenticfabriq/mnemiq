@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import numbers
+from decimal import Decimal, InvalidOperation
+from types import MappingProxyType
 
 from sqlglot import exp
 from sqlglot.optimizer.merge_subqueries import merge_subqueries
@@ -13,9 +16,59 @@ from mnemiq.sql.verdict import Refusal, RefusalCode
 
 logger = logging.getLogger(__name__)
 
-# (object_id, column name) -> True when the column's non-null values are all distinct, False when
-# some repeat. A column the profile never measured is ABSENT, and absence is never read as either.
-KeyFacts = dict[tuple[str, str], bool]
+class KeyFacts(dict):
+    """(object_id, column name) -> True when the column's non-null values are all distinct, False
+    when some repeat. A column the profile never measured is ABSENT, and absence is never read as
+    either.
+
+    `partitions` maps (object_id, column, partition label) to the columns unique among that
+    partition's rows (`Column.unique_within`). A plain dict works wherever a KeyFacts does: it
+    simply has no partitions.
+    """
+
+    partitions: MappingProxyType = MappingProxyType({})  # read-only default; key_facts sets its own
+
+
+def partition_label(value) -> str:
+    """How a value names a profiled partition -- the one spelling profiling and the check share.
+
+    `=true`, `=1`, `='Y'`, or `IS NULL`. A number is written as an integer when it is one, so a
+    driver's 1.0 and a query's 1 meet; a string keeps its case, as SQL equality does.
+    """
+    if value is None:
+        return "IS NULL"
+    if isinstance(value, bool):
+        return "=true" if value else "=false"
+    if isinstance(value, numbers.Number):
+        return f"={_exact(value)}"
+    return f"='{value}'"
+
+
+def _exact(value) -> str:
+    """A number's exact decimal spelling: 1.0 and 1 meet, 1.50 and 1.5 meet, and every digit of an
+    integer is kept. A float round trip spelled 2**53 and 2**53 + 1 the same, and profiling then
+    gave one partition the other's facts.
+
+    Built from the digits and exponent, never through `int()` or a context-bound `normalize()`: a
+    query's literal is untrusted, and `1e5000` would exceed the integer-string limit while
+    `1e99999999` would build a hundred-million-digit integer. Plain notation up to 30 places either
+    side of the point, `str()` beyond. Two values never share a spelling: either form parses back to
+    exactly the value it came from."""
+    try:
+        number = value if isinstance(value, Decimal) else Decimal(str(value))  # a float's shortest repr
+    except InvalidOperation:
+        return str(value)
+    if not number.is_finite():
+        return str(number)
+    sign, digits, exponent = number.as_tuple()
+    kept = len(digits)
+    while kept > 1 and digits[kept - 1] == 0:  # 1.50 -> 1.5, 10 -> 1E+1
+        kept -= 1
+    exponent += len(digits) - kept
+    if digits[:kept] == (0,):
+        return "0"  # -0 is 0 to SQL
+    canonical = Decimal((sign, digits[:kept], exponent))
+    return format(canonical, "f") if -30 <= exponent <= 30 else str(canonical)
 
 
 def key_facts(snapshot: Snapshot) -> KeyFacts:
@@ -26,13 +79,17 @@ def key_facts(snapshot: Snapshot) -> KeyFacts:
     escapes schema metadata. The profile's `count(DISTINCT col)` is exact, so this is a fact about
     the data at profiling time, not an estimate.
     """
-    facts: KeyFacts = {}
+    facts = KeyFacts()
+    partitions: dict[tuple[str, str, str], frozenset[str]] = {}
     for column in snapshot.columns:
+        for label, unique in (column.unique_within or {}).items():
+            partitions[(column.object_id, column.name, label)] = frozenset(unique)
         if column.row_count is None or column.distinct_count is None or column.null_count is None:
             continue
         facts[(column.object_id, column.name)] = (
             column.distinct_count == column.row_count - column.null_count
         )
+    facts.partitions = partitions
     return facts
 
 
@@ -298,7 +355,12 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
         if asof in (a, b):
             at_most_one.add((b, a) if asof == a else (a, b))
 
-    conditions: list[tuple[exp.Expression, str | None]] = []  # (condition, its ASOF right side)
+    # (condition, its ASOF right side, the aliases it can FILTER -- None for all). A conjunct in
+    # an outer join's ON removes no row of the preserved side: `LEFT JOIN x ON ... AND
+    # d.is_current = 1` still joins every history row of `d`, and reading it as a filter on `d`
+    # approved an inflated sum. WHERE and an inner ON filter every alias; a LEFT JOIN's ON only
+    # its right side; a RIGHT or FULL JOIN's ON none.
+    conditions: list[tuple[exp.Expression, str | None, set[str] | None]] = []
     # USING binds to the tables LEFT of the join, and after `a JOIN b USING (k)` the merged `k`
     # equals both `a.k` and `b.k` -- so a later `JOIN c USING (k)` is an edge to each of them.
     # Binding to "the one other table with that column" instead refuses nothing on a three-way
@@ -317,7 +379,9 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
         # but one right row can meet many left rows, and that direction stays an edge.
         asof = right if str(join.args.get("method") or "").upper() == "ASOF" else None
         if join.args.get("on") is not None:
-            conditions.append((join.args["on"], asof))
+            side = str(join.args.get("side") or "").upper()
+            filters = None if not side else {right} if side == "LEFT" and right else set()
+            conditions.append((join.args["on"], asof, filters))
         for ident in join.args.get("using") or []:
             if right not in sources:
                 continue
@@ -327,8 +391,8 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
         if right is not None:
             earlier.append(right)
     if select.args.get("where") is not None:
-        conditions.append((select.args["where"].this, None))
-    for condition, asof in conditions:
+        conditions.append((select.args["where"].this, None, None))
+    for condition, asof, _ in conditions:
         for eq in condition.find_all(exp.EQ):
             if eq.find_ancestor(exp.Select) is not select:
                 continue  # inside a subquery: its columns belong to another scope
@@ -348,17 +412,34 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
     # and unknown never fires. Nothing wider: counting a flag (`is_current`), an equality or an
     # IS NULL let an ordinary binary filter (`is_returned = 'N'`) switch the guard off for an
     # inflated sum -- a silent wrong number where a refusal is a visible deferral -- and syntax
-    # cannot tell a current-row flag from one. So a current-row filter still refuses (known
-    # limit); telling them apart needs the data -- key uniqueness per flag value.
+    # cannot tell a current-row flag from one. The DATA can: `pinned` below.
     narrowed: dict[str, set[str]] = {}
+    # alias -> the columns a filter pins to one row per value, per the profile's partitions
+    # (`Column.unique_within`): among the rows where `is_current = 1`, `customer_id` is unique, a
+    # definite fact, not a guess -- while among the rows where `is_returned = 0`, `product_id`
+    # still repeats and nothing is recorded. A snapshot without partitions pins nothing.
+    partitions = getattr(facts, "partitions", {})
+    pinned: dict[str, set[str]] = {}
 
     def conjuncts(e: exp.Expression):
         e = e.unnest()  # flatten() unwraps parentheses inside the AND chain itself
         return e.flatten() if isinstance(e, exp.And) else [e]
 
-    for condition, _ in conditions:
+    for condition, _, filters in conditions:
         for c in conjuncts(condition):
             if not isinstance(c, exp.Between):
+                col, labels = _partition_filter(c)
+                alias = owner(col) if col is not None and col.find_ancestor(exp.Select) is select \
+                    else None
+                if alias is None or (filters is not None and alias not in filters):
+                    continue
+                name = _spelling(col.name, visible.get(sources[alias], ()))
+                if labels is _TRUTHY:
+                    labels = _truthy_label(partitions, sources[alias], name)
+                for label in labels:
+                    unique = partitions.get((sources[alias], name, label))
+                    if unique:
+                        pinned.setdefault(alias, set()).update(u.lower() for u in unique)
                 continue
             bounds, tested = [c.args.get("low"), c.args.get("high")], c.this
             if not all(isinstance(x, exp.Column) and x.find_ancestor(exp.Select) is select
@@ -368,6 +449,8 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
             if len(owners) != 1 or None in owners or owner(tested) in owners | {None}:
                 continue
             alias = owners.pop()
+            if filters is not None and alias not in filters:
+                continue
             names = [_spelling(x.name, visible.get(sources[alias], ())) for x in bounds]
             if None not in names:
                 narrowed.setdefault(alias, set()).update(n.lower() for n in names)
@@ -375,6 +458,8 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
     def repeats(alias: str, key: tuple[str, ...]) -> bool:
         if _unique(facts, sources[alias], key) is not False:
             return False
+        if {k.lower() for k in key} <= pinned.get(alias, set()):
+            return False  # the filter leaves one row per key value, per the profile
         return not narrowed.get(alias, set()) - {k.lower() for k in key}
 
     adj: dict[str, list[str]] = {a: [] for a in sources}
@@ -468,6 +553,50 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
     if chasm is not None:
         return _counted_chasm(chasm, sources)
     return None
+
+
+_TRUTHY = ["<truthy>"]  # a bare `F` or `F IS TRUE`; resolved by `_truthy_label`
+
+
+def _truthy_label(partitions, table: str, column: str) -> list[str]:
+    """Which partition a bare `F` or `F IS TRUE` picks: `=true` on a boolean column, `=1` on a
+    0/1 flag, and nothing otherwise -- on values {1, 2} a bare `F` keeps both partitions, and
+    reading it as `= 1` pinned a key the other partition repeats. The profile records every
+    value's label, so the value set is known."""
+    labels = {label for (t, c, label) in partitions if t == table and c == column}
+    if labels and labels <= {"=true", "=false"}:
+        return ["=true"]
+    if labels and labels <= {"=0", "=1"}:
+        return ["=1"]
+    return []
+
+
+def _partition_filter(c: exp.Expression) -> tuple[exp.Column | None, list[str]]:
+    """The column a filter conjunct restricts, and the partition labels it may pick.
+
+    `F = 1` -> `=1`; `F = 'Y'` -> `='Y'`; a bare `F` or `F IS TRUE` -> `_TRUTHY`, resolved against
+    the column's profiled values (`_truthy_label`); `F IS NULL` -> `IS NULL`. Anything else picks
+    no profiled partition.
+    """
+    if isinstance(c, exp.Column):
+        return c, _TRUTHY
+    if isinstance(c, exp.Is) and isinstance(c.this, exp.Column):
+        if isinstance(c.expression, exp.Null):
+            return c.this, ["IS NULL"]
+        if isinstance(c.expression, exp.Boolean) and c.expression.this:
+            return c.this, _TRUTHY
+    if isinstance(c, exp.EQ):
+        for col, value in ((c.left, c.right), (c.right, c.left)):
+            if isinstance(col, exp.Column) and isinstance(value, exp.Boolean):
+                return col, [partition_label(bool(value.this))]
+            if isinstance(col, exp.Column) and isinstance(value, exp.Literal):
+                if value.is_string:
+                    return col, [partition_label(value.this)]
+                try:
+                    return col, [partition_label(Decimal(value.this))]
+                except InvalidOperation:
+                    return None, []
+    return None, []
 
 
 def _defines(select: exp.Select) -> set[str]:

@@ -41,6 +41,10 @@ class Column(BaseModel):
     row_count: int | None = None
     distinct_count: int | None = None
     null_count: int | None = None
+    # On a two-valued or nullable-date column: partition label (`=1`, `=true`, `='Y'`, `IS NULL`)
+    # -> the other columns that repeat table-wide but are unique among that partition's rows.
+    # A type-2 dimension's `is_current` says `{"=1": ["customer_id"]}`. None: not measured.
+    unique_within: dict[str, list[str]] | None = None
 
 
 class ViewDefinition(BaseModel):
