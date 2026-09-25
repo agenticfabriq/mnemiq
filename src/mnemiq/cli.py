@@ -288,7 +288,7 @@ def _cmd_enrich(settings: Settings) -> int:
               "this is said out loud", file=sys.stderr)
     from mnemiq.enrichment.pipeline import partition_warning
 
-    if warning := partition_warning(snap, settings.guard_fanout):
+    if warning := partition_warning(snap):
         print(warning, file=sys.stderr)
     return 0
 

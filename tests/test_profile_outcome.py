@@ -319,18 +319,17 @@ def test_a_snapshot_written_before_the_cause_existed_still_loads():
     assert verdict == "unmeasured" and "t0.AMOUNT" in detail
 
 
-# -- M109: a failed partition query is said out loud, when the guard can act on it ---------------
+# -- M109: a failed partition query is said out loud -----------------------------------------------
 
 
-@pytest.mark.parametrize("status, guard, warns", [
-    ("partial", None, True), ("partial", True, True), ("partial", False, False),
-    ("done", None, False), (None, None, False),
-])
-def test_enrich_names_failed_partition_queries_when_the_guard_can_refuse(status, guard, warns):
+@pytest.mark.parametrize("status, warns", [("partial", True), ("done", False), (None, False)])
+def test_enrich_names_failed_partition_queries(status, warns):
+    """Whatever the enrich run's own setting: the guard reads its setting at ask time, and auto
+    counts a partial job as profiled, so this is the only message that explains the refusals."""
     jobs = [] if status is None else [Job(id="profile:partitions", source_id="s",
                                           kind="profile:partitions", status=status,
                                           detail="dim.is_current: temp space")]
-    warning = partition_warning(_snap("done", extra=jobs), guard)
+    warning = partition_warning(_snap("done", extra=jobs))
     assert (warning is not None) is warns
     if warns:
         assert "dim.is_current: temp space" in warning

@@ -132,16 +132,18 @@ def profile_outcome(snapshot: Snapshot) -> tuple[str, str]:
            f"measured and carry no counts: {causes}" if unmeasured else "")))
 
 
-def partition_warning(snapshot: Snapshot, guard_fanout: bool | None) -> str | None:
+def partition_warning(snapshot: Snapshot) -> str | None:
     """What `enrich` must say when a partition query failed, or None. A failed query leaves its
     column without partition facts, so the fan-out guard refuses that table's current-row joins at
-    ask time -- and the refusal cannot say why. Nothing to say when the guard is set off."""
+    ask time -- and the refusal cannot say why. Said whatever this run's setting: the guard reads
+    its own setting when the snapshot is asked, and auto counts a partial job as profiled."""
     partial = next((j for j in snapshot.jobs if j.id == PARTITIONS_JOB and j.status == "partial"),
                    None)
-    if partial is None or guard_fanout is False:
+    if partial is None:
         return None
-    return (f"WARNING: partition profiling failed for: {partial.detail}. The fan-out guard will "
-            "refuse current-row SCD joins on these tables until a re-enrich succeeds")
+    return (f"WARNING: partition profiling failed for: {partial.detail}. Wherever the fan-out "
+            "guard is on, it will refuse current-row SCD joins on these tables until a re-enrich "
+            "succeeds")
 
 
 def enrich_structural(adapter, source_id: str) -> Snapshot:
