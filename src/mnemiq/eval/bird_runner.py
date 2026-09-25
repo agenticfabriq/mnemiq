@@ -372,10 +372,9 @@ def _enrich_cache_suffix(
         parts.append("facts")
     if settings.enrich_examples:
         # the fan-out guard decides which proposed examples survive -> a guard-off example set
-        # must not be reused with the guard on (M109). Auto (None) screens: a snapshot enriched
-        # here has its partitions profiled. One reused from the cache keeps what it was built
-        # with, and at ask time auto reads its jobs -- a cache from before partition profiling
-        # runs with the guard off, and says so; `--refresh` rebuilds it.
+        # must not be reused with the guard on (M109). Auto (None) always screens examples
+        # (`enrich_examples`). At ask time auto reads the snapshot's jobs, so a cache from before
+        # partition profiling runs with the guard off, and says so; `--refresh` rebuilds it.
         parts.append("examples_fanout" if settings.guard_fanout is not False else "examples")
     if settings.dictionary_path:
         # a dictionary changes grounded meanings -> must not reuse a no-dict (or other-dict)

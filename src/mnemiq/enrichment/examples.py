@@ -11,7 +11,7 @@ from mnemiq.enrichment.proposals import _clean_text, _extract_json
 from mnemiq.execute.runner import ExecutionError, run
 from mnemiq.semantic.cards import build_cards
 from mnemiq.sql.decide import decide
-from mnemiq.sql.fanout_check import guard_on, key_facts
+from mnemiq.sql.fanout_check import key_facts
 from mnemiq.sql.verdict import Approved
 
 _MAX_QUESTION = 300
@@ -107,7 +107,10 @@ def enrich_examples(
     query the guard would refuse at ask time was taught as one.
     """
     cards = {c.object_id: c.text for c in build_cards(snapshot)}
-    keys = key_facts(snapshot) if guard_on(guard_fanout, snapshot) else None
+    # Auto (None) screens whatever the snapshot's partitions: a missing partition fact can only
+    # drop a valid current-row example, never keep an inflated one, and a dropped example costs
+    # nothing an ask-time refusal would. `guard_on` is for questions, where a refusal does cost.
+    keys = key_facts(snapshot) if guard_fanout is not False else None
 
     kept: list[Example] = []
     for table in cards:

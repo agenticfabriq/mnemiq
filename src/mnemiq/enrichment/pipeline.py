@@ -240,12 +240,13 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
     jobs.append(Job(id="discover:views", source_id=source_id, kind="discover", status=status))
     # Per-partition key uniqueness ran inside `profile_table`, fail-soft per column. Recorded as
     # its own job because "profiled, found none" and "never profiled" carry the same facts, and
-    # the fan-out guard's auto setting must tell them apart (`guard_on`). `failed` when any
-    # partition query failed: that table's current-row joins cannot be shown unique, so auto must
-    # not count the snapshot as profiled. A table that failed outright is not in the model at all.
-    # Not kind "profile": that string counts tables.
+    # the fan-out guard's auto setting must tell them apart (`guard_on`). `partial` when a
+    # partition query failed, each failed column in the detail: that column simply has no
+    # partition facts, so only its table's current-row joins refuse -- visibly. Counting the whole
+    # snapshot unprofiled instead would leave every other table's sums unguarded. A table that
+    # failed outright is not in the model at all. Not kind "profile": that string counts tables.
     jobs.append(Job(id=PARTITIONS_JOB, source_id=source_id, kind="profile:partitions",
-                    status="failed" if partition_failures else "done",
+                    status="partial" if partition_failures else "done",
                     detail="; ".join(partition_failures)[:2000] or None))
 
     snapshot = Snapshot(

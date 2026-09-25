@@ -331,10 +331,12 @@ def test_flag_values_past_float_precision_keep_their_own_facts(tmp_path):
     assert check(f"{big + 1}.0") is None, "the literal side spells it exactly too"
 
 
-def test_a_failed_partition_query_leaves_the_snapshot_unprofiled(tmp_path):
-    """The job must not claim partitions were profiled when a query for them failed: that table's
-    current-row joins cannot be shown unique, and auto would refuse them."""
+def test_a_failed_partition_query_costs_its_table_not_the_snapshot(tmp_path):
+    """Recorded, never claimed as profiled: the job reads `partial` and names the column. The
+    guard stays on -- only that table's current-row join refuses, visibly -- rather than leaving
+    every other table's sums unguarded."""
     from mnemiq.enrichment.pipeline import enrich_structural
+    from mnemiq.generate.plan_query import Deferred
 
     adapter = _db(tmp_path)
 
@@ -351,8 +353,9 @@ def test_a_failed_partition_query_leaves_the_snapshot_unprofiled(tmp_path):
 
     snapshot = enrich_structural(_Failing(), "shop")
     job = next(j for j in snapshot.jobs if j.id == PARTITIONS_JOB)
-    assert job.status == "failed" and "dim_customer.is_current: temp space" in job.detail
-    assert not partitions_profiled(snapshot)
+    assert job.status == "partial" and "dim_customer.is_current: temp space" in job.detail
+    assert partitions_profiled(snapshot)
+    assert isinstance(_plan(snapshot, _CURRENT, None), Deferred), "on: that join refuses"
 
 
 def test_one_profiled_source_does_not_vouch_for_a_federated_legacy_one(tmp_path):
