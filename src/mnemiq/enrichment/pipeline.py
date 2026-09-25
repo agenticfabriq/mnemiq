@@ -50,6 +50,14 @@ def content_version(snapshot: Snapshot) -> str:
     discovery = next((j.status for j in snapshot.jobs if j.id == "discover:views"), None)
     if discovery is not None:
         body["views_discovery"] = discovery
+    # The `profile:partitions` STATUS, for the same reason: under the fan-out guard's auto setting
+    # it decides whether the guard runs (`guard_on`). A source with no two-valued column
+    # re-enriches to IDENTICAL columns, so without this the re-enriched snapshot hashed like the
+    # one it replaces -- `reload_if_stale` never swapped it in, auto stayed off, and answers cached
+    # unguarded kept being served. Only when set, so a snapshot predating the job keeps its version.
+    partitions = next((j.status for j in snapshot.jobs if j.id == PARTITIONS_JOB), None)
+    if partitions is not None:
+        body["partitions_profiling"] = partitions
     if snapshot.ontology_version:
         body["ontology_version"] = snapshot.ontology_version
     payload = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)

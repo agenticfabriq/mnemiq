@@ -370,3 +370,39 @@ def test_one_profiled_source_does_not_vouch_for_a_federated_legacy_one(tmp_path)
 
     assert partitions_profiled(merge_snapshots([(spec("a"), fresh), (spec("b"), fresh)]))
     assert not partitions_profiled(merge_snapshots([(spec("a"), fresh), (spec("b"), _legacy(fresh))]))
+
+
+# -- the marker moves the version: it decides whether the guard runs ----------------------------------
+
+
+def test_re_enriching_a_source_with_no_partitions_moves_the_version(tmp_path):
+    """The join `reload_if_stale` and every version-keyed cache depend on. A source with no
+    two-valued column re-enriches to identical columns, so only the job tells the new snapshot
+    from the one it replaces -- and under auto the job is what turns the guard on."""
+    from mnemiq.enrichment.pipeline import content_version, enrich_structural
+
+    path = tmp_path / "flat.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE orders (order_id INTEGER, customer_id INTEGER, amount INTEGER);
+        INSERT INTO orders VALUES (10, 1, 5), (11, 1, 7), (12, 2, 9), (13, 3, 4);
+    """)
+    con.commit()
+    con.close()
+    fresh = enrich_structural(SQLiteAdapter(str(path)), "flat")
+    assert not any(c.unique_within for c in fresh.columns), "no partitions: columns are identical"
+    assert content_version(_legacy(fresh)) != fresh.version
+
+
+def test_a_snapshot_predating_the_job_keeps_its_version():
+    """Only when present, as for `discover:views`: a legacy store must not churn on upgrade."""
+    from mnemiq.contract import Job
+    from mnemiq.enrichment.pipeline import content_version
+
+    snap = _snapshot()
+    other = snap.model_copy(update={"jobs": [
+        Job(id="profile:t", source_id="shop", kind="profile", status="done")]})
+    assert content_version(snap) == content_version(other), "an unrelated job still does not"
+    marked = snap.model_copy(update={"jobs": [
+        Job(id=PARTITIONS_JOB, source_id="shop", kind="profile:partitions", status="done")]})
+    assert content_version(marked) != content_version(snap)
