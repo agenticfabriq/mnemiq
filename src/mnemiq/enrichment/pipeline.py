@@ -19,7 +19,8 @@ def content_version(snapshot: Snapshot) -> str:
 
     Covers the observed codes -- and, after semantic enrichment, the descriptions and code
     meanings -- so a shifted vocabulary invalidates downstream caches. Excludes created_at
-    and jobs: those are run bookkeeping, not content.
+    and jobs: those are run bookkeeping, not content -- except the two job STATUSES that decide
+    behaviour at ask time, `discover:views` and `profile:partitions`, folded in below.
 
     The ontology vocabulary lives outside the columns (a column carries only its scheme id/label
     via `code_scheme`, never the concepts), so `ontology_version` -- the merged local+certified

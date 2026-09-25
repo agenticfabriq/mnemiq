@@ -406,3 +406,7 @@ def test_a_snapshot_predating_the_job_keeps_its_version():
     marked = snap.model_copy(update={"jobs": [
         Job(id=PARTITIONS_JOB, source_id="shop", kind="profile:partitions", status="done")]})
     assert content_version(marked) != content_version(snap)
+    versions = {content_version(snap.model_copy(update={"jobs": [
+        Job(id=PARTITIONS_JOB, source_id="shop", kind="profile:partitions", status=status)]}))
+        for status in ("done", "partial", "failed")}
+    assert len(versions) == 3, "the STATUS is hashed: a repaired snapshot must swap in"

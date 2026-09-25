@@ -175,8 +175,8 @@ class Job(BaseModel):
     # cause survives only in the log of the run that produced it, and a snapshot outlives its run
     # -- so a reader months later can see THAT a column was not measured and never learn whether
     # it was temp space, a privilege, or a driver fault (**M73**). Optional and defaulted, so every
-    # snapshot written before it parses unchanged, and `content_version` excludes jobs, so adding
-    # it invalidates no cached model.
+    # snapshot written before it parses unchanged, and `content_version` hashes no job detail (only
+    # two job statuses), so adding it invalidates no cached model.
     detail: str | None = None
     tenant_id: str | None = None
     checkpoints: list[str] = Field(default_factory=list)
