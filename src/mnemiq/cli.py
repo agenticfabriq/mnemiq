@@ -286,6 +286,14 @@ def _cmd_enrich(settings: Settings) -> int:
               f"{', '.join(sorted(unmeasured))}. Their tables are in the model; these columns look "
               "in the snapshot exactly like a column whose type cannot be counted, which is why "
               "this is said out loud", file=sys.stderr)
+    # A failed partition query leaves its column without partition facts, so the fan-out guard
+    # refuses that table's current-row joins at ask time -- and the refusal cannot say why.
+    partial = next((j for j in snap.jobs if j.id == "profile:partitions" and j.status == "partial"),
+                   None)
+    if partial:
+        print(f"WARNING: partition profiling failed for: {partial.detail}. The fan-out guard will "
+              "refuse current-row SCD joins on these tables until a re-enrich succeeds",
+              file=sys.stderr)
     return 0
 
 

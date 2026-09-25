@@ -102,9 +102,10 @@ def enrich_examples(
     """Third LLM phase: verified worked examples. Keeps only decider-approved, executed,
     rows>0 pairs. Fail-soft per table; re-versions.
 
-    `guard_fanout` screens proposals with the fan-out check (M109), as `plan_query` does at ask
-    time. A kept example is shown to the model as a verified pattern, so without it an inflated
-    query the guard would refuse at ask time was taught as one.
+    `guard_fanout` screens proposals with the fan-out check (M109). A kept example is shown to
+    the model as a verified pattern, so without it an inflated query the guard would refuse at ask
+    time was taught as one. Auto (None) always screens here, unlike `plan_query`, which leaves an
+    older snapshot unguarded (`guard_on`): dropping an example costs nothing a refusal would.
     """
     cards = {c.object_id: c.text for c in build_cards(snapshot)}
     # Auto (None) screens whatever the snapshot's partitions: a missing partition fact can only
