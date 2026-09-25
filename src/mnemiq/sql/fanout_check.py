@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 
 from sqlglot import exp
+from sqlglot.optimizer.merge_subqueries import merge_subqueries
+from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import traverse_scope
 
 from mnemiq.contract import Snapshot
@@ -191,11 +193,48 @@ def check_fanout(
        constants) only when EVERY table is duplicated -- a count over a plain one-to-many counts
        the finer table, which may be what was asked.
 
-    Never fires on MIN, MAX, or any DISTINCT aggregate (immune to repetition), on a join whose
-    key uniqueness is unknown, or through a CTE or subquery: a derived source is opaque and
-    treated as unique, because an aggregated CTE is usually one row per key and guessing
-    otherwise would refuse the very rewrite this asks for.
+    Never fires on MIN, MAX, or any DISTINCT aggregate (immune to repetition), or on a join whose
+    key uniqueness is unknown. A CTE or subquery that aggregates, de-duplicates, windows or limits
+    is opaque and treated as unique: an aggregated CTE is usually one row per key, and guessing
+    otherwise would refuse the very rewrite this asks for. One that only passes a join's rows
+    through is merged into its parent and checked flat (`_merged`).
     """
+    found = _check_scopes(ast, visible, facts)
+    if found is None and (ast.find(exp.Subquery) or ast.find(exp.CTE)):
+        merged = _merged(ast, visible)
+        if merged is not None:
+            found = _check_scopes(merged, visible, facts)
+    return found
+
+
+def _merged(ast: exp.Expression, visible: dict[str, set[str]]) -> exp.Expression | None:
+    """The query with every derived table that only projects rows merged into its parent.
+
+    Opaque derived sources were a bypass: `SELECT SUM(t.x) FROM (SELECT c.x FROM claim c JOIN
+    premium p ON ...) t` got an inflated sum approved, and BIRD gold that computes its inflation
+    that way hid from the gold check. sqlglot's `merge_subqueries` merges exactly the derived
+    tables whose rows pass through unchanged -- none that aggregates, de-duplicates, windows or
+    limits -- which is the line this needs; a merged query means the same as its original, so it
+    is checked like any flat one. Anything qualify or merge cannot handle leaves the check as it
+    was.
+    """
+    schema: dict = {}
+    for object_id, columns in visible.items():
+        node = schema
+        *parents, name = object_id.split(".")
+        for part in parents:
+            node = node.setdefault(part, {})
+        node[name] = {c: "TEXT" for c in columns}
+    try:
+        return merge_subqueries(qualify(ast.copy(), schema=schema, quote_identifiers=False,
+                                        validate_qualify_columns=False))
+    except Exception as exc:  # noqa: BLE001 -- unmergeable is not evidence of fan-out
+        logger.warning("fan-out check could not merge derived tables: %s", exc)
+        return None
+
+
+def _check_scopes(ast: exp.Expression, visible: dict[str, set[str]],
+                  facts: KeyFacts) -> Refusal | None:
     try:
         scopes = traverse_scope(ast)
     except Exception as exc:  # noqa: BLE001 -- an unresolvable scope is not evidence of fan-out

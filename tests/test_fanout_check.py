@@ -779,3 +779,45 @@ def test_the_message_quotes_no_profile_number():
     )
     for number in ("30000", "23322", "125000", "50000"):
         assert number not in verdict.message, number
+
+
+# -- a derived table that only projects a join ---------------------------------------------------
+
+_JOINED_ROWS = ("SELECT c.paid_amount_cents AS paid, p.earned_premium_cents AS earned "
+                "FROM fact_claim c JOIN fact_premium p ON c.policy_id = p.policy_id")
+
+
+@pytest.mark.parametrize("sql", [
+    f"SELECT SUM(t.paid) / SUM(t.earned) FROM ({_JOINED_ROWS}) t",
+    f"WITH j AS ({_JOINED_ROWS}) SELECT SUM(paid) / SUM(earned) FROM j",
+])
+def test_a_fan_out_wrapped_in_a_projecting_subquery_is_still_refused(sql):
+    """Derived sources are opaque, so wrapping the fan-out join in a subquery that only passes its
+    rows through got an inflated sum approved -- a bypass, and the same opacity hid BIRD gold that
+    computes the inflation that way. A derived table with no aggregate, DISTINCT, window or LIMIT
+    is merged into the outer query (sqlglot's merge_subqueries) and the flat form is checked."""
+    verdict = _check(sql)
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_distinct_subquery_is_not_merged():
+    """DISTINCT restores the claim grain, so the sum over it is not inflated."""
+    assert _check("SELECT SUM(t.paid) FROM (SELECT DISTINCT c.claim_id, c.paid_amount_cents AS paid "
+                  "FROM fact_claim c JOIN fact_premium p ON c.policy_id = p.policy_id) t") is None
+
+
+def test_a_projecting_subquery_over_a_harmless_join_is_approved():
+    assert _check("SELECT t.region, SUM(t.paid) FROM (SELECT d.region, c.paid_amount_cents AS paid "
+                  "FROM fact_claim c JOIN dim_policy d ON d.policy_id = c.policy_id) t "
+                  "GROUP BY t.region") is None
+
+
+def test_a_federated_projecting_subquery_is_merged_too():
+    profile = {f"pg.{t}": cols for t, cols in _PROFILE.items()}
+    visible = {t: set(cols) for t, cols in profile.items()}
+    verdict = _check(
+        "SELECT SUM(t.paid) FROM (SELECT c.paid_amount_cents AS paid FROM pg.fact_claim c "
+        "JOIN pg.fact_premium p ON c.policy_id = p.policy_id) t",
+        keys=key_facts(_snapshot(profile)), visible=visible,
+    )
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
