@@ -108,7 +108,7 @@ def decide(
         # An aggregate over rows a join has multiplied runs fine and answers inflated (M109) --
         # the third silently-wrong class, and the one a literal fix cannot reach, so it goes last.
         # `keys` comes from the snapshot's column profiles; None means the guard is off.
-        inflated = check_fanout(shaped, visible, keys)
+        inflated = check_fanout(shaped, visible, keys, dialect=dialect)
         if inflated is not None:
             return inflated
 
