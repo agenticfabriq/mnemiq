@@ -292,6 +292,43 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
     if not pairs:
         return None
 
+    # alias -> the columns an as-of filter in this scope narrows it by. Uniqueness is read
+    # table-wide, so a versioned table joined as of the fact's date (`o.day BETWEEN d.valid_from
+    # AND d.valid_to`) was refused, and every repair that kept the join was refused again until
+    # the question deferred. A BETWEEN whose bounds are two of the table's own columns, tested
+    # against another table's value, is that join: it MAY leave one version per key, unknown,
+    # and unknown never fires. Nothing wider: counting a flag (`is_current`), an equality or an
+    # IS NULL let an ordinary binary filter (`is_returned = 'N'`) switch the guard off for an
+    # inflated sum -- a silent wrong number where a refusal is a visible deferral -- and syntax
+    # cannot tell a current-row flag from one. So a current-row filter still refuses (known
+    # limit); telling them apart needs the data -- key uniqueness per flag value.
+    narrowed: dict[str, set[str]] = {}
+
+    def conjuncts(e: exp.Expression):
+        e = e.unnest()  # flatten() unwraps parentheses inside the AND chain itself
+        return e.flatten() if isinstance(e, exp.And) else [e]
+
+    for condition, _ in conditions:
+        for c in conjuncts(condition):
+            if not isinstance(c, exp.Between):
+                continue
+            bounds, tested = [c.args.get("low"), c.args.get("high")], c.this
+            if not all(isinstance(x, exp.Column) and x.find_ancestor(exp.Select) is select
+                       for x in [*bounds, tested]):
+                continue
+            owners = {owner(x) for x in bounds}
+            if len(owners) != 1 or None in owners or owner(tested) in owners | {None}:
+                continue
+            alias = owners.pop()
+            names = [_spelling(x.name, visible.get(sources[alias], ())) for x in bounds]
+            if None not in names:
+                narrowed.setdefault(alias, set()).update(n.lower() for n in names)
+
+    def repeats(alias: str, key: tuple[str, ...]) -> bool:
+        if _unique(facts, sources[alias], key) is not False:
+            return False
+        return not narrowed.get(alias, set()) - {k.lower() for k in key}
+
     adj: dict[str, list[str]] = {a: [] for a in sources}
     # a -> {b: b's key columns}: each `a` row meets MANY `b` rows, because b's key repeats
     fans_into: dict[str, dict[str, tuple[str, ...]]] = {a: {} for a in sources}
@@ -299,9 +336,9 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
         a_cols, b_cols = tuple(c[0] for c in cols), tuple(c[1] for c in cols)
         adj[a].append(b)
         adj[b].append(a)
-        if _unique(facts, sources[b], b_cols) is False and (a, b) not in at_most_one:
+        if repeats(b, b_cols) and (a, b) not in at_most_one:
             fans_into[a][b] = b_cols
-        if _unique(facts, sources[a], a_cols) is False and (b, a) not in at_most_one:
+        if repeats(a, a_cols) and (b, a) not in at_most_one:
             fans_into[b][a] = a_cols
 
     def multiplier(t: str) -> tuple[str, tuple[str, ...]] | None:
@@ -361,6 +398,7 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
 
     summed: dict[str, None] = {}  # duplicated aliases whose values are aggregated, in order
     chasm: exp.Expression | None = None
+    windowed = False
     for agg in select.find_all(exp.Sum, exp.Avg, exp.Count):
         if agg.find_ancestor(exp.Select) is not select:
             continue
@@ -375,8 +413,10 @@ def _check_scope(select: exp.Select, sources: dict[str, str], visible, facts: Ke
             owners = list(dict.fromkeys(owner(col) for col in term if of_this_row(col)))
             if any(o in dup for o in owners) and not any(o is None or o in single for o in owners):
                 summed.update(dict.fromkeys(o for o in owners if o in dup))
+                window = agg.find_ancestor(exp.Window)
+                windowed |= window is not None and window.find_ancestor(exp.Select) is select
     if summed:
-        return _inflated(list(summed), sources, dup)
+        return _inflated(list(summed), sources, dup, select, windowed)
     if chasm is not None:
         return _counted_chasm(chasm, sources)
     return None
@@ -389,21 +429,95 @@ def _defines(select: exp.Select) -> set[str]:
     return {n.alias_or_name.lower() for n in nodes}
 
 
-def _inflated(aliases: list[str], sources: dict[str, str], dup) -> Refusal:
-    because = []
+def _grouping(select: exp.Select) -> list[str] | None:
+    """The answer's grain as the query states it, or None when the query has no GROUP BY.
+
+    Every grouping form counts: plain expressions (`GROUP BY 1` named by its column), ROLLUP,
+    CUBE, GROUPING SETS, and DuckDB's `GROUP BY ALL` (every non-aggregate output). Reading only
+    the plain list sent those to the one-overall-total advice, whose repair returns one figure
+    where the question asked for one per group. A form this cannot name still comes back as []
+    -- grouped, unnamed -- never as None.
+    """
+    group = select.args.get("group")
+    if group is None:
+        return None
+    named = []
+    for e in group.expressions:
+        if isinstance(e, exp.Literal) and e.is_int and 1 <= int(e.this) <= len(select.expressions):
+            e = select.expressions[int(e.this) - 1].unalias()
+        named.append(e.sql())
+    for form in ("rollup", "cube", "grouping_sets"):
+        for node in group.args.get(form) or []:
+            named += [c.sql() for c in node.find_all(exp.Column)]
+    if group.args.get("all"):
+        named += [e.unalias().sql() for e in select.expressions if not e.find(exp.AggFunc)]
+    return list(dict.fromkeys(named))
+
+
+def _inflated(aliases: list[str], sources: dict[str, str], dup, select: exp.Select,
+              windowed: bool = False) -> Refusal:
+    because, keys = [], {}
     for a in aliases:
         entered, key = dup[a]
         t, w = sources[a], sources[entered]
         because.append(f"each {t} row is repeated once per matching {w} row "
                        f"({w}.{', '.join(key)} is not unique)")
+        keys.update(dict.fromkeys(key))
     tables = " and ".join(dict.fromkeys(sources[a] for a in aliases))
+    key = ", ".join(keys)
+    head = ("This query aggregates across a join that multiplies rows, so the result is "
+            f"inflated: {'; '.join(because)}.")
+    if windowed:
+        # A window keeps one output row per input row; the GROUP BY advice below would discard
+        # its partition and that row-level grain.
+        return Refusal(code=RefusalCode.FAN_OUT, message=(
+            f"{head} Compute the window on {tables}'s own rows in a CTE or subquery, keeping its "
+            "PARTITION BY, then join that result instead of the raw table."))
+    # The first wording said "grouped by the key you join or group on", and the local 14B did
+    # exactly that: a CTE per fact grouped by the join key, inner-joined on it, which drops every
+    # key present in only one table and repaired 0 of 8. So name the ANSWER's grain instead, and
+    # say how to combine without an inner join -- per region it drops a region, one grain up.
+    grouped = _grouping(select)
+    by_key = grouped is not None and any(
+        g.split(".")[-1].lower() in {k.lower() for k in keys} for g in grouped)
+    group = select.args.get("group")
+    subtotals = group is not None and any(group.args.get(f) for f in ("rollup", "cube",
+                                                                       "grouping_sets"))
+    if grouped is None:
+        grain = "reduced to one overall total with no GROUP BY"
+        combine = "then CROSS JOIN those one-row totals"
+    else:
+        columns = ", ".join(grouped) or "the columns your query groups by"
+        # NULL-safe, because GROUP BY puts NULL keys in one group and `=` never matches NULL to
+        # NULL: a plain FULL OUTER JOIN returns a NULL group as two half-rows.
+        on = (f"joining on {columns} with IS NOT DISTINCT FROM and outputting COALESCE of the two "
+              "sides' values (an inner join, or plain =, drops a group present on one side only "
+              "or whose value is NULL)")
+        if subtotals:
+            # Flattened to its columns, a ROLLUP loses its subtotal and grand-total rows; kept
+            # whole, a subtotal row and a real NULL group are both NULL in the column, and only
+            # GROUPING() tells them apart.
+            grain = (f"grouped exactly as your query groups ({group.sql()}) with "
+                     f"GROUPING({columns}) kept as a column")
+            combine = f"then FULL OUTER JOIN those results on that GROUPING column too, {on}"
+        else:
+            grain = (f"grouped by the answer's own columns ({columns}), joining in only the lookup "
+                     "table that supplies a column it lacks")
+            combine = f"then FULL OUTER JOIN those per-group results, {on}"
+    avoid = "" if by_key else f", not by the join key ({key})"
+    warn = "" if by_key else (
+        f" Grouping each table by {key} and inner-joining the results drops every "
+        f"{' or '.join(keys)} value that appears in only one table.")
+    # An inner join can MEAN "only keys in both" (products that had returns); whole-table totals
+    # widen that cohort silently. Usually it is an accident -- the loss ratio's was -- so the
+    # restriction is kept only when the question sets it.
+    cohort = (" These totals count every key; only if the question itself limits the answer to "
+              "keys present in both tables, restrict each table with EXISTS on the other first.")
     return Refusal(
         code=RefusalCode.FAN_OUT,
         message=(
-            "This query aggregates across a join that multiplies rows, so the result is "
-            f"inflated: {'; '.join(because)}. Aggregate {tables} separately first -- one CTE or "
-            "subquery per table, grouped by the key you join or group on -- then join those "
-            "aggregated results instead of the raw tables."
+            f"{head} Aggregate each of {tables} in its own CTE or subquery, {grain}{avoid}; "
+            f"{combine}.{warn}{cohort}"
         ),
     )
 

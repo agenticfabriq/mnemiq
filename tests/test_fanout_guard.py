@@ -210,7 +210,7 @@ def test_one_setting_reaches_the_agent_in_both_states():
     site, is held by the call-site scan in `test_undefined_term_guard.py`, which now owes
     `guard_fanout` at the same sites as `guard_undefined_terms`."""
     assert Settings.model_fields["guard_fanout"].default is False, (
-        "off until the pre-registered measurement flips it"
+        "off: the pre-registered measurement's BIRD no-harm bar was not met on the final code"
     )
     for wanted in (True, False):
         settings = Settings(guard_fanout=wanted,
@@ -220,3 +220,33 @@ def test_one_setting_reaches_the_agent_in_both_states():
             corrector=None, values=None, selector=None, guard_fanout=settings.guard_fanout,
         )
         assert agent.guard_fanout is wanted
+
+
+def test_with_the_guard_on_an_as_of_dimension_join_is_answered():
+    """The case that made default-on unsafe: a type-2 dimension joined as of the fact's date was
+    refused, every repair that kept the join was refused again, and the question deferred. Through
+    `plan_query` with the guard on, it now plans. (Joined on a current-row flag it still refuses
+    -- a pinned known limit in test_fanout_check.)"""
+
+    profile = {
+        "orders": {"customer_id": (1000, 200, 0), "amount": (1000, 900, 0),
+                   "order_date": (1000, 300, 0)},
+        "dim_customer": {"customer_id": (600, 200, 0), "valid_from": (600, 500, 0),
+                         "valid_to": (600, 400, 0), "segment": (600, 4, 0)},
+    }
+    snapshot = Snapshot(version="v1", source_id="shop", created_at="t", columns=[
+        Column(id=f"{t}.{c}", object_id=t, name=c, row_count=r, distinct_count=d, null_count=n)
+        for t, cols in profile.items() for c, (r, d, n) in cols.items()
+    ])
+    packet = ContextPacket(
+        question="revenue by customer segment",
+        cards=[RetrievedCard(object_id="orders", card="TABLE orders", score=1.0),
+               RetrievedCard(object_id="dim_customer", card="TABLE dim_customer", score=1.0)],
+        grant_fingerprint="fp", enrichment_version="v1",
+    )
+    sql = ("SELECT d.segment, SUM(o.amount) AS revenue FROM orders o JOIN dim_customer d "
+           "ON d.customer_id = o.customer_id AND o.order_date BETWEEN d.valid_from AND d.valid_to "
+           "GROUP BY d.segment")
+    outcome = plan_query(packet, snapshot, GrantSet(frozenset({"orders", "dim_customer"})),
+                         FakeGenerator([_reply(sql)]), target="duckdb", guard_fanout=True)
+    assert isinstance(outcome, Approved)
