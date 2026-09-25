@@ -9,6 +9,7 @@ inflated sum -- but one GROUP BY per two-valued (or nullable date) column at pro
 from __future__ import annotations
 
 import sqlite3
+from decimal import Decimal
 
 import pytest
 import sqlglot
@@ -89,6 +90,29 @@ def test_a_partition_query_that_fails_costs_only_its_partition(tmp_path):
     assert stats["customer_id"].distinct_count == 2, "the table's own counts are unaffected"
 
 
+def test_two_values_spelled_alike_keep_only_the_facts_both_hold(tmp_path):
+    """A driver can hand back 1 and 1.0 as separate groups. One label then names both, and it must
+    not carry the facts of whichever group came last."""
+    adapter = _db(tmp_path)
+
+    class _Alike:
+        dialect = adapter.dialect
+
+        def __getattr__(self, name):
+            return getattr(adapter, name)
+
+        def execute(self, sql, *a, **kw):
+            rows = adapter.execute(sql, *a, **kw)
+            if '"is_current" IS NOT NULL GROUP BY' in sql:  # history (0) first, current (1) last
+                return [(1.0 if row[0] == 0 else 1, *row[1:]) for row in rows]
+            return rows
+
+    table = next(t for t in introspect(adapter) if t.name == "dim_customer")
+    stats = {s.column: s for s in profile_table(_Alike(), table)}
+    assert stats["is_current"].unique_within == {"=1": ["tier"]}, (
+        "customer_id repeats among the history rows; tier is unique in both groups")
+
+
 # -- key facts and the check -----------------------------------------------------------------------
 
 
@@ -96,6 +120,14 @@ def test_partition_labels_match_between_profile_values_and_sql_literals():
     assert partition_label(True) == "=true" and partition_label(1) == "=1"
     assert partition_label("Y") == "='Y'" and partition_label(None) == "IS NULL"
     assert partition_label(1.0) == "=1"
+
+
+def test_partition_labels_are_exact():
+    """A float round trip spelled 2**53 and 2**53 + 1 alike."""
+    assert partition_label(2 ** 53) != partition_label(2 ** 53 + 1)
+    assert partition_label(2 ** 53 + 1) == "=9007199254740993"
+    assert partition_label(Decimal("1.50")) == partition_label(1.5) == "=1.5"
+    assert partition_label(Decimal("10")) == partition_label(1e1) == "=10"
 
 
 def _snapshot():
@@ -120,6 +152,19 @@ def _check(sql):
 
 _JOIN = ("SELECT d.tier, SUM(o.amount) FROM orders o JOIN dim_customer d "
          "ON d.customer_id = o.customer_id")
+
+
+@pytest.mark.parametrize("one", ["1.0", "1.00", "1e0", "10e-1"])
+def test_a_literal_meets_the_profiled_value_however_it_is_spelled(one):
+    assert _check(_JOIN + f" AND d.is_current = {one} GROUP BY d.tier") is None
+
+
+@pytest.mark.parametrize("huge", ["1e5000", "1e99999999", "-1e-99999999"])
+def test_an_extreme_literal_is_spelled_without_building_it(huge):
+    """`int()` on `1e5000` raised out of the decider; on `1e99999999` it ran for as long as a
+    hundred-million-digit integer takes. The literal picks no partition, so the join refuses."""
+    assert _check(_JOIN + f" AND d.is_current = {huge} GROUP BY d.tier") is not None
+    assert partition_label(Decimal(huge)).startswith("=")
 
 
 def test_key_facts_carry_the_partitions():
@@ -194,3 +239,32 @@ def test_a_current_row_join_plans_after_structural_enrichment(tmp_path):
     history = plan(_JOIN + " AND d.is_current = 0 GROUP BY d.tier")
     assert isinstance(current, Approved)
     assert isinstance(history, Deferred)
+
+
+def test_flag_values_past_float_precision_keep_their_own_facts(tmp_path):
+    """2**53 and 2**53 + 1 are one float. Spelled through one, the partition where the key repeats
+    took the facts of the one where it does not, and an inflated sum was approved."""
+    from mnemiq.enrichment.pipeline import enrich_structural
+
+    big = 2 ** 53
+    path = tmp_path / "big.sqlite"
+    con = sqlite3.connect(path)
+    con.executescript(f"""
+        CREATE TABLE dim (customer_id INTEGER, batch INTEGER, tier TEXT);
+        INSERT INTO dim VALUES (1, {big}, 'a'), (1, {big}, 'b'), (2, {big + 1}, 'a'),
+                               (3, {big + 1}, 'b');
+        CREATE TABLE orders (customer_id INTEGER, amount INTEGER);
+        INSERT INTO orders VALUES (1, 5), (1, 7), (2, 9);
+    """)
+    con.commit()
+    con.close()
+    snap = enrich_structural(SQLiteAdapter(str(path)), "big")
+
+    def check(batch):
+        sql = ("SELECT d.tier, SUM(o.amount) FROM orders o JOIN dim d "
+               f"ON d.customer_id = o.customer_id AND d.batch = {batch} GROUP BY d.tier")
+        return check_fanout(sqlglot.parse_one(sql, read="sqlite"), schema_map(snap), key_facts(snap))
+
+    assert check(big) is not None, "customer 1 has two rows in this batch"
+    assert check(big + 1) is None
+    assert check(f"{big + 1}.0") is None, "the literal side spells it exactly too"

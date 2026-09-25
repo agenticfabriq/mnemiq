@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import numbers
+from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 
 from sqlglot import exp
@@ -39,9 +40,35 @@ def partition_label(value) -> str:
     if isinstance(value, bool):
         return "=true" if value else "=false"
     if isinstance(value, numbers.Number):
-        number = float(value)
-        return f"={int(number)}" if number.is_integer() else f"={number}"
+        return f"={_exact(value)}"
     return f"='{value}'"
+
+
+def _exact(value) -> str:
+    """A number's exact decimal spelling: 1.0 and 1 meet, 1.50 and 1.5 meet, and every digit of an
+    integer is kept. A float round trip spelled 2**53 and 2**53 + 1 the same, and profiling then
+    gave one partition the other's facts.
+
+    Built from the digits and exponent, never through `int()` or a context-bound `normalize()`: a
+    query's literal is untrusted, and `1e5000` would exceed the integer-string limit while
+    `1e99999999` would build a hundred-million-digit integer. Plain notation up to 30 places either
+    side of the point, scientific beyond; the two forms never collide, since only the second has
+    an `E`."""
+    try:
+        number = value if isinstance(value, Decimal) else Decimal(str(value))  # a float's shortest repr
+    except InvalidOperation:
+        return str(value)
+    if not number.is_finite():
+        return str(number)
+    sign, digits, exponent = number.as_tuple()
+    kept = len(digits)
+    while kept > 1 and digits[kept - 1] == 0:  # 1.50 -> 1.5, 10 -> 1E+1
+        kept -= 1
+    exponent += len(digits) - kept
+    if digits[:kept] == (0,):
+        return "0"  # -0 is 0 to SQL
+    canonical = Decimal((sign, digits[:kept], exponent))
+    return format(canonical, "f") if -30 <= exponent <= 30 else str(canonical)
 
 
 def key_facts(snapshot: Snapshot) -> KeyFacts:
@@ -566,8 +593,8 @@ def _partition_filter(c: exp.Expression) -> tuple[exp.Column | None, list[str]]:
                 if value.is_string:
                     return col, [partition_label(value.this)]
                 try:
-                    return col, [partition_label(float(value.this))]
-                except ValueError:
+                    return col, [partition_label(Decimal(value.this))]
+                except InvalidOperation:
                     return None, []
     return None, []
 

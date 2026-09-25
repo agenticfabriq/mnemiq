@@ -346,13 +346,16 @@ def _profile_partitions(adapter: SourceAdapter, table: TableInfo, stats: list[Co
                 rows = adapter.execute(
                     f'SELECT count(*), {counts} FROM "{table.name}" WHERE "{part.column}" IS NULL')
                 groups = [("IS NULL", rows[0])]
-            within = dict(part.unique_within or {})
+            within: dict[str, list[str]] = {}
             for label, (size, *row) in groups:
                 # EVERY label is recorded, so the value set is known (a bare `F` resolves against
                 # it). A one-row partition makes every column unique by default -- true today, and
                 # the first new row can end it -- so it records no columns.
-                within[label] = [] if size < 2 else [
+                unique = [] if size < 2 else [
                     c for i, c in enumerate(others) if row[2 * i + 1] and row[2 * i] == row[2 * i + 1]]
+                # Two values spelled alike would pool their facts under one label; keep only what
+                # holds in both, never the last group's word.
+                within[label] = [c for c in within[label] if c in unique] if label in within else unique
         except Exception as exc:  # noqa: BLE001 -- one partition failing costs only itself
             logger.warning("partition profile of %r.%r failed: %s", table.name, part.column, exc)
             continue
