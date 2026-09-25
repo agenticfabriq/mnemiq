@@ -209,8 +209,8 @@ def test_one_setting_reaches_the_agent_in_both_states():
     """Settings -> build_agent -> Agent. The Agent -> plan_query hop, and every other construction
     site, is held by the call-site scan in `test_undefined_term_guard.py`, which now owes
     `guard_fanout` at the same sites as `guard_undefined_terms`."""
-    assert Settings.model_fields["guard_fanout"].default is True, (
-        "flipped by the pre-registered measurement"
+    assert Settings.model_fields["guard_fanout"].default is False, (
+        "off: the pre-registered measurement's BIRD no-harm bar was not met on the final code"
     )
     for wanted in (True, False):
         settings = Settings(guard_fanout=wanted,
@@ -222,12 +222,11 @@ def test_one_setting_reaches_the_agent_in_both_states():
         assert agent.guard_fanout is wanted
 
 
-def test_with_the_default_setting_an_as_of_dimension_join_is_answered():
+def test_with_the_guard_on_an_as_of_dimension_join_is_answered():
     """The case that made default-on unsafe: a type-2 dimension joined as of the fact's date was
     refused, every repair that kept the join was refused again, and the question deferred. Through
-    `plan_query` with the guard at its shipped default, it now plans. (Joined on a current-row
-    flag it still refuses -- a pinned known limit in test_fanout_check.)"""
-    from mnemiq.config import Settings
+    `plan_query` with the guard on, it now plans. (Joined on a current-row flag it still refuses
+    -- a pinned known limit in test_fanout_check.)"""
 
     profile = {
         "orders": {"customer_id": (1000, 200, 0), "amount": (1000, 900, 0),
@@ -249,7 +248,5 @@ def test_with_the_default_setting_an_as_of_dimension_join_is_answered():
            "ON d.customer_id = o.customer_id AND o.order_date BETWEEN d.valid_from AND d.valid_to "
            "GROUP BY d.segment")
     outcome = plan_query(packet, snapshot, GrantSet(frozenset({"orders", "dim_customer"})),
-                         FakeGenerator([_reply(sql)]), target="duckdb",
-                         guard_fanout=Settings().guard_fanout)
-    assert Settings().guard_fanout is True
+                         FakeGenerator([_reply(sql)]), target="duckdb", guard_fanout=True)
     assert isinstance(outcome, Approved)
