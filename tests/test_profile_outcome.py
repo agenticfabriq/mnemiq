@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 
 from mnemiq.contract import Job, Snapshot
-from mnemiq.enrichment.pipeline import profile_outcome
+from mnemiq.enrichment.pipeline import partition_warning, profile_outcome
 
 
 def _snap(*statuses: str, extra: list[Job] | None = None) -> Snapshot:
@@ -317,3 +317,20 @@ def test_a_snapshot_written_before_the_cause_existed_still_loads():
     assert next(j for j in snap.jobs if j.kind == "profile:column").detail is None
     verdict, detail = profile_outcome(snap)
     assert verdict == "unmeasured" and "t0.AMOUNT" in detail
+
+
+# -- M109: a failed partition query is said out loud, when the guard can act on it ---------------
+
+
+@pytest.mark.parametrize("status, guard, warns", [
+    ("partial", None, True), ("partial", True, True), ("partial", False, False),
+    ("done", None, False), (None, None, False),
+])
+def test_enrich_names_failed_partition_queries_when_the_guard_can_refuse(status, guard, warns):
+    jobs = [] if status is None else [Job(id="profile:partitions", source_id="s",
+                                          kind="profile:partitions", status=status,
+                                          detail="dim.is_current: temp space")]
+    warning = partition_warning(_snap("done", extra=jobs), guard)
+    assert (warning is not None) is warns
+    if warns:
+        assert "dim.is_current: temp space" in warning
