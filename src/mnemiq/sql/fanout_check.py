@@ -52,8 +52,8 @@ def _exact(value) -> str:
     Built from the digits and exponent, never through `int()` or a context-bound `normalize()`: a
     query's literal is untrusted, and `1e5000` would exceed the integer-string limit while
     `1e99999999` would build a hundred-million-digit integer. Plain notation up to 30 places either
-    side of the point, scientific beyond; the two forms never collide, since only the second has
-    an `E`."""
+    side of the point, `str()` beyond. Two values never share a spelling: either form parses back to
+    exactly the value it came from."""
     try:
         number = value if isinstance(value, Decimal) else Decimal(str(value))  # a float's shortest repr
     except InvalidOperation:
