@@ -218,8 +218,8 @@ def _merged(ast: exp.Expression, visible: dict[str, set[str]],
     the result means the same -- never one that aggregates or de-duplicates -- so a merged query is
     checked like any flat one. This NARROWS the bypass rather than closing it: sqlglot also leaves
     a CTE read more than once, and some derived tables under an outer join, unmerged, and those
-    stay opaque (pinned in the tests). Anything qualify or merge cannot handle leaves the check as
-    it was.
+    stay opaque (the CTE case is pinned in the tests). Anything qualify or merge cannot handle
+    leaves the check as it was.
     """
     schema: dict = {}
     for object_id, columns in visible.items():
