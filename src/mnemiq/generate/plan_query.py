@@ -10,7 +10,7 @@ from mnemiq.generate.undefined_terms import ungrounded_terms
 from mnemiq.generate.generator import Generator
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.decide import decide
-from mnemiq.sql.fanout_check import key_facts
+from mnemiq.sql.fanout_check import guard_on, key_facts
 from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import visible_schema
@@ -93,7 +93,7 @@ def plan_query(
     corrector=None,
     values=None,
     guard_undefined_terms: bool = False,
-    guard_fanout: bool = False,
+    guard_fanout: bool | None = False,
 ) -> Outcome:
     """Propose, decide, repair -- and defer rather than guess.
 
@@ -111,8 +111,9 @@ def plan_query(
     # from the snapshot rather than from the source at ask time: it is versioned content, and
     # a body that drifted from the one the policy was reasoned about is a governance change.
     views = inventory_for(snapshot)
-    # M109: key uniqueness from the profile, read once per question. None leaves the check off.
-    keys = key_facts(snapshot) if guard_fanout else None
+    # M109: key uniqueness from the profile, read once per question. None leaves the check off;
+    # a `guard_fanout` of None is auto, resolved against this snapshot (`guard_on`).
+    keys = key_facts(snapshot) if guard_on(guard_fanout, snapshot) else None
     if not views.available and policy.row_filters:
         # Knowable before the first `generator.propose`, and unfixable by rephrasing: the refusal
         # fires ahead of the AST walk, so all `max_attempts` iterations would propose, be refused

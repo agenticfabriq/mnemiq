@@ -29,6 +29,44 @@ class KeyFacts(dict):
     partitions: MappingProxyType = MappingProxyType({})  # read-only default; key_facts sets its own
 
 
+PARTITIONS_JOB = "profile:partitions"  # recorded by enrich_structural once partitions are profiled
+_warned: set[tuple[str, str]] = set()
+
+
+def partitions_profiled(snapshot) -> bool:
+    """Whether enrichment profiled key uniqueness per partition for this snapshot -- found or
+    not. A database can legitimately record none, so the job, not the facts, is the signal.
+
+    Coverage, not existence, as `inventory_for` learned for view discovery: a federated snapshot
+    carries every source's jobs, re-keyed to its catalog, and one re-enriched source must not
+    vouch for a legacy one. Every catalog in `registry` needs the job; a single source, one.
+    `partial` counts: a failed partition query leaves only its own column without facts.
+    """
+    done = {j.source_id for j in getattr(snapshot, "jobs", None) or []
+            if j.id == PARTITIONS_JOB and j.status in ("done", "partial")}
+    registry = getattr(snapshot, "registry", {}) or {}
+    return set(registry) <= done if registry else bool(done)
+
+
+def guard_on(setting: bool | None, snapshot) -> bool:
+    """Whether the fan-out check runs for this snapshot. An explicit setting wins. Unset (auto),
+    it runs exactly when the snapshot's partitions were profiled: on an older snapshot a
+    current-row SCD join would be refused -- the join is correct, the key facts cannot yet show
+    it -- so auto leaves that snapshot as it was, and says so once."""
+    if setting is not None:
+        return setting
+    if partitions_profiled(snapshot):
+        return True
+    seen = (getattr(snapshot, "source_id", ""), getattr(snapshot, "version", ""))
+    if seen not in _warned:
+        _warned.add(seen)
+        logger.warning(
+            "fan-out guard off for snapshot %s of %r: it (or a federated source of it) was "
+            "enriched before per-partition profiling, so current-row SCD joins would be refused. "
+            "Re-enrich to turn it on, or set MNEMIQ_GUARD_FANOUT=1 to force it.", seen[1], seen[0])
+    return False
+
+
 def partition_label(value) -> str:
     """How a value names a profiled partition -- the one spelling profiling and the check share.
 

@@ -64,7 +64,7 @@ def build_agent(
     selector,
     verifier=None,
     guard_undefined_terms: bool = False,
-    guard_fanout: bool = False,
+    guard_fanout: bool | None = False,
 ) -> Agent:
     """One thin Agent per mode over SHARED components (safe: they hold no per-call state)."""
     return Agent(

@@ -9,6 +9,7 @@ from mnemiq.catalog import introspect
 from mnemiq.contract import CodedValue, Column, Job, Snapshot, SourceBinding, ViewDefinition
 from mnemiq.enrichment.joins import build_relationships
 from mnemiq.enrichment.profiling import FAILED, profile_table
+from mnemiq.sql.fanout_check import PARTITIONS_JOB
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +19,8 @@ def content_version(snapshot: Snapshot) -> str:
 
     Covers the observed codes -- and, after semantic enrichment, the descriptions and code
     meanings -- so a shifted vocabulary invalidates downstream caches. Excludes created_at
-    and jobs: those are run bookkeeping, not content.
+    and jobs: those are run bookkeeping, not content -- except the two job STATUSES that decide
+    behaviour at ask time, `discover:views` and `profile:partitions`, folded in below.
 
     The ontology vocabulary lives outside the columns (a column carries only its scheme id/label
     via `code_scheme`, never the concepts), so `ontology_version` -- the merged local+certified
@@ -49,6 +51,14 @@ def content_version(snapshot: Snapshot) -> str:
     discovery = next((j.status for j in snapshot.jobs if j.id == "discover:views"), None)
     if discovery is not None:
         body["views_discovery"] = discovery
+    # The `profile:partitions` STATUS, for the same reason: under the fan-out guard's auto setting
+    # it decides whether the guard runs (`guard_on`). A source with no two-valued column
+    # re-enriches to IDENTICAL columns, so without this the re-enriched snapshot hashed like the
+    # one it replaces -- `reload_if_stale` never swapped it in, auto stayed off, and answers cached
+    # unguarded kept being served. Only when set, so a snapshot predating the job keeps its version.
+    partitions = next((j.status for j in snapshot.jobs if j.id == PARTITIONS_JOB), None)
+    if partitions is not None:
+        body["partitions_profiling"] = partitions
     if snapshot.ontology_version:
         body["ontology_version"] = snapshot.ontology_version
     payload = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
@@ -131,6 +141,20 @@ def profile_outcome(snapshot: Snapshot) -> tuple[str, str]:
            f"measured and carry no counts: {causes}" if unmeasured else "")))
 
 
+def partition_warning(snapshot: Snapshot) -> str | None:
+    """What `enrich` must say when a partition query failed, or None. A failed query leaves its
+    column without partition facts, so the fan-out guard refuses that table's current-row joins at
+    ask time -- and the refusal cannot say why. Said whatever this run's setting: the guard reads
+    its own setting when the snapshot is asked, and auto counts a partial job as profiled."""
+    partial = next((j for j in snapshot.jobs if j.id == PARTITIONS_JOB and j.status == "partial"),
+                   None)
+    if partial is None:
+        return None
+    return (f"WARNING: partition profiling failed for: {partial.detail}. Wherever the fan-out "
+            "guard is on, it will refuse current-row SCD joins on these tables until a re-enrich "
+            "succeeds")
+
+
 def enrich_structural(adapter, source_id: str) -> Snapshot:
     """The no-LLM enrichment pass: discover, profile, infer joins.
 
@@ -141,6 +165,7 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
     columns: list[Column] = []
     source_bindings: list[SourceBinding] = []
     jobs: list[Job] = []
+    partition_failures: list[str] = []
 
     # Declared-FK child columns are keys, not coded vocabularies -- even when their names
     # (CDSCode, ID) don't match the naming gate. Fail-soft: no catalog FKs -> the gate stands.
@@ -185,6 +210,8 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
             # `kind` is deliberately not "profile": `profile_outcome` and `_cmd_enrich` both
             # filter on that exact string to count TABLES, and a column job landing in that count
             # would report a table that does not exist.
+            partition_failures += [f"{table.name}.{st.column}: {st.partition_failure}"
+                                   for st in stats.values() if st.partition_failure]
             unmeasured = [st for st in stats.values() if st.measurement == FAILED]
             for st in unmeasured:
                 jobs.append(Job(id=f"profile:{table.name}.{st.column}", source_id=source_id,
@@ -234,6 +261,16 @@ def enrich_structural(adapter, source_id: str) -> Snapshot:
     except Exception:
         views, status = [], "failed"
     jobs.append(Job(id="discover:views", source_id=source_id, kind="discover", status=status))
+    # Per-partition key uniqueness ran inside `profile_table`, fail-soft per column. Recorded as
+    # its own job because "profiled, found none" and "never profiled" carry the same facts, and
+    # the fan-out guard's auto setting must tell them apart (`guard_on`). `partial` when a
+    # partition query failed, each failed column in the detail: that column simply has no
+    # partition facts, so only its table's current-row joins refuse -- visibly. Counting the whole
+    # snapshot unprofiled instead would leave every other table's sums unguarded. A table that
+    # failed outright is not in the model at all. Not kind "profile": that string counts tables.
+    jobs.append(Job(id=PARTITIONS_JOB, source_id=source_id, kind="profile:partitions",
+                    status="partial" if partition_failures else "done",
+                    detail="; ".join(partition_failures)[:2000] or None))
 
     snapshot = Snapshot(
         version="",

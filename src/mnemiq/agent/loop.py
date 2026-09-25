@@ -186,7 +186,7 @@ class Agent:
         verifier=None,
         preview_rows: int = 100,
         guard_undefined_terms: bool = False,
-        guard_fanout: bool = False,
+        guard_fanout: bool | None = False,
     ) -> None:
         self.generator = generator
         self.guard_undefined_terms = guard_undefined_terms

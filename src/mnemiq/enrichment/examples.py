@@ -97,17 +97,21 @@ def _visible_for(snapshot: Snapshot, table: str) -> dict[str, set[str]]:
 
 def enrich_examples(
     snapshot: Snapshot, generator: ExampleGenerator, adapter, dialect: str = "duckdb",
-    per_table: int = 3, *, guard_fanout: bool = False,
+    per_table: int = 3, *, guard_fanout: bool | None = False,
 ) -> Snapshot:
     """Third LLM phase: verified worked examples. Keeps only decider-approved, executed,
     rows>0 pairs. Fail-soft per table; re-versions.
 
-    `guard_fanout` screens proposals with the fan-out check (M109), as `plan_query` does at ask
-    time. A kept example is shown to the model as a verified pattern, so without it an inflated
-    query the guard would refuse at ask time was taught as one.
+    `guard_fanout` screens proposals with the fan-out check (M109). A kept example is shown to
+    the model as a verified pattern, so without it an inflated query the guard would refuse at ask
+    time was taught as one. Auto (None) always screens here, unlike `plan_query`, which leaves an
+    older snapshot unguarded (`guard_on`): dropping an example costs nothing a refusal would.
     """
     cards = {c.object_id: c.text for c in build_cards(snapshot)}
-    keys = key_facts(snapshot) if guard_fanout else None
+    # Auto (None) screens whatever the snapshot's partitions: a missing partition fact can only
+    # drop a valid current-row example, never keep an inflated one, and a dropped example costs
+    # nothing an ask-time refusal would. `guard_on` is for questions, where a refusal does cost.
+    keys = key_facts(snapshot) if guard_fanout is not False else None
 
     kept: list[Example] = []
     for table in cards:

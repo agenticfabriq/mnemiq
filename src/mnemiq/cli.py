@@ -286,6 +286,10 @@ def _cmd_enrich(settings: Settings) -> int:
               f"{', '.join(sorted(unmeasured))}. Their tables are in the model; these columns look "
               "in the snapshot exactly like a column whose type cannot be counted, which is why "
               "this is said out loud", file=sys.stderr)
+    from mnemiq.enrichment.pipeline import partition_warning
+
+    if warning := partition_warning(snap):
+        print(warning, file=sys.stderr)
     return 0
 
 

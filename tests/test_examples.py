@@ -1,4 +1,5 @@
 import pyarrow as pa
+import pytest
 
 from mnemiq.contract import Column, Snapshot
 from mnemiq.enrichment.examples import FakeExampleGenerator, enrich_examples
@@ -78,14 +79,17 @@ def _two_fact_snapshot():
     )
 
 
-def _fanout_examples(guard_fanout: bool):
+def _fanout_examples(guard_fanout: bool | None):
     gen = FakeExampleGenerator({"dim_policy": [{"question": "loss ratio?", "sql": _FANOUT_SQL}]})
     return enrich_examples(_two_fact_snapshot(), gen, _Adapter(), dialect="duckdb",
                            guard_fanout=guard_fanout).examples
 
 
-def test_the_fanout_guard_keeps_no_inflated_example():
-    assert _fanout_examples(guard_fanout=True) == []
+@pytest.mark.parametrize("guard", [True, None])
+def test_the_fanout_guard_keeps_no_inflated_example(guard):
+    """Auto screens too, though this snapshot records no partition profiling: a missing partition
+    fact can only drop a valid example, and the examples are cached as screened."""
+    assert _fanout_examples(guard_fanout=guard) == []
 
 
 def test_without_the_fanout_guard_the_inflated_example_is_kept():
