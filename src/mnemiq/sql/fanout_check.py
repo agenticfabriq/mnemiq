@@ -177,6 +177,7 @@ def check_fanout(
     ast: exp.Expression,
     visible: dict[str, set[str]],
     facts: KeyFacts,
+    dialect: str | None = None,
 ) -> Refusal | None:
     """Refuse an aggregate whose rows a join has multiplied (register M109).
 
@@ -197,26 +198,28 @@ def check_fanout(
     key uniqueness is unknown. A CTE or subquery that aggregates, de-duplicates, windows or limits
     is opaque and treated as unique: an aggregated CTE is usually one row per key, and guessing
     otherwise would refuse the very rewrite this asks for. One that only passes a join's rows
-    through is merged into its parent and checked flat (`_merged`).
+    through is, where sqlglot can merge it, merged into its parent and checked flat (`_merged`).
     """
     found = _check_scopes(ast, visible, facts)
     if found is None and (ast.find(exp.Subquery) or ast.find(exp.CTE)):
-        merged = _merged(ast, visible)
+        merged = _merged(ast, visible, dialect)
         if merged is not None:
             found = _check_scopes(merged, visible, facts)
     return found
 
 
-def _merged(ast: exp.Expression, visible: dict[str, set[str]]) -> exp.Expression | None:
-    """The query with every derived table that only projects rows merged into its parent.
+def _merged(ast: exp.Expression, visible: dict[str, set[str]],
+            dialect: str | None = None) -> exp.Expression | None:
+    """The query with its pass-through derived tables merged into their parents, where sqlglot can.
 
     Opaque derived sources were a bypass: `SELECT SUM(t.x) FROM (SELECT c.x FROM claim c JOIN
     premium p ON ...) t` got an inflated sum approved, and BIRD gold that computes its inflation
-    that way hid from the gold check. sqlglot's `merge_subqueries` merges exactly the derived
-    tables whose rows pass through unchanged -- none that aggregates, de-duplicates, windows or
-    limits -- which is the line this needs; a merged query means the same as its original, so it
-    is checked like any flat one. Anything qualify or merge cannot handle leaves the check as it
-    was.
+    that way hid from the gold check. sqlglot's `merge_subqueries` merges a derived table only when
+    the result means the same -- never one that aggregates or de-duplicates -- so a merged query is
+    checked like any flat one. This NARROWS the bypass rather than closing it: sqlglot also leaves
+    a CTE read more than once, and some derived tables under an outer join, unmerged, and those
+    stay opaque (pinned in the tests). Anything qualify or merge cannot handle leaves the check as
+    it was.
     """
     schema: dict = {}
     for object_id, columns in visible.items():
@@ -225,12 +228,18 @@ def _merged(ast: exp.Expression, visible: dict[str, set[str]]) -> exp.Expression
         for part in parents:
             node = node.setdefault(part, {})
         node[name] = {c: "TEXT" for c in columns}
-    try:
-        return merge_subqueries(qualify(ast.copy(), schema=schema, quote_identifiers=False,
-                                        validate_qualify_columns=False))
-    except Exception as exc:  # noqa: BLE001 -- unmergeable is not evidence of fan-out
-        logger.warning("fan-out check could not merge derived tables: %s", exc)
-        return None
+    # A catalog that mixes bare and qualified object ids is a schema sqlglot rejects (it wants one
+    # nesting depth), which silently switched the merge off for every query against it. Without
+    # a schema, qualify still resolves every column the query itself qualifies.
+    for attempt in (schema, None):
+        try:
+            return merge_subqueries(qualify(ast.copy(), schema=attempt, dialect=dialect,
+                                            quote_identifiers=False,
+                                            validate_qualify_columns=False))
+        except Exception as exc:  # noqa: BLE001 -- unmergeable is not evidence of fan-out
+            if attempt is None:
+                logger.warning("fan-out check could not merge derived tables: %s", exc)
+    return None
 
 
 def _check_scopes(ast: exp.Expression, visible: dict[str, set[str]],

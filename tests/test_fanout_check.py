@@ -821,3 +821,18 @@ def test_a_federated_projecting_subquery_is_merged_too():
         keys=key_facts(_snapshot(profile)), visible=visible,
     )
     assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_mixed_depth_catalog_still_merges():
+    """A federated catalog can mix bare and qualified object ids; sqlglot's schema rejects mixed
+    depths, and that turned the merge off for every query against the catalog."""
+    visible = {**VISIBLE, "pg.other": {"x"}}
+    verdict = _check(f"SELECT SUM(t.paid) / SUM(t.earned) FROM ({_JOINED_ROWS}) t", visible=visible)
+    assert verdict is not None and verdict.code == RefusalCode.FAN_OUT
+
+
+def test_a_cte_read_twice_is_not_merged_known_limit():
+    """sqlglot merges a CTE only when it is read once, so a pass-through CTE read twice stays
+    opaque and its inflated sum is approved. Narrowed, not closed; pinned so a change is a choice."""
+    assert _check(f"WITH j AS ({_JOINED_ROWS}) SELECT SUM(paid) FROM j "
+                  "UNION ALL SELECT SUM(paid) FROM j") is None
