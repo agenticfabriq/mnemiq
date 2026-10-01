@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 
 import httpx
@@ -8,6 +9,7 @@ from openai import APIError, OpenAI
 from mnemiq.config import Settings
 
 _GPT5 = re.compile(r"(^|\.)gpt-5")
+logger = logging.getLogger(__name__)
 
 
 class ModelUnavailable(RuntimeError):
@@ -147,8 +149,12 @@ class LLMClient:
             if _on_a_window_edge(read):
                 try:
                     again = self._count(self._create(system, user + _PROBE_PADDING, self._kwargs(1)))
-                except ModelUnavailable:
-                    # The reply in hand came back; a probe that did not cannot convict it.
+                except ModelUnavailable as exc:
+                    # The reply in hand came back; a probe that did not cannot convict it. Failing
+                    # closed would turn a passing 429 into a failed answer on every window edge, so
+                    # this answers -- but says so, or a server whose probe always fails is invisible.
+                    logger.warning("could not check for a cut prompt (%s tokens read, on a window "
+                                   "edge): the probe failed: %s", read, exc)
                     return resp.choices[0].message.content or ""
                 if again and again <= read:  # no count on the probe proves nothing
                     raise PromptCut(

@@ -147,7 +147,7 @@ def test_a_count_off_the_edge_is_not_probed(monkeypatch):
     assert client.calls == 1
 
 
-def test_a_probe_that_fails_keeps_the_reply_in_hand(monkeypatch):
+def test_a_probe_that_fails_keeps_the_reply_in_hand_and_says_so(monkeypatch, caplog):
     import httpx
     from openai import APIConnectionError
 
@@ -162,7 +162,9 @@ def test_a_probe_that_fails_keeps_the_reply_in_hand(monkeypatch):
     monkeypatch.setattr(module, "OpenAI", _ProbeFails)
     client = LLMClient(Settings(llm_base_url="http://x", llm_api_key="k", llm_model="m",
                                 pg_dsn=None, acme_data_dir=None))
-    assert client.complete("s" * 4_475, "u" * 4_475) == "reply 1"
+    with caplog.at_level("WARNING", logger="mnemiq.llm.client"):
+        assert client.complete("s" * 4_475, "u" * 4_475) == "reply 1"
+    assert "could not check for a cut prompt" in caplog.text, "a probe that never ran must be visible"
 
 
 def test_a_probe_that_reports_no_usage_is_not_called_a_cut(monkeypatch):
