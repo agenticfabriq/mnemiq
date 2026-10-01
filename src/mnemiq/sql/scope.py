@@ -228,7 +228,39 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
     for target in _target_reads(ast):
         if not any(t is target for t in out):
             out.append(target)
+    # On a WRITE, a table the walk left out that no CTE could stand in front of is a table the
+    # scope model MISSED, and an unreported read is one no guard sees: fail toward over-reporting,
+    # exactly as an unresolvable scope does. Not hypothetical (M121): sqlglot 30.17 began scoping
+    # UPDATE, its scope lists none of the FROM tables, and `UPDATE s SET a = c.a FROM c` reported
+    # `s` alone -- so `c` was neither grant-checked nor row-filtered. Names only: a name no CTE in
+    # the statement carries can only be a real read, whatever this sqlglot's scope model thinks.
+    # The write's own TARGET is excused (an INSERT writes it without reading it; a target that is
+    # read is in `out` through `_target_reads`). Writes only: on the read path an under-report is
+    # lineage's to classify (`views.py` names an unmodelled source as such), and no read-path test
+    # failed under sqlglot 30.21.
+    written = _written_targets(ast)
+    if written:
+        ctes = {cte.alias_or_name.lower() for cte in ast.find_all(exp.CTE)}
+        if any(not any(t is table for t in out) and not any(w is table for w in written)
+               and table.name.lower() not in ctes
+               for table in ast.find_all(exp.Table)):
+            return list(ast.find_all(exp.Table))
     return out
+
+
+def _written_targets(ast: exp.Expression) -> list[exp.Table]:
+    """The table nodes a write statement writes, located by position: INSERT's `this` (inside the
+    column-list Schema when there is one), UPDATE's and MERGE's `this`, DELETE's `this` or its
+    `tables`. Empty for a SELECT."""
+    if not isinstance(ast, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+        return []
+    found: list[exp.Table] = []
+    for node in [ast.this, *(ast.args.get("tables") or [])]:
+        if isinstance(node, exp.Schema):
+            node = node.this
+        if isinstance(node, exp.Table):
+            found.append(node)
+    return found
 
 
 def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, str] | None:
