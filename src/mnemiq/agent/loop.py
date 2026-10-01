@@ -15,7 +15,7 @@ from mnemiq.contract.seams import (
     lineage_disclosure_sentence,
 )
 from mnemiq.contract import DeferralReason, IdentityContext, Snapshot, Trace
-from mnemiq.llm.client import ModelUnavailable
+from mnemiq.llm.client import ModelUnavailable, PromptCut
 from mnemiq.progress import Emit, Stage, step
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
@@ -233,6 +233,15 @@ class Agent:
             # different problems wearing one sentence. Diagnosing a 30-case failure took
             # twenty minutes for want of the string that was already in hand.
             detail = str(exc).strip()
+            if isinstance(exc, PromptCut):
+                # Not an outage, and "try again" would send the same prompt to the same window.
+                return AgentAnswer(
+                    answer=("Could not answer this question: the model server cut the prompt to fit "
+                            "its context window, so the model never saw all of it. This is a "
+                            f"configuration problem, not a judgement about your data. {detail}"),
+                    failed=True,
+                    reason_code=DeferralReason.MODEL_UNAVAILABLE,
+                )
             return AgentAnswer(
                 answer=(
                     "Could not answer this question: the model provider did not respond. "
