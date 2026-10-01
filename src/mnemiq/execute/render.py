@@ -18,7 +18,8 @@ def _cell(value: object, max_cell: int) -> tuple[str, bool]:
     return text[: max_cell - 1] + "…", True
 
 
-def render_result(table: pa.Table, max_rows: int = 50, max_cell: int = MAX_CELL) -> str:
+def render_result(table: pa.Table, max_rows: int = 50, max_cell: int = MAX_CELL,
+                  cut_at: int | None = None) -> str:
     """Render rows for a prompt: bounded, and loud about what it left out.
 
     Silently showing 50 of 1000 rows invites the model to summarize a partial view as if it
@@ -44,7 +45,11 @@ def render_result(table: pa.Table, max_rows: int = 50, max_cell: int = MAX_CELL)
         shortened = shortened or any(cut for _, cut in rendered)
         lines.append(" | ".join(text for text, _ in rendered))
 
-    if shown < total:
+    if cut_at is not None:
+        # Not a total: the query stopped at the engine's limit and may have more (M118).
+        lines.append(f"... showing {shown} rows; the query stopped at the {cut_at:,}-row limit, "
+                     "so there may be more -- do not report a total or a count of these rows")
+    elif shown < total:
         lines.append(f"... showing {shown} of {total} rows (truncated)")
     else:
         lines.append(f"({total} rows)")

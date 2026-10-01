@@ -739,13 +739,19 @@ def _has_projection_star(ast: exp.Expression, dialect: str,
 
 
 def _with_limit(ast: exp.Expression, max_rows: int) -> exp.Expression:
+    """Bound the result, and mark the tree when the bound is ours (M118).
+
+    A limit the query set itself is the query's business: `LIMIT 10` for a top ten returns ten
+    rows on purpose. One the guard imposed is a cut nobody asked for, and a result that fills it
+    may have been cut -- so the tree carries `meta["row_cap"]` for the caller to say so.
+    """
     existing = ast.args.get("limit")
-    if existing is None:
-        return ast.limit(max_rows)
-
-    try:
-        requested = int(existing.expression.name)
-    except (AttributeError, ValueError):
-        return ast.limit(max_rows)  # unreadable limit -> impose our own
-
-    return ast if requested <= max_rows else ast.limit(max_rows)
+    if existing is not None:
+        try:
+            if int(existing.expression.name) <= max_rows:
+                return ast
+        except (AttributeError, ValueError):
+            pass  # unreadable limit -> impose our own
+    capped = ast.limit(max_rows)
+    capped.meta["row_cap"] = max_rows
+    return capped

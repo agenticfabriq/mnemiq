@@ -50,6 +50,7 @@ def decide(
                          columns=visible)
     if isinstance(shaped, Refusal):
         return shaped
+    row_cap = shaped.meta.get("row_cap")  # read now: the rewrites below build new trees
 
     refusal = check_access(shaped, visible, target)
     if refusal is not None:
@@ -167,4 +168,4 @@ def decide(
             return refused
 
     return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables,
-                    lineage=lineage, columns=columns, narrowed=narrowed)
+                    lineage=lineage, columns=columns, narrowed=narrowed, row_cap=row_cap)

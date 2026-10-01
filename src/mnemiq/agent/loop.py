@@ -46,15 +46,29 @@ class ResultPreview:
 
     columns: list[str]
     rows: list[list[object]]
-    row_count: int  # true count, not the capped length
-    truncated: bool
+    row_count: int  # rows the query returned; a floor, not the total, when `capped`
+    truncated: bool  # the preview shows fewer rows than the query returned
+    capped: bool = False  # the query stopped at the guard's row limit and may have more (M118)
 
 
-def result_preview(table, cap: int) -> ResultPreview:
+def result_preview(table, cap: int, capped: bool = False) -> ResultPreview:
     cols = [str(c) for c in table.column_names]
     raw = table.slice(0, cap).to_pylist()
     return ResultPreview(columns=cols, rows=[[r[c] for c in cols] for r in raw],
-                         row_count=table.num_rows, truncated=table.num_rows > cap)
+                         row_count=table.num_rows, truncated=table.num_rows > cap, capped=capped)
+
+
+def cap_sentence(row_cap: int) -> str:
+    """Said after the model, like the other disclosures: a cut result must not pass a step that
+    could present 1,000 rows as the whole answer."""
+    return (f"These results stop at the {row_cap:,}-row limit, so there may be more: counts and "
+            "totals over them are not the whole.")
+
+
+def _cut(approved, table) -> int | None:
+    """The guard's limit, when the result filled it -- the one case where rows may be missing."""
+    cap = getattr(approved, "row_cap", None)
+    return cap if cap is not None and table.num_rows >= cap else None
 
 
 def _narrowed_of(executed):
@@ -577,9 +591,10 @@ class Agent:
         emit: Emit | None = None,
         attempts: int | None = None,
     ) -> AgentAnswer:
+        cut = _cut(approved, table)
         with step(emit, Stage.SYNTHESIZE, forced=forced):
             answer = self.synthesizer.answer(
-                packet.question, approved.plan_sql, render_result(table), forced=forced,
+                packet.question, approved.plan_sql, render_result(table, cut_at=cut), forced=forced,
                 row_count=table.num_rows,
             )
         trace = build_trace(
@@ -606,8 +621,9 @@ class Agent:
             lineage_disclosure_sentence(trace.lineage_completeness,
                                         list(trace.lineage_unresolved),
                                         list(trace.lineage_reasons)),
+            cap_sentence(cut) if cut is not None else "",
         )
         return AgentAnswer(answer=answer, trace=trace, deferred=False, cached=cached,
                            narrowed=getattr(approved, "narrowed", None),
-                           preview=result_preview(table, self.preview_rows),
+                           preview=result_preview(table, self.preview_rows, capped=cut is not None),
                            attempts=attempts, corrected=approved.corrected)
