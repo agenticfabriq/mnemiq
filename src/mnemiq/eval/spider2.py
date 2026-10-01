@@ -46,7 +46,7 @@ from mnemiq.eval.bird_runner import (
     enrich_bird_db,
 )
 from mnemiq.eval.engine import build_engine
-from mnemiq.eval.grade import results_match
+from mnemiq.eval.grade import GotFactsUndecided, results_match
 from mnemiq.eval.harness import CaseResult, Engine, Outcome, _preview
 from mnemiq.llm.client import ModelUnavailable
 
@@ -143,9 +143,14 @@ def grade_alternatives(candidate: pa.Table, alternatives: list[pa.Table]) -> Out
     if it is correct against ANY answer the benchmark accepts."""
     if any(results_match(g, candidate, allow_extra_columns=False) for g in alternatives):
         return Outcome.CORRECT
-    if any(results_match(g, candidate, allow_extra_columns=True) for g in alternatives):
-        return Outcome.CORRECT_FACTS
-    return Outcome.WRONG
+    undecided = False
+    for g in alternatives:
+        try:
+            if results_match(g, candidate, allow_extra_columns=True):
+                return Outcome.CORRECT_FACTS
+        except GotFactsUndecided:
+            undecided = True  # not a verdict: an error unless another alternative decides it
+    return Outcome.ERROR if undecided else Outcome.WRONG
 
 
 def run_case_csv(

@@ -18,7 +18,7 @@ from mnemiq.execute.resultset import (
 
 # normalize is re-exported: harness.py imports it from here. _rows/_match_rows back
 # results_match below; the shared definitions live in the engine's resultset module.
-__all__ = ["normalize", "results_match"]
+__all__ = ["GotFactsUndecided", "normalize", "results_match"]
 
 # The definitions these two readings implement are the grading contract agreed with
 # beacon on 2026-08-07: beacon `docs/grading.md`. That document is the agreement; this
@@ -41,6 +41,18 @@ def _distinct_rows(rows: list[list[object]]) -> list[list[object]]:
             seen.add(key)
             out.append(row)
     return out
+
+
+# How many surviving column choices got-facts will try before it says it cannot decide. On
+# the design-partner answers at most 13 survived; past this the answer is pathological (dozens
+# of flag-like columns on a wrong answer), and a visible "undecided" beats a hang or a silent
+# WRONG -- the bound that scored 19 right answers wrong was exactly such a silent WRONG.
+MAX_CHOICES = 10_000
+
+
+class GotFactsUndecided(Exception):
+    """More column choices survived pruning than got-facts will try. Not a verdict: the
+    caller records it as an error, never as a wrong answer."""
 
 
 def results_match(
@@ -127,8 +139,19 @@ def results_match(
         sorted_gold = _distinct_rows(sorted_gold)
     all_keys = [[repr(cell) for cell in row] for row in all_rows]
 
+    tried = 0
+
+    def spend() -> None:
+        nonlocal tried
+        tried += 1
+        if tried > MAX_CHOICES:
+            raise GotFactsUndecided(
+                f"more than {MAX_CHOICES:,} column choices survive pruning "
+                f"({candidate.num_columns} candidate columns, {gold.num_columns} gold)")
+
     for keep in _positional_choices(gold_rows, all_rows, gold.num_columns,
                                     candidate.num_columns, cell_match):
+        spend()
         candidate_rows = [[row[i] for i in keep] for row in all_rows]
         if duplicate_rows_insignificant:
             candidate_rows = _distinct_rows(candidate_rows)
@@ -136,6 +159,7 @@ def results_match(
             return True
     for keep in _sorted_choices(gold_rows, all_rows, gold.num_columns, candidate.num_columns,
                                 cell_match):
+        spend()
         sorted_candidate = [
             [value for _, value in sorted(((keys[i], row[i]) for i in keep), key=lambda p: p[0])]
             for row, keys in zip(all_rows, all_keys, strict=True)
@@ -254,13 +278,34 @@ def _positional_choices(gold_rows: list[list[object]], cand_rows: list[list[obje
     fits = [[c for c in range(width)
              if _covers(gold_cols[j], gold_idx[j], cand_cols[c], cand_idx[c], cell_match)]
             for j in range(arity)]
+    yield from _increasing_choices(fits)
+
+
+def _increasing_choices(fits: list[list[int]]) -> Iterator[tuple[int, ...]]:
+    """Every increasing tuple taking its j-th column from `fits[j]`, without walking dead ends.
+
+    A plain depth-first walk explores every prefix before finding that a later level has no room
+    -- 0/1 flag columns fit most levels, and a 42 that fits none made it walk billions of
+    prefixes and yield nothing. So first find the LATEST column each level may take and still
+    leave increasing room for the levels after it; a walk held under those bounds completes
+    every prefix it starts, and its work is bounded by what it yields.
+    """
+    latest: list[int] = []
+    bound = math.inf
+    for options in reversed(fits):
+        room = [c for c in options if c < bound]
+        if not room:
+            return
+        bound = max(room)
+        latest.append(bound)
+    latest.reverse()
 
     def walk(j: int, after: int, chosen: tuple[int, ...]) -> Iterator[tuple[int, ...]]:
-        if j == arity:
+        if j == len(fits):
             yield chosen
             return
         for c in fits[j]:
-            if c > after:
+            if after < c <= latest[j]:
                 yield from walk(j + 1, c, (*chosen, c))
 
     yield from walk(0, -1, ())
@@ -276,4 +321,44 @@ def _sorted_choices(gold_rows: list[list[object]], cand_rows: list[list[object]]
     gold_cells = _ValueIndex([cell for row in gold_rows for cell in row])
     usable = [c for c in range(width)
               if all(gold_cells.any_match(row[c], cell_match, x_is_gold=False) for row in cand_rows)]
+    # And every gold cell is compared with some chosen cell, so each must be matchable by a
+    # usable column: one gold value nobody holds rules out every set at once.
+    usable_cells = _ValueIndex([row[c] for row in cand_rows for c in usable])
+    if not all(usable_cells.any_match(cell, cell_match, x_is_gold=True)
+               for row in gold_rows for cell in row):
+        return
+    if len(cand_rows) == 1 and len(gold_rows) == 1:
+        # One row, the usual shape of a wide answer: the chosen cells pair one to one with
+        # gold's, so a set exists only if gold's cells can each take a DIFFERENT usable column.
+        # No such pairing rules out every set; one found is the set most likely to pass, so try
+        # it first.
+        pairing = _pair_cells(gold_rows[0], cand_rows[0], usable, cell_match)
+        if pairing is None:
+            return
+        first = tuple(sorted(pairing))
+        yield first
+        yield from (keep for keep in combinations(usable, arity) if keep != first)
+        return
     yield from combinations(usable, arity)
+
+
+def _pair_cells(gold_row: list[object], cand_row: list[object], usable: list[int],
+                cell_match: CellMatch) -> list[int] | None:
+    """Give each gold cell a different candidate column holding a matching value, or None.
+    Augmenting paths (Kuhn's algorithm): rows are a few dozen cells wide."""
+    edges = [[c for c in usable if cell_match(g, cand_row[c])] for g in gold_row]
+    owner: dict[int, int] = {}
+
+    def assign(j: int, seen: set[int]) -> bool:
+        for c in edges[j]:
+            if c in seen:
+                continue
+            seen.add(c)
+            if c not in owner or assign(owner[c], seen):
+                owner[c] = j
+                return True
+        return False
+
+    if not all(assign(j, set()) for j in range(len(gold_row))):
+        return None
+    return list(owner)

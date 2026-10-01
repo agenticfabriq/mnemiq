@@ -9,13 +9,12 @@ right (tolerance edges, roundings in both directions, NULLs, bools, duplicates, 
 from __future__ import annotations
 
 import random
-import time
 from itertools import combinations
 
 import pyarrow as pa
 import pytest
 
-from mnemiq.eval.grade import _distinct_rows, results_match
+from mnemiq.eval.grade import GotFactsUndecided, _distinct_rows, results_match
 from mnemiq.execute.resultset import _match_rows, _rows, facts_cells_match, grade_cells_match
 
 
@@ -61,34 +60,37 @@ def _brute_force(gold: pa.Table, candidate: pa.Table, allow_extra_columns: bool 
 
 
 # Values chosen to sit on the edges the pruning must not cross: a rounding either way, a value
-# just inside and just outside the numeric tolerance, integers that must stay exact, a bool
-# that Python calls equal to 1.0, NULL, NaN, and strings.
-_POOL = [0.0, 1.0, 2.0, 1.4249, 1.42, 1.425, 1.43, 1.4, 1.0000004, 1.000006, 52.63, 53.0, 0.196,
-         0.2, 0.0, 38.125, 38.12, 38.13, 1e6, 1e6 + 5.0, 1e6 + 20.0, 7.0, None, True, False, "a",
-         "b", "1", float("nan"), -1.5, -2.0,
-         # Within the 1e-5 relative tolerance of each other but no rounding of each other --
-         # the only pairs that test the tolerance window on its own -- and one just outside.
-         1234567.5, 1234570.25, 1234599.5]
+# just inside and just outside the numeric tolerance, integers that must stay exact, NULL and
+# NaN. Each column holds ONE type, so arrow keeps it -- a mixed column would be stringified and
+# turn every tolerance case into string equality.
+_FLOATS = [0.0, 1.0, 2.0, 1.4249, 1.42, 1.425, 1.43, 1.4, 1.0000004, 1.000006, 52.63, 53.0, 0.196,
+           0.2, 38.125, 38.12, 38.13, 7.0, -1.5, -2.0, None, float("nan"),
+           # Within the 1e-5 relative tolerance of each other but no rounding of each other --
+           # the only pairs that test the tolerance window on its own -- and one just outside.
+           1234567.5, 1234570.25, 1234599.5]
+_STRINGS = ["a", "b", "1", "1.0", None]
+_BOOLS = [True, False, None]
 
 
 def _col(rng: random.Random, n: int) -> list[object]:
-    kind = rng.random()
-    if kind < 0.15:  # a constant column: many choices look alike
-        v = rng.choice(_POOL)
-        return [v] * n
-    return [rng.choice(_POOL) for _ in range(n)]
+    pool = rng.choices([_FLOATS, _STRINGS, _BOOLS], [6, 2, 1])[0]
+    if rng.random() < 0.15:  # a constant column: many choices look alike
+        return [rng.choice(pool)] * n
+    return [rng.choice(pool) for _ in range(n)]
+
+
+def _as_planted(rng: random.Random, col: list[object]) -> list[object]:
+    """Gold's column as a candidate might spell it: rounded, or a bool read as 1.0/0.0
+    (Python calls True == 1.0, and both cell readings follow it)."""
+    if all(v is None or isinstance(v, bool) for v in col) and rng.random() < 0.5:
+        return [None if v is None else float(v) for v in col]
+    if rng.random() < 0.3:
+        return [round(v, 2) if isinstance(v, float) and v == v else v for v in col]
+    return list(col)
 
 
 def _table(cols: list[list[object]]) -> pa.Table:
-    # Mixed types do not fit one arrow column, so carry them as python objects via strings
-    # only where needed: arrow infers a type per column, and a mixed column falls back here.
-    arrays = []
-    for col in cols:
-        try:
-            arrays.append(pa.array(col))
-        except (pa.ArrowInvalid, pa.ArrowTypeError):
-            arrays.append(pa.array([None if v is None else str(v) for v in col]))
-    return pa.Table.from_arrays(arrays, names=[f"c{i}" for i in range(len(cols))])
+    return pa.Table.from_arrays([pa.array(c) for c in cols], names=[f"c{i}" for i in range(len(cols))])
 
 
 def _case(rng: random.Random, extra_columns: bool) -> tuple[pa.Table, pa.Table]:
@@ -98,13 +100,10 @@ def _case(rng: random.Random, extra_columns: bool) -> tuple[pa.Table, pa.Table]:
     # Exact match needs the same width, so there the candidate is mostly gold's own columns.
     width = rng.choice([1, 2, 3, 4, 5, 6]) if extra_columns or rng.random() < 0.3 else 0
     cand_cols = [_col(rng, rows) for _ in range(width)]
-    # Often plant gold's columns in the candidate -- reordered, rounded, or with rows shuffled --
-    # so that matches are common enough to test the True side too.
+    # Often plant gold's columns in the candidate -- respelled, reordered, rows shuffled -- so
+    # that matches are common enough to test the True side too.
     if gold_cols and rng.random() < 0.7:
-        planted = list(gold_cols)
-        if rng.random() < 0.3:
-            planted = [[round(v, 2) if isinstance(v, float) and v == v else v for v in c]
-                       for c in planted]
+        planted = [_as_planted(rng, c) for c in gold_cols]
         slots = sorted(rng.sample(range(width + len(planted)), len(planted)))
         if rng.random() < 0.3:
             rng.shuffle(slots)
@@ -133,24 +132,122 @@ def test_the_pruned_search_agrees_with_the_full_one(allow_extra, dupes):
     assert matched > agree * 0.1, f"only {matched} of {agree} cases matched"
 
 
-def test_a_wide_answer_holding_every_gold_column_is_graded_and_fast():
+def _counting(monkeypatch) -> list[int]:
+    """How many column choices reach the row comparison: the work, counted rather than timed."""
+    import mnemiq.eval.grade as grade
+
+    calls = [0]
+    real = grade._match_rows
+
+    def counted(*args, **kwargs):
+        calls[0] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(grade, "_match_rows", counted)
+    return calls
+
+
+def test_a_wide_answer_holding_every_gold_column_is_graded(monkeypatch):
     """The shape that hung: one row, gold's 11 columns among 74. C(74, 11) is 4e12 choices."""
+    calls = _counting(monkeypatch)
     rng = random.Random(7)
     gold_vals = {f"g{i}": [round(rng.uniform(0, 100), 4)] for i in range(11)}
     cand = {f"x{i}": [round(rng.uniform(100, 200), 4)] for i in range(63)}
     cand.update({f"c_{k}": v for k, v in gold_vals.items()})
-    start = time.perf_counter()
     assert results_match(pa.table(gold_vals), pa.table(cand), allow_extra_columns=True)
-    assert time.perf_counter() - start < 2.0
+    assert calls[0] <= 2
 
 
-def test_a_wide_wrong_answer_is_refused_fast():
+def test_a_wide_wrong_answer_is_refused_without_trying_choices(monkeypatch):
     """And the False side, where the old search had to try every choice before giving up."""
+    calls = _counting(monkeypatch)
     gold = pa.table({f"g{i}": [float(i) + 0.5] for i in range(11)})
     cand = pa.table({f"x{i}": [float(i) + 0.25] for i in range(74)})
-    start = time.perf_counter()
     assert not results_match(gold, cand, allow_extra_columns=True)
-    assert time.perf_counter() - start < 2.0
+    assert calls[0] == 0
+
+
+def test_flag_columns_cannot_hide_a_missing_gold_value(monkeypatch):
+    """Found by review: 0/1/NULL columns appear in almost any gold row, so per-column pruning
+    keeps all 74 -- and with gold's 42 held by none of them, every set is still wrong. One gold
+    value no usable column holds rules them all out at once."""
+    calls = _counting(monkeypatch)
+    flags = [0.0, 1.0, None]
+    gold = pa.table({f"g{i}": [v] for i, v in enumerate(
+        [0.0, 1.0, None, 0.0, 1.0, None, 0.0, 1.0, 0.0, 1.0, 42.0])})
+    cand = pa.table({f"x{i}": pa.array([flags[i % 3]], pa.float64()) for i in range(74)})
+    assert not results_match(gold, cand, allow_extra_columns=True)
+    assert calls[0] == 0
+
+
+def test_a_gold_value_no_column_holds_rules_out_every_set_on_many_rows_too(monkeypatch):
+    """On one row the cell pairing already catches it; on two the held-value check is what
+    stops the cell-sorted reading from trying every set of three flag columns."""
+    calls = _counting(monkeypatch)
+    gold = pa.table({"a": [0.0, 1.0], "b": [1.0, 0.0], "c": [42.0, 0.0]})
+    cand = pa.table({f"x{i}": [[0.0, 1.0][i % 2], [1.0, 0.0][i % 2]] for i in range(12)})
+    assert not results_match(gold, cand, allow_extra_columns=True)
+    assert calls[0] == 0
+
+
+class _Budget(list):
+    """A list that counts how often it is walked, and stops a walk that has run away."""
+
+    steps = 0
+
+    def __iter__(self):
+        _Budget.steps += 1
+        if _Budget.steps > 10_000:
+            raise AssertionError("the walk is exploring dead ends")
+        return super().__iter__()
+
+
+@pytest.mark.parametrize("last", [[], [5]], ids=["no-column-fits", "no-room-left"])
+def test_the_position_wise_walk_does_not_explore_dead_ends(last):
+    """Found by timing the flag test: ten levels that fit 60 columns each, and a last level that
+    fits none (or only a column too early to follow ten others). A plain walk explores C(60, 10)
+    prefixes before it learns that; this one yields nothing without walking them."""
+    from mnemiq.eval.grade import _increasing_choices
+
+    _Budget.steps = 0
+    fits = [_Budget(range(60)) for _ in range(10)] + [_Budget(last)]
+    assert list(_increasing_choices(fits)) == []
+
+
+def test_the_position_wise_walk_stays_inside_the_room_it_has():
+    """The bounds, not the up-front check: the last level fits only column 10, so the ten before
+    it must be 0..9 -- exactly one tuple. Unbounded, the walk tries prefixes up to column 59 and
+    abandons each one."""
+    from mnemiq.eval.grade import _increasing_choices
+
+    _Budget.steps = 0
+    fits = [_Budget(range(60)) for _ in range(10)] + [_Budget([10])]
+    assert list(_increasing_choices(fits)) == [tuple(range(11))]
+
+
+def test_the_position_wise_walk_yields_exactly_the_increasing_tuples():
+    from mnemiq.eval.grade import _increasing_choices
+
+    rng = random.Random(3)
+    for _ in range(300):
+        width, arity = rng.randint(0, 7), rng.randint(0, 4)
+        fits = [sorted(rng.sample(range(width), rng.randint(0, width))) for _ in range(arity)]
+        expected = [t for t in combinations(range(width), arity)
+                    if all(c in fits[j] for j, c in enumerate(t))]
+        assert list(_increasing_choices(fits)) == expected
+
+
+def test_one_row_flags_in_the_wrong_counts_are_refused_without_trying_choices(monkeypatch):
+    """The same 74 flag columns with a 42 among them: every gold value is held, but gold needs
+    four zeros and the row has two. Gold's cells cannot each take a different column, so no set
+    of eleven can match."""
+    calls = _counting(monkeypatch)
+    gold = pa.table({f"g{i}": [v] for i, v in enumerate(
+        [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, None, None, 1.0, 1.0, 42.0])})
+    cols = {f"x{i}": pa.array([v], pa.float64()) for i, v in enumerate([0.0, 0.0, 42.0])}
+    cols.update({f"y{i}": pa.array([[1.0, None][i % 2]], pa.float64()) for i in range(71)})
+    assert not results_match(gold, pa.table(cols), allow_extra_columns=True)
+    assert calls[0] == 0
 
 
 def test_a_wide_answer_under_the_cell_sorted_reading_is_graded():
@@ -159,3 +256,50 @@ def test_a_wide_answer_under_the_cell_sorted_reading_is_graded():
     cand = {f"x{i}": [f"z{i}", f"y{i}"] for i in range(40)}
     cand.update({"count": [3.0, 5.0], "key": ["a", "b"]})
     assert results_match(gold, pa.table(cand), allow_extra_columns=True)
+
+
+def _undecidable() -> tuple[pa.Table, pa.Table]:
+    """Two rows of flags: every column survives pruning and no set of three matches."""
+    gold = pa.table({"a": [0.0, 1.0], "b": [1.0, 0.0], "c": [0.0, 0.0]})
+    cand = pa.table({f"x{i}": [[0.0, 1.0][i % 2], [1.0, 0.0][i % 2]] for i in range(12)})
+    return gold, cand
+
+
+def test_past_the_limit_got_facts_says_it_cannot_decide(monkeypatch):
+    import mnemiq.eval.grade as grade
+
+    gold, cand = _undecidable()
+    assert not results_match(gold, cand)  # control: decided (False) at the real limit
+    monkeypatch.setattr(grade, "MAX_CHOICES", 5)
+    with pytest.raises(GotFactsUndecided):
+        results_match(gold, cand)
+
+
+def test_the_harness_records_undecided_as_an_error_not_a_wrong_answer(monkeypatch):
+    """The join: run_case's own grading, not results_match alone. WRONG is the outcome nobody
+    sees; an undecided grade must surface."""
+    import mnemiq.eval.grade as grade
+    from mnemiq.eval.harness import Outcome, run_case
+    from test_harness import _answered, _case
+
+    gold, cand = _undecidable()
+
+    class _Adapter:
+        def execute_arrow(self, sql, timeout_s=30):
+            return cand if sql == "CANDIDATE" else gold
+
+    monkeypatch.setattr(grade, "MAX_CHOICES", 5)
+    result = run_case(_case(), lambda q: _answered(), _Adapter())
+    assert result.outcome == Outcome.ERROR and "undecided" in result.answer
+
+
+def test_spider2_reports_undecided_unless_another_alternative_decides(monkeypatch):
+    import mnemiq.eval.grade as grade
+    from mnemiq.eval.harness import Outcome
+    from mnemiq.eval.spider2 import grade_alternatives
+
+    gold, cand = _undecidable()
+    monkeypatch.setattr(grade, "MAX_CHOICES", 5)
+    assert grade_alternatives(cand, [gold]) == Outcome.ERROR
+    decides = pa.table({"x0": [0.0, 1.0]})  # cand's first column: got-facts, decided
+    assert grade_alternatives(cand, [gold, decides]) == Outcome.CORRECT_FACTS
