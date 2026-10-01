@@ -188,7 +188,8 @@ small for the characters sent, or sitting on a window size), mnemiq re-sends the
 padding (about 1.7% of calls, plus the rare prompt of highly repetitive rows); a count that does not grow means the server is keeping a fixed window, and
 mnemiq returns a failed answer that names the cut instead of an answer built on a fragment. If that
 check cannot run (the server refused it, or gave no count), mnemiq answers and logs a warning, unless the
-count is past 12 characters a token, which no whole prompt reaches; then it refuses all the same. Set `OLLAMA_CONTEXT_LENGTH` (or the model's `num_ctx`) to
+ratio is past 12 characters a token, far above anything measured (at most 4.5 over 612 real prompts, 6.2
+for deliberately repetitive rows); then it refuses all the same. Set `OLLAMA_CONTEXT_LENGTH` (or the model's `num_ctx`) to
 cover the largest prompt plus the reply, with headroom: a modest cut to a window that is not a multiple
 of 1,024 tokens can still slip by. `MNEMIQ_LLM_PROMPT_CUT_CHECK=0` turns the check off, for a server or
 proxy whose `prompt_tokens` leaves out tokens it reused from a cache (Ollama 0.5.4 counts them: measured).

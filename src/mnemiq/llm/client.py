@@ -62,7 +62,8 @@ _WINDOW_SLACK = 8  # a recent Ollama reported 16,386 for a 32,768 window: half, 
 _PROBE_PADDING = "\n" + " padding" * 64
 _MIN_GROWTH = 32  # of the padding's ~64 tokens; a server that read it all shows most of them
 # When the probe cannot decide (it failed, or carried no count), a ratio this high is refused anyway:
-# twice the suspicion line, and nothing measured or constructed comes near it.
+# twice the suspicion line, and far above anything measured (4.50) or constructed (6.19). A measure,
+# not a guarantee: rows built of one long repeated token could in principle pass it.
 _CERTAIN_CHARS_PER_TOKEN = 12.0
 
 
@@ -164,7 +165,7 @@ class LLMClient:
             if sent / read > _CERTAIN_CHARS_PER_TOKEN:
                 raise PromptCut(
                     f"The model server read {read:,} tokens of a {sent:,}-character prompt, "
-                    f"{sent / read:.0f} characters a token, which no whole prompt reaches; the "
+                    f"{sent / read:.0f} characters a token, far above any whole prompt measured; the "
                     f"check that would confirm it could not run ({why}). {_RAISE}")
             logger.warning("could not check for a cut prompt (%s tokens read of %s characters): %s",
                            read, sent, why)

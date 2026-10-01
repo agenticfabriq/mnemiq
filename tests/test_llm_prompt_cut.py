@@ -7,8 +7,8 @@ anything mnemiq's own prompts measure (1.4 to 4.5); a modest cut to a full windo
 leaves the ratio normal but parks the count on the window. Neither is proof -- result rows that
 repeat long words compress past 6 with nothing cut -- so a suspicious count is re-sent with
 padding, and a count that does not grow is a cut. Only when that check cannot run (the probe
-failed, or carried no count) does a ratio decide alone, and only past 12, which no whole prompt
-reaches.
+failed, or carried no count) does a ratio decide alone, and only past 12, far above anything
+measured (4.50 over 612 real prompts; 6.19 for deliberately repetitive rows).
 """
 
 from types import SimpleNamespace
