@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from sqlglot import exp
 from sqlglot.optimizer.scope import build_scope
-from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
 from mnemiq.sql.identifiers import resolve_identifier, resolve_name
 from mnemiq.sql.qualify import object_key
@@ -248,14 +247,6 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
     return out
 
 
-def _identifier_key(ident: exp.Expression | None, dialect: str | None) -> str | None:
-    """A name as the engine resolves it: unquoted folded the dialect's way, quoted kept as written
-    -- so Postgres's `"Claim"` and `claim` are two names, as they are to Postgres."""
-    if not isinstance(ident, exp.Identifier):
-        return None
-    return normalize_identifiers(ident.copy(), dialect=dialect).name
-
-
 def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
     """Is a CTE of this table's name in scope where the table is read?
 
@@ -266,13 +257,14 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
     approved with `claim` ungranted on the locked sqlglot (M122). Inside a WITH's own CTE bodies
     only earlier siblings are visible, plus the CTE itself when the WITH is RECURSIVE (M31's rule).
     A qualified reference (`main.claim`) is never a CTE -- a CTE has no schema -- and names are
-    compared as the engine resolves them (`_identifier_key`): matching lowercased bare names
-    excused `FROM main.claim` behind a CTE `claim`, and Postgres's `claim` behind `"Claim"`.
+    resolved by `mnemiq.sql.identifiers`, the one resolver (M55), so this guard and every other
+    agree on which spellings are one name: matching lowercased bare names excused `FROM
+    main.claim` behind a CTE `claim`, and Postgres's `claim` behind `"Claim"`.
     Structural, never by arg name. In doubt the answer is False, which over-reports: a refusal.
     """
     if table.db or table.catalog:
         return False
-    name = _identifier_key(table.this, dialect)
+    name = resolve_name(table, dialect)
     if name is None:
         return False
     child, node, last_cte = table, table.parent, None
@@ -280,8 +272,7 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
         if isinstance(node, exp.CTE):
             last_cte = node
         for with_ in (v for v in node.args.values() if isinstance(v, exp.With)):
-            names = [_identifier_key(getattr(cte.args.get("alias"), "this", None), dialect)
-                     for cte in with_.expressions]
+            names = [resolve_name(cte, dialect) for cte in with_.expressions]
             if child is with_:  # the table sits inside one of this WITH's own CTE bodies
                 at = next((i for i, cte in enumerate(with_.expressions) if cte is last_cte), 0)
                 visible = names[:at] + (names[at:at + 1] if with_.args.get("recursive") else [])
