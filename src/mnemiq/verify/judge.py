@@ -88,7 +88,11 @@ class SemanticJudge:
         """
         self.calls += 1
         try:
-            raw = self._client.complete(_SYSTEM, _prompt(question, schema, sql, preview), max_tokens=self._max_tokens)
+            # Temperature 0: a verdict that changes between two reads of the same SQL and rows is a
+            # draw, not a check. MEASURED (M120): unset, vLLM sampled the 32B at its default 0.7,
+            # and the judge accepted and declined the identical query and result on two tries.
+            raw = self._client.complete(_SYSTEM, _prompt(question, schema, sql, preview),
+                                        max_tokens=self._max_tokens, temperature=0)
             m = _CONF.search(raw or "")
             if not m:
                 self.unparsed += 1

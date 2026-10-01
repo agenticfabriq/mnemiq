@@ -19,6 +19,15 @@ class ModelUnavailable(RuntimeError):
     """
 
 
+_FIXED_SAMPLING = re.compile(r"(^|\.)(gpt-5|o[134](-|$))")
+
+
+def accepts_temperature(model: str) -> bool:
+    """Reasoning models (GPT-5, o1/o3/o4) reject any temperature but their default; asked for 0,
+    the provider fails the request. Every other model takes it."""
+    return not _FIXED_SAMPLING.search(model)
+
+
 def token_param_name(model: str) -> str:
     # GPT-5 family spends reasoning tokens; it rejects `max_tokens`.
     return "max_completion_tokens" if _GPT5.search(model) else "max_tokens"
@@ -88,8 +97,12 @@ class LLMClient:
         return self.prompt_tokens + self.completion_tokens
 
     def complete(self, system: str, user: str, max_tokens: int = 512,
-                 extra_body: dict | None = None) -> str:
+                 extra_body: dict | None = None, temperature: float | None = None) -> str:
         kwargs = {token_param_name(self._model): reasoning_budget(self._model, max_tokens)}
+        if temperature is not None and accepts_temperature(self._model):
+            # Unset, a local server samples at the model's own default -- Qwen2.5's is 0.7 -- and
+            # a caller that needs the same verdict twice has to say so (M120).
+            kwargs["temperature"] = temperature
         if self._seed is not None:
             # Forwarded, not guaranteed. MEASURED: vLLM honours it; the hosted endpoint accepts
             # it, returns no system_fingerprint, and still varies its output -- two identical
