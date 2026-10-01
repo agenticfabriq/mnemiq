@@ -59,9 +59,9 @@ def test_a_prompt_the_server_cut_is_refused(monkeypatch):
 
 
 def test_the_worst_real_prompt_measured_still_passes(monkeypatch):
-    # 4.46 characters a token: the highest of 386 real prompts under either tokenizer measured.
+    # 4.50 characters a token: the highest of 612 real prompts, every call site, either tokenizer.
     client = _client(monkeypatch, prompt_tokens=1_000)
-    assert client.complete("s" * 2_230, "u" * 2_230) == '{"sql": "SELECT 1"}'
+    assert client.complete("s" * 2_250, "u" * 2_250) == '{"sql": "SELECT 1"}'
 
 
 def test_just_under_the_threshold_passes_and_just_over_is_refused(monkeypatch):
@@ -91,8 +91,9 @@ def test_the_check_can_be_turned_off_for_a_proxy_that_under_reports(monkeypatch)
 
 
 def test_a_cut_is_a_kind_of_model_failure():
-    # So every existing handler -- the agent's stated failure, the judge's fail-closed path --
-    # catches it without learning a new type.
+    # So every existing handler catches it without learning a new type: the agent turns it into a
+    # stated failure; the judge records itself unavailable, and the verifier fails closed on that
+    # by default (MNEMIQ_VERIFY_FAIL_CLOSED).
     assert issubclass(PromptCut, ModelUnavailable)
 
 
@@ -144,6 +145,24 @@ def test_a_count_off_the_edge_is_not_probed(monkeypatch):
     client = _windowed(monkeypatch, window=100_000)
     client.complete("s" * 3_500, "u" * 3_500)  # 2,333 tokens
     assert client.calls == 1
+
+
+def test_a_probe_that_fails_keeps_the_reply_in_hand(monkeypatch):
+    import httpx
+    from openai import APIConnectionError
+
+    import mnemiq.llm.client as module
+
+    class _ProbeFails(_server_with_a_window(2_048)):
+        def _create(self, messages, **kwargs):
+            if self.requests:
+                raise APIConnectionError(request=httpx.Request("POST", "http://x"))
+            return super()._create(messages, **kwargs)
+
+    monkeypatch.setattr(module, "OpenAI", _ProbeFails)
+    client = LLMClient(Settings(llm_base_url="http://x", llm_api_key="k", llm_model="m",
+                                pg_dsn=None, acme_data_dir=None))
+    assert client.complete("s" * 4_475, "u" * 4_475) == "reply 1"
 
 
 def test_a_probe_that_reports_no_usage_is_not_called_a_cut(monkeypatch):

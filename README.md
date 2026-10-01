@@ -188,8 +188,8 @@ that names the cut, instead of an answer built on a fragment, when the count is 
 characters sent, or when it sits on a window size and does not grow when the prompt does (checked by
 re-sending with padding, about 1.7% of calls). Set `OLLAMA_CONTEXT_LENGTH` (or the model's `num_ctx`) to
 cover the largest prompt plus the reply, with headroom: a modest cut to a window that is not a multiple
-of 1,024 tokens can still slip by. `MNEMIQ_LLM_PROMPT_CUT_CHECK=0` turns the check off, for a proxy whose
-`prompt_tokens` leaves out cached tokens.
+of 1,024 tokens can still slip by. `MNEMIQ_LLM_PROMPT_CUT_CHECK=0` turns the check off, for a server or
+proxy whose `prompt_tokens` leaves out tokens it reused from a cache (Ollama 0.5.4 counts them: measured).
 
 Set `MNEMIQ_LOCAL_ONLY=1` to make that verification the `mnemiq` command's job instead of yours
 (the standalone scripts under `scripts/` build their own `Settings` and don't call this check, so

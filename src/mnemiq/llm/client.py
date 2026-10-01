@@ -32,11 +32,12 @@ class PromptCut(ModelUnavailable):
 
 # Two signs of a cut, because servers cut in two ways.
 #
-# A big cut shows in the ratio. MEASURED on 386 prompts the ask path really sends (generator,
-# corrector, judge, synthesis over BIRD mini-dev, KaggleDBQA and a 1,500-column enterprise schema):
-# 1.43 to 4.26 characters a token under Qwen2.5's tokenizer, 2.10 to 4.46 under o200k, the long
-# prompts 2.8 to 3.0 (identifier-dense schema). A recent Ollama keeps about half its window, so a
-# cut prompt at least doubles its ratio; 6 leaves 1.35x over the worst real prompt.
+# A big cut shows in the ratio. MEASURED on 612 prompts from every call site (generator,
+# corrector, judge, synthesis, deep mode's selector, and enrichment's annotation, facts and
+# examples, over BIRD mini-dev, KaggleDBQA and a 1,500-column enterprise schema): 1.43 to 4.26
+# characters a token under Qwen2.5's tokenizer, 2.10 to 4.50 under o200k; the prompts long enough
+# to be cut, 2.2 to 3.4. A recent Ollama keeps about half its window, so a cut prompt at least
+# doubles its ratio; 6 leaves 1.33x over the worst real prompt.
 #
 # A modest cut does not. MEASURED on Ollama 0.5.4 with a 2,048-token window: an 8,950-character
 # prompt (about 2,980 tokens) came back as exactly 2,048 tokens read -- 4.4 characters a token, well
@@ -144,7 +145,11 @@ class LLMClient:
                     f"{sent / read:.1f} characters a token where mnemiq's prompts measure 1.4 to 4.5. "
                     f"It most likely cut the prompt to fit its context window and answered from the rest. {_RAISE}")
             if _on_a_window_edge(read):
-                again = self._count(self._create(system, user + _PROBE_PADDING, self._kwargs(1)))
+                try:
+                    again = self._count(self._create(system, user + _PROBE_PADDING, self._kwargs(1)))
+                except ModelUnavailable:
+                    # The reply in hand came back; a probe that did not cannot convict it.
+                    return resp.choices[0].message.content or ""
                 if again and again <= read:  # no count on the probe proves nothing
                     raise PromptCut(
                         f"The model server read {read:,} tokens of a {sent:,}-character prompt and still "
