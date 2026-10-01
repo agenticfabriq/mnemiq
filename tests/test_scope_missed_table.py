@@ -104,3 +104,26 @@ def test_a_merge_is_checked_and_its_target_is_not_excused(monkeypatch):
     ast = sqlglot.parse_one("MERGE INTO scratch USING claim ON scratch.id = claim.id "
                             "WHEN MATCHED THEN UPDATE SET amount = claim.amount", read="duckdb")
     assert sorted(t.name for t in base_tables(ast)) == ["claim", "scratch"]
+
+
+
+def _ungranted(sql: str, dialect: str = "duckdb"):
+    return decide_write(sql, {"scratch": _SCHEMA["scratch"]},
+                        GrantSet(frozenset({"scratch"}), writable=frozenset({"scratch"})),
+                        adapter=_Ok(), dialect=dialect, writes_enabled=True,
+                        policy=AccessPolicy(policy_schema=_SCHEMA))
+
+
+def test_a_qualified_table_is_never_excused_as_a_cte():
+    """Review of the scope-aware rule, on the locked sqlglot, no stand-in: `main.claim` was taken
+    for the CTE `claim`, and the write approved with `claim` ungranted. A CTE has no schema."""
+    verdict = _ungranted("UPDATE scratch SET amount = x.amount FROM (WITH claim AS (SELECT 1 AS amount) "
+                         "SELECT amount FROM main.claim) x WHERE scratch.id = 1")
+    assert isinstance(verdict, Refusal) and verdict.code == RefusalCode.UNAUTHORIZED_TABLE, verdict
+
+
+def test_a_quoted_cte_does_not_excuse_a_table_the_engine_names_differently():
+    """Postgres: `"Claim"` and `claim` are different names; lowercasing both excused the table."""
+    verdict = _ungranted('UPDATE scratch SET amount = x.amount FROM (WITH "Claim" AS (SELECT 1 AS amount) '
+                         "SELECT amount FROM claim) x WHERE scratch.id = 1", dialect="postgres")
+    assert isinstance(verdict, Refusal) and verdict.code == RefusalCode.UNAUTHORIZED_TABLE, verdict

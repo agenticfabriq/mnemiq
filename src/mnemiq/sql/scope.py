@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 from sqlglot.optimizer.scope import build_scope
+from sqlglot.optimizer.normalize_identifiers import normalize_identifiers
 
 from mnemiq.sql.identifiers import resolve_identifier, resolve_name
 from mnemiq.sql.qualify import object_key
@@ -241,13 +242,21 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
     if isinstance(ast, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
         written = _written_targets(ast)
         if any(not any(t is table for t in out) and not any(w is table for w in written)
-               and not _cte_in_scope(table)
+               and not _cte_in_scope(table, dialect)
                for table in ast.find_all(exp.Table)):
             return list(ast.find_all(exp.Table))
     return out
 
 
-def _cte_in_scope(table: exp.Table) -> bool:
+def _identifier_key(ident: exp.Expression | None, dialect: str | None) -> str | None:
+    """A name as the engine resolves it: unquoted folded the dialect's way, quoted kept as written
+    -- so Postgres's `"Claim"` and `claim` are two names, as they are to Postgres."""
+    if not isinstance(ident, exp.Identifier):
+        return None
+    return normalize_identifiers(ident.copy(), dialect=dialect).name
+
+
+def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
     """Is a CTE of this table's name in scope where the table is read?
 
     Only a WITH on one of the table's ENCLOSING queries can stand in front of it. A name matched
@@ -256,15 +265,23 @@ def _cte_in_scope(table: exp.Table) -> bool:
     the real table -- matched by name, it was skipped, never grant-checked, and the write was
     approved with `claim` ungranted on the locked sqlglot (M122). Inside a WITH's own CTE bodies
     only earlier siblings are visible, plus the CTE itself when the WITH is RECURSIVE (M31's rule).
+    A qualified reference (`main.claim`) is never a CTE -- a CTE has no schema -- and names are
+    compared as the engine resolves them (`_identifier_key`): matching lowercased bare names
+    excused `FROM main.claim` behind a CTE `claim`, and Postgres's `claim` behind `"Claim"`.
     Structural, never by arg name. In doubt the answer is False, which over-reports: a refusal.
     """
-    name = table.name.lower()
+    if table.db or table.catalog:
+        return False
+    name = _identifier_key(table.this, dialect)
+    if name is None:
+        return False
     child, node, last_cte = table, table.parent, None
     while node is not None:
         if isinstance(node, exp.CTE):
             last_cte = node
         for with_ in (v for v in node.args.values() if isinstance(v, exp.With)):
-            names = [cte.alias_or_name.lower() for cte in with_.expressions]
+            names = [_identifier_key(getattr(cte.args.get("alias"), "this", None), dialect)
+                     for cte in with_.expressions]
             if child is with_:  # the table sits inside one of this WITH's own CTE bodies
                 at = next((i for i, cte in enumerate(with_.expressions) if cte is last_cte), 0)
                 visible = names[:at] + (names[at:at + 1] if with_.args.get("recursive") else [])
