@@ -183,10 +183,10 @@ and no row ever leaves it. Embeddings follow the same setting, or their own via 
 A wide schema makes long prompts; on a 1,500-column schema the generator's prompt runs about 21,000
 tokens. vLLM refuses a prompt longer than `--max-model-len` with an error. Ollama does not: it keeps part
 of the prompt and answers anyway (a recent version keeps about half its window; 0.5.4 keeps the whole
-window and drops the rest). mnemiq reads the token count the server reports and returns a failed answer
-that names the cut, instead of an answer built on a fragment, when the count is far too small for the
-characters sent, or when it sits on a window size and does not grow when the prompt does (checked by
-re-sending with padding, about 1.7% of calls). Set `OLLAMA_CONTEXT_LENGTH` (or the model's `num_ctx`) to
+window and drops the rest). mnemiq reads the token count the server reports. When it looks wrong (far too
+small for the characters sent, or sitting on a window size), mnemiq re-sends the prompt with a little
+padding, about 1.7% of calls; a count that does not grow means the server is keeping a fixed window, and
+mnemiq returns a failed answer that names the cut instead of an answer built on a fragment. Set `OLLAMA_CONTEXT_LENGTH` (or the model's `num_ctx`) to
 cover the largest prompt plus the reply, with headroom: a modest cut to a window that is not a multiple
 of 1,024 tokens can still slip by. `MNEMIQ_LLM_PROMPT_CUT_CHECK=0` turns the check off, for a server or
 proxy whose `prompt_tokens` leaves out tokens it reused from a cache (Ollama 0.5.4 counts them: measured).

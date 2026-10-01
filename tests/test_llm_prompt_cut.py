@@ -1,10 +1,12 @@
 """M119: a server that silently cuts the prompt is caught, not answered from.
 
 Ollama keeps part of an over-long prompt and returns no error; the only trace is in
-`usage.prompt_tokens`. Two signs, because servers cut two ways: a big cut (a recent Ollama keeps
-about half its window) pushes the ratio of characters sent to tokens read past anything a real
-prompt measures (1.4 to 4.5); a modest cut to a full window (Ollama 0.5.4) leaves the ratio normal
-but parks the count on the window, where it stops growing when the prompt grows.
+`usage.prompt_tokens`. Two signs raise suspicion, because servers cut two ways: a big cut (a recent
+Ollama keeps about half its window) pushes the ratio of characters sent to tokens read past
+anything mnemiq's own prompts measure (1.4 to 4.5); a modest cut to a full window (Ollama 0.5.4)
+leaves the ratio normal but parks the count on the window. Neither is proof -- result rows that
+repeat long words compress past 6 with nothing cut -- so a suspicious count is re-sent with
+padding, and only a count that does not grow is a cut.
 """
 
 from types import SimpleNamespace
@@ -14,11 +16,12 @@ import pytest
 
 from mnemiq.agent.budget import Budget
 from mnemiq.agent.loop import Agent
-from mnemiq.agent.synthesize import FakeSynthesizer
+from mnemiq.agent.synthesize import FakeSynthesizer, LLMSynthesizer
 from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.config import Settings
 from mnemiq.contract import Column, DeferralReason, IdentityContext, Snapshot
+from mnemiq.execute.render import render_result
 from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient, ModelUnavailable, PromptCut, _on_a_window_edge
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
@@ -49,7 +52,7 @@ def _client(monkeypatch, prompt_tokens, **overrides) -> LLMClient:
 
 
 def test_a_prompt_the_server_cut_is_refused(monkeypatch):
-    # 60,000 characters read as 1,000 tokens: 60 characters a token, a prompt cut to a fragment.
+    # 60,000 characters read as 1,000 tokens, and still 1,000 when padded: cut to a fragment.
     client = _client(monkeypatch, prompt_tokens=1_000)
     with pytest.raises(PromptCut) as cut:
         client.complete("s" * 30_000, "u" * 30_000)
@@ -76,7 +79,8 @@ def test_a_cut_call_is_still_counted(monkeypatch):
     client = _client(monkeypatch, prompt_tokens=1_000)
     with pytest.raises(PromptCut):
         client.complete("s" * 30_000, "u" * 30_000)
-    assert client.calls == 1 and client.prompt_tokens == 1_000 and client.completion_tokens == 5
+    assert client.calls == 2, "the call and its probe"
+    assert client.prompt_tokens == 2_000 and client.completion_tokens == 10
 
 
 def test_no_usage_or_zero_tokens_cannot_be_checked_and_is_not_refused(monkeypatch):
@@ -97,8 +101,8 @@ def test_a_cut_is_a_kind_of_model_failure():
     assert issubclass(PromptCut, ModelUnavailable)
 
 
-def _server_with_a_window(window: int, probe_usage: bool = True):
-    """A fake server that reads three characters a token and keeps at most `window` of them."""
+def _server_with_a_window(window: int, probe_usage: bool = True, chars_per_token: float = 3):
+    """A fake server that reads `chars_per_token` characters a token and keeps at most `window`."""
 
     class _Fake:
         def __init__(self, *_, **__):
@@ -108,13 +112,33 @@ def _server_with_a_window(window: int, probe_usage: bool = True):
         def _create(self, messages, **_kwargs):
             self.requests += 1
             sent = sum(len(m["content"]) for m in messages)
-            usage = SimpleNamespace(prompt_tokens=min(sent // 3, window), completion_tokens=5)
+            usage = SimpleNamespace(prompt_tokens=min(int(sent / chars_per_token), window),
+                                    completion_tokens=5)
             if self.requests > 1 and not probe_usage:
                 usage = None
             return SimpleNamespace(
                 choices=[SimpleNamespace(message=SimpleNamespace(content=f"reply {self.requests}"))],
                 usage=usage)
     return _Fake
+
+
+def test_compressible_text_read_whole_is_answered(monkeypatch):
+    # 6.2 characters a token -- over the ratio's threshold -- but the padding is read too: no cut.
+    client = _windowed(monkeypatch, window=1_000_000, chars_per_token=6.2)
+    assert client.complete("s" * 30_000, "u" * 30_000) == "reply 1"
+    assert client.calls == 2
+
+
+def test_a_real_synthesis_prompt_over_compressible_rows_is_answered(monkeypatch):
+    """The review's counterexample, through the real synthesizer and the real renderer: 50 rows of
+    one long company name read whole at 6.19 characters a token under o200k. Refusing it would
+    fail an answer no larger window could fix."""
+    rows = pa.table({"company": ["International Business Machines Corporation"] * 50,
+                     "n": list(range(50))})
+    synth = LLMSynthesizer(_windowed(monkeypatch, window=1_000_000, chars_per_token=6.2))
+    reply = synth.answer("Which companies placed orders?", "SELECT company, n FROM orders",
+                         render_result(rows), row_count=50)
+    assert reply == "reply 1"
 
 
 def _windowed(monkeypatch, window, **kw) -> LLMClient:

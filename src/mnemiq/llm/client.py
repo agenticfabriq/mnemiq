@@ -32,30 +32,34 @@ class PromptCut(ModelUnavailable):
     """
 
 
-# Two signs of a cut, because servers cut in two ways.
+# Two signs that a server may have cut the prompt, because servers cut in two ways -- and neither
+# sign is proof, so each only triggers a check.
 #
-# A big cut shows in the ratio. MEASURED on 612 prompts from every call site (generator,
-# corrector, judge, synthesis, deep mode's selector, and enrichment's annotation, facts and
-# examples, over BIRD mini-dev, KaggleDBQA and a 1,500-column enterprise schema): 1.43 to 4.26
-# characters a token under Qwen2.5's tokenizer, 2.10 to 4.50 under o200k; the prompts long enough
-# to be cut, 2.2 to 3.4. A recent Ollama keeps about half its window, so a cut prompt at least
-# doubles its ratio; 6 leaves 1.33x over the worst real prompt.
+# A big cut moves the ratio. MEASURED on 612 prompts from every call site (generator, corrector,
+# judge, synthesis, deep mode's selector, and enrichment's annotation, facts and examples, over BIRD
+# mini-dev, KaggleDBQA and a 1,500-column enterprise schema): 1.43 to 4.26 characters a token under
+# Qwen2.5's tokenizer, 2.10 to 4.50 under o200k. A recent Ollama keeps about half its window, so a
+# cut prompt at least doubles its ratio. But a ratio is not proof: result rows repeating long words
+# compress hard, and a synthesis prompt of 50 rows of "International Business Machines Corporation"
+# reads 6.19 under o200k with nothing cut (found in review).
 #
-# A modest cut does not. MEASURED on Ollama 0.5.4 with a 2,048-token window: an 8,950-character
-# prompt (about 2,980 tokens) came back as exactly 2,048 tokens read -- 4.4 characters a token, well
-# inside the normal range. What gives it away is that the count sits on the window and stops
-# growing when the prompt grows. Windows are set in multiples of 1,024, so a count within a few
-# tokens of one is re-sent with padding: a server that reads no more of the longer prompt is
-# keeping a fixed window. That probe costs one extra request on about 1.7% of calls.
+# A modest cut does not move the ratio at all. MEASURED on Ollama 0.5.4 with a 2,048-token window:
+# an 8,950-character prompt (about 3,300 tokens) came back as exactly 2,048 tokens read -- 4.4
+# characters a token, inside the normal range. What gives it away is the count sitting on the
+# window, and windows are set in multiples of 1,024.
 #
-# Still missed: a cut to a window that is not a multiple of 1,024 and too modest for the ratio, and
-# scripts that tokenize densely (CJK), whose ratio stays low even when cut.
+# The check: re-send the prompt with ~64 tokens of padding. A server that read the whole prompt
+# reads the padding too (MEASURED on Ollama 0.5.4: 3,299 -> 3,363, from its prefix cache); one
+# keeping a fixed window reads no more. It runs on about 1.7% of calls, plus the rare compressible
+# prompt. Still missed: a modest cut to a window that is not a multiple of 1,024, and densely
+# tokenized scripts (CJK), whose ratio stays low even when cut.
 _RAISE = ("Raise the server's context length (Ollama: OLLAMA_CONTEXT_LENGTH or num_ctx; "
           "vLLM: --max-model-len) or use a model with a larger window.")
 _MAX_CHARS_PER_TOKEN = 6.0
 _WINDOW_STEP = 1024
 _WINDOW_SLACK = 8  # a recent Ollama reported 16,386 for a 32,768 window: half, plus two
 _PROBE_PADDING = "\n" + " padding" * 64
+_MIN_GROWTH = 32  # of the padding's ~64 tokens; a server that read it all shows most of them
 
 
 def _on_a_window_edge(read: int) -> bool:
@@ -140,28 +144,25 @@ class LLMClient:
         read = self._count(resp)
         sent = len(system) + len(user)
         # Counted first: the server did the work, and the cost report must not lose it.
-        if self._check_cut and read:
-            if sent / read > _MAX_CHARS_PER_TOKEN:
-                raise PromptCut(
-                    f"The model server read {read:,} tokens of a {sent:,}-character prompt, "
-                    f"{sent / read:.1f} characters a token where mnemiq's prompts measure 1.4 to 4.5. "
-                    f"It most likely cut the prompt to fit its context window and answered from the rest. {_RAISE}")
-            if _on_a_window_edge(read):
-                try:
-                    again = self._count(self._create(system, user + _PROBE_PADDING, self._kwargs(1)))
-                except ModelUnavailable as exc:
-                    # The reply in hand came back; a probe that did not cannot convict it. Failing
-                    # closed would turn a passing 429 into a failed answer on every window edge, so
-                    # this answers -- but says so, or a server whose probe always fails is invisible.
-                    logger.warning("could not check for a cut prompt (%s tokens read, on a window "
-                                   "edge): the probe failed: %s", read, exc)
-                    return resp.choices[0].message.content or ""
-                if again and again <= read:  # no count on the probe proves nothing
-                    raise PromptCut(
-                        f"The model server read {read:,} tokens of a {sent:,}-character prompt and still "
-                        f"{again:,} when the prompt grew: it is keeping a fixed window and dropping the "
-                        f"rest. {_RAISE}")
-        return resp.choices[0].message.content or ""
+        reply = resp.choices[0].message.content or ""
+        if not (self._check_cut and read
+                and (sent / read > _MAX_CHARS_PER_TOKEN or _on_a_window_edge(read))):
+            return reply
+        try:
+            again = self._count(self._create(system, user + _PROBE_PADDING, self._kwargs(1)))
+        except ModelUnavailable as exc:
+            # The reply in hand came back; a probe that did not cannot convict it. Failing closed
+            # would turn a passing 429 into a failed answer on every suspicious count, so this
+            # answers -- but says so, or a server whose probe always fails is invisible.
+            logger.warning("could not check for a cut prompt (%s tokens read of %s characters): "
+                           "the probe failed: %s", read, sent, exc)
+            return reply
+        if again and again - read < _MIN_GROWTH:  # no count on the probe proves nothing
+            raise PromptCut(
+                f"The model server read {read:,} tokens of a {sent:,}-character prompt, and {again:,} "
+                "when the prompt grew by about 64 tokens: it is keeping a fixed window and dropping "
+                f"the rest of the prompt. {_RAISE}")
+        return reply
 
     def _kwargs(self, max_tokens: int) -> dict:
         kwargs = {token_param_name(self._model): reasoning_budget(self._model, max_tokens)}
