@@ -238,8 +238,8 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
     # read is in `out` through `_target_reads`). Writes only: on the read path an under-report is
     # lineage's to classify (`views.py` names an unmodelled source as such), and no read-path test
     # failed under sqlglot 30.21.
-    written = _written_targets(ast)
-    if written:
+    if isinstance(ast, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+        written = _written_targets(ast)
         if any(not any(t is table for t in out) and not any(w is table for w in written)
                and not _cte_in_scope(table)
                for table in ast.find_all(exp.Table)):

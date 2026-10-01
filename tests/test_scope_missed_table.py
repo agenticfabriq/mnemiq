@@ -92,3 +92,15 @@ def test_a_cte_on_an_enclosing_query_still_stands_in_front_of_its_name():
     ast = sqlglot.parse_one("INSERT INTO scratch (id, amount) WITH c AS (SELECT id, amount FROM claim) "
                             "SELECT id, amount FROM c", read="duckdb")
     assert sorted(t.name for t in base_tables(ast)) == ["claim"]
+
+
+def test_a_merge_is_checked_and_its_target_is_not_excused(monkeypatch):
+    """MERGE reads its target and nothing models that, so a scope that misses its tables must
+    fall back to all of them -- the check runs on MERGE even though no target is excused."""
+    empty = build_scope(sqlglot.parse_one("SELECT 1"))
+    real = scope_module._root_scope
+    monkeypatch.setattr(scope_module, "_root_scope",
+                        lambda ast: empty if isinstance(ast, exp.Merge) else real(ast))
+    ast = sqlglot.parse_one("MERGE INTO scratch USING claim ON scratch.id = claim.id "
+                            "WHEN MATCHED THEN UPDATE SET amount = claim.amount", read="duckdb")
+    assert sorted(t.name for t in base_tables(ast)) == ["claim", "scratch"]
