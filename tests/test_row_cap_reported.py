@@ -162,4 +162,4 @@ def test_a_mirrored_gold_over_the_limit_goes_through_run_case_and_is_graded():
     case = EvaluationCase(id="mirror", question="which pairs", gold_sql="SELECT a, b FROM pairs",
                           answerable=True)
     graded = run_case(case, lambda q: answer, _Mirrored(0), duplicate_rows_insignificant=True)
-    assert graded.outcome != Outcome.ERROR, "graded, not called unmatchable"
+    assert graded.outcome == Outcome.CORRECT_FACTS, "graded, and the got-facts match is not lost"
