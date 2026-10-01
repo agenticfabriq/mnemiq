@@ -133,6 +133,14 @@ def test_a_prompt_that_fits_just_under_the_window_is_not_called_cut_by_its_own_p
     assert "reached the window" in caplog.text
 
 
+def test_partial_growth_past_the_ratio_ceiling_is_still_refused(monkeypatch):
+    # Undecided by growth (the probe reached the window), but 30 characters a token: past doubt.
+    client = _windowed(monkeypatch, window=2_048, chars_per_token=30)
+    with pytest.raises(PromptCut) as cut:
+        client.complete("s" * 30_600, "u" * 30_600)  # 2,040 tokens read, the probe reads 2,048
+    assert "reached the window" in str(cut.value)
+
+
 def test_compressible_text_read_whole_is_answered(monkeypatch):
     # 6.2 characters a token -- over the ratio's threshold -- but the padding is read too: no cut.
     client = _windowed(monkeypatch, window=1_000_000, chars_per_token=6.2)

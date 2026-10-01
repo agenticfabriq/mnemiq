@@ -33,8 +33,8 @@ class PromptCut(ModelUnavailable):
 
 
 # Two signs that a server may have cut the prompt, because servers cut in two ways -- and neither
-# sign is proof, so each only triggers a check. Only when the check cannot run does a ratio decide
-# alone, and only past _CERTAIN_CHARS_PER_TOKEN.
+# sign is proof, so each only triggers a check. Only when the check cannot decide does a ratio
+# decide alone, and only past _CERTAIN_CHARS_PER_TOKEN.
 #
 # A big cut moves the ratio. MEASURED on 612 prompts from every call site (generator, corrector,
 # judge, synthesis, deep mode's selector, and enrichment's annotation, facts and examples, over BIRD
@@ -63,7 +63,8 @@ _WINDOW_STEP = 1024
 _WINDOW_SLACK = 8  # a recent Ollama reported 16,386 for a 32,768 window: half, plus two
 _PROBE_PADDING = "\n" + " padding" * 64
 _MIN_GROWTH = 32  # of the padding's ~64 tokens; a server that read it all shows most of them
-# When the probe cannot decide (it failed, or carried no count), a ratio this high is refused anyway:
+# When the probe cannot decide (it failed, carried no count, or itself reached the window), a ratio
+# this high is refused anyway:
 # twice the suspicion line, and far above anything measured (4.50) or constructed (6.19). A measure,
 # not a guarantee: rows built of one long repeated token could in principle pass it.
 _CERTAIN_CHARS_PER_TOKEN = 12.0
