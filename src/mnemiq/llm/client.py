@@ -51,7 +51,9 @@ class PromptCut(ModelUnavailable):
 #
 # The check: re-send the prompt with ~64 tokens of padding. A server that read the whole prompt
 # reads the padding too (MEASURED on Ollama 0.5.4: 3,299 -> 3,363, from its prefix cache); one
-# keeping a fixed window reads no more. It runs on about 1.7% of calls, plus the rare compressible
+# keeping a fixed window reads exactly as many as before (2,048 -> 2,048). Growth between the two
+# proves nothing about the original: a prompt that fit just under the window gives a probe that
+# does not (found in review: 2,040 fits, its probe reads 2,048), so that is undecided, not a cut. It runs on about 1.7% of calls, plus the rare compressible
 # prompt. Still missed: a modest cut to a window that is not a multiple of 1,024, and densely
 # tokenized scripts (CJK), whose ratio stays low even when cut.
 _RAISE = ("Raise the server's context length (Ollama: OLLAMA_CONTEXT_LENGTH or num_ctx; "
@@ -155,7 +157,8 @@ class LLMClient:
             return reply
         try:
             again = self._count(self._create(system, user + _PROBE_PADDING, self._kwargs(1)))
-            why = "" if again else "the probe carried no token count"
+            why = ("the probe carried no token count" if not again else
+                   "the probe itself reached the window" if 0 < again - read < _MIN_GROWTH else "")
         except ModelUnavailable as exc:
             again, why = 0, f"the probe failed: {exc}"
         if why:
@@ -170,7 +173,7 @@ class LLMClient:
             logger.warning("could not check for a cut prompt (%s tokens read of %s characters): %s",
                            read, sent, why)
             return reply
-        if again - read < _MIN_GROWTH:
+        if again <= read:
             raise PromptCut(
                 f"The model server read {read:,} tokens of a {sent:,}-character prompt, and {again:,} "
                 "when the prompt grew by about 64 tokens: it is keeping a fixed window and dropping "

@@ -124,6 +124,15 @@ def _server_with_a_window(window: int, probe_usage: bool = True, chars_per_token
     return _Fake
 
 
+def test_a_prompt_that_fits_just_under_the_window_is_not_called_cut_by_its_own_probe(monkeypatch, caplog):
+    # The review's counterexample: 2,040 tokens fit a 2,048 window; the padded probe does not, so it
+    # reads 2,048 -- eight more. That is the probe reaching the window, not the original being cut.
+    client = _windowed(monkeypatch, window=2_048)
+    with caplog.at_level("WARNING", logger="mnemiq.llm.client"):
+        assert client.complete("s" * 3_060, "u" * 3_060) == "reply 1"
+    assert "reached the window" in caplog.text
+
+
 def test_compressible_text_read_whole_is_answered(monkeypatch):
     # 6.2 characters a token -- over the ratio's threshold -- but the padding is read too: no cut.
     client = _windowed(monkeypatch, window=1_000_000, chars_per_token=6.2)
