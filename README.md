@@ -185,7 +185,7 @@ tokens. vLLM refuses a prompt longer than `--max-model-len` with an error. Ollam
 of the prompt and answers anyway (a recent version keeps about half its window; 0.5.4 keeps the whole
 window and drops the rest). mnemiq reads the token count the server reports. When it looks wrong (far too
 small for the characters sent, or sitting on a window size), mnemiq re-sends the prompt with a little
-padding, about 1.7% of calls; a count that does not grow means the server is keeping a fixed window, and
+padding (about 1.7% of calls, plus the rare prompt of highly repetitive rows); a count that does not grow means the server is keeping a fixed window, and
 mnemiq returns a failed answer that names the cut instead of an answer built on a fragment. Set `OLLAMA_CONTEXT_LENGTH` (or the model's `num_ctx`) to
 cover the largest prompt plus the reply, with headroom: a modest cut to a window that is not a multiple
 of 1,024 tokens can still slip by. `MNEMIQ_LLM_PROMPT_CUT_CHECK=0` turns the check off, for a server or

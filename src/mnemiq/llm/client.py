@@ -60,6 +60,9 @@ _WINDOW_STEP = 1024
 _WINDOW_SLACK = 8  # a recent Ollama reported 16,386 for a 32,768 window: half, plus two
 _PROBE_PADDING = "\n" + " padding" * 64
 _MIN_GROWTH = 32  # of the padding's ~64 tokens; a server that read it all shows most of them
+# When the probe cannot decide (it failed, or carried no count), a ratio this high is refused anyway:
+# twice the suspicion line, and nothing measured or constructed comes near it.
+_CERTAIN_CHARS_PER_TOKEN = 12.0
 
 
 def _on_a_window_edge(read: int) -> bool:
@@ -150,14 +153,22 @@ class LLMClient:
             return reply
         try:
             again = self._count(self._create(system, user + _PROBE_PADDING, self._kwargs(1)))
+            why = "" if again else "the probe carried no token count"
         except ModelUnavailable as exc:
-            # The reply in hand came back; a probe that did not cannot convict it. Failing closed
-            # would turn a passing 429 into a failed answer on every suspicious count, so this
-            # answers -- but says so, or a server whose probe always fails is invisible.
-            logger.warning("could not check for a cut prompt (%s tokens read of %s characters): "
-                           "the probe failed: %s", read, sent, exc)
+            again, why = 0, f"the probe failed: {exc}"
+        if why:
+            # Undecided. Failing closed would turn a passing 429 into a failed answer on every
+            # suspicious count, so this answers -- unless the ratio alone is past doubt -- and
+            # says so, or a server whose probe never decides is invisible.
+            if sent / read > _CERTAIN_CHARS_PER_TOKEN:
+                raise PromptCut(
+                    f"The model server read {read:,} tokens of a {sent:,}-character prompt, "
+                    f"{sent / read:.0f} characters a token, which no whole prompt reaches; the "
+                    f"check that would confirm it could not run ({why}). {_RAISE}")
+            logger.warning("could not check for a cut prompt (%s tokens read of %s characters): %s",
+                           read, sent, why)
             return reply
-        if again and again - read < _MIN_GROWTH:  # no count on the probe proves nothing
+        if again - read < _MIN_GROWTH:
             raise PromptCut(
                 f"The model server read {read:,} tokens of a {sent:,}-character prompt, and {again:,} "
                 "when the prompt grew by about 64 tokens: it is keeping a fixed window and dropping "

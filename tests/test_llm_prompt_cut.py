@@ -130,15 +130,16 @@ def test_compressible_text_read_whole_is_answered(monkeypatch):
 
 
 def test_a_real_synthesis_prompt_over_compressible_rows_is_answered(monkeypatch):
-    """The review's counterexample, through the real synthesizer and the real renderer: 50 rows of
-    one long company name read whole at 6.19 characters a token under o200k. Refusing it would
-    fail an answer no larger window could fix."""
+    """The review's counterexample in shape: 50 rows of one long company name, rendered and wrapped
+    by the real renderer and synthesizer, read whole at 6.19 characters a token under o200k. The
+    fake server sets the ratio (6.2), not the prompt; what this pins is that the synthesizer's call
+    is probed and answered rather than refused. Refusing would fail an answer no window could fix."""
     rows = pa.table({"company": ["International Business Machines Corporation"] * 50,
                      "n": list(range(50))})
     synth = LLMSynthesizer(_windowed(monkeypatch, window=1_000_000, chars_per_token=6.2))
     reply = synth.answer("Which companies placed orders?", "SELECT company, n FROM orders",
                          render_result(rows), row_count=50)
-    assert reply == "reply 1"
+    assert reply == "reply 1" and synth._client.calls == 2, "probed, then answered"
 
 
 def _windowed(monkeypatch, window, **kw) -> LLMClient:
@@ -150,7 +151,7 @@ def _windowed(monkeypatch, window, **kw) -> LLMClient:
 
 
 def test_a_modest_cut_to_a_full_window_is_caught_by_the_probe(monkeypatch):
-    # The measured Ollama 0.5.4 shape: ~2,980 tokens sent, exactly 2,048 read -- 4.4 characters a
+    # The measured Ollama 0.5.4 shape: about 3,300 tokens sent, exactly 2,048 read -- 4.4 characters a
     # token, inside the normal range, so only the stalled count gives it away.
     client = _windowed(monkeypatch, window=2_048)
     with pytest.raises(PromptCut) as cut:
@@ -191,9 +192,19 @@ def test_a_probe_that_fails_keeps_the_reply_in_hand_and_says_so(monkeypatch, cap
     assert "could not check for a cut prompt" in caplog.text, "a probe that never ran must be visible"
 
 
-def test_a_probe_that_reports_no_usage_is_not_called_a_cut(monkeypatch):
+def test_a_probe_that_reports_no_usage_is_not_called_a_cut_but_says_so(monkeypatch, caplog):
     client = _windowed(monkeypatch, window=2_048, probe_usage=False)
-    assert client.complete("s" * 4_475, "u" * 4_475) == "reply 1"
+    with caplog.at_level("WARNING", logger="mnemiq.llm.client"):
+        assert client.complete("s" * 4_475, "u" * 4_475) == "reply 1"
+    assert "no token count" in caplog.text
+
+
+def test_an_undecided_probe_still_refuses_a_ratio_no_whole_prompt_reaches(monkeypatch):
+    # 60 characters a token, and the probe carries no count: past doubt, so refused anyway.
+    client = _windowed(monkeypatch, window=1_000, probe_usage=False)
+    with pytest.raises(PromptCut) as cut:
+        client.complete("s" * 30_000, "u" * 30_000)
+    assert "could not run" in str(cut.value)
 
 
 def test_window_edges_are_multiples_of_1024_give_or_take_eight():
