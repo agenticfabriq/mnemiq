@@ -70,6 +70,13 @@ class GotFactsUndecided(Exception):
     into a new WRONG."""
 
 
+def rows_that_count(gold: pa.Table, duplicate_rows_insignificant: bool = False) -> int:
+    """How many rows an answer must return to match `gold`, read the way `results_match` reads it:
+    distinct rows when the benchmark declares duplicates insignificant, every row otherwise."""
+    rows = _rows(gold)
+    return len(_distinct_rows(rows)) if duplicate_rows_insignificant else len(rows)
+
+
 def results_match(
     gold: pa.Table,
     candidate: pa.Table,

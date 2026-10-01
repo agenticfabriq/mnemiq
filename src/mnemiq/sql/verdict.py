@@ -166,6 +166,9 @@ class Approved:
     # SQL the model first proposed. Without it the corrector is the one mode difference nobody
     # can observe (M33).
     corrected: bool = False
+    # The row limit the guard imposed, when the query did not bound itself tighter (M118). A
+    # result with this many rows may have been cut; `None` means any limit is the query's own.
+    row_cap: int | None = None
     # What the access policy narrowed, table-granular, on the SAME rule as `lineage`: the fact
     # travels with the answer or not at all -- INCLUDING its absence. `None` is "not evaluated",
     # `[]` is the claim "the policy narrowed nothing". They are different sentences and a default
