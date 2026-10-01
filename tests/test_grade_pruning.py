@@ -67,7 +67,9 @@ _FLOATS = [0.0, 1.0, 2.0, 1.4249, 1.42, 1.425, 1.43, 1.4, 1.0000004, 1.000006, 5
            0.2, 38.125, 38.12, 38.13, 7.0, -1.5, -2.0, None, float("nan"),
            # Within the 1e-5 relative tolerance of each other but no rounding of each other --
            # the only pairs that test the tolerance window on its own -- and one just outside.
-           1234567.5, 1234570.25, 1234599.5]
+           1234567.5, 1234570.25, 1234599.5,
+           # Large WHOLE numbers: inside 1e-5 of each other, yet counts compare exactly.
+           1e6, 1e6 + 5.0, 1e6 + 20.0]
 _STRINGS = ["a", "b", "1", "1.0", None]
 _BOOLS = [True, False, None]
 
@@ -293,13 +295,18 @@ def test_the_harness_records_undecided_as_an_error_not_a_wrong_answer(monkeypatc
     assert result.outcome == Outcome.ERROR and "undecided" in result.answer
 
 
-def test_spider2_reports_undecided_unless_another_alternative_decides(monkeypatch):
+def test_spider2_records_undecided_as_an_error_with_its_reason(monkeypatch):
+    """The join again, through run_case_csv: the reason reaches the result, not only ERROR."""
     import mnemiq.eval.grade as grade
+    from mnemiq.agent.loop import AgentAnswer
     from mnemiq.eval.harness import Outcome
-    from mnemiq.eval.spider2 import grade_alternatives
+    from mnemiq.eval.spider2 import grade_alternatives, run_case_csv
+    from test_spider2 import _Adapter, _case, _trace
 
     gold, cand = _undecidable()
     monkeypatch.setattr(grade, "MAX_CHOICES", 5)
-    assert grade_alternatives(cand, [gold]) == Outcome.ERROR
+    engine = lambda q: AgentAnswer(answer="flags", trace=_trace("SELECT *"))  # noqa: E731
+    result = run_case_csv(_case(), engine, _Adapter(cand), [gold])
+    assert result.outcome == Outcome.ERROR and "got-facts undecided" in result.answer
     decides = pa.table({"x0": [0.0, 1.0]})  # cand's first column: got-facts, decided
     assert grade_alternatives(cand, [gold, decides]) == Outcome.CORRECT_FACTS
