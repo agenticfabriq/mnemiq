@@ -9,7 +9,7 @@ import pyarrow as pa
 
 from mnemiq.agent.loop import AgentAnswer
 from mnemiq.contract import EvaluationCase
-from mnemiq.eval.grade import normalize, results_match
+from mnemiq.eval.grade import GotFactsUndecided, normalize, results_match
 
 _PREVIEW_ROWS = 100
 
@@ -189,12 +189,18 @@ def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None, *
     # its published EX compares `set(rows)` -- and a benchmark that does not keeps the multiset
     # reading, where the same rows at a different multiplicity are not obviously the same
     # answer. See `results_match` and register M105.
-    if results_match(gold, candidate, allow_extra_columns=False,
-                     duplicate_rows_insignificant=duplicate_rows_insignificant):
-        result.outcome = Outcome.CORRECT
-    elif results_match(gold, candidate, allow_extra_columns=True,
-                       duplicate_rows_insignificant=duplicate_rows_insignificant):
-        result.outcome = Outcome.CORRECT_FACTS
-    else:
-        result.outcome = Outcome.WRONG
+    try:
+        if results_match(gold, candidate, allow_extra_columns=False,
+                         duplicate_rows_insignificant=duplicate_rows_insignificant):
+            result.outcome = Outcome.CORRECT
+        elif results_match(gold, candidate, allow_extra_columns=True,
+                           duplicate_rows_insignificant=duplicate_rows_insignificant):
+            result.outcome = Outcome.CORRECT_FACTS
+        else:
+            result.outcome = Outcome.WRONG
+    except GotFactsUndecided as exc:
+        # Not a verdict: the grader could not decide, and saying WRONG here is how a bound
+        # once scored 19 right answers wrong (register M113).
+        result.outcome = Outcome.ERROR
+        result.answer = f"got-facts undecided: {exc}"
     return result

@@ -27,6 +27,7 @@ import json
 import os
 
 from mnemiq.adapters.sqlite import SQLiteAdapter
+from mnemiq.eval.grade import GotFactsUndecided
 from mnemiq.eval.harness import Outcome
 from mnemiq.eval.spider2 import gold_alternatives, grade_alternatives, spider2_db_path
 
@@ -48,7 +49,7 @@ def main() -> int:
         n = len(records)
         graded = sum(1 for r in records if r["outcome"] in _GRADED)
         before = sum(1 for r in records if r["outcome"] == "correct")
-        changed = failed = no_gold = 0
+        changed = failed = undecided = no_gold = 0
         for r in records:
             if r["outcome"] not in _GRADED:
                 # A deferral or an error has no gold comparison to redo, so it is not "skipped"
@@ -77,7 +78,12 @@ def main() -> int:
                 failed += 1
                 r["regrade"] = "skipped:unrunnable"
                 continue
-            new = _NAME[grade_alternatives(candidate, alternatives)]
+            try:
+                new = _NAME[grade_alternatives(candidate, alternatives)]
+            except GotFactsUndecided:  # not a verdict: the label stays, and says it was not re-checked
+                undecided += 1
+                r["regrade"] = "skipped:undecided"
+                continue
             # Every re-checked record says so, not only the ones that moved. The filename claims the
             # whole file was re-graded; without this, a record that was SKIPPED is byte-identical to
             # one re-checked and confirmed, and a downstream reader counting `outcome_as_run` markers
@@ -88,11 +94,12 @@ def main() -> int:
                 changed += 1
         after = sum(1 for r in records if r["outcome"] == "correct")
         print(f"{run}: exact-match {before}/{n} ({before / n:.1%}) -> {after}/{n} ({after / n:.1%}); "
-              f"{changed} labels changed, {failed} unrunnable, {no_gold} without gold")
+              f"{changed} labels changed, {failed} unrunnable, {undecided} undecided, "
+              f"{no_gold} without gold")
         if changed:
             out = run.replace(".jsonl", f".{args.suffix}.jsonl")
             print(f"  per-record `regrade`: {sum(1 for r in records if r.get('regrade') == 'confirmed')} "
-                  f"confirmed, {changed} changed, {failed + no_gold} skipped")
+                  f"confirmed, {changed} changed, {failed + undecided + no_gold} skipped")
             with open(out, "w") as fh:
                 for r in records:
                     fh.write(json.dumps(r) + "\n")
@@ -104,11 +111,12 @@ def main() -> int:
             # not run is a property of the answer, a case with no published gold is a property of
             # the checkout, and reading the second as the first sent an earlier version of this
             # script looking for a dialect problem in a missing directory.
-            skipped = failed + no_gold
+            skipped = failed + undecided + no_gold
             if skipped:
                 print(f"  no file written, and {skipped} of {graded} graded cases were NOT "
-                      f"re-checked ({failed} unrunnable candidates, {no_gold} with no published "
-                      "gold): they keep the labels they had, which this run says nothing about")
+                      f"re-checked ({failed} unrunnable candidates, {undecided} the grader could "
+                      f"not decide, {no_gold} with no published gold): they keep the labels they "
+                      "had, which this run says nothing about")
             else:
                 print(f"  no file written: all {graded} graded cases re-checked, and the labels "
                       "they have ARE the current rule's")

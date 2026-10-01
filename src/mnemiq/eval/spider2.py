@@ -46,7 +46,7 @@ from mnemiq.eval.bird_runner import (
     enrich_bird_db,
 )
 from mnemiq.eval.engine import build_engine
-from mnemiq.eval.grade import results_match
+from mnemiq.eval.grade import GotFactsUndecided, results_match
 from mnemiq.eval.harness import CaseResult, Engine, Outcome, _preview
 from mnemiq.llm.client import ModelUnavailable
 
@@ -140,11 +140,19 @@ def gold_alternatives(spider2_dir: str, instance_id: str) -> list[pa.Table]:
 
 def grade_alternatives(candidate: pa.Table, alternatives: list[pa.Table]) -> Outcome:
     """Best outcome across the acceptable results: a case is CORRECT against the benchmark
-    if it is correct against ANY answer the benchmark accepts."""
+    if it is correct against ANY answer the benchmark accepts. Raises GotFactsUndecided when
+    got-facts could not decide for some alternative and no other one decided it."""
     if any(results_match(g, candidate, allow_extra_columns=False) for g in alternatives):
         return Outcome.CORRECT
-    if any(results_match(g, candidate, allow_extra_columns=True) for g in alternatives):
-        return Outcome.CORRECT_FACTS
+    undecided: GotFactsUndecided | None = None
+    for g in alternatives:
+        try:
+            if results_match(g, candidate, allow_extra_columns=True):
+                return Outcome.CORRECT_FACTS
+        except GotFactsUndecided as exc:
+            undecided = exc  # not a verdict: the caller's error unless another alternative decides
+    if undecided is not None:
+        raise undecided
     return Outcome.WRONG
 
 
@@ -215,7 +223,11 @@ def run_case_csv(
     # Keyed on the adapter rather than hardcoded: run this through a DuckDB attachment and
     # the claim stops being free, and the flag must go back to being earned.
     result.portable_to_gold_engine = getattr(adapter, "dialect", None) == "sqlite"
-    result.outcome = grade_alternatives(candidate, alternatives)
+    try:
+        result.outcome = grade_alternatives(candidate, alternatives)
+    except GotFactsUndecided as exc:
+        result.outcome = Outcome.ERROR  # never WRONG: the grader could not decide (register M113)
+        result.answer = f"got-facts undecided: {exc}"
     return result
 
 
