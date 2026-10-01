@@ -71,3 +71,24 @@ def test_an_insert_target_is_not_mistaken_for_a_missed_read(monkeypatch):
     ast = sqlglot.parse_one("INSERT INTO scratch (id, amount) SELECT id, amount FROM claim", read="duckdb")
     assert sorted(t.name for t in base_tables(ast)) == ["claim"]
     assert not any(isinstance(t, exp.Table) and t.name == "scratch" for t in base_tables(ast))
+
+
+_SHADOW = ("UPDATE scratch SET amount = (WITH claim AS (SELECT 1 AS amount) SELECT amount FROM claim) "
+           "FROM claim WHERE scratch.id = claim.id")
+
+
+def test_a_cte_in_a_subquery_does_not_hide_the_real_table_of_its_name():
+    """On the LOCKED sqlglot, no stand-in: a CTE named `claim` inside a scalar subquery hid the
+    outer `FROM claim` from every guard, and the write was approved with `claim` ungranted (M122)."""
+    visible = {"scratch": _SCHEMA["scratch"]}
+    verdict = decide_write(_SHADOW, visible, GrantSet(frozenset({"scratch"}), writable=frozenset({"scratch"})),
+                           adapter=_Ok(), dialect="duckdb", writes_enabled=True,
+                           policy=AccessPolicy(policy_schema=_SCHEMA))
+    assert isinstance(verdict, Refusal), verdict
+    assert verdict.code == RefusalCode.UNAUTHORIZED_TABLE and verdict.subject == "claim"
+
+
+def test_a_cte_on_an_enclosing_query_still_stands_in_front_of_its_name():
+    ast = sqlglot.parse_one("INSERT INTO scratch (id, amount) WITH c AS (SELECT id, amount FROM claim) "
+                            "SELECT id, amount FROM c", read="duckdb")
+    assert sorted(t.name for t in base_tables(ast)) == ["claim"]

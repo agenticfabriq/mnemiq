@@ -240,19 +240,48 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
     # failed under sqlglot 30.21.
     written = _written_targets(ast)
     if written:
-        ctes = {cte.alias_or_name.lower() for cte in ast.find_all(exp.CTE)}
         if any(not any(t is table for t in out) and not any(w is table for w in written)
-               and table.name.lower() not in ctes
+               and not _cte_in_scope(table)
                for table in ast.find_all(exp.Table)):
             return list(ast.find_all(exp.Table))
     return out
 
 
+def _cte_in_scope(table: exp.Table) -> bool:
+    """Is a CTE of this table's name in scope where the table is read?
+
+    Only a WITH on one of the table's ENCLOSING queries can stand in front of it. A name matched
+    anywhere in the statement is not enough: `UPDATE t SET a = (WITH claim AS (...) SELECT a FROM
+    claim) FROM claim` declares `claim` inside a scalar subquery, and the outer `FROM claim` is
+    the real table -- matched by name, it was skipped, never grant-checked, and the write was
+    approved with `claim` ungranted on the locked sqlglot (M122). Inside a WITH's own CTE bodies
+    only earlier siblings are visible, plus the CTE itself when the WITH is RECURSIVE (M31's rule).
+    Structural, never by arg name. In doubt the answer is False, which over-reports: a refusal.
+    """
+    name = table.name.lower()
+    child, node, last_cte = table, table.parent, None
+    while node is not None:
+        if isinstance(node, exp.CTE):
+            last_cte = node
+        for with_ in (v for v in node.args.values() if isinstance(v, exp.With)):
+            names = [cte.alias_or_name.lower() for cte in with_.expressions]
+            if child is with_:  # the table sits inside one of this WITH's own CTE bodies
+                at = next((i for i, cte in enumerate(with_.expressions) if cte is last_cte), 0)
+                visible = names[:at] + (names[at:at + 1] if with_.args.get("recursive") else [])
+            else:
+                visible = names
+            if name in visible:
+                return True
+        child, node = node, node.parent
+    return False
+
+
 def _written_targets(ast: exp.Expression) -> list[exp.Table]:
     """The table nodes a write statement writes, located by position: INSERT's `this` (inside the
-    column-list Schema when there is one), UPDATE's and MERGE's `this`, DELETE's `this` or its
-    `tables`. Empty for a SELECT."""
-    if not isinstance(ast, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+    column-list Schema when there is one), UPDATE's `this`, DELETE's `this` or its `tables`. Empty
+    otherwise -- MERGE included: it reads its target and `_target_reads` does not model it, so its
+    target must stay a missed read, and fail closed, rather than be excused."""
+    if not isinstance(ast, (exp.Insert, exp.Update, exp.Delete)):
         return []
     found: list[exp.Table] = []
     for node in [ast.this, *(ast.args.get("tables") or [])]:
