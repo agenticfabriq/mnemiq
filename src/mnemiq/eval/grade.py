@@ -78,7 +78,8 @@ def rows_that_count(gold: pa.Table, duplicate_rows_insignificant: bool = False) 
     rows = _rows(gold)
     if not duplicate_rows_insignificant:
         return len(rows)
-    return min(len(_distinct_rows(rows)), len(_distinct_rows([sorted(r, key=repr) for r in rows])))
+    # Sorting cells only merges distinct rows, never splits them, so this is the smaller count.
+    return len(_distinct_rows([sorted(r, key=repr) for r in rows]))
 
 
 def results_match(

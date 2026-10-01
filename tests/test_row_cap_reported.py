@@ -146,3 +146,20 @@ def test_mirrored_rows_count_once_as_the_got_facts_reading_counts_them():
     gold = pa.table({"a": [p[0] for p in pairs], "b": [p[1] for p in pairs]})
     assert rows_that_count(gold, duplicate_rows_insignificant=True) == 550
     assert rows_that_count(gold) == 1_100
+
+
+def test_a_mirrored_gold_over_the_limit_goes_through_run_case_and_is_graded():
+    from mnemiq.contract import EvaluationCase
+
+    pairs = [(i, i + 1) for i in range(550)] + [(i + 1, i) for i in range(550)]
+
+    class _Mirrored(_Rows):  # gold: 1,100 ordered pairs; the candidate: each fact once
+        def execute_arrow(self, sql, timeout_s=None):
+            rows = pairs[:550] if "LIMIT" in sql.upper() else pairs
+            return pa.table({"a": [p[0] for p in rows], "b": [p[1] for p in rows]})
+
+    answer, _ = _ask("SELECT n FROM claim", rows=MAX_ROWS)
+    case = EvaluationCase(id="mirror", question="which pairs", gold_sql="SELECT a, b FROM pairs",
+                          answerable=True)
+    graded = run_case(case, lambda q: answer, _Mirrored(0), duplicate_rows_insignificant=True)
+    assert graded.outcome != Outcome.ERROR, "graded, not called unmatchable"
