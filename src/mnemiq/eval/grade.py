@@ -50,10 +50,18 @@ def _distinct_rows(rows: list[list[object]]) -> list[list[object]]:
 MAX_CHOICES = 10_000
 
 
+# How many value lookups and cell comparisons the pruning itself may spend. It reads each DISTINCT value once and
+# stops at the first match, so ordinary answers spend a few thousand; this bounds the
+# pathological ones before the choice limit is ever reached.
+MAX_PRUNING_STEPS = 2_000_000
+
+
 class GotFactsUndecided(Exception):
-    """More column choices survived pruning than got-facts will try. Not a verdict: a caller
-    grading a case records it as an error, and a caller re-checking a stored label keeps the
-    label and marks it not re-checked -- none turns it into a new WRONG."""
+    """Got-facts could not decide: more column choices survived pruning than it will try, the
+    pruning ran out of budget, or the only choices left meet a cell pair the readings cannot
+    compare. Not a verdict: a caller grading a case records it as an error, and a caller
+    re-checking a stored label keeps the label and marks it not re-checked -- none turns it
+    into a new WRONG."""
 
 
 def results_match(
@@ -140,7 +148,9 @@ def results_match(
         sorted_gold = _distinct_rows(sorted_gold)
     all_keys = [[repr(cell) for cell in row] for row in all_rows]
 
+    work = _Work(MAX_PRUNING_STEPS, candidate.num_columns, gold.num_columns)
     tried = 0
+    uncomparable = False
 
     def spend() -> None:
         nonlocal tried
@@ -151,15 +161,17 @@ def results_match(
                 f"({candidate.num_columns} candidate columns, {gold.num_columns} gold)")
 
     for keep in _positional_choices(gold_rows, all_rows, gold.num_columns,
-                                    candidate.num_columns, cell_match):
+                                    candidate.num_columns, cell_match, work):
         spend()
         candidate_rows = [[row[i] for i in keep] for row in all_rows]
         if duplicate_rows_insignificant:
             candidate_rows = _distinct_rows(candidate_rows)
-        if _match_rows(gold_rows, candidate_rows, 0.0, cell_match):
+        verdict = _checks(gold_rows, candidate_rows, cell_match)
+        if verdict:
             return True
+        uncomparable |= verdict is None
     for keep in _sorted_choices(gold_rows, all_rows, gold.num_columns, candidate.num_columns,
-                                cell_match):
+                                cell_match, work):
         spend()
         sorted_candidate = [
             [value for _, value in sorted(((keys[i], row[i]) for i in keep), key=lambda p: p[0])]
@@ -167,9 +179,29 @@ def results_match(
         ]
         if duplicate_rows_insignificant:
             sorted_candidate = _distinct_rows(sorted_candidate)
-        if _match_rows(sorted_gold, sorted_candidate, 0.0, cell_match):
+        verdict = _checks(sorted_gold, sorted_candidate, cell_match)
+        if verdict:
             return True
+        uncomparable |= verdict is None
+    if uncomparable:
+        # Some choice met a pair the readings cannot compare and none matched without one: that
+        # is not a mismatch, so it is not a verdict either.
+        raise GotFactsUndecided("a cell pair the readings cannot compare (an infinity, or a "
+                                "magnitude too large to round) decides the remaining choices")
     return False
+
+
+def _checks(gold_rows: list[list[object]], candidate_rows: list[list[object]],
+            cell_match: CellMatch) -> bool | None:
+    """`_match_rows` on one choice, or None when it meets a cell pair the readings cannot
+    compare (an infinity, or a magnitude Decimal cannot quantize, meeting the rounding rule).
+    The full search raised on such a pair if it got that far; going on instead keeps every
+    verdict it reached (it reached them before any such pair), finds a match it crashed short
+    of, and leaves undecided -- never WRONG -- what only such pairs could decide."""
+    try:
+        return _match_rows(gold_rows, candidate_rows, 0.0, cell_match)
+    except ArithmeticError:
+        return None
 
 
 # -- which column choices can possibly match -----------------------------------------------------
@@ -184,44 +216,80 @@ def results_match(
 CellMatch = Callable[[object, object], bool]
 
 
+class _Work:
+    """The pruning's comparison budget, shared by every index of one grading."""
+
+    def __init__(self, limit: int, candidate_cols: int, gold_cols: int) -> None:
+        self.left = limit
+        self.shape = f"{candidate_cols} candidate columns, {gold_cols} gold"
+
+    def spend(self) -> None:
+        self.left -= 1
+        if self.left < 0:
+            raise GotFactsUndecided(
+                f"pruning spent more than {MAX_PRUNING_STEPS:,} lookups and cell comparisons "
+                f"({self.shape})")
+
+
 class _ValueIndex:
     """Answers "does any value here match `x`?" without comparing `x` to every value.
 
     Exact for both grading cell readings, which accept a pair only when the values are equal,
-    or when both are floats and either lie within the numeric tolerance (at most 5e-7, or 1e-5
-    of the gold value) or one is the other rounded to 0-6 decimal places (so at most half a
-    unit of the last place kept, plus 1e-9). Those are the only places a match can hide, so
-    the index looks there and lets `cell_match` decide each pair it finds.
+    when an infinity meets any number (the tolerance reads `inf <= 1e-5 * inf` as true), or when
+    both are ordinary floats and either lie within the numeric tolerance (at most 5e-7, or 1e-5 of the
+    gold value) or one is the other rounded to 0-6 decimal places (so at most half a unit of the
+    last place kept, plus 1e-9). Those are the only places a match can hide, so the index looks
+    there and lets `cell_match` decide each pair it finds. Values are held once each, and a pair
+    `cell_match` cannot compare counts as a possible match: keeping a column only costs time.
     """
 
-    def __init__(self, values: list[object]) -> None:
-        self._exact = {v for v in values if v is None or _hashable(v)}
-        floats = sorted(v for v in values if isinstance(v, float) and not math.isnan(v))
-        self._floats = floats
-
-    def _near(self, lo: float, hi: float) -> list[float]:
-        return self._floats[bisect_left(self._floats, lo):bisect_right(self._floats, hi)]
+    def __init__(self, values: list[object], work: _Work) -> None:
+        self._work = work
+        # NaN is left out: a set finds it by identity, but the readings never call NaN equal.
+        self._exact = {v for v in values
+                       if (v is None or _hashable(v)) and not (isinstance(v, float) and math.isnan(v))}
+        floats = [v for v in values if isinstance(v, float)]
+        self._unsure = [v for v in floats if _unsure(v)]
+        self._floats = sorted({v for v in floats if not _unsure(v)})
+        self._fractional = [v for v in self._floats if not v.is_integer()]
 
     def any_match(self, x: object, cell_match: CellMatch, x_is_gold: bool) -> bool:
         def ok(v: object) -> bool:
-            return cell_match(x, v) if x_is_gold else cell_match(v, x)
+            self._work.spend()
+            try:
+                return cell_match(x, v) if x_is_gold else cell_match(v, x)
+            except ArithmeticError:
+                return True  # the full search would raise on this pair: keep it, let the check decide
 
-        if isinstance(x, float) and math.isnan(x):
-            return False  # NaN equals nothing, and no tolerance or rounding reaches it
+        self._work.spend()  # every lookup counts, not only the comparisons it leads to
+        nan = isinstance(x, float) and math.isnan(x)
         # Equal values always match under both readings (None to None, 1.0 to True included).
-        if (x is None or _hashable(x)) and x in self._exact:
+        if not nan and (x is None or _hashable(x)) and x in self._exact:
             return True
         if not isinstance(x, float):
             return False  # anything else matches only by equality
+        # The values the readings meet unpredictably are compared outright, every time.
+        if any(ok(v) for v in self._unsure):
+            return True
+        if _unsure(x):
+            # NaN against an ordinary number neither matches nor raises; an infinity or a huge
+            # value may meet any of them (the tolerance, or a raise), so look at every one.
+            return False if nan else any(ok(v) for v in self._floats)
         # Numeric tolerance: 1e-5 of the GOLD value, so widen a little when x is the candidate.
+        # Two whole numbers compare exactly, so a whole x looks only at fractional neighbours.
         width = 5e-7 + 1.1e-5 * abs(x) + 1e-12
-        if any(ok(v) for v in self._near(x - width, x + width)):
+        if self._scan(self._fractional if x.is_integer() else self._floats, x - width, x + width, ok):
             return True
         try:
             return self._rounding_match(x, ok)
         except InvalidOperation:
-            # Too large (or infinite) to quantize: compare with every float, as the full search did.
+            # Too large to quantize: compare with every float, as the full search did.
             return any(ok(v) for v in self._floats)
+
+    @staticmethod
+    def _scan(pool: list[float], lo: float, hi: float, ok: Callable[[object], bool]) -> bool:
+        """The first match in [lo, hi], walked in place: a window can hold every value."""
+        return any(ok(pool[i]) for i in range(bisect_left(pool, lo), bisect_right(pool, hi)))
 
     def _rounding_match(self, x: float, ok: Callable[[object], bool]) -> bool:
         exact = Decimal(str(x))
@@ -230,15 +298,45 @@ class _ValueIndex:
             # Some value is x rounded to `places`...
             for mode in (ROUND_HALF_EVEN, ROUND_HALF_UP):
                 r = float(exact.quantize(step, rounding=mode))
-                if any(ok(v) for v in self._near(r - 2e-9, r + 2e-9)):
+                if self._scan(self._floats, r - 2e-9, r + 2e-9, ok):
                     return True
-            # ...or x is some value rounded to `places`, which needs x to have at most that
-            # many decimals and puts the value within half a unit of that place.
+            # ...or x is some value rounded to `places`, which needs x to have at most that many
+            # decimals and puts the value within half a unit of that place. A whole value rounds
+            # to itself, so only fractional ones can do this without being equal to x.
             if abs(float(exact.quantize(step, rounding=ROUND_HALF_EVEN)) - x) <= 1e-9:
                 half = 0.5 * 10.0 ** -places + 2e-9
-                if any(ok(v) for v in self._near(x - half, x + half)):
+                if self._scan(self._fractional, x - half, x + half, ok):
                     return True
         return False
+
+
+# At and past this magnitude the rounding rule cannot quantize to six places (Decimal keeps 28
+# digits), so the got-facts reading raises on such a value against a fraction. Measured: 1e22
+# raises against 0.5, 1e21 does not; the bound sits a decade below to be safe.
+_UNSURE_MAGNITUDE = 1e21
+
+
+def _unsure(v: float) -> bool:
+    """A float the cell readings meet unpredictably: an infinity matches every number under the
+    tolerance (inf <= 1e-5 * inf), and an infinity, a NaN or a huge value can make the rounding
+    rule raise. The index compares these outright instead of looking for them in a window."""
+    return math.isnan(v) or math.isinf(v) or abs(v) >= _UNSURE_MAGNITUDE
+
+
+def _distinct(values: list[object]) -> list[object]:
+    """Each value once, for the existential checks. Keyed by type as well as value: True and 1.0
+    are equal to Python but not to the readings (1.4 rounds to 1.0, not to True)."""
+    seen: set[tuple[type, object]] = set()
+    out: list[object] = []
+    for v in values:
+        if v is not None and not _hashable(v):
+            out.append(v)
+            continue
+        key = (type(v), v)
+        if key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out
 
 
 def _hashable(value: object) -> bool:
@@ -266,16 +364,16 @@ def _no_rows(gold_rows: list[list[object]], width: int, arity: int) -> Iterator[
 
 
 def _positional_choices(gold_rows: list[list[object]], cand_rows: list[list[object]], arity: int,
-                        width: int, cell_match: CellMatch) -> Iterator[tuple[int, ...]]:
+                        width: int, cell_match: CellMatch, work: _Work) -> Iterator[tuple[int, ...]]:
     """Increasing column tuples -- the position-wise reading keeps the candidate's column order --
     whose every column covers the gold column it stands in for."""
     if not cand_rows:
         yield from _no_rows(gold_rows, width, arity)
         return
-    gold_cols = [[row[j] for row in gold_rows] for j in range(arity)]
-    cand_cols = [[row[c] for row in cand_rows] for c in range(width)]
-    gold_idx = [_ValueIndex(col) for col in gold_cols]
-    cand_idx = [_ValueIndex(col) for col in cand_cols]
+    gold_cols = [_distinct([row[j] for row in gold_rows]) for j in range(arity)]
+    cand_cols = [_distinct([row[c] for row in cand_rows]) for c in range(width)]
+    gold_idx = [_ValueIndex(col, work) for col in gold_cols]
+    cand_idx = [_ValueIndex(col, work) for col in cand_cols]
     fits = [[c for c in range(width)
              if _covers(gold_cols[j], gold_idx[j], cand_cols[c], cand_idx[c], cell_match)]
             for j in range(arity)]
@@ -313,27 +411,28 @@ def _increasing_choices(fits: list[list[int]]) -> Iterator[tuple[int, ...]]:
 
 
 def _sorted_choices(gold_rows: list[list[object]], cand_rows: list[list[object]], arity: int,
-                    width: int, cell_match: CellMatch) -> Iterator[tuple[int, ...]]:
+                    width: int, cell_match: CellMatch, work: _Work) -> Iterator[tuple[int, ...]]:
     """Column sets for the cell-sorted reading. There every candidate cell is compared with SOME
     cell of its gold row, so a usable column holds only values that appear somewhere in gold."""
     if not cand_rows:
         yield from _no_rows(gold_rows, width, arity)
         return
-    gold_cells = _ValueIndex([cell for row in gold_rows for cell in row])
+    gold_values = _distinct([cell for row in gold_rows for cell in row])
+    gold_cells = _ValueIndex(gold_values, work)
     usable = [c for c in range(width)
-              if all(gold_cells.any_match(row[c], cell_match, x_is_gold=False) for row in cand_rows)]
+              if all(gold_cells.any_match(v, cell_match, x_is_gold=False)
+                     for v in _distinct([row[c] for row in cand_rows]))]
     # And every gold cell is compared with some chosen cell, so each must be matchable by a
     # usable column: one gold value nobody holds rules out every set at once.
-    usable_cells = _ValueIndex([row[c] for row in cand_rows for c in usable])
-    if not all(usable_cells.any_match(cell, cell_match, x_is_gold=True)
-               for row in gold_rows for cell in row):
+    usable_cells = _ValueIndex(_distinct([row[c] for row in cand_rows for c in usable]), work)
+    if not all(usable_cells.any_match(v, cell_match, x_is_gold=True) for v in gold_values):
         return
     if len(cand_rows) == 1 and len(gold_rows) == 1:
         # One row, the usual shape of a wide answer: the chosen cells pair one to one with
         # gold's, so a set exists only if gold's cells can each take a DIFFERENT usable column.
         # No such pairing rules out every set; one found is the set most likely to pass, so try
         # it first.
-        pairing = _pair_cells(gold_rows[0], cand_rows[0], usable, cell_match)
+        pairing = _pair_cells(gold_rows[0], cand_rows[0], usable, cell_match, work)
         if pairing is None:
             return
         first = tuple(sorted(pairing))
@@ -344,10 +443,17 @@ def _sorted_choices(gold_rows: list[list[object]], cand_rows: list[list[object]]
 
 
 def _pair_cells(gold_row: list[object], cand_row: list[object], usable: list[int],
-                cell_match: CellMatch) -> list[int] | None:
+                cell_match: CellMatch, work: _Work) -> list[int] | None:
     """Give each gold cell a different candidate column holding a matching value, or None.
     Augmenting paths (Kuhn's algorithm): rows are a few dozen cells wide."""
-    edges = [[c for c in usable if cell_match(g, cand_row[c])] for g in gold_row]
+    def edge(g: object, c: object) -> bool:
+        work.spend()
+        try:
+            return cell_match(g, c)
+        except ArithmeticError:
+            return True  # cannot compare: a possible match, so no set is ruled out on it
+
+    edges = [[c for c in usable if edge(g, cand_row[c])] for g in gold_row]
     owner: dict[int, int] = {}
 
     def assign(j: int, seen: set[int]) -> bool:

@@ -19,9 +19,18 @@ from mnemiq.execute.resultset import _match_rows, _rows, facts_cells_match, grad
 
 
 def _brute_force(gold: pa.Table, candidate: pa.Table, allow_extra_columns: bool = True,
-                 duplicate_rows_insignificant: bool = False) -> bool:
-    """The search before pruning, kept verbatim as the oracle."""
+                 duplicate_rows_insignificant: bool = False, optimistic: bool = False) -> bool:
+    """The search before pruning, kept verbatim as the oracle. `optimistic` reads a pair the
+    cell readings cannot compare (they raise) as a match: the most any resolution could match."""
     cell_match = facts_cells_match if allow_extra_columns else grade_cells_match
+    if optimistic:
+        strict_match = cell_match
+
+        def cell_match(a, b):
+            try:
+                return strict_match(a, b)
+            except ArithmeticError:
+                return True
     if allow_extra_columns:
         if gold.num_columns > candidate.num_columns:
             return False
@@ -70,15 +79,23 @@ _FLOATS = [0.0, 1.0, 2.0, 1.4249, 1.42, 1.425, 1.43, 1.4, 1.0000004, 1.000006, 5
            1234567.5, 1234570.25, 1234599.5,
            # Large WHOLE numbers: inside 1e-5 of each other, yet counts compare exactly.
            1e6, 1e6 + 5.0, 1e6 + 20.0]
+# The readings' own edges, drawn rarely: an infinity meets every number under the tolerance
+# (inf <= 1e-5 * inf), and inf against inf, or 1e22 against a fraction, raises inside the
+# rounding rule -- the full search crashes there, which the oracle allows for.
+_EDGES = [float("inf"), float("-inf"), 1e22]
 _STRINGS = ["a", "b", "1", "1.0", None]
 _BOOLS = [True, False, None]
 
 
 def _col(rng: random.Random, n: int) -> list[object]:
     pool = rng.choices([_FLOATS, _STRINGS, _BOOLS], [6, 2, 1])[0]
+
+    def pick() -> object:
+        return rng.choice(_EDGES) if pool is _FLOATS and rng.random() < 0.02 else rng.choice(pool)
+
     if rng.random() < 0.15:  # a constant column: many choices look alike
-        return [rng.choice(pool)] * n
-    return [rng.choice(pool) for _ in range(n)]
+        return [pick()] * n
+    return [pick() for _ in range(n)]
 
 
 def _as_planted(rng: random.Random, col: list[object]) -> list[object]:
@@ -122,16 +139,117 @@ def _case(rng: random.Random, extra_columns: bool) -> tuple[pa.Table, pa.Table]:
 @pytest.mark.parametrize("dupes", [False, True])
 def test_the_pruned_search_agrees_with_the_full_one(allow_extra, dupes):
     rng = random.Random(1113 + 2 * allow_extra + dupes)
-    agree = matched = 0
+    agree = matched = crashed = 0
     for _ in range(4000):
         gold, cand = _case(rng, allow_extra)
-        expected = _brute_force(gold, cand, allow_extra, dupes)
+        try:
+            expected = _brute_force(gold, cand, allow_extra, dupes)
+        except ArithmeticError:
+            # The full search crashed on a pair the readings cannot compare. The pruned one may
+            # answer True (a choice matched outright) or undecided; it may answer False only if
+            # nothing could match even reading every such pair as a match.
+            crashed += 1
+            try:
+                got = results_match(gold, cand, allow_extra, dupes)
+            except GotFactsUndecided:
+                got = None
+            if got is False:
+                assert not _brute_force(gold, cand, allow_extra, dupes, optimistic=True), (
+                    gold.to_pydict(), cand.to_pydict(), allow_extra, dupes)
+            continue
         got = results_match(gold, cand, allow_extra, dupes)
         assert got == expected, (gold.to_pydict(), cand.to_pydict(), allow_extra, dupes)
         agree += 1
         matched += expected
+    assert crashed < agree * 0.1, f"{crashed} crashes leave too little compared"
     # A sampler that never produced a match would test only the False side.
     assert matched > agree * 0.1, f"only {matched} of {agree} cases matched"
+
+
+@pytest.mark.parametrize("dupes", [False, True])
+@pytest.mark.parametrize("edge", [float("inf"), float("-inf")])
+def test_an_infinite_gold_value_is_still_matched_as_the_full_search_matches_it(edge, dupes):
+    """Found by review: the tolerance reads inf <= 1e-5 * inf as true, so an infinite gold value
+    matches ANY finite one, and the windows around a finite candidate never reached it. Whether
+    that rule is right is a separate question; the pruning must not change it."""
+    gold, cand = pa.table({"g": [edge]}), pa.table({"c": [1.5], "x": ["pad"]})
+    assert _brute_force(gold, cand, True, dupes) is True
+    assert results_match(gold, cand, True, dupes) is True
+
+
+def test_a_pair_the_readings_cannot_compare_is_undecided_never_wrong():
+    """inf against inf raises inside the rounding rule (inf - inf is NaN, then Decimal cannot
+    quantize Infinity), so the full search crashes here. Found by review: skipping the choice
+    turned an answer identical to gold into a silent WRONG. It is undecided."""
+    gold, cand = pa.table({"g": [float("inf")]}), pa.table({"c": [float("inf")]})
+    with pytest.raises(ArithmeticError):
+        _brute_force(gold, cand)
+    with pytest.raises(GotFactsUndecided, match="cannot compare"):
+        results_match(gold, cand)
+
+
+def test_a_match_elsewhere_still_decides_past_an_uncomparable_pair():
+    """2.5 against inf raises inside the rounding rule, and the full search meets that column
+    first and crashes. The next column matches outright, so the answer is decided: True."""
+    gold = pa.table({"g": [2.5]})
+    cand = pa.table({"a": [float("inf")], "b": [2.5]})
+    with pytest.raises(ArithmeticError):
+        _brute_force(gold, cand)
+    assert results_match(gold, cand) is True
+
+
+def test_a_long_column_of_near_equal_values_is_read_once_per_value(monkeypatch):
+    """Found by review: 10,000 rows of 1000.1 against 10,000 of 1000.1001 cost 2N queries that
+    each copied an N-value window before looking. Each distinct value is now read once and a
+    window is walked only to its first match."""
+    import mnemiq.eval.grade as grade
+
+    calls = [0]
+    real = grade.facts_cells_match
+
+    def counted(a, b):
+        calls[0] += 1
+        return real(a, b)
+
+    monkeypatch.setattr(grade, "facts_cells_match", counted)
+    n = 10_000
+    gold = pa.table({"g": [1000.1] * n})
+    cand = pa.table({"c": [1000.1001] * n, "x": [7.25] * n})
+    assert results_match(gold, cand)
+    assert calls[0] < 100 + 2 * n, calls[0]  # the pruning reads 2 values; the check compares n rows
+
+
+class _NoSlicing(list):
+    """A pool that counts the items read and refuses to be copied."""
+
+    reads = 0
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            raise AssertionError("the window was copied")
+        _NoSlicing.reads += 1
+        return super().__getitem__(i)
+
+
+def test_a_window_is_walked_in_place_and_only_to_its_first_match():
+    from mnemiq.eval.grade import _ValueIndex
+
+    _NoSlicing.reads = 0
+    pool = _NoSlicing([1.0 + i * 1e-9 for i in range(5000)])
+    assert _ValueIndex._scan(pool, 0.0, 2.0, lambda v: True)
+    # two binary searches find the window's ends; then one value is read, not 5,000
+    assert _NoSlicing.reads <= 2 * len(pool).bit_length() + 1
+
+
+def test_pruning_that_runs_out_of_budget_says_it_cannot_decide(monkeypatch):
+    import mnemiq.eval.grade as grade
+
+    gold = pa.table({"g": [float(i) + 0.5 for i in range(50)]})
+    cand = pa.table({f"x{j}": [float(i) + 0.25 for i in range(50)] for j in range(5)})
+    assert not results_match(gold, cand)  # control: decided within the real budget
+    monkeypatch.setattr(grade, "MAX_PRUNING_STEPS", 3)
+    with pytest.raises(GotFactsUndecided, match="lookups and cell comparisons"):
+        results_match(gold, cand)
 
 
 def _counting(monkeypatch) -> list[int]:
