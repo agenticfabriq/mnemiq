@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import math
+from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Iterator
+from decimal import ROUND_HALF_EVEN, ROUND_HALF_UP, Decimal, InvalidOperation
 from itertools import combinations
 
 import pyarrow as pa
@@ -93,70 +97,47 @@ def results_match(
         # gold column. Extra columns cannot rescue wrong rows -- every gold row still matches.
         if gold.num_columns > candidate.num_columns:
             return False
-        column_choices = combinations(range(candidate.num_columns), gold.num_columns)
-    else:
-        if gold.num_columns != candidate.num_columns:
-            return False
-        column_choices = [tuple(range(candidate.num_columns))]
+    elif gold.num_columns != candidate.num_columns:
+        return False
 
     gold_rows = _rows(gold)
     if duplicate_rows_insignificant:
         gold_rows = _distinct_rows(gold_rows)
-
-    # Normalize the candidate ONCE and project by index, rather than re-running _rows() --
-    # and so normalize() on every cell -- for each column choice. The choices are
-    # combinatorial, C(candidate_cols, gold_cols), so normalizing inside the loop multiplied
-    # the same work by the number of projections. Measured on a 14-column candidate against a
-    # 4-column gold over 400 rows: 1,603,200 normalize calls for 7,200 cells, 223x redundant.
-    # Wall-clock is a smaller win than that ratio suggests -- 1.1x to 2.3x depending on cell
-    # type, because _match_rows and not normalize is the dominant cost on ordinary shapes.
-    # The redundancy is what this removes; it is unbounded in the column count, where the
-    # wall-clock gain is not. Projecting after normalizing is exact because normalize() reads
-    # one cell and nothing else -- no column, no row, no table.
+    # Normalized ONCE and projected by index: normalize() reads one cell and nothing else, so
+    # projecting after normalizing is exact, and the projections below never re-read the table.
     all_rows = _rows(candidate)
-    # repr() is the sort key for the column-order retry below and carried the same multiplier,
-    # recomputed for every cell of every projection. Computed once per cell here; the retry
-    # then sorts precomputed keys.
+
+    if not allow_extra_columns:
+        candidate_rows = _distinct_rows(all_rows) if duplicate_rows_insignificant else all_rows
+        return _match_rows(gold_rows, candidate_rows, 0.0, cell_match)
+
+    # Without the declaration both readings compare multisets, and projecting keeps the row
+    # count, so a different count fails every projection: say so once instead of trying them all.
+    if not duplicate_rows_insignificant and len(gold_rows) != len(all_rows):
+        return False
+
+    # Column order is presentation, so got-facts also compares each row with its cells sorted
+    # into a canonical order -- `SELECT k, count(*)` and `SELECT count(*), k` carry the same
+    # information. Exact match does NOT: BIRD's evaluator compares row tuples position-wise.
+    sorted_gold = [sorted(row, key=repr) for row in gold_rows]
+    if duplicate_rows_insignificant:
+        # Re-collapse AFTER sorting: two rows distinct by column order become identical once
+        # each row's cells are canonicalised (gold `{a:[1,2], b:[2,1]}` against candidate
+        # `{a:[1], b:[2]}` is one fact either way).
+        sorted_gold = _distinct_rows(sorted_gold)
     all_keys = [[repr(cell) for cell in row] for row in all_rows]
 
-    # Gold does not vary across projections, so sorting it inside the loop rebuilt an
-    # identical list once per column choice.
-    sorted_gold: list[list[object]] = []
-    if allow_extra_columns:
-        sorted_gold = [sorted(row, key=repr) for row in gold_rows]
-        if duplicate_rows_insignificant:
-            sorted_gold = _distinct_rows(sorted_gold)
-
-    for keep in column_choices:
+    for keep in _positional_choices(gold_rows, all_rows, gold.num_columns,
+                                    candidate.num_columns, cell_match):
         candidate_rows = [[row[i] for i in keep] for row in all_rows]
         if duplicate_rows_insignificant:
             candidate_rows = _distinct_rows(candidate_rows)
         if _match_rows(gold_rows, candidate_rows, 0.0, cell_match):
             return True
-
-        # Column order is presentation, so got-facts retries with each row's cells sorted
-        # into a canonical order -- `SELECT k, count(*)` and `SELECT count(*), k` carry
-        # the same information. Exact match does NOT: BIRD's evaluator compares row
-        # tuples position-wise, so the strict number has to stay the one the leaderboard
-        # publishes. This retry running on both readings is what made mnemiq's own BIRD
-        # "correct" slightly generous against the published metric.
-        if not allow_extra_columns:
-            continue
-
-        # Re-collapse AFTER sorting: two rows distinct by column order become identical
-        # once each row's cells are canonicalised, so a dedupe done only before the loop
-        # leaves duplicates this branch created. Measured on the real module -- gold
-        # `{a:[1,2], b:[2,1]}` against candidate `{a:[1], b:[2]}` answered False while the
-        # same fact spelled `{a:[1,1], b:[2,2]}` answered True, which is the docstring's
-        # "collapses in BOTH metrics" failing on exactly one branch.
-        # Sorted from the UNPROJECTED rows and collapsed after, which yields the same list
-        # as sorting the already-collapsed projection: collapsing keeps first occurrences and
-        # sorting cells is elementwise, so the first row producing a given sorted form is the
-        # first occurrence of itself and survives either order.
+    for keep in _sorted_choices(gold_rows, all_rows, gold.num_columns, candidate.num_columns,
+                                cell_match):
         sorted_candidate = [
-            [value for _, value in sorted(
-                ((keys[i], row[i]) for i in keep), key=lambda pair: pair[0]
-            )]
+            [value for _, value in sorted(((keys[i], row[i]) for i in keep), key=lambda p: p[0])]
             for row, keys in zip(all_rows, all_keys, strict=True)
         ]
         if duplicate_rows_insignificant:
@@ -164,3 +145,135 @@ def results_match(
         if _match_rows(sorted_gold, sorted_candidate, 0.0, cell_match):
             return True
     return False
+
+
+# -- which column choices can possibly match -----------------------------------------------------
+#
+# Got-facts asks whether SOME choice of the candidate's columns, one per gold column, states
+# gold's rows. Trying every choice is C(candidate columns, gold columns): 4e12 for a 74-column
+# answer to an 11-column gold, and the search hung (register M113). Each pruning rule below is a
+# condition every matching choice must meet, so dropping a choice that fails it cannot change
+# the verdict -- the survivors are still checked by the same `_match_rows` as before.
+
+
+CellMatch = Callable[[object, object], bool]
+
+
+class _ValueIndex:
+    """Answers "does any value here match `x`?" without comparing `x` to every value.
+
+    Exact for both grading cell readings, which accept a pair only when the values are equal,
+    or when both are floats and either lie within the numeric tolerance (at most 5e-7, or 1e-5
+    of the gold value) or one is the other rounded to 0-6 decimal places (so at most half a
+    unit of the last place kept, plus 1e-9). Those are the only places a match can hide, so
+    the index looks there and lets `cell_match` decide each pair it finds.
+    """
+
+    def __init__(self, values: list[object]) -> None:
+        self._exact = {v for v in values if v is None or _hashable(v)}
+        floats = sorted(v for v in values if isinstance(v, float) and not math.isnan(v))
+        self._floats = floats
+
+    def _near(self, lo: float, hi: float) -> list[float]:
+        return self._floats[bisect_left(self._floats, lo):bisect_right(self._floats, hi)]
+
+    def any_match(self, x: object, cell_match: CellMatch, x_is_gold: bool) -> bool:
+        def ok(v: object) -> bool:
+            return cell_match(x, v) if x_is_gold else cell_match(v, x)
+
+        if isinstance(x, float) and math.isnan(x):
+            return False  # NaN equals nothing, and no tolerance or rounding reaches it
+        # Equal values always match under both readings (None to None, 1.0 to True included).
+        if (x is None or _hashable(x)) and x in self._exact:
+            return True
+        if not isinstance(x, float):
+            return False  # anything else matches only by equality
+        # Numeric tolerance: 1e-5 of the GOLD value, so widen a little when x is the candidate.
+        width = 5e-7 + 1.1e-5 * abs(x) + 1e-12
+        if any(ok(v) for v in self._near(x - width, x + width)):
+            return True
+        try:
+            return self._rounding_match(x, ok)
+        except InvalidOperation:
+            # Too large (or infinite) to quantize: compare with every float, as the full search did.
+            return any(ok(v) for v in self._floats)
+
+    def _rounding_match(self, x: float, ok: Callable[[object], bool]) -> bool:
+        exact = Decimal(str(x))
+        for places in range(0, 7):
+            step = Decimal(1).scaleb(-places)
+            # Some value is x rounded to `places`...
+            for mode in (ROUND_HALF_EVEN, ROUND_HALF_UP):
+                r = float(exact.quantize(step, rounding=mode))
+                if any(ok(v) for v in self._near(r - 2e-9, r + 2e-9)):
+                    return True
+            # ...or x is some value rounded to `places`, which needs x to have at most that
+            # many decimals and puts the value within half a unit of that place.
+            if abs(float(exact.quantize(step, rounding=ROUND_HALF_EVEN)) - x) <= 1e-9:
+                half = 0.5 * 10.0 ** -places + 2e-9
+                if any(ok(v) for v in self._near(x - half, x + half)):
+                    return True
+        return False
+
+
+def _hashable(value: object) -> bool:
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
+
+
+def _covers(gold_values: list[object], gold_index: _ValueIndex, cand_values: list[object],
+            cand_index: _ValueIndex, cell_match: CellMatch) -> bool:
+    """Whether every gold value matches some candidate value and every candidate value some
+    gold value. A matching choice pairs gold's rows with the candidate's one to one (or, with
+    duplicates insignificant, each distinct row with one), so every gold column it uses meets
+    this against the candidate column standing in for it."""
+    return (all(cand_index.any_match(g, cell_match, x_is_gold=True) for g in gold_values)
+            and all(gold_index.any_match(c, cell_match, x_is_gold=False) for c in cand_values))
+
+
+def _no_rows(gold_rows: list[list[object]], width: int, arity: int) -> Iterator[tuple[int, ...]]:
+    """A candidate with no rows matches only a gold with none, and then any choice does."""
+    if not gold_rows and arity <= width:
+        yield tuple(range(arity))
+
+
+def _positional_choices(gold_rows: list[list[object]], cand_rows: list[list[object]], arity: int,
+                        width: int, cell_match: CellMatch) -> Iterator[tuple[int, ...]]:
+    """Increasing column tuples -- the position-wise reading keeps the candidate's column order --
+    whose every column covers the gold column it stands in for."""
+    if not cand_rows:
+        yield from _no_rows(gold_rows, width, arity)
+        return
+    gold_cols = [[row[j] for row in gold_rows] for j in range(arity)]
+    cand_cols = [[row[c] for row in cand_rows] for c in range(width)]
+    gold_idx = [_ValueIndex(col) for col in gold_cols]
+    cand_idx = [_ValueIndex(col) for col in cand_cols]
+    fits = [[c for c in range(width)
+             if _covers(gold_cols[j], gold_idx[j], cand_cols[c], cand_idx[c], cell_match)]
+            for j in range(arity)]
+
+    def walk(j: int, after: int, chosen: tuple[int, ...]) -> Iterator[tuple[int, ...]]:
+        if j == arity:
+            yield chosen
+            return
+        for c in fits[j]:
+            if c > after:
+                yield from walk(j + 1, c, (*chosen, c))
+
+    yield from walk(0, -1, ())
+
+
+def _sorted_choices(gold_rows: list[list[object]], cand_rows: list[list[object]], arity: int,
+                    width: int, cell_match: CellMatch) -> Iterator[tuple[int, ...]]:
+    """Column sets for the cell-sorted reading. There every candidate cell is compared with SOME
+    cell of its gold row, so a usable column holds only values that appear somewhere in gold."""
+    if not cand_rows:
+        yield from _no_rows(gold_rows, width, arity)
+        return
+    gold_cells = _ValueIndex([cell for row in gold_rows for cell in row])
+    usable = [c for c in range(width)
+              if all(gold_cells.any_match(row[c], cell_match, x_is_gold=False) for row in cand_rows)]
+    yield from combinations(usable, arity)

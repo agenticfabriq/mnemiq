@@ -328,7 +328,7 @@ def test_each_cell_is_normalized_once_not_once_per_column_projection(monkeypatch
     candidate = _t({f"c{i}": list(range(rows)) for i in range(cand_cols)})
     gold = _t({f"g{i}": [v + 1000 for v in range(rows)] for i in range(gold_cols)})
 
-    assert not results_match(gold, candidate)  # no projection matches, so ALL are tried
+    assert not results_match(gold, candidate)  # no projection matches: every survivor is tried
     assert calls == rows * (cand_cols + gold_cols)
 
 
