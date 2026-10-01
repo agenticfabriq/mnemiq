@@ -51,8 +51,9 @@ MAX_CHOICES = 10_000
 
 
 class GotFactsUndecided(Exception):
-    """More column choices survived pruning than got-facts will try. Not a verdict: the
-    caller records it as an error, never as a wrong answer."""
+    """More column choices survived pruning than got-facts will try. Not a verdict: a caller
+    grading a case records it as an error, and a caller re-checking a stored label keeps the
+    label and marks it not re-checked -- none turns it into a new WRONG."""
 
 
 def results_match(
