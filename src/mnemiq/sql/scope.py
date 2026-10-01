@@ -99,7 +99,7 @@ def _root_scope(ast: exp.Expression):
         return None
 
 
-def scope_resolved(ast: exp.Expression) -> bool:
+def scope_resolved(ast: exp.Expression, dialect: str | None = None) -> bool:
     """Did the scope resolve, so that `base_tables` is a resolved answer rather than a fallback?
 
     When it did not, `base_tables` returns `find_all(exp.Table)` -- CTE aliases included -- which
@@ -109,7 +109,7 @@ def scope_resolved(ast: exp.Expression) -> bool:
     """
     ast_root = _root_scope(ast)
     return (ast_root is not None and not _unscoped_ctes(ast, ast_root)
-            and not _scope_missed_a_read(ast, _walked_reads(ast, ast_root, None), None))
+            and not _scope_missed_a_read(ast, _walked_reads(ast, ast_root, dialect), dialect))
 
 
 def _defining_identifier(source) -> exp.Expression | None:
@@ -343,7 +343,7 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
     if root is None or _unscoped_ctes(ast, root):
         return None
     if _scope_missed_a_read(ast, _walked_reads(ast, root, dialect), dialect):
-        return None  # the coverage `base_tables` just fell back on is not trusted for columns either
+        return None  # the coverage `base_tables` falls back on is not trusted for columns either
 
     out: dict[int, str] = {}
     for scope in root.traverse():

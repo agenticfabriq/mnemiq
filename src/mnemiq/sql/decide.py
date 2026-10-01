@@ -143,7 +143,7 @@ def decide(
     # differ.
     lineage = lineage_for(shaped, tables, {} if views is None else views,
                           functions=functions,
-                          scope_resolved=scope_resolved(shaped))
+                          scope_resolved=scope_resolved(shaped, target))
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
     narrowed: list = []
