@@ -311,15 +311,23 @@ def test_a_gold_value_no_column_holds_rules_out_every_set_on_many_rows_too(monke
 
 
 class _Budget(list):
-    """A list that counts how often it is walked, and stops a walk that has run away."""
+    """A list that counts every read -- an item, a walk, a binary-search probe -- and stops a
+    walk that has run away."""
 
     steps = 0
 
-    def __iter__(self):
+    def _step(self):
         _Budget.steps += 1
         if _Budget.steps > 10_000:
             raise AssertionError("the walk is exploring dead ends")
+
+    def __iter__(self):
+        self._step()
         return super().__iter__()
+
+    def __getitem__(self, i):
+        self._step()
+        return super().__getitem__(i)
 
 
 @pytest.mark.parametrize("last", [[], [5]], ids=["no-column-fits", "no-room-left"])
@@ -355,6 +363,56 @@ def test_the_position_wise_walk_yields_exactly_the_increasing_tuples():
         expected = [t for t in combinations(range(width), arity)
                     if all(c in fits[j] for j, c in enumerate(t))]
         assert list(_increasing_choices(fits)) == expected
+
+
+def test_a_gold_wider_than_the_stack_is_walked_without_recursion():
+    """Found by review: the walk took one stack frame per gold column, and a 1,000-column table
+    against itself raised RecursionError -- outside the undecided handling. A SELECT * over a
+    965-column table is an ordinary gold. Here 300 columns under a 250-frame limit: any walk
+    that recursed per column would hit it."""
+    import sys
+
+    t = pa.table({f"c{i}": [i] for i in range(300)})
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(250)
+    try:
+        assert results_match(t, t, allow_extra_columns=True)
+    finally:
+        sys.setrecursionlimit(limit)
+
+
+def test_one_long_check_spends_from_a_budget(monkeypatch):
+    """Found by review: the row check is quadratic, and one check of 2,100 rows against the same
+    rows reversed cost 2.2 million comparisons outside every limit."""
+    import mnemiq.eval.grade as grade
+
+    n = 2100
+    gold = pa.table({"g": list(range(n))})
+    cand = pa.table({"c": list(reversed(range(n))), "x": ["pad"] * n})
+    assert results_match(gold, cand)  # control: decided within the real budget
+    monkeypatch.setattr(grade, "MAX_CHECK_STEPS", 1_000_000)
+    with pytest.raises(GotFactsUndecided, match="row checks"):
+        results_match(gold, cand)
+
+
+def test_the_cell_pairing_finds_one_exactly_when_one_exists():
+    """The pairing is iterative now (a path can be as long as the row is wide): held to an
+    exhaustive search for a one-to-one assignment on random graphs."""
+    from itertools import permutations
+
+    from mnemiq.eval.grade import _augment
+
+    rng = random.Random(11)
+    for _ in range(400):
+        k, m = rng.randint(0, 5), rng.randint(0, 6)
+        edges = [sorted(rng.sample(range(m), rng.randint(0, m))) for _ in range(k)]
+        owner: dict[int, int] = {}
+        found = all(_augment(j, edges, owner) for j in range(k))
+        exists = any(all(p[j] in edges[j] for j in range(k)) for p in permutations(range(m), k))
+        assert found == exists, edges
+        if found:
+            assert sorted(owner.values()) == list(range(k))
+            assert all(c in edges[j] for c, j in owner.items())
 
 
 def test_one_row_flags_in_the_wrong_counts_are_refused_without_trying_choices(monkeypatch):

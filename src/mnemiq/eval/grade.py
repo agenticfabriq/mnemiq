@@ -50,6 +50,12 @@ def _distinct_rows(rows: list[list[object]]) -> list[list[object]]:
 MAX_CHOICES = 10_000
 
 
+# How many cell comparisons the row checks may spend in one grading. A check is the engine's
+# greedy `_match_rows`, quadratic in rows: two copies of 2,100 rows in reverse order cost 2.2
+# million comparisons in ONE check. Answers are capped at 1,000 rows (500,000 at worst per check),
+# so this allows dozens of full checks and stops a pathological grading instead of stalling it.
+MAX_CHECK_STEPS = 20_000_000
+
 # How many value lookups and cell comparisons the pruning itself may spend. It reads each DISTINCT value once and
 # stops at the first match, so ordinary answers spend a few thousand; this bounds the
 # pathological ones before the choice limit is ever reached.
@@ -58,8 +64,8 @@ MAX_PRUNING_STEPS = 2_000_000
 
 class GotFactsUndecided(Exception):
     """Got-facts could not decide: more column choices survived pruning than it will try, the
-    pruning ran out of budget, or the only choices left meet a cell pair the readings cannot
-    compare. Not a verdict: a caller grading a case records it as an error, and a caller
+    pruning or the row checks ran out of budget, or the only choices left meet a cell pair the
+    readings cannot compare. Not a verdict: a caller grading a case records it as an error, and a caller
     re-checking a stored label keeps the label and marks it not re-checked -- none turns it
     into a new WRONG."""
 
@@ -149,6 +155,12 @@ def results_match(
     all_keys = [[repr(cell) for cell in row] for row in all_rows]
 
     work = _Work(MAX_PRUNING_STEPS, candidate.num_columns, gold.num_columns)
+    check_work = _Work(MAX_CHECK_STEPS, candidate.num_columns, gold.num_columns, what="row checks")
+
+    def counted_match(a: object, b: object) -> bool:
+        check_work.spend()
+        return cell_match(a, b)
+
     tried = 0
     uncomparable = False
 
@@ -166,7 +178,7 @@ def results_match(
         candidate_rows = [[row[i] for i in keep] for row in all_rows]
         if duplicate_rows_insignificant:
             candidate_rows = _distinct_rows(candidate_rows)
-        verdict = _checks(gold_rows, candidate_rows, cell_match)
+        verdict = _checks(gold_rows, candidate_rows, counted_match)
         if verdict:
             return True
         uncomparable |= verdict is None
@@ -179,7 +191,7 @@ def results_match(
         ]
         if duplicate_rows_insignificant:
             sorted_candidate = _distinct_rows(sorted_candidate)
-        verdict = _checks(sorted_gold, sorted_candidate, cell_match)
+        verdict = _checks(sorted_gold, sorted_candidate, counted_match)
         if verdict:
             return True
         uncomparable |= verdict is None
@@ -217,17 +229,20 @@ CellMatch = Callable[[object, object], bool]
 
 
 class _Work:
-    """The pruning's comparison budget, shared by every index of one grading."""
+    """A budget of steps for one grading -- the pruning's, or the row checks' -- that raises
+    GotFactsUndecided when spent, so no part of got-facts can stall a run."""
 
-    def __init__(self, limit: int, candidate_cols: int, gold_cols: int) -> None:
-        self.left = limit
+    def __init__(self, limit: int, candidate_cols: int, gold_cols: int,
+                 what: str = "pruning") -> None:
+        self.limit = self.left = limit
+        self.what = what
         self.shape = f"{candidate_cols} candidate columns, {gold_cols} gold"
 
     def spend(self) -> None:
         self.left -= 1
         if self.left < 0:
             raise GotFactsUndecided(
-                f"pruning spent more than {MAX_PRUNING_STEPS:,} lookups and cell comparisons "
+                f"{self.what} spent more than {self.limit:,} lookups and cell comparisons "
                 f"({self.shape})")
 
 
@@ -387,7 +402,7 @@ def _increasing_choices(fits: list[list[int]]) -> Iterator[tuple[int, ...]]:
     -- 0/1 flag columns fit most levels, and a 42 that fits none made it walk billions of
     prefixes and yield nothing. So first find the LATEST column each level may take and still
     leave increasing room for the levels after it; a walk held under those bounds completes
-    every prefix it starts, and its work is bounded by what it yields.
+    every prefix it starts, and its work is bounded by what it yields. `fits[j]` is ascending.
     """
     latest: list[int] = []
     bound = math.inf
@@ -399,15 +414,26 @@ def _increasing_choices(fits: list[list[int]]) -> Iterator[tuple[int, ...]]:
         latest.append(bound)
     latest.reverse()
 
-    def walk(j: int, after: int, chosen: tuple[int, ...]) -> Iterator[tuple[int, ...]]:
-        if j == len(fits):
-            yield chosen
-            return
-        for c in fits[j]:
-            if after < c <= latest[j]:
-                yield from walk(j + 1, c, (*chosen, c))
-
-    yield from walk(0, -1, ())
+    # Iterative, not recursive: a gold of a thousand columns would need a thousand frames.
+    k = len(fits)
+    if k == 0:
+        yield ()
+        return
+    chosen = [0] * k
+    nxt = [0] * k  # where level j resumes in fits[j]
+    j = 0
+    while j >= 0:
+        options = fits[j]
+        i = max(nxt[j], bisect_right(options, chosen[j - 1] if j else -1))
+        if i < len(options) and options[i] <= latest[j]:
+            chosen[j], nxt[j] = options[i], i + 1
+            if j == k - 1:
+                yield tuple(chosen)
+            else:
+                j += 1
+                nxt[j] = 0
+        else:
+            j -= 1
 
 
 def _sorted_choices(gold_rows: list[list[object]], cand_rows: list[list[object]], arity: int,
@@ -455,17 +481,33 @@ def _pair_cells(gold_row: list[object], cand_row: list[object], usable: list[int
 
     edges = [[c for c in usable if edge(g, cand_row[c])] for g in gold_row]
     owner: dict[int, int] = {}
+    if not all(_augment(j, edges, owner) for j in range(len(gold_row))):
+        return None
+    return list(owner)
 
-    def assign(j: int, seen: set[int]) -> bool:
-        for c in edges[j]:
+
+def _augment(start: int, edges: list[list[int]], owner: dict[int, int]) -> bool:
+    """One augmenting path from gold cell `start`, found with an explicit stack (a path can be
+    as long as the row is wide). `path[i]` is the column taken from `stack[i]` to `stack[i+1]`;
+    on reaching a free column every cell on the path moves to the column it took."""
+    seen: set[int] = set()
+    stack = [(start, iter(edges[start]))]
+    path: list[tuple[int, int]] = []
+    while stack:
+        gold, options = stack[-1]
+        for c in options:
             if c in seen:
                 continue
             seen.add(c)
-            if c not in owner or assign(owner[c], seen):
-                owner[c] = j
+            path.append((gold, c))
+            if c not in owner:
+                for g, col in path:
+                    owner[col] = g
                 return True
-        return False
-
-    if not all(assign(j, set()) for j in range(len(gold_row))):
-        return None
-    return list(owner)
+            stack.append((owner[c], iter(edges[owner[c]])))
+            break
+        else:
+            stack.pop()
+            if path:
+                path.pop()
+    return False
