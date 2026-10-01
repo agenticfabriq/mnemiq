@@ -141,6 +141,7 @@ class Settings(BaseSettings):
     verity_client_id: str | None = Field(default=None, description="Verity service client id (created in the workbench API Credentials page)")
     verity_client_secret: str | None = Field(default=None, description="Verity service client secret; presented only to the token endpoint, never to the records endpoint")
     llm_seed: int | None = Field(default=None, description="sampling seed forwarded to the provider; honoured by vLLM, IGNORED by the hosted endpoint (accepted, no system_fingerprint, output still varies) -- so it buys reproducibility on the local path only")
+    llm_prompt_cut_check: bool = Field(default=True, description="refuse an answer when the server cut the prompt to fit its context window without an error, as Ollama does (M119): it reports far fewer prompt tokens than the characters sent allow, or a count stuck on a window size that does not grow when the prompt does; 0 only for a proxy that reports prompt_tokens without its cached tokens")
     retrieval_k: int = Field(default=DEFAULT_RETRIEVAL_K, ge=1, description="schema cards retrieved into the generation packet")
     definition_index_max_concepts: int = Field(default=500, ge=0,
         description="per-scheme concept cap for the enrich-time definition-grounding index")

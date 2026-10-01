@@ -19,6 +19,46 @@ class ModelUnavailable(RuntimeError):
     """
 
 
+class PromptCut(ModelUnavailable):
+    """The server read only part of the prompt and answered anyway (M119).
+
+    Ollama, given a prompt longer than its context window, keeps the last part of it and returns
+    no error; the instructions at the start are what is lost, and the answer reads as normal. The
+    one trace is `usage.prompt_tokens`, which counts what the model READ, not what was sent. A
+    ModelUnavailable because the model never saw the request it was sent -- but a configuration
+    failure, not an outage: retrying sends the same prompt to the same window.
+    """
+
+
+# Two signs of a cut, because servers cut in two ways.
+#
+# A big cut shows in the ratio. MEASURED on 386 prompts the ask path really sends (generator,
+# corrector, judge, synthesis over BIRD mini-dev, KaggleDBQA and a 1,500-column enterprise schema):
+# 1.43 to 4.26 characters a token under Qwen2.5's tokenizer, 2.10 to 4.46 under o200k, the long
+# prompts 2.8 to 3.0 (identifier-dense schema). A recent Ollama keeps about half its window, so a
+# cut prompt at least doubles its ratio; 6 leaves 1.35x over the worst real prompt.
+#
+# A modest cut does not. MEASURED on Ollama 0.5.4 with a 2,048-token window: an 8,950-character
+# prompt (about 2,980 tokens) came back as exactly 2,048 tokens read -- 4.4 characters a token, well
+# inside the normal range. What gives it away is that the count sits on the window and stops
+# growing when the prompt grows. Windows are set in multiples of 1,024, so a count within a few
+# tokens of one is re-sent with padding: a server that reads no more of the longer prompt is
+# keeping a fixed window. That probe costs one extra request on about 1.7% of calls.
+#
+# Still missed: a cut to a window that is not a multiple of 1,024 and too modest for the ratio, and
+# scripts that tokenize densely (CJK), whose ratio stays low even when cut.
+_RAISE = ("Raise the server's context length (Ollama: OLLAMA_CONTEXT_LENGTH or num_ctx; "
+          "vLLM: --max-model-len) or use a model with a larger window.")
+_MAX_CHARS_PER_TOKEN = 6.0
+_WINDOW_STEP = 1024
+_WINDOW_SLACK = 8  # a recent Ollama reported 16,386 for a 32,768 window: half, plus two
+_PROBE_PADDING = "\n" + " padding" * 64
+
+
+def _on_a_window_edge(read: int) -> bool:
+    return read >= _WINDOW_STEP and min(read % _WINDOW_STEP, -read % _WINDOW_STEP) <= _WINDOW_SLACK
+
+
 def token_param_name(model: str) -> str:
     # GPT-5 family spends reasoning tokens; it rejects `max_tokens`.
     return "max_completion_tokens" if _GPT5.search(model) else "max_tokens"
@@ -67,6 +107,7 @@ class LLMClient:
             raise RuntimeError("LLM base_url/api_key not configured (set MNEMIQ_LLM_* env)")
         self._model = settings.llm_model
         self._seed = settings.llm_seed
+        self._check_cut = settings.llm_prompt_cut_check
         # The SDK's own _DefaultHttpxClient sets follow_redirects=True, so a base_url that
         # `assert_local_only` approved at boot could still 302 a live request off-network on
         # every call after -- the boot check validates the CONFIGURED host once, not where a
@@ -89,6 +130,29 @@ class LLMClient:
 
     def complete(self, system: str, user: str, max_tokens: int = 512,
                  extra_body: dict | None = None) -> str:
+        kwargs = self._kwargs(max_tokens)
+        if extra_body:  # e.g. constrained decoding (response_format json_schema)
+            kwargs["extra_body"] = extra_body
+        resp = self._create(system, user, kwargs)
+        read = self._count(resp)
+        sent = len(system) + len(user)
+        # Counted first: the server did the work, and the cost report must not lose it.
+        if self._check_cut and read:
+            if sent / read > _MAX_CHARS_PER_TOKEN:
+                raise PromptCut(
+                    f"The model server read {read:,} tokens of a {sent:,}-character prompt, "
+                    f"{sent / read:.1f} characters a token where mnemiq's prompts measure 1.4 to 4.5. "
+                    f"It most likely cut the prompt to fit its context window and answered from the rest. {_RAISE}")
+            if _on_a_window_edge(read):
+                again = self._count(self._create(system, user + _PROBE_PADDING, self._kwargs(1)))
+                if again and again <= read:  # no count on the probe proves nothing
+                    raise PromptCut(
+                        f"The model server read {read:,} tokens of a {sent:,}-character prompt and still "
+                        f"{again:,} when the prompt grew: it is keeping a fixed window and dropping the "
+                        f"rest. {_RAISE}")
+        return resp.choices[0].message.content or ""
+
+    def _kwargs(self, max_tokens: int) -> dict:
         kwargs = {token_param_name(self._model): reasoning_budget(self._model, max_tokens)}
         if self._seed is not None:
             # Forwarded, not guaranteed. MEASURED: vLLM honours it; the hosted endpoint accepts
@@ -103,8 +167,9 @@ class LLMClient:
             # feedback -- rather than relying on sampling noise. A future strategy that
             # resamples the same prompt would need to vary this per call.
             kwargs["seed"] = self._seed
-        if extra_body:  # e.g. constrained decoding (response_format json_schema)
-            kwargs["extra_body"] = extra_body
+        return kwargs
+
+    def _create(self, system: str, user: str, kwargs: dict):
         try:
             resp = self._client.chat.completions.create(
                 model=self._model,
@@ -116,9 +181,15 @@ class LLMClient:
             )
         except APIError as exc:
             raise ModelUnavailable(str(exc)) from exc
+        return resp
+
+    def _count(self, resp) -> int:
+        """Add one response to the running totals; return the prompt tokens the server read."""
         self.calls += 1
         usage = getattr(resp, "usage", None)
-        if usage is not None:
-            self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
-            self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
-        return resp.choices[0].message.content or ""
+        if usage is None:
+            return 0
+        read = getattr(usage, "prompt_tokens", 0) or 0
+        self.prompt_tokens += read
+        self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+        return read
