@@ -101,7 +101,7 @@ def test_the_api_carries_the_flag():
 
 def test_an_eval_gold_over_the_limit_is_not_graded_wrong():
     """No answer can pass a gold with more rows than the guard lets through, so grading one
-    against it is scoring the cap, not the model (the BIRD runner already skips such golds)."""
+    against it is scoring the cap, not the model."""
     from mnemiq.contract import EvaluationCase
 
     class _Gold(_Rows):  # the gold query reads 1,140 rows; the candidate, cut by its LIMIT, 1,000
@@ -135,3 +135,14 @@ def test_under_set_semantics_a_long_gold_of_few_distinct_rows_is_still_graded():
     assert graded.outcome == Outcome.CORRECT
     multiset = run_case(case, lambda q: answer, _Repeats(0))
     assert multiset.outcome == Outcome.ERROR, "every row counts without the declaration"
+
+
+def test_mirrored_rows_count_once_as_the_got_facts_reading_counts_them():
+    """Got-facts sorts each row's cells before collapsing, so (1, 2) and (2, 1) are one fact: a gold
+    of 1,100 distinct ordered pairs that are 550 facts is matchable, and must be graded."""
+    from mnemiq.eval.grade import rows_that_count
+
+    pairs = [(i, i + 1) for i in range(550)] + [(i + 1, i) for i in range(550)]
+    gold = pa.table({"a": [p[0] for p in pairs], "b": [p[1] for p in pairs]})
+    assert rows_that_count(gold, duplicate_rows_insignificant=True) == 550
+    assert rows_that_count(gold) == 1_100

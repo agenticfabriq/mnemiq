@@ -71,10 +71,14 @@ class GotFactsUndecided(Exception):
 
 
 def rows_that_count(gold: pa.Table, duplicate_rows_insignificant: bool = False) -> int:
-    """How many rows an answer must return to match `gold`, read the way `results_match` reads it:
-    distinct rows when the benchmark declares duplicates insignificant, every row otherwise."""
+    """The fewest rows an answer could return and still match `gold` under any reading
+    `results_match` makes: every row, or -- when the benchmark declares duplicates insignificant --
+    the distinct rows, or the distinct rows once each row's cells are sorted, which is how the
+    got-facts reading collapses `(1, 2)` and `(2, 1)` into one fact."""
     rows = _rows(gold)
-    return len(_distinct_rows(rows)) if duplicate_rows_insignificant else len(rows)
+    if not duplicate_rows_insignificant:
+        return len(rows)
+    return min(len(_distinct_rows(rows)), len(_distinct_rows([sorted(r, key=repr) for r in rows])))
 
 
 def results_match(
