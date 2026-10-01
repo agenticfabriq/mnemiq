@@ -19,12 +19,14 @@ class ModelUnavailable(RuntimeError):
     """
 
 
-_FIXED_SAMPLING = re.compile(r"(^|\.)(gpt-5|o[134](-|$))")
+_FIXED_SAMPLING = re.compile(r"(^|[./])(gpt-5|o[134](-|$))")
 
 
 def accepts_temperature(model: str) -> bool:
-    """Reasoning models (GPT-5, o1/o3/o4) reject any temperature but their default; asked for 0,
-    the provider fails the request. Every other model takes it."""
+    """Reasoning models (GPT-5, o1/o3/o4, also behind a gateway prefix such as `openai/o3`) reject
+    any temperature but their default; asked for 0, the provider fails the request. Matched by
+    family, so a GPT-5 chat variant that would accept one is not sent it either: it keeps its
+    default sampling, which fails safe rather than failing the request."""
     return not _FIXED_SAMPLING.search(model)
 
 

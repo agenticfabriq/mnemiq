@@ -49,7 +49,8 @@ def test_a_caller_that_asks_for_nothing_still_sends_nothing(monkeypatch):
     assert "temperature" not in _Capturing.sent
 
 
-@pytest.mark.parametrize("model", ["openai.gpt-5.5", "gpt-5-mini", "o3", "o4-mini", "openai.o1"])
+@pytest.mark.parametrize("model", ["openai.gpt-5.5", "gpt-5-mini", "o3", "o4-mini", "openai.o1",
+                                   "openai/o3", "azure/gpt-5"])
 def test_a_reasoning_model_is_never_sent_one(monkeypatch, model):
     # They reject any temperature but their default: asked for 0, the provider fails the request.
     SemanticJudge(_client(monkeypatch, model)).score("q", "schema", "SELECT 1", "rows")
