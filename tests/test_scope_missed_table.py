@@ -127,3 +127,19 @@ def test_a_quoted_cte_does_not_excuse_a_table_the_engine_names_differently():
     verdict = _ungranted('UPDATE scratch SET amount = x.amount FROM (WITH "Claim" AS (SELECT 1 AS amount) '
                          "SELECT amount FROM claim) x WHERE scratch.id = 1", dialect="postgres")
     assert isinstance(verdict, Refusal) and verdict.code == RefusalCode.UNAUTHORIZED_TABLE, verdict
+
+
+
+def test_a_denied_column_behind_a_cte_shadow_is_refused():
+    """Codex review of #66, on the locked sqlglot, no stand-in: the table fallback fixed
+    `base_tables`, but `column_tables` still trusted the same incomplete scope, so the denied
+    `claim.secret` was never attributed to `claim` and the write that copies it was approved."""
+    schema = {"claim": {"id", "amount", "secret"}, "scratch": {"id", "amount"}}
+    verdict = decide_write(
+        "UPDATE scratch SET amount = claim.secret + (WITH claim AS (SELECT 1 AS n) SELECT n FROM claim) "
+        "FROM claim WHERE scratch.id = claim.id",
+        schema, GrantSet(frozenset(schema), writable=frozenset({"scratch"})), adapter=_Ok(),
+        dialect="duckdb", writes_enabled=True,
+        policy=AccessPolicy(denied=frozenset({("claim", "secret")}), policy_schema=schema))
+    assert isinstance(verdict, Refusal), verdict
+    assert verdict.code == RefusalCode.UNAUTHORIZED_COLUMN

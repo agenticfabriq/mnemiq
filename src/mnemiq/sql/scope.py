@@ -108,7 +108,8 @@ def scope_resolved(ast: exp.Expression) -> bool:
     name an object the query never read. So the record needs to know, and the guard does not.
     """
     ast_root = _root_scope(ast)
-    return ast_root is not None and not _unscoped_ctes(ast, ast_root)
+    return (ast_root is not None and not _unscoped_ctes(ast, ast_root)
+            and not _scope_missed_a_read(ast, _walked_reads(ast, ast_root, None), None))
 
 
 def _defining_identifier(source) -> exp.Expression | None:
@@ -218,6 +219,14 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
         # alternative, falling back to the flat name set, is exactly the M31 bypass.
         return list(ast.find_all(exp.Table))
 
+    out = _walked_reads(ast, root, dialect)
+    if _scope_missed_a_read(ast, out, dialect):
+        return list(ast.find_all(exp.Table))
+    return out
+
+
+def _walked_reads(ast: exp.Expression, root, dialect: str | None) -> list[exp.Table]:
+    """The real reads the scope walk names, plus any write target the write reads."""
     out: list[exp.Table] = []
     for scope in root.traverse():
         for table in scope.tables:
@@ -228,23 +237,32 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
     for target in _target_reads(ast):
         if not any(t is target for t in out):
             out.append(target)
-    # On a WRITE, a table the walk left out that no CTE could stand in front of is a table the
-    # scope model MISSED, and an unreported read is one no guard sees: fail toward over-reporting,
-    # exactly as an unresolvable scope does. Not hypothetical (M121): sqlglot 30.17 began scoping
-    # UPDATE, its scope lists none of the FROM tables, and `UPDATE s SET a = c.a FROM c` reported
-    # `s` alone -- so `c` was neither grant-checked nor row-filtered. Names only: a name no CTE in
-    # the statement carries can only be a real read, whatever this sqlglot's scope model thinks.
-    # The write's own TARGET is excused (an INSERT writes it without reading it; a target that is
-    # read is in `out` through `_target_reads`). Writes only: on the read path an under-report is
-    # lineage's to classify (`views.py` names an unmodelled source as such), and no read-path test
-    # failed under sqlglot 30.21.
-    if isinstance(ast, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
-        written = _written_targets(ast)
-        if any(not any(t is table for t in out) and not any(w is table for w in written)
-               and not _cte_in_scope(table, dialect)
-               for table in ast.find_all(exp.Table)):
-            return list(ast.find_all(exp.Table))
     return out
+
+
+def _scope_missed_a_read(ast: exp.Expression, walked: list[exp.Table], dialect: str | None) -> bool:
+    """Did the scope walk leave out a table a WRITE reads? ONE predicate for `base_tables`,
+    `column_tables` and `scope_resolved`: a resolver that falls back for tables but still trusts
+    the same incomplete scope for columns let a denied column through (Codex review of #66:
+    `claim.secret` copied into an ungoverned table on the locked sqlglot).
+
+    On a WRITE, a table the walk left out that no CTE could stand in front of is a table the
+    scope model MISSED, and an unreported read is one no guard sees: fail toward over-reporting,
+    exactly as an unresolvable scope does. Not hypothetical (M121): sqlglot 30.17 began scoping
+    UPDATE, its scope lists none of the FROM tables, and `UPDATE s SET a = c.a FROM c` reported
+    `s` alone -- so `c` was neither grant-checked nor row-filtered. A name no CTE on an enclosing
+    query defines (`_cte_in_scope`) can only be a real read, whatever this sqlglot's scope model
+    thinks. The write's own TARGET is excused (an INSERT writes it without reading it; a target
+    that is read is in `walked` through `_target_reads`). Writes only: on the read path an under-report is
+    lineage's to classify (`views.py` names an unmodelled source as such), and no read-path test
+    failed under sqlglot 30.21.
+    """
+    if not isinstance(ast, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+        return False
+    written = _written_targets(ast)
+    return any(not any(t is table for t in walked) and not any(w is table for w in written)
+               and not _cte_in_scope(table, dialect)
+               for table in ast.find_all(exp.Table))
 
 
 def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
@@ -257,8 +275,8 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
     approved with `claim` ungranted on the locked sqlglot (M122). Inside a WITH's own CTE bodies
     only earlier siblings are visible, plus the CTE itself when the WITH is RECURSIVE (M31's rule).
     A qualified reference (`main.claim`) is never a CTE -- a CTE has no schema -- and names are
-    resolved by `mnemiq.sql.identifiers`, the one resolver (M55), so this guard and every other
-    agree on which spellings are one name: matching lowercased bare names excused `FROM
+    resolved by `mnemiq.sql.identifiers`, the shared resolver (M55) -- which `authz_guard`'s and
+    `cls`'s own CTE name sets do not use yet, so they may still disagree with this one: matching lowercased bare names excused `FROM
     main.claim` behind a CTE `claim`, and Postgres's `claim` behind `"Claim"`.
     Structural, never by arg name. In doubt the answer is False, which over-reports: a refusal.
     """
@@ -324,6 +342,8 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
     root = _root_scope(ast)
     if root is None or _unscoped_ctes(ast, root):
         return None
+    if _scope_missed_a_read(ast, _walked_reads(ast, root, dialect), dialect):
+        return None  # the coverage `base_tables` just fell back on is not trusted for columns either
 
     out: dict[int, str] = {}
     for scope in root.traverse():
