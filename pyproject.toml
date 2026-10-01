@@ -11,10 +11,12 @@ dependencies = [
   "pydantic>=2",
   "pydantic-settings>=2",
   "pytz",  # DuckDB needs it to profile Postgres timestamptz columns (else profiling throws)
-  "sqlglot>=25.34.1",
+  # 30.17 drops the FROM table of UPDATE ... FROM from the write path's table walk, so the write is
+  # approved with no row filter on it; 30.19 changes the grouping shapes the fan-out check reads (M121).
+  "sqlglot>=25.34.1,<30.17",
   "pyarrow>=17",
   "cachetools>=5",
-  "mcp>=1.28",
+  "mcp>=1.28,<2",  # 2.x fails stdio startup (M121)
 ]
 
 [project.optional-dependencies]
