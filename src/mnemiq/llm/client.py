@@ -33,7 +33,8 @@ class PromptCut(ModelUnavailable):
 
 
 # Two signs that a server may have cut the prompt, because servers cut in two ways -- and neither
-# sign is proof, so each only triggers a check.
+# sign is proof, so each only triggers a check. Only when the check cannot run does a ratio decide
+# alone, and only past _CERTAIN_CHARS_PER_TOKEN.
 #
 # A big cut moves the ratio. MEASURED on 612 prompts from every call site (generator, corrector,
 # judge, synthesis, deep mode's selector, and enrichment's annotation, facts and examples, over BIRD

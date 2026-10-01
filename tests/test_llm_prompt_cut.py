@@ -6,7 +6,9 @@ Ollama keeps about half its window) pushes the ratio of characters sent to token
 anything mnemiq's own prompts measure (1.4 to 4.5); a modest cut to a full window (Ollama 0.5.4)
 leaves the ratio normal but parks the count on the window. Neither is proof -- result rows that
 repeat long words compress past 6 with nothing cut -- so a suspicious count is re-sent with
-padding, and only a count that does not grow is a cut.
+padding, and a count that does not grow is a cut. Only when that check cannot run (the probe
+failed, or carried no count) does a ratio decide alone, and only past 12, which no whole prompt
+reaches.
 """
 
 from types import SimpleNamespace
@@ -197,6 +199,36 @@ def test_a_probe_that_reports_no_usage_is_not_called_a_cut_but_says_so(monkeypat
     with caplog.at_level("WARNING", logger="mnemiq.llm.client"):
         assert client.complete("s" * 4_475, "u" * 4_475) == "reply 1"
     assert "no token count" in caplog.text
+
+
+@pytest.mark.parametrize("chars, refused", [(11_900, False), (12_100, True)])
+def test_the_ceiling_for_an_undecided_probe_sits_at_12(monkeypatch, chars, refused):
+    client = _windowed(monkeypatch, window=1_000, probe_usage=False)
+    if refused:
+        with pytest.raises(PromptCut):
+            client.complete("s" * (chars // 2), "u" * (chars // 2))
+    else:
+        assert client.complete("s" * (chars // 2), "u" * (chars // 2)) == "reply 1"
+
+
+def test_a_failed_probe_still_refuses_a_ratio_no_whole_prompt_reaches(monkeypatch):
+    import httpx
+    from openai import APIConnectionError
+
+    import mnemiq.llm.client as module
+
+    class _ProbeFails(_server_with_a_window(1_000)):
+        def _create(self, messages, **kwargs):
+            if self.requests:
+                raise APIConnectionError(request=httpx.Request("POST", "http://x"))
+            return super()._create(messages, **kwargs)
+
+    monkeypatch.setattr(module, "OpenAI", _ProbeFails)
+    client = LLMClient(Settings(llm_base_url="http://x", llm_api_key="k", llm_model="m",
+                                pg_dsn=None, acme_data_dir=None))
+    with pytest.raises(PromptCut) as cut:
+        client.complete("s" * 30_000, "u" * 30_000)
+    assert "probe failed" in str(cut.value)
 
 
 def test_an_undecided_probe_still_refuses_a_ratio_no_whole_prompt_reaches(monkeypatch):
