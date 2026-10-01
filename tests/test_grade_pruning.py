@@ -395,6 +395,22 @@ def test_one_long_check_spends_from_a_budget(monkeypatch):
         results_match(gold, cand)
 
 
+def test_a_long_cell_sorted_check_spends_from_the_same_budget(monkeypatch):
+    """Review: the budget test above decides in the position-wise loop. Here gold's two columns
+    come back in the other order, so only the cell-sorted reading can match, and its check is
+    the long one."""
+    import mnemiq.eval.grade as grade
+
+    n = 1500
+    gold = pa.table({"k": [f"k{i}" for i in range(n)], "v": [float(i) for i in range(n)]})
+    cand = pa.table({"v": [float(i) for i in reversed(range(n))],
+                     "k": [f"k{i}" for i in reversed(range(n))]})
+    assert results_match(gold, cand)  # control: the cell-sorted reading decides it
+    monkeypatch.setattr(grade, "MAX_CHECK_STEPS", 200_000)
+    with pytest.raises(GotFactsUndecided, match="row checks spent more than 200,000 cell comparisons"):
+        results_match(gold, cand)
+
+
 def test_the_cell_pairing_finds_one_exactly_when_one_exists():
     """The pairing is iterative now (a path can be as long as the row is wide): held to an
     exhaustive search for a one-to-one assignment on random graphs."""

@@ -155,7 +155,8 @@ def results_match(
     all_keys = [[repr(cell) for cell in row] for row in all_rows]
 
     work = _Work(MAX_PRUNING_STEPS, candidate.num_columns, gold.num_columns)
-    check_work = _Work(MAX_CHECK_STEPS, candidate.num_columns, gold.num_columns, what="row checks")
+    check_work = _Work(MAX_CHECK_STEPS, candidate.num_columns, gold.num_columns,
+                       what="row checks", unit="cell comparisons")
 
     def counted_match(a: object, b: object) -> bool:
         check_work.spend()
@@ -233,17 +234,16 @@ class _Work:
     GotFactsUndecided when spent, so no part of got-facts can stall a run."""
 
     def __init__(self, limit: int, candidate_cols: int, gold_cols: int,
-                 what: str = "pruning") -> None:
+                 what: str = "pruning", unit: str = "lookups and cell comparisons") -> None:
         self.limit = self.left = limit
-        self.what = what
+        self.what, self.unit = what, unit
         self.shape = f"{candidate_cols} candidate columns, {gold_cols} gold"
 
     def spend(self) -> None:
         self.left -= 1
         if self.left < 0:
             raise GotFactsUndecided(
-                f"{self.what} spent more than {self.limit:,} lookups and cell comparisons "
-                f"({self.shape})")
+                f"{self.what} spent more than {self.limit:,} {self.unit} ({self.shape})")
 
 
 class _ValueIndex:
