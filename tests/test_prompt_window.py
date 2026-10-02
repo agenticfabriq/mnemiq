@@ -89,6 +89,19 @@ def test_a_narrow_table_with_much_bound_to_it_outweighs_a_wider_bare_one():
     assert user.count("N" * 500) == 50
 
 
+def test_a_definition_shared_with_a_table_outside_the_k_still_counts():
+    """Every table is visible when measuring: an identity granted both tables sees a definition
+    bound to the shown one and to one past the k, so the largest prompt carries it."""
+    snap = _snapshot()
+    shared = Definition(id="d:shared", term="shared rule", domain="ops",
+                        definition="SHARED-DEFINITION-TEXT", bound_objects=["wide", "narrow"])
+    snap = snap.model_copy(update={"definitions": [*snap.definitions, shared]})
+    _, user, _ = largest_prompt(duckdb.connect(), snap, _settings(), "duckdb")
+
+    assert "narrow" not in user.split("TABLES:")[1], "narrow is past k=2"
+    assert "SHARED-DEFINITION-TEXT" in user
+
+
 def test_a_store_without_examples_still_measures():
     _, user, cards = largest_prompt(duckdb.connect(), _snapshot(), _settings(), "duckdb")
     assert cards == 2 and "WORKED EXAMPLES" not in user
@@ -189,6 +202,7 @@ def test_a_prompt_past_the_window_warns_and_says_how_sure(caplog, monkeypatch, b
         _warn_prompt_window(_settings(), None, _snapshot(), None, frozenset())
     warned = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warned) == 1 and f"prompt window {label}:" in warned[0].getMessage()
+    assert "5 tables bringing the most into it" in warned[0].getMessage()
     assert "MNEMIQ_RETRIEVAL_K" in warned[0].getMessage()
 
 
