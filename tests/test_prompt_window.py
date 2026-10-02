@@ -47,6 +47,31 @@ def _settings(**over) -> Settings:
                        "llm_model": "m", "retrieval_k": 2, **over})
 
 
+class _Everything:
+    """A provider that lists no roles and grants every table, every PII level cleared."""
+
+    def grants_for(self, identity):
+        return window.everything(_snapshot())
+
+
+class _Roles:
+    """A provider that declares roles, each with its own grants."""
+
+    def __init__(self, by_role: dict):
+        self._by_role = by_role
+
+    def policy_roles(self):
+        return list(self._by_role)
+
+    def grants_for(self, identity):
+        from mnemiq.authz.grants import EMPTY
+
+        return next((self._by_role[r] for r in identity.roles if r in self._by_role), EMPTY)
+
+
+_ALL = _Everything()
+
+
 def _con_with_examples(examples: list[tuple[str, str]]) -> duckdb.DuckDBPyConnection:
     con = duckdb.connect()
     con.execute("CREATE TABLE example (question TEXT, sql TEXT, tables TEXT, object_id TEXT, "
@@ -248,21 +273,84 @@ def _pii_table(described: int, bare: int) -> Snapshot:
 
 @pytest.mark.parametrize("style", ["cards", "ddl"])
 @pytest.mark.parametrize(("described", "bare"), [(0, 300), (40, 40)])
-def test_a_masked_card_can_be_the_longer_one_and_is_measured(style, described, bare):
-    """Codex review of #73: measured unscoped, 300 bare PII columns came to 5,626 characters where
-    an identity that sees them masked is shown 22,726. Every identity's card must fit inside the
-    measure: all masked, none masked, and anything between."""
+def test_each_identity_is_measured_as_it_is_shown(style, described, bare):
+    """Codex review of #73: a masked column's note can outrun the description it replaces, so a
+    masking identity's card can be the longer one -- and the measure is per identity, under its own
+    policy, so it covers that card without ever rendering what the identity is not shown."""
     from mnemiq.authz.grants import GrantSet
     from mnemiq.semantic.cards import build_cards
     from mnemiq.sql.policy import build_access_policy
 
     snap = _pii_table(described, bare)
-    _, user, _ = largest_prompt(duckdb.connect(), snap, _settings(card_style=style), "duckdb")
-    measured = user.split("TABLES:")[1]
     for grants in (GrantSet(frozenset({"p"}), pii_clearance=frozenset({"high"})),
                    GrantSet(frozenset({"p"}), pii_mask=frozenset({"high"}))):
+        _, user, _ = largest_prompt(duckdb.connect(), snap, _settings(card_style=style), "duckdb",
+                                    grants=grants)
+        measured = user.split("TABLES:")[1]
         shown = build_cards(snap, policy=build_access_policy(snap, grants), style=style)
         assert len(measured) >= len(shown[0].text)
+        if grants.pii_mask and described:
+            assert "A long description" not in user, "a masked description was rendered"
+
+
+def test_what_is_sent_is_only_what_that_role_is_shown():
+    """Codex review of #73: the worst case was built from every column's metadata and POSTed to
+    the model server -- a denied column's description included. Now each role is measured under its
+    own policy, and the server sees only what that role's own questions could send."""
+    from mnemiq.authz.grants import GrantSet
+
+    snap = _snapshot().model_copy(update={"columns": [
+        *_snapshot().columns,
+        Column(id="wide.secret", object_id="wide", name="secret", data_type="text",
+               pii_level="direct", description="CONFIDENTIAL-COLUMN-NOTE"),
+    ]})
+    analyst = GrantSet(frozenset({"wide", "middle"}))  # no clearance: the direct column is denied
+    sent: list[str] = []
+
+    def handle(request):
+        sent.append(request.content.decode())
+        return httpx.Response(200, json={"count": 10, "max_model_len": 28_672})
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE example (question TEXT, sql TEXT, tables TEXT, object_id TEXT, "
+                "source_id TEXT)")
+    con.execute("INSERT INTO example VALUES ('q?', 'SELECT HIDDEN_EXAMPLE FROM narrow', "
+                "'[\"narrow\"]', 'narrow', 's')")
+    report = window.worst_window(con, snap, _settings(), "duckdb", _Roles({"analyst": analyst}),
+                                 http=httpx.Client(transport=httpx.MockTransport(handle)))
+    assert report is not None and report.who == "role analyst" and sent
+    assert all("HIDDEN_EXAMPLE" not in body for body in sent), "an example over an ungranted table"
+    assert all("CONFIDENTIAL-COLUMN-NOTE" not in body and "secret" not in body for body in sent)
+    assert all("narrow" not in body.split("TABLES:")[1] for body in sent), "an ungranted table"
+
+
+def test_the_heaviest_role_is_the_one_counted_and_named():
+    from mnemiq.authz.grants import GrantSet
+
+    roles = _Roles({"narrow_only": GrantSet(frozenset({"narrow"})),
+                    "wide_reader": GrantSet(frozenset({"wide", "middle"}))})
+    report = window.worst_window(duckdb.connect(), _snapshot(), _settings(), "duckdb", roles,
+                                 http=_server(None, 404))
+    assert report.who == "role wide_reader"
+    assert "for role wide_reader, the longest" in report.sentence()
+
+
+def test_roles_that_see_nothing_leave_nothing_to_measure(caplog):
+    from mnemiq.authz.grants import EMPTY
+    from mnemiq.runtime import _warn_prompt_window
+
+    assert window.worst_window(duckdb.connect(), _snapshot(), _settings(), "duckdb",
+                               _Roles({"none": EMPTY})) is None
+    with caplog.at_level(logging.INFO):
+        _warn_prompt_window(_settings(), duckdb.connect(), _snapshot(), None,
+                            _Roles({"none": EMPTY}), frozenset())
+    assert "no role in the access policy sees a table" in caplog.text
+
+
+def test_a_provider_that_cannot_list_roles_measures_the_configured_identity():
+    report = window.worst_window(duckdb.connect(), _snapshot(), _settings(), "duckdb", _ALL,
+                                 http=_server(None, 404))
+    assert report is not None and report.who.startswith("identity ")
 
 
 def test_a_store_without_examples_still_measures():
@@ -358,7 +446,7 @@ def test_a_base_url_httpx_cannot_parse_is_reported_not_read_as_no_count(caplog):
 
     settings = _settings(llm_base_url="http://[::1", llm_context_window=999_999)
     with caplog.at_level(logging.INFO):
-        _warn_prompt_window(settings, duckdb.connect(), _snapshot(), None, frozenset())
+        _warn_prompt_window(settings, duckdb.connect(), _snapshot(), None, _ALL, frozenset())
     assert "prompt window not checked: the measurement failed" in caplog.text
     assert "fits" not in caplog.text
 
@@ -432,9 +520,9 @@ def _report(fits: bool, by_server: bool = True) -> WindowReport:
 def test_a_prompt_past_the_window_warns_and_says_how_sure(caplog, monkeypatch, by_server, label):
     from mnemiq.runtime import _warn_prompt_window
 
-    monkeypatch.setattr(window, "check_window", lambda *a, **k: _report(False, by_server))
+    monkeypatch.setattr(window, "worst_window", lambda *a, **k: _report(False, by_server))
     with caplog.at_level(logging.INFO):
-        _warn_prompt_window(_settings(), None, _snapshot(), None, frozenset())
+        _warn_prompt_window(_settings(), None, _snapshot(), None, _ALL, frozenset())
     warned = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warned) == 1 and f"prompt window {label}:" in warned[0].getMessage()
     assert "5 tables bringing the most into it" in warned[0].getMessage()
@@ -469,15 +557,15 @@ def test_a_bound_inflated_by_shared_definitions_warns_may_not_can(caplog, monkey
 
     snap = _all_share(20)
     con = duckdb.connect()
-    _, bound, real, _ = window.largest_prompts(con, snap, _settings(), "duckdb")
+    _, bound, real, _ = window.largest_prompts(con, snap, _settings(), "duckdb", window.everything(snap))
     assert len(bound) > 1.5 * len(real), "the case: the bound counts each definition twice"
     between = (len(real) + len(bound)) // 8 + window.QUESTION_ALLOWANCE + GENERATOR_MAX_TOKENS
     report = check_window(con, snap, _settings(), "duckdb", http=_counting_server(between))
     assert report.fits is False and not report.certain
 
-    monkeypatch.setattr(window, "check_window", lambda *a, **k: report)
+    monkeypatch.setattr(window, "worst_window", lambda *a, **k: report)
     with caplog.at_level(logging.WARNING):
-        _warn_prompt_window(_settings(), None, snap, None, frozenset())
+        _warn_prompt_window(_settings(), None, snap, None, _ALL, frozenset())
     assert "prompt window MAY BE TOO SMALL" in caplog.text and "tables may fail" in caplog.text
     assert "a real packet of those tables" in caplog.text
 
@@ -490,9 +578,9 @@ def test_a_real_packet_past_the_window_warns_can(caplog, monkeypatch):
     report = check_window(con, snap, _settings(), "duckdb", http=_counting_server(1_000))
     assert report.certain
 
-    monkeypatch.setattr(window, "check_window", lambda *a, **k: report)
+    monkeypatch.setattr(window, "worst_window", lambda *a, **k: report)
     with caplog.at_level(logging.WARNING):
-        _warn_prompt_window(_settings(), None, snap, None, frozenset())
+        _warn_prompt_window(_settings(), None, snap, None, _ALL, frozenset())
     assert "prompt window TOO SMALL" in caplog.text and "tables can fail" in caplog.text
 
 
@@ -525,9 +613,9 @@ def test_a_second_count_that_fails_keeps_the_first(monkeypatch, second):
 def test_an_acknowledged_small_window_drops_to_info(caplog, monkeypatch):
     from mnemiq.runtime import _warn_prompt_window
 
-    monkeypatch.setattr(window, "check_window", lambda *a, **k: _report(False))
+    monkeypatch.setattr(window, "worst_window", lambda *a, **k: _report(False))
     with caplog.at_level(logging.INFO):
-        _warn_prompt_window(_settings(), None, _snapshot(), None, frozenset({"window:too-small"}))
+        _warn_prompt_window(_settings(), None, _snapshot(), None, _ALL, frozenset({"window:too-small"}))
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert "prompt window TOO SMALL" in caplog.text
 
@@ -535,9 +623,9 @@ def test_an_acknowledged_small_window_drops_to_info(caplog, monkeypatch):
 def test_a_prompt_that_fits_does_not_warn(caplog, monkeypatch):
     from mnemiq.runtime import _warn_prompt_window
 
-    monkeypatch.setattr(window, "check_window", lambda *a, **k: _report(True))
+    monkeypatch.setattr(window, "worst_window", lambda *a, **k: _report(True))
     with caplog.at_level(logging.INFO):
-        _warn_prompt_window(_settings(), None, _snapshot(), None, frozenset())
+        _warn_prompt_window(_settings(), None, _snapshot(), None, _ALL, frozenset())
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert "prompt window fits" in caplog.text
 
@@ -548,9 +636,9 @@ def test_the_advisory_never_raises_and_says_it_did_not_measure(caplog, monkeypat
     def boom(*a, **k):
         raise ValueError("no cards")
 
-    monkeypatch.setattr(window, "check_window", boom)
+    monkeypatch.setattr(window, "worst_window", boom)
     with caplog.at_level(logging.INFO):
-        _warn_prompt_window(_settings(), None, _snapshot(), None, frozenset())  # no exception
+        _warn_prompt_window(_settings(), None, _snapshot(), None, _ALL, frozenset())  # no exception
     assert "prompt window not checked: the measurement failed (no cards)" in caplog.text
 
 
@@ -569,8 +657,8 @@ def test_switched_off_it_asks_nothing(monkeypatch):
     def must_not_run(*a, **k):
         raise AssertionError("checked while switched off")
 
-    monkeypatch.setattr(window, "check_window", must_not_run)
-    _warn_prompt_window(_settings(llm_window_check=False), None, _snapshot(), None, frozenset())
+    monkeypatch.setattr(window, "worst_window", must_not_run)
+    _warn_prompt_window(_settings(llm_window_check=False), None, _snapshot(), None, _ALL, frozenset())
 
 
 def test_build_runtime_runs_it_over_the_store_it_built(caplog, monkeypatch, tmp_path):
@@ -589,6 +677,8 @@ def test_build_runtime_runs_it_over_the_store_it_built(caplog, monkeypatch, tmp_
     manifest = tmp_path / "sources.json"
     manifest.write_text(json.dumps([{"id": "only", "kind": "duckdb", "target": str(source),
                                      "catalog": "src", "schema": "main"}]))
+    authz = tmp_path / "authz.json"
+    authz.write_text(json.dumps({"roles": {"analyst": ["wide", "middle", "narrow"]}}))
 
     measured: list[str] = []
 
@@ -597,7 +687,8 @@ def test_build_runtime_runs_it_over_the_store_it_built(caplog, monkeypatch, tmp_
         return (30_000, 28_672)
 
     monkeypatch.setattr(window, "count_on_server", server)
-    settings = _settings(sources_path=str(manifest), store_path=str(store))
+    settings = _settings(sources_path=str(manifest), store_path=str(store),
+                         authz_path=str(authz))
     with caplog.at_level(logging.WARNING):
         build_runtime(settings)
 
@@ -622,7 +713,7 @@ def test_a_hot_swapped_snapshot_re_measures(monkeypatch):
     monkeypatch.setattr("mnemiq.runtime.load_current_snapshot",
                         lambda _s, _c: (new_snapshot, {"src": "v2"}))
     monkeypatch.setattr("mnemiq.runtime._warn_prompt_window",
-                        lambda settings, con, snapshot, adapter, ack: seen.append(snapshot))
+                        lambda settings, con, snapshot, adapter, authz, ack: seen.append(snapshot))
 
     rt.reload_if_stale()
 

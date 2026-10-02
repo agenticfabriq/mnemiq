@@ -5,16 +5,22 @@ prompt plus reply budget longer than `--max-model-len` outright. Both are right,
 one question at a time, after the work. This asks once, at boot: the largest prompt this store can
 produce, plus the room the generator is given to reply in, against the window.
 
-"Largest" is built with the real formatter from the parts that do not depend on the question: the
-`retrieval_k` tables that bring the most into a prompt -- card in the generator's card style with
-each maskable column rendered the longer of masked and unmasked (a mask note can outrun the
-description it replaces), facts, and the definitions and certified measures bound to it -- with
-every table visible, a definition shared by two of them counted with each, and a section they leave
-empty given one item from a table that fills it; the `retrieval_k` worked examples that add the
-most once rendered; the longest strategy's system prompt. The question is an allowance of 500
-tokens, not text: `sanitize` keeps 500 characters, and a byte-level tokenizer spends at most one
-token on an ASCII character. Left out, because they depend on the question: the code vocabulary for
-its columns, glossary terms it happens to name, and the conversation history.
+"Largest" is built with the real formatter, for one identity at a time, from the parts that do not
+depend on the question: the `retrieval_k` granted tables that bring the most into a prompt -- card
+rendered under that identity's access policy (denied columns gone, masked ones carrying their mask
+note), facts, and the definitions and certified measures bound to it -- with a definition shared by
+two of them counted with each, and a section they leave empty given one item from a granted table
+that fills it; the `retrieval_k` permitted worked examples that add the most once rendered; the
+longest strategy's system prompt. The question is an allowance of 500 tokens, not text: `sanitize`
+keeps 500 characters, and a byte-level tokenizer spends at most one token on an ASCII character.
+Left out, because they depend on the question: the code vocabulary for its columns, glossary terms
+it happens to name, and the conversation history.
+
+Per identity, because the prompt is sent to the model server to be counted, and the server must see
+nothing it would not see from that identity's own questions: a worst case over metadata no one is
+shown -- a PII column's description, a denied table -- would be a disclosure the boot check made by
+itself. Each role the access policy declares is measured locally (the configured identity, where
+the provider cannot list its roles), and only the heaviest is counted on the server.
 
 Longest by length, then counted in tokens -- not longest in tokens. A set of tables shorter in
 characters but denser in tokens (long identifiers, non-Latin text) can count more than the one
@@ -69,6 +75,7 @@ class WindowReport:
     counted_by_server: bool
     cards: int
     real_tokens: int | None = None
+    who: str = ""
 
     @property
     def needed(self) -> int:
@@ -97,7 +104,8 @@ class WindowReport:
                   if self.window is None else
                   f"{self.window:,} tokens ({'reported by the server' if self.counted_by_server else 'MNEMIQ_LLM_CONTEXT_WINDOW'})")
         tables = "the table" if self.cards == 1 else f"the {self.cards} tables"
-        return (f"the longest generation prompt this store can produce ({tables} "
+        return (f"{'for ' + self.who + ', ' if self.who else ''}"
+                f"the longest generation prompt this store can produce ({tables} "
                 f"bringing the most into it, with their definitions, measures and examples, and "
                 f"{QUESTION_ALLOWANCE} tokens for the question) is "
                 f"{count}; with the "
@@ -105,26 +113,40 @@ class WindowReport:
                 f"the window is {window}")
 
 
-def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int]:
+def everything(snapshot) -> GrantSet:
+    """Every table, every PII level cleared: the widest view, for tests and a single-identity store."""
+    levels = frozenset(c.pii_level for c in snapshot.columns if c.pii_level)
+    tables = {b.object_id for b in snapshot.source_bindings} | {c.object_id for c in snapshot.columns}
+    return GrantSet(frozenset(tables), pii_clearance=levels)
+
+
+def largest_prompt(con, snapshot, settings, dialect: str,
+                   grants: GrantSet | None = None) -> tuple[str, str, int]:
     """(system, user, cards) for the largest prompt the question-independent parts can make."""
-    system, bound, _real, cards = largest_prompts(con, snapshot, settings, dialect)
+    system, bound, _real, cards = largest_prompts(con, snapshot, settings, dialect,
+                                                  grants or everything(snapshot))
     return system, bound, cards
 
 
-def largest_prompts(con, snapshot, settings, dialect: str) -> tuple[str, str, str, int]:
-    """(system, upper bound, real packet of the same tables, cards)."""
+def largest_prompts(con, snapshot, settings, dialect: str,
+                    grants: GrantSet) -> tuple[str, str, str, int]:
+    """(system, upper bound, real packet of the same tables, cards), as `grants` may see them."""
     from mnemiq.agent.loop import STRATEGIES
     from mnemiq.semantic.cards import build_cards
     from mnemiq.semantic.glossary import select_definitions
     from mnemiq.semantic.measures import select_dimensions, select_metrics
     from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_facts
 
+    from mnemiq.sql.policy import build_access_policy
+
     k = settings.retrieval_k
-    rendered = build_cards(snapshot, policy=_mask_where_longer(snapshot, settings.card_style),
-                           style=settings.card_style)
-    # Every table visible: an identity granted all of them sees the most, and a definition bound to
-    # a table outside the k still rides in with the one inside it.
-    shown = GrantSet(frozenset(c.object_id for c in rendered))
+    # The cards retrieval renders for this identity: its tables only, under its column policy.
+    rendered = [c for c in build_cards(snapshot, policy=build_access_policy(snapshot, grants),
+                                       style=settings.card_style)
+                if c.object_id in grants.objects]
+    # Every granted table visible, so a definition bound to one inside the k and one outside it
+    # still rides in.
+    shown = grants
 
     def packet_for(cards: list) -> ContextPacket:
         _attach_facts(cards, snapshot.table_facts, settings.card_style)
@@ -171,7 +193,7 @@ def largest_prompts(con, snapshot, settings, dialect: str) -> tuple[str, str, st
         question="", cards=[p.cards[0] for p in per_table], grant_fingerprint="",
         enrichment_version=None, **sections,
     )
-    examples = _largest_examples(con, k)
+    examples = _largest_examples(con, k, grants.objects)
     packet.examples = examples
     # The same tables as one retrieval can bring them: each shared definition once, nothing
     # borrowed for an empty section -- though still with the largest examples, the longest
@@ -184,37 +206,7 @@ def largest_prompts(con, snapshot, settings, dialect: str) -> tuple[str, str, st
     return system, user_prompt(packet), user_prompt(real), len(packet.cards)
 
 
-def _mask_where_longer(snapshot, style: str):
-    """A policy masking exactly the columns whose masked line is the longer one.
-
-    A policy does not only remove: a masked column keeps its name and gains "MASKED for this
-    identity: do not select or filter on it." in place of its description and values, which for a
-    column with neither is longer than the column unmasked. Only a PII-tagged column can be masked
-    (`build_access_policy`), so each is rendered alone both ways, in the generator's card style,
-    and the longer kept -- the longest card any identity can be shown.
-    """
-    from mnemiq.semantic.cards import build_cards
-    from mnemiq.sql.policy import AccessPolicy
-
-    longer: set[tuple[str, str]] = set()
-    for column in snapshot.columns:
-        if not column.pii_level or column.pii_level == "none":
-            continue
-        key = (column.object_id, column.name)
-        alone = snapshot.model_copy(update={
-            "columns": [column], "relationships": [],
-            "source_bindings": [b for b in snapshot.source_bindings
-                                if b.object_id == column.object_id],
-        })
-        plain = sum(len(c.text) for c in build_cards(alone, policy=None, style=style))
-        hidden = sum(len(c.text) for c in build_cards(alone, policy=AccessPolicy(masked={key}),
-                                                      style=style))
-        if hidden > plain:
-            longer.add(key)
-    return AccessPolicy(masked=longer) if longer else None
-
-
-def _largest_examples(con, k: int) -> list:
+def _largest_examples(con, k: int, allowed) -> list:
     """The k examples that add the most once rendered -- `user_prompt` cuts a question to 300
     characters, so a long question with short SQL can add less than it looks. Every stored example
     is read and rendered twice on each check, which runs at boot and again on every ask that sees a
@@ -228,8 +220,11 @@ def _largest_examples(con, k: int) -> list:
     ).fetchone()
     if exists is None:
         return []
+    # Only examples whose tables the identity may see, as retrieval filters them.
     examples = [Example(question=q, sql=s, object_id=o)
-                for q, s, o in con.execute("SELECT question, sql, object_id FROM example").fetchall()]
+                for q, s, t, o in con.execute(
+                    "SELECT question, sql, tables, object_id FROM example").fetchall()
+                if set(json.loads(t)) <= set(allowed)]
     empty = ContextPacket(question="", cards=[], grant_fingerprint="", enrichment_version=None)
 
     def adds(example) -> int:
@@ -316,9 +311,52 @@ def _within_deadline(fn, *args, deadline: float | None = None, **kwargs):
     return outcome.get("result")
 
 
-def check_window(con, snapshot, settings, dialect: str,
-                 http: httpx.Client | None = None) -> WindowReport:
-    system, bound, real, cards = largest_prompts(con, snapshot, settings, dialect)
+def check_window(con, snapshot, settings, dialect: str, grants: GrantSet | None = None,
+                 http: httpx.Client | None = None, who: str = "") -> WindowReport:
+    prompts = largest_prompts(con, snapshot, settings, dialect, grants or everything(snapshot))
+    return _count(prompts, settings, http, who)
+
+
+def grant_sets(authz, settings) -> list[tuple[str, GrantSet]]:
+    """(label, grants) for each distinct view to measure: every role the policy declares, or the
+    configured identity where the provider cannot list its roles. Views that see no table are
+    dropped, and roles with identical grants are measured once."""
+    from mnemiq.contract import IdentityContext
+
+    roles = getattr(authz, "policy_roles", None)
+    if roles is not None:
+        views = [(f"role {role}", authz.grants_for(
+            IdentityContext(tenant_id="boot", principal_id="boot", roles=[role])))
+            for role in roles()]
+    else:
+        from mnemiq.config import identity_from_settings
+
+        identity = identity_from_settings(settings)
+        views = [(f"identity {identity.principal_id}", authz.grants_for(identity))]
+    measured: list[tuple[str, GrantSet]] = []
+    seen: set[str] = set()
+    for label, grants in views:
+        if grants.objects and grants.fingerprint not in seen:
+            seen.add(grants.fingerprint)
+            measured.append((label, grants))
+    return measured
+
+
+def worst_window(con, snapshot, settings, dialect: str, authz,
+                 http: httpx.Client | None = None) -> WindowReport | None:
+    """The report for the view whose largest prompt is longest, measured locally and then counted
+    on the server; None when no view sees a table."""
+    candidates = [(label, largest_prompts(con, snapshot, settings, dialect, grants))
+                  for label, grants in grant_sets(authz, settings)]
+    if not candidates:
+        return None
+    label, prompts = max(candidates, key=lambda c: (len(c[1][0]) + len(c[1][1]), c[0]))
+    return _count(prompts, settings, http, label)
+
+
+def _count(prompts: tuple[str, str, str, int], settings, http: httpx.Client | None,
+           who: str) -> WindowReport:
+    system, bound, real, cards = prompts
     reply = reasoning_budget(settings.llm_model, GENERATOR_MAX_TOKENS)
 
     def count(user: str):
@@ -335,10 +373,11 @@ def check_window(con, snapshot, settings, dialect: str,
             count, real, deadline=DEADLINE_S - (time.monotonic() - started))
         return WindowReport(prompt + QUESTION_ALLOWANCE, reply, window, counted_by_server=True,
                             cards=cards,
-                            real_tokens=None if second is None else second[0] + QUESTION_ALLOWANCE)
+                            real_tokens=None if second is None else second[0] + QUESTION_ALLOWANCE,
+                            who=who)
 
     def estimate(user: str) -> int:
         return math.ceil((len(system) + len(user)) / CHARS_PER_TOKEN_FLOOR) + QUESTION_ALLOWANCE
 
     return WindowReport(estimate(bound), reply, settings.llm_context_window,
-                        counted_by_server=False, cards=cards, real_tokens=estimate(real))
+                        counted_by_server=False, cards=cards, real_tokens=estimate(real), who=who)

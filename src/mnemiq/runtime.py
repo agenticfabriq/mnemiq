@@ -129,7 +129,7 @@ class Runtime:
             # is a deployment property this repo cannot see.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
             _warn_prompt_window(self.settings, self.con, snapshot, getattr(self, "adapter", None),
-                                _acknowledged(self.settings))
+                                self.authz, _acknowledged(self.settings))
             _warn_policy_advisories(self.authz, snapshot)
 
     def _source_id(self) -> str:
@@ -374,7 +374,7 @@ def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
                     "no such verdict, or the verdict half is misspelled", entry)
 
 
-def _warn_prompt_window(settings: Settings, con, snapshot, adapter,
+def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
                         acknowledged: frozenset[str]) -> None:
     """Say at boot when the largest generation prompt cannot fit the server's window (M119).
 
@@ -391,14 +391,21 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter,
         # advisory must never stop one any more than a boot.
         if not settings.llm_window_check or not settings.llm_base_url or snapshot is None:
             return
-        from mnemiq.llm.window import check_window
+        from mnemiq.llm.window import worst_window
 
-        report = check_window(con, snapshot, settings, getattr(adapter, "dialect", "duckdb"))
+        # Per identity: what is sent to be counted must be what that identity's own questions
+        # could send (`mnemiq.llm.window`).
+        report = worst_window(con, snapshot, settings, getattr(adapter, "dialect", "duckdb"),
+                              authz)
     except Exception as exc:  # noqa: BLE001 -- an advisory check must never stop a boot
         # INFO, not DEBUG: a server that cannot be reached is already a count it did not give, so
         # what lands here is the measurement itself failing (or a base URL httpx cannot parse),
         # and silence would read as "fits".
         logger.info("prompt window not checked: the measurement failed (%s)", exc)
+        return
+    if report is None:
+        logger.info("prompt window not checked: no role in the access policy sees a table")
+        _ack_did_not_apply(acknowledged, None, prefix="window:")
         return
     if report.fits is None:
         logger.info("prompt window not checked: %s; set MNEMIQ_LLM_CONTEXT_WINDOW to check it",
@@ -872,7 +879,7 @@ def build_runtime(settings: Settings) -> Runtime:
     # calling this from inside the function advisory ran it only when that one found
     # nothing to report, which is every deployment except a schema with no helpers.
     _warn_view_inventory(snapshot, _acknowledged(settings))
-    _warn_prompt_window(settings, con, snapshot, adapter, _acknowledged(settings))
+    _warn_prompt_window(settings, con, snapshot, adapter, _boot_authz, _acknowledged(settings))
     return Runtime(
         con=con,
         snapshot=snapshot,
