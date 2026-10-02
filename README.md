@@ -211,6 +211,18 @@ Postgres or SQLite source fetches DuckDB's matching `postgres`/`sqlite` extensio
 pre-seed DuckDB's extension cache, or vendor the extensions your source and store need, ahead of
 time.
 
+**A local server samples unless told not to.** vLLM answers a request that names no temperature with the
+model's own defaults: Qwen2.5-Coder-32B ships temperature 0.7, and five identical requests came back five
+different ways (one way at temperature 0). So mnemiq sends temperature 0 for the two calls that decide what you
+are shown: the judge that scores whether a result answers the question, and the selector that picks among
+deep mode's candidates. The same SQL and rows then get the same verdict. Every other call samples at the
+server's default: SQL generation and its corrector (the repair loop and deep mode's candidates vary the
+prompt, not the sample), the answer's wording, and enrichment, whose descriptions, facts and examples are
+stored and read by later questions. To make those repeat too, set `MNEMIQ_LLM_SEED`, which mnemiq sends on
+every call (vLLM honours it; a hosted endpoint may accept it and still vary), or lower the server's default
+(vLLM: `--override-generation-config '{"temperature": 0}'`). Reasoning models that refuse any temperature but their
+own (GPT-5, o1, o3, o4, also behind a gateway prefix such as `openai/o3`) are sent none.
+
 ## Use it from a browser (workbench)
 
 ```
