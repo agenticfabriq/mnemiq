@@ -36,6 +36,19 @@ describe("ResultView", () => {
     expect(csv.getAttribute("title")).toMatch(/1,000-row limit, so there may be more/);
   });
 
+  it("says it for a capped chart even when every row fits on screen", () => {
+    render(<ResultView preview={chartable({ row_count: 1000, truncated: false, capped: true })} />);
+    expect(screen.getByText(/1,000\+ rows/)).toBeInTheDocument();
+    expect(screen.getByText(/row limit/)).toBeInTheDocument();
+  });
+
+  it("does not claim a row limit for a long preview the engine did not cut", () => {
+    render(<ResultView preview={chartable({ row_count: 999, truncated: true })} />);
+    expect(screen.getByText(/2 of 999 rows/)).toBeInTheDocument();
+    expect(screen.queryByText(/row limit/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /CSV/ }).getAttribute("title")).toMatch(/not all 999/);
+  });
+
   it("leaves an uncut chart's caption as it was", () => {
     render(<ResultView preview={chartable({})} />);
     expect(screen.getByText(/2 rows/)).toBeInTheDocument();
