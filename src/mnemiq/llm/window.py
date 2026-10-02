@@ -319,7 +319,7 @@ def check_window(con, snapshot, settings, dialect: str, grants: GrantSet | None 
 
 def grant_sets(authz, settings) -> list[tuple[str, GrantSet]]:
     """(label, grants) for each distinct view to measure: every role the policy declares, and the
-    configured identity, whose roles merge into one grant wider than any of them. Views that see no
+    configured identity, whose roles merge into one grant that may be wider than any of them. Views that see no
     table are dropped, and identical grants are measured once. Other principals holding several
     roles are not: their combinations are not listed anywhere to measure."""
     from mnemiq.config import identity_from_settings

@@ -106,13 +106,14 @@ class Runtime:
             # the policy file per declared role, and `warn_unfiltered_dependents` walks parents
             # over `snapshot.relationships` for every granted table. Paid by the ask that
             # observes a version change, not by the ones after, and the alternative is a replica
-            # answering from a snapshot nobody assessed. `_warn_prompt_window` adds a network
-            # round trip to that ask: one POST to the chat server's `/tokenize`, after building
-            # the largest prompt from the new snapshot for each distinct role grant (and the
-            # configured identity) -- local work that grows with the number of roles. The server call holds the ask at most 15
-            # seconds (`DEADLINE_S` in `mnemiq.llm.window`), however the network behaves; building
-            # the prompt is local work and not under that bound. A call still waiting on a stalled
-            # resolver at the deadline leaves its thread behind, one per timed-out check.
+            # answering from a snapshot nobody assessed. `_warn_prompt_window` adds a network round
+            # trip to that ask: one POST to the chat server's `/tokenize`, after building the
+            # largest prompt from the new snapshot for each distinct role grant (and the configured
+            # identity) -- local work that grows with the number of roles. The server call holds the
+            # ask at most 15 seconds (`DEADLINE_S` in `mnemiq.llm.window`), however the network
+            # behaves; building the prompt is local work and not under that bound. A call still
+            # waiting on a stalled resolver at the deadline leaves its thread behind, one per
+            # timed-out check.
             #
             # NOT once per swap on the threaded server, and this is measured from the code
             # rather than assumed: `build_app` closes over ONE runtime and serves it through
