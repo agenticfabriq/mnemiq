@@ -28,7 +28,7 @@ class _Client:
     def __init__(self, reply):
         self._reply = reply
 
-    def complete(self, system, user, max_tokens=512):
+    def complete(self, system, user, max_tokens=512, extra_body=None, temperature=None):
         if isinstance(self._reply, Exception):
             raise self._reply
         return self._reply

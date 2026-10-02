@@ -19,7 +19,7 @@ class _FakeClient:
         self.calls = 0
         self.seen = {}
 
-    def complete(self, system, user, max_tokens=512):
+    def complete(self, system, user, max_tokens=512, extra_body=None, temperature=None):
         self.calls += 1
         self.seen = {"system": system, "user": user}
         return self._reply
@@ -67,7 +67,7 @@ def test_out_of_range_reply_falls_back_to_majority():
 
 def test_a_client_exception_falls_back_to_majority():
     class _Boom:
-        def complete(self, system, user, max_tokens=512):
+        def complete(self, system, user, max_tokens=512, extra_body=None, temperature=None):
             raise RuntimeError("endpoint down")
 
     assert LLMSelector(_Boom()).select("q", _views(2, 3)) == 1
