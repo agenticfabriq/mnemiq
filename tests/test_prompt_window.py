@@ -232,6 +232,39 @@ def test_the_question_is_counted_as_its_allowance():
     assert report.prompt_tokens == 1_000 + window.QUESTION_ALLOWANCE
 
 
+def _pii_table(described: int, bare: int) -> Snapshot:
+    """One table of PII columns: `described` with long descriptions (masking shortens them),
+    `bare` with none (masking lengthens them: the mask note is longer than nothing)."""
+    cols = [Column(id=f"p.d{i}", object_id="p", name=f"d{i}", data_type="text", pii_level="high",
+                   description="A long description of what this column holds. " * 3)
+            for i in range(described)]
+    cols += [Column(id=f"p.b{i}", object_id="p", name=f"b{i}", data_type="text", pii_level="high")
+             for i in range(bare)]
+    return Snapshot(version="v1", source_id="s", created_at="2026-10-02T00:00:00Z",
+                    source_bindings=[SourceBinding(id="sb:p", source_id="s", object_id="p",
+                                                   source_object="p", binding_type="table")],
+                    columns=cols)
+
+
+@pytest.mark.parametrize("style", ["cards", "ddl"])
+@pytest.mark.parametrize(("described", "bare"), [(0, 300), (40, 40)])
+def test_a_masked_card_can_be_the_longer_one_and_is_measured(style, described, bare):
+    """Codex review of #73: measured unscoped, 300 bare PII columns came to 5,626 characters where
+    an identity that sees them masked is shown 22,726. Every identity's card must fit inside the
+    measure: all masked, none masked, and anything between."""
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.semantic.cards import build_cards
+    from mnemiq.sql.policy import build_access_policy
+
+    snap = _pii_table(described, bare)
+    _, user, _ = largest_prompt(duckdb.connect(), snap, _settings(card_style=style), "duckdb")
+    measured = user.split("TABLES:")[1]
+    for grants in (GrantSet(frozenset({"p"}), pii_clearance=frozenset({"high"})),
+                   GrantSet(frozenset({"p"}), pii_mask=frozenset({"high"}))):
+        shown = build_cards(snap, policy=build_access_policy(snap, grants), style=style)
+        assert len(measured) >= len(shown[0].text)
+
+
 def test_a_store_without_examples_still_measures():
     _, user, cards = largest_prompt(duckdb.connect(), _snapshot(), _settings(), "duckdb")
     assert cards == 2 and "WORKED EXAMPLES" not in user

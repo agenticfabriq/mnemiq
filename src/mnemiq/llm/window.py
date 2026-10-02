@@ -6,14 +6,15 @@ one question at a time, after the work. This asks once, at boot: the largest pro
 produce, plus the room the generator is given to reply in, against the window.
 
 "Largest" is built with the real formatter from the parts that do not depend on the question: the
-`retrieval_k` tables that bring the most into a prompt -- card in the generator's card style,
-unscoped (a policy only removes columns), facts, and the definitions and certified measures bound
-to it -- with every table visible, a definition shared by two of them counted with each, and a
-section they leave empty given one item from a table that fills it; the `retrieval_k` worked
-examples that add the most once rendered; the longest strategy's system prompt. The question is an
-allowance of 500 tokens, not text: `sanitize` keeps 500 characters, and a byte-level tokenizer
-spends at most one token on an ASCII character. Left out, because they depend on the question: the
-code vocabulary for its columns, glossary terms it happens to name, and the conversation history.
+`retrieval_k` tables that bring the most into a prompt -- card in the generator's card style with
+each maskable column rendered the longer of masked and unmasked (a mask note can outrun the
+description it replaces), facts, and the definitions and certified measures bound to it -- with
+every table visible, a definition shared by two of them counted with each, and a section they leave
+empty given one item from a table that fills it; the `retrieval_k` worked examples that add the
+most once rendered; the longest strategy's system prompt. The question is an allowance of 500
+tokens, not text: `sanitize` keeps 500 characters, and a byte-level tokenizer spends at most one
+token on an ASCII character. Left out, because they depend on the question: the code vocabulary for
+its columns, glossary terms it happens to name, and the conversation history.
 
 Longest by length, then counted in tokens -- not longest in tokens. A set of tables shorter in
 characters but denser in tokens (long identifiers, non-Latin text) can count more than the one
@@ -89,7 +90,8 @@ def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int
     from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_facts
 
     k = settings.retrieval_k
-    rendered = build_cards(snapshot, policy=None, style=settings.card_style)
+    rendered = build_cards(snapshot, policy=_mask_where_longer(snapshot, settings.card_style),
+                           style=settings.card_style)
     # Every table visible: an identity granted all of them sees the most, and a definition bound to
     # a table outside the k still rides in with the one inside it.
     shown = GrantSet(frozenset(c.object_id for c in rendered))
@@ -144,6 +146,36 @@ def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int
                                 declare_assumed_terms=settings.guard_undefined_terms)
                   for s in (None, *STRATEGIES)), key=len)
     return system, user_prompt(packet), len(packet.cards)
+
+
+def _mask_where_longer(snapshot, style: str):
+    """A policy masking exactly the columns whose masked line is the longer one.
+
+    A policy does not only remove: a masked column keeps its name and gains "MASKED for this
+    identity: do not select or filter on it." in place of its description and values, which for a
+    column with neither is longer than the column unmasked. Only a PII-tagged column can be masked
+    (`build_access_policy`), so each is rendered alone both ways, in the generator's card style,
+    and the longer kept -- the longest card any identity can be shown.
+    """
+    from mnemiq.semantic.cards import build_cards
+    from mnemiq.sql.policy import AccessPolicy
+
+    longer: set[tuple[str, str]] = set()
+    for column in snapshot.columns:
+        if not column.pii_level or column.pii_level == "none":
+            continue
+        key = (column.object_id, column.name)
+        alone = snapshot.model_copy(update={
+            "columns": [column], "relationships": [],
+            "source_bindings": [b for b in snapshot.source_bindings
+                                if b.object_id == column.object_id],
+        })
+        plain = sum(len(c.text) for c in build_cards(alone, policy=None, style=style))
+        hidden = sum(len(c.text) for c in build_cards(alone, policy=AccessPolicy(masked={key}),
+                                                      style=style))
+        if hidden > plain:
+            longer.add(key)
+    return AccessPolicy(masked=longer) if longer else None
 
 
 def _largest_examples(con, k: int) -> list:
