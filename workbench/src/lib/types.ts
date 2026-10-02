@@ -33,9 +33,12 @@ export type Cell = string | number | boolean | null;
 export type ResultPreview = {
   columns: string[];
   rows: Cell[][];
-  /** True count in the result, not the capped length of `rows`. */
+  /** Rows the query returned, not the shortened length of `rows`; a floor, not the total, when `capped`. */
   row_count: number;
   truncated: boolean;
+  /** The engine's row limit cut the query off: there may be more rows than `row_count` (M118).
+   * Optional, so a server from before the field reads as not capped. */
+  capped?: boolean;
 };
 
 /** One prior turn, echoed back so a follow-up can resolve against it. */

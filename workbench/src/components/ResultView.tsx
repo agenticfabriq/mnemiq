@@ -25,6 +25,9 @@ export function ResultView({ preview }: { preview: ResultPreview }) {
   const showing = spec ? (chosen ?? "chart") : "table";
   const setView = setChosen;
   const shown = measure && spec?.valueColumns.includes(measure) ? measure : spec?.valueColumns[0];
+  // A cut result's count is a floor (M118), written as the answer's own sentence writes it.
+  const limit = preview.row_count.toLocaleString("en-US");
+  const total = preview.capped ? `${limit}+` : `${preview.row_count}`;
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -51,9 +54,11 @@ export function ResultView({ preview }: { preview: ResultPreview }) {
           type="button"
           onClick={() => downloadCsv(preview)}
           title={
-            preview.truncated
-              ? `Downloads the ${preview.rows.length} rows shown, not all ${preview.row_count}`
-              : `Downloads all ${preview.row_count} rows`
+            preview.capped
+              ? `Downloads the ${preview.rows.length} rows shown; the query stopped at the ${limit}-row limit, so there may be more`
+              : preview.truncated
+                ? `Downloads the ${preview.rows.length} rows shown, not all ${preview.row_count}`
+                : `Downloads all ${preview.row_count} rows`
           }
           className="label border border-rule px-2 py-1 hover:border-brass hover:text-brass"
         >
@@ -88,8 +93,9 @@ export function ResultView({ preview }: { preview: ResultPreview }) {
             {shown} by {spec.labelColumn}
             {" · "}
             {preview.truncated
-              ? `${preview.rows.length} of ${preview.row_count} rows`
-              : `${preview.row_count} ${preview.row_count === 1 ? "row" : "rows"}`}
+              ? `${preview.rows.length} of ${total} rows`
+              : `${total} ${preview.row_count === 1 && !preview.capped ? "row" : "rows"}`}
+            {preview.capped && ` · the query stopped at the ${limit}-row limit`}
           </figcaption>
         </figure>
       ) : (

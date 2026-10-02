@@ -29,6 +29,29 @@ describe("ResultTable", () => {
     expect(screen.getByText("showing 100 of 820 rows")).toBeInTheDocument();
   });
 
+  it("says the query stopped at the row limit when the engine cut it off", () => {
+    render(
+      <ResultTable
+        preview={{ columns: ["n"], rows: [[1], [2]], row_count: 1000, truncated: true, capped: true }}
+      />,
+    );
+    expect(screen.getByText(/showing 2 of 1,000\+ rows/)).toBeInTheDocument();
+    expect(screen.getByText(/the query stopped at the 1,000-row limit/)).toBeInTheDocument();
+  });
+
+  it("says it for a capped result even when every row fits on screen", () => {
+    // capped and truncated are different facts: the engine's limit against the preview's.
+    render(<ResultTable preview={{ columns: ["n"], rows: [[1]], row_count: 1000, truncated: false, capped: true }} />);
+    expect(screen.getByText(/1,000\+ rows/)).toBeInTheDocument();
+    expect(screen.getByText(/row limit/)).toBeInTheDocument();
+  });
+
+  it("does not call a long preview capped when the engine did not cut it", () => {
+    render(<ResultTable preview={{ columns: ["n"], rows: [[1]], row_count: 999, truncated: true }} />);
+    expect(screen.getByText(/showing 1 of 999 rows/)).toBeInTheDocument();
+    expect(screen.queryByText(/row limit/)).not.toBeInTheDocument();
+  });
+
   it("singularises a one-row result", () => {
     render(<ResultTable preview={SCALAR_ANSWER.preview!} />);
     expect(screen.getByText("1 row")).toBeInTheDocument();
