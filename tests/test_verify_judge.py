@@ -6,8 +6,11 @@ class _Client:
         self.reply = reply
         self.seen = None
 
-    def complete(self, system, user, max_tokens=512):
+    def complete(self, system, user, max_tokens=512, extra_body=None, temperature=None):
+        # The real client's signature: a fake that refuses the judge's temperature raises, and a
+        # judge that raises falls open to 1.0 -- the value two tests below expect anyway (M120).
         self.seen = (system, user)
+        self.temperature = temperature
         return self.reply
 
 

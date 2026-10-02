@@ -21,6 +21,17 @@ class ModelUnavailable(RuntimeError):
     """
 
 
+_FIXED_SAMPLING = re.compile(r"(^|[./])(gpt-5|o[134](-|$))")
+
+
+def accepts_temperature(model: str) -> bool:
+    """Reasoning models (GPT-5, o1/o3/o4, also behind a gateway prefix such as `openai/o3`) reject
+    any temperature but their default; asked for 0, the provider fails the request. Matched by
+    family, so a GPT-5 chat variant that would accept one is not sent it either: it keeps its
+    default sampling, which fails safe rather than failing the request."""
+    return not _FIXED_SAMPLING.search(model)
+
+
 class PromptCut(ModelUnavailable):
     """The server read only part of the prompt and answered anyway (M119).
 
@@ -144,8 +155,12 @@ class LLMClient:
         return self.prompt_tokens + self.completion_tokens
 
     def complete(self, system: str, user: str, max_tokens: int = 512,
-                 extra_body: dict | None = None) -> str:
+                 extra_body: dict | None = None, temperature: float | None = None) -> str:
         kwargs = self._kwargs(max_tokens)
+        if temperature is not None and accepts_temperature(self._model):
+            # Unset, a local server samples at the model's own default -- Qwen2.5's is 0.7 -- and
+            # a caller that needs the same verdict twice has to say so (M120).
+            kwargs["temperature"] = temperature
         if extra_body:  # e.g. constrained decoding (response_format json_schema)
             kwargs["extra_body"] = extra_body
         resp = self._create(system, user, kwargs)
