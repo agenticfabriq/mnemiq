@@ -149,8 +149,8 @@ def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int
 def _largest_examples(con, k: int) -> list:
     """The k examples that add the most once rendered -- `user_prompt` cuts a question to 300
     characters, so a long question with short SQL can add less than it looks. Every stored example
-    is read and rendered twice, once per boot: linear in the example store, which is a few per
-    table today."""
+    is read and rendered twice, at boot and on the ask that sees a snapshot swap: linear in the
+    size of the example store."""
     from mnemiq.contract import Example
     from mnemiq.semantic.retrieval import ContextPacket
 
