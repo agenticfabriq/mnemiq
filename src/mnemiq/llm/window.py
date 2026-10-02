@@ -321,7 +321,7 @@ def check_window(con, snapshot, settings, dialect: str,
         return count_on_server(settings.llm_base_url, settings.llm_model, system, user, http=http)
 
     # One deadline for both counts, the bound first: whatever the second does, the first is kept,
-    # and a real packet that could not be counted only weakens WILL to MAY.
+    # and a real packet that could not be counted only weakens CAN to MAY.
     started = time.monotonic()
     first = _within_deadline(count, bound)
     if first is not None:
