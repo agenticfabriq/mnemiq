@@ -99,7 +99,7 @@ def _root_scope(ast: exp.Expression):
         return None
 
 
-def scope_resolved(ast: exp.Expression) -> bool:
+def scope_resolved(ast: exp.Expression, dialect: str | None = None) -> bool:
     """Did the scope resolve, so that `base_tables` is a resolved answer rather than a fallback?
 
     When it did not, `base_tables` returns `find_all(exp.Table)` -- CTE aliases included -- which
@@ -108,7 +108,8 @@ def scope_resolved(ast: exp.Expression) -> bool:
     name an object the query never read. So the record needs to know, and the guard does not.
     """
     ast_root = _root_scope(ast)
-    return ast_root is not None and not _unscoped_ctes(ast, ast_root)
+    return (ast_root is not None and not _unscoped_ctes(ast, ast_root)
+            and not _scope_missed_a_read(ast, _walked_reads(ast, ast_root, dialect), dialect))
 
 
 def _defining_identifier(source) -> exp.Expression | None:
@@ -218,6 +219,14 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
         # alternative, falling back to the flat name set, is exactly the M31 bypass.
         return list(ast.find_all(exp.Table))
 
+    out = _walked_reads(ast, root, dialect)
+    if _scope_missed_a_read(ast, out, dialect):
+        return list(ast.find_all(exp.Table))
+    return out
+
+
+def _walked_reads(ast: exp.Expression, root, dialect: str | None) -> list[exp.Table]:
+    """The real reads the scope walk names, plus any write target the write reads."""
     out: list[exp.Table] = []
     for scope in root.traverse():
         for table in scope.tables:
@@ -229,6 +238,84 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
         if not any(t is target for t in out):
             out.append(target)
     return out
+
+
+def _scope_missed_a_read(ast: exp.Expression, walked: list[exp.Table], dialect: str | None) -> bool:
+    """Did the scope walk leave out a table a WRITE reads? ONE predicate for `base_tables`,
+    `column_tables` and `scope_resolved`: a resolver that falls back for tables but still trusts
+    the same incomplete scope for columns let a denied column through (Codex review of #66:
+    `claim.secret` copied into an ungoverned table on the locked sqlglot).
+
+    On a WRITE, a table the walk left out that no CTE could stand in front of is a table the
+    scope model MISSED, and an unreported read is one no guard sees: fail toward over-reporting,
+    exactly as an unresolvable scope does. Not hypothetical (M121): sqlglot 30.17 began scoping
+    UPDATE, its scope lists none of the FROM tables, and `UPDATE s SET a = c.a FROM c` reported
+    `s` alone -- so `c` was neither grant-checked nor row-filtered. A name no CTE on an enclosing
+    query defines (`_cte_in_scope`) can only be a real read, whatever this sqlglot's scope model
+    thinks. The write's own TARGET is excused (an INSERT writes it without reading it; a target
+    that is read is in `walked` through `_target_reads`). Writes only: on the read path an under-report is
+    lineage's to classify (`views.py` names an unmodelled source as such), and no read-path test
+    failed under sqlglot 30.21.
+    """
+    if not isinstance(ast, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
+        return False
+    written = _written_targets(ast)
+    return any(not any(t is table for t in walked) and not any(w is table for w in written)
+               and not _cte_in_scope(table, dialect)
+               for table in ast.find_all(exp.Table))
+
+
+def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
+    """Is a CTE of this table's name in scope where the table is read?
+
+    Only a WITH on one of the table's ENCLOSING queries can stand in front of it. A name matched
+    anywhere in the statement is not enough: `UPDATE t SET a = (WITH claim AS (...) SELECT a FROM
+    claim) FROM claim` declares `claim` inside a scalar subquery, and the outer `FROM claim` is
+    the real table -- matched by name, it was skipped, never grant-checked, and the write was
+    approved with `claim` ungranted on the locked sqlglot (M122). Inside a WITH's own CTE bodies
+    only earlier siblings are visible, plus the CTE itself when the WITH is RECURSIVE (M31's rule).
+    A qualified reference (`main.claim`) is never a CTE -- a CTE has no schema -- and names are
+    resolved by `mnemiq.sql.identifiers`, the shared resolver (M55) -- which `authz_guard`'s and
+    `cls`'s own CTE name sets do not use yet, so they may still disagree with this one: matching lowercased bare names excused `FROM
+    main.claim` behind a CTE `claim`, and Postgres's `claim` behind `"Claim"`.
+    Structural, never by arg name. In doubt the answer is False, which over-reports: a refusal.
+    """
+    if table.db or table.catalog:
+        return False
+    name = resolve_name(table, dialect)
+    if name is None:
+        return False
+    child, node, last_cte = table, table.parent, None
+    while node is not None:
+        if isinstance(node, exp.CTE):
+            last_cte = node
+        for with_ in (v for v in node.args.values() if isinstance(v, exp.With)):
+            names = [resolve_name(cte, dialect) for cte in with_.expressions]
+            if child is with_:  # the table sits inside one of this WITH's own CTE bodies
+                at = next((i for i, cte in enumerate(with_.expressions) if cte is last_cte), 0)
+                visible = names[:at] + (names[at:at + 1] if with_.args.get("recursive") else [])
+            else:
+                visible = names
+            if name in visible:
+                return True
+        child, node = node, node.parent
+    return False
+
+
+def _written_targets(ast: exp.Expression) -> list[exp.Table]:
+    """The table nodes a write statement writes, located by position: INSERT's `this` (inside the
+    column-list Schema when there is one), UPDATE's `this`, DELETE's `this` or its `tables`. Empty
+    otherwise -- MERGE included: it reads its target and `_target_reads` does not model it, so its
+    target must stay a missed read, and fail closed, rather than be excused."""
+    if not isinstance(ast, (exp.Insert, exp.Update, exp.Delete)):
+        return []
+    found: list[exp.Table] = []
+    for node in [ast.this, *(ast.args.get("tables") or [])]:
+        if isinstance(node, exp.Schema):
+            node = node.this
+        if isinstance(node, exp.Table):
+            found.append(node)
+    return found
 
 
 def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, str] | None:
@@ -255,6 +342,8 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
     root = _root_scope(ast)
     if root is None or _unscoped_ctes(ast, root):
         return None
+    if _scope_missed_a_read(ast, _walked_reads(ast, root, dialect), dialect):
+        return None  # the coverage `base_tables` falls back on is not trusted for columns either
 
     out: dict[int, str] = {}
     for scope in root.traverse():

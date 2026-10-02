@@ -94,5 +94,5 @@ def answer_payload(ans: AgentAnswer) -> dict:
         "enrichment_version": t.enrichment_version if t else None,
         "timing": t.timing if t else None,
         "preview": ({"columns": p.columns, "rows": p.rows, "row_count": p.row_count,
-                     "truncated": p.truncated} if p else None),
+                     "truncated": p.truncated, "capped": p.capped} if p else None),
     }

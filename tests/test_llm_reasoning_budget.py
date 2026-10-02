@@ -57,7 +57,11 @@ class _CapturingOpenAI:
         type(self).sent = kwargs
         return SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(content='{"confidence": 0.5}'))],
-            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+            # A count a real server could report for this prompt (three characters a token): one
+            # token for a 600-character judge prompt reads as a cut, and the cut check's probe
+            # would then be the request this test captures.
+            usage=SimpleNamespace(prompt_tokens=max(1, sum(len(m["content"]) for m in kwargs["messages"]) // 3),
+                                  completion_tokens=1),
         )
 
 

@@ -9,7 +9,8 @@ import pyarrow as pa
 
 from mnemiq.agent.loop import AgentAnswer
 from mnemiq.contract import EvaluationCase
-from mnemiq.eval.grade import GotFactsUndecided, normalize, results_match
+from mnemiq.eval.grade import GotFactsUndecided, normalize, results_match, rows_that_count
+from mnemiq.sql.guard import MAX_ROWS
 
 _PREVIEW_ROWS = 100
 
@@ -183,6 +184,25 @@ def run_case(case: EvaluationCase, engine: Engine, adapter, gold_adapter=None, *
         except Exception as exc:
             result.portable_to_gold_engine = False
             result.dialect_error = str(exc)
+
+    # A gold needing more rows than the guard lets any answer return cannot be matched (M118):
+    # grading against it scores the limit, not the model, so it is an ERROR that says why, never a
+    # WRONG, with the agent's answer kept beside the reason. The guard's MAX_ROWS is the bound,
+    # because it is what every answer faced; the BIRD runner's --max-rows only chooses which golds
+    # it skips before asking. Rows counted as the most lenient reading counts them
+    # (`rows_that_count`): under a benchmark that declares duplicates insignificant, distinct rows
+    # with each row's cells sorted, so a 1,140-row gold of 500 facts is graded. The trade-off, chosen:
+    # such a gold may still be out of reach for the strict reading, which needs every distinct
+    # ordered row, so a cut answer there can score CORRECT_FACTS at best -- graded, rather than
+    # an ERROR that would also hide a got-facts match.
+    if gold.num_rows > MAX_ROWS:
+        needed = rows_that_count(gold, duplicate_rows_insignificant)
+        if needed > MAX_ROWS:
+            result.outcome = Outcome.ERROR
+            result.answer = (f"Not graded: the gold has {needed:,} rows, over the {MAX_ROWS:,}-row "
+                             f"limit the engine puts on every answer, so no answer can match it. "
+                             f"The agent answered: {result.answer}")
+            return result
 
     # `duplicate_rows_insignificant` is the BENCHMARK's declaration, not this runner's
     # policy, which is why it arrives as an argument and defaults to off. BIRD declares it --

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 
 import httpx
@@ -8,6 +9,7 @@ from openai import APIError, OpenAI
 from mnemiq.config import Settings
 
 _GPT5 = re.compile(r"(^|\.)gpt-5")
+logger = logging.getLogger(__name__)
 
 
 class ModelUnavailable(RuntimeError):
@@ -28,6 +30,59 @@ def accepts_temperature(model: str) -> bool:
     family, so a GPT-5 chat variant that would accept one is not sent it either: it keeps its
     default sampling, which fails safe rather than failing the request."""
     return not _FIXED_SAMPLING.search(model)
+
+
+class PromptCut(ModelUnavailable):
+    """The server read only part of the prompt and answered anyway (M119).
+
+    Ollama, given a prompt longer than its context window, keeps the last part of it and returns
+    no error; the instructions at the start are what is lost, and the answer reads as normal. The
+    one trace is `usage.prompt_tokens`, which counts what the model READ, not what was sent. A
+    ModelUnavailable because the model never saw the request it was sent -- but a configuration
+    failure, not an outage: retrying sends the same prompt to the same window.
+    """
+
+
+# Two signs that a server may have cut the prompt, because servers cut in two ways -- and neither
+# sign is proof, so each only triggers a check. Only when the check cannot decide does a ratio
+# decide alone, and only past _CERTAIN_CHARS_PER_TOKEN.
+#
+# A big cut moves the ratio. MEASURED on 612 prompts from every call site (generator, corrector,
+# judge, synthesis, deep mode's selector, and enrichment's annotation, facts and examples, over BIRD
+# mini-dev, KaggleDBQA and a 1,500-column enterprise schema): 1.43 to 4.26 characters a token under
+# Qwen2.5's tokenizer, 2.10 to 4.50 under o200k. A recent Ollama keeps about half its window, so a
+# cut prompt at least doubles its ratio. But a ratio is not proof: result rows repeating long words
+# compress hard, and a synthesis prompt of 50 rows of "International Business Machines Corporation"
+# reads 6.19 under o200k with nothing cut (found in review).
+#
+# A modest cut does not move the ratio at all. MEASURED on Ollama 0.5.4 with a 2,048-token window:
+# an 8,950-character prompt (about 3,300 tokens) came back as exactly 2,048 tokens read -- 4.4
+# characters a token, inside the normal range. What gives it away is the count sitting on the
+# window, and windows are set in multiples of 1,024.
+#
+# The check: re-send the prompt with ~64 tokens of padding. A server that read the whole prompt
+# reads the padding too (MEASURED on Ollama 0.5.4: 3,299 -> 3,363, from its prefix cache); one
+# keeping a fixed window reads exactly as many as before (2,048 -> 2,048). Growth between the two
+# proves nothing about the original: a prompt that fit just under the window gives a probe that
+# does not (found in review: 2,040 fits, its probe reads 2,048), so that is undecided, not a cut. It runs on about 1.7% of calls, plus the rare compressible
+# prompt. Still missed: a modest cut to a window that is not a multiple of 1,024, and densely
+# tokenized scripts (CJK), whose ratio stays low even when cut.
+_RAISE = ("Raise the server's context length (Ollama: OLLAMA_CONTEXT_LENGTH or num_ctx; "
+          "vLLM: --max-model-len) or use a model with a larger window.")
+_MAX_CHARS_PER_TOKEN = 6.0
+_WINDOW_STEP = 1024
+_WINDOW_SLACK = 8  # a recent Ollama reported 16,386 for a 32,768 window: half, plus two
+_PROBE_PADDING = "\n" + " padding" * 64
+_MIN_GROWTH = 32  # of the padding's ~64 tokens; a server that read it all shows most of them
+# When the probe cannot decide (it failed, carried no count, or itself reached the window), a ratio
+# this high is refused anyway:
+# twice the suspicion line, and far above anything measured (4.50) or constructed (6.19). A measure,
+# not a guarantee: rows built of one long repeated token could in principle pass it.
+_CERTAIN_CHARS_PER_TOKEN = 12.0
+
+
+def _on_a_window_edge(read: int) -> bool:
+    return read >= _WINDOW_STEP and min(read % _WINDOW_STEP, -read % _WINDOW_STEP) <= _WINDOW_SLACK
 
 
 def token_param_name(model: str) -> str:
@@ -78,6 +133,7 @@ class LLMClient:
             raise RuntimeError("LLM base_url/api_key not configured (set MNEMIQ_LLM_* env)")
         self._model = settings.llm_model
         self._seed = settings.llm_seed
+        self._check_cut = settings.llm_prompt_cut_check
         # The SDK's own _DefaultHttpxClient sets follow_redirects=True, so a base_url that
         # `assert_local_only` approved at boot could still 302 a live request off-network on
         # every call after -- the boot check validates the CONFIGURED host once, not where a
@@ -100,11 +156,48 @@ class LLMClient:
 
     def complete(self, system: str, user: str, max_tokens: int = 512,
                  extra_body: dict | None = None, temperature: float | None = None) -> str:
-        kwargs = {token_param_name(self._model): reasoning_budget(self._model, max_tokens)}
+        kwargs = self._kwargs(max_tokens)
         if temperature is not None and accepts_temperature(self._model):
             # Unset, a local server samples at the model's own default -- Qwen2.5's is 0.7 -- and
             # a caller that needs the same verdict twice has to say so (M120).
             kwargs["temperature"] = temperature
+        if extra_body:  # e.g. constrained decoding (response_format json_schema)
+            kwargs["extra_body"] = extra_body
+        resp = self._create(system, user, kwargs)
+        read = self._count(resp)
+        sent = len(system) + len(user)
+        # Counted first: the server did the work, and the cost report must not lose it.
+        reply = resp.choices[0].message.content or ""
+        if not (self._check_cut and read
+                and (sent / read > _MAX_CHARS_PER_TOKEN or _on_a_window_edge(read))):
+            return reply
+        try:
+            again = self._count(self._create(system, user + _PROBE_PADDING, self._kwargs(1)))
+            why = ("the probe carried no token count" if not again else
+                   "the probe itself reached the window" if 0 < again - read < _MIN_GROWTH else "")
+        except ModelUnavailable as exc:
+            again, why = 0, f"the probe failed: {exc}"
+        if why:
+            # Undecided. Failing closed would turn a passing 429 into a failed answer on every
+            # suspicious count, so this answers -- unless the ratio alone is past doubt -- and
+            # says so, or a server whose probe never decides is invisible.
+            if sent / read > _CERTAIN_CHARS_PER_TOKEN:
+                raise PromptCut(
+                    f"The model server read {read:,} tokens of a {sent:,}-character prompt, "
+                    f"{sent / read:.0f} characters a token, far above any whole prompt measured; the "
+                    f"check that would confirm it could not run ({why}). {_RAISE}")
+            logger.warning("could not check for a cut prompt (%s tokens read of %s characters): %s",
+                           read, sent, why)
+            return reply
+        if again <= read:
+            raise PromptCut(
+                f"The model server read {read:,} tokens of a {sent:,}-character prompt, and {again:,} "
+                "when the prompt grew by about 64 tokens: it is keeping a fixed window and dropping "
+                f"the rest of the prompt. {_RAISE}")
+        return reply
+
+    def _kwargs(self, max_tokens: int) -> dict:
+        kwargs = {token_param_name(self._model): reasoning_budget(self._model, max_tokens)}
         if self._seed is not None:
             # Forwarded, not guaranteed. MEASURED: vLLM honours it; the hosted endpoint accepts
             # it, returns no system_fingerprint, and still varies its output -- two identical
@@ -118,8 +211,9 @@ class LLMClient:
             # feedback -- rather than relying on sampling noise. A future strategy that
             # resamples the same prompt would need to vary this per call.
             kwargs["seed"] = self._seed
-        if extra_body:  # e.g. constrained decoding (response_format json_schema)
-            kwargs["extra_body"] = extra_body
+        return kwargs
+
+    def _create(self, system: str, user: str, kwargs: dict):
         try:
             resp = self._client.chat.completions.create(
                 model=self._model,
@@ -131,9 +225,15 @@ class LLMClient:
             )
         except APIError as exc:
             raise ModelUnavailable(str(exc)) from exc
+        return resp
+
+    def _count(self, resp) -> int:
+        """Add one response to the running totals; return the prompt tokens the server read."""
         self.calls += 1
         usage = getattr(resp, "usage", None)
-        if usage is not None:
-            self.prompt_tokens += getattr(usage, "prompt_tokens", 0) or 0
-            self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
-        return resp.choices[0].message.content or ""
+        if usage is None:
+            return 0
+        read = getattr(usage, "prompt_tokens", 0) or 0
+        self.prompt_tokens += read
+        self.completion_tokens += getattr(usage, "completion_tokens", 0) or 0
+        return read
