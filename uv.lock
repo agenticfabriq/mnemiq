@@ -829,7 +829,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
     { name = "snowflake-connector-python", marker = "extra == 'snowflake'", specifier = ">=3" },
     { name = "snowflake-connector-python", marker = "extra == 'warehouse'", specifier = ">=3" },
-    { name = "sqlglot", specifier = ">=25.34.1,<30.17" },
+    { name = "sqlglot", specifier = ">=25.34.1,<30.22" },
     { name = "sqlglot", marker = "extra == 'warehouse'", specifier = ">=25" },
     { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.30" },
     { name = "uvicorn", marker = "extra == 'server'", specifier = ">=0.30" },

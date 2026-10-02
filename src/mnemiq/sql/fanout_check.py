@@ -658,15 +658,32 @@ def _grouping(select: exp.Select) -> list[str] | None:
         return None
     named = []
     for e in group.expressions:
+        if isinstance(e, _SUBTOTAL_FORMS):
+            continue  # newer sqlglot keeps these here; named below with the rest of their kind
         if isinstance(e, exp.Literal) and e.is_int and 1 <= int(e.this) <= len(select.expressions):
             e = select.expressions[int(e.this) - 1].unalias()
         named.append(e.sql())
-    for form in ("rollup", "cube", "grouping_sets"):
-        for node in group.args.get(form) or []:
-            named += [c.sql() for c in node.find_all(exp.Column)]
+    for node in _subtotal_forms(group):
+        named += [c.sql() for c in node.find_all(exp.Column)]
     if group.args.get("all"):
         named += [e.unalias().sql() for e in select.expressions if not e.find(exp.AggFunc)]
     return list(dict.fromkeys(named))
+
+
+_SUBTOTAL_FORMS = (exp.Rollup, exp.Cube, exp.GroupingSets)
+
+
+def _subtotal_forms(group: exp.Group) -> list[exp.Expression]:
+    """The ROLLUP, CUBE and GROUPING SETS nodes of a GROUP BY, found by node TYPE wherever the group
+    keeps them. sqlglot 30.12 files them under the args `rollup`, `cube` and `grouping_sets`; 30.19
+    puts the same nodes in `expressions`. Reading the arg names lost every subtotal form on 30.19
+    (M121): node types are stable across versions in a way arg names are not."""
+    found = []
+    for value in group.args.values():
+        for node in value if isinstance(value, list) else [value]:
+            if isinstance(node, _SUBTOTAL_FORMS):
+                found.append(node)
+    return found
 
 
 def _inflated(aliases: list[str], sources: dict[str, str], dup, select: exp.Select,
@@ -696,8 +713,7 @@ def _inflated(aliases: list[str], sources: dict[str, str], dup, select: exp.Sele
     by_key = grouped is not None and any(
         g.split(".")[-1].lower() in {k.lower() for k in keys} for g in grouped)
     group = select.args.get("group")
-    subtotals = group is not None and any(group.args.get(f) for f in ("rollup", "cube",
-                                                                       "grouping_sets"))
+    subtotals = group is not None and bool(_subtotal_forms(group))
     if grouped is None:
         grain = "reduced to one overall total with no GROUP BY"
         combine = "then CROSS JOIN those one-row totals"
