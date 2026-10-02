@@ -19,7 +19,10 @@ function CellView({ value }: { value: Cell }) {
 }
 
 export function ResultTable({ preview }: { preview: ResultPreview }) {
-  const { columns, rows, row_count, truncated } = preview;
+  const { columns, rows, row_count, truncated, capped } = preview;
+  // A cut result's count is a floor, so it reads as one, and says why (M118).
+  const limit = row_count.toLocaleString("en-US");  // as the answer's own sentence writes it
+  const total = capped ? `${limit}+` : `${row_count}`;
   if (columns.length === 0) return null;
 
   // Right-align a column only when every cell in it reads as a figure.
@@ -68,8 +71,9 @@ export function ResultTable({ preview }: { preview: ResultPreview }) {
       </div>
       <figcaption className="label border-t border-rule px-2.5 py-1.5">
         {truncated
-          ? `showing ${rows.length} of ${row_count} rows`
-          : `${row_count} ${row_count === 1 ? "row" : "rows"}`}
+          ? `showing ${rows.length} of ${total} rows`
+          : `${total} ${row_count === 1 && !capped ? "row" : "rows"}`}
+        {capped && ` · the query stopped at the ${limit}-row limit`}
       </figcaption>
     </figure>
   );
