@@ -206,10 +206,12 @@ class LLMClient:
             # reproducibility on the local path and nothing on the frontier one; do not build
             # an experiment design that assumes it.
             #
-            # Safe with multi-candidate generation and the repair loop regardless, because
-            # BOTH vary the prompt -- candidates by engineered strategy, retries by appended
-            # feedback -- rather than relying on sampling noise. A future strategy that
-            # resamples the same prompt would need to vary this per call.
+            # Safe with the repair loop, whose retries append feedback and so change the prompt.
+            # NOT safe with deep mode as it stands: its five candidates cycle three strategies
+            # (STRATEGIES in agent/loop.py), so the fourth and fifth repeat a prompt and, seeded,
+            # can repeat its answer -- inflating the agreement its confidence gate counts. The
+            # setting's description says to leave it unset there; varying the seed per candidate
+            # would remove the hazard.
             kwargs["seed"] = self._seed
         return kwargs
 
