@@ -126,9 +126,16 @@ def count_on_server(base_url: str, model: str, system: str, user: str,
         if resp.status_code != 200:
             return None
         data = resp.json()
+    except (httpx.HTTPError, ValueError):
+        # Down, slow, or answering with something other than JSON (a proxy's catch-all page):
+        # none of it is a count, and a declared window can still be checked without one -- an
+        # Ollama that is not up yet at boot is exactly who MNEMIQ_LLM_CONTEXT_WINDOW is for.
+        return None
     finally:
         if http is None:
             client.close()
+    if not isinstance(data, dict):
+        return None
     count, window = data.get("count"), data.get("max_model_len")
     if isinstance(count, int) and isinstance(window, int):
         return count, window

@@ -106,7 +106,9 @@ class Runtime:
             # the policy file per declared role, and `warn_unfiltered_dependents` walks parents
             # over `snapshot.relationships` for every granted table. Paid by the ask that
             # observes a version change, not by the ones after, and the alternative is a replica
-            # answering from a snapshot nobody assessed.
+            # answering from a snapshot nobody assessed. `_warn_prompt_window` adds a network
+            # round trip to that ask: one POST to the chat server's `/tokenize`, bounded by its
+            # 10-second timeout, after building the largest prompt from the new snapshot.
             #
             # NOT once per swap on the threaded server, and this is measured from the code
             # rather than assumed: `build_app` closes over ONE runtime and serves it through
@@ -348,8 +350,8 @@ def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
     """Say, at INFO, that an acknowledgement key was set and silenced nothing.
 
     `prefix` selects the namespace: `functions:` for the inventory advisory, `views:` for the
-    view one. One helper for both, because the reasoning is identical and two copies would
-    drift.
+    view one, `window:` for the prompt-window one. One helper for all, because the reasoning is
+    identical and copies would drift.
 
     It says "did not apply" rather than "did not apply this boot". `_warn_source_enforcement`
     emits both phrasings, and the plain one is right here for a reason worth keeping: the view
@@ -389,8 +391,10 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter,
         from mnemiq.llm.window import check_window
 
         report = check_window(con, snapshot, settings, getattr(adapter, "dialect", "duckdb"))
-    except Exception:  # noqa: BLE001 -- an advisory check must never stop a boot
-        logger.debug("prompt-window advisory failed", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 -- an advisory check must never stop a boot
+        # INFO, not DEBUG: a server that cannot be reached is already a count it did not give, so
+        # what lands here is the measurement itself failing, and silence would read as "fits".
+        logger.info("prompt window not checked: the measurement failed (%s)", exc)
         return
     if report.fits is None:
         logger.info("prompt window not checked: %s; set MNEMIQ_LLM_CONTEXT_WINDOW to check it",

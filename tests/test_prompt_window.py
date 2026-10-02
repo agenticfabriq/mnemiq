@@ -97,6 +97,32 @@ def test_vllm_counts_at_its_root_tokenize_with_the_chat_messages():
                                 {"role": "user", "content": "USER"}]
 
 
+def test_a_server_that_is_down_or_not_json_is_no_count():
+    def refused(request):
+        raise httpx.ConnectError("refused")
+
+    down = httpx.Client(transport=httpx.MockTransport(refused))
+    html = httpx.Client(transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, text="<html>catch-all</html>")))
+    listed = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, json=[1])))
+    for client in (down, html, listed):
+        assert count_on_server("http://h/v1", "m", "s", "u", http=client) is None
+
+
+def test_a_declared_window_is_still_checked_when_the_server_is_down():
+    def refused(request):
+        raise httpx.ConnectError("refused")
+
+    report = check_window(duckdb.connect(), _snapshot(), _settings(llm_context_window=100),
+                          "duckdb", http=httpx.Client(transport=httpx.MockTransport(refused)))
+    assert report.window == 100 and report.fits is False
+
+
+def test_a_prompt_and_reply_exactly_filling_the_window_fit():
+    assert WindowReport(24_672, 4_000, 28_672, counted_by_server=True, cards=5).fits is True
+    assert WindowReport(24_673, 4_000, 28_672, counted_by_server=True, cards=5).fits is False
+
+
 @pytest.mark.parametrize(("reply", "status"), [
     (None, 404),                        # no such door: Ollama, a hosted API
     ({"count": 10}, 200),               # a count with no window says nothing to compare
