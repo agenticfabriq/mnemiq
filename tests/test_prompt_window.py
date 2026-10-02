@@ -196,14 +196,21 @@ def test_a_prompt_that_fits_does_not_warn(caplog, monkeypatch):
     assert "prompt window fits" in caplog.text
 
 
-def test_the_advisory_never_raises(monkeypatch):
+def test_the_advisory_never_raises_and_says_it_did_not_measure(caplog, monkeypatch):
     from mnemiq.runtime import _warn_prompt_window
 
     def boom(*a, **k):
-        raise httpx.ConnectError("refused")
+        raise ValueError("no cards")
 
     monkeypatch.setattr(window, "check_window", boom)
-    _warn_prompt_window(_settings(), None, _snapshot(), None, frozenset())  # no exception
+    with caplog.at_level(logging.INFO):
+        _warn_prompt_window(_settings(), None, _snapshot(), None, frozenset())  # no exception
+    assert "prompt window not checked: the measurement failed (no cards)" in caplog.text
+
+
+def test_no_count_says_the_server_may_simply_be_down():
+    report = WindowReport(10, 4_000, None, counted_by_server=False, cards=1)
+    assert "did not answer" in report.sentence()
 
 
 def test_switched_off_it_asks_nothing(monkeypatch):

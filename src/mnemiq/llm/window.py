@@ -55,7 +55,8 @@ class WindowReport:
     def sentence(self) -> str:
         count = (f"{self.prompt_tokens:,} tokens, counted by the server" if self.counted_by_server
                  else f"about {self.prompt_tokens:,} tokens at most, estimated from its length")
-        window = ("unknown: the server reports none and MNEMIQ_LLM_CONTEXT_WINDOW is unset"
+        window = ("unknown: the server gave no count (it has no /tokenize, or it did not answer) "
+                  "and MNEMIQ_LLM_CONTEXT_WINDOW is unset"
                   if self.window is None else
                   f"{self.window:,} tokens ({'reported by the server' if self.counted_by_server else 'MNEMIQ_LLM_CONTEXT_WINDOW'})")
         return (f"the largest generation prompt this store can produce (its {self.cards} largest table "

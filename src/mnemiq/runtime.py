@@ -107,8 +107,10 @@ class Runtime:
             # over `snapshot.relationships` for every granted table. Paid by the ask that
             # observes a version change, not by the ones after, and the alternative is a replica
             # answering from a snapshot nobody assessed. `_warn_prompt_window` adds a network
-            # round trip to that ask: one POST to the chat server's `/tokenize`, bounded by its
-            # 10-second timeout, after building the largest prompt from the new snapshot.
+            # round trip to that ask: one POST to the chat server's `/tokenize`, after building
+            # the largest prompt from the new snapshot. Its 10-second timeout applies per httpx
+            # phase (connect, read, ...), and a read restarts on each chunk, so a stalled proxy
+            # can hold the ask longer than that.
             #
             # NOT once per swap on the threaded server, and this is measured from the code
             # rather than assumed: `build_app` closes over ONE runtime and serves it through
@@ -393,7 +395,8 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter,
         report = check_window(con, snapshot, settings, getattr(adapter, "dialect", "duckdb"))
     except Exception as exc:  # noqa: BLE001 -- an advisory check must never stop a boot
         # INFO, not DEBUG: a server that cannot be reached is already a count it did not give, so
-        # what lands here is the measurement itself failing, and silence would read as "fits".
+        # what lands here is the measurement itself failing (or a base URL httpx cannot parse),
+        # and silence would read as "fits".
         logger.info("prompt window not checked: the measurement failed (%s)", exc)
         return
     if report.fits is None:
