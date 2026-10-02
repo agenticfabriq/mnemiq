@@ -301,6 +301,32 @@ def test_a_server_that_is_down_or_not_json_is_no_count():
         assert count_on_server("http://h/v1", "m", "s", "u", http=client) is None
 
 
+def test_a_reply_dripped_past_the_deadline_is_no_count(monkeypatch):
+    """Codex review of #73: httpx's timeout limits each silence, so a proxy sending a byte at a
+    time could hold the boot indefinitely. The whole reply now has a deadline."""
+    import time
+
+    monkeypatch.setattr(window, "DEADLINE_S", 0.2)
+
+    def drip():
+        for _ in range(1_000):
+            time.sleep(0.01)
+            yield b" "
+
+    slow = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=drip())))
+    started = time.monotonic()
+    assert count_on_server("http://h/v1", "m", "s", "u", http=slow) is None
+    assert time.monotonic() - started < 1.0, "it waited for the drip instead of the deadline"
+
+
+def test_a_reply_past_the_size_cap_is_no_count(monkeypatch):
+    monkeypatch.setattr(window, "MAX_REPLY_BYTES", 1_000)
+    big = {"count": 5, "max_model_len": 9, "tokens": list(range(1_000))}
+    assert count_on_server("http://h/v1", "m", "s", "u", http=_server(big)) is None
+    monkeypatch.undo()
+    assert count_on_server("http://h/v1", "m", "s", "u", http=_server(big)) == (5, 9)
+
+
 def test_a_declared_window_is_still_checked_when_the_server_is_down():
     def refused(request):
         raise httpx.ConnectError("refused")
@@ -440,7 +466,7 @@ def test_build_runtime_runs_it_over_the_store_it_built(caplog, monkeypatch, tmp_
 
     measured: list[str] = []
 
-    def server(base_url, model, system, user, http=None, timeout=10.0):
+    def server(base_url, model, system, user, http=None):
         measured.append(user)
         return (30_000, 28_672)
 

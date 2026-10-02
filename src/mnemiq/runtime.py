@@ -108,9 +108,9 @@ class Runtime:
             # observes a version change, not by the ones after, and the alternative is a replica
             # answering from a snapshot nobody assessed. `_warn_prompt_window` adds a network
             # round trip to that ask: one POST to the chat server's `/tokenize`, after building
-            # the largest prompt from the new snapshot. Its 10-second timeout applies per httpx
-            # phase (connect, read, ...), and a read restarts on each chunk, so a stalled proxy
-            # can hold the ask longer than that.
+            # the largest prompt from the new snapshot. Bounded overall: a 15-second deadline
+            # checked as each chunk of the reply lands, so at most that plus one 5-second phase
+            # timeout (`count_on_server`).
             #
             # NOT once per swap on the threaded server, and this is measured from the code
             # rather than assumed: `build_app` closes over ONE runtime and serves it through

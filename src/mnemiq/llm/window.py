@@ -30,7 +30,9 @@ generation prompt (2.56, over 220 of them), so the estimate errs toward warning.
 
 from __future__ import annotations
 
+import json
 import math
+import time
 from dataclasses import dataclass, replace
 
 import httpx
@@ -41,6 +43,11 @@ from mnemiq.generate.prompts import system_prompt, user_prompt
 from mnemiq.llm.client import reasoning_budget
 
 CHARS_PER_TOKEN_FLOOR = 2.5
+# The `/tokenize` call's limits (`count_on_server`). The reply lists every token id, about 7 bytes
+# each: some 700 KB for a 100,000-token prompt.
+DEADLINE_S = 15.0
+MAX_REPLY_BYTES = 8 * 1024 * 1024
+_PHASE_TIMEOUT_S = 5.0
 # `sanitize` keeps 500 characters of a question, and a byte-level tokenizer spends at most one token
 # on an ASCII character. Added as tokens: as text, any filler tokenizes its own way (500 x's are a few).
 # ASCII only: a byte-level tokenizer can spend a token per UTF-8 byte, so a 500-character question in
@@ -204,22 +211,35 @@ def _largest_examples(con, k: int) -> list:
 
 
 def count_on_server(base_url: str, model: str, system: str, user: str,
-                    http: httpx.Client | None = None, timeout: float = 10.0) -> tuple[int, int] | None:
+                    http: httpx.Client | None = None) -> tuple[int, int] | None:
     """(prompt tokens, window) from vLLM's `/tokenize`, or None where the server has no such door.
 
     `/tokenize` sits at the server root, beside `/v1`, and takes the chat messages, so the count
     includes the template the server wraps them in.
+
+    Bounded overall, not only per phase: httpx's timeout limits each silence, so a proxy dripping a
+    byte every few seconds would hold the boot -- or the ask that saw a snapshot swap -- for as long
+    as it liked. The reply is read in chunks against a deadline and a size cap, and either one
+    reached is no count. The deadline is checked as each chunk lands, so the worst case is the
+    deadline plus one per-phase timeout.
     """
     root = base_url.rstrip("/")
     root = root[:-3] if root.endswith("/v1") else root
     body = {"model": model, "messages": [{"role": "system", "content": system},
                                          {"role": "user", "content": user}]}
-    client = http or httpx.Client(follow_redirects=False, timeout=timeout)
+    client = http or httpx.Client(follow_redirects=False, timeout=_PHASE_TIMEOUT_S)
+    started = time.monotonic()
     try:
-        resp = client.post(f"{root}/tokenize", json=body)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
+        with client.stream("POST", f"{root}/tokenize", json=body) as resp:
+            if resp.status_code != 200:
+                return None
+            chunks, size = [], 0
+            for chunk in resp.iter_bytes():
+                size += len(chunk)
+                if size > MAX_REPLY_BYTES or time.monotonic() - started > DEADLINE_S:
+                    return None
+                chunks.append(chunk)
+        data = json.loads(b"".join(chunks))
     except (httpx.HTTPError, ValueError):
         # Down, slow, or answering with something other than JSON (a proxy's catch-all page):
         # none of it is a count, and a declared window can still be checked without one -- an
