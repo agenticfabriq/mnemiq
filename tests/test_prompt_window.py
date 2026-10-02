@@ -102,6 +102,58 @@ def test_a_definition_shared_with_a_table_outside_the_k_still_counts():
     assert "SHARED-DEFINITION-TEXT" in user
 
 
+def _abc_shared() -> Snapshot:
+    """Codex's case on #73: A and B share fifty long definitions, C has fifty slightly shorter ones
+    of its own. Ranked alone, A and B each bring the most, but the real pair A+C is the longest."""
+    tables = ("a", "b", "c")
+    shared = [Definition(id=f"d:s{i}", term=f"shared {i}", domain="ops",
+                         definition="S" * 400 + f" {i}", bound_objects=["a", "b"]) for i in range(50)]
+    own = [Definition(id=f"d:c{i}", term=f"own {i}", domain="ops",
+                      definition="C" * 390 + f" {i}", bound_objects=["c"]) for i in range(50)]
+    return Snapshot(
+        version="v1", source_id="s", created_at="2026-10-02T00:00:00Z",
+        source_bindings=[SourceBinding(id=f"sb:{t}", source_id="s", object_id=t, source_object=t,
+                                       binding_type="table") for t in tables],
+        columns=[Column(id=f"{t}.x", object_id=t, name="x", data_type="text") for t in tables],
+        definitions=[*shared, *own],
+    )
+
+
+def _real_prompt(snap: Snapshot, ids: list[str]) -> str:
+    """The prompt real retrieval builds when exactly these tables are shown, everything granted."""
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.generate.prompts import user_prompt
+    from mnemiq.semantic.cards import build_cards
+    from mnemiq.semantic.glossary import select_definitions
+    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
+
+    cards = [RetrievedCard(object_id=c.object_id, card=c.text, score=0.0)
+             for c in build_cards(snap) if c.object_id in ids]
+    everything = GrantSet(frozenset(c.object_id for c in build_cards(snap)))
+    return user_prompt(ContextPacket(
+        question="x" * 500, cards=cards, grant_fingerprint="", enrichment_version=None,
+        definitions=select_definitions("", snap.definitions, everything, ids)))
+
+
+def test_shared_definitions_cannot_hide_a_longer_real_packet():
+    snap = _abc_shared()
+    _, measured, _ = largest_prompt(duckdb.connect(), snap, _settings(), "duckdb")
+    real = {pair: len(_real_prompt(snap, list(pair))) for pair in (("a", "b"), ("a", "c"), ("b", "c"))}
+    assert real[("a", "c")] > real[("a", "b")], "the case: the pair the ranking passes over is longer"
+    assert len(measured) >= max(real.values())
+
+
+def test_a_window_too_small_for_the_longest_real_pair_never_reads_fits():
+    snap = _abc_shared()
+    con = duckdb.connect()
+    system, _, _ = largest_prompt(con, snap, _settings(), "duckdb")
+    longest = math.ceil((len(system) + len(_real_prompt(snap, ["a", "c"])))
+                        / window.CHARS_PER_TOKEN_FLOOR)
+    tight = _settings(llm_context_window=longest + GENERATOR_MAX_TOKENS - 1)
+    report = check_window(con, snap, tight, "duckdb", http=_server(None, 404))
+    assert report.fits is False
+
+
 def test_a_store_without_examples_still_measures():
     _, user, cards = largest_prompt(duckdb.connect(), _snapshot(), _settings(), "duckdb")
     assert cards == 2 and "WORKED EXAMPLES" not in user

@@ -8,7 +8,8 @@ produce, plus the room the generator is given to reply in, against the window.
 "Largest" is built with the real formatter from the parts that do not depend on the question: the
 `retrieval_k` tables that bring the most into a prompt -- card in the generator's card style,
 unscoped (a policy only removes columns), facts, and the definitions and certified measures bound
-to it -- with every table visible; the `retrieval_k` largest worked examples; a question at the 500
+to it -- with every table visible and a definition shared by two of them counted with each, so the
+measure is an upper bound; the `retrieval_k` largest worked examples; a question at the 500
 characters `sanitize` keeps; the longest strategy's system prompt. Left out, because they depend on
 the question: the code vocabulary for its columns, glossary terms it happens to name, and the
 conversation history. So a warning is about the measured parts, and silence means they fit -- not
@@ -54,7 +55,7 @@ class WindowReport:
         return None if self.window is None else self.needed <= self.window
 
     def sentence(self) -> str:
-        count = (f"{self.prompt_tokens:,} tokens, counted by the server" if self.counted_by_server
+        count = (f"at most {self.prompt_tokens:,} tokens, counted by the server" if self.counted_by_server
                  else f"about {self.prompt_tokens:,} tokens at most, estimated from its length")
         window = ("unknown: the server gave no count (it has no /tokenize, or it did not answer) "
                   "and MNEMIQ_LLM_CONTEXT_WINDOW is unset"
@@ -97,12 +98,22 @@ def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int
         return RetrievedCard(object_id=c.object_id, card=c.text, score=0.0)
 
     # Ranked by what each table brings into the prompt, not by its card alone: a narrow table with
-    # fifty bound definitions outweighs a wide one with none. A definition bound to two tables is
-    # counted for each here and once in the prompt below, so the k chosen can miss the true largest
-    # set when definitions are shared; the prompt itself is still built exactly.
+    # fifty bound definitions outweighs a wide one with none.
     largest = sorted(rendered, key=lambda c: (-len(user_prompt(packet_for([card(c)]))),
                                               c.object_id))[:k]
-    packet = packet_for([card(c) for c in largest], question=_QUESTION)
+    # An upper bound, not one real packet: each chosen table's bound definitions and measures are
+    # listed with it, so one bound to two of them appears twice where a real packet lists it once.
+    # Every real packet of k tables is at most the sum of what its tables bring alone, and these k
+    # have the largest such sum -- so no set, including one the ranking passed over because its
+    # tables share less, builds a longer prompt than this. Exact when nothing is shared.
+    per_table = [packet_for([card(c)]) for c in largest]
+    packet = ContextPacket(
+        question=_QUESTION, cards=[p.cards[0] for p in per_table], grant_fingerprint="",
+        enrichment_version=None,
+        definitions=[d for p in per_table for d in p.definitions],
+        metrics=[m for p in per_table for m in p.metrics],
+        dimensions=[d for p in per_table for d in p.dimensions],
+    )
     packet.examples = _largest_examples(con, k)
     system = max((system_prompt(dialect=dialect, strategy=s, assertive=settings.assertive_sql,
                                 declare_assumed_terms=settings.guard_undefined_terms)
