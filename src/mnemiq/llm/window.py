@@ -8,12 +8,18 @@ produce, plus the room the generator is given to reply in, against the window.
 "Largest" is built with the real formatter from the parts that do not depend on the question: the
 `retrieval_k` tables that bring the most into a prompt -- card in the generator's card style,
 unscoped (a policy only removes columns), facts, and the definitions and certified measures bound
-to it -- with every table visible and a definition shared by two of them counted with each, so the
-measure is an upper bound; the `retrieval_k` largest worked examples; a question at the 500
-characters `sanitize` keeps; the longest strategy's system prompt. Left out, because they depend on
-the question: the code vocabulary for its columns, glossary terms it happens to name, and the
-conversation history. So a warning is about the measured parts, and silence means they fit -- not
-that every question will.
+to it -- with every table visible, a definition shared by two of them counted with each, and a
+section they leave empty given one item from a table that fills it; the `retrieval_k` worked
+examples that add the most once rendered; the longest strategy's system prompt. The question is an
+allowance of 500 tokens, not text: `sanitize` keeps 500 characters, and a byte-level tokenizer
+spends at most one token on an ASCII character. Left out, because they depend on the question: the
+code vocabulary for its columns, glossary terms it happens to name, and the conversation history.
+
+Longest by length, then counted in tokens -- not longest in tokens. A set of tables shorter in
+characters but denser in tokens (long identifiers, non-Latin text) can count more than the one
+measured, and counting every candidate would cost a server round trip per table at boot. So a
+warning means the measured parts do not fit, and a "fits" close to the window is not a promise:
+leave headroom.
 
 Counted by the server where it can count: vLLM's `/tokenize` returns the count, chat template
 included, and `max_model_len` in one call. Otherwise the window is `MNEMIQ_LLM_CONTEXT_WINDOW`, as
@@ -34,7 +40,9 @@ from mnemiq.generate.prompts import system_prompt, user_prompt
 from mnemiq.llm.client import reasoning_budget
 
 CHARS_PER_TOKEN_FLOOR = 2.5
-_QUESTION = "x" * 500  # `sanitize` keeps 500 characters of a question
+# `sanitize` keeps 500 characters of a question, and a byte-level tokenizer spends at most one token
+# on an ASCII character. Added as tokens: as text, any filler tokenizes its own way (500 x's are a few).
+QUESTION_ALLOWANCE = 500
 
 
 @dataclass(frozen=True)
@@ -55,15 +63,16 @@ class WindowReport:
         return None if self.window is None else self.needed <= self.window
 
     def sentence(self) -> str:
-        count = (f"at most {self.prompt_tokens:,} tokens, counted by the server" if self.counted_by_server
-                 else f"about {self.prompt_tokens:,} tokens at most, estimated from its length")
+        count = (f"{self.prompt_tokens:,} tokens, counted by the server" if self.counted_by_server
+                 else f"about {self.prompt_tokens:,} tokens, estimated from its length")
         window = ("unknown: the server gave no count (it has no /tokenize, or it did not answer) "
                   "and MNEMIQ_LLM_CONTEXT_WINDOW is unset"
                   if self.window is None else
                   f"{self.window:,} tokens ({'reported by the server' if self.counted_by_server else 'MNEMIQ_LLM_CONTEXT_WINDOW'})")
         tables = "the table" if self.cards == 1 else f"the {self.cards} tables"
-        return (f"the largest generation prompt this store can produce ({tables} "
-                f"bringing the most into it, with their definitions, measures and examples) is "
+        return (f"the longest generation prompt this store can produce ({tables} "
+                f"bringing the most into it, with their definitions, measures and examples, and "
+                f"{QUESTION_ALLOWANCE} tokens for the question) is "
                 f"{count}; with the "
                 f"generator's {self.reply_tokens:,}-token reply budget it needs {self.needed:,}, and "
                 f"the window is {window}")
@@ -125,7 +134,7 @@ def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int
             filled = next((getattr(p, part) for p in singles.values() if getattr(p, part)), [])
             items.extend(filled[:1])
     packet = ContextPacket(
-        question=_QUESTION, cards=[p.cards[0] for p in per_table], grant_fingerprint="",
+        question="", cards=[p.cards[0] for p in per_table], grant_fingerprint="",
         enrichment_version=None, **sections,
     )
     packet.examples = _largest_examples(con, k)
@@ -136,7 +145,10 @@ def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int
 
 
 def _largest_examples(con, k: int) -> list:
+    """The k examples that add the most once rendered -- `user_prompt` cuts a question to 300
+    characters, so a long question with short SQL can add less than it looks."""
     from mnemiq.contract import Example
+    from mnemiq.semantic.retrieval import ContextPacket
 
     exists = con.execute(
         "SELECT 1 FROM information_schema.tables WHERE table_name = 'example' "
@@ -144,11 +156,15 @@ def _largest_examples(con, k: int) -> list:
     ).fetchone()
     if exists is None:
         return []
-    rows = con.execute(
-        "SELECT question, sql, object_id FROM example "
-        "ORDER BY length(question) + length(sql) DESC LIMIT ?", [k]
-    ).fetchall()
-    return [Example(question=q, sql=s, object_id=o) for q, s, o in rows]
+    examples = [Example(question=q, sql=s, object_id=o)
+                for q, s, o in con.execute("SELECT question, sql, object_id FROM example").fetchall()]
+    empty = ContextPacket(question="", cards=[], grant_fingerprint="", enrichment_version=None)
+
+    def adds(example) -> int:
+        once = len(user_prompt(replace(empty, examples=[example])))
+        return len(user_prompt(replace(empty, examples=[example, example]))) - once
+
+    return sorted(examples, key=lambda e: (-adds(e), e.question, e.sql))[:k]
 
 
 def count_on_server(base_url: str, model: str, system: str, user: str,
@@ -191,7 +207,8 @@ def check_window(con, snapshot, settings, dialect: str,
     counted = count_on_server(settings.llm_base_url, settings.llm_model, system, user, http=http)
     if counted is not None:
         prompt, window = counted
-        return WindowReport(prompt, reply, window, counted_by_server=True, cards=cards)
-    estimate = math.ceil((len(system) + len(user)) / CHARS_PER_TOKEN_FLOOR)
+        return WindowReport(prompt + QUESTION_ALLOWANCE, reply, window, counted_by_server=True,
+                            cards=cards)
+    estimate = math.ceil((len(system) + len(user)) / CHARS_PER_TOKEN_FLOOR) + QUESTION_ALLOWANCE
     return WindowReport(estimate, reply, settings.llm_context_window, counted_by_server=False,
                         cards=cards)

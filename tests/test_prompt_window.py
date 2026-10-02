@@ -43,8 +43,8 @@ def _snapshot() -> Snapshot:
 
 
 def _settings(**over) -> Settings:
-    return Settings(llm_base_url="http://127.0.0.1:9/v1", llm_api_key="k", llm_model="m",
-                    retrieval_k=2, **over)
+    return Settings(**{"llm_base_url": "http://127.0.0.1:9/v1", "llm_api_key": "k",
+                       "llm_model": "m", "retrieval_k": 2, **over})
 
 
 def _con_with_examples(examples: list[tuple[str, str]]) -> duckdb.DuckDBPyConnection:
@@ -69,7 +69,7 @@ def test_the_largest_prompt_holds_the_k_widest_cards_and_what_rides_with_them():
     assert "NARROW-DEFINITION-TEXT" not in user, "its table was not shown"
     assert "a much longer question?" in user and "medium question?" in user
     assert "short?" not in user, "only the k largest examples"
-    assert "x" * 500 in user, "the question at the length sanitize keeps"
+    assert user.startswith("QUESTION: \n"), "the question is an allowance in tokens, not text"
     assert system
 
 
@@ -130,8 +130,9 @@ def _real_prompt(snap: Snapshot, ids: list[str]) -> str:
     cards = [RetrievedCard(object_id=c.object_id, card=c.text, score=0.0)
              for c in build_cards(snap) if c.object_id in ids]
     everything = GrantSet(frozenset(c.object_id for c in build_cards(snap)))
+    # The question as largest_prompt renders it: empty, its 500 tokens added beside the count.
     return user_prompt(ContextPacket(
-        question="x" * 500, cards=cards, grant_fingerprint="", enrichment_version=None,
+        question="", cards=cards, grant_fingerprint="", enrichment_version=None,
         definitions=select_definitions("", snap.definitions, everything, ids)))
 
 
@@ -215,6 +216,22 @@ def test_a_section_the_chosen_tables_leave_empty_still_counts_its_header():
     assert not shortfalls, f"measured below a real pair at B description lengths {shortfalls}"
 
 
+def test_examples_are_ranked_as_rendered_not_as_stored():
+    """Codex review of #73: the prompt cuts an example's question to 300 characters, so a
+    2,000-character question with `SELECT 1` adds less than a short question with long SQL --
+    ranked by stored length it won, and the longer example real retrieval can bring was left out."""
+    long_sql = "SELECT " + ", ".join(f"col_{i}" for i in range(150)) + " FROM wide"
+    con = _con_with_examples([("q" * 2000, "SELECT 1"), ("short?", long_sql)])
+    _, user, _ = largest_prompt(con, _snapshot(), _settings(retrieval_k=1), "duckdb")
+    assert long_sql in user
+
+
+def test_the_question_is_counted_as_its_allowance():
+    report = check_window(duckdb.connect(), _snapshot(), _settings(), "duckdb",
+                          http=_server({"count": 1_000, "max_model_len": 28_672}))
+    assert report.prompt_tokens == 1_000 + window.QUESTION_ALLOWANCE
+
+
 def test_a_store_without_examples_still_measures():
     _, user, cards = largest_prompt(duckdb.connect(), _snapshot(), _settings(), "duckdb")
     assert cards == 2 and "WORKED EXAMPLES" not in user
@@ -289,7 +306,8 @@ def test_without_a_server_count_the_estimate_errs_long_against_the_declared_wind
     report = check_window(con, snap, settings, "duckdb", http=_server(None, 404))
     system, user, _ = largest_prompt(con, snap, settings, "duckdb")
     assert not report.counted_by_server and report.window == 100
-    assert report.prompt_tokens == math.ceil((len(system) + len(user)) / window.CHARS_PER_TOKEN_FLOOR)
+    assert report.prompt_tokens == (math.ceil((len(system) + len(user)) / window.CHARS_PER_TOKEN_FLOOR)
+                                    + window.QUESTION_ALLOWANCE)
     assert report.fits is False
 
 
