@@ -240,11 +240,14 @@ def _largest_examples(con, k: int) -> list:
 
 
 def count_on_server(base_url: str, model: str, system: str, user: str,
-                    http: httpx.Client | None = None) -> tuple[int, int] | None:
+                    http: httpx.Client | None = None,
+                    api_key: str | None = None) -> tuple[int, int] | None:
     """(prompt tokens, window) from vLLM's `/tokenize`, or None where the server has no such door.
 
     `/tokenize` sits at the server root, beside `/v1`, and takes the chat messages, so the count
-    includes the template the server wraps them in.
+    includes the template the server wraps them in. It carries the chat calls' own key, to the host
+    they already send it to (redirects stay off): a server behind an authenticating proxy answers
+    a keyless call with 401, which would read as no count.
 
     Bounded overall, not only per phase: httpx's timeout limits each silence, so a proxy dripping a
     byte every few seconds would hold the boot -- or the ask that saw a snapshot swap -- for as long
@@ -259,7 +262,8 @@ def count_on_server(base_url: str, model: str, system: str, user: str,
     client = http or httpx.Client(follow_redirects=False, timeout=_PHASE_TIMEOUT_S)
     started = time.monotonic()
     try:
-        with client.stream("POST", f"{root}/tokenize", json=body) as resp:
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        with client.stream("POST", f"{root}/tokenize", json=body, headers=headers) as resp:
             if resp.status_code != 200:
                 return None
             chunks, size = [], 0
@@ -318,7 +322,8 @@ def check_window(con, snapshot, settings, dialect: str,
     reply = reasoning_budget(settings.llm_model, GENERATOR_MAX_TOKENS)
 
     def count(user: str):
-        return count_on_server(settings.llm_base_url, settings.llm_model, system, user, http=http)
+        return count_on_server(settings.llm_base_url, settings.llm_model, system, user, http=http,
+                               api_key=settings.llm_api_key)
 
     # One deadline for both counts, the bound first: whatever the second does, the first is kept,
     # and a real packet that could not be counted only weakens CAN to MAY.

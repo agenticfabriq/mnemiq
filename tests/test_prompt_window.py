@@ -289,6 +289,19 @@ def test_vllm_counts_at_its_root_tokenize_with_the_chat_messages():
                                 {"role": "user", "content": "USER"}]
 
 
+def test_the_count_carries_the_chat_calls_key():
+    """Codex review of #73: behind an authenticating proxy a keyless /tokenize got 401, and the
+    advisory reported no check at all against a server that would have counted."""
+    def guarded(request):
+        if request.headers.get("Authorization") != "Bearer k":
+            return httpx.Response(401)
+        return httpx.Response(200, json={"count": 30_000, "max_model_len": 28_672})
+
+    report = check_window(duckdb.connect(), _snapshot(), _settings(), "duckdb",
+                          http=httpx.Client(transport=httpx.MockTransport(guarded)))
+    assert report.counted_by_server and report.window == 28_672 and report.fits is False
+
+
 def test_a_server_that_is_down_or_not_json_is_no_count():
     def refused(request):
         raise httpx.ConnectError("refused")
@@ -579,7 +592,7 @@ def test_build_runtime_runs_it_over_the_store_it_built(caplog, monkeypatch, tmp_
 
     measured: list[str] = []
 
-    def server(base_url, model, system, user, http=None):
+    def server(base_url, model, system, user, http=None, api_key=None):
         measured.append(user)
         return (30_000, 28_672)
 
