@@ -174,7 +174,7 @@ def _ab_defined_c_bare(c_description: str) -> Snapshot:
 
 def test_section_headers_cannot_tip_the_ranking_below_a_real_packet():
     shortfalls = []
-    for n in range(0, 160, 4):
+    for n in range(0, 120, 8):  # each bug this guards shows across lengths 20-88
         snap = _ab_defined_c_bare("d" * n)
         _, measured, _ = largest_prompt(duckdb.connect(), snap, _settings(), "duckdb")
         longest = max(len(_real_prompt(snap, list(pair)))
@@ -182,6 +182,37 @@ def test_section_headers_cannot_tip_the_ranking_below_a_real_packet():
         if len(measured) < longest:
             shortfalls.append((n, longest - len(measured)))
     assert not shortfalls, f"measured below a real pair at C description lengths {shortfalls}"
+
+
+def _ab_bare_c_defined(b_description: str) -> Snapshot:
+    """Gate review of #73: A and B bare cards, C a short card with a definition. When B's card
+    outweighs C's content, A and B are chosen and their prompt has no DEFINITIONS section -- yet
+    the real A+C carries that header, which a sum of contents leaves out."""
+    tables = ("a", "b", "c")
+    return Snapshot(
+        version="v1", source_id="s", created_at="2026-10-02T00:00:00Z",
+        source_bindings=[SourceBinding(id=f"sb:{t}", source_id="s", object_id=t, source_object=t,
+                                       binding_type="table") for t in tables],
+        columns=[Column(id="a.x", object_id="a", name="x", data_type="text",
+                        description="a" * 300),
+                 Column(id="b.x", object_id="b", name="x", data_type="text",
+                        description=b_description),
+                 Column(id="c.x", object_id="c", name="x", data_type="text")],
+        definitions=[Definition(id="d:c", term="rule c", domain="ops",
+                                definition="ten chars.", bound_objects=["c"])],
+    )
+
+
+def test_a_section_the_chosen_tables_leave_empty_still_counts_its_header():
+    shortfalls = []
+    for n in range(0, 120, 8):  # each bug this guards shows across lengths 20-88
+        snap = _ab_bare_c_defined("b" * n)
+        _, measured, _ = largest_prompt(duckdb.connect(), snap, _settings(), "duckdb")
+        longest = max(len(_real_prompt(snap, list(pair)))
+                      for pair in (("a", "b"), ("a", "c"), ("b", "c")))
+        if len(measured) < longest:
+            shortfalls.append((n, longest - len(measured)))
+    assert not shortfalls, f"measured below a real pair at B description lengths {shortfalls}"
 
 
 def test_a_store_without_examples_still_measures():
