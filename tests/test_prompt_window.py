@@ -316,10 +316,14 @@ def test_what_is_sent_is_only_what_that_role_is_shown():
                 "source_id TEXT)")
     con.execute("INSERT INTO example VALUES ('q?', 'SELECT HIDDEN_EXAMPLE FROM narrow', "
                 "'[\"narrow\"]', 'narrow', 's')")
+    # Owned by an ungranted table though its SQL reads only granted ones: retrieval drops it too.
+    con.execute("INSERT INTO example VALUES ('OWNED_ELSEWHERE?', 'SELECT 1 FROM wide', "
+                "'[\"wide\"]', 'narrow', 's')")
     report = window.worst_window(con, snap, _settings(), "duckdb", _Roles({"analyst": analyst}),
                                  http=httpx.Client(transport=httpx.MockTransport(handle)))
     assert report is not None and report.who == "role analyst" and sent
     assert all("HIDDEN_EXAMPLE" not in body for body in sent), "an example over an ungranted table"
+    assert all("OWNED_ELSEWHERE" not in body for body in sent), "an example owned by one"
     assert all("CONFIDENTIAL-COLUMN-NOTE" not in body and "secret" not in body for body in sent)
     assert all("narrow" not in body.split("TABLES:")[1] for body in sent), "an ungranted table"
 

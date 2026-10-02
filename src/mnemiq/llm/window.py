@@ -220,11 +220,14 @@ def _largest_examples(con, k: int, allowed) -> list:
     ).fetchone()
     if exists is None:
         return []
-    # Only examples whose tables the identity may see, as retrieval filters them.
+    # Only examples retrieval would offer this identity: owned by a granted table AND touching only
+    # granted tables (`_retrieve_examples` checks both; an example's owner can differ from the
+    # tables its SQL reads).
+    allowed = set(allowed)
     examples = [Example(question=q, sql=s, object_id=o)
                 for q, s, t, o in con.execute(
                     "SELECT question, sql, tables, object_id FROM example").fetchall()
-                if set(json.loads(t)) <= set(allowed)]
+                if o in allowed and set(json.loads(t)) <= allowed]
     empty = ContextPacket(question="", cards=[], grant_fingerprint="", enrichment_version=None)
 
     def adds(example) -> int:
