@@ -43,6 +43,7 @@ describe("ResultTable", () => {
     // capped and truncated are different facts: the engine's limit against the preview's.
     render(<ResultTable preview={{ columns: ["n"], rows: [[1]], row_count: 1000, truncated: false, capped: true }} />);
     expect(screen.getByText(/1,000\+ rows/)).toBeInTheDocument();
+    expect(screen.queryByText(/showing/)).not.toBeInTheDocument();  // the uncut-preview caption ran
     expect(screen.getByText(/row limit/)).toBeInTheDocument();
   });
 

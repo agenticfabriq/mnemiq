@@ -39,6 +39,7 @@ describe("ResultView", () => {
   it("says it for a capped chart even when every row fits on screen", () => {
     render(<ResultView preview={chartable({ row_count: 1000, truncated: false, capped: true })} />);
     expect(screen.getByText(/1,000\+ rows/)).toBeInTheDocument();
+    expect(screen.queryByText(/ of 1,000/)).not.toBeInTheDocument();  // the uncut-preview caption ran
     expect(screen.getByText(/row limit/)).toBeInTheDocument();
   });
 
