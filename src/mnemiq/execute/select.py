@@ -188,8 +188,11 @@ class LLMSelector:
         consumer of the bare int ever could.
         """
         try:
+            # Temperature 0 for the same reason as the result judge (M120): a pick that changes
+            # between two reads of the same clusters is a draw, not a judgement.
             raw = self._client.complete(
-                _SYSTEM, _judge_prompt(question, clusters), max_tokens=self._max_tokens
+                _SYSTEM, _judge_prompt(question, clusters), max_tokens=self._max_tokens,
+                temperature=0,
             )
         except Exception:
             return SelectorRead(majority_index(clusters), fell_back=True, reason="error")

@@ -60,3 +60,13 @@ def test_a_reasoning_model_is_never_sent_one(monkeypatch, model):
 @pytest.mark.parametrize("model", ["qwen2.5-coder-32b", "llama3.1:8b", "openai.gpt-4o", "o3x-local"])
 def test_every_other_model_takes_it(model):
     assert accepts_temperature(model)
+
+
+def test_the_deep_mode_selector_also_reads_at_temperature_0(monkeypatch):
+    """The same join for the candidate selector: the real LLMSelector over the real client."""
+    from mnemiq.execute.select import ClusterView, LLMSelector
+
+    client = _client(monkeypatch, "qwen2.5-coder-32b")
+    clusters = [ClusterView(sql="SELECT 1", preview="1", size=1), ClusterView(sql="SELECT 2", preview="2", size=1)]
+    LLMSelector(client).read("q", clusters)
+    assert _Capturing.sent["temperature"] == 0
