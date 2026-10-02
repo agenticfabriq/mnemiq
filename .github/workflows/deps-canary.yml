@@ -1,0 +1,41 @@
+name: deps-canary
+# The lock pins what CI and `uv sync` install; nothing pins what `pip install` resolves. A fresh resolve
+# once picked up a sqlglot under which a write skipped its grant check (M121) and no job noticed, because
+# every job installs from uv.lock. This one resolves without the lock, weekly and on demand.
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Within pyproject's bounds, as a stranger's `pip install` resolves today. Red here is a real
+  # problem: an install we tell people to do gets versions the suite has not passed on.
+  fresh-within-bounds:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv venv && uv pip install -e ".[dev,ontology,oracle]"
+      - run: uv pip freeze | grep -iE '^(sqlglot|mcp|duckdb|openai|pydantic|pyarrow)=='
+      - run: .venv/bin/python -m pytest -m "not integration and not live_llm" -q
+
+  # Past the caps pyproject sets, one capped package at a time: the newest release, forced. Tells us
+  # when a cap can rise, or what breaks first. Informational, so a known gap (mcp 2.x fails stdio
+  # startup today) does not turn the workflow red; read the job's own result.
+  past-the-caps:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [sqlglot, mcp]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv venv && uv pip install -e ".[dev,ontology,oracle]"
+      - run: uv pip install --no-deps --upgrade ${{ matrix.package }}
+      - run: uv pip freeze | grep -i '^${{ matrix.package }}=='
+      - run: .venv/bin/python -m pytest -m "not integration and not live_llm" -q

@@ -11,9 +11,10 @@ dependencies = [
   "pydantic>=2",
   "pydantic-settings>=2",
   "pytz",  # DuckDB needs it to profile Postgres timestamptz columns (else profiling throws)
-  # 30.17 drops the FROM table of UPDATE ... FROM from the write path's table walk, so the write is
-  # approved with no row filter on it; 30.19 changes the grouping shapes the fan-out check reads (M121).
-  "sqlglot>=25.34.1,<30.17",
+  # Capped at the newest release the suite has passed on: 30.17 broke the write path's table walk and
+  # 30.19 the fan-out check's grouping reads (M121), both now read by node type. Raise the cap when the
+  # deps-canary job passes past it.
+  "sqlglot>=25.34.1,<30.22",
   "pyarrow>=17",
   "cachetools>=5",
   "mcp>=1.28,<2",  # 2.x fails stdio startup (M121)
