@@ -17,9 +17,9 @@ code vocabulary for its columns, glossary terms it happens to name, and the conv
 
 Longest by length, then counted in tokens -- not longest in tokens. A set of tables shorter in
 characters but denser in tokens (long identifiers, non-Latin text) can count more than the one
-measured, and counting every candidate would cost a server round trip per table at boot. So a
-warning means the measured parts do not fit, and a "fits" close to the window is not a promise:
-leave headroom.
+measured, as can a non-ASCII question against its allowance, and counting every candidate would
+cost a server round trip per table at boot. So a warning means the measured parts do not fit, and a
+"fits" close to the window is not a promise: leave headroom.
 
 Counted by the server where it can count: vLLM's `/tokenize` returns the count, chat template
 included, and `max_model_len` in one call. Otherwise the window is `MNEMIQ_LLM_CONTEXT_WINDOW`, as
@@ -42,6 +42,8 @@ from mnemiq.llm.client import reasoning_budget
 CHARS_PER_TOKEN_FLOOR = 2.5
 # `sanitize` keeps 500 characters of a question, and a byte-level tokenizer spends at most one token
 # on an ASCII character. Added as tokens: as text, any filler tokenizes its own way (500 x's are a few).
+# ASCII only: a byte-level tokenizer can spend a token per UTF-8 byte, so a 500-character question in
+# Chinese or heavy with accents can cost more -- headroom again.
 QUESTION_ALLOWANCE = 500
 
 
@@ -146,7 +148,9 @@ def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int
 
 def _largest_examples(con, k: int) -> list:
     """The k examples that add the most once rendered -- `user_prompt` cuts a question to 300
-    characters, so a long question with short SQL can add less than it looks."""
+    characters, so a long question with short SQL can add less than it looks. Every stored example
+    is read and rendered twice, once per boot: linear in the example store, which is a few per
+    table today."""
     from mnemiq.contract import Example
     from mnemiq.semantic.retrieval import ContextPacket
 
