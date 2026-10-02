@@ -123,6 +123,8 @@ class Runtime:
             # that fronts the same tools in-process alongside the HTTP app would be, and that
             # is a deployment property this repo cannot see.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
+            _warn_prompt_window(self.settings, self.con, snapshot, getattr(self, "adapter", None),
+                                _acknowledged(self.settings))
             _warn_policy_advisories(self.authz, snapshot)
 
     def _source_id(self) -> str:
@@ -365,6 +367,47 @@ def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
             continue
         logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply -- either this source produced "
                     "no such verdict, or the verdict half is misspelled", entry)
+
+
+def _warn_prompt_window(settings: Settings, con, snapshot, adapter,
+                        acknowledged: frozenset[str]) -> None:
+    """Say at boot when the largest generation prompt cannot fit the server's window (M119).
+
+    Without it the first sign is a question that retrieves the widest tables: vLLM refuses prompt
+    plus reply budget past `--max-model-len`, and a server that cuts prompts has the answer refused
+    by the cut check -- per question, after the work, and only for the questions that happen to
+    reach the wide tables. What is measured and what is left out is in `mnemiq.llm.window`.
+
+    TWO CALL SITES, like the view advisory and for the same reason: the cards are the subject, and a
+    snapshot swap replaces them. A warning only: refusing to boot would stop the questions that fit.
+    """
+    try:
+        # Inside the try, settings reads included: on a swap this runs on a user's ask, and an
+        # advisory must never stop one any more than a boot.
+        if not settings.llm_window_check or not settings.llm_base_url or snapshot is None:
+            return
+        from mnemiq.llm.window import check_window
+
+        report = check_window(con, snapshot, settings, getattr(adapter, "dialect", "duckdb"))
+    except Exception:  # noqa: BLE001 -- an advisory check must never stop a boot
+        logger.debug("prompt-window advisory failed", exc_info=True)
+        return
+    if report.fits is None:
+        logger.info("prompt window not checked: %s; set MNEMIQ_LLM_CONTEXT_WINDOW to check it",
+                    report.sentence())
+        _ack_did_not_apply(acknowledged, None, prefix="window:")
+        return
+    if report.fits:
+        logger.info("prompt window fits: %s", report.sentence())
+        _ack_did_not_apply(acknowledged, None, prefix="window:")
+        return
+    verdict = "window:too-small"
+    log = logger.info if verdict in acknowledged else logger.warning
+    log("prompt window %s: %s. A question that retrieves the widest tables will fail (vLLM refuses "
+        "the request) or have its answer refused (a server that cuts the prompt). Raise the window "
+        "(vLLM --max-model-len, Ollama OLLAMA_CONTEXT_LENGTH) or lower MNEMIQ_RETRIEVAL_K.",
+        "TOO SMALL" if report.counted_by_server else "MAY BE TOO SMALL", report.sentence())
+    _ack_did_not_apply(acknowledged, verdict, prefix="window:")
 
 
 def _warn_view_inventory(snapshot, acknowledged: frozenset[str]) -> None:
@@ -817,6 +860,7 @@ def build_runtime(settings: Settings) -> Runtime:
     # calling this from inside the function advisory ran it only when that one found
     # nothing to report, which is every deployment except a schema with no helpers.
     _warn_view_inventory(snapshot, _acknowledged(settings))
+    _warn_prompt_window(settings, con, snapshot, adapter, _acknowledged(settings))
     return Runtime(
         con=con,
         snapshot=snapshot,
