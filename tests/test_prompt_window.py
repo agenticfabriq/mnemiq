@@ -411,7 +411,8 @@ def test_no_count_and_no_declaration_is_not_a_verdict():
 
 def _report(fits: bool, by_server: bool = True) -> WindowReport:
     prompt = 21_000 if fits else 30_000
-    return WindowReport(prompt, 4_000, 28_672, counted_by_server=by_server, cards=5)
+    return WindowReport(prompt, 4_000, 28_672, counted_by_server=by_server, cards=5,
+                        real_tokens=prompt)
 
 
 @pytest.mark.parametrize(("by_server", "label"), [(True, "TOO SMALL"), (False, "MAY BE TOO SMALL")])
@@ -425,6 +426,87 @@ def test_a_prompt_past_the_window_warns_and_says_how_sure(caplog, monkeypatch, b
     assert len(warned) == 1 and f"prompt window {label}:" in warned[0].getMessage()
     assert "5 tables bringing the most into it" in warned[0].getMessage()
     assert "MNEMIQ_RETRIEVAL_K" in warned[0].getMessage()
+
+
+def _all_share(n_defs: int) -> Snapshot:
+    """Codex review of #73: definitions bound to every table. The bound lists each with every
+    chosen table; a real packet lists it once."""
+    tables = ("a", "b", "c")
+    return Snapshot(
+        version="v1", source_id="s", created_at="2026-10-02T00:00:00Z",
+        source_bindings=[SourceBinding(id=f"sb:{t}", source_id="s", object_id=t, source_object=t,
+                                       binding_type="table") for t in tables],
+        columns=[Column(id=f"{t}.x", object_id=t, name="x", data_type="text") for t in tables],
+        definitions=[Definition(id=f"d:{i}", term=f"rule {i}", domain="ops",
+                                definition="R" * 500 + f" {i}", bound_objects=list(tables))
+                     for i in range(n_defs)],
+    )
+
+
+def _counting_server(window_tokens: int) -> httpx.Client:
+    """Counts a quarter of the user prompt's characters, reports the given window."""
+    def handle(request):
+        user = json.loads(request.content)["messages"][1]["content"]
+        return httpx.Response(200, json={"count": len(user) // 4, "max_model_len": window_tokens})
+    return httpx.Client(transport=httpx.MockTransport(handle))
+
+
+def test_a_bound_inflated_by_shared_definitions_warns_may_not_can(caplog, monkeypatch):
+    from mnemiq.runtime import _warn_prompt_window
+
+    snap = _all_share(20)
+    con = duckdb.connect()
+    _, bound, real, _ = window.largest_prompts(con, snap, _settings(), "duckdb")
+    assert len(bound) > 1.5 * len(real), "the case: the bound counts each definition twice"
+    between = (len(real) + len(bound)) // 8 + window.QUESTION_ALLOWANCE + GENERATOR_MAX_TOKENS
+    report = check_window(con, snap, _settings(), "duckdb", http=_counting_server(between))
+    assert report.fits is False and not report.certain
+
+    monkeypatch.setattr(window, "check_window", lambda *a, **k: report)
+    with caplog.at_level(logging.WARNING):
+        _warn_prompt_window(_settings(), None, snap, None, frozenset())
+    assert "prompt window MAY BE TOO SMALL" in caplog.text and "tables may fail" in caplog.text
+    assert "a real packet of those tables" in caplog.text
+
+
+def test_a_real_packet_past_the_window_warns_can(caplog, monkeypatch):
+    from mnemiq.runtime import _warn_prompt_window
+
+    snap = _all_share(20)
+    con = duckdb.connect()
+    report = check_window(con, snap, _settings(), "duckdb", http=_counting_server(1_000))
+    assert report.certain
+
+    monkeypatch.setattr(window, "check_window", lambda *a, **k: report)
+    with caplog.at_level(logging.WARNING):
+        _warn_prompt_window(_settings(), None, snap, None, frozenset())
+    assert "prompt window TOO SMALL" in caplog.text and "tables can fail" in caplog.text
+
+
+@pytest.mark.parametrize("second", ["refused", "slow"])
+def test_a_second_count_that_fails_keeps_the_first(monkeypatch, second):
+    """Gate review of #73: both counts once shared one wait that returned only when both did, so a
+    slow second call threw away a first count the server had already given."""
+    import time
+
+    monkeypatch.setattr(window, "DEADLINE_S", 0.5)
+    calls = []
+
+    def handle(request):
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(200, json={"count": 900, "max_model_len": 1_000})
+        if second == "slow":
+            time.sleep(3)
+        return httpx.Response(404)
+
+    snap = _all_share(5)
+    started = time.monotonic()
+    report = check_window(duckdb.connect(), snap, _settings(), "duckdb",
+                          http=httpx.Client(transport=httpx.MockTransport(handle)))
+    assert time.monotonic() - started < 2.0
+    assert report.counted_by_server and report.window == 1_000, "the first count was kept"
+    assert report.real_tokens is None and not report.certain, "an uncounted real packet is MAY"
 
 
 def test_an_acknowledged_small_window_drops_to_info(caplog, monkeypatch):

@@ -58,11 +58,17 @@ QUESTION_ALLOWANCE = 500
 
 @dataclass(frozen=True)
 class WindowReport:
+    """`prompt_tokens` is the upper bound; `real_tokens` the deduplicated packet of the same tables,
+    one a retrieval can build (None when it could not be counted) -- with the largest examples, the
+    longest strategy and a long question, so a question meeting those tables with less still fits.
+    Past the window, the bound says a question MAY fail; the real packet says one CAN."""
+
     prompt_tokens: int
     reply_tokens: int
     window: int | None
     counted_by_server: bool
     cards: int
+    real_tokens: int | None = None
 
     @property
     def needed(self) -> int:
@@ -73,9 +79,19 @@ class WindowReport:
         """None when no window is known: nothing to compare against."""
         return None if self.window is None else self.needed <= self.window
 
+    @property
+    def certain(self) -> bool:
+        """A real packet, counted by the server, past the window: a question can fail."""
+        return (self.counted_by_server and self.window is not None
+                and self.real_tokens is not None
+                and self.real_tokens + self.reply_tokens > self.window)
+
     def sentence(self) -> str:
         count = (f"{self.prompt_tokens:,} tokens, counted by the server" if self.counted_by_server
                  else f"about {self.prompt_tokens:,} tokens, estimated from its length")
+        if self.real_tokens is not None and self.real_tokens != self.prompt_tokens:
+            count += (f" (an upper bound; a real packet of those tables, each shared definition "
+                      f"once, is {self.real_tokens:,})")
         window = ("unknown: the server gave no count (it has no /tokenize, or it did not answer) "
                   "and MNEMIQ_LLM_CONTEXT_WINDOW is unset"
                   if self.window is None else
@@ -91,6 +107,12 @@ class WindowReport:
 
 def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int]:
     """(system, user, cards) for the largest prompt the question-independent parts can make."""
+    system, bound, _real, cards = largest_prompts(con, snapshot, settings, dialect)
+    return system, bound, cards
+
+
+def largest_prompts(con, snapshot, settings, dialect: str) -> tuple[str, str, str, int]:
+    """(system, upper bound, real packet of the same tables, cards)."""
     from mnemiq.agent.loop import STRATEGIES
     from mnemiq.semantic.cards import build_cards
     from mnemiq.semantic.glossary import select_definitions
@@ -149,11 +171,17 @@ def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int
         question="", cards=[p.cards[0] for p in per_table], grant_fingerprint="",
         enrichment_version=None, **sections,
     )
-    packet.examples = _largest_examples(con, k)
+    examples = _largest_examples(con, k)
+    packet.examples = examples
+    # The same tables as one retrieval can bring them: each shared definition once, nothing
+    # borrowed for an empty section -- though still with the largest examples, the longest
+    # strategy and a long question. Past the window, a question can fail.
+    real = packet_for([card(c) for c in largest])
+    real.examples = examples
     system = max((system_prompt(dialect=dialect, strategy=s, assertive=settings.assertive_sql,
                                 declare_assumed_terms=settings.guard_undefined_terms)
                   for s in (None, *STRATEGIES)), key=len)
-    return system, user_prompt(packet), len(packet.cards)
+    return system, user_prompt(packet), user_prompt(real), len(packet.cards)
 
 
 def _mask_where_longer(snapshot, style: str):
@@ -257,8 +285,9 @@ def count_on_server(base_url: str, model: str, system: str, user: str,
     return None
 
 
-def _within_deadline(fn, *args, **kwargs):
-    """`fn`'s result, or None once DEADLINE_S has passed -- a wall-clock bound on the caller.
+def _within_deadline(fn, *args, deadline: float | None = None, **kwargs):
+    """`fn`'s result, or None once `deadline` (default DEADLINE_S) has passed -- a wall-clock
+    bound on the caller.
 
     A daemon thread, because nothing in the socket stack can be interrupted from outside: on the
     deadline the caller stops waiting and the thread is left to its own timeouts. It holds nothing
@@ -277,7 +306,7 @@ def _within_deadline(fn, *args, **kwargs):
 
     worker = threading.Thread(target=run, name="mnemiq-window-count", daemon=True)
     worker.start()
-    worker.join(DEADLINE_S)
+    worker.join(DEADLINE_S if deadline is None else max(deadline, 0.0))
     if "error" in outcome:
         raise outcome["error"]
     return outcome.get("result")
@@ -285,14 +314,26 @@ def _within_deadline(fn, *args, **kwargs):
 
 def check_window(con, snapshot, settings, dialect: str,
                  http: httpx.Client | None = None) -> WindowReport:
-    system, user, cards = largest_prompt(con, snapshot, settings, dialect)
+    system, bound, real, cards = largest_prompts(con, snapshot, settings, dialect)
     reply = reasoning_budget(settings.llm_model, GENERATOR_MAX_TOKENS)
-    counted = _within_deadline(count_on_server, settings.llm_base_url, settings.llm_model, system,
-                               user, http=http)
-    if counted is not None:
-        prompt, window = counted
+
+    def count(user: str):
+        return count_on_server(settings.llm_base_url, settings.llm_model, system, user, http=http)
+
+    # One deadline for both counts, the bound first: whatever the second does, the first is kept,
+    # and a real packet that could not be counted only weakens WILL to MAY.
+    started = time.monotonic()
+    first = _within_deadline(count, bound)
+    if first is not None:
+        prompt, window = first
+        second = first if real == bound else _within_deadline(
+            count, real, deadline=DEADLINE_S - (time.monotonic() - started))
         return WindowReport(prompt + QUESTION_ALLOWANCE, reply, window, counted_by_server=True,
-                            cards=cards)
-    estimate = math.ceil((len(system) + len(user)) / CHARS_PER_TOKEN_FLOOR) + QUESTION_ALLOWANCE
-    return WindowReport(estimate, reply, settings.llm_context_window, counted_by_server=False,
-                        cards=cards)
+                            cards=cards,
+                            real_tokens=None if second is None else second[0] + QUESTION_ALLOWANCE)
+
+    def estimate(user: str) -> int:
+        return math.ceil((len(system) + len(user)) / CHARS_PER_TOKEN_FLOOR) + QUESTION_ALLOWANCE
+
+    return WindowReport(estimate(bound), reply, settings.llm_context_window,
+                        counted_by_server=False, cards=cards, real_tokens=estimate(real))

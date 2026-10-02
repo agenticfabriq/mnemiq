@@ -411,10 +411,14 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter,
         return
     verdict = "window:too-small"
     log = logger.info if verdict in acknowledged else logger.warning
-    log("prompt window %s: %s. A question that retrieves those tables will fail (vLLM refuses "
-        "the request) or have its answer refused (a server that cuts the prompt). Raise the window "
+    # CAN only on a real packet the server counted past the window; the upper bound alone, or an
+    # estimate, is a risk to weigh -- raising capacity or cutting retrieval for a bound that
+    # duplicated shared definitions would cost the operator for nothing.
+    log("prompt window %s: %s. A question that retrieves those tables %s fail (vLLM refuses the "
+        "request) or have its answer refused (a server that cuts the prompt). Raise the window "
         "(vLLM --max-model-len, Ollama OLLAMA_CONTEXT_LENGTH) or lower MNEMIQ_RETRIEVAL_K.",
-        "TOO SMALL" if report.counted_by_server else "MAY BE TOO SMALL", report.sentence())
+        "TOO SMALL" if report.certain else "MAY BE TOO SMALL", report.sentence(),
+        "can" if report.certain else "may")
     _ack_did_not_apply(acknowledged, verdict, prefix="window:")
 
 
