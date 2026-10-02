@@ -73,6 +73,22 @@ def test_the_largest_prompt_holds_the_k_widest_cards_and_what_rides_with_them():
     assert system
 
 
+def test_a_narrow_table_with_much_bound_to_it_outweighs_a_wider_bare_one():
+    """Ranking by the bare card picked wide and middle and measured a fraction of the prompt real
+    retrieval builds when the narrow table is shown: its bound definitions ride in with it (Codex
+    review of #73: 5,639 characters measured against 33,875)."""
+    snap = _snapshot()
+    heavy = [Definition(id=f"d:n{i}", term=f"narrow rule {i}", domain="ops",
+                        definition="N" * 500 + f" rule {i}", bound_objects=["narrow"])
+             for i in range(50)]
+    snap = snap.model_copy(update={"definitions": [*snap.definitions, *heavy]})
+    _, user, _ = largest_prompt(duckdb.connect(), snap, _settings(), "duckdb")
+
+    tables = user.split("TABLES:")[1]
+    assert "narrow" in tables and "wide" in tables and "middle" not in tables
+    assert user.count("N" * 500) == 50
+
+
 def test_a_store_without_examples_still_measures():
     _, user, cards = largest_prompt(duckdb.connect(), _snapshot(), _settings(), "duckdb")
     assert cards == 2 and "WORKED EXAMPLES" not in user

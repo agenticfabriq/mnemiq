@@ -6,12 +6,13 @@ one question at a time, after the work. This asks once, at boot: the largest pro
 produce, plus the room the generator is given to reply in, against the window.
 
 "Largest" is built with the real formatter from the parts that do not depend on the question: the
-`retrieval_k` largest table cards in the generator's card style, unscoped (a policy only removes
-columns), with their facts; the definitions and certified measures bound to those tables; the
-`retrieval_k` largest worked examples; a question at the 500 characters `sanitize` keeps; the
-longest strategy's system prompt. Left out, because they depend on the question: the code
-vocabulary for its columns, glossary terms it happens to name, and the conversation history. So a
-warning is about the measured parts, and silence means they fit -- not that every question will.
+`retrieval_k` tables that bring the most into a prompt -- card in the generator's card style,
+unscoped (a policy only removes columns), facts, and the definitions and certified measures bound
+to it -- with every table visible; the `retrieval_k` largest worked examples; a question at the 500
+characters `sanitize` keeps; the longest strategy's system prompt. Left out, because they depend on
+the question: the code vocabulary for its columns, glossary terms it happens to name, and the
+conversation history. So a warning is about the measured parts, and silence means they fit -- not
+that every question will.
 
 Counted by the server where it can count: vLLM's `/tokenize` returns the count, chat template
 included, and `max_model_len` in one call. Otherwise the window is `MNEMIQ_LLM_CONTEXT_WINDOW`, as
@@ -74,24 +75,37 @@ def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int
     from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_facts
 
     k = settings.retrieval_k
-    rendered = sorted(build_cards(snapshot, policy=None, style=settings.card_style),
-                      key=lambda c: (-len(c.text), c.object_id))[:k]
-    cards = [RetrievedCard(object_id=c.object_id, card=c.text, score=0.0) for c in rendered]
-    _attach_facts(cards, snapshot.table_facts, settings.card_style)
-    table_ids = [c.object_id for c in cards]
-    shown = GrantSet(frozenset(table_ids))
-    packet = ContextPacket(
-        question=_QUESTION, cards=cards, grant_fingerprint="", enrichment_version=None,
-        # Bound definitions ride with their tables whatever the question says; "" matches no term.
-        definitions=select_definitions("", snapshot.definitions, shown, table_ids),
-        metrics=select_metrics(table_ids, snapshot.metrics, shown),
-        dimensions=select_dimensions(table_ids, snapshot.dimensions, shown),
-        examples=_largest_examples(con, k),
-    )
+    rendered = build_cards(snapshot, policy=None, style=settings.card_style)
+    # Every table visible: an identity granted all of them sees the most, and a definition bound to
+    # a table outside the k still rides in with the one inside it.
+    shown = GrantSet(frozenset(c.object_id for c in rendered))
+
+    def packet_for(cards: list, question: str = "") -> ContextPacket:
+        _attach_facts(cards, snapshot.table_facts, settings.card_style)
+        ids = [c.object_id for c in cards]
+        return ContextPacket(
+            question=question, cards=cards, grant_fingerprint="", enrichment_version=None,
+            # Bound definitions ride with their tables whatever the question says; "" names no term.
+            definitions=select_definitions("", snapshot.definitions, shown, ids),
+            metrics=select_metrics(ids, snapshot.metrics, shown),
+            dimensions=select_dimensions(ids, snapshot.dimensions, shown),
+        )
+
+    def card(c) -> RetrievedCard:
+        return RetrievedCard(object_id=c.object_id, card=c.text, score=0.0)
+
+    # Ranked by what each table brings into the prompt, not by its card alone: a narrow table with
+    # fifty bound definitions outweighs a wide one with none. A definition bound to two tables is
+    # counted for each here and once in the prompt below, so the k chosen can miss the true largest
+    # set when definitions are shared; the prompt itself is still built exactly.
+    largest = sorted(rendered, key=lambda c: (-len(user_prompt(packet_for([card(c)]))),
+                                              c.object_id))[:k]
+    packet = packet_for([card(c) for c in largest], question=_QUESTION)
+    packet.examples = _largest_examples(con, k)
     system = max((system_prompt(dialect=dialect, strategy=s, assertive=settings.assertive_sql,
                                 declare_assumed_terms=settings.guard_undefined_terms)
                   for s in (None, *STRATEGIES)), key=len)
-    return system, user_prompt(packet), len(cards)
+    return system, user_prompt(packet), len(packet.cards)
 
 
 def _largest_examples(con, k: int) -> list:
