@@ -108,9 +108,10 @@ class Runtime:
             # observes a version change, not by the ones after, and the alternative is a replica
             # answering from a snapshot nobody assessed. `_warn_prompt_window` adds a network
             # round trip to that ask: one POST to the chat server's `/tokenize`, after building
-            # the largest prompt from the new snapshot. Bounded overall: a 15-second deadline
-            # checked as each chunk of the reply lands, so at most that plus one 5-second phase
-            # timeout (`count_on_server`).
+            # the largest prompt from the new snapshot. The server call holds the ask at most 15
+            # seconds (`DEADLINE_S` in `mnemiq.llm.window`), however the network behaves; building
+            # the prompt is local work and not under that bound. A call still waiting on a stalled
+            # resolver at the deadline leaves its thread behind, one per timed-out check.
             #
             # NOT once per swap on the threaded server, and this is measured from the code
             # rather than assumed: `build_app` closes over ONE runtime and serves it through

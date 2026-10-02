@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 from dataclasses import dataclass, replace
 
@@ -220,8 +221,8 @@ def count_on_server(base_url: str, model: str, system: str, user: str,
     Bounded overall, not only per phase: httpx's timeout limits each silence, so a proxy dripping a
     byte every few seconds would hold the boot -- or the ask that saw a snapshot swap -- for as long
     as it liked. The reply is read in chunks against a deadline and a size cap, and either one
-    reached is no count. The deadline is checked as each chunk lands, so the worst case is the
-    deadline plus one per-phase timeout.
+    reached is no count. What comes before the body -- the DNS lookup, which has no timeout, each
+    address tried, the headers -- is bounded by `check_window`, which stops waiting at the deadline.
     """
     root = base_url.rstrip("/")
     root = root[:-3] if root.endswith("/v1") else root
@@ -256,11 +257,38 @@ def count_on_server(base_url: str, model: str, system: str, user: str,
     return None
 
 
+def _within_deadline(fn, *args, **kwargs):
+    """`fn`'s result, or None once DEADLINE_S has passed -- a wall-clock bound on the caller.
+
+    A daemon thread, because nothing in the socket stack can be interrupted from outside: on the
+    deadline the caller stops waiting and the thread is left to its own timeouts. It holds nothing
+    the caller needs when the caller passed no client of its own, as the runtime does not. Only the
+    deadline means "no count": an exception `fn` raised is raised here, so a base URL httpx cannot
+    parse still reaches the advisory's "measurement failed" line instead of reading as a server
+    with no `/tokenize`.
+    """
+    outcome: dict = {}
+
+    def run() -> None:
+        try:
+            outcome["result"] = fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001 -- handed to the caller, raised there
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, name="mnemiq-window-count", daemon=True)
+    worker.start()
+    worker.join(DEADLINE_S)
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("result")
+
+
 def check_window(con, snapshot, settings, dialect: str,
                  http: httpx.Client | None = None) -> WindowReport:
     system, user, cards = largest_prompt(con, snapshot, settings, dialect)
     reply = reasoning_budget(settings.llm_model, GENERATOR_MAX_TOKENS)
-    counted = count_on_server(settings.llm_base_url, settings.llm_model, system, user, http=http)
+    counted = _within_deadline(count_on_server, settings.llm_base_url, settings.llm_model, system,
+                               user, http=http)
     if counted is not None:
         prompt, window = counted
         return WindowReport(prompt + QUESTION_ALLOWANCE, reply, window, counted_by_server=True,

@@ -319,6 +319,37 @@ def test_a_reply_dripped_past_the_deadline_is_no_count(monkeypatch):
     assert time.monotonic() - started < 1.0, "it waited for the drip instead of the deadline"
 
 
+def test_a_server_that_never_sends_headers_cannot_hold_the_check(monkeypatch):
+    """Before the body there is nothing to check a deadline against -- a DNS lookup has no timeout
+    at all -- so the check stops waiting at the deadline instead."""
+    import time
+
+    monkeypatch.setattr(window, "DEADLINE_S", 0.2)
+
+    def stall(request):
+        time.sleep(3)
+        return httpx.Response(200, json={"count": 1, "max_model_len": 2})
+
+    started = time.monotonic()
+    report = check_window(duckdb.connect(), _snapshot(), _settings(llm_context_window=100),
+                          "duckdb", http=httpx.Client(transport=httpx.MockTransport(stall)))
+    assert time.monotonic() - started < 1.5
+    assert not report.counted_by_server and report.window == 100, "fell back to the declaration"
+
+
+def test_a_base_url_httpx_cannot_parse_is_reported_not_read_as_no_count(caplog):
+    """The thread hands its exceptions back: an unparseable base URL is a configuration error the
+    operator must see, not a server without `/tokenize` -- and with a declared window it would
+    otherwise have read as 'fits'."""
+    from mnemiq.runtime import _warn_prompt_window
+
+    settings = _settings(llm_base_url="http://[::1", llm_context_window=999_999)
+    with caplog.at_level(logging.INFO):
+        _warn_prompt_window(settings, duckdb.connect(), _snapshot(), None, frozenset())
+    assert "prompt window not checked: the measurement failed" in caplog.text
+    assert "fits" not in caplog.text
+
+
 def test_a_reply_past_the_size_cap_is_no_count(monkeypatch):
     monkeypatch.setattr(window, "MAX_REPLY_BYTES", 1_000)
     big = {"count": 5, "max_model_len": 9, "tokens": list(range(1_000))}
