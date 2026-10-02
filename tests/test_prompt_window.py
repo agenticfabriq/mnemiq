@@ -154,6 +154,36 @@ def test_a_window_too_small_for_the_longest_real_pair_never_reads_fits():
     assert report.fits is False
 
 
+def _ab_defined_c_bare(c_description: str) -> Snapshot:
+    """Gate review of #73: A and B each a short card plus a short definition, C a longer card and
+    nothing else. Ranked with the DEFINITIONS header counted per table, A and B beat C whenever
+    C's card is within a header of A's card plus its definition -- and the real A+C is longer."""
+    tables = ("a", "b", "c")
+    return Snapshot(
+        version="v1", source_id="s", created_at="2026-10-02T00:00:00Z",
+        source_bindings=[SourceBinding(id=f"sb:{t}", source_id="s", object_id=t, source_object=t,
+                                       binding_type="table") for t in tables],
+        columns=[Column(id="a.x", object_id="a", name="x", data_type="text"),
+                 Column(id="b.x", object_id="b", name="x", data_type="text"),
+                 Column(id="c.x", object_id="c", name="x", data_type="text",
+                        description=c_description)],
+        definitions=[Definition(id=f"d:{t}", term=f"rule {t}", domain="ops",
+                                definition="ten chars.", bound_objects=[t]) for t in ("a", "b")],
+    )
+
+
+def test_section_headers_cannot_tip_the_ranking_below_a_real_packet():
+    shortfalls = []
+    for n in range(0, 160, 4):
+        snap = _ab_defined_c_bare("d" * n)
+        _, measured, _ = largest_prompt(duckdb.connect(), snap, _settings(), "duckdb")
+        longest = max(len(_real_prompt(snap, list(pair)))
+                      for pair in (("a", "b"), ("a", "c"), ("b", "c")))
+        if len(measured) < longest:
+            shortfalls.append((n, longest - len(measured)))
+    assert not shortfalls, f"measured below a real pair at C description lengths {shortfalls}"
+
+
 def test_a_store_without_examples_still_measures():
     _, user, cards = largest_prompt(duckdb.connect(), _snapshot(), _settings(), "duckdb")
     assert cards == 2 and "WORKED EXAMPLES" not in user

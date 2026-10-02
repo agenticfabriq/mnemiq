@@ -9,11 +9,11 @@ produce, plus the room the generator is given to reply in, against the window.
 `retrieval_k` tables that bring the most into a prompt -- card in the generator's card style,
 unscoped (a policy only removes columns), facts, and the definitions and certified measures bound
 to it -- with every table visible and a definition shared by two of them counted with each, so the
-measure is an upper bound; the `retrieval_k` largest worked examples; a question at the 500
-characters `sanitize` keeps; the longest strategy's system prompt. Left out, because they depend on
-the question: the code vocabulary for its columns, glossary terms it happens to name, and the
-conversation history. So a warning is about the measured parts, and silence means they fit -- not
-that every question will.
+measure is an upper bound (to within a section header); the `retrieval_k` largest worked examples;
+a question at the 500 characters `sanitize` keeps; the longest strategy's system prompt. Left out,
+because they depend on the question: the code vocabulary for its columns, glossary terms it happens
+to name, and the conversation history. So a warning is about the measured parts, and silence means
+they fit -- not that every question will.
 
 Counted by the server where it can count: vLLM's `/tokenize` returns the count, chat template
 included, and `max_model_len` in one call. Otherwise the window is `MNEMIQ_LLM_CONTEXT_WINDOW`, as
@@ -24,7 +24,7 @@ generation prompt (2.56, over 220 of them), so the estimate errs toward warning.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 
@@ -55,7 +55,7 @@ class WindowReport:
         return None if self.window is None else self.needed <= self.window
 
     def sentence(self) -> str:
-        count = (f"at most {self.prompt_tokens:,} tokens, counted by the server" if self.counted_by_server
+        count = (f"{self.prompt_tokens:,} tokens, counted by the server" if self.counted_by_server
                  else f"about {self.prompt_tokens:,} tokens at most, estimated from its length")
         window = ("unknown: the server gave no count (it has no /tokenize, or it did not answer) "
                   "and MNEMIQ_LLM_CONTEXT_WINDOW is unset"
@@ -97,15 +97,24 @@ def largest_prompt(con, snapshot, settings, dialect: str) -> tuple[str, str, int
     def card(c) -> RetrievedCard:
         return RetrievedCard(object_id=c.object_id, card=c.text, score=0.0)
 
+    def brings(c) -> int:
+        """What a table adds to a prompt that already has every section's header: each section it
+        fills, rendered twice minus once, which is that section's content without its header."""
+        one = packet_for([card(c)])
+        base = len(user_prompt(one))
+        return sum(len(user_prompt(replace(one, **{part: getattr(one, part) * 2}))) - base
+                   for part in ("cards", "definitions", "metrics", "dimensions"))
+
     # Ranked by what each table brings into the prompt, not by its card alone: a narrow table with
-    # fifty bound definitions outweighs a wide one with none.
-    largest = sorted(rendered, key=lambda c: (-len(user_prompt(packet_for([card(c)]))),
-                                              c.object_id))[:k]
-    # An upper bound, not one real packet: each chosen table's bound definitions and measures are
-    # listed with it, so one bound to two of them appears twice where a real packet lists it once.
-    # Every real packet of k tables is at most the sum of what its tables bring alone, and these k
-    # have the largest such sum -- so no set, including one the ranking passed over because its
-    # tables share less, builds a longer prompt than this. Exact when nothing is shared.
+    # fifty bound definitions outweighs a wide one with none. Headers are left out of the rank, since
+    # the prompt prints each once however many tables fill its section.
+    largest = sorted(rendered, key=lambda c: (-brings(c), c.object_id))[:k]
+    # Then an upper bound rather than one real packet: each chosen table's bound definitions and
+    # measures are listed with it, so one bound to two of them appears twice where a real packet
+    # lists it once. A real packet of k tables is at most the sum of what its tables bring, plus the
+    # header of any section these k leave empty (a few hundred characters at most), and these k
+    # bring the largest sum -- so no set the ranking passed over, because its tables share less,
+    # builds a longer prompt beyond those headers. Exact when nothing is shared.
     per_table = [packet_for([card(c)]) for c in largest]
     packet = ContextPacket(
         question=_QUESTION, cards=[p.cards[0] for p in per_table], grant_fingerprint="",
