@@ -111,8 +111,13 @@ class Generator(Protocol):
     def propose(self, packet: ContextPacket, feedback: str | None = None) -> SqlProposal: ...
 
 
+# The room a proposal is given to write in. Named because the boot window advisory has to reserve
+# the same room beside the prompt (`llm.window`): vLLM refuses prompt plus this past its window.
+GENERATOR_MAX_TOKENS = 4000
+
+
 class LLMGenerator:
-    def __init__(self, client, max_tokens: int = 4000, dialect: str = "duckdb",
+    def __init__(self, client, max_tokens: int = GENERATOR_MAX_TOKENS, dialect: str = "duckdb",
                  guided_sql: bool = False, assertive: bool = False,
                  declare_assumed_terms: bool = False) -> None:
         self._client = client

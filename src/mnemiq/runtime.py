@@ -106,7 +106,14 @@ class Runtime:
             # the policy file per declared role, and `warn_unfiltered_dependents` walks parents
             # over `snapshot.relationships` for every granted table. Paid by the ask that
             # observes a version change, not by the ones after, and the alternative is a replica
-            # answering from a snapshot nobody assessed.
+            # answering from a snapshot nobody assessed. `_warn_prompt_window` adds a network round
+            # trip to that ask: one POST to the chat server's `/tokenize`, after building the
+            # largest prompt from the new snapshot for each distinct role grant (and the configured
+            # identity) -- local work that grows with the number of roles. The server call holds the
+            # ask at most 15 seconds (`DEADLINE_S` in `mnemiq.llm.window`), however the network
+            # behaves; building the prompt is local work and not under that bound. A call still
+            # waiting on a stalled resolver at the deadline leaves its thread behind, one per
+            # timed-out check.
             #
             # NOT once per swap on the threaded server, and this is measured from the code
             # rather than assumed: `build_app` closes over ONE runtime and serves it through
@@ -123,6 +130,8 @@ class Runtime:
             # that fronts the same tools in-process alongside the HTTP app would be, and that
             # is a deployment property this repo cannot see.
             _warn_view_inventory(snapshot, _acknowledged(self.settings))
+            _warn_prompt_window(self.settings, self.con, snapshot, getattr(self, "adapter", None),
+                                self.authz, _acknowledged(self.settings))
             _warn_policy_advisories(self.authz, snapshot)
 
     def _source_id(self) -> str:
@@ -346,8 +355,8 @@ def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
     """Say, at INFO, that an acknowledgement key was set and silenced nothing.
 
     `prefix` selects the namespace: `functions:` for the inventory advisory, `views:` for the
-    view one. One helper for both, because the reasoning is identical and two copies would
-    drift.
+    view one, `window:` for the prompt-window one. One helper for all, because the reasoning is
+    identical and copies would drift.
 
     It says "did not apply" rather than "did not apply this boot". `_warn_source_enforcement`
     emits both phrasings, and the plain one is right here for a reason worth keeping: the view
@@ -365,6 +374,63 @@ def _ack_did_not_apply(acknowledged: frozenset[str], matched: str | None,
             continue
         logger.info("MNEMIQ_ACK_ADVISORIES: %r did not apply -- either this source produced "
                     "no such verdict, or the verdict half is misspelled", entry)
+
+
+def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
+                        acknowledged: frozenset[str]) -> None:
+    """Say at boot when the largest generation prompt cannot fit the server's window (M119).
+
+    Without it the first sign is a question that retrieves the heaviest tables: vLLM refuses prompt
+    plus reply budget past `--max-model-len`, and a server that cuts prompts has the answer refused
+    by the cut check -- per question, after the work, and only for the questions that happen to
+    reach the wide tables. What is measured and what is left out is in `mnemiq.llm.window`.
+
+    TWO CALL SITES, like the view advisory and for the same reason: the cards are the subject, and a
+    snapshot swap replaces them. A warning only: refusing to boot would stop the questions that fit.
+    """
+    try:
+        # Inside the try, settings reads included: on a swap this runs on a user's ask, and an
+        # advisory must never stop one any more than a boot.
+        if not settings.llm_window_check or not settings.llm_base_url or snapshot is None:
+            return
+        from mnemiq.llm.window import worst_window
+
+        # Per identity: what is sent to be counted must be what that identity's own questions
+        # could send (`mnemiq.llm.window`).
+        report = worst_window(con, snapshot, settings, getattr(adapter, "dialect", "duckdb"),
+                              authz)
+    except Exception as exc:  # noqa: BLE001 -- an advisory check must never stop a boot
+        # INFO, not DEBUG: a server that cannot be reached is already a count it did not give, so
+        # what lands here is the measurement itself failing (or a base URL httpx cannot parse),
+        # and silence would read as "fits".
+        logger.info("prompt window not checked: the measurement failed (%s)", exc)
+        return
+    if report is None:
+        logger.info("prompt window not checked: neither a role in the access policy nor the "
+                    "configured identity sees a table (no policy, one granting nothing, or one "
+                    "that could not be read)")
+        _ack_did_not_apply(acknowledged, None, prefix="window:")
+        return
+    if report.fits is None:
+        logger.info("prompt window not checked: %s; set MNEMIQ_LLM_CONTEXT_WINDOW to check it",
+                    report.sentence())
+        _ack_did_not_apply(acknowledged, None, prefix="window:")
+        return
+    if report.fits:
+        logger.info("prompt window fits: %s", report.sentence())
+        _ack_did_not_apply(acknowledged, None, prefix="window:")
+        return
+    verdict = "window:too-small"
+    log = logger.info if verdict in acknowledged else logger.warning
+    # CAN only on a real packet the server counted past the window; the upper bound alone, or an
+    # estimate, is a risk to weigh -- raising capacity or cutting retrieval for a bound that
+    # duplicated shared definitions would cost the operator for nothing.
+    log("prompt window %s: %s. A question that retrieves those tables %s fail (vLLM refuses the "
+        "request) or have its answer refused (a server that cuts the prompt). Raise the window "
+        "(vLLM --max-model-len, Ollama OLLAMA_CONTEXT_LENGTH) or lower MNEMIQ_RETRIEVAL_K.",
+        "TOO SMALL" if report.certain else "MAY BE TOO SMALL", report.sentence(),
+        "can" if report.certain else "may")
+    _ack_did_not_apply(acknowledged, verdict, prefix="window:")
 
 
 def _warn_view_inventory(snapshot, acknowledged: frozenset[str]) -> None:
@@ -817,6 +883,7 @@ def build_runtime(settings: Settings) -> Runtime:
     # calling this from inside the function advisory ran it only when that one found
     # nothing to report, which is every deployment except a schema with no helpers.
     _warn_view_inventory(snapshot, _acknowledged(settings))
+    _warn_prompt_window(settings, con, snapshot, adapter, _boot_authz, _acknowledged(settings))
     return Runtime(
         con=con,
         snapshot=snapshot,
