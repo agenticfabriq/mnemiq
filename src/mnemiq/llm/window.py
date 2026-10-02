@@ -60,7 +60,8 @@ class WindowReport:
                   "and MNEMIQ_LLM_CONTEXT_WINDOW is unset"
                   if self.window is None else
                   f"{self.window:,} tokens ({'reported by the server' if self.counted_by_server else 'MNEMIQ_LLM_CONTEXT_WINDOW'})")
-        return (f"the largest generation prompt this store can produce (the {self.cards} tables "
+        tables = "the table" if self.cards == 1 else f"the {self.cards} tables"
+        return (f"the largest generation prompt this store can produce ({tables} "
                 f"bringing the most into it, with their definitions, measures and examples) is "
                 f"{count}; with the "
                 f"generator's {self.reply_tokens:,}-token reply budget it needs {self.needed:,}, and "

@@ -377,7 +377,7 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter,
                         acknowledged: frozenset[str]) -> None:
     """Say at boot when the largest generation prompt cannot fit the server's window (M119).
 
-    Without it the first sign is a question that retrieves the widest tables: vLLM refuses prompt
+    Without it the first sign is a question that retrieves the heaviest tables: vLLM refuses prompt
     plus reply budget past `--max-model-len`, and a server that cuts prompts has the answer refused
     by the cut check -- per question, after the work, and only for the questions that happen to
     reach the wide tables. What is measured and what is left out is in `mnemiq.llm.window`.
@@ -410,7 +410,7 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter,
         return
     verdict = "window:too-small"
     log = logger.info if verdict in acknowledged else logger.warning
-    log("prompt window %s: %s. A question that retrieves the widest tables will fail (vLLM refuses "
+    log("prompt window %s: %s. A question that retrieves those tables will fail (vLLM refuses "
         "the request) or have its answer refused (a server that cuts the prompt). Raise the window "
         "(vLLM --max-model-len, Ollama OLLAMA_CONTEXT_LENGTH) or lower MNEMIQ_RETRIEVAL_K.",
         "TOO SMALL" if report.counted_by_server else "MAY BE TOO SMALL", report.sentence())

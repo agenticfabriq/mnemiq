@@ -238,6 +238,10 @@ def test_the_advisory_never_raises_and_says_it_did_not_measure(caplog, monkeypat
     assert "prompt window not checked: the measurement failed (no cards)" in caplog.text
 
 
+def test_one_table_reads_as_one():
+    assert "(the table bringing" in WindowReport(1, 1, 9, counted_by_server=True, cards=1).sentence()
+
+
 def test_no_count_says_the_server_may_simply_be_down():
     report = WindowReport(10, 4_000, None, counted_by_server=False, cards=1)
     assert "did not answer" in report.sentence()

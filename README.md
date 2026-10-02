@@ -191,7 +191,7 @@ check cannot decide (the server refused it, gave no count, or the padding itself
 ratio is past 12 characters a token, far above anything measured (at most 4.5 over 612 real prompts, 6.2
 for deliberately repetitive rows); then it refuses all the same. Set `OLLAMA_CONTEXT_LENGTH` (or the model's `num_ctx`) to
 cover the largest prompt plus the reply, with headroom: a modest cut to a window that is not a multiple
-of 1,024 tokens can still slip by. At startup mnemiq also measures the largest prompt its store can produce (the widest table cards, with their definitions and examples) plus the generator's 4,000-token reply, against the window, and logs a warning when it does not fit: vLLM counts it and reports its window itself; for Ollama, set `MNEMIQ_LLM_CONTEXT_WINDOW` to the window you configured and mnemiq estimates, erring long (`MNEMIQ_LLM_WINDOW_CHECK=0` skips the measurement). `MNEMIQ_LLM_PROMPT_CUT_CHECK=0` turns the cut check off, for a server or
+of 1,024 tokens can still slip by. At startup mnemiq also measures the largest prompt its store can produce (the tables that bring the most into it: card, definitions and examples) plus the generator's 4,000-token reply, against the window, and logs a warning when it does not fit: vLLM counts it and reports its window itself; for Ollama, set `MNEMIQ_LLM_CONTEXT_WINDOW` to the window you configured and mnemiq estimates, erring long (`MNEMIQ_LLM_WINDOW_CHECK=0` skips the measurement). `MNEMIQ_LLM_PROMPT_CUT_CHECK=0` turns the cut check off, for a server or
 proxy whose `prompt_tokens` leaves out tokens it reused from a cache (Ollama 0.5.4 counts them: measured).
 
 Set `MNEMIQ_LOCAL_ONLY=1` to make that verification the `mnemiq` command's job instead of yours
