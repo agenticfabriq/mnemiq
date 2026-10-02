@@ -108,7 +108,8 @@ class Runtime:
             # observes a version change, not by the ones after, and the alternative is a replica
             # answering from a snapshot nobody assessed. `_warn_prompt_window` adds a network
             # round trip to that ask: one POST to the chat server's `/tokenize`, after building
-            # the largest prompt from the new snapshot. The server call holds the ask at most 15
+            # the largest prompt from the new snapshot for each distinct role grant (and the
+            # configured identity) -- local work that grows with the number of roles. The server call holds the ask at most 15
             # seconds (`DEADLINE_S` in `mnemiq.llm.window`), however the network behaves; building
             # the prompt is local work and not under that bound. A call still waiting on a stalled
             # resolver at the deadline leaves its thread behind, one per timed-out check.
@@ -404,7 +405,9 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
         logger.info("prompt window not checked: the measurement failed (%s)", exc)
         return
     if report is None:
-        logger.info("prompt window not checked: no role in the access policy sees a table")
+        logger.info("prompt window not checked: neither a role in the access policy nor the "
+                    "configured identity sees a table (no policy, one granting nothing, or one "
+                    "that could not be read)")
         _ack_did_not_apply(acknowledged, None, prefix="window:")
         return
     if report.fits is None:

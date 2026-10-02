@@ -318,21 +318,19 @@ def check_window(con, snapshot, settings, dialect: str, grants: GrantSet | None 
 
 
 def grant_sets(authz, settings) -> list[tuple[str, GrantSet]]:
-    """(label, grants) for each distinct view to measure: every role the policy declares, or the
-    configured identity where the provider cannot list its roles. Views that see no table are
-    dropped, and roles with identical grants are measured once."""
+    """(label, grants) for each distinct view to measure: every role the policy declares, and the
+    configured identity, whose roles merge into one grant wider than any of them. Views that see no
+    table are dropped, and identical grants are measured once. Other principals holding several
+    roles are not: their combinations are not listed anywhere to measure."""
+    from mnemiq.config import identity_from_settings
     from mnemiq.contract import IdentityContext
 
     roles = getattr(authz, "policy_roles", None)
-    if roles is not None:
-        views = [(f"role {role}", authz.grants_for(
-            IdentityContext(tenant_id="boot", principal_id="boot", roles=[role])))
-            for role in roles()]
-    else:
-        from mnemiq.config import identity_from_settings
-
-        identity = identity_from_settings(settings)
-        views = [(f"identity {identity.principal_id}", authz.grants_for(identity))]
+    views = [(f"role {role}", authz.grants_for(
+        IdentityContext(tenant_id="boot", principal_id="boot", roles=[role])))
+        for role in (roles() if roles is not None else [])]
+    identity = identity_from_settings(settings)
+    views.append((f"identity {identity.principal_id}", authz.grants_for(identity)))
     measured: list[tuple[str, GrantSet]] = []
     seen: set[str] = set()
     for label, grants in views:

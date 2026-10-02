@@ -344,7 +344,24 @@ def test_roles_that_see_nothing_leave_nothing_to_measure(caplog):
     with caplog.at_level(logging.INFO):
         _warn_prompt_window(_settings(), duckdb.connect(), _snapshot(), None,
                             _Roles({"none": EMPTY}), frozenset())
-    assert "no role in the access policy sees a table" in caplog.text
+    assert "neither a role in the access policy nor the configured identity sees a table" in (
+        caplog.text)
+
+
+def test_the_configured_identitys_merged_roles_are_measured_too():
+    """An identity holding two roles is shown the union -- more than either role -- so the
+    configured identity is measured beside each role, and here it is the heaviest."""
+    from mnemiq.authz.grants import GrantSet
+
+    class _Merging(_Roles):
+        def grants_for(self, identity):
+            granted = [self._by_role[r] for r in identity.roles if r in self._by_role]
+            return GrantSet(frozenset().union(*(g.objects for g in granted)))
+
+    roles = _Merging({"a": GrantSet(frozenset({"wide"})), "b": GrantSet(frozenset({"middle"}))})
+    report = window.worst_window(duckdb.connect(), _snapshot(), _settings(roles="a,b"), "duckdb",
+                                 roles, http=_server(None, 404))
+    assert report.who.startswith("identity ") and report.cards == 2
 
 
 def test_a_provider_that_cannot_list_roles_measures_the_configured_identity():
