@@ -569,3 +569,26 @@ def test_the_heaviest_view_is_chosen_by_bytes_not_characters():
     no_count = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
     report = window.worst_window(con, snap, settings, "duckdb", _ByTable(), http=no_count)
     assert report.who == "role cjk" and not report.counted_by_server
+
+
+def test_a_server_window_that_shrinks_is_honoured_by_the_next_count():
+    """Third Codex review: the window learned once was kept forever, so a server restarted with a
+    smaller one kept receiving prompts sized for the old. Every count refreshes it, the current
+    request re-reads it, and the remembered one expires after WINDOW_TTL_S."""
+    from mnemiq.semantic import fit as fit_module
+
+    snap = _snapshot()
+    packet = _packet(snap)
+    probe = _fitter(None)
+    full = _piece_count(probe.system(), user_prompt(packet))
+    roomy = full + REPLY + FEEDBACK_ALLOWANCE + 1_000
+    small = full + REPLY + FEEDBACK_ALLOWANCE - full // 3
+    reported = [roomy]
+    fitter = _fitter(None, count=lambda s, u: (_piece_count(s, u), reported[0]))
+
+    assert fitter.fit(packet, snap, _grants(snap)) is packet, "fits the window first reported"
+    reported[0] = small  # the server comes back smaller
+    fitter._window_seen_at -= fit_module.WINDOW_TTL_S + 1  # and the remembered window has aged
+    fitted = fitter.fit(_packet(snap, "again"), snap, _grants(snap))
+    assert fitted.descriptions is not None
+    assert _piece_count(fitter.system(), user_prompt(fitted)) + REPLY + FEEDBACK_ALLOWANCE <= small

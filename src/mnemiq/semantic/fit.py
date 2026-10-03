@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 # A server that gave no count is asked again after this long, not on every question.
 NO_COUNT_RETRY_S = 600.0
+# The server's window is re-learned after this long: a server restarted with a smaller window must
+# not keep receiving prompts sized for the old one. One /tokenize a minute, at most.
+WINDOW_TTL_S = 60.0
 # How many times the chosen prompt is re-counted and shrunk before it is sent as it stands.
 RECOUNTS = 3
 # Estimates from a server-calibrated ratio stay this far under the window: the trimmed text is not
@@ -110,6 +113,7 @@ class PromptFitter:
     count: object = None
     _server_window: int | None = field(default=None, init=False, repr=False)
     _no_count_until: float | None = field(default=None, init=False, repr=False)
+    _window_seen_at: float = field(default=0.0, init=False, repr=False)
 
     def system(self) -> str:
         """The longest system prompt a call can carry: deep mode's strategies differ in length."""
@@ -144,7 +148,8 @@ class PromptFitter:
             return None
         self._no_count_until = None
         tokens, reported = counted
-        self._server_window = self._server_window or reported
+        # Every count refreshes it: the latest word on the window is the server's latest answer.
+        self._server_window, self._window_seen_at = reported, time.monotonic()
         return tokens
 
     def _fit(self, packet: ContextPacket, snapshot, grants) -> ContextPacket:
@@ -157,10 +162,11 @@ class PromptFitter:
         user = user_prompt(packet)
         ceiling = byte_bound(system, user)
         tokens = None
-        if self._server_window is None:
+        if (self._server_window is None
+                or time.monotonic() - self._window_seen_at > WINDOW_TTL_S):
             # The server's window outranks a declared one (MNEMIQ_LLM_CONTEXT_WINDOW is the fallback
             # for a server that reports none), so it is learned before anything is waved through:
-            # one count, on the first question, then remembered.
+            # a count on the first question, and again once WINDOW_TTL_S has passed.
             tokens = self._counted(system, user)
         window = self._server_window or self.window
         if window is None:
@@ -171,6 +177,7 @@ class PromptFitter:
             return packet
         if tokens is None:
             tokens = self._counted(system, user)
+            window = self._server_window or self.window  # that count may have moved it
         if (tokens if tokens is not None else ceiling) + reserve <= window:
             return packet
         return self._trim(packet, snapshot, grants, system, window - reserve, tokens)
