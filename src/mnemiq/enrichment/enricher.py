@@ -103,7 +103,14 @@ class LLMEnricher:
         allowed = _allowed(chunk)
         why = ""
         for _attempt in range(attempts):  # one retry by default; models drop the channel occasionally
-            raw = self._client.complete(system, user, max_tokens=self._max_tokens)
+            try:
+                raw = self._client.complete(system, user, max_tokens=self._max_tokens)
+            except Exception as exc:  # noqa: BLE001 -- one chunk's outage, not the table's
+                # Caught here, not by the caller: a timeout on the second chunk used to escape
+                # and discard the first chunk's columns with it. The type only -- a provider's
+                # exception text can carry a host or a key, and the job outlives the run.
+                why = f"the call failed: {type(exc).__name__}"
+                continue
             annotation = parse_annotation(raw, table, allowed)
             if annotation.columns:
                 return annotation.columns, ""

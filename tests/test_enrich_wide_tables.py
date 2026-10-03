@@ -59,6 +59,33 @@ def test_a_wide_table_is_described_in_chunks_and_every_column_lands():
         assert "for context only" in prompt, "each chunk names the rest of the table"
 
 
+def test_a_chunk_whose_call_raises_keeps_the_other_chunks():
+    """Codex review of #75: a timeout on the second chunk escaped the loop and the whole table
+    lost the first chunk's columns. Each call's failure stays with its chunk, and is retried."""
+    class _Flaky(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            reply = super().complete(system, user, max_tokens, **kw)
+            if len(self.prompts) in (2, 3):  # both attempts at the second chunk time out
+                raise TimeoutError("read timed out at https://provider.example key=sk-secret")
+            return reply
+
+    annotation = LLMEnricher(_Flaky()).annotate("wide", _facts(84))
+    assert len(annotation.columns) == 54
+    assert annotation.failures == ["columns 31-60 of 84: the call failed: TimeoutError"]
+
+
+def test_a_call_that_raises_once_is_retried():
+    class _Once(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            reply = super().complete(system, user, max_tokens, **kw)
+            if len(self.prompts) == 1:
+                raise ConnectionError("reset")
+            return reply
+
+    annotation = LLMEnricher(_Once()).annotate("narrow", _facts(20))
+    assert len(annotation.columns) == 20 and not annotation.failures
+
+
 def test_a_narrow_table_is_one_call_with_no_context_line():
     model = _Model()
     annotation = LLMEnricher(model).annotate("narrow", _facts(20))
