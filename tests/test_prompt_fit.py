@@ -571,17 +571,18 @@ def test_the_heaviest_view_is_chosen_by_bytes_not_characters():
     assert report.who == "role cjk" and not report.counted_by_server
 
 
-def test_a_server_window_that_shrinks_is_honoured_by_the_next_count():
+def test_a_server_window_that_shrinks_is_honoured_once_the_remembered_one_expires():
     """Third Codex review: the window learned once was kept forever, so a server restarted with a
-    smaller one kept receiving prompts sized for the old. Every count refreshes it, the current
-    request re-reads it, and the remembered one expires after WINDOW_TTL_S."""
+    smaller one kept receiving prompts sized for the old. The case the expiry exists for: a prompt
+    whose BYTES fit the old window, which the fast path would wave through unasked."""
+    from mnemiq.llm.window import byte_bound
     from mnemiq.semantic import fit as fit_module
 
     snap = _snapshot()
     packet = _packet(snap)
     probe = _fitter(None)
     full = _piece_count(probe.system(), user_prompt(packet))
-    roomy = full + REPLY + FEEDBACK_ALLOWANCE + 1_000
+    roomy = byte_bound(probe.system(), user_prompt(_packet(snap, "again"))) + REPLY + FEEDBACK_ALLOWANCE + 500
     small = full + REPLY + FEEDBACK_ALLOWANCE - full // 3
     reported = [roomy]
     fitter = _fitter(None, count=lambda s, u: (_piece_count(s, u), reported[0]))
@@ -590,5 +591,45 @@ def test_a_server_window_that_shrinks_is_honoured_by_the_next_count():
     reported[0] = small  # the server comes back smaller
     fitter._window_seen_at -= fit_module.WINDOW_TTL_S + 1  # and the remembered window has aged
     fitted = fitter.fit(_packet(snap, "again"), snap, _grants(snap))
-    assert fitted.descriptions is not None
+    assert fitted.descriptions is not None, "re-learned, not waved through on the old window's bytes"
+    assert _piece_count(fitter.system(), user_prompt(fitted)) + REPLY + FEEDBACK_ALLOWANCE <= small
+
+
+def test_a_window_that_shrinks_during_one_fit_is_the_one_verified_against():
+    """Fourth Codex review: the trim kept the budget it began with while its own counts could
+    report a smaller window, and verified a candidate against the old one."""
+    snap = _snapshot(120)
+    packet = _packet(snap)
+    probe = _fitter(None)
+    full = _piece_count(probe.system(), user_prompt(packet))
+    first = full + REPLY + FEEDBACK_ALLOWANCE - full // 4
+    later = first - full // 4
+    calls = []
+
+    def shrinking(system, user):
+        calls.append(1)
+        return _piece_count(system, user), (first if len(calls) == 1 else later)
+
+    fitter = _fitter(None, count=shrinking)
+    fitted = fitter.fit(packet, snap, _grants(snap))
+    assert len(calls) > 1
+    assert _piece_count(fitter.system(), user_prompt(fitted)) + REPLY + FEEDBACK_ALLOWANCE <= later
+
+
+def test_a_count_within_the_ttl_that_reports_a_smaller_window_is_obeyed_at_once():
+    """The request re-reads the window after its own count: a fresh remembered window does not
+    outvote the server's latest answer."""
+    snap = _snapshot()
+    packet = _packet(snap)
+    probe = _fitter(None)
+    tokens = _piece_count(probe.system(), user_prompt(packet))
+    roomy = tokens + REPLY + FEEDBACK_ALLOWANCE + 100  # the bytes overflow it, the tokens fit
+    small = tokens + REPLY + FEEDBACK_ALLOWANCE - tokens // 3
+    reported = [roomy]
+    fitter = _fitter(None, count=lambda s, u: (_piece_count(s, u), reported[0]))
+
+    assert fitter.fit(packet, snap, _grants(snap)) is packet
+    reported[0] = small  # within the TTL: the remembered window is still fresh
+    fitted = fitter.fit(packet, snap, _grants(snap))
+    assert fitted is not packet
     assert _piece_count(fitter.system(), user_prompt(fitted)) + REPLY + FEEDBACK_ALLOWANCE <= small

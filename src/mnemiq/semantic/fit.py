@@ -15,7 +15,8 @@ the corrector's feedback.
 cards byte for byte as retrieval rendered them: without a request when the prompt's UTF-8 bytes
 already fit (`mnemiq.llm.window.byte_bound`: at most a token a byte, plus room for the chat
 template), and on the server's /tokenize count otherwise -- one round trip for each question whose
-bytes do not fit, milliseconds on vLLM. **Without a count** (a server with no /tokenize and a
+bytes do not fit, and one a minute however small the prompt, to keep the server's window current
+(milliseconds on vLLM). **Without a count** (a server with no /tokenize and a
 declared MNEMIQ_LLM_CONTEXT_WINDOW) the byte bound decides alone, and it errs long, about 2.5
 times for English: such a deployment trims descriptions it has room for. That is the trade --
 never too little, often too much -- and the boot check, which uses the same bound, says so.
@@ -99,8 +100,8 @@ def rank_columns(packet: ContextPacket, snapshot, policy) -> list[tuple[str, str
 class PromptFitter:
     """What `fit` needs to know about the model and the prompt it will be sent.
 
-    `window` is the declared one (MNEMIQ_LLM_CONTEXT_WINDOW); without it, the window the server
-    reports the first time a prompt is counted is kept for the rest of the process. `count` is
+    `window` is the declared one (MNEMIQ_LLM_CONTEXT_WINDOW), the fallback: the window the server
+    reports outranks it, refreshed by every count and re-learned once WINDOW_TTL_S has passed. `count` is
     `(system, user) -> (tokens, window) | None`, the server's own count, None where it has none.
     """
 
@@ -180,10 +181,10 @@ class PromptFitter:
             window = self._server_window or self.window  # that count may have moved it
         if (tokens if tokens is not None else ceiling) + reserve <= window:
             return packet
-        return self._trim(packet, snapshot, grants, system, window - reserve, tokens)
+        return self._trim(packet, snapshot, grants, system, reserve, tokens)
 
-    def _trim(self, packet, snapshot, grants, system, budget, full_tokens) -> ContextPacket:
-        """The most descriptions, in rank order, whose prompt fits `budget`.
+    def _trim(self, packet, snapshot, grants, system, reserve, full_tokens) -> ContextPacket:
+        """The most descriptions, in rank order, whose prompt fits the window less `reserve`.
 
         Estimated from the server's counts at both ends -- the full prompt and the one with no
         descriptions -- because one average ratio is wrong for the middle: descriptions are prose
@@ -217,6 +218,11 @@ class PromptFitter:
         def chars(candidate: ContextPacket) -> int:
             return len(system) + len(user_prompt(candidate))
 
+        def budget() -> int:
+            # Re-read at every decision: each count can report a new window (a server restarted
+            # mid-fit), and a candidate is verified against the latest, not the one it began with.
+            return (self._server_window or self.window) - reserve
+
         floor = render(0)
         floor_tokens = self._counted(system, user_prompt(floor)) if full_tokens is not None else None
         if floor_tokens is None:
@@ -229,16 +235,16 @@ class PromptFitter:
             def estimate(candidate: ContextPacket) -> int:
                 return floor_tokens + math.ceil((chars(candidate) - chars(floor)) * per_char * MARGIN)
 
-        if estimate(floor) > budget:
+        if estimate(floor) > budget():
             logger.warning("prompt window: even with no column descriptions the prompt needs about "
                            "%d tokens against %d after the reply budget; the server may refuse it",
-                           estimate(floor), budget)
+                           estimate(floor), budget())
             return floor
         low, high, best = 0, len(ranked), floor
         while low < high:  # the most descriptions that fit, in rank order
             mid = (low + high + 1) // 2
             candidate = render(mid)
-            if estimate(candidate) <= budget:
+            if estimate(candidate) <= budget():
                 low, best = mid, candidate
             else:
                 high = mid - 1
@@ -252,10 +258,10 @@ class PromptFitter:
                 counted = self._counted(system, user_prompt(best))
                 if counted is None:
                     break
-                if counted <= budget:
+                if counted <= budget():
                     verified = True
                     break
-                low = max(0, low - math.ceil((counted - budget) / per_description) - 1)
+                low = max(0, low - math.ceil((counted - budget()) / per_description) - 1)
                 best = render(low)
                 if low == 0:
                     verified = True  # the floor, counted at the start
@@ -263,7 +269,7 @@ class PromptFitter:
             if not verified:
                 low, best = 0, floor
         logger.info("prompt window: %d of %d column descriptions sent, to fit %d tokens",
-                    low, len(ranked), budget)
+                    low, len(ranked), budget())
         return best
 
 
