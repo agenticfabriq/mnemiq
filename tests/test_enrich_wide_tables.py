@@ -437,3 +437,66 @@ def test_a_cut_off_answer_still_splits_when_the_retry_cannot_be_parsed(monkeypat
 def test_a_cut_off_answer_still_splits_when_the_retry_holds_no_json():
     annotation = LLMEnricher(_cut_then("no json")).annotate("wide", _facts(30))
     assert len(annotation.columns) == 30 and not annotation.failures
+
+
+
+def test_a_context_length_refusal_splits_and_the_table_goes_on():
+    """Codex review of #75: vLLM refuses a prompt plus reply budget over its window with a 400,
+    which the client wrapped as an outage -- two of them took the endpoint for down and skipped
+    the rest of the table. It is a size failure: split, and go on."""
+    from mnemiq.llm.client import ContextTooLong
+
+    class _Strict(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            reply = super().complete(system, user, max_tokens, **kw)
+            names = _ASKED.findall(user.split("The table's other columns")[0])
+            if len(names) == 30 and "c30" in names:
+                raise ContextTooLong("This model's maximum context length is 28672 tokens.")
+            return reply
+
+    annotation = LLMEnricher(_Strict()).annotate("wide", _facts(84))
+    assert len(annotation.columns) == 84 and not annotation.failures
+
+
+def test_the_client_names_a_context_length_refusal():
+    from types import SimpleNamespace
+
+    import httpx
+    import openai
+
+    import mnemiq.llm.client as module
+    from mnemiq.config import Settings
+    from mnemiq.llm.client import ContextTooLong, ModelUnavailable
+
+    def refusing(message, code=None):
+        class _Fake:
+            def __init__(self, *_, **__):
+                self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+            def _create(self, **_):
+                request = httpx.Request("POST", "http://x/v1/chat/completions")
+                raise openai.BadRequestError(
+                    message, response=httpx.Response(400, request=request),
+                    body={"code": code} if code else None)
+        return _Fake
+
+    settings = Settings(llm_base_url="http://x", llm_api_key="k", llm_model="m", pg_dsn=None,
+                        acme_data_dir=None)
+    original = module.OpenAI
+    try:
+        for message, code, expected in [
+            ("This model's maximum context length is 28672 tokens. However, you requested 30000",
+             None, ContextTooLong),
+            ("too long", "context_length_exceeded", ContextTooLong),
+            ("invalid model name", None, ModelUnavailable),
+        ]:
+            module.OpenAI = refusing(message, code)
+            client = module.LLMClient(settings)
+            try:
+                client.complete("s", "u")
+            except ModelUnavailable as exc:
+                assert type(exc) is expected, (message, type(exc))
+            else:
+                raise AssertionError("no exception")
+    finally:
+        module.OpenAI = original

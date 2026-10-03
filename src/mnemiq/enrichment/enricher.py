@@ -16,7 +16,7 @@ from mnemiq.enrichment.proposals import (
     diagnose_reply,
     parse_annotation,
 )
-from mnemiq.llm.client import PromptCut
+from mnemiq.llm.client import ContextTooLong, PromptCut
 
 # Columns described per call (M112). One call for a whole table capped the reply at the budget: a
 # 34-column table's reply closed cleanly, an 84-column table's stopped mid-JSON and the table got
@@ -34,8 +34,8 @@ _CONTEXT_NAMES = 200
 # retried) rather than 16, and a reasoning model still over its cap at 15 columns loses them --
 # reported, not silent -- where halving further might have saved them.
 _MIN_SPLIT = 5
-# The server's window, not the reply budget: PromptCut says this chunk's prompt was longer than the
-# server keeps. A size failure like a cut-off reply -- halving shortens the prompt -- and never a
+# The server's window, not the reply budget: PromptCut (the server kept part of this chunk's prompt)
+# or ContextTooLong (it refused the prompt plus reply budget as over its window). A size failure like a cut-off reply -- halving shortens the prompt -- and never a
 # sign the endpoint is down, since the next chunk's prompt is a different length.
 _TOO_LONG = "the prompt was longer than the server's window"
 
@@ -129,9 +129,10 @@ class LLMEnricher:
                 # and discard the first chunk's columns with it. The type only -- a provider's
                 # exception text can carry a host or a key, and the job outlives the run. A size
                 # diagnosis from an earlier attempt outranks it: that is what splitting acts on.
-                if isinstance(exc, PromptCut):
-                    # The server read the prompt -- part of it -- so it is up; asking again cuts
-                    # again, and halving is what shortens the prompt.
+                if isinstance(exc, (PromptCut, ContextTooLong)):
+                    # The server read the prompt (part of it), or refused it as over its window:
+                    # either way it is up, asking again fails again, and halving is what shortens
+                    # the prompt.
                     why, replied = _TOO_LONG, True
                     break
                 if not _size_failure(why, True):
