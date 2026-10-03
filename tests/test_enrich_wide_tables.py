@@ -77,6 +77,26 @@ def test_a_chunk_cut_off_once_is_halved_and_recovered():
 _MIDDLE = frozenset(f"c{i}" for i in range(30, 60))
 
 
+def test_a_chunk_that_never_fits_costs_at_most_sixteen_calls():
+    """Halves are tried once each: a 30-column chunk that never fits is 2 calls, then 2 + 4 + 8 for
+    its halves down to 3- and 4-column spans."""
+    model = _Model(cut_columns=frozenset(f"c{i}" for i in range(30)))
+    LLMEnricher(model).annotate("wide", _facts(30))
+    assert len(model.prompts) == 16
+
+
+def test_an_empty_reply_at_the_cap_is_halved_too():
+    """A reasoning model that spends its cap thinking returns an empty string, not a cut-off JSON."""
+    class _Thinker(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            reply = super().complete(system, user, max_tokens, **kw)
+            names = _ASKED.findall(user.split("The table's other columns")[0])
+            return "" if len(names) > 15 else reply
+
+    annotation = LLMEnricher(_Thinker()).annotate("wide", _facts(30))
+    assert len(annotation.columns) == 30 and not annotation.failures
+
+
 def test_a_span_that_overflows_however_small_costs_its_columns_and_says_why():
     annotation = LLMEnricher(_Model(cut_columns=_MIDDLE)).annotate("wide", _facts(84))
 

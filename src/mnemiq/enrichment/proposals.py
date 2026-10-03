@@ -49,17 +49,23 @@ class TableAnnotation(BaseModel):
     failures: list[str] = Field(default_factory=list)
 
 
+# The causes that mean "the reply did not fit its budget": a reply cut off mid-JSON, and the empty
+# string a reasoning model returns when its thinking spent the whole cap. The enricher halves a
+# chunk on either.
+CUT_OFF = "the reply stopped before its JSON closed"
+EMPTY = "the reply was empty"
+
+
 def diagnose_reply(raw: str, allowed: dict[str, set[str]]) -> str:
     """Why a reply yielded no annotated column -- for the job, never shown to the model."""
     text = (raw or "").strip()
     if not text:
-        return "the reply was empty"
+        return EMPTY
     if "{" not in text:
         return f"the reply held no JSON ({len(text):,} characters)"
     if not _extract_json(text):
         if text.count("{") > text.count("}"):
-            return (f"the reply stopped before its JSON closed ({len(text):,} characters; the "
-                    "reply budget is the likely cut)")
+            return (f"{CUT_OFF} ({len(text):,} characters; the reply budget is the likely cut)")
         return f"the reply's JSON did not parse ({len(text):,} characters)"
     if not isinstance(_extract_json(text).get("columns"), list):
         return "the reply's JSON carried no columns list"

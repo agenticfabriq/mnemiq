@@ -9,7 +9,13 @@ from mnemiq.enrichment.prompts import (
     system_prompt,
     user_prompt,
 )
-from mnemiq.enrichment.proposals import TableAnnotation, diagnose_reply, parse_annotation
+from mnemiq.enrichment.proposals import (
+    CUT_OFF,
+    EMPTY,
+    TableAnnotation,
+    diagnose_reply,
+    parse_annotation,
+)
 
 # Columns described per call (M112). One call for a whole table capped the reply at the budget: a
 # 34-column table's reply closed cleanly, an 84-column table's stopped mid-JSON and the table got
@@ -18,9 +24,10 @@ CHUNK_COLUMNS = 30
 # The rest of a wide table's column names ride with each chunk, for context only; a table of
 # thousands would otherwise put them all in every call.
 _CONTEXT_NAMES = 200
-# A cut-off chunk is halved until a reply fits or it is this small.
+# A chunk whose reply did not fit is halved until one does or it is this small. The halves are
+# tried once each, not twice: a 30-column chunk that never fits costs at most 16 calls (2 for the
+# chunk, then 2 + 4 + 8 for its halves down to 3- and 4-column spans), not 30.
 _MIN_SPLIT = 5
-_CUT_OFF = "the reply stopped before its JSON closed"
 
 
 def _allowed(facts: list[ColumnFacts]) -> dict[str, set[str]]:
@@ -52,25 +59,26 @@ class LLMEnricher:
         return TableAnnotation(table=table, columns=columns, failures=failures)
 
     def _annotate_span(self, table: str, facts: list[ColumnFacts], start: int, end: int,
-                       grounding: str) -> tuple[list, list[str]]:
-        """Columns start..end described, and why any span yielded none. A span whose reply was cut
-        off is split in half and tried again, down to _MIN_SPLIT columns: a column count does not
-        bound a reply -- code-heavy columns each carry their meanings."""
+                       grounding: str, attempts: int = 2) -> tuple[list, list[str]]:
+        """Columns start..end described, and why any span yielded none. A span whose reply did not
+        fit -- cut off, or empty as a reasoning model's is at the cap -- is split in half and tried
+        again, down to _MIN_SPLIT columns: a column count does not bound a reply, since code-heavy
+        columns each carry their meanings."""
         chunk = facts[start:end]
         others = facts[:start] + facts[end:]
-        described, why = self._annotate_chunk(table, chunk, others, grounding)
+        described, why = self._annotate_chunk(table, chunk, others, grounding, attempts)
         if described:
             return described, []
-        if why.startswith(_CUT_OFF) and len(chunk) > _MIN_SPLIT:
+        if (why.startswith(CUT_OFF) or why == EMPTY) and len(chunk) > _MIN_SPLIT:
             middle = start + len(chunk) // 2
-            left, left_why = self._annotate_span(table, facts, start, middle, grounding)
-            right, right_why = self._annotate_span(table, facts, middle, end, grounding)
+            left, left_why = self._annotate_span(table, facts, start, middle, grounding, 1)
+            right, right_why = self._annotate_span(table, facts, middle, end, grounding, 1)
             return left + right, left_why + right_why
         span = f"columns {start + 1}-{end} of {len(facts)}: " if len(facts) > len(chunk) else ""
         return [], [span + why]
 
     def _annotate_chunk(self, table: str, chunk: list[ColumnFacts], others: list[ColumnFacts],
-                        grounding: str) -> tuple[list, str]:
+                        grounding: str, attempts: int = 2) -> tuple[list, str]:
         """The columns described in one call, and why none were if none were."""
         facts_block = render_table_facts(table, chunk)
         if others:
@@ -81,7 +89,7 @@ class LLMEnricher:
         system, user = system_prompt(), user_prompt(facts_block, grounding)
         allowed = _allowed(chunk)
         why = ""
-        for _attempt in range(2):  # one bounded retry; models drop the channel occasionally
+        for _attempt in range(attempts):  # one retry by default; models drop the channel occasionally
             raw = self._client.complete(system, user, max_tokens=self._max_tokens)
             annotation = parse_annotation(raw, table, allowed)
             if annotation.columns:
