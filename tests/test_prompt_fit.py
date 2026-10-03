@@ -675,3 +675,21 @@ def test_a_floor_returned_after_the_window_shrank_below_it_says_so(caplog):
         fitted = _fitter(None, count=collapsing).fit(packet, snap, _grants(snap))
     assert fitted.descriptions[0] == 0
     assert "even with no column descriptions" in caplog.text
+
+
+def test_a_server_that_keeps_failing_returns_to_the_long_back_off():
+    from mnemiq.semantic import fit as fit_module
+
+    snap = _snapshot()
+    answers = [(10**6,)]
+    fitter = _fitter(None, count=lambda s, u: None if answers[0] is None
+                     else (_piece_count(s, u), answers[0][0]))
+    fitter.fit(_packet(snap), snap, _grants(snap))  # counted once: the window is known
+    answers[0] = None
+    waits = []
+    for _ in range(3):
+        fitter._window_seen_at -= fit_module.WINDOW_TTL_S + 1
+        fitter._no_count_until = None
+        fitter.fit(_packet(snap, "again"), snap, _grants(snap))
+        waits.append(fitter._no_count_until - fit_module.time.monotonic())
+    assert waits[0] <= fit_module.TRANSIENT_RETRY_S < waits[-1] <= fit_module.NO_COUNT_RETRY_S

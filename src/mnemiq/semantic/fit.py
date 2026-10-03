@@ -118,6 +118,7 @@ class PromptFitter:
     _server_window: int | None = field(default=None, init=False, repr=False)
     _no_count_until: float | None = field(default=None, init=False, repr=False)
     _window_seen_at: float = field(default=0.0, init=False, repr=False)
+    _failures: int = field(default=0, init=False, repr=False)
 
     def system(self) -> str:
         """The longest system prompt a call can carry: deep mode's strategies differ in length."""
@@ -140,17 +141,20 @@ class PromptFitter:
             return packet
 
     def _counted(self, system: str, user: str) -> int | None:
-        """The server's count of this prompt, or None. A server that gave none (no /tokenize, or not
-        answering) is not asked again for NO_COUNT_RETRY_S: without a declared window every question
-        would otherwise pay a round trip, up to the count's deadline, for nothing."""
+        """The server's count of this prompt, or None. A server that gave none is not asked again for
+        a while -- TRANSIENT_RETRY_S if it has counted before and has failed fewer than three times in
+        a row, NO_COUNT_RETRY_S otherwise (no /tokenize, most likely) -- since every question would
+        otherwise pay a round trip, up to the count's deadline, for nothing. A failure also retires
+        an expired server window in favour of the declared one; a success refreshes it."""
         if not callable(self.count) or (
                 self._no_count_until is not None and time.monotonic() < self._no_count_until):
             return None
         counted = self.count(system, user)
         if counted is None:
             now = time.monotonic()
-            self._no_count_until = now + (TRANSIENT_RETRY_S if self._window_seen_at
-                                          else NO_COUNT_RETRY_S)
+            self._failures += 1
+            passing = self._window_seen_at and self._failures < 3
+            self._no_count_until = now + (TRANSIENT_RETRY_S if passing else NO_COUNT_RETRY_S)
             if (self._server_window is not None and self.window is not None
                     and now - self._window_seen_at > WINDOW_TTL_S):
                 # An expired window the server would not confirm yields to the declared one -- a
@@ -158,7 +162,7 @@ class PromptFitter:
                 # no declared window, the last one the server gave is still the best word there is.
                 self._server_window = None
             return None
-        self._no_count_until = None
+        self._no_count_until, self._failures = None, 0
         tokens, reported = counted
         # Every count refreshes it: the latest word on the window is the server's latest answer.
         self._server_window, self._window_seen_at = reported, time.monotonic()
