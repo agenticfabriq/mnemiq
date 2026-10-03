@@ -114,10 +114,16 @@ def enrich_semantic(
                 continue  # certified meaning is authoritative; the LLM never clobbers it
             if column.name in by_name:
                 annotated[column.id] = _annotated(column, by_name[column.name])
-        # Done, but a wide table can come back partly described when one of its chunks failed:
-        # the job says how much and why, as `detail` on a done job.
-        partial = (f"{len(annotation.columns)} of {len(columns)} columns described; "
-                   + "; ".join(annotation.failures)) if annotation.failures else None
+        # Done, but possibly only partly: a chunk can fail, or the model can skip columns it was
+        # asked about. Counted from what LANDED -- a description on an unprotected column -- so a
+        # proposal with a blank description, or one for a certified column, is not counted. The
+        # job says how much and why, as `detail` on a done job.
+        askable = [c for c in columns if c.id not in protected]
+        landed = sum(1 for c in askable if c.id in annotated and annotated[c.id].description)
+        partial = None
+        if landed < len(askable):
+            partial = "; ".join([f"{landed} of {len(askable)} columns described",
+                                 *annotation.failures])
         jobs.append(
             Job(
                 id=f"semantic:{table}",

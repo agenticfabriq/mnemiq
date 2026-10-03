@@ -21,20 +21,26 @@ _ASKED = re.compile(r"^- (\S+) \(type=", re.MULTILINE)
 
 
 class _Model:
-    """Documents exactly the columns a prompt's facts list, as a well-behaved model would; the
-    calls numbered in `cut` (from 1) stop mid-JSON, as an over-long reply does at the budget."""
+    """Documents exactly the columns a prompt's facts list, as a well-behaved model would. A reply
+    stops mid-JSON, as an over-long one does at the budget, for the calls numbered in `cut` (from
+    1), or whenever a prompt asks about any column in `cut_columns` -- a span that overflows however
+    small it is split."""
 
-    def __init__(self, cut: frozenset[int] = frozenset(), raises: bool = False):
+    def __init__(self, cut: frozenset[int] = frozenset(), cut_columns: frozenset[str] = frozenset(),
+                 raises: bool = False, skip: int = 0):
         self.prompts: list[str] = []
-        self._cut, self._raises = cut, raises
+        self._cut, self._cut_columns, self._raises, self._skip = cut, cut_columns, raises, skip
 
     def complete(self, system, user, max_tokens=512, **_):
         if self._raises:
             raise RuntimeError("rate limited at https://provider.example/v1 key=sk-secret")
         self.prompts.append(user)
         names = _ASKED.findall(user.split("The table's other columns")[0])
-        reply = json.dumps({"columns": [{"name": n, "description": f"about {n}"} for n in names]})
-        return reply[: len(reply) // 2] if len(self.prompts) in self._cut else reply
+        documented = names[self._skip:]  # a model that skips some of what it was asked
+        reply = json.dumps({"columns": [{"name": n, "description": f"about {n}"}
+                                        for n in documented]})
+        cut = len(self.prompts) in self._cut or self._cut_columns.intersection(names)
+        return reply[: len(reply) // 2] if cut else reply
 
 
 def _facts(n: int) -> list[ColumnFacts]:
@@ -60,14 +66,27 @@ def test_a_narrow_table_is_one_call_with_no_context_line():
     assert "for context only" not in model.prompts[0]
 
 
-def test_a_chunk_that_fails_costs_its_columns_and_says_why():
+def test_a_chunk_cut_off_once_is_halved_and_recovered():
+    """A column count does not bound a reply -- code-heavy columns carry their meanings -- so a
+    chunk that overflows is split in half and asked again."""
     model = _Model(cut=frozenset({2, 3}))  # both attempts at the second chunk come back cut off
     annotation = LLMEnricher(model).annotate("wide", _facts(84))
+    assert len(annotation.columns) == 84 and not annotation.failures
+
+
+_MIDDLE = frozenset(f"c{i}" for i in range(30, 60))
+
+
+def test_a_span_that_overflows_however_small_costs_its_columns_and_says_why():
+    annotation = LLMEnricher(_Model(cut_columns=_MIDDLE)).annotate("wide", _facts(84))
 
     assert len(annotation.columns) == 54
-    (failure,) = annotation.failures
-    assert failure.startswith("columns 31-60 of 84: the reply stopped before its JSON closed (")
-    assert failure.endswith(" characters; the reply budget is the likely cut)")
+    assert annotation.failures, "the lost columns are accounted for"
+    for failure in annotation.failures:
+        span = re.match(r"columns (\d+)-(\d+) of 84: the reply stopped before its JSON closed",
+                        failure)
+        assert span and 31 <= int(span[1]) <= int(span[2]) <= 60
+        assert int(span[2]) - int(span[1]) + 1 <= 5, "halved down to the smallest span"
 
 
 def _snapshot(width: int) -> Snapshot:
@@ -84,20 +103,21 @@ def _job(snap: Snapshot):
 
 
 def test_a_partly_described_table_is_done_and_says_how_much():
-    snap = enrich_semantic(_snapshot(84), LLMEnricher(_Model(cut=frozenset({2, 3}))))
+    snap = enrich_semantic(_snapshot(84), LLMEnricher(_Model(cut_columns=_MIDDLE)))
     job = _job(snap)
     assert job.status == "done"
-    assert job.detail.startswith("54 of 84 columns described; columns 31-60 of 84: the reply "
-                                 "stopped before its JSON closed")
+    assert job.detail.startswith("54 of 84 columns described; columns 31-")
+    assert "the reply stopped before its JSON closed" in job.detail
     described = [c for c in snap.columns if c.description]
     assert len(described) == 54
 
 
 def test_a_table_with_nothing_described_is_failed_with_its_cause():
-    snap = enrich_semantic(_snapshot(20), LLMEnricher(_Model(cut=frozenset({1, 2}))))
+    every = frozenset(f"c{i}" for i in range(20))
+    snap = enrich_semantic(_snapshot(20), LLMEnricher(_Model(cut_columns=every)))
     job = _job(snap)
     assert job.status == "failed"
-    assert job.detail.startswith("the reply stopped before its JSON closed")
+    assert "the reply stopped before its JSON closed" in job.detail
 
 
 def test_a_call_that_raises_records_its_type_and_never_its_text():
@@ -106,6 +126,21 @@ def test_a_call_that_raises_records_its_type_and_never_its_text():
     job = _job(snap)
     assert job.status == "failed" and job.detail == "the call failed: RuntimeError"
     assert "sk-secret" not in job.detail and "provider.example" not in job.detail
+
+
+def test_columns_the_model_skips_are_counted_as_not_described():
+    """Gate review: a chunk answered for 3 of its 30 columns was a success, and the table passed as
+    healthy. What is counted is what landed on the snapshot."""
+    snap = enrich_semantic(_snapshot(30), LLMEnricher(_Model(skip=27)))
+    job = _job(snap)
+    assert job.status == "done" and job.detail == "3 of 30 columns described"
+    (line,) = semantic_warnings(snap)
+    assert "PARTLY described: wide (3 of 30 columns described)" in line
+
+
+def test_a_certified_column_is_not_counted_as_described_or_missing():
+    snap = enrich_semantic(_snapshot(30), LLMEnricher(_Model()), protected=frozenset({"wide.c0"}))
+    assert _job(snap).detail is None, "29 of 29 unprotected columns landed"
 
 
 def test_a_fully_described_table_carries_no_detail():
@@ -120,15 +155,16 @@ def test_each_way_a_reply_falls_short_is_named():
     assert diagnose_reply('{"columns": [{"name": "a"', allowed).startswith(
         "the reply stopped before its JSON closed")
     assert diagnose_reply('{"columns": [}', allowed).startswith("the reply's JSON did not parse")
+    assert diagnose_reply('{"answer": 1}', allowed) == "the reply's JSON carried no columns list"
     assert diagnose_reply('{"columns": [{"name": "zz"}]}', allowed) == (
-        "the reply named none of the 2 column(s) asked about")
+        "the reply described none of the 2 column(s) asked about")
 
 
 def test_enrich_says_out_loud_what_fell_short():
     ok = enrich_semantic(_snapshot(84), LLMEnricher(_Model()))
     assert semantic_warnings(ok) == []
 
-    partial = enrich_semantic(_snapshot(84), LLMEnricher(_Model(cut=frozenset({2, 3}))))
+    partial = enrich_semantic(_snapshot(84), LLMEnricher(_Model(cut_columns=_MIDDLE)))
     (line,) = semantic_warnings(partial)
     assert line.startswith("WARNING: 1 table(s) were only PARTLY described: wide (54 of 84")
 

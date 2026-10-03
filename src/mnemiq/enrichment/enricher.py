@@ -13,11 +13,14 @@ from mnemiq.enrichment.proposals import TableAnnotation, diagnose_reply, parse_a
 
 # Columns described per call (M112). One call for a whole table capped the reply at the budget: a
 # 34-column table's reply closed cleanly, an 84-column table's stopped mid-JSON and the table got
-# nothing. 30 keeps every chunk under the size that worked.
+# nothing. 30 starts every chunk under the size that worked; one that still overflows is halved.
 CHUNK_COLUMNS = 30
 # The rest of a wide table's column names ride with each chunk, for context only; a table of
 # thousands would otherwise put them all in every call.
 _CONTEXT_NAMES = 200
+# A cut-off chunk is halved until a reply fits or it is this small.
+_MIN_SPLIT = 5
+_CUT_OFF = "the reply stopped before its JSON closed"
 
 
 def _allowed(facts: list[ColumnFacts]) -> dict[str, set[str]]:
@@ -40,17 +43,31 @@ class LLMEnricher:
     def annotate(self, table: str, facts: list[ColumnFacts], grounding: str = "") -> TableAnnotation:
         if not facts:
             return TableAnnotation(table=table)
-        chunks = [facts[i:i + CHUNK_COLUMNS] for i in range(0, len(facts), CHUNK_COLUMNS)]
         columns, failures = [], []
-        for start, chunk in zip(range(0, len(facts), CHUNK_COLUMNS), chunks, strict=True):
-            others = facts[:start] + facts[start + len(chunk):] if len(chunks) > 1 else []
-            described, why = self._annotate_chunk(table, chunk, others, grounding)
+        for start in range(0, len(facts), CHUNK_COLUMNS):
+            described, why = self._annotate_span(table, facts, start,
+                                                 min(start + CHUNK_COLUMNS, len(facts)), grounding)
             columns += described
-            if why:
-                span = (f"columns {start + 1}-{start + len(chunk)} of {len(facts)}: "
-                        if len(chunks) > 1 else "")
-                failures.append(span + why)
+            failures += why
         return TableAnnotation(table=table, columns=columns, failures=failures)
+
+    def _annotate_span(self, table: str, facts: list[ColumnFacts], start: int, end: int,
+                       grounding: str) -> tuple[list, list[str]]:
+        """Columns start..end described, and why any span yielded none. A span whose reply was cut
+        off is split in half and tried again, down to _MIN_SPLIT columns: a column count does not
+        bound a reply -- code-heavy columns each carry their meanings."""
+        chunk = facts[start:end]
+        others = facts[:start] + facts[end:]
+        described, why = self._annotate_chunk(table, chunk, others, grounding)
+        if described:
+            return described, []
+        if why.startswith(_CUT_OFF) and len(chunk) > _MIN_SPLIT:
+            middle = start + len(chunk) // 2
+            left, left_why = self._annotate_span(table, facts, start, middle, grounding)
+            right, right_why = self._annotate_span(table, facts, middle, end, grounding)
+            return left + right, left_why + right_why
+        span = f"columns {start + 1}-{end} of {len(facts)}: " if len(facts) > len(chunk) else ""
+        return [], [span + why]
 
     def _annotate_chunk(self, table: str, chunk: list[ColumnFacts], others: list[ColumnFacts],
                         grounding: str) -> tuple[list, str]:

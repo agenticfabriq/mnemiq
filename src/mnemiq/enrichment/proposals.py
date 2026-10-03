@@ -61,7 +61,9 @@ def diagnose_reply(raw: str, allowed: dict[str, set[str]]) -> str:
             return (f"the reply stopped before its JSON closed ({len(text):,} characters; the "
                     "reply budget is the likely cut)")
         return f"the reply's JSON did not parse ({len(text):,} characters)"
-    return f"the reply named none of the {len(allowed)} column(s) asked about"
+    if not isinstance(_extract_json(text).get("columns"), list):
+        return "the reply's JSON carried no columns list"
+    return f"the reply described none of the {len(allowed)} column(s) asked about"
 
 
 def _extract_json(raw: str) -> dict:
