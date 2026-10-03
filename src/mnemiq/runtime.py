@@ -79,6 +79,8 @@ class Runtime:
     # six scalars fast; this one batches, crosses a network to another product and may retry.
     # None = emit nothing, and the engine is byte-for-byte unchanged.
     trace_sink: Any = None
+    # Fits each packet to the model's window before the agent sees it (M127); None = as retrieved.
+    fitter: Any = None
     ontology: Any = None  # OntologyIndex reader; None = no question-time code resolution
 
     def reload_if_stale(self) -> None:
@@ -191,6 +193,10 @@ class Runtime:
         grants = self.authz.grants_for(identity)
         # Scoped against THIS identity's boundary, never the one that produced the turn.
         packet.history = scope_history(history, grants.fingerprint)
+        # After the history, which the prompt carries too; before the agent, so the generator, the
+        # corrector and the judge all read the cards the window has room for (M127).
+        if self.fitter is not None:
+            packet = self.fitter.fit(packet, self.snapshot, grants)
         answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
         answer.mode = name
         answer.grant_fingerprint = grants.fingerprint
@@ -419,6 +425,17 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
     if report.fits:
         logger.info("prompt window fits: %s", report.sentence())
         _ack_did_not_apply(acknowledged, None, prefix="window:")
+        return
+    if report.floor_fits:
+        # Answered, with fewer descriptions than enrichment wrote: the fit (M127) withholds the
+        # ones the question is least about. Worth knowing, not a failure.
+        verdict = "window:trims"
+        log = logger.info if verdict in acknowledged else logger.warning
+        log("prompt window fits only by withholding column descriptions: %s. With none, that "
+            "prompt is %s tokens, so a question that retrieves those tables is sent with as many "
+            "descriptions as fit, the ones it names first. Raise the window (vLLM "
+            "--max-model-len) to send them all.", report.sentence(), f"{report.floor_tokens:,}")
+        _ack_did_not_apply(acknowledged, verdict, prefix="window:")
         return
     verdict = "window:too-small"
     log = logger.info if verdict in acknowledged else logger.warning
@@ -898,4 +915,5 @@ def build_runtime(settings: Settings) -> Runtime:
         sink=sink,
         trace_sink=trace_sink,
         ontology=ontology,
+        fitter=kit.fitter,
     )

@@ -220,6 +220,8 @@ def build_engine(
                           metrics=snapshot.metrics, dimensions=snapshot.dimensions,
                           columns=snapshot.columns, ontology_index=ontology_index,
                           snapshot=snapshot)
+        # The product door's fit, from the same kit: an eval must measure the prompt `ask` sends.
+        packet = kit.fitter.fit(packet, snapshot, grants)
         return agent.answer(packet, snapshot, grants, IDENTITY)
 
     return ask, client

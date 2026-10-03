@@ -76,6 +76,9 @@ class WindowReport:
     cards: int
     real_tokens: int | None = None
     who: str = ""
+    # The same largest prompt with no column descriptions, measured only when the full one does not
+    # fit: what is left once the fit (M127) has withheld every description it can.
+    floor_tokens: int | None = None
 
     @property
     def needed(self) -> int:
@@ -85,6 +88,13 @@ class WindowReport:
     def fits(self) -> bool | None:
         """None when no window is known: nothing to compare against."""
         return None if self.window is None else self.needed <= self.window
+
+    @property
+    def floor_fits(self) -> bool:
+        """The full prompt does not fit but the descriptionless one does: questions are answered,
+        with fewer descriptions than enrichment wrote."""
+        return (self.window is not None and self.floor_tokens is not None
+                and self.floor_tokens + self.reply_tokens <= self.window)
 
     @property
     def certain(self) -> bool:
@@ -129,8 +139,11 @@ def largest_prompt(con, snapshot, settings, dialect: str,
 
 
 def largest_prompts(con, snapshot, settings, dialect: str,
-                    grants: GrantSet) -> tuple[str, str, str, int]:
-    """(system, upper bound, real packet of the same tables, cards), as `grants` may see them."""
+                    grants: GrantSet, describe=None) -> tuple[str, str, str, int]:
+    """(system, upper bound, real packet of the same tables, cards), as `grants` may see them.
+
+    `describe` is `build_cards`' own: `lambda table, column: False` gives the floor the fit (M127)
+    can bring a prompt down to."""
     from mnemiq.agent.loop import STRATEGIES
     from mnemiq.semantic.cards import build_cards
     from mnemiq.semantic.glossary import select_definitions
@@ -142,7 +155,7 @@ def largest_prompts(con, snapshot, settings, dialect: str,
     k = settings.retrieval_k
     # The cards retrieval renders for this identity: its tables only, under its column policy.
     rendered = [c for c in build_cards(snapshot, policy=build_access_policy(snapshot, grants),
-                                       style=settings.card_style)
+                                       style=settings.card_style, describe=describe)
                 if c.object_id in grants.objects]
     # Every granted table visible, so a definition bound to one inside the k and one outside it
     # still rides in.
@@ -347,12 +360,21 @@ def worst_window(con, snapshot, settings, dialect: str, authz,
                  http: httpx.Client | None = None) -> WindowReport | None:
     """The report for the view whose largest prompt is longest, measured locally and then counted
     on the server; None when no view sees a table."""
+    views = dict(grant_sets(authz, settings))
     candidates = [(label, largest_prompts(con, snapshot, settings, dialect, grants))
-                  for label, grants in grant_sets(authz, settings)]
+                  for label, grants in views.items()]
     if not candidates:
         return None
     label, prompts = max(candidates, key=lambda c: (len(c[1][0]) + len(c[1][1]), c[0]))
-    return _count(prompts, settings, http, label)
+    report = _count(prompts, settings, http, label)
+    if report.fits is False:
+        # Past the window with every description: what the fit can bring it down to. The same
+        # view, its tables re-chosen by what they bring without descriptions.
+        floor = _count(largest_prompts(con, snapshot, settings, dialect, views[label],
+                                       describe=lambda _table, _column: False),
+                       settings, http, label)
+        report = replace(report, floor_tokens=floor.real_tokens or floor.prompt_tokens)
+    return report
 
 
 def _count(prompts: tuple[str, str, str, int], settings, http: httpx.Client | None,

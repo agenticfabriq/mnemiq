@@ -55,6 +55,9 @@ class ContextPacket:
     examples: list[Example] = field(default_factory=list)  # Plan 08 seam; filled by retrieve()
     # Prior turns, already scoped to this identity's authorization boundary by the caller.
     history: list[HistoryTurn] = field(default_factory=list)
+    # (sent, described) when `mnemiq.semantic.fit` withheld column descriptions to fit the window
+    # (M127); None when every card is as retrieval rendered it.
+    descriptions: tuple[int, int] | None = None
 
 
 def _rank(rows: list[tuple[str, float]]) -> dict[str, int]:
