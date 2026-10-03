@@ -52,6 +52,23 @@ class SourceSpec:
     target: str  # dsn (postgres), file path (sqlite/duckdb), Easy Connect or TNS alias (oracle)
     catalog: str  # DuckDB attach alias AND the object_id prefix in a federated store
     schema: str  # source schema: "public" (postgres) / "main" (sqlite)
+    # The tables enrichment may see, exact names or shell patterns, without regard to case (M110);
+    # empty means every table the source reports. See `mnemiq.adapters.scoped`.
+    tables: tuple[str, ...] = ()
+
+
+def _manifest_tables(entry: dict) -> tuple[str, ...]:
+    """A source's optional `tables` list, refused unless it is non-empty strings: a bare string
+    would iterate as one-letter patterns, and an empty list would read as 'no tables'."""
+    tables = entry.get("tables")
+    if tables is None:
+        return ()
+    if (not isinstance(tables, list) or not tables
+            or not all(isinstance(t, str) and t.strip() for t in tables)):
+        raise ValueError(
+            f"source {entry.get('id')!r}: \"tables\" must be a non-empty list of table names or "
+            f"patterns, got {tables!r}")
+    return tuple(t.strip() for t in tables)
 
 
 class Settings(BaseSettings):
@@ -327,7 +344,8 @@ class Settings(BaseSettings):
             with open(self.sources_path) as fh:
                 raw = json.load(fh)
             return [SourceSpec(id=d["id"], kind=d["kind"], target=d["target"],
-                               catalog=d["catalog"], schema=d["schema"]) for d in raw]
+                               catalog=d["catalog"], schema=d["schema"],
+                               tables=_manifest_tables(d)) for d in raw]
         return [SourceSpec(id=self.source_id or "acme", kind="postgres",
                            target=self.pg_dsn or "", catalog="src", schema="public")]
 

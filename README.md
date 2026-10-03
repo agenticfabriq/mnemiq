@@ -260,6 +260,20 @@ Postgres, SQLite, DuckDB, Oracle, Snowflake and Databricks, with DuckDB as the u
 The semantic model (`mnemiq-contract`) is open, and dbt-semantic-interfaces import/export ships
 with it.
 
+**Enrich only the tables you name.** A source in the manifest at `MNEMIQ_SOURCES_PATH` may carry a
+`tables` list, exact names or shell patterns, matched without regard to case:
+
+```json
+[{"id": "plant", "kind": "oracle", "target": "db.example:1521/PLANT", "catalog": "src",
+  "schema": "MES", "tables": ["WIP_LOT", "WIP_LOT_HIST", "EQP_*"]}]
+```
+
+Enrichment then sees only those tables -- introspection, profiling, cards and descriptions alike,
+foreign keys only between two of them -- so you can point it at a production schema of thousands
+of tables instead of copying the few you need. A name or pattern that matches nothing stops
+`mnemiq enrich` with a message saying which, so a typo cannot shrink the model unnoticed. Without
+`tables`, every table the source reports is enriched, as before.
+
 ### Deploying against Oracle
 
 The Oracle read plane refuses writes, but that refusal is partly a property of your **deployment**
