@@ -121,7 +121,7 @@ class LLMEnricher:
         for _attempt in range(attempts):  # one retry by default; models drop the channel occasionally
             try:
                 raw = self._client.complete(system, user, max_tokens=self._max_tokens)
-            except Exception as exc:  # noqa: BLE001 -- one chunk's outage, not the table's
+            except Exception as exc:  # noqa: BLE001 -- keep the chunks already described
                 # Caught here, not by the caller: a timeout on the second chunk used to escape
                 # and discard the first chunk's columns with it. The type only -- a provider's
                 # exception text can carry a host or a key, and the job outlives the run. A size
