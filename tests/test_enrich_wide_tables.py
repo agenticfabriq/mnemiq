@@ -489,6 +489,7 @@ def test_the_client_names_a_context_length_refusal():
              None, ContextTooLong),
             ("too long", "context_length_exceeded", ContextTooLong),
             ("invalid model name", None, ModelUnavailable),
+            ("too long", "some_other_code", ModelUnavailable),
         ]:
             module.OpenAI = refusing(message, code)
             client = module.LLMClient(settings)
@@ -498,5 +499,21 @@ def test_the_client_names_a_context_length_refusal():
                 assert type(exc) is expected, (message, type(exc))
             else:
                 raise AssertionError("no exception")
+        # A 5xx that happens to say the words is an outage, not a size failure.
+        class _Fake500:
+            def __init__(self, *_, **__):
+                self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+            def _create(self, **_):
+                request = httpx.Request("POST", "http://x/v1/chat/completions")
+                raise openai.InternalServerError(
+                    "upstream: maximum context length handler crashed",
+                    response=httpx.Response(500, request=request), body=None)
+
+        module.OpenAI = _Fake500
+        try:
+            module.LLMClient(settings).complete("s", "u")
+        except ModelUnavailable as exc:
+            assert type(exc) is ModelUnavailable
     finally:
         module.OpenAI = original

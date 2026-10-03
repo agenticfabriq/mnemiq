@@ -15,7 +15,7 @@ from mnemiq.contract.seams import (
     lineage_disclosure_sentence,
 )
 from mnemiq.contract import DeferralReason, IdentityContext, Snapshot, Trace
-from mnemiq.llm.client import ModelUnavailable, PromptCut, seed_offset
+from mnemiq.llm.client import ContextTooLong, ModelUnavailable, PromptCut, seed_offset
 from mnemiq.progress import Emit, Stage, step
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
@@ -253,6 +253,16 @@ class Agent:
                     answer=("Could not answer this question: the model server cut the prompt to fit "
                             "its context window, so the model never saw all of it. This is a "
                             f"configuration problem, not a judgement about your data. {detail}"),
+                    failed=True,
+                    reason_code=DeferralReason.MODEL_UNAVAILABLE,
+                )
+            if isinstance(exc, ContextTooLong):
+                # Refused rather than cut: the same configuration problem, told the same way.
+                return AgentAnswer(
+                    answer=("Could not answer this question: the model server refused the prompt "
+                            "as longer than its context window. This is a configuration problem, "
+                            "not a judgement about your data -- raise the server's window or lower "
+                            f"MNEMIQ_RETRIEVAL_K. {detail[:300]}"),
                     failed=True,
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
                 )
