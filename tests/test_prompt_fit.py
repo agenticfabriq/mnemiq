@@ -692,4 +692,15 @@ def test_a_server_that_keeps_failing_returns_to_the_long_back_off():
         fitter._no_count_until = None
         fitter.fit(_packet(snap, "again"), snap, _grants(snap))
         waits.append(fitter._no_count_until - fit_module.time.monotonic())
-    assert waits[0] <= fit_module.TRANSIENT_RETRY_S < waits[-1] <= fit_module.NO_COUNT_RETRY_S
+    assert waits[0] <= fit_module.TRANSIENT_RETRY_S and waits[1] <= fit_module.TRANSIENT_RETRY_S
+    assert fit_module.TRANSIENT_RETRY_S < waits[2] <= fit_module.NO_COUNT_RETRY_S
+
+    # A success in between starts the count again: a server that blips now and then stays short.
+    answers[0] = (10**6,)
+    fitter._no_count_until = None
+    fitter._window_seen_at -= fit_module.WINDOW_TTL_S + 1
+    fitter.fit(_packet(snap, "healthy"), snap, _grants(snap))
+    answers[0] = None
+    fitter._window_seen_at -= fit_module.WINDOW_TTL_S + 1
+    fitter.fit(_packet(snap, "blip"), snap, _grants(snap))
+    assert fitter._no_count_until - fit_module.time.monotonic() <= fit_module.TRANSIENT_RETRY_S
