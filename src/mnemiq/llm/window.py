@@ -60,6 +60,10 @@ _PHASE_TIMEOUT_S = 5.0
 # ASCII only: a byte-level tokenizer can spend a token per UTF-8 byte, so a 500-character question in
 # Chinese or heavy with accents can cost more -- headroom again.
 QUESTION_ALLOWANCE = 500
+# A retry re-sends the prompt with the database's error and the failed SQL, and the judge adds
+# the SQL and a result preview: room the fit (M127) keeps free beyond the reply, and the floor
+# test below uses too, so the boot line and the question path agree on what fits.
+FEEDBACK_ALLOWANCE = 500
 
 
 @dataclass(frozen=True)
@@ -94,7 +98,7 @@ class WindowReport:
         """The full prompt does not fit but the descriptionless one does: questions are answered,
         with fewer descriptions than enrichment wrote."""
         return (self.window is not None and self.floor_tokens is not None
-                and self.floor_tokens + self.reply_tokens <= self.window)
+                and self.floor_tokens + self.reply_tokens + FEEDBACK_ALLOWANCE <= self.window)
 
     @property
     def certain(self) -> bool:
@@ -368,11 +372,14 @@ def worst_window(con, snapshot, settings, dialect: str, authz,
     label, prompts = max(candidates, key=lambda c: (len(c[1][0]) + len(c[1][1]), c[0]))
     report = _count(prompts, settings, http, label)
     if report.fits is False:
-        # Past the window with every description: what the fit can bring it down to. The same
-        # view, its tables re-chosen by what they bring without descriptions.
-        floor = _count(largest_prompts(con, snapshot, settings, dialect, views[label],
-                                       describe=lambda _table, _column: False),
-                       settings, http, label)
+        # Past the window with every description: what the fit can bring it down to. Over every
+        # view, not only the one heaviest with descriptions -- a view whose columns are many and
+        # their descriptions short can be the heaviest without them.
+        bare = [(lbl, largest_prompts(con, snapshot, settings, dialect, grants,
+                                      describe=lambda _table, _column: False))
+                for lbl, grants in views.items()]
+        lbl, heaviest = max(bare, key=lambda c: (len(c[1][0]) + len(c[1][1]), c[0]))
+        floor = _count(heaviest, settings, http, lbl)
         report = replace(report, floor_tokens=floor.real_tokens or floor.prompt_tokens)
     return report
 

@@ -194,6 +194,15 @@ cover the largest prompt plus the reply, with headroom: a modest cut to a window
 of 1,024 tokens can still slip by. At startup mnemiq also measures, for each role in the access policy and from only what that role is shown, the largest prompt its store can produce (the tables that bring the most into it: card, definitions and examples) plus the generator's 4,000-token reply, against the window, and logs a warning when it does not fit: vLLM counts it and reports its window itself; for Ollama, set `MNEMIQ_LLM_CONTEXT_WINDOW` to the window you configured and mnemiq estimates, erring long (`MNEMIQ_LLM_WINDOW_CHECK=0` skips the measurement). `MNEMIQ_LLM_PROMPT_CUT_CHECK=0` turns the cut check off, for a server or
 proxy whose `prompt_tokens` leaves out tokens it reused from a cache (Ollama 0.5.4 counts them: measured).
 
+**Once every column is described, the cards can outgrow the window, and mnemiq trims descriptions rather
+than send a prompt the server refuses.** On that 1,500-column schema, a description per column takes the
+largest prompt from about 23,000 tokens to about 40,000. When a question's prompt would not fit with the
+reply, every column keeps its name and type, and descriptions go first to the columns the question, a
+definition or a measure names, then to join keys, then to columns sharing the question's words, as many as
+fit. A prompt that fits is sent exactly as before. This needs the window: vLLM reports it, and for another
+server set `MNEMIQ_LLM_CONTEXT_WINDOW`; without either, prompts go whole. The startup check says when the
+window fits only by withholding descriptions (`window:trims`); raise the window to send them all.
+
 Set `MNEMIQ_LOCAL_ONLY=1` to make that verification the `mnemiq` command's job instead of yours
 (the standalone scripts under `scripts/` build their own `Settings` and don't call this check, so
 the guarantee below is for `mnemiq` commands specifically): it refuses to run if the chat,

@@ -274,7 +274,7 @@ class _All:
         return window.everything(self._snap)
 
 
-@pytest.mark.parametrize("room", ["fits", "trims", "too small"])
+@pytest.mark.parametrize("room", ["fits", "trims", "too small", "inside the allowance"])
 def test_the_advisory_says_whether_the_window_fits_trims_or_is_too_small(caplog, room):
     from mnemiq.runtime import _warn_prompt_window
 
@@ -288,7 +288,9 @@ def test_the_advisory_says_whether_the_window_fits_trims_or_is_too_small(caplog,
                                 http=_counting_server(1))  # forces the floor measurement
     window_tokens = {"fits": full.needed,
                      "trims": (full.needed + floor.floor_tokens + REPLY) // 2,
-                     "too small": floor.floor_tokens + REPLY - 1}[room]
+                     "too small": floor.floor_tokens + REPLY - 1,
+                     # the fit keeps FEEDBACK_ALLOWANCE free too: the boot line must agree with it
+                     "inside the allowance": floor.floor_tokens + REPLY + FEEDBACK_ALLOWANCE - 1}[room]
     report = window.worst_window(con, snap, settings, "duckdb", _All(snap),
                                  http=_counting_server(window_tokens))
     import mnemiq.llm.window as window_module
@@ -307,4 +309,91 @@ def test_the_advisory_says_whether_the_window_fits_trims_or_is_too_small(caplog,
         assert "fits only by withholding column descriptions" in text
         assert "TOO SMALL" not in text
     else:
-        assert "prompt window TOO SMALL" in text
+        assert "prompt window TOO SMALL" in text, room
+
+
+# --- gate review of the first version -----------------------------------------------------------
+
+_PIECE = __import__("re").compile(r"[A-Za-z]+|\d|[^\sA-Za-z\d]")
+
+
+def _piece_count(system: str, user: str) -> int:
+    """Words cost one token, every digit and punctuation mark another: a column name such as
+    `step_001_time` is seven tokens in thirteen characters, prose about four characters a token --
+    the split that made one average ratio undercount a trimmed prompt (3.96 vs 3.16 measured)."""
+    return len(_PIECE.findall(system)) + len(_PIECE.findall(user))
+
+
+def test_the_fitted_prompt_fits_the_servers_own_count_when_names_and_prose_count_differently():
+    snap = _snapshot(120)
+    packet = _packet(snap)
+    fitter = _fitter(None)
+    full = _piece_count(fitter.system(), user_prompt(packet))
+    window_tokens = full + REPLY + FEEDBACK_ALLOWANCE - full // 4
+    fitter = _fitter(window_tokens, count=lambda s, u: (_piece_count(s, u), window_tokens))
+
+    fitted = fitter.fit(packet, snap, _grants(snap))
+
+    sent, described = fitted.descriptions
+    assert 0 < sent < described
+    assert (_piece_count(fitter.system(), user_prompt(fitted)) + REPLY + FEEDBACK_ALLOWANCE
+            <= window_tokens), "what is sent must fit the server's count, not the estimate's"
+
+
+def test_a_server_that_gives_no_count_is_not_asked_on_every_question():
+    snap = _snapshot()
+    asked = []
+    fitter = _fitter(None, count=lambda s, u: asked.append(1))
+    fitter.fit(_packet(snap), snap, _grants(snap))
+    fitter.fit(_packet(snap, "another question"), snap, _grants(snap))
+    assert asked == [1]
+
+
+def test_a_column_a_metric_or_dimension_names_ranks_with_the_named():
+    from mnemiq.contract import Dimension, Metric
+    from mnemiq.contract.values import MeasureExpr
+
+    snap = _snapshot(8)
+    packet = _packet(snap, question="anything at all")
+    packet.definitions = []
+    packet.metrics = [Metric(id="m1", label="cycle", status="certified", owner="o", grain="lot",
+                             measure=MeasureExpr(expr="AVG(step_003_time)", source="wide_trace"),
+                             time_dimension="step_000_time")]
+    packet.dimensions = [Dimension(id="d1", label="by step", source="wide_trace",
+                                   expr="step_004_time")]
+    ranked = rank_columns(packet, snap, build_access_policy(snap, _grants(snap)))
+    first = set(ranked[:3])
+    assert {("wide_trace", "step_003_time"), ("wide_trace", "step_004_time")} <= first
+
+
+def test_the_advisory_floor_is_the_heaviest_view_without_descriptions():
+    """Gate review: measured only for the view heaviest WITH descriptions, a view of many columns
+    and short descriptions could be the heaviest without them and read as trims, not TOO SMALL."""
+    tables = {"long_prose": (6, "x" * 2000), "many_columns": (90, "short")}
+    snap = Snapshot(
+        version="v1", source_id="s", created_at="2026-10-03T00:00:00Z",
+        source_bindings=[SourceBinding(id=f"sb:{t}", source_id="s", object_id=t, source_object=t,
+                                       binding_type="table") for t in tables],
+        columns=[Column(id=f"{t}.column_number_{i:03d}", object_id=t, name=f"column_number_{i:03d}",
+                        data_type="text", description=d)
+                 for t, (n, d) in tables.items() for i in range(n)])
+
+    class _TwoRoles:
+        def policy_roles(self):
+            return ["prose", "wide"]
+
+        def grants_for(self, identity):
+            seen = {"prose": "long_prose", "wide": "many_columns"}
+            return GrantSet(frozenset(seen[r] for r in identity.roles if r in seen))
+
+    settings = Settings(llm_base_url="http://127.0.0.1:9/v1", llm_api_key="k", llm_model="m",
+                        retrieval_k=1)
+    con = duckdb.connect()
+    by_view = {label: window.largest_prompts(con, snap, settings, "duckdb", grants,
+                                             describe=lambda t, c: False)
+               for label, grants in window.grant_sets(_TwoRoles(), settings)}
+    heaviest_bare = max(len(s) + len(u) for s, u, _r, _c in by_view.values())
+    report = window.worst_window(con, snap, settings, "duckdb", _TwoRoles(),
+                                 http=_counting_server(1))
+    assert report.who == "role prose", "the full prompt's heaviest view is the prose one"
+    assert report.floor_tokens >= heaviest_bare // 4, "the floor is the wide view's"

@@ -25,16 +25,20 @@ from __future__ import annotations
 import logging
 import math
 import re
+import time
 from dataclasses import dataclass, field, replace
 
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_facts
 
 logger = logging.getLogger(__name__)
 
-# The corrector's retry re-sends the prompt with the database's error and the failed SQL, and the
-# judge adds the SQL and a result preview: room for those, so a first call that just fits does not
-# become a retry the server refuses.
-FEEDBACK_ALLOWANCE = 1000
+# FEEDBACK_ALLOWANCE lives with the boot advisory (`mnemiq.llm.window`), so the two agree on what
+# "fits" means; re-exported here for readers of this module.
+from mnemiq.llm.window import FEEDBACK_ALLOWANCE  # noqa: E402
+# A server that gave no count is asked again after this long, not on every question.
+NO_COUNT_RETRY_S = 600.0
+# How many times the chosen prompt is re-counted and shrunk before it is sent as it stands.
+RECOUNTS = 3
 # Estimates from a server-calibrated ratio stay this far under the window: the trimmed text is not
 # the text that was counted.
 MARGIN = 1.03
@@ -102,6 +106,7 @@ class PromptFitter:
     window: int | None = None
     count: object = None
     _server_window: int | None = field(default=None, init=False, repr=False)
+    _no_count_until: float | None = field(default=None, init=False, repr=False)
 
     def system(self) -> str:
         """The longest system prompt a call can carry: deep mode's strategies differ in length."""
@@ -123,6 +128,22 @@ class PromptFitter:
                            exc_info=True)
             return packet
 
+    def _counted(self, system: str, user: str) -> int | None:
+        """The server's count of this prompt, or None. A server that gave none (no /tokenize, or not
+        answering) is not asked again for NO_COUNT_RETRY_S: without a declared window every question
+        would otherwise pay a round trip, up to the count's deadline, for nothing."""
+        if not callable(self.count) or (
+                self._no_count_until is not None and time.monotonic() < self._no_count_until):
+            return None
+        counted = self.count(system, user)
+        if counted is None:
+            self._no_count_until = time.monotonic() + NO_COUNT_RETRY_S
+            return None
+        self._no_count_until = None
+        tokens, reported = counted
+        self._server_window = self._server_window or reported
+        return tokens
+
     def _fit(self, packet: ContextPacket, snapshot, grants) -> ContextPacket:
         from mnemiq.generate.prompts import user_prompt
         from mnemiq.llm.window import CHARS_PER_TOKEN_FLOOR
@@ -131,31 +152,33 @@ class PromptFitter:
             return packet
         system = self.system()
         reserve = self.reply_tokens + FEEDBACK_ALLOWANCE
-        full_chars = len(system) + len(user_prompt(packet))
+        user = user_prompt(packet)
+        ceiling = math.ceil((len(system) + len(user)) / CHARS_PER_TOKEN_FLOOR)
         window = self.window or self._server_window
         # A floor of characters per token makes this a ceiling on tokens: when it fits, the prompt
         # fits, and no request leaves the process.
-        if window is not None and math.ceil(full_chars / CHARS_PER_TOKEN_FLOOR) + reserve <= window:
+        if window is not None and ceiling + reserve <= window:
             return packet
-        counted = self.count(system, user_prompt(packet)) if callable(self.count) else None
-        if counted is not None:
-            tokens, reported = counted
-            self._server_window = self._server_window or reported
-            window = window or reported
+        tokens = self._counted(system, user)
+        window = self.window or self._server_window
         if window is None:
             return packet  # nothing to fit against: as before M127
-        if counted is not None:
-            if tokens + reserve <= window:
-                return packet
-            per_char = tokens / full_chars
-        else:
-            if math.ceil(full_chars / CHARS_PER_TOKEN_FLOOR) + reserve <= window:
-                return packet
-            per_char = 1 / CHARS_PER_TOKEN_FLOOR
-        return self._trim(packet, snapshot, grants, system, window - reserve, per_char)
+        if (tokens if tokens is not None else ceiling) + reserve <= window:
+            return packet
+        return self._trim(packet, snapshot, grants, system, window - reserve, tokens)
 
-    def _trim(self, packet, snapshot, grants, system, budget, per_char) -> ContextPacket:
+    def _trim(self, packet, snapshot, grants, system, budget, full_tokens) -> ContextPacket:
+        """The most descriptions, in rank order, whose prompt fits `budget`.
+
+        Estimated from the server's counts at both ends -- the full prompt and the one with no
+        descriptions -- because one average ratio is wrong for the middle: descriptions are prose
+        and column names are not (measured on the partner shape: 3.96 characters a token with
+        every description, 3.16 with none), so a ratio taken from the full prompt undercounts a
+        trimmed one by a quarter, which the server then refused. The chosen prompt is counted
+        once more and shrunk while it is still over. Without counts, the ceiling estimate is used
+        throughout: it trims more than needed, never too little."""
         from mnemiq.generate.prompts import user_prompt
+        from mnemiq.llm.window import CHARS_PER_TOKEN_FLOOR
         from mnemiq.semantic.cards import build_cards
         from mnemiq.sql.policy import build_access_policy
 
@@ -175,23 +198,42 @@ class PromptFitter:
             cards = [by_id.get(c.object_id, c) for c in packet.cards]
             return replace(packet, cards=cards, descriptions=(n, len(ranked)))
 
-        def tokens(candidate: ContextPacket) -> int:
-            return math.ceil((len(system) + len(user_prompt(candidate))) * per_char * MARGIN)
+        def chars(candidate: ContextPacket) -> int:
+            return len(system) + len(user_prompt(candidate))
 
-        low, high = 0, len(ranked)
-        best = render(0)
-        if tokens(best) > budget:
+        floor = render(0)
+        floor_tokens = self._counted(system, user_prompt(floor)) if full_tokens is not None else None
+        if floor_tokens is None:
+            def estimate(candidate: ContextPacket) -> int:
+                return math.ceil(chars(candidate) / CHARS_PER_TOKEN_FLOOR)
+        else:
+            spread = max(chars(render(len(ranked))) - chars(floor), 1)
+            per_char = max(full_tokens - floor_tokens, 0) / spread
+
+            def estimate(candidate: ContextPacket) -> int:
+                return floor_tokens + math.ceil((chars(candidate) - chars(floor)) * per_char * MARGIN)
+
+        if estimate(floor) > budget:
             logger.warning("prompt window: even with no column descriptions the prompt needs about "
                            "%d tokens against %d after the reply budget; the server may refuse it",
-                           tokens(best), budget)
-            return best
+                           estimate(floor), budget)
+            return floor
+        low, high, best = 0, len(ranked), floor
         while low < high:  # the most descriptions that fit, in rank order
             mid = (low + high + 1) // 2
             candidate = render(mid)
-            if tokens(candidate) <= budget:
+            if estimate(candidate) <= budget:
                 low, best = mid, candidate
             else:
                 high = mid - 1
+        if floor_tokens is not None and low:
+            per_description = max((full_tokens - floor_tokens) / len(ranked), 1.0)
+            for _ in range(RECOUNTS):  # the server has the last word on the chosen prompt
+                counted = self._counted(system, user_prompt(best))
+                if counted is None or counted <= budget:
+                    break
+                low = max(0, low - math.ceil((counted - budget) / per_description) - 1)
+                best = render(low)
         logger.info("prompt window: %d of %d column descriptions sent, to fit %d tokens",
                     low, len(ranked), budget)
         return best
