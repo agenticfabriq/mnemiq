@@ -81,6 +81,17 @@ class SourceUnconfigured(RuntimeError):
 
 
 def adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only: bool = True):
+    """The adapter for one source, seen through its manifest `tables` list when it has one (M110):
+    every caller -- enrich, refresh, the runtime -- then reads the same catalogue."""
+    adapter = _adapter_for(spec, settings, read_only=read_only)
+    if spec.tables:
+        from mnemiq.adapters.scoped import TableScopedAdapter
+
+        return TableScopedAdapter(adapter, spec.tables, spec.id)
+    return adapter
+
+
+def _adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only: bool = True):
     """The adapter for one source. `settings` is required only for Oracle's credentials.
 
     `read_only` is threaded through to every adapter rather than defaulted per-kind, because a

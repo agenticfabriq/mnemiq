@@ -163,7 +163,13 @@ def _cmd_enrich(settings: Settings) -> int:
     from mnemiq.enrichment.pipeline import content_version, profile_outcome
     from mnemiq.ontology.records import load_records, merge_records
 
-    snap = enrich_structural(adapter, spec.id)
+    from mnemiq.adapters.scoped import TablesNotFound
+
+    try:
+        snap = enrich_structural(adapter, spec.id)
+    except TablesNotFound as exc:  # a manifest "tables" entry matching nothing: say which (M110)
+        print(str(exc), file=sys.stderr)
+        return 1
     # Read what the profile jobs say BEFORE spending LLM calls on the result or saving it. M59,
     # as corrected: the statuses were already read and REPORTED by the WARNING at the tail of this
     # function, which pre-dates this check. What nobody did was ACT on them -- the run exited 0 and
@@ -357,7 +363,13 @@ def _cmd_refresh(settings: Settings) -> int:
     if version is None:
         print("no snapshot -- run `mnemiq enrich` first", file=sys.stderr)
         return 1
-    diff = catalog_diff(adapter, load_snapshot(con, version))
+    from mnemiq.adapters.scoped import TablesNotFound
+
+    try:
+        diff = catalog_diff(adapter, load_snapshot(con, version))
+    except TablesNotFound as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     print(f"added={diff.added} changed={diff.changed} dropped={diff.dropped}")
     if not diff.has_changes:
         print("catalog unchanged -- nothing to refresh")
