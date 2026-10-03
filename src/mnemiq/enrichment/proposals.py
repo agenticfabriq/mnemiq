@@ -44,6 +44,32 @@ class ColumnAnnotation(BaseModel):
 class TableAnnotation(BaseModel):
     table: str
     columns: list[ColumnAnnotation] = Field(default_factory=list)
+    # Why a call, or a chunk of a wide table, produced nothing (M112): the job records it, so a
+    # table left undescribed says why instead of passing as a success.
+    failures: list[str] = Field(default_factory=list)
+
+
+# The causes that mean "the reply did not fit its budget": a reply cut off mid-JSON, and the empty
+# string a reasoning model returns when its thinking spent the whole cap. The enricher halves a
+# chunk on either.
+CUT_OFF = "the reply stopped before its JSON closed"
+EMPTY = "the reply was empty"
+
+
+def diagnose_reply(raw: str, allowed: dict[str, set[str]]) -> str:
+    """Why a reply yielded no annotated column -- for the job, never shown to the model."""
+    text = (raw or "").strip()
+    if not text:
+        return EMPTY
+    if "{" not in text:
+        return f"the reply held no JSON ({len(text):,} characters)"
+    if not _extract_json(text):
+        if text.count("{") > text.count("}"):
+            return (f"{CUT_OFF} ({len(text):,} characters; the reply budget is the likely cut)")
+        return f"the reply's JSON did not parse ({len(text):,} characters)"
+    if not isinstance(_extract_json(text).get("columns"), list):
+        return "the reply's JSON carried no columns list"
+    return f"the reply described none of the {len(allowed)} column(s) asked about"
 
 
 def _extract_json(raw: str) -> dict:
@@ -87,8 +113,8 @@ def parse_annotation(raw: str, table: str, allowed: dict[str, set[str]]) -> Tabl
         if not isinstance(item, dict):
             continue
         name = item.get("name")
-        if name not in allowed or name in seen:
-            continue  # a column we never asked about does not exist
+        if not isinstance(name, str) or name not in allowed or name in seen:
+            continue  # a column we never asked about does not exist (a list is not a name)
         seen.add(name)
 
         raw_meanings = item.get("code_meanings")

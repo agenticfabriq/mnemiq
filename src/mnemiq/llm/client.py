@@ -52,6 +52,21 @@ def seed_offset(n: int) -> Iterator[None]:
         _SEED_OFFSET.reset(token)
 
 
+class ContextTooLong(ModelUnavailable):
+    """The server refused the request as longer than its window -- vLLM refuses a prompt plus the
+    reply budget past `--max-model-len` with a 400, and OpenAI-compatible services name it
+    `context_length_exceeded`. A ModelUnavailable for every caller that already handles one, and its
+    own type for a caller that can shorten the prompt: the server is up, a shorter request is served.
+    """
+
+
+def _context_too_long(exc: Exception) -> bool:
+    if getattr(exc, "status_code", None) != 400:
+        return False
+    return (getattr(exc, "code", None) == "context_length_exceeded"
+            or "maximum context length" in str(exc).lower())
+
+
 class PromptCut(ModelUnavailable):
     """The server read only part of the prompt and answered anyway (M119).
 
@@ -245,6 +260,8 @@ class LLMClient:
                 **kwargs,
             )
         except APIError as exc:
+            if _context_too_long(exc):
+                raise ContextTooLong(str(exc)) from exc
             raise ModelUnavailable(str(exc)) from exc
         return resp
 

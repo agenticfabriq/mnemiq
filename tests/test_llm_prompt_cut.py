@@ -290,3 +290,31 @@ def test_a_cut_reaches_the_user_as_a_configuration_failure_not_an_outage(monkeyp
     assert "cut" in answer.answer and "context" in answer.answer
     assert "outage" not in answer.answer and "try again" not in answer.answer, \
         "retrying cannot fix a window that is too small"
+
+
+
+def test_a_context_length_refusal_reaches_the_user_as_a_configuration_failure(monkeypatch):
+    """vLLM refuses a prompt plus reply budget past its window with a 400; the client names it
+    ContextTooLong, and the user is told what to change -- not 'outage, try again'."""
+    from mnemiq.llm.client import ContextTooLong
+
+    class _Refusing:
+        def propose(self, packet, feedback=None):
+            raise ContextTooLong("This model's maximum context length is 28672 tokens.")
+
+    agent = Agent(generator=_Refusing(), synthesizer=FakeSynthesizer(), adapter=_Adapter(),
+                  cache=TwoTierCache(L1Cache()), budget=Budget(wall_clock_s=5.0, max_attempts=2))
+    packet = ContextPacket(question="how many claims?",
+                           cards=[RetrievedCard(object_id="claim", card="TABLE claim (n INTEGER)",
+                                                score=1.0)],
+                           grant_fingerprint="f", enrichment_version="v1")
+    snapshot = Snapshot(version="v1", source_id="acme", created_at="2026-07-13T00:00:00Z",
+                        columns=[Column(id="claim.n", object_id="claim", name="n")])
+    identity = IdentityContext(tenant_id="t", principal_id="u", roles=["analyst"])
+
+    answer = agent.answer(packet, snapshot, GrantSet(frozenset({"claim"})), identity)
+
+    assert answer.failed is True and answer.reason_code == DeferralReason.MODEL_UNAVAILABLE
+    assert "longer than its context window" in answer.answer
+    assert "--max-model-len" in answer.answer and "MNEMIQ_RETRIEVAL_K" in answer.answer
+    assert "outage" not in answer.answer and "try again" not in answer.answer
