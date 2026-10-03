@@ -26,10 +26,12 @@ CHUNK_COLUMNS = 30
 _CONTEXT_NAMES = 200
 # A chunk whose reply did not fit is halved until one does or it is this small. Size failures
 # split; every other failure -- no JSON, unparseable, the wrong columns: a dropped channel -- gets
-# one retry at any level. So a 30-column chunk that never fits costs at most 16 calls (2 for the
-# chunk, then 2 + 4 + 8 for its halves down to 3- and 4-column spans). An EMPTY reply splits only
-# once: a reasoning model at its cap fits in half the columns, and a server that answers empty for
-# some other reason costs 6 calls (the chunk's 2, then each half asked and retried) rather than 16.
+# one retry at any level. So a 30-column chunk whose every reply is cut off costs 16 calls (2 for
+# the chunk, then 2 + 4 + 8 for its halves down to 3- and 4-column spans); mixed failures, each
+# retried before splitting, can cost up to 30. An EMPTY reply splits only once, a trade: a server
+# that answers empty for some other reason costs 6 calls (the chunk's 2, then each half asked and
+# retried) rather than 16, and a reasoning model still over its cap at 15 columns loses them --
+# reported, not silent -- where halving further might have saved them.
 _MIN_SPLIT = 5
 
 
@@ -64,10 +66,10 @@ class LLMEnricher:
     def _annotate_span(self, table: str, facts: list[ColumnFacts], start: int, end: int,
                        grounding: str, root: bool = True,
                        empty_split: bool = True) -> tuple[list, list[str]]:
-        """Columns start..end described, and why any span yielded none. A span whose reply did not
-        fit -- cut off, or empty as a reasoning model's is at the cap -- is split in half and tried
-        again, down to _MIN_SPLIT columns: a column count does not bound a reply, since code-heavy
-        columns each carry their meanings."""
+        """Columns start..end described, and why any span yielded none. A span whose reply was
+        cut off is split in half and tried again, down to _MIN_SPLIT columns -- a column count does
+        not bound a reply, since code-heavy columns each carry their meanings; an empty one, as a
+        reasoning model's is at its cap, splits one level only (see _MIN_SPLIT)."""
         chunk = facts[start:end]
         others = facts[:start] + facts[end:]
         # The root gets its usual retry up front; a split span is asked once, and retried below
