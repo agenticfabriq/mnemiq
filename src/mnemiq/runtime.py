@@ -434,8 +434,7 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
         log("prompt window fits only by withholding column descriptions: %s. With none, the "
             "longest prompt (%s) is %s tokens, so a question that retrieves those tables is sent "
             "with as many descriptions as fit, the ones it names first. Raise the window (vLLM "
-            "--max-model-len) to send them all.", report.sentence(),
-            f"for {report.floor_who}" if report.floor_who else "the same view",
+            "--max-model-len) to send them all.", report.sentence(), f"for {report.floor_who}",
             f"{report.floor_tokens:,}")
         _ack_did_not_apply(acknowledged, verdict, prefix="window:")
         return

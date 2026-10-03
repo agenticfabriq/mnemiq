@@ -308,6 +308,7 @@ def test_the_advisory_says_whether_the_window_fits_trims_or_is_too_small(caplog,
         assert "prompt window fits:" in text and "WARNING" not in text
     elif room == "trims":
         assert "fits only by withholding column descriptions" in text
+        assert f"(for {report.floor_who})" in text, "the line names the view the floor measured"
         assert "TOO SMALL" not in text
     else:
         assert "prompt window TOO SMALL" in text, room
