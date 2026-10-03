@@ -29,9 +29,11 @@ class _Model:
     def __init__(self, cut: frozenset[int] = frozenset(), cut_columns: frozenset[str] = frozenset(),
                  raises: bool = False, skip: int = 0):
         self.prompts: list[str] = []
+        self.calls = 0
         self._cut, self._cut_columns, self._raises, self._skip = cut, cut_columns, raises, skip
 
     def complete(self, system, user, max_tokens=512, **_):
+        self.calls += 1
         if self._raises:
             raise RuntimeError("rate limited at https://provider.example/v1 key=sk-secret")
         self.prompts.append(user)
@@ -59,9 +61,10 @@ def test_a_wide_table_is_described_in_chunks_and_every_column_lands():
         assert "for context only" in prompt, "each chunk names the rest of the table"
 
 
-def test_a_chunk_whose_call_raises_keeps_the_other_chunks():
+def test_a_chunk_whose_calls_raise_keeps_the_earlier_chunks_and_stops_asking():
     """Codex review of #75: a timeout on the second chunk escaped the loop and the whole table
-    lost the first chunk's columns. Each call's failure stays with its chunk, and is retried."""
+    lost the first chunk's columns. The failure stays with its chunk, after a retry; and a chunk
+    that got no reply at all means the endpoint is failing, so the rest is recorded, not asked."""
     class _Flaky(_Model):
         def complete(self, system, user, max_tokens=512, **kw):
             reply = super().complete(system, user, max_tokens, **kw)
@@ -70,8 +73,71 @@ def test_a_chunk_whose_call_raises_keeps_the_other_chunks():
             return reply
 
     annotation = LLMEnricher(_Flaky()).annotate("wide", _facts(84))
-    assert len(annotation.columns) == 54
-    assert annotation.failures == ["columns 31-60 of 84: the call failed: TimeoutError"]
+    assert len(annotation.columns) == 30, "the first chunk's columns survive"
+    assert annotation.failures == ["columns 31-60 of 84: the call failed: TimeoutError",
+                                   "columns 61-84 of 84: not asked -- the call failed: TimeoutError"]
+
+
+def test_a_dead_endpoint_costs_two_calls_per_table_not_two_per_chunk():
+    """Gate review: retrying every chunk of every table against an endpoint that is down paid for
+    100+ failing calls on a 1,527-column shape."""
+    model = _Model(raises=True)
+    annotation = LLMEnricher(model).annotate("wide", _facts(300))
+    assert model.calls == 2 and not annotation.columns
+    assert annotation.failures[0] == "columns 1-30 of 300: the call failed: RuntimeError"
+    assert all("not asked" in f for f in annotation.failures[1:])
+
+
+def test_a_cut_off_reply_still_splits_when_the_retry_times_out():
+    """Gate review: the retry's exception overwrote the first attempt's size diagnosis, so the
+    chunk was not halved."""
+    class _CutThenTimeout(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            reply = super().complete(system, user, max_tokens, **kw)
+            if len(self.prompts) == 1:
+                return reply[: len(reply) // 2]
+            if len(self.prompts) == 2:
+                raise TimeoutError("slow")
+            return reply
+
+    annotation = LLMEnricher(_CutThenTimeout()).annotate("wide", _facts(30))
+    assert len(annotation.columns) == 30 and not annotation.failures
+
+
+def test_a_prompt_too_long_for_the_window_splits_and_the_table_goes_on():
+    """Gate review: a PromptCut is one chunk's prompt over the server's window -- not an endpoint
+    that is down. Not retried (asking again cuts again), halved (which shortens the prompt), and the
+    rest of the table is still asked."""
+    from mnemiq.llm.client import PromptCut
+
+    class _Window(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            reply = super().complete(system, user, max_tokens, **kw)
+            names = _ASKED.findall(user.split("The table's other columns")[0])
+            if len(names) == 30 and "c30" in names:  # the second chunk's prompt is too long
+                raise PromptCut("the server kept a fixed window")
+            return reply
+
+    model = _Window()
+    annotation = LLMEnricher(model).annotate("wide", _facts(84))
+    assert len(annotation.columns) == 84 and not annotation.failures
+    second = [p for p in model.prompts if "- c30 (type=" in p.split("The table's other columns")[0]]
+    assert len(second) == 2, "the cut chunk once, not retried, then its first half"
+
+
+def test_a_passing_fault_on_a_split_half_is_retried_not_taken_for_a_dead_endpoint():
+    class _HalfGlitch(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            reply = super().complete(system, user, max_tokens, **kw)
+            names = _ASKED.findall(user.split("The table's other columns")[0])
+            if len(names) == 30:
+                return reply[: len(reply) // 2]  # the chunk overflows: split
+            if len(self.prompts) == 3:
+                raise ConnectionError("reset")  # the first half's first ask fails once
+            return reply
+
+    annotation = LLMEnricher(_HalfGlitch()).annotate("wide", _facts(30))
+    assert len(annotation.columns) == 30 and not annotation.failures
 
 
 def test_a_call_that_raises_once_is_retried():

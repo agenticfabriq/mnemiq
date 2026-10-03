@@ -16,6 +16,7 @@ from mnemiq.enrichment.proposals import (
     diagnose_reply,
     parse_annotation,
 )
+from mnemiq.llm.client import PromptCut
 
 # Columns described per call (M112). One call for a whole table capped the reply at the budget: a
 # 34-column table's reply closed cleanly, an 84-column table's stopped mid-JSON and the table got
@@ -33,6 +34,10 @@ _CONTEXT_NAMES = 200
 # retried) rather than 16, and a reasoning model still over its cap at 15 columns loses them --
 # reported, not silent -- where halving further might have saved them.
 _MIN_SPLIT = 5
+# The server's window, not the reply budget: PromptCut says this chunk's prompt was longer than the
+# server keeps. A size failure like a cut-off reply -- halving shortens the prompt -- and never a
+# sign the endpoint is down, since the next chunk's prompt is a different length.
+_TOO_LONG = "the prompt was longer than the server's window"
 
 
 def _allowed(facts: list[ColumnFacts]) -> dict[str, set[str]]:
@@ -55,44 +60,55 @@ class LLMEnricher:
     def annotate(self, table: str, facts: list[ColumnFacts], grounding: str = "") -> TableAnnotation:
         if not facts:
             return TableAnnotation(table=table)
-        columns, failures = [], []
+        columns, failures, down = [], [], ""
         for start in range(0, len(facts), CHUNK_COLUMNS):
-            described, why = self._annotate_span(table, facts, start,
-                                                 min(start + CHUNK_COLUMNS, len(facts)), grounding)
+            end = min(start + CHUNK_COLUMNS, len(facts))
+            if down:  # the endpoint is failing: the rest of the table is not asked
+                failures.append(_span(start, end, len(facts)) + f"not asked -- {down}")
+                continue
+            described, why, down = self._annotate_span(table, facts, start, end, grounding)
             columns += described
             failures += why
         return TableAnnotation(table=table, columns=columns, failures=failures)
 
     def _annotate_span(self, table: str, facts: list[ColumnFacts], start: int, end: int,
                        grounding: str, root: bool = True,
-                       empty_split: bool = True) -> tuple[list, list[str]]:
-        """Columns start..end described, and why any span yielded none. A span whose reply was
-        cut off is split in half and tried again, down to _MIN_SPLIT columns -- a column count does
+                       empty_split: bool = True) -> tuple[list, list[str], str]:
+        """Columns start..end described, why any span yielded none, and -- when every attempt
+        raised -- the endpoint's failure, so the caller stops asking. A span whose reply was cut
+        off is split in half and tried again, down to _MIN_SPLIT columns -- a column count does
         not bound a reply, since code-heavy columns each carry their meanings; an empty one, as a
         reasoning model's is at its cap, splits one level only (see _MIN_SPLIT)."""
         chunk = facts[start:end]
         others = facts[:start] + facts[end:]
         # The root gets its usual retry up front; a split span is asked once, and retried below
         # only for a failure that is not about size.
-        described, why = self._annotate_chunk(table, chunk, others, grounding, 2 if root else 1)
-        too_big = why.startswith(CUT_OFF) or (why == EMPTY and empty_split)
+        described, why, down = self._annotate_chunk(table, chunk, others, grounding,
+                                                    2 if root else 1)
+        too_big = _size_failure(why, empty_split)
         if not described and not root and not too_big:
-            described, why = self._annotate_chunk(table, chunk, others, grounding, 1)
-            too_big = why.startswith(CUT_OFF) or (why == EMPTY and empty_split)
+            # A split span gets its retry before the endpoint counts as down: one passing fault
+            # on a half must not abandon the table.
+            described, why, down = self._annotate_chunk(table, chunk, others, grounding, 1)
+            too_big = _size_failure(why, empty_split)
         if described:
-            return described, []
-        if too_big and len(chunk) > _MIN_SPLIT:
+            return described, [], ""
+        if too_big and not down and len(chunk) > _MIN_SPLIT:
             middle = start + len(chunk) // 2
             keep = empty_split and why != EMPTY  # an empty reply splits once, no further
-            left, left_why = self._annotate_span(table, facts, start, middle, grounding, False, keep)
-            right, right_why = self._annotate_span(table, facts, middle, end, grounding, False, keep)
-            return left + right, left_why + right_why
-        span = f"columns {start + 1}-{end} of {len(facts)}: " if len(facts) > len(chunk) else ""
-        return [], [span + why]
+            left, left_why, down = self._annotate_span(table, facts, start, middle, grounding,
+                                                       False, keep)
+            if down:
+                return left, [*left_why, _span(middle, end, len(facts)) + f"not asked -- {down}"], down
+            right, right_why, down = self._annotate_span(table, facts, middle, end, grounding,
+                                                         False, keep)
+            return left + right, left_why + right_why, down
+        return [], [_span(start, end, len(facts), whole=len(chunk) == len(facts)) + why], down
 
     def _annotate_chunk(self, table: str, chunk: list[ColumnFacts], others: list[ColumnFacts],
-                        grounding: str, attempts: int = 2) -> tuple[list, str]:
-        """The columns described in one call, and why none were if none were."""
+                        grounding: str, attempts: int = 2) -> tuple[list, str, str]:
+        """The columns described in one call, why none were if none were, and the endpoint's
+        failure when no attempt got a reply at all."""
         facts_block = render_table_facts(table, chunk)
         if others:
             names = ", ".join(sanitize(f.name) for f in others[:_CONTEXT_NAMES])
@@ -101,21 +117,39 @@ class LLMEnricher:
                             f"columns above: {names}{more}")
         system, user = system_prompt(), user_prompt(facts_block, grounding)
         allowed = _allowed(chunk)
-        why = ""
+        why, replied = "", False
         for _attempt in range(attempts):  # one retry by default; models drop the channel occasionally
             try:
                 raw = self._client.complete(system, user, max_tokens=self._max_tokens)
             except Exception as exc:  # noqa: BLE001 -- one chunk's outage, not the table's
                 # Caught here, not by the caller: a timeout on the second chunk used to escape
                 # and discard the first chunk's columns with it. The type only -- a provider's
-                # exception text can carry a host or a key, and the job outlives the run.
-                why = f"the call failed: {type(exc).__name__}"
+                # exception text can carry a host or a key, and the job outlives the run. A size
+                # diagnosis from an earlier attempt outranks it: that is what splitting acts on.
+                if isinstance(exc, PromptCut):
+                    # The server read the prompt -- part of it -- so it is up; asking again cuts
+                    # again, and halving is what shortens the prompt.
+                    why, replied = _TOO_LONG, True
+                    break
+                if not _size_failure(why, True):
+                    why = f"the call failed: {type(exc).__name__}"
                 continue
+            replied = True
             annotation = parse_annotation(raw, table, allowed)
             if annotation.columns:
-                return annotation.columns, ""
+                return annotation.columns, "", ""
             why = diagnose_reply(raw, allowed)
-        return [], why
+        return [], why, ("" if replied else why)
+
+
+def _size_failure(why: str, empty_split: bool) -> bool:
+    """A reply that did not fit its budget, or a prompt that did not fit the window: halving acts
+    on both. An empty reply counts only while `empty_split` allows (see _MIN_SPLIT)."""
+    return why.startswith(CUT_OFF) or why == _TOO_LONG or (why == EMPTY and empty_split)
+
+
+def _span(start: int, end: int, total: int, whole: bool = False) -> str:
+    return "" if whole else f"columns {start + 1}-{end} of {total}: "
 
 
 class FakeEnricher:
