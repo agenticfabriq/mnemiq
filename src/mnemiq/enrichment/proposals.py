@@ -44,6 +44,24 @@ class ColumnAnnotation(BaseModel):
 class TableAnnotation(BaseModel):
     table: str
     columns: list[ColumnAnnotation] = Field(default_factory=list)
+    # Why a call, or a chunk of a wide table, produced nothing (M112): the job records it, so a
+    # table left undescribed says why instead of passing as a success.
+    failures: list[str] = Field(default_factory=list)
+
+
+def diagnose_reply(raw: str, allowed: dict[str, set[str]]) -> str:
+    """Why a reply yielded no annotated column -- for the job, never shown to the model."""
+    text = (raw or "").strip()
+    if not text:
+        return "the reply was empty"
+    if "{" not in text:
+        return f"the reply held no JSON ({len(text):,} characters)"
+    if not _extract_json(text):
+        if text.count("{") > text.count("}"):
+            return (f"the reply stopped before its JSON closed ({len(text):,} characters; the "
+                    "reply budget is the likely cut)")
+        return f"the reply's JSON did not parse ({len(text):,} characters)"
+    return f"the reply named none of the {len(allowed)} column(s) asked about"
 
 
 def _extract_json(raw: str) -> dict:

@@ -281,6 +281,10 @@ def _cmd_enrich(settings: Settings) -> int:
         # driver dep for a column type) would otherwise look like a healthy run.
         print(f"WARNING: {len(failed)} table(s) FAILED to profile and were EXCLUDED -- the semantic "
               f"model is INCOMPLETE: {', '.join(sorted(failed))}", file=sys.stderr)
+    from mnemiq.enrichment.semantic import semantic_warnings
+
+    for line in semantic_warnings(snap):
+        print(line, file=sys.stderr)
     if unmeasured:
         print(f"WARNING: {len(unmeasured)} column(s) could not be MEASURED and carry no counts: "
               f"{', '.join(sorted(unmeasured))}. Their tables are in the model; these columns look "

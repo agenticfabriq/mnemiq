@@ -87,16 +87,23 @@ def enrich_semantic(
                 grounding = ""  # degrade-to-local: grounding is optional, never fatal
         try:
             annotation = enricher.annotate(table, _facts(columns, fk_map), grounding)
-        except Exception:
-            annotation = None  # fail-soft: a rate-limit costs us a table, not the run
+            failed_call = ""
+        except Exception as exc:
+            # Fail-soft: a rate-limit costs us a table, not the run. The type only: a provider's
+            # exception text can carry hosts and keys, and the job outlives the run.
+            annotation, failed_call = None, f"the call failed: {type(exc).__name__}"
 
         if annotation is None or not annotation.columns:
+            # The cause on the job (M112): an undescribed table used to be a bare `failed` that
+            # nothing read, so a run that described none of the wide tables read as a success.
             jobs.append(
                 Job(
                     id=f"semantic:{table}",
                     source_id=snapshot.source_id,
                     kind="semantic",
                     status="failed",
+                    detail=failed_call or "; ".join(annotation.failures if annotation else [])
+                    or "no column was described",
                 )
             )
             continue
@@ -107,12 +114,17 @@ def enrich_semantic(
                 continue  # certified meaning is authoritative; the LLM never clobbers it
             if column.name in by_name:
                 annotated[column.id] = _annotated(column, by_name[column.name])
+        # Done, but a wide table can come back partly described when one of its chunks failed:
+        # the job says how much and why, as `detail` on a done job.
+        partial = (f"{len(annotation.columns)} of {len(columns)} columns described; "
+                   + "; ".join(annotation.failures)) if annotation.failures else None
         jobs.append(
             Job(
                 id=f"semantic:{table}",
                 source_id=snapshot.source_id,
                 kind="semantic",
                 status="done",
+                detail=partial,
             )
         )
 
@@ -125,3 +137,23 @@ def enrich_semantic(
     )
     enriched.version = content_version(enriched)
     return enriched
+
+
+def semantic_warnings(snapshot: Snapshot) -> list[str]:
+    """What `mnemiq enrich` says about semantic enrichment that fell short (M112): tables left
+    with no description, and tables only partly described, each with its cause."""
+    def name(job: Job) -> str:
+        return job.id.removeprefix("semantic:")
+
+    failed = [f"{name(j)} ({j.detail})" if j.detail else name(j)
+              for j in snapshot.jobs if j.kind == "semantic" and j.status == "failed"]
+    partial = [f"{name(j)} ({j.detail})"
+               for j in snapshot.jobs if j.kind == "semantic" and j.status == "done" and j.detail]
+    lines = []
+    if failed:
+        lines.append(f"WARNING: {len(failed)} table(s) got NO column descriptions -- semantic "
+                     f"enrichment failed: {', '.join(sorted(failed))}")
+    if partial:
+        lines.append(f"WARNING: {len(partial)} table(s) were only PARTLY described: "
+                     f"{', '.join(sorted(partial))}")
+    return lines
