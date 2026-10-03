@@ -12,9 +12,11 @@ question's words. As many as the window has room for, after the reply budget and
 the corrector's feedback.
 
 **Nothing changes while the prompt fits.** The packet comes back as the same object, cards byte
-for byte as retrieval rendered them, without a call to the server when a conservative estimate
-already fits; only past that does a server count decide. A schema that fits today (every BIRD
-database, the demo stores) never reaches the trimming at all.
+for byte as retrieval rendered them. Without a call to the server when the prompt's UTF-8 bytes
+already fit -- a byte-level tokenizer spends at most one token a byte, so that is a bound, where a
+characters-per-token ratio is only an estimate (digits are a token each; a CJK character is
+three bytes) -- and on the server's count otherwise. A schema that fits today never reaches the
+trimming at all.
 
 Both doors call `fit`: `Runtime.ask` and eval's `build_engine`, after the packet is complete and
 before the agent sees it, so the generator, the corrector and the judge read the same cards.
@@ -34,6 +36,9 @@ from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_fact
 
 logger = logging.getLogger(__name__)
 
+# What the server's chat template wraps around the two messages (role markers, separators), in
+# tokens: added to the byte bound below, which counts only the messages' own text.
+TEMPLATE_ALLOWANCE = 64
 # A server that gave no count is asked again after this long, not on every question.
 NO_COUNT_RETRY_S = 600.0
 # How many times the chosen prompt is re-counted and shrunk before it is sent as it stands.
@@ -48,6 +53,11 @@ this that to was were what which who with all any each list me our your how many
 
 def _words(text: str) -> set[str]:
     return {w for w in _WORD.findall(text.lower()) if len(w) > 2 and w not in _STOP}
+
+
+def _byte_bound(system: str, user: str) -> int:
+    """An upper bound on the prompt's tokens: a byte-level tokenizer spends at most one a byte."""
+    return len(system.encode()) + len(user.encode()) + TEMPLATE_ALLOWANCE
 
 
 def rank_columns(packet: ContextPacket, snapshot, policy) -> list[tuple[str, str]]:
@@ -145,17 +155,16 @@ class PromptFitter:
 
     def _fit(self, packet: ContextPacket, snapshot, grants) -> ContextPacket:
         from mnemiq.generate.prompts import user_prompt
-        from mnemiq.llm.window import CHARS_PER_TOKEN_FLOOR
 
         if snapshot is None or not packet.cards:
             return packet
         system = self.system()
         reserve = self.reply_tokens + FEEDBACK_ALLOWANCE
         user = user_prompt(packet)
-        ceiling = math.ceil((len(system) + len(user)) / CHARS_PER_TOKEN_FLOOR)
+        ceiling = _byte_bound(system, user)
         window = self.window or self._server_window
-        # A floor of characters per token makes this a ceiling on tokens: when it fits, the prompt
-        # fits, and no request leaves the process.
+        # At most a token a byte: when the bytes fit, the prompt fits, and no request leaves the
+        # process.
         if window is not None and ceiling + reserve <= window:
             return packet
         tokens = self._counted(system, user)
@@ -174,10 +183,9 @@ class PromptFitter:
         and column names are not (measured on the partner shape: 3.96 characters a token with
         every description, 3.16 with none), so a ratio taken from the full prompt undercounts a
         trimmed one by a quarter, which the server then refused. The chosen prompt is counted
-        once more and shrunk while it is still over. Without counts, the ceiling estimate is used
+        once more and shrunk while it is still over. Without counts, the byte bound is used
         throughout: it trims more than needed, never too little."""
         from mnemiq.generate.prompts import user_prompt
-        from mnemiq.llm.window import CHARS_PER_TOKEN_FLOOR
         from mnemiq.semantic.cards import build_cards
         from mnemiq.sql.policy import build_access_policy
 
@@ -204,7 +212,7 @@ class PromptFitter:
         floor_tokens = self._counted(system, user_prompt(floor)) if full_tokens is not None else None
         if floor_tokens is None:
             def estimate(candidate: ContextPacket) -> int:
-                return math.ceil(chars(candidate) / CHARS_PER_TOKEN_FLOOR)
+                return _byte_bound(system, user_prompt(candidate))
         else:
             spread = max(chars(render(len(ranked))) - chars(floor), 1)
             per_char = max(full_tokens - floor_tokens, 0) / spread

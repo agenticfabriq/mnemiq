@@ -411,3 +411,54 @@ def test_the_advisory_floor_is_the_heaviest_view_without_descriptions(caplog, mo
     with caplog.at_level(logging.INFO):
         _warn_prompt_window(settings, con, snap, None, _TwoRoles(), frozenset())
     assert "(for role wide)" in caplog.text and "(for role prose)" not in caplog.text
+
+
+# --- Codex review of #78: a characters-per-token ratio is not a bound ---------------------------
+
+def _cjk_snapshot() -> Snapshot:
+    """Descriptions in Chinese: three UTF-8 bytes a character, where 2.5 characters a token would
+    guess under half a token each."""
+    snap = _snapshot(60)
+    return snap.model_copy(update={"columns": [
+        c.model_copy(update={"description": "每一批次在生产线上记录的数值，按系统原样保存。" * 3})
+        for c in snap.columns]})
+
+
+def _bytes_count(system: str, user: str) -> int:
+    """The worst a byte-level tokenizer can do: a token a byte."""
+    return len(system.encode()) + len(user.encode())
+
+
+def _between(fitter, packet) -> int:
+    """A window the 2.5-characters-a-token guess says fits and the byte count says does not."""
+    user = user_prompt(packet)
+    guess = math.ceil((len(fitter.system()) + len(user)) / 2.5)
+    bytes_ = _bytes_count(fitter.system(), user)
+    assert guess + 1000 < bytes_, "the case: the guess and the bytes are far apart"
+    return (guess + bytes_) // 2 + REPLY + FEEDBACK_ALLOWANCE
+
+
+def test_a_token_dense_prompt_is_counted_not_waved_through_on_a_ratio():
+    snap = _cjk_snapshot()
+    packet = _packet(snap)
+    window_tokens = _between(_fitter(None), packet)
+    fitter = _fitter(window_tokens, count=lambda s, u: (_bytes_count(s, u), window_tokens))
+
+    fitted = fitter.fit(packet, snap, _grants(snap))
+
+    assert fitted is not packet, "the ratio said it fits; the server's count says it does not"
+    assert (_bytes_count(fitter.system(), user_prompt(fitted)) + REPLY + FEEDBACK_ALLOWANCE
+            <= window_tokens)
+
+
+def test_without_a_count_a_declared_window_is_held_to_the_byte_bound():
+    snap = _cjk_snapshot()
+    packet = _packet(snap)
+    window_tokens = _between(_fitter(None), packet)
+    fitter = _fitter(window_tokens, count=lambda s, u: None)
+
+    fitted = fitter.fit(packet, snap, _grants(snap))
+
+    assert fitted is not packet
+    assert (_bytes_count(fitter.system(), user_prompt(fitted)) + 64 + REPLY + FEEDBACK_ALLOWANCE
+            <= window_tokens), "trimmed to the bound, which no tokenizer can exceed"
