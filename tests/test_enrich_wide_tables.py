@@ -97,6 +97,39 @@ def test_an_empty_reply_at_the_cap_is_halved_too():
     assert len(annotation.columns) == 30 and not annotation.failures
 
 
+def test_a_server_that_always_answers_empty_is_halved_once_not_to_the_floor():
+    """Gate review: an empty reply is not always a full budget -- a filter, or an answer put in a
+    reasoning channel -- and halving to the floor would ask 16 times for nothing. Once: 2 calls
+    for the chunk, then each half asked and retried as any failure is."""
+    class _Silent(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            super().complete(system, user, max_tokens, **kw)
+            return ""
+
+    model = _Silent()
+    annotation = LLMEnricher(model).annotate("wide", _facts(30))
+    assert len(model.prompts) == 6 and not annotation.columns
+    assert all(f.endswith("the reply was empty") for f in annotation.failures)
+
+
+def test_a_split_span_still_gets_a_retry_for_a_dropped_reply():
+    """Size failures split; a one-off garbled reply on a split span is asked again, as the root's
+    would be."""
+    class _Glitchy(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            reply = super().complete(system, user, max_tokens, **kw)
+            names = _ASKED.findall(user.split("The table's other columns")[0])
+            if len(names) == 30:
+                return reply[: len(reply) // 2]  # the root overflows: split
+            if len(self.prompts) == 3:
+                return "Sorry, something went wrong."  # the first half's first answer is garbled
+            return reply
+
+    model = _Glitchy()
+    annotation = LLMEnricher(model).annotate("wide", _facts(30))
+    assert len(annotation.columns) == 30 and not annotation.failures
+
+
 def test_a_span_that_overflows_however_small_costs_its_columns_and_says_why():
     annotation = LLMEnricher(_Model(cut_columns=_MIDDLE)).annotate("wide", _facts(84))
 

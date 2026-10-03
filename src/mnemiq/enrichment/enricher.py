@@ -24,9 +24,12 @@ CHUNK_COLUMNS = 30
 # The rest of a wide table's column names ride with each chunk, for context only; a table of
 # thousands would otherwise put them all in every call.
 _CONTEXT_NAMES = 200
-# A chunk whose reply did not fit is halved until one does or it is this small. The halves are
-# tried once each, not twice: a 30-column chunk that never fits costs at most 16 calls (2 for the
-# chunk, then 2 + 4 + 8 for its halves down to 3- and 4-column spans), not 30.
+# A chunk whose reply did not fit is halved until one does or it is this small. Size failures
+# split; every other failure -- no JSON, unparseable, the wrong columns: a dropped channel -- gets
+# one retry at any level. So a 30-column chunk that never fits costs at most 16 calls (2 for the
+# chunk, then 2 + 4 + 8 for its halves down to 3- and 4-column spans). An EMPTY reply splits only
+# once: a reasoning model at its cap fits in half the columns, and a server that answers empty for
+# some other reason costs 6 calls (the chunk's 2, then each half asked and retried) rather than 16.
 _MIN_SPLIT = 5
 
 
@@ -59,20 +62,28 @@ class LLMEnricher:
         return TableAnnotation(table=table, columns=columns, failures=failures)
 
     def _annotate_span(self, table: str, facts: list[ColumnFacts], start: int, end: int,
-                       grounding: str, attempts: int = 2) -> tuple[list, list[str]]:
+                       grounding: str, root: bool = True,
+                       empty_split: bool = True) -> tuple[list, list[str]]:
         """Columns start..end described, and why any span yielded none. A span whose reply did not
         fit -- cut off, or empty as a reasoning model's is at the cap -- is split in half and tried
         again, down to _MIN_SPLIT columns: a column count does not bound a reply, since code-heavy
         columns each carry their meanings."""
         chunk = facts[start:end]
         others = facts[:start] + facts[end:]
-        described, why = self._annotate_chunk(table, chunk, others, grounding, attempts)
+        # The root gets its usual retry up front; a split span is asked once, and retried below
+        # only for a failure that is not about size.
+        described, why = self._annotate_chunk(table, chunk, others, grounding, 2 if root else 1)
+        too_big = why.startswith(CUT_OFF) or (why == EMPTY and empty_split)
+        if not described and not root and not too_big:
+            described, why = self._annotate_chunk(table, chunk, others, grounding, 1)
+            too_big = why.startswith(CUT_OFF) or (why == EMPTY and empty_split)
         if described:
             return described, []
-        if (why.startswith(CUT_OFF) or why == EMPTY) and len(chunk) > _MIN_SPLIT:
+        if too_big and len(chunk) > _MIN_SPLIT:
             middle = start + len(chunk) // 2
-            left, left_why = self._annotate_span(table, facts, start, middle, grounding, 1)
-            right, right_why = self._annotate_span(table, facts, middle, end, grounding, 1)
+            keep = empty_split and why != EMPTY  # an empty reply splits once, no further
+            left, left_why = self._annotate_span(table, facts, start, middle, grounding, False, keep)
+            right, right_why = self._annotate_span(table, facts, middle, end, grounding, False, keep)
             return left + right, left_why + right_why
         span = f"columns {start + 1}-{end} of {len(facts)}: " if len(facts) > len(chunk) else ""
         return [], [span + why]
