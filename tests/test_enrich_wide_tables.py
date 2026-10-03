@@ -78,6 +78,26 @@ def test_a_chunk_whose_calls_raise_keeps_the_earlier_chunks_and_stops_asking():
                                    "columns 61-84 of 84: not asked -- the call failed: TimeoutError"]
 
 
+def test_a_garbled_reply_then_a_timeout_on_a_split_half_is_not_an_outage():
+    """Codex review of #75: the retry forgot that the first ask was answered, so a half that got
+    non-JSON and then a timeout took the endpoint for dead and skipped the rest of the table."""
+    class _GarbledThenTimeout(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            reply = super().complete(system, user, max_tokens, **kw)
+            names = _ASKED.findall(user.split("The table's other columns")[0])
+            if len(names) == 30 and "c0" in names:
+                return reply[: len(reply) // 2]  # the first chunk overflows: split
+            if len(self.prompts) == 3:
+                return "Sorry, I can't."  # the first half's first answer is not JSON
+            if len(self.prompts) == 4:
+                raise TimeoutError("slow")  # and its retry times out
+            return reply
+
+    annotation = LLMEnricher(_GarbledThenTimeout()).annotate("wide", _facts(84))
+    assert len(annotation.columns) == 69, "only the first half's 15 are lost"
+    assert annotation.failures == ["columns 1-15 of 84: the call failed: TimeoutError"]
+
+
 def test_a_dead_endpoint_costs_two_calls_per_table_not_two_per_chunk():
     """Gate review: retrying every chunk of every table against an endpoint that is down paid for
     100+ failing calls on a 1,527-column shape."""

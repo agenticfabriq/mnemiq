@@ -88,8 +88,11 @@ class LLMEnricher:
         too_big = _size_failure(why, empty_split)
         if not described and not root and not too_big:
             # A split span gets its retry before the endpoint counts as down: one passing fault
-            # on a half must not abandon the table.
+            # on a half must not abandon the table. Down only if BOTH asks went unanswered -- a
+            # first reply, however garbled, means the endpoint is up.
+            answered = not down
             described, why, down = self._annotate_chunk(table, chunk, others, grounding, 1)
+            down = "" if answered else down
             too_big = _size_failure(why, empty_split)
         if described:
             return described, [], ""
