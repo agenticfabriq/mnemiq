@@ -22,6 +22,7 @@ from mnemiq.contract import Column, Definition, JoinKey, Relationship, Snapshot,
 from mnemiq.generate.prompts import user_prompt
 from mnemiq.llm import window
 from mnemiq.semantic.cards import build_cards
+from mnemiq.llm.window import TEMPLATE_ALLOWANCE
 from mnemiq.semantic.fit import FEEDBACK_ALLOWANCE, PromptFitter, rank_columns
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
 from mnemiq.sql.policy import build_access_policy
@@ -460,5 +461,5 @@ def test_without_a_count_a_declared_window_is_held_to_the_byte_bound():
     fitted = fitter.fit(packet, snap, _grants(snap))
 
     assert fitted is not packet
-    assert (_bytes_count(fitter.system(), user_prompt(fitted)) + 64 + REPLY + FEEDBACK_ALLOWANCE
-            <= window_tokens), "trimmed to the bound, which no tokenizer can exceed"
+    assert (_bytes_count(fitter.system(), user_prompt(fitted)) + TEMPLATE_ALLOWANCE + REPLY
+            + FEEDBACK_ALLOWANCE <= window_tokens), "trimmed to the byte bound"

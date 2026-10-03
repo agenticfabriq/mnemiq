@@ -37,7 +37,6 @@ generation prompt (2.56, over 220 of them), so the estimate errs toward warning.
 from __future__ import annotations
 
 import json
-import math
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -49,7 +48,19 @@ from mnemiq.generate.generator import GENERATOR_MAX_TOKENS
 from mnemiq.generate.prompts import system_prompt, user_prompt
 from mnemiq.llm.client import reasoning_budget
 
-CHARS_PER_TOKEN_FLOOR = 2.5
+# Without a server count, a prompt is held to its UTF-8 bytes: a byte-level tokenizer spends at most
+# one token a byte, which makes that a bound on the messages, where a characters-per-token ratio is
+# only an estimate (Qwen spends a token on each digit; a CJK character is three bytes). The chat
+# template adds tokens around the messages; TEMPLATE_ALLOWANCE is room for them -- an allowance, not
+# a measurement: a template that injects a long preamble needs the server's count. Both the boot
+# check and the fit (M127) use this, so they agree on what fits.
+TEMPLATE_ALLOWANCE = 256
+
+
+def byte_bound(system: str, user: str) -> int:
+    return len(system.encode()) + len(user.encode()) + TEMPLATE_ALLOWANCE
+
+
 # The `/tokenize` call's limits (`count_on_server`). The reply lists every token id, about 7 bytes
 # each: some 700 KB for a 100,000-token prompt.
 DEADLINE_S = 15.0
@@ -413,7 +424,7 @@ def _count(prompts: tuple[str, str, str, int], settings, http: httpx.Client | No
                             who=who)
 
     def estimate(user: str) -> int:
-        return math.ceil((len(system) + len(user)) / CHARS_PER_TOKEN_FLOOR) + QUESTION_ALLOWANCE
+        return byte_bound(system, user) + QUESTION_ALLOWANCE
 
     return WindowReport(estimate(bound), reply, settings.llm_context_window,
                         counted_by_server=False, cards=cards, real_tokens=estimate(real), who=who)

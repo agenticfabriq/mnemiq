@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 
 import duckdb
 import httpx
@@ -173,8 +172,7 @@ def test_a_window_too_small_for_the_longest_real_pair_never_reads_fits():
     snap = _abc_shared()
     con = duckdb.connect()
     system, _, _ = largest_prompt(con, snap, _settings(), "duckdb")
-    longest = math.ceil((len(system) + len(_real_prompt(snap, ["a", "c"])))
-                        / window.CHARS_PER_TOKEN_FLOOR)
+    longest = window.byte_bound(system, _real_prompt(snap, ["a", "c"]))
     tight = _settings(llm_context_window=longest + GENERATOR_MAX_TOKENS - 1)
     report = check_window(con, snap, tight, "duckdb", http=_server(None, 404))
     assert report.fits is False
@@ -518,8 +516,7 @@ def test_without_a_server_count_the_estimate_errs_long_against_the_declared_wind
     report = check_window(con, snap, settings, "duckdb", http=_server(None, 404))
     system, user, _ = largest_prompt(con, snap, settings, "duckdb")
     assert not report.counted_by_server and report.window == 100
-    assert report.prompt_tokens == (math.ceil((len(system) + len(user)) / window.CHARS_PER_TOKEN_FLOOR)
-                                    + window.QUESTION_ALLOWANCE)
+    assert report.prompt_tokens == window.byte_bound(system, user) + window.QUESTION_ALLOWANCE
     assert report.fits is False
 
 
