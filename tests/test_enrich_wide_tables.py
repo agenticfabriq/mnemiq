@@ -98,6 +98,30 @@ def test_a_garbled_reply_then_a_timeout_on_a_split_half_is_not_an_outage():
     assert annotation.failures == ["columns 1-15 of 84: the call failed: TimeoutError"]
 
 
+def test_a_malformed_reply_in_a_later_chunk_keeps_the_earlier_ones_and_the_table_goes_on():
+    """Codex review of #75: valid JSON with a list where a column name belongs made the parser
+    raise, which escaped the chunk and discarded the first chunk's descriptions."""
+    class _Malformed(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            reply = super().complete(system, user, max_tokens, **kw)
+            if len(self.prompts) in (2, 3):  # both answers to the second chunk are malformed
+                return '{"columns": [{"name": ["c30"], "description": "x"}]}'
+            return reply
+
+    annotation = LLMEnricher(_Malformed()).annotate("wide", _facts(84))
+    assert len(annotation.columns) == 54, "the first and third chunks land"
+    assert annotation.failures == [
+        "columns 31-60 of 84: the reply described none of the 30 column(s) asked about"]
+
+
+def test_a_list_for_a_column_name_is_ignored_not_an_error():
+    from mnemiq.enrichment.proposals import parse_annotation
+
+    annotation = parse_annotation('{"columns": [{"name": ["a"]}, {"name": "a"}]}', "t",
+                                  {"a": set()})
+    assert [c.name for c in annotation.columns] == ["a"]
+
+
 def test_a_dead_endpoint_costs_two_calls_per_table_not_two_per_chunk():
     """Gate review: retrying every chunk of every table against an endpoint that is down paid for
     100+ failing calls on a 1,527-column shape."""
@@ -356,3 +380,23 @@ def test_the_enrich_command_prints_them():
     assert printed, "_cmd_enrich no longer prints semantic_warnings"
     body = ast.unparse(printed[0])
     assert "sys.stderr" in body
+
+
+def test_any_parse_failure_stays_with_its_chunk(monkeypatch):
+    """`parse_annotation` never raises by design; if a reply shape still gets past it, the chunk
+    fails and is retried, and the chunks already described survive."""
+    import mnemiq.enrichment.enricher as enricher
+    from mnemiq.enrichment.proposals import parse_annotation
+
+    calls = []
+
+    def fragile(raw, table, allowed):
+        calls.append(1)
+        if len(calls) in (2, 3):
+            raise TypeError("unhashable type: 'list'")
+        return parse_annotation(raw, table, allowed)
+
+    monkeypatch.setattr(enricher, "parse_annotation", fragile)
+    annotation = LLMEnricher(_Model()).annotate("wide", _facts(84))
+    assert len(annotation.columns) == 54
+    assert annotation.failures == ["columns 31-60 of 84: the reply could not be read: TypeError"]

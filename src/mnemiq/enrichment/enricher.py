@@ -138,7 +138,14 @@ class LLMEnricher:
                     why = f"the call failed: {type(exc).__name__}"
                 continue
             replied = True
-            annotation = parse_annotation(raw, table, allowed)
+            try:
+                annotation = parse_annotation(raw, table, allowed)
+            except Exception as exc:  # noqa: BLE001 -- a reply the screen cannot read is a bad reply
+                # `parse_annotation` never raises by design; if a shape still gets past it, the
+                # chunk fails and is retried like any garbled reply -- it must not escape and take
+                # the chunks already described with it.
+                why = f"the reply could not be read: {type(exc).__name__}"
+                continue
             if annotation.columns:
                 return annotation.columns, "", ""
             why = diagnose_reply(raw, allowed)

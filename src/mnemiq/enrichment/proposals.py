@@ -113,8 +113,8 @@ def parse_annotation(raw: str, table: str, allowed: dict[str, set[str]]) -> Tabl
         if not isinstance(item, dict):
             continue
         name = item.get("name")
-        if name not in allowed or name in seen:
-            continue  # a column we never asked about does not exist
+        if not isinstance(name, str) or name not in allowed or name in seen:
+            continue  # a column we never asked about does not exist (a list is not a name)
         seen.add(name)
 
         raw_meanings = item.get("code_meanings")
