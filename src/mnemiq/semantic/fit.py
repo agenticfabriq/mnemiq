@@ -28,13 +28,12 @@ import re
 import time
 from dataclasses import dataclass, field, replace
 
+# Defined with the boot advisory, so the boot line and the question path agree on what fits.
+from mnemiq.llm.window import FEEDBACK_ALLOWANCE
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_facts
 
 logger = logging.getLogger(__name__)
 
-# FEEDBACK_ALLOWANCE lives with the boot advisory (`mnemiq.llm.window`), so the two agree on what
-# "fits" means; re-exported here for readers of this module.
-from mnemiq.llm.window import FEEDBACK_ALLOWANCE  # noqa: E402
 # A server that gave no count is asked again after this long, not on every question.
 NO_COUNT_RETRY_S = 600.0
 # How many times the chosen prompt is re-counted and shrunk before it is sent as it stands.

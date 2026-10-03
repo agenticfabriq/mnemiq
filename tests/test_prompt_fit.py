@@ -287,10 +287,11 @@ def test_the_advisory_says_whether_the_window_fits_trims_or_is_too_small(caplog,
     floor = window.worst_window(con, snap, settings, "duckdb", _All(snap),
                                 http=_counting_server(1))  # forces the floor measurement
     window_tokens = {"fits": full.needed,
-                     "trims": (full.needed + floor.floor_tokens + REPLY) // 2,
+                     "trims": floor.floor_tokens + REPLY + FEEDBACK_ALLOWANCE,
                      "too small": floor.floor_tokens + REPLY - 1,
                      # the fit keeps FEEDBACK_ALLOWANCE free too: the boot line must agree with it
                      "inside the allowance": floor.floor_tokens + REPLY + FEEDBACK_ALLOWANCE - 1}[room]
+    assert floor.floor_tokens + REPLY + FEEDBACK_ALLOWANCE < full.needed, "the case: a gap to trim in"
     report = window.worst_window(con, snap, settings, "duckdb", _All(snap),
                                  http=_counting_server(window_tokens))
     import mnemiq.llm.window as window_module
@@ -397,3 +398,4 @@ def test_the_advisory_floor_is_the_heaviest_view_without_descriptions():
                                  http=_counting_server(1))
     assert report.who == "role prose", "the full prompt's heaviest view is the prose one"
     assert report.floor_tokens >= heaviest_bare // 4, "the floor is the wide view's"
+    assert report.floor_who == "role wide", "and the boot line names the view it measured"

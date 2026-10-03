@@ -62,8 +62,10 @@ _PHASE_TIMEOUT_S = 5.0
 QUESTION_ALLOWANCE = 500
 # A retry re-sends the prompt with the database's error and the failed SQL, and the judge adds
 # the SQL and a result preview: room the fit (M127) keeps free beyond the reply, and the floor
-# test below uses too, so the boot line and the question path agree on what fits.
-FEEDBACK_ALLOWANCE = 500
+# test below uses too, so the boot line and the question path agree on what fits. A guess, not a
+# measurement: the judge's preview is capped in rows and cell width but not in columns, so a wide
+# SELECT * can outgrow it (register M130).
+FEEDBACK_ALLOWANCE = 1000
 
 
 @dataclass(frozen=True)
@@ -83,6 +85,9 @@ class WindowReport:
     # The same largest prompt with no column descriptions, measured only when the full one does not
     # fit: what is left once the fit (M127) has withheld every description it can.
     floor_tokens: int | None = None
+    # The view the floor was measured for: the heaviest without descriptions, which need not be
+    # `who`, the heaviest with them.
+    floor_who: str = ""
 
     @property
     def needed(self) -> int:
@@ -380,7 +385,8 @@ def worst_window(con, snapshot, settings, dialect: str, authz,
                 for lbl, grants in views.items()]
         lbl, heaviest = max(bare, key=lambda c: (len(c[1][0]) + len(c[1][1]), c[0]))
         floor = _count(heaviest, settings, http, lbl)
-        report = replace(report, floor_tokens=floor.real_tokens or floor.prompt_tokens)
+        report = replace(report, floor_tokens=floor.real_tokens or floor.prompt_tokens,
+                         floor_who=lbl)
     return report
 
 

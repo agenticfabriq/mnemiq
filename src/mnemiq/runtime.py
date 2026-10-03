@@ -431,10 +431,12 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
         # ones the question is least about. Worth knowing, not a failure.
         verdict = "window:trims"
         log = logger.info if verdict in acknowledged else logger.warning
-        log("prompt window fits only by withholding column descriptions: %s. With none, that "
-            "prompt is %s tokens, so a question that retrieves those tables is sent with as many "
-            "descriptions as fit, the ones it names first. Raise the window (vLLM "
-            "--max-model-len) to send them all.", report.sentence(), f"{report.floor_tokens:,}")
+        log("prompt window fits only by withholding column descriptions: %s. With none, the "
+            "longest prompt (%s) is %s tokens, so a question that retrieves those tables is sent "
+            "with as many descriptions as fit, the ones it names first. Raise the window (vLLM "
+            "--max-model-len) to send them all.", report.sentence(),
+            f"for {report.floor_who}" if report.floor_who else "the same view",
+            f"{report.floor_tokens:,}")
         _ack_did_not_apply(acknowledged, verdict, prefix="window:")
         return
     verdict = "window:too-small"
