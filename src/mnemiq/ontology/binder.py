@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
+import sqlglot
+
 from mnemiq.catalog import is_key_like, is_sensitive_name
 from mnemiq.contract import CodeScheme, Snapshot
 from mnemiq.ontology.records import ConceptScheme, OntologyRecords
@@ -48,11 +50,16 @@ def _observed(adapter, snapshot: Snapshot, column) -> list[str]:
         return []
     physical = {sb.object_id: sb.source_object for sb in snapshot.source_bindings}
     table = physical.get(column.object_id, column.object_id)
+    query = (f'SELECT DISTINCT "{column.name}" FROM "{table}" '
+             f'WHERE "{column.name}" IS NOT NULL LIMIT {SAMPLE_LIMIT}')
     try:
-        rows = adapter.execute(
-            f'SELECT DISTINCT "{column.name}" FROM "{table}" '
-            f'WHERE "{column.name}" IS NOT NULL LIMIT {SAMPLE_LIMIT}'
-        )
+        # In the source's dialect, as profiling's `_top_k` writes its sample: Oracle refuses
+        # `LIMIT` (ORA-03049), so raw, this probe failed on every column it reached there and a
+        # large code system could never bind on Oracle.
+        dialect = getattr(adapter, "dialect", "duckdb")
+        if dialect != "duckdb":
+            query = sqlglot.transpile(query, read="duckdb", write=dialect)[0]
+        rows = adapter.execute(query)
     except Exception as exc:
         logger.warning("ontology probe failed for %s: %s", column.id, exc)
         return []
@@ -124,7 +131,10 @@ def bind_schemes(adapter, snapshot: Snapshot, records: OntologyRecords,
         bound[column_id] = CodeScheme(id=scheme.id, label=scheme.label)
         evidence.append(BindEvidence(column_id=column_id, scheme_id=scheme.id, method="explicit"))
 
-    for column in snapshot.columns:
+    # No scheme, nothing a probe could match: without this, a glossary with no code systems still
+    # cost one DISTINCT scan of the source per column -- on a production schema, a full scan of
+    # every wide table, column by column, for no possible bind.
+    for column in snapshot.columns if records.schemes else ():
         if column.id in bound or is_key_like(column.name) or is_sensitive_name(column.name):
             continue
         values = _observed(adapter, snapshot, column)
@@ -199,6 +209,8 @@ def suggest_bindings(adapter, snapshot: Snapshot, records: OntologyRecords,
     """Reviewable binding candidates for unbound columns: near-misses (relaxed thresholds) and the
     ambiguous >1-strict-match case the auto-binder deliberately declines. Never mutates the snapshot.
     Run AFTER bind_schemes -- already-bound columns carry a code_scheme and are skipped."""
+    if not records.schemes:
+        return []  # nothing to suggest, so nothing to probe (see bind_schemes)
     by_scheme = {s.id: s for s in records.schemes}
     notations = {
         s.id: {c.notation.strip().casefold() for c in s.concepts} for s in records.schemes
