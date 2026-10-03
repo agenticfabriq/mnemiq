@@ -15,7 +15,7 @@ from mnemiq.contract.seams import (
     lineage_disclosure_sentence,
 )
 from mnemiq.contract import DeferralReason, IdentityContext, Snapshot, Trace
-from mnemiq.llm.client import ModelUnavailable, PromptCut
+from mnemiq.llm.client import ModelUnavailable, PromptCut, seed_offset
 from mnemiq.progress import Emit, Stage, step
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
@@ -413,7 +413,9 @@ class Agent:
         executed: list[tuple[Approved, object]] = []
         undefined: Deferred | None = None
         for i in range(self.candidates):
-            with step(emit, Stage.CANDIDATE, index=i + 1, of=self.candidates):
+            # seed_offset: a candidate that repeats an earlier one's strategy -- the fourth and
+            # fifth of five -- must not also repeat its seeded sample (M124).
+            with step(emit, Stage.CANDIDATE, index=i + 1, of=self.candidates), seed_offset(i):
                 outcome = plan_query(
                     packet,
                     snapshot,

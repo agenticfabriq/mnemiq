@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import httpx
 from openai import APIError, OpenAI
@@ -30,6 +33,23 @@ def accepts_temperature(model: str) -> bool:
     family, so a GPT-5 chat variant that would accept one is not sent it either: it keeps its
     default sampling, which fails safe rather than failing the request."""
     return not _FIXED_SAMPLING.search(model)
+
+
+# Added to MNEMIQ_LLM_SEED for every call made inside `seed_offset(n)`. A context variable rather than
+# a parameter, so it reaches the client through any generator, corrector or test double without
+# their signatures knowing it exists, and holds per thread under the HTTP server.
+_SEED_OFFSET: ContextVar[int] = ContextVar("mnemiq_seed_offset", default=0)
+
+
+@contextmanager
+def seed_offset(n: int) -> Iterator[None]:
+    """Calls made inside send seed + n (M124): deep mode wraps each candidate in its index, so a
+    candidate repeating an earlier one's prompt does not also repeat its sample."""
+    token = _SEED_OFFSET.set(n)
+    try:
+        yield
+    finally:
+        _SEED_OFFSET.reset(token)
 
 
 class PromptCut(ModelUnavailable):
@@ -206,13 +226,12 @@ class LLMClient:
             # reproducibility on the local path and nothing on the frontier one; do not build
             # an experiment design that assumes it.
             #
-            # Safe with the repair loop, whose retries append feedback and so change the prompt.
-            # NOT safe with deep mode as it stands: its five candidates cycle three strategies
-            # (STRATEGIES in agent/loop.py), so the fourth and fifth repeat a prompt and, seeded,
-            # can repeat its answer -- inflating the agreement its confidence gate counts. The
-            # setting's description says to leave it unset there; varying the seed per candidate
-            # would remove the hazard.
-            kwargs["seed"] = self._seed
+            # Offset per deep-mode candidate (`seed_offset`): its five candidates cycle three
+            # strategies (STRATEGIES in agent/loop.py), so the fourth and fifth repeat a prompt,
+            # and one shared seed made them repeat its answer too -- inflating the agreement the
+            # confidence gate counts (M124). The repair loop needs no offset: its retries append
+            # feedback, so the prompt itself changes.
+            kwargs["seed"] = self._seed + _SEED_OFFSET.get()
         return kwargs
 
     def _create(self, system: str, user: str, kwargs: dict):

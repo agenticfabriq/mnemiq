@@ -533,3 +533,68 @@ def test_a_first_time_answer_says_one_attempt_and_no_repair():
     result = _answer(_agent(['{"sql": "SELECT n FROM claim"}']))
     assert result.attempts == 1
     assert result.corrected is False
+
+
+def _seed_recording_client(seed):
+    """A real LLMClient over a fake OpenAI that answers count(*) and records each call's seed."""
+    from types import SimpleNamespace
+
+    import mnemiq.llm.client as module
+    from mnemiq.config import Settings
+
+    seen = []
+
+    class _Fake:
+        def __init__(self, *_, **__):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def _create(self, **kwargs):
+            seen.append(kwargs.get("seed"))
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=_sql("count(*)")))],
+                usage=None)
+
+    original = module.OpenAI
+    module.OpenAI = _Fake
+    try:
+        client = module.LLMClient(Settings(llm_base_url="http://x", llm_api_key="k",
+                                           llm_model="m", llm_seed=seed, pg_dsn=None,
+                                           acme_data_dir=None))
+    finally:
+        module.OpenAI = original
+    return client, seen
+
+
+def test_each_candidate_is_seeded_apart_so_a_repeated_strategy_is_not_a_repeated_answer():
+    """M124: five candidates cycle three strategies, so the fourth and fifth send the first and
+    second prompts again -- and with one shared seed, vLLM returned the same SQL, counted twice
+    toward the agreement gate. Each candidate now sends seed + its index, through the real
+    generator and client."""
+    from mnemiq.generate.generator import LLMGenerator
+
+    client, seen = _seed_recording_client(seed=40)
+    agent = _vote_agent([], 5)
+    agent.generator = LLMGenerator(client)
+    _answer(agent)
+
+    assert seen[:5] == [40, 41, 42, 43, 44]
+
+
+def test_outside_deep_mode_the_seed_is_sent_as_set():
+    from mnemiq.llm.client import seed_offset
+
+    client, seen = _seed_recording_client(seed=40)
+    client.complete("s", "u")
+    with seed_offset(3):
+        client.complete("s", "u")
+    client.complete("s", "u")
+    assert seen == [40, 43, 40], "the offset applies inside the block and is reset after it"
+
+
+def test_no_seed_set_means_none_sent_whatever_the_candidate():
+    from mnemiq.llm.client import seed_offset
+
+    client, seen = _seed_recording_client(seed=None)
+    with seed_offset(2):
+        client.complete("s", "u")
+    assert seen == [None]
