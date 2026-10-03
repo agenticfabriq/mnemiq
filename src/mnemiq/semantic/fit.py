@@ -39,8 +39,10 @@ from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_fact
 
 logger = logging.getLogger(__name__)
 
-# A server that gave no count is asked again after this long, not on every question.
+# A server that gave no count is asked again after this long, not on every question: long for one
+# that never counted (no /tokenize, most likely), short for one that has (a passing failure).
 NO_COUNT_RETRY_S = 600.0
+TRANSIENT_RETRY_S = 30.0
 # The server's window is re-learned after this long: a server restarted with a smaller window must
 # not keep receiving prompts sized for the old one. One /tokenize a minute, at most.
 WINDOW_TTL_S = 60.0
@@ -101,8 +103,9 @@ class PromptFitter:
     """What `fit` needs to know about the model and the prompt it will be sent.
 
     `window` is the declared one (MNEMIQ_LLM_CONTEXT_WINDOW), the fallback: the window the server
-    reports outranks it, refreshed by every count and re-learned once WINDOW_TTL_S has passed. `count` is
-    `(system, user) -> (tokens, window) | None`, the server's own count, None where it has none.
+    reports outranks it, refreshed by every count and re-learned once WINDOW_TTL_S has passed.
+    `count` is `(system, user) -> (tokens, window) | None`, the server's own count, None where it
+    has none.
     """
 
     dialect: str
@@ -145,7 +148,15 @@ class PromptFitter:
             return None
         counted = self.count(system, user)
         if counted is None:
-            self._no_count_until = time.monotonic() + NO_COUNT_RETRY_S
+            now = time.monotonic()
+            self._no_count_until = now + (TRANSIENT_RETRY_S if self._window_seen_at
+                                          else NO_COUNT_RETRY_S)
+            if (self._server_window is not None and self.window is not None
+                    and now - self._window_seen_at > WINDOW_TTL_S):
+                # An expired window the server would not confirm yields to the declared one -- a
+                # server restarted smaller must not keep its old limit through a failed count. With
+                # no declared window, the last one the server gave is still the best word there is.
+                self._server_window = None
             return None
         self._no_count_until = None
         tokens, reported = counted
@@ -264,10 +275,13 @@ class PromptFitter:
                 low = max(0, low - math.ceil((counted - budget()) / per_description) - 1)
                 best = render(low)
                 if low == 0:
-                    verified = True  # the floor, counted at the start
                     break
             if not verified:
                 low, best = 0, floor
+                if floor_tokens > budget():  # the window shrank below even the floor mid-fit
+                    logger.warning("prompt window: even with no column descriptions the prompt "
+                                   "needs %d tokens against %d after the reply budget; the "
+                                   "server may refuse it", floor_tokens, budget())
         logger.info("prompt window: %d of %d column descriptions sent, to fit %d tokens",
                     low, len(ranked), budget())
         return best

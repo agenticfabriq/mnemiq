@@ -633,3 +633,45 @@ def test_a_count_within_the_ttl_that_reports_a_smaller_window_is_obeyed_at_once(
     fitted = fitter.fit(packet, snap, _grants(snap))
     assert fitted is not packet
     assert _piece_count(fitter.system(), user_prompt(fitted)) + REPLY + FEEDBACK_ALLOWANCE <= small
+
+
+def test_an_expired_window_the_server_will_not_confirm_yields_to_the_declared_one():
+    """Fifth Codex review: a failed refresh kept the expired window and backed off ten minutes."""
+    from mnemiq.semantic import fit as fit_module
+
+    snap = _snapshot()
+    packet = _packet(snap)
+    probe = _fitter(None)
+    tokens = _piece_count(probe.system(), user_prompt(packet))
+    declared = tokens + REPLY + FEEDBACK_ALLOWANCE - tokens // 3
+    answers = [(10**6,)]
+
+    def flaky(system, user):
+        answer = answers[0]
+        return None if answer is None else (_piece_count(system, user), answer[0])
+
+    fitter = _fitter(declared, count=flaky)
+    assert fitter.fit(packet, snap, _grants(snap)) is packet, "the server's roomy window rules"
+    fitter._window_seen_at -= fit_module.WINDOW_TTL_S + 1
+    answers[0] = None  # the refresh fails
+    fitted = fitter.fit(_packet(snap, "again"), snap, _grants(snap))
+    assert fitted.descriptions is not None, "fitted to the declared window, not the expired one"
+    assert fitter._no_count_until - fit_module.time.monotonic() <= fit_module.TRANSIENT_RETRY_S
+
+
+def test_a_floor_returned_after_the_window_shrank_below_it_says_so(caplog):
+    snap = _snapshot(120)
+    packet = _packet(snap)
+    probe = _fitter(None)
+    full = _piece_count(probe.system(), user_prompt(packet))
+    first = full + REPLY + FEEDBACK_ALLOWANCE - full // 4
+    calls = []
+
+    def collapsing(system, user):  # full and floor counted at the first window, then it collapses
+        calls.append(1)
+        return _piece_count(system, user), (first if len(calls) <= 2 else REPLY)
+
+    with caplog.at_level(logging.WARNING):
+        fitted = _fitter(None, count=collapsing).fit(packet, snap, _grants(snap))
+    assert fitted.descriptions[0] == 0
+    assert "even with no column descriptions" in caplog.text
