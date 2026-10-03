@@ -144,11 +144,13 @@ class LLMEnricher:
                 # `parse_annotation` never raises by design; if a shape still gets past it, the
                 # chunk fails and is retried like any garbled reply -- it must not escape and take
                 # the chunks already described with it.
-                why = f"the reply could not be read: {type(exc).__name__}"
+                if not _size_failure(why, True):  # a size diagnosis outranks it, as above
+                    why = f"the reply could not be read: {type(exc).__name__}"
                 continue
             if annotation.columns:
                 return annotation.columns, "", ""
-            why = diagnose_reply(raw, allowed)
+            if not _size_failure(why, True):  # once an attempt shows a size failure, it stays
+                why = diagnose_reply(raw, allowed)
         return [], why, ("" if replied else why)
 
 

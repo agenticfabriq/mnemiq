@@ -400,3 +400,40 @@ def test_any_parse_failure_stays_with_its_chunk(monkeypatch):
     annotation = LLMEnricher(_Model()).annotate("wide", _facts(84))
     assert len(annotation.columns) == 54
     assert annotation.failures == ["columns 31-60 of 84: the reply could not be read: TypeError"]
+
+
+
+def _cut_then(second):
+    """A model whose first answer to the 30-column chunk is cut off and whose second is `second`
+    ('raise' in the parser, or a reply with no JSON); halves are answered normally."""
+    class _M(_Model):
+        def complete(self, system, user, max_tokens=512, **kw):
+            reply = super().complete(system, user, max_tokens, **kw)
+            names = _ASKED.findall(user.split("The table's other columns")[0])
+            if len(names) == 30 and len(self.prompts) == 1:
+                return reply[: len(reply) // 2]
+            if len(names) == 30 and len(self.prompts) == 2:
+                return '{"columns": [{"name": ["c0"]}]}' if second == "raise" else "Sorry."
+            return reply
+    return _M()
+
+
+def test_a_cut_off_answer_still_splits_when_the_retry_cannot_be_parsed(monkeypatch):
+    """Gate review: a size diagnosis from the first answer outranks whatever the retry does --
+    here a reply the parser chokes on -- so the chunk is halved and recovered."""
+    import mnemiq.enrichment.enricher as enricher
+    from mnemiq.enrichment.proposals import parse_annotation
+
+    def fragile(raw, table, allowed):
+        if '["c0"]' in raw:
+            raise TypeError("unhashable type: 'list'")
+        return parse_annotation(raw, table, allowed)
+
+    monkeypatch.setattr(enricher, "parse_annotation", fragile)
+    annotation = LLMEnricher(_cut_then("raise")).annotate("wide", _facts(30))
+    assert len(annotation.columns) == 30 and not annotation.failures
+
+
+def test_a_cut_off_answer_still_splits_when_the_retry_holds_no_json():
+    annotation = LLMEnricher(_cut_then("no json")).annotate("wide", _facts(30))
+    assert len(annotation.columns) == 30 and not annotation.failures
