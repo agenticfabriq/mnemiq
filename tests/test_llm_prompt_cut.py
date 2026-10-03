@@ -316,5 +316,5 @@ def test_a_context_length_refusal_reaches_the_user_as_a_configuration_failure(mo
 
     assert answer.failed is True and answer.reason_code == DeferralReason.MODEL_UNAVAILABLE
     assert "longer than its context window" in answer.answer
-    assert "MNEMIQ_RETRIEVAL_K" in answer.answer
+    assert "--max-model-len" in answer.answer
     assert "outage" not in answer.answer and "try again" not in answer.answer

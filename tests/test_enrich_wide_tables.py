@@ -489,7 +489,8 @@ def test_the_client_names_a_context_length_refusal():
              None, ContextTooLong),
             ("too long", "context_length_exceeded", ContextTooLong),
             ("invalid model name", None, ModelUnavailable),
-            ("too long", "some_other_code", ModelUnavailable),
+            ("request too long", "some_other_code", ModelUnavailable),
+            ("request too long", "context_length_exceeded", ContextTooLong),
         ]:
             module.OpenAI = refusing(message, code)
             client = module.LLMClient(settings)
@@ -515,5 +516,7 @@ def test_the_client_names_a_context_length_refusal():
             module.LLMClient(settings).complete("s", "u")
         except ModelUnavailable as exc:
             assert type(exc) is ModelUnavailable
+        else:
+            raise AssertionError("a 500 must raise")
     finally:
         module.OpenAI = original
