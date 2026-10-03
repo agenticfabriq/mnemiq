@@ -308,7 +308,6 @@ def test_the_advisory_says_whether_the_window_fits_trims_or_is_too_small(caplog,
         assert "prompt window fits:" in text and "WARNING" not in text
     elif room == "trims":
         assert "fits only by withholding column descriptions" in text
-        assert f"(for {report.floor_who})" in text, "the line names the view the floor measured"
         assert "TOO SMALL" not in text
     else:
         assert "prompt window TOO SMALL" in text, room
@@ -368,7 +367,7 @@ def test_a_column_a_metric_or_dimension_names_ranks_with_the_named():
     assert {("wide_trace", "step_003_time"), ("wide_trace", "step_004_time")} <= first
 
 
-def test_the_advisory_floor_is_the_heaviest_view_without_descriptions():
+def test_the_advisory_floor_is_the_heaviest_view_without_descriptions(caplog, monkeypatch):
     """Gate review: measured only for the view heaviest WITH descriptions, a view of many columns
     and short descriptions could be the heaviest without them and read as trims, not TOO SMALL."""
     tables = {"long_prose": (6, "x" * 2000), "many_columns": (90, "short")}
@@ -399,4 +398,16 @@ def test_the_advisory_floor_is_the_heaviest_view_without_descriptions():
                                  http=_counting_server(1))
     assert report.who == "role prose", "the full prompt's heaviest view is the prose one"
     assert report.floor_tokens >= heaviest_bare // 4, "the floor is the wide view's"
-    assert report.floor_who == "role wide", "and the boot line names the view it measured"
+    assert report.floor_who == "role wide", "and the report names the view it measured"
+
+    # ...and so does the boot line, at a window where the floor fits and the full prompt does not.
+    from mnemiq.runtime import _warn_prompt_window
+
+    trims = window.worst_window(con, snap, settings, "duckdb", _TwoRoles(),
+                                http=_counting_server(report.floor_tokens + REPLY
+                                                      + FEEDBACK_ALLOWANCE))
+    assert trims.floor_fits and trims.who == "role prose" and trims.floor_who == "role wide"
+    monkeypatch.setattr(window, "worst_window", lambda *a, **k: trims)
+    with caplog.at_level(logging.INFO):
+        _warn_prompt_window(settings, con, snap, None, _TwoRoles(), frozenset())
+    assert "(for role wide)" in caplog.text and "(for role prose)" not in caplog.text
