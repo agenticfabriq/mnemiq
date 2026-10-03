@@ -22,16 +22,20 @@ shown -- a PII column's description, a denied table -- would be a disclosure the
 itself. Each role the access policy declares is measured locally (the configured identity, where
 the provider cannot list its roles), and only the heaviest is counted on the server.
 
-Longest by length, then counted in tokens -- not longest in tokens. A set of tables shorter in
-characters but denser in tokens (long identifiers, non-Latin text) can count more than the one
-measured, as can a non-ASCII question against its allowance, and counting every candidate would
-cost a server round trip per table at boot. So a warning means the measured parts do not fit, and a
+Longest by bytes (`byte_bound`), then counted in tokens -- not longest in tokens. Bytes already
+weigh non-Latin text by what it costs, but a set of tables shorter in bytes and denser in tokens
+(long digit-heavy identifiers) can still count more than the one measured, as can a non-ASCII
+question against its allowance, and counting every candidate would cost a server round trip per
+table at boot. So a warning means the measured parts do not fit, and a
 "fits" close to the window is not a promise: leave headroom.
 
 Counted by the server where it can count: vLLM's `/tokenize` returns the count, chat template
 included, and `max_model_len` in one call. Otherwise the window is `MNEMIQ_LLM_CONTEXT_WINDOW`, as
-declared, and the count an estimate at 2.5 characters a token -- below the fewest measured for a
-generation prompt (2.56, over 220 of them), so the estimate errs toward warning.
+declared, and the count a bound: the prompt's UTF-8 bytes plus room for the chat template
+(`byte_bound`), since a byte-level tokenizer spends at most a token a byte. It errs long -- at least
+2.5 times for English prose (the fewest characters a token measured was 2.56; typical prose is near
+4) -- so without a count the check warns early rather than late. (It was 2.5 characters a token until M127: an estimate, which a
+digit-heavy or non-Latin prompt can beat, where the fit needs a bound.)
 """
 
 from __future__ import annotations
@@ -125,7 +129,8 @@ class WindowReport:
 
     def sentence(self) -> str:
         count = (f"{self.prompt_tokens:,} tokens, counted by the server" if self.counted_by_server
-                 else f"about {self.prompt_tokens:,} tokens, estimated from its length")
+                 else f"{self.prompt_tokens:,} tokens bounded from its bytes, with allowances for the "
+                      "template and the question (the server gave no count, so this errs long)")
         if self.real_tokens is not None and self.real_tokens != self.prompt_tokens:
             count += (f" (an upper bound; a real packet of those tables, each shared definition "
                       f"once, is {self.real_tokens:,})")
@@ -385,7 +390,7 @@ def worst_window(con, snapshot, settings, dialect: str, authz,
                   for label, grants in views.items()]
     if not candidates:
         return None
-    label, prompts = max(candidates, key=lambda c: (len(c[1][0]) + len(c[1][1]), c[0]))
+    label, prompts = max(candidates, key=lambda c: (byte_bound(c[1][0], c[1][1]), c[0]))
     report = _count(prompts, settings, http, label)
     if report.fits is False:
         # Past the window with every description: what the fit can bring it down to. Over every
@@ -394,7 +399,7 @@ def worst_window(con, snapshot, settings, dialect: str, authz,
         bare = [(lbl, largest_prompts(con, snapshot, settings, dialect, grants,
                                       describe=lambda _table, _column: False))
                 for lbl, grants in views.items()]
-        lbl, heaviest = max(bare, key=lambda c: (len(c[1][0]) + len(c[1][1]), c[0]))
+        lbl, heaviest = max(bare, key=lambda c: (byte_bound(c[1][0], c[1][1]), c[0]))
         floor = _count(heaviest, settings, http, lbl)
         report = replace(report, floor_tokens=floor.real_tokens or floor.prompt_tokens,
                          floor_who=lbl)

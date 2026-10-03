@@ -22,7 +22,6 @@ from mnemiq.contract import Column, Definition, JoinKey, Relationship, Snapshot,
 from mnemiq.generate.prompts import user_prompt
 from mnemiq.llm import window
 from mnemiq.semantic.cards import build_cards
-from mnemiq.llm.window import TEMPLATE_ALLOWANCE
 from mnemiq.semantic.fit import FEEDBACK_ALLOWANCE, PromptFitter, rank_columns
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
 from mnemiq.sql.policy import build_access_policy
@@ -92,17 +91,27 @@ def test_describe_withholds_only_the_description():
 
 # --- nothing changes while it fits --------------------------------------------------------------
 
-def test_a_prompt_that_fits_comes_back_as_the_same_packet_without_asking_the_server():
+def test_a_prompt_that_fits_comes_back_as_the_same_packet_asking_the_server_once_at_most():
+    """The first question asks once, to learn the server's window (it outranks a declared one); a
+    server that gave none is not asked again, and a prompt whose bytes fit needs no count."""
     snap = _snapshot()
     packet = _packet(snap)
     asked = []
     fitter = _fitter(10_000_000, count=lambda s, u: asked.append(1))
     assert fitter.fit(packet, snap, _grants(snap)) is packet
-    assert asked == [], "a conservative estimate that fits needs no count"
+    assert fitter.fit(_packet(snap, "another"), snap, _grants(snap)).descriptions is None
+    assert asked == [1]
+
+    known = []
+    fitter = _fitter(None, count=lambda s, u: known.append(1) or (len(s + u) // 4, 10_000_000))
+    fitter.fit(packet, snap, _grants(snap))
+    assert fitter.fit(_packet(snap, "another"), snap, _grants(snap)).descriptions is None
+    assert known == [1], "once the window is known, bytes that fit need no request"
 
 
 def test_the_server_count_decides_when_the_estimate_is_over():
-    """The estimate errs long (2.5 characters a token); the server's count is the real one."""
+    """Bytes overcount English (the window sits between characters / 2.5 and the bytes); the
+    server's count is the real one."""
     snap = _snapshot()
     packet = _packet(snap)
     fitter = _fitter(None)
@@ -461,5 +470,102 @@ def test_without_a_count_a_declared_window_is_held_to_the_byte_bound():
     fitted = fitter.fit(packet, snap, _grants(snap))
 
     assert fitted is not packet
-    assert (_bytes_count(fitter.system(), user_prompt(fitted)) + TEMPLATE_ALLOWANCE + REPLY
+    assert (_bytes_count(fitter.system(), user_prompt(fitted)) + window.TEMPLATE_ALLOWANCE + REPLY
             + FEEDBACK_ALLOWANCE <= window_tokens), "trimmed to the byte bound"
+
+
+# --- second Codex review and commit gate of #78 -------------------------------------------------
+
+def _uneven_snapshot() -> Snapshot:
+    """The first thirty columns (the ones the ranking reaches first, the question naming none)
+    carry digit strings -- a token a digit -- and the rest long prose: an average cost per
+    description, taken over both, undercounts the ones kept first."""
+    snap = _snapshot(120)
+    columns = []
+    for i, c in enumerate(snap.columns):
+        text = ("0123456789" * 8) if i < 30 else ("the value recorded for each lot, kept as written " * 4)
+        columns.append(c.model_copy(update={"description": text}))
+    return snap.model_copy(update={"columns": columns})
+
+
+def test_only_a_prompt_the_server_counted_inside_the_budget_is_returned():
+    snap = _uneven_snapshot()
+    packet = _packet(snap, question="anything")
+    probe = _fitter(None)
+    full = _piece_count(probe.system(), user_prompt(packet))
+    window_tokens = full + REPLY + FEEDBACK_ALLOWANCE - (3 * full) // 4
+    fitter = _fitter(window_tokens, count=lambda s, u: (_piece_count(s, u), window_tokens))
+
+    fitted = fitter.fit(packet, snap, _grants(snap))
+
+    assert (_piece_count(fitter.system(), user_prompt(fitted)) + REPLY + FEEDBACK_ALLOWANCE
+            <= window_tokens), "whatever the estimate did, what is sent fits the server's count"
+
+
+def test_a_recount_that_fails_falls_back_to_the_counted_floor():
+    snap = _snapshot(120)
+    packet = _packet(snap)
+    probe = _fitter(None)
+    full = _piece_count(probe.system(), user_prompt(packet))
+    window_tokens = full + REPLY + FEEDBACK_ALLOWANCE - full // 4
+    answered = []
+
+    def count_twice(system, user):  # the full prompt and the floor, then the server goes quiet
+        answered.append(1)
+        return (_piece_count(system, user), window_tokens) if len(answered) <= 2 else None
+
+    fitted = _fitter(window_tokens, count=count_twice).fit(packet, snap, _grants(snap))
+    assert fitted.descriptions == (0, len(snap.columns)), "unconfirmed: the floor, which was counted"
+
+
+def test_the_servers_window_outranks_a_declared_one():
+    """MNEMIQ_LLM_CONTEXT_WINDOW is the fallback for a server that reports none; a stale, larger
+    declaration must not wave through a prompt the server will refuse."""
+    snap = _snapshot()
+    packet = _packet(snap)
+    probe = _fitter(None)
+    full = _piece_count(probe.system(), user_prompt(packet))
+    real_window = full + REPLY + FEEDBACK_ALLOWANCE - full // 3
+    fitter = _fitter(10**7, count=lambda s, u: (_piece_count(s, u), real_window))
+
+    for question in ("total body weight per lot", "and again"):
+        fitted = fitter.fit(_packet(snap, question), snap, _grants(snap))
+        assert fitted.descriptions is not None, question
+        assert (_piece_count(fitter.system(), user_prompt(fitted)) + REPLY + FEEDBACK_ALLOWANCE
+                <= real_window), question
+
+
+def test_the_heaviest_view_is_chosen_by_bytes_not_characters():
+    """Commit gate: the boot check estimates in bytes without a count, so it must also choose the
+    view in bytes -- a view of Chinese descriptions is shorter in characters and longer in bytes."""
+    tables = {"ascii_view": "an English description of this column, kept " * 2,  # 90 chars, 90 bytes
+              "cjk_view": "每一批次在生产线上记录的数值按系统原样保存。" * 2}  # 44 chars, 132 bytes
+    snap = Snapshot(
+        version="v1", source_id="s", created_at="2026-10-03T00:00:00Z",
+        source_bindings=[SourceBinding(id=f"sb:{t}", source_id="s", object_id=t, source_object=t,
+                                       binding_type="table") for t in tables],
+        columns=[Column(id=f"{t}.c{i:02d}", object_id=t, name=f"c{i:02d}", data_type="text",
+                        description=d) for t, d in tables.items() for i in range(20)])
+
+    class _ByTable:
+        def policy_roles(self):
+            return ["ascii", "cjk"]
+
+        def grants_for(self, identity):
+            seen = {"ascii": "ascii_view", "cjk": "cjk_view"}
+            return GrantSet(frozenset(seen[r] for r in identity.roles if r in seen))
+
+    settings = Settings(llm_base_url="http://127.0.0.1:9/v1", llm_api_key="k", llm_model="m",
+                        retrieval_k=1, llm_context_window=1_000)
+    con = duckdb.connect()
+    prompts = {label: window.largest_prompts(con, snap, settings, "duckdb", grants)
+               for label, grants in window.grant_sets(_ByTable(), settings)}
+    by_chars = max(prompts, key=lambda k: len(prompts[k][0]) + len(prompts[k][1]))
+    by_bytes = max(prompts, key=lambda k: window.byte_bound(prompts[k][0], prompts[k][1]))
+    assert (by_chars, by_bytes) == ("role ascii", "role cjk"), "the case: the two orders disagree"
+
+    import httpx
+
+    no_count = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(404)))
+    report = window.worst_window(con, snap, settings, "duckdb", _ByTable(), http=no_count)
+    assert report.who == "role cjk" and not report.counted_by_server

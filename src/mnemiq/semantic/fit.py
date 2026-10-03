@@ -156,15 +156,21 @@ class PromptFitter:
         reserve = self.reply_tokens + FEEDBACK_ALLOWANCE
         user = user_prompt(packet)
         ceiling = byte_bound(system, user)
-        window = self.window or self._server_window
-        # At most a token a byte: when the bytes fit, the prompt fits, and no request leaves the
-        # process.
-        if window is not None and ceiling + reserve <= window:
-            return packet
-        tokens = self._counted(system, user)
-        window = self.window or self._server_window
+        tokens = None
+        if self._server_window is None:
+            # The server's window outranks a declared one (MNEMIQ_LLM_CONTEXT_WINDOW is the fallback
+            # for a server that reports none), so it is learned before anything is waved through:
+            # one count, on the first question, then remembered.
+            tokens = self._counted(system, user)
+        window = self._server_window or self.window
         if window is None:
             return packet  # nothing to fit against: as before M127
+        # At most a token a byte: when the bytes fit, the prompt fits, and no request leaves the
+        # process.
+        if tokens is None and ceiling + reserve <= window:
+            return packet
+        if tokens is None:
+            tokens = self._counted(system, user)
         if (tokens if tokens is not None else ceiling) + reserve <= window:
             return packet
         return self._trim(packet, snapshot, grants, system, window - reserve, tokens)
@@ -176,9 +182,11 @@ class PromptFitter:
         descriptions -- because one average ratio is wrong for the middle: descriptions are prose
         and column names are not (measured on the partner shape: 3.96 characters a token with
         every description, 3.16 with none), so a ratio taken from the full prompt undercounts a
-        trimmed one by a quarter, which the server then refused. The chosen prompt is counted
-        once more and shrunk while it is still over. Without counts, the byte bound is used
-        throughout: it trims more than needed, never too little."""
+        trimmed one by a quarter, which the server then refused. Only a prompt the server has
+        counted inside the budget is returned: the chosen one is counted and shrunk while it is
+        still over, and if no count confirms it, the prompt with no descriptions -- counted at the
+        start -- goes instead. Without counts, the byte bound is used throughout: it trims more
+        than needed, never too little."""
         from mnemiq.generate.prompts import user_prompt
         from mnemiq.semantic.cards import build_cards
         from mnemiq.sql.policy import build_access_policy
@@ -228,13 +236,25 @@ class PromptFitter:
             else:
                 high = mid - 1
         if floor_tokens is not None and low:
+            # The server has the last word: return a prompt it counted inside the budget, or the
+            # floor, which it already did. An estimate is not enough -- descriptions differ in
+            # length and density, and a shrink by their average can miss three times running.
             per_description = max((full_tokens - floor_tokens) / len(ranked), 1.0)
-            for _ in range(RECOUNTS):  # the server has the last word on the chosen prompt
+            verified = False
+            for _ in range(RECOUNTS):
                 counted = self._counted(system, user_prompt(best))
-                if counted is None or counted <= budget:
+                if counted is None:
+                    break
+                if counted <= budget:
+                    verified = True
                     break
                 low = max(0, low - math.ceil((counted - budget) / per_description) - 1)
                 best = render(low)
+                if low == 0:
+                    verified = True  # the floor, counted at the start
+                    break
+            if not verified:
+                low, best = 0, floor
         logger.info("prompt window: %d of %d column descriptions sent, to fit %d tokens",
                     low, len(ranked), budget)
         return best
