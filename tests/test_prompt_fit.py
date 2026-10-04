@@ -743,5 +743,5 @@ def test_a_wide_table_whose_descriptions_match_the_question_does_not_starve_the_
     fitted = fitter.fit(packet, snap, _grants(snap))
     narrow = next(c.card for c in fitted.cards if c.object_id == "batch")
     sent, _total = fitted.descriptions
-    assert sent < 40, "the case: room for a few, not all"
+    assert 6 <= sent < 40, "the case: room for a few, not all, and not none"
     assert narrow.count("Recorded once per lot") >= min(6, sent // 2), "the narrow table keeps its share"
