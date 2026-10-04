@@ -641,16 +641,37 @@ def test_a_label_must_match_an_identifier_not_merely_avoid_five_characters():
         sqlglot.parse_one("SELECT all_ssns() FROM claim", read="duckdb"))[0] == ["all_ssns"]
 
 
-def test_the_cli_json_surface_carries_lineage_too():
+def test_the_cli_json_surface_carries_lineage_too(monkeypatch, capsys):
     """The fourth surface. A machine consumer reading `--json` got answer/deferred/mode/sql and no
-    audit artifact at all — worse than a bare list, since there was neither marker nor tables."""
-    import inspect
+    audit artifact at all — worse than a bare list, since there was neither marker nor tables.
 
-    from mnemiq import cli
+    Asserted on what `--json` PRINTS, not on the source text: the surface now prints the shared HTTP
+    payload (M128), and a text check would pass a renamed key and fail a correct refactor."""
+    import json
 
-    src = inspect.getsource(cli._cmd_ask)
-    json_block = src[src.index("if args.json"):src.index("print(ans.answer)")]
-    assert '"lineage"' in json_block and '"tables_used"' in json_block
+    import mnemiq.cli as cli
+    from mnemiq.agent.loop import AgentAnswer
+    from mnemiq.config import Settings
+    from mnemiq.contract import IdentityContext, Trace
+
+    trace = Trace(question="q", plan_sql="SELECT 1", target_sql="SELECT 1", result_shape="1x1",
+                  timing={}, enrichment_version="v1", tables_used=["claim"],
+                  identity=IdentityContext(tenant_id="t", principal_id="p", roles=[]),
+                  lineage_completeness="incomplete", lineage_unresolved=["f"],
+                  lineage_reasons=["function"])
+
+    class _RT:
+        def ask(self, q, identity, mode=None):
+            return AgentAnswer(answer="A", trace=trace)
+
+    monkeypatch.setattr(cli, "build_runtime", lambda settings: _RT())
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: Settings(
+        llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d", acme_data_dir=None)))
+    assert cli.main(["ask", "q", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["tables_used"] == ["claim"]
+    assert printed["lineage"] == {"tables": ["claim"], "completeness": "incomplete",
+                                  "unresolved": ["f"], "reasons": ["function"]}
 
 
 def test_a_bare_name_in_a_view_body_is_not_the_callers_bare_name():

@@ -390,33 +390,15 @@ def _cmd_ask(settings: Settings, args) -> int:
     if args.json:
         import json
 
-        print(
-            json.dumps(
-                {
-                    "answer": ans.answer,
-                    "deferred": ans.deferred,
-                    "mode": ans.mode,
-                    "sql": ans.trace.target_sql if ans.trace else None,
-                    # The FOURTH surface. Human CLI, HTTP and MCP were each fixed in turn while
-                    # the commit message counted them wrong every time -- "the two surfaces",
-                    # then three. A machine consumer reading `--json` got answer/deferred/mode/sql
-                    # and no audit artifact at all, which is a worse version of the bare list: not
-                    # a misleading marker but no marker and no tables either.
-                    "tables_used": list(ans.trace.tables_used) if ans.trace else None,
-                    "lineage": ({"tables": list(ans.trace.tables_used),
-                                 "completeness": ans.trace.lineage_completeness,
-                                 "unresolved": list(ans.trace.lineage_unresolved),
-                                 "reasons": list(ans.trace.lineage_reasons)}
-                                if ans.trace else None),
-                    # The sentence is already in `answer`; this is the same fact structured, so a
-                    # machine consumer never has to parse prose to learn it was narrowed. `null`
-                    # means governance was not evaluated, `[]` that it narrowed nothing.
-                    "narrowed": ([n.model_dump() for n in ans.trace.narrowed]
-                                 if ans.trace and ans.trace.narrowed is not None else None),
-                },
-                default=str,
-            )
-        )
+        from mnemiq.server.serialize import answer_payload
+
+        # The HTTP payload itself, not a fifth hand-built dict. This surface was the one that
+        # drifted: its own copy carried answer/deferred/sql/lineage but not `failed` or
+        # `reason_code`, so a refusal by the model server read as an answer with no SQL, and a
+        # rehearsal script scored a should-decline question "answered" (M128). Sharing the
+        # serializer keeps this surface and HTTP from drifting apart. (MCP shares only
+        # `verified_state` and still builds its own, narrower dict.)
+        print(json.dumps(answer_payload(ans), default=str))
         return 0
     print(ans.answer)
     if ans.trace is not None:

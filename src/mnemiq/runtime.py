@@ -445,7 +445,10 @@ def _warn_prompt_window(settings: Settings, con, snapshot, adapter, authz,
     # duplicated shared definitions would cost the operator for nothing.
     log("prompt window %s: %s. A question that retrieves those tables %s fail (vLLM refuses the "
         "request) or have its answer refused (a server that cuts the prompt). Raise the window "
-        "(vLLM --max-model-len, Ollama OLLAMA_CONTEXT_LENGTH) or lower MNEMIQ_RETRIEVAL_K.",
+        "(vLLM --max-model-len, Ollama OLLAMA_CONTEXT_LENGTH) up to the model's own limit; past it, "
+        "send less -- fewer tables a question (MNEMIQ_RETRIEVAL_K) when many fill the prompt, or "
+        "fewer in the source manifest's `tables` list: even without column descriptions, which "
+        "mnemiq withholds to fit, those tables do not fit.",
         "TOO SMALL" if report.certain else "MAY BE TOO SMALL", report.sentence(),
         "can" if report.certain else "may")
     _ack_did_not_apply(acknowledged, verdict, prefix="window:")
