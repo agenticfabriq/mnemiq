@@ -289,3 +289,30 @@ def test_roles_flag_strips_names_and_an_empty_flag_still_means_no_roles(monkeypa
     # `or` alone, so it reads the strip not at all -- deleting `.strip()` left every test green.
     assert ident(["ask", "q", "--principal", "   "]).principal_id == "alice@corp.com"
     assert ident(["ask", "q"]).roles == ["analyst"]
+
+
+def test_ask_json_is_the_http_payload_and_carries_a_failure(monkeypatch, capsys):
+    """M128: `--json` built its own dict and dropped `failed` and `reason_code`, so a refusal by the
+    model server read as an answer with no SQL. It now prints the HTTP serializer's payload."""
+    import json
+
+    import mnemiq.cli as cli
+    from mnemiq.agent.loop import AgentAnswer
+    from mnemiq.contract import DeferralReason
+    from mnemiq.server.serialize import answer_payload
+
+    failed = AgentAnswer(answer="Could not answer this question: the model server refused the prompt.",
+                         failed=True, reason_code=DeferralReason.MODEL_UNAVAILABLE)
+
+    class _RT:
+        def ask(self, q, identity, mode=None):
+            return failed
+
+    monkeypatch.setattr(cli, "build_runtime", lambda settings: _RT())
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: _fake_settings()))
+    assert main(["ask", "how many claims?", "--json"]) == 0
+    printed = json.loads(capsys.readouterr().out)
+
+    assert printed["failed"] is True and printed["deferred"] is False
+    assert printed["reason_code"] == str(DeferralReason.MODEL_UNAVAILABLE)
+    assert printed == json.loads(json.dumps(answer_payload(failed), default=str))

@@ -262,8 +262,9 @@ class Agent:
                     answer=("Could not answer this question: the model server refused the prompt "
                             "as longer than its context window. This is a configuration problem, "
                             "not a judgement about your data -- raise the server's window (vLLM: "
-                            "--max-model-len) or, where you cannot, lower MNEMIQ_RETRIEVAL_K to send "
-                            f"less. {detail[:300]}"),
+                            "--max-model-len). Where the server reports no window, set "
+                            "MNEMIQ_LLM_CONTEXT_WINDOW: mnemiq then trims column descriptions to fit. "
+                            f"{detail[:300]}"),
                     failed=True,
                     reason_code=DeferralReason.MODEL_UNAVAILABLE,
                 )

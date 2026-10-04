@@ -316,5 +316,8 @@ def test_a_context_length_refusal_reaches_the_user_as_a_configuration_failure(mo
 
     assert answer.failed is True and answer.reason_code == DeferralReason.MODEL_UNAVAILABLE
     assert "longer than its context window" in answer.answer
-    assert "--max-model-len" in answer.answer and "MNEMIQ_RETRIEVAL_K" in answer.answer
+    assert "--max-model-len" in answer.answer and "MNEMIQ_LLM_CONTEXT_WINDOW" in answer.answer
+    # Not "lower MNEMIQ_RETRIEVAL_K": on a wide schema one table's card can fill the window alone,
+    # and fewer tables does not shrink it; the window and the fit (M127) are what help.
+    assert "MNEMIQ_RETRIEVAL_K" not in answer.answer
     assert "outage" not in answer.answer and "try again" not in answer.answer
