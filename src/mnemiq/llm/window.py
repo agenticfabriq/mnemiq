@@ -22,22 +22,25 @@ shown -- a PII column's description, a denied table -- would be a disclosure the
 itself. Each role the access policy declares is measured locally (the configured identity, where
 the provider cannot list its roles), and only the heaviest is counted on the server.
 
-Longest by length, then counted in tokens -- not longest in tokens. A set of tables shorter in
-characters but denser in tokens (long identifiers, non-Latin text) can count more than the one
-measured, as can a non-ASCII question against its allowance, and counting every candidate would
-cost a server round trip per table at boot. So a warning means the measured parts do not fit, and a
+Longest by bytes (`byte_bound`), then counted in tokens -- not longest in tokens. Bytes already
+weigh non-Latin text by what it costs, but a set of tables shorter in bytes and denser in tokens
+(long digit-heavy identifiers) can still count more than the one measured, as can a non-ASCII
+question against its allowance, and counting every candidate would cost a server round trip per
+table at boot. So a warning means the measured parts do not fit, and a
 "fits" close to the window is not a promise: leave headroom.
 
 Counted by the server where it can count: vLLM's `/tokenize` returns the count, chat template
 included, and `max_model_len` in one call. Otherwise the window is `MNEMIQ_LLM_CONTEXT_WINDOW`, as
-declared, and the count an estimate at 2.5 characters a token -- below the fewest measured for a
-generation prompt (2.56, over 220 of them), so the estimate errs toward warning.
+declared, and the count a bound: the prompt's UTF-8 bytes plus room for the chat template
+(`byte_bound`), since a byte-level tokenizer spends at most a token a byte. It errs long -- at least
+2.5 times for English prose (the fewest characters a token measured was 2.56; typical prose is near
+4) -- so without a count the check warns early rather than late. (It was 2.5 characters a token until M127: an estimate, which a
+digit-heavy or non-Latin prompt can beat, where the fit needs a bound.)
 """
 
 from __future__ import annotations
 
 import json
-import math
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -49,7 +52,19 @@ from mnemiq.generate.generator import GENERATOR_MAX_TOKENS
 from mnemiq.generate.prompts import system_prompt, user_prompt
 from mnemiq.llm.client import reasoning_budget
 
-CHARS_PER_TOKEN_FLOOR = 2.5
+# Without a server count, a prompt is held to its UTF-8 bytes: a byte-level tokenizer spends at most
+# one token a byte, which makes that a bound on the messages, where a characters-per-token ratio is
+# only an estimate (Qwen spends a token on each digit; a CJK character is three bytes). The chat
+# template adds tokens around the messages; TEMPLATE_ALLOWANCE is room for them -- an allowance, not
+# a measurement: a template that injects a long preamble needs the server's count. Both the boot
+# check and the fit (M127) use this, so they agree on what fits.
+TEMPLATE_ALLOWANCE = 256
+
+
+def byte_bound(system: str, user: str) -> int:
+    return len(system.encode()) + len(user.encode()) + TEMPLATE_ALLOWANCE
+
+
 # The `/tokenize` call's limits (`count_on_server`). The reply lists every token id, about 7 bytes
 # each: some 700 KB for a 100,000-token prompt.
 DEADLINE_S = 15.0
@@ -60,6 +75,12 @@ _PHASE_TIMEOUT_S = 5.0
 # ASCII only: a byte-level tokenizer can spend a token per UTF-8 byte, so a 500-character question in
 # Chinese or heavy with accents can cost more -- headroom again.
 QUESTION_ALLOWANCE = 500
+# A retry re-sends the prompt with the database's error and the failed SQL, and the judge adds
+# the SQL and a result preview: room the fit (M127) keeps free beyond the reply, and the floor
+# test below uses too, so the boot line and the question path agree on what fits. A guess, not a
+# measurement: the judge's preview is capped in rows and cell width but not in columns, so a wide
+# SELECT * can outgrow it (register M130).
+FEEDBACK_ALLOWANCE = 1000
 
 
 @dataclass(frozen=True)
@@ -76,6 +97,12 @@ class WindowReport:
     cards: int
     real_tokens: int | None = None
     who: str = ""
+    # The same largest prompt with no column descriptions, measured only when the full one does not
+    # fit: what is left once the fit (M127) has withheld every description it can.
+    floor_tokens: int | None = None
+    # The view the floor was measured for: the heaviest without descriptions, which need not be
+    # `who`, the heaviest with them.
+    floor_who: str = ""
 
     @property
     def needed(self) -> int:
@@ -87,6 +114,13 @@ class WindowReport:
         return None if self.window is None else self.needed <= self.window
 
     @property
+    def floor_fits(self) -> bool:
+        """The full prompt does not fit but the descriptionless one does: questions are answered,
+        with fewer descriptions than enrichment wrote."""
+        return (self.window is not None and self.floor_tokens is not None
+                and self.floor_tokens + self.reply_tokens + FEEDBACK_ALLOWANCE <= self.window)
+
+    @property
     def certain(self) -> bool:
         """A real packet, counted by the server, past the window: a question can fail."""
         return (self.counted_by_server and self.window is not None
@@ -95,7 +129,8 @@ class WindowReport:
 
     def sentence(self) -> str:
         count = (f"{self.prompt_tokens:,} tokens, counted by the server" if self.counted_by_server
-                 else f"about {self.prompt_tokens:,} tokens, estimated from its length")
+                 else f"{self.prompt_tokens:,} tokens bounded from its bytes, with allowances for the "
+                      "template and the question (the server gave no count, so this errs long)")
         if self.real_tokens is not None and self.real_tokens != self.prompt_tokens:
             count += (f" (an upper bound; a real packet of those tables, each shared definition "
                       f"once, is {self.real_tokens:,})")
@@ -129,8 +164,11 @@ def largest_prompt(con, snapshot, settings, dialect: str,
 
 
 def largest_prompts(con, snapshot, settings, dialect: str,
-                    grants: GrantSet) -> tuple[str, str, str, int]:
-    """(system, upper bound, real packet of the same tables, cards), as `grants` may see them."""
+                    grants: GrantSet, describe=None) -> tuple[str, str, str, int]:
+    """(system, upper bound, real packet of the same tables, cards), as `grants` may see them.
+
+    `describe` is `build_cards`' own: `lambda table, column: False` gives the floor the fit (M127)
+    can bring a prompt down to."""
     from mnemiq.agent.loop import STRATEGIES
     from mnemiq.semantic.cards import build_cards
     from mnemiq.semantic.glossary import select_definitions
@@ -142,7 +180,7 @@ def largest_prompts(con, snapshot, settings, dialect: str,
     k = settings.retrieval_k
     # The cards retrieval renders for this identity: its tables only, under its column policy.
     rendered = [c for c in build_cards(snapshot, policy=build_access_policy(snapshot, grants),
-                                       style=settings.card_style)
+                                       style=settings.card_style, describe=describe)
                 if c.object_id in grants.objects]
     # Every granted table visible, so a definition bound to one inside the k and one outside it
     # still rides in.
@@ -347,12 +385,25 @@ def worst_window(con, snapshot, settings, dialect: str, authz,
                  http: httpx.Client | None = None) -> WindowReport | None:
     """The report for the view whose largest prompt is longest, measured locally and then counted
     on the server; None when no view sees a table."""
+    views = dict(grant_sets(authz, settings))
     candidates = [(label, largest_prompts(con, snapshot, settings, dialect, grants))
-                  for label, grants in grant_sets(authz, settings)]
+                  for label, grants in views.items()]
     if not candidates:
         return None
-    label, prompts = max(candidates, key=lambda c: (len(c[1][0]) + len(c[1][1]), c[0]))
-    return _count(prompts, settings, http, label)
+    label, prompts = max(candidates, key=lambda c: (byte_bound(c[1][0], c[1][1]), c[0]))
+    report = _count(prompts, settings, http, label)
+    if report.fits is False:
+        # Past the window with every description: what the fit can bring it down to. Over every
+        # view, not only the one heaviest with descriptions -- a view whose columns are many and
+        # their descriptions short can be the heaviest without them.
+        bare = [(lbl, largest_prompts(con, snapshot, settings, dialect, grants,
+                                      describe=lambda _table, _column: False))
+                for lbl, grants in views.items()]
+        lbl, heaviest = max(bare, key=lambda c: (byte_bound(c[1][0], c[1][1]), c[0]))
+        floor = _count(heaviest, settings, http, lbl)
+        report = replace(report, floor_tokens=floor.real_tokens or floor.prompt_tokens,
+                         floor_who=lbl)
+    return report
 
 
 def _count(prompts: tuple[str, str, str, int], settings, http: httpx.Client | None,
@@ -378,7 +429,7 @@ def _count(prompts: tuple[str, str, str, int], settings, http: httpx.Client | No
                             who=who)
 
     def estimate(user: str) -> int:
-        return math.ceil((len(system) + len(user)) / CHARS_PER_TOKEN_FLOOR) + QUESTION_ALLOWANCE
+        return byte_bound(system, user) + QUESTION_ALLOWANCE
 
     return WindowReport(estimate(bound), reply, settings.llm_context_window,
                         counted_by_server=False, cards=cards, real_tokens=estimate(real), who=who)

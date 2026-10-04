@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from mnemiq.contract import Column, Snapshot
@@ -34,7 +35,8 @@ def render_facts_block(tf) -> str:
 
 
 def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
-                style: str = "cards") -> list[SchemaCard]:
+                style: str = "cards",
+                describe: Callable[[str, str], bool] | None = None) -> list[SchemaCard]:
     """One self-sufficient card per table: what it is, what it holds, how it joins.
 
     This is the retrieval unit -- indexed, matched, and later read by the agent to write
@@ -53,6 +55,11 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
     `style="ddl"` re-spells the finished card as `CREATE TABLE` for a generator that was
     fine-tuned on DDL. It is deliberately NOT the default and NOT what `build_index`
     embeds: the indexed card must stay the form top-k was measured on.
+
+    `describe(table, column)` chooses which columns keep their description (M127); without it,
+    every column does. Only the description is withheld: the name, type, coded values and the
+    entirely-null note stay, so a column the window had no room to explain can still be found
+    and used. `mnemiq.semantic.fit` is its caller.
     """
     columns: dict[str, list[Column]] = {}
     for column in snapshot.columns:
@@ -88,7 +95,7 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
                 ddl.append((column.name, column.data_type or "text",
                             "MASKED for this identity: do not select or filter on it."))
                 continue
-            if column.description:
+            if column.description and (describe is None or describe(table, column.name)):
                 line += f" {column.description}"
             if (
                 column.row_count is not None
