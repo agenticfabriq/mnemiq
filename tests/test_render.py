@@ -114,7 +114,10 @@ def test_the_judge_reads_a_bounded_preview_of_a_wide_result(protocol):
             seen["preview"] = preview
             return 0.9
 
-    class _Reader(_Scorer):
+    class _Reader:  # no `score` to fall back on, so this case proves the `read` door was taken
+        def score(self, question, schema, sql, preview):
+            raise AssertionError("a judge offering `read` must be read, not scored")
+
         def read(self, question, schema, sql, preview):
             seen["preview"] = preview
             return SimpleNamespace(score=0.9, fell_open=False, reason="ok")

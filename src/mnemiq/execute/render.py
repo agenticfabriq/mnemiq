@@ -11,9 +11,9 @@ MAX_CELL = 240
 # prompts, and could outgrow the window the generation prompt had just been fitted to. All three
 # share this bound on purpose: the answer writer describes the columns the judge read, and the user
 # still sees every column, because the answer's display preview (`result_preview`) is not bounded
-# here. Gold results never come near it -- at most 6 columns across BIRD dev (1,534 cases) and
-# mini-dev (500), 19 on KaggleDBQA -- so only a candidate that selects a whole wide table is cut
-# (BIRD's widest: 115). It removes the wide-table blowup; it does not guarantee a fit, since rows
+# here. Gold results never come near it -- executing every gold query (2026-10-04) gave at most 6
+# columns across BIRD dev (1,534 cases) and mini-dev (500), 19 on KaggleDBQA -- so only a candidate
+# that selects a whole wide table is cut (BIRD dev's widest table: 115 columns). It removes the wide-table blowup; it does not guarantee a fit, since rows
 # times cells still multiply.
 MAX_COLS = 50
 
