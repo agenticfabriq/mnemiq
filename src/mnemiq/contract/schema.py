@@ -10,8 +10,9 @@ FORMAT_VERSION = "1.3.0"
 
 
 def export_json_schema() -> dict:
-    # Function-level imports: ontology/records.py imports from contract, so importing it (or the
-    # records module that references ConceptScheme) at module top would be circular.
+    # Function-level import of OntologyRecords: ontology/records.py imports from contract, so
+    # importing it at module top would be circular. (contract/records.py no longer would -- its
+    # ConceptScheme now lives in contract/concepts.py, M129 -- but it stays beside its sibling.)
     from mnemiq.contract.records import CertifiedRecord
     from mnemiq.ontology.records import OntologyRecords
 
