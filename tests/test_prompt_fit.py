@@ -704,3 +704,44 @@ def test_a_server_that_keeps_failing_returns_to_the_long_back_off():
     fitter._window_seen_at -= fit_module.WINDOW_TTL_S + 1
     fitter.fit(_packet(snap, "blip"), snap, _grants(snap))
     assert fitter._no_count_until - fit_module.time.monotonic() <= fit_module.TRANSIENT_RETRY_S
+
+
+# --- the follow-up: one wide table must not take the whole budget -------------------------------
+
+def _wide_and_narrow() -> Snapshot:
+    """A 100-column table whose every description says "ingot" and "batch", and a six-column one
+    whose descriptions do not -- the partner shape that sent most descriptions to the wide table and
+    left the batch table, holding the column the answer needs, nearly bare."""
+    tables = {"wide": (100, "Measured for each ingot and batch along the production line."),
+              "batch": (6, "Recorded once per lot when the run closes.")}
+    return Snapshot(
+        version="v1", source_id="s", created_at="2026-10-04T00:00:00Z",
+        source_bindings=[SourceBinding(id=f"sb:{t}", source_id="s", object_id=t, source_object=t,
+                                       binding_type="table") for t in tables],
+        columns=[Column(id=f"{t}.col_{i:03d}", object_id=t, name=f"col_{i:03d}", data_type="text",
+                        description=d) for t, (n, d) in tables.items() for i in range(n)])
+
+
+def test_the_rest_of_the_budget_goes_in_turns_across_tables():
+    snap = _wide_and_narrow()
+    packet = _packet(snap, question="ingot production by batch")
+    ranked = rank_columns(packet, snap, build_access_policy(snap, _grants(snap)))
+    assert [t for t, _c in ranked[:12]].count("batch") == 6, "the narrow table's six come in the first twelve"
+    assert [t for t, _c in ranked[:4]] in (["wide", "batch"] * 2, ["batch", "wide"] * 2)
+
+
+def test_a_wide_table_whose_descriptions_match_the_question_does_not_starve_the_others():
+    snap = _wide_and_narrow()
+    packet = _packet(snap, question="ingot production by batch")
+    probe = _fitter(None)
+    bare = replace(packet, cards=[RetrievedCard(object_id=c.object_id, card=c.text, score=1.0)
+                                  for c in build_cards(snap, describe=lambda t, c: False)])
+    one = len(snap.columns[0].description) // 4
+    room = math.ceil((_tokens(probe, bare) + 12 * one) * 1.05) + REPLY + FEEDBACK_ALLOWANCE
+    fitter = _fitter(room, count=lambda s, u: (len(s + u) // 4, room))
+
+    fitted = fitter.fit(packet, snap, _grants(snap))
+    narrow = next(c.card for c in fitted.cards if c.object_id == "batch")
+    sent, _total = fitted.descriptions
+    assert sent < 40, "the case: room for a few, not all"
+    assert narrow.count("Recorded once per lot") >= min(6, sent // 2), "the narrow table keeps its share"

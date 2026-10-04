@@ -31,6 +31,7 @@ import logging
 import math
 import re
 import time
+from itertools import zip_longest
 from dataclasses import dataclass, field, replace
 
 # Defined with the boot advisory, so the boot line and the question path agree on what fits.
@@ -63,10 +64,16 @@ def _words(text: str) -> set[str]:
 def rank_columns(packet: ContextPacket, snapshot, policy) -> list[tuple[str, str]]:
     """The packet's described columns, the ones a description helps most first.
 
-    Named (the question, a definition or a measure spells the column), then join keys, then by
-    shared words -- a word of the question in the column's name counts twice, in its description
-    once. Ties keep retrieval's table order and the snapshot's column order. Denied and masked
-    columns are left out: their descriptions are never rendered.
+    Named (the question, a definition or a measure spells the column), then join keys, then the
+    rest **in turns across tables**: each table's best remaining column, table by table, then each
+    table's next. Within a table the best is the one sharing most of the question's words (in its
+    name counting twice, in its description once), ties in the snapshot's column order. Denied and
+    masked columns are left out: their descriptions are never rendered.
+
+    In turns because one ranking over every column let a single wide table take the budget: on a
+    design partner's shape, a 965-column table whose descriptions all mention "ingot" and "batch"
+    got most of the descriptions sent, the batch table holding the definition's column came last
+    with few, and the model answered that the batch table was missing (M127's follow-up).
     """
     order = {c.object_id: i for i, c in enumerate(packet.cards)}
     named_text = "\n".join(
@@ -95,7 +102,14 @@ def rank_columns(packet: ContextPacket, snapshot, policy) -> list[tuple[str, str
                  + len(question & _words(column.description)))
         ranked.append((tier, -score, order[table], index, key))
     ranked.sort()
-    return [entry[-1] for entry in ranked]
+    first = [entry[-1] for entry in ranked if entry[0] < 2]
+    by_table: dict[str, list[tuple[str, str]]] = {}
+    for entry in ranked:  # already in score order within each table
+        if entry[0] == 2:
+            by_table.setdefault(entry[-1][0], []).append(entry[-1])
+    turns = [by_table[t] for t in sorted(by_table, key=order.__getitem__)]
+    shared = [column for round_ in zip_longest(*turns) for column in round_ if column is not None]
+    return first + shared
 
 
 @dataclass
