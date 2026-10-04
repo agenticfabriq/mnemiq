@@ -5,25 +5,8 @@ import json
 
 from pydantic import BaseModel, Field, ValidationError
 
+from mnemiq.contract.concepts import Concept, ConceptScheme  # noqa: F401 -- re-exported (M129)
 from mnemiq.contract.semantic import Definition
-
-
-class Concept(BaseModel):
-    """One member of a code system. `notation` is the ONLY join key to stored data -- every
-    match downstream compares stored values against it, never against a label."""
-    id: str
-    notation: str
-    pref_label: str
-    alt_labels: list[str] = Field(default_factory=list)
-    definition: str | None = None
-    broader: list[str] = Field(default_factory=list)
-
-
-class ConceptScheme(BaseModel):
-    id: str
-    label: str
-    description: str | None = None
-    concepts: list[Concept] = Field(default_factory=list)
 
 
 class OntologyRecords(BaseModel):

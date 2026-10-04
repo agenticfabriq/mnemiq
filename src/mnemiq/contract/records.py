@@ -13,7 +13,7 @@ from mnemiq.contract.semantic import (
     Relationship,
     TableFacts,
 )
-from mnemiq.ontology.records import ConceptScheme
+from mnemiq.contract.concepts import ConceptScheme
 
 
 class Provenance(BaseModel):
