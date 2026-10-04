@@ -6,6 +6,12 @@ import pyarrow as pa
 # marker means something when it does appear. 120 silently halved schema and description
 # columns, and a model cannot tell a value that ends from one that was cut.
 MAX_CELL = 240
+# Columns are bounded like rows and cells (M130). A wide `SELECT *` -- 965 columns on a design
+# partner's shape -- rendered every column into the judge's, the selector's and the answer-writer's
+# prompts, and could outgrow the window the generation prompt had just been fitted to. 50 leaves
+# ordinary results untouched: the widest benchmark tables run to about 74 columns, and gold queries
+# rarely select them all.
+MAX_COLS = 50
 
 
 def _cell(value: object, max_cell: int) -> tuple[str, bool]:
@@ -19,7 +25,7 @@ def _cell(value: object, max_cell: int) -> tuple[str, bool]:
 
 
 def render_result(table: pa.Table, max_rows: int = 50, max_cell: int = MAX_CELL,
-                  cut_at: int | None = None) -> str:
+                  cut_at: int | None = None, max_cols: int | None = MAX_COLS) -> str:
     """Render rows for a prompt: bounded, and loud about what it left out.
 
     Silently showing 50 of 1000 rows invites the model to summarize a partial view as if it
@@ -29,11 +35,18 @@ def render_result(table: pa.Table, max_rows: int = 50, max_cell: int = MAX_CELL,
     bare `…` with nothing to say so. A reader could not tell a truncated value from the
     data, and neither could the model -- it read the ellipses as evidence and reported rows
     as truncated when only cells were. Both bounds are declared now.
+
+    Columns too, past `max_cols`: the first ones are shown and the rest counted, never listed --
+    listing 900 hidden names would undo the bound.
     """
-    columns = table.schema.names
+    every = table.schema.names
+    columns = every[:max_cols] if max_cols is not None and len(every) > max_cols else every
+    hidden = len(every) - len(columns)
+    hidden_note = (f"... showing the first {len(columns)} of {len(every)} columns; the other "
+                   f"{hidden} are not shown -- do not describe, compare or count them")
     total = table.num_rows
     if total == 0:
-        return f"columns: {', '.join(columns)}\n(0 rows)"
+        return f"columns: {', '.join(columns)}\n(0 rows)" + (f"\n{hidden_note}" if hidden else "")
 
     shown = min(total, max_rows)
     rows = table.slice(0, shown).to_pylist()
@@ -53,6 +66,8 @@ def render_result(table: pa.Table, max_rows: int = 50, max_cell: int = MAX_CELL,
         lines.append(f"... showing {shown} of {total} rows (truncated)")
     else:
         lines.append(f"({total} rows)")
+    if hidden:
+        lines.append(hidden_note)
     if shortened:
         lines.append(
             f"... some values were longer than {max_cell} characters and end in `…`; "

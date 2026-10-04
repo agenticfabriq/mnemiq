@@ -65,3 +65,56 @@ def test_both_bounds_are_declared_together():
     out = render_result(pa.table({"detail": rows}), max_rows=50)
     assert "showing 50 of 60 rows (truncated)" in out
     assert "shortened for this prompt" in out
+
+
+def test_a_wide_result_shows_the_first_columns_and_counts_the_rest():
+    """M130: a 965-column SELECT * rendered every column into the judge's and the answer-writer's
+    prompts. Columns are bounded like rows and cells, and the bound is declared."""
+    import pyarrow as pa
+
+    from mnemiq.execute.render import MAX_COLS, render_result
+
+    table = pa.table({f"c{i:03d}": [i, i + 1] for i in range(965)})
+    text = render_result(table, max_rows=5)
+    header = text.splitlines()[0].split(" | ")
+    assert header == [f"c{i:03d}" for i in range(MAX_COLS)]
+    assert f"showing the first {MAX_COLS} of 965 columns; the other {965 - MAX_COLS} are not shown" in text
+    assert "c964" not in text, "the hidden names are counted, not listed"
+    empty = render_result(table.slice(0, 0))
+    assert "of 965 columns" in empty and "c964" not in empty
+
+
+def test_a_result_within_the_column_bound_renders_as_before():
+    import pyarrow as pa
+
+    from mnemiq.execute.render import MAX_COLS, render_result
+
+    table = pa.table({f"c{i}": ["x", "y"] for i in range(MAX_COLS)})
+    assert render_result(table) == render_result(table, max_cols=None)
+    assert "columns;" not in render_result(table)
+
+
+def test_the_judge_reads_a_bounded_preview_of_a_wide_result():
+    """The join, not the ends: the verifier hands its judge a preview of a 965-column result, and
+    that preview is bounded -- the path M130 was found on."""
+    import pyarrow as pa
+
+    from mnemiq.execute.render import MAX_COLS
+    from mnemiq.semantic.retrieval import ContextPacket
+    from mnemiq.sql.verdict import Approved
+    from mnemiq.verify.verifier import Verifier
+
+    seen = {}
+
+    class _Judge:
+        def score(self, question, schema, sql, preview):
+            seen["preview"] = preview
+            return 0.9
+
+    table = pa.table({f"c{i:03d}": [i] for i in range(965)})
+    packet = ContextPacket(question="everything for lot 7", cards=[], grant_fingerprint="f",
+                           enrichment_version=None)
+    Verifier(sanity=False, judge=_Judge()).verify(
+        packet, Approved(plan_sql="SELECT * FROM t", target_sql="SELECT * FROM t"), table)
+    assert f"showing the first {MAX_COLS} of 965 columns" in seen["preview"]
+    assert len(seen["preview"]) < 5_000
