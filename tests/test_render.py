@@ -1,4 +1,5 @@
 import pyarrow as pa
+import pytest
 
 from mnemiq.execute.render import render_result
 
@@ -94,10 +95,12 @@ def test_a_result_within_the_column_bound_renders_as_before():
     assert "columns;" not in render_result(table)
 
 
-def test_the_judge_reads_a_bounded_preview_of_a_wide_result():
+@pytest.mark.parametrize("protocol", ["read", "score"])
+def test_the_judge_reads_a_bounded_preview_of_a_wide_result(protocol):
     """The join, not the ends: the verifier hands its judge a preview of a 965-column result, and
-    that preview is bounded -- the path M130 was found on."""
-    import pyarrow as pa
+    that preview is bounded -- the path M130 was found on. Both doors: `read` is what the shipped
+    judge speaks, `score` what a stub speaks, and each renders the preview on its own line."""
+    from types import SimpleNamespace
 
     from mnemiq.execute.render import MAX_COLS
     from mnemiq.semantic.retrieval import ContextPacket
@@ -106,11 +109,17 @@ def test_the_judge_reads_a_bounded_preview_of_a_wide_result():
 
     seen = {}
 
-    class _Judge:
+    class _Scorer:
         def score(self, question, schema, sql, preview):
             seen["preview"] = preview
             return 0.9
 
+    class _Reader(_Scorer):
+        def read(self, question, schema, sql, preview):
+            seen["preview"] = preview
+            return SimpleNamespace(score=0.9, fell_open=False, reason="ok")
+
+    _Judge = _Reader if protocol == "read" else _Scorer
     table = pa.table({f"c{i:03d}": [i] for i in range(965)})
     packet = ContextPacket(question="everything for lot 7", cards=[], grant_fingerprint="f",
                            enrichment_version=None)
@@ -118,3 +127,64 @@ def test_the_judge_reads_a_bounded_preview_of_a_wide_result():
         packet, Approved(plan_sql="SELECT * FROM t", target_sql="SELECT * FROM t"), table)
     assert f"showing the first {MAX_COLS} of 965 columns" in seen["preview"]
     assert len(seen["preview"]) < 5_000
+
+
+def _wide(marker: int = 0) -> pa.Table:
+    return pa.table({f"c{i:03d}": [marker] for i in range(965)})
+
+
+class _WideAdapter:
+    """Every query returns 965 columns; a SUM in the SQL changes the values, so two candidates
+    disagree and the selector is consulted."""
+
+    def execute(self, sql):  # EXPLAIN, inside decide()
+        return []
+
+    def execute_arrow(self, sql, timeout_s=None):
+        return _wide(5 if "SUM" in sql.upper() else 7)
+
+
+def test_the_answer_writer_reads_a_bounded_preview_and_the_user_sees_every_column():
+    """The answer writer shares the judge's bound, which is safe only because the user's own view
+    of the result -- the answer's display preview -- keeps every column. Both halves together."""
+    from mnemiq.execute.render import MAX_COLS
+    from tests.test_agent import _agent, _answer
+
+    class _Synth:
+        rendered = None
+
+        def answer(self, question, sql, rendered, forced=False, row_count=None):
+            _Synth.rendered = rendered
+            return "Lot 7."
+
+    answer = _answer(_agent(['{"sql": "SELECT n FROM claim"}'], adapter=_WideAdapter(),
+                            synth=_Synth()))
+    assert f"showing the first {MAX_COLS} of 965 columns" in _Synth.rendered
+    assert "c964" not in _Synth.rendered
+    assert len(answer.preview.columns) == 965 and answer.preview.columns[-1] == "c964"
+
+
+def test_the_selector_reads_bounded_previews_of_wide_candidates():
+    from mnemiq.agent.loop import Agent
+    from mnemiq.agent.synthesize import FakeSynthesizer
+    from mnemiq.cache.store import L1Cache, TwoTierCache
+    from mnemiq.execute.render import MAX_COLS
+    from mnemiq.execute.select import FakeSelector
+    from mnemiq.generate.generator import FakeGenerator
+    from tests.test_agent import _answer, _sql
+
+    selector = FakeSelector([0])
+    agent = Agent(generator=FakeGenerator([_sql("count(*)"), _sql("sum(n)")]),
+                  synthesizer=FakeSynthesizer("Lot 7."), adapter=_WideAdapter(),
+                  cache=TwoTierCache(L1Cache()), candidates=2, selector=selector)
+    _answer(agent)
+    assert len(selector.calls) == 1, "two disagreeing clusters must reach the selector"
+    previews = [view.preview for view in selector.calls[0][1]]
+    assert len(previews) == 2
+    for preview in previews:
+        assert f"showing the first {MAX_COLS} of 965 columns" in preview and "c964" not in preview
+
+
+def test_a_zero_column_bound_shows_no_columns_and_says_so():
+    text = render_result(pa.table({"a": [1], "b": [2]}), max_cols=0)
+    assert "showing the first 0 of 2 columns; the other 2 are not shown" in text

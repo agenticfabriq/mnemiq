@@ -8,9 +8,13 @@ import pyarrow as pa
 MAX_CELL = 240
 # Columns are bounded like rows and cells (M130). A wide `SELECT *` -- 965 columns on a design
 # partner's shape -- rendered every column into the judge's, the selector's and the answer-writer's
-# prompts, and could outgrow the window the generation prompt had just been fitted to. 50 leaves
-# ordinary results untouched: the widest benchmark tables run to about 74 columns, and gold queries
-# rarely select them all.
+# prompts, and could outgrow the window the generation prompt had just been fitted to. All three
+# share this bound on purpose: the answer writer describes the columns the judge read, and the user
+# still sees every column, because the answer's display preview (`result_preview`) is not bounded
+# here. Gold results never come near it -- at most 6 columns across BIRD dev (1,534 cases) and
+# mini-dev (500), 19 on KaggleDBQA -- so only a candidate that selects a whole wide table is cut
+# (BIRD's widest: 115). It removes the wide-table blowup; it does not guarantee a fit, since rows
+# times cells still multiply.
 MAX_COLS = 50
 
 
