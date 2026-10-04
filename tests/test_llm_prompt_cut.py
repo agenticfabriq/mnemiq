@@ -320,4 +320,5 @@ def test_a_context_length_refusal_reaches_the_user_as_a_configuration_failure(mo
     # Fewer tables is offered only where it helps -- when many fill the prompt -- and the manifest's
     # `tables` list beside it: on a wide schema one table's card can fill the window alone (M127).
     assert "when many fill the prompt" in answer.answer and "`tables` list" in answer.answer
+    assert "MNEMIQ_RETRIEVAL_K" in answer.answer, "the setting that sends fewer tables is named"
     assert "outage" not in answer.answer and "try again" not in answer.answer
