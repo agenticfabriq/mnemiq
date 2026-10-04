@@ -396,7 +396,8 @@ def _cmd_ask(settings: Settings, args) -> int:
         # drifted: its own copy carried answer/deferred/sql/lineage but not `failed` or
         # `reason_code`, so a refusal by the model server read as an answer with no SQL, and a
         # rehearsal script scored a should-decline question "answered" (M128). Sharing the
-        # serializer is what keeps the surfaces from drifting again; MCP imports from it too.
+        # serializer keeps this surface and HTTP from drifting apart. (MCP shares only
+        # `verified_state` and still builds its own, narrower dict.)
         print(json.dumps(answer_payload(ans), default=str))
         return 0
     print(ans.answer)
