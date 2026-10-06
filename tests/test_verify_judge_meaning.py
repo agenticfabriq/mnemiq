@@ -108,9 +108,9 @@ def test_a_packet_with_no_certified_meaning_is_judged_as_before():
 
 
 def test_every_packet_field_is_judged_or_left_out_on_purpose():
-    """Derived from the struct, so a new kind of meaning cannot reach the generator and quietly
-    miss the judge (M132 one field over): a field added to `ContextPacket` fails this until it is
-    placed on one side."""
+    """Derived from the struct: a field added to `ContextPacket` fails this until it is placed on
+    one side, and a field placed on the judged side must change what the judge reads -- so the
+    placement is checked, not just made (M132 one field over)."""
     judged = {"cards", "definitions", "metrics", "dimensions", "concepts"}
     not_judged = {
         "question",  # handed to the judge on its own
@@ -119,3 +119,9 @@ def test_every_packet_field_is_judged_or_left_out_on_purpose():
         "history",  # the judge grades a follow-up without the earlier turns (M134)
     }
     assert {f.name for f in dataclasses.fields(ContextPacket)} == judged | not_judged
+    # Every judged field but the cards has a value in the fixture, and each, filled on its own,
+    # reaches the judge.
+    assert set(_meaning()) == judged - {"cards"}
+    unread = [name for name, value in _meaning().items()
+              if _judged_schema(_packet(**{name: value})) == _CARD]
+    assert unread == []
