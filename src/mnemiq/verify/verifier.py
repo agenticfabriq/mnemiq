@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from mnemiq.contract.seams import DeferralReason
 from mnemiq.execute.render import render_result
+from mnemiq.generate.prompts import meaning_sections
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
 from mnemiq.verify.grounding import grounding_check
@@ -9,8 +10,18 @@ from mnemiq.verify.sanity import sanity_check
 from mnemiq.verify.verdict import VerifyVerdict
 
 
-def _cards_text(packet: ContextPacket) -> str:
-    return "\n".join(c.card for c in packet.cards)
+def _judge_schema(packet: ContextPacket) -> str:
+    """What the judge reads as SCHEMA: the cards, then the certified meaning the generator was given.
+
+    Both, because a judge that sees only the cards grades the answer against its own guess at the
+    question's words -- "net volume" read as amount minus refunds, when the certified measure says
+    otherwise -- and so declines the certified answer and passes the guess (M132). A packet with no
+    certified meaning renders exactly as before, so the 0.5 threshold, measured on bare packets,
+    still describes those.
+    """
+    cards = "\n".join(c.card for c in packet.cards)
+    meaning = "\n".join(meaning_sections(packet)).strip()
+    return f"{cards}\n\n{meaning}" if meaning else cards
 
 
 # Written out rather than composed from a clause, because composing them produced "The verifier
@@ -103,12 +114,12 @@ class Verifier:
             # counters.
             reader = getattr(self.judge, "read", None)
             if reader is not None:
-                got = reader(packet.question, _cards_text(packet), approved.plan_sql,
+                got = reader(packet.question, _judge_schema(packet), approved.plan_sql,
                              render_result(table, max_rows=5))
                 c, fell_open, why = got.score, got.fell_open, got.reason
             else:
                 c, fell_open, why = self.judge.score(
-                    packet.question, _cards_text(packet), approved.plan_sql,
+                    packet.question, _judge_schema(packet), approved.plan_sql,
                     render_result(table, max_rows=5)
                 ), False, "ok"
             if fell_open:

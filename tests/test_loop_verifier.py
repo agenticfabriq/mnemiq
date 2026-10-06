@@ -61,3 +61,25 @@ def test_high_confidence_judge_answers():
     v = Verifier(threshold=0.5, sanity=False, grounding=False, judge=FakeJudge(0.9))
     r = _answer(_agent(verifier=v))
     assert r.deferred is False and r.answer == "There are 7 claims."
+
+
+def test_the_judge_the_agent_calls_reads_the_packets_certified_measure():
+    """The join for M132: the packet the agent answers from is the one its judge reads, certified
+    measure included -- not only when a test hands the verifier a packet directly."""
+    from mnemiq.contract import MeasureExpr, Metric
+
+    seen = {}
+
+    class _Judge:
+        def score(self, question, schema, sql, preview):
+            seen["schema"] = schema
+            return 0.9
+
+    packet = _packet()
+    packet.metrics = [Metric(id="claim_total", label="Claim Total", status="certified", owner="o",
+                             grain="claim", measure=MeasureExpr(expr="sum(claim.n)", source="claim"),
+                             time_dimension="claim.n")]
+    v = Verifier(threshold=0.5, sanity=False, grounding=False, judge=_Judge())
+    r = _agent(verifier=v).answer(packet, _snapshot(), _GRANTS, _IDENTITY)
+    assert r.deferred is False
+    assert "Claim Total (claim_total) over claim: sum(claim.n)" in seen["schema"]
