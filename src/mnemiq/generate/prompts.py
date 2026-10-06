@@ -99,9 +99,16 @@ Return ONLY a JSON object, no prose and no code fences:
     return f"{base}\n{preamble}\n" if preamble else base
 
 
-def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
-    cards = "\n\n".join(c.card for c in packet.cards) or "(no tables are available to you)"
-    parts = [f"QUESTION: {sanitize(packet.question, limit=500)}"]
+def meaning_sections(packet: ContextPacket) -> list[str]:
+    """The certified meaning a packet carries -- definitions, measures, dimensions, code vocabulary
+    -- as prompt lines, each section led by a blank line; empty when the packet carries none.
+
+    One rendering for every model that reads an answer, not only the one that writes it. The
+    result judge was handed the cards alone, so it judged a certified expression against its own
+    reading of the question's words: on the fs payments corpus it declined three of six answers
+    that were the certified expression verbatim, and passed the bare arm's six wrong ones (M132).
+    """
+    parts: list[str] = []
     if packet.definitions:
         parts += ["", "DEFINITIONS (authoritative business meanings -- follow them exactly):"]
         parts += [
@@ -134,6 +141,13 @@ def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
             )
         for (column_id, scheme), items in grouped.items():
             parts.append(f"- {column_id} uses {scheme}. Candidates: {'; '.join(items)}")
+    return parts
+
+
+def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
+    cards = "\n\n".join(c.card for c in packet.cards) or "(no tables are available to you)"
+    parts = [f"QUESTION: {sanitize(packet.question, limit=500)}"]
+    parts += meaning_sections(packet)
     if packet.examples:
         parts += ["", "WORKED EXAMPLES (verified queries over these tables -- adapt, don't copy blindly):"]
         for ex in packet.examples:
