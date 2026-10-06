@@ -8,6 +8,7 @@ certified block, the six right answers scored 0.97 to 1.0, and nine of ten disti
 stayed under the cutoff on every read.
 """
 
+import dataclasses
 from types import SimpleNamespace
 
 import pyarrow as pa
@@ -89,9 +90,10 @@ def test_the_judge_reads_the_certified_meaning(protocol):
 
 
 def test_the_judge_reads_every_meaning_line_the_generator_reads():
-    """Against the generator's own prompt, not against the shared renderer: a section added to
-    `user_prompt` outside `meaning_sections` reaches the generator and not the judge, which is
-    M132 again one field over."""
+    """Against the generator's own prompt, not against the shared renderer: a section that
+    `user_prompt` renders outside `meaning_sections`, from a field this packet fills, reaches the
+    generator and not the judge. A section from a NEW field would sit empty here; the field guard
+    below is what catches that one."""
     packet = _packet(**_meaning())
     lines = user_prompt(packet).splitlines()
     generator_meaning = [line for line in lines[1:lines.index("TABLES:")] if line.strip()]
@@ -103,3 +105,17 @@ def test_the_judge_reads_every_meaning_line_the_generator_reads():
 def test_a_packet_with_no_certified_meaning_is_judged_as_before():
     """The 0.5 threshold was measured on packets like this one, so its text must not move."""
     assert _judged_schema(_packet()) == _CARD
+
+
+def test_every_packet_field_is_judged_or_left_out_on_purpose():
+    """Derived from the struct, so a new kind of meaning cannot reach the generator and quietly
+    miss the judge (M132 one field over): a field added to `ContextPacket` fails this until it is
+    placed on one side."""
+    judged = {"cards", "definitions", "metrics", "dimensions", "concepts"}
+    not_judged = {
+        "question",  # handed to the judge on its own
+        "grant_fingerprint", "enrichment_version", "descriptions",  # bookkeeping, not prompt text
+        "examples",  # how to write SQL over these tables, not what a term means
+        "history",  # the judge grades a follow-up without the earlier turns (M134)
+    }
+    assert {f.name for f in dataclasses.fields(ContextPacket)} == judged | not_judged
