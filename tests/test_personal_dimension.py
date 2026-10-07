@@ -173,16 +173,18 @@ def test_a_dimension_adds_to_a_columns_own_level_and_never_lowers_it():
     assert _ssn(out).dimension_pii_levels == ["phi", "pii"]
 
 
-def test_a_personal_dimension_that_classifies_no_column_is_recorded():
-    # Hidden from the uncleared either way; what the run record says is that no column requires
-    # its clearance -- an expression naming no column this snapshot holds.
+def test_a_personal_dimension_naming_a_column_the_snapshot_lacks_is_recorded():
+    # Hidden from the uncleared either way; what the run record says is that some column it reads
+    # requires nobody's clearance here: none of its columns held, some of them, or none of its
+    # own table's at all.
     out = apply_certified(_customers(), [_record("customer_tin", "tin", "pii"),
                                          _record("customer_ssn", "ssn", "pii"),
                                          _record("customer_dob", "extract(year from dob)", "phi"),
-                                         _record("customer_id", "ssn || ' ' || tin", "pii")])
+                                         _record("customer_id", "ssn || ' ' || tin", "pii"),
+                                         _record("customer_ext", "employee.ssn", "pii")])
     job = next(j for j in out.jobs if j.kind == "certified_dimension_column_unresolved")
-    # `customer_id` reads `ssn`, held, and `tin`, not: one column of it requires nobody's clearance.
-    assert job.checkpoints == ["customer_dob", "customer_id", "customer_tin"]
+    # `customer_id` reads `ssn`, held, and `tin`, not; `customer_ext` reads another table's column.
+    assert job.checkpoints == ["customer_dob", "customer_ext", "customer_id", "customer_tin"]
     assert _ssn(out).pii_levels() == {"pii"}
     assert job.status == "refused"
 
