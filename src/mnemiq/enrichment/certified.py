@@ -555,87 +555,96 @@ def _is_attested(record: CertifiedRecord) -> bool:
     )
 
 
-def _column_named(expr: str, source: str) -> str:
-    """The folded name of the column of `source` that `expr` is -- or a name no column has.
+# The dialects a dimension's `expr` is read in. It carries none of its own, so it is read as each
+# would: the default (double quotes) and sqlite, which takes backticks and brackets as well -- the
+# quoting MySQL, BigQuery and SQL Server write. A column any of them reads is read.
+_EXPR_DIALECTS: tuple[str | None, ...] = (None, "sqlite")
+_QUOTES = '"`[]'
 
-    Read by sqlglot where it reads a column: the gate on this found `"ssn"`, then `customer.ssn`,
-    then `"customer"."ssn"` and a schema-qualified source, each naming the column and each missed
-    by the spelling read before. Its qualifier must name the dimension's table, compared on dotted
-    suffixes -- `pg.person` is named by `person.ssn` and the other way round, and a same-named
-    table of another schema matches too, which classifies more, never less; a column of another
-    table names none of this one's. sqlglot's default dialect, since the dimension carries none,
-    so a dialect's own quoting (backticks, brackets) is not read as one.
 
-    Where sqlglot reads no column, the spelling read: the table's own qualifier and one layer of
-    double quotes off, folded. sqlglot reads `comment` as a command and `customer.select` as
-    nothing, and the gate measured each leaving a keyword-named column open. An expression over a
-    column (`lower(ssn)`) folds to a name no column has, so it classifies nothing.
+def _names_table(qualifier: str, table: str) -> bool:
+    """Whether a column's qualifier names `table`, compared on dotted suffixes: `pg.person` and
+    `person` name each other. A same-named table of another schema matches too, which requires
+    more clearances, never fewer."""
+    q, t = qualifier.lower(), table.lower()
+    return not q or q == t or t.endswith("." + q) or q.endswith("." + t)
+
+
+def _columns_read(expr: str, source: str) -> set[str]:
+    """The folded names of the columns of `source` that `expr` reads.
+
+    Every column it reads, not only an `expr` that IS one: a personal value derived from columns
+    -- `lower(ssn)` -- makes them personal, and reading them requires its clearance as reading it
+    would. A column the expression only tests (`status` in `CASE WHEN status = 'x' THEN ssn
+    END`) takes the level too, deliberately: it can deny a column that is not itself personal to
+    the uncleared, which refuses more, and narrowing it would mean deciding which reads expose. Parsed by sqlglot in each of `_EXPR_DIALECTS`; where none reads a column, the spelling
+    read: the last dotted part, if what precedes it -- its quotes off -- names the table. sqlglot
+    reads an unquoted `comment` as a command and `customer.select` as nothing, and the gate
+    measured each leaving a keyword-named column open. (A quoted name always parses in one of the
+    dialects, so only the qualifier's quotes reach this.)
     """
-    try:
-        node = sqlglot.parse_one(expr)
-    except sqlglot.errors.SqlglotError:
-        node = None
-    table = source.lower()
-    if isinstance(node, exp.Column) and node.name:
-        qualifier = ".".join(p for p in (node.catalog, node.db, node.table) if p).lower()
-        if qualifier and not (qualifier == table or table.endswith("." + qualifier)
-                              or qualifier.endswith("." + table)):
-            return ""
-        return node.name.lower()
-    name = expr.strip()
-    if name.lower().startswith(table + "."):
-        name = name[len(table) + 1:]
-    if len(name) > 2 and name[0] == name[-1] == '"':
-        name = name[1:-1]
-    return name.lower()
+    names: set[str] = set()
+    for dialect in _EXPR_DIALECTS:
+        try:
+            node = sqlglot.parse_one(expr, read=dialect)
+        except sqlglot.errors.SqlglotError:
+            continue
+        if node is None:
+            continue
+        for column in node.find_all(exp.Column):
+            qualifier = ".".join(p for p in (column.catalog, column.db, column.table) if p)
+            if column.name and _names_table(qualifier, source):
+                names.add(column.name.lower())
+    if names:
+        return names
+    qualifier, _, name = expr.strip().rpartition(".")
+    qualifier = ".".join(part.strip(_QUOTES) for part in qualifier.split(".")) if qualifier else ""
+    return {name.lower()} if name and _names_table(qualifier, source) else set()
 
 
-def _classify_dimension_columns(columns: list, dimensions: list) -> list:
-    """M135. The column a personal dimension IS, classified at the dimension's level.
+def _classify_dimension_columns(columns: list, dimensions: list) -> tuple[list, list[str]]:
+    """M135. Each column a personal dimension reads, made to require the dimension's clearance.
 
     Keeping the dimension out of the packet (`select_dimensions`) leaves the model free to write
-    the column by name, and the decider refuses on the column's classification, not the
-    dimension's -- so where Verity classified the dimension and not the column, the column is
-    classified too. Only a column that says nothing (no level, or `none`): its own sensitive level
-    is the more specific statement, and `pii` and `phi` are clearances, not an order to raise
-    along. Only where the `expr` IS one column of the dimension's table (`_column_named`), its
-    name folded -- a quoted one too, since classifying a near-miss refuses more, never less. A
-    personal dimension that names no column the snapshot holds -- an expression over one
-    (`lower(ssn)`), another table's, an absent one -- classifies nothing, and it is said: the
-    dimension is still hidden from the uncleared, and the column is refused only by its own
-    classification.
+    the column by name, and the decider refuses on the column, not the dimension -- so the column
+    takes the dimension's level into `dimension_pii_levels`, BESIDE its own: reading it raw then
+    takes every clearance that applies. Added, never chosen: two dimensions over one column at
+    `pii` and `phi` require both, in either order, and a column's own level stays (Codex's review
+    of the first shape, which kept the first level and let a `pii`-only identity read data a
+    `phi` dimension classified).
+
+    Answers the columns and the ids of the personal dimensions that name a column the snapshot
+    does not hold -- none of their columns, or some (`first || middle` with no `middle`): hidden
+    from the uncleared all the same, but some column they read requires nobody's clearance here,
+    which the caller records.
     """
-    levels: dict[tuple[str, str], str] = {}
-    named_by: dict[tuple[str, str], list] = {}
+    by_column: dict[tuple[str, str], set[str]] = {}
+    reads: dict[str, set[tuple[str, str]]] = {}
     for dim in dimensions:
         if dim.pii_level not in SENSITIVE_PII:
             continue
-        key = (dim.source.lower(), _column_named(dim.expr or "", dim.source))
-        named_by.setdefault(key, []).append(dim)
-        if levels.setdefault(key, dim.pii_level) != dim.pii_level:
-            logger.warning(
-                "dimensions over %s.%s are classified both %r and %r; the column takes %r",
-                dim.source, key[1], levels[key], dim.pii_level, levels[key],
-            )
-    out = []
-    matched = set()
+        keys = {(dim.source.lower(), name) for name in _columns_read(dim.expr or "", dim.source)}
+        reads[dim.id] = keys
+        for key in keys:
+            by_column.setdefault(key, set()).add(dim.pii_level)
+    out, held = [], set()
     for col in columns:
         key = (col.object_id.lower(), col.name.lower())
-        level = levels.get(key)
-        if level:
-            matched.add(key)
-        if level and col.pii_level in (None, "none"):
-            logger.info("column %r classified %r by the certified dimension over it", col.id, level)
-            col = col.model_copy(update={"pii_level": level})
+        levels = by_column.get(key)
+        if levels:
+            held.add(key)
+            merged = sorted(set(col.dimension_pii_levels) | levels)
+            if merged != col.dimension_pii_levels:
+                logger.info("column %r requires %s by the certified dimensions over it", col.id, merged)
+                col = col.model_copy(update={"dimension_pii_levels": merged})
         out.append(col)
-    for key in sorted(named_by.keys() - matched):
-        for dim in named_by[key]:
-            logger.warning(
-                "personal dimension %r (%r) names no column of %r the snapshot holds, so no column "
-                "is classified by it; the column is refused only by its own classification",
-                dim.id, dim.expr, dim.source,
-            )
-    return out
+    unresolved = sorted(dim_id for dim_id, keys in reads.items() if not keys or keys - held)
+    for dim_id in unresolved:
+        logger.warning(
+            "personal dimension %r names a column of its table the snapshot does not hold, so that "
+            "column requires nobody's clearance here; it is still hidden from the uncleared", dim_id,
+        )
+    return out, unresolved
 
 
 def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snapshot:
@@ -736,7 +745,7 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
         dimensions.append(dim)
     if dimensions:
         by_type["dimension"] = dimensions
-    new_cols = _classify_dimension_columns(new_cols, dimensions)
+    new_cols, unresolved_dimensions = _classify_dimension_columns(new_cols, dimensions)
 
     updates: dict = {"columns": new_cols}
     # `snapshot.jobs` is this codebase's structured run record, so a security-relevant refusal goes
@@ -765,6 +774,21 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
                 kind="certified_pii_downgrade_refused",
                 status="refused",
                 checkpoints=sorted(refused_downgrades),
+            )
+        )
+    if unresolved_dimensions:
+        new_jobs.append(
+            Job(
+                id="certified:dimension_column_unresolved",
+                source_id=snapshot.source_id,
+                kind="certified_dimension_column_unresolved",
+                status="refused",
+                detail=(
+                    "a personal dimension names a column of its table this snapshot does not hold, "
+                    "so that column requires nobody's clearance here; the dimension is hidden from "
+                    "the uncleared"
+                ),
+                checkpoints=unresolved_dimensions,
             )
         )
     if new_jobs:

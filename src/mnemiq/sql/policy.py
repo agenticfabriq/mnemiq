@@ -198,10 +198,12 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     for c in snapshot.columns:
         if c.object_id not in reachable and c.object_id.lower() not in folded:
             continue  # not reachable even through a view -> nothing here can ever apply
-        level = c.pii_level
-        if not level or level == "none" or level in grants.pii_clearance:
+        # Every level the column is read under (M135): raw only where each is cleared, masked
+        # where each is cleared or masked, else denied. One level is the old rule exactly.
+        levels = c.pii_levels()
+        if levels <= grants.pii_clearance:
             continue  # raw
-        if level in grants.pii_mask:
+        if levels <= grants.pii_clearance | grants.pii_mask:
             masked.add((c.object_id, c.name))
         else:
             denied.add((c.object_id, c.name))

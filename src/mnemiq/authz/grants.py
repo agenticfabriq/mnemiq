@@ -17,7 +17,7 @@ def classified_levels(snapshot) -> frozenset[str]:
     read from the columns alone, it left a dimension classified in Verity alone hidden from it."""
     return frozenset(
         level
-        for level in (*(c.pii_level for c in snapshot.columns),
+        for level in (*(lvl for c in snapshot.columns for lvl in c.pii_levels()),
                       *(d.pii_level for d in snapshot.dimensions))
         if level and level != "none"
     )

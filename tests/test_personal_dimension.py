@@ -82,67 +82,132 @@ def test_an_unrecognised_dimension_level_reads_as_personal():
     assert job.checkpoints == ["dimension:customer_ssn"]
 
 
-def test_the_bare_column_of_a_personal_dimension_is_classified():
+def _ssn(out) -> Column:
+    return next(c for c in out.columns if c.id == "customer.ssn")
+
+
+def test_the_bare_column_of_a_personal_dimension_requires_its_clearance():
     out = apply_certified(_customers(), [_record("customer_ssn", "SSN", "pii")])
 
-    levels = {c.id: c.pii_level for c in out.columns}
-    assert levels == {"customer.ssn": "pii", "customer.region": None}, (
+    levels = {c.id: c.pii_levels() for c in out.columns}
+    assert levels == {"customer.ssn": {"pii"}, "customer.region": set()}, (
         "unquoted identifiers fold, so `SSN` names the column `ssn`"
     )
+    assert _ssn(out).pii_level is None, "the column's own level is its own; the dimension's is beside it"
 
 
-def test_a_quoted_or_qualified_column_name_classifies_the_column():
-    # The gate's advisory: both name the column, and left unclassified `SELECT ssn` stayed open.
+def test_every_spelling_of_the_column_requires_its_clearance():
+    # Each was found leaving `SELECT ssn` open: double quotes and qualifiers by the commit gate,
+    # backticks and brackets -- MySQL's, BigQuery's, SQL Server's -- by Codex's review.
     for expr in ('"ssn"', "customer.ssn", 'customer."ssn"', " Customer.SSN ", '"customer"."ssn"',
-                 '"customer".ssn', "pg.customer.ssn"):
+                 '"customer".ssn', "pg.customer.ssn", "`ssn`", "[ssn]", "customer.`ssn`",
+                 "customer.[ssn]", "lower(`ssn`)", "lower([ssn])"):
         out = apply_certified(_customers(), [_record("customer_ssn", expr, "pii")])
-        assert next(c for c in out.columns if c.id == "customer.ssn").pii_level == "pii", expr
-    # A column named like a keyword: sqlglot alone reads `comment` as a command and `case` as
-    # nothing, and the gate measured the column left open by it.
+        assert _ssn(out).pii_levels() == {"pii"}, expr
+    # A column named like a keyword: sqlglot reads `comment` as a command and `case` as nothing.
     for keyword in ("comment", "case", "desc", "customer.comment", '"case"', "customer.select",
-                    "customer.not", "customer.true", "customer.false"):
+                    "customer.not", "customer.true", "customer.false", "pg.customer.select",
+                    '"customer".select', "`select`"):
+        name = keyword.rpartition(".")[2].strip('"`')
         snap = Snapshot(version="v", source_id="s", created_at="t", columns=[
-            Column(id=f"customer.{keyword.split('.')[-1].strip(chr(34))}", object_id="customer",
-                   name=keyword.split(".")[-1].strip(chr(34)))])
+            Column(id=f"customer.{name}", object_id="customer", name=name)])
         out = apply_certified(snap, [_record("customer_note", keyword, "pii")])
-        assert out.columns[0].pii_level == "pii", keyword
+        assert out.columns[0].pii_levels() == {"pii"}, keyword
     # A column of another table names none of this one's.
     out = apply_certified(_customers(), [_record("customer_ssn", "employee.ssn", "pii")])
-    assert next(c for c in out.columns if c.id == "customer.ssn").pii_level is None
+    assert _ssn(out).pii_levels() == set()
 
 
-def test_two_levels_over_one_column_classify_it_once_and_say_so(caplog):
-    # `pii` and `phi` are clearances, not an order; the first record's level is kept, and the
-    # disagreement is said rather than settled silently.
-    with caplog.at_level("WARNING", logger="mnemiq.enrichment.certified"):
-        out = apply_certified(_customers(), [_record("customer_ssn", "ssn", "pii"),
-                                             _record("customer_ssn_health", "ssn", "phi")])
-    assert next(c for c in out.columns if c.id == "customer.ssn").pii_level == "pii"
-    assert "classified both 'pii' and 'phi'" in caplog.text
+def test_every_column_a_personal_expression_reads_requires_its_clearance():
+    # A personal value derived from columns makes them personal: `lower(ssn)` left `ssn` open
+    # when only an expression that IS a column classified one.
+    snap = Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="customer.ssn", object_id="customer", name="ssn"),
+        Column(id="customer.first", object_id="customer", name="first"),
+        Column(id="customer.last", object_id="customer", name="last"),
+        Column(id="customer.region", object_id="customer", name="region")])
+    out = apply_certified(snap, [_record("customer_ssn", "lower(ssn)", "pii"),
+                                 _record("customer_name", "customer.first || ' ' || last", "pii")])
+    assert {c.name for c in out.columns if c.pii_levels()} == {"ssn", "first", "last"}
+    # A column the expression only tests takes the level too, by design: refusing more.
+    out = apply_certified(snap, [_record("ssn_when", "CASE WHEN region = 'x' THEN ssn END", "pii")])
+    assert {c.name for c in out.columns if c.pii_levels()} == {"ssn", "region"}
 
 
-def test_a_personal_dimension_that_classifies_no_column_says_so(caplog):
-    # Hidden from the uncleared either way; what is said is that its column is not refused by it.
-    with caplog.at_level("WARNING", logger="mnemiq.enrichment.certified"):
-        apply_certified(_customers(), [_record("customer_ssn", "lower(ssn)", "pii"),
-                                       _record("customer_tin", "tin", "pii")])
-    said = [r.getMessage() for r in caplog.records if "names no column" in r.getMessage()]
-    assert len(said) == 2, said
-    assert "'customer_ssn' ('lower(ssn)')" in said[0] or "'customer_ssn' ('lower(ssn)')" in said[1]
-    assert any("'customer_tin' ('tin')" in line for line in said)
+def test_two_levels_over_one_column_require_both_in_either_order():
+    """Codex's review: the first shape kept the first level, so a `pii`-only identity read a
+    column a `phi` dimension classified when `pii` arrived first, and was denied when it did not.
+    Both clearances are required now, whatever the order."""
+    from mnemiq.sql.policy import build_access_policy
+
+    pii, phi = _record("customer_ssn", "ssn", "pii"), _record("customer_dx", "ssn", "phi")
+    for records in ([pii, phi], [phi, pii]):
+        out = apply_certified(_customers(), records)
+        assert _ssn(out).pii_levels() == {"pii", "phi"}
+
+        def disposition(grants):
+            policy = build_access_policy(out, grants)
+            if ("customer", "ssn") in policy.denied:
+                return "denied"
+            return "masked" if ("customer", "ssn") in policy.masked else "raw"
+
+        assert disposition(_grants({"pii"})) == "denied"
+        assert disposition(_grants({"phi"})) == "denied"
+        assert disposition(_grants({"pii", "phi"})) == "raw"
+        assert disposition(_grants({"pii"}, mask={"phi"})) == "masked"
 
 
-def test_a_dimension_classifies_only_a_column_that_says_nothing():
-    # The column's own sensitive level is the more specific statement; a dimension never swaps
-    # pii for phi or back, and an unmarked or non-bare dimension touches no column.
+def test_a_dimension_adds_to_a_columns_own_level_and_never_lowers_it():
     phi = apply_certified(_customers("phi"), [_record("customer_ssn", "ssn", "pii")])
-    assert next(c for c in phi.columns if c.id == "customer.ssn").pii_level == "phi"
+    assert _ssn(phi).pii_level == "phi"
+    assert _ssn(phi).pii_levels() == {"phi", "pii"}
 
-    for record in (_record("customer_ssn", "ssn", None),
-                   _record("customer_ssn", "ssn", "none"),
-                   _record("customer_ssn", "lower(ssn)", "pii")):
+    for record in (_record("customer_ssn", "ssn", None), _record("customer_ssn", "ssn", "none")):
         out = apply_certified(_customers(), [record])
-        assert next(c for c in out.columns if c.id == "customer.ssn").pii_level is None, record
+        assert _ssn(out).pii_levels() == set(), record
+
+    # Applied over a column already requiring a dimension's level, the new one is added to it.
+    carried = _customers()
+    carried.columns[0] = carried.columns[0].model_copy(update={"dimension_pii_levels": ["phi"]})
+    out = apply_certified(carried, [_record("customer_ssn", "ssn", "pii")])
+    assert _ssn(out).dimension_pii_levels == ["phi", "pii"]
+
+
+def test_a_personal_dimension_naming_a_column_the_snapshot_lacks_is_recorded():
+    # Hidden from the uncleared either way; what the run record says is that some column it reads
+    # requires nobody's clearance here: none of its columns held, some of them, or none of its
+    # own table's at all.
+    out = apply_certified(_customers(), [_record("customer_tin", "tin", "pii"),
+                                         _record("customer_ssn", "ssn", "pii"),
+                                         _record("customer_dob", "extract(year from dob)", "phi"),
+                                         _record("customer_id", "ssn || ' ' || tin", "pii"),
+                                         _record("customer_ext", "employee.ssn", "pii")])
+    job = next(j for j in out.jobs if j.kind == "certified_dimension_column_unresolved")
+    # `customer_id` reads `ssn`, held, and `tin`, not; `customer_ext` reads another table's column.
+    assert job.checkpoints == ["customer_dob", "customer_ext", "customer_id", "customer_tin"]
+    assert _ssn(out).pii_levels() == {"pii"}
+    assert job.status == "refused"
+
+
+def test_a_column_a_personal_dimension_reads_is_kept_out_of_the_value_index():
+    # The value index harvests a bounded string column's distinct values into the model's view;
+    # a column personal by its dimension alone was harvested when the gate read the own level.
+    from mnemiq.semantic.values import _qualifies
+
+    snap = Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="customer.region", object_id="customer", name="region", data_type="text",
+               distinct_count=5)])
+    assert _qualifies(snap.columns[0], 200), "setup: an unclassified region would be harvested"
+    out = apply_certified(snap, [_record("customer_region", "region", "pii")])
+    assert not _qualifies(out.columns[0], 200)
+
+
+def test_the_card_names_the_levels_a_dimension_gives_a_column():
+    from mnemiq.semantic.cards import build_cards
+
+    out = apply_certified(_customers("phi"), [_record("customer_ssn", "ssn", "pii")])
+    card = next(c for c in build_cards(out) if c.object_id == "customer").text
+    assert "ssn (text, phi, pii)" in card, card
 
 
 def test_the_column_policy_refuses_the_column_a_personal_dimension_classified():
@@ -198,9 +263,13 @@ def test_a_grant_that_clears_everything_clears_a_level_only_a_dimension_carries(
     # classifies no column, so the level is on the dimension only.
     from mnemiq.llm.window import everything
 
-    out = apply_certified(_customers(), [_record("customer_ssn", "lower(ssn)", "phi")])
-    assert {c.pii_level for c in out.columns} == {None}, "setup: no column carries phi"
+    out = apply_certified(_customers(), [_record("customer_ssn", "dob", "phi")])
+    assert not any(c.pii_levels() for c in out.columns), "setup: no column carries phi"
 
     widest = everything(out)
     assert "phi" in widest.pii_clearance
+    # A column carrying a dimension's level with the dimension not in this snapshot is cleared too.
+    carried = _customers()
+    carried.columns[0] = carried.columns[0].model_copy(update={"dimension_pii_levels": ["pii"]})
+    assert "pii" in everything(carried).pii_clearance
     assert [d.id for d in select_dimensions(["customer"], out.dimensions, widest)] == ["customer_ssn"]

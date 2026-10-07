@@ -42,7 +42,7 @@ def _qualifies(column, max_distinct: int) -> bool:
         and _is_string_type(column.data_type)
         and not is_key_like(column.name)
         and not is_sensitive_name(column.name)
-        and column.pii_level not in SENSITIVE_PII
+        and not column.pii_levels() & SENSITIVE_PII
     )
 
 
