@@ -129,6 +129,9 @@ def test_every_column_a_personal_expression_reads_requires_its_clearance():
     out = apply_certified(snap, [_record("customer_ssn", "lower(ssn)", "pii"),
                                  _record("customer_name", "customer.first || ' ' || last", "pii")])
     assert {c.name for c in out.columns if c.pii_levels()} == {"ssn", "first", "last"}
+    # A column the expression only tests takes the level too, by design: refusing more.
+    out = apply_certified(snap, [_record("ssn_when", "CASE WHEN region = 'x' THEN ssn END", "pii")])
+    assert {c.name for c in out.columns if c.pii_levels()} == {"ssn", "region"}
 
 
 def test_two_levels_over_one_column_require_both_in_either_order():
@@ -175,9 +178,12 @@ def test_a_personal_dimension_that_classifies_no_column_is_recorded():
     # its clearance -- an expression naming no column this snapshot holds.
     out = apply_certified(_customers(), [_record("customer_tin", "tin", "pii"),
                                          _record("customer_ssn", "ssn", "pii"),
-                                         _record("customer_dob", "extract(year from dob)", "phi")])
+                                         _record("customer_dob", "extract(year from dob)", "phi"),
+                                         _record("customer_id", "ssn || ' ' || tin", "pii")])
     job = next(j for j in out.jobs if j.kind == "certified_dimension_column_unresolved")
-    assert job.checkpoints == ["customer_dob", "customer_tin"]
+    # `customer_id` reads `ssn`, held, and `tin`, not: one column of it requires nobody's clearance.
+    assert job.checkpoints == ["customer_dob", "customer_id", "customer_tin"]
+    assert _ssn(out).pii_levels() == {"pii"}
     assert job.status == "refused"
 
 

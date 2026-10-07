@@ -34,9 +34,10 @@ class Column(BaseModel):
     semantic_type: str | None = None
     description: str | None = None
     pii_level: str | None = None
-    # M135. The levels certified personal dimensions over this column give it (`apply_certified`),
-    # beside its own -- added, never substituted: `pii` and `phi` are separate clearances, so one
-    # level cannot stand for two, and choosing one exposed the other's data to whoever held it.
+    # M135. The levels certified personal dimensions over this column give it, beside its own --
+    # added, never substituted: `pii` and `phi` are separate clearances, so one level cannot stand
+    # for two, and choosing one exposed the other's data to whoever held it. DERIVED by
+    # `apply_certified` from the dimensions; a certified column record's own value is not read.
     dimension_pii_levels: list[str] = Field(default_factory=list)
     coded_values: list[CodedValue] = Field(default_factory=list)
     code_scheme: CodeScheme | None = None

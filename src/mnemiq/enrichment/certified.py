@@ -575,7 +575,9 @@ def _columns_read(expr: str, source: str) -> set[str]:
 
     Every column it reads, not only an `expr` that IS one: a personal value derived from columns
     -- `lower(ssn)` -- makes them personal, and reading them requires its clearance as reading it
-    would. Parsed by sqlglot in each of `_EXPR_DIALECTS`; where none reads a column, the spelling
+    would. A column the expression only tests (`status` in `CASE WHEN status = 'x' THEN ssn
+    END`) takes the level too, deliberately: it can deny a column that is not itself personal to
+    the uncleared, which refuses more, and narrowing it would mean deciding which reads expose. Parsed by sqlglot in each of `_EXPR_DIALECTS`; where none reads a column, the spelling
     read: the last dotted part, if what precedes it -- its quotes off -- names the table. sqlglot
     reads an unquoted `comment` as a command and `customer.select` as nothing, and the gate
     measured each leaving a keyword-named column open. (A quoted name always parses in one of the
@@ -611,9 +613,10 @@ def _classify_dimension_columns(columns: list, dimensions: list) -> tuple[list, 
     of the first shape, which kept the first level and let a `pii`-only identity read data a
     `phi` dimension classified).
 
-    Answers the columns and the ids of the personal dimensions that classified none -- an
-    expression naming no column the snapshot holds: hidden from the uncleared all the same, but
-    requiring nobody's clearance on any column, which the caller records.
+    Answers the columns and the ids of the personal dimensions that name a column the snapshot
+    does not hold -- none of their columns, or some (`first || middle` with no `middle`): hidden
+    from the uncleared all the same, but some column they read requires nobody's clearance here,
+    which the caller records.
     """
     by_column: dict[tuple[str, str], set[str]] = {}
     reads: dict[str, set[tuple[str, str]]] = {}
@@ -635,11 +638,11 @@ def _classify_dimension_columns(columns: list, dimensions: list) -> tuple[list, 
                 logger.info("column %r requires %s by the certified dimensions over it", col.id, merged)
                 col = col.model_copy(update={"dimension_pii_levels": merged})
         out.append(col)
-    unresolved = sorted(dim_id for dim_id, keys in reads.items() if not keys & held)
+    unresolved = sorted(dim_id for dim_id, keys in reads.items() if not keys or keys - held)
     for dim_id in unresolved:
         logger.warning(
-            "personal dimension %r names no column of its table the snapshot holds, so no column "
-            "requires its clearance; it is still hidden from the uncleared", dim_id,
+            "personal dimension %r names a column of its table the snapshot does not hold, so that "
+            "column requires nobody's clearance here; it is still hidden from the uncleared", dim_id,
         )
     return out, unresolved
 
@@ -781,8 +784,9 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
                 kind="certified_dimension_column_unresolved",
                 status="refused",
                 detail=(
-                    "a personal dimension names no column of its table this snapshot holds, so no "
-                    "column requires its clearance; the dimension is hidden from the uncleared"
+                    "a personal dimension names a column of its table this snapshot does not hold, "
+                    "so that column requires nobody's clearance here; the dimension is hidden from "
+                    "the uncleared"
                 ),
                 checkpoints=unresolved_dimensions,
             )
