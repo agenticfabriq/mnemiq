@@ -1,0 +1,165 @@
+"""M135: a certified dimension Verity marks personal reached mnemiq as an ordinary one.
+
+Verity's D332 gave a dimension a `pii_level` (`none | pii | phi`, this package's own `PII_LEVELS`)
+and refuses to slice by a sensitive one in its own compiler. mnemiq's `Dimension` had no such field,
+so the classification was dropped on the way in, and `packet.dimensions` -- the CERTIFIED
+DIMENSIONS block the generator and the judge both read -- offered a personal dimension like any
+other. The field is carried now, and it is applied the way a column's is:
+
+- the packet shows a sensitive dimension only to an identity cleared for its exact level, the
+  rule `sql.policy` applies to a column read raw;
+- a dimension that is a bare column of its table classifies that column where the column says
+  nothing, so the column policy refuses the column itself -- hiding the dimension alone leaves the
+  model free to write the column by name.
+"""
+
+from mnemiq.authz.grants import GrantSet
+from mnemiq.contract import CertifiedRecord, Column, Dimension, Snapshot
+from mnemiq.enrichment.certified import apply_certified
+from mnemiq.generate.prompts import user_prompt
+from mnemiq.semantic.measures import select_dimensions
+
+
+def _record(dimension_id: str, expr: str, pii_level: str | None) -> CertifiedRecord:
+    # The shape Verity's open projection publishes: the dimension's serialised contract, its
+    # fields allow-listed by this package's schema.
+    payload = {"id": dimension_id, "label": dimension_id.replace("_", " ").title(),
+               "source": "customer", "expr": expr}
+    if pii_level is not None:
+        payload["pii_level"] = pii_level
+    return CertifiedRecord.model_validate({
+        "envelope": {"object_type": "dimension", "object_id": dimension_id, "version": "v1",
+                     "source_system": "verity", "provenance": {"status": "certified",
+                                                               "certifier": "reviewer@acme"}},
+        "payload": payload,
+    })
+
+
+def _customers(ssn_level: str | None = None) -> Snapshot:
+    return Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="customer.ssn", object_id="customer", name="ssn", data_type="text",
+               pii_level=ssn_level),
+        Column(id="customer.region", object_id="customer", name="region", data_type="text"),
+    ])
+
+
+def _grants(clearance: set[str] = frozenset(), mask: set[str] = frozenset()) -> GrantSet:
+    return GrantSet(frozenset({"customer"}), pii_clearance=frozenset(clearance),
+                    pii_mask=frozenset(mask))
+
+
+def test_a_certified_dimension_keeps_its_pii_level():
+    out = apply_certified(_customers(), [_record("customer_ssn", "ssn", "pii")])
+
+    assert [(d.id, d.pii_level) for d in out.dimensions] == [("customer_ssn", "pii")]
+
+
+def test_a_personal_dimension_is_shown_only_to_an_identity_cleared_for_its_level():
+    ssn = Dimension(id="customer_ssn", label="SSN", source="customer", expr="ssn", pii_level="pii")
+    diagnosis = Dimension(id="diagnosis", label="Diagnosis", source="customer", expr="dx",
+                          pii_level="phi")
+    region = Dimension(id="region", label="Region", source="customer", expr="region")
+    dims = [ssn, diagnosis, region]
+
+    def shown(grants):
+        return [d.id for d in select_dimensions(["customer"], dims, grants)]
+
+    assert shown(_grants()) == ["region"], "no clearance: the personal ones stay out"
+    assert shown(_grants({"pii"})) == ["customer_ssn", "region"], "cleared for pii, not for phi"
+    assert shown(_grants({"pii", "phi"})) == ["customer_ssn", "diagnosis", "region"]
+    # A masked level is read masked, and a grouping by masked values names no one -- but it is
+    # not a raw read, which is what offering the dimension invites.
+    assert shown(_grants(mask={"pii"})) == ["region"]
+
+
+def test_an_unrecognised_dimension_level_reads_as_personal():
+    # M41's fail-open, on a dimension: "personal" reads as sensitive to a person and as nothing to
+    # a check against the vocabulary. It becomes `pii`, and the run record says which one.
+    out = apply_certified(_customers(), [_record("customer_ssn", "lower(ssn)", "personal")])
+
+    assert [d.pii_level for d in out.dimensions] == ["pii"]
+    job = next(j for j in out.jobs if j.kind == "certified_pii_level_unrecognised")
+    assert job.checkpoints == ["dimension:customer_ssn"]
+
+
+def test_the_bare_column_of_a_personal_dimension_is_classified():
+    out = apply_certified(_customers(), [_record("customer_ssn", "SSN", "pii")])
+
+    levels = {c.id: c.pii_level for c in out.columns}
+    assert levels == {"customer.ssn": "pii", "customer.region": None}, (
+        "unquoted identifiers fold, so `SSN` names the column `ssn`"
+    )
+
+
+def test_a_dimension_classifies_only_a_column_that_says_nothing():
+    # The column's own sensitive level is the more specific statement; a dimension never swaps
+    # pii for phi or back, and an unmarked or non-bare dimension touches no column.
+    phi = apply_certified(_customers("phi"), [_record("customer_ssn", "ssn", "pii")])
+    assert next(c for c in phi.columns if c.id == "customer.ssn").pii_level == "phi"
+
+    for record in (_record("customer_ssn", "ssn", None),
+                   _record("customer_ssn", "ssn", "none"),
+                   _record("customer_ssn", "lower(ssn)", "pii")):
+        out = apply_certified(_customers(), [record])
+        assert next(c for c in out.columns if c.id == "customer.ssn").pii_level is None, record
+
+
+def test_the_column_policy_refuses_the_column_a_personal_dimension_classified():
+    """The join to enforcement. Hiding the dimension leaves `SELECT ssn` open to the model; the
+    column's classification is what the decider refuses on."""
+    from mnemiq.sql.policy import build_access_policy
+
+    out = apply_certified(_customers(), [_record("customer_ssn", "ssn", "pii")])
+
+    uncleared = build_access_policy(out, _grants())
+    assert ("customer", "ssn") in uncleared.denied
+    assert ("customer", "region") not in uncleared.denied
+    assert ("customer", "ssn") not in build_access_policy(out, _grants({"pii"})).denied
+
+
+def test_the_prompt_offers_a_personal_dimension_only_to_the_cleared(tmp_path):
+    """From the record Verity publishes to the prompt the generator reads -- the path the field
+    was lost on."""
+    from mnemiq.semantic.retrieval import retrieve
+    from tests.test_retrieval import FakeEmbedder, _con, _identity
+
+    out = apply_certified(
+        Snapshot(version="v", source_id="s", created_at="t"),
+        [CertifiedRecord.model_validate({
+            "envelope": {"object_type": "dimension", "object_id": "claimant_ssn", "version": "v1",
+                         "source_system": "verity", "provenance": {"status": "certified"}},
+            "payload": {"id": "claimant_ssn", "label": "Claimant SSN", "source": "claim",
+                        "expr": "claimant_ssn", "pii_level": "pii"},
+        })],
+    )
+
+    class _Authz:
+        def __init__(self, grants):
+            self._grants = grants
+
+        def grants_for(self, identity):
+            return self._grants
+
+    def prompt(grants):
+        packet = retrieve(_con(tmp_path), "claim_identifier", _identity(), _Authz(grants),
+                          FakeEmbedder(), dimensions=out.dimensions)
+        assert [c.object_id for c in packet.cards][:1] == ["claim"], "setup: the claim card"
+        return user_prompt(packet)
+
+    assert "Claimant SSN" not in prompt(GrantSet(frozenset({"claim", "policy"})))
+    assert "Claimant SSN" in prompt(
+        GrantSet(frozenset({"claim", "policy"}), pii_clearance=frozenset({"pii"})))
+
+
+def test_a_grant_that_clears_everything_clears_a_level_only_a_dimension_carries():
+    # `everything` is the widest view, for tests and a single-identity store. Built from the columns'
+    # levels alone, it hid a dimension classified in Verity alone -- an expression over a column
+    # classifies no column, so the level is on the dimension only.
+    from mnemiq.llm.window import everything
+
+    out = apply_certified(_customers(), [_record("customer_ssn", "lower(ssn)", "phi")])
+    assert {c.pii_level for c in out.columns} == {None}, "setup: no column carries phi"
+
+    widest = everything(out)
+    assert "phi" in widest.pii_clearance
+    assert [d.id for d in select_dimensions(["customer"], out.dimensions, widest)] == ["customer_ssn"]

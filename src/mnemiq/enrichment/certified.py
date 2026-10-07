@@ -552,6 +552,41 @@ def _is_attested(record: CertifiedRecord) -> bool:
     )
 
 
+def _classify_dimension_columns(columns: list, dimensions: list) -> list:
+    """M135. The column a personal dimension IS, classified at the dimension's level.
+
+    Keeping the dimension out of the packet (`select_dimensions`) leaves the model free to write
+    the column by name, and the decider refuses on the column's classification, not the
+    dimension's -- so where Verity classified the dimension and not the column, the column is
+    classified too. Only a column that says nothing (no level, or `none`): its own sensitive level
+    is the more specific statement, and `pii` and `phi` are clearances, not an order to raise
+    along. Only where the `expr` IS the column's name, folded as unquoted identifiers are; an
+    expression over the column (`lower(ssn)`) names no column, and is left to the column's own
+    classification.
+    """
+    levels: dict[tuple[str, str], str] = {}
+    for dim in dimensions:
+        expr = (dim.expr or "").strip()
+        if dim.pii_level not in SENSITIVE_PII or not expr:
+            continue
+        key = (dim.source.lower(), expr.lower())
+        if levels.setdefault(key, dim.pii_level) != dim.pii_level:
+            logger.warning(
+                "dimensions over %s.%s are classified both %r and %r; the column takes %r",
+                dim.source, expr, levels[key], dim.pii_level, levels[key],
+            )
+    if not levels:
+        return columns
+    out = []
+    for col in columns:
+        level = levels.get((col.object_id.lower(), col.name.lower()))
+        if level and col.pii_level in (None, "none"):
+            logger.info("column %r classified %r by the certified dimension over it", col.id, level)
+            col = col.model_copy(update={"pii_level": level})
+        out.append(col)
+    return out
+
+
 def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snapshot:
     """Overlay certified MEANING onto locally-profiled STRUCTURE.
 
@@ -635,6 +670,22 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
             "coded_values": coded,
             "code_scheme": cert.code_scheme,
         }))
+
+    # M135. A certified dimension's `pii_level`, read as a column's (M41): an unrecognised level
+    # is recorded beside the columns' and read as `_MOST_SENSITIVE`, never as nothing.
+    dimensions = []
+    for dim in by_type.get("dimension", []):
+        if dim.pii_level is not None and dim.pii_level not in PII_LEVELS:
+            logger.warning(
+                "unrecognised pii_level %r on dimension %r (not one of %s) -- read as %r",
+                dim.pii_level, dim.id, "/".join(PII_LEVELS), _MOST_SENSITIVE,
+            )
+            unrecognised_levels.append(f"dimension:{dim.id}")
+            dim = dim.model_copy(update={"pii_level": _MOST_SENSITIVE})
+        dimensions.append(dim)
+    if dimensions:
+        by_type["dimension"] = dimensions
+    new_cols = _classify_dimension_columns(new_cols, dimensions)
 
     updates: dict = {"columns": new_cols}
     # `snapshot.jobs` is this codebase's structured run record, so a security-relevant refusal goes

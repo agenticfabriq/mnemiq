@@ -84,7 +84,10 @@ def test_build_engine_still_grants_everything_when_no_plan_is_given():
 
     src = inspect.getsource(engine.build_engine)
     assert "if grants is None:" in src
-    assert "pii_clearance=levels" in src, "the ungoverned default must still clear every level"
+    # Every level the snapshot classifies, columns and certified dimensions (M135): the helper is
+    # what `everything` uses too, and its behaviour is tested in `test_personal_dimension`.
+    assert "pii_clearance=classified_levels(snapshot)" in src, (
+        "the ungoverned default must still clear every level")
 
 
 def test_a_TAUTOLOGICAL_filter_does_not_certify_the_arm():

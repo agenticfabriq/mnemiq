@@ -72,6 +72,11 @@ class Dimension(BaseModel):
     expr: str | None = None
     data_type: str | None = None
     semantic_type: str | None = None
+    # M135. Whether the dimension holds personal data, in `PII_LEVELS` -- Verity classifies its
+    # dimensions in this vocabulary (its D332). Read as a column's is: a sensitive dimension is
+    # offered only to an identity cleared for its level (`select_dimensions`), and one that is a
+    # bare column classifies that column (`apply_certified`). None: nothing was said.
+    pii_level: str | None = None
 
 
 class Metric(BaseModel):

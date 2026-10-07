@@ -11,6 +11,18 @@ from mnemiq.contract import IdentityContext
 logger = logging.getLogger(__name__)
 
 
+def classified_levels(snapshot) -> frozenset[str]:
+    """Every level the snapshot classifies anything at, `none` aside: its columns' and, since
+    M135, its certified dimensions'. What a grant meaning "everything cleared" has to clear --
+    read from the columns alone, it left a dimension classified in Verity alone hidden from it."""
+    return frozenset(
+        level
+        for level in (*(c.pii_level for c in snapshot.columns),
+                      *(d.pii_level for d in snapshot.dimensions))
+        if level and level != "none"
+    )
+
+
 @dataclass(frozen=True)
 class GrantSet:
     objects: frozenset[str]
