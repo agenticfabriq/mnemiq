@@ -8,6 +8,9 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import sqlglot
+from sqlglot import exp
+
 from mnemiq.config import CERTIFIED_RECORDS_PATH
 from mnemiq.contract import PII_LEVELS, CertifiedRecord, CodedValue, Job, Snapshot
 from mnemiq.contract.semantic import CertifiedRef
@@ -553,10 +556,35 @@ def _is_attested(record: CertifiedRecord) -> bool:
 
 
 def _column_named(expr: str, source: str) -> str:
-    """`expr` as the folded name of a column of `source`, or what it is when it names none."""
+    """The folded name of the column of `source` that `expr` is -- or a name no column has.
+
+    Read by sqlglot where it reads a column: the gate on this found `"ssn"`, then `customer.ssn`,
+    then `"customer"."ssn"` and a schema-qualified source, each naming the column and each missed
+    by the spelling read before. Its qualifier must name the dimension's table, compared on dotted
+    suffixes -- `pg.person` is named by `person.ssn` and the other way round, and a same-named
+    table of another schema matches too, which classifies more, never less; a column of another
+    table names none of this one's. sqlglot's default dialect, since the dimension carries none,
+    so a dialect's own quoting (backticks, brackets) is not read as one.
+
+    Where sqlglot reads no column, the spelling read: the table's own qualifier and one layer of
+    double quotes off, folded. sqlglot reads `comment` as a command and `customer.select` as
+    nothing, and the gate measured each leaving a keyword-named column open. An expression over a
+    column (`lower(ssn)`) folds to a name no column has, so it classifies nothing.
+    """
+    try:
+        node = sqlglot.parse_one(expr)
+    except sqlglot.errors.SqlglotError:
+        node = None
+    table = source.lower()
+    if isinstance(node, exp.Column) and node.name:
+        qualifier = ".".join(p for p in (node.catalog, node.db, node.table) if p).lower()
+        if qualifier and not (qualifier == table or table.endswith("." + qualifier)
+                              or qualifier.endswith("." + table)):
+            return ""
+        return node.name.lower()
     name = expr.strip()
-    if name.lower().startswith(source.lower() + "."):
-        name = name[len(source) + 1:]
+    if name.lower().startswith(table + "."):
+        name = name[len(table) + 1:]
     if len(name) > 2 and name[0] == name[-1] == '"':
         name = name[1:-1]
     return name.lower()
@@ -570,31 +598,43 @@ def _classify_dimension_columns(columns: list, dimensions: list) -> list:
     dimension's -- so where Verity classified the dimension and not the column, the column is
     classified too. Only a column that says nothing (no level, or `none`): its own sensitive level
     is the more specific statement, and `pii` and `phi` are clearances, not an order to raise
-    along. Only where the `expr` names the column -- `ssn`, `"ssn"` or `customer.ssn`, folded as
-    unquoted identifiers are (a quoted one folded too: classifying a near-miss refuses more, never
-    less); an expression over the column (`lower(ssn)`) names no column, and is left to the
-    column's own classification.
+    along. Only where the `expr` IS one column of the dimension's table (`_column_named`), its
+    name folded -- a quoted one too, since classifying a near-miss refuses more, never less. A
+    personal dimension that names no column the snapshot holds -- an expression over one
+    (`lower(ssn)`), another table's, an absent one -- classifies nothing, and it is said: the
+    dimension is still hidden from the uncleared, and the column is refused only by its own
+    classification.
     """
     levels: dict[tuple[str, str], str] = {}
+    named_by: dict[tuple[str, str], list] = {}
     for dim in dimensions:
-        expr = _column_named(dim.expr or "", dim.source)
-        if dim.pii_level not in SENSITIVE_PII or not expr:
+        if dim.pii_level not in SENSITIVE_PII:
             continue
-        key = (dim.source.lower(), expr)
+        key = (dim.source.lower(), _column_named(dim.expr or "", dim.source))
+        named_by.setdefault(key, []).append(dim)
         if levels.setdefault(key, dim.pii_level) != dim.pii_level:
             logger.warning(
                 "dimensions over %s.%s are classified both %r and %r; the column takes %r",
-                dim.source, expr, levels[key], dim.pii_level, levels[key],
+                dim.source, key[1], levels[key], dim.pii_level, levels[key],
             )
-    if not levels:
-        return columns
     out = []
+    matched = set()
     for col in columns:
-        level = levels.get((col.object_id.lower(), col.name.lower()))
+        key = (col.object_id.lower(), col.name.lower())
+        level = levels.get(key)
+        if level:
+            matched.add(key)
         if level and col.pii_level in (None, "none"):
             logger.info("column %r classified %r by the certified dimension over it", col.id, level)
             col = col.model_copy(update={"pii_level": level})
         out.append(col)
+    for key in sorted(named_by.keys() - matched):
+        for dim in named_by[key]:
+            logger.warning(
+                "personal dimension %r (%r) names no column of %r the snapshot holds, so no column "
+                "is classified by it; the column is refused only by its own classification",
+                dim.id, dim.expr, dim.source,
+            )
     return out
 
 

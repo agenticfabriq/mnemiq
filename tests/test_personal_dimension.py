@@ -93,9 +93,43 @@ def test_the_bare_column_of_a_personal_dimension_is_classified():
 
 def test_a_quoted_or_qualified_column_name_classifies_the_column():
     # The gate's advisory: both name the column, and left unclassified `SELECT ssn` stayed open.
-    for expr in ('"ssn"', "customer.ssn", 'customer."ssn"', " Customer.SSN "):
+    for expr in ('"ssn"', "customer.ssn", 'customer."ssn"', " Customer.SSN ", '"customer"."ssn"',
+                 '"customer".ssn', "pg.customer.ssn"):
         out = apply_certified(_customers(), [_record("customer_ssn", expr, "pii")])
         assert next(c for c in out.columns if c.id == "customer.ssn").pii_level == "pii", expr
+    # A column named like a keyword: sqlglot alone reads `comment` as a command and `case` as
+    # nothing, and the gate measured the column left open by it.
+    for keyword in ("comment", "case", "desc", "customer.comment", '"case"', "customer.select",
+                    "customer.not", "customer.true", "customer.false"):
+        snap = Snapshot(version="v", source_id="s", created_at="t", columns=[
+            Column(id=f"customer.{keyword.split('.')[-1].strip(chr(34))}", object_id="customer",
+                   name=keyword.split(".")[-1].strip(chr(34)))])
+        out = apply_certified(snap, [_record("customer_note", keyword, "pii")])
+        assert out.columns[0].pii_level == "pii", keyword
+    # A column of another table names none of this one's.
+    out = apply_certified(_customers(), [_record("customer_ssn", "employee.ssn", "pii")])
+    assert next(c for c in out.columns if c.id == "customer.ssn").pii_level is None
+
+
+def test_two_levels_over_one_column_classify_it_once_and_say_so(caplog):
+    # `pii` and `phi` are clearances, not an order; the first record's level is kept, and the
+    # disagreement is said rather than settled silently.
+    with caplog.at_level("WARNING", logger="mnemiq.enrichment.certified"):
+        out = apply_certified(_customers(), [_record("customer_ssn", "ssn", "pii"),
+                                             _record("customer_ssn_health", "ssn", "phi")])
+    assert next(c for c in out.columns if c.id == "customer.ssn").pii_level == "pii"
+    assert "classified both 'pii' and 'phi'" in caplog.text
+
+
+def test_a_personal_dimension_that_classifies_no_column_says_so(caplog):
+    # Hidden from the uncleared either way; what is said is that its column is not refused by it.
+    with caplog.at_level("WARNING", logger="mnemiq.enrichment.certified"):
+        apply_certified(_customers(), [_record("customer_ssn", "lower(ssn)", "pii"),
+                                       _record("customer_tin", "tin", "pii")])
+    said = [r.getMessage() for r in caplog.records if "names no column" in r.getMessage()]
+    assert len(said) == 2, said
+    assert "'customer_ssn' ('lower(ssn)')" in said[0] or "'customer_ssn' ('lower(ssn)')" in said[1]
+    assert any("'customer_tin' ('tin')" in line for line in said)
 
 
 def test_a_dimension_classifies_only_a_column_that_says_nothing():
