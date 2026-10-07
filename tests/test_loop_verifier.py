@@ -83,3 +83,55 @@ def test_the_judge_the_agent_calls_reads_the_packets_certified_measure():
     r = _agent(verifier=v).answer(packet, _snapshot(), _GRANTS, _IDENTITY)
     assert r.deferred is False
     assert "Claim Total (claim_total) over claim: sum(claim.n)" in seen["schema"]
+
+
+def _recording_judge(seen):
+    class _Judge:
+        def score(self, question, schema, sql, preview):
+            seen["schema"] = schema
+            return 0.9
+
+    return _Judge()
+
+
+def _turn(question: str, fingerprint: str):
+    from mnemiq.contract import HistoryTurn
+
+    return HistoryTurn(question=question, sql="SELECT n FROM claim", columns=["n"], rows=[[7]],
+                       grant_fingerprint=fingerprint)
+
+
+def test_the_judge_the_agent_calls_reads_the_packets_history():
+    """The join for M134: the earlier turns the agent answers with are the ones its judge reads."""
+    seen = {}
+    packet = _packet()
+    packet.history = [_turn("how many claims are open?", _GRANTS.fingerprint)]
+    v = Verifier(threshold=0.5, sanity=False, grounding=False, judge=_recording_judge(seen))
+    r = _agent(verifier=v).answer(packet, _snapshot(), _GRANTS, _IDENTITY)
+    assert r.deferred is False
+    assert "Q: how many claims are open?" in seen["schema"]
+
+
+def test_a_turn_from_another_boundary_never_reaches_the_judge(monkeypatch):
+    """Through `Runtime.ask`, the door a caller's history enters by: the judge reads the turns
+    `scope_history` admitted for this identity's grants, and not a turn answered under another
+    boundary -- so the judge is sent nothing this identity's generator could not be sent."""
+    import mnemiq.runtime as rt_mod
+    from mnemiq.runtime import Runtime
+
+    class _Authz:
+        def grants_for(self, _identity):
+            return _GRANTS
+
+    seen = {}
+    monkeypatch.setattr(rt_mod, "retrieve", lambda *a, **k: _packet())
+    v = Verifier(threshold=0.5, sanity=False, grounding=False, judge=_recording_judge(seen))
+    rt = Runtime(con=None, snapshot=_snapshot(), adapter=_FakeAdapter(), agent=_agent(verifier=v),
+                 embedder=None, authz=_Authz(), settings=None)
+    r = rt.ask("and how many are closed?", _IDENTITY, history=[
+        _turn("how many claims are open?", _GRANTS.fingerprint),
+        _turn("whose claims are open?", "another-boundary"),
+    ])
+    assert r.deferred is False
+    assert "Q: how many claims are open?" in seen["schema"]
+    assert "whose claims are open?" not in seen["schema"]

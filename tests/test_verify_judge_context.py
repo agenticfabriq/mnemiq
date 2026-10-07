@@ -1,11 +1,14 @@
-"""M132: the result judge reads the certified meaning the generator was given.
+"""The result judge reads the context the generator was given: certified meaning and earlier turns.
 
-Before this the judge was handed the cards alone. On the fs payments corpus that made it decline
-three of six answers that were the certified expression verbatim (0.12 to 0.25 against the 0.5
-cutoff) while passing all six of the bare arm's wrong answers (0.62 to 0.95), because it graded
-each against its own reading of words like "net" and "gross". Given the same cards and the
-certified block, the six right answers scored 0.97 to 1.0, and nine of ten distinct wrong queries
-stayed under the cutoff on every read.
+M132. Handed the cards alone, the judge declined three of six fs payments answers that were the
+certified expression verbatim (0.12 to 0.25 against the 0.5 cutoff) while passing all six of the
+bare arm's wrong answers (0.62 to 0.95), because it graded each against its own reading of words
+like "net" and "gross". Given the certified block, the six right answers scored 0.97 to 1.0, and
+nine of ten distinct wrong queries stayed under the cutoff on every read.
+
+M134. Without the earlier turns, the judge declined three of five right follow-ups ("and by
+channel?", "which one is the largest?") at 0.15 to 0.45; given them, all five scored 0.97 to 1.0,
+and five wrong follow-ups 0.0 to 0.10.
 """
 
 import dataclasses
@@ -14,7 +17,7 @@ from types import SimpleNamespace
 import pyarrow as pa
 import pytest
 
-from mnemiq.contract import Definition, Dimension, MeasureExpr, Metric
+from mnemiq.contract import Definition, Dimension, Example, HistoryTurn, MeasureExpr, Metric
 from mnemiq.generate.prompts import user_prompt
 from mnemiq.semantic.retrieval import ContextPacket, ResolvedConcept, RetrievedCard
 from mnemiq.sql.verdict import Approved
@@ -45,6 +48,10 @@ def _meaning() -> dict:
             ResolvedConcept("payment_transaction.payment_channel", "Channels", "MOB", "Mobile"),
         ],
     }
+
+
+_TURN = HistoryTurn(question="What is the net payment volume?", sql=_SQL,
+                    columns=["net_payment_volume"], rows=[[1808030.48]], grant_fingerprint="f")
 
 
 def _packet(**meaning) -> ContextPacket:
@@ -107,21 +114,44 @@ def test_a_packet_with_no_certified_meaning_is_judged_as_before():
     assert _judged_schema(_packet()) == _CARD
 
 
+@pytest.mark.parametrize("protocol", ["read", "score"])
+def test_the_judge_reads_the_earlier_turns(protocol):
+    schema = _judged_schema(_packet(history=[_TURN]), protocol)
+    assert _CARD in schema
+    assert "Q: What is the net payment volume?" in schema
+    assert f"SQL: {_SQL}" in schema
+    assert "1808030.48" in schema
+
+
+def test_the_judge_reads_every_history_line_the_generator_reads():
+    packet = _packet(history=[_TURN])
+    lines = user_prompt(packet).splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("EARLIER IN THIS CONVERSATION"))
+    generator_history = [line for line in lines[start:lines.index("TABLES:")] if line.strip()]
+    assert len(generator_history) == 5  # header, Q, SQL, RESULT, one row
+    judged = _judged_schema(packet).splitlines()
+    assert [line for line in generator_history if line not in judged] == []
+
+
 def test_every_packet_field_is_judged_or_left_out_on_purpose():
     """Derived from the struct: a field added to `ContextPacket` fails this until it is placed on
-    one side, and a field placed on the judged side must change what the judge reads -- so the
-    placement is checked, not just made (M132 one field over)."""
-    judged = {"cards", "definitions", "metrics", "dimensions", "concepts"}
-    not_judged = {
-        "question",  # handed to the judge on its own
-        "grant_fingerprint", "enrichment_version", "descriptions",  # bookkeeping, not prompt text
-        "examples",  # how to write SQL over these tables, not what a term means
-        "history",  # the judge grades a follow-up without the earlier turns (M134)
+    one side, and the placement is checked both ways -- a judged field, filled on its own, changes
+    what the judge reads, and a field left out does not (M132 and M134 one field over)."""
+    judged = {"cards", "definitions", "metrics", "dimensions", "concepts", "history"}
+    left_out = {
+        "question": "a different question",  # handed to the judge on its own
+        "grant_fingerprint": "another-boundary",  # bookkeeping, not prompt text
+        "enrichment_version": "v2",
+        "descriptions": (1, 2),
+        # How to write SQL over these tables, not what a term means or what was asked before.
+        "examples": [Example(question="q", sql="SELECT 1", object_id="payment_transaction")],
     }
-    assert {f.name for f in dataclasses.fields(ContextPacket)} == judged | not_judged
-    # Every judged field but the cards has a value in the fixture, and each, filled on its own,
-    # reaches the judge.
-    assert set(_meaning()) == judged - {"cards"}
-    unread = [name for name, value in _meaning().items()
+    assert {f.name for f in dataclasses.fields(ContextPacket)} == judged | set(left_out)
+    filled = {**_meaning(), "history": [_TURN]}
+    assert set(filled) == judged - {"cards"}
+    unread = [name for name, value in filled.items()
               if _judged_schema(_packet(**{name: value})) == _CARD]
     assert unread == []
+    leaked = [name for name, value in left_out.items()
+              if _judged_schema(_packet(**{name: value})) != _CARD]
+    assert leaked == []
