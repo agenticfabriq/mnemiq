@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from mnemiq.contract.seams import DeferralReason
 from mnemiq.execute.render import render_result
-from mnemiq.generate.prompts import meaning_sections
+from mnemiq.generate.prompts import history_section, meaning_sections
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
 from mnemiq.verify.grounding import grounding_check
@@ -11,17 +11,20 @@ from mnemiq.verify.verdict import VerifyVerdict
 
 
 def _judge_schema(packet: ContextPacket) -> str:
-    """What the judge reads as SCHEMA: the cards, then the certified meaning the generator was given.
+    """What the judge reads as SCHEMA: the cards, then the certified meaning and the earlier turns
+    the generator was given.
 
-    Both, because a judge that sees only the cards grades the answer against its own guess at the
+    All three, because a judge missing either grades the answer against its own guess: at the
     question's words -- "net volume" read as amount minus refunds, when the certified measure says
-    otherwise -- and so declines the certified answer and passes the guess (M132). A packet with no
-    certified meaning renders exactly as before, so the 0.5 threshold, measured on bare packets,
-    still describes those.
+    otherwise (M132) -- or at a follow-up's, where "and by channel?" names no measure at all
+    (M134). Either way it declines the right answer. A single-turn packet with no certified
+    meaning renders exactly as before, so the 0.5 threshold, measured on those, still describes
+    them. The history is the scoped list `Runtime.ask` set, so no turn reaches the judge that this
+    identity's boundary did not admit.
     """
     cards = "\n".join(c.card for c in packet.cards)
-    meaning = "\n".join(meaning_sections(packet)).strip()
-    return f"{cards}\n\n{meaning}" if meaning else cards
+    context = "\n".join(meaning_sections(packet) + history_section(packet)).strip()
+    return f"{cards}\n\n{context}" if context else cards
 
 
 # Written out rather than composed from a clause, because composing them produced "The verifier

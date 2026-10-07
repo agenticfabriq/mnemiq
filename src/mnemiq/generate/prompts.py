@@ -144,6 +144,35 @@ def meaning_sections(packet: ContextPacket) -> list[str]:
     return parts
 
 
+def history_section(packet: ContextPacket) -> list[str]:
+    """The packet's earlier turns as prompt lines, led by a blank line; empty when there are none.
+
+    Shared with the judge for the reason `meaning_sections` is: a follow-up such as "and by
+    channel?" names nothing on its own, so a judge without the earlier turns grades the words and
+    declined three of five right follow-ups on the fs payments corpus (M134).
+    """
+    if not packet.history:
+        return []
+    # Prior turns, oldest first. The rows are what a pronoun resolves against: the
+    # previous SQL computed "the top region" without ever naming it.
+    parts = [
+        "",
+        "EARLIER IN THIS CONVERSATION (resolve references like \"it\" against these "
+        "results; the current QUESTION is still the one to answer):",
+    ]
+    for turn in packet.history:
+        parts.append(f"Q: {sanitize(turn.question, limit=300)}")
+        if turn.sql:
+            parts.append(f"SQL: {turn.sql}")
+        if turn.columns and turn.rows:
+            parts.append("RESULT: " + " | ".join(sanitize(c, limit=60) for c in turn.columns))
+            for row in turn.rows:
+                parts.append(
+                    "        " + " | ".join(sanitize(str(v), limit=60) for v in row)
+                )
+    return parts
+
+
 def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
     cards = "\n\n".join(c.card for c in packet.cards) or "(no tables are available to you)"
     parts = [f"QUESTION: {sanitize(packet.question, limit=500)}"]
@@ -152,24 +181,7 @@ def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
         parts += ["", "WORKED EXAMPLES (verified queries over these tables -- adapt, don't copy blindly):"]
         for ex in packet.examples:
             parts += [f"Q: {sanitize(ex.question, limit=300)}", f"SQL: {ex.sql}"]
-    if packet.history:
-        # Prior turns, oldest first. The rows are what a pronoun resolves against: the
-        # previous SQL computed "the top region" without ever naming it.
-        parts += [
-            "",
-            "EARLIER IN THIS CONVERSATION (resolve references like \"it\" against these "
-            "results; the current QUESTION is still the one to answer):",
-        ]
-        for turn in packet.history:
-            parts.append(f"Q: {sanitize(turn.question, limit=300)}")
-            if turn.sql:
-                parts.append(f"SQL: {turn.sql}")
-            if turn.columns and turn.rows:
-                parts.append("RESULT: " + " | ".join(sanitize(c, limit=60) for c in turn.columns))
-                for row in turn.rows:
-                    parts.append(
-                        "        " + " | ".join(sanitize(str(v), limit=60) for v in row)
-                    )
+    parts += history_section(packet)
     parts += ["", "TABLES:", cards]
     if feedback:
         parts += [
