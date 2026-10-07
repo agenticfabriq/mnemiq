@@ -91,6 +91,13 @@ def test_the_bare_column_of_a_personal_dimension_is_classified():
     )
 
 
+def test_a_quoted_or_qualified_column_name_classifies_the_column():
+    # The gate's advisory: both name the column, and left unclassified `SELECT ssn` stayed open.
+    for expr in ('"ssn"', "customer.ssn", 'customer."ssn"', " Customer.SSN "):
+        out = apply_certified(_customers(), [_record("customer_ssn", expr, "pii")])
+        assert next(c for c in out.columns if c.id == "customer.ssn").pii_level == "pii", expr
+
+
 def test_a_dimension_classifies_only_a_column_that_says_nothing():
     # The column's own sensitive level is the more specific statement; a dimension never swaps
     # pii for phi or back, and an unmarked or non-bare dimension touches no column.

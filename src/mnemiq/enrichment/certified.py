@@ -552,6 +552,16 @@ def _is_attested(record: CertifiedRecord) -> bool:
     )
 
 
+def _column_named(expr: str, source: str) -> str:
+    """`expr` as the folded name of a column of `source`, or what it is when it names none."""
+    name = expr.strip()
+    if name.lower().startswith(source.lower() + "."):
+        name = name[len(source) + 1:]
+    if len(name) > 2 and name[0] == name[-1] == '"':
+        name = name[1:-1]
+    return name.lower()
+
+
 def _classify_dimension_columns(columns: list, dimensions: list) -> list:
     """M135. The column a personal dimension IS, classified at the dimension's level.
 
@@ -560,16 +570,17 @@ def _classify_dimension_columns(columns: list, dimensions: list) -> list:
     dimension's -- so where Verity classified the dimension and not the column, the column is
     classified too. Only a column that says nothing (no level, or `none`): its own sensitive level
     is the more specific statement, and `pii` and `phi` are clearances, not an order to raise
-    along. Only where the `expr` IS the column's name, folded as unquoted identifiers are; an
-    expression over the column (`lower(ssn)`) names no column, and is left to the column's own
-    classification.
+    along. Only where the `expr` names the column -- `ssn`, `"ssn"` or `customer.ssn`, folded as
+    unquoted identifiers are (a quoted one folded too: classifying a near-miss refuses more, never
+    less); an expression over the column (`lower(ssn)`) names no column, and is left to the
+    column's own classification.
     """
     levels: dict[tuple[str, str], str] = {}
     for dim in dimensions:
-        expr = (dim.expr or "").strip()
+        expr = _column_named(dim.expr or "", dim.source)
         if dim.pii_level not in SENSITIVE_PII or not expr:
             continue
-        key = (dim.source.lower(), expr.lower())
+        key = (dim.source.lower(), expr)
         if levels.setdefault(key, dim.pii_level) != dim.pii_level:
             logger.warning(
                 "dimensions over %s.%s are classified both %r and %r; the column takes %r",

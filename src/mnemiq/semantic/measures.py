@@ -45,7 +45,9 @@ def select_dimensions(
     **A personal one only where the identity reads its level raw (M135)** -- `sql.policy`'s rule
     for a column: no level, `none`, or a level in `pii_clearance`. A masked level is not enough:
     offering a dimension invites grouping by it, which is a raw read. Exact level, as clearance
-    is: cleared for `pii` is not cleared for `phi`, and an unrecognised level clears for no one.
+    is: cleared for `pii` is not cleared for `phi`. A level outside the vocabulary clears for no
+    one here -- though a certified dimension arrives with one already read as `pii` by
+    `apply_certified`, as a column's is.
     """
     in_context = set(table_ids)
     return [
