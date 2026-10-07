@@ -34,6 +34,10 @@ class Column(BaseModel):
     semantic_type: str | None = None
     description: str | None = None
     pii_level: str | None = None
+    # M135. The levels certified personal dimensions over this column give it (`apply_certified`),
+    # beside its own -- added, never substituted: `pii` and `phi` are separate clearances, so one
+    # level cannot stand for two, and choosing one exposed the other's data to whoever held it.
+    dimension_pii_levels: list[str] = Field(default_factory=list)
     coded_values: list[CodedValue] = Field(default_factory=list)
     code_scheme: CodeScheme | None = None
     # Profile counts. None means "profiling did not run", never zero -- a fabricated
@@ -45,6 +49,15 @@ class Column(BaseModel):
     # -> the other columns that repeat table-wide but are unique among that partition's rows.
     # A type-2 dimension's `is_current` says `{"=1": ["customer_id"]}`. None: not measured.
     unique_within: dict[str, list[str]] | None = None
+
+    def pii_levels(self) -> frozenset[str]:
+        """Every level this column is read under, its own and its dimensions', `none` aside.
+        Reading it raw takes clearance for each (`sql.policy`), and any sensitive one keeps its
+        values out of the index (`semantic.values`)."""
+        return frozenset(
+            level for level in (self.pii_level, *self.dimension_pii_levels)
+            if level and level != "none"
+        )
 
 
 class ViewDefinition(BaseModel):

@@ -93,7 +93,7 @@ def governed_grants(
     chosen_level = mask_level if mask_level in all_levels else None
     masked = tuple(sorted(
         c.object_id + "." + c.name for c in snapshot.columns
-        if chosen_level and c.pii_level == chosen_level))
+        if chosen_level and chosen_level in c.pii_levels()))
 
     known = {t.lower() for t in tables}
     in_corpus = (filter_table or "").lower() in known

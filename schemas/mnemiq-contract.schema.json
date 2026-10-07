@@ -101,6 +101,13 @@
             "default": null,
             "title": "Description"
           },
+          "dimension_pii_levels": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Dimension Pii Levels",
+            "type": "array"
+          },
           "distinct_count": {
             "anyOf": [
               {
@@ -746,7 +753,7 @@
     "title": "CertifiedRecord",
     "type": "object"
   },
-  "format_version": "1.4.0",
+  "format_version": "1.5.0",
   "identity_context": {
     "properties": {
       "attributes": {
@@ -1099,6 +1106,13 @@
             ],
             "default": null,
             "title": "Description"
+          },
+          "dimension_pii_levels": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Dimension Pii Levels",
+            "type": "array"
           },
           "distinct_count": {
             "anyOf": [

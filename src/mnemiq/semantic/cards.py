@@ -84,8 +84,8 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
             parts = [f"- {column.name} ({column.data_type or 'unknown'}"]
             if column.semantic_type:
                 parts.append(f", {column.semantic_type}")
-            if column.pii_level and column.pii_level != "none":
-                parts.append(f", {column.pii_level}")
+            for level in sorted(column.pii_levels()):
+                parts.append(f", {level}")
             parts.append(")")
 
             line = "".join(parts)
@@ -126,9 +126,7 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
             # cards form labels `(text, identifier, high)` reached a ddl-style generator
             # with no PII marker at all.
             annotations = ", ".join(
-                a for a in (column.semantic_type,
-                            column.pii_level if column.pii_level not in (None, "none") else None)
-                if a)
+                a for a in (column.semantic_type, *sorted(column.pii_levels())) if a)
             prose = line[len("".join(parts)):].strip()
             ddl.append((column.name, column.data_type or "text",
                         "; ".join(x for x in (annotations, prose) if x)))
