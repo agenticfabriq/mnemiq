@@ -40,10 +40,24 @@ def select_metrics(
 def select_dimensions(
     table_ids: Sequence[str], dimensions: Sequence[Dimension], grants: GrantSet
 ) -> list[Dimension]:
-    """The certified dimensions over the tables in context, that this identity may see."""
+    """The certified dimensions over the tables in context, that this identity may see.
+
+    **A personal one only where the identity reads its level raw (M135)** -- `sql.policy`'s rule
+    for a column: no level, `none`, or a level in `pii_clearance`. A masked level is not enough:
+    offering a dimension invites grouping by it, which is a raw read. Exact level, as clearance
+    is: cleared for `pii` is not cleared for `phi`. A level outside the vocabulary clears for no
+    one here -- though a certified dimension arrives with one already read as `pii` by
+    `apply_certified`, as a column's is.
+    """
     in_context = set(table_ids)
     return [
         dimension
         for dimension in dimensions
-        if dimension.source in in_context and grants.allows(dimension.source)
+        if dimension.source in in_context
+        and grants.allows(dimension.source)
+        and _read_raw(dimension.pii_level, grants)
     ]
+
+
+def _read_raw(level: str | None, grants: GrantSet) -> bool:
+    return not level or level == "none" or level in grants.pii_clearance

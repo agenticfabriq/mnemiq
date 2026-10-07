@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from mnemiq.authz.grants import GrantSet
+from mnemiq.authz.grants import GrantSet, classified_levels
 from mnemiq.contract import Snapshot
 
 
@@ -88,7 +88,7 @@ def governed_grants(
             "filter_table needs a filter_predicate that can exclude rows; there is no safe "
             "default, because the obvious one (`1 = 1`) withholds nothing")
 
-    all_levels = {c.pii_level for c in snapshot.columns if c.pii_level and c.pii_level != "none"}
+    all_levels = set(classified_levels(snapshot))
 
     chosen_level = mask_level if mask_level in all_levels else None
     masked = tuple(sorted(

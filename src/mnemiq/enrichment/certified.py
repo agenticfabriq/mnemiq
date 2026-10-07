@@ -8,6 +8,9 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import sqlglot
+from sqlglot import exp
+
 from mnemiq.config import CERTIFIED_RECORDS_PATH
 from mnemiq.contract import PII_LEVELS, CertifiedRecord, CodedValue, Job, Snapshot
 from mnemiq.contract.semantic import CertifiedRef
@@ -552,6 +555,89 @@ def _is_attested(record: CertifiedRecord) -> bool:
     )
 
 
+def _column_named(expr: str, source: str) -> str:
+    """The folded name of the column of `source` that `expr` is -- or a name no column has.
+
+    Read by sqlglot where it reads a column: the gate on this found `"ssn"`, then `customer.ssn`,
+    then `"customer"."ssn"` and a schema-qualified source, each naming the column and each missed
+    by the spelling read before. Its qualifier must name the dimension's table, compared on dotted
+    suffixes -- `pg.person` is named by `person.ssn` and the other way round, and a same-named
+    table of another schema matches too, which classifies more, never less; a column of another
+    table names none of this one's. sqlglot's default dialect, since the dimension carries none,
+    so a dialect's own quoting (backticks, brackets) is not read as one.
+
+    Where sqlglot reads no column, the spelling read: the table's own qualifier and one layer of
+    double quotes off, folded. sqlglot reads `comment` as a command and `customer.select` as
+    nothing, and the gate measured each leaving a keyword-named column open. An expression over a
+    column (`lower(ssn)`) folds to a name no column has, so it classifies nothing.
+    """
+    try:
+        node = sqlglot.parse_one(expr)
+    except sqlglot.errors.SqlglotError:
+        node = None
+    table = source.lower()
+    if isinstance(node, exp.Column) and node.name:
+        qualifier = ".".join(p for p in (node.catalog, node.db, node.table) if p).lower()
+        if qualifier and not (qualifier == table or table.endswith("." + qualifier)
+                              or qualifier.endswith("." + table)):
+            return ""
+        return node.name.lower()
+    name = expr.strip()
+    if name.lower().startswith(table + "."):
+        name = name[len(table) + 1:]
+    if len(name) > 2 and name[0] == name[-1] == '"':
+        name = name[1:-1]
+    return name.lower()
+
+
+def _classify_dimension_columns(columns: list, dimensions: list) -> list:
+    """M135. The column a personal dimension IS, classified at the dimension's level.
+
+    Keeping the dimension out of the packet (`select_dimensions`) leaves the model free to write
+    the column by name, and the decider refuses on the column's classification, not the
+    dimension's -- so where Verity classified the dimension and not the column, the column is
+    classified too. Only a column that says nothing (no level, or `none`): its own sensitive level
+    is the more specific statement, and `pii` and `phi` are clearances, not an order to raise
+    along. Only where the `expr` IS one column of the dimension's table (`_column_named`), its
+    name folded -- a quoted one too, since classifying a near-miss refuses more, never less. A
+    personal dimension that names no column the snapshot holds -- an expression over one
+    (`lower(ssn)`), another table's, an absent one -- classifies nothing, and it is said: the
+    dimension is still hidden from the uncleared, and the column is refused only by its own
+    classification.
+    """
+    levels: dict[tuple[str, str], str] = {}
+    named_by: dict[tuple[str, str], list] = {}
+    for dim in dimensions:
+        if dim.pii_level not in SENSITIVE_PII:
+            continue
+        key = (dim.source.lower(), _column_named(dim.expr or "", dim.source))
+        named_by.setdefault(key, []).append(dim)
+        if levels.setdefault(key, dim.pii_level) != dim.pii_level:
+            logger.warning(
+                "dimensions over %s.%s are classified both %r and %r; the column takes %r",
+                dim.source, key[1], levels[key], dim.pii_level, levels[key],
+            )
+    out = []
+    matched = set()
+    for col in columns:
+        key = (col.object_id.lower(), col.name.lower())
+        level = levels.get(key)
+        if level:
+            matched.add(key)
+        if level and col.pii_level in (None, "none"):
+            logger.info("column %r classified %r by the certified dimension over it", col.id, level)
+            col = col.model_copy(update={"pii_level": level})
+        out.append(col)
+    for key in sorted(named_by.keys() - matched):
+        for dim in named_by[key]:
+            logger.warning(
+                "personal dimension %r (%r) names no column of %r the snapshot holds, so no column "
+                "is classified by it; the column is refused only by its own classification",
+                dim.id, dim.expr, dim.source,
+            )
+    return out
+
+
 def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snapshot:
     """Overlay certified MEANING onto locally-profiled STRUCTURE.
 
@@ -635,6 +721,22 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
             "coded_values": coded,
             "code_scheme": cert.code_scheme,
         }))
+
+    # M135. A certified dimension's `pii_level`, read as a column's (M41): an unrecognised level
+    # is recorded beside the columns' and read as `_MOST_SENSITIVE`, never as nothing.
+    dimensions = []
+    for dim in by_type.get("dimension", []):
+        if dim.pii_level is not None and dim.pii_level not in PII_LEVELS:
+            logger.warning(
+                "unrecognised pii_level %r on dimension %r (not one of %s) -- read as %r",
+                dim.pii_level, dim.id, "/".join(PII_LEVELS), _MOST_SENSITIVE,
+            )
+            unrecognised_levels.append(f"dimension:{dim.id}")
+            dim = dim.model_copy(update={"pii_level": _MOST_SENSITIVE})
+        dimensions.append(dim)
+    if dimensions:
+        by_type["dimension"] = dimensions
+    new_cols = _classify_dimension_columns(new_cols, dimensions)
 
     updates: dict = {"columns": new_cols}
     # `snapshot.jobs` is this codebase's structured run record, so a security-relevant refusal goes

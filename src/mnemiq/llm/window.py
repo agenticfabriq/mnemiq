@@ -47,7 +47,7 @@ from dataclasses import dataclass, replace
 
 import httpx
 
-from mnemiq.authz.grants import GrantSet
+from mnemiq.authz.grants import GrantSet, classified_levels
 from mnemiq.generate.generator import GENERATOR_MAX_TOKENS
 from mnemiq.generate.prompts import system_prompt, user_prompt
 from mnemiq.llm.client import reasoning_budget
@@ -150,9 +150,8 @@ class WindowReport:
 
 def everything(snapshot) -> GrantSet:
     """Every table, every PII level cleared: the widest view, for tests and a single-identity store."""
-    levels = frozenset(c.pii_level for c in snapshot.columns if c.pii_level)
     tables = {b.object_id for b in snapshot.source_bindings} | {c.object_id for c in snapshot.columns}
-    return GrantSet(frozenset(tables), pii_clearance=levels)
+    return GrantSet(frozenset(tables), pii_clearance=classified_levels(snapshot))
 
 
 def largest_prompt(con, snapshot, settings, dialect: str,

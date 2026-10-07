@@ -5,7 +5,7 @@ from collections.abc import Callable, Sequence
 from mnemiq.agent.budget import Budget
 from mnemiq.agent.loop import Agent, AgentAnswer
 from mnemiq.assembly import build_components
-from mnemiq.authz.grants import GrantSet
+from mnemiq.authz.grants import GrantSet, classified_levels
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.config import Settings
 from mnemiq.contract import Definition, IdentityContext, Snapshot
@@ -135,9 +135,7 @@ def build_engine(
     # so CLS does not refuse legitimate columns (e.g. CustomerID). Governance/RLS/CLS have their
     # own tests; a benchmark that denied enrichment-tagged PII would under-count every attempt.
     if grants is None:
-        levels = frozenset(
-            c.pii_level for c in snapshot.columns if c.pii_level and c.pii_level != "none")
-        grants = GrantSet(frozenset(tables), pii_clearance=levels)
+        grants = GrantSet(frozenset(tables), pii_clearance=classified_levels(snapshot))
     else:
         # A GOVERNED arm. Every arm above this line grants everything by design, so nothing the
         # benchmark has ever measured exercised a narrowed answer end to end -- which is why the
