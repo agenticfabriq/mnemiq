@@ -130,7 +130,14 @@ def test_a_quoted_path_names_its_column():
         assert ("customer", "ssn") in build_access_policy(out, _grants()).denied, expr
         assert not any(j.kind == "certified_dimension_column_unresolved" for j in out.jobs), (
             f"{expr}: a reference whose split reading is held is resolved")
-    # The whole name is kept as a reading too: a column truly named with a dot is classified.
+    # The whole name is kept as a reading too: with a column truly named `customer.ssn` beside
+    # `ssn`, the same spelling makes both require the clearance, as both readings could be meant.
+    both = Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="customer.ssn", object_id="customer", name="ssn"),
+        Column(id="customer.customer.ssn", object_id="customer", name="customer.ssn")])
+    out = apply_certified(both, [_record("customer_ssn", "`customer.ssn`", "pii")])
+    assert {c.name: c.pii_levels() for c in out.columns} == {
+        "ssn": {"pii"}, "customer.ssn": {"pii"}}
     dotted = Snapshot(version="v", source_id="s", created_at="t", columns=[
         Column(id="customer.a.b", object_id="customer", name="a.b")])
     out = apply_certified(dotted, [_record("customer_ab", '"a.b"', "pii")])
