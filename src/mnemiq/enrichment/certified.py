@@ -570,20 +570,26 @@ def _names_table(qualifier: str, table: str) -> bool:
     return not q or q == t or t.endswith("." + q) or q.endswith("." + t)
 
 
-def _columns_read(expr: str, source: str) -> set[str]:
-    """The folded names of the columns of `source` that `expr` reads.
+def _columns_read(expr: str, source: str) -> set[frozenset[str]]:
+    """The columns of `source` that `expr` reads, each as the folded names it could be.
 
     Every column it reads, not only an `expr` that IS one: a personal value derived from columns
     -- `lower(ssn)` -- makes them personal, and reading them requires its clearance as reading it
     would. A column the expression only tests (`status` in `CASE WHEN status = 'x' THEN ssn
     END`) takes the level too, deliberately: it can deny a column that is not itself personal to
-    the uncleared, which refuses more, and narrowing it would mean deciding which reads expose. Parsed by sqlglot in each of `_EXPR_DIALECTS`; where none reads a column, the spelling
-    read: the last dotted part, if what precedes it -- its quotes off -- names the table. sqlglot
-    reads an unquoted `comment` as a command and `customer.select` as nothing, and the gate
-    measured each leaving a keyword-named column open. (A quoted name always parses in one of the
-    dialects, so only the qualifier's quotes reach this.)
+    the uncleared, which refuses more, and narrowing it would mean deciding which reads expose.
+
+    Parsed by sqlglot in each of `_EXPR_DIALECTS`. A name read with a dot in it is a quoted path
+    read as one identifier -- BigQuery's `` `customer.ssn` `` is one name to sqlite (Codex's review
+    of the option-A change, which measured it leaving `ssn` open) -- so it is also split: the last
+    part the column, the rest its qualifier. Both readings are kept, the split one and the whole
+    one a column may truly be named, and a reference is one set of the names it could be.
+
+    Where no dialect reads a column, the spelling read: the last dotted part, if what precedes it
+    -- its quotes off -- names the table. sqlglot reads an unquoted `comment` as a command and
+    `customer.select` as nothing, and the gate measured each leaving a keyword-named column open.
     """
-    names: set[str] = set()
+    refs: set[frozenset[str]] = set()
     for dialect in _EXPR_DIALECTS:
         try:
             node = sqlglot.parse_one(expr, read=dialect)
@@ -592,14 +598,22 @@ def _columns_read(expr: str, source: str) -> set[str]:
         if node is None:
             continue
         for column in node.find_all(exp.Column):
+            if not column.name:
+                continue
             qualifier = ".".join(p for p in (column.catalog, column.db, column.table) if p)
-            if column.name and _names_table(qualifier, source):
+            names = set()
+            if _names_table(qualifier, source):
                 names.add(column.name.lower())
-    if names:
-        return names
+            path, _, last = column.name.rpartition(".")
+            if path and last and _names_table(".".join(p for p in (qualifier, path) if p), source):
+                names.add(last.lower())
+            if names:
+                refs.add(frozenset(names))
+    if refs:
+        return refs
     qualifier, _, name = expr.strip().rpartition(".")
     qualifier = ".".join(part.strip(_QUOTES) for part in qualifier.split(".")) if qualifier else ""
-    return {name.lower()} if name and _names_table(qualifier, source) else set()
+    return {frozenset({name.lower()})} if name and _names_table(qualifier, source) else set()
 
 
 def _classify_dimension_columns(columns: list, dimensions: list) -> tuple[list, list[str]]:
@@ -619,14 +633,18 @@ def _classify_dimension_columns(columns: list, dimensions: list) -> tuple[list, 
     which the caller records.
     """
     by_column: dict[tuple[str, str], set[str]] = {}
-    reads: dict[str, set[tuple[str, str]]] = {}
+    reads: dict[str, list[set[tuple[str, str]]]] = {}
     for dim in dimensions:
         if dim.pii_level not in SENSITIVE_PII:
             continue
-        keys = {(dim.source.lower(), name) for name in _columns_read(dim.expr or "", dim.source)}
-        reads[dim.id] = keys
-        for key in keys:
-            by_column.setdefault(key, set()).add(dim.pii_level)
+        table = dim.source.lower()
+        # Each reference as the keys it could be; every one of them takes the level, which refuses
+        # more where a reading names a column the expression did not mean.
+        reads[dim.id] = [{(table, name) for name in ref}
+                         for ref in _columns_read(dim.expr or "", dim.source)]
+        for keys in reads[dim.id]:
+            for key in keys:
+                by_column.setdefault(key, set()).add(dim.pii_level)
     out, held = [], set()
     for col in columns:
         key = (col.object_id.lower(), col.name.lower())
@@ -638,7 +656,9 @@ def _classify_dimension_columns(columns: list, dimensions: list) -> tuple[list, 
                 logger.info("column %r requires %s by the certified dimensions over it", col.id, merged)
                 col = col.model_copy(update={"dimension_pii_levels": merged})
         out.append(col)
-    unresolved = sorted(dim_id for dim_id, keys in reads.items() if not keys or keys - held)
+    # Resolved where some reading of each reference is a column this snapshot holds.
+    unresolved = sorted(dim_id for dim_id, refs in reads.items()
+                        if not refs or any(not keys & held for keys in refs))
     for dim_id in unresolved:
         logger.warning(
             "personal dimension %r names a column of its table the snapshot does not hold, so that "

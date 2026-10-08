@@ -118,6 +118,32 @@ def test_every_spelling_of_the_column_requires_its_clearance():
     assert _ssn(out).pii_levels() == set()
 
 
+def test_a_quoted_path_names_its_column():
+    """Codex's review of option A: BigQuery quotes a whole path, `` `customer.ssn` ``, and sqlite
+    reads it as ONE column named `customer.ssn` -- so `ssn` was left open to the uncleared. A name
+    read with a dot in it is split as well, and the policy denies the column."""
+    from mnemiq.sql.policy import build_access_policy
+
+    for expr in ("`customer.ssn`", "lower(`customer.ssn`)", "`pg.customer.ssn`"):
+        out = apply_certified(_customers(), [_record("customer_ssn", expr, "pii")])
+        assert _ssn(out).pii_levels() == {"pii"}, expr
+        assert ("customer", "ssn") in build_access_policy(out, _grants()).denied, expr
+        assert not any(j.kind == "certified_dimension_column_unresolved" for j in out.jobs), (
+            f"{expr}: a reference whose split reading is held is resolved")
+    # The whole name is kept as a reading too: with a column truly named `customer.ssn` beside
+    # `ssn`, the same spelling makes both require the clearance, as both readings could be meant.
+    both = Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="customer.ssn", object_id="customer", name="ssn"),
+        Column(id="customer.customer.ssn", object_id="customer", name="customer.ssn")])
+    out = apply_certified(both, [_record("customer_ssn", "`customer.ssn`", "pii")])
+    assert {c.name: c.pii_levels() for c in out.columns} == {
+        "ssn": {"pii"}, "customer.ssn": {"pii"}}
+    dotted = Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id="customer.a.b", object_id="customer", name="a.b")])
+    out = apply_certified(dotted, [_record("customer_ab", '"a.b"', "pii")])
+    assert out.columns[0].pii_levels() == {"pii"}
+
+
 def test_every_column_a_personal_expression_reads_requires_its_clearance():
     # A personal value derived from columns makes them personal: `lower(ssn)` left `ssn` open
     # when only an expression that IS a column classified one.
