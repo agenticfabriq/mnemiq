@@ -64,6 +64,18 @@ def test_transpiling_targets_the_source_dialect():
     assert "SELECT" in verdict.target_sql
 
 
+def test_a_capped_rollup_reaches_the_target_dialect_instead_of_crashing():
+    # M137: sqlglot parses `GROUP BY ... WITH ROLLUP` and the row cap appends `LIMIT 1000`, but sqlglot cannot
+    # parse its own `... WITH ROLLUP LIMIT 1000` back. Rendering the target from text raised out of `decide`;
+    # rendering it from the tree is the statement the source accepts.
+    verdict = decide(
+        "SELECT claim_identifier, COUNT(claim_open_date) AS n FROM claim GROUP BY claim_identifier WITH ROLLUP",
+        VISIBLE, target="mysql",
+    )
+    assert isinstance(verdict, Approved)
+    assert verdict.target_sql.endswith("GROUP BY claim_identifier WITH ROLLUP LIMIT 1000")
+
+
 @pytest.mark.integration
 @requires_acme
 def test_explain_proves_the_query_against_the_real_source():
