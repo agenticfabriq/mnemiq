@@ -66,8 +66,8 @@ def test_transpiling_targets_the_source_dialect():
 
 def test_a_capped_rollup_reaches_the_target_dialect_instead_of_crashing():
     # M137: sqlglot parses `GROUP BY ... WITH ROLLUP` and the row cap appends `LIMIT 1000`, but sqlglot cannot
-    # parse its own `... WITH ROLLUP LIMIT 1000` back. Rendering the target from text raised out of `decide`;
-    # rendering it from the tree is the statement the source accepts.
+    # parse its own `... WITH ROLLUP LIMIT 1000` back, so re-reading the capped plan raised out of `decide`.
+    # The plan is re-read without its cap and the cap put back (`_transpile_under_the_cap`).
     verdict = decide(
         "SELECT claim_identifier, COUNT(claim_open_date) AS n FROM claim GROUP BY claim_identifier WITH ROLLUP",
         VISIBLE, target="mysql",
@@ -79,7 +79,8 @@ def test_a_capped_rollup_reaches_the_target_dialect_instead_of_crashing():
 def test_a_parseable_plan_still_reaches_the_target_through_the_dialect_round_trip():
     # The round trip normalizes dialect types: BigQuery's FLOAT is 64-bit, and the plan text re-read as BigQuery
     # becomes DuckDB's DOUBLE. Rendering the tree straight to DuckDB gives REAL, which loses precision at
-    # 16777217 and still passes EXPLAIN. The tree is M137's fallback for text sqlglot cannot read, nothing more.
+    # 16777217 and still passes EXPLAIN. So the target is never rendered straight from the tree, not even in
+    # M137's fallback, which re-reads the plan without its cap instead.
     verdict = decide("SELECT CAST(a AS FLOAT) AS x FROM t", {"t": {"a"}}, dialect="bigquery", target="duckdb")
     assert isinstance(verdict, Approved)
     assert "CAST(a AS DOUBLE)" in verdict.target_sql
