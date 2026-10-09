@@ -21,6 +21,24 @@ from mnemiq.sql.views import check_views
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
 
 
+def _transpile_under_the_cap(shaped: exp.Expression, dialect: str, target: str) -> str:
+    """The plan's round trip to the target with the row cap taken off, and the cap put back after.
+
+    sqlglot 30.12 cannot parse a LIMIT straight after `GROUP BY ROLLUP`, `CUBE`, `GROUPING SETS` or `WITH
+    ROLLUP`, and the cap is what puts one there, so re-reading the capped plan raised out of `decide` (M137).
+    The round trip itself is still wanted: it normalizes dialect types (BigQuery's FLOAT is 64-bit and re-reads
+    as DuckDB's DOUBLE, where the tree rendered straight to DuckDB says REAL and loses precision). So the plan is
+    re-read without its LIMIT, which sqlglot can parse, and the LIMIT goes back onto the re-read tree.
+    """
+    limit = shaped.args.get("limit")
+    uncapped = shaped.copy()
+    uncapped.set("limit", None)
+    reread = sqlglot.parse_one(uncapped.sql(dialect=dialect), read=dialect)
+    if limit is not None:
+        reread.set("limit", limit.copy())
+    return reread.sql(dialect=target)
+
+
 def decide(
     sql: str,
     visible: dict[str, set[str]],
@@ -161,11 +179,7 @@ def decide(
     try:
         target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
     except sqlglot.errors.ParseError:
-        # sqlglot can render text it cannot read back, and the row cap produces some: `GROUP BY ... WITH
-        # ROLLUP` parses, gains `LIMIT 1000`, and the re-parse raised out of `decide` (M137). The round trip
-        # stays the rule because it normalizes dialect types -- BigQuery's FLOAT is 64-bit, and the tree
-        # rendered straight to DuckDB says REAL -- so the tree is only the fallback for unreadable text.
-        target_sql = shaped.sql(dialect=target)
+        target_sql = _transpile_under_the_cap(shaped, dialect, target)
 
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof

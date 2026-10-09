@@ -85,6 +85,23 @@ def test_a_parseable_plan_still_reaches_the_target_through_the_dialect_round_tri
     assert "CAST(a AS DOUBLE)" in verdict.target_sql
 
 
+def test_a_capped_grouping_set_keeps_the_dialect_round_trip_and_its_precision():
+    # sqlglot 30.12 cannot parse a LIMIT straight after ROLLUP, CUBE or GROUPING SETS, and the cap puts it there.
+    # Rendering that plan straight from the tree skips the round trip's type normalization: BigQuery's 64-bit
+    # FLOAT becomes DuckDB's REAL, and 16777217 comes back as 16777216 after EXPLAIN has passed.
+    import duckdb
+
+    verdict = decide(
+        "SELECT CAST(a AS FLOAT) AS x, COUNT(*) AS n FROM t GROUP BY ROLLUP(a)", {"t": {"a"}},
+        dialect="bigquery", target="duckdb",
+    )
+    assert isinstance(verdict, Approved)
+    assert verdict.target_sql.endswith("LIMIT 1000")
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t AS SELECT 16777217::BIGINT AS a")
+    assert 16777217.0 in {row[0] for row in con.execute(verdict.target_sql).fetchall()}
+
+
 @pytest.mark.integration
 @requires_acme
 def test_explain_proves_the_query_against_the_real_source():
