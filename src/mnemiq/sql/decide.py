@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlglot
 from sqlglot import exp
 
 from mnemiq.contract import ViewDefinition
@@ -157,10 +158,14 @@ def decide(
     expand_tables(shaped, registry or {})
 
     plan_sql = shaped.sql(dialect=dialect)
-    # From the tree, not by re-parsing `plan_sql`: sqlglot can render text it cannot read back, and the row
-    # cap is what produces it -- `GROUP BY ... WITH ROLLUP` parses, gains `LIMIT 1000`, and the round trip
-    # raised out of `decide` instead of answering (M137).
-    target_sql = shaped.sql(dialect=target)
+    try:
+        target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
+    except sqlglot.errors.ParseError:
+        # sqlglot can render text it cannot read back, and the row cap produces some: `GROUP BY ... WITH
+        # ROLLUP` parses, gains `LIMIT 1000`, and the re-parse raised out of `decide` (M137). The round trip
+        # stays the rule because it normalizes dialect types -- BigQuery's FLOAT is 64-bit, and the tree
+        # rendered straight to DuckDB says REAL -- so the tree is only the fallback for unreadable text.
+        target_sql = shaped.sql(dialect=target)
 
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof

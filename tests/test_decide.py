@@ -76,6 +76,15 @@ def test_a_capped_rollup_reaches_the_target_dialect_instead_of_crashing():
     assert verdict.target_sql.endswith("GROUP BY claim_identifier WITH ROLLUP LIMIT 1000")
 
 
+def test_a_parseable_plan_still_reaches_the_target_through_the_dialect_round_trip():
+    # The round trip normalizes dialect types: BigQuery's FLOAT is 64-bit, and the plan text re-read as BigQuery
+    # becomes DuckDB's DOUBLE. Rendering the tree straight to DuckDB gives REAL, which loses precision at
+    # 16777217 and still passes EXPLAIN. The tree is M137's fallback for text sqlglot cannot read, nothing more.
+    verdict = decide("SELECT CAST(a AS FLOAT) AS x FROM t", {"t": {"a"}}, dialect="bigquery", target="duckdb")
+    assert isinstance(verdict, Approved)
+    assert "CAST(a AS DOUBLE)" in verdict.target_sql
+
+
 @pytest.mark.integration
 @requires_acme
 def test_explain_proves_the_query_against_the_real_source():
