@@ -160,6 +160,7 @@ def profile_table(
     table: TableInfo,
     k: int = 10,
     code_max_distinct: int = 25,
+    code_max_length: int = 200,
     key_columns: set[str] | None = None,
 ) -> list[ColumnStats]:
     """One counts query for the whole table; top-k only where it is cheap and useful."""
@@ -291,6 +292,11 @@ def profile_table(
             # code set (<= code_max_distinct distinct), so a rare code must not be dropped -- else a
             # dictionary can never ground it and the model never sees it. Bounded by the cap.
             s.top_k = _top_k(adapter, table.name, c, code_max_distinct)
+            # A small value set is not a vocabulary when a value in it is a document: BEAVER's nova
+            # keeps JSON of up to 2,975 characters in columns with 18 distinct values, and the card
+            # printed every one in full, past any prompt window, with nothing the fit could trim (M139).
+            if any(len(str(value)) > code_max_length for value, _count in s.top_k):
+                s.top_k = []
         stats.append(s)
     _profile_partitions(adapter, table, stats)
     return stats
