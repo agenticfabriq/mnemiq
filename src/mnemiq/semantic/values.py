@@ -13,6 +13,23 @@ from mnemiq.semantic.textmatch import similarity
 # the trust check and the harvesting gate cannot drift apart.
 SENSITIVE_PII = frozenset({"pii", "phi"})
 
+# Longer than this, a value is a document, not a code (M139: BEAVER's nova keeps JSON of up to 2,975
+# characters in columns with 18 distinct values). The snapshot and this index keep it whole, because
+# grounding and the binder compare real values; only what a prompt shows is cut.
+SHOWN_LIMIT = 200
+
+
+def shown(value: str) -> str:
+    """A value as a prompt shows it: whole up to SHOWN_LIMIT characters, past that its start and length.
+
+    The marker says the start is not the value, because the generator is told to copy codes exactly
+    and an equality against a cut value matches nothing.
+    """
+    if len(value) <= SHOWN_LIMIT:
+        return value
+    return (f"{value[:SHOWN_LIMIT]}...[cut: the first {SHOWN_LIMIT} of {len(value):,} characters, "
+            "never compare with it]")
+
 # Physical column names avoid `column`/`value`, which are reserved words in DuckDB.
 _DDL = """
 CREATE TABLE IF NOT EXISTS value_index (

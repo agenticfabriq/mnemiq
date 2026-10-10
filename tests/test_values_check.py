@@ -61,3 +61,14 @@ def test_an_ambiguous_unqualified_column_is_skipped():
     idx = _FakeIndex({("a", "Country"): {"X"}, ("b", "Country"): {"Y"}})
     sql = "SELECT * FROM a JOIN b ON a.id = b.id WHERE Country = 'Z'"
     assert check_values(_ast(sql), visible, idx) is None
+
+
+def test_a_document_among_the_nearest_values_is_cut_in_the_refusal():
+    # M139: the refusal goes back to the model as repair feedback, and quoted up to 8 of nova's
+    # 2,975-character JSON values whole -- the overflow the card no longer causes.
+    doc = '{"cells": [' + ", ".join('{"id": %d}' % i for i in range(300)) + "]}"
+    idx = _FakeIndex({("t", "doc"): {doc, "short"}})
+    v = check_values(_ast("SELECT doc FROM t WHERE doc = 'x'"), {"t": {"doc"}}, idx)
+    assert isinstance(v, Refusal) and v.code == RefusalCode.VALUE_GROUNDING
+    assert doc not in v.message and doc[:200] in v.message
+    assert "never compare with it" in v.message and "short" in v.message

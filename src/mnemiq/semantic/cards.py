@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from mnemiq.contract import Column, Snapshot
+from mnemiq.semantic.values import shown
 from mnemiq.sql.policy import AccessPolicy
 
 
@@ -110,7 +111,7 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
                 )
             if column.coded_values:
                 codes = "; ".join(
-                    f"{cv.code} = {cv.meaning}" if cv.meaning else cv.code
+                    f"{shown(cv.code)} = {cv.meaning}" if cv.meaning else shown(cv.code)
                     for cv in column.coded_values
                 )
                 line += f" Values: {codes}"
