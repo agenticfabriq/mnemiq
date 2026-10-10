@@ -38,6 +38,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from mnemiq import verity_http
 from mnemiq.enrichment.verity_auth import access_token
 
 logger = logging.getLogger(__name__)
@@ -489,7 +490,7 @@ class VerityTraceSink(TraceSink):
             headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with verity_http.urlopen(request, timeout=10) as response:
                 self._note_voided_claims(response)
                 return
         except (urllib.error.URLError, OSError, ValueError) as exc:
@@ -500,9 +501,11 @@ class VerityTraceSink(TraceSink):
             # `HTTPError` subclasses `URLError` and carries `.code`, which is the whole difference
             # between "you are wrong" and "they are down". A 4xx is permanent and actionable; a 5xx
             # is the receiver being broken, which is an outage that heals without anyone acting, so
-            # it groups with a refused socket rather than with a rejection.
+            # it groups with a refused socket rather than with a rejection. A 3xx is a redirect
+            # `verity_http` refused (M106): the configured URL is not the final one -- permanent
+            # until someone fixes it, so a rejection too.
             code = getattr(exc, "code", None)
-            cause = "rejected" if isinstance(code, int) and 400 <= code < 500 else "unavailable"
+            cause = "rejected" if isinstance(code, int) and 300 <= code < 500 else "unavailable"
             self._drop(cause, exc)
 
 

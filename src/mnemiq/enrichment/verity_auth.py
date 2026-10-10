@@ -7,6 +7,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from mnemiq import verity_http
+
 logger = logging.getLogger(__name__)
 
 # (token_url, client_id) -> (access_token, expires_at_epoch_seconds)
@@ -62,7 +64,7 @@ def access_token(settings, *, force_refresh: bool = False) -> str | None:
         token_url, data=body,
         headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with verity_http.urlopen(request, timeout=30) as response:
             payload = json.loads(response.read())
     except (urllib.error.URLError, OSError, ValueError) as exc:
         # `exc` carries the URL and status only -- the secret must never reach a log line.

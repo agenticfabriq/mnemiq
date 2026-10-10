@@ -14,6 +14,7 @@ from sqlglot import exp
 from mnemiq.config import CERTIFIED_RECORDS_PATH
 from mnemiq.contract import PII_LEVELS, CertifiedRecord, CodedValue, Job, Snapshot
 from mnemiq.contract.semantic import CertifiedRef
+from mnemiq import verity_http
 from mnemiq.enrichment.verity_auth import access_token
 from mnemiq.ontology.records import ConceptScheme
 from mnemiq.semantic.values import SENSITIVE_PII
@@ -478,7 +479,7 @@ def _get_records(settings, url: str) -> dict | None:
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         request = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with verity_http.urlopen(request, timeout=30) as response:
                 return json.loads(response.read())
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and token is not None and not force_refresh:

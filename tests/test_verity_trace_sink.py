@@ -15,6 +15,7 @@ import pytest
 from dataclasses import dataclass, field
 
 
+from mnemiq import verity_http
 from mnemiq.contract.seams import IdentityContext
 from mnemiq.contract.semantic import CertifiedRef
 from mnemiq.observability import trace_sink as mod
@@ -114,9 +115,8 @@ def _sent(monkeypatch, settings, event) -> dict:
         captured["body"] = json.loads(request.data)
         return _Resp()
 
-    from mnemiq.observability import trace_sink as mod
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     VerityTraceSink(settings).record_answer(event)
     return captured["body"]["traces"][0]
 
@@ -204,12 +204,11 @@ def test_an_outage_does_not_fail_the_answer_and_is_counted(monkeypatch):
     that had nothing to send."""
     import urllib.error
 
-    from mnemiq.observability import trace_sink as mod
 
     def boom(request, timeout=0):
         raise urllib.error.URLError("verity is down")
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(verity_http, "urlopen", boom)
     sink = VerityTraceSink(_Settings())
     sink.record_answer(_event())  # must not raise
 
@@ -217,12 +216,11 @@ def test_an_outage_does_not_fail_the_answer_and_is_counted(monkeypatch):
 
 
 def test_no_verity_configured_sends_nothing(monkeypatch):
-    from mnemiq.observability import trace_sink as mod
 
     def fail(request, timeout=0):  # pragma: no cover - must not be reached
         raise AssertionError("emitted with no Verity configured")
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fail)
+    monkeypatch.setattr(verity_http, "urlopen", fail)
     VerityTraceSink(_Settings(verity_traces_url=None)).record_answer(_event())
 
 
@@ -314,12 +312,11 @@ def test_a_rejected_request_is_counted_as_our_configuration(monkeypatch):
     auth mode answers 401 to the headers this sink sends, so this is the live case."""
     import urllib.error
 
-    from mnemiq.observability import trace_sink as mod
 
     def unauthorized(request, timeout=0):
         raise urllib.error.HTTPError(request.full_url, 401, "Unauthorized", {}, None)
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", unauthorized)
+    monkeypatch.setattr(verity_http, "urlopen", unauthorized)
     sink = VerityTraceSink(_Settings())
     sink.record_answer(_event())
 
@@ -333,14 +330,13 @@ def test_an_unreachable_receiver_is_counted_as_their_outage(monkeypatch, failure
     from a 4xx rather than a different log line."""
     import urllib.error
 
-    from mnemiq.observability import trace_sink as mod
 
     def boom(request, timeout=0):
         if failure == "url_error":
             raise urllib.error.URLError("verity is down")
         raise urllib.error.HTTPError(request.full_url, 503, "Service Unavailable", {}, None)
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(verity_http, "urlopen", boom)
     sink = VerityTraceSink(_Settings())
     sink.record_answer(_event())
 
@@ -352,15 +348,14 @@ def test_the_total_still_counts_every_cause(monkeypatch):
     keeps one number to watch; only the operator asking "why" needs the breakdown."""
     import urllib.error
 
-    from mnemiq.observability import trace_sink as mod
 
     sink = VerityTraceSink(_Settings())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen",
+    monkeypatch.setattr(verity_http, "urlopen",
                         lambda r, timeout=0: (_ for _ in ()).throw(
                             urllib.error.HTTPError(r.full_url, 401, "no", {}, None)))
     sink.record_answer(_event())
-    monkeypatch.setattr(mod.urllib.request, "urlopen",
+    monkeypatch.setattr(verity_http, "urlopen",
                         lambda r, timeout=0: (_ for _ in ()).throw(urllib.error.URLError("down")))
     sink.record_answer(_event())
 
@@ -401,7 +396,7 @@ def _respond(monkeypatch, payload: bytes):
             amt = args[0] if args else None
             return payload if amt is None else payload[:amt]
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
+    monkeypatch.setattr(verity_http, "urlopen", lambda request, timeout=0: _Resp())
 
 
 def test_a_voided_lineage_claim_is_counted_not_swallowed(monkeypatch, caplog):
@@ -525,7 +520,7 @@ def test_the_receipt_read_is_bounded_by_the_declared_length(monkeypatch):
             seen["limit"] = args[0] if args else None
             return body
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
+    monkeypatch.setattr(verity_http, "urlopen", lambda request, timeout=0: _Resp())
     sink = VerityTraceSink(_Settings())
     sink.record_answer(_event())
 
@@ -564,7 +559,7 @@ def test_a_receipt_without_a_declared_length_is_not_waited_on(monkeypatch):
             reads.append(args)
             return b"{}"
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
+    monkeypatch.setattr(verity_http, "urlopen", lambda request, timeout=0: _Resp())
     sink = VerityTraceSink(_Settings())
 
     sink.record_answer(_event())
@@ -599,7 +594,7 @@ def test_a_receipt_larger_than_the_cap_is_not_read(monkeypatch):
             reads.append(args)
             return b"{}"
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
+    monkeypatch.setattr(verity_http, "urlopen", lambda request, timeout=0: _Resp())
     sink = VerityTraceSink(_Settings())
 
     sink.record_answer(_event())
@@ -662,7 +657,7 @@ def test_a_nonsensical_declared_length_is_refused(monkeypatch, declared):
             reads.append(args)
             return b"{}"
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", lambda request, timeout=0: _Resp())
+    monkeypatch.setattr(verity_http, "urlopen", lambda request, timeout=0: _Resp())
     sink = VerityTraceSink(_Settings())
 
     sink.record_answer(_event())

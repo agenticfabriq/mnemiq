@@ -1,5 +1,6 @@
 import io
 import json as _json
+from mnemiq import verity_http
 
 
 class _Resp(io.BytesIO):
@@ -37,7 +38,7 @@ def test_drains_all_pages_following_next_cursor(tmp_path, monkeypatch):
         return _Resp(_json.dumps({"records": [_record("a")], "watermark": "t2",
                                   "next_cursor": "1"}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     records = mod.fetch_certified_records(_settings(tmp_path)).records
     assert [r.envelope.object_id for r in records] == ["a", "b"]  # both pages
     assert any("cursor=1" in url for url in seen)  # followed next_cursor
@@ -50,7 +51,7 @@ def test_persists_watermark_after_full_drain_and_sends_it_next_time(tmp_path, mo
         return _Resp(_json.dumps({"records": [_record("a")], "watermark": "t9",
                                   "next_cursor": None}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", once)
+    monkeypatch.setattr(verity_http, "urlopen", once)
     mod.fetch_certified_records(_settings(tmp_path)).records
     # M18: the sidecar holds the records as well as the watermark, in one write, so a watermark
     # that advanced while its records did not is not a state that can exist.
@@ -65,7 +66,7 @@ def test_persists_watermark_after_full_drain_and_sends_it_next_time(tmp_path, mo
         sent.append(req.full_url)
         return _Resp(_json.dumps({"records": [], "watermark": "t9", "next_cursor": None}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", capture)
+    monkeypatch.setattr(verity_http, "urlopen", capture)
     mod.fetch_certified_records(_settings(tmp_path)).records
     assert any("since=t9" in url for url in sent)  # incremental on the second pull
 
@@ -80,7 +81,7 @@ def test_partial_drain_does_not_advance_the_watermark(tmp_path, monkeypatch):
         return _Resp(_json.dumps({"records": [_record("a")], "watermark": "t2",
                                   "next_cursor": "1"}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     records = mod.fetch_certified_records(_settings(tmp_path)).records
     # M18 changed this deliberately. This used to return the page-1 records -- a KNOWINGLY
     # TRUNCATED set, which `enrich` would then bake into a snapshot that becomes the current one:
@@ -103,7 +104,7 @@ def test_a_partial_drain_serves_the_last_complete_set(tmp_path, monkeypatch):
         return _Resp(_json.dumps({"records": [_record("a"), _record("b")], "watermark": "t1",
                                   "next_cursor": None}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", first_pull)
+    monkeypatch.setattr(verity_http, "urlopen", first_pull)
     mod.fetch_certified_records(_settings(tmp_path)).records
 
     def blips_mid_drain(req, timeout=0):
@@ -112,7 +113,7 @@ def test_a_partial_drain_serves_the_last_complete_set(tmp_path, monkeypatch):
         return _Resp(_json.dumps({"records": [_record("c")], "watermark": "t2",
                                   "next_cursor": "1"}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", blips_mid_drain)
+    monkeypatch.setattr(verity_http, "urlopen", blips_mid_drain)
     records = mod.fetch_certified_records(_settings(tmp_path)).records
 
     assert sorted(r.envelope.object_id for r in records) == ["a", "b"], (
@@ -130,6 +131,6 @@ def test_missing_sidecar_means_full_pull(tmp_path, monkeypatch):
         return _Resp(_json.dumps({"records": [_record("a")], "watermark": None,
                                   "next_cursor": None}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     mod.fetch_certified_records(_settings(tmp_path)).records
     assert not any("since=" in url for url in sent)  # no watermark on disk -> no since=
