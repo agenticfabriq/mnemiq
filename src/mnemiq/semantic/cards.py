@@ -48,7 +48,7 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
     caller must be rendered WITH a policy** -- a denied column is omitted outright, and a masked one
     keeps its name and type while losing everything derived from the data (description, coded
     values, code scheme, the entirely-null note). A relationship is shown only when the identity is
-    granted both of its tables: the line names the other table and its join key.
+    granted both of its tables and denied neither key column, since the line names all of them (M142).
 
     Redaction lives here, in the renderer, rather than in a pass over rendered text: parsing this
     format back apart would be a second implementation of the card vocabulary, free to drift from
@@ -67,10 +67,22 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
     for column in snapshot.columns:
         columns.setdefault(column.object_id, []).append(column)
 
+    def join_visible(rel) -> bool:
+        # A join names the other table and both key columns, so it is shown only to an identity
+        # granted both tables and denied neither key. A key may arrive qualified; the left one is
+        # `from_`'s and the right one `to`'s.
+        if policy is None:
+            return True
+        if not (policy.names(rel.from_) and policy.names(rel.to)):
+            return False
+        return not any(policy.denies(rel.from_, k.left.rsplit(".", 1)[-1])
+                       or policy.denies(rel.to, k.right.rsplit(".", 1)[-1])
+                       for k in rel.join_keys)
+
     joins: dict[str, list[str]] = {}
     for rel in snapshot.relationships:
-        if policy is not None and not (policy.names(rel.from_) and policy.names(rel.to)):
-            continue  # a join names the other table and its key; the identity is not told either
+        if not join_visible(rel):
+            continue
         keys = ", ".join(f"{k.left} = {k.right}" for k in rel.join_keys)
         line = f"- joins {rel.to} ({rel.cardinality}{': ' + keys if keys else ''})"
         joins.setdefault(rel.from_, []).append(line)
