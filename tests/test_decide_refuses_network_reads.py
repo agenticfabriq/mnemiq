@@ -2,8 +2,9 @@
 
 Where DuckDB's `httpfs` is installed it fetches a URL for `read_csv('https://...')`, and a query
 can carry data out in that URL (`... || (SELECT max(id) FROM claim)`). Under MNEMIQ_LOCAL_ONLY the
-engine's connections cannot load `httpfs` at all (#92); everywhere, the deciders are what stands
-between the model and the network. Measured 2026-10-10: every shape below is refused, each for the
+engine's connections neither auto-install nor auto-load an extension (#92) -- but an explicit `LOAD`
+still runs on one, so everywhere, local-only or not, these refusals are the control between the
+model and the network, not a backup to it. Measured 2026-10-10: every shape below is refused, each for the
 reason pinned beside it. Most are table functions, which reach `check_access` as a table named
 `''` -- no grant names it, so `unauthorized_table` with that empty subject. That reason is
 incidental and so worth pinning: a change that skipped unnamed tables let four of them through,
@@ -79,3 +80,47 @@ def test_the_same_shapes_over_a_granted_table_are_approved():
                      GrantSet(frozenset(_VISIBLE), writable=frozenset({"claim"})),
                      adapter=_ExplainsAnything(), dialect="duckdb", writes_enabled=True,
                      policy=AccessPolicy()), Refusal)
+
+
+# Codex's review of M107's connection-level fix (#92): a local-only connection's flags govern only
+# automatic installation and loading, so `LOAD postgres` followed by an `ATTACH` to a remote DSN, or
+# `SET autoload_known_extensions = true`, run on one. What keeps model-written SQL from issuing them
+# is these refusals -- the shape check, by code (the subject is parser detail and may move); a
+# scanner function, as the table named '' like any other table function.
+EXPLICIT = {
+    "LOAD": ("LOAD httpfs", "not_select_only", "not_a_write"),
+    "INSTALL": ("INSTALL httpfs", "not_select_only", "not_a_write"),
+    "SET re-enabling auto-load":
+        ("SET autoload_known_extensions = true", "not_select_only", "not_a_write"),
+    "ATTACH a remote database":
+        ("ATTACH 'postgresql://h/db' AS r (TYPE POSTGRES)", "not_select_only", "not_a_write"),
+    "PRAGMA": ("PRAGMA enable_external_access", "not_select_only", "not_a_write"),
+    "CALL": ("CALL postgres_attach('postgresql://h/db')", "not_select_only", "not_a_write"),
+}
+
+SCANNERS = {
+    "postgres_scan": "SELECT a FROM postgres_scan('postgresql://h/db', 'public', 't')",
+    "postgres_query": "SELECT a FROM postgres_query('r', 'select 1')",
+}
+
+
+@pytest.mark.parametrize(("sql", "read_code", "write_code"), EXPLICIT.values(),
+                         ids=EXPLICIT.keys())
+def test_both_deciders_refuse_statements_that_load_attach_or_reconfigure(sql, read_code,
+                                                                          write_code):
+    read = decide(sql, _VISIBLE, dialect="duckdb", target="duckdb")
+    write = decide_write(sql, _VISIBLE, GrantSet(frozenset(_VISIBLE), writable=frozenset({"claim"})),
+                         adapter=_ExplainsAnything(), dialect="duckdb", writes_enabled=True,
+                         policy=AccessPolicy())
+    assert _why(read)[0] == read_code
+    assert _why(write)[0] == write_code
+
+
+@pytest.mark.parametrize("sql", SCANNERS.values(), ids=SCANNERS.keys())
+def test_both_deciders_refuse_a_scanner_function_as_the_unnamed_table(sql):
+    assert _why(decide(sql, _VISIBLE, dialect="duckdb", target="duckdb")) == _UNNAMED
+    write = decide_write(f"INSERT INTO claim (id) {sql}", _VISIBLE,
+                         GrantSet(frozenset(_VISIBLE), writable=frozenset({"claim"})),
+                         adapter=_ExplainsAnything(), dialect="duckdb", writes_enabled=True,
+                         policy=AccessPolicy())
+    assert _why(write) == _UNNAMED
