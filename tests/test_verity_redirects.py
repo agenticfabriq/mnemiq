@@ -17,8 +17,9 @@ import pytest
 
 
 class _Host:
-    """A local HTTP host. With `redirect_to` it answers every request 302 to that base, keeping
-    the path; without, 200 and `body` as JSON. `seen` records what reached it."""
+    """A local HTTP host. With `redirect_to` it answers every request 302 to that base's
+    `/redirected` -- a fixed path, never the request's own, so no header is built from what a
+    client sent; without, 200 and `body` as JSON. `seen` records what reached it."""
 
     def __init__(self, body=None, redirect_to=None):
         self.seen: list[dict] = []
@@ -35,7 +36,7 @@ class _Host:
                                   "body": sent.decode(errors="replace")})
                 if host.redirect_to:
                     self.send_response(302)
-                    self.send_header("Location", host.redirect_to + self.path)
+                    self.send_header("Location", host.redirect_to + "/redirected")
                     self.send_header("content-length", "0")
                     self.end_headers()
                     return
