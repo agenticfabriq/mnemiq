@@ -47,7 +47,8 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
     enrich-time, identity-independent unit that gets embedded and indexed. **A card served to a
     caller must be rendered WITH a policy** -- a denied column is omitted outright, and a masked one
     keeps its name and type while losing everything derived from the data (description, coded
-    values, code scheme, the entirely-null note).
+    values, code scheme, the entirely-null note). A relationship is shown only when the identity is
+    granted both of its tables: the line names the other table and its join key.
 
     Redaction lives here, in the renderer, rather than in a pass over rendered text: parsing this
     format back apart would be a second implementation of the card vocabulary, free to drift from
@@ -68,6 +69,8 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
 
     joins: dict[str, list[str]] = {}
     for rel in snapshot.relationships:
+        if policy is not None and not (policy.names(rel.from_) and policy.names(rel.to)):
+            continue  # a join names the other table and its key; the identity is not told either
         keys = ", ".join(f"{k.left} = {k.right}" for k in rel.join_keys)
         line = f"- joins {rel.to} ({rel.cardinality}{': ' + keys if keys else ''})"
         joins.setdefault(rel.from_, []).append(line)
