@@ -580,7 +580,7 @@ def _classify_dimension_columns(columns: list, dimensions: list) -> tuple[list, 
         # Each reference as the keys it could be; every one of them takes the level, which refuses
         # more where a reading names a column the expression did not mean.
         reads[dim.id] = [{(table, name) for name in ref}
-                         for ref in columns_read(dim.expr or "", dim.source)]
+                         for ref in columns_read(dim.expression(), dim.source)]
         for keys in reads[dim.id]:
             for key in keys:
                 by_column.setdefault(key, set()).add(dim.pii_level)

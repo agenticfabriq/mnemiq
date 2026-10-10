@@ -53,7 +53,11 @@ def select_dimensions(
     `apply_certified`, as a column's is.
     """
     in_context = set(table_ids)
-    by_key = {(c.object_id.lower(), c.name.lower()): c for c in columns}
+    # Every column under each folded name: `customer."SSN"` and `customer.ssn` are two columns in
+    # Postgres, and keeping one decided the clearance by their order (Codex on #95).
+    by_key: dict[tuple[str, str], list[Column]] = {}
+    for column in columns:
+        by_key.setdefault((column.object_id.lower(), column.name.lower()), []).append(column)
     return [
         dimension
         for dimension in dimensions
@@ -75,12 +79,11 @@ def _reads_every_column_raw(dimension: Dimension, by_key: dict, grants: GrantSet
     no column here decides nothing: the dimension's own level still does.
     """
     table = dimension.source.lower()
-    for ref in _columns_read(dimension.expr or "", dimension.source):
+    for ref in _columns_read(dimension.expression(), dimension.source):
         for name in ref:
-            column = by_key.get((table, name))
-            if column is not None and not all(_read_raw(level, grants)
-                                               for level in column.pii_levels()):
-                return False
+            for column in by_key.get((table, name), ()):
+                if not all(_read_raw(level, grants) for level in column.pii_levels()):
+                    return False
     return True
 
 
