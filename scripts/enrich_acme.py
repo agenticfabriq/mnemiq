@@ -21,7 +21,7 @@ def main() -> int:
         print("set MNEMIQ_PG_DSN", file=sys.stderr)
         return 1
 
-    adapter = DuckDBPostgresAdapter(settings.pg_dsn)
+    adapter = DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only)
 
     print("structural pass...")
     snapshot = enrich_structural(adapter, "acme")
@@ -44,7 +44,7 @@ def main() -> int:
         print(f"  failed: {', '.join(failed)}")
 
     store_path = os.getenv("MNEMIQ_STORE_PATH", "mnemiq.duckdb")
-    save_snapshot(init_store(store_path), snapshot)
+    save_snapshot(init_store(store_path, local_only=settings.local_only), snapshot)
     print(f"snapshot {snapshot.version} -> {store_path}")
     return 0
 

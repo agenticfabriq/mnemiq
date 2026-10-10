@@ -17,6 +17,9 @@ import sys
 
 import duckdb
 
+from mnemiq.config import Settings
+from mnemiq.duckdb_extensions import load_extension
+
 
 def _lit(value: str) -> str:
     """SQL string literal. DuckDB's ATTACH and COPY..TO take a literal, not a parameter."""
@@ -44,7 +47,7 @@ def sqlite_dbs(root: str) -> list[tuple[str, str]]:
 
 def _attach(sqlite_path: str, *, all_varchar: bool = False):
     con = duckdb.connect()
-    con.execute("INSTALL sqlite; LOAD sqlite;")
+    load_extension(con, "sqlite", local_only=Settings().local_only)
     if all_varchar:
         # SQLite is dynamically typed, so a column declared INTEGER can hold "F" (Spider's
         # `Is_male` does). Reading that table as text is lossy but truthful; the alternative is

@@ -5,6 +5,8 @@ import threading
 import duckdb
 import pyarrow as pa
 
+from mnemiq.duckdb_extensions import load_extension
+
 # The declared-FK query for Postgres sources: run through postgres_query so the
 # information_schema joins execute with real Postgres semantics, not DuckDB's proxy.
 _PG_FK_QUERY = (
@@ -82,6 +84,7 @@ class DuckDBAdapter:
         table_schema: str,
         fk_via_postgres: bool,
         read_only: bool = True,
+        local_only: bool = False,
     ) -> None:
         self._catalog = catalog
         self._table_schema = table_schema
@@ -91,19 +94,22 @@ class DuckDBAdapter:
         # A DuckDB file needs no extension: the engine already speaks its own format. INSTALLing a
         # nonexistent "duckdb" extension would fail, so the empty string means "nothing to load".
         if extension:
-            self._con.execute(f"INSTALL {extension}; LOAD {extension};")
+            load_extension(self._con, extension, local_only=local_only)
         # READ_ONLY unless a write is explicitly enabled -- the backstop under the write path.
         clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
         self._con.execute(f"ATTACH '{attach_target}' AS {catalog} {clause}")
         self._con.execute(f"USE {catalog}.{table_schema}")
 
     @classmethod
-    def postgres(cls, dsn: str, schema: str = "src", read_only: bool = True) -> "DuckDBAdapter":
+    def postgres(cls, dsn: str, schema: str = "src", read_only: bool = True, *,
+                 local_only: bool = False) -> "DuckDBAdapter":
         return cls(attach_target=dsn, attach_type="POSTGRES", extension="postgres",
-                   catalog=schema, table_schema="public", fk_via_postgres=True, read_only=read_only)
+                   catalog=schema, table_schema="public", fk_via_postgres=True, read_only=read_only,
+                   local_only=local_only)
 
     @classmethod
-    def duckdb(cls, path: str, schema: str = "d", read_only: bool = True) -> "DuckDBAdapter":
+    def duckdb(cls, path: str, schema: str = "d", read_only: bool = True, *,
+               local_only: bool = False) -> "DuckDBAdapter":
         """A DuckDB file as the source.
 
         The class calls itself the universal executor and could attach Postgres and SQLite and not
@@ -112,12 +118,14 @@ class DuckDBAdapter:
         """
         return cls(attach_target=path, attach_type="DUCKDB", extension="",
                    catalog=schema, table_schema="main", fk_via_postgres=False,
-                   read_only=read_only)
+                   read_only=read_only, local_only=local_only)
 
     @classmethod
-    def sqlite(cls, path: str, schema: str = "s", read_only: bool = True) -> "DuckDBAdapter":
+    def sqlite(cls, path: str, schema: str = "s", read_only: bool = True, *,
+               local_only: bool = False) -> "DuckDBAdapter":
         return cls(attach_target=path, attach_type="SQLITE", extension="sqlite",
-                   catalog=schema, table_schema="main", fk_via_postgres=False, read_only=read_only)
+                   catalog=schema, table_schema="main", fk_via_postgres=False, read_only=read_only,
+                   local_only=local_only)
 
     def introspect(self) -> list[str]:
         rows = self._con.execute(
@@ -321,7 +329,8 @@ class DuckDBPostgresAdapter(DuckDBAdapter):
     Preserved as a thin subclass so existing imports and call sites are unchanged.
     """
 
-    def __init__(self, dsn: str, schema: str = "src", read_only: bool = True) -> None:
+    def __init__(self, dsn: str, schema: str = "src", read_only: bool = True, *,
+                 local_only: bool = False) -> None:
         super().__init__(attach_target=dsn, attach_type="POSTGRES", extension="postgres",
                          catalog=schema, table_schema="public", fk_via_postgres=True,
-                         read_only=read_only)
+                         read_only=read_only, local_only=local_only)

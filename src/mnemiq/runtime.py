@@ -820,7 +820,7 @@ def build_runtime(settings: Settings) -> Runtime:
         raise UnknownMode(
             f"MNEMIQ_MODE={default_mode!r} names no mode; valid modes: {sorted(MODES)}"
         )
-    con = init_store(settings.store_path)
+    con = init_store(settings.store_path, local_only=settings.local_only)
     # Current version per source (shared pointer when a control DSN is set, else local) + snapshot.
     snapshot, loaded_versions = load_current_snapshot(settings, con)
     specs = settings.source_specs()
@@ -829,7 +829,8 @@ def build_runtime(settings: Settings) -> Runtime:
         # carrying the catalog->schema registry the decider expands with.
         from mnemiq.adapters.federated import FederatedAdapter
 
-        adapter = FederatedAdapter(specs, read_only=not settings.write_enabled)
+        adapter = FederatedAdapter(specs, read_only=not settings.write_enabled,
+                                   local_only=settings.local_only)
     else:
         # Single source: dispatch on the SPEC, not on pg_dsn. This branch used to read
         # `settings.pg_dsn` directly, which meant a one-entry manifest was resolved into a spec

@@ -11,6 +11,7 @@ from mnemiq.adapters.duckdb import (
     duckdb_user_functions,
 )
 from mnemiq.config import SourceSpec
+from mnemiq.duckdb_extensions import load_extension
 
 _EXT = {"postgres": ("postgres", "POSTGRES"), "sqlite": ("sqlite", "SQLITE")}
 
@@ -27,7 +28,9 @@ class FederatedAdapter:
 
     dialect = "duckdb"
 
-    def __init__(self, specs: list[SourceSpec], read_only: bool = True) -> None:
+    def __init__(
+        self, specs: list[SourceSpec], read_only: bool = True, *, local_only: bool = False
+    ) -> None:
         self.registry: dict[str, str] = {s.catalog: s.schema for s in specs}
         self.catalogs = frozenset(self.registry)
         # Validate the WHOLE manifest before connecting to any of it. Checked inside the attach
@@ -47,7 +50,7 @@ class FederatedAdapter:
         for spec in specs:
             ext, attach_type = _EXT[spec.kind]
             if ext not in loaded:
-                self._con.execute(f"INSTALL {ext}; LOAD {ext};")
+                load_extension(self._con, ext, local_only=local_only)
                 loaded.add(ext)
             clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
             self._con.execute(f"ATTACH '{spec.target}' AS {spec.catalog} {clause}")

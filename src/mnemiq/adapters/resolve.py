@@ -152,6 +152,7 @@ def _adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_onl
         table_schema=spec.schema or default_schema,
         fk_via_postgres=fk_via_postgres,
         read_only=read_only,
+        local_only=bool(settings is not None and settings.local_only),
     )
 
 

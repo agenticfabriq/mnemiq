@@ -102,7 +102,7 @@ def build_engine(
     can report what the run cost.
     """
     embedder = LLMEmbedder(settings)
-    con = init_store(store_path)
+    con = init_store(store_path, local_only=settings.local_only)
     build_index(con, snapshot, embedder)
     build_example_index(con, snapshot, embedder)
     build_value_index(adapter, snapshot, con)

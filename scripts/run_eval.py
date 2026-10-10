@@ -67,7 +67,7 @@ def main() -> int:
         print("set MNEMIQ_PG_DSN", file=sys.stderr)
         return 1
 
-    adapter = DuckDBPostgresAdapter(settings.pg_dsn)
+    adapter = DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only)
     report_dir = Path(args.report) if args.report else None
 
     # The glossary applies to BOTH arms: the A/B isolates enrichment, nothing else.
