@@ -47,7 +47,7 @@ def main() -> int:
     source_id = os.getenv("MNEMIQ_SOURCE_ID", "acme")
     store_path = os.getenv("MNEMIQ_STORE_PATH", "mnemiq.duckdb")
 
-    con = init_store(store_path)
+    con = init_store(store_path, local_only=settings.local_only)
     version = current_version(con, source_id)
     if version is None:
         print("no snapshot: run enrich_acme.py then build_store.py", file=sys.stderr)
@@ -96,7 +96,7 @@ def main() -> int:
         generator=LLMGenerator(LLMClient(settings),
                                declare_assumed_terms=settings.guard_undefined_terms),
         synthesizer=LLMSynthesizer(LLMClient(settings)),
-        adapter=DuckDBPostgresAdapter(settings.pg_dsn),
+        adapter=DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only),
         cache=TwoTierCache(L1Cache()),
         guard_undefined_terms=settings.guard_undefined_terms,
         guard_fanout=settings.guard_fanout,

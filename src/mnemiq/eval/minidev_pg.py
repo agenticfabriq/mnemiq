@@ -76,7 +76,8 @@ def run_minidev_pg(
         )
 
         def _build(snapshot=snapshot):  # bind the current db's snapshot; own connections per worker
-            engine_adapter = DuckDBAdapter.postgres(pg_dsn, read_only=True)  # engine SQL -> bird_dev
+            engine_adapter = DuckDBAdapter.postgres(pg_dsn, read_only=True,
+                                                    local_only=settings.local_only)  # engine SQL -> bird_dev
             ask, client = build_engine(snapshot, engine_adapter, settings, candidates=candidates)
             gold_adapter = PostgresAdapter(pg_dsn)  # gold PG SQL on native Postgres
             return ask, engine_adapter, gold_adapter, client

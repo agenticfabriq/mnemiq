@@ -45,7 +45,7 @@ def main() -> int:
     source_id = os.getenv("MNEMIQ_SOURCE_ID", "acme")
     store_path = os.getenv("MNEMIQ_STORE_PATH", "mnemiq.duckdb")
 
-    con = init_store(store_path)
+    con = init_store(store_path, local_only=settings.local_only)
     version = current_version(con, source_id)
     if version is None:
         print(
@@ -93,7 +93,8 @@ def main() -> int:
                       snapshot=snapshot)
     print(f"retrieved: {[c.object_id for c in packet.cards]}")
 
-    adapter = DuckDBPostgresAdapter(settings.pg_dsn) if settings.pg_dsn else None
+    adapter = (DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only)
+               if settings.pg_dsn else None)
     outcome = plan_query(
         packet,
         snapshot,

@@ -54,12 +54,18 @@ def test_the_default_postgres_source_attaches_exactly_as_before(recorded):
     assert adapter.kwargs == {
         "attach_target": "postgresql://h/db", "attach_type": "POSTGRES",
         "extension": "postgres", "catalog": "src", "table_schema": "public",
-        "fk_via_postgres": True, "read_only": True,
+        "fk_via_postgres": True, "read_only": True, "local_only": False,
     }
 
 
 def test_read_only_is_threaded_through_rather_than_defaulted(recorded):
     assert resolve.adapter_for(_spec(), _settings(), read_only=False).kwargs["read_only"] is False
+
+
+def test_local_only_is_taken_from_the_settings(recorded):
+    # M107: an adapter opened under MNEMIQ_LOCAL_ONLY must not install its extension by download.
+    assert resolve.adapter_for(_spec(), _settings(local_only=True)).kwargs["local_only"] is True
+    assert resolve.adapter_for(_spec(), _settings()).kwargs["local_only"] is False
 
 
 # -- the bug this module was written to close --------------------------------------------------

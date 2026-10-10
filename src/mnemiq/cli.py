@@ -239,7 +239,7 @@ def _cmd_enrich(settings: Settings) -> int:
             snap, LLMExampleGenerator(LLMClient(settings)), adapter, dialect=adapter.dialect,
             guard_fanout=settings.guard_fanout,
         )
-    con = init_store(settings.store_path)
+    con = init_store(settings.store_path, local_only=settings.local_only)
     save_snapshot(con, snap)
     n_values = build_value_index(adapter, snap, con)
     n_concepts = 0
@@ -309,7 +309,7 @@ def _cmd_build(settings: Settings) -> int:
     from mnemiq.store.bootstrap import init_store
     from mnemiq.store.snapshot_store import current_version, load_snapshot
 
-    con = init_store(settings.store_path)
+    con = init_store(settings.store_path, local_only=settings.local_only)
     embedder = LLMEmbedder(settings)
     if len(settings.source_specs()) > 1:
         from mnemiq.store.federated_build import build_federated
@@ -358,7 +358,7 @@ def _cmd_refresh(settings: Settings) -> int:
     except (SourceUnconfigured, UnknownSourceKind) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    con = init_store(settings.store_path)
+    con = init_store(settings.store_path, local_only=settings.local_only)
     version = current_version(con, spec.id)
     if version is None:
         print("no snapshot -- run `mnemiq enrich` first", file=sys.stderr)
@@ -471,7 +471,7 @@ def _cmd_metrics(settings: Settings) -> int:
     # on -- and returned a member id like `pg`. Both produced an EMPTY metrics view rather than a
     # wrong one, which is the harder kind to see.
     try:
-        con = init_store(settings.store_path)
+        con = init_store(settings.store_path, local_only=settings.local_only)
         source_id = load_current_snapshot(settings, con)[0].source_id
     except SnapshotMissing:
         source_id = settings.source_id or "unknown"

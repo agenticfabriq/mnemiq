@@ -19,7 +19,7 @@ def main() -> int:
     source_id = os.getenv("MNEMIQ_SOURCE_ID", "acme")
     store_path = os.getenv("MNEMIQ_STORE_PATH", "mnemiq.duckdb")
 
-    con: duckdb.DuckDBPyConnection = init_store(store_path)
+    con: duckdb.DuckDBPyConnection = init_store(store_path, local_only=settings.local_only)
     version = current_version(con, source_id)
     if version is None:
         print(f"no snapshot for source {source_id!r} in {store_path}", file=sys.stderr)

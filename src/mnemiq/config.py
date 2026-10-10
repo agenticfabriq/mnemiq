@@ -323,7 +323,8 @@ class Settings(BaseSettings):
             )
         cleared = ", ".join(checked) if checked else "(no chat/embedding/judge/verity endpoint configured)"
         print(
-            f"MNEMIQ_LOCAL_ONLY verified: {cleared} -- pg_dsn/control_dsn are not checked here",
+            f"MNEMIQ_LOCAL_ONLY verified: {cleared} -- pg_dsn/control_dsn are not checked here; "
+            "DuckDB extensions are checked when the store opens, and never downloaded",
             file=sys.stderr,
         )
 

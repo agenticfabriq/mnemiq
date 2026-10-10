@@ -37,7 +37,7 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
     from mnemiq.enrichment.pipeline import content_version
     from mnemiq.ontology.records import load_records
 
-    adapter = DuckDBPostgresAdapter(settings.pg_dsn)
+    adapter = DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only)
     _snap = enrich_structural(adapter, settings.source_id)
     _dict = load_dictionary(settings.dictionary_path) if settings.dictionary_path else None
     _onto = load_records(settings.ontology_records_path) if settings.ontology_records_path else None
