@@ -64,6 +64,45 @@ def test_transpiling_targets_the_source_dialect():
     assert "SELECT" in verdict.target_sql
 
 
+def test_a_capped_rollup_reaches_the_target_dialect_instead_of_crashing():
+    # M137: sqlglot parses `GROUP BY ... WITH ROLLUP` and the row cap appends `LIMIT 1000`, but sqlglot cannot
+    # parse its own `... WITH ROLLUP LIMIT 1000` back, so re-reading the capped plan raised out of `decide`.
+    # The plan is re-read without its cap and the cap put back (`_transpile_under_the_cap`).
+    verdict = decide(
+        "SELECT claim_identifier, COUNT(claim_open_date) AS n FROM claim GROUP BY claim_identifier WITH ROLLUP",
+        VISIBLE, target="mysql",
+    )
+    assert isinstance(verdict, Approved)
+    assert verdict.target_sql.endswith("GROUP BY claim_identifier WITH ROLLUP LIMIT 1000")
+
+
+def test_a_parseable_plan_still_reaches_the_target_through_the_dialect_round_trip():
+    # The round trip normalizes dialect types: BigQuery's FLOAT is 64-bit, and the plan text re-read as BigQuery
+    # becomes DuckDB's DOUBLE. Rendering the tree straight to DuckDB gives REAL, which loses precision at
+    # 16777217 and still passes EXPLAIN. So the target is never rendered straight from the tree, not even in
+    # M137's fallback, which re-reads the plan without its cap instead.
+    verdict = decide("SELECT CAST(a AS FLOAT) AS x FROM t", {"t": {"a"}}, dialect="bigquery", target="duckdb")
+    assert isinstance(verdict, Approved)
+    assert "CAST(a AS DOUBLE)" in verdict.target_sql
+
+
+def test_a_capped_grouping_set_keeps_the_dialect_round_trip_and_its_precision():
+    # sqlglot 30.12 cannot parse a LIMIT straight after ROLLUP, CUBE or GROUPING SETS, and the cap puts it there.
+    # Rendering that plan straight from the tree skips the round trip's type normalization: BigQuery's 64-bit
+    # FLOAT becomes DuckDB's REAL, and 16777217 comes back as 16777216 after EXPLAIN has passed.
+    import duckdb
+
+    verdict = decide(
+        "SELECT CAST(a AS FLOAT) AS x, COUNT(*) AS n FROM t GROUP BY ROLLUP(a)", {"t": {"a"}},
+        dialect="bigquery", target="duckdb",
+    )
+    assert isinstance(verdict, Approved)
+    assert verdict.target_sql.endswith("LIMIT 1000")
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t AS SELECT 16777217::BIGINT AS a")
+    assert 16777217.0 in {row[0] for row in con.execute(verdict.target_sql).fetchall()}
+
+
 @pytest.mark.integration
 @requires_acme
 def test_explain_proves_the_query_against_the_real_source():
