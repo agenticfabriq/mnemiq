@@ -69,14 +69,13 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
 
     def join_visible(rel) -> bool:
         # A join names the other table and both key columns, so it is shown only to an identity
-        # granted both tables and denied neither key. A key may arrive qualified; the left one is
-        # `from_`'s and the right one `to`'s.
+        # granted both tables and denied neither key. Keys are bare column names as enrichment
+        # writes them, the left one `from_`'s and the right one `to`'s; a name may contain a dot.
         if policy is None:
             return True
         if not (policy.names(rel.from_) and policy.names(rel.to)):
             return False
-        return not any(policy.denies(rel.from_, k.left.rsplit(".", 1)[-1])
-                       or policy.denies(rel.to, k.right.rsplit(".", 1)[-1])
+        return not any(policy.denies(rel.from_, k.left) or policy.denies(rel.to, k.right)
                        for k in rel.join_keys)
 
     joins: dict[str, list[str]] = {}

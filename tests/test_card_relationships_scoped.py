@@ -78,3 +78,13 @@ def test_a_join_on_a_denied_key_column_is_not_shown(tmp_path, style):
     both = {"orders", "layoff_plans"}
     assert "plan_id" not in _orders_card(tmp_path, both, style, snap=personal)
     assert "joins layoff_plans" in _orders_card(tmp_path, both, style, snap=personal, cleared={"high"})
+
+
+def test_a_denied_key_whose_name_holds_a_dot_is_checked_as_written(tmp_path):
+    # A quoted column can be named `plan.id`; cutting it at the dot would check `id` and pass it.
+    dotted = SNAP.model_copy(update={
+        "columns": [c.model_copy(update={"name": "plan.id", "id": "orders.plan.id", "pii_level": "high"})
+                    if c.id == "orders.plan_id" else c for c in SNAP.columns],
+        "relationships": [SNAP.relationships[0].model_copy(update={"join_keys": [JoinKey(left="plan.id", right="id")]})],
+    })
+    assert "plan.id" not in _orders_card(tmp_path, {"orders", "layoff_plans"}, snap=dotted)
