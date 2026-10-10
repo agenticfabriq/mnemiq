@@ -193,7 +193,8 @@ def largest_prompts(con, snapshot, settings, dialect: str,
             # Bound definitions ride with their tables whatever the question says; "" names no term.
             definitions=select_definitions("", snapshot.definitions, shown, ids),
             metrics=select_metrics(ids, snapshot.metrics, shown),
-            dimensions=select_dimensions(ids, snapshot.dimensions, shown),
+            dimensions=select_dimensions(ids, snapshot.dimensions, shown,
+                                         columns=snapshot.columns),
         )
 
     def card(c) -> RetrievedCard:

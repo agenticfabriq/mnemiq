@@ -62,7 +62,8 @@ def test_a_personal_dimension_is_shown_only_to_an_identity_cleared_for_its_level
     dims = [ssn, diagnosis, region]
 
     def shown(grants):
-        return [d.id for d in select_dimensions(["customer"], dims, grants)]
+        return [d.id for d in select_dimensions(["customer"], dims, grants,
+                                                columns=_customers().columns)]
 
     assert shown(_grants()) == ["region"], "no clearance: the personal ones stay out"
     assert shown(_grants({"pii"})) == ["customer_ssn", "region"], "cleared for pii, not for phi"
@@ -298,4 +299,5 @@ def test_a_grant_that_clears_everything_clears_a_level_only_a_dimension_carries(
     carried = _customers()
     carried.columns[0] = carried.columns[0].model_copy(update={"dimension_pii_levels": ["pii"]})
     assert "pii" in everything(carried).pii_clearance
-    assert [d.id for d in select_dimensions(["customer"], out.dimensions, widest)] == ["customer_ssn"]
+    assert [d.id for d in select_dimensions(["customer"], out.dimensions, widest,
+                                            columns=out.columns)] == ["customer_ssn"]

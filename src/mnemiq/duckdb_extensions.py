@@ -18,6 +18,28 @@ from __future__ import annotations
 import duckdb
 
 
+def connect_duckdb(database: str = ":memory:", *, local_only: bool) -> duckdb.DuckDBPyConnection:
+    """Every DuckDB connection mnemiq opens. **Codex's review of M107**: auto-install was switched
+    off only inside `load_extension`, so a connection that loads no extension -- a native DuckDB
+    source -- kept it on, and model-written SQL needing a known extension (`read_csv` on a URL needs
+    `httpfs`) installed it by download. Under local-only it is off in the connection's config, so
+    it holds before any ATTACH or query. `local_only` has no default: a caller decides.
+
+    Auto-LOAD is off too (review gate): where `httpfs` was already installed, the same `read_csv`
+    loaded it and fetched the URL -- measured, the request reached the server -- which is network
+    egress from model-written SQL, and a query can carry data out in a URL. What stays usable is
+    what is built in (`core_functions`, `icu`, `json`, `parquet`) and what is loaded by name
+    through `load_extension`. The cost: an auto-loadable extension that never touches the network
+    is no longer loaded on demand either -- measured with `sqlite_scan`, which auto-loads
+    `sqlite_scanner` on an ordinary connection and is refused on a local-only one -- so a
+    local-only query needing such an extension fails until it is loaded by name. Telling the two
+    kinds apart per extension is not something DuckDB offers, and the network ones are the reason
+    for local-only."""
+    config = ({"autoinstall_known_extensions": False, "autoload_known_extensions": False}
+              if local_only else {})
+    return duckdb.connect(database, config=config)
+
+
 class ExtensionNotInstalled(RuntimeError):
     """MNEMIQ_LOCAL_ONLY is set and loading this extension would download it."""
 

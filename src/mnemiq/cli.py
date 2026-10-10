@@ -212,15 +212,15 @@ def _cmd_enrich(settings: Settings) -> int:
     retriever = None
     if _onto is not None:
         try:
-            import duckdb
-
+            from mnemiq.duckdb_extensions import connect_duckdb
             from mnemiq.llm.embeddings import LLMEmbedder
             from mnemiq.semantic.definition_index import (
                 DefinitionIndex, DefinitionRetriever, build_definition_index,
             )
 
             embedder = LLMEmbedder(settings)  # raises if no embed endpoint configured
-            gcon = duckdb.connect()  # ephemeral: grounding is enrich-time only, not persisted
+            # ephemeral: grounding is enrich-time only, not persisted
+            gcon = connect_duckdb(local_only=settings.local_only)
             build_definition_index(_onto, snap, gcon, embedder,
                                    max_concepts=settings.definition_index_max_concepts)
             retriever = DefinitionRetriever(DefinitionIndex(gcon), embedder)

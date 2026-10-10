@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import threading
 
-import duckdb
 import pyarrow as pa
 
 from mnemiq.adapters.duckdb import (
@@ -11,7 +10,7 @@ from mnemiq.adapters.duckdb import (
     duckdb_user_functions,
 )
 from mnemiq.config import SourceSpec
-from mnemiq.duckdb_extensions import load_extension
+from mnemiq.duckdb_extensions import connect_duckdb, load_extension
 
 _EXT = {"postgres": ("postgres", "POSTGRES"), "sqlite": ("sqlite", "SQLITE")}
 
@@ -45,7 +44,7 @@ class FederatedAdapter:
                     f"federation supports {', '.join(sorted(_EXT))}. Configure it as the only "
                     "source, or reach it through a source DuckDB can attach."
                 )
-        self._con = duckdb.connect()
+        self._con = connect_duckdb(local_only=local_only)
         loaded: set[str] = set()
         for spec in specs:
             ext, attach_type = _EXT[spec.kind]

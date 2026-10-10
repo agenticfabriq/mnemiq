@@ -620,6 +620,7 @@ class Agent:
             enrichment_version=packet.enrichment_version,
             timing={"execute_ms": execute_ms, "total_ms": deadline.elapsed_ms},
             result_shape=_shape(table.num_rows, table.num_columns),
+            definitions=packet.definitions,
         )
         # Appended HERE, once, rather than rendered by each surface. The four surfaces were fixed
         # one at a time before -- the comment in `cli.py` records the commit messages saying "the

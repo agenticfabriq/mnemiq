@@ -12,10 +12,9 @@ import argparse
 import os
 import sys
 
-import duckdb
 
 from mnemiq.config import Settings
-from mnemiq.duckdb_extensions import load_extension
+from mnemiq.duckdb_extensions import connect_duckdb, load_extension
 import snowflake.connector
 
 from bird_to_parquet import _INTERNAL_PREFIXES, sqlite_dbs
@@ -26,8 +25,9 @@ _DEFAULT_MINIDEV = os.environ.get(
 
 
 def sqlite_counts(sqlite_path: str) -> dict[str, int]:
-    con = duckdb.connect()
-    load_extension(con, "sqlite", local_only=Settings().local_only)
+    local_only = Settings().local_only
+    con = connect_duckdb(local_only=local_only)
+    load_extension(con, "sqlite", local_only=local_only)
     con.execute(f"ATTACH '{sqlite_path}' AS s (TYPE sqlite, READ_ONLY);")
     tables = [
         row[0]

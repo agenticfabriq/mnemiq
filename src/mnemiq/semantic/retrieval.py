@@ -285,7 +285,7 @@ def retrieve(
     # retrieved has to be known first. It used to be selected before anything was ranked.
     packet.definitions = select_definitions(question, definitions, grants, table_ids)
     packet.metrics = select_metrics(table_ids, metrics, grants)
-    packet.dimensions = select_dimensions(table_ids, dimensions, grants)
+    packet.dimensions = select_dimensions(table_ids, dimensions, grants, columns=columns)
     packet.examples = _retrieve_examples(con, embedding, set(grants.objects), k=k)
     if ontology_index is not None and packet.cards:
         packet.concepts = _resolve_concepts(
