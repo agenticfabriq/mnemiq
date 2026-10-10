@@ -14,6 +14,7 @@ looks exactly like one that is working. Beacon guards its own benchmark against 
 import io
 import json as _json
 import urllib.error
+from mnemiq import verity_http
 
 
 class _Resp(io.BytesIO):
@@ -43,7 +44,7 @@ def test_a_tenant_with_nothing_certified_is_available(tmp_path, monkeypatch):
     would block one -- the error is on FAILURE, never on emptiness."""
     from mnemiq.enrichment import certified as mod
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen",
+    monkeypatch.setattr(verity_http, "urlopen",
                         lambda req, timeout=0: _Resp(_json.dumps(
                             {"records": [], "watermark": "t1", "next_cursor": None}).encode()))
     got = mod.fetch_certified_records(_settings(tmp_path))
@@ -58,7 +59,7 @@ def test_a_refused_pull_with_a_cold_cache_is_not_available(tmp_path, monkeypatch
     def refuse(req, timeout=0):
         raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(verity_http, "urlopen", refuse)
     got = mod.fetch_certified_records(_settings(tmp_path))
     assert got.records == []
     assert got.available is False, "we could not read the corpus; that is an outage, not an answer"
@@ -68,7 +69,7 @@ def test_the_two_states_are_distinguishable(tmp_path, monkeypatch):
     """The whole point, stated as the comparison that used to be impossible."""
     from mnemiq.enrichment import certified as mod
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen",
+    monkeypatch.setattr(verity_http, "urlopen",
                         lambda req, timeout=0: _Resp(_json.dumps(
                             {"records": [], "watermark": "t1", "next_cursor": None}).encode()))
     empty = mod.fetch_certified_records(_settings(tmp_path))
@@ -76,7 +77,7 @@ def test_the_two_states_are_distinguishable(tmp_path, monkeypatch):
     def refuse(req, timeout=0):
         raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(verity_http, "urlopen", refuse)
     refused = mod.fetch_certified_records(_settings(tmp_path / "cold"))
 
     assert empty.records == refused.records == []
@@ -91,7 +92,7 @@ def test_a_served_cache_is_available(tmp_path, monkeypatch):
     the behaviour being preserved, not overridden."""
     from mnemiq.enrichment import certified as mod
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen",
+    monkeypatch.setattr(verity_http, "urlopen",
                         lambda req, timeout=0: _Resp(_json.dumps(
                             {"records": [_record("a")], "watermark": "t1",
                              "next_cursor": None}).encode()))
@@ -101,7 +102,7 @@ def test_a_served_cache_is_available(tmp_path, monkeypatch):
     def refuse(req, timeout=0):
         raise urllib.error.HTTPError(req.full_url, 503, "Service Unavailable", {}, None)
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(verity_http, "urlopen", refuse)
     got = mod.fetch_certified_records(settings)
     assert [r.envelope.object_id for r in got.records] == ["a"]
     assert got.available is True, "we are serving a real corpus; degraded freshness is not absence"

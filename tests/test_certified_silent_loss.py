@@ -14,6 +14,7 @@ description cannot pull at all, and the refusal that says why is thrown away.
 """
 import io
 import json as _json
+from mnemiq import verity_http
 
 import pytest
 
@@ -64,7 +65,7 @@ def _serving(payload):
 def test_a_record_that_could_not_be_parsed_is_named_on_the_set(tmp_path, monkeypatch):
     from mnemiq.enrichment import certified as mod
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", _serving({
+    monkeypatch.setattr(verity_http, "urlopen", _serving({
         "records": [_record("good"), _column_record("claim.ssn", malformed=True)],
         "watermark": "t1", "next_cursor": None}))
 
@@ -79,7 +80,7 @@ def test_a_record_that_could_not_be_parsed_is_named_on_the_set(tmp_path, monkeyp
 def test_a_clean_pull_reports_nothing_skipped(tmp_path, monkeypatch):
     from mnemiq.enrichment import certified as mod
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", _serving({
+    monkeypatch.setattr(verity_http, "urlopen", _serving({
         "records": [_record("a")], "watermark": "t1", "next_cursor": None}))
     assert mod.fetch_certified_records(_settings(tmp_path)).skipped == ()
 
@@ -100,7 +101,7 @@ def test_a_record_that_stopped_parsing_IN_THE_CACHE_is_named_too(tmp_path, monke
     def dead(req, timeout=0):
         raise OSError("verity is down")
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", dead)
+    monkeypatch.setattr(verity_http, "urlopen", dead)
     got = mod.fetch_certified_records(_settings(tmp_path))
     assert got.available is True and [r.envelope.object_id for r in got.records] == ["good"]
     assert got.skipped == ("column:claim.dob",)
@@ -182,7 +183,7 @@ def test_a_url_that_is_not_the_open_endpoint_is_called_out_before_the_pull(tmp_p
     """
     from mnemiq.enrichment import certified as mod
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", _serving({
+    monkeypatch.setattr(verity_http, "urlopen", _serving({
         "records": [], "watermark": "t1", "next_cursor": None}))
     from mnemiq.config import Settings
     settings = Settings(verity_records_url="https://v/api/semantic/records",
@@ -195,7 +196,7 @@ def test_a_url_that_is_not_the_open_endpoint_is_called_out_before_the_pull(tmp_p
 def test_the_open_endpoint_is_not_second_guessed(tmp_path, monkeypatch, caplog):
     from mnemiq.enrichment import certified as mod
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", _serving({
+    monkeypatch.setattr(verity_http, "urlopen", _serving({
         "records": [], "watermark": "t1", "next_cursor": None}))
     with caplog.at_level("WARNING"):
         mod.fetch_certified_records(_settings(tmp_path))
@@ -232,7 +233,7 @@ def test_the_refusal_verity_gave_reaches_the_operator(tmp_path, monkeypatch, cap
         raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {},
                                      io.BytesIO(body.encode()))
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(verity_http, "urlopen", refuse)
     with caplog.at_level("WARNING"):
         got = mod.fetch_certified_records(_settings(tmp_path))
     assert got.available is False
@@ -293,7 +294,7 @@ def test_the_warning_reads_the_PATH_and_not_the_whole_url(tmp_path, monkeypatch,
     from mnemiq.config import Settings
     from mnemiq.enrichment import certified as mod
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", _serving({
+    monkeypatch.setattr(verity_http, "urlopen", _serving({
         "records": [], "watermark": "t1", "next_cursor": None}))
     with caplog.at_level("WARNING"):
         mod.fetch_certified_records(Settings(
@@ -375,7 +376,7 @@ def test_a_server_that_never_advances_the_cursor_is_not_asked_ten_thousand_times
         return _Resp(_json.dumps({"records": [_record("a")], "watermark": "t1",
                                   "next_cursor": "stuck"}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     with caplog.at_level("WARNING"):
         got = mod.fetch_certified_records(_settings(tmp_path))
 
@@ -406,7 +407,7 @@ def test_a_dropped_cursor_stops_even_when_the_server_keeps_inventing_new_ones(tm
         return _Resp(_json.dumps({"records": [_record("a")], "watermark": "t1",
                                   "next_cursor": f"page-{next(tokens)}"}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     with caplog.at_level("WARNING"):
         mod.fetch_certified_records(Settings(
             verity_records_url="https://v/api/semantic/records/open#frag",

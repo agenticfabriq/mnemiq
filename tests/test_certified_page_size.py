@@ -1,5 +1,6 @@
 import io
 import json as _json
+from mnemiq import verity_http
 
 
 class _Resp(io.BytesIO):
@@ -34,7 +35,7 @@ def test_default_page_size_is_sent_as_limit(tmp_path, monkeypatch):
         return _Resp(_json.dumps({"records": [_record("a")], "watermark": "t1",
                                   "next_cursor": None}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     mod.fetch_certified_records(_settings(tmp_path)).records  # default page size 500
     assert any("limit=500" in url for url in seen)
 
@@ -53,7 +54,7 @@ def test_bounded_pages_drain_via_next_cursor(tmp_path, monkeypatch):
         return _Resp(_json.dumps({"records": [_record("a")], "watermark": "t2",
                                   "next_cursor": "1"}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     records = mod.fetch_certified_records(_settings(tmp_path, verity_page_size=1)).records
     assert [r.envelope.object_id for r in records] == ["a", "b"]  # drained both pages
     assert all("limit=1" in url for url in seen)  # every page bounded
@@ -70,6 +71,6 @@ def test_page_size_zero_omits_limit(tmp_path, monkeypatch):
         return _Resp(_json.dumps({"records": [_record("a")], "watermark": None,
                                   "next_cursor": None}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     mod.fetch_certified_records(_settings(tmp_path, verity_page_size=0)).records
     assert not any("limit=" in url for url in seen)  # full-dump escape hatch

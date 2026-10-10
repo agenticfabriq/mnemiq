@@ -1,3 +1,4 @@
+from mnemiq import verity_http
 from mnemiq.contract import (
     CertifiedRecord, CodedValue, CodeScheme, Column, Definition, RecordEnvelope, Snapshot,
 )
@@ -100,7 +101,7 @@ def test_fetch_parses_records_and_presents_the_bearer_token(monkeypatch):
         return _Resp(_json.dumps({"records": [_record_json(),
                                               {"envelope": {}, "payload": {}}]}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     records = mod.fetch_certified_records(Settings(
         verity_records_url="https://v/api/semantic/records",
         verity_token_url="https://v/api/auth/token",
@@ -132,7 +133,7 @@ def test_fetch_sends_no_authorization_header_when_unconfigured(monkeypatch):
         seen.append(req)
         return _Resp(_json.dumps({"records": [_record_json()]}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     records = mod.fetch_certified_records(
         Settings(verity_records_url="https://v/api/semantic/records")).records
 
@@ -168,7 +169,7 @@ def test_fetch_refreshes_the_token_once_on_401(monkeypatch):
             raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
         return _Resp(_json.dumps({"records": [_record_json()]}).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     records = mod.fetch_certified_records(Settings(
         verity_records_url="https://v/api/semantic/records",
         verity_token_url="https://v/api/auth/token",
@@ -202,7 +203,7 @@ def test_fetch_gives_up_after_one_refresh_when_401_persists(monkeypatch):
         record_attempts.append(req)
         raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     # A revoked credential 401s forever: degrade to local-only rather than loop.
     assert mod.fetch_certified_records(Settings(
         verity_records_url="https://v/api/semantic/records",
@@ -221,7 +222,7 @@ def test_fetch_is_fail_soft_on_network_error(monkeypatch):
     def boom(req, timeout=0):
         raise urllib.error.URLError("verity down")
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", boom)
+    monkeypatch.setattr(verity_http, "urlopen", boom)
     assert mod.fetch_certified_records(
         Settings(verity_records_url="https://v/api/semantic/records")).records == []
 

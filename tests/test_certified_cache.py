@@ -13,6 +13,7 @@ Each test here fails against the pre-M18 code.
 import io
 import json as _json
 import time
+from mnemiq import verity_http
 
 
 class _Resp(io.BytesIO):
@@ -44,7 +45,6 @@ def _ids(records):
 
 def _serve(monkeypatch, pages):
     """Serve one response per call, recording the URLs asked for."""
-    from mnemiq.enrichment import certified as mod
     seen = []
     remaining = list(pages)
 
@@ -55,7 +55,7 @@ def _serve(monkeypatch, pages):
             raise payload
         return _Resp(_json.dumps(payload).encode())
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(verity_http, "urlopen", fake_urlopen)
     return seen
 
 
