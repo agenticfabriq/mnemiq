@@ -80,7 +80,7 @@ def rank_columns(packet: ContextPacket, snapshot, policy) -> list[tuple[str, str
         [packet.question]
         + [f"{d.term} {d.definition}" for d in packet.definitions]
         + [f"{m.label} {m.measure.expr}" for m in packet.metrics]
-        + [f"{d.label} {d.expr or ''}" for d in packet.dimensions])
+        + [f"{d.label} {d.expression()}" for d in packet.dimensions])
     question = _words(packet.question)
     joins: set[tuple[str, str]] = set()
     for rel in snapshot.relationships:

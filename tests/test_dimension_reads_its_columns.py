@@ -71,3 +71,47 @@ def test_retrieve_offers_the_packet_only_the_dimensions_whose_columns_are_read(t
 
     assert offered("pii") == []
     assert offered("pii", "phi") == ["claim_ref"]
+
+
+# Codex's review of #95, both reproduced.
+
+def test_case_distinct_columns_under_one_folded_name_each_require_their_clearance():
+    """`customer."SSN"` (pii) and `customer.ssn` (plain) are two columns in Postgres. Keyed by the
+    folded name, the selector kept whichever came last, so the order decided the clearance."""
+    from mnemiq.contract import Column, Snapshot
+
+    pii = Column(id='customer."SSN"', object_id="customer", name="SSN", data_type="text",
+                 pii_level="pii")
+    plain = Column(id="customer.ssn", object_id="customer", name="ssn", data_type="text")
+    dimension = Dimension(id="ssn_dim", label="SSN", source="customer", expr='"SSN"')
+    for columns in ([pii, plain], [plain, pii]):
+        snap = Snapshot(version="v", source_id="s", created_at="t", columns=columns,
+                        dimensions=[dimension])
+        assert _shown(snap, _grants()) == [], [c.name for c in columns]
+        assert _shown(snap, _grants({"pii"})) == ["ssn_dim"]
+
+
+def test_a_dimension_with_no_expression_is_read_as_the_prompt_renders_it():
+    """The prompt shows a dimension as `expr or id`; the selector parsed an empty string, so a
+    dimension `ssn` with no expression, over a personal `ssn`, was offered to the uncleared."""
+    for expr in (None, ""):
+        snap = _customers("pii").model_copy(update={"dimensions": [
+            Dimension(id="ssn", label="SSN", source="customer", expr=expr)]})
+        assert _shown(snap, _grants()) == [], repr(expr)
+        assert _shown(snap, _grants({"pii"})) == ["ssn"]
+
+
+def test_a_personal_dimension_with_no_expression_classifies_the_column_its_id_names():
+    """M135's stamping read `expr or ""` too, so a personal dimension without an expression
+    classified no column -- the one its id names, and the prompt shows, stayed open."""
+    from mnemiq.contract import CertifiedRecord
+
+    record = CertifiedRecord.model_validate({
+        "envelope": {"object_type": "dimension", "object_id": "ssn", "version": "v1",
+                     "source_system": "verity", "provenance": {"status": "certified",
+                                                               "certifier": "reviewer@acme"}},
+        "payload": {"id": "ssn", "label": "SSN", "source": "customer", "pii_level": "pii"},
+    })
+    out = apply_certified(_customers(), [record])
+    ssn = next(c for c in out.columns if c.name == "ssn")
+    assert ssn.pii_levels() == frozenset({"pii"})

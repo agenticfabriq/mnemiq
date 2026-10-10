@@ -128,7 +128,7 @@ def meaning_sections(packet: ContextPacket) -> list[str]:
     if packet.dimensions:
         parts += ["", "CERTIFIED DIMENSIONS (the agreed way to slice these tables):"]
         parts += [
-            f"- {sanitize(d.label, limit=80)} = {sanitize(d.expr or d.id, limit=200)}"
+            f"- {sanitize(d.label, limit=80)} = {sanitize(d.expression(), limit=200)}"
             f" on {sanitize(d.source, limit=80)}"
             for d in packet.dimensions
         ]

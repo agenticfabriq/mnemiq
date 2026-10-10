@@ -93,6 +93,13 @@ class Dimension(BaseModel):
     # bare column classifies that column (`apply_certified`). None: nothing was said.
     pii_level: str | None = None
 
+    def expression(self) -> str:
+        """What the dimension computes, as the prompt renders it: its `expr`, or its `id` where it
+        has none. One reading for the prompt, the classification of its columns and the choice of
+        which identities it is offered to -- three readings that disagreed (Codex on #95: a
+        dimension `ssn` with no expression was shown as `ssn` and checked as nothing)."""
+        return self.expr or self.id
+
 
 class Metric(BaseModel):
     id: str
