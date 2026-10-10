@@ -23,8 +23,16 @@ def connect_duckdb(database: str = ":memory:", *, local_only: bool) -> duckdb.Du
     off only inside `load_extension`, so a connection that loads no extension -- a native DuckDB
     source -- kept it on, and model-written SQL needing a known extension (`read_csv` on a URL needs
     `httpfs`) installed it by download. Under local-only it is off in the connection's config, so
-    it holds before any ATTACH or query. `local_only` has no default: a caller decides."""
-    config = {"autoinstall_known_extensions": False} if local_only else {}
+    it holds before any ATTACH or query. `local_only` has no default: a caller decides.
+
+    Auto-LOAD is off too (review gate): where `httpfs` was already installed, the same `read_csv`
+    loaded it and fetched the URL -- measured, the request reached the server -- which is network
+    egress from model-written SQL, and a query can carry data out in a URL. What stays usable is
+    what is built in (`core_functions`, `icu`, `json`, `parquet`) and what mnemiq loads by name
+    through `load_extension`; everything auto-loadable is cloud or network (`httpfs`, `aws`,
+    `azure`, `motherduck`, `iceberg`, ...) or one mnemiq loads explicitly anyway."""
+    config = ({"autoinstall_known_extensions": False, "autoload_known_extensions": False}
+              if local_only else {})
     return duckdb.connect(database, config=config)
 
 

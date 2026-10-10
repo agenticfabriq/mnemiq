@@ -305,3 +305,23 @@ def test_connect_duckdb_opens_local_only_connections_with_auto_install_off():
 
     assert autoinstall(connect_duckdb(local_only=True)) is False
     assert autoinstall(connect_duckdb(local_only=False)) is True
+
+
+@pytest.mark.skipif(not _installed_here("sqlite"),
+                    reason="needs sqlite_scanner installed in this machine's extension directory")
+def test_a_local_only_connection_auto_loads_nothing(tmp_path):
+    """An installed extension is not auto-loaded under local-only: where `httpfs` is installed, an
+    auto-load is a URL fetched from model-written SQL (measured). `sqlite_scanner` stands in for it
+    here, with no network: `sqlite_scan` auto-loads it unless auto-load is off."""
+    import sqlite3
+
+    from mnemiq.duckdb_extensions import connect_duckdb
+
+    db = tmp_path / "x.sqlite"
+    sqlite3.connect(db).execute("CREATE TABLE t (x INTEGER)").connection.commit()
+    scan = f"SELECT count(*) FROM sqlite_scan('{db}', 't')"
+    assert connect_duckdb(local_only=False).execute(scan).fetchone() == (0,), "control: it loads"
+    con = connect_duckdb(local_only=True)
+    assert con.execute("SELECT current_setting('autoload_known_extensions')").fetchone()[0] is False
+    with pytest.raises(duckdb.Error):
+        con.execute(scan).fetchall()
