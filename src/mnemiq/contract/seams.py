@@ -215,7 +215,11 @@ class Trace(BaseModel):
     # This engine's reason codes. A separate field because a consumer rendering `unresolved` as
     # objects would otherwise show `scope-unresolved` as a table name.
     lineage_reasons: list[str] = Field(default_factory=list)
-    definitions_used: list[str] = Field(default_factory=list)
+    definitions_used: list[str] = Field(
+        default_factory=list,
+        description="Ids of the definitions the prompt held for this answer -- what the model was "
+                    "offered, after the prompt fit -- not a claim that the SQL relied on each one.",
+    )
     # What the access decision narrowed, per object. `None` is "it was not evaluated";
     # `[]` is the claim "it narrowed nothing" -- the same distinction `lineage_completeness`
     # draws with `unknown`, and for the same reason.
