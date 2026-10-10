@@ -24,6 +24,7 @@ def test_the_trace_records_what_the_engine_actually_did():
         enrichment_version="v1",
         timing={"execute_ms": 12.0, "total_ms": 900.0},
         result_shape="scalar",
+        definitions=[],
     )
 
     assert isinstance(trace, Trace)
@@ -44,5 +45,6 @@ def test_the_trace_round_trips_as_the_open_contract():
         enrichment_version="v1",
         timing={"total_ms": 1.0},
         result_shape="table",
+        definitions=[],
     )
     assert Trace.model_validate_json(trace.model_dump_json()) == trace
