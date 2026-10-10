@@ -30,8 +30,9 @@ def connect_duckdb(database: str = ":memory:", *, local_only: bool) -> duckdb.Du
     egress from model-written SQL, and a query can carry data out in a URL. What stays usable is
     what is built in (`core_functions`, `icu`, `json`, `parquet`) and what is loaded by name
     through `load_extension`. The cost: an auto-loadable extension that never touches the network
-    -- `spatial`, `inet`, `excel`, `tpch`, ... -- is no longer loaded on demand either, so a
-    local-only query needing one fails until that extension is loaded by name. Telling the two
+    is no longer loaded on demand either -- measured with `sqlite_scan`, which auto-loads
+    `sqlite_scanner` on an ordinary connection and is refused on a local-only one -- so a
+    local-only query needing such an extension fails until it is loaded by name. Telling the two
     kinds apart per extension is not something DuckDB offers, and the network ones are the reason
     for local-only."""
     config = ({"autoinstall_known_extensions": False, "autoload_known_extensions": False}
