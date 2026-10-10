@@ -20,6 +20,9 @@ class AccessPolicy:
     # table, is one no caller is ever granted (M28). Empty means no subquery filter can be
     # validated, and an unvalidatable filter is refused rather than guessed at.
     policy_schema: dict[str, set[str]] = field(default_factory=dict)
+    # The CALLER's tables, the objects it is granted: what a card served to it may name. None means
+    # no table scope, for a policy built by hand rather than from a grant set.
+    visible: frozenset[str] | None = None
 
     @property
     def empty(self) -> bool:
@@ -43,6 +46,10 @@ class AccessPolicy:
     # caller mutates these in place today, but they are plain mutable set/dict sitting directly
     # under three authorization methods, and a stale authorization answer is silent and wrong.
     # These sets hold a handful of entries; folding per call costs nothing worth this risk.
+
+    def names(self, table: str) -> bool:
+        """Whether a card served to this caller may name `table`, folded like every lookup here."""
+        return self.visible is None or names_one_object(table, self.visible)
 
     def denies(self, table: str, column: str) -> bool:
         return any(names_one_object(table, [t]) and c.lower() == column.lower()
@@ -224,5 +231,6 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     for c in snapshot.columns:
         policy_schema.setdefault(c.object_id, set()).add(c.name)
     return AccessPolicy(
-        row_filters=row_filters, denied=denied, masked=masked, policy_schema=policy_schema
+        row_filters=row_filters, denied=denied, masked=masked, policy_schema=policy_schema,
+        visible=frozenset(grants.objects),
     )
