@@ -179,7 +179,9 @@ def test_every_door_passes_local_only():
     assert missing == [], f"pass local_only= at: {missing}"
     # ...and no extension installed anywhere but the one function that knows the rule.
     raw = [str(path.relative_to(root)) for path in sources
-           if path.name != "duckdb_extensions.py" and re.search(r"INSTALL \w", path.read_text())]
+           if path.name != "duckdb_extensions.py"
+           # `{` as well as a word: the form removed from the adapters was `f"INSTALL {extension}"`.
+           and re.search(r"INSTALL [\w{]", path.read_text())]
     assert raw == [], f"load the extension through duckdb_extensions.load_extension: {raw}"
 
 
