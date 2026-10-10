@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlglot import exp
 
+from mnemiq.semantic.values import shown
 from mnemiq.sql.qualify import names_one_object
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
@@ -74,7 +75,7 @@ def check_values(
             code=RefusalCode.VALUE_GROUNDING,
             message=(
                 f"the value {literal!r} does not appear in {table}.{column.name}; "
-                f"the real values include: {', '.join(near)}. Use the intended one."
+                f"the real values include: {', '.join(shown(v) for v in near)}. Use the intended one."
             ),
         )
 

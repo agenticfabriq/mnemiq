@@ -41,6 +41,7 @@ def test_the_card_cuts_the_document_and_shows_the_short_codes_whole(tmp_path):
     assert BLOB not in line
     assert BLOB[:200] in line
     assert f"{len(BLOB):,} characters" in line  # says it was cut, and from how long
+    assert "never compare with it" in line  # the model is told to copy codes exactly; a cut one matches nothing
     assert "short-a" in line and "short-b" in line
 
 
