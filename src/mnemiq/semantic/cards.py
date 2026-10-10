@@ -10,6 +10,16 @@ from mnemiq.sql.policy import AccessPolicy
 
 _BARE_IDENT = re.compile(r"[a-z_][a-z0-9_]*")
 
+# Longer than this, a value is a document, not a code, and the card shows its start and its length.
+# The snapshot keeps it whole: grounding and the binder compare the real values (M139).
+CARD_VALUE_LIMIT = 200
+
+
+def _shown(code: str) -> str:
+    if len(code) <= CARD_VALUE_LIMIT:
+        return code
+    return f"{code[:CARD_VALUE_LIMIT]}... [cut, {len(code):,} characters]"
+
 
 @dataclass
 class SchemaCard:
@@ -110,7 +120,7 @@ def build_cards(snapshot: Snapshot, policy: AccessPolicy | None = None,
                 )
             if column.coded_values:
                 codes = "; ".join(
-                    f"{cv.code} = {cv.meaning}" if cv.meaning else cv.code
+                    f"{_shown(cv.code)} = {cv.meaning}" if cv.meaning else _shown(cv.code)
                     for cv in column.coded_values
                 )
                 line += f" Values: {codes}"

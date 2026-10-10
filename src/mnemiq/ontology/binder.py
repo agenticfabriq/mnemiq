@@ -41,9 +41,8 @@ class BindEvidence:
 def _observed(adapter, snapshot: Snapshot, column) -> list[str]:
     """The column's value set. Regime 1 reuses the harvested vocabulary; regime 2 probes.
 
-    Regime 2 exists because profiling harvests coded_values only below code_max_distinct (and
-    only when no value exceeds code_max_length), so a large standard code system arrives with
-    nothing harvested at all.
+    Regime 2 exists because profiling harvests coded_values only below code_max_distinct, so
+    a large standard code system arrives with nothing harvested at all.
     """
     if column.coded_values:
         return [cv.code for cv in column.coded_values]
