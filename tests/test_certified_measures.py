@@ -76,10 +76,12 @@ def test_a_metric_over_an_ungranted_table_is_never_offered():
 
 
 def test_dimensions_follow_their_table_too():
-    selected = select_dimensions(["payment_transaction"], [_channel()], _granting("payment_transaction", "refund"))
+    selected = select_dimensions(["payment_transaction"], [_channel()],
+                                 _granting("payment_transaction", "refund"), columns=[])
     assert [d.id for d in selected] == ["payment_channel"]
 
-    assert select_dimensions(["refund"], [_channel()], _granting("payment_transaction", "refund")) == []
+    assert select_dimensions(["refund"], [_channel()], _granting("payment_transaction", "refund"),
+                             columns=[]) == []
 
 
 def test_the_question_does_not_have_to_name_the_metric():

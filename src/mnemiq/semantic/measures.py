@@ -20,9 +20,11 @@ then reject.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
 
 from mnemiq.authz.grants import GrantSet
-from mnemiq.contract import Dimension, Metric
+from mnemiq.contract import Column, Dimension, Metric
+from mnemiq.semantic.expr_columns import columns_read
 
 
 def select_metrics(
@@ -38,7 +40,8 @@ def select_metrics(
 
 
 def select_dimensions(
-    table_ids: Sequence[str], dimensions: Sequence[Dimension], grants: GrantSet
+    table_ids: Sequence[str], dimensions: Sequence[Dimension], grants: GrantSet, *,
+    columns: Sequence[Column],
 ) -> list[Dimension]:
     """The certified dimensions over the tables in context, that this identity may see.
 
@@ -50,13 +53,41 @@ def select_dimensions(
     `apply_certified`, as a column's is.
     """
     in_context = set(table_ids)
+    by_key = {(c.object_id.lower(), c.name.lower()): c for c in columns}
     return [
         dimension
         for dimension in dimensions
         if dimension.source in in_context
         and grants.allows(dimension.source)
         and _read_raw(dimension.pii_level, grants)
+        and _reads_every_column_raw(dimension, by_key, grants)
     ]
+
+
+def _reads_every_column_raw(dimension: Dimension, by_key: dict, grants: GrantSet) -> bool:
+    """**M136.** Every column the dimension's expression reads, read raw by this identity.
+
+    Its own level is not the whole of it: a column requires every level the personal dimensions
+    over it carry (M135), so `region` (pii) and `region_health` (phi) over one column each need
+    both -- and a plain dimension over a personal column needs that column's. Offering one the
+    identity cannot read invites a grouping the decider refuses. Read with `columns_read`, the
+    parser that stamped the levels, and keyed as `apply_certified` keys them. A reference naming
+    no column here decides nothing: the dimension's own level still does.
+    """
+    table = dimension.source.lower()
+    for ref in _columns_read(dimension.expr or "", dimension.source):
+        for name in ref:
+            column = by_key.get((table, name))
+            if column is not None and not all(_read_raw(level, grants)
+                                               for level in column.pii_levels()):
+                return False
+    return True
+
+
+@lru_cache(maxsize=1024)
+def _columns_read(expr: str, source: str) -> frozenset[frozenset[str]]:
+    # Parsed per expression, not per question: this runs on every packet.
+    return frozenset(columns_read(expr, source))
 
 
 def _read_raw(level: str | None, grants: GrantSet) -> bool:
