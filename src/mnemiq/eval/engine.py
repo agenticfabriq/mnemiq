@@ -193,8 +193,9 @@ def build_engine(
 
     def ask(question: str, grants: GrantSet | None = None) -> AgentAnswer:
         # `grants` narrows this one question, as `Runtime.ask` resolves grants per identity on every
-        # call; None keeps the engine's. BEAVER's restricted arm grants each question only the
-        # tables its annotations name, and an engine is built once per database, not per question.
+        # call; None keeps the engine's. It is for a caller outside this repo that scopes each
+        # question differently (a benchmark harness granting only the tables annotated for that
+        # question), since an engine is built once per database, not per question.
         # The answer cache keys on the grant fingerprint, so two scopes never share an answer.
         scope = engine_grants if grants is None else grants
         # EVERY grounding argument `Runtime.ask` passes, and for the same reasons. This call used
