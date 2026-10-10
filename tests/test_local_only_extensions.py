@@ -177,7 +177,16 @@ def test_every_door_passes_local_only():
 
     missing, raw_connects = [], []
     for path in sources:
-        for node in ast.walk(ast.parse(path.read_text())):
+        tree = ast.parse(path.read_text())
+        # The names `duckdb` goes by here (`import duckdb as ddb`), and any `connect` imported from
+        # it (`from duckdb import connect`) -- a raw connection by another spelling (review gate).
+        modules, bare = {"duckdb"}, set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                modules |= {a.asname or a.name for a in node.names if a.name == "duckdb"}
+            elif isinstance(node, ast.ImportFrom) and node.module == "duckdb":
+                bare |= {a.asname or a.name for a in node.names if a.name == "connect"}
+        for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
@@ -187,9 +196,10 @@ def test_every_door_passes_local_only():
                 # setting dropped with the keyword still present.
                 if not passed or isinstance(passed[0], ast.Constant):
                     missing.append(f"{path.relative_to(root)}:{node.lineno} {name}")
-            elif (isinstance(func, ast.Attribute) and func.attr == "connect"
-                  and isinstance(func.value, ast.Name) and func.value.id == "duckdb"
-                  and path.name != "duckdb_extensions.py"):
+            elif path.name != "duckdb_extensions.py" and (
+                    (isinstance(func, ast.Attribute) and func.attr == "connect"
+                     and isinstance(func.value, ast.Name) and func.value.id in modules)
+                    or (isinstance(func, ast.Name) and func.id in bare)):
                 raw_connects.append(f"{path.relative_to(root)}:{node.lineno}")
     assert missing == [], f"pass the caller's local_only= at: {missing}"
     # A connection opened around `connect_duckdb` keeps DuckDB's auto-install on (Codex on M107).
