@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from mnemiq.contract import IdentityContext, Trace
+from collections.abc import Sequence
+
+from mnemiq.contract import Definition, IdentityContext, Trace
 from mnemiq.contract.seams import Narrowed
 from mnemiq.sql.verdict import Approved
 
@@ -12,6 +14,7 @@ def build_trace(
     enrichment_version: str | None,
     timing: dict[str, float],
     result_shape: str,
+    definitions: Sequence[Definition],
 ) -> Trace:
     """What the engine did, in the open contract's own words.
 
@@ -39,5 +42,8 @@ def build_trace(
         narrowed=[Narrowed(object=n.object, rows=n.rows, columns=n.columns)
                   for n in (getattr(approved, "narrowed", None) or [])]
         if getattr(approved, "narrowed", None) is not None else None,
-        definitions_used=[],  # the glossary lands in Plan 08
+        # M138: the definitions the prompt held -- the packet after its fit, which leaves them
+        # alone. Required, not defaulted: `[]` here said "no definition was used" on every
+        # answer for months, including ones grounded on one.
+        definitions_used=[d.id for d in definitions],
     )
