@@ -14,6 +14,10 @@ import pytest
 
 from mnemiq.duckdb_extensions import ExtensionNotInstalled, load_extension
 
+# The real `connect`, taken before any fixture redirects it to an empty extension directory -- what
+# this machine actually has installed is read through it.
+_REAL_CONNECT = duckdb.connect
+
 
 def _files(directory: Path) -> list[str]:
     return sorted(str(p.relative_to(directory)) for p in directory.rglob("*") if p.is_file())
@@ -166,17 +170,30 @@ def test_every_door_passes_local_only():
         else:
             return None
         head = name.split(".")[0]
-        if head in ("init_store", "FederatedAdapter") or re.fullmatch(r"DuckDB\w*Adapter", head):
+        if head in ("init_store", "FederatedAdapter", "connect_duckdb") or re.fullmatch(
+                r"DuckDB\w*Adapter", head):
             return name
         return None
 
-    missing = []
+    missing, raw_connects = [], []
     for path in sources:
         for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Call) and (name := door(node)) is not None:
-                if not any(keyword.arg == "local_only" for keyword in node.keywords):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (name := door(node)) is not None:
+                passed = [k.value for k in node.keywords if k.arg == "local_only"]
+                # From the caller, never a constant: `local_only=False` written at a door is the
+                # setting dropped with the keyword still present.
+                if not passed or isinstance(passed[0], ast.Constant):
                     missing.append(f"{path.relative_to(root)}:{node.lineno} {name}")
-    assert missing == [], f"pass local_only= at: {missing}"
+            elif (isinstance(func, ast.Attribute) and func.attr == "connect"
+                  and isinstance(func.value, ast.Name) and func.value.id == "duckdb"
+                  and path.name != "duckdb_extensions.py"):
+                raw_connects.append(f"{path.relative_to(root)}:{node.lineno}")
+    assert missing == [], f"pass the caller's local_only= at: {missing}"
+    # A connection opened around `connect_duckdb` keeps DuckDB's auto-install on (Codex on M107).
+    assert raw_connects == [], f"open it with duckdb_extensions.connect_duckdb: {raw_connects}"
     # ...and no extension installed anywhere but the one function that knows the rule.
     raw = [str(path.relative_to(root)) for path in sources
            if path.name != "duckdb_extensions.py"
@@ -194,3 +211,87 @@ def test_the_verified_line_says_extensions_are_checked_when_the_store_opens(caps
     line = capsys.readouterr().err
     assert "MNEMIQ_LOCAL_ONLY verified" in line
     assert "DuckDB extensions are checked when the store opens, and never downloaded" in line
+
+
+# Codex's review of M107: auto-install was switched off only inside `load_extension`, so a
+# connection that loads nothing -- a native DuckDB source -- kept it on, and model-written SQL that
+# needs a known extension (`read_csv` on a URL needs `httpfs`) downloaded it. Off at connect now.
+
+def _an_implicit_extension_trigger(con) -> None:
+    with pytest.raises(duckdb.Error):
+        con.execute("SELECT * FROM read_csv('https://example.invalid/data.csv')").fetchall()
+
+
+def test_a_native_duckdb_source_local_only_cannot_auto_install(fresh_extensions):
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+
+    adapter = DuckDBAdapter.duckdb(":memory:", read_only=False, local_only=True)
+    con = adapter._con
+    assert con.execute("SELECT current_setting('autoinstall_known_extensions')").fetchone()[0] is False
+    _an_implicit_extension_trigger(con)
+    assert _files(fresh_extensions) == [], "nothing was fetched"
+
+
+def _default_install_path(name: str) -> Path | None:
+    row = _REAL_CONNECT().execute(
+        "SELECT install_path FROM duckdb_extensions() WHERE extension_name = ? AND installed",
+        [name]).fetchone()
+    return Path(row[0]) if row and row[0] and row[0] != "(BUILT-IN)" else None
+
+
+_SEEDS = ("vss", "fts", "sqlite_scanner")
+
+
+@pytest.fixture
+def pre_seeded(fresh_extensions):
+    """A local-only machine prepared the way the refusal says: the extension files copied into
+    `<directory>/v<version>/<platform>/`. Skipped where this machine has none to copy."""
+    import shutil
+
+    paths = {name: _default_install_path(name) for name in _SEEDS}
+    if not all(paths.values()):
+        pytest.skip("needs vss, fts and sqlite_scanner installed in this machine's extension directory")
+    for path in paths.values():
+        target = fresh_extensions / path.parent.parent.name / path.parent.name
+        target.mkdir(parents=True, exist_ok=True)
+        shutil.copy(path, target / path.name)
+    return fresh_extensions
+
+
+def test_a_pre_seeded_store_opens_local_only_and_still_cannot_auto_install(pre_seeded, tmp_path):
+    from mnemiq.store.bootstrap import init_store
+
+    before = _files(pre_seeded)
+    con = init_store(str(tmp_path / "s.duckdb"), local_only=True)  # not stranded: it opens
+    assert con.execute("SELECT current_setting('autoinstall_known_extensions')").fetchone()[0] is False
+    _an_implicit_extension_trigger(con)
+    assert _files(pre_seeded) == before, "nothing beyond what was pre-seeded"
+
+
+def test_a_pre_seeded_federation_attaches_local_only_and_still_cannot_auto_install(pre_seeded,
+                                                                                    tmp_path):
+    import sqlite3
+
+    from mnemiq.adapters.federated import FederatedAdapter
+    from mnemiq.config import SourceSpec
+
+    specs = []
+    for name in ("a", "b"):
+        db = tmp_path / f"{name}.sqlite"
+        sqlite3.connect(db).execute("CREATE TABLE t (x INTEGER)").connection.commit()
+        specs.append(SourceSpec(id=name, kind="sqlite", target=str(db), catalog=name,
+                                schema="main"))
+    before = _files(pre_seeded)
+    adapter = FederatedAdapter(specs, local_only=True)
+    _an_implicit_extension_trigger(adapter._con)
+    assert _files(pre_seeded) == before
+
+
+def test_connect_duckdb_opens_local_only_connections_with_auto_install_off():
+    from mnemiq.duckdb_extensions import connect_duckdb
+
+    def autoinstall(con):
+        return con.execute("SELECT current_setting('autoinstall_known_extensions')").fetchone()[0]
+
+    assert autoinstall(connect_duckdb(local_only=True)) is False
+    assert autoinstall(connect_duckdb(local_only=False)) is True

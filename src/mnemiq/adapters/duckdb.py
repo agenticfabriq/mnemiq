@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import threading
 
-import duckdb
 import pyarrow as pa
 
-from mnemiq.duckdb_extensions import load_extension
+from mnemiq.duckdb_extensions import connect_duckdb, load_extension
 
 # The declared-FK query for Postgres sources: run through postgres_query so the
 # information_schema joins execute with real Postgres semantics, not DuckDB's proxy.
@@ -90,7 +89,7 @@ class DuckDBAdapter:
         self._table_schema = table_schema
         self._fk_via_postgres = fk_via_postgres
         self._attach_type = attach_type.upper()
-        self._con = duckdb.connect()
+        self._con = connect_duckdb(local_only=local_only)
         # A DuckDB file needs no extension: the engine already speaks its own format. INSTALLing a
         # nonexistent "duckdb" extension would fail, so the empty string means "nothing to load".
         if extension:

@@ -18,6 +18,16 @@ from __future__ import annotations
 import duckdb
 
 
+def connect_duckdb(database: str = ":memory:", *, local_only: bool) -> duckdb.DuckDBPyConnection:
+    """Every DuckDB connection mnemiq opens. **Codex's review of M107**: auto-install was switched
+    off only inside `load_extension`, so a connection that loads no extension -- a native DuckDB
+    source -- kept it on, and model-written SQL needing a known extension (`read_csv` on a URL needs
+    `httpfs`) installed it by download. Under local-only it is off in the connection's config, so
+    it holds before any ATTACH or query. `local_only` has no default: a caller decides."""
+    config = {"autoinstall_known_extensions": False} if local_only else {}
+    return duckdb.connect(database, config=config)
+
+
 class ExtensionNotInstalled(RuntimeError):
     """MNEMIQ_LOCAL_ONLY is set and loading this extension would download it."""
 
