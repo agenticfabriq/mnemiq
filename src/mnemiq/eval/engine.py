@@ -145,7 +145,7 @@ def build_engine(
         # The objects are still the caller's to choose: a governed arm that granted no tables would
         # measure refusal, not narrowing, and the two are different signals.
         pass
-    authz = _GrantAll(grants)
+    engine_grants = grants
 
     kit = build_components(settings, adapter, con)
 
@@ -191,7 +191,12 @@ def build_engine(
     # coverage; k=6 left 48 cases, mostly big DBs, without their gold table). Tunable per source.
     k = settings.retrieval_k
 
-    def ask(question: str) -> AgentAnswer:
+    def ask(question: str, grants: GrantSet | None = None) -> AgentAnswer:
+        # `grants` narrows this one question, as `Runtime.ask` resolves grants per identity on every
+        # call; None keeps the engine's. BEAVER's restricted arm grants each question only the
+        # tables its annotations name, and an engine is built once per database, not per question.
+        # The answer cache keys on the grant fingerprint, so two scopes never share an answer.
+        scope = engine_grants if grants is None else grants
         # EVERY grounding argument `Runtime.ask` passes, and for the same reasons. This call used
         # to omit `metrics`, `dimensions` and `snapshot`, which meant an eval measured a strictly
         # less-grounded engine than production:
@@ -208,7 +213,7 @@ def build_engine(
         # The gap has now appeared in BOTH directions -- the ontology index and glossary once
         # reached this door and not the product's -- which is why the test that guards it compares
         # the two call sites rather than either one alone.
-        packet = retrieve(con, question, IDENTITY, authz, embedder, k=k,
+        packet = retrieve(con, question, IDENTITY, _GrantAll(scope), embedder, k=k,
                           # Same Settings field the product door reads, not a second env
                           # lookup: MNEMIQ_CARD_STYLE resolves through Settings, which
                           # validates it, so `DDL` or a stray space cannot silently select
@@ -219,7 +224,7 @@ def build_engine(
                           columns=snapshot.columns, ontology_index=ontology_index,
                           snapshot=snapshot)
         # The product door's fit, from the same kit: an eval must measure the prompt `ask` sends.
-        packet = kit.fitter.fit(packet, snapshot, grants)
-        return agent.answer(packet, snapshot, grants, IDENTITY)
+        packet = kit.fitter.fit(packet, snapshot, scope)
+        return agent.answer(packet, snapshot, scope, IDENTITY)
 
     return ask, client
