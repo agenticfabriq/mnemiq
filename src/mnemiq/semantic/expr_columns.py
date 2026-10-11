@@ -18,6 +18,13 @@ from sqlglot import exp
 _EXPR_DIALECTS: tuple[str | None, ...] = (None, "sqlite")
 _QUOTES = '"`[]'
 
+# What every engine reads as itself, never as a same-named column: a bare number, a quoted
+# string, NULL. Only bare: `-42` or `(42)` still takes the spelling, which requires more
+# clearance, never less. Not `true` or `current_date`, though sqlglot parses each as a constant
+# -- with a column so named on the table, sqlite reads `true` as it and DuckDB `current_date`
+# (Codex's review of #96, both measured), so their spelling still names the column.
+_CONSTANTS = (exp.Literal, exp.Null)
+
 
 def _names_table(qualifier: str, table: str) -> bool:
     """Whether a column's qualifier names `table`, compared on dotted suffixes: `pg.person` and
@@ -45,8 +52,10 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
     Where no dialect reads a column, the spelling read: the last dotted part, if what precedes it
     -- its quotes off -- names the table. sqlglot reads an unquoted `comment` as a command and
     `customer.select` as nothing, and the gate measured each leaving a keyword-named column open.
+    Not where every dialect read a constant (`_CONSTANTS`): `42` reads no column named `42`.
     """
     refs: set[frozenset[str]] = set()
+    constants: list[bool] = []
     for dialect in _EXPR_DIALECTS:
         try:
             node = sqlglot.parse_one(expr, read=dialect)
@@ -54,6 +63,7 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
             continue
         if node is None:
             continue
+        constants.append(isinstance(node, _CONSTANTS))
         for column in node.find_all(exp.Column):
             if not column.name:
                 continue
@@ -68,6 +78,8 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
                 refs.add(frozenset(names))
     if refs:
         return refs
+    if constants and all(constants):
+        return set()
     qualifier, _, name = expr.strip().rpartition(".")
     qualifier = ".".join(part.strip(_QUOTES) for part in qualifier.split(".")) if qualifier else ""
     return {frozenset({name.lower()})} if name and _names_table(qualifier, source) else set()
