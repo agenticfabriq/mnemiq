@@ -115,3 +115,62 @@ def test_a_personal_dimension_with_no_expression_classifies_the_column_its_id_na
     out = apply_certified(_customers(), [record])
     ssn = next(c for c in out.columns if c.name == "ssn")
     assert ssn.pii_levels() == frozenset({"pii"})
+
+
+# Codex's review of #96: the spelling fallback named a column for a constant too.
+
+def _expressionless(dimension_id: str, pii_level: str):
+    from mnemiq.contract import CertifiedRecord
+
+    return CertifiedRecord.model_validate({
+        "envelope": {"object_type": "dimension", "object_id": dimension_id, "version": "v1",
+                     "source_system": "verity", "provenance": {"status": "certified",
+                                                               "certifier": "reviewer@acme"}},
+        "payload": {"id": dimension_id, "label": dimension_id, "source": "customer",
+                    "pii_level": pii_level},
+    })
+
+
+def _one_column(name: str, pii_level: str | None = None):
+    from mnemiq.contract import Column, Snapshot
+
+    return Snapshot(version="v", source_id="s", created_at="t", columns=[
+        Column(id=f"customer.{name}", object_id="customer", name=name, pii_level=pii_level)])
+
+
+def test_a_constant_reads_no_column_of_its_spelling():
+    """A dimension `42` with no expression, phi, stamped the table's column `42` with phi; every
+    engine reads `42` and `null` as themselves, so the column stays as it was."""
+    for spelling in ("42", "null"):
+        for record in (_expressionless(spelling, "phi"), _record("note", spelling, "phi")):
+            out = apply_certified(_one_column(spelling), [record])
+            assert out.columns[0].pii_levels() == frozenset(), (spelling, record.payload)
+        snap = _one_column(spelling, "pii").model_copy(update={"dimensions": [
+            Dimension(id=spelling, label="Constant", source="customer")]})
+        assert _shown(snap, _grants()) == [spelling], spelling
+
+
+def test_a_keyword_an_engine_reads_as_its_column_still_names_it():
+    """sqlglot parses `current_date` and `true` as constants too, but with a column so named on
+    the table DuckDB reads `current_date` as it and sqlite `true` -- so both still classify and
+    require it. Checked against the engines, so a change in either says why this test stands."""
+    import sqlite3
+
+    import duckdb
+
+    duck = duckdb.connect()
+    duck.execute('CREATE TABLE customer("current_date" VARCHAR)')
+    duck.execute("INSERT INTO customer VALUES ('the column')")
+    assert duck.execute("SELECT current_date FROM customer").fetchall() == [("the column",)]
+    lite = sqlite3.connect(":memory:")
+    lite.execute('CREATE TABLE customer("true" TEXT)')
+    lite.execute("INSERT INTO customer VALUES ('the column')")
+    assert lite.execute("SELECT true FROM customer").fetchall() == [("the column",)]
+
+    for spelling in ("current_date", "true"):
+        out = apply_certified(_one_column(spelling), [_expressionless(spelling, "phi")])
+        assert out.columns[0].pii_levels() == frozenset({"phi"}), spelling
+        snap = _one_column(spelling, "pii").model_copy(update={"dimensions": [
+            Dimension(id=spelling, label="Keyword", source="customer")]})
+        assert _shown(snap, _grants()) == [], spelling
+        assert _shown(snap, _grants({"pii"})) == [spelling], spelling
