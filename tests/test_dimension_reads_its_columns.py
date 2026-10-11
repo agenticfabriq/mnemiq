@@ -140,8 +140,9 @@ def _one_column(name: str, pii_level: str | None = None):
 
 def test_a_constant_reads_no_column_of_its_spelling():
     """A dimension `42` with no expression, phi, stamped the table's column `42` with phi; every
-    engine reads `42` and `null` as themselves, so the column stays as it was."""
-    for spelling in ("42", "null"):
+    engine reads `42`, `4.2` and `null` as themselves, so the column stays as it was. `4.2` is
+    not matched as a constant; the spelling reads it as table `4`, which this is not."""
+    for spelling in ("42", "4.2", "null"):
         for record in (_expressionless(spelling, "phi"), _record("note", spelling, "phi")):
             out = apply_certified(_one_column(spelling), [record])
             assert out.columns[0].pii_levels() == frozenset(), (spelling, record.payload)
@@ -172,5 +173,19 @@ def test_a_keyword_an_engine_reads_as_its_column_still_names_it():
         assert out.columns[0].pii_levels() == frozenset({"phi"}), spelling
         snap = _one_column(spelling, "pii").model_copy(update={"dimensions": [
             Dimension(id=spelling, label="Keyword", source="customer")]})
+        assert _shown(snap, _grants()) == [], spelling
+        assert _shown(snap, _grants({"pii"})) == [spelling], spelling
+
+
+def test_a_digit_led_name_mysql_reads_as_a_column_still_names_it():
+    """Codex's review of #100: sqlglot parses `1e` as a number, and MySQL 8.4 reads a bare `1e`,
+    `1E` or `123e` as a column so named (measured on a throwaway server; CI has none, so it is not
+    asserted here). Read as a constant by sqlglot's parse, the column was left open; the spelling
+    still names it."""
+    for spelling in ("1e", "1E", "123e"):
+        out = apply_certified(_one_column(spelling), [_expressionless(spelling, "phi")])
+        assert out.columns[0].pii_levels() == frozenset({"phi"}), spelling
+        snap = _one_column(spelling, "pii").model_copy(update={"dimensions": [
+            Dimension(id=spelling, label="Digit-led", source="customer")]})
         assert _shown(snap, _grants()) == [], spelling
         assert _shown(snap, _grants({"pii"})) == [spelling], spelling
