@@ -35,6 +35,7 @@ from itertools import zip_longest
 from dataclasses import dataclass, field, replace
 
 # Defined with the boot advisory, so the boot line and the question path agree on what fits.
+from mnemiq.config import DEFAULT_MAX_QUESTION_CHARS
 from mnemiq.llm.window import FEEDBACK_ALLOWANCE, byte_bound
 from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_facts
 
@@ -129,6 +130,9 @@ class PromptFitter:
     declare_assumed_terms: bool = False
     window: int | None = None
     count: object = None
+    # The agent declines a longer question (M147); the fitter runs first in both doors, so it must not count or trim
+    # for one, which would send it whole to the server and warn about a prompt nobody will send.
+    max_question_chars: int = DEFAULT_MAX_QUESTION_CHARS
     _server_window: int | None = field(default=None, init=False, repr=False)
     _no_count_until: float | None = field(default=None, init=False, repr=False)
     _window_seen_at: float = field(default=0.0, init=False, repr=False)
@@ -147,6 +151,8 @@ class PromptFitter:
         """`packet` itself when it fits (or nothing says how big the window is); otherwise a copy
         whose cards carry as many descriptions as fit. Never raises: a question is not stopped by
         the step that exists to let it through."""
+        if len(packet.question) > self.max_question_chars:
+            return packet  # the agent declines it next (M147): nothing to fit, nothing to count
         try:
             return self._fit(packet, snapshot, grants)
         except Exception:  # noqa: BLE001
@@ -325,4 +331,5 @@ def fitter_for(settings, dialect: str) -> PromptFitter:
         dialect=dialect, card_style=settings.card_style,
         reply_tokens=reasoning_budget(settings.llm_model, GENERATOR_MAX_TOKENS),
         assertive=settings.assertive_sql, declare_assumed_terms=settings.guard_undefined_terms,
-        window=settings.llm_context_window, count=count)
+        window=settings.llm_context_window, count=count,
+        max_question_chars=settings.max_question_chars)

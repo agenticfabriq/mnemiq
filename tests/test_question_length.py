@@ -150,7 +150,9 @@ def test_every_agent_construction_in_the_engine_passes_the_limit():
     sites, missing = 0, []
     for path in root.rglob("*.py"):
         for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "Agent":
+            func = getattr(node, "func", None)
+            named = getattr(func, "id", None) if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if isinstance(node, ast.Call) and named == "Agent":  # `Agent(...)` and `loop.Agent(...)` alike
                 sites += 1
                 if "max_question_chars" not in {k.arg for k in node.keywords}:
                     missing.append(f"{path.relative_to(root)}:{node.lineno}")
@@ -170,3 +172,50 @@ def test_the_boot_window_check_budgets_the_configured_question(limit):
                                  "duckdb", http=_server({"count": 1_000, "max_model_len": 28_672}))
     assert report.prompt_tokens == 1_000 + limit
     assert f"{limit:,} tokens for the question" in report.sentence()
+
+
+def _fitter_case(question_chars: int, limit: int):
+    from tests.test_prompt_fit import _fitter, _packet, _snapshot as _fit_snapshot
+
+    counted = []
+
+    def count(system, user):
+        counted.append(len(user))
+        return 10_000, 8_000  # always over: a question the fitter works on is counted, then trimmed
+
+    snap = _fit_snapshot()
+    fitter = _fitter(8_000, count=count)
+    fitter.max_question_chars = limit
+    packet = _packet(snap, question=_question(question_chars))
+    return fitter, packet, snap, counted
+
+
+def test_the_fitter_leaves_a_question_over_the_limit_alone(caplog):
+    """Both doors fit before the agent: without this, a question the agent is about to decline is sent whole to the
+    server's count, maybe more than once, and the operator's log says the prompt will not fit."""
+    import logging
+
+    from tests.test_prompt_fit import _grants
+
+    fitter, packet, snap, counted = _fitter_case(1_001, 1_000)
+    with caplog.at_level(logging.INFO, logger="mnemiq.semantic.fit"):
+        out = fitter.fit(packet, snap, _grants(snap))
+    assert out is packet and counted == []
+    assert "prompt window" not in caplog.text
+
+
+def test_the_fitter_still_fits_a_question_at_the_limit():
+    from tests.test_prompt_fit import _grants
+
+    fitter, packet, snap, counted = _fitter_case(1_000, 1_000)
+    fitter.fit(packet, snap, _grants(snap))
+    assert counted, "the control: a question within the limit is counted as before"
+
+
+def test_fitter_for_carries_the_setting():
+    from mnemiq.semantic.fit import fitter_for
+
+    for limit in (500, 8_000):
+        settings = Settings(max_question_chars=limit, llm_base_url="http://127.0.0.1:9/v1", llm_api_key="k",
+                            llm_model="m")
+        assert fitter_for(settings, "duckdb").max_question_chars == limit
