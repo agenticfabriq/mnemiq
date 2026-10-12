@@ -160,15 +160,17 @@ class Runtime:
         emit: Emit | None = None,
         history: list[HistoryTurn] | None = None,
     ) -> AgentAnswer:
-        self.reload_if_stale()
-        started = time.perf_counter()
-        # Route first: an unknown mode fails before any retrieval or LLM work.
+        # Route first: an unknown mode fails before any work.
         name = self.router.route(question, mode)
         agent = (self.agents or {}).get(name, self.agent)
-        # Before retrieval, which embeds the question, and the fit, which counts it on the model server: a
-        # question too long to read whole reaches neither, and is still recorded as an answer (M147).
+        # A question too long to read whole is declined before any work that can fail or wait on a server: the
+        # snapshot reload (the control database, and on a swap the window count), retrieval (which embeds it) and
+        # the fit (which counts it). It is still recorded as an answer (M147).
         if (declined := agent.decline_if_too_long(question)) is not None:
-            return self._record(declined, name, self.authz.grants_for(identity), identity, question, None, started)
+            return self._record(declined, name, self.authz.grants_for(identity), identity, question, None,
+                                time.perf_counter())
+        self.reload_if_stale()
+        started = time.perf_counter()
         with step(emit, Stage.RETRIEVE, mode=name):
             packet = retrieve(
                 self.con, question, identity, self.authz, self.embedder,
