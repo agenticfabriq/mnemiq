@@ -228,6 +228,21 @@ class Agent:
         # EXTRACT to SQLite strftime). The generator is constructed with the same dialect.
         self.dialect = getattr(adapter, "dialect", "duckdb")
 
+    def decline_if_too_long(self, question: str) -> AgentAnswer | None:
+        """The decline for a question too long to read whole, or None. Every stage reads the question whole, so
+        a longer one is declined, never cut (M147). Both doors call this before retrieval, which embeds the
+        question; `answer` calls it again for a caller that skipped it."""
+        if len(question) <= self.max_question_chars:
+            return None
+        return AgentAnswer(
+            answer=(f"Your question is {len(question):,} characters long; the limit is "
+                    f"{self.max_question_chars:,}. Shorten it, or ask an operator to raise "
+                    "MNEMIQ_MAX_QUESTION_CHARS. It was not cut: a cut question is answered as a "
+                    "different question."),
+            deferred=True,
+            reason_code=DeferralReason.QUESTION_TOO_LONG,
+        )
+
     def answer(
         self,
         packet: ContextPacket,
@@ -236,17 +251,8 @@ class Agent:
         identity: IdentityContext,
         emit: Emit | None = None,
     ) -> AgentAnswer:
-        # Before any generation: every stage reads the question whole, so a question too long to read whole is
-        # declined, never cut (M147). Here because both doors -- Runtime.ask and the eval engine -- call this.
-        if len(packet.question) > self.max_question_chars:
-            return AgentAnswer(
-                answer=(f"Your question is {len(packet.question):,} characters long; the limit is "
-                        f"{self.max_question_chars:,}. Shorten it, or ask an operator to raise "
-                        "MNEMIQ_MAX_QUESTION_CHARS. It was not cut: a cut question is answered as a "
-                        "different question."),
-                deferred=True,
-                reason_code=DeferralReason.QUESTION_TOO_LONG,
-            )
+        if (declined := self.decline_if_too_long(packet.question)) is not None:
+            return declined
         deadline = self.budget.started()
         try:
             if self.candidates <= 1:

@@ -6,8 +6,9 @@ it. On BEAVER's 200 sampled questions 84 reached the generator cut, and the anno
 question almost never arrived (domain knowledge on 0 of 125 questions) while the judge read every word. Nothing said
 so: the only witness was the model, which replied on 11 questions that the question looked truncated.
 
-Now every stage reads the same question. Up to MNEMIQ_MAX_QUESTION_CHARS the generator gets it whole; past it the
-agent declines before the generator is called, with a reason that says what to do (shorten it, or raise the limit).
+Now every stage reads the same question. Up to MNEMIQ_MAX_QUESTION_CHARS the generator gets it whole; past it both
+doors decline before retrieval, which embeds the question, with a reason that says what to do (shorten it, or raise
+the limit). `Agent.answer` declines it again, for a caller that skipped the door.
 """
 
 import ast
@@ -219,3 +220,75 @@ def test_fitter_for_carries_the_setting():
         settings = Settings(max_question_chars=limit, llm_base_url="http://127.0.0.1:9/v1", llm_api_key="k",
                             llm_model="m")
         assert fitter_for(settings, "duckdb").max_question_chars == limit
+
+
+# --- both doors decline before retrieval ---------------------------------------------------------
+# Retrieval embeds the question (`embedder.embed([question])`), and the fitter counts it on the model
+# server, so a check that waited for `Agent.answer` still sent an over-limit question to two servers
+# and, if either failed, answered with that error instead of question_too_long (Codex's review of #102).
+
+def _no_retrieve(*a, **k):
+    raise AssertionError("retrieval ran: it embeds the question, so the embedding server was sent it")
+
+
+class _NoFit:
+    def fit(self, *a, **k):
+        raise AssertionError("the fitter ran: it counts the question on the model server")
+
+
+def test_runtime_declines_an_over_limit_question_before_retrieval_and_still_reports_it(monkeypatch):
+    import mnemiq.runtime as rt_mod
+    from mnemiq.runtime import Runtime
+
+    monkeypatch.setattr(rt_mod, "retrieve", _no_retrieve)
+    records, traces = [], []
+
+    class _Sink:
+        def record(self, source_id, record):
+            records.append(record)
+
+    class _Trace:
+        def record_answer(self, event):
+            traces.append(event)
+
+    class _Authz:
+        def grants_for(self, identity):
+            return _GRANTS
+
+    generator = FakeGenerator([_REPLY])
+    rt = Runtime(con=None, snapshot=_snapshot(), adapter=None, agent=_agent(generator, max_question_chars=1_000),
+                 embedder=None, authz=_Authz(), settings=None, sink=_Sink(), trace_sink=_Trace(), fitter=_NoFit())
+    question = _question(1_001)
+    answer = rt.ask(question, _IDENTITY)
+
+    assert answer.reason_code == DeferralReason.QUESTION_TOO_LONG and answer.deferred and not answer.failed
+    assert generator.calls == []
+    assert answer.mode == "thinking" and answer.grant_fingerprint == _GRANTS.fingerprint
+    assert [r.reason_code for r in records] == [DeferralReason.QUESTION_TOO_LONG]
+    assert records[0].deferred and not records[0].failed
+    assert [t.question for t in traces] == [question]
+
+
+def test_the_eval_engine_declines_an_over_limit_question_before_retrieval(monkeypatch, tmp_path):
+    import mnemiq.eval.engine as engine
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(engine, "LLMEmbedder", lambda settings: None)
+    monkeypatch.setattr(engine, "build_index", lambda con, *a, **k: con.execute(
+        "CREATE TABLE IF NOT EXISTS semantic_object (object_id TEXT)"))
+    monkeypatch.setattr(engine, "build_example_index", lambda *a, **k: None)
+    monkeypatch.setattr(engine, "build_value_index", lambda *a, **k: 0)
+    monkeypatch.setattr(engine, "retrieve", _no_retrieve)
+    generator = FakeGenerator([_REPLY])
+    monkeypatch.setattr(engine, "build_components", lambda settings, adapter, con: SimpleNamespace(
+        fitter=_NoFit(), client=None, generator=generator, synthesizer=FakeSynthesizer("x"), corrector=None,
+        values=None, selector=None))
+
+    settings = Settings(llm_base_url=None, llm_api_key=None, llm_model=None, pg_dsn="x", acme_data_dir=None,
+                        store_path=str(tmp_path / "s.duckdb"), max_question_chars=1_000)
+    ask, _ = engine.build_engine(Snapshot(version="v", source_id="s", created_at="t"), adapter=None,
+                                 settings=settings, grants=_GRANTS)
+    answer = ask(_question(1_001))
+
+    assert answer.reason_code == DeferralReason.QUESTION_TOO_LONG and answer.deferred and not answer.failed
+    assert generator.calls == []

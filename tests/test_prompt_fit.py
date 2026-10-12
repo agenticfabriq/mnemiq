@@ -240,6 +240,9 @@ def test_runtime_ask_hands_the_agent_the_fitted_packet(monkeypatch, tmp_path):
     seen = {}
 
     class _Agent:
+        def decline_if_too_long(self, question):  # the doors ask before retrieval (M147)
+            return None
+
         def answer(self, packet, snapshot, grants, identity, emit=None):
             seen["packet"] = packet
             return AgentAnswer(answer="A")

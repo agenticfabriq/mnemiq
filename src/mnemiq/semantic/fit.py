@@ -130,8 +130,8 @@ class PromptFitter:
     declare_assumed_terms: bool = False
     window: int | None = None
     count: object = None
-    # The agent declines a longer question (M147); the fitter runs first in both doors, so it must not count or trim
-    # for one, which would send it whole to the server and warn about a prompt nobody will send.
+    # Both doors decline a longer question before retrieval (M147). The fitter skips one too, for a caller that fits
+    # without asking first: counting it would send it whole to the server and warn about a prompt nobody will send.
     max_question_chars: int = DEFAULT_MAX_QUESTION_CHARS
     _server_window: int | None = field(default=None, init=False, repr=False)
     _no_count_until: float | None = field(default=None, init=False, repr=False)
@@ -152,7 +152,7 @@ class PromptFitter:
         whose cards carry as many descriptions as fit. Never raises: a question is not stopped by
         the step that exists to let it through."""
         if len(packet.question) > self.max_question_chars:
-            return packet  # the agent declines it next (M147): nothing to fit, nothing to count
+            return packet  # declined, by the door or the agent (M147): nothing to fit, nothing to count
         try:
             return self._fit(packet, snapshot, grants)
         except Exception:  # noqa: BLE001
