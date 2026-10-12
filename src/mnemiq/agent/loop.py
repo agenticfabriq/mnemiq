@@ -9,6 +9,7 @@ from mnemiq.agent.trace import build_trace
 from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.keys import cache_key
 from mnemiq.cache.store import Cache, from_ipc, to_ipc
+from mnemiq.config import DEFAULT_MAX_QUESTION_CHARS
 from mnemiq.contract.seams import (
     append_notes,
     disclosure_sentence,
@@ -201,8 +202,12 @@ class Agent:
         preview_rows: int = 100,
         guard_undefined_terms: bool = False,
         guard_fanout: bool | None = False,
+        max_question_chars: int = DEFAULT_MAX_QUESTION_CHARS,
     ) -> None:
         self.generator = generator
+        # Defaults to the shipped limit, not to none: a construction site that forgets it still declines what no
+        # stage would read alike (M147).
+        self.max_question_chars = max_question_chars
         self.guard_undefined_terms = guard_undefined_terms
         self.guard_fanout = guard_fanout
         self.synthesizer = synthesizer
@@ -231,6 +236,17 @@ class Agent:
         identity: IdentityContext,
         emit: Emit | None = None,
     ) -> AgentAnswer:
+        # Before any generation: every stage reads the question whole, so a question too long to read whole is
+        # declined, never cut (M147). Here because both doors -- Runtime.ask and the eval engine -- call this.
+        if len(packet.question) > self.max_question_chars:
+            return AgentAnswer(
+                answer=(f"Your question is {len(packet.question):,} characters long; the limit is "
+                        f"{self.max_question_chars:,}. Shorten it, or ask an operator to raise "
+                        "MNEMIQ_MAX_QUESTION_CHARS. It was not cut: a cut question is answered as a "
+                        "different question."),
+                deferred=True,
+                reason_code=DeferralReason.QUESTION_TOO_LONG,
+            )
         deadline = self.budget.started()
         try:
             if self.candidates <= 1:

@@ -29,6 +29,9 @@ DEFAULT_EMBED_MODEL = "openai.text-embedding-3-small"
 # Measured on the full Spider 2.0-lite sweep against a variance control; see
 # tests/test_config.py::test_the_retrieval_k_default_is_the_measured_one.
 DEFAULT_RETRIEVAL_K = 24
+# The longest question every stage reads whole (M147). One constant, because the Agent falls back to it when a
+# construction site passes no limit: a second copy of the number is a second thing to forget.
+DEFAULT_MAX_QUESTION_CHARS = 4_000
 
 _SECRET_HINTS = ("api_key", "dsn", "password", "secret")  # fields whose value is never printed in .env.example
 
@@ -161,6 +164,7 @@ class Settings(BaseSettings):
     llm_prompt_cut_check: bool = Field(default=True, description="refuse an answer when the server cut the prompt to fit its context window without an error, as Ollama does (M119): a suspicious prompt-token count (far too few for the characters sent, or on a window size) that does not grow when the prompt is re-sent with padding; 0 only for a server or proxy whose prompt_tokens leaves out tokens it reused from a cache")
     llm_window_check: bool = Field(default=True, description="at boot, warn when the largest generation prompt this store can produce, plus the generator's reply budget, is longer than the server's context window (M119), for each role the access policy declares and from only what that role is shown: counted by the server where it can (vLLM's /tokenize), else bounded by its bytes against MNEMIQ_LLM_CONTEXT_WINDOW; a warning only, never a refusal")
     llm_context_window: int | None = Field(default=None, ge=1, description="the chat server's context window in tokens, for servers that do not report it (Ollama: your OLLAMA_CONTEXT_LENGTH or num_ctx); vLLM reports its own --max-model-len and this is then ignored")
+    max_question_chars: int = Field(default=DEFAULT_MAX_QUESTION_CHARS, ge=1, description="the longest question, in characters, that mnemiq answers; every stage reads it whole, and a longer one is declined before the generator is called (reason question_too_long), never cut (M147: a 500-character cut in the generator alone answered long questions as cut ones). The boot window check budgets this many tokens for the question, so lower it where the model's window is small")
     retrieval_k: int = Field(default=DEFAULT_RETRIEVAL_K, ge=1, description="schema cards retrieved into the generation packet")
     definition_index_max_concepts: int = Field(default=500, ge=0,
         description="per-scheme concept cap for the enrich-time definition-grounding index")

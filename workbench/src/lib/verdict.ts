@@ -95,6 +95,12 @@ export const REASONS: Record<DeferralReason, { title: string; next: string }> = 
     title: "The engine cannot confirm this query is governed",
     next: "Page an operator. Rephrasing will not help — the reason is in the source or the policy, not in your question.",
   },
+  // M147. A deferral: declined before the generator ran, because cutting it was the defect -- the generator read a
+  // cut question while the judge read the whole one. The body says the length and the limit.
+  question_too_long: {
+    title: "The question is longer than this deployment reads",
+    next: "Shorten it, or ask an operator to raise MNEMIQ_MAX_QUESTION_CHARS. Nothing was cut: a cut question is answered as a different question.",
+  },
 };
 
 /** 412 ms / 8.5 s / 2 m 04 s -- always legible, never more precision than is useful. */

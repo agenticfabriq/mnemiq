@@ -185,6 +185,8 @@ def build_engine(
         # harness the withdrawal says a revival has to be measured through.
         guard_undefined_terms=settings.guard_undefined_terms,
         guard_fanout=settings.guard_fanout,
+        # Both doors decline the same questions, or the eval measures a limit `ask` does not apply (M147).
+        max_question_chars=settings.max_question_chars,
     )
 
     # k=12 measured +2.3 strict / +2.3 facts over k=6 (recall probe: k=12 -> 100% gold-table

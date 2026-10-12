@@ -893,6 +893,7 @@ def build_runtime(settings: Settings) -> Runtime:
             verifier=verifiers[name],
             guard_undefined_terms=settings.guard_undefined_terms,
             guard_fanout=settings.guard_fanout,
+            max_question_chars=settings.max_question_chars,
         )
         for name, mode in MODES.items()
     }

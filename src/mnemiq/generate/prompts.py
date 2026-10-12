@@ -175,7 +175,10 @@ def history_section(packet: ContextPacket) -> list[str]:
 
 def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
     cards = "\n\n".join(c.card for c in packet.cards) or "(no tables are available to you)"
-    parts = [f"QUESTION: {sanitize(packet.question, limit=500)}"]
+    # Whole, as the judge, the selector and the synthesizer read it. A 500-character cut here answered long questions
+    # as cut ones while the judge checked the whole (M147); the agent declines a question over
+    # MNEMIQ_MAX_QUESTION_CHARS before this runs, so nothing here bounds it.
+    parts = [f"QUESTION: {sanitize(packet.question, limit=None)}"]
     parts += meaning_sections(packet)
     if packet.examples:
         parts += ["", "WORKED EXAMPLES (verified queries over these tables -- adapt, don't copy blindly):"]

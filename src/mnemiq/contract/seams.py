@@ -53,6 +53,11 @@ class DeferralReason(StrEnum):
     # not try, because trying could not have worked. The caller's move is to page an operator,
     # and telling them to rephrase would waste their time as well as the model's.
     UNGOVERNABLE = "ungovernable"
+    # M147: the question is longer than MNEMIQ_MAX_QUESTION_CHARS. Declined before the generator is called, because
+    # the alternative was the defect: the generator read a cut question while the judge read the whole one, so the
+    # SQL answered a different question than the one it was checked against. The caller shortens the question or
+    # raises the limit; neither rephrasing nor a grant helps.
+    QUESTION_TOO_LONG = "question_too_long"
 
 
 class IdentityContext(BaseModel):
