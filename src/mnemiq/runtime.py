@@ -165,6 +165,10 @@ class Runtime:
         # Route first: an unknown mode fails before any retrieval or LLM work.
         name = self.router.route(question, mode)
         agent = (self.agents or {}).get(name, self.agent)
+        # Before retrieval, which embeds the question, and the fit, which counts it on the model server: a
+        # question too long to read whole reaches neither, and is still recorded as an answer (M147).
+        if (declined := agent.decline_if_too_long(question)) is not None:
+            return self._record(declined, name, self.authz.grants_for(identity), identity, question, None, started)
         with step(emit, Stage.RETRIEVE, mode=name):
             packet = retrieve(
                 self.con, question, identity, self.authz, self.embedder,
@@ -198,6 +202,11 @@ class Runtime:
         if self.fitter is not None:
             packet = self.fitter.fit(packet, self.snapshot, grants)
         answer = agent.answer(packet, self.snapshot, grants, identity, emit=emit)
+        return self._record(answer, name, grants, identity, packet.question, packet, started)
+
+    def _record(self, answer: AgentAnswer, name: str, grants, identity: IdentityContext, question: str,
+                packet, started: float) -> AgentAnswer:
+        """Stamps the answer with its mode and grants, and records it once in each sink."""
         answer.mode = name
         answer.grant_fingerprint = grants.fingerprint
         if self.trace_sink is not None:
@@ -209,7 +218,7 @@ class Runtime:
 
             event = AnswerEvent(
                 source_id=self._source_id(),
-                question=packet.question,
+                question=question,
                 identity=identity,
                 answer=answer,
                 elapsed_ms=(time.perf_counter() - started) * 1000,
@@ -893,6 +902,7 @@ def build_runtime(settings: Settings) -> Runtime:
             verifier=verifiers[name],
             guard_undefined_terms=settings.guard_undefined_terms,
             guard_fanout=settings.guard_fanout,
+            max_question_chars=settings.max_question_chars,
         )
         for name, mode in MODES.items()
     }

@@ -40,6 +40,9 @@ def _engine(monkeypatch, tmp_path, grants):
         def __init__(self, **kw):
             pass
 
+        def decline_if_too_long(self, question):  # the doors ask before retrieval (M147)
+            return None
+
         def answer(self, packet, snapshot, grants, identity):
             seen["answer"].append(grants.objects)
             return AgentAnswer(answer="A")

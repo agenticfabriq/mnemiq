@@ -252,7 +252,7 @@ def test_examples_are_ranked_as_rendered_not_as_stored():
 def test_the_question_is_counted_as_its_allowance():
     report = check_window(duckdb.connect(), _snapshot(), _settings(), "duckdb",
                           http=_server({"count": 1_000, "max_model_len": 28_672}))
-    assert report.prompt_tokens == 1_000 + window.QUESTION_ALLOWANCE
+    assert report.prompt_tokens == 1_000 + window.question_allowance(_settings())
 
 
 def _pii_table(described: int, bare: int) -> Snapshot:
@@ -516,7 +516,7 @@ def test_without_a_server_count_the_estimate_errs_long_against_the_declared_wind
     report = check_window(con, snap, settings, "duckdb", http=_server(None, 404))
     system, user, _ = largest_prompt(con, snap, settings, "duckdb")
     assert not report.counted_by_server and report.window == 100
-    assert report.prompt_tokens == window.byte_bound(system, user) + window.QUESTION_ALLOWANCE
+    assert report.prompt_tokens == window.byte_bound(system, user) + window.question_allowance(settings)
     assert report.fits is False
 
 
@@ -577,7 +577,7 @@ def test_a_bound_inflated_by_shared_definitions_warns_may_not_can(caplog, monkey
     con = duckdb.connect()
     _, bound, real, _ = window.largest_prompts(con, snap, _settings(), "duckdb", window.everything(snap))
     assert len(bound) > 1.5 * len(real), "the case: the bound counts each definition twice"
-    between = (len(real) + len(bound)) // 8 + window.QUESTION_ALLOWANCE + GENERATOR_MAX_TOKENS
+    between = (len(real) + len(bound)) // 8 + window.question_allowance(_settings()) + GENERATOR_MAX_TOKENS
     report = check_window(con, snap, _settings(), "duckdb", http=_counting_server(between))
     assert report.fits is False and not report.certain
 

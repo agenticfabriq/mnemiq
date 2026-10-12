@@ -185,6 +185,8 @@ def build_engine(
         # harness the withdrawal says a revival has to be measured through.
         guard_undefined_terms=settings.guard_undefined_terms,
         guard_fanout=settings.guard_fanout,
+        # Both doors decline the same questions, or the eval measures a limit `ask` does not apply (M147).
+        max_question_chars=settings.max_question_chars,
     )
 
     # k=12 measured +2.3 strict / +2.3 facts over k=6 (recall probe: k=12 -> 100% gold-table
@@ -198,6 +200,9 @@ def build_engine(
         # question), since an engine is built once per database, not per question.
         # The answer cache keys on the grant fingerprint, so two scopes never share an answer.
         scope = engine_grants if grants is None else grants
+        # Before retrieval, as `Runtime.ask` does: retrieval embeds the question (M147).
+        if (declined := agent.decline_if_too_long(question)) is not None:
+            return declined
         # EVERY grounding argument `Runtime.ask` passes, and for the same reasons. This call used
         # to omit `metrics`, `dimensions` and `snapshot`, which meant an eval measured a strictly
         # less-grounded engine than production:

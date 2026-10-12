@@ -123,6 +123,9 @@ def test_ask_retrieves_scoped_and_delegates_to_the_agent(monkeypatch):
                              enrichment_version="v1")
 
     class _Agent:
+        def decline_if_too_long(self, question):  # the doors ask before retrieval (M147)
+            return None
+
         def answer(self, packet, snapshot, grants, identity, emit=None):
             calls["answer"] = (packet, snapshot, grants.objects)
             return AgentAnswer(answer="ANSWER")
@@ -154,6 +157,9 @@ def test_ask_dispatches_to_the_mode_agent_and_stamps_the_mode(monkeypatch):
     class _A:
         def __init__(self, tag):
             self.tag = tag
+
+        def decline_if_too_long(self, question):  # the doors ask before retrieval (M147)
+            return None
 
         def answer(self, packet, snapshot, grants, identity, emit=None):
             return AgentAnswer(answer=self.tag)
@@ -325,6 +331,9 @@ def test_ask_threads_ontology_index_columns_and_definitions(monkeypatch):
     monkeypatch.setattr(rt_mod, "retrieve", fake_retrieve)
 
     class _Agent:
+        def decline_if_too_long(self, question):  # the doors ask before retrieval (M147)
+            return None
+
         def answer(self, packet, snapshot, grants, identity, emit=None):
             return AgentAnswer(answer="ANSWER")
 
@@ -432,6 +441,9 @@ def test_ask_hands_retrieval_the_configured_card_style(monkeypatch, tmp_path):
                              enrichment_version=None)
 
     class _Agent:
+        def decline_if_too_long(self, question):  # the doors ask before retrieval (M147)
+            return None
+
         def answer(self, packet, snapshot, grants, identity, emit=None):
             return AgentAnswer(answer="A")
 

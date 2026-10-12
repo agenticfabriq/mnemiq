@@ -11,8 +11,9 @@ rendered under that identity's access policy (denied columns gone, masked ones c
 note), facts, and the definitions and certified measures bound to it -- with a definition shared by
 two of them counted with each, and a section they leave empty given one item from a granted table
 that fills it; the `retrieval_k` permitted worked examples that add the most once rendered; the
-longest strategy's system prompt. The question is an allowance of 500 tokens, not text: `sanitize`
-keeps 500 characters, and a byte-level tokenizer spends at most one token on an ASCII character.
+longest strategy's system prompt. The question is an allowance, not text: MNEMIQ_MAX_QUESTION_CHARS
+tokens, because the agent declines a longer question (M147) and a byte-level tokenizer spends at most
+one token on an ASCII character.
 Left out, because they depend on the question: the code vocabulary for its columns, glossary terms
 it happens to name, and the conversation history.
 
@@ -70,11 +71,16 @@ def byte_bound(system: str, user: str) -> int:
 DEADLINE_S = 15.0
 MAX_REPLY_BYTES = 8 * 1024 * 1024
 _PHASE_TIMEOUT_S = 5.0
-# `sanitize` keeps 500 characters of a question, and a byte-level tokenizer spends at most one token
-# on an ASCII character. Added as tokens: as text, any filler tokenizes its own way (500 x's are a few).
-# ASCII only: a byte-level tokenizer can spend a token per UTF-8 byte, so a 500-character question in
-# Chinese or heavy with accents can cost more -- headroom again.
-QUESTION_ALLOWANCE = 500
+# The question's allowance is `settings.max_question_chars` tokens (`question_allowance`): the agent declines a
+# longer question (M147), and a byte-level tokenizer spends at most one token on an ASCII character. Added as
+# tokens: as text, any filler tokenizes its own way (500 x's are a few). ASCII only: a byte-level tokenizer can
+# spend a token per UTF-8 byte, so a question in Chinese or heavy with accents can cost more -- headroom again.
+
+
+def question_allowance(settings) -> int:
+    return settings.max_question_chars
+
+
 # A retry re-sends the prompt with the database's error and the failed SQL, and the judge adds
 # the SQL and a result preview: room the fit (M127) keeps free beyond the reply, and the floor
 # test below uses too, so the boot line and the question path agree on what fits. A guess, not a
@@ -97,6 +103,8 @@ class WindowReport:
     cards: int
     real_tokens: int | None = None
     who: str = ""
+    # What `prompt_tokens` holds for the question (`question_allowance`), so the sentence names it.
+    question_tokens: int = 0
     # The same largest prompt with no column descriptions, measured only when the full one does not
     # fit: what is left once the fit (M127) has withheld every description it can.
     floor_tokens: int | None = None
@@ -142,7 +150,7 @@ class WindowReport:
         return (f"{'for ' + self.who + ', ' if self.who else ''}"
                 f"the longest generation prompt this store can produce ({tables} "
                 f"bringing the most into it, with their definitions, measures and examples, and "
-                f"{QUESTION_ALLOWANCE} tokens for the question) is "
+                f"{self.question_tokens:,} tokens for the question) is "
                 f"{count}; with the "
                 f"generator's {self.reply_tokens:,}-token reply budget it needs {self.needed:,}, and "
                 f"the window is {window}")
@@ -410,6 +418,7 @@ def _count(prompts: tuple[str, str, str, int], settings, http: httpx.Client | No
            who: str) -> WindowReport:
     system, bound, real, cards = prompts
     reply = reasoning_budget(settings.llm_model, GENERATOR_MAX_TOKENS)
+    question = question_allowance(settings)
 
     def count(user: str):
         return count_on_server(settings.llm_base_url, settings.llm_model, system, user, http=http,
@@ -423,13 +432,14 @@ def _count(prompts: tuple[str, str, str, int], settings, http: httpx.Client | No
         prompt, window = first
         second = first if real == bound else _within_deadline(
             count, real, deadline=DEADLINE_S - (time.monotonic() - started))
-        return WindowReport(prompt + QUESTION_ALLOWANCE, reply, window, counted_by_server=True,
+        return WindowReport(prompt + question, reply, window, counted_by_server=True,
                             cards=cards,
-                            real_tokens=None if second is None else second[0] + QUESTION_ALLOWANCE,
-                            who=who)
+                            real_tokens=None if second is None else second[0] + question,
+                            who=who, question_tokens=question)
 
     def estimate(user: str) -> int:
-        return byte_bound(system, user) + QUESTION_ALLOWANCE
+        return byte_bound(system, user) + question
 
     return WindowReport(estimate(bound), reply, settings.llm_context_window,
-                        counted_by_server=False, cards=cards, real_tokens=estimate(real), who=who)
+                        counted_by_server=False, cards=cards, real_tokens=estimate(real), who=who,
+                        question_tokens=question)

@@ -9,6 +9,7 @@ from mnemiq.agent.trace import build_trace
 from mnemiq.authz.grants import GrantSet
 from mnemiq.cache.keys import cache_key
 from mnemiq.cache.store import Cache, from_ipc, to_ipc
+from mnemiq.config import DEFAULT_MAX_QUESTION_CHARS
 from mnemiq.contract.seams import (
     append_notes,
     disclosure_sentence,
@@ -201,8 +202,12 @@ class Agent:
         preview_rows: int = 100,
         guard_undefined_terms: bool = False,
         guard_fanout: bool | None = False,
+        max_question_chars: int = DEFAULT_MAX_QUESTION_CHARS,
     ) -> None:
         self.generator = generator
+        # Defaults to the shipped limit, not to none: a construction site that forgets it still declines what no
+        # stage would read alike (M147).
+        self.max_question_chars = max_question_chars
         self.guard_undefined_terms = guard_undefined_terms
         self.guard_fanout = guard_fanout
         self.synthesizer = synthesizer
@@ -223,6 +228,21 @@ class Agent:
         # EXTRACT to SQLite strftime). The generator is constructed with the same dialect.
         self.dialect = getattr(adapter, "dialect", "duckdb")
 
+    def decline_if_too_long(self, question: str) -> AgentAnswer | None:
+        """The decline for a question too long to read whole, or None. Every stage reads the question whole, so
+        a longer one is declined, never cut (M147). Both doors call this before retrieval, which embeds the
+        question; `answer` calls it again for a caller that skipped it."""
+        if len(question) <= self.max_question_chars:
+            return None
+        return AgentAnswer(
+            answer=(f"Your question is {len(question):,} characters long; the limit is "
+                    f"{self.max_question_chars:,}. Shorten it, or ask an operator to raise "
+                    "MNEMIQ_MAX_QUESTION_CHARS. It was not cut: a cut question is answered as a "
+                    "different question."),
+            deferred=True,
+            reason_code=DeferralReason.QUESTION_TOO_LONG,
+        )
+
     def answer(
         self,
         packet: ContextPacket,
@@ -231,6 +251,8 @@ class Agent:
         identity: IdentityContext,
         emit: Emit | None = None,
     ) -> AgentAnswer:
+        if (declined := self.decline_if_too_long(packet.question)) is not None:
+            return declined
         deadline = self.budget.started()
         try:
             if self.candidates <= 1:

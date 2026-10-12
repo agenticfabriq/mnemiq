@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from mnemiq.agent.budget import Budget
 from mnemiq.agent.loop import Agent
+from mnemiq.config import DEFAULT_MAX_QUESTION_CHARS
 
 # Modes are USER-INTENT bundles (pay ~6x when the answer matters), not an accuracy
 # router: routing by difficulty measured no signal (plan 18 calibration -- deep's gain
@@ -65,6 +66,7 @@ def build_agent(
     verifier=None,
     guard_undefined_terms: bool = False,
     guard_fanout: bool | None = False,
+    max_question_chars: int = DEFAULT_MAX_QUESTION_CHARS,
 ) -> Agent:
     """One thin Agent per mode over SHARED components (safe: they hold no per-call state)."""
     return Agent(
@@ -81,4 +83,5 @@ def build_agent(
         verifier=verifier,
         guard_undefined_terms=guard_undefined_terms,
         guard_fanout=guard_fanout,
+        max_question_chars=max_question_chars,
     )
