@@ -292,3 +292,41 @@ def test_the_eval_engine_declines_an_over_limit_question_before_retrieval(monkey
 
     assert answer.reason_code == DeferralReason.QUESTION_TOO_LONG and answer.deferred and not answer.failed
     assert generator.calls == []
+
+
+def test_runtime_declines_an_over_limit_question_before_the_snapshot_reload(monkeypatch):
+    """The reload reaches the control database, and on a swap the model server's window count. Neither is sent the
+    question, but either failing raised instead of the decline, and a swap's count held it up (Codex's review of
+    #102's fix)."""
+    import mnemiq.runtime as rt_mod
+    from mnemiq.runtime import Runtime
+
+    def _no_reload(*a, **k):
+        raise AssertionError("the snapshot reload ran: it reaches the control database")
+
+    monkeypatch.setattr(rt_mod, "load_current_snapshot", _no_reload)
+    monkeypatch.setattr(rt_mod, "retrieve", _no_retrieve)
+    records, traces = [], []
+
+    class _Sink:
+        def record(self, source_id, record):
+            records.append(record)
+
+    class _Trace:
+        def record_answer(self, event):
+            traces.append(event)
+
+    class _Authz:
+        def grants_for(self, identity):
+            return _GRANTS
+
+    settings = Settings(llm_base_url=None, llm_api_key=None, llm_model=None, pg_dsn="x", acme_data_dir=None,
+                        control_dsn="postgresql://control.invalid/x")
+    rt = Runtime(con=None, snapshot=_snapshot(), adapter=None, agent=_agent(FakeGenerator([_REPLY]),
+                 max_question_chars=1_000), embedder=None, authz=_Authz(), settings=settings, sink=_Sink(),
+                 trace_sink=_Trace(), fitter=_NoFit())
+    answer = rt.ask(_question(1_001), _IDENTITY)
+
+    assert answer.reason_code == DeferralReason.QUESTION_TOO_LONG
+    assert [r.reason_code for r in records] == [DeferralReason.QUESTION_TOO_LONG]
+    assert [t.packet for t in traces] == [None]
