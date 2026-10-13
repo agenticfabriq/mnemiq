@@ -10,7 +10,12 @@ from mnemiq.adapters.duckdb import (
     duckdb_user_functions,
 )
 from mnemiq.config import SourceSpec
-from mnemiq.duckdb_extensions import SOURCE_EXTENSIONS, connect_duckdb, load_extension
+from mnemiq.duckdb_extensions import (
+    SOURCE_EXTENSIONS,
+    connect_duckdb,
+    load_extension,
+    lock_configuration,
+)
 
 _EXT = {"postgres": (SOURCE_EXTENSIONS["postgres"], "POSTGRES"),
         "sqlite": (SOURCE_EXTENSIONS["sqlite"], "SQLITE")}
@@ -55,6 +60,7 @@ class FederatedAdapter:
             clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
             self._con.execute(f"ATTACH '{spec.target}' AS {spec.catalog} {clause}")
         # No single USE: every query is catalog-qualified (catalog.schema.table).
+        lock_configuration(self._con, local_only=local_only)
 
     # The same three catalogue reads the single-source DuckDB path uses, on the same kind of
     # connection. Without them a federated deployment got `never_asked` and M43's residual fix

@@ -206,3 +206,18 @@ def fetch_extensions(out: Path, names: Iterable[str] = ALL_EXTENSIONS, *,
             raise RuntimeError("downloaded but does not load, so removed:\n  " + "\n  ".join(
                 f"{path.name}: {reason}" for path, reason in bad))
     return written
+
+
+def lock_configuration(con: duckdb.DuckDBPyConnection, *, local_only: bool) -> None:
+    """The last step of a local-only connection's setup that runs model-written SQL: no later
+    `SET` but of `schema` or `search_path` -- `SET autoload_known_extensions = true` above all --
+    changes its configuration (Codex's review of #92). The deciders already refuse `SET` by shape; this makes the engine
+    refuse it too.
+
+    Measured on DuckDB 1.5.4: after it 158 of the 160 settings refuse a `SET`, unlocking
+    included; `schema` and `search_path` still take one, and `LOAD`, `ATTACH` and `USE` still run --
+    so the deciders' refusal of those stays the guard for them.
+    Last, because `load_extension` runs a `SET` of its own. Not the store's connection: its build
+    sets `hnsw_enable_experimental_persistence`, and it runs no model-written SQL."""
+    if local_only:
+        con.execute("SET lock_configuration = true")
