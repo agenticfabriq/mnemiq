@@ -549,14 +549,19 @@ def test_a_read_through_an_unmodelled_source_is_refused(sql, dialect):
 
 
 @pytest.mark.parametrize("dialect", _DIALECTS)
-def test_the_source_rule_still_refuses_what_it_cannot_model(dialect):
-    """The whitelist stays as the second layer: a LATERAL VALUES over a GRANTED table passes
-    `check_access` and is refused by the rule, repairably and by name."""
-    v = _decide("SELECT 1 AS one FROM LATERAL (VALUES ((SELECT max(amount) FROM claim))) AS lv(x)",
-                dialect)
+@pytest.mark.parametrize(("sql", "shape"), [
+    ("SELECT 1 AS one FROM LATERAL (VALUES ((SELECT max(amount) FROM claim))) AS lv(x)", "lateral"),
+    ("SELECT 1 AS one FROM (VALUES (1), (2)) AS v(x)", "values"),
+    ("SELECT 1 AS one FROM claim CROSS JOIN LATERAL (VALUES (1)) AS lv(x)", "lateral"),
+])
+def test_the_source_rule_still_refuses_what_it_cannot_model(sql, shape, dialect):
+    """LOAD-BEARING as the second layer behind the coverage fallback: each of these reads only
+    granted tables, passes `check_access`, and is refused by the source rule alone -- repairably,
+    by name. Dropping `check_unmodelled_source` fails every case here."""
+    v = _decide(sql, dialect)
     assert isinstance(v, Refusal) and v.code == RefusalCode.UNMODELLED_SOURCE, v
     assert v.repairable is True, "the same query can be written with tables and subqueries"
-    assert "lateral" in v.message, "the model cannot avoid a shape the refusal does not name"
+    assert shape in v.message, "the model cannot avoid a shape the refusal does not name"
 
 
 @pytest.mark.parametrize("dialect", _DIALECTS)
@@ -619,12 +624,21 @@ _VALUES_OUTSIDE_A_SOURCE = [
 @pytest.mark.parametrize("dialect", _DIALECTS)
 @pytest.mark.parametrize("sql", _VALUES_OUTSIDE_A_SOURCE)
 def test_a_read_hidden_in_values_outside_a_source_is_refused(sql, dialect):
-    """Refused. The subject is `customer`, or -- in the CTE forms -- the CTE's own name: once the
-    scope is known to have missed a read, every table node counts as one, CTE references included.
-    That over-reports, which is the direction a guard fails in."""
+    """Refused, naming `customer`: the reads the walk missed come first in the fallback, so the
+    refusal names the hidden table rather than the CTE the query defined."""
     v = _decide(sql, dialect)
     assert isinstance(v, Refusal) and v.code == RefusalCode.UNAUTHORIZED_TABLE, v
-    assert v.subject in {"customer", "t"}, v
+    assert v.subject == "customer", v
+
+
+@pytest.mark.xfail(strict=True, reason="the fallback's cost: once a read is missed every table "
+                   "node counts, the CTE's own name included, so a granted read through VALUES in a "
+                   "CTE is refused as the CTE. 0 of 9,687 gold queries take this shape.")
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_a_granted_read_hidden_in_a_cte_values_is_approved(dialect):
+    v = _decide("WITH t(x) AS (VALUES ((SELECT max(amount) FROM claim)) UNION ALL SELECT 1) "
+                "SELECT x FROM t", dialect)
+    assert not isinstance(v, Refusal), v
 
 
 @pytest.mark.parametrize("dialect", _DIALECTS)

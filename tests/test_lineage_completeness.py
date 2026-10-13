@@ -549,11 +549,10 @@ def test_a_quoted_function_name_cannot_carry_a_literal_into_the_always_tier():
 
 
 def test_an_unmodelled_source_in_a_view_body_is_not_a_clean_bill():
-    """`base_tables` can return FEWER tables for a shape it does not model while scope
-    construction still reports success — a Postgres view over `LATERAL (VALUES ((SELECT
-    max(store_id) FROM customer)))` gave COMPLETE with `customer` unaccounted. `views.py` refuses
-    on unmodelled sources for exactly this reason and the whitelist is reused rather than
-    re-derived."""
+    """`base_tables` returned FEWER tables for a shape it does not model while scope construction
+    still reported success -- a Postgres view over `LATERAL (VALUES ((SELECT max(store_id) FROM
+    customer)))` gave COMPLETE with `customer` unaccounted. Since Codex's review of M65 the scope
+    reports that miss, and the whitelist the marker reuses names the shape as well."""
     views = [ViewDefinition(
         object_id="v",
         definition="SELECT * FROM LATERAL (VALUES ((SELECT max(store_id) FROM customer))) AS lv(x)",

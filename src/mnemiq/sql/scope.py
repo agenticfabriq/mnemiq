@@ -220,8 +220,13 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
         return list(ast.find_all(exp.Table))
 
     out = _walked_reads(ast, root, dialect)
-    if _scope_missed_a_read(ast, out, dialect):
-        return list(ast.find_all(exp.Table))
+    missed = _missed_reads(ast, out, dialect)
+    if missed:
+        # Every table node, as an unresolvable scope gives -- but the reads the walk MISSED first,
+        # so a guard refusing at the first name not granted names the table the query hid, not a
+        # CTE it defined (review gate on Codex's review of #109: the model was told it may not
+        # query `t`, its own CTE).
+        return missed + [t for t in ast.find_all(exp.Table) if not any(m is t for m in missed)]
     return out
 
 
@@ -265,10 +270,16 @@ def _scope_missed_a_read(ast: exp.Expression, walked: list[exp.Table], dialect: 
     missed falls back to every table node. Measured cost on reads: none of 9,687 gold queries
     (BIRD mini-dev in SQLite, Postgres and MySQL, KaggleDBQA, BEAVER, Spider2-lite local).
     """
+    return bool(_missed_reads(ast, walked, dialect))
+
+
+def _missed_reads(ast: exp.Expression, walked: list[exp.Table], dialect: str | None) -> list[exp.Table]:
+    """The table nodes `_scope_missed_a_read` counts: left out by the walk, not written, and not
+    a CTE in scope -- reads the scope model missed."""
     written = _written_targets(ast)
-    return any(not any(t is table for t in walked) and not any(w is table for w in written)
-               and not _cte_in_scope(table, dialect)
-               for table in ast.find_all(exp.Table))
+    return [table for table in ast.find_all(exp.Table)
+            if not any(t is table for t in walked) and not any(w is table for w in written)
+            and not _cte_in_scope(table, dialect)]
 
 
 def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
