@@ -174,7 +174,7 @@ def _record(into: list[Narrowing], one: Narrowing) -> None:
 
 
 def unplaceable_policy(ast: exp.Expression, policy: AccessPolicy, dialect: str | None) -> Refusal | None:
-    """Refuse to rewrite a statement whose scope missed a read when a CTE in it is named after a
+    """Refuse to rewrite a statement whose read list fell back when a CTE in it is named after a
     table the policy governs (Codex's review of #111).
 
     When the walk misses a read, `base_tables` falls back to every table node -- CTE references
@@ -199,9 +199,10 @@ def unplaceable_policy(ast: exp.Expression, policy: AccessPolicy, dialect: str |
                 code=RefusalCode.UNMODELLED_SOURCE,
                 message=(
                     f"The query names a CTE {cte.name!r} after a table with a row or column "
-                    "policy, and reads that table where this engine cannot see it -- inside a "
-                    "VALUES or a set-operation branch -- so it cannot tell the two apart to apply "
-                    "the policy. Rename the CTE, or write it with joins and subqueries."
+                    "policy, in a statement this engine cannot fully resolve -- a table read "
+                    "inside a VALUES or a set-operation branch is one cause -- so it cannot tell "
+                    "the two apart to apply the policy. Rename the CTE, or write it with joins "
+                    "and subqueries."
                 ),
                 subject=cte.name,
             )

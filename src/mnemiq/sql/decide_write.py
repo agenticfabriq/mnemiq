@@ -306,7 +306,7 @@ def decide_write(
     # filter was spliced in without validation (M7). Both are one defect: there were two
     # implementations and the second was wrong. `apply_row_filters_to_write` wraps the reads and
     # conjoins the target, using the same `_validate_filter` the read decider uses.
-    # Codex's review of #111: not on a scope that missed a read, where the rewrite would filter a
+    # Codex's review of #111: not where the read list fell back, where the rewrite would filter a
     # CTE named like a filtered table as if it were the table.
     unplaceable = unplaceable_policy(shaped, policy, target)
     if unplaceable is not None:
