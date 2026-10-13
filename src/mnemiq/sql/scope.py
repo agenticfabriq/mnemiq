@@ -273,6 +273,22 @@ def _scope_missed_a_read(ast: exp.Expression, walked: list[exp.Table], dialect: 
     return bool(_missed_reads(ast, walked, dialect))
 
 
+def missed_reads(ast: exp.Expression, dialect: str | None = None) -> list[exp.Table]:
+    """The reads a scope that DID resolve left out of its walk -- what made `base_tables` fall back
+    (Codex's review of #109). Empty when there are none, and when the scope did not resolve at
+    all: that fallback is older, and the guards built on it already handle it."""
+    root = _root_scope(ast)
+    if root is None or _unscoped_ctes(ast, root):
+        return []
+    return _missed_reads(ast, _walked_reads(ast, root, dialect), dialect)
+
+
+def cte_references(ast: exp.Expression, dialect: str | None = None) -> list[exp.Table]:
+    """The table nodes that name a CTE in scope where they stand -- what the fallback over-reports
+    as reads when the walk missed one."""
+    return [table for table in ast.find_all(exp.Table) if _cte_in_scope(table, dialect)]
+
+
 def _missed_reads(ast: exp.Expression, walked: list[exp.Table], dialect: str | None) -> list[exp.Table]:
     """The table nodes `_scope_missed_a_read` counts: left out by the walk, not written, and not
     a CTE in scope -- reads the scope model missed."""

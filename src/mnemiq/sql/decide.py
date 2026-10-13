@@ -20,7 +20,7 @@ from mnemiq.sql.prove import prove
 from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.lineage import lineage_for
 from mnemiq.sql.scope import base_tables, scope_resolved
-from mnemiq.sql.rls import apply_row_and_mask
+from mnemiq.sql.rls import apply_row_and_mask, unplaceable_policy
 from mnemiq.sql.values_check import check_values
 from mnemiq.sql.views import check_views
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
@@ -176,6 +176,9 @@ def decide(
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
     narrowed: list = []
+    unplaceable = unplaceable_policy(shaped, policy, target)
+    if unplaceable is not None:
+        return unplaceable
     if not policy.empty:
         shaped, narrowed = apply_row_and_mask(shaped, policy, visible, dialect=dialect,
                                               executes_as=target)

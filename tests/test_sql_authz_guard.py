@@ -652,3 +652,59 @@ def test_the_scope_reports_itself_unresolved_when_it_missed_a_read(dialect):
     ast = sqlglot.parse_one(_VALUES_OUTSIDE_A_SOURCE[2], read=dialect)
     assert scope_resolved(ast, dialect) is False
     assert "customer" in {t.name for t in base_tables(ast, dialect)}
+
+
+# --------------------------------------------------------------------------------------------
+# Codex's review of #111: when the walk misses a read, `base_tables` falls back to every table
+# node, CTE references included. Right for authorization; wrong for the rewrite, which filtered a
+# CTE named like the filtered table as the table itself -- APPROVED, answering [30] for [30, 1].
+# --------------------------------------------------------------------------------------------
+
+_CTE_NAMED_LIKE_THE_TABLE = (
+    "WITH claim(amount) AS (VALUES ((SELECT max(amount) FROM claim)) UNION ALL SELECT 1) "
+    "SELECT amount FROM claim"
+)
+
+
+def _filtered():
+    from mnemiq.sql.decide import AccessPolicy
+
+    return AccessPolicy(row_filters={"claim": "amount > 10"},
+                        policy_schema={"claim": {"id", "amount"}})
+
+
+def test_a_policy_is_not_placed_on_a_scope_that_missed_a_read():
+    from mnemiq.sql.decide import decide
+
+    v = decide(_CTE_NAMED_LIKE_THE_TABLE, {"claim": {"id", "amount"}}, dialect="duckdb",
+               target="duckdb", policy=_filtered())
+    assert isinstance(v, Refusal) and v.code == RefusalCode.UNMODELLED_SOURCE, v
+    assert v.subject == "claim", v
+
+
+def test_without_a_policy_the_same_read_answers_correctly():
+    """The control, executed: nothing is rewritten, so the answer is the true one."""
+    import duckdb
+
+    from mnemiq.sql.decide import decide
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INT, amount INT); INSERT INTO claim VALUES (1, 20), (2, 30)")
+    v = decide(_CTE_NAMED_LIKE_THE_TABLE, {"claim": {"id", "amount"}}, dialect="duckdb",
+               target="duckdb")
+    assert not isinstance(v, Refusal), v
+    assert sorted(r[0] for r in con.execute(v.plan_sql).fetchall()) == [1, 30]
+
+
+def test_a_write_does_not_place_a_policy_on_a_scope_that_missed_a_read():
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.sql.decide_write import decide_write
+
+    v = decide_write(
+        "INSERT INTO claim (id, amount) " + _CTE_NAMED_LIKE_THE_TABLE.replace(
+            "SELECT amount FROM claim", "SELECT 9, amount FROM claim"),
+        {"claim": {"id", "amount"}},
+        GrantSet(frozenset({"claim"}), writable=frozenset({"claim"})),
+        policy=_filtered(), dialect="duckdb", target="duckdb", writes_enabled=True,
+    )
+    assert isinstance(v, Refusal) and v.code == RefusalCode.UNMODELLED_SOURCE, v

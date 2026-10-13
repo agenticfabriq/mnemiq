@@ -6,8 +6,8 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
-from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables, column_tables
+from mnemiq.sql.qualify import names_one_object, object_key
+from mnemiq.sql.scope import base_tables, column_tables, cte_references, missed_reads
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -171,6 +171,39 @@ def _record(into: list[Narrowing], one: Narrowing) -> None:
                                 columns=existing.columns or one.columns)
             return
     into.append(one)
+
+
+def unplaceable_policy(ast: exp.Expression, policy: AccessPolicy, dialect: str | None) -> Refusal | None:
+    """Refuse to rewrite a statement whose scope missed a read when a CTE in it is named after a
+    table the policy governs (Codex's review of #111).
+
+    When the walk misses a read, `base_tables` falls back to every table node -- CTE references
+    included -- which is right for authorization, where over-reporting refuses. The rewrite reads
+    the same list, so a CTE named like a filtered table was filtered as if it were the table:
+    `WITH claim(amount) AS (VALUES ((SELECT max(amount) FROM claim)) UNION ALL SELECT 1) SELECT
+    amount FROM claim` under `amount > 10` was APPROVED and answered `[30]` where the truth is
+    `[30, 1]` -- measured on DuckDB, read and write paths both.
+
+    Only that collision is refused. A missed read with no CTE named after a governed table is
+    placed correctly -- M121's write through a scope that missed its FROM table is approved and
+    row-filtered -- and refusing it would decline a policy this engine can apply.
+    """
+    if policy.empty or not missed_reads(ast, dialect):
+        return None
+    governed = list(policy.row_filters) + [t for t, _ in policy.masked | policy.denied]
+    for cte in cte_references(ast, dialect):
+        if names_one_object(cte.name, governed):
+            return Refusal(
+                code=RefusalCode.UNMODELLED_SOURCE,
+                message=(
+                    f"The query names a CTE {cte.name!r} after a table with a row or column "
+                    "policy, and reads that table where this engine cannot see it -- inside a "
+                    "VALUES or a set-operation branch -- so it cannot tell the two apart to apply "
+                    "the policy. Rename the CTE, or write it with joins and subqueries."
+                ),
+                subject=cte.name,
+            )
+    return None
 
 
 def apply_row_and_mask(
