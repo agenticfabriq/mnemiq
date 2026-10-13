@@ -78,8 +78,9 @@ def lock_configuration(con: duckdb.DuckDBPyConnection, *, local_only: bool) -> N
     (Codex's review of #92). The deciders already refuse `SET` by shape; this makes the engine
     refuse it too.
 
-    Measured on DuckDB 1.5.4: after it every `SET` is refused, unlocking included, while `LOAD`,
-    `ATTACH` and `USE` still run -- so the deciders' refusal of those stays the guard for them.
+    Measured on DuckDB 1.5.4: after it 158 of the 160 settings refuse a `SET`, unlocking
+    included; `schema` and `search_path` still take one, and `LOAD`, `ATTACH` and `USE` still run --
+    so the deciders' refusal of those stays the guard for them.
     Last, because `load_extension` runs a `SET` of its own. Not the store's connection: its build
     sets `hnsw_enable_experimental_persistence`, and it runs no model-written SQL."""
     if local_only:
