@@ -10,9 +10,15 @@ from mnemiq.adapters.duckdb import (
     duckdb_user_functions,
 )
 from mnemiq.config import SourceSpec
-from mnemiq.duckdb_extensions import connect_duckdb, load_extension, lock_configuration
+from mnemiq.duckdb_extensions import (
+    SOURCE_EXTENSIONS,
+    connect_duckdb,
+    load_extension,
+    lock_configuration,
+)
 
-_EXT = {"postgres": ("postgres", "POSTGRES"), "sqlite": ("sqlite", "SQLITE")}
+_EXT = {"postgres": (SOURCE_EXTENSIONS["postgres"], "POSTGRES"),
+        "sqlite": (SOURCE_EXTENSIONS["sqlite"], "SQLITE")}
 
 
 class UnfederatableSource(ValueError):

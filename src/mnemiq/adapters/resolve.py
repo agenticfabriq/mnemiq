@@ -42,6 +42,7 @@ from __future__ import annotations
 from mnemiq.adapters.duckdb import DuckDBAdapter
 from mnemiq.adapters.oracle import OracleAdapter
 from mnemiq.config import Settings, SourceSpec
+from mnemiq.duckdb_extensions import SOURCE_EXTENSIONS
 
 # The kinds a source may declare. `federated.py` supports a SUBSET of these -- see `FEDERABLE`.
 KINDS = ("postgres", "sqlite", "duckdb", "oracle")
@@ -61,8 +62,8 @@ _TARGET_ENV = {"postgres": "MNEMIQ_PG_DSN"}
 
 _ATTACH = {
     # kind -> (ATTACH type, DuckDB extension, default schema, fk lookup via postgres catalog)
-    "postgres": ("POSTGRES", "postgres", "public", True),
-    "sqlite": ("SQLITE", "sqlite", "main", False),
+    "postgres": ("POSTGRES", SOURCE_EXTENSIONS["postgres"], "public", True),
+    "sqlite": ("SQLITE", SOURCE_EXTENSIONS["sqlite"], "main", False),
     "duckdb": ("DUCKDB", "", "main", False),
 }
 
