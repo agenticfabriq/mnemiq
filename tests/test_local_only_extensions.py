@@ -325,3 +325,49 @@ def test_a_local_only_connection_auto_loads_nothing(tmp_path):
     assert con.execute("SELECT current_setting('autoload_known_extensions')").fetchone()[0] is False
     with pytest.raises(duckdb.Error):
         con.execute(scan).fetchall()
+
+
+# Codex's review of #92: a local-only connection's flags govern only AUTOMATIC installing and
+# loading, so a later `SET autoload_known_extensions = true` on it turned auto-load back on. The
+# deciders refuse `SET` by shape; the owner's call (2026-10-12) is to lock the configuration of the
+# connections that run model-written SQL as well, so the engine refuses it too.
+
+def _set_refused(con) -> None:
+    with pytest.raises(duckdb.InvalidInputException, match="Cannot change configuration option"):
+        con.execute("SET autoload_known_extensions = true")
+    with pytest.raises(duckdb.InvalidInputException, match="Cannot change configuration option"):
+        con.execute("SET lock_configuration = false")
+
+
+def test_a_local_only_adapter_refuses_a_later_set_and_still_answers(fresh_extensions):
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+
+    adapter = DuckDBAdapter.duckdb(":memory:", read_only=False, local_only=True)
+    _set_refused(adapter._con)
+    assert adapter.execute("SELECT 42") == [(42,)]
+    assert adapter._con.execute(
+        "SELECT current_setting('autoload_known_extensions')").fetchone()[0] is False
+
+
+def test_a_local_only_federation_refuses_a_later_set(pre_seeded, tmp_path):
+    import sqlite3
+
+    from mnemiq.adapters.federated import FederatedAdapter
+    from mnemiq.config import SourceSpec
+
+    specs = []
+    for name in ("a", "b"):
+        db = tmp_path / f"{name}.sqlite"
+        sqlite3.connect(db).execute("CREATE TABLE t (x INTEGER)").connection.commit()
+        specs.append(SourceSpec(id=name, kind="sqlite", target=str(db), catalog=name,
+                                schema="main"))
+    adapter = FederatedAdapter(specs, local_only=True)
+    _set_refused(adapter._con)
+    assert adapter._con.execute("SELECT count(*) FROM a.main.t").fetchone() == (0,)
+
+
+def test_an_adapter_that_is_not_local_only_is_not_locked():
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+
+    adapter = DuckDBAdapter.duckdb(":memory:", read_only=False, local_only=False)
+    adapter._con.execute("SET threads = 2")

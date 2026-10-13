@@ -4,7 +4,7 @@ import threading
 
 import pyarrow as pa
 
-from mnemiq.duckdb_extensions import connect_duckdb, load_extension
+from mnemiq.duckdb_extensions import connect_duckdb, load_extension, lock_configuration
 
 # The declared-FK query for Postgres sources: run through postgres_query so the
 # information_schema joins execute with real Postgres semantics, not DuckDB's proxy.
@@ -98,6 +98,7 @@ class DuckDBAdapter:
         clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
         self._con.execute(f"ATTACH '{attach_target}' AS {catalog} {clause}")
         self._con.execute(f"USE {catalog}.{table_schema}")
+        lock_configuration(self._con, local_only=local_only)
 
     @classmethod
     def postgres(cls, dsn: str, schema: str = "src", read_only: bool = True, *,
