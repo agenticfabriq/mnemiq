@@ -388,3 +388,23 @@ def test_tables_tied_on_bm25_come_back_in_one_order_however_they_were_stored(tmp
     # Both cards match `shared_col` alike, while the embedding ranks zeta first: the BM25 tie decides between them.
     first = _order(tmp_path, ["zeta", "beta"], "shared_col", _Pointing(near="zeta"))
     assert first == _order(tmp_path, ["beta", "zeta"], "shared_col", _Pointing(near="zeta"))
+
+
+def test_examples_tied_on_the_embedding_come_back_in_one_order_however_they_were_stored(tmp_path):
+    # M149 again: the example ranking sorted by score alone, so tied examples could reach the generator in a different
+    # order, or a different set at the k * 3 cut.
+    from mnemiq.contract import Example
+    from mnemiq.semantic.retrieval import _retrieve_examples
+    from mnemiq.semantic.store import build_example_index
+
+    def stored(order):
+        con = init_store(str(tmp_path / f"{'-'.join(order)}.duckdb"))
+        build_example_index(con, Snapshot(
+            version="v1", source_id="acme", created_at="t",
+            columns=[Column(id="claim.n", object_id="claim", name="n")],
+            examples=[Example(question=q, sql=f"SELECT '{q}' FROM claim", tables=["claim"], object_id="claim")
+                      for q in order]), _Pointing())
+        (qvec,) = _Pointing().embed(["anything"])
+        return [e.question for e in _retrieve_examples(con, qvec, allowed={"claim"}, k=5)]
+
+    assert stored(["zeta case", "beta case"]) == stored(["beta case", "zeta case"]) == ["beta case", "zeta case"]

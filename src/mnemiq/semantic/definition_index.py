@@ -128,10 +128,11 @@ class DefinitionIndex:
             ).fetchone()
             if table_exists is None:
                 return []
+            # Ties broken by term and text: DuckDB returns tied rows in no fixed order (M149).
             rows = self._con.execute(
                 f"SELECT term, text, "
                 f"array_cosine_similarity(embedding, ?::FLOAT[{len(embedding)}]) AS score "
-                f"FROM definition_concept ORDER BY score DESC LIMIT ?",
+                f"FROM definition_concept ORDER BY score DESC, term, text LIMIT ?",
                 [embedding, k],
             ).fetchall()
         except Exception as exc:  # an unavailable array function or similar -> no grounding

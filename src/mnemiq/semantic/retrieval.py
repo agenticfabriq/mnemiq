@@ -108,10 +108,13 @@ def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5) -> list[Ex
     if table_exists is None:
         return []
     try:
+        # Ties broken on every column but the vector: `example` has no key, and DuckDB returns tied rows in no fixed
+        # order, so tied examples would otherwise change order, or which ones make the k * 3 cut, per call (M149).
         rows = con.execute(
             "SELECT question, sql, tables, object_id, "
             f"array_cosine_similarity(embedding, ?::FLOAT[{len(embedding)}]) AS s "
-            f"FROM example WHERE object_id IN ({placeholders}) ORDER BY s DESC LIMIT ?",
+            f"FROM example WHERE object_id IN ({placeholders}) "
+            "ORDER BY s DESC, object_id, question, sql, tables LIMIT ?",
             [embedding, *allowed, k * 3],
         ).fetchall()
     except Exception as exc:
