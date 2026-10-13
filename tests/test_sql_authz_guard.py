@@ -573,3 +573,16 @@ def test_the_write_decider_applies_the_same_source_rule(dialect):
 def test_tables_joins_and_subqueries_are_still_approved(sql, dialect):
     """The passing control: the whitelist admits every shape the engine models."""
     assert not isinstance(_decide(sql, dialect), Refusal), f"{sql!r} refused under {dialect}"
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_an_ungranted_table_inside_a_lateral_subquery_is_still_refused(dialect):
+    """The whitelist admits a LATERAL over a real subquery because `base_tables` reads inside it.
+    If that ever stopped, this read of `customer` would be approved past `check_access` -- M65 one
+    shape over -- so the premise is pinned here, at the decider."""
+    v = _decide(
+        "SELECT c.id, l.x FROM claim AS c CROSS JOIN LATERAL (SELECT max(ssn) AS x FROM customer) AS l",
+        dialect,
+    )
+    assert isinstance(v, Refusal) and v.code == RefusalCode.UNAUTHORIZED_TABLE, v
+    assert v.subject == "customer", v

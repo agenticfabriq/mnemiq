@@ -1023,3 +1023,23 @@ def test_the_trace_says_why_it_could_not_confirm():
                        functions=FunctionInventory.of([], covers_view_bodies=False))
     assert "unconfirmed-function-identity" in body.reasons
     assert "function-inventory-covers-no-view-bodies" in body.reasons
+
+
+def test_a_lateral_over_a_real_subquery_is_complete_and_names_what_it_reads():
+    """M65 admitted a LATERAL over a real subquery to the whitelist the marker reads, so such a
+    read is no longer `unmodelled-source:lateral`. It is COMPLETE only because `base_tables` sees
+    inside the subquery: the record must name the table read there, not just the outer one."""
+    from mnemiq.sql.qualify import object_key
+    from mnemiq.sql.scope import base_tables
+
+    ast = sqlglot.parse_one(
+        # No function call: with no function inventory a call alone makes the marker UNKNOWN,
+        # derived table or LATERAL alike, and that is not what this asserts.
+        "SELECT c.id, l.store_id FROM claim c "
+        "CROSS JOIN LATERAL (SELECT store_id FROM customer WHERE customer.id = c.id) l",
+        read="postgres")
+    tables = sorted({object_key(t) for t in base_tables(ast, "postgres")})
+    assert tables == ["claim", "customer"], tables
+    lineage = lineage_for(ast, tables, inventory_for(_snapshot(jobs=[_DISCOVERED])))
+    assert lineage.completeness == COMPLETE, lineage.unresolved
+    assert lineage.tables == ["claim", "customer"]

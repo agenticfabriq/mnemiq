@@ -81,7 +81,8 @@ REPAIRABLE = frozenset(
         # Repairable for the same reason: the message names the shape, and the same query can be
         # written with tables, joins and subqueries. Measured cost: none of 9,687 gold queries
         # (BIRD mini-dev in SQLite, Postgres and MySQL, KaggleDBQA, BEAVER, Spider2-lite local)
-        # reads through one (M65).
+        # reads through one, measured before LATERAL subqueries were admitted -- the stricter
+        # rule, so the count can only have fallen (M65).
         RefusalCode.UNMODELLED_SOURCE,
         # The three below were absent while nothing read this set, so nothing had checked them
         # against the loop that ignored it. Each says what to do differently, in its own

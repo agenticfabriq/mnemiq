@@ -48,8 +48,13 @@ UNFILTERED = AccessPolicy(row_filters={"film": "film_id > 0"}, policy_schema=SCH
         "SELECT COUNT(email) FROM customer",
         "SELECT c.customer_id AS a FROM customer c JOIN film f ON c.customer_id = f.film_id",
         "SELECT a FROM (SELECT customer_id AS a FROM customer) inner_q",
+        # M65 admitted a LATERAL over a real subquery to the whitelist: the filtered table inside
+        # it must still be found, or a view-level M65 returns with every other test passing.
+        "SELECT f.film_id AS a, l.store_id AS b FROM film f "
+        "CROSS JOIN LATERAL (SELECT store_id FROM customer WHERE customer_id = f.film_id) l",
     ],
-    ids=["plain", "star", "union", "unaliased-aggregate", "join", "derived-table"],
+    ids=["plain", "star", "union", "unaliased-aggregate", "join", "derived-table",
+         "lateral-subquery"],
 )
 def test_every_view_shape_that_reads_a_filtered_table_is_refused(body):
     verdict = plan("SELECT a FROM v", view(body), FILTERED)
