@@ -20,6 +20,7 @@ that loads each one this deployment needs before anything runs.
 from __future__ import annotations
 
 import gzip
+import re
 import urllib.request
 import zlib
 from collections.abc import Callable, Iterable
@@ -39,6 +40,9 @@ ALL_EXTENSIONS = (*STORE_EXTENSIONS, *SOURCE_EXTENSIONS.values())
 # itself.
 _REPOSITORY = "https://extensions.duckdb.org"
 _USER_AGENT = f"mnemiq-extensions-fetch (DuckDB {duckdb.__version__})"
+# A DuckDB platform name -- `linux_amd64`, `osx_arm64`, `windows_amd64_mingw` -- and nothing a path
+# could be made of: it becomes a directory under `--out` (Codex's review of M107).
+_PLATFORM = re.compile(r"[a-z0-9_]+")
 
 
 def connect_duckdb(database: str = ":memory:", *, local_only: bool) -> duckdb.DuckDBPyConnection:
@@ -156,6 +160,8 @@ def fetch_extensions(out: Path, names: Iterable[str] = ALL_EXTENSIONS, *,
     signed and DuckDB checks the signature at LOAD, so one altered in transit is refused where it
     is used; where `platform` is this machine's, each is loaded from `out` here as well, so a bad
     download is found before it is carried across."""
+    if platform is not None and not _PLATFORM.fullmatch(platform):
+        raise ValueError(f"not a DuckDB platform name: {platform!r} (e.g. linux_amd64, osx_arm64)")
     con = duckdb.connect(config={"autoinstall_known_extensions": False,
                                  "autoload_known_extensions": False})
     try:

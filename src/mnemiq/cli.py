@@ -113,6 +113,12 @@ def _identity(args, settings: Settings | None = None) -> IdentityContext:
     )
 
 
+# What a command loads beyond the deployment's sources, for the local-only boot check. `eval` reads
+# the ACME golden set through `DuckDBPostgresAdapter(settings.pg_dsn)` whatever the manifest says,
+# so a SQLite deployment passed the check and `eval` then refused (Codex's review of M107).
+_COMMAND_EXTENSIONS = {"eval": ("postgres",)}
+
+
 def _cmd_extensions(settings: Settings, args) -> int:
     # It downloads, which is exactly what MNEMIQ_LOCAL_ONLY promises mnemiq never does: run it on a
     # connected machine and carry the directory across.
@@ -565,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
     # traceback: the point of the check is to hand a security reviewer a clean refusal, not a
     # stack trace they have to read past to find the same message.
     try:
-        settings.assert_local_only()
+        settings.assert_local_only(also=_COMMAND_EXTENSIONS.get(args.command, ()))
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2

@@ -299,7 +299,7 @@ def test_the_cli_calls_the_assertion_before_any_command_does_work(monkeypatch, c
     # `call_order == ["init_store"]`, never with an uncaught error.
     call_order: list[str] = []
 
-    def fake_assert_local_only(self) -> None:
+    def fake_assert_local_only(self, **kwargs) -> None:
         call_order.append("assert_local_only")
         raise RuntimeError("stopped-before-work")
 

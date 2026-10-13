@@ -507,3 +507,42 @@ def test_an_adapter_that_is_not_local_only_is_not_locked():
 
     adapter = DuckDBAdapter.duckdb(":memory:", read_only=False, local_only=False)
     adapter._con.execute("SET threads = 2")
+
+
+# Codex's review of M107.
+
+def test_eval_needs_the_postgres_scanner_whatever_the_manifest_says(fresh_extensions, tmp_path,
+                                                                    monkeypatch, capsys):
+    """`eval` builds `DuckDBPostgresAdapter(settings.pg_dsn)` whatever the sources are, so its boot
+    check asks for `postgres_scanner` where a SQLite deployment's other commands do not."""
+    from mnemiq.cli import main
+
+    manifest = tmp_path / "sources.json"
+    manifest.write_text('[{"id": "s", "kind": "sqlite", "target": "t", "catalog": "s", '
+                        '"schema": "main"}]')
+    for name in ("LLM", "EMBED", "VERIFY"):
+        monkeypatch.delenv(f"MNEMIQ_{name}_BASE_URL", raising=False)
+    for name in ("RECORDS", "TOKEN", "TRACES"):
+        monkeypatch.delenv(f"MNEMIQ_VERITY_{name}_URL", raising=False)
+    monkeypatch.setenv("MNEMIQ_LOCAL_ONLY", "1")
+    monkeypatch.setenv("MNEMIQ_SOURCES_PATH", str(manifest))
+    monkeypatch.setenv("MNEMIQ_PG_DSN", "postgresql://127.0.0.1/acme")
+
+    assert main(["metrics"]) == 2
+    refused = capsys.readouterr().err
+    assert "sqlite_scanner: not installed" in refused and "postgres_scanner" not in refused
+    assert main(["eval"]) == 2
+    assert "postgres_scanner: not installed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("platform", ["/escape", "../..", "linux/amd64", ""])
+def test_a_platform_that_is_not_a_platform_name_is_refused_before_anything(tmp_path, platform):
+    from mnemiq.duckdb_extensions import fetch_extensions
+
+    out = tmp_path / "out"
+    asked: list[str] = []
+    platform = str(tmp_path / "escape") if platform == "/escape" else platform
+    with pytest.raises(ValueError, match="not a DuckDB platform name"):
+        fetch_extensions(out, ["fts"], platform=platform, urlopen=_gzip_server({}, asked))
+    assert asked == [], "no request made"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [], "nothing created, inside or out"
