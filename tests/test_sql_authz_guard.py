@@ -541,7 +541,19 @@ _M65_READS = [
 @pytest.mark.parametrize("dialect", _DIALECTS)
 @pytest.mark.parametrize("sql", _M65_READS)
 def test_a_read_through_an_unmodelled_source_is_refused(sql, dialect):
+    """Refused as the read it is: since Codex's review of M65 the scope reports the table it
+    missed, so `check_access` names `customer` before the source rule is reached."""
     v = _decide(sql, dialect)
+    assert isinstance(v, Refusal) and v.code == RefusalCode.UNAUTHORIZED_TABLE, v
+    assert v.subject == "customer", v
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_the_source_rule_still_refuses_what_it_cannot_model(dialect):
+    """The whitelist stays as the second layer: a LATERAL VALUES over a GRANTED table passes
+    `check_access` and is refused by the rule, repairably and by name."""
+    v = _decide("SELECT 1 AS one FROM LATERAL (VALUES ((SELECT max(amount) FROM claim))) AS lv(x)",
+                dialect)
     assert isinstance(v, Refusal) and v.code == RefusalCode.UNMODELLED_SOURCE, v
     assert v.repairable is True, "the same query can be written with tables and subqueries"
     assert "lateral" in v.message, "the model cannot avoid a shape the refusal does not name"
@@ -586,3 +598,43 @@ def test_an_ungranted_table_inside_a_lateral_subquery_is_still_refused(dialect):
     )
     assert isinstance(v, Refusal) and v.code == RefusalCode.UNAUTHORIZED_TABLE, v
     assert v.subject == "customer", v
+
+
+# --------------------------------------------------------------------------------------------
+# Codex's review of M65 (#109): a scalar subquery inside a VALUES that sits outside every
+# FROM/JOIN position -- a set-operation branch, a CTE body, a LATERAL body -- is outside scope
+# resolution's walk, so `base_tables` and `check_access` never saw the table it reads. Measured
+# APPROVED on duckdb and postgres, before #109 and after it; Codex read the SSN back on DuckDB.
+# --------------------------------------------------------------------------------------------
+
+_VALUES_OUTSIDE_A_SOURCE = [
+    "SELECT x FROM LATERAL (VALUES ((SELECT ssn FROM customer)) UNION ALL SELECT 1) AS v(x)",
+    "SELECT x FROM LATERAL (SELECT 1 UNION ALL VALUES ((SELECT ssn FROM customer))) AS v(x)",
+    # No LATERAL at all: the blind spot is the VALUES, not the LATERAL.
+    "WITH t(x) AS (VALUES ((SELECT ssn FROM customer)) UNION ALL SELECT 1) SELECT x FROM t",
+    "WITH t(x) AS (SELECT 1 UNION ALL VALUES ((SELECT ssn FROM customer))) SELECT x FROM t",
+]
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize("sql", _VALUES_OUTSIDE_A_SOURCE)
+def test_a_read_hidden_in_values_outside_a_source_is_refused(sql, dialect):
+    """Refused. The subject is `customer`, or -- in the CTE forms -- the CTE's own name: once the
+    scope is known to have missed a read, every table node counts as one, CTE references included.
+    That over-reports, which is the direction a guard fails in."""
+    v = _decide(sql, dialect)
+    assert isinstance(v, Refusal) and v.code == RefusalCode.UNAUTHORIZED_TABLE, v
+    assert v.subject in {"customer", "t"}, v
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_the_scope_reports_itself_unresolved_when_it_missed_a_read(dialect):
+    """`scope_resolved` feeds the lineage marker: a walk that missed `customer` must not let the
+    record call the read list settled."""
+    import sqlglot
+
+    from mnemiq.sql.scope import base_tables, scope_resolved
+
+    ast = sqlglot.parse_one(_VALUES_OUTSIDE_A_SOURCE[2], read=dialect)
+    assert scope_resolved(ast, dialect) is False
+    assert "customer" in {t.name for t in base_tables(ast, dialect)}

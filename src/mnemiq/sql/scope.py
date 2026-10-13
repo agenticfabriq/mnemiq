@@ -241,7 +241,7 @@ def _walked_reads(ast: exp.Expression, root, dialect: str | None) -> list[exp.Ta
 
 
 def _scope_missed_a_read(ast: exp.Expression, walked: list[exp.Table], dialect: str | None) -> bool:
-    """Did the scope walk leave out a table a WRITE reads? ONE predicate for `base_tables`,
+    """Did the scope walk leave out a table the statement reads? ONE predicate for `base_tables`,
     `column_tables` and `scope_resolved`: a resolver that falls back for tables but still trusts
     the same incomplete scope for columns let a denied column through (Codex review of #66:
     `claim.secret` copied into an ungoverned table on the locked sqlglot).
@@ -253,12 +253,18 @@ def _scope_missed_a_read(ast: exp.Expression, walked: list[exp.Table], dialect: 
     `s` alone -- so `c` was neither grant-checked nor row-filtered. A name no CTE on an enclosing
     query defines (`_cte_in_scope`) can only be a real read, whatever this sqlglot's scope model
     thinks. The write's own TARGET is excused (an INSERT writes it without reading it; a target
-    that is read is in `walked` through `_target_reads`). Writes only: on the read path an under-report is
-    lineage's to classify (`views.py` names an unmodelled source as such), and no read-path test
-    failed under sqlglot 30.21.
+    that is read is in `walked` through `_target_reads`).
+
+    **Reads too, since Codex's review of M65 (#109).** This was writes-only, on the reasoning that
+    an under-report on the read path was lineage's to classify and no read-path test failed. But
+    the read decider's `check_access` reads the same list: a scalar subquery inside a VALUES that
+    sits outside every FROM/JOIN position -- a set-operation branch, a CTE body, a LATERAL body --
+    is outside the walk, so `WITH t(x) AS (VALUES ((SELECT ssn FROM customer)) UNION ALL SELECT 1)
+    SELECT x FROM t` was APPROVED, measured on DuckDB and Postgres, and returned the ungranted SSN.
+    A source whitelist cannot see a VALUES that is not a source. Coverage can: whatever the walk
+    missed falls back to every table node. Measured cost on reads: none of 9,687 gold queries
+    (BIRD mini-dev in SQLite, Postgres and MySQL, KaggleDBQA, BEAVER, Spider2-lite local).
     """
-    if not isinstance(ast, (exp.Insert, exp.Update, exp.Delete, exp.Merge)):
-        return False
     written = _written_targets(ast)
     return any(not any(t is table for t in walked) and not any(w is table for w in written)
                and not _cte_in_scope(table, dialect)

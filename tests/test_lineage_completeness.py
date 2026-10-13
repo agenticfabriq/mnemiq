@@ -560,7 +560,10 @@ def test_an_unmodelled_source_in_a_view_body_is_not_a_clean_bill():
         dialect="postgres")]
     lineage = lineage_for(_ast("SELECT x FROM v"), ["v"],
                           inventory_for(_snapshot(views=views, jobs=[_DISCOVERED])))
-    assert lineage.completeness == UNKNOWN
+    # INCOMPLETE since Codex's review of M65: scope now reports the read it missed inside the
+    # body, so the view's reach past the record is demonstrable rather than merely unclear --
+    # and INCOMPLETE outranks UNKNOWN by design.
+    assert lineage.completeness == INCOMPLETE
     assert any(u.startswith("unmodelled-source:") for u in lineage.unresolved)
 
 
