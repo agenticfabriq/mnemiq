@@ -498,6 +498,7 @@ _RETRIED = {
     RefusalCode.UNKNOWN_COLUMN: True,
     RefusalCode.EXPLAIN_FAILED: True,
     RefusalCode.UNMODELLED_CALL: True,
+    RefusalCode.UNMODELLED_SOURCE: True,
     RefusalCode.LOGIC_LINT: True,
     RefusalCode.VALUE_GROUNDING: True,
     RefusalCode.FAN_OUT: True,

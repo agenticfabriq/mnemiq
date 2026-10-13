@@ -9,6 +9,33 @@ from mnemiq.sql.scope import base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
+def check_unmodelled_source(ast: exp.Expression) -> Refusal | None:
+    """Refuse a statement that reads through a source this engine does not model (M65).
+
+    `check_access` walks `base_tables`, and `SELECT x FROM LATERAL (VALUES ((SELECT max(store_id)
+    FROM customer))) AS lv(x)` gives it `[]` while scope resolution reports success -- so the
+    decider APPROVED a read of `customer` with `customer` absent from `visible`, measured on DuckDB
+    and Postgres. An empty list is a normal answer, and nothing downstream can tell "read nothing"
+    from "could not see what was read". `views.unrecognised_source` is the whitelist built for
+    this, and it was applied to view bodies and to the audit record but not to the statement the
+    decider approves. Same rule, one level out: what the engine cannot model, it does not approve.
+    """
+    from mnemiq.sql.views import unrecognised_source
+
+    shape = unrecognised_source(ast)
+    if shape is None:
+        return None
+    return Refusal(
+        code=RefusalCode.UNMODELLED_SOURCE,
+        message=(
+            f"The query reads through a {shape.lower()} rather than a named table or a subquery "
+            "over one, so this engine cannot tell which tables it reads. Write it with tables, "
+            "joins and subqueries instead."
+        ),
+        subject=shape.lower(),
+    )
+
+
 def check_access(ast: exp.Expression, visible: dict[str, set[str]],
                  dialect: str | None = None) -> Refusal | None:
     """Re-check every table and column the query touches against what the identity may see.

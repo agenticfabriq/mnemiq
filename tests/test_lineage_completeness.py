@@ -614,10 +614,10 @@ def test_a_direct_unmodelled_source_is_not_reported_complete():
     `base_tables == []` while scope resolution reports SUCCESS — so the empty list looked settled
     and the marker said COMPLETE over a read of `customer` it never named.
 
-    Note this is also an AUTHORIZATION bypass and that half is NOT fixed here: `check_access`
-    reads the same empty `base_tables`, so `decide` approves the statement with `customer` absent
-    from `visible`. Pre-existing, same family as M43, filed rather than fixed — the marker's job
-    is to stop the audit record from calling it accounted for.
+    It was also an AUTHORIZATION bypass -- `check_access` read the same empty `base_tables`, so
+    `decide` approved the statement with `customer` absent from `visible` -- filed as M65 and since
+    closed by `check_unmodelled_source`, which refuses it in both deciders. The marker's job stays
+    the same: the audit record never calls such a read accounted for.
     """
     lineage = lineage_for(sqlglot.parse_one(
         "SELECT x FROM LATERAL (VALUES ((SELECT max(store_id) FROM customer))) AS lv(x)",
@@ -1023,3 +1023,24 @@ def test_the_trace_says_why_it_could_not_confirm():
                        functions=FunctionInventory.of([], covers_view_bodies=False))
     assert "unconfirmed-function-identity" in body.reasons
     assert "function-inventory-covers-no-view-bodies" in body.reasons
+
+
+def test_a_lateral_over_a_real_subquery_is_complete_and_names_what_it_reads():
+    """M65 admitted a LATERAL over a real subquery to the whitelist the marker reads, so such a
+    read is no longer `unmodelled-source:lateral`. It is COMPLETE only because `base_tables` sees
+    inside the subquery: the record must name the table read there, not just the outer one."""
+    from mnemiq.sql.qualify import object_key
+    from mnemiq.sql.scope import base_tables
+
+    ast = sqlglot.parse_one(
+        # No function call: with no function inventory a call alone makes the marker UNKNOWN,
+        # derived table or LATERAL alike, and that is not what this asserts.
+        "SELECT c.id, l.store_id FROM claim c "
+        "CROSS JOIN LATERAL (SELECT store_id FROM customer WHERE customer.id = c.id) l",
+        read="postgres")
+    tables = sorted({object_key(t) for t in base_tables(ast, "postgres")})
+    assert tables == ["claim", "customer"], tables
+    lineage = lineage_for(ast, tables, inventory_for(_snapshot(jobs=[_DISCOVERED])))
+    # COMPLETE, over the list `base_tables` gave above: `lineage_for` records the tables it is
+    # handed, so naming `customer` is that assertion's to prove, not this one's.
+    assert lineage.completeness == COMPLETE, lineage.unresolved

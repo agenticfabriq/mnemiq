@@ -524,3 +524,65 @@ def test_a_join_key_that_is_denied_on_one_table_and_masked_on_another_is_not_a_c
     policy = AccessPolicy(denied={("claim", "ssn")}, masked={("person", "ssn")})
     ast = sqlglot.parse_one("SELECT c.id FROM claim c JOIN person p USING (ssn)", read="duckdb")
     assert check_cls(ast, policy, "duckdb").code.value == "unauthorized_column"
+
+
+# --------------------------------------------------------------------------------------------
+# M65: a source the engine does not model gave `base_tables == []` with scope resolved, so
+# `check_access` had nothing to refuse and the read of an ungranted table was APPROVED.
+# --------------------------------------------------------------------------------------------
+
+_M65_READS = [
+    # Measured APPROVED with tables=[] on duckdb and postgres before the fix.
+    "SELECT x FROM LATERAL (VALUES ((SELECT max(ssn) FROM customer))) AS lv(x)",
+    "SELECT id, lv.x FROM claim CROSS JOIN LATERAL (VALUES ((SELECT max(ssn) FROM customer))) AS lv(x)",
+]
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize("sql", _M65_READS)
+def test_a_read_through_an_unmodelled_source_is_refused(sql, dialect):
+    v = _decide(sql, dialect)
+    assert isinstance(v, Refusal) and v.code == RefusalCode.UNMODELLED_SOURCE, v
+    assert v.repairable is True, "the same query can be written with tables and subqueries"
+    assert "lateral" in v.message, "the model cannot avoid a shape the refusal does not name"
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_the_write_decider_applies_the_same_source_rule(dialect):
+    """The write path never had M65's bypass -- measured, `check_access` refuses every ungranted
+    variant there as `unauthorized_table customer` -- but the two deciders must not disagree about
+    the same statement shape. Visible on a LATERAL VALUES over a GRANTED table, which passes
+    `check_access` and is refused by the rule both deciders now apply."""
+    v = _decide_write(
+        "INSERT INTO claim (id, amount) "
+        "SELECT 1, 2 FROM LATERAL (VALUES ((SELECT max(amount) FROM claim))) AS lv(x)",
+        dialect,
+    )
+    assert isinstance(v, Refusal) and v.code == RefusalCode.UNMODELLED_SOURCE, v
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize("sql", [
+    "SELECT c.id FROM claim AS c JOIN (SELECT id FROM claim WHERE amount > 1) AS big ON big.id = c.id",
+    "SELECT id FROM claim WHERE amount > (SELECT avg(amount) FROM claim)",
+    "WITH big AS (SELECT id FROM claim WHERE amount > 1) SELECT id FROM big",
+    # A LATERAL over a real subquery is a correlated subquery, scoped like one.
+    "SELECT c.id, l.top FROM claim AS c CROSS JOIN LATERAL "
+    "(SELECT max(amount) AS top FROM claim WHERE claim.id = c.id) AS l",
+])
+def test_tables_joins_and_subqueries_are_still_approved(sql, dialect):
+    """The passing control: the whitelist admits every shape the engine models."""
+    assert not isinstance(_decide(sql, dialect), Refusal), f"{sql!r} refused under {dialect}"
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_an_ungranted_table_inside_a_lateral_subquery_is_still_refused(dialect):
+    """The whitelist admits a LATERAL over a real subquery because `base_tables` reads inside it.
+    If that ever stopped, this read of `customer` would be approved past `check_access` -- M65 one
+    shape over -- so the premise is pinned here, at the decider."""
+    v = _decide(
+        "SELECT c.id, l.x FROM claim AS c CROSS JOIN LATERAL (SELECT max(ssn) AS x FROM customer) AS l",
+        dialect,
+    )
+    assert isinstance(v, Refusal) and v.code == RefusalCode.UNAUTHORIZED_TABLE, v
+    assert v.subject == "customer", v

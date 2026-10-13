@@ -23,6 +23,9 @@ class RefusalCode(StrEnum):
     # that one names a function to avoid, this one usually condemns every query against the
     # source (M43's residual). `_cannot_resolve` is where the arrivals are told apart.
     UNRESOLVABLE_CALLS = "unresolvable_calls"
+    # A source that is not a named table or a subquery over one -- LATERAL, VALUES, UNNEST, a
+    # table literal -- so `base_tables` cannot say what the query reads (M65).
+    UNMODELLED_SOURCE = "unmodelled_source"
     LOGIC_LINT = "logic_lint"
     VALUE_GROUNDING = "value_grounding"
     # An aggregate over rows a join has multiplied: runs fine, silently inflated (M109).
@@ -75,6 +78,12 @@ REPAIRABLE = frozenset(
         # and the repair loop can rewrite that into arithmetic the engine does model.
         # Without this the guard's false positives become deferrals instead of retries.
         RefusalCode.UNMODELLED_CALL,
+        # Repairable for the same reason: the message names the shape, and the same query can be
+        # written with tables, joins and subqueries. Measured cost: none of 9,687 gold queries
+        # (BIRD mini-dev in SQLite, Postgres and MySQL, KaggleDBQA, BEAVER, Spider2-lite local)
+        # reads through one, measured before LATERAL subqueries were admitted -- the stricter
+        # rule, so the count can only have fallen (M65).
+        RefusalCode.UNMODELLED_SOURCE,
         # The three below were absent while nothing read this set, so nothing had checked them
         # against the loop that ignored it. Each says what to do differently, in its own
         # message, which is the test for belonging here:

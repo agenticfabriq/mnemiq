@@ -5,7 +5,12 @@ from sqlglot import exp
 
 from mnemiq.contract import ViewDefinition
 from mnemiq.sql.functions import inventory_from, opaque_columns
-from mnemiq.sql.authz_guard import check_access, check_opaque_columns, check_unmodelled_calls
+from mnemiq.sql.authz_guard import (
+    check_access,
+    check_opaque_columns,
+    check_unmodelled_calls,
+    check_unmodelled_source,
+)
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.fanout_check import KeyFacts, check_fanout
 from mnemiq.sql.guard import MAX_ROWS, check_shape
@@ -73,6 +78,11 @@ def decide(
     refusal = check_access(shaped, visible, target)
     if refusal is not None:
         return refusal
+    # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
+    # and an empty list passes. After it, so a source it already refuses keeps its refusal.
+    unmodelled = check_unmodelled_source(shaped)
+    if unmodelled is not None:
+        return unmodelled
 
     # Beside `check_access` because it defends the same premise: that the decider sees every
     # table the query reads. `check_access` walks `exp.Table` nodes, and a function in
