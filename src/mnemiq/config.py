@@ -209,7 +209,7 @@ class Settings(BaseSettings):
     def from_env(cls) -> "Settings":
         return cls()
 
-    def assert_local_only(self) -> None:
+    def assert_local_only(self, *, also: tuple[str, ...] = ()) -> None:
         """Refuse to run when a chat, embedding, judge or Verity endpoint would carry data off
         the network.
 
@@ -336,8 +336,10 @@ class Settings(BaseSettings):
             kinds = {spec.kind for spec in self.source_specs()}
         except (OSError, ValueError, KeyError, TypeError):
             kinds = set()
+        # `also`: what the command loads beyond the deployment's sources (Codex's review of M107).
         loaded = check_extensions(
-            [*STORE_EXTENSIONS, *(SOURCE_EXTENSIONS[k] for k in sorted(kinds) if k in SOURCE_EXTENSIONS)])
+            [*STORE_EXTENSIONS, *(SOURCE_EXTENSIONS[k] for k in sorted(kinds) if k in SOURCE_EXTENSIONS),
+             *also])
         cleared = ", ".join(checked) if checked else "(no chat/embedding/judge/verity endpoint configured)"
         print(
             f"MNEMIQ_LOCAL_ONLY verified: {cleared}; DuckDB extensions loaded, none downloaded: "
