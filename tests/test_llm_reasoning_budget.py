@@ -14,16 +14,16 @@ from mnemiq.verify.judge import SemanticJudge
 
 def test_a_reasoning_model_gets_its_reserve_on_top_of_the_request():
     # The shipped `SemanticJudge` default. Measured at 10/10 provider failures on real prompts.
-    assert reasoning_budget("openai.gpt-5.5", 200) == 4296
-    assert reasoning_budget("openai.gpt-5-mini", 512) == 4608
+    assert reasoning_budget("openai.gpt-5.5", 200) == 8392
+    assert reasoning_budget("openai.gpt-5-mini", 512) == 8704
 
 
 def test_every_caller_keeps_the_output_room_it_asked_for():
     """The distinction from a floor, and the reason this is not one. `synthesize` asks 1000
-    because it wants 1000 tokens of prose; a floor at 4096 would hand it 3096 tokens to think in
+    because it wants 1000 tokens of prose; a floor at 8192 would hand it 7192 tokens to think in
     and call the problem solved. Both of these callers must come out ABOVE what they requested."""
-    assert reasoning_budget("openai.gpt-5.5", 1000) == 5096      # synthesize, correct
-    assert reasoning_budget("openai.gpt-5.5", 4000) == 8096      # generator
+    assert reasoning_budget("openai.gpt-5.5", 1000) == 9192      # synthesize, correct
+    assert reasoning_budget("openai.gpt-5.5", 4000) == 12192     # generator
 
 
 def test_a_non_reasoning_model_is_untouched():
@@ -78,7 +78,7 @@ def test_the_reserve_reaches_the_provider(monkeypatch):
     `complete` actually sends it. Without this, dropping the call and keeping the function leaves
     the whole suite green with the fix deleted."""
     _client(monkeypatch, "openai.gpt-5.5").complete("s", "u", max_tokens=200)
-    assert _CapturingOpenAI.sent["max_completion_tokens"] == 4296
+    assert _CapturingOpenAI.sent["max_completion_tokens"] == 8392
 
 
 def test_a_non_reasoning_model_is_billed_what_the_caller_asked_for(monkeypatch):
@@ -92,4 +92,4 @@ def test_the_judge_built_the_way_the_product_builds_it_gets_the_reserve(monkeypa
     product's own construction now sends a budget that covers the reasoning."""
     client = _client(monkeypatch, "openai.gpt-5.5")
     SemanticJudge(client).score("q", "schema", "SELECT 1", "preview")
-    assert _CapturingOpenAI.sent["max_completion_tokens"] == 4296
+    assert _CapturingOpenAI.sent["max_completion_tokens"] == 8392
