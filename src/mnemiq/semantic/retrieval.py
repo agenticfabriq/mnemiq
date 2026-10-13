@@ -108,10 +108,13 @@ def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5) -> list[Ex
     if table_exists is None:
         return []
     try:
+        # Ties broken on every selected column but the score: `example` has no key, and DuckDB returns tied rows in no fixed
+        # order, so tied examples would otherwise change order, or which ones make the k * 3 cut, per call (M149).
         rows = con.execute(
             "SELECT question, sql, tables, object_id, "
             f"array_cosine_similarity(embedding, ?::FLOAT[{len(embedding)}]) AS s "
-            f"FROM example WHERE object_id IN ({placeholders}) ORDER BY s DESC LIMIT ?",
+            f"FROM example WHERE object_id IN ({placeholders}) "
+            "ORDER BY s DESC, object_id, question, sql, tables LIMIT ?",
             [embedding, *allowed, k * 3],
         ).fetchall()
     except Exception as exc:
@@ -201,6 +204,8 @@ def retrieve(
     allowed = list(grants.objects)
     placeholders = ", ".join("?" for _ in allowed)
 
+    # Both rankings break ties by object_id. DuckDB returns tied rows in no fixed order, and `_rank` numbers rows by
+    # position, so without it the same question could reach the generator with its cards in another order (M149).
     lexical = con.execute(
         f"""
         SELECT object_id, score FROM (
@@ -209,7 +214,7 @@ def retrieve(
           FROM semantic_object
           WHERE object_id IN ({placeholders})
         ) WHERE score IS NOT NULL
-        ORDER BY score DESC LIMIT ?
+        ORDER BY score DESC, object_id LIMIT ?
         """,
         [question, *allowed, k],
     ).fetchall()
@@ -228,7 +233,7 @@ def retrieve(
         SELECT object_id, array_cosine_similarity(embedding, ?::FLOAT[{len(embedding)}]) AS score
         FROM semantic_object
         WHERE object_id IN ({placeholders})
-        ORDER BY score DESC LIMIT ?
+        ORDER BY score DESC, object_id LIMIT ?
         """,
         [embedding, *allowed, k],
     ).fetchall()

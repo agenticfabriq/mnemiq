@@ -134,9 +134,7 @@ class ValueIndex:
         ]
 
     def nearest(self, object_id: str, column: str, literal: str, k: int = 8) -> list[str]:
-        ranked = sorted(
-            self._values(object_id, column),
-            key=lambda v: similarity(literal, v),
-            reverse=True,
-        )
+        # Ties broken by the value: `_values` reads in no fixed order, and a stable sort would keep that order for
+        # tied values and let it pick which make the cut (M149).
+        ranked = sorted(self._values(object_id, column), key=lambda v: (-similarity(literal, v), v))
         return ranked[:k]  # returns all when the column has <= k values

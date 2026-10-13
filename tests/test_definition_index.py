@@ -205,3 +205,23 @@ def test_nearest_returns_k_scored_terms(tmp_path):
                for t, x, s in hits)
     scores = [s for _, _, s in hits]
     assert scores == sorted(scores, reverse=True)  # descending
+
+
+class _Same:
+    """Every text gets the same vector, so every stored concept ties with every other."""
+
+    dim = 4
+
+    def embed(self, texts):
+        return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+
+def test_concepts_tied_on_the_embedding_come_back_in_one_order_however_they_were_stored():
+    # M149: the nearest-concept query sorted by score alone, so tied concepts reached enrichment in DuckDB's order.
+    def stored(terms):
+        con = duckdb.connect()
+        build_definition_index(OntologyRecords(), _snapshot([
+            Definition(id=f"d-{t}", term=t, domain="ins", definition=f"what {t} means") for t in terms]), con, _Same())
+        return [term for term, _text, _score in DefinitionIndex(con).nearest("anything", _Same(), k=5)]
+
+    assert stored(["Zeta", "Beta"]) == stored(["Beta", "Zeta"]) == ["Beta", "Zeta"]

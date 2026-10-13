@@ -85,3 +85,17 @@ def test_nearest_surfaces_the_intended_value_first():
     near = vi.nearest("gasstations", "Country", "CZE", k=8)
     assert near[0] == "Czech Republic"  # trigram overlap on 'cze' ranks it first
     assert len(near) == 5  # <= k -> all returned, ranked
+
+
+def test_nearest_breaks_similarity_ties_by_value_so_storage_order_decides_nothing():
+    # M149: values tied on similarity kept the order the unordered read returned them in, and that order also decided
+    # which of them made the cut of eight that reaches the repair prompt.
+    def stored(values):
+        con = duckdb.connect(":memory:")
+        index = ValueIndex(con)
+        con.executemany("INSERT INTO value_index (source_id, object_id, column_name, value_text) "
+                        "VALUES ('s', 't', 'c', ?)", [[v] for v in values])
+        return index.nearest("t", "c", "zzz")
+
+    letters = list("abcdefghi")  # nine values, none like the literal: all tie, one more than the eight kept
+    assert stored(letters) == stored(letters[::-1]) == letters[:8]

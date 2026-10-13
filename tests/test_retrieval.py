@@ -337,3 +337,81 @@ def test_resolve_concepts_covers_only_bound_columns_on_shown_cards():
                            "Type 2 diabetes mellitus") in got
     # a column on a table that was not retrieved is never resolved
     assert all(c.column_id == "patient.icd10_cd" for c in got)
+
+
+# M149: retrieval sorted each ranking by score alone, so tables with tied scores came back in whatever order DuckDB
+# returned them (on BEAVER, per call), and the same question could reach the generator with its cards in another
+# order. Each test stores the same tied tables in both orders and needs the same packet from both.
+class _Pointing:
+    """A tiny embedder: a text naming `near` points along the first axis, as the question does; other text points
+    elsewhere. `near=None` points everything the same way, so every table ties."""
+
+    dim = 4
+
+    def __init__(self, near: str | None = None) -> None:
+        self._near = near
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        def vector(text: str) -> list[float]:
+            if self._near is None or "TABLE " not in text or f"TABLE {self._near}" in text:
+                return [1.0, 0.0, 0.0, 0.0]
+            return [0.6, 0.8, 0.0, 0.0]
+        return [vector(t) for t in texts]
+
+
+def _tied_snapshot(order: list[str]) -> Snapshot:
+    """Tables whose cards differ only in a name of the same length, so BM25 scores them alike."""
+    return Snapshot(
+        version="v1", source_id="acme", created_at="2026-07-13T00:00:00Z",
+        source_bindings=[SourceBinding(id=f"sb:{t}", source_id="acme", object_id=t, source_object=t,
+                                       binding_type="table") for t in order],
+        columns=[Column(id=f"{t}.shared_col", object_id=t, name="shared_col", data_type="text") for t in order],
+    )
+
+
+def _order(tmp_path, order, question, embedder, k=24):
+    con = init_store(str(tmp_path / f"{'-'.join(order)}.duckdb"))
+    build_index(con, _tied_snapshot(order), embedder)
+    packet = retrieve(con, question, _identity(), _StaticAuthz(*order), embedder, k=k)
+    return [c.object_id for c in packet.cards]
+
+
+def test_tables_tied_on_the_embedding_come_back_in_one_order_however_they_were_stored(tmp_path):
+    # No lexical match, and every vector alike: only the cosine ranking runs, and every table ties in it.
+    tables = ["zeta", "beta", "mid0"]
+    first = _order(tmp_path, tables, "nothing in common", _Pointing())
+    assert first == _order(tmp_path, tables[::-1], "nothing in common", _Pointing())
+    assert first == sorted(tables)
+
+
+def test_at_the_cut_a_tie_decides_which_tables_are_served_the_same_way_every_time(tmp_path):
+    # Three tables tie and only two fit: the tie-break picks which two, not just their order.
+    tables = ["zeta", "beta", "mid0"]
+    first = _order(tmp_path, tables, "nothing in common", _Pointing(), k=2)
+    assert first == _order(tmp_path, tables[::-1], "nothing in common", _Pointing(), k=2) == ["beta", "mid0"]
+
+
+def test_tables_tied_on_bm25_come_back_in_one_order_however_they_were_stored(tmp_path):
+    # Both cards match `shared_col` alike, while the embedding ranks zeta first: the BM25 tie decides between them.
+    first = _order(tmp_path, ["zeta", "beta"], "shared_col", _Pointing(near="zeta"))
+    assert first == _order(tmp_path, ["beta", "zeta"], "shared_col", _Pointing(near="zeta"))
+
+
+def test_examples_tied_on_the_embedding_come_back_in_one_order_however_they_were_stored(tmp_path):
+    # M149 again: the example ranking sorted by score alone, so tied examples could reach the generator in a different
+    # order, or a different set at the k * 3 cut.
+    from mnemiq.contract import Example
+    from mnemiq.semantic.retrieval import _retrieve_examples
+    from mnemiq.semantic.store import build_example_index
+
+    def stored(order):
+        con = init_store(str(tmp_path / f"{'-'.join(order)}.duckdb"))
+        build_example_index(con, Snapshot(
+            version="v1", source_id="acme", created_at="t",
+            columns=[Column(id="claim.n", object_id="claim", name="n")],
+            examples=[Example(question=q, sql=f"SELECT '{q}' FROM claim", tables=["claim"], object_id="claim")
+                      for q in order]), _Pointing())
+        (qvec,) = _Pointing().embed(["anything"])
+        return [e.question for e in _retrieve_examples(con, qvec, allowed={"claim"}, k=5)]
+
+    assert stored(["zeta case", "beta case"]) == stored(["beta case", "zeta case"]) == ["beta case", "zeta case"]
