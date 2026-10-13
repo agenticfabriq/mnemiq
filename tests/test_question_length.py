@@ -37,8 +37,7 @@ _REPLY = '{"sql": "SELECT count(*) AS n FROM claim", "reason": "ok"}'
 
 
 def _question(chars: int) -> str:
-    """Exactly `chars` characters ending in a marker, so a cut anywhere is a missing tail. Single spaces only:
-    `sanitize` folds runs of whitespace, and a folded space would read as a mismatch that is not a cut."""
+    """Exactly `chars` characters ending in a marker, so a cut anywhere is a missing tail."""
     tail = " ENDOFQUESTION"
     body = ("abcdefghi " * (chars // 10 + 1))[: chars - len(tail)]
     if body.endswith(" "):

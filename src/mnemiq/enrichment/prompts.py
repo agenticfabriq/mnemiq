@@ -25,7 +25,8 @@ def sanitize(text: str, limit: int = 200) -> str:
     (proposals.py), so a successful injection still cannot invent a column, a code, or a
     value outside the closed vocabulary.
 
-    Not for the user's question, which every stage reads as asked (M147, M148).
+    Not for the question being answered, which every stage reads as asked (M147, M148). Earlier questions in the
+    conversation history still go through it, cut to 300 characters (`history_section`).
     """
     flat = re.sub(r"\s+", " ", str(text)).replace("`", "'")
     flat = _INJECTION_MARKERS.sub("[redacted]", flat)
