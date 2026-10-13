@@ -126,7 +126,7 @@ def token_param_name(model: str) -> str:
 
 
 # Reasoning room ADDED to every caller's request, not a threshold a few of them fall under.
-_REASONING_RESERVE = 4096
+_REASONING_RESERVE = 8192
 
 
 def reasoning_budget(model: str, max_tokens: int) -> int:
@@ -148,6 +148,17 @@ def reasoning_budget(model: str, max_tokens: int) -> int:
     argument for headroom over the smallest number that passed once, and the reason the product
     still needs its fail-open to be visible rather than merely rare.
 
+    Raised from 4096 to 8192 when longer prompts found the tail again. MEASURED (openai.gpt-5.5,
+    judge prompts of 16,000 to 46,500 characters from a BEAVER benchmark session): 21 calls with
+    room to spare reasoned for 2,035 to 5,076 tokens; at a reserve of 4096, 4 of 12 calls spent the
+    whole cap and came back with no reply, which the judge reads as unparsed and the verifier as an
+    answer it will not stand behind (7 of 800 answers in that session); at 8192, none of 12 did.
+    That makes the failure rarer, not impossible: the 2224 batches above went 0 of 6 and 1 of 3.
+    The reserve is also reply room wherever a prompt is fitted to a window (`PromptFitter.reply_tokens`
+    and the boot window check both count it), so a GPT-5-family deployment with a declared window
+    leaves the generator's prompt 4096 fewer tokens than before; against windows of hundreds of
+    thousands of tokens that is a few percent at most.
+
     A reserve, not a floor. A floor is the wrong shape: it would lift the judge's 200 to something
     workable while leaving `synthesize`'s 1000 -- a caller that genuinely wants 1000 tokens of
     prose -- with whatever the floor left over, which is not reasoning room at all. Adding instead
@@ -156,7 +167,8 @@ def reasoning_budget(model: str, max_tokens: int) -> int:
 
     Cheap, and MEASURED rather than assumed: over caps of 1224, 2048, 4024 and 8192 on one prompt,
     billed completion tokens were 89, 89, 105 and 118 -- a 6.7x allowance for ~33% more spend, so
-    the bill tracks the work, not the cap. It is not free, so this is a reserve and not a blank
+    the bill tracks the work, not the cap. (The generator's cap is now 12192, above the largest
+    measured here.) It is not free, so this is a reserve and not a blank
     cheque; it is far too cheap to justify truncating a request instead.
     """
     return max_tokens + _REASONING_RESERVE if _GPT5.search(model) else max_tokens
