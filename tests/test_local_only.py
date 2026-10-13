@@ -307,10 +307,15 @@ def test_the_cli_calls_the_assertion_before_any_command_does_work(monkeypatch, c
         call_order.append("init_store")
         raise AssertionError("real work started before assert_local_only ran")
 
+    # Imported BEFORE the patch: `cli` imports `runtime`, which binds `init_store` by name on first
+    # import, so importing it under the patch left the tripwire in `runtime` for every later test
+    # in the session (`test_the_runtime_opens_its_store_local_only_when_the_setting_says_so`
+    # failed after this file). `metrics` imports `init_store` when it runs, so the patch still
+    # reaches it.
+    from mnemiq import cli
+
     monkeypatch.setattr(Settings, "assert_local_only", fake_assert_local_only)
     monkeypatch.setattr("mnemiq.store.bootstrap.init_store", fake_init_store)
-
-    from mnemiq import cli
 
     rc = cli.main(["metrics"])
     assert rc == 2, "a refused startup is a clean exit code, not a raised exception out of main"
