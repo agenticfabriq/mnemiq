@@ -17,7 +17,7 @@ _INJECTION_MARKERS = re.compile(
 )
 
 
-def sanitize(text: str, limit: int | None = 200) -> str:
+def sanitize(text: str, limit: int = 200) -> str:
     """Neutralize a catalog-derived string before it reaches a prompt.
 
     Anyone who can name a column can write into our prompt. This is defense in depth; the
@@ -25,8 +25,8 @@ def sanitize(text: str, limit: int | None = 200) -> str:
     (proposals.py), so a successful injection still cannot invent a column, a code, or a
     value outside the closed vocabulary.
 
-    `limit=None` keeps the whole text: for the user's question, which every stage must read alike and whose length
-    the agent bounds by declining (M147), never by cutting.
+    Not for the question being answered, which every stage reads as asked (M147, M148). Earlier questions in the
+    conversation history still go through it, cut to 300 characters (`history_section`).
     """
     flat = re.sub(r"\s+", " ", str(text)).replace("`", "'")
     flat = _INJECTION_MARKERS.sub("[redacted]", flat)
