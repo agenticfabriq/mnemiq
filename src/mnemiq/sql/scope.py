@@ -274,9 +274,9 @@ def _scope_missed_a_read(ast: exp.Expression, walked: list[exp.Table], dialect: 
 
 
 def missed_reads(ast: exp.Expression, dialect: str | None = None) -> list[exp.Table]:
-    """The reads a scope that DID resolve left out of its walk -- what made `base_tables` fall back
-    (Codex's review of #109). Empty when there are none, and when the scope did not resolve at
-    all: that fallback is older, and the guards built on it already handle it."""
+    """The reads a scope that DID resolve left out of its walk -- one cause of `base_tables` falling
+    back (Codex's review of #109). Empty when there are none, and when the scope did not resolve
+    at all, which is the other cause: `scope_resolved` answers for both."""
     root = _root_scope(ast)
     if root is None or _unscoped_ctes(ast, root):
         return []

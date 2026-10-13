@@ -7,7 +7,7 @@ from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import names_one_object, object_key
-from mnemiq.sql.scope import base_tables, column_tables, cte_references, missed_reads
+from mnemiq.sql.scope import base_tables, column_tables, cte_references, scope_resolved
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -186,9 +186,11 @@ def unplaceable_policy(ast: exp.Expression, policy: AccessPolicy, dialect: str |
 
     Only that collision is refused. A missed read with no CTE named after a governed table is
     placed correctly -- M121's write through a scope that missed its FROM table is approved and
-    row-filtered -- and refusing it would decline a policy this engine can apply.
+    row-filtered -- and refusing it would decline a policy this engine can apply. Any fallback, not
+    only a missed read: a scope that does not resolve at all gives `base_tables` the same list
+    (review gate), so `scope_resolved` decides, which answers for every cause.
     """
-    if policy.empty or not missed_reads(ast, dialect):
+    if policy.empty or scope_resolved(ast, dialect):
         return None
     governed = list(policy.row_filters) + [t for t, _ in policy.masked | policy.denied]
     for cte in cte_references(ast, dialect):

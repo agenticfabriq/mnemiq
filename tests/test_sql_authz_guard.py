@@ -673,7 +673,7 @@ def _filtered():
                         policy_schema={"claim": {"id", "amount"}})
 
 
-def test_a_policy_is_not_placed_on_a_scope_that_missed_a_read():
+def test_a_policy_is_not_placed_where_a_cte_is_named_after_a_governed_table():
     from mnemiq.sql.decide import decide
 
     v = decide(_CTE_NAMED_LIKE_THE_TABLE, {"claim": {"id", "amount"}}, dialect="duckdb",
@@ -696,7 +696,7 @@ def test_without_a_policy_the_same_read_answers_correctly():
     assert sorted(r[0] for r in con.execute(v.plan_sql).fetchall()) == [1, 30]
 
 
-def test_a_write_does_not_place_a_policy_on_a_scope_that_missed_a_read():
+def test_a_write_does_not_place_a_policy_where_a_cte_is_named_after_a_governed_table():
     from mnemiq.authz.grants import GrantSet
     from mnemiq.sql.decide_write import decide_write
 
@@ -707,4 +707,17 @@ def test_a_write_does_not_place_a_policy_on_a_scope_that_missed_a_read():
         GrantSet(frozenset({"claim"}), writable=frozenset({"claim"})),
         policy=_filtered(), dialect="duckdb", target="duckdb", writes_enabled=True,
     )
+    assert isinstance(v, Refusal) and v.code == RefusalCode.UNMODELLED_SOURCE, v
+
+
+def test_a_scope_that_does_not_resolve_at_all_is_refused_the_same_way(monkeypatch):
+    """The other fallback: a scope that does not resolve gives `base_tables` every table node too,
+    CTE references included, so the rewrite would misplace the policy the same way. sqlglot's own
+    failure is stood in for, as `test_scope_missed_table` stands in sqlglot 30.17's."""
+    import mnemiq.sql.scope as scope_module
+    from mnemiq.sql.decide import decide
+
+    monkeypatch.setattr(scope_module, "_root_scope", lambda ast: None)
+    v = decide("WITH claim AS (SELECT amount FROM claim WHERE id > 0) SELECT amount FROM claim",
+               {"claim": {"id", "amount"}}, dialect="duckdb", target="duckdb", policy=_filtered())
     assert isinstance(v, Refusal) and v.code == RefusalCode.UNMODELLED_SOURCE, v
