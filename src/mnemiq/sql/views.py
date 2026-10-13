@@ -72,6 +72,18 @@ def unrecognised_source(body: exp.Expression) -> str | None:
             continue
         if isinstance(source, exp.Subquery) and isinstance(source.this, exp.Query):
             continue  # a real subquery: its own FROM/JOIN nodes are enumerated by this walk
+        # A LATERAL over a real subquery is that subquery, correlated: its FROM/JOIN nodes are
+        # enumerated by this walk too, and scope resolution reads them (M65 measured `LATERAL
+        # (SELECT id FROM customer)` refused as `unauthorized_table customer`). A LATERAL over
+        # anything else -- `VALUES` above all, whose scalar subqueries scope resolution does not
+        # reach, so `FROM LATERAL (VALUES ((SELECT max(ssn) FROM customer)))` read an ungranted
+        # table with `base_tables == []` -- still refuses: sqlglot's `Values` is not a `Query`.
+        if (
+            isinstance(source, exp.Lateral)
+            and isinstance(source.this, exp.Subquery)
+            and isinstance(source.this.this, exp.Query)
+        ):
+            continue
         return type(source).__name__
     return None
 

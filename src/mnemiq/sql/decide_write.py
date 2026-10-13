@@ -5,7 +5,12 @@ from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import ViewDefinition
-from mnemiq.sql.authz_guard import check_access, check_opaque_columns, check_unmodelled_calls
+from mnemiq.sql.authz_guard import (
+    check_access,
+    check_opaque_columns,
+    check_unmodelled_calls,
+    check_unmodelled_source,
+)
 from mnemiq.sql.functions import inventory_from, opaque_columns
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.policy import AccessPolicy
@@ -212,6 +217,11 @@ def decide_write(
     refusal = check_access(shaped, visible, target)  # every referenced table readable, cols exist
     if refusal is not None:
         return refusal
+    # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
+    # and an empty list passes. After it, so a source it already refuses keeps its refusal.
+    unmodelled = check_unmodelled_source(shaped)
+    if unmodelled is not None:
+        return unmodelled
 
     # The read path's M43 fix, on the write path, because the premise is identical and a write
     # is the worse place to lose it: measured before this line existed, `UPDATE claim SET

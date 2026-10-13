@@ -614,10 +614,10 @@ def test_a_direct_unmodelled_source_is_not_reported_complete():
     `base_tables == []` while scope resolution reports SUCCESS — so the empty list looked settled
     and the marker said COMPLETE over a read of `customer` it never named.
 
-    Note this is also an AUTHORIZATION bypass and that half is NOT fixed here: `check_access`
-    reads the same empty `base_tables`, so `decide` approves the statement with `customer` absent
-    from `visible`. Pre-existing, same family as M43, filed rather than fixed — the marker's job
-    is to stop the audit record from calling it accounted for.
+    It was also an AUTHORIZATION bypass -- `check_access` read the same empty `base_tables`, so
+    `decide` approved the statement with `customer` absent from `visible` -- filed as M65 and since
+    closed by `check_unmodelled_source`, which refuses it in both deciders. The marker's job stays
+    the same: the audit record never calls such a read accounted for.
     """
     lineage = lineage_for(sqlglot.parse_one(
         "SELECT x FROM LATERAL (VALUES ((SELECT max(store_id) FROM customer))) AS lv(x)",
