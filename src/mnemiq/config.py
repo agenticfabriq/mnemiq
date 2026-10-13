@@ -334,7 +334,7 @@ class Settings(BaseSettings):
 
         try:
             kinds = {spec.kind for spec in self.source_specs()}
-        except (OSError, ValueError, KeyError):
+        except (OSError, ValueError, KeyError, TypeError):
             kinds = set()
         loaded = check_extensions(
             [*STORE_EXTENSIONS, *(SOURCE_EXTENSIONS[k] for k in sorted(kinds) if k in SOURCE_EXTENSIONS)])

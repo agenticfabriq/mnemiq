@@ -369,6 +369,32 @@ def test_a_pre_seeded_deployment_starts_and_says_what_it_loaded(pre_seeded, tmp_
     assert _files(pre_seeded) == sorted(_files(pre_seeded)), "nothing beyond what was pre-seeded"
 
 
+
+@pytest.mark.parametrize("manifest", [
+    None,                      # no file: OSError
+    "not json",                # ValueError
+    '{"id": "s"}',             # an object, not a list: TypeError
+    '["s"]',                   # a list of strings: TypeError
+    '[{"kind": "sqlite"}]',    # a source with no id: KeyError
+])
+def test_a_manifest_that_cannot_be_read_still_has_the_store_extensions_checked(
+        fresh_extensions, tmp_path, manifest):
+    """Its own error still comes from `source_specs`, where the command meets it; the boot check
+    reads no kinds from it, and still checks the store's two -- it does not escape as a traceback."""
+    from mnemiq.config import Settings
+    from mnemiq.duckdb_extensions import ExtensionsNotReady
+
+    path = tmp_path / "sources.json"
+    if manifest is not None:
+        path.write_text(manifest)
+    settings = Settings(local_only=True, llm_base_url=None, embed_base_url=None,
+                        sources_path=str(path))
+    with pytest.raises((OSError, ValueError, TypeError, KeyError)):
+        settings.source_specs()
+    with pytest.raises(ExtensionsNotReady) as refused:
+        settings.assert_local_only()
+    assert "vss: not installed" in str(refused.value) and "fts: not installed" in str(refused.value)
+
 def _gzip_server(bodies: dict[str, bytes], asked: list[str]):
     """An `urlopen` that serves `bodies` by file name, gzipped, and records every URL asked. The
     repository refuses Python's default User-Agent with 403 (measured), so a request without its
@@ -406,10 +432,12 @@ def test_fetch_for_this_platform_loads_what_it_wrote(tmp_path):
     from mnemiq.duckdb_extensions import fetch_extensions
 
     asked: list[str] = []
-    with pytest.raises(duckdb.Error, match="not a DuckDB extension"):
-        fetch_extensions(tmp_path, ["fts"],
-                         urlopen=_gzip_server({"fts.duckdb_extension": b"x" * 600}, asked))
-    assert len(asked) == 1
+    bodies = {"fts.duckdb_extension": b"x" * 600, "vss.duckdb_extension": b"y" * 600}
+    with pytest.raises(RuntimeError, match="does not load, so removed") as refused:
+        fetch_extensions(tmp_path, ["fts", "vss"], urlopen=_gzip_server(bodies, asked))
+    assert "fts.duckdb_extension" in str(refused.value) and "vss.duckdb_extension" in str(refused.value)
+    assert len(asked) == 2
+    assert _files(tmp_path) == [], "none left to be copied across"
 
 
 def test_fetch_from_a_real_extension_loads(tmp_path):

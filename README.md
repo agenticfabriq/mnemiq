@@ -217,8 +217,9 @@ check on them would refuse legitimate DSNs rather than catch anything; verify th
 
 Under `MNEMIQ_LOCAL_ONLY` mnemiq never downloads a DuckDB extension, so pre-seed the ones it loads:
 the store's `vss` and `fts`, and `postgres` or `sqlite` for each source of that kind. Every command
-loads them at startup and refuses, naming each one missing, before doing anything else. On a
-connected machine with the same mnemiq release (so the same DuckDB), run
+that touches a source, a store or an endpoint loads them at startup and refuses, naming each one
+missing, before doing anything else. On a connected machine with the same mnemiq release (so the
+same DuckDB), run
 
 ```bash
 mnemiq extensions fetch --platform linux_amd64 --out ./duckdb-extensions

@@ -189,9 +189,20 @@ def fetch_extensions(out: Path, names: Iterable[str] = ALL_EXTENSIONS, *,
         check = duckdb.connect(config={"autoinstall_known_extensions": False,
                                        "autoload_known_extensions": False,
                                        "extension_directory": str(out)})
+        bad = []
         try:
-            for file in files:
-                check.execute(f"LOAD {file}")
+            for path in written:
+                try:
+                    check.execute(f"LOAD {path.name.removesuffix('.duckdb_extension')}")
+                except duckdb.Error as exc:
+                    bad.append((path, str(exc).splitlines()[0]))
         finally:
             check.close()
+        # Every file checked first, then each that failed removed: none is left in `out` to be
+        # carried across, where the boot check would refuse it.
+        for path, _ in bad:
+            path.unlink()
+        if bad:
+            raise RuntimeError("downloaded but does not load, so removed:\n  " + "\n  ".join(
+                f"{path.name}: {reason}" for path, reason in bad))
     return written
