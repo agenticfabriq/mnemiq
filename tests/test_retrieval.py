@@ -337,3 +337,54 @@ def test_resolve_concepts_covers_only_bound_columns_on_shown_cards():
                            "Type 2 diabetes mellitus") in got
     # a column on a table that was not retrieved is never resolved
     assert all(c.column_id == "patient.icd10_cd" for c in got)
+
+
+# M149: retrieval sorted each ranking by score alone, so tables with tied scores came back in whatever order DuckDB
+# returned them (on BEAVER, per call), and the same question could reach the generator with its cards in another
+# order. Each test stores the same tied tables in both orders and needs the same packet from both.
+class _Pointing:
+    """A tiny embedder: a text naming `near` points along the first axis, as the question does; other text points
+    elsewhere. `near=None` points everything the same way, so every table ties."""
+
+    dim = 4
+
+    def __init__(self, near: str | None = None) -> None:
+        self._near = near
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        def vector(text: str) -> list[float]:
+            if self._near is None or "TABLE " not in text or f"TABLE {self._near}" in text:
+                return [1.0, 0.0, 0.0, 0.0]
+            return [0.6, 0.8, 0.0, 0.0]
+        return [vector(t) for t in texts]
+
+
+def _tied_snapshot(order: list[str]) -> Snapshot:
+    """Tables whose cards differ only in a name of the same length, so BM25 scores them alike."""
+    return Snapshot(
+        version="v1", source_id="acme", created_at="2026-07-13T00:00:00Z",
+        source_bindings=[SourceBinding(id=f"sb:{t}", source_id="acme", object_id=t, source_object=t,
+                                       binding_type="table") for t in order],
+        columns=[Column(id=f"{t}.shared_col", object_id=t, name="shared_col", data_type="text") for t in order],
+    )
+
+
+def _order(tmp_path, order, question, embedder):
+    con = init_store(str(tmp_path / f"{'-'.join(order)}.duckdb"))
+    build_index(con, _tied_snapshot(order), embedder)
+    packet = retrieve(con, question, _identity(), _StaticAuthz(*order), embedder)
+    return [c.object_id for c in packet.cards]
+
+
+def test_tables_tied_on_the_embedding_come_back_in_one_order_however_they_were_stored(tmp_path):
+    # No lexical match, and every vector alike: only the cosine ranking runs, and every table ties in it.
+    tables = ["zeta", "beta", "mid0"]
+    first = _order(tmp_path, tables, "nothing in common", _Pointing())
+    assert first == _order(tmp_path, tables[::-1], "nothing in common", _Pointing())
+    assert first == sorted(tables)
+
+
+def test_tables_tied_on_bm25_come_back_in_one_order_however_they_were_stored(tmp_path):
+    # Both cards match `shared_col` alike, while the embedding ranks zeta first: the BM25 tie decides between them.
+    first = _order(tmp_path, ["zeta", "beta"], "shared_col", _Pointing(near="zeta"))
+    assert first == _order(tmp_path, ["beta", "zeta"], "shared_col", _Pointing(near="zeta"))
