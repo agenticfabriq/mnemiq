@@ -369,10 +369,10 @@ def _tied_snapshot(order: list[str]) -> Snapshot:
     )
 
 
-def _order(tmp_path, order, question, embedder):
+def _order(tmp_path, order, question, embedder, k=24):
     con = init_store(str(tmp_path / f"{'-'.join(order)}.duckdb"))
     build_index(con, _tied_snapshot(order), embedder)
-    packet = retrieve(con, question, _identity(), _StaticAuthz(*order), embedder)
+    packet = retrieve(con, question, _identity(), _StaticAuthz(*order), embedder, k=k)
     return [c.object_id for c in packet.cards]
 
 
@@ -382,6 +382,13 @@ def test_tables_tied_on_the_embedding_come_back_in_one_order_however_they_were_s
     first = _order(tmp_path, tables, "nothing in common", _Pointing())
     assert first == _order(tmp_path, tables[::-1], "nothing in common", _Pointing())
     assert first == sorted(tables)
+
+
+def test_at_the_cut_a_tie_decides_which_tables_are_served_the_same_way_every_time(tmp_path):
+    # Three tables tie and only two fit: the tie-break picks which two, not just their order.
+    tables = ["zeta", "beta", "mid0"]
+    first = _order(tmp_path, tables, "nothing in common", _Pointing(), k=2)
+    assert first == _order(tmp_path, tables[::-1], "nothing in common", _Pointing(), k=2) == ["beta", "mid0"]
 
 
 def test_tables_tied_on_bm25_come_back_in_one_order_however_they_were_stored(tmp_path):
