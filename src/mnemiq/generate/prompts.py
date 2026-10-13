@@ -175,10 +175,12 @@ def history_section(packet: ContextPacket) -> list[str]:
 
 def user_prompt(packet: ContextPacket, feedback: str | None = None) -> str:
     cards = "\n\n".join(c.card for c in packet.cards) or "(no tables are available to you)"
-    # Whole, as the judge, the selector and the synthesizer read it. A 500-character cut here answered long questions
-    # as cut ones while the judge checked the whole (M147). The bound is MNEMIQ_MAX_QUESTION_CHARS, applied before
-    # this runs: both doors decline a longer question before retrieval, and `Agent.answer` declines it again.
-    parts = [f"QUESTION: {sanitize(packet.question, limit=None)}"]
+    # As asked, the way the judge, the selector and the synthesizer read it. A 500-character cut here answered long
+    # questions as cut ones (M147), and `sanitize` turned backticks into quotes and folded line breaks for the
+    # generator alone (M148). `sanitize` guards catalog text, which anyone who can name a column writes; the question is
+    # the asker's own. Its length is bounded before this runs: both doors decline a question over
+    # MNEMIQ_MAX_QUESTION_CHARS before retrieval, and `Agent.answer` declines it again.
+    parts = [f"QUESTION: {packet.question}"]
     parts += meaning_sections(packet)
     if packet.examples:
         parts += ["", "WORKED EXAMPLES (verified queries over these tables -- adapt, don't copy blindly):"]

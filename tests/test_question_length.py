@@ -100,6 +100,26 @@ def test_the_generator_and_the_judge_read_the_same_question():
     assert generator_line == f"QUESTION: {seen['question']}"
 
 
+def test_the_generator_reads_backticks_and_line_breaks_as_the_judge_does():
+    """M148: the generator alone read the question through `sanitize`, which turns backticks into quotes and folds line
+    breaks, so sub-question SQL that quotes a column as `amount` reached it as the string 'amount' while the judge read
+    the identifier."""
+    question = "How much was paid?\n\nSub-question SQL: SELECT `amount` FROM claim"
+    packet = _packet(question)
+    seen = {}
+
+    class _Judge:
+        def score(self, q, schema, sql, preview):
+            seen["question"] = q
+            return 0.9
+
+    sql = "SELECT count(*) AS n FROM claim"
+    Verifier(sanity=False, judge=_Judge()).verify(packet, Approved(plan_sql=sql, target_sql=sql),
+                                                  pa.table({"n": [7]}))
+    assert seen["question"] == question
+    assert user_prompt(packet).startswith(f"QUESTION: {question}\n")
+
+
 def test_a_question_over_the_limit_is_declined_before_the_generator_is_called():
     generator = FakeGenerator([_REPLY])
     answer = _agent(generator, max_question_chars=1_000).answer(
