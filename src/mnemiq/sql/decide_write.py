@@ -17,7 +17,7 @@ from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import base_tables
-from mnemiq.sql.rls import apply_row_filters_to_write
+from mnemiq.sql.rls import apply_row_filters_to_write, unplaceable_policy
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import check_views
 
@@ -306,6 +306,11 @@ def decide_write(
     # filter was spliced in without validation (M7). Both are one defect: there were two
     # implementations and the second was wrong. `apply_row_filters_to_write` wraps the reads and
     # conjoins the target, using the same `_validate_filter` the read decider uses.
+    # Codex's review of #111: not where the read list fell back, where the rewrite would filter a
+    # CTE named like a filtered table as if it were the table.
+    unplaceable = unplaceable_policy(shaped, policy, target)
+    if unplaceable is not None:
+        return unplaceable
     governed, narrowed = apply_row_filters_to_write(
         shaped, policy, visible, _target_node(shaped), dialect, executes_as=target)
     if isinstance(governed, Refusal):

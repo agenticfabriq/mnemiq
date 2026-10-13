@@ -273,6 +273,12 @@ def _scope_missed_a_read(ast: exp.Expression, walked: list[exp.Table], dialect: 
     return bool(_missed_reads(ast, walked, dialect))
 
 
+def cte_references(ast: exp.Expression, dialect: str | None = None) -> list[exp.Table]:
+    """The table nodes that name a CTE in scope where they stand -- what the fallback over-reports
+    as reads when the walk missed one."""
+    return [table for table in ast.find_all(exp.Table) if _cte_in_scope(table, dialect)]
+
+
 def _missed_reads(ast: exp.Expression, walked: list[exp.Table], dialect: str | None) -> list[exp.Table]:
     """The table nodes `_scope_missed_a_read` counts: left out by the walk, not written, and not
     a CTE in scope -- reads the scope model missed."""
