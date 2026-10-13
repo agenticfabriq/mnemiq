@@ -193,8 +193,10 @@ def test_every_door_passes_local_only():
             if (name := door(node)) is not None:
                 passed = [k.value for k in node.keywords if k.arg == "local_only"]
                 # From the caller, never a constant: `local_only=False` written at a door is the
-                # setting dropped with the keyword still present.
-                if not passed or isinstance(passed[0], ast.Constant):
+                # setting dropped with the keyword still present. `True` only tightens, and the
+                # boot check, which exists only under local-only, writes it.
+                if not passed or (isinstance(passed[0], ast.Constant)
+                                  and passed[0].value is not True):
                     missing.append(f"{path.relative_to(root)}:{node.lineno} {name}")
             elif path.name != "duckdb_extensions.py" and (
                     (isinstance(func, ast.Attribute) and func.attr == "connect"
@@ -210,17 +212,6 @@ def test_every_door_passes_local_only():
            # `{` as well as a word: the form removed from the adapters was `f"INSTALL {extension}"`.
            and re.search(r"INSTALL [\w{]", path.read_text())]
     assert raw == [], f"load the extension through duckdb_extensions.load_extension: {raw}"
-
-
-def test_the_verified_line_says_extensions_are_checked_when_the_store_opens(capsys):
-    """It printed "verified" and the next step downloaded; now it says what it has not checked yet,
-    and where that check happens."""
-    from mnemiq.config import Settings
-
-    Settings(local_only=True, llm_base_url=None, embed_base_url=None).assert_local_only()
-    line = capsys.readouterr().err
-    assert "MNEMIQ_LOCAL_ONLY verified" in line
-    assert "DuckDB extensions are checked when the store opens, and never downloaded" in line
 
 
 # Codex's review of M107: auto-install was switched off only inside `load_extension`, so a
@@ -325,3 +316,120 @@ def test_a_local_only_connection_auto_loads_nothing(tmp_path):
     assert con.execute("SELECT current_setting('autoload_known_extensions')").fetchone()[0] is False
     with pytest.raises(duckdb.Error):
         con.execute(scan).fetchall()
+
+
+# **M107, the owner's call (2026-10-12): the operator pre-seeds.** Under local-only every command
+# loads the extensions the deployment needs at startup -- before the verified line -- and
+# `mnemiq extensions fetch` is how a connected machine prepares them.
+
+def _local_only(tmp_path, kind: str | None = None):
+    from mnemiq.config import Settings
+
+    fields = {"local_only": True, "llm_base_url": None, "embed_base_url": None}
+    if kind:
+        manifest = tmp_path / "sources.json"
+        manifest.write_text(f'[{{"id": "s", "kind": "{kind}", "target": "t", "catalog": "s", '
+                            f'"schema": "main"}}]')
+        fields["sources_path"] = str(manifest)
+    return Settings(**fields)
+
+
+def test_local_only_refuses_at_startup_naming_every_extension_it_would_need(fresh_extensions,
+                                                                            tmp_path, capsys):
+    from mnemiq.duckdb_extensions import ExtensionsNotReady
+
+    with pytest.raises(ExtensionsNotReady) as refused:
+        _local_only(tmp_path, "postgres").assert_local_only()
+    message = str(refused.value)
+    for missing in ("vss: not installed", "fts: not installed", "postgres_scanner: not installed"):
+        assert missing in message, message
+    assert "sqlite_scanner" not in message, "a deployment with no SQLite source needs no scanner"
+    platform = duckdb.connect().execute("PRAGMA platform").fetchone()[0]
+    assert f"mnemiq extensions fetch --platform {platform} --out <dir>" in message
+    assert "verified" not in capsys.readouterr().err, "refused before the verified line"
+    assert _files(fresh_extensions) == [], "nothing was fetched"
+
+
+def test_a_file_that_is_not_an_extension_is_refused_at_startup(fresh_extensions, tmp_path):
+    from mnemiq.duckdb_extensions import ExtensionsNotReady
+
+    platform = duckdb.connect().execute("PRAGMA platform").fetchone()[0]
+    seeded = fresh_extensions / f"v{duckdb.__version__}" / platform
+    seeded.mkdir(parents=True)
+    (seeded / "vss.duckdb_extension").write_bytes(b"not an extension")  # reads as installed
+    with pytest.raises(ExtensionsNotReady, match="vss: installed but does not load"):
+        _local_only(tmp_path).assert_local_only()
+
+
+def test_a_pre_seeded_deployment_starts_and_says_what_it_loaded(pre_seeded, tmp_path, capsys):
+    _local_only(tmp_path, "sqlite").assert_local_only()
+    line = capsys.readouterr().err
+    assert "MNEMIQ_LOCAL_ONLY verified" in line
+    assert "DuckDB extensions loaded, none downloaded: fts, sqlite_scanner, vss" in line
+    assert _files(pre_seeded) == sorted(_files(pre_seeded)), "nothing beyond what was pre-seeded"
+
+
+def _gzip_server(bodies: dict[str, bytes], asked: list[str]):
+    """An `urlopen` that serves `bodies` by file name, gzipped, and records every URL asked. The
+    repository refuses Python's default User-Agent with 403 (measured), so a request without its
+    own is refused here too."""
+    import gzip
+    import io
+
+    def urlopen(request, timeout=None):
+        agent = request.get_header("User-agent") or ""
+        assert agent and not agent.startswith("Python-urllib"), "the repository answers 403"
+        asked.append(request.full_url)
+        name = request.full_url.rsplit("/", 1)[1].removesuffix(".gz")
+        return io.BytesIO(gzip.compress(bodies[name]))
+
+    return urlopen
+
+
+def test_fetch_writes_the_layout_duckdb_reads_from_where_duckdb_installs(tmp_path):
+    from mnemiq.duckdb_extensions import fetch_extensions
+
+    here = duckdb.connect().execute("PRAGMA platform").fetchone()[0]
+    other = next(p for p in ("windows_amd64", "linux_arm64") if p != here)  # nothing to load here
+    files = ["vss", "fts", "postgres_scanner", "sqlite_scanner"]
+    bodies = {f"{f}.duckdb_extension": f"bytes of {f}".encode() for f in files}
+    asked: list[str] = []
+    written = fetch_extensions(tmp_path, platform=other, urlopen=_gzip_server(bodies, asked))
+    version = f"v{duckdb.__version__}"
+    assert asked == [f"https://extensions.duckdb.org/{version}/{other}/{f}.duckdb_extension.gz"
+                     for f in files]
+    assert written == [tmp_path / version / other / f"{f}.duckdb_extension" for f in files]
+    assert [p.read_bytes() for p in written] == [bodies[p.name] for p in written]
+
+
+def test_fetch_for_this_platform_loads_what_it_wrote(tmp_path):
+    from mnemiq.duckdb_extensions import fetch_extensions
+
+    asked: list[str] = []
+    with pytest.raises(duckdb.Error, match="not a DuckDB extension"):
+        fetch_extensions(tmp_path, ["fts"],
+                         urlopen=_gzip_server({"fts.duckdb_extension": b"x" * 600}, asked))
+    assert len(asked) == 1
+
+
+def test_fetch_from_a_real_extension_loads(tmp_path):
+    from mnemiq.duckdb_extensions import fetch_extensions
+
+    path = _default_install_path("fts")
+    if path is None:
+        pytest.skip("needs fts installed in this machine's extension directory")
+    written = fetch_extensions(tmp_path, ["fts"],
+                               urlopen=_gzip_server({path.name: path.read_bytes()}, []))
+    assert written[0].read_bytes() == path.read_bytes()
+
+
+def test_fetch_refuses_under_local_only(monkeypatch, tmp_path):
+    import mnemiq.duckdb_extensions as extensions
+    from mnemiq.cli import main
+
+    def fetched(*args, **kwargs):
+        raise AssertionError("fetched under MNEMIQ_LOCAL_ONLY")
+
+    monkeypatch.setattr(extensions, "fetch_extensions", fetched)
+    monkeypatch.setenv("MNEMIQ_LOCAL_ONLY", "1")
+    assert main(["extensions", "fetch", "--out", str(tmp_path)]) == 2

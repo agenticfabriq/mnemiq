@@ -3,6 +3,14 @@ import pytest
 from mnemiq.config import Settings
 
 
+@pytest.fixture(autouse=True)
+def _extensions_loaded(monkeypatch):
+    """These are the endpoint checks. The boot check also loads the deployment's DuckDB extensions
+    (M107), which depends on what this machine has installed; that half is tested in
+    test_local_only_extensions.py against an extension directory the test controls."""
+    monkeypatch.setattr("mnemiq.duckdb_extensions.check_extensions", lambda names: list(names))
+
+
 def _s(**kw) -> Settings:
     return Settings(local_only=True, **kw)
 

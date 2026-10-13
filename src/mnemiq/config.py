@@ -91,8 +91,9 @@ class Settings(BaseSettings):
     local_only: bool = Field(
         default=False,
         description="refuse to start if a chat, embedding, judge or Verity endpoint would leave "
-                     "this machine or network (see assert_local_only for exactly what this checks "
-                     "and what it deliberately does not)",
+                     "this machine or network, or a DuckDB extension it loads is not pre-seeded "
+                     "(`mnemiq extensions fetch`; see assert_local_only for exactly what this "
+                     "checks and what it deliberately does not)",
     )
     # --- connection ---
     llm_base_url: str | None = Field(default=None, description="chat/generation OpenAI-compat base URL")
@@ -325,10 +326,22 @@ class Settings(BaseSettings):
                   "which `urlparse` can read as a hostname -- a fail-closed check on them would "
                   "refuse every legitimate keyword DSN. Verify those separately."
             )
+        # **M107.** Every DuckDB extension this deployment loads -- the store's two and each
+        # source's scanner -- is loaded once here, so a machine missing one refuses before the
+        # verified line rather than after it, mid-build. A manifest that cannot be read is left
+        # to fail where it always has, with its own message; the store's two are checked anyway.
+        from mnemiq.duckdb_extensions import SOURCE_EXTENSIONS, STORE_EXTENSIONS, check_extensions
+
+        try:
+            kinds = {spec.kind for spec in self.source_specs()}
+        except (OSError, ValueError, KeyError):
+            kinds = set()
+        loaded = check_extensions(
+            [*STORE_EXTENSIONS, *(SOURCE_EXTENSIONS[k] for k in sorted(kinds) if k in SOURCE_EXTENSIONS)])
         cleared = ", ".join(checked) if checked else "(no chat/embedding/judge/verity endpoint configured)"
         print(
-            f"MNEMIQ_LOCAL_ONLY verified: {cleared} -- pg_dsn/control_dsn are not checked here; "
-            "DuckDB extensions are checked when the store opens, and never downloaded",
+            f"MNEMIQ_LOCAL_ONLY verified: {cleared}; DuckDB extensions loaded, none downloaded: "
+            f"{', '.join(sorted(loaded))} -- pg_dsn/control_dsn are not checked here",
             file=sys.stderr,
         )
 
