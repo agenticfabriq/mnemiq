@@ -1,4 +1,4 @@
-"""The `mnemiq` command: enrich, build, ask, serve, eval."""
+"""The `mnemiq` command: enrich, build, ask, serve, eval, extensions."""
 
 from __future__ import annotations
 
@@ -66,6 +66,19 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--golden", default="evals/acme.json")
     e.add_argument("--gate", action="store_true", help="exit non-zero on accuracy regression")
     e.add_argument("--record", action="store_true", help="record this run in the accuracy trend")
+
+    x = sub.add_parser("extensions", help="pre-seed DuckDB's extensions for a MNEMIQ_LOCAL_ONLY machine")
+    xs = x.add_subparsers(dest="extensions_command", required=True)
+    xf = xs.add_parser(
+        "fetch", help="download the extensions, on a connected machine, into a directory to copy to "
+                      "a local-only one")
+    xf.add_argument("--out", required=True, help="the directory to download into")
+    xf.add_argument("--platform", default=None,
+                    help="the local-only machine's DuckDB platform, e.g. linux_amd64 (default: "
+                         "this machine's); its refusal names it")
+    xf.add_argument("names", nargs="*",
+                    help="the extensions to fetch (default: all mnemiq loads -- vss, fts, "
+                         "postgres, sqlite)")
     return p
 
 
@@ -98,6 +111,29 @@ def _identity(args, settings: Settings | None = None) -> IdentityContext:
         roles=([r.strip() for r in roles_raw.split(",") if r.strip()]
                if roles_raw is not None else base.roles),
     )
+
+
+def _cmd_extensions(settings: Settings, args) -> int:
+    # It downloads, which is exactly what MNEMIQ_LOCAL_ONLY promises mnemiq never does: run it on a
+    # connected machine and carry the directory across.
+    if settings.local_only:
+        print("mnemiq extensions fetch downloads from extensions.duckdb.org, and MNEMIQ_LOCAL_ONLY "
+              "is set: run it on a connected machine and copy the directory it writes across.",
+              file=sys.stderr)
+        return 2
+    from mnemiq.duckdb_extensions import ALL_EXTENSIONS, fetch_extensions
+
+    try:
+        written = fetch_extensions(args.out, args.names or ALL_EXTENSIONS, platform=args.platform)
+    except (RuntimeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    for path in written:
+        print(path)
+    print(f"Copy {written[0].parent}/ to <extension directory>/{written[0].parent.parent.name}/"
+          f"{written[0].parent.name}/ on the local-only machine (by default "
+          "~/.duckdb/extensions, for the user mnemiq runs as).", file=sys.stderr)
+    return 0
 
 
 def _cmd_digest_ontology(args) -> int:
@@ -519,6 +555,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "digest-ontology":  # likewise: TTL in, JSON out -- no source needed
         return _cmd_digest_ontology(args)
     settings = Settings.from_env()
+    if args.command == "extensions":  # before the check: it is how a local-only machine passes it
+        return _cmd_extensions(settings, args)
     # The one call site for every command that touches a source, a store or an endpoint --
     # `config` and `digest-ontology` never reach this line, which is why they are dispatched
     # above it instead of after. Placed here, before the command dispatch below, an operator's

@@ -213,12 +213,21 @@ outright: this performs no lookups, so it cannot confirm where any name actually
 `MNEMIQ_PG_DSN` and `MNEMIQ_CONTROL_DSN` are deliberately **not** checked — libpq accepts keyword
 form (`host=... port=...`), multi-host URIs and Unix-socket targets, none of which a URL parser
 can read a hostname from, so a fail-closed
-check on them would refuse legitimate DSNs rather than catch anything; verify those by hand. Two
-more things worth knowing before an air-gapped run: any command that opens the store fetches
-DuckDB's `vss` and `fts` extensions from `extensions.duckdb.org` on first use, and attaching a
-Postgres or SQLite source fetches DuckDB's matching `postgres`/`sqlite` extension the same way —
-pre-seed DuckDB's extension cache, or vendor the extensions your source and store need, ahead of
-time.
+check on them would refuse legitimate DSNs rather than catch anything; verify those by hand.
+
+Under `MNEMIQ_LOCAL_ONLY` mnemiq never downloads a DuckDB extension, so pre-seed the ones it loads:
+the store's `vss` and `fts`, and `postgres` or `sqlite` for each source of that kind. Every command
+that touches a source, a store or an endpoint loads them at startup and refuses, naming each one
+missing, before doing anything else. On a connected machine with the same mnemiq release (so the
+same DuckDB), run
+
+```bash
+mnemiq extensions fetch --platform linux_amd64 --out ./duckdb-extensions
+```
+
+with the platform the refusal names, and copy `./duckdb-extensions/v<DuckDB version>/<platform>/`
+into `~/.duckdb/extensions/` for the user mnemiq runs as, keeping those two directory levels. All
+four come to about 89 MB per platform. DuckDB checks each extension's signature when it loads it.
 
 **A local server samples unless told not to.** vLLM answers a request that names no temperature with the
 model's own defaults: Qwen2.5-Coder-32B ships temperature 0.7, and five identical requests came back five
