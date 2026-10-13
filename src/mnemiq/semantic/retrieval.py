@@ -108,7 +108,7 @@ def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5) -> list[Ex
     if table_exists is None:
         return []
     try:
-        # Ties broken on every column but the vector: `example` has no key, and DuckDB returns tied rows in no fixed
+        # Ties broken on every selected column but the score: `example` has no key, and DuckDB returns tied rows in no fixed
         # order, so tied examples would otherwise change order, or which ones make the k * 3 cut, per call (M149).
         rows = con.execute(
             "SELECT question, sql, tables, object_id, "
