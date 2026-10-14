@@ -20,7 +20,7 @@ from mnemiq.llm.client import ContextTooLong, ModelUnavailable, PromptCut, seed_
 from mnemiq.progress import Emit, Stage, step
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
-from mnemiq.execute.runner import ExecutionError, run
+from mnemiq.execute.runner import DEFAULT_TIMEOUT_S, ExecutionError, run
 from mnemiq.execute.select import (
     ClusterView,
     SelectorRead,
@@ -192,7 +192,7 @@ class Agent:
         adapter,
         cache: Cache,
         budget: Budget | None = None,
-        timeout_s: float = 30.0,
+        timeout_s: float = DEFAULT_TIMEOUT_S,  # the server-side bound's value too (M152)
         candidates: int = 1,
         corrector=None,
         values=None,
