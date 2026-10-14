@@ -169,7 +169,8 @@ revenue column, and the engine says so instead of returning a number.
 Access is fail-closed. A role is required — pass `--roles analyst`, or `export
 MNEMIQ_ROLES=analyst` alongside the other settings above. Without a role the engine grants nothing
 and defers, which is the correct behaviour and the first thing people mistake for a bug. No policy,
-no grants, no snapshot — no data.
+no grants, no snapshot — no data. The policy format, and what row filters do and do not cover, is
+in [docs/access-policy.md](docs/access-policy.md).
 
 ### Which LLM endpoints work
 
