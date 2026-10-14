@@ -219,11 +219,12 @@ def test_an_attested_off_vocabulary_level_still_clamps():
 
 
 def test_an_omitted_level_on_an_attested_record_is_not_clamped():
-    # M42's territory and deliberately pinned here: absent is not the same as unrecognised, and
-    # the clamp must not start treating silence as an off-vocabulary value.
+    # Absent is not the same as unrecognised: the clamp must not treat silence as an
+    # off-vocabulary value. Since M42 the silence also leaves the local level as it was, rather
+    # than writing None over it (`test_certified_omitted_fields.py`).
     updated = apply_certified(_snapshot("none"), [_record(_ATTESTED, pii_level=None)])
 
-    assert updated.columns[0].pii_level is None
+    assert updated.columns[0].pii_level == "none"
     assert not [j for j in updated.jobs if j.kind == "certified_pii_level_unrecognised"]
 
 
