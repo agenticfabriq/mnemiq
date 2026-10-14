@@ -133,6 +133,11 @@ class TableFacts(BaseModel):
     gotchas: list[str] = Field(default_factory=list)
     canonical_measures: dict[str, str] = Field(default_factory=dict)  # business name -> expr
     default_time_column: str | None = None
+    # What each prose fact depends on, keyed by the fact's own text (the grain or a gotcha): each
+    # entry `table.column` or `table`. A fact with no entry has none recorded, which is not the
+    # same as an empty list (depends on nothing); keying by text means a fact reworded after
+    # enrichment loses its record rather than keeping one that describes other words (M143).
+    reads: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class Example(BaseModel):

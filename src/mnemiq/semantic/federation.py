@@ -34,9 +34,14 @@ def merge_snapshots(pairs: list[tuple[SourceSpec, Snapshot]]) -> FederatedSnapsh
         for c in snap.columns:
             columns.append(c.model_copy(update={"object_id": qualify_object_id(cat, c.object_id)}))
         for tf in snap.table_facts:
-            table_facts.append(
-                tf.model_copy(update={"object_id": qualify_object_id(cat, tf.object_id)})
-            )
+            # `reads` names tables and columns as the source keys them, so they are qualified
+            # like the fact's own table: left bare, no dependency resolves in the merged
+            # snapshot and every recorded fact is withheld from everyone (review gate, M143).
+            table_facts.append(tf.model_copy(update={
+                "object_id": qualify_object_id(cat, tf.object_id),
+                "reads": {text: [qualify_object_id(cat, dep) for dep in deps]
+                          for text, deps in tf.reads.items()},
+            }))
         for e in snap.examples:
             examples.append(e.model_copy(update={
                 "object_id": qualify_object_id(cat, e.object_id),
