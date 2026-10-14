@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
 from mnemiq.sql.qualify import names_one_object
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -23,6 +26,11 @@ class AccessPolicy:
     # The CALLER's tables, the objects it is granted: what a card served to it may name. None means
     # no table scope, for a policy built by hand rather than from a grant set.
     visible: frozenset[str] | None = None
+    # M50: row-filter keys that name no object the snapshot holds, even after the case fold.
+    # Any of them may be the misspelled key of a table this identity reads -- `public.claim`
+    # against a snapshot keyed `claim`, a plural, a catalog the source does not use -- so while
+    # this is non-empty every decider refuses rather than read that table unfiltered.
+    unknown_filter_targets: frozenset[str] = field(default_factory=frozenset)
 
     @property
     def empty(self) -> bool:
@@ -189,6 +197,33 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
     return reachable
 
 
+def unknown_filter_targets(snapshot: Snapshot, row_filters) -> frozenset[str]:
+    """The row-filter keys that name no object in the snapshot, compared with the case fold (M50).
+
+    Not the same question as reachability. A key naming a real object this identity cannot read
+    is DROPPED below, correctly: nothing it could filter is readable. A key naming NO object
+    cannot be told apart from a typo for one that is readable, and dropping it read that table
+    unfiltered -- measured, `public.claim`, `claims` and `pg.claim` against a snapshot keyed
+    `claim` each approved `SELECT id FROM claim` with no predicate and no log line. A table whose
+    profiling failed has no columns here either, so a filter on one refuses too: an enrichment
+    fault the operator must see, rather than a guess that the key meant it.
+    """
+    known = {c.object_id for c in snapshot.columns} | {v.object_id for v in snapshot.views}
+    folded = {k.lower() for k in known}
+    return frozenset(k for k in row_filters if k not in known and k.lower() not in folded)
+
+
+# (snapshot version, key set) pairs already logged, so a policy that refuses every ask names its
+# key once per snapshot rather than twice per question (`build_access_policy` runs for retrieval
+# and for the decider), and a swap logs it again under the version it now refuses against. A set
+# of pairs, not the last version per key set: two snapshots in use at once (a request in flight
+# across a swap) would otherwise flip the memory and log on every call. Cleared past a bound, so
+# a long-lived process swapping often cannot grow it without limit; clearing costs one repeat line
+# per pair still in use.
+_reported: set[tuple[str, frozenset[str]]] = set()
+_REPORTED_BOUND = 64
+
+
 def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     """Resolve per-column dispositions from pii_level + clearance, and readable row filters."""
     reachable = _reachable(snapshot, grants)
@@ -230,7 +265,19 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     policy_schema: dict[str, set[str]] = {}
     for c in snapshot.columns:
         policy_schema.setdefault(c.object_id, set()).add(c.name)
+    unknown = unknown_filter_targets(snapshot, grants.row_filters)
+    if unknown and (snapshot.version, unknown) not in _reported:
+        if len(_reported) >= _REPORTED_BOUND:
+            _reported.clear()
+        _reported.add((snapshot.version, unknown))
+        logger.warning(
+            "row filter keyed %s names no table or view in snapshot %s, so every read for an "
+            "identity holding it is refused until the policy names an object the snapshot holds "
+            "(a typo, a schema or catalog the snapshot does not use, or a table enrichment did "
+            "not record) (M50)",
+            ", ".join(repr(k) for k in sorted(unknown)), snapshot.version,
+        )
     return AccessPolicy(
         row_filters=row_filters, denied=denied, masked=masked, policy_schema=policy_schema,
-        visible=frozenset(grants.objects),
+        visible=frozenset(grants.objects), unknown_filter_targets=unknown,
     )

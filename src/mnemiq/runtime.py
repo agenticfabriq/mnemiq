@@ -331,12 +331,16 @@ def _authz(settings: Settings) -> AuthzProvider:
 
 
 def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> None:
-    """Say the two ways a policy silently grants less than its author meant:
+    """Say the two ways a policy silently grants less than its author meant, and one way it refuses:
 
     a row filter that fails to reach every table hanging off its tenancy axis, and a
     `pii_clearance`/`pii_mask` value that names no PII level and so clears nothing (M40).
     Both faithfully apply what the policy said, so nothing downstream complains. Advisory:
     it reports, it never refuses. The operator's policy is the operator's.
+
+    The third is different in kind: a row-filter key that names no object in the snapshot makes
+    the deciders refuse every read for that role (M50). It is reported here so the operator learns
+    of it at boot rather than from a user.
 
     TWO CALL SITES, not one. `build_runtime` at boot, and `Runtime.reload_if_stale` on an
     actual version swap -- `warn_unfiltered_dependents` reads `snapshot.relationships`, so a
@@ -344,7 +348,11 @@ def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> 
     against the boot snapshot forever. See the cost note at the reload site: this is
     boot-shaped work and the swap puts it on a user request.
     """
-    from mnemiq.authz.coverage import warn_unfiltered_dependents, warn_unknown_pii_levels
+    from mnemiq.authz.coverage import (
+        warn_unfiltered_dependents,
+        warn_unknown_filter_targets,
+        warn_unknown_pii_levels,
+    )
     from mnemiq.contract import IdentityContext
 
     roles = getattr(authz, "policy_roles", None)
@@ -359,6 +367,7 @@ def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> 
         warn_unknown_pii_levels(grants, role=role)
         if snapshot is not None:
             warn_unfiltered_dependents(grants, snapshot.relationships, role=role)
+            warn_unknown_filter_targets(grants, snapshot, role=role)
 
 
 def _acknowledged(settings: Settings) -> frozenset[str]:

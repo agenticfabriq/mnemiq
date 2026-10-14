@@ -17,7 +17,7 @@ from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import base_tables
-from mnemiq.sql.rls import apply_row_filters_to_write, unplaceable_policy
+from mnemiq.sql.rls import apply_row_filters_to_write, check_filter_targets, unplaceable_policy
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import check_views
 
@@ -418,6 +418,10 @@ def decide_write(
     # conjoins the target, using the same `_validate_filter` the read decider uses.
     # Codex's review of #111: not where the read list fell back, where the rewrite would filter a
     # CTE named like a filtered table as if it were the table.
+    # M50, at the same point as on the read path and for the same reason.
+    misplaced = check_filter_targets(policy)
+    if misplaced is not None:
+        return misplaced
     unplaceable = unplaceable_policy(shaped, policy, target)
     if unplaceable is not None:
         return unplaceable

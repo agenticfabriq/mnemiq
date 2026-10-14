@@ -20,7 +20,7 @@ from mnemiq.sql.prove import prove
 from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.lineage import lineage_for
 from mnemiq.sql.scope import base_tables, scope_resolved
-from mnemiq.sql.rls import apply_row_and_mask, unplaceable_policy
+from mnemiq.sql.rls import apply_row_and_mask, check_filter_targets, unplaceable_policy
 from mnemiq.sql.values_check import check_values
 from mnemiq.sql.views import check_views
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
@@ -176,6 +176,13 @@ def decide(
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
     narrowed: list = []
+    # M50: a filter key that names nothing may be the misspelled key of any table this reads, so
+    # nothing is approved while one is held. Here, ahead of the rewrite every approval passes
+    # through, and not at the top: a statement an earlier check refuses keeps that check's more
+    # precise reason (a view inventory that failed, a body that will not parse).
+    misplaced = check_filter_targets(policy)
+    if misplaced is not None:
+        return misplaced
     unplaceable = unplaceable_policy(shaped, policy, target)
     if unplaceable is not None:
         return unplaceable
