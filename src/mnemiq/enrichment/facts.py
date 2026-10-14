@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from typing import Protocol
 
 import sqlglot
@@ -26,18 +28,95 @@ def _expr_columns_ok(expr: str, allowed: set[str]) -> bool:
     return all(c.name in allowed for c in tree.find_all(exp.Column))
 
 
-def parse_facts(raw: str, table: str, columns: set[str], related: set[str]) -> TableFacts:
-    """Screen a facts proposal. Never raises; drops what it cannot verify."""
+_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*")
+
+
+def _vocabulary(table: str, columns: set[str],
+                related_tables: Mapping[str, set[str]]) -> dict[str, set[str]]:
+    """Each name a fact may use, folded, to the dependencies it may mean: an own column to
+    `table.column`, a related table to itself, a related column to `related.column` -- under
+    its bare name too, so a bare `plan_id` shared by two tables means both. Meaning more only
+    withholds more."""
+    vocab: dict[str, set[str]] = {}
+
+    def add(name: str, dep: str) -> None:
+        vocab.setdefault(name.lower(), set()).add(dep)
+
+    for column in columns:
+        add(column, f"{table}.{column}")
+        add(f"{table}.{column}", f"{table}.{column}")
+    for other, other_columns in related_tables.items():
+        bare = other.rsplit(".", 1)[-1]
+        add(other, other)
+        add(bare, other)
+        for column in other_columns:
+            for spelled in (column, f"{other}.{column}", f"{bare}.{column}"):
+                add(spelled, f"{other}.{column}")
+    return vocab
+
+
+def _named(text: str, vocab: dict[str, set[str]]) -> set[str]:
+    """Every dependency the text names, by any dotted suffix of any identifier-like token."""
+    found: set[str] = set()
+    for token in _NAME.findall(text):
+        parts = token.lower().split(".")
+        for i in range(len(parts)):
+            found |= vocab.get(".".join(parts[i:]), set())
+        for part in parts:
+            found |= vocab.get(part, set())
+    return found
+
+
+def _declared(names, vocab: dict[str, set[str]]) -> set[str] | None:
+    """The model's own list, resolved; None when it is missing or names anything it was not
+    given -- an invented name cannot be checked against a grant, so the fact goes unrecorded."""
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        return None
+    out: set[str] = set()
+    for name in names:
+        deps = vocab.get(name.strip().lower())
+        if not deps:
+            return None
+        out |= deps
+    return out
+
+
+def parse_facts(raw: str, table: str, columns: set[str], related: set[str], *,
+                related_tables: Mapping[str, set[str]] | None = None) -> TableFacts:
+    """Screen a facts proposal. Never raises; drops what it cannot verify.
+
+    `related_tables` is `{related table: its columns}`. With it, each prose fact records what
+    it depends on (M143): the columns the model lists for it, checked closed-world, together
+    with every column or table its text names. A fact the model gave no valid list for has none
+    recorded, and is shown only to an identity that sees its table whole. Without it nothing is
+    recorded, since a related column cannot be qualified.
+    """
     payload = _extract_json(raw)
     allowed = columns | related
+    vocab = _vocabulary(table, columns, related_tables) if related_tables is not None else None
+    reads: dict[str, set[str]] = {}
+    unrecorded: set[str] = set()
+
+    # Keyed by text, so a grain and a gotcha with the same words share one entry: their lists
+    # are unioned, and one that has none recorded leaves the text with none (review gate).
+    def record(text: str, names) -> None:
+        if vocab is None:
+            return
+        declared = _declared(names, vocab)
+        if declared is None:
+            unrecorded.add(text)
+        else:
+            reads.setdefault(text, set()).update(declared | _named(text, vocab))
 
     gotchas: list[str] = []
     raw_gotchas = payload.get("gotchas")
     if isinstance(raw_gotchas, list):
         for g in raw_gotchas:
-            text = _clean_text(g, _MAX_GOTCHA)
+            names = g.get("reads") if isinstance(g, dict) else None
+            text = _clean_text(g.get("text") if isinstance(g, dict) else g, _MAX_GOTCHA)
             if text is not None:
                 gotchas.append(text)
+                record(text, names)
             if len(gotchas) >= _MAX_GOTCHAS:
                 break
 
@@ -50,13 +129,17 @@ def parse_facts(raw: str, table: str, columns: set[str], related: set[str]) -> T
             if clean_name and clean_expr and _expr_columns_ok(clean_expr, allowed):
                 measures[clean_name] = clean_expr
 
+    grain = _clean_text(payload.get("grain"), _MAX_GRAIN)
+    if grain is not None:
+        record(grain, payload.get("grain_reads"))
     tc = payload.get("default_time_column")
     return TableFacts(
         object_id=table,
-        grain=_clean_text(payload.get("grain"), _MAX_GRAIN),
+        grain=grain,
         gotchas=gotchas,
         canonical_measures=measures,
         default_time_column=tc if isinstance(tc, str) and tc in columns else None,
+        reads={text: sorted(deps) for text, deps in reads.items() if text not in unrecorded},
     )
 
 
@@ -72,13 +155,19 @@ columns given to you (or a column of a related table for a measure). Never inven
 Return ONLY a JSON object, no prose, of exactly this shape:
 {{
   "grain": "<one sentence: 'one row per X within Y', or null>",
-  "gotchas": ["<a query trap: text-typed numerics, fan-out/pre-aggregate, role-specific keys, PII>", "..."],
+  "grain_reads": ["<each column or table the grain refers to>"],
+  "gotchas": [{{"text": "<a query trap: text-typed numerics, fan-out/pre-aggregate, role-specific keys, PII>",
+               "reads": ["<each column or table this trap refers to>"]}}],
   "canonical_measures": {{"<business name>": "<expression over real columns, e.g. sum(amount)>"}},
   "default_time_column": "<the column analysts filter time by, or null>"
 }}
 
 Gotchas are the highest-value output: encode traps a schema alone never reveals. A null grain
-or time column is better than a guess."""
+or time column is better than a guess.
+
+Every "reads" list names, exactly as given to you, each column and related table the sentence
+is about -- including one it describes in other words ("the diagnosis code" is about the column
+holding it). An empty list means the sentence is about no particular column."""
 
 
 def _render_context(table: str, columns: list[Column], relationships: list[str]) -> str:
@@ -96,7 +185,8 @@ def _render_context(table: str, columns: list[Column], relationships: list[str])
 
 class FactsEnricher(Protocol):
     def facts(
-        self, table: str, context: str, columns: set[str], related: set[str]
+        self, table: str, context: str, columns: set[str], related: set[str], *,
+        related_tables: Mapping[str, set[str]] | None = None,
     ) -> TableFacts: ...
 
 
@@ -106,10 +196,11 @@ class LLMFactsEnricher:
         self._max_tokens = max_tokens
 
     def facts(
-        self, table: str, context: str, columns: set[str], related: set[str]
+        self, table: str, context: str, columns: set[str], related: set[str], *,
+        related_tables: Mapping[str, set[str]] | None = None,
     ) -> TableFacts:
         raw = self._client.complete(_facts_system_prompt(), context, max_tokens=self._max_tokens)
-        return parse_facts(raw, table, columns, related)
+        return parse_facts(raw, table, columns, related, related_tables=related_tables)
 
 
 class FakeFactsEnricher:
@@ -118,10 +209,12 @@ class FakeFactsEnricher:
         self.calls: list[str] = []
 
     def facts(
-        self, table: str, context: str, columns: set[str], related: set[str]
+        self, table: str, context: str, columns: set[str], related: set[str], *,
+        related_tables: Mapping[str, set[str]] | None = None,
     ) -> TableFacts:
         self.calls.append(table)
-        return parse_facts(self._replies.get(table, ""), table, columns, related)
+        return parse_facts(self._replies.get(table, ""), table, columns, related,
+                           related_tables=related_tables)
 
 
 def enrich_table_facts(snapshot: Snapshot, enricher: FactsEnricher) -> Snapshot:
@@ -147,9 +240,12 @@ def enrich_table_facts(snapshot: Snapshot, enricher: FactsEnricher) -> Snapshot:
         related_cols = {
             c.name for c in snapshot.columns if c.object_id in related.get(table, set())
         }
+        related_tables = {other: {c.name for c in by_table.get(other, [])}
+                          for other in related.get(table, set())}
         try:
             context = _render_context(table, columns, rel_lines.get(table, []))
-            tf = enricher.facts(table, context, col_names, related_cols)
+            tf = enricher.facts(table, context, col_names, related_cols,
+                                related_tables=related_tables)
         except Exception:
             jobs.append(Job(id=f"facts:{table}", source_id=snapshot.source_id,
                             kind="facts", status="failed"))

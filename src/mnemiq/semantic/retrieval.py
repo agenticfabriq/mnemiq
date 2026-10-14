@@ -70,7 +70,8 @@ def _rank(rows: list[tuple[str, float]]) -> dict[str, int]:
 
 
 def _attach_facts(cards: list[RetrievedCard], table_facts: Sequence[TableFacts],
-                  card_style: str = "cards", *, grants, columns: Sequence[Column]) -> None:
+                  card_style: str = "cards", *, grants, columns: Sequence[Column],
+                  relationships) -> None:
     """Attach each retrieved table's structural-facts block. Facts live here, NOT in the
     indexed card, so they never perturb retrieval top-k.
 
@@ -79,11 +80,16 @@ def _attach_facts(cards: list[RetrievedCard], table_facts: Sequence[TableFacts],
     the header and the first column and hands the generator malformed DDL, which is the one
     thing the ddl form exists to avoid. In ddl style the block follows the closing paren,
     commented, so it is legal SQL either way.
+
+    `relationships` is required, and None means unknown: a fact with no dependencies recorded
+    is shown only to an identity holding every related table, which cannot be established
+    without them (M143). A default of none would show such facts wherever a caller forgot.
     """
     by_id = {tf.object_id: tf for tf in table_facts}
     for c in cards:
         tf = by_id.get(c.object_id)
-        block = render_facts_block(_scoped_facts(tf, grants, columns)) if tf else ""
+        block = (render_facts_block(_scoped_facts(tf, grants, columns, relationships))
+                 if tf else "")
         if not block:
             continue
         if card_style == "ddl":
@@ -92,6 +98,16 @@ def _attach_facts(cards: list[RetrievedCard], table_facts: Sequence[TableFacts],
             continue
         head, _, rest = c.card.partition("\n")
         c.card = f"{head}\n{block}\n{rest}" if rest else f"{head}\n{block}"
+
+
+def known_relationships(snapshot):
+    """The snapshot's relationships, or None where they are not known. A merged federated
+    snapshot carries none -- `merge_snapshots` does not merge them -- and its empty list would
+    read as "no related tables", showing a fact with no dependencies recorded to an identity
+    that does not hold one (review gate, M143)."""
+    if snapshot is None or getattr(snapshot, "registry", None):
+        return None
+    return snapshot.relationships
 
 
 def _reads_unnamed_columns(ast) -> bool:
@@ -111,18 +127,61 @@ def _reads_unnamed_columns(ast) -> bool:
                for column in ast.find_all(exp.Column))
 
 
-def _scoped_facts(tf: TableFacts, grants, columns: Sequence[Column]) -> TableFacts:
-    """A table's facts with the expressions this identity may not read raw taken out (M143's
-    structured fields; Codex's review of #121 found the facts block naming `count(secret_code)`
-    after the metric selector had withheld the same expression). A canonical measure or the
-    default time column is kept only where `expression_reads_raw` keeps a metric. The grain and
-    gotchas are prose, with no column to resolve, and are M143's remaining question."""
+def _scoped_facts(tf: TableFacts, grants, columns: Sequence[Column],
+                  relationships) -> TableFacts:
+    """A table's facts with what this identity may not see taken out (M143).
+
+    A canonical measure or the default time column is kept only where `expression_reads_raw`
+    keeps a metric (Codex's review of #121 found the block naming `count(secret_code)` after the
+    metric selector had withheld it). The grain and each gotcha are prose, kept only where the
+    identity can see every dependency enrichment recorded for that text -- a column read raw, a
+    table granted, and anything the snapshot does not hold seen by no one. A fact with none
+    recorded is kept only for an identity that reads every column of the table raw and holds
+    every related table: the owner's rule (2026-10-14) for facts enriched before dependencies
+    were recorded, or reworded since.
+    """
     measures = {name: expr for name, expr in tf.canonical_measures.items()
                 if expression_reads_raw(expr, tf.object_id, columns, grants)}
     time = tf.default_time_column
     if time and not expression_reads_raw(time, tf.object_id, columns, grants):
         time = None
-    return tf.model_copy(update={"canonical_measures": measures, "default_time_column": time})
+
+    granted = {o.lower() for o in grants.objects}
+    by_key: dict[tuple[str, str], list[Column]] = {}
+    tables: set[str] = set()
+    for column in columns:
+        by_key.setdefault((column.object_id.lower(), column.name.lower()), []).append(column)
+        tables.add(column.object_id.lower())
+
+    def visible(dep: str) -> bool:
+        # `table.column` or `table`; a dotted table makes the two readings ambiguous, so each
+        # one that names something must be visible, and one naming nothing sees no one.
+        table, _, name = dep.lower().rpartition(".")
+        as_column = by_key.get((table, name)) if table else None
+        as_table = dep.lower() in tables
+        if not as_column and not as_table:
+            return False
+        if as_column and not (table in granted and all(read_raw(c, grants) for c in as_column)):
+            return False
+        return not as_table or dep.lower() in granted
+
+    def unrestricted() -> bool:
+        if relationships is None:
+            return False
+        own = tf.object_id.lower()
+        related = {(r.to if r.from_.lower() == own else r.from_).lower()
+                   for r in relationships if own in (r.from_.lower(), r.to.lower())}
+        return (own in granted and related <= granted
+                and all(read_raw(c, grants) for c in columns if c.object_id.lower() == own))
+
+    def shown(text: str) -> bool:
+        deps = tf.reads.get(text)
+        return unrestricted() if deps is None else all(visible(d) for d in deps)
+
+    grain = tf.grain if tf.grain and shown(tf.grain) else None
+    gotchas = [g for g in tf.gotchas if shown(g)]
+    return tf.model_copy(update={"canonical_measures": measures, "default_time_column": time,
+                                 "grain": grain, "gotchas": gotchas})
 
 
 def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5, *,
@@ -362,7 +421,8 @@ def retrieve(
         if object_id in cards
     ]
     packet.enrichment_version = next(iter(cards.values()))[1] if cards else None
-    _attach_facts(packet.cards, table_facts, card_style, grants=grants, columns=columns)
+    _attach_facts(packet.cards, table_facts, card_style, grants=grants, columns=columns,
+                  relationships=known_relationships(snapshot))
     # After the cards are chosen, because a certified measure rides with its table -- see
     # `semantic.measures` for why that rule differs from the glossary's word-matching one.
     table_ids = [c.object_id for c in packet.cards]

@@ -205,7 +205,7 @@ def test_the_facts_block_withholds_what_the_metric_selector_withholds():
 
     def card_for(grants):
         card = RetrievedCard(object_id="orders", card="TABLE orders\n  id int", score=1.0)
-        _attach_facts([card], [_facts()], grants=grants, columns=_COLUMNS)
+        _attach_facts([card], [_facts()], grants=grants, columns=_COLUMNS, relationships=[])
         return card.card
 
     uncleared, cleared = card_for(_UNCLEARED), card_for(_CLEARED)

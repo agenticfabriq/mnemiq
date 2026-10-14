@@ -180,7 +180,12 @@ def largest_prompts(con, snapshot, settings, dialect: str,
     from mnemiq.semantic.cards import build_cards
     from mnemiq.semantic.glossary import select_definitions
     from mnemiq.semantic.measures import select_dimensions, select_metrics
-    from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_facts
+    from mnemiq.semantic.retrieval import (
+        ContextPacket,
+        RetrievedCard,
+        _attach_facts,
+        known_relationships,
+    )
 
     from mnemiq.sql.policy import build_access_policy
 
@@ -195,7 +200,7 @@ def largest_prompts(con, snapshot, settings, dialect: str,
 
     def packet_for(cards: list) -> ContextPacket:
         _attach_facts(cards, snapshot.table_facts, settings.card_style, grants=shown,
-                      columns=snapshot.columns)
+                      columns=snapshot.columns, relationships=known_relationships(snapshot))
         ids = [c.object_id for c in cards]
         return ContextPacket(
             question="", cards=cards, grant_fingerprint="", enrichment_version=None,

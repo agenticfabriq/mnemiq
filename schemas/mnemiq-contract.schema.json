@@ -702,6 +702,16 @@
           "object_id": {
             "title": "Object Id",
             "type": "string"
+          },
+          "reads": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Reads",
+            "type": "object"
           }
         },
         "required": [
@@ -753,7 +763,7 @@
     "title": "CertifiedRecord",
     "type": "object"
   },
-  "format_version": "1.5.0",
+  "format_version": "1.6.0",
   "identity_context": {
     "properties": {
       "attributes": {
@@ -1791,6 +1801,16 @@
           "object_id": {
             "title": "Object Id",
             "type": "string"
+          },
+          "reads": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": "Reads",
+            "type": "object"
           }
         },
         "required": [

@@ -37,7 +37,12 @@ from dataclasses import dataclass, field, replace
 # Defined with the boot advisory, so the boot line and the question path agree on what fits.
 from mnemiq.config import DEFAULT_MAX_QUESTION_CHARS
 from mnemiq.llm.window import FEEDBACK_ALLOWANCE, byte_bound
-from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard, _attach_facts
+from mnemiq.semantic.retrieval import (
+    ContextPacket,
+    RetrievedCard,
+    _attach_facts,
+    known_relationships,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -245,7 +250,8 @@ class PromptFitter:
             fresh = [RetrievedCard(object_id=c.object_id, card=texts[c.object_id], score=c.score)
                      for c in packet.cards if c.object_id in texts]
             _attach_facts(fresh, snapshot.table_facts, self.card_style, grants=grants,
-                          columns=snapshot.columns)
+                          columns=snapshot.columns,
+                          relationships=known_relationships(snapshot))
             by_id = {c.object_id: c for c in fresh}
             # A card retrieval served from the stored text (no snapshot binding) is kept as served.
             cards = [by_id.get(c.object_id, c) for c in packet.cards]
