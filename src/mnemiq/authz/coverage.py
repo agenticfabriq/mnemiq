@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import logging
 
+from sqlglot import exp
+
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import PII_LEVELS
 
@@ -35,11 +37,22 @@ logger = logging.getLogger(__name__)
 _OWNING = {"many_to_one", "one_to_one"}
 
 
-def unfiltered_dependents(grants: GrantSet, relationships) -> list[tuple[str, str]]:
-    """Granted, unfiltered tables whose rows hang off a filtered one.
+def unfiltered_dependents(grants: GrantSet, relationships,
+                          views=None) -> list[tuple[str, str]]:
+    """Granted, unfiltered tables -- and granted views -- whose rows hang off a filtered one.
 
-    Returns `(table, the filtered ancestor it reaches)`, sorted, so a caller can name both
-    the hole and the filter it defeats.
+    Returns `(table or view, the filtered ancestor it reaches)`, sorted, so a caller can name
+    both the hole and the filter it defeats.
+
+    `views` is `{object_id: ViewDefinition}`. A granted view has no foreign keys of its own, so
+    without it a view over a dependent table was a door this never named (M29): measured, a view
+    over `payment` under a filtered `customer` was approved and read every store's payments.
+    Each view is followed to its base tables, through nested views, and the walk below runs from
+    each base. A view reaching ANY filtered table is skipped: the deciders refuse every read of
+    it (UNGOVERNED_VIEW), so it is not readable across the boundary. Their other view refusals
+    -- an object the source does not know, a source that is not a table, an inventory that could
+    not be read -- are not modelled here, so such a view can be named although every read of it
+    is refused: a false warning, which is the safe direction for an advisory.
     """
     filtered = set(grants.row_filters)
     if not filtered:
@@ -53,23 +66,87 @@ def unfiltered_dependents(grants: GrantSet, relationships) -> list[tuple[str, st
         if child and parent:
             parents.setdefault(child, set()).add(parent)
 
-    found: list[tuple[str, str]] = []
-    for table in grants.objects:
-        if table in filtered:
-            continue
+    def ancestor(table: str) -> str | None:
         # Walk child -> parent until a filtered ancestor turns up. Transitive on purpose: a
         # grandchild leaks exactly as well as a child.
         seen, stack = {table}, [table]
         while stack:
-            for parent in parents.get(stack.pop(), ()):
+            for parent in sorted(parents.get(stack.pop(), ())):
                 if parent in filtered:
-                    found.append((table, parent))
-                    stack = []
-                    break
+                    return parent
                 if parent not in seen:
                     seen.add(parent)
                     stack.append(parent)
+        return None
+
+    views = views or {}
+    tables = set(parents) | {p for ps in parents.values() for p in ps} | filtered
+    found: list[tuple[str, str]] = []
+    for name in grants.objects:
+        if name in filtered:
+            continue
+        if name not in views:
+            hit = ancestor(name)
+            if hit is not None:
+                found.append((name, hit))
+            continue
+        bases = _view_bases(name, views, tables)
+        if bases & filtered:
+            continue
+        hits = sorted(h for h in (ancestor(b) for b in bases) if h is not None)
+        if hits:
+            found.append((name, hits[0]))
     return sorted(set(found))
+
+
+def _view_bases(view: str, views, tables: set[str]) -> set[str]:
+    """The tables a view reads, through nested views, as the relationship graph spells them.
+
+    A body is written in its source's naming -- `payment` where a federated snapshot keys
+    `pg.payment` -- so each name is resolved as written, then in the ENCLOSING view's catalog,
+    both case-insensitively. Only a name neither finds falls back to the bare-segment fold
+    (`spellings`). `check_views` tries a nested view's bare name before its catalog; this does
+    not, since a bare match across catalogs is exactly what hid the hole below. Folding first let two catalogs resolve to each other's
+    objects, and a wrong match is not always the safe direction here: one that reaches a
+    filtered table makes the caller skip the view, and its hole goes unnamed (review gate). A
+    body that does not parse contributes nothing: the deciders refuse such a view.
+    """
+    from mnemiq.sql.qualify import object_key
+    from mnemiq.sql.views import body_of, spellings
+
+    def resolver(keys):
+        exact = {k.lower(): k for k in keys}
+        folded: dict[str, set[str]] = {}
+        for key in keys:
+            for spelled in spellings({key}):
+                folded.setdefault(spelled, set()).add(key)
+
+        def resolve(node, catalog: str) -> set[str]:
+            written = object_key(node)
+            for candidate in (written, f"{catalog}.{written}" if catalog else ""):
+                if candidate and candidate.lower() in exact:
+                    return {exact[candidate.lower()]}
+            # Folded on the mention side too: `spellings` holds a key as written and lowercased,
+            # and the deciders read `PUBLIC.PAYMENT` as `public.payment` (review gate).
+            return folded.get(written.lower(), set()) | folded.get(node.name.lower(), set())
+
+        return resolve
+
+    view_of, table_of = resolver(set(views)), resolver(tables)
+    out: set[str] = set()
+    seen, stack = {view}, [view]
+    while stack:
+        key = stack.pop()
+        body = body_of(views[key])
+        if body is None:
+            continue
+        catalog = key.rsplit(".", 1)[0] if "." in key else ""
+        for node in body.find_all(exp.Table):
+            for inner in view_of(node, catalog) - seen:
+                seen.add(inner)
+                stack.append(inner)
+            out |= table_of(node, catalog)
+    return out
 
 
 def unknown_pii_levels(grants: GrantSet) -> list[str]:
@@ -128,10 +205,11 @@ def warn_unknown_filter_targets(grants: GrantSet, snapshot, role: str = "") -> N
     )
 
 
-def warn_unfiltered_dependents(grants: GrantSet, relationships, role: str = "") -> None:
+def warn_unfiltered_dependents(grants: GrantSet, relationships, role: str = "",
+                               views=None) -> None:
     """Log the holes, fail-soft. A warning, never a refusal -- the policy is the operator's."""
     try:
-        holes = unfiltered_dependents(grants, relationships)
+        holes = unfiltered_dependents(grants, relationships, views=views)
     except Exception:  # noqa: BLE001 -- an advisory check must never stop a boot
         logger.debug("row-filter coverage check failed", exc_info=True)
         return
