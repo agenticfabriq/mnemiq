@@ -1,14 +1,15 @@
 """Codex's review of #134 (M152): the statement-timeout bound keeps a connection service's options,
 and a federated source's server cancellation reads as a timeout too.
 
-A DSN naming a service (`service=prod`, PGSERVICE, `servicefile=`) takes its settings from a
-service file, which psycopg's conninfo parser does not expand -- so the bound arrived as the
-connection's WHOLE `options`, and libpq let it replace the service's. Measured on a throwaway
-Postgres 16: a service setting `-c search_path=from_service` connected with `from_service`
-unbounded and with `"$user", public` bounded. Unqualified names then resolve elsewhere. The settings
-the connection's startup applied are now read back from the server (`pg_settings`, source
-'client') and carried behind the bound -- exact wherever libpq found them, a service in libpq's
-compiled-in directory included, which a file parser here could not see.
+A DSN naming a service (`service=prod`, PGSERVICE) takes its settings from a service file, which
+psycopg's conninfo parser does not expand -- so the bound arrived as the connection's WHOLE
+`options`, and libpq let it replace the service's. Measured on a throwaway Postgres 16: a service
+setting `-c search_path=from_service` connected with `from_service` unbounded and with
+`"$user", public` bounded. Unqualified names then resolve elsewhere. For a service, the settings
+its startup applied are now read back from the server (`pg_settings`, source 'client', plus
+`current_setting('role')`, which pg_settings hides) and carried behind the bound -- wherever libpq
+found the file, its compiled-in directory included. A DSN's own options and PGOPTIONS are known
+exactly and carried verbatim. A `servicefile=` DSN is left unbounded, with a warning.
 
 The federated adapter had no translation of the server's cancellation, so a source's timeout
 reached the model as "The source rejected this query" rather than the runner's timed-out guidance.
@@ -37,8 +38,9 @@ def _no_libpq_environment(monkeypatch):
 
 
 def test_the_servers_account_of_the_startup_is_carried_behind_the_bound():
-    """What libpq applied -- from a service file wherever it lives, the DSN, or PGOPTIONS -- is
-    what `pg_settings` reports with source 'client', and it is carried whole."""
+    """For a SERVICE, what its options applied -- found wherever libpq found the file -- is what
+    `pg_settings` reports with source 'client', and it is carried behind the bound. (A DSN's own
+    options and PGOPTIONS are carried verbatim instead: see the next tests.)"""
     dsn = bounded_dsn("service=prod", 30,
                       client_settings=[("search_path", "from_service"), ("work_mem", "7168")])
     assert _options(dsn) == ("-c statement_timeout=30000 -c search_path=from_service "
@@ -106,11 +108,13 @@ def test_attach_carries_the_servers_account_into_the_bounded_connection(monkeypa
             sql.append(statement)
             return self
 
-        def fetchall(self):
+        def fetchall(self):  # the pg_settings read
             return [("statement_timeout", "0", "default"),
                     ("search_path", "from_service", "client"),
-                    ("transaction_read_only", "on", "session"),  # DuckDB's own: never carried
-                    ("role", "reporting", "hidden")]
+                    ("transaction_read_only", "on", "session")]  # DuckDB's own: never carried
+
+        def fetchone(self):  # the role read
+            return ("reporting",)
 
     monkeypatch.setattr(module, "connect_duckdb", lambda **kw: _Con())
     monkeypatch.setattr(module, "load_extension", lambda *a, **kw: None)
@@ -124,6 +128,39 @@ def test_attach_carries_the_servers_account_into_the_bounded_connection(monkeypa
     # The probe must ASK for the role: pg_settings never lists it, so a probe that stopped reading
     # current_setting('role') would drop it with nothing here noticing.
     assert any("current_setting(''role'')" in s for s in sql), sql
+
+
+def test_a_service_whose_role_cannot_be_read_is_left_unbounded(monkeypatch):
+    """Review gate: an incomplete account is what ran a bounded connection as the login role. A
+    role that cannot be confirmed leaves the service as configured -- and a tighter source limit,
+    read before it, still holds on its own."""
+    import mnemiq.adapters.duckdb as module
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+
+    sql = []
+
+    class _Con:
+        def __init__(self, limit):
+            self.limit = limit
+
+        def execute(self, statement, *args):
+            sql.append(statement)
+            return self
+
+        def fetchall(self):
+            return [("statement_timeout", self.limit, "default"), ("search_path", "x", "client")]
+
+        def fetchone(self):
+            raise RuntimeError("unrecognized configuration parameter")
+
+    monkeypatch.setattr(module, "load_extension", lambda *a, **kw: None)
+    monkeypatch.setattr(module, "lock_configuration", lambda *a, **kw: None)
+    for limit in ("0", "2000"):
+        sql.clear()
+        monkeypatch.setattr(module, "connect_duckdb", lambda **kw: _Con(limit))
+        DuckDBAdapter.postgres("service=prod", statement_timeout_s=30)
+        attaches = [s for s in sql if s.startswith(("ATTACH", "DETACH"))]
+        assert len(attaches) == 1 and "statement_timeout" not in attaches[0], (limit, sql)
 
 
 def test_a_federated_source_s_cancellation_reaches_the_model_as_a_timeout():

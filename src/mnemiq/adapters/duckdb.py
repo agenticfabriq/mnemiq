@@ -100,10 +100,10 @@ def bounded_dsn(dsn: str, statement_timeout_s: float | None,
     where `source = 'client'`, read by `attach_postgres`), plus `role`, which `pg_settings` hides
     (Codex's review of #134 found a service's search_path dropped; the gate, a role). Without that
     account a service DSN is left unbounded, with a warning. A `servicefile=` DSN, which psycopg's
-    parser rejects outright, is always left unbounded, with a warning. Ours goes FIRST: a `-c statement_timeout` the operator wrote comes later and
-    wins, so an explicit setting is theirs to keep. A DBA's per-role limit is the other case:
-    startup options override it, so `attach_postgres` applies this only where the source's own
-    limit is looser.
+    parser rejects outright, is always left unbounded, with a warning. Ours goes FIRST: a
+    `-c statement_timeout` the operator wrote comes later and wins, so an explicit setting is
+    theirs to keep. A DBA's per-role limit is the other case: startup options override it, so
+    `attach_postgres` applies this only where the source's own limit is looser.
     """
     if not statement_timeout_s:
         return dsn
@@ -166,33 +166,42 @@ def attach_postgres(con, target: str, catalog: str, clause: str,
 
     Startup options override a role's `ALTER ROLE ... SET statement_timeout` -- measured: a role
     limited to 2 s read 30s once our option was on its connection -- so the bound is not applied
-    blind. The source is attached as configured, and one read of `pg_settings` gives both its
-    effective limit and every setting its startup applied; it is re-attached bounded, carrying
-    those, only where the limit is off or looser. If that read fails, the DSN alone decides
-    (`bounded_dsn` without the server's account): bounded where its options are known, and left
-    as it is where they are not.
+    blind. The source is attached as configured, and `pg_settings` gives its effective limit and
+    the settings its startup applied; it is re-attached bounded only where that limit is off or
+    looser. What the re-attach carries is `bounded_dsn`'s choice: a DSN's own options or PGOPTIONS
+    verbatim, and the server's account -- those settings, plus `current_setting('role')` read on
+    its own, since `pg_settings` hides it -- only for a service. Each read can fail alone: an
+    unreadable limit falls back to the DSN alone, and a role that cannot be read leaves a
+    service's account incomplete, so the service is left unbounded rather than re-attached
+    without it (an incomplete account is what ran a bounded connection as the login role).
     """
     if statement_timeout_s and not _SERVICEFILE.search(target):
         _parsed(target)  # first: an unparseable DSN fails before any connection
     con.execute(f"ATTACH {attach_literal(target)} AS {catalog} {clause}")
     if not statement_timeout_s:
         return
-    probe = ("SELECT name, setting, source FROM pg_settings "
-             "WHERE name = 'statement_timeout' OR source = 'client' "
-             "UNION ALL SELECT 'role', current_setting('role'), 'hidden'")
+    def remote(sql: str):
+        return con.execute(f"SELECT * FROM postgres_query({attach_literal(catalog)}, "
+                           f"{attach_literal(sql)})")
+
     try:
-        rows = con.execute(
-            f"SELECT * FROM postgres_query({attach_literal(catalog)}, "
-            f"{attach_literal(probe)})").fetchall()
+        rows = remote("SELECT name, setting, source FROM pg_settings "
+                      "WHERE name = 'statement_timeout' OR source = 'client'").fetchall()
         current = next(int(setting) for name, setting, _ in rows if name == "statement_timeout")
-        if 0 < current <= statement_timeout_s * 1000:
-            return  # the source's own limit is tighter; ours would only raise it
-        client = [(name, setting) for name, setting, source in rows if source == "client"]
-        role = next((setting for name, setting, source in rows
-                     if source == "hidden" and name == "role" and setting != "none"), None)
-        bounded = bounded_dsn(target, statement_timeout_s, client_settings=client, role=role)
     except Exception:  # noqa: BLE001 -- unreadable: the DSN alone decides
         bounded = bounded_dsn(target, statement_timeout_s)
+    else:
+        if 0 < current <= statement_timeout_s * 1000:
+            return  # the source's own limit is tighter; ours would only raise it
+        account: list[tuple[str, str]] | None = [
+            (name, setting) for name, setting, source in rows if source == "client"]
+        role = None
+        try:
+            (setting,) = remote("SELECT current_setting('role') AS role").fetchone()
+            role = None if setting == "none" else setting
+        except Exception:  # noqa: BLE001 -- a service's role unconfirmed: its account is incomplete
+            account = None
+        bounded = bounded_dsn(target, statement_timeout_s, client_settings=account, role=role)
     if bounded == target:
         return
     con.execute(f"DETACH {catalog}")

@@ -127,6 +127,9 @@ class _RecordingCon:
             raise RuntimeError("permission denied for pg_settings")
         return [("statement_timeout", self.limit, "default")]
 
+    def fetchone(self):  # the role read: unset
+        return ("none",)
+
     def interrupt(self):  # the timer's target; without it the timer's own AttributeError, which
         pass              # names "interrupt", would pass the timeout test for the wrong reason
 
