@@ -64,7 +64,8 @@ def test_the_cards_and_the_agent_are_scoped_by_the_same_grants(tmp_path):
 
 
 def test_retrieve_still_resolves_grants_itself_when_none_are_handed_to_it(tmp_path):
-    """The eval's door calls `retrieve` with a provider and no grants; that keeps working."""
+    """A caller handing `retrieve` no grants still has them resolved by its provider, once. Both
+    doors in this repo now pass grants, so this is the fallback for any other caller."""
     from mnemiq.semantic.retrieval import retrieve
 
     con = init_store(str(tmp_path / "s.duckdb"))
