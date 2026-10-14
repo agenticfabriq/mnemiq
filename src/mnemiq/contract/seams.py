@@ -207,6 +207,11 @@ class Trace(BaseModel):
     question: str
     plan_sql: str
     target_sql: str
+    # M51: the statement as asked, before a row or column policy rewrote it -- what a caller is
+    # shown. `target_sql` stays the executed statement, for the audit record and the in-process
+    # graders that re-run it; it can name a policy's own tables and literals, which this does not.
+    # None where nothing recorded it, so a surface shows no SQL rather than the executed one.
+    asked_sql: str | None = None
     result_shape: str
     timing: dict[str, float]
     enrichment_version: str

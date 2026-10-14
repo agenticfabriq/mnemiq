@@ -51,7 +51,9 @@ reason rather than a plausible number.
 
 Two properties fall out of that ordering. Permissions apply *before* schema retrieval, so the model
 is never shown a table the caller may not see — naming it is useless rather than refused. And every
-answer carries a trace: the SQL that ran, the tables it touched, the enrichment version behind it.
+answer carries a trace: the SQL as asked, the tables it touched, the enrichment version behind it.
+Where a row or column policy rewrote that SQL, the answer says which tables it narrowed, and the
+statement as executed -- which can name the policy's own tables -- is kept in the audit trace.
 
 ![The nine stages of a mnemiq answer: knowledge sources, enrichment, the semantic contract,
 retrieval, generation, the decider, execution, verification, and the answer with its trace.

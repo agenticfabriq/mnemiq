@@ -108,7 +108,7 @@ def main() -> int:
         return 0
 
     print(f"ANSWER: {result.answer}\n")
-    print(f"SQL:\n{result.trace.target_sql}\n")
+    print(f"SQL:\n{result.trace.asked_sql}\n")  # M51: as asked, not the policy's rewrite
     print(f"tables: {result.trace.tables_used}")
     print(f"timing: {result.trace.timing}")
     print(f"cached: {result.cached}")

@@ -8,6 +8,7 @@ from mnemiq.server.serialize import answer_payload
 def _trace():
     ident = IdentityContext(tenant_id="t", principal_id="u", roles=["analyst"])
     return Trace(question="q", plan_sql="SELECT 1", target_sql="SELECT count(*) FROM claim",
+                 asked_sql="SELECT count(*) FROM claim",
                  result_shape="scalar", timing={"total_ms": 5.0}, enrichment_version="v1",
                  identity=ident, tables_used=["claim"])
 

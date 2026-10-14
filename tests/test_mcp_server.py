@@ -9,6 +9,7 @@ def _identity():
 
 def _trace():
     return Trace(question="q", plan_sql="SELECT 1", target_sql="SELECT count(*) FROM claim",
+                 asked_sql="SELECT count(*) FROM claim",
                  result_shape="scalar", timing={"total_ms": 5.0}, enrichment_version="v1",
                  identity=_identity(), tables_used=["claim"])
 

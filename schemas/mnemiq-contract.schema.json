@@ -2028,6 +2028,18 @@
       }
     },
     "properties": {
+      "asked_sql": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Asked Sql"
+      },
       "definitions_used": {
         "description": "Ids of the definitions the prompt held for this answer -- what the model was offered, after the prompt fit -- not a claim that the SQL relied on each one.",
         "items": {

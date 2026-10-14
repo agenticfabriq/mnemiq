@@ -444,7 +444,7 @@ def _cmd_ask(settings: Settings, args) -> int:
         return 0
     print(ans.answer)
     if ans.trace is not None:
-        print(f"\nSQL:\n{ans.trace.target_sql}")
+        print(f"\nSQL:\n{ans.trace.asked_sql}")  # M51: as asked, not the policy's rewrite
         # The list never prints without its marker. HTTP and MCP were fixed first and this was
         # missed while the commit message said "the two surfaces a customer actually reads" --
         # there are three, and this is the one a human reads directly. `tables: []` on a

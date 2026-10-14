@@ -25,6 +25,7 @@ def build_trace(
         question=question,
         plan_sql=approved.plan_sql,
         target_sql=approved.target_sql,
+        asked_sql=getattr(approved, "asked_sql", None),
         result_shape=result_shape,
         timing=timing,
         enrichment_version=enrichment_version or "unknown",
