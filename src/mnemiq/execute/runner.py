@@ -25,7 +25,19 @@ class ExecutionError(Exception):
 
     @property
     def repair_text(self) -> str:
-        """What the model repairs against: our sentence, plus the source's own words."""
+        """What the model repairs against: our sentence, plus the source's own words -- with any
+        credential in them taken out first (M96), as `Refusal.repair_text` does."""
+        if not self.source_detail:
+            return self.message
+        from mnemiq.redact import scrub_credentials
+
+        return f"{self.message} {scrub_credentials(self.source_detail)}"
+
+    @property
+    def full_text(self) -> str:
+        """The whole of it, credentials included -- for the operator's log only, never a prompt.
+        The operator holds the credential already, and a log scrubbed like the prompt would hide
+        which connection failed from the one person who can fix it."""
         return f"{self.message} {self.source_detail}" if self.source_detail else self.message
 
 

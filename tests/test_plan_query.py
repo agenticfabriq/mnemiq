@@ -283,8 +283,10 @@ def test_an_explain_refusal_also_marks_the_feedback_as_the_sources(caplog):
     assert isinstance(outcome, Deferred)
     for secret in ("payroll_salary", "hr_prod", "10.2.0.7", "postgresql://"):
         assert secret not in outcome.reason, f"the model carried {secret!r} out through prove"
-    # Still fed to the model, and still recorded for the operator.
-    assert any(leaky in (c or "") for c in generator.calls)
+    # Still fed to the model -- minus the credential (M96) -- and recorded whole for the operator.
+    from mnemiq.redact import scrub_credentials
+    assert any(scrub_credentials(leaky) in (c or "") for c in generator.calls)
+    assert not any("svc_mnemiq" in (c or "") for c in generator.calls)
     assert leaky in caplog.text
 
 

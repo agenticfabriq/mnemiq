@@ -286,9 +286,12 @@ def test_a_model_that_quotes_its_feedback_cannot_carry_the_source_out():
     for secret in ("payroll_salary", "hr_prod", "svc_mnemiq", "10.2.0.7", "postgresql://"):
         assert secret not in result.answer, f"the model carried {secret!r} back to the caller"
     # The repair loop must not have been paid for with the fix.
-    assert any(leaky in (c or "") for c in agent.generator.calls), (
+    # The words, minus the credential (M96): the userinfo never reaches a prompt.
+    from mnemiq.redact import scrub_credentials
+    assert any(scrub_credentials(leaky) in (c or "") for c in agent.generator.calls), (
         "closing the exit by starving the model is the wrong fix -- the words are the repair's input"
     )
+    assert not any("svc_mnemiq" in (c or "") for c in agent.generator.calls)
 
 
 def test_a_model_that_was_told_nothing_by_the_source_still_speaks_for_itself():
