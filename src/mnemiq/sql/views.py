@@ -238,6 +238,12 @@ def check_views(
     detail goes to the server log. `granted` is the caller's visible objects; None names nothing
     beyond the view the query read -- the safe direction for a caller that does not pass it.
 
+    `known` is the objects the source holds, and None and empty mean opposite things (M45): None
+    is not supplied, and skips the unknown-object rule; an empty set is a source that knows
+    nothing, so every object a body reads is unknown and the view is refused. A caller must never
+    turn an empty set into None (`... or None`), which would skip the rule exactly where it is
+    widest. Both deciders pass `set(policy.policy_schema)`.
+
     M27: a view's rows are defined by SQL held in the source, so a filter on its base table
     reaches nothing -- the decider refused the base table correctly, and the repair loop used
     that refusal as a signpost to the same rows through the view.
@@ -275,7 +281,7 @@ def check_views(
         )
     # Exact names, case-folded -- never `spellings`, whose bare last segment would let a grant on
     # `sales.customer` name a filtered `public.customer` the caller does not hold.
-    return _walk(ast, views, filtered, known or set(), (), 0, "", "",
+    return _walk(ast, views, filtered, known, (), 0, "", "",
                  {g.lower() for g in granted} if granted else set())
 
 
@@ -292,7 +298,7 @@ def _walk(
     ast: exp.Expression,
     views: dict[str, ViewDefinition],
     filtered: set[str],
-    known: set[str],
+    known: set[str] | None,
     stack: tuple[str, ...],
     depth: int,
     catalog: str,
@@ -377,7 +383,7 @@ def _walk(
         # the caller could not. That is M27's shape -- the view reaching past the caller's own
         # boundary -- and it closes every unknown-object spelling at once rather than the file
         # literal specifically.
-        if known:
+        if known is not None:
             # A CTE alias is a name the BODY defines; the source is not expected to know it.
             # Counting it as an unknown object refused every ordinary CTE view -- five of eight
             # new refusals in the review's matrix were legitimate SQL. This weakens nothing:
