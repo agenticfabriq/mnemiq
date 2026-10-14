@@ -388,7 +388,8 @@ def decide_write(
     # plain SELECT returns them forever. The read decider has had this floor since M27; the write
     # decider had no `views` parameter at all, so it could not have run it even in principle.
     ungoverned = check_views(shaped, {} if views is None else views, set(policy.row_filters),
-                             known=set(policy.policy_schema))
+                             known=set(policy.policy_schema),
+                             granted=set(visible))
     if ungoverned is not None:
         return ungoverned
 
