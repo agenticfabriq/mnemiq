@@ -369,7 +369,8 @@ def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> 
         # so it is warned about even when no snapshot is available to check filter coverage.
         warn_unknown_pii_levels(grants, role=role)
         if snapshot is not None:
-            warn_unfiltered_dependents(grants, snapshot.relationships, role=role)
+            warn_unfiltered_dependents(grants, snapshot.relationships, role=role,
+                                       views={v.object_id: v for v in snapshot.views})
             warn_unknown_filter_targets(grants, snapshot, role=role)
 
 
