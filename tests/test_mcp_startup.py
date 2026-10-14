@@ -45,7 +45,7 @@ def test_unconfigured_stdio_server_lists_tools_and_survives_tool_errors(tmp_path
 
 
 def test_a_mistyped_mode_reaches_the_client_as_its_instruction(tmp_path):
-    """mcp 2.x shows a client only `Error executing tool <name>` for anything but its ToolError
+    """mcp 2.2 and later show a client only `Error executing tool <name>` for anything but ToolError
     (M121), so a setup failure the operator can fix is carried as one -- a mistyped MNEMIQ_MODE
     among them, raised building the runtime on the first call."""
     async def check():
@@ -73,7 +73,7 @@ def test_a_mistyped_mode_reaches_the_client_as_its_instruction(tmp_path):
 
 def test_a_mistyped_mode_on_one_call_reaches_the_client_as_its_instruction():
     """The per-call `mode` of `db_read`, routed after the runtime is built: an `UnknownMode` there
-    lists the valid modes, and on mcp 2.x it reached an agent as `Error executing tool db_read`
+    lists the valid modes, and on mcp 2.2 and later it reached an agent as `Error executing tool db_read`
     unless carried as ToolError (review gate on M121)."""
     from mnemiq.agent.route import UnknownMode
     from mnemiq.contract import IdentityContext

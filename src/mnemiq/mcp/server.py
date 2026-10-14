@@ -118,7 +118,7 @@ def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContex
         with runtime_lock:
             if callable(runtime):
                 # A deployment not set up yet is a failure the operator can act on, and its message
-                # says how. mcp 2.x shows a client only `Error executing tool <name>` for anything
+                # says how. mcp 2.2 and later show a client only `Error executing tool <name>` for anything
                 # but its `ToolError`, so the instruction is carried as one (M121).
                 try:
                     runtime = runtime()

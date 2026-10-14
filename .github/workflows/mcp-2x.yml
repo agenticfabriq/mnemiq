@@ -8,9 +8,10 @@ on:
 permissions:
   contents: read
 jobs:
-  # The lock pins mcp 1.x, but the cap admits 2.x (M121), and 2.x hides an unexpected tool
-  # exception from the client -- the reason `mcp/server.py` raises setup failures as ToolError. On
-  # 1.x every exception's message reaches the client anyway, so only a 2.x run checks that path.
+  # The lock pins mcp 1.x, but the cap admits 2.x (M121), and from 2.2 an unexpected tool exception
+  # is hidden from the client -- the reason `mcp/server.py` raises setup failures as ToolError. On
+  # 1.x, and 2.0-2.1, its message reaches the client anyway, so only a 2.2+ run checks that path:
+  # the upgrade below resolves the newest within the cap.
   mcp-2x:
     runs-on: ubuntu-latest
     steps:
