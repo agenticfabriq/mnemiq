@@ -69,15 +69,20 @@ ORACLE_DSN = os.environ.get("MNEMIQ_ORACLE_TEST_DSN")
 
 @pytest.mark.integration
 @pytest.mark.skipif(not ORACLE_DSN, reason="set MNEMIQ_ORACLE_TEST_DSN to run against Oracle")
-def test_oracle_errors_on_every_shape_where_its_binding_differs():
-    """Why Oracle is on POLICY_TARGETS, checked where it can be: decided as oracle under a row
-    filter, the forward reference and the self-reference both reach Oracle -- the decider does
-    not stop them -- and Oracle rejects each (23ai, which takes SELECT without FROM dual)."""
+def test_oracle_rejects_a_forward_reference_and_a_rewritten_self_reference():
+    """Why Oracle is on POLICY_TARGETS, for the two shapes where its binding of a CTE name is known
+    to differ from the rule's: decided as oracle under a row filter, both reach Oracle -- the
+    decider does not stop them -- and Oracle rejects each (23ai, which takes SELECT without FROM
+    dual). Other shapes are not enumerated here."""
     oracledb = pytest.importorskip("oracledb")
     con = oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
                            password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"),
                            dsn=ORACLE_DSN)
     cur = con.cursor()
+    try:  # a run killed before its own cleanup left the table behind
+        cur.execute("DROP TABLE m150_claim PURGE")
+    except oracledb.DatabaseError:
+        pass
     schema = {"m150_claim": {"amount"}}
     policy = AccessPolicy(row_filters={"m150_claim": "amount > 10"}, policy_schema=schema)
     cur.execute("CREATE TABLE m150_claim (amount NUMBER)")
@@ -102,3 +107,4 @@ def test_oracle_errors_on_every_shape_where_its_binding_differs():
         assert [r[0] for r in cur.fetchall()] == [20]
     finally:
         cur.execute("DROP TABLE m150_claim PURGE")
+        con.close()
