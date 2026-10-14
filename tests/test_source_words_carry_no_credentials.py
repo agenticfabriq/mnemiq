@@ -32,6 +32,22 @@ _DUCKDB_PG = ('IO Error: Unable to connect to Postgres at "host=10.0.0.5 user=sv
     ("Driver={x};UID=u;PWD=topsecret;Server=s", "topsecret", "Server=s"),
     ("password='a b c' host=h", "a b c", "host=h"),
     ('Password = "q w"', "q w", "Password"),
+    # The review gate's shapes on the first version, each of which came back unchanged:
+    ("PGPASSWORD=hunter2 psql -h db", "hunter2", "psql -h db"),
+    ("password: hunter2\nhost: db", "hunter2", "host: db"),
+    ('{"password": "x9", "host": "db"}', "x9", '"host": "db"'),
+    ("postgresql://svc:p/w@h/db", "p/w", "postgresql://***@h/db"),
+    ("Driver={x};PWD={a;b};Server=s", "a;b", "Server=s"),
+    ("password=abc123== host=h", "abc123", "password=*** host=h"),  # a base64 tail of `=`
+    # The gate's second round: a bare value holds `,` and braces; braces escape as `}}`; and
+    # libpq skips whitespace after `=` (an empty value is `''`), so these are all password.
+    ("password=a,b host=h", "a,b", "password=*** host=h"),
+    ("password=ab{cd host=h", "ab{cd", "password=*** host=h"),
+    ("Driver={x};PWD={a}}b};Server=s", "b}", "Driver={x};PWD=***;Server=s"),
+    ("password= se=cret host=h", "se=cret", "password= *** host=h"),
+    ("password= abc123== host=h", "abc123", "password= *** host=h"),
+    ("password=\n  secret", "secret", "password=\n  ***"),  # any whitespace, as libpq skips it
+    ("password=\r\nsecret host=h", "secret", "password=\r\n*** host=h"),
 ])
 def test_a_credential_in_a_source_error_is_taken_out(text, secret, kept):
     scrubbed = scrub_credentials(text)
@@ -39,6 +55,7 @@ def test_a_credential_in_a_source_error_is_taken_out(text, secret, kept):
 
 
 @pytest.mark.parametrize("text", [
+    "passwordless=true",
     "contact user@example.com",
     "column \"password\" does not exist",
     "the password column is not granted",
