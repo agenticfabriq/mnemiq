@@ -6,7 +6,7 @@ import pyarrow as pa
 
 from mnemiq.adapters.duckdb import (
     attach_literal,
-    bounded_dsn,
+    attach_postgres,
     duckdb_builtin_functions,
     duckdb_reachable_user_functions,
     duckdb_user_functions,
@@ -62,9 +62,10 @@ class FederatedAdapter:
                 loaded.add(ext)
             clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
             # Each Postgres catalog bounded server-side, as the single-source path is (M152).
-            target = (bounded_dsn(spec.target, statement_timeout_s) if attach_type == "POSTGRES"
-                      else spec.target)
-            self._con.execute(f"ATTACH {attach_literal(target)} AS {spec.catalog} {clause}")
+            if attach_type == "POSTGRES":
+                attach_postgres(self._con, spec.target, spec.catalog, clause, statement_timeout_s)
+            else:
+                self._con.execute(f"ATTACH {attach_literal(spec.target)} AS {spec.catalog} {clause}")
         # No single USE: every query is catalog-qualified (catalog.schema.table).
         lock_configuration(self._con, local_only=local_only)
 

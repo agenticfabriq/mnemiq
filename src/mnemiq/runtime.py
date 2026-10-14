@@ -858,9 +858,14 @@ def build_runtime(settings: Settings) -> Runtime:
         # carrying the catalog->schema registry the decider expands with.
         from mnemiq.adapters.federated import FederatedAdapter
 
-        adapter = FederatedAdapter(specs, read_only=not settings.write_enabled,
-                                   local_only=settings.local_only,
-                                   statement_timeout_s=DEFAULT_TIMEOUT_S)
+        from mnemiq.adapters.duckdb import UnparseableDSN
+
+        try:
+            adapter = FederatedAdapter(specs, read_only=not settings.write_enabled,
+                                       local_only=settings.local_only,
+                                       statement_timeout_s=DEFAULT_TIMEOUT_S)
+        except UnparseableDSN as exc:  # a sentence, as the single-source door gives
+            raise SnapshotMissing(str(exc)) from exc
     else:
         # Single source: dispatch on the SPEC, not on pg_dsn. This branch used to read
         # `settings.pg_dsn` directly, which meant a one-entry manifest was resolved into a spec

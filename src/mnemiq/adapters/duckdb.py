@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import threading
 
+import duckdb
 import pyarrow as pa
 
 from mnemiq.duckdb_extensions import connect_duckdb, load_extension, lock_configuration
@@ -70,6 +72,10 @@ def attach_literal(target: str) -> str:
     return "'" + target.replace("'", "''") + "'"
 
 
+class UnparseableDSN(ValueError):
+    """A Postgres DSN libpq's parser cannot read. Its message never quotes the DSN."""
+
+
 def bounded_dsn(dsn: str, statement_timeout_s: float | None) -> str:
     """`dsn` with a server-side `statement_timeout` every connection made from it carries (M152).
 
@@ -80,8 +86,11 @@ def bounded_dsn(dsn: str, statement_timeout_s: float | None) -> str:
     reached the connection a scan runs on.
 
     Merged by libpq's own parser (psycopg's `conninfo`), so a keyword DSN, a URI and an operator's
-    own `options` all survive. Ours goes FIRST: a `-c statement_timeout` the operator wrote comes
-    later and wins, so an explicit setting is theirs to keep.
+    own `options` all survive -- written in the DSN, or in `PGOPTIONS`, which libpq reads only when
+    the DSN has no `options` and so would drop the moment we add one (review gate). Ours goes FIRST:
+    a `-c statement_timeout` the operator wrote comes later and wins, so an explicit setting is
+    theirs to keep. A DBA's per-role limit is the other case: startup options override it, so
+    `attach_postgres` applies this only where the source's own limit is looser.
     """
     if not statement_timeout_s:
         return dsn
@@ -90,10 +99,43 @@ def bounded_dsn(dsn: str, statement_timeout_s: float | None) -> str:
     try:
         existing = conninfo_to_dict(dsn).get("options")
     except Exception:  # noqa: BLE001 -- the parser's message can quote the DSN, credentials and all
-        raise ValueError("the Postgres DSN could not be parsed to add a statement timeout; "
-                         "check its syntax") from None
+        raise UnparseableDSN("the Postgres DSN could not be parsed to add a statement timeout; "
+                             "check its syntax") from None
+    existing = existing or os.environ.get("PGOPTIONS")
     bound = f"-c statement_timeout={int(statement_timeout_s * 1000)}"
     return make_conninfo(dsn, options=f"{bound} {existing}" if existing else bound)
+
+
+def attach_postgres(con, target: str, catalog: str, clause: str,
+                    statement_timeout_s: float | None) -> None:
+    """ATTACH a Postgres source, bounded server-side at `statement_timeout_s` unless the source
+    already bounds it tighter (M152).
+
+    Startup options override a role's `ALTER ROLE ... SET statement_timeout` -- measured: a role
+    limited to 2 s read 30s once our option was on its connection -- so the bound is not applied
+    blind. The source is attached as configured, its effective limit read, and it is re-attached
+    bounded only where that limit is off or looser. If the limit cannot be read, it is bounded
+    anyway: the failure points at a timeout, never at an unbounded statement.
+    """
+    bounded = bounded_dsn(target, statement_timeout_s)  # first: an unparseable DSN fails here
+    con.execute(f"ATTACH {attach_literal(target)} AS {catalog} {clause}")
+    if not statement_timeout_s:
+        return
+    probe = "SELECT setting FROM pg_settings WHERE name = 'statement_timeout'"
+    try:
+        (current,) = con.execute(
+            f"SELECT setting FROM postgres_query({attach_literal(catalog)}, "
+            f"{attach_literal(probe)})").fetchone()
+        if 0 < int(current) <= statement_timeout_s * 1000:
+            return  # the source's own limit is tighter; ours would only raise it
+    except Exception:  # noqa: BLE001 -- unreadable: bound it, below
+        pass
+    con.execute(f"DETACH {catalog}")
+    con.execute(f"ATTACH {attach_literal(bounded)} AS {catalog} {clause}")
+
+
+def _ended_by_statement_timeout(exc: Exception) -> bool:
+    return "canceling statement due to statement timeout" in str(exc)
 
 
 class DuckDBAdapter:
@@ -131,8 +173,9 @@ class DuckDBAdapter:
         # READ_ONLY unless a write is explicitly enabled -- the backstop under the write path.
         clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
         if self._attach_type == "POSTGRES":
-            attach_target = bounded_dsn(attach_target, statement_timeout_s)
-        self._con.execute(f"ATTACH {attach_literal(attach_target)} AS {catalog} {clause}")
+            attach_postgres(self._con, attach_target, catalog, clause, statement_timeout_s)
+        else:
+            self._con.execute(f"ATTACH {attach_literal(attach_target)} AS {catalog} {clause}")
         self._con.execute(f"USE {catalog}.{table_schema}")
         lock_configuration(self._con, local_only=local_only)
 
@@ -348,13 +391,21 @@ class DuckDBAdapter:
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
         """Run a query and return Arrow, cancelling it if it overruns. A LIMIT bounds rows;
-        only an interrupt bounds a query that never produces a first row."""
+        only an interrupt bounds a query that never produces a first row -- and on a Postgres
+        source only the server's statement timeout does (M152), so its cancellation is raised as
+        the interrupt it is, and the runner's timed-out guidance reaches the model."""
         timer = None
         if timeout_s is not None:
             timer = threading.Timer(timeout_s, self._con.interrupt)
             timer.start()
         try:
             return self._con.execute(sql).to_arrow_table()
+        except Exception as exc:
+            if timeout_s is not None and _ended_by_statement_timeout(exc):
+                raise duckdb.InterruptException(
+                    f"query timed out after {timeout_s}s: the source ended it at its statement "
+                    "timeout") from exc
+            raise
         finally:
             if timer is not None:
                 timer.cancel()
@@ -367,7 +418,8 @@ class DuckDBPostgresAdapter(DuckDBAdapter):
     """
 
     def __init__(self, dsn: str, schema: str = "src", read_only: bool = True, *,
-                 local_only: bool = False) -> None:
+                 local_only: bool = False, statement_timeout_s: float | None = None) -> None:
         super().__init__(attach_target=dsn, attach_type="POSTGRES", extension="postgres",
                          catalog=schema, table_schema="public", fk_via_postgres=True,
-                         read_only=read_only, local_only=local_only)
+                         read_only=read_only, local_only=local_only,
+                         statement_timeout_s=statement_timeout_s)
