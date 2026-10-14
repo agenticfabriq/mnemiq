@@ -90,19 +90,21 @@ def test_a_write_with_no_view_snapshot_is_unaffected():
     assert isinstance(verdict, ApprovedWrite)
 
 
-# -- floor 2: a statement-level WITH is invisible to every guard ---------------------------------
+# -- floor 2: a statement-level WITH is moved where every guard reads it, or refused -------------
 
 # sqlglot parks a LEADING `WITH` in the write root's `with_` arg, outside where `build_scope`
-# roots itself -- so `base_tables` returns [] and each guard sees an empty statement. The M30
+# roots itself -- so `base_tables` returned [] and each guard saw an empty statement. The M30
 # xfails pinned only the RLS symptom, on a table that was granted. Measured, with the plain
 # spellings as controls:
 #   plain read of ungranted table  REFUSED(UNAUTHORIZED_TABLE)  |  leading WITH  APPROVED
 #   plain unknown column           REFUSED(UNKNOWN_COLUMN)      |  leading WITH  APPROVED
 #   -> executed, copying [(7, 700), (8, 800)] out of a table with no grant at all.
-# So the residual was never only "the filter is missing"; it was "no guard runs". A floor is the
-# honest response to that: refuse the spelling until its CTEs are inside the scope the guards
-# walk. The equivalent INSERT-internal spelling stays approved and stays governed, which is what
-# makes this a floor and not a ban on CTEs.
+# So the residual was never only "the filter is missing"; it was "no guard runs". It was first
+# floored by refusing the spelling. `check_write_shape` now moves an INSERT's WITH into its
+# source query, where every guard runs (`test_write_rls_parity.py` pins the filter), and refuses
+# every shape a move could change the meaning of, UPDATE and DELETE among them. The tests below
+# pin both halves: the guards that used to be skipped now run, and each refused shape stays
+# refused for its own reason.
 
 _W_VISIBLE = {"claim": {"id", "amount", "region"}, "scratch": {"id", "amount"}}
 _W_SCHEMA = {k: set(v) for k, v in _W_VISIBLE.items()}
@@ -117,30 +119,69 @@ def _w_write(sql: str, visible=None, grants=None):
                         writes_enabled=True)
 
 
-_LEADING_WITH = [
-    "WITH x AS (SELECT id, amount FROM claim) "
-    "INSERT INTO scratch (id, amount) SELECT id, amount FROM x",
-    "WITH x AS (SELECT id FROM claim) UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM x)",
-    "WITH x AS (SELECT id FROM claim) DELETE FROM scratch WHERE id IN (SELECT id FROM x)",
-]
-
-
-@pytest.mark.parametrize("sql", _LEADING_WITH)
-def test_a_statement_level_with_is_refused_rather_than_approved_ungoverned(sql):
-    verdict = _w_write(sql)
-    assert isinstance(verdict, Refusal)
-    assert verdict.code is RefusalCode.UNSCOPED_CTE
-
-
-def test_the_floor_covers_the_authorization_dimension_not_only_the_filter():
+def test_behind_a_leading_with_a_table_with_no_grant_is_refused_by_name():
     """The dimension the M30 xfails did not pin, and the one that made this critical: behind a
-    leading WITH the identity read a table it holds no grant on whatsoever."""
+    leading WITH the identity read a table it holds no grant on whatsoever. The floor refused
+    the spelling; now the access check runs and names the table."""
     visible = {"scratch": {"id", "amount"}}  # `secret` is neither visible nor granted
     grants = GrantSet(frozenset(visible), writable=frozenset({"scratch"}))
     verdict = _w_write("WITH x AS (SELECT id, amount FROM secret) "
                        "INSERT INTO scratch (id, amount) SELECT id, amount FROM x",
                        visible=visible, grants=grants)
     assert isinstance(verdict, Refusal)
+    assert (verdict.code, verdict.subject) == (RefusalCode.UNAUTHORIZED_TABLE, "secret")
+
+
+def test_behind_a_leading_with_an_unknown_column_is_refused():
+    verdict = _w_write("WITH x AS (SELECT id, nope FROM claim) "
+                       "INSERT INTO scratch (id, amount) SELECT id, nope FROM x")
+    assert isinstance(verdict, Refusal)
+    assert verdict.code is RefusalCode.UNKNOWN_COLUMN
+
+
+# Each is refused because moving its WITH could change what the statement means.
+_UNPLACEABLE = [
+    # UPDATE and DELETE: moved into a subquery, a CTE body gains the target row as an outer
+    # scope. Measured on DuckDB 1.5.4, this fails with the WITH leading ("Referenced table
+    # scratch not found") and updates every row once moved.
+    ("an_update_whose_cte_reads_the_target", "WITH x AS (SELECT id FROM claim "
+                                             "WHERE amount > scratch.amount) "
+                                             "UPDATE scratch SET amount = 0 "
+                                             "WHERE id IN (SELECT id FROM x)"),
+    ("an_update", "WITH x AS (SELECT id FROM claim) "
+                  "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM x)"),
+    ("a_delete", "WITH x AS (SELECT id FROM claim) DELETE FROM scratch WHERE id IN (SELECT id FROM x)"),
+    ("an_update_from_source", "WITH x AS (SELECT id, amount FROM claim) "
+                              "UPDATE scratch SET amount = x.amount FROM x WHERE scratch.id = x.id"),
+    # INSERT: the source query is the only place a move keeps every name bound as it was.
+    ("also_used_by_on_conflict", "WITH x AS (SELECT id, amount FROM claim) "
+                                 "INSERT INTO scratch (id, amount) SELECT id, amount FROM x "
+                                 "ON CONFLICT (id) DO UPDATE SET amount = (SELECT max(amount) FROM x)"),
+    ("used_only_in_values", "WITH x AS (SELECT max(id) AS m FROM claim) "
+                            "INSERT INTO scratch (id, amount) VALUES ((SELECT m FROM x), 0)"),
+    ("named_like_the_insert_target", "WITH scratch AS (SELECT id, amount FROM claim) "
+                                     "INSERT INTO scratch (id, amount) SELECT id, amount FROM scratch"),
+    # The same in another case: DuckDB folds an unquoted name, so an exact comparison would miss
+    # that this CTE is the target's name and move it.
+    ("named_like_the_target_in_another_case", "WITH Scratch AS (SELECT id, amount FROM claim) "
+                                              "INSERT INTO scratch (id, amount) "
+                                              "SELECT id, amount FROM Scratch"),
+    # Merging two WITH lists changes which name a body binds (M150's ground).
+    ("the_query_has_its_own_with", "WITH a AS (SELECT id, amount FROM claim) "
+                                   "INSERT INTO scratch (id, amount) "
+                                   "WITH b AS (SELECT id, amount FROM a) SELECT id, amount FROM b"),
+    ("no_query_uses_it", "WITH x AS (SELECT id FROM claim) "
+                         "INSERT INTO scratch (id, amount) VALUES (1, 0)"),
+    ("a_body_that_is_not_a_query", "WITH d AS (DELETE FROM claim WHERE id = 1 RETURNING id) "
+                                   "INSERT INTO scratch (id, amount) SELECT id, 0 FROM d"),
+]
+
+
+@pytest.mark.parametrize("label,sql", _UNPLACEABLE, ids=[c[0] for c in _UNPLACEABLE])
+def test_a_leading_with_that_cannot_move_without_changing_meaning_is_refused(label, sql):
+    verdict = _w_write(sql)
+    assert isinstance(verdict, Refusal), f"{label}: {verdict}"
+    assert verdict.code is RefusalCode.UNSCOPED_CTE, f"{label}: {verdict.code}"
 
 
 def test_the_same_cte_spelled_inside_the_insert_is_approved_and_governed():

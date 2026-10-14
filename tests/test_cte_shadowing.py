@@ -149,9 +149,10 @@ def test_a_derived_table_sharing_the_name_was_already_correct():
 #
 # A write root parks its CTEs in its own WITH arg, outside the query `build_scope` roots itself
 # at, so every guard saw an empty statement and approved it ungoverned. `check_write_shape`
-# refuses this shape outright now (UNSCOPED_CTE), so these assert the FLOOR underneath that
-# refusal: one guard's decision must not be the only thing standing between a write and an
-# unresolved scope, because `base_tables` is the premise all three of them share.
+# now moves the WITH into the query that uses it, or refuses it (UNSCOPED_CTE), so no write
+# reaches the resolver carrying one. These call the resolver on the raw statement and assert the
+# FLOOR underneath: one guard's decision must not be the only thing standing between a write and
+# an unresolved scope, because `base_tables` is the premise all three of them share.
 #
 # `build_scope` is `traverse_scope(...)[-1]`, and traverse_scope DOES visit the write root's
 # CTEs -- taking only the last scope is what discards them. Measured, all three shapes below:
