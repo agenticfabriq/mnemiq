@@ -35,6 +35,9 @@ def test_grants_are_resolved_once_and_handed_to_retrieval_and_the_planner(path):
     passed = {k.arg: k.value for k in retrieve.keywords}
     assert isinstance(passed.get("grants"), ast.Name), "retrieve must be handed the resolved grants"
     name = passed["grants"].id
+    assigned = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == name for t in n.targets)]
+    assert len(assigned) == 1, "one binding, so retrieval and the planner see one set"
     (consumer,) = _calls(tree, CONSUMERS[path])
     assert any(isinstance(a, ast.Name) and a.id == name for a in consumer.args), \
         "the planner must be handed the same grants retrieval was"
@@ -44,4 +47,6 @@ def test_grants_are_resolved_once_and_handed_to_retrieval_and_the_planner(path):
 def test_the_adapter_that_runs_model_sql_is_bounded_on_the_server(path):
     tree = ast.parse(pathlib.Path(path).read_text())
     (adapter,) = _calls(tree, "DuckDBPostgresAdapter")
-    assert "statement_timeout_s" in {k.arg for k in adapter.keywords}
+    value = {k.arg: k.value for k in adapter.keywords}.get("statement_timeout_s")
+    # The constant itself: a falsy value (None, 0) would mean no bound at all.
+    assert isinstance(value, ast.Name) and value.id == "DEFAULT_TIMEOUT_S"
