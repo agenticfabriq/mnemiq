@@ -70,9 +70,10 @@ def test_a_mistyped_mode_reaches_the_client_as_its_instruction(tmp_path):
                     result = await session.call_tool("get_schema", {})
                     assert getattr(result, "is_error", getattr(result, "isError", None)) is True
                     text = result.content[0].text
-                    # The offered modes, composed from the registry -- not the operator's value
-                    # echoed back, which `thinkin` in `thinking` once passed for.
-                    assert "Unknown mode" in text and "'deep', 'instant', 'thinking'" in text, text
+                    # Names the deployment setting, which the operator fixes, and the offered modes
+                    # from the registry -- not the value echoed back, which `thinkin` in `thinking`
+                    # once passed for.
+                    assert "MNEMIQ_MODE" in text and "'deep', 'instant', 'thinking'" in text, text
 
     anyio.run(check)
 
@@ -103,7 +104,6 @@ def test_a_mistyped_mode_on_one_call_reaches_the_client_as_its_instruction():
         raise AssertionError("a mistyped mode was answered")
 
 
-
 def _tool_error_from(raised: Exception) -> str:
     """The text a client gets when building the runtime raises `raised`, via the installed mcp."""
     from mnemiq.contract import IdentityContext
@@ -132,7 +132,8 @@ def test_each_setup_failure_reaches_the_client_as_its_instruction_without_its_de
     from mnemiq.adapters.federated import UnfederatableSource
     from mnemiq.adapters.oracle import DriverMissing
     from mnemiq.adapters.resolve import SourceUnconfigured
-    from mnemiq.duckdb_extensions import ExtensionNotInstalled
+    from mnemiq.adapters.scoped import TablesNotFound
+    from mnemiq.duckdb_extensions import ExtensionNotInstalled, ExtensionsNotReady
     from mnemiq.runtime import SnapshotMissing
 
     secret = "/srv/secret-layout/store.duckdb"
@@ -143,6 +144,8 @@ def test_each_setup_failure_reaches_the_client_as_its_instruction_without_its_de
         (unconfigured, "source is not configured"),
         (SourceUnconfigured(secret), "source is not configured"),
         (ExtensionNotInstalled(secret), "mnemiq extensions fetch"),
+        (ExtensionsNotReady(secret), "mnemiq extensions fetch"),
+        (TablesNotFound(secret), "manifest lists does not exist"),
         (UnfederatableSource(secret), "federates a source DuckDB cannot attach"),
         (DriverMissing(secret), "mnemiq[oracle]"),
     ]:

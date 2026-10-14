@@ -13,11 +13,12 @@ from threading import Lock
 from mnemiq.adapters.federated import UnfederatableSource
 from mnemiq.adapters.oracle import DriverMissing
 from mnemiq.adapters.resolve import SourceUnconfigured, UnknownSourceKind
+from mnemiq.adapters.scoped import TablesNotFound
 from mnemiq.agent.modes import MODES
 from mnemiq.agent.route import UnknownMode
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
-from mnemiq.duckdb_extensions import ExtensionNotInstalled
+from mnemiq.duckdb_extensions import ExtensionNotInstalled, ExtensionsNotReady
 from mnemiq.runtime import Runtime, SnapshotMissing, build_runtime
 from mnemiq.server.serialize import verified_state
 
@@ -116,6 +117,11 @@ def _mcp_classes():
 _INTERNAL = "mnemiq could not complete this call: an internal error, recorded in the server log."
 
 
+class _DeploymentMode(UnknownMode):
+    """An UnknownMode from the deployment's own MNEMIQ_MODE, raised building the runtime -- told
+    apart from a mistyped per-call `mode`, which is the caller's to fix."""
+
+
 def _client_message(exc: Exception) -> str:
     if isinstance(exc, SnapshotMissing) and isinstance(exc.__cause__, (SourceUnconfigured, UnknownSourceKind)):
         return ("This deployment's source is not configured: the operator's server log names what "
@@ -126,12 +132,18 @@ def _client_message(exc: Exception) -> str:
     if isinstance(exc, SourceUnconfigured):
         return ("This deployment's source is not configured: the operator's server log names what "
                 "is missing.")
-    if isinstance(exc, ExtensionNotInstalled):
+    if isinstance(exc, (ExtensionNotInstalled, ExtensionsNotReady)):
         return ("A DuckDB extension this deployment loads is not installed, and MNEMIQ_LOCAL_ONLY "
                 "forbids downloading it: the operator pre-seeds it with `mnemiq extensions fetch`; "
                 "the server log names which.")
+    if isinstance(exc, _DeploymentMode):
+        return (f"This deployment's MNEMIQ_MODE names no mode: the operator sets it to one of "
+                f"{sorted(MODES)}.")
     if isinstance(exc, UnknownMode):
         return f"Unknown mode; this deployment offers: {sorted(MODES)}."
+    if isinstance(exc, TablesNotFound):
+        return ("A table this deployment's source manifest lists does not exist in its source: the "
+                "operator's server log names it.")
     if isinstance(exc, UnfederatableSource):
         return ("This deployment's source manifest federates a source DuckDB cannot attach: the "
                 "operator's server log names it.")
@@ -140,8 +152,8 @@ def _client_message(exc: Exception) -> str:
     return _INTERNAL
 
 
-_SETUP = (SnapshotMissing, SourceUnconfigured, ExtensionNotInstalled, UnknownMode,
-          UnfederatableSource, DriverMissing)
+_SETUP = (SnapshotMissing, SourceUnconfigured, ExtensionNotInstalled, ExtensionsNotReady,
+          UnknownMode, UnfederatableSource, DriverMissing, TablesNotFound)
 
 
 def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContext):
@@ -158,7 +170,10 @@ def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContex
         nonlocal runtime
         with runtime_lock:
             if callable(runtime):
-                runtime = runtime()
+                try:
+                    runtime = runtime()
+                except UnknownMode as exc:  # building the runtime: the deployment's MNEMIQ_MODE
+                    raise _DeploymentMode(str(exc)) from exc
             return runtime
 
     def guarded(call: Callable[[], dict]) -> dict:
