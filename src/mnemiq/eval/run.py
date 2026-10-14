@@ -9,6 +9,7 @@ from mnemiq.eval.engine import build_engine
 from mnemiq.eval.golden import load_cases
 from mnemiq.eval.harness import run_case
 from mnemiq.eval.report import summarize
+from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
 from mnemiq.llm.client import LLMClient
 
 
@@ -51,8 +52,15 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
         _snap = apply_dictionary(_snap, _dict)
         _snap.version = content_version(_snap)
     snapshot = _snap
-    ask, client = build_engine(snapshot, adapter, settings)
-    results = [run_case(c, ask, adapter) for c in load_cases(golden)]
+    # Engine and gold queries are bounded on the server, as a served deployment's are (M152): DuckDB's
+    # interrupt alone left the database running every query it gave up on. `run_case` already asks
+    # both for DEFAULT_TIMEOUT_S's 30 s, so the bound enforces the limit it already sets.
+    # One adapter for both, as before: two distinct ones switch on run_case's cross-engine probe,
+    # which re-runs every candidate. The profiling above keeps `adapter`, which has no such limit.
+    serving = DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only,
+                                    statement_timeout_s=DEFAULT_TIMEOUT_S)
+    ask, client = build_engine(snapshot, serving, settings)
+    results = [run_case(c, ask, serving) for c in load_cases(golden)]
     report = summarize(results, tokens=client.total_tokens, llm_calls=client.calls)
     print(report.render())
 
