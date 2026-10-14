@@ -168,8 +168,12 @@ class Runtime:
         # A question too long to read whole is declined before any work that can fail or wait on a server: the
         # snapshot reload (the control database, and on a swap the window count), retrieval (which embeds it) and
         # the fit (which counts it). It is still recorded as an answer (M147).
+        # ONE resolution per question, handed to everything below (M13). The provider may re-read
+        # its policy file per call, so asking twice let retrieval scope the cards against one
+        # version of it and the agent decide against another, within one request.
+        grants = self.authz.grants_for(identity)
         if (declined := agent.decline_if_too_long(question)) is not None:
-            return self._record(declined, name, self.authz.grants_for(identity), identity, question, None,
+            return self._record(declined, name, grants, identity, question, None,
                                 time.perf_counter())
         self.reload_if_stale()
         started = time.perf_counter()
@@ -197,8 +201,8 @@ class Runtime:
                 ontology_index=self.ontology,
                 # M4: lets retrieve re-render each card against this identity's column policy.
                 snapshot=self.snapshot,
+                grants=grants,
             )
-        grants = self.authz.grants_for(identity)
         # Scoped against THIS identity's boundary, never the one that produced the turn.
         packet.history = scope_history(history, grants.fingerprint)
         # After the history, which the prompt carries too; before the agent, so the generator, the

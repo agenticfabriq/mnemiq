@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 
 import duckdb
 
-from mnemiq.authz.grants import AuthzProvider
+from mnemiq.authz.grants import AuthzProvider, GrantSet
 from mnemiq.contract import (
     Column, Definition, Dimension, Example, HistoryTurn, IdentityContext, Metric,
     TableFacts,
@@ -314,6 +314,7 @@ def retrieve(
     ontology_index=None,
     snapshot=None,
     card_style: str = "cards",
+    grants: GrantSet | None = None,
 ) -> ContextPacket:
     """Hybrid retrieval, scoped to the identity's grants *before* anything is ranked.
 
@@ -328,8 +329,14 @@ def retrieve(
     the identity's column policy before they go in the packet. Ranking still runs on the stored,
     identity-independent card -- an index per grant set is combinatorial, and ranking is not a
     channel: nothing about a hidden column reaches the caller.
+
+    `grants`, when given, are the identity's grants as the caller already resolved them for this
+    question, and `authz` is not asked again (M13): a provider that re-reads its policy file per
+    call could otherwise scope these cards against one version of it and the agent's decision
+    against another.
     """
-    grants = authz.grants_for(identity)
+    if grants is None:
+        grants = authz.grants_for(identity)
     packet = ContextPacket(
         question=question,
         cards=[],
