@@ -244,7 +244,8 @@ class PromptFitter:
                 describe=lambda table, column: (table, column) in keep)}
             fresh = [RetrievedCard(object_id=c.object_id, card=texts[c.object_id], score=c.score)
                      for c in packet.cards if c.object_id in texts]
-            _attach_facts(fresh, snapshot.table_facts, self.card_style)
+            _attach_facts(fresh, snapshot.table_facts, self.card_style, grants=grants,
+                          columns=snapshot.columns)
             by_id = {c.object_id: c for c in fresh}
             # A card retrieval served from the stored text (no snapshot binding) is kept as served.
             cards = [by_id.get(c.object_id, c) for c in packet.cards]

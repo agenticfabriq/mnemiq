@@ -13,6 +13,7 @@ reads every column it reads raw.
 from __future__ import annotations
 
 import duckdb
+import pytest
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import CodeScheme, Column, Example, IdentityContext, Metric, Snapshot
@@ -144,3 +145,106 @@ def test_an_example_whose_columns_cannot_be_read_is_not_shown_and_says_so(caplog
     assert any("withheld" in r.getMessage() and r.levelno >= logging.INFO
                for r in caplog.records), [r.getMessage() for r in caplog.records]
     assert _reads_only_raw(broken, frozenset()) is True
+
+
+# -- Codex's review of #121: three ways past the selectors, each closed ------------------------
+
+_UNCHECKABLE = [
+    "(SELECT count(p.secret_code) FROM patients p)",  # a subquery: reads a relation of its own
+    "count(patients.secret_code)",                     # a column another table qualifies
+    "count(secret_code) FILTER (WHERE",                # parses in no dialect, names no column
+    "count(patients.secret_code) FILTER (WHERE",       # parses nowhere, its spelling not ours
+    "(SELECT count(p.secret_code) FROM patients p",    # the same, unbalanced
+]
+
+
+@pytest.mark.parametrize("expr", _UNCHECKABLE)
+def test_an_expression_the_check_cannot_read_is_withheld_from_everyone(expr):
+    """`columns_read` reports the columns of the metric's own source, so these read columns it
+    never names, and a check built on it passed them. Withheld even from the cleared: what they
+    read cannot be established for anyone."""
+    for grants in (_UNCLEARED, _CLEARED):
+        assert select_metrics(["orders"], [_metric(expr)], grants, columns=_COLUMNS) == []
+
+
+def test_a_keyword_named_column_still_reads_through_its_spelling():
+    """The control for the rule above: an expression no dialect parses is withheld only when its
+    spelling names no column. `orders.select` names one, as M136's gate measured."""
+    columns = [*_COLUMNS, Column(id="orders.select", object_id="orders", name="select")]
+    kept = select_metrics(["orders"], [_metric("orders.select"), _metric("count(*)")],
+                          _UNCLEARED, columns=columns)
+    assert [m.measure.expr for m in kept] == ["orders.select", "count(*)"]
+
+
+@pytest.mark.parametrize("sql", ["SELECT * FROM orders", "SELECT o.* FROM orders o",
+                                 "SELECT COLUMNS('secret_code') FROM orders",
+                                 "SELECT * EXCLUDE (id) FROM orders",
+                                 # DuckDB returns the whole row for a relation used as a value.
+                                 "SELECT o FROM orders o", "SELECT to_json(o) FROM orders o"])
+def test_an_example_reading_through_a_star_is_withheld_where_a_column_is(sql):
+    """A star or COLUMNS(...) reads columns no node names, so `check_cls` cannot see them."""
+    from mnemiq.semantic.retrieval import _reads_only_raw
+
+    assert _reads_only_raw(sql, frozenset({("orders", "secret_code")})) is False
+    assert _reads_only_raw(sql, frozenset()) is True
+    # and only where it touches a table that has a withheld column
+    assert _reads_only_raw(sql.replace("orders", "customers"),
+                           frozenset({("orders", "secret_code")})) is True
+
+
+def _facts():
+    from mnemiq.contract import TableFacts
+
+    return TableFacts(object_id="orders", canonical_measures={
+        "coded orders": "count(secret_code)", "orders": "count(id)"},
+        default_time_column="secret_code")
+
+
+def test_the_facts_block_withholds_what_the_metric_selector_withholds():
+    from mnemiq.semantic.retrieval import RetrievedCard, _attach_facts
+
+    def card_for(grants):
+        card = RetrievedCard(object_id="orders", card="TABLE orders\n  id int", score=1.0)
+        _attach_facts([card], [_facts()], grants=grants, columns=_COLUMNS)
+        return card.card
+
+    uncleared, cleared = card_for(_UNCLEARED), card_for(_CLEARED)
+    assert "secret_code" not in uncleared and "count(id)" in uncleared
+    assert "count(secret_code)" in cleared  # the control
+
+
+def test_retrieve_scopes_the_facts_block_too(tmp_path):
+    """The join for the facts block: `retrieve` must hand it the identity's columns."""
+    con = init_store(str(tmp_path / "s.duckdb"))
+    embedder = FakeEmbedder()
+    build_index(con, _snapshot(), embedder)
+    packet = retrieve(con, "how many orders", IdentityContext(tenant_id="t", principal_id="p",
+                                                               roles=["r"]),
+                      _Authz(_UNCLEARED), embedder, columns=_COLUMNS, table_facts=[_facts()],
+                      snapshot=_snapshot())
+    text = "\n".join(c.card for c in packet.cards)
+    assert "count(id)" in text, "the facts block has to arrive, or this proves nothing"
+    assert "secret_code" not in text
+
+
+def test_counting_rows_reads_no_column_and_is_shown():
+    """The review gate's blocker on the first version: `count(*)` holds a star and was withheld,
+    taking every row-count example from any identity with a withheld column."""
+    from mnemiq.semantic.retrieval import _reads_only_raw
+
+    assert _reads_only_raw("SELECT count(*) FROM orders", frozenset({("orders", "secret_code")}))
+
+
+def test_a_dimension_reading_another_table_is_withheld_from_everyone():
+    """Dimensions share the expression check, so they share its stricter rule: one qualified by
+    another table cannot be checked against this source's columns."""
+    from mnemiq.contract import Dimension
+    from mnemiq.semantic.measures import select_dimensions
+
+    def dim(expr):
+        return Dimension(id=f"d:{expr}", label=expr, source="orders", expr=expr)
+
+    for grants in (_UNCLEARED, _CLEARED):
+        kept = select_dimensions(["orders"], [dim("customer.region"), dim("id")], grants,
+                                 columns=_COLUMNS)
+        assert [d.expr for d in kept] == ["id"]

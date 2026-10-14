@@ -16,7 +16,12 @@ from mnemiq.llm.embeddings import Embedder
 from mnemiq.semantic.cards import render_facts_block
 from mnemiq.semantic.embedding_width import refuse_if_mismatched
 from mnemiq.semantic.glossary import select_definitions
-from mnemiq.semantic.measures import read_raw, select_dimensions, select_metrics
+from mnemiq.semantic.measures import (
+    expression_reads_raw,
+    read_raw,
+    select_dimensions,
+    select_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +70,7 @@ def _rank(rows: list[tuple[str, float]]) -> dict[str, int]:
 
 
 def _attach_facts(cards: list[RetrievedCard], table_facts: Sequence[TableFacts],
-                  card_style: str = "cards") -> None:
+                  card_style: str = "cards", *, grants, columns: Sequence[Column]) -> None:
     """Attach each retrieved table's structural-facts block. Facts live here, NOT in the
     indexed card, so they never perturb retrieval top-k.
 
@@ -78,7 +83,7 @@ def _attach_facts(cards: list[RetrievedCard], table_facts: Sequence[TableFacts],
     by_id = {tf.object_id: tf for tf in table_facts}
     for c in cards:
         tf = by_id.get(c.object_id)
-        block = render_facts_block(tf) if tf else ""
+        block = render_facts_block(_scoped_facts(tf, grants, columns)) if tf else ""
         if not block:
             continue
         if card_style == "ddl":
@@ -87,6 +92,37 @@ def _attach_facts(cards: list[RetrievedCard], table_facts: Sequence[TableFacts],
             continue
         head, _, rest = c.card.partition("\n")
         c.card = f"{head}\n{block}\n{rest}" if rest else f"{head}\n{block}"
+
+
+def _reads_unnamed_columns(ast) -> bool:
+    """Does the query read columns it never names: a star in a projection (`*`, `o.*`, with or
+    without EXCLUDE), DuckDB's `COLUMNS(...)`, or a table or alias used as a value -- DuckDB
+    returns the whole row as a struct for `SELECT o FROM orders o`, measured. `count(*)` names
+    nothing and reads nothing, so a star whose parent is COUNT does not count."""
+    from sqlglot import exp
+
+    if ast.find(exp.Columns) is not None:
+        return True
+    if any(not isinstance(star.parent, exp.Count) for star in ast.find_all(exp.Star)):
+        return True
+    relations = {name.lower() for t in ast.find_all(exp.Table)
+                 for name in (t.name, t.alias_or_name) if name}
+    return any(not column.table and column.name.lower() in relations
+               for column in ast.find_all(exp.Column))
+
+
+def _scoped_facts(tf: TableFacts, grants, columns: Sequence[Column]) -> TableFacts:
+    """A table's facts with the expressions this identity may not read raw taken out (M143's
+    structured fields; Codex's review of #121 found the facts block naming `count(secret_code)`
+    after the metric selector had withheld the same expression). A canonical measure or the
+    default time column is kept only where `expression_reads_raw` keeps a metric. The grain and
+    gotchas are prose, with no column to resolve, and are M143's remaining question."""
+    measures = {name: expr for name, expr in tf.canonical_measures.items()
+                if expression_reads_raw(expr, tf.object_id, columns, grants)}
+    time = tf.default_time_column
+    if time and not expression_reads_raw(time, tf.object_id, columns, grants):
+        time = None
+    return tf.model_copy(update={"canonical_measures": measures, "default_time_column": time})
 
 
 def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5, *,
@@ -160,11 +196,20 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
     from mnemiq.sql.cls import check_cls
     from mnemiq.sql.policy import AccessPolicy
 
+    from sqlglot import exp
+
+    withheld_tables = {obj.lower().rsplit(".", 1)[-1] for obj, _ in not_raw}
     for dialect in ("duckdb", "oracle"):
         try:
             ast = sqlglot.parse_one(sql, read=dialect)
         except Exception:  # noqa: BLE001 -- try the other dialect; neither means not shown
             continue
+        # A read of columns no node names cannot be seen by `check_cls`, which checks named ones
+        # (Codex's review of #121): `SELECT COLUMNS('secret_code') FROM orders` returns the column.
+        # Withheld when any table the example reads has a withheld column.
+        if _reads_unnamed_columns(ast) and any(
+                t.name.lower() in withheld_tables for t in ast.find_all(exp.Table)):
+            return False
         return check_cls(ast, AccessPolicy(denied=set(not_raw)), dialect) is None
     logger.info("an example was withheld from an identity with columns withheld: its SQL parses as "
                 "neither duckdb nor oracle, so the columns it reads cannot be checked: %.80s", sql)
@@ -317,7 +362,7 @@ def retrieve(
         if object_id in cards
     ]
     packet.enrichment_version = next(iter(cards.values()))[1] if cards else None
-    _attach_facts(packet.cards, table_facts, card_style)
+    _attach_facts(packet.cards, table_facts, card_style, grants=grants, columns=columns)
     # After the cards are chosen, because a certified measure rides with its table -- see
     # `semantic.measures` for why that rule differs from the glossary's word-matching one.
     table_ids = [c.object_id for c in packet.cards]

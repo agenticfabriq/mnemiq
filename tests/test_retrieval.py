@@ -161,11 +161,13 @@ def test_attach_facts_inserts_block_after_table_line():
     from mnemiq.semantic.retrieval import RetrievedCard, _attach_facts
 
     card = RetrievedCard(object_id="claim", card="TABLE claim\nCOLUMNS:\n- amount", score=1.0)
-    _attach_facts([card], [TableFacts(object_id="claim", grain="one row per claim")])
+    _attach_facts([card], [TableFacts(object_id="claim", grain="one row per claim")],
+                  grants=GrantSet(frozenset({"claim"})), columns=[])
     assert card.card.startswith("TABLE claim\nGRAIN: one row per claim\nCOLUMNS:")
     # a table with no facts is untouched
     other = RetrievedCard(object_id="party", card="TABLE party\nCOLUMNS:", score=1.0)
-    _attach_facts([other], [TableFacts(object_id="claim", grain="x")])
+    _attach_facts([other], [TableFacts(object_id="claim", grain="x")],
+                  grants=GrantSet(frozenset({"claim"})), columns=[])
     assert other.card == "TABLE party\nCOLUMNS:"
 
 
@@ -188,7 +190,7 @@ def test_attach_facts_keeps_ddl_parseable():
         [card],
         [TableFacts(object_id="frpm", grain="one row per school-year",
                     gotchas=["nulls in enrollment"])],
-        card_style="ddl",
+        card_style="ddl", grants=GrantSet(frozenset({"frpm"})), columns=[],
     )
 
     assert "GRAIN" in card.card, "the facts have to arrive at all, or this proves nothing"
