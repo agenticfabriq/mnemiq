@@ -36,7 +36,8 @@ def test_grants_are_resolved_once_and_handed_to_retrieval_and_the_planner(path):
     assert isinstance(passed.get("grants"), ast.Name), "retrieve must be handed the resolved grants"
     name = passed["grants"].id
     bindings = [n for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == name
-                and isinstance(n.ctx, ast.Store)]  # every form: =, :, |=, :=, for, tuple targets
+                and isinstance(n.ctx, ast.Store)]  # =, :, |=, :=, for and tuple targets; not
+    # `except ... as`, `import ... as` or a `case` capture, which bind a bare string
     assert len(bindings) == 1, "one binding, so retrieval and the planner see one set"
     (binding,) = [n for n in ast.walk(tree) if isinstance(n, ast.Assign) and n.targets
                   and isinstance(n.targets[0], ast.Name) and n.targets[0].id == name]
