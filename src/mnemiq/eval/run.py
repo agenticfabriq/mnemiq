@@ -56,10 +56,11 @@ def run_acme(settings: Settings, golden: str = "evals/acme.json",
     # interrupt alone left the database running every query it gave up on. `run_case` already asks
     # both for DEFAULT_TIMEOUT_S's 30 s, so the bound enforces the limit it already sets.
     # One adapter for both, as before: two distinct ones switch on run_case's cross-engine probe,
-    # which re-runs every candidate. The profiling above keeps `adapter`, which has no such limit.
+    # which re-runs every candidate. The profiling above keeps `adapter`, which has no such limit,
+    # and so does the value index build_engine builds (its scans have none either).
     serving = DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only,
                                     statement_timeout_s=DEFAULT_TIMEOUT_S)
-    ask, client = build_engine(snapshot, serving, settings)
+    ask, client = build_engine(snapshot, serving, settings, index_adapter=adapter)
     results = [run_case(c, ask, serving) for c in load_cases(golden)]
     report = summarize(results, tokens=client.total_tokens, llm_calls=client.calls)
     print(report.render())
