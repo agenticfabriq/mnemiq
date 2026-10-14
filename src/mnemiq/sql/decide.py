@@ -124,6 +124,17 @@ def decide(
         # silently-wrong SQL: runs fine, wrong answer. Repairable -- the corrector fixes it.
         return Refusal(code=RefusalCode.LOGIC_LINT, message=violation.message)
 
+    # M50: a filter key that names nothing may be the misspelled key of any table this reads, so
+    # nothing is approved while one is held. Not at the top: a statement an earlier check refuses
+    # keeps that check's more precise reason (a view inventory that failed, a body that will not
+    # parse), and those checks name objects, never row values. But BEFORE value grounding, whose
+    # refusal lists values from the unfiltered index and withholds only for the filters it is
+    # told of -- none, for a dropped key. Placed after it first, and Codex's review of #118
+    # measured the leak: a mistyped key listed `east` from rows a correct key withholds.
+    misplaced = check_filter_targets(policy)
+    if misplaced is not None:
+        return misplaced
+
     if values is not None:
         # a filter literal that does not exist in its column runs fine and answers wrong --
         # another silently-wrong class the corrector fixes, given the real values to pick from.
@@ -176,13 +187,6 @@ def decide(
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
     narrowed: list = []
-    # M50: a filter key that names nothing may be the misspelled key of any table this reads, so
-    # nothing is approved while one is held. Here, ahead of the rewrite every approval passes
-    # through, and not at the top: a statement an earlier check refuses keeps that check's more
-    # precise reason (a view inventory that failed, a body that will not parse).
-    misplaced = check_filter_targets(policy)
-    if misplaced is not None:
-        return misplaced
     unplaceable = unplaceable_policy(shaped, policy, target)
     if unplaceable is not None:
         return unplaceable

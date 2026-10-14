@@ -103,6 +103,38 @@ def test_on_a_federated_snapshot_the_catalog_is_part_of_the_name(key, refused):
     assert isinstance(verdict, Refusal) is refused, verdict
 
 
+class _Values:
+    """A value index holding `claim.region` = west and east, unfiltered as the real one is."""
+
+    def has(self, object_id, column):
+        return (object_id, column) == ("claim", "region")
+
+    def contains(self, object_id, column, literal):
+        return literal in {"west", "east"}
+
+    def nearest(self, object_id, column, literal, k=8):
+        return ["west", "east"]
+
+
+@pytest.mark.parametrize("target", ["duckdb", "oracle"])
+def test_no_refusal_lists_a_value_while_a_key_is_unknown(target):
+    """Codex's review of #118. Value grounding refuses an unknown literal by listing the column's
+    real values, withholding them only for tables it is told are filtered -- and a dropped key
+    tells it of none. It ran before the M50 check, so `claims` listed `east`, from rows a correct
+    `claim` key withholds. The control is the same query under the correct key."""
+    def read(key):
+        grants = GrantSet(frozenset({"claim"}), row_filters={key: _FILTER})
+        return decide("SELECT id FROM claim WHERE region = 'nope'", _VISIBLE,
+                      policy=build_access_policy(_snapshot(), grants), target=target,
+                      values=_Values())
+
+    control = read("claim")
+    assert control.code is RefusalCode.VALUE_GROUNDING and "east" not in control.message
+    verdict = read("claims")
+    assert verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    assert "east" not in verdict.message
+
+
 def test_a_write_is_refused_too():
     grants = GrantSet(frozenset({"claim", "scratch"}), writable=frozenset({"scratch"}),
                       row_filters={"public.claim": _FILTER})
