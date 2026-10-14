@@ -12,6 +12,11 @@ import pyarrow as pa
 logger = logging.getLogger(__name__)
 
 
+class DriverMissing(RuntimeError):
+    """The optional `oracledb` driver is not installed (`mnemiq[oracle]`). Its own type, so a door
+    that shows a caller an instruction for it can tell it from any other RuntimeError (M121)."""
+
+
 class OracleAdapter:
     """Read an Oracle database through `oracledb` in THIN mode.
 
@@ -89,8 +94,8 @@ class OracleAdapter:
         """
         try:
             import oracledb
-        except ModuleNotFoundError as exc:  # pragma: no cover - exercised by deployment, not tests
-            raise RuntimeError(
+        except ModuleNotFoundError as exc:
+            raise DriverMissing(
                 "the Oracle adapter needs the `oracledb` driver: pip install 'mnemiq[oracle]'"
             ) from exc
 
