@@ -606,11 +606,19 @@ def _classify_dimension_columns(columns: list, dimensions: list) -> tuple[list, 
     return out, unresolved
 
 
+# The overlaid fields copied as the record states them. `pii_level` and `coded_values` are
+# overlaid too, through the M1/M41 checks and the coded-value rebuild in `apply_certified`.
+_MEANING_AS_STATED = ("description", "semantic_type", "code_scheme")
+
+
 def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snapshot:
     """Overlay certified MEANING onto locally-profiled STRUCTURE.
 
     A column's meaning (description, semantic_type, pii_level, coded_values, code_scheme) comes
-    from the certified record; its structure (data_type, row/distinct/null counts) stays local.
+    from the certified record, for each field the record STATES; a field it omits keeps its local
+    value, and so does a null `pii_level` (M42 -- silence is not an assertion, and None reads as
+    "not sensitive" to every consumer). Its structure (data_type, row/distinct/null counts) stays
+    local.
     Standalone objects (definition/metric/...) are appended to their lists. A certified column
     with no local counterpart is dropped -- mnemiq grounds what is physically in the DB.
 
@@ -644,14 +652,24 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
             continue
         coded = [CodedValue(code=cv.code, meaning=cv.meaning, source="certified")
                  for cv in cert.coded_values]
-        pii_level = cert.pii_level
+        # M42: a record supplies the meaning it STATES, and silence about a field is not a
+        # statement. Every field used to be written, so a record that omitted `pii_level` set it
+        # to None -- which `_qualifies` and `build_access_policy` both read as "not sensitive", so
+        # a `phi` column had its values harvested into prompts and was readable raw by anyone.
+        # Only the keys the payload carried are overlaid (`model_fields_set`: the record cache
+        # keeps the wire dicts, so this is what the producer sent). For `pii_level` an explicit
+        # null is no statement either -- the vocabulary's word for "not personal" is `none`, and
+        # None is the value every consumer reads as harmless -- so absent and null are one case.
+        stated = cert.model_fields_set
+        states_level = cert.pii_level is not None
+        pii_level = cert.pii_level if states_level else col.pii_level
         # M41. `Column.pii_level` is `str | None` and this is the one producer that does not clamp
         # to the vocabulary (enrichment parses through `_in_vocabulary`), so an unrecognised value
         # used to land on the column -- and `_qualifies` gates harvesting on
         # `pii_level not in SENSITIVE_PII`, which anything unrecognised passes. That fails OPEN:
         # "personal", "sensitive", a typo'd "pii " all read as sensitive to a human and as
         # harvestable to the code. The value is recorded here and SUBSTITUTED BELOW, after M1.
-        unrecognised = pii_level is not None and pii_level not in PII_LEVELS
+        unrecognised = states_level and pii_level not in PII_LEVELS
         if unrecognised:
             logger.warning(
                 "unrecognised pii_level %r on %r (not one of %s) -- an unrecognised level must "
@@ -682,13 +700,12 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
             # record was rejected for M1's stated reason: the danger is one field, and dropping
             # meaning over it degrades enrichment.
             pii_level = _MOST_SENSITIVE
-        new_cols.append(col.model_copy(update={
-            "description": cert.description,
-            "semantic_type": cert.semantic_type,
-            "pii_level": pii_level,
-            "coded_values": coded,
-            "code_scheme": cert.code_scheme,
-        }))
+        update = {"pii_level": pii_level}
+        if "coded_values" in stated:
+            update["coded_values"] = coded
+        update.update({field: getattr(cert, field) for field in _MEANING_AS_STATED
+                       if field in stated})
+        new_cols.append(col.model_copy(update=update))
 
     # M135. A certified dimension's `pii_level`, read as a column's (M41): an unrecognised level
     # is recorded beside the columns' and read as `_MOST_SENSITIVE`, never as nothing.
