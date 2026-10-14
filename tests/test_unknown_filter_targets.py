@@ -48,8 +48,9 @@ _VISIBLE = {"claim": {"id", "region"}}
 
 @pytest.fixture(autouse=True)
 def _fresh_log_memory(monkeypatch):
-    """The once-per-process log memory, emptied per test so each sees its own first warning."""
-    monkeypatch.setattr(policy_module, "_reported", set())
+    """The log memory (last version logged per key set), emptied per test so each sees its own
+    first warning."""
+    monkeypatch.setattr(policy_module, "_reported", {})
 
 
 def _read(key: str, snapshot: Snapshot | None = None):
