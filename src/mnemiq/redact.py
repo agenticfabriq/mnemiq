@@ -12,8 +12,12 @@ launder. Two grammars, never a guess at what looks secret:
   * a password field: a key ending in `password`, `passwd` or `pwd` (so `PGPASSWORD` and
     `db_password` too, never `passwordless`), optionally quoted, then `=` or `:`, then its value
     read by the value's own grammar -- quoted ('...' or "..."), braced as ODBC writes `{a;b}` (with
-    `}}` a literal brace), or a bare token running to whitespace, `;`, `&` or a quote, so it may
-    hold `=`, `,` or braces (a base64 password ends in `=`). Whitespace after the separator is
+    `}}` a literal brace), or a bare token running to the next UNESCAPED whitespace, as libpq reads
+    an unquoted value -- so it may hold `=`, `;`, `&`, `,`, braces or quotes, and a backslash-escaped
+    space does not end it. ODBC and a JDBC query end a value at `;` or `&`, libpq does not, and the text cannot say
+    which it is: so a bare value is read to whitespace, and an ODBC or JDBC tail after the
+    password (`;Server=s`) is scrubbed with it (Codex's review of #125: `password=abc;TOPSECRET`
+    showed `TOPSECRET`). Whitespace after the separator is
     skipped, as libpq skips it -- whose grammar spells an empty value `''`, so in
     `password= host=h` the password IS `host=h`, and it is scrubbed. Where the grammar is
     ambiguous this reads more as secret, never less: a scrubber's error should hide repair input,
@@ -29,7 +33,7 @@ import re
 
 _URI_USERINFO = re.compile(r"(?P<scheme>\b[A-Za-z][A-Za-z0-9+.\-]*://)[^\s?#]+@")
 _PASSWORD_KEY = re.compile(r"(?i)[\"']?\b\w*(?:password|passwd|pwd)[\"']?\s*[=:]")
-_BARE_END = frozenset(" \t\r\n;&'\"")
+_BARE_END = frozenset(" \t\r\n")
 
 
 def scrub_credentials(text: str) -> str:
@@ -75,5 +79,5 @@ def _value_end(text: str, value: int) -> int | None:
         return len(text)
     end = value
     while end < len(text) and text[end] not in _BARE_END:
-        end += 1
-    return end if end > value else None
+        end += 2 if text[end] == "\\" else 1  # libpq's backslash escape: `\ ` is in the value
+    return min(end, len(text)) if end > value else None

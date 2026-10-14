@@ -21,15 +21,16 @@ from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
 from mnemiq.sql.prove import prove
 
 _DUCKDB_PG = ('IO Error: Unable to connect to Postgres at "host=10.0.0.5 user=svc '
-              'password=hunter2 dbname=acme": connection refused')
+              'password=hun;ter2 dbname=acme": connection refused')
 
 
 @pytest.mark.parametrize("text,secret,kept", [
-    (_DUCKDB_PG, "hunter2", "host=10.0.0.5"),
+    (_DUCKDB_PG, "ter2", "host=10.0.0.5"),
     ("could not reach postgresql://svc:pw@10.2.0.7/acme", "svc:pw", "10.2.0.7/acme"),
     ("mysql://root:s3cr@t@db:3306/x refused", "s3cr@t", "mysql://***@db:3306/x refused"),
-    ("jdbc:postgresql://h/db?user=u&password=y9&ssl=true", "y9", "ssl=true"),
-    ("Driver={x};UID=u;PWD=topsecret;Server=s", "topsecret", "Server=s"),
+    # A bare value runs to whitespace, so a JDBC or ODBC tail after the password goes with it.
+    ("jdbc:postgresql://h/db?user=u&password=y9&ssl=true", "y9", "user=u&password=***"),
+    ("Driver={x};UID=u;PWD=topsecret;Server=s", "topsecret", "Driver={x};UID=u;PWD=***"),
     ("password='a b c' host=h", "a b c", "host=h"),
     ('Password = "q w"', "q w", "Password"),
     # The review gate's shapes on the first version, each of which came back unchanged:
@@ -47,6 +48,10 @@ _DUCKDB_PG = ('IO Error: Unable to connect to Postgres at "host=10.0.0.5 user=sv
     ("password= se=cret host=h", "se=cret", "password= *** host=h"),
     ("password= abc123== host=h", "abc123", "password= *** host=h"),
     ("password=\n  secret", "secret", "password=\n  ***"),  # any whitespace, as libpq skips it
+    # Codex's review of #125: libpq ends an unquoted value only at unescaped whitespace.
+    ("password=abc;TOPSECRET host=db", "TOPSECRET", "password=*** host=db"),
+    ("password=a&b host=h", "&b", "password=*** host=h"),
+    ("password=first\\ second host=db", "second", "password=*** host=db"),
     ("password=\r\nsecret host=h", "secret", "password=\r\n*** host=h"),
 ])
 def test_a_credential_in_a_source_error_is_taken_out(text, secret, kept):
@@ -84,14 +89,14 @@ class _Refusing:
 
 def test_a_refused_plan_repairs_against_no_credential():
     refusal = prove(_Refusing(), "SELECT 1")
-    assert "hunter2" not in refusal.repair_text
+    assert "ter2" not in refusal.repair_text  # the tail after `;`, which a `;` stop leaked
     assert "host=10.0.0.5" in refusal.repair_text  # the repair input survives
 
 
 def test_a_failed_execution_repairs_against_no_credential():
     with pytest.raises(ExecutionError) as caught:
         run(_Refusing(), "SELECT 1")
-    assert "hunter2" not in caught.value.repair_text
+    assert "ter2" not in caught.value.repair_text
     assert "connection refused" in caught.value.repair_text
 
 
@@ -108,4 +113,4 @@ def test_the_model_is_never_handed_the_credential():
                adapter=_Refusing(times=1), target="duckdb")
     assert len(generator.calls) == 2, generator.calls
     feedback = generator.calls[1]
-    assert feedback and "hunter2" not in feedback and "host=10.0.0.5" in feedback
+    assert feedback and "ter2" not in feedback and "host=10.0.0.5" in feedback
