@@ -9,9 +9,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from threading import Lock
 
+from mnemiq.adapters.resolve import SourceUnconfigured
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
-from mnemiq.runtime import Runtime, build_runtime
+from mnemiq.duckdb_extensions import ExtensionNotInstalled
+from mnemiq.runtime import Runtime, SnapshotMissing, build_runtime
 from mnemiq.server.serialize import verified_state
 
 
@@ -87,22 +89,40 @@ def _identity_from_settings(settings: Settings | None) -> IdentityContext:
     return identity_from_settings(settings)
 
 
+def _mcp_classes():
+    """The server class and the anticipated-failure exception of whichever `mcp` is installed.
+    mcp 2.x renamed `FastMCP` to `MCPServer` and moved both (M121); the decorator and `run()` this
+    module uses are the same in each, measured by the stdio startup test on mcp 1.28 and 2.3."""
+    try:
+        from mcp.server.mcpserver import MCPServer  # mcp 2.x
+        from mcp.server.mcpserver.exceptions import ToolError
+    except ImportError:
+        from mcp.server.fastmcp import FastMCP as MCPServer  # mcp 1.x
+        from mcp.server.fastmcp.exceptions import ToolError
+    return MCPServer, ToolError
+
+
 def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContext):
     """Register tools without opening the database when given a runtime factory.
 
     Initialize on the first tool call and reuse the runtime. Failed initialization
     remains a tool error and can be retried after the operator completes setup.
     """
-    from mcp.server.fastmcp import FastMCP
-
-    mcp = FastMCP("mnemiq")
+    server_class, tool_error = _mcp_classes()
+    mcp = server_class("mnemiq")
     runtime_lock = Lock()
 
     def get_runtime() -> Runtime:
         nonlocal runtime
         with runtime_lock:
             if callable(runtime):
-                runtime = runtime()
+                # A deployment not set up yet is a failure the operator can act on, and its message
+                # says how. mcp 2.x shows a client only `Error executing tool <name>` for anything
+                # but its `ToolError`, so the instruction is carried as one (M121).
+                try:
+                    runtime = runtime()
+                except (SnapshotMissing, SourceUnconfigured, ExtensionNotInstalled) as exc:
+                    raise tool_error(str(exc)) from exc
             return runtime
 
     @mcp.tool()

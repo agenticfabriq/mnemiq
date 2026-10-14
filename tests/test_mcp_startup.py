@@ -36,7 +36,8 @@ def test_unconfigured_stdio_server_lists_tools_and_survives_tool_errors(tmp_path
                         ("db_write", {"sql": "DELETE FROM orders"}),
                     ]:
                         result = await session.call_tool(name, arguments)
-                        assert result.isError
+                        # `is_error` from mcp 2.x, `isError` before it (M121).
+                        assert getattr(result, "is_error", getattr(result, "isError", None)) is True
                         assert "enrich" in result.content[0].text.lower()
                     await session.send_ping()
 
