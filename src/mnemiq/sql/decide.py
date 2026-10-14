@@ -19,7 +19,7 @@ from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove
 from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.lineage import lineage_for
-from mnemiq.sql.scope import base_tables, scope_resolved
+from mnemiq.sql.scope import base_tables, check_policy_target, scope_resolved
 from mnemiq.sql.rls import apply_row_and_mask, check_filter_targets, unplaceable_policy
 from mnemiq.sql.values_check import check_values
 from mnemiq.sql.views import check_views
@@ -83,6 +83,10 @@ def decide(
                          columns=visible)
     if isinstance(shaped, Refusal):
         return shaped
+    # M150: before any policy is applied, refuse an engine whose CTE binding the rewrite misreads.
+    unsupported = check_policy_target(shaped, policy, target)
+    if unsupported is not None:
+        return unsupported
     row_cap = shaped.meta.get("row_cap")  # read now: the rewrites below build new trees
 
     refusal = check_access(shaped, visible, target)

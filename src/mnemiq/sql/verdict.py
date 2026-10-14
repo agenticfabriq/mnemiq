@@ -59,6 +59,9 @@ class RefusalCode(StrEnum):
     # decision must not be made against a guess: the previous fallback picked the first table in
     # the tree, which for a multi-target DELETE is a SOURCE.
     AMBIGUOUS_WRITE_TARGET = "ambiguous_write_target"
+    # A row or column policy, decided for an engine whose binding of a CTE name the scope rule does
+    # not model (M150). A deployment's configuration, not the statement: never repairable.
+    POLICY_TARGET_UNSUPPORTED = "policy_target_unsupported"
 
 
 # A refusal the model can act on is a repair; a refusal it cannot act on is a dead end.

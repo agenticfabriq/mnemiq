@@ -24,7 +24,9 @@ from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.scope import base_tables, column_tables
 from mnemiq.sql.verdict import Approved, RefusalCode
 
-DIALECT = "postgres"
+# DuckDB: the engine every non-Oracle source executes on, and whose binding of a CTE name the
+# scope rule models. Decided as postgres under a policy, a CTE is refused (M150).
+DIALECT = "duckdb"
 
 VISIBLE = {
     "customer": {"customer_id", "store_id", "first_name", "email"},
