@@ -138,7 +138,8 @@ class Refusal:
     #
     # Bounded claim, deliberately. The approved SQL is model-authored too and ships to the
     # caller as `trace.asked_sql` (the executed `target_sql` stays in the audit trace, M51), so a
-    # model can still launder text through a string literal. Suppressing that would cost the transparency the SQL surface exists for, and
+    # model can still launder text through a string literal. Suppressing that would cost the
+    # transparency the SQL surface exists for, and
     # a partial-containment check is a guard with a false-positive rate nobody has measured.
     source_detail: str | None = None
 
