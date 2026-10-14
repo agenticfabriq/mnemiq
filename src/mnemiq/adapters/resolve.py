@@ -81,10 +81,16 @@ class SourceUnconfigured(RuntimeError):
     """
 
 
-def adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only: bool = True):
+def adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only: bool = True,
+                statement_timeout_s: float | None = None):
     """The adapter for one source, seen through its manifest `tables` list when it has one (M110):
-    every caller -- enrich, refresh, the runtime -- then reads the same catalogue."""
-    adapter = _adapter_for(spec, settings, read_only=read_only)
+    every caller -- enrich, refresh, the runtime -- then reads the same catalogue.
+
+    `statement_timeout_s` bounds every statement on a Postgres source SERVER-side (M152), which
+    is the only bound that stops it: the serving runtime passes its execution timeout, while
+    enrich and refresh pass none, since profiling a large table may rightly run long."""
+    adapter = _adapter_for(spec, settings, read_only=read_only,
+                           statement_timeout_s=statement_timeout_s)
     if spec.tables:
         from mnemiq.adapters.scoped import TableScopedAdapter
 
@@ -92,7 +98,8 @@ def adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only
     return adapter
 
 
-def _adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only: bool = True):
+def _adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_only: bool = True,
+                 statement_timeout_s: float | None = None):
     """The adapter for one source. `settings` is required only for Oracle's credentials.
 
     `read_only` is threaded through to every adapter rather than defaulted per-kind, because a
@@ -154,6 +161,7 @@ def _adapter_for(spec: SourceSpec, settings: Settings | None = None, *, read_onl
         fk_via_postgres=fk_via_postgres,
         read_only=read_only,
         local_only=bool(settings is not None and settings.local_only),
+        statement_timeout_s=statement_timeout_s if spec.kind == "postgres" else None,
     )
 
 

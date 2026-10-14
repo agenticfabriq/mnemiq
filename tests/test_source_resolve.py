@@ -55,6 +55,8 @@ def test_the_default_postgres_source_attaches_exactly_as_before(recorded):
         "attach_target": "postgresql://h/db", "attach_type": "POSTGRES",
         "extension": "postgres", "catalog": "src", "table_schema": "public",
         "fk_via_postgres": True, "read_only": True, "local_only": False,
+        # Unbounded: enrich and refresh call this without a timeout, as before M152.
+        "statement_timeout_s": None,
     }
 
 
@@ -237,7 +239,7 @@ def test_build_runtime_dispatches_on_the_spec_not_on_pg_dsn(monkeypatch, tmp_pat
 
     seen = {}
 
-    def _spy(spec, settings=None, *, read_only=True):
+    def _spy(spec, settings=None, *, read_only=True, statement_timeout_s=None):
         seen.update(id=spec.id, kind=spec.kind, target=spec.target, read_only=read_only)
         raise _Reached
 

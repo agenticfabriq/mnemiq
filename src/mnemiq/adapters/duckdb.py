@@ -63,6 +63,39 @@ def duckdb_reachable_user_functions(con) -> list[str]:
         if f"{db}.{schema}" in entries or schema in entries]
 
 
+def attach_literal(target: str) -> str:
+    """`target` as the SQL string literal ATTACH takes: single quotes doubled. Interpolated bare, a
+    `'` anywhere in a DSN -- a quoted libpq value such as `options='-c x=y'` or a password -- ended
+    the literal and the ATTACH failed to parse (M152)."""
+    return "'" + target.replace("'", "''") + "'"
+
+
+def bounded_dsn(dsn: str, statement_timeout_s: float | None) -> str:
+    """`dsn` with a server-side `statement_timeout` every connection made from it carries (M152).
+
+    DuckDB's interrupt does not bound a Postgres scan: measured, the ROLLBACK it issues waits on
+    the connection still streaming the scan, so the request waited for the server's query to
+    finish while Postgres kept running it. A timeout the SERVER enforces ends the statement, and
+    the client with it. DuckDB's own `pg_statement_timeout_millis` was measured too and never
+    reached the connection a scan runs on.
+
+    Merged by libpq's own parser (psycopg's `conninfo`), so a keyword DSN, a URI and an operator's
+    own `options` all survive. Ours goes FIRST: a `-c statement_timeout` the operator wrote comes
+    later and wins, so an explicit setting is theirs to keep.
+    """
+    if not statement_timeout_s:
+        return dsn
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    try:
+        existing = conninfo_to_dict(dsn).get("options")
+    except Exception:  # noqa: BLE001 -- the parser's message can quote the DSN, credentials and all
+        raise ValueError("the Postgres DSN could not be parsed to add a statement timeout; "
+                         "check its syntax") from None
+    bound = f"-c statement_timeout={int(statement_timeout_s * 1000)}"
+    return make_conninfo(dsn, options=f"{bound} {existing}" if existing else bound)
+
+
 class DuckDBAdapter:
     """DuckDB as the universal executor: ATTACH a source and read it via DuckDB's scanner.
 
@@ -84,6 +117,7 @@ class DuckDBAdapter:
         fk_via_postgres: bool,
         read_only: bool = True,
         local_only: bool = False,
+        statement_timeout_s: float | None = None,
     ) -> None:
         self._catalog = catalog
         self._table_schema = table_schema
@@ -96,16 +130,19 @@ class DuckDBAdapter:
             load_extension(self._con, extension, local_only=local_only)
         # READ_ONLY unless a write is explicitly enabled -- the backstop under the write path.
         clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
-        self._con.execute(f"ATTACH '{attach_target}' AS {catalog} {clause}")
+        if self._attach_type == "POSTGRES":
+            attach_target = bounded_dsn(attach_target, statement_timeout_s)
+        self._con.execute(f"ATTACH {attach_literal(attach_target)} AS {catalog} {clause}")
         self._con.execute(f"USE {catalog}.{table_schema}")
         lock_configuration(self._con, local_only=local_only)
 
     @classmethod
     def postgres(cls, dsn: str, schema: str = "src", read_only: bool = True, *,
-                 local_only: bool = False) -> "DuckDBAdapter":
+                 local_only: bool = False,
+                 statement_timeout_s: float | None = None) -> "DuckDBAdapter":
         return cls(attach_target=dsn, attach_type="POSTGRES", extension="postgres",
                    catalog=schema, table_schema="public", fk_via_postgres=True, read_only=read_only,
-                   local_only=local_only)
+                   local_only=local_only, statement_timeout_s=statement_timeout_s)
 
     @classmethod
     def duckdb(cls, path: str, schema: str = "d", read_only: bool = True, *,

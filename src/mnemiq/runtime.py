@@ -15,6 +15,7 @@ from mnemiq.authz.grants import AuthzProvider, DenyAll, FileAuthzProvider
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.config import DEFAULT_RETRIEVAL_K, Settings
 from mnemiq.contract import HistoryTurn, IdentityContext, Snapshot
+from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import Embedder, LLMEmbedder
 from mnemiq.progress import Emit, Stage, step
@@ -858,7 +859,8 @@ def build_runtime(settings: Settings) -> Runtime:
         from mnemiq.adapters.federated import FederatedAdapter
 
         adapter = FederatedAdapter(specs, read_only=not settings.write_enabled,
-                                   local_only=settings.local_only)
+                                   local_only=settings.local_only,
+                                   statement_timeout_s=DEFAULT_TIMEOUT_S)
     else:
         # Single source: dispatch on the SPEC, not on pg_dsn. This branch used to read
         # `settings.pg_dsn` directly, which meant a one-entry manifest was resolved into a spec
@@ -868,7 +870,10 @@ def build_runtime(settings: Settings) -> Runtime:
         from mnemiq.adapters.resolve import SourceUnconfigured, UnknownSourceKind, adapter_for
 
         try:
-            adapter = adapter_for(specs[0], settings, read_only=not settings.write_enabled)
+            # Bounded server-side at the execution timeout (M152): DuckDB's interrupt alone left
+            # the request waiting on, and the database running, every query it gave up on.
+            adapter = adapter_for(specs[0], settings, read_only=not settings.write_enabled,
+                                  statement_timeout_s=DEFAULT_TIMEOUT_S)
         except (SourceUnconfigured, UnknownSourceKind) as exc:
             # Preserves the established contract: a source the engine cannot connect to raises
             # SnapshotMissing, now with a message that names what is actually missing. The

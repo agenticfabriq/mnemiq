@@ -5,6 +5,8 @@ import threading
 import pyarrow as pa
 
 from mnemiq.adapters.duckdb import (
+    attach_literal,
+    bounded_dsn,
     duckdb_builtin_functions,
     duckdb_reachable_user_functions,
     duckdb_user_functions,
@@ -34,7 +36,8 @@ class FederatedAdapter:
     dialect = "duckdb"
 
     def __init__(
-        self, specs: list[SourceSpec], read_only: bool = True, *, local_only: bool = False
+        self, specs: list[SourceSpec], read_only: bool = True, *, local_only: bool = False,
+        statement_timeout_s: float | None = None,
     ) -> None:
         self.registry: dict[str, str] = {s.catalog: s.schema for s in specs}
         self.catalogs = frozenset(self.registry)
@@ -58,7 +61,10 @@ class FederatedAdapter:
                 load_extension(self._con, ext, local_only=local_only)
                 loaded.add(ext)
             clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
-            self._con.execute(f"ATTACH '{spec.target}' AS {spec.catalog} {clause}")
+            # Each Postgres catalog bounded server-side, as the single-source path is (M152).
+            target = (bounded_dsn(spec.target, statement_timeout_s) if attach_type == "POSTGRES"
+                      else spec.target)
+            self._con.execute(f"ATTACH {attach_literal(target)} AS {spec.catalog} {clause}")
         # No single USE: every query is catalog-qualified (catalog.schema.table).
         lock_configuration(self._con, local_only=local_only)
 
