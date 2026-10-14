@@ -22,8 +22,9 @@ class AccessPolicy:
     # resolving it through that boundary is circular; and the standard shape, an entitlements
     # table, is one no caller is ever granted (M28). Empty means no subquery filter can be
     # validated, and an unvalidatable filter is refused rather than guessed at. Empty also means
-    # the source knows no objects, so under a row filter every view is refused UNRESOLVABLE_VIEW
-    # (M45): a policy built by hand with `row_filters` must carry the schema its views read.
+    # the source knows no objects, so under a row filter a view whose body reads a source object
+    # is refused UNRESOLVABLE_VIEW (M45): a policy built by hand with `row_filters` must carry the
+    # schema its views read.
     policy_schema: dict[str, set[str]] = field(default_factory=dict)
     # The CALLER's tables, the objects it is granted: what a card served to it may name. None means
     # no table scope, for a policy built by hand rather than from a grant set.
