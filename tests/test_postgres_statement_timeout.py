@@ -190,6 +190,20 @@ def test_the_federated_adapter_bounds_each_postgres_catalog_only(monkeypatch):
     assert lite and "statement_timeout" not in lite[0]
 
 
+def test_a_federated_bad_dsn_names_its_source_and_not_its_text(monkeypatch):
+    import mnemiq.adapters.federated as module
+    from mnemiq.adapters.duckdb import UnparseableDSN
+    from mnemiq.config import SourceSpec
+
+    specs = [SourceSpec(id="good", kind="postgres", target="host=h dbname=d", catalog="pg",
+                        schema="public"),
+             SourceSpec(id="broken", kind="postgres", target="host=h password='unterminated",
+                        catalog="pg2", schema="public")]
+    with pytest.raises(UnparseableDSN) as caught:
+        _attaches(monkeypatch, module, lambda: module.FederatedAdapter(specs, statement_timeout_s=30))
+    assert "'broken'" in str(caught.value) and "unterminated" not in str(caught.value)
+
+
 def test_the_servers_cancellation_reaches_the_model_as_a_timeout():
     """The runner turns an interrupt into its timed-out guidance; the server's cancellation
     arrived as a plain source error, "The source rejected this query."."""
