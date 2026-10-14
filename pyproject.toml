@@ -20,7 +20,10 @@ dependencies = [
   "sqlglot>=25.34.1,<30.23",
   "pyarrow>=17",
   "cachetools>=5",
-  "mcp>=1.28,<2",  # 2.x fails stdio startup (M121)
+  # Capped at the newest release the suite has passed on (M121). 2.x renamed FastMCP to MCPServer and,
+  # from 2.1, hides an unexpected tool exception from the client; `mcp/server.py` reads either version and raises
+  # setup failures as the installed ToolError so their instruction still arrives.
+  "mcp>=1.28,<2.4",
 ]
 
 [project.optional-dependencies]
