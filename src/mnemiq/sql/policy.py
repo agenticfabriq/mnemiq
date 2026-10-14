@@ -213,11 +213,14 @@ def unknown_filter_targets(snapshot: Snapshot, row_filters) -> frozenset[str]:
     return frozenset(k for k in row_filters if k not in known and k.lower() not in folded)
 
 
-# The snapshot version each key set was last logged under, so a policy that refuses every ask
-# names its key once per snapshot rather than twice per question (`build_access_policy` runs for
-# retrieval and for the decider), a swap logs it again under the version it now refuses against,
-# and the memory holds one entry per distinct key set however many swaps there are.
-_reported: dict[frozenset[str], str] = {}
+# (snapshot version, key set) pairs already logged, so a policy that refuses every ask names its
+# key once per snapshot rather than twice per question (`build_access_policy` runs for retrieval
+# and for the decider), and a swap logs it again under the version it now refuses against. A set
+# of pairs, not the last version per key set: two snapshots in use at once (a request in flight
+# across a swap) would otherwise flip the memory and log on every call. Cleared past a bound, so
+# a long-lived process swapping often cannot grow it without limit; clearing costs one repeat line.
+_reported: set[tuple[str, frozenset[str]]] = set()
+_REPORTED_BOUND = 64
 
 
 def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
@@ -262,8 +265,10 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     for c in snapshot.columns:
         policy_schema.setdefault(c.object_id, set()).add(c.name)
     unknown = unknown_filter_targets(snapshot, grants.row_filters)
-    if unknown and _reported.get(unknown) != snapshot.version:
-        _reported[unknown] = snapshot.version
+    if unknown and (snapshot.version, unknown) not in _reported:
+        if len(_reported) >= _REPORTED_BOUND:
+            _reported.clear()
+        _reported.add((snapshot.version, unknown))
         logger.warning(
             "row filter keyed %s names no table or view in snapshot %s, so every read for an "
             "identity holding it is refused until the policy names an object the snapshot holds "

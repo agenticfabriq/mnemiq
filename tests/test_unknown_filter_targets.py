@@ -48,9 +48,8 @@ _VISIBLE = {"claim": {"id", "region"}}
 
 @pytest.fixture(autouse=True)
 def _fresh_log_memory(monkeypatch):
-    """The log memory (last version logged per key set), emptied per test so each sees its own
-    first warning."""
-    monkeypatch.setattr(policy_module, "_reported", {})
+    """The log memory, emptied per test so each sees its own first warning."""
+    monkeypatch.setattr(policy_module, "_reported", set())
 
 
 def _read(key: str, snapshot: Snapshot | None = None):
@@ -146,6 +145,21 @@ def test_a_snapshot_swap_logs_the_key_again_under_the_new_version(caplog):
         build_access_policy(swapped, grants)
     versions = [r.getMessage() for r in caplog.records if "'public.claim'" in r.getMessage()]
     assert len(versions) == 2 and "v2" in versions[1], versions
+
+
+def test_two_snapshots_in_use_at_once_log_once_each_and_the_memory_stays_bounded(caplog):
+    """A request in flight across a swap builds against the old version while new ones build
+    against the new: alternating must not log on every call, and many swaps must not grow the
+    memory without limit."""
+    grants = GrantSet(frozenset({"claim"}), row_filters={"public.claim": _FILTER})
+    v1, v2 = _snapshot(), _snapshot().model_copy(update={"version": "v2"})
+    with caplog.at_level(logging.WARNING, logger="mnemiq.sql.policy"):
+        for snapshot in (v1, v2, v1, v2, v1):
+            build_access_policy(snapshot, grants)
+    assert len([r for r in caplog.records if "'public.claim'" in r.getMessage()]) == 2
+    for n in range(3 * policy_module._REPORTED_BOUND):
+        build_access_policy(_snapshot().model_copy(update={"version": f"s{n}"}), grants)
+    assert len(policy_module._reported) <= policy_module._REPORTED_BOUND
 
 
 def test_the_boot_advisory_names_the_key(caplog):
