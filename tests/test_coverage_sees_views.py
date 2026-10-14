@@ -4,7 +4,8 @@ The warning walked child -> parent foreign keys from each granted TABLE. A grant
 foreign keys, so a view over `payment` -- a child of the filtered `customer` -- was a door the
 warning never named: measured, `SELECT sum(amount) FROM payments_v` was approved and read every
 store's payments, while the warning listed nothing. A view whose bases include a filtered table
-is not a hole: the deciders refuse every read of it (UNGOVERNED_VIEW, M27's floor).
+is not a hole: the deciders refuse every read of it (UNGOVERNED_VIEW, M27's floor). Their other
+view refusals are not modelled, so the warning can name a view they refuse -- the safe direction.
 """
 
 from __future__ import annotations
@@ -90,3 +91,36 @@ def test_the_boot_advisory_hands_the_snapshot_views_to_the_warning(caplog):
         _warn_policy_advisories(_Authz(), snapshot)
     assert any("payments_v (reaches filtered customer)" in r.getMessage()
                for r in caplog.records), [r.getMessage() for r in caplog.records]
+
+
+def test_a_same_named_view_in_another_catalog_does_not_hide_the_hole():
+    """Review gate: resolved by the bare segment, `inner_v` in `pg.outer_v`'s body could follow
+    `my.inner_v`, which reads the filtered `my.customer`, and the hole went unnamed."""
+    grants = GrantSet(frozenset({"pg.customer", "pg.outer_v"}),
+                      row_filters={"pg.customer": "store_id = 1", "my.customer": "region = 'w'"})
+    views = {key: ViewDefinition(object_id=key, dialect="duckdb", definition=body)
+             for key, body in {"pg.outer_v": "SELECT amount FROM inner_v",
+                               "pg.inner_v": "SELECT amount FROM payment",
+                               "my.inner_v": "SELECT amount FROM customer"}.items()}
+    rels = [_rel("pg.payment", "pg.customer"), _rel("my.payment", "my.customer")]
+    for order in (views, dict(reversed(list(views.items())))):
+        assert unfiltered_dependents(grants, rels, views=order) == [("pg.outer_v", "pg.customer")]
+
+
+def test_a_schema_qualified_body_reaches_a_table_the_graph_keys_bare():
+    """Neither the name as written nor the view's catalog finds `public.payment`; only the
+    bare-segment fallback does -- in either case, as the deciders read an unquoted name."""
+    grants = GrantSet(frozenset({"customer", "v"}), row_filters=FILTER)
+    for body in ("SELECT amount FROM public.payment", "SELECT amount FROM PUBLIC.PAYMENT"):
+        found = unfiltered_dependents(grants, RELS, views=_views(v=body))
+        assert found == [("v", "customer")], body
+
+
+def test_a_bare_body_name_reaches_a_table_the_graph_keys_by_schema():
+    """The other direction: a body on a search path says `payment` where the graph keys
+    `sales.payment`, and the view's own key carries no catalog to qualify it with."""
+    grants = GrantSet(frozenset({"sales.customer", "v"}),
+                      row_filters={"sales.customer": "store_id = 1"})
+    found = unfiltered_dependents(grants, [_rel("sales.payment", "sales.customer")],
+                                  views=_views(v="SELECT amount FROM payment"))
+    assert found == [("v", "sales.customer")]
