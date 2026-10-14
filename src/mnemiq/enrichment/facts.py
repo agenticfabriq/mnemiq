@@ -65,15 +65,15 @@ def _named(text: str, vocab: dict[str, set[str]]) -> set[str]:
     Not by splitting the text into identifier tokens, which read `secret code` as two words and
     matched neither -- a quoted identifier with a space, or with punctuation such as
     `Enrollment (K-12)`, was never found, and the fact went out with an empty list to every
-    identity (Codex's review of #130). A name counts where no word character touches either end,
-    so `id` is not found in `idle`; a dot before it does not stop it, so a qualified mention still
+    identity (Codex's review of #130). A name counts where no letter or underscore precedes it and
+    no letter, digit, underscore or `$` follows it, so `id` is not found in `idle`; a dot before it does not stop it, so a qualified mention still
     names the bare column. Over-matching only withholds more. The boundaries are ASCII, as the old
-    tokenizer's were -- a digit before a name or a non-ASCII letter after it does not hide it
-    (`2ssn`, `ssné`) -- and whitespace is folded on both sides, as `_clean_text` folds the fact.
+    tokenizer's were, which could start a name after a digit or a `$` -- so `2ssn`, `$ssn` and
+    `ssné` all name `ssn` -- and whitespace is folded on both sides, as `_clean_text` folds the fact.
     """
     low = _fold(text)
     return {dep for name, deps in vocab.items()
-            if name and re.search(r"(?<![A-Za-z_$])" + re.escape(name) + r"(?![A-Za-z0-9_$])", low)
+            if name and re.search(r"(?<![A-Za-z_])" + re.escape(name) + r"(?![A-Za-z0-9_$])", low)
             for dep in deps}
 
 

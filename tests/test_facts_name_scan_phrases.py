@@ -71,7 +71,7 @@ def test_the_old_tokenizers_reach_is_kept():
     """Review gate: Unicode word boundaries counted a digit before a name, or an accented letter
     after it, as part of the word, and missed what the old ASCII tokenizer found."""
     vocab_columns = {"ssn"}
-    for text in ("2ssn values are padded", "ssn\u00e9 is masked"):
+    for text in ("2ssn values are padded", "$ssn is a bind name", "ssn\u00e9 is masked"):
         tf = parse_facts(json.dumps({"gotchas": [{"text": text, "reads": []}]}), "orders",
                          vocab_columns, set(), related_tables={})
         assert tf.reads[text] == ["orders.ssn"], text
