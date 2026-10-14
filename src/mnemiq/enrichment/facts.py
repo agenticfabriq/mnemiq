@@ -28,7 +28,11 @@ def _expr_columns_ok(expr: str, allowed: set[str]) -> bool:
     return all(c.name in allowed for c in tree.find_all(exp.Column))
 
 
-_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*")
+
+
+def _fold(name: str) -> str:
+    """A name or a fact's text as both sides are compared: case folded, whitespace runs to one."""
+    return " ".join(name.split()).lower()
 
 
 def _vocabulary(table: str, columns: set[str],
@@ -40,7 +44,7 @@ def _vocabulary(table: str, columns: set[str],
     vocab: dict[str, set[str]] = {}
 
     def add(name: str, dep: str) -> None:
-        vocab.setdefault(name.lower(), set()).add(dep)
+        vocab.setdefault(_fold(name), set()).add(dep)
 
     for column in columns:
         add(column, f"{table}.{column}")
@@ -56,15 +60,21 @@ def _vocabulary(table: str, columns: set[str],
 
 
 def _named(text: str, vocab: dict[str, set[str]]) -> set[str]:
-    """Every dependency the text names, by any dotted suffix of any identifier-like token."""
-    found: set[str] = set()
-    for token in _NAME.findall(text):
-        parts = token.lower().split(".")
-        for i in range(len(parts)):
-            found |= vocab.get(".".join(parts[i:]), set())
-        for part in parts:
-            found |= vocab.get(part, set())
-    return found
+    """Every dependency the text names: each known name matched WHOLE, case folded.
+
+    Not by splitting the text into identifier tokens, which read `secret code` as two words and
+    matched neither -- a quoted identifier with a space, or with punctuation such as
+    `Enrollment (K-12)`, was never found, and the fact went out with an empty list to every
+    identity (Codex's review of #130). A name counts where no letter or underscore precedes it and
+    no letter, digit, underscore or `$` follows it, so `id` is not found in `idle`; a dot before it does not stop it, so a qualified mention still
+    names the bare column. Over-matching only withholds more. The boundaries are ASCII, as the old
+    tokenizer's were, which could start a name after a digit or a `$` -- so `2ssn`, `$ssn` and
+    `ssné` all name `ssn` -- and whitespace is folded on both sides, as `_clean_text` folds the fact.
+    """
+    low = _fold(text)
+    return {dep for name, deps in vocab.items()
+            if name and re.search(r"(?<![A-Za-z_])" + re.escape(name) + r"(?![A-Za-z0-9_$])", low)
+            for dep in deps}
 
 
 def _declared(names, vocab: dict[str, set[str]]) -> set[str] | None:
@@ -74,7 +84,7 @@ def _declared(names, vocab: dict[str, set[str]]) -> set[str] | None:
         return None
     out: set[str] = set()
     for name in names:
-        deps = vocab.get(name.strip().lower())
+        deps = vocab.get(_fold(name))
         if not deps:
             return None
         out |= deps
