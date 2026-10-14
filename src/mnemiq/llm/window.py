@@ -194,7 +194,8 @@ def largest_prompts(con, snapshot, settings, dialect: str,
     shown = grants
 
     def packet_for(cards: list) -> ContextPacket:
-        _attach_facts(cards, snapshot.table_facts, settings.card_style)
+        _attach_facts(cards, snapshot.table_facts, settings.card_style, grants=shown,
+                      columns=snapshot.columns)
         ids = [c.object_id for c in cards]
         return ContextPacket(
             question="", cards=cards, grant_fingerprint="", enrichment_version=None,

@@ -24,7 +24,7 @@ from functools import lru_cache
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Dimension, Metric
-from mnemiq.semantic.expr_columns import columns_read
+from mnemiq.semantic.expr_columns import columns_read, expression_scope
 
 
 def select_metrics(
@@ -47,6 +47,13 @@ def select_metrics(
         if metric.measure.source in in_context and grants.allows(metric.measure.source)
         and _reads_raw(metric.measure.expr, metric.measure.source, by_key, grants)
     ]
+
+
+def expression_reads_raw(expr: str, source: str, columns: Sequence[Column],
+                         grants: GrantSet) -> bool:
+    """Does `expr` over `source` read only columns this identity reads raw -- the metric and
+    dimension rule, for other selectors that hold an expression (the facts block's measures)."""
+    return _reads_raw(expr, source, _by_key(columns), grants)
 
 
 def read_raw(column: Column, grants: GrantSet) -> bool:
@@ -96,16 +103,31 @@ def _reads_raw(expr: str, source: str, by_key: dict, grants: GrantSet) -> bool:
     over it carry (M135), so `region` (pii) and `region_health` (phi) over one column each need
     both -- and a plain dimension over a personal column needs that column's. Offering one the
     identity cannot read invites a grouping the decider refuses. Read with `columns_read`, the
-    parser that stamped the levels, and keyed as `apply_certified` keys them. A reference naming
-    no column here decides nothing: the dimension's own level still does.
+    parser that stamped the levels, and keyed as `apply_certified` keys them. In an expression
+    that parses and reads only its source, a reference naming no column here decides nothing: the
+    dimension's own level still does. One that reads another relation, or parses nowhere and
+    names nothing, is withheld from every identity, since what it reads cannot be established
+    (Codex's review of #121).
     """
     table = source.lower()
-    for ref in _columns_read(expr, source):
-        for name in ref:
-            for column in by_key.get((table, name), ()):
-                if not read_raw(column, grants):
-                    return False
+    scope = _expression_scope(expr, source)
+    if scope == "foreign":
+        return False  # reads a relation `columns_read` cannot report on (Codex's review of #121)
+    refs = _columns_read(expr, source)
+    if scope == "unparsed" and not refs:
+        return False  # parses nowhere and its spelling names nothing of the source: unchecked
+    for ref in refs:
+        known = [column for name in ref for column in by_key.get((table, name), ())]
+        if scope == "unparsed" and not known:
+            return False  # a spelling that names no column: malformed, so unchecked, so withheld
+        if not all(read_raw(column, grants) for column in known):
+            return False
     return True
+
+
+@lru_cache(maxsize=1024)
+def _expression_scope(expr: str, source: str) -> str:
+    return expression_scope(expr, source)
 
 
 @lru_cache(maxsize=1024)

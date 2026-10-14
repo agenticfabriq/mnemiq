@@ -84,3 +84,31 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
     qualifier, _, name = expr.strip().rpartition(".")
     qualifier = ".".join(part.strip(_QUOTES) for part in qualifier.split(".")) if qualifier else ""
     return {frozenset({name.lower()})} if name and _names_table(qualifier, source) else set()
+
+
+def expression_scope(expr: str, source: str) -> str:
+    """Whether `columns_read` can answer for `expr` over `source`: `"own"`, `"foreign"` or
+    `"unparsed"` (M144, Codex's review of #121).
+
+    `columns_read` names the columns of SOURCE an expression reads, so an expression that reads
+    anything else -- a subquery, or a column another table qualifies -- reads columns it never
+    reports, and a check built on it passed `(SELECT count(p.secret_code) FROM patients p)` over
+    `orders`. That is `"foreign"`. `"unparsed"` is an expression no dialect parses, for which
+    `columns_read` falls back to its spelling; the caller decides whether that spelling names a
+    real column (a keyword-named one does) or nothing (a malformed expression does).
+    """
+    for dialect in _EXPR_DIALECTS:
+        try:
+            node = sqlglot.parse_one(expr, read=dialect)
+        except sqlglot.errors.SqlglotError:
+            continue
+        if node is None:
+            continue
+        if node.find(exp.Query) is not None:
+            return "foreign"
+        for column in node.find_all(exp.Column):
+            qualifier = ".".join(p for p in (column.catalog, column.db, column.table) if p)
+            if qualifier and not _names_table(qualifier, source):
+                return "foreign"
+        return "own"
+    return "unparsed"
