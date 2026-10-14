@@ -527,6 +527,8 @@ _RETRIED = {
     RefusalCode.UNAUTHORIZED_WRITE: DeferralReason.UNGOVERNABLE,
     RefusalCode.WRITES_DISABLED: DeferralReason.UNGOVERNABLE,
     RefusalCode.AMBIGUOUS_WRITE_TARGET: DeferralReason.UNGOVERNABLE,
+    # M150: the deployment decides a governed CTE for an engine the scope rule does not model.
+    RefusalCode.POLICY_TARGET_UNSUPPORTED: DeferralReason.UNGOVERNABLE,
     RefusalCode.UNSCOPED_CTE: DeferralReason.UNGOVERNABLE,
 }
 

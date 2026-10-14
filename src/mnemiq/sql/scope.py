@@ -288,6 +288,42 @@ def _missed_reads(ast: exp.Expression, walked: list[exp.Table], dialect: str | N
             and not _cte_in_scope(table, dialect)]
 
 
+# The engines a row or column policy may be decided for (M150). `_cte_in_scope` models DuckDB's
+# binding of a name in a WITH: earlier siblings in scope, the CTE itself only under RECURSIVE, a
+# later sibling never. Postgres binds a later sibling under RECURSIVE and SQLite always, so there
+# the policy rewrite would wrap a CTE's output as if it were the table -- measured on Postgres 16,
+# `[40]` for `[1, 40]`. Oracle is on the list by measurement, not by modelling: it refuses a
+# forward reference (ORA-32031) and rejects a rewritten self-reference (ORA-32042), so a mismatch
+# there errors rather than answers (mnemiq-internal, 2026-10-14-m150-oracle-forward-cte-binding).
+POLICY_TARGETS = frozenset({"duckdb", "oracle"})
+
+
+def check_policy_target(ast: exp.Expression, policy, target: str | None):
+    """Refuse a statement that names a CTE, under a row or column policy, decided for an engine
+    outside POLICY_TARGETS. Production always decides as the adapter's own dialect -- duckdb, or
+    oracle for an Oracle source -- so this is the precondition made a check: a deployment that ever
+    executes model SQL elsewhere under a policy is refused, never answered wrong.
+
+    Only a statement with a WITH: the engines differ in how they bind a CTE's NAME, so a statement
+    naming no CTE binds the same everywhere, and refusing it would refuse every governed read on
+    such a target for a mismatch it cannot have."""
+    from mnemiq.sql.verdict import Refusal, RefusalCode
+
+    if policy is None or policy.empty or (target or "").lower() in POLICY_TARGETS:
+        return None
+    if ast.find(exp.CTE) is None:
+        return None
+    return Refusal(
+        code=RefusalCode.POLICY_TARGET_UNSUPPORTED,
+        message=(
+            f"This engine applies row and column policies to a statement with a WITH clause only "
+            f"when it executes as one of {', '.join(sorted(POLICY_TARGETS))}, and this source is "
+            f"decided as {target!r}. This is a deployment setting, not a limit on your grants."
+        ),
+        subject=None,
+    )
+
+
 def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
     """Is a CTE of this table's name in scope where the table is read?
 
