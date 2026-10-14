@@ -147,8 +147,11 @@ def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5, *,
 def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
     """Does an example's SQL read no column in `not_raw`? Asked of `check_cls`, the decider's own
     column resolution, so an alias, a CTE or an unqualified name resolves as it would on a real
-    query. An example is stored as an approved plan in the decider's dialect, `duckdb` or
-    `oracle`; one neither reads is not shown, since what it reads cannot be checked."""
+    query. Enrichment stores an example as an approved plan in the deciding dialect -- `duckdb`
+    for every production source but Oracle, which is `oracle` -- while feedback capture stores the
+    SQL an operator wrote, in any spelling. One neither parser reads is withheld, since what it
+    reads cannot be checked, and logged, since an operator would otherwise see only examples
+    missing from the prompts of identities with something withheld."""
     if not not_raw:
         return True
     import sqlglot
@@ -162,6 +165,8 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
         except Exception:  # noqa: BLE001 -- try the other dialect; neither means not shown
             continue
         return check_cls(ast, AccessPolicy(denied=set(not_raw)), dialect) is None
+    logger.info("an example was withheld from an identity with columns withheld: its SQL parses as "
+                "neither duckdb nor oracle, so the columns it reads cannot be checked: %.80s", sql)
     return False
 
 
