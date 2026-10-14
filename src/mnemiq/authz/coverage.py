@@ -103,6 +103,31 @@ def warn_unknown_pii_levels(grants: GrantSet, role: str = "") -> None:
     )
 
 
+def warn_unknown_filter_targets(grants: GrantSet, snapshot, role: str = "") -> None:
+    """Log, at boot and on a snapshot swap, a row-filter key that names no object (M50).
+
+    Unlike the other advisories here this one describes a REFUSAL, not a hole: the deciders refuse
+    every read for an identity holding such a key (`sql.rls.check_filter_targets`). It is logged
+    here too because a refusal that only shows up when someone asks is found by a user, not by
+    the operator who can fix it.
+    """
+    from mnemiq.sql.policy import unknown_filter_targets
+
+    try:
+        unknown = unknown_filter_targets(snapshot, grants.row_filters)
+    except Exception:  # noqa: BLE001 -- an advisory check must never stop a boot
+        logger.debug("row-filter target check failed", exc_info=True)
+        return
+    if not unknown:
+        return
+    who = f" for role '{role}'" if role else ""
+    logger.warning(
+        "row-filter targets%s: %s name no table or view in the snapshot, so every read for this "
+        "role is refused until the policy names an object the snapshot holds",
+        who, ", ".join(repr(k) for k in sorted(unknown)),
+    )
+
+
 def warn_unfiltered_dependents(grants: GrantSet, relationships, role: str = "") -> None:
     """Log the holes, fail-soft. A warning, never a refusal -- the policy is the operator's."""
     try:

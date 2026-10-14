@@ -126,6 +126,17 @@ def plan_query(
                     "connectivity fault, not a limit on your access."),
             code=DeferralReason.POLICY_UNAVAILABLE,
         )
+    if policy.unknown_filter_targets:
+        # M50. Knowable before the first `generator.propose`, and every proposal would be refused
+        # identically by the decider, so no model call is spent on it -- the same shape as the
+        # fast path above, and after it, so a view inventory that failed keeps its own reason. UNGOVERNABLE, as INVALID_ROW_FILTER maps: the policy was read, and a
+        # filter in it cannot be placed.
+        return Deferred(
+            reason=("Your access policy has a row filter that names no table this deployment "
+                    "knows, so no answer can be governed for you. This is a configuration fault "
+                    "for the operator, not a limit on your account."),
+            code=DeferralReason.UNGOVERNABLE,
+        )
     if not packet.cards or not visible:
         if not grants.available:
             # The policy could not be READ. Denying everything is correct; saying "your access"

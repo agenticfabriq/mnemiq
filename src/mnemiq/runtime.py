@@ -344,7 +344,11 @@ def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> 
     against the boot snapshot forever. See the cost note at the reload site: this is
     boot-shaped work and the swap puts it on a user request.
     """
-    from mnemiq.authz.coverage import warn_unfiltered_dependents, warn_unknown_pii_levels
+    from mnemiq.authz.coverage import (
+        warn_unfiltered_dependents,
+        warn_unknown_filter_targets,
+        warn_unknown_pii_levels,
+    )
     from mnemiq.contract import IdentityContext
 
     roles = getattr(authz, "policy_roles", None)
@@ -359,6 +363,7 @@ def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> 
         warn_unknown_pii_levels(grants, role=role)
         if snapshot is not None:
             warn_unfiltered_dependents(grants, snapshot.relationships, role=role)
+            warn_unknown_filter_targets(grants, snapshot, role=role)
 
 
 def _acknowledged(settings: Settings) -> frozenset[str]:

@@ -173,6 +173,24 @@ def _record(into: list[Narrowing], one: Narrowing) -> None:
     into.append(one)
 
 
+def check_filter_targets(policy: AccessPolicy) -> Refusal | None:
+    """Refuse everything while a row filter names no object the snapshot holds (M50).
+
+    Every read, not only reads of a table the key might have meant: which table a misspelled key
+    meant is the one thing this cannot know. The caller is not told the key -- it names a table
+    the policy governs, which the caller may not be granted -- only that the operator must act;
+    `build_access_policy` logs the key for them.
+    """
+    if not policy.unknown_filter_targets:
+        return None
+    return Refusal(
+        code=RefusalCode.INVALID_ROW_FILTER,
+        message=("This identity's access policy has a row filter that names no table this "
+                 "deployment knows, so no query can be governed for it. The operator must "
+                 "correct the policy; the server log names the filter."),
+    )
+
+
 def unplaceable_policy(ast: exp.Expression, policy: AccessPolicy, dialect: str | None) -> Refusal | None:
     """Refuse to rewrite a statement whose read list fell back when a CTE in it is named after a
     table the policy governs (Codex's review of #111).
