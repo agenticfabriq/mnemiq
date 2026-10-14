@@ -137,8 +137,9 @@ class Refusal:
     # the model hand it back.
     #
     # Bounded claim, deliberately. The approved SQL is model-authored too and ships to the
-    # caller as `trace.target_sql`, so a model can still launder text through a string
-    # literal. Suppressing that would cost the transparency the SQL surface exists for, and
+    # caller as `trace.asked_sql` (the executed `target_sql` stays in the audit trace, M51), so a
+    # model can still launder text through a string literal. Suppressing that would cost the
+    # transparency the SQL surface exists for, and
     # a partial-containment check is a guard with a false-positive rate nobody has measured.
     source_detail: str | None = None
 
@@ -185,6 +186,13 @@ class Approved:
     # `Approved` is constructed outside any decider (`eval/verify_replay.py`), and there the
     # honest value is None.
     narrowed: list | None = None
+    # M51: the statement as asked -- shaped and row-capped, in the target's dialect -- before any
+    # row or column policy rewrote it. What a CALLER is shown: the executed `target_sql` carries
+    # the policy's own predicate, which under an entitlements filter names a table and literals
+    # the caller is never granted. Equal to `target_sql` when the policy changed nothing, which
+    # is when `narrowed` is empty. None where no decider set it, so a caller is shown nothing
+    # rather than the executed statement by default.
+    asked_sql: str | None = None
 
 
 @dataclass
@@ -197,6 +205,8 @@ class ApprovedWrite:
     # only place a governed UPDATE/DELETE's own filtering can be reported from. `None` vs `[]`
     # carries the same distinction as on `Approved`.
     narrowed: list | None = None
+    # M51, as on `Approved`: the write as asked, before the row-filter rewrite.
+    asked_sql: str | None = None
 
 
 Verdict = Approved | Refusal

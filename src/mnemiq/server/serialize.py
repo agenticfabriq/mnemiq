@@ -76,7 +76,10 @@ def answer_payload(ans: AgentAnswer) -> dict:
         # indistinguishable on a question that succeeds first time -- which is most of them.
         "attempts": ans.attempts,
         "corrected": ans.corrected,
-        "sql": t.target_sql if t else None,
+        # M51: the statement as asked. The executed one carries a row policy's own predicate --
+        # under an entitlements filter, a table and literals this caller is never granted -- and
+        # stays in the audit trace. `narrowed`, below, says whether the policy changed anything.
+        "sql": t.asked_sql if t else None,
         "tables_used": list(t.tables_used) if t else None,
         # M56: the list never ships without the marker. A bare `tables_used` is the misleading
         # artifact this engine now refuses to produce -- `[]` reads as "nothing was read" where

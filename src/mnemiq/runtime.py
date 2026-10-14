@@ -49,6 +49,8 @@ class WriteResult:
     refusal: str | None = None
     plan_sql: str | None = None
     target_sql: str | None = None
+    # M51: the write as asked, before the row-filter rewrite -- what a caller is shown.
+    asked_sql: str | None = None
     # What the access decision narrowed. `None` is "not evaluated", `[]` is "narrowed nothing".
     #
     # `rows_affected` is the reason this cannot be optional. A governed DELETE narrowed from 47
@@ -317,12 +319,13 @@ class Runtime:
             logger.warning("the source refused a write; it said: %s", exc)
             return WriteResult(approved=False, refusal="the source rejected the write",
                                target=verdict.target, plan_sql=verdict.plan_sql,
-                               target_sql=verdict.target_sql,
+                               target_sql=verdict.target_sql, asked_sql=verdict.asked_sql,
                                narrowed=getattr(verdict, "narrowed", None))
         rows = (result[0][0] if result and len(result[0]) == 1
                 and isinstance(result[0][0], int) else None)
         return WriteResult(approved=True, target=verdict.target, rows_affected=rows,
                            plan_sql=verdict.plan_sql, target_sql=verdict.target_sql,
+                           asked_sql=verdict.asked_sql,
                            narrowed=getattr(verdict, "narrowed", None))
 
 

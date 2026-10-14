@@ -43,7 +43,9 @@ def _db_read(
         # reached; hand-building a second dict here is how this surface would silently diverge,
         # which is the failure M56's marker comment warns about one field down.
         "verified": verified_state(ans.verify_layer),
-        "sql": trace.target_sql if trace else None,  # a deferral never carries a fabricated query
+        # A deferral never carries a fabricated query. The statement as asked, not as executed
+        # (M51): the executed one carries the row policy's own predicate.
+        "sql": trace.asked_sql if trace else None,
         "preview": (
             {"columns": ans.preview.columns, "rows": ans.preview.rows,
              "row_count": ans.preview.row_count, "truncated": ans.preview.truncated}
@@ -79,7 +81,7 @@ def _db_write(runtime: Runtime, identity: IdentityContext, sql: str) -> dict:
         "target": res.target,
         "rows_affected": res.rows_affected,
         "refusal": res.refusal,
-        "sql": res.target_sql,
+        "sql": res.asked_sql,  # M51: as asked; the executed write carries the row policy
         # Beside `rows_affected`, which is exactly where an agent needs it: 3 of 47 deleted reads
         # as success without this. `null` means the decision was not evaluated.
         "narrowed": ([{"object": n.object, "rows": n.rows, "columns": n.columns}

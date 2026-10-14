@@ -26,6 +26,16 @@ from mnemiq.sql.views import check_views
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
 
 
+def _render_target(tree: exp.Expression, plan_sql: str, dialect: str, target: str) -> str:
+    """`plan_sql` in the target's dialect, through the row-cap fallback where sqlglot needs it.
+    One path for the executed statement and the one a caller is shown (M51), so the two agree
+    whenever the policy changed nothing."""
+    try:
+        return sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
+    except sqlglot.errors.ParseError:
+        return _transpile_under_the_cap(tree, dialect, target)
+
+
 def _transpile_under_the_cap(shaped: exp.Expression, dialect: str, target: str) -> str:
     """The plan's round trip to the target with the row cap taken off, and the cap put back after.
 
@@ -187,6 +197,8 @@ def decide(
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 
     narrowed: list = []
+    # M51: the statement as asked, kept before any policy rewrite -- what a caller is shown.
+    asked = shaped.copy()
     unplaceable = unplaceable_policy(shaped, policy, target)
     if unplaceable is not None:
         return unplaceable
@@ -198,12 +210,13 @@ def decide(
 
     # Federation: 'catalog.table' -> 'catalog.schema.table' so DuckDB resolves it. No-op single-source.
     expand_tables(shaped, registry or {})
+    expand_tables(asked, registry or {})
 
     plan_sql = shaped.sql(dialect=dialect)
-    try:
-        target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
-    except sqlglot.errors.ParseError:
-        target_sql = _transpile_under_the_cap(shaped, dialect, target)
+    target_sql = _render_target(shaped, plan_sql, dialect, target)
+    asked_plan = asked.sql(dialect=dialect)
+    asked_sql = (target_sql if asked_plan == plan_sql
+                 else _render_target(asked, asked_plan, dialect, target))
 
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof
@@ -213,4 +226,5 @@ def decide(
             return refused
 
     return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables,
-                    lineage=lineage, columns=columns, narrowed=narrowed, row_cap=row_cap)
+                    lineage=lineage, columns=columns, narrowed=narrowed, row_cap=row_cap,
+                    asked_sql=asked_sql)

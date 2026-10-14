@@ -425,6 +425,7 @@ def decide_write(
     unplaceable = unplaceable_policy(shaped, policy, target)
     if unplaceable is not None:
         return unplaceable
+    asked = shaped.copy()  # M51: the write as asked, before the row-filter rewrite
     governed, narrowed = apply_row_filters_to_write(
         shaped, policy, visible, _target_node(shaped), dialect, executes_as=target)
     if isinstance(governed, Refusal):
@@ -433,6 +434,9 @@ def decide_write(
 
     plan_sql = shaped.sql(dialect=dialect)
     target_sql = sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
+    asked_plan = asked.sql(dialect=dialect)
+    asked_sql = (target_sql if asked_plan == plan_sql
+                 else sqlglot.transpile(asked_plan, read=dialect, write=target)[0])
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof
         # the source understands -- `EXPLAIN` is not Oracle syntax (see mnemiq.sql.prove).
@@ -441,4 +445,4 @@ def decide_write(
             return refused
 
     return ApprovedWrite(plan_sql=plan_sql, target_sql=target_sql, target=tgt, tables=tables,
-                         narrowed=narrowed)
+                         narrowed=narrowed, asked_sql=asked_sql)
