@@ -7,6 +7,7 @@ from sqlglot import exp
 
 from mnemiq.contract import ViewDefinition
 from mnemiq.sql.qualify import object_key
+from mnemiq.sql.scope import cte_references
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 # A view nested deeper than this is either a cycle the stack missed or a schema nobody should
@@ -384,20 +385,25 @@ def _walk(
         # boundary -- and it closes every unknown-object spelling at once rather than the file
         # literal specifically.
         if known is not None:
-            # A CTE alias is a name the BODY defines; the source is not expected to know it.
-            # Counting it as an unknown object refused every ordinary CTE view -- five of eight
-            # new refusals in the review's matrix were legitimate SQL. This weakens nothing:
-            # `_mentions` still collects the alias, so a CTE named after a filtered table still
-            # trips the filtered check below.
-            local = {cte.alias_or_name for cte in body.find_all(exp.CTE)}
-            recognised = spellings(known) | spellings(set(views)) | spellings(local)
+            # A reference a CTE BINDS is a name the body defines; the source is not expected to
+            # know it. Counting one as an unknown object refused every ordinary CTE view -- five
+            # of eight new refusals in the review's matrix were legitimate SQL. Exempt by SCOPE,
+            # not by name: pooling every alias in the body and matching it by bare name let
+            # `WITH secret AS (...) SELECT ... FROM main.secret` read a real table the snapshot
+            # does not know, and a `secret` read outside the CTE's scope too, with any inventory
+            # (Codex's review of #132). `cte_references` is the deciders' own binding -- DuckDB's,
+            # the narrowest of the engines measured, so it never exempts a read an engine makes
+            # of the table -- and never excuses a qualified name. `_mentions` still collects
+            # every alias, so a CTE named after a filtered table still trips the filtered check.
+            bound = {id(t) for t in cte_references(body, view.dialect)}
+            recognised = spellings(known) | spellings(set(views))
             # BOTH sides normalised. Widening only the known set still rejected `public.film`
             # against a snapshot that keys it `film`: a name is known when ANY of its spellings
             # matches any recognised one, not when its exact text appears.
             unknown = sorted(
                 object_key(x)
                 for x in body.find_all(exp.Table)
-                if not (spellings({object_key(x)}) & recognised)
+                if id(x) not in bound and not (spellings({object_key(x)}) & recognised)
             )
             if unknown:
                 return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
