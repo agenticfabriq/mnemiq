@@ -81,7 +81,8 @@ class UnparseableDSN(ValueError):
 
 
 def bounded_dsn(dsn: str, statement_timeout_s: float | None,
-                client_settings: list[tuple[str, str]] | None = None) -> str:
+                client_settings: list[tuple[str, str]] | None = None,
+                role: str | None = None) -> str:
     """`dsn` with a server-side `statement_timeout` every connection made from it carries (M152).
 
     DuckDB's interrupt does not bound a Postgres scan: measured, the ROLLBACK it issues waits on
@@ -92,13 +93,14 @@ def bounded_dsn(dsn: str, statement_timeout_s: float | None,
 
     The bound becomes the connection's `options`, which REPLACES whatever options libpq would
     otherwise apply -- from the DSN, a connection service, or PGOPTIONS. So those are carried
-    behind it. `client_settings` is the server's own account of what the connection's startup
-    applied (`pg_settings` where `source = 'client'`), read by `attach_postgres` after a first
-    connection: exact wherever libpq found them, a service file in libpq's compiled-in directory
-    or named by `servicefile=` included (Codex's review of #134 found a service's search_path
-    dropped). Without it, a DSN's own options or PGOPTIONS are carried as libpq ranks them, and a
-    DSN that names a service is left unbounded, with a warning, since its options cannot be
-    known from here. Ours goes FIRST: a `-c statement_timeout` the operator wrote comes later and
+    behind it. Where they are known exactly -- the DSN's own `options`, else PGOPTIONS with no
+    service named -- they are carried verbatim. A connection SERVICE supplies its options from a
+    file this engine cannot reliably find (libpq's compiled-in directory, for one), so for a service
+    `client_settings` is used: the server's account of what the startup applied (`pg_settings`
+    where `source = 'client'`, read by `attach_postgres`), plus `role`, which `pg_settings` hides
+    (Codex's review of #134 found a service's search_path dropped; the gate, a role). Without that
+    account a service DSN is left unbounded, with a warning. A `servicefile=` DSN, which psycopg's
+    parser rejects outright, is always left unbounded, with a warning. Ours goes FIRST: a `-c statement_timeout` the operator wrote comes later and
     wins, so an explicit setting is theirs to keep. A DBA's per-role limit is the other case:
     startup options override it, so `attach_postgres` applies this only where the source's own
     limit is looser.
@@ -116,21 +118,29 @@ def bounded_dsn(dsn: str, statement_timeout_s: float | None,
         return dsn
     parsed = _parsed(dsn)
     bound = f"-c statement_timeout={int(statement_timeout_s * 1000)}"
-    if client_settings is not None:
-        carried = [f"-c {name}={_option_value(value)}" for name, value in client_settings]
-        return make_conninfo(dsn, options=" ".join([bound, *carried]))
-    service = parsed.get("service") or parsed.get("servicefile") or os.environ.get("PGSERVICE")
-    if service and "options" not in parsed:
+    service = parsed.get("service") or os.environ.get("PGSERVICE")
+    if "options" in parsed or not service:
+        # Known exactly, so carried VERBATIM: the DSN's own options, else PGOPTIONS, which libpq
+        # reads only when there is no service to supply them.
+        existing = parsed.get("options") or os.environ.get("PGOPTIONS")
+        return make_conninfo(dsn, options=f"{bound} {existing}" if existing else bound)
+    if client_settings is None:
         logger.warning(
             "the Postgres connection names a service (%r) whose settings the server could not "
             "report, so no server-side statement timeout is added: it would replace the service's "
             "options. Put `-c statement_timeout=...` in them instead.", service)
         return dsn
-    existing = parsed.get("options") or os.environ.get("PGOPTIONS")
-    return make_conninfo(dsn, options=f"{bound} {existing}" if existing else bound)
+    # A service's options, known only by the server's account of them. `pg_settings` hides `role`
+    # (GUC_NO_SHOW_ALL), so it is carried from `current_setting` -- measured: with `-c
+    # role=reporting` dropped, the bounded connection ran as the LOGIN role. `session_authorization`
+    # needs nothing: a startup option cannot change it (measured, even for a superuser).
+    carried = [f"-c {name}={_option_value(value)}" for name, value in client_settings]
+    if role:
+        carried.append(f"-c role={_option_value(role)}")
+    return make_conninfo(dsn, options=" ".join([bound, *carried]))
 
 
-_SERVICEFILE = re.compile(r"(?:^|\s)servicefile\s*=", re.IGNORECASE)
+_SERVICEFILE = re.compile(r"(?:^|[\s?&])servicefile\s*=", re.IGNORECASE)  # keyword or URI form
 
 
 def _parsed(dsn: str) -> dict:
@@ -144,8 +154,9 @@ def _parsed(dsn: str) -> dict:
 
 
 def _option_value(value: str) -> str:
-    """A setting's value as libpq's `options` takes it: a backslash and a space each escaped."""
-    return value.replace("\\", "\\\\").replace(" ", "\\ ")
+    """A setting's value as the server splits `options`: every backslash and whitespace character
+    escaped with a backslash, since any whitespace separates arguments there."""
+    return re.sub(r"([\\\s])", r"\\\1", value)
 
 
 def attach_postgres(con, target: str, catalog: str, clause: str,
@@ -167,7 +178,8 @@ def attach_postgres(con, target: str, catalog: str, clause: str,
     if not statement_timeout_s:
         return
     probe = ("SELECT name, setting, source FROM pg_settings "
-             "WHERE name = 'statement_timeout' OR source = 'client'")
+             "WHERE name = 'statement_timeout' OR source = 'client' "
+             "UNION ALL SELECT 'role', current_setting('role'), 'hidden'")
     try:
         rows = con.execute(
             f"SELECT * FROM postgres_query({attach_literal(catalog)}, "
@@ -176,7 +188,9 @@ def attach_postgres(con, target: str, catalog: str, clause: str,
         if 0 < current <= statement_timeout_s * 1000:
             return  # the source's own limit is tighter; ours would only raise it
         client = [(name, setting) for name, setting, source in rows if source == "client"]
-        bounded = bounded_dsn(target, statement_timeout_s, client_settings=client)
+        role = next((setting for name, setting, source in rows
+                     if source == "hidden" and name == "role" and setting != "none"), None)
+        bounded = bounded_dsn(target, statement_timeout_s, client_settings=client, role=role)
     except Exception:  # noqa: BLE001 -- unreadable: the DSN alone decides
         bounded = bounded_dsn(target, statement_timeout_s)
     if bounded == target:

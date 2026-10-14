@@ -115,8 +115,8 @@ class _RecordingCon:
     """Records what an adapter executes instead of connecting. `limit` is the source's own
     `statement_timeout` in ms, as `pg_settings` reports it; None makes the read fail."""
 
-    def __init__(self, limit="0", client=()):
-        self.sql, self.limit, self.client = [], limit, list(client)
+    def __init__(self, limit="0"):
+        self.sql, self.limit = [], limit
 
     def execute(self, sql, *args):
         self.sql.append(sql)
@@ -125,7 +125,7 @@ class _RecordingCon:
     def fetchall(self):  # the probe: (name, setting, source) from pg_settings
         if self.limit is None:
             raise RuntimeError("permission denied for pg_settings")
-        return [("statement_timeout", self.limit, "default"), *self.client]
+        return [("statement_timeout", self.limit, "default")]
 
     def interrupt(self):  # the timer's target; without it the timer's own AttributeError, which
         pass              # names "interrupt", would pass the timeout test for the wrong reason

@@ -45,13 +45,39 @@ def test_the_servers_account_of_the_startup_is_carried_behind_the_bound():
                              "-c work_mem=7168")
 
 
-def test_a_carried_value_with_a_space_is_escaped_as_libpq_reads_it():
-    dsn = bounded_dsn("host=h", 30, client_settings=[("search_path", "a, b")])
-    assert _options(dsn) == "-c statement_timeout=30000 -c search_path=a,\\ b"
+def test_a_carried_value_with_whitespace_is_escaped_as_the_server_splits_it():
+    dsn = bounded_dsn("service=prod", 30,
+                      client_settings=[("search_path", "a, b"), ("application_name", "t\tu")])
+    assert _options(dsn) == ("-c statement_timeout=30000 -c search_path=a,\\ b "
+                             "-c application_name=t\\\tu")
+
+
+def test_a_dsn_s_own_options_are_carried_verbatim_a_role_included():
+    """Review gate: the server's account omits `role` (pg_settings hides it), and carrying that
+    account in place of a DSN's own options ran the bounded connection as the LOGIN role --
+    measured, `-c role=reporting` became `postgres`. Options the DSN states are carried as they
+    are written, whatever the server reported."""
+    dsn = bounded_dsn("host=h options='-c role=reporting'", 30,
+                      client_settings=[("search_path", "x")])
+    assert _options(dsn) == "-c statement_timeout=30000 -c role=reporting"
+
+
+def test_a_service_dsn_s_own_options_outrank_the_servers_account():
+    """libpq lets a DSN's `options` replace its service's, so they are what the startup applied
+    and are carried verbatim -- the server's account is for a service's options alone."""
+    dsn = bounded_dsn("service=prod options='-c role=reporting'", 30,
+                      client_settings=[("search_path", "x")])
+    assert _options(dsn) == "-c statement_timeout=30000 -c role=reporting"
+
+
+def test_a_service_s_role_is_carried_from_current_setting():
+    dsn = bounded_dsn("service=prod", 30, client_settings=[("search_path", "x")], role="reporting")
+    assert _options(dsn) == "-c statement_timeout=30000 -c search_path=x -c role=reporting"
 
 
 @pytest.mark.parametrize("dsn,env", [("service=prod", None), ("host=h", "prod"),
-                                     ("host=h servicefile=/etc/x.conf", None)])
+                                     ("host=h servicefile=/etc/x.conf", None),
+                                     ("postgresql://h/d?servicefile=/etc/x.conf", None)])
 def test_a_service_whose_settings_the_server_did_not_report_is_left_unbounded(
         dsn, env, monkeypatch, caplog):
     """Its options cannot be known from here, and adding ours would replace them."""
@@ -83,7 +109,8 @@ def test_attach_carries_the_servers_account_into_the_bounded_connection(monkeypa
         def fetchall(self):
             return [("statement_timeout", "0", "default"),
                     ("search_path", "from_service", "client"),
-                    ("transaction_read_only", "on", "session")]  # DuckDB's own: never carried
+                    ("transaction_read_only", "on", "session"),  # DuckDB's own: never carried
+                    ("role", "reporting", "hidden")]
 
     monkeypatch.setattr(module, "connect_duckdb", lambda **kw: _Con())
     monkeypatch.setattr(module, "load_extension", lambda *a, **kw: None)
@@ -93,6 +120,10 @@ def test_attach_carries_the_servers_account_into_the_bounded_connection(monkeypa
     assert len(attaches) == 2, sql
     assert "search_path=from_service" in attaches[-1] and "statement_timeout=30000" in attaches[-1]
     assert "transaction_read_only" not in attaches[-1]
+    assert "role=reporting" in attaches[-1]
+    # The probe must ASK for the role: pg_settings never lists it, so a probe that stopped reading
+    # current_setting('role') would drop it with nothing here noticing.
+    assert any("current_setting(''role'')" in s for s in sql), sql
 
 
 def test_a_federated_source_s_cancellation_reaches_the_model_as_a_timeout():
