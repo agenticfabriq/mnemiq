@@ -238,6 +238,12 @@ def check_views(
     detail goes to the server log. `granted` is the caller's visible objects; None names nothing
     beyond the view the query read -- the safe direction for a caller that does not pass it.
 
+    `known` is the objects the source holds, and None and empty mean opposite things (M45): None
+    is not supplied, and skips the unknown-object rule; an empty set is a source that knows
+    nothing, so every object a body reads is unknown and the view is refused. A caller must never
+    turn an empty set into None (`... or None`), which would skip the rule exactly where it is
+    widest. Both deciders pass `set(policy.policy_schema)`.
+
     M27: a view's rows are defined by SQL held in the source, so a filter on its base table
     reaches nothing -- the decider refused the base table correctly, and the repair loop used
     that refusal as a signpost to the same rows through the view.
