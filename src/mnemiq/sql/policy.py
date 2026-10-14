@@ -218,7 +218,8 @@ def unknown_filter_targets(snapshot: Snapshot, row_filters) -> frozenset[str]:
 # and for the decider), and a swap logs it again under the version it now refuses against. A set
 # of pairs, not the last version per key set: two snapshots in use at once (a request in flight
 # across a swap) would otherwise flip the memory and log on every call. Cleared past a bound, so
-# a long-lived process swapping often cannot grow it without limit; clearing costs one repeat line.
+# a long-lived process swapping often cannot grow it without limit; clearing costs one repeat line
+# per pair still in use.
 _reported: set[tuple[str, frozenset[str]]] = set()
 _REPORTED_BOUND = 64
 
