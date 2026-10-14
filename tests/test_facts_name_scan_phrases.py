@@ -4,8 +4,7 @@ The scan split the text into identifier tokens, so a column named `secret code` 
 table named `layoff plans` -- legal quoted identifiers, and common in BIRD-style schemas
 (`Enrollment (K-12)`) -- matched nothing. With the model listing nothing either, the fact
 recorded an empty list and reached every identity, the PHI column's included. Each known name is
-now matched as a whole phrase, case folded, so the scan finds what the text names however the
-name is spelled.
+now matched as a whole phrase, case and whitespace folded on both sides.
 
 Not addressed here, by the owner's decision (2026-10-14): a fact that PARAPHRASES a column the
 model then omits from its list is still recorded without it. That is the residual of the
@@ -66,3 +65,20 @@ def test_the_withheld_column_never_reaches_an_identity_that_cannot_read_it():
     assert "diagnoses" not in block(GrantSet(frozenset({"orders", "layoff plans"})))
     assert "diagnoses" in block(GrantSet(frozenset({"orders", "layoff plans"}),
                                          pii_clearance=frozenset({"phi"})))
+
+
+def test_the_old_tokenizers_reach_is_kept():
+    """Review gate: Unicode word boundaries counted a digit before a name, or an accented letter
+    after it, as part of the word, and missed what the old ASCII tokenizer found."""
+    vocab_columns = {"ssn"}
+    for text in ("2ssn values are padded", "ssn\u00e9 is masked"):
+        tf = parse_facts(json.dumps({"gotchas": [{"text": text, "reads": []}]}), "orders",
+                         vocab_columns, set(), related_tables={})
+        assert tf.reads[text] == ["orders.ssn"], text
+
+
+def test_a_name_with_a_run_of_whitespace_is_found():
+    """The fact's text has its whitespace folded (`_clean_text`); the name is folded the same."""
+    tf = parse_facts(json.dumps({"gotchas": [{"text": "secret code holds x", "reads": []}]}),
+                     "orders", {"secret  code"}, set(), related_tables={})
+    assert tf.reads["secret code holds x"] == ["orders.secret  code"]

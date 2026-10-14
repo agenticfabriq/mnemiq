@@ -30,6 +30,11 @@ def _expr_columns_ok(expr: str, allowed: set[str]) -> bool:
 
 
 
+def _fold(name: str) -> str:
+    """A name or a fact's text as both sides are compared: case folded, whitespace runs to one."""
+    return " ".join(name.split()).lower()
+
+
 def _vocabulary(table: str, columns: set[str],
                 related_tables: Mapping[str, set[str]]) -> dict[str, set[str]]:
     """Each name a fact may use, folded, to the dependencies it may mean: an own column to
@@ -39,7 +44,7 @@ def _vocabulary(table: str, columns: set[str],
     vocab: dict[str, set[str]] = {}
 
     def add(name: str, dep: str) -> None:
-        vocab.setdefault(name.lower(), set()).add(dep)
+        vocab.setdefault(_fold(name), set()).add(dep)
 
     for column in columns:
         add(column, f"{table}.{column}")
@@ -62,11 +67,13 @@ def _named(text: str, vocab: dict[str, set[str]]) -> set[str]:
     `Enrollment (K-12)`, was never found, and the fact went out with an empty list to every
     identity (Codex's review of #130). A name counts where no word character touches either end,
     so `id` is not found in `idle`; a dot before it does not stop it, so a qualified mention still
-    names the bare column. Over-matching only withholds more.
+    names the bare column. Over-matching only withholds more. The boundaries are ASCII, as the old
+    tokenizer's were -- a digit before a name or a non-ASCII letter after it does not hide it
+    (`2ssn`, `ssné`) -- and whitespace is folded on both sides, as `_clean_text` folds the fact.
     """
-    low = text.lower()
+    low = _fold(text)
     return {dep for name, deps in vocab.items()
-            if name and re.search(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])", low)
+            if name and re.search(r"(?<![A-Za-z_$])" + re.escape(name) + r"(?![A-Za-z0-9_$])", low)
             for dep in deps}
 
 
@@ -77,7 +84,7 @@ def _declared(names, vocab: dict[str, set[str]]) -> set[str] | None:
         return None
     out: set[str] = set()
     for name in names:
-        deps = vocab.get(name.strip().lower())
+        deps = vocab.get(_fold(name))
         if not deps:
             return None
         out |= deps
