@@ -157,8 +157,13 @@ class Refusal:
 
     @property
     def repair_text(self) -> str:
-        """What the model repairs against: our refusal, plus the source's own words."""
-        return f"{self.message} {self.source_detail}" if self.source_detail else self.message
+        """What the model repairs against: our refusal, plus the source's own words -- with any
+        credential in them taken out first (M96: a model can copy what it reads into a literal)."""
+        if not self.source_detail:
+            return self.message
+        from mnemiq.redact import scrub_credentials
+
+        return f"{self.message} {scrub_credentials(self.source_detail)}"
 
 
 @dataclass

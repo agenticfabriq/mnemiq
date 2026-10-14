@@ -105,7 +105,10 @@ def test_the_sources_words_are_kept_out_of_the_callers_half_of_a_refusal(caplog)
     # The model is the consumer this half is FOR -- the repair loop is corrected by it. That is
     # not the same as the prompt being a safe place: see the residual at `Refusal.source_detail`.
     assert leaky in verdict.source_detail
-    assert leaky in verdict.repair_text
+    # What the model reads is the source's words minus the credential (M96).
+    from mnemiq.redact import scrub_credentials
+    assert verdict.repair_text.endswith(scrub_credentials(leaky))
+    assert "svc_mnemiq" not in verdict.repair_text
     # And the operator's half: an EXPLAIN refusal a later attempt repairs is logged here or
     # nowhere, since `plan_query` keeps only the last one.
     assert leaky in caplog.text

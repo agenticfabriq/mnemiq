@@ -365,7 +365,7 @@ class Agent:
                 # Every attempt, not just the last: `failure` is overwritten each time round,
                 # so an error that a later attempt repaired would otherwise be recorded nowhere.
                 logger.warning("execution attempt %d failed; the source said: %s",
-                               _attempt + 1, exc.repair_text)
+                               _attempt + 1, exc.full_text)
                 failure = exc
                 feedback = Feedback(exc.repair_text, from_source=exc.source_detail is not None)
                 continue
@@ -404,7 +404,7 @@ class Agent:
         # log holds the whole retry rather than just whichever error came last.
         logger.warning(
             "every execution attempt failed; last source error: %s",
-            failure.repair_text if failure is not None else "(no attempt was made)",
+            failure.full_text if failure is not None else "(no attempt was made)",
         )
         return AgentAnswer(
             answer=(
@@ -428,7 +428,7 @@ class Agent:
             # path logs: when three of five candidates are rejected by the source and two
             # succeed, the answer reports `candidates_executed=2` and the three rejections are
             # otherwise recorded nowhere -- a source half-refusing looks like a narrower vote.
-            logger.warning("a candidate's execution failed; the source said: %s", exc.repair_text)
+            logger.warning("a candidate's execution failed; the source said: %s", exc.full_text)
             return None
         self.cache.put(key, to_ipc(result.table))
         return result.table
