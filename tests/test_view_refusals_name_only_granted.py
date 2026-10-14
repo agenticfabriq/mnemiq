@@ -102,3 +102,11 @@ def test_the_caller_is_not_told_once_the_retries_run_out():
     assert "row-filtered" in outcome.reason, outcome.reason  # the view refusal, not another exit
     assert "customer" not in outcome.reason
     assert not any("customer" in (c or "") for c in generator.calls)
+
+
+def test_a_grant_on_a_same_named_table_elsewhere_does_not_name_it():
+    """Review gate: matching on bare last segments let a grant on `sales.customer` name the
+    filtered `customer` the view reads -- a table this caller does not hold."""
+    verdict = _read(_views(v="SELECT id FROM customer"),
+                    visible={"v": {"id"}, "sales.customer": {"id"}})
+    assert "customer" not in verdict.message and "directly" not in verdict.message

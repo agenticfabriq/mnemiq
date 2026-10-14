@@ -273,14 +273,18 @@ def check_views(
                 "reachable; this is not a limit on your grants."
             ),
         )
+    # Exact names, case-folded -- never `spellings`, whose bare last segment would let a grant on
+    # `sales.customer` name a filtered `public.customer` the caller does not hold.
     return _walk(ast, views, filtered, known or set(), (), 0, "", "",
-                 spellings(granted) if granted else set())
+                 {g.lower() for g in granted} if granted else set())
 
 
 def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
     """A view refusal naming only the view the query read; the dependency it is about goes to the
     operator's log, never to the model or the caller (M53)."""
-    logger.info("view %r refused (%s): %s", view, code.value, detail)
+    # WARNING, as `plan_query` logs the names it withholds: what cannot be said to the caller still
+    # has to be said somewhere, and INFO is dropped under default logging.
+    logger.warning("view %r refused (%s): %s", view, code.value, detail)
     return Refusal(code=code, message=message, subject=view)
 
 
@@ -398,8 +402,7 @@ def _walk(
         if reached:
             base = reached[0]
             # The table is named, and offered as the repair, only to a caller who reads it.
-            repair = (f" Query {base!r} directly." if spellings({base}) & granted
-                      else "")
+            repair = f" Query {base!r} directly." if base.lower() in granted else ""
             return _refuse(RefusalCode.UNGOVERNED_VIEW, here,
                            f"{it} reads a table that is row-filtered for you, and this engine "
                            f"cannot apply that filter through a view.{repair}",
