@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 import os
 import threading
+from pathlib import Path
 
 import duckdb
 import pyarrow as pa
 
 from mnemiq.duckdb_extensions import connect_duckdb, load_extension, lock_configuration
+
+logger = logging.getLogger(__name__)
 
 # The declared-FK query for Postgres sources: run through postgres_query so the
 # information_schema joins execute with real Postgres semantics, not DuckDB's proxy.
@@ -101,9 +105,52 @@ def bounded_dsn(dsn: str, statement_timeout_s: float | None) -> str:
     except Exception:  # noqa: BLE001 -- the parser's message can quote the DSN, credentials and all
         raise UnparseableDSN("the Postgres DSN could not be parsed to add a statement timeout; "
                              "check its syntax") from None
-    existing = existing or os.environ.get("PGOPTIONS")
+    if existing is None:
+        # libpq's precedence for `options`: the DSN, then the connection service, then PGOPTIONS.
+        # Ours becomes the DSN's, so anything below it must be carried up or it is dropped --
+        # measured: a service's `-c search_path=from_service` read `"$user", public` once bounded
+        # (Codex's review of #134).
+        service = conninfo_to_dict(dsn).get("service") or os.environ.get("PGSERVICE")
+        if service:
+            found, existing = _service_options(service)
+            if not found:
+                logger.warning(
+                    "Postgres connection service %r was not found in a readable service file, so "
+                    "no server-side statement timeout is added: its options cannot be kept "
+                    "beside one. Put `-c statement_timeout=...` in the service's options.", service)
+                return dsn
+        existing = existing or os.environ.get("PGOPTIONS")
     bound = f"-c statement_timeout={int(statement_timeout_s * 1000)}"
     return make_conninfo(dsn, options=f"{bound} {existing}" if existing else bound)
+
+
+def _service_options(service: str) -> tuple[bool, str | None]:
+    """(found, options) for a connection service, looked up as libpq looks it up: the user's file
+    (PGSERVICEFILE, else ~/.pg_service.conf), then PGSYSCONFDIR's pg_service.conf; the first file
+    holding the section is the one used, whole. The compiled-in system directory libpq falls back
+    to is not knowable from here, so a service only there reads as not found."""
+    user = os.environ.get("PGSERVICEFILE") or str(Path.home() / ".pg_service.conf")
+    system = os.environ.get("PGSYSCONFDIR")
+    for path in (user, *([str(Path(system) / "pg_service.conf")] if system else [])):
+        try:
+            text = Path(path).read_text()
+        except OSError:
+            continue
+        section, options, found = None, None, False
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip()
+                found = found or section == service
+                continue
+            key, sep, value = line.partition("=")
+            if sep and section == service and key.strip() == "options":
+                options = value.strip()
+        if found:
+            return True, options
+    return False, None
 
 
 def attach_postgres(con, target: str, catalog: str, clause: str,
@@ -136,6 +183,28 @@ def attach_postgres(con, target: str, catalog: str, clause: str,
 
 def _ended_by_statement_timeout(exc: Exception) -> bool:
     return "canceling statement due to statement timeout" in str(exc)
+
+
+def execute_bounded(con, sql: str, timeout_s: float | None) -> pa.Table:
+    """Run `sql` on a DuckDB connection, interrupted if it overruns `timeout_s`, and with a source's
+    own statement-timeout cancellation raised as the interrupt it is -- one body for the single-
+    source and the federated adapter, so they cannot disagree about what a timeout looks like
+    (Codex's review of #134 found the federated one never translated it)."""
+    timer = None
+    if timeout_s is not None:
+        timer = threading.Timer(timeout_s, con.interrupt)
+        timer.start()
+    try:
+        return con.execute(sql).to_arrow_table()
+    except Exception as exc:
+        if timeout_s is not None and _ended_by_statement_timeout(exc):
+            raise duckdb.InterruptException(
+                f"query timed out after {timeout_s}s: the source ended it at its statement "
+                "timeout") from exc
+        raise
+    finally:
+        if timer is not None:
+            timer.cancel()
 
 
 class DuckDBAdapter:
@@ -394,21 +463,7 @@ class DuckDBAdapter:
         only an interrupt bounds a query that never produces a first row -- and on a Postgres
         source only the server's statement timeout does (M152), so its cancellation is raised as
         the interrupt it is, and the runner's timed-out guidance reaches the model."""
-        timer = None
-        if timeout_s is not None:
-            timer = threading.Timer(timeout_s, self._con.interrupt)
-            timer.start()
-        try:
-            return self._con.execute(sql).to_arrow_table()
-        except Exception as exc:
-            if timeout_s is not None and _ended_by_statement_timeout(exc):
-                raise duckdb.InterruptException(
-                    f"query timed out after {timeout_s}s: the source ended it at its statement "
-                    "timeout") from exc
-            raise
-        finally:
-            if timer is not None:
-                timer.cancel()
+        return execute_bounded(self._con, sql, timeout_s)
 
 
 class DuckDBPostgresAdapter(DuckDBAdapter):
