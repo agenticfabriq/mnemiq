@@ -28,15 +28,40 @@ from mnemiq.semantic.expr_columns import columns_read
 
 
 def select_metrics(
-    table_ids: Sequence[str], metrics: Sequence[Metric], grants: GrantSet
+    table_ids: Sequence[str], metrics: Sequence[Metric], grants: GrantSet, *,
+    columns: Sequence[Column],
 ) -> list[Metric]:
-    """The certified metrics defined over the tables in context, that this identity may see."""
+    """The certified metrics defined over the tables in context, that this identity may see.
+
+    **And whose expression reads only columns the identity reads raw (M144)** -- the rule a
+    dimension already meets (M136). A table grant alone let `count(secret_code)` reach the prompt
+    for an identity the card had withheld `secret_code` from: the decider would refuse the SQL,
+    but the column's existence and expression were already in the prompt. Raw, not merely
+    visible, because the decider refuses a masked column under an aggregate too.
+    """
     in_context = set(table_ids)
+    by_key = _by_key(columns)
     return [
         metric
         for metric in metrics
         if metric.measure.source in in_context and grants.allows(metric.measure.source)
+        and _reads_raw(metric.measure.expr, metric.measure.source, by_key, grants)
     ]
+
+
+def read_raw(column: Column, grants: GrantSet) -> bool:
+    """Does this identity read `column` raw: every level it is read under cleared (M135)? The
+    `build_access_policy` rule for a column, for selectors that hold columns and grants."""
+    return all(_read_raw(level, grants) for level in column.pii_levels())
+
+
+def _by_key(columns: Sequence[Column]) -> dict[tuple[str, str], list[Column]]:
+    # Every column under each folded name: `customer."SSN"` and `customer.ssn` are two columns in
+    # Postgres, and keeping one decided the clearance by their order (Codex on #95).
+    by_key: dict[tuple[str, str], list[Column]] = {}
+    for column in columns:
+        by_key.setdefault((column.object_id.lower(), column.name.lower()), []).append(column)
+    return by_key
 
 
 def select_dimensions(
@@ -53,23 +78,19 @@ def select_dimensions(
     `apply_certified`, as a column's is.
     """
     in_context = set(table_ids)
-    # Every column under each folded name: `customer."SSN"` and `customer.ssn` are two columns in
-    # Postgres, and keeping one decided the clearance by their order (Codex on #95).
-    by_key: dict[tuple[str, str], list[Column]] = {}
-    for column in columns:
-        by_key.setdefault((column.object_id.lower(), column.name.lower()), []).append(column)
+    by_key = _by_key(columns)
     return [
         dimension
         for dimension in dimensions
         if dimension.source in in_context
         and grants.allows(dimension.source)
         and _read_raw(dimension.pii_level, grants)
-        and _reads_every_column_raw(dimension, by_key, grants)
+        and _reads_raw(dimension.expression(), dimension.source, by_key, grants)
     ]
 
 
-def _reads_every_column_raw(dimension: Dimension, by_key: dict, grants: GrantSet) -> bool:
-    """**M136.** Every column the dimension's expression reads, read raw by this identity.
+def _reads_raw(expr: str, source: str, by_key: dict, grants: GrantSet) -> bool:
+    """**M136, and M144 for metrics.** Every column the expression reads, read raw by this identity.
 
     Its own level is not the whole of it: a column requires every level the personal dimensions
     over it carry (M135), so `region` (pii) and `region_health` (phi) over one column each need
@@ -78,11 +99,11 @@ def _reads_every_column_raw(dimension: Dimension, by_key: dict, grants: GrantSet
     parser that stamped the levels, and keyed as `apply_certified` keys them. A reference naming
     no column here decides nothing: the dimension's own level still does.
     """
-    table = dimension.source.lower()
-    for ref in _columns_read(dimension.expression(), dimension.source):
+    table = source.lower()
+    for ref in _columns_read(expr, source):
         for name in ref:
             for column in by_key.get((table, name), ()):
-                if not all(_read_raw(level, grants) for level in column.pii_levels()):
+                if not read_raw(column, grants):
                     return False
     return True
 
