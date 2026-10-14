@@ -122,10 +122,13 @@ class _RecordingCon:
         self.sql.append(sql)
         return self
 
-    def fetchone(self):
+    def fetchall(self):  # the probe: (name, setting, source) from pg_settings
         if self.limit is None:
             raise RuntimeError("permission denied for pg_settings")
-        return (self.limit,)
+        return [("statement_timeout", self.limit, "default")]
+
+    def fetchone(self):  # the role read: unset
+        return ("none",)
 
     def interrupt(self):  # the timer's target; without it the timer's own AttributeError, which
         pass              # names "interrupt", would pass the timeout test for the wrong reason

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import threading
-
 import pyarrow as pa
 
 from mnemiq.adapters.duckdb import (
@@ -11,6 +9,7 @@ from mnemiq.adapters.duckdb import (
     duckdb_builtin_functions,
     duckdb_reachable_user_functions,
     duckdb_user_functions,
+    execute_bounded,
 )
 from mnemiq.config import SourceSpec
 from mnemiq.duckdb_extensions import (
@@ -96,12 +95,4 @@ class FederatedAdapter:
         return self._con.execute(sql).fetchall()
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
-        timer = None
-        if timeout_s is not None:
-            timer = threading.Timer(timeout_s, self._con.interrupt)
-            timer.start()
-        try:
-            return self._con.execute(sql).to_arrow_table()
-        finally:
-            if timer is not None:
-                timer.cancel()
+        return execute_bounded(self._con, sql, timeout_s)

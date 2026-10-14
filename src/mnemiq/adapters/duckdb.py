@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import logging
 import os
+import re
 import threading
 
 import duckdb
 import pyarrow as pa
 
 from mnemiq.duckdb_extensions import connect_duckdb, load_extension, lock_configuration
+
+logger = logging.getLogger(__name__)
 
 # The declared-FK query for Postgres sources: run through postgres_query so the
 # information_schema joins execute with real Postgres semantics, not DuckDB's proxy.
@@ -76,7 +80,9 @@ class UnparseableDSN(ValueError):
     """A Postgres DSN libpq's parser cannot read. Its message never quotes the DSN."""
 
 
-def bounded_dsn(dsn: str, statement_timeout_s: float | None) -> str:
+def bounded_dsn(dsn: str, statement_timeout_s: float | None,
+                client_settings: list[tuple[str, str]] | None = None,
+                role: str | None = None) -> str:
     """`dsn` with a server-side `statement_timeout` every connection made from it carries (M152).
 
     DuckDB's interrupt does not bound a Postgres scan: measured, the ROLLBACK it issues waits on
@@ -85,25 +91,72 @@ def bounded_dsn(dsn: str, statement_timeout_s: float | None) -> str:
     the client with it. DuckDB's own `pg_statement_timeout_millis` was measured too and never
     reached the connection a scan runs on.
 
-    Merged by libpq's own parser (psycopg's `conninfo`), so a keyword DSN, a URI and an operator's
-    own `options` all survive -- written in the DSN, or in `PGOPTIONS`, which libpq reads only when
-    the DSN has no `options` and so would drop the moment we add one (review gate). Ours goes FIRST:
-    a `-c statement_timeout` the operator wrote comes later and wins, so an explicit setting is
+    The bound becomes the connection's `options`, which REPLACES whatever options libpq would
+    otherwise apply -- from the DSN, a connection service, or PGOPTIONS. So those are carried
+    behind it. Where they are known exactly -- the DSN's own `options`, else PGOPTIONS with no
+    service named -- they are carried verbatim. A connection SERVICE supplies its options from a
+    file this engine cannot reliably find (libpq's compiled-in directory, for one), so for a service
+    `client_settings` is used: the server's account of what the startup applied (`pg_settings`
+    where `source = 'client'`, read by `attach_postgres`), plus `role`, which `pg_settings` hides
+    (Codex's review of #134 found a service's search_path dropped; the gate, a role). Without that
+    account a service DSN is left unbounded, with a warning. A `servicefile=` DSN, which psycopg's
+    parser rejects outright, is always left unbounded, with a warning. Ours goes FIRST: a
+    `-c statement_timeout` the operator wrote comes later and wins, so an explicit setting is
     theirs to keep. A DBA's per-role limit is the other case: startup options override it, so
     `attach_postgres` applies this only where the source's own limit is looser.
     """
     if not statement_timeout_s:
         return dsn
-    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+    from psycopg.conninfo import make_conninfo
+
+    if _SERVICEFILE.search(dsn):
+        # libpq 18's keyword, which psycopg's parser rejects outright: this DSN cannot be rebuilt
+        # here at all, so it is left as configured rather than refused at startup.
+        logger.warning("the Postgres DSN names a service file (`servicefile=`), which this engine "
+                       "cannot rewrite, so no server-side statement timeout is added. Put "
+                       "`-c statement_timeout=...` in the service's options instead.")
+        return dsn
+    parsed = _parsed(dsn)
+    bound = f"-c statement_timeout={int(statement_timeout_s * 1000)}"
+    service = parsed.get("service") or os.environ.get("PGSERVICE")
+    if "options" in parsed or not service:
+        # Known exactly, so carried VERBATIM: the DSN's own options, else PGOPTIONS, which libpq
+        # reads only when there is no service to supply them.
+        existing = parsed.get("options") or os.environ.get("PGOPTIONS")
+        return make_conninfo(dsn, options=f"{bound} {existing}" if existing else bound)
+    if client_settings is None:
+        logger.warning(
+            "the Postgres connection names a service (%r) whose settings the server could not "
+            "report, so no server-side statement timeout is added: it would replace the service's "
+            "options. Put `-c statement_timeout=...` in them instead.", service)
+        return dsn
+    # A service's options, known only by the server's account of them. `pg_settings` hides `role`
+    # (GUC_NO_SHOW_ALL), so it is carried from `current_setting` -- measured: with `-c
+    # role=reporting` dropped, the bounded connection ran as the LOGIN role. `session_authorization`
+    # needs nothing: a startup option cannot change it (measured, even for a superuser).
+    carried = [f"-c {name}={_option_value(value)}" for name, value in client_settings]
+    if role:
+        carried.append(f"-c role={_option_value(role)}")
+    return make_conninfo(dsn, options=" ".join([bound, *carried]))
+
+
+_SERVICEFILE = re.compile(r"(?:^|[\s?&])servicefile\s*=", re.IGNORECASE)  # keyword or URI form
+
+
+def _parsed(dsn: str) -> dict:
+    from psycopg.conninfo import conninfo_to_dict
 
     try:
-        existing = conninfo_to_dict(dsn).get("options")
+        return conninfo_to_dict(dsn)
     except Exception:  # noqa: BLE001 -- the parser's message can quote the DSN, credentials and all
         raise UnparseableDSN("the Postgres DSN could not be parsed to add a statement timeout; "
                              "check its syntax") from None
-    existing = existing or os.environ.get("PGOPTIONS")
-    bound = f"-c statement_timeout={int(statement_timeout_s * 1000)}"
-    return make_conninfo(dsn, options=f"{bound} {existing}" if existing else bound)
+
+
+def _option_value(value: str) -> str:
+    """A setting's value as the server splits `options`: every backslash and whitespace character
+    escaped with a backslash, since any whitespace separates arguments there."""
+    return re.sub(r"([\\\s])", r"\\\1", value)
 
 
 def attach_postgres(con, target: str, catalog: str, clause: str,
@@ -113,29 +166,72 @@ def attach_postgres(con, target: str, catalog: str, clause: str,
 
     Startup options override a role's `ALTER ROLE ... SET statement_timeout` -- measured: a role
     limited to 2 s read 30s once our option was on its connection -- so the bound is not applied
-    blind. The source is attached as configured, its effective limit read, and it is re-attached
-    bounded only where that limit is off or looser. If the limit cannot be read, it is bounded
-    anyway: the failure points at a timeout, never at an unbounded statement.
+    blind. The source is attached as configured, and `pg_settings` gives its effective limit and
+    the settings its startup applied; it is re-attached bounded only where that limit is off or
+    looser. What the re-attach carries is `bounded_dsn`'s choice: a DSN's own options or PGOPTIONS
+    verbatim, and the server's account -- those settings, plus `current_setting('role')` read on
+    its own, since `pg_settings` hides it -- only for a service. Each read can fail alone: an
+    unreadable limit falls back to the DSN alone, and a role that cannot be read leaves a
+    service's account incomplete, so the service is left unbounded rather than re-attached
+    without it (an incomplete account is what ran a bounded connection as the login role).
     """
-    bounded = bounded_dsn(target, statement_timeout_s)  # first: an unparseable DSN fails here
+    if statement_timeout_s and not _SERVICEFILE.search(target):
+        _parsed(target)  # first: an unparseable DSN fails before any connection
     con.execute(f"ATTACH {attach_literal(target)} AS {catalog} {clause}")
     if not statement_timeout_s:
         return
-    probe = "SELECT setting FROM pg_settings WHERE name = 'statement_timeout'"
+    def remote(sql: str):
+        return con.execute(f"SELECT * FROM postgres_query({attach_literal(catalog)}, "
+                           f"{attach_literal(sql)})")
+
     try:
-        (current,) = con.execute(
-            f"SELECT setting FROM postgres_query({attach_literal(catalog)}, "
-            f"{attach_literal(probe)})").fetchone()
-        if 0 < int(current) <= statement_timeout_s * 1000:
+        rows = remote("SELECT name, setting, source FROM pg_settings "
+                      "WHERE name = 'statement_timeout' OR source = 'client'").fetchall()
+        current = next(int(setting) for name, setting, _ in rows if name == "statement_timeout")
+    except Exception:  # noqa: BLE001 -- unreadable: the DSN alone decides
+        bounded = bounded_dsn(target, statement_timeout_s)
+    else:
+        if 0 < current <= statement_timeout_s * 1000:
             return  # the source's own limit is tighter; ours would only raise it
-    except Exception:  # noqa: BLE001 -- unreadable: bound it, below
-        pass
+        account: list[tuple[str, str]] | None = [
+            (name, setting) for name, setting, source in rows if source == "client"]
+        role = None
+        try:
+            (setting,) = remote("SELECT current_setting('role') AS role").fetchone()
+            role = None if setting == "none" else setting
+        except Exception:  # noqa: BLE001 -- a service's role unconfirmed: its account is incomplete
+            account = None
+        bounded = bounded_dsn(target, statement_timeout_s, client_settings=account, role=role)
+    if bounded == target:
+        return
     con.execute(f"DETACH {catalog}")
     con.execute(f"ATTACH {attach_literal(bounded)} AS {catalog} {clause}")
 
 
 def _ended_by_statement_timeout(exc: Exception) -> bool:
     return "canceling statement due to statement timeout" in str(exc)
+
+
+def execute_bounded(con, sql: str, timeout_s: float | None) -> pa.Table:
+    """Run `sql` on a DuckDB connection, interrupted if it overruns `timeout_s`, and with a source's
+    own statement-timeout cancellation raised as the interrupt it is -- one body for the single-
+    source and the federated adapter, so they cannot disagree about what a timeout looks like
+    (Codex's review of #134 found the federated one never translated it)."""
+    timer = None
+    if timeout_s is not None:
+        timer = threading.Timer(timeout_s, con.interrupt)
+        timer.start()
+    try:
+        return con.execute(sql).to_arrow_table()
+    except Exception as exc:
+        if timeout_s is not None and _ended_by_statement_timeout(exc):
+            raise duckdb.InterruptException(
+                f"query timed out after {timeout_s}s: the source ended it at its statement "
+                "timeout") from exc
+        raise
+    finally:
+        if timer is not None:
+            timer.cancel()
 
 
 class DuckDBAdapter:
@@ -394,21 +490,7 @@ class DuckDBAdapter:
         only an interrupt bounds a query that never produces a first row -- and on a Postgres
         source only the server's statement timeout does (M152), so its cancellation is raised as
         the interrupt it is, and the runner's timed-out guidance reaches the model."""
-        timer = None
-        if timeout_s is not None:
-            timer = threading.Timer(timeout_s, self._con.interrupt)
-            timer.start()
-        try:
-            return self._con.execute(sql).to_arrow_table()
-        except Exception as exc:
-            if timeout_s is not None and _ended_by_statement_timeout(exc):
-                raise duckdb.InterruptException(
-                    f"query timed out after {timeout_s}s: the source ended it at its statement "
-                    "timeout") from exc
-            raise
-        finally:
-            if timer is not None:
-                timer.cancel()
+        return execute_bounded(self._con, sql, timeout_s)
 
 
 class DuckDBPostgresAdapter(DuckDBAdapter):
