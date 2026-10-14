@@ -148,7 +148,8 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
     """Does an example's SQL read no column in `not_raw`? Asked of `check_cls`, the decider's own
     column resolution, so an alias, a CTE or an unqualified name resolves as it would on a real
     query. Enrichment stores an example as an approved plan in the deciding dialect -- `duckdb`
-    for every production source but Oracle, which is `oracle` -- while feedback capture stores the
+    for every source `adapters/resolve.py` builds but Oracle, which is `oracle`; an adapter kind
+    added there with its own dialect would land here -- while feedback capture stores the
     SQL an operator wrote, in any spelling. One neither parser reads is withheld, since what it
     reads cannot be checked, and logged, since an operator would otherwise see only examples
     missing from the prompts of identities with something withheld."""

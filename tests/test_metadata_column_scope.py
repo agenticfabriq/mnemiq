@@ -130,11 +130,17 @@ def test_retrieve_scopes_all_three_to_the_identity(tmp_path):
     assert cleared.concepts
 
 
-def test_an_example_whose_columns_cannot_be_read_is_not_shown():
+def test_an_example_whose_columns_cannot_be_read_is_not_shown_and_says_so(caplog):
     """Fail closed: SQL neither dialect parses cannot be checked, so it is not shown -- but only
-    when something is withheld; with nothing to withhold there is nothing to check."""
+    when something is withheld; with nothing to withhold there is nothing to check. The log line
+    is how an operator learns why an example is missing from some identities' prompts."""
+    import logging
+
     from mnemiq.semantic.retrieval import _reads_only_raw
 
     broken = "SELEC secret_code FRM orders"
-    assert _reads_only_raw(broken, frozenset({("orders", "secret_code")})) is False
+    with caplog.at_level(logging.INFO, logger="mnemiq.semantic.retrieval"):
+        assert _reads_only_raw(broken, frozenset({("orders", "secret_code")})) is False
+    assert any("withheld" in r.getMessage() and r.levelno >= logging.INFO
+               for r in caplog.records), [r.getMessage() for r in caplog.records]
     assert _reads_only_raw(broken, frozenset()) is True
