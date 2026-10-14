@@ -63,7 +63,11 @@ def test_both_write_surfaces_report_it_structurally():
     from mnemiq import cli
     from mnemiq.mcp import server
 
-    assert '"narrowed"' in inspect.getsource(server._db_write), "MCP write drops the narrowing"
+    assert "write_payload(" in inspect.getsource(server._db_write), "MCP write builds its own shape"
+    from mnemiq.server.serialize import write_payload
+    assert '"narrowed"' in inspect.getsource(write_payload), "the write serializer drops the narrowing"
     cli_src = inspect.getsource(cli)
-    assert 'payload["narrowed"]' in cli_src, "--json write emits stringified dataclasses"
+    # One serializer for both write surfaces; behaviourally pinned through Runtime.write in
+    # test_caller_sees_sql_as_asked.py.
+    assert "write_payload(res)" in cli_src, "--json write builds its own shape"
     assert "disclosure_sentence(res.narrowed)" in cli_src, "human write output says nothing"

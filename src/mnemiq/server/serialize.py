@@ -99,3 +99,25 @@ def answer_payload(ans: AgentAnswer) -> dict:
         "preview": ({"columns": p.columns, "rows": p.rows, "row_count": p.row_count,
                      "truncated": p.truncated, "capped": p.capped} if p else None),
     }
+
+
+def write_payload(res) -> dict:
+    """A governed write's result, as a caller is shown it -- one shape for MCP `db_write` and
+    `mnemiq write --json`, so the two cannot drift (the read path shares `answer_payload` for the
+    same reason).
+
+    Named fields, never the whole `WriteResult`: it also carries `plan_sql` and `target_sql`, the
+    write as EXECUTED, which under a row policy names the policy's own tables and literals (M51;
+    Codex's review of #122 found the CLI dumping both). `sql` is the statement as asked.
+    `narrowed` beside `rows_affected`, which is exactly where an agent needs it: 3 of 47 deleted
+    reads as success without it; `null` means the decision was not evaluated.
+    """
+    return {
+        "approved": res.approved,
+        "target": res.target,
+        "rows_affected": res.rows_affected,
+        "refusal": res.refusal,
+        "sql": res.asked_sql,
+        "narrowed": ([{"object": n.object, "rows": n.rows, "columns": n.columns}
+                      for n in res.narrowed] if res.narrowed is not None else None),
+    }

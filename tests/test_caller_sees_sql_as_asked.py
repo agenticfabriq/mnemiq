@@ -110,3 +110,48 @@ def test_a_governed_write_shows_the_statement_as_asked_through_runtime_and_mcp()
     assert "entitlement" not in result.asked_sql
     sql = _db_write(runtime, _IDENTITY, "INSERT INTO scratch (id) SELECT id FROM claim")["sql"]
     assert sql and "entitlement" not in sql
+
+
+def test_the_cli_write_json_shows_the_statement_as_asked(monkeypatch, capsys):
+    """Codex's review of #122: `mnemiq write --json` dumped `vars(res)`, so `plan_sql` and
+    `target_sql` -- the write as executed, carrying the entitlement subquery -- reached the
+    caller beside the safe field. Driven through the real Runtime.write, for an approved write and
+    for one the source rejects (which also carries the executed statement)."""
+    import json
+
+    import mnemiq.cli as cli
+    from mnemiq.config import Settings
+
+    class _Authz:
+        def grants_for(self, _identity):
+            return _grants()
+
+    def runtime(rejects: bool):
+        class _Adapter:
+            dialect = "duckdb"
+
+            def execute(self, sql):
+                if sql.startswith("EXPLAIN"):
+                    return []
+                if rejects:
+                    raise RuntimeError("permission denied")
+                return [(1,)]
+
+        class _WritesEnabled:
+            write_enabled = True
+            source_id = "s"
+
+        return Runtime(con=None, snapshot=_snapshot(), adapter=_Adapter(), agent=None,
+                       embedder=None, authz=_Authz(), settings=_WritesEnabled())
+
+    settings = Settings(llm_base_url="x", llm_api_key="k", llm_model="m", pg_dsn="d")
+    monkeypatch.setattr(cli.Settings, "from_env", classmethod(lambda cls: settings))
+    for rejects in (False, True):
+        monkeypatch.setattr(cli, "build_runtime", lambda s, r=rejects: runtime(r))
+        assert cli.main(["write", "INSERT INTO scratch (id) SELECT id FROM claim", "--json"]) == 0
+        out = capsys.readouterr().out
+        payload = json.loads(out)
+        assert "entitlement" not in out, (rejects, out)
+        assert payload["sql"] and payload["approved"] is not rejects
+        # `narrowed` structured, which the old dump existed to fix, and still the flag.
+        assert payload["narrowed"] == [{"object": "claim", "rows": True, "columns": False}]

@@ -20,7 +20,7 @@ from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
 from mnemiq.duckdb_extensions import ExtensionNotInstalled, ExtensionsNotReady
 from mnemiq.runtime import Runtime, SnapshotMissing, build_runtime
-from mnemiq.server.serialize import verified_state
+from mnemiq.server.serialize import verified_state, write_payload
 
 logger = logging.getLogger(__name__)
 
@@ -75,18 +75,9 @@ def _db_read(
 
 
 def _db_write(runtime: Runtime, identity: IdentityContext, sql: str) -> dict:
-    res = runtime.write(sql, identity)
-    return {
-        "approved": res.approved,
-        "target": res.target,
-        "rows_affected": res.rows_affected,
-        "refusal": res.refusal,
-        "sql": res.asked_sql,  # M51: as asked; the executed write carries the row policy
-        # Beside `rows_affected`, which is exactly where an agent needs it: 3 of 47 deleted reads
-        # as success without this. `null` means the decision was not evaluated.
-        "narrowed": ([{"object": n.object, "rows": n.rows, "columns": n.columns}
-                      for n in res.narrowed] if res.narrowed is not None else None),
-    }
+    # The one write serializer, shared with `mnemiq write --json`: the statement as asked, and
+    # `narrowed` beside `rows_affected` (M51).
+    return write_payload(runtime.write(sql, identity))
 
 
 def _get_schema(runtime: Runtime, identity: IdentityContext) -> dict:
