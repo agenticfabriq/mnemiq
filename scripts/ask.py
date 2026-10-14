@@ -9,6 +9,7 @@ from mnemiq.adapters.duckdb_postgres import DuckDBPostgresAdapter
 from mnemiq.authz.grants import DenyAll, FileAuthzProvider, GrantSet
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
+from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
 from mnemiq.generate.generator import LLMGenerator
 from mnemiq.generate.plan_query import Deferred, plan_query
 from mnemiq.llm.client import LLMClient
@@ -79,6 +80,10 @@ def main() -> int:
     # `packet.definitions` is what it checks AGAINST. `retrieve` defaults it to `()`, so with
     # the guard on this script refused every declared term -- including terms the loaded
     # snapshot certifies. Fed the same way the runtime feeds it.
+    # ONE resolution per question, handed to retrieval and the planner alike (M13): the file
+    # provider re-reads its policy on every call, so two reads could scope the cards and the
+    # decision against two versions of it.
+    grants = authz.grants_for(identity)
     packet = retrieve(con, question, identity, authz, embedder, k=5,
                       definitions=snapshot.definitions if snapshot else (),
                       # The certified measures and the snapshot, for the same reason the
@@ -90,15 +95,16 @@ def main() -> int:
                       columns=snapshot.columns if snapshot else (),
                       metrics=snapshot.metrics if snapshot else (),
                       dimensions=snapshot.dimensions if snapshot else (),
-                      snapshot=snapshot)
+                      snapshot=snapshot, grants=grants)
     print(f"retrieved: {[c.object_id for c in packet.cards]}")
 
-    adapter = (DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only)
+    adapter = (DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only,
+                                  statement_timeout_s=DEFAULT_TIMEOUT_S)
                if settings.pg_dsn else None)
     outcome = plan_query(
         packet,
         snapshot,
-        authz.grants_for(identity),
+        grants,
         LLMGenerator(LLMClient(settings),
                      declare_assumed_terms=settings.guard_undefined_terms),
         adapter=adapter,

@@ -12,6 +12,7 @@ from mnemiq.authz.grants import DenyAll, FileAuthzProvider, GrantSet
 from mnemiq.cache.store import L1Cache, TwoTierCache
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
+from mnemiq.execute.runner import DEFAULT_TIMEOUT_S
 from mnemiq.generate.generator import LLMGenerator
 from mnemiq.llm.client import LLMClient
 from mnemiq.llm.embeddings import LLMEmbedder
@@ -75,6 +76,10 @@ def main() -> int:
 
     # See `ask.py`: `retrieve` defaults `definitions` to `()`, so an enabled guard checked
     # declared terms against an empty corpus and refused all of them.
+    # ONE resolution per question, handed to retrieval and the planner alike (M13): the file
+    # provider re-reads its policy on every call, so two reads could scope the cards and the
+    # decision against two versions of it.
+    grants = authz.grants_for(identity)
     packet = retrieve(con, question, identity, authz, LLMEmbedder(settings), k=5,
                       definitions=snapshot.definitions if snapshot else (),
                       # The certified measures and the snapshot, for the same reason the
@@ -86,7 +91,7 @@ def main() -> int:
                       columns=snapshot.columns if snapshot else (),
                       metrics=snapshot.metrics if snapshot else (),
                       dimensions=snapshot.dimensions if snapshot else (),
-                      snapshot=snapshot)
+                      snapshot=snapshot, grants=grants)
     print(f"retrieved: {[c.object_id for c in packet.cards]}\n")
 
     agent = Agent(
@@ -96,12 +101,13 @@ def main() -> int:
         generator=LLMGenerator(LLMClient(settings),
                                declare_assumed_terms=settings.guard_undefined_terms),
         synthesizer=LLMSynthesizer(LLMClient(settings)),
-        adapter=DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only),
+        adapter=DuckDBPostgresAdapter(settings.pg_dsn, local_only=settings.local_only,
+                                  statement_timeout_s=DEFAULT_TIMEOUT_S),
         cache=TwoTierCache(L1Cache()),
         guard_undefined_terms=settings.guard_undefined_terms,
         guard_fanout=settings.guard_fanout,
     )
-    result = agent.answer(packet, snapshot, authz.grants_for(identity), identity)
+    result = agent.answer(packet, snapshot, grants, identity)
 
     if result.deferred:
         print(f"DEFERRED: {result.answer}")
