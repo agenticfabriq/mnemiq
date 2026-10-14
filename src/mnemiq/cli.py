@@ -468,11 +468,20 @@ def _cmd_write(settings: Settings, args) -> int:
     if args.json:
         import json
 
-        # `vars(res)` would emit `narrowed` as stringified dataclasses via `default=str`, which is
-        # present but unparseable. A machine consumer of a governed write needs it structured.
-        payload = dict(vars(res))
-        payload["narrowed"] = ([{"object": n.object, "rows": n.rows, "columns": n.columns}
-                                for n in res.narrowed] if res.narrowed is not None else None)
+        # Named fields, never `vars(res)`: the WriteResult also carries `plan_sql` and `target_sql`,
+        # the write as EXECUTED, which under a row policy names the policy's own tables and
+        # literals (M51; Codex's review of #122 found this dump still shipping both). The shape
+        # matches MCP's `db_write`. `narrowed` is structured: a machine consumer of a governed
+        # write needs it parseable, not stringified dataclasses.
+        payload = {
+            "approved": res.approved,
+            "target": res.target,
+            "rows_affected": res.rows_affected,
+            "refusal": res.refusal,
+            "sql": res.asked_sql,
+            "narrowed": ([{"object": n.object, "rows": n.rows, "columns": n.columns}
+                          for n in res.narrowed] if res.narrowed is not None else None),
+        }
         print(json.dumps(payload, default=str))
         return 0
     if res.approved:
