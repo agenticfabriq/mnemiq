@@ -35,7 +35,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     w = sub.add_parser("write", help="execute a single INSERT/UPDATE/DELETE (governed)")
     w.add_argument("sql")
-    w.add_argument("--json", action="store_true", help="emit the WriteResult")
+    w.add_argument("--json", action="store_true",
+                   help="emit the result as MCP db_write does (the statement as asked, never as executed)")
     w.add_argument("--principal", default=None, help="identity principal (defaults to MNEMIQ_PRINCIPAL)")
     w.add_argument("--roles", default=None, help="comma-separated (defaults to MNEMIQ_ROLES)")
 
@@ -468,21 +469,11 @@ def _cmd_write(settings: Settings, args) -> int:
     if args.json:
         import json
 
-        # Named fields, never `vars(res)`: the WriteResult also carries `plan_sql` and `target_sql`,
-        # the write as EXECUTED, which under a row policy names the policy's own tables and
-        # literals (M51; Codex's review of #122 found this dump still shipping both). The shape
-        # matches MCP's `db_write`. `narrowed` is structured: a machine consumer of a governed
-        # write needs it parseable, not stringified dataclasses.
-        payload = {
-            "approved": res.approved,
-            "target": res.target,
-            "rows_affected": res.rows_affected,
-            "refusal": res.refusal,
-            "sql": res.asked_sql,
-            "narrowed": ([{"object": n.object, "rows": n.rows, "columns": n.columns}
-                          for n in res.narrowed] if res.narrowed is not None else None),
-        }
-        print(json.dumps(payload, default=str))
+        from mnemiq.server.serialize import write_payload
+
+        # MCP's shape, from the one serializer both use: never the whole WriteResult, which also
+        # carries the write as executed (M51).
+        print(json.dumps(write_payload(res), default=str))
         return 0
     if res.approved:
         # The disclosure belongs BESIDE the row count, which is what makes it legible: "rows
