@@ -4,7 +4,8 @@ The scope rule models DuckDB: a WITH's earlier siblings are in scope, the CTE it
 RECURSIVE, a later sibling never. Postgres binds a later sibling under RECURSIVE and SQLite always,
 so there the row-policy rewrite would wrap a CTE's literal rows as if they were the table --
 measured on Postgres 16, `[40]` for `[1, 40]`. Production always decides as the adapter's dialect
-(duckdb, or oracle, which refuses the shapes where the bindings differ), so this was latent; the
+(duckdb, or oracle, which rejects the two shapes measured to differ -- a forward reference and a
+rewritten self-reference), so this was latent; the
 owner's decision (2026-10-14) was to make the precondition a check rather than leave it to stay so.
 """
 
@@ -78,33 +79,33 @@ def test_oracle_rejects_a_forward_reference_and_a_rewritten_self_reference():
     con = oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
                            password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"),
                            dsn=ORACLE_DSN)
-    cur = con.cursor()
-    try:  # a run killed before its own cleanup left the table behind
-        cur.execute("DROP TABLE m150_claim PURGE")
-    except oracledb.DatabaseError:
-        pass
-    schema = {"m150_claim": {"amount"}}
-    policy = AccessPolicy(row_filters={"m150_claim": "amount > 10"}, policy_schema=schema)
-    cur.execute("CREATE TABLE m150_claim (amount NUMBER)")
-    try:
-        cur.execute("INSERT INTO m150_claim VALUES (5)")
-        cur.execute("INSERT INTO m150_claim VALUES (20)")
-        cases = {
-            "ORA-32031": "WITH foo AS (SELECT amount FROM m150_claim), m150_claim (amount) AS "
-                         "(SELECT 1 UNION ALL SELECT 40) SELECT amount FROM foo",
-            "ORA-32042": "WITH m150_claim (amount) AS (SELECT 1 UNION ALL SELECT amount + 1 "
-                         "FROM m150_claim WHERE amount < 3) SELECT amount FROM m150_claim",
-        }
-        for error, sql in cases.items():
-            verdict = decide(sql, schema, dialect="oracle", target="oracle", policy=policy)
-            assert not isinstance(verdict, Refusal), (sql, verdict)
-            with pytest.raises(oracledb.DatabaseError, match=error):
-                cur.execute(verdict.target_sql)
-        # The control: with no CTE named like the table, the policy applies and rows come back.
-        verdict = decide("WITH foo AS (SELECT amount FROM m150_claim) SELECT amount FROM foo",
-                         schema, dialect="oracle", target="oracle", policy=policy)
-        cur.execute(verdict.target_sql)
-        assert [r[0] for r in cur.fetchall()] == [20]
-    finally:
-        cur.execute("DROP TABLE m150_claim PURGE")
-        con.close()
+    with con:  # closed on every path, a failed CREATE or DROP included
+        cur = con.cursor()
+        try:  # a run killed before its own cleanup left the table behind
+            cur.execute("DROP TABLE m150_claim PURGE")
+        except oracledb.DatabaseError:
+            pass
+        schema = {"m150_claim": {"amount"}}
+        policy = AccessPolicy(row_filters={"m150_claim": "amount > 10"}, policy_schema=schema)
+        cur.execute("CREATE TABLE m150_claim (amount NUMBER)")
+        try:
+            cur.execute("INSERT INTO m150_claim VALUES (5)")
+            cur.execute("INSERT INTO m150_claim VALUES (20)")
+            cases = {
+                "ORA-32031": "WITH foo AS (SELECT amount FROM m150_claim), m150_claim (amount) AS "
+                             "(SELECT 1 UNION ALL SELECT 40) SELECT amount FROM foo",
+                "ORA-32042": "WITH m150_claim (amount) AS (SELECT 1 UNION ALL SELECT amount + 1 "
+                             "FROM m150_claim WHERE amount < 3) SELECT amount FROM m150_claim",
+            }
+            for error, sql in cases.items():
+                verdict = decide(sql, schema, dialect="oracle", target="oracle", policy=policy)
+                assert not isinstance(verdict, Refusal), (sql, verdict)
+                with pytest.raises(oracledb.DatabaseError, match=error):
+                    cur.execute(verdict.target_sql)
+            # The control: with no CTE named like the table, the policy applies and rows come back.
+            verdict = decide("WITH foo AS (SELECT amount FROM m150_claim) SELECT amount FROM foo",
+                             schema, dialect="oracle", target="oracle", policy=policy)
+            cur.execute(verdict.target_sql)
+            assert [r[0] for r in cur.fetchall()] == [20]
+        finally:
+            cur.execute("DROP TABLE m150_claim PURGE")
