@@ -13,6 +13,7 @@ code agreeing with itself, which is green by construction on exactly the defects
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass, field
 
 from sqlglot import exp
@@ -39,6 +40,16 @@ class Touched:
     # holding any of these is UNMEASURABLE for the mask half, not green.
     unattributable: tuple[str, ...] = ()
 
+
+# `infer_schema` is gone from `qualify_columns` in sqlglot 30.22 (M121's canary found it: 14 failures
+# on a forced upgrade). Passed where the installed sqlglot still takes it, so the locked version
+# keeps the behaviour it was measured with. Measured by hand on three shapes -- a column of a table
+# in the schema, of one outside it, and both across a join -- the two differ for a column of
+# a table OUTSIDE the schema: 30.12 attributes it by inference (`person.ssn`), 30.22 leaves it
+# unattributable -- the run-invalid direction. An approved plan reads no table outside the caller's
+# visible map (`check_access` refuses one), which is why no test tells them apart.
+_INFER_SCHEMA = ({"infer_schema": True}
+                 if "infer_schema" in inspect.signature(qualify_columns).parameters else {})
 
 def _qualified(ast: exp.Expression, schema) -> exp.Expression:
     """The plan with every column attributed to its object, or the plan unchanged.
@@ -75,7 +86,7 @@ def _qualified(ast: exp.Expression, schema) -> exp.Expression:
         return qualify_columns(
             ast.copy(),
             MappingSchema({t: {c: "UNKNOWN" for c in cols} for t, cols in schema.items()}),
-            infer_schema=True,
+            **_INFER_SCHEMA,
             # Stars stay stars. Expanding them gives `touched` a definition of "referenced" the
             # disclosure side does not share -- that side walks `find_all(exp.Column)` on the raw
             # tree, where a star is an `exp.Star` and reads nothing. With expansion,
