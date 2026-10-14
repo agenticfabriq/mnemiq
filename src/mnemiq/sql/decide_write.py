@@ -49,6 +49,112 @@ def _has_unscoped_with(ast: exp.Expression) -> bool:
     return False
 
 
+# A query a leading WITH can move into. A Subquery is only the parentheses around one, so the
+# Select or set operation inside it is the node whose names the CTEs bind.
+_QUERIES = (exp.Select, exp.SetOperation)
+
+
+def _own_with(node: exp.Expression) -> tuple[str, exp.With] | None:
+    """The WITH attached directly to `node` and the arg holding it, found by node TYPE (see
+    `_has_unscoped_with` for why never by arg name). The key comes back so the WITH can be
+    re-parked under the same spelling, which every root in one sqlglot version shares."""
+    for key, value in node.args.items():
+        if isinstance(value, exp.With):
+            return key, value
+    return None
+
+
+def _inside(node: exp.Expression, ancestor: exp.Expression) -> bool:
+    while node is not None:
+        if node is ancestor:
+            return True
+        node = node.parent
+    return False
+
+
+def _statement_queries(ast: exp.Expression, skip: exp.Expression) -> list[exp.Expression]:
+    """The queries directly under a write: each Select or set operation with no other query
+    between it and the root -- an INSERT's source, a WHERE or SET subquery, a derived table.
+    Nothing inside `skip` (the leading WITH itself) counts."""
+    out: list[exp.Expression] = []
+
+    def visit(node: exp.Expression) -> None:
+        for child in node.iter_expressions():
+            if child is skip:
+                continue
+            if isinstance(child, _QUERIES):
+                out.append(child)
+            else:
+                visit(child)
+
+    visit(ast)
+    return out
+
+
+def _lower_leading_with(ast: exp.Expression) -> exp.Expression | None:
+    """Move an INSERT's leading WITH into the INSERT's source query, or None to refuse.
+
+    M30's remainder. `build_scope` roots at the query a write runs, so CTEs parked on the write
+    root are read by no guard (see the UNSCOPED_CTE comment in `check_write_shape`). The same CTEs
+    spelled inside that query are read by every guard. So this moves the WITH there, and the
+    statement every guard checks is then the statement that runs -- one implementation of the
+    scope rules, not a second one taught to look in the root's WITH (M7's lesson).
+
+    Moved only where the move cannot change what the statement means, which is an INSERT's
+    source query and nowhere else. That query has no outer scope, so a CTE body moved into it
+    binds exactly the names it bound before. A subquery of an UPDATE or DELETE does have one:
+    the target row. Measured on DuckDB 1.5.4, a body reading `scratch.amount`, or an unqualified
+    `amount` its own tables lack, fails with the WITH leading ("Referenced table/column not
+    found") and RUNS once moved, correlated to the row being updated -- and a body correlated
+    that way is evaluated per row, not once. Telling those apart needs the schema and the
+    engine's binding rules, so a leading WITH on an UPDATE or DELETE stays refused. Also refused:
+
+      * a CTE body that is not a query (`WITH d AS (DELETE ... RETURNING ...)`): no read to
+        govern it as.
+      * a CTE name used outside the source query -- including the INSERT target itself, which
+        DuckDB binds to the table but which this does not assume of every engine.
+      * CTEs used by any query besides the source (an ON CONFLICT subquery, a VALUES scalar):
+        the move would leave that use bound to a table, or need a copy evaluated once per copy.
+      * a source query with its own WITH: merging two lists changes which name a body binds,
+        and that is the forward-reference ground M150 found engines disagree on.
+
+    A name is matched case-insensitively and with no schema qualifier. That over-matches a
+    quoted identifier, and over-matching only refuses more or moves the WITH somewhere it is
+    shadowed and inert. Under-matching is the unsafe direction: a reference the move missed would
+    read the table instead of the CTE.
+    """
+    if not isinstance(ast, exp.Insert):
+        return None
+    found = _own_with(ast)
+    if found is None:
+        return None  # a WITH in a list arg, which no supported sqlglot builds
+    key, leading = found
+    ctes = leading.expressions
+    if not ctes or not all(isinstance(cte.this, exp.Query) for cte in ctes):
+        return None
+    names = {cte.alias.casefold() for cte in ctes}
+
+    def names_a_cte(table: exp.Table) -> bool:
+        return (not table.args.get("db") and not table.args.get("catalog")
+                and table.name.casefold() in names)
+
+    queries = _statement_queries(ast, leading)
+    users = [q for q in queries if any(names_a_cte(t) for t in q.find_all(exp.Table))]
+    outside = [t for t in ast.find_all(exp.Table)
+               if names_a_cte(t) and not _inside(t, leading)
+               and not any(_inside(t, q) for q in queries)]
+    source = ast.expression
+    while isinstance(source, (exp.Subquery, exp.Paren)):  # INSERT INTO t (SELECT ...)
+        source = source.this
+    if outside or len(users) != 1 or users[0] is not source:
+        return None
+    query = source
+    if _own_with(query) is not None or key not in type(query).arg_types:
+        return None
+    query.set(key, leading.pop())
+    return ast
+
+
 def _target_node(ast: exp.Expression) -> exp.Table | None:
     """The table node being written, as a NODE, or None if this engine cannot name exactly one.
 
@@ -140,16 +246,20 @@ def check_write_shape(sql: str, dialect: str = "duckdb") -> exp.Expression | Ref
         # spelling as a control: a read of a table with NO grant was approved and executed, and so
         # was a reference to a column that does not exist.
         #
-        # Refused by shape, which is a question with no unmodelled cases -- either the arg is set
-        # or it is not. Modelling the scope instead is M48's job in the v1 lane; until it lands,
-        # a shape this engine cannot see into is declined rather than approved blind. The same
-        # CTE spelled INSIDE the INSERT parses into the projection, where `build_scope` sees it,
-        # and stays approved and governed.
-        return Refusal(
-            code=RefusalCode.UNSCOPED_CTE,
-            message=("Put the WITH clause inside the statement rather than before it, or inline "
-                     "it: a leading WITH is not visible to this engine's policy checks."),
-        )
+        # So an INSERT's WITH is moved into its source query, where every guard reads it and from
+        # where it runs (M30). Anywhere a move could change the statement's meaning -- every
+        # UPDATE and DELETE among them -- it is declined rather than approved blind;
+        # `_lower_leading_with` says why for each shape.
+        lowered = _lower_leading_with(ast)
+        if lowered is None:
+            return Refusal(
+                code=RefusalCode.UNSCOPED_CTE,
+                message=("Put the WITH inside the query that uses its CTEs, merging it with any "
+                         "WITH that query already has, or inline it. A leading WITH is checked "
+                         "only on an INSERT whose SELECT is the one query using its CTEs, where "
+                         "each CTE is a SELECT and none is named like the target."),
+            )
+        ast = lowered
     if not isinstance(ast, _WRITE_ROOTS):
         return Refusal(
             code=RefusalCode.NOT_A_WRITE,

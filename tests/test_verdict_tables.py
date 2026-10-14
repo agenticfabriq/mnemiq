@@ -85,8 +85,8 @@ def _write_tables(sql):
     return v.tables
 
 
-# The write path spells its CTE inside the INSERT: a LEADING `WITH` is refused by shape
-# (UNSCOPED_CTE), so this is the only spelling that reaches the recorder at all.
+# The CTE spelled inside the INSERT. A LEADING `WITH` is moved there before any guard runs
+# (M30), so the leading spelling must record the same tables -- pinned below.
 _LEAK = ("INSERT INTO scratch (id, customer_id) "
          "WITH customer AS (SELECT id, ssn FROM customer) "
          "SELECT o.id, o.customer_id FROM orders o JOIN customer c ON c.id = o.customer_id")
@@ -101,6 +101,15 @@ def test_the_write_decider_records_a_cte_shadowed_table_too():
     the real table.
     """
     assert _write_tables(_LEAK) == ["customer", "orders", "scratch"]
+
+
+def test_a_leading_with_records_what_its_inside_spelling_records():
+    """A leading WITH is moved into the INSERT's query before the recorder reads it, so a CTE
+    sharing a governed table's name must not delete that table from the record here either."""
+    leading = ("WITH customer AS (SELECT id, ssn FROM customer) "
+               "INSERT INTO scratch (id, customer_id) "
+               "SELECT o.id, o.customer_id FROM orders o JOIN customer c ON c.id = o.customer_id")
+    assert _write_tables(leading) == _write_tables(_LEAK) == ["customer", "orders", "scratch"]
 
 
 def test_the_write_target_is_recorded_even_though_nothing_reads_it():

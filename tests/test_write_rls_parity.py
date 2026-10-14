@@ -305,47 +305,49 @@ def test_the_target_conjunction_binds_tighter_than_an_existing_or(existing_where
     assert touched <= in_filter, f"mutated rows outside the filter: {touched - in_filter}"
 
 
-# -- the residual, recorded as a tripwire rather than as prose --------------------------------------
+# -- a statement-level WITH: moved into the query that uses it, then governed as that spelling --
+
+_LEADING_WITH = [
+    ("insert", "WITH x AS (SELECT id, amount FROM claim) "
+               "INSERT INTO scratch (id, amount) SELECT id, amount FROM x",
+               "INSERT INTO scratch (id, amount) "
+               "WITH x AS (SELECT id, amount FROM claim) SELECT id, amount FROM x"),
+    ("parenthesised_source", "WITH x AS (SELECT id, amount FROM claim) "
+                             "INSERT INTO scratch (id, amount) (SELECT id, amount FROM x)",
+                             "INSERT INTO scratch (id, amount) "
+                             "(WITH x AS (SELECT id, amount FROM claim) SELECT id, amount FROM x)"),
+    ("chained", "WITH a AS (SELECT id, amount FROM claim), b AS (SELECT id, amount FROM a) "
+                "INSERT INTO scratch (id, amount) SELECT id, amount FROM b",
+                "INSERT INTO scratch (id, amount) WITH a AS (SELECT id, amount FROM claim), "
+                "b AS (SELECT id, amount FROM a) SELECT id, amount FROM b"),
+    ("named_after_its_table", "WITH claim AS (SELECT id, amount FROM claim) "
+                              "INSERT INTO scratch (id, amount) SELECT id, amount FROM claim",
+                              "INSERT INTO scratch (id, amount) "
+                              "WITH claim AS (SELECT id, amount FROM claim) SELECT id, amount FROM claim"),
+]
 
 
-@pytest.mark.xfail(strict=True, reason="M30's residual: a statement-level WITH parks its CTEs in "
-                                       "the write root's `with_` arg, outside where build_scope "
-                                       "roots itself, so every guard sees an empty statement. This "
-                                       "asserts the GOVERNED outcome, and nothing on either "
-                                       "lane produces it: the shape is REFUSED by the "
-                                       "UNSCOPED_CTE floor, and M48's `_unscoped_ctes` refuses "
-                                       "it too rather than governing it -- measured on that "
-                                       "branch, `base_tables` returns ['claim','scratch','x'] "
-                                       "and `check_access` gives UNAUTHORIZED_TABLE on the CTE's "
-                                       "own alias, because declaring the scope unresolvable "
-                                       "falls back to `find_all(exp.Table)`. Governing this "
-                                       "needs `build_scope` to descend into the write root's "
-                                       "`with_`, which nobody has built. So this xpasses only "
-                                       "when that exists; it does NOT distinguish 'approved "
-                                       "ungoverned' from 'refused', which is why "
-                                       "test_write_governance_floors.py asserts the disposition "
-                                       "directly.")
-@pytest.mark.parametrize("sql", [
-    "WITH x AS (SELECT id, amount FROM claim) "
-    "INSERT INTO scratch (id, amount) SELECT id, amount FROM x",
-    "WITH x AS (SELECT id FROM claim) UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM x)",
-    "WITH x AS (SELECT id FROM claim) DELETE FROM scratch WHERE id IN (SELECT id FROM x)",
-])
-def test_a_statement_level_with_is_still_invisible_to_the_rewrite(sql):
-    """M30 is closed for every shape above and open for this one.
+@pytest.mark.parametrize("label,leading,inside", _LEADING_WITH, ids=[c[0] for c in _LEADING_WITH])
+def test_a_statement_level_with_is_governed_as_the_query_that_uses_it(label, leading, inside):
+    """M30's remainder, for the shape that exfiltrates: an INSERT copying governed rows into an
+    ungoverned table. A leading WITH parks its CTEs on the write root, where no guard looked, so
+    it was refused by shape. An INSERT's is now moved into its source query, and must then be
+    exactly the statement its inside spelling is: the same plan, filtered, moving the same rows.
+    UPDATE and DELETE stay refused (`test_write_governance_floors.py` says why).
 
-    The 14-shape sweep has a CTE case and still missed this: it spells the WITH *inside* the
-    INSERT, which sqlglot parses into the projection where `build_scope` can see it. A leading
-    WITH parses somewhere else entirely. Shapes generated from one spelling read as covering the
-    class -- which is how a sweep can be exhaustive and blind at once.
+    The 14-shape sweep above has a CTE case and still missed this shape: it spells the WITH inside
+    the INSERT, which parses somewhere else entirely. Shapes generated from one spelling read as
+    covering the class -- how a sweep can be exhaustive and blind at once."""
+    moved, control = _write(leading), _write(inside)
+    assert isinstance(control, ApprovedWrite), f"control: {control}"
+    assert isinstance(moved, ApprovedWrite), f"{label}: {moved}"
+    assert moved.plan_sql == control.plan_sql
+    assert _FILTER in moved.plan_sql
 
-    What this tripwire pinned when it was written was too narrow, and that is the more useful
-    lesson: it asserts an RLS predicate on a table that IS granted, so it recorded a missing
-    filter. Measured later, the same shape approved a read of a table with no grant at all and a
-    reference to a column that does not exist -- the guards were not filtering less, they were
-    not running. A tripwire built from the symptom you noticed pins the symptom you noticed.
-    `test_write_governance_floors.py` carries the authorization dimensions.
-    """
-    verdict = _write(sql)
-    assert isinstance(verdict, ApprovedWrite)
-    assert "region = 'west'" in verdict.plan_sql
+    def after(sql):
+        con = _con()
+        con.execute("INSERT INTO scratch VALUES (1, 99), (2, 99), (3, 99)")
+        con.execute(sql)
+        return sorted(con.execute("SELECT id, amount FROM scratch").fetchall())
+
+    assert after(moved.target_sql) == after(control.target_sql)

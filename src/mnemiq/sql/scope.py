@@ -20,11 +20,11 @@ def _unscoped_ctes(ast: exp.Expression, root) -> bool:
     by the comment *"their sources were checked above"*, and above, nothing was. Ninth instance
     in this codebase of an absence and a failure sharing one value (M2, M6, M34, M45, ...).
 
-    DEFENCE IN DEPTH, and not the live control: `check_write_shape` refuses this shape outright
-    with UNSCOPED_CTE, so nothing reaches here today carrying a leading WITH. Kept because the
-    refusal is ONE guard's decision while `base_tables` is the premise `check_access`, `check_cls`
-    and `apply_row_and_mask` all share, and a resolver must not answer `[]` for a statement it
-    never read. Measured with the shape refusal out of the way: these return `['claim', 'scratch',
+    DEFENCE IN DEPTH, and not the live control: `check_write_shape` moves a leading WITH into the
+    one query that uses it, or refuses it with UNSCOPED_CTE, so no write reaches here from the
+    write decider carrying one (M30). Kept because that is ONE guard's decision while
+    `base_tables` is the premise `check_access`, `check_cls` and `apply_row_and_mask` all share,
+    and a resolver must not answer `[]` for a statement it never read. Measured with the shape refusal out of the way: these return `['claim', 'scratch',
     'x']` and are refused on `x`. So this floor declines; it does not govern.
 
     The predicate is STRUCTURAL -- an `exp.With` among the root's own args -- and never an arg
