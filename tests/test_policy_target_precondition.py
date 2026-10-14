@@ -10,6 +10,8 @@ owner's decision (2026-10-14) was to make the precondition a check rather than l
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from mnemiq.authz.grants import GrantSet
@@ -60,3 +62,43 @@ def test_the_write_decider_refuses_it_too():
                            "SELECT amount FROM c", SCHEMA, grants, policy=FILTERED,
                            dialect="duckdb", target="postgres", writes_enabled=True)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.POLICY_TARGET_UNSUPPORTED
+
+
+ORACLE_DSN = os.environ.get("MNEMIQ_ORACLE_TEST_DSN")
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not ORACLE_DSN, reason="set MNEMIQ_ORACLE_TEST_DSN to run against Oracle")
+def test_oracle_errors_on_every_shape_where_its_binding_differs():
+    """Why Oracle is on POLICY_TARGETS, checked where it can be: decided as oracle under a row
+    filter, the forward reference and the self-reference both reach Oracle -- the decider does
+    not stop them -- and Oracle rejects each (23ai, which takes SELECT without FROM dual)."""
+    oracledb = pytest.importorskip("oracledb")
+    con = oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
+                           password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"),
+                           dsn=ORACLE_DSN)
+    cur = con.cursor()
+    schema = {"m150_claim": {"amount"}}
+    policy = AccessPolicy(row_filters={"m150_claim": "amount > 10"}, policy_schema=schema)
+    cur.execute("CREATE TABLE m150_claim (amount NUMBER)")
+    try:
+        cur.execute("INSERT INTO m150_claim VALUES (5)")
+        cur.execute("INSERT INTO m150_claim VALUES (20)")
+        cases = {
+            "ORA-32031": "WITH foo AS (SELECT amount FROM m150_claim), m150_claim (amount) AS "
+                         "(SELECT 1 UNION ALL SELECT 40) SELECT amount FROM foo",
+            "ORA-32042": "WITH m150_claim (amount) AS (SELECT 1 UNION ALL SELECT amount + 1 "
+                         "FROM m150_claim WHERE amount < 3) SELECT amount FROM m150_claim",
+        }
+        for error, sql in cases.items():
+            verdict = decide(sql, schema, dialect="oracle", target="oracle", policy=policy)
+            assert not isinstance(verdict, Refusal), (sql, verdict)
+            with pytest.raises(oracledb.DatabaseError, match=error):
+                cur.execute(verdict.target_sql)
+        # The control: with no CTE named like the table, the policy applies and rows come back.
+        verdict = decide("WITH foo AS (SELECT amount FROM m150_claim) SELECT amount FROM foo",
+                         schema, dialect="oracle", target="oracle", policy=policy)
+        cur.execute(verdict.target_sql)
+        assert [r[0] for r in cur.fetchall()] == [20]
+    finally:
+        cur.execute("DROP TABLE m150_claim PURGE")

@@ -316,9 +316,9 @@ def check_policy_target(ast: exp.Expression, policy, target: str | None):
     return Refusal(
         code=RefusalCode.POLICY_TARGET_UNSUPPORTED,
         message=(
-            f"This engine applies row and column policies only when it executes as DuckDB or "
-            f"Oracle, and this source is decided as {target!r}. This is a deployment setting, "
-            "not a limit on your grants."
+            f"This engine applies row and column policies to a statement with a WITH clause only "
+            f"when it executes as one of {', '.join(sorted(POLICY_TARGETS))}, and this source is "
+            f"decided as {target!r}. This is a deployment setting, not a limit on your grants."
         ),
         subject=None,
     )
