@@ -23,8 +23,9 @@ jobs:
       - run: .venv/bin/python -m pytest -m "not integration and not live_llm" -q
 
   # Past the caps pyproject sets, one capped package at a time: the newest release, forced. Tells us
-  # when a cap can rise, or what breaks first. Informational, so a known gap (mcp 2.x fails stdio
-  # startup today) does not turn the workflow red; read the job's own result.
+  # when a cap can rise, or what breaks first. Informational, so a release past the cap that breaks
+  # something does not turn the workflow red; read the job's own result. `uv pip install --upgrade`
+  # goes past the editable package's own cap (measured: an mcp<2.2 cap, upgraded to 2.3.0).
   past-the-caps:
     runs-on: ubuntu-latest
     continue-on-error: true

@@ -42,3 +42,30 @@ def test_unconfigured_stdio_server_lists_tools_and_survives_tool_errors(tmp_path
                     await session.send_ping()
 
     anyio.run(check)
+
+
+def test_a_mistyped_mode_reaches_the_client_as_its_instruction(tmp_path):
+    """mcp 2.x shows a client only `Error executing tool <name>` for anything but its ToolError
+    (M121), so a setup failure the operator can fix is carried as one -- a mistyped MNEMIQ_MODE
+    among them, raised building the runtime on the first call."""
+    async def check():
+        server = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "mnemiq.cli", "serve"],
+            cwd=str(tmp_path),
+            env={
+                "PATH": os.environ.get("PATH", ""),
+                "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
+                "MNEMIQ_STORE_PATH": str(tmp_path / "empty.duckdb"),
+                "MNEMIQ_MODE": "thinkin",
+            },
+        )
+        with anyio.fail_after(20):
+            async with stdio_client(server) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await session.call_tool("get_schema", {})
+                    assert getattr(result, "is_error", getattr(result, "isError", None)) is True
+                    assert "thinkin" in result.content[0].text, result.content[0].text
+
+    anyio.run(check)

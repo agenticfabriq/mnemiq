@@ -10,6 +10,7 @@ from collections.abc import Callable
 from threading import Lock
 
 from mnemiq.adapters.resolve import SourceUnconfigured
+from mnemiq.agent.route import UnknownMode
 from mnemiq.config import Settings
 from mnemiq.contract import IdentityContext
 from mnemiq.duckdb_extensions import ExtensionNotInstalled
@@ -121,7 +122,7 @@ def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContex
                 # but its `ToolError`, so the instruction is carried as one (M121).
                 try:
                     runtime = runtime()
-                except (SnapshotMissing, SourceUnconfigured, ExtensionNotInstalled) as exc:
+                except (SnapshotMissing, SourceUnconfigured, ExtensionNotInstalled, UnknownMode) as exc:
                     raise tool_error(str(exc)) from exc
             return runtime
 
