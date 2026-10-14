@@ -275,7 +275,7 @@ def check_views(
         )
     # Exact names, case-folded -- never `spellings`, whose bare last segment would let a grant on
     # `sales.customer` name a filtered `public.customer` the caller does not hold.
-    return _walk(ast, views, filtered, known or set(), (), 0, "", "",
+    return _walk(ast, views, filtered, known, (), 0, "", "",
                  {g.lower() for g in granted} if granted else set())
 
 
@@ -292,7 +292,7 @@ def _walk(
     ast: exp.Expression,
     views: dict[str, ViewDefinition],
     filtered: set[str],
-    known: set[str],
+    known: set[str] | None,
     stack: tuple[str, ...],
     depth: int,
     catalog: str,
@@ -377,7 +377,7 @@ def _walk(
         # the caller could not. That is M27's shape -- the view reaching past the caller's own
         # boundary -- and it closes every unknown-object spelling at once rather than the file
         # literal specifically.
-        if known:
+        if known is not None:
             # A CTE alias is a name the BODY defines; the source is not expected to know it.
             # Counting it as an unknown object refused every ordinary CTE view -- five of eight
             # new refusals in the review's matrix were legitimate SQL. This weakens nothing:
