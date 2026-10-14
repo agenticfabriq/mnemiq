@@ -1,5 +1,6 @@
 import sqlite3
 
+from mnemiq.authz.grants import GrantSet
 from mnemiq.adapters.sqlite import SQLiteAdapter
 from mnemiq.enrichment.grounding import ground_codes
 from mnemiq.enrichment.pipeline import enrich_structural
@@ -71,7 +72,8 @@ def test_ttl_to_question_time_candidates(tmp_path):
     store = duckdb.connect(":memory:")
     build_ontology_index(records, grounded, store)
     question = "how many patients have type 2 diabetes"
-    concepts = _resolve_concepts(question, grounded.columns, {"patient"}, OntologyIndex(store))
+    concepts = _resolve_concepts(question, grounded.columns, {"patient"}, OntologyIndex(store),
+                                 GrantSet(frozenset({"patient"})))
     assert concepts[0].notation == "E11"
 
     packet = ContextPacket(question=question, cards=[], grant_fingerprint="f",

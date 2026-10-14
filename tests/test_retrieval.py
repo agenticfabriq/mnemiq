@@ -260,7 +260,7 @@ def test_retrieve_examples_by_question_similarity_and_access_scope(tmp_path):
     emb = FakeEmbedder()
     build_example_index(con, snap, emb)
     (qvec,) = emb.embed(["how many claims?"])
-    got = _retrieve_examples(con, qvec, allowed={"claim"}, k=5)
+    got = _retrieve_examples(con, qvec, allowed={"claim"}, k=5, not_raw=frozenset())
     assert [e.object_id for e in got] == ["claim"]
 
 
@@ -271,7 +271,7 @@ def test_retrieve_examples_no_index_returns_empty(tmp_path, caplog):
 
     con = init_store(str(tmp_path / "s.duckdb"))  # no example table built
     (qvec,) = FakeEmbedder().embed(["q"])
-    assert _retrieve_examples(con, qvec, allowed={"claim"}, k=5) == []
+    assert _retrieve_examples(con, qvec, allowed={"claim"}, k=5, not_raw=frozenset()) == []
     # This is the common, unremarkable state (examples were never built) -- unlike the width
     # mismatch below, it must NOT log a warning on every retrieve() call.
     assert caplog.text == ""
@@ -303,7 +303,7 @@ def test_retrieve_examples_width_mismatch_also_returns_empty_but_is_logged(tmp_p
     build_example_index(con, snap, FakeEmbedder())  # 1536-wide
     (qvec,) = FakeEmbedder(dim=1024).embed(["q"])  # a differently-sized query vector
     with caplog.at_level(logging.WARNING):
-        assert _retrieve_examples(con, qvec, allowed={"claim"}, k=5) == []
+        assert _retrieve_examples(con, qvec, allowed={"claim"}, k=5, not_raw=frozenset()) == []
     assert "example retrieval failed" in caplog.text
 
 
@@ -331,7 +331,7 @@ def test_resolve_concepts_covers_only_bound_columns_on_shown_cards():
         Column(id="patient.x", object_id="patient", name="x"),
     ]
     got = _resolve_concepts("how many with type 2 diabetes", columns, {"patient"},
-                            OntologyIndex(con))
+                            OntologyIndex(con), GrantSet(frozenset({"patient"})))
 
     assert ResolvedConcept("patient.icd10_cd", "ICD-10-CM", "E11",
                            "Type 2 diabetes mellitus") in got
@@ -412,6 +412,6 @@ def test_examples_tied_on_the_embedding_come_back_in_one_order_however_they_were
             examples=[Example(question=q, sql=f"SELECT '{q}' FROM claim", tables=["claim"], object_id="claim")
                       for q in order]), _Pointing())
         (qvec,) = _Pointing().embed(["anything"])
-        return [e.question for e in _retrieve_examples(con, qvec, allowed={"claim"}, k=5)]
+        return [e.question for e in _retrieve_examples(con, qvec, allowed={"claim"}, k=5, not_raw=frozenset())]
 
     assert stored(["zeta case", "beta case"]) == stored(["beta case", "zeta case"]) == ["beta case", "zeta case"]

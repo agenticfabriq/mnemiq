@@ -59,7 +59,7 @@ def _granting(*objects: str) -> GrantSet:
 
 
 def test_a_metric_is_offered_when_its_table_is_in_context():
-    selected = select_metrics(["payment_transaction"], [_settled(), _elsewhere()], _granting("payment_transaction", "refund"))
+    selected = select_metrics(["payment_transaction"], [_settled(), _elsewhere()], _granting("payment_transaction", "refund"), columns=[])
 
     assert [m.id for m in selected] == ["settled_payment_volume"], (
         "a metric over a table that is not in context is noise; one over a table that is, is the "
@@ -70,7 +70,7 @@ def test_a_metric_is_offered_when_its_table_is_in_context():
 def test_a_metric_over_an_ungranted_table_is_never_offered():
     # Same rule the glossary applies: showing it leaks that the table exists and steers the model
     # into SQL the decider must reject.
-    selected = select_metrics(["payment_transaction"], [_settled()], _granting("refund"))
+    selected = select_metrics(["payment_transaction"], [_settled()], _granting("refund"), columns=[])
 
     assert selected == []
 
@@ -87,7 +87,7 @@ def test_dimensions_follow_their_table_too():
 def test_the_question_does_not_have_to_name_the_metric():
     """The point of the whole thing. `select_definitions` matches the asker's words; a metric that
     only appeared when named would be absent exactly when it is needed most."""
-    selected = select_metrics(["payment_transaction"], [_settled()], _granting("payment_transaction", "refund"))
+    selected = select_metrics(["payment_transaction"], [_settled()], _granting("payment_transaction", "refund"), columns=[])
     assert selected, "no question text was consulted at all, and that is deliberate"
 
 

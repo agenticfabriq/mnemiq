@@ -16,7 +16,7 @@ from mnemiq.llm.embeddings import Embedder
 from mnemiq.semantic.cards import render_facts_block
 from mnemiq.semantic.embedding_width import refuse_if_mismatched
 from mnemiq.semantic.glossary import select_definitions
-from mnemiq.semantic.measures import select_dimensions, select_metrics
+from mnemiq.semantic.measures import read_raw, select_dimensions, select_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -89,9 +89,12 @@ def _attach_facts(cards: list[RetrievedCard], table_facts: Sequence[TableFacts],
         c.card = f"{head}\n{block}\n{rest}" if rest else f"{head}\n{block}"
 
 
-def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5) -> list[Example]:
+def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5, *,
+                       not_raw: frozenset[tuple[str, str]]) -> list[Example]:
     """Top-k validated examples by QUESTION similarity to the asked question -- on-target
-    few-shot, not per-table. Never surfaces an example touching a table outside the grants."""
+    few-shot, not per-table. Never surfaces an example touching a table outside the grants, nor
+    one reading a column the identity does not read raw (`not_raw`, M144): its SQL would show the
+    model that column's name and use, which the card withheld."""
     placeholders = ", ".join("?" for _ in allowed)
     # Never built -- checked explicitly, by name, schema AND catalog (matching
     # DefinitionIndex.nearest's identical check; a same-named table in a different attached
@@ -133,25 +136,57 @@ def _retrieve_examples(con, embedding, allowed: set[str], k: int = 5) -> list[Ex
     out: list[Example] = []
     for question, sql, tables_json, object_id, _s in rows:
         tables = json.loads(tables_json)
-        if set(tables) <= allowed:  # an example must not reveal a forbidden table
+        # An example must not reveal a forbidden table, nor a column this identity may not read.
+        if set(tables) <= allowed and _reads_only_raw(sql, not_raw):
             out.append(Example(question=question, sql=sql, tables=tables, object_id=object_id))
         if len(out) >= k:
             break
     return out
 
 
+def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
+    """Does an example's SQL read no column in `not_raw`? Asked of `check_cls`, the decider's own
+    column resolution, so an alias, a CTE or an unqualified name resolves as it would on a real
+    query. Enrichment stores an example as an approved plan in the deciding dialect -- `duckdb`
+    for every source `adapters/resolve.py` builds but Oracle, which is `oracle`; an adapter kind
+    added there with its own dialect would land here -- while feedback capture stores the
+    SQL an operator wrote, in any spelling. One neither parser reads is withheld, since what it
+    reads cannot be checked, and logged, since an operator would otherwise see only examples
+    missing from the prompts of identities with something withheld."""
+    if not not_raw:
+        return True
+    import sqlglot
+
+    from mnemiq.sql.cls import check_cls
+    from mnemiq.sql.policy import AccessPolicy
+
+    for dialect in ("duckdb", "oracle"):
+        try:
+            ast = sqlglot.parse_one(sql, read=dialect)
+        except Exception:  # noqa: BLE001 -- try the other dialect; neither means not shown
+            continue
+        return check_cls(ast, AccessPolicy(denied=set(not_raw)), dialect) is None
+    logger.info("an example was withheld from an identity with columns withheld: its SQL parses as "
+                "neither duckdb nor oracle, so the columns it reads cannot be checked: %.80s", sql)
+    return False
+
+
 _CONCEPT_CAP = 15  # total across all columns: a prompt block, not a data dump
 
 
-def _resolve_concepts(question, columns, shown: set[str], index) -> list[ResolvedConcept]:
-    """Candidate codes for the question, for scheme-bound columns on RETRIEVED tables only.
+def _resolve_concepts(question, columns, shown: set[str], index, grants) -> list[ResolvedConcept]:
+    """Candidate codes for the question, for scheme-bound columns on RETRIEVED tables only, that
+    the identity reads raw.
 
-    Grant safety is inherited, not re-implemented: `shown` comes from cards that were already
-    scoped to the identity's grants before anything was ranked.
+    TABLE safety is inherited: `shown` comes from cards already scoped to the identity's grants.
+    COLUMN safety is not, and the docstring that said it was covered only tables (M144): a denied
+    or masked column on a shown table had its code vocabulary resolved into the prompt.
     """
     out: list[ResolvedConcept] = []
     for column in columns:
         if column.object_id not in shown or column.code_scheme is None:
+            continue
+        if not read_raw(column, grants):
             continue
         for notation, label in index.nearest(column.code_scheme.id, question):
             out.append(ResolvedConcept(column.id, column.code_scheme.label, notation, label))
@@ -289,11 +324,13 @@ def retrieve(
     # After the cards, not before: a bound definition rides with its table, so which tables were
     # retrieved has to be known first. It used to be selected before anything was ranked.
     packet.definitions = select_definitions(question, definitions, grants, table_ids)
-    packet.metrics = select_metrics(table_ids, metrics, grants)
+    packet.metrics = select_metrics(table_ids, metrics, grants, columns=columns)
     packet.dimensions = select_dimensions(table_ids, dimensions, grants, columns=columns)
-    packet.examples = _retrieve_examples(con, embedding, set(grants.objects), k=k)
+    not_raw = frozenset((c.object_id, c.name) for c in columns if not read_raw(c, grants))
+    packet.examples = _retrieve_examples(con, embedding, set(grants.objects), k=k,
+                                         not_raw=not_raw)
     if ontology_index is not None and packet.cards:
         packet.concepts = _resolve_concepts(
-            question, columns, {c.object_id for c in packet.cards}, ontology_index
+            question, columns, {c.object_id for c in packet.cards}, ontology_index, grants
         )
     return packet
