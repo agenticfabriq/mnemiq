@@ -137,6 +137,16 @@ def test_the_key_reaches_the_server_log_once(caplog):
     assert len(named) == 1, [r.getMessage() for r in caplog.records]
 
 
+def test_a_snapshot_swap_logs_the_key_again_under_the_new_version(caplog):
+    grants = GrantSet(frozenset({"claim"}), row_filters={"public.claim": _FILTER})
+    swapped = _snapshot().model_copy(update={"version": "v2"})
+    with caplog.at_level(logging.WARNING, logger="mnemiq.sql.policy"):
+        build_access_policy(_snapshot(), grants)
+        build_access_policy(swapped, grants)
+    versions = [r.getMessage() for r in caplog.records if "'public.claim'" in r.getMessage()]
+    assert len(versions) == 2 and "v2" in versions[1], versions
+
+
 def test_the_boot_advisory_names_the_key(caplog):
     grants = GrantSet(frozenset({"claim"}), row_filters={"claims": _FILTER})
     with caplog.at_level(logging.WARNING, logger="mnemiq.authz.coverage"):

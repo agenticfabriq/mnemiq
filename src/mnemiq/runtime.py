@@ -331,12 +331,16 @@ def _authz(settings: Settings) -> AuthzProvider:
 
 
 def _warn_policy_advisories(authz: AuthzProvider, snapshot: Snapshot | None) -> None:
-    """Say the two ways a policy silently grants less than its author meant:
+    """Say the two ways a policy silently grants less than its author meant, and one way it refuses:
 
     a row filter that fails to reach every table hanging off its tenancy axis, and a
     `pii_clearance`/`pii_mask` value that names no PII level and so clears nothing (M40).
     Both faithfully apply what the policy said, so nothing downstream complains. Advisory:
     it reports, it never refuses. The operator's policy is the operator's.
+
+    The third is different in kind: a row-filter key that names no object in the snapshot makes
+    the deciders refuse every read for that role (M50). It is reported here so the operator learns
+    of it at boot rather than from a user.
 
     TWO CALL SITES, not one. `build_runtime` at boot, and `Runtime.reload_if_stale` on an
     actual version swap -- `warn_unfiltered_dependents` reads `snapshot.relationships`, so a

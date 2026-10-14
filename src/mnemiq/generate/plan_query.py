@@ -129,8 +129,9 @@ def plan_query(
     if policy.unknown_filter_targets:
         # M50. Knowable before the first `generator.propose`, and every proposal would be refused
         # identically by the decider, so no model call is spent on it -- the same shape as the
-        # fast path above, and after it, so a view inventory that failed keeps its own reason. UNGOVERNABLE, as INVALID_ROW_FILTER maps: the policy was read, and a
-        # filter in it cannot be placed.
+        # fast path above, and after it, so a view inventory that failed keeps its own reason.
+        # UNGOVERNABLE, as INVALID_ROW_FILTER maps: the policy was read, and a filter in it cannot
+        # be placed.
         return Deferred(
             reason=("Your access policy has a row filter that names no table this deployment "
                     "knows, so no answer can be governed for you. This is a configuration fault "

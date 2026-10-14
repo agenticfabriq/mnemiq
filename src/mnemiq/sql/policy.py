@@ -213,9 +213,10 @@ def unknown_filter_targets(snapshot: Snapshot, row_filters) -> frozenset[str]:
     return frozenset(k for k in row_filters if k not in known and k.lower() not in folded)
 
 
-# Key sets already logged, so a policy that refuses every ask names its key once per process
-# rather than twice per question (`build_access_policy` runs for retrieval and for the decider).
-_reported: set[frozenset[str]] = set()
+# Key sets already logged, per snapshot version, so a policy that refuses every ask names its key
+# once per snapshot rather than twice per question (`build_access_policy` runs for retrieval and
+# for the decider) -- and a swap logs it again under the version it now refuses against.
+_reported: set[tuple[str, frozenset[str]]] = set()
 
 
 def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
@@ -260,8 +261,8 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     for c in snapshot.columns:
         policy_schema.setdefault(c.object_id, set()).add(c.name)
     unknown = unknown_filter_targets(snapshot, grants.row_filters)
-    if unknown and unknown not in _reported:
-        _reported.add(unknown)
+    if unknown and (snapshot.version, unknown) not in _reported:
+        _reported.add((snapshot.version, unknown))
         logger.warning(
             "row filter keyed %s names no table or view in snapshot %s, so every read for an "
             "identity holding it is refused until the policy names an object the snapshot holds "
