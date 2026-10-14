@@ -43,10 +43,11 @@ class Touched:
 
 # `infer_schema` is gone from `qualify_columns` in sqlglot 30.22 (M121's canary found it: 14 failures
 # on a forced upgrade). Passed where the installed sqlglot still takes it, so the locked version
-# keeps the behaviour it was measured with. The two differ only for a column of a table OUTSIDE the
-# schema: 30.12 attributes it by inference (`person.ssn`), 30.22 leaves it unattributable -- the
-# run-invalid direction. An approved plan reads no table outside the caller's visible map, which is
-# why no test tells them apart.
+# keeps the behaviour it was measured with. Measured by hand on three shapes -- a column of a table
+# in the schema, of one outside it, and both across a join -- the two differ for a column of
+# a table OUTSIDE the schema: 30.12 attributes it by inference (`person.ssn`), 30.22 leaves it
+# unattributable -- the run-invalid direction. An approved plan reads no table outside the caller's
+# visible map (`check_access` refuses one), which is why no test tells them apart.
 _INFER_SCHEMA = ({"infer_schema": True}
                  if "infer_schema" in inspect.signature(qualify_columns).parameters else {})
 

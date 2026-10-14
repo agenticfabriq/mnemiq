@@ -14,7 +14,9 @@ dependencies = [
   # Capped at the newest release the suite has passed on (M121): 30.17 broke the write path's table walk
   # (a write whose scope misses a table now fails closed, #66), 30.19 the fan-out check's grouping
   # reads (now by node type), and 30.22 removed `qualify_columns(infer_schema=)` (the eval criterion
-  # passes it only where accepted). Raise the cap when the deps-canary job passes past it.
+  # passes it only where accepted). Known from 30.13 on, failing closed: a VALUES branch of a set
+  # operation inside a CTE is refused as `unmodelled_source` where 30.12 approves it -- none of 9,687
+  # gold queries has the shape. Raise the cap when the deps-canary job passes past it.
   "sqlglot>=25.34.1,<30.23",
   "pyarrow>=17",
   "cachetools>=5",
