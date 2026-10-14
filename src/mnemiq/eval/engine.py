@@ -93,8 +93,14 @@ def build_engine(
     candidates: int = 1,
     verify: bool = False,
     grants: GrantSet | None = None,
+    index_adapter=None,
 ) -> tuple[Engine, LLMClient]:
     """Retrieval + agent over one snapshot, assembled exactly once.
+
+    `index_adapter` builds the value index, and defaults to `adapter`. A caller whose `adapter`
+    is bounded on the server (M152) passes an unbounded one here: each column's `SELECT DISTINCT`
+    has no limit of its own, and one the bound cancels is skipped silently, losing that column's
+    value check.
 
     The script and the live test must measure the SAME engine; assembling it twice, two
     subtly different ways, is how an eval drifts away from the thing it claims to measure.
@@ -105,7 +111,7 @@ def build_engine(
     con = init_store(store_path, local_only=settings.local_only)
     build_index(con, snapshot, embedder)
     build_example_index(con, snapshot, embedder)
-    build_value_index(adapter, snapshot, con)
+    build_value_index(index_adapter if index_adapter is not None else adapter, snapshot, con)
 
     ontology_index = None
     from mnemiq.enrichment.certified import (
