@@ -161,6 +161,8 @@ def test_a_service_whose_role_cannot_be_read_is_left_unbounded(monkeypatch):
         DuckDBAdapter.postgres("service=prod", statement_timeout_s=30)
         attaches = [s for s in sql if s.startswith(("ATTACH", "DETACH"))]
         assert len(attaches) == 1 and "statement_timeout" not in attaches[0], (limit, sql)
+        if limit == "2000":  # the tighter limit decides first: the role is never even asked for
+            assert not any("current_setting(''role'')" in s for s in sql), sql
 
 
 def test_a_federated_source_s_cancellation_reaches_the_model_as_a_timeout():
