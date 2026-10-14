@@ -144,7 +144,7 @@ def test_each_setup_failure_reaches_the_client_as_its_instruction_without_its_de
         (unconfigured, "source is not configured"),
         (SourceUnconfigured(secret), "source is not configured"),
         (ExtensionNotInstalled(secret), "mnemiq extensions fetch"),
-        (ExtensionsNotReady(secret), "mnemiq extensions fetch"),
+        (ExtensionsNotReady(secret), "missing or will not load"),
         (TablesNotFound(secret), "manifest lists does not exist"),
         (UnfederatableSource(secret), "federates a source DuckDB cannot attach"),
         (DriverMissing(secret), "mnemiq[oracle]"),

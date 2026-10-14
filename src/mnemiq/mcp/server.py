@@ -132,7 +132,10 @@ def _client_message(exc: Exception) -> str:
     if isinstance(exc, SourceUnconfigured):
         return ("This deployment's source is not configured: the operator's server log names what "
                 "is missing.")
-    if isinstance(exc, (ExtensionNotInstalled, ExtensionsNotReady)):
+    if isinstance(exc, ExtensionsNotReady):  # missing, or installed and refused at LOAD: fetch may not fix it
+        return ("A DuckDB extension this deployment loads is missing or will not load, and "
+                "MNEMIQ_LOCAL_ONLY forbids downloading one: the server log names which, and why.")
+    if isinstance(exc, ExtensionNotInstalled):
         return ("A DuckDB extension this deployment loads is not installed, and MNEMIQ_LOCAL_ONLY "
                 "forbids downloading it: the operator pre-seeds it with `mnemiq extensions fetch`; "
                 "the server log names which.")
