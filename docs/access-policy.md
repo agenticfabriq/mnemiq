@@ -53,6 +53,6 @@ Here is a Pagila example, using the policy above:
 
 Check a multi-table total before trusting it. Nothing flags an intersection as wrong, because it is what the policy says.
 
-**A view over a filtered table is refused.** mnemiq cannot apply a table's filter through a view's own SQL, so a query reading such a view is refused. The refusal names only the view. When the view reads exactly one filtered table, its SQL names that table exactly as the policy does, and the caller holds it, the caller is told to query it directly.
+**A view over a filtered table is refused.** mnemiq cannot apply a table's filter through a view's own SQL, so a query reading such a view is refused. The refusal names only the view. When the view reads exactly one filtered table, its SQL names that table as the policy does (case aside), and the caller holds it, the caller is told to query it directly.
 
-**A filter naming nothing in the source refuses every read.** A key must name a table or view the source holds; a misspelt one would otherwise drop its filter silently. An identity's roles merge into one policy, so the refusal covers everything that identity reads, including what its other roles grant. The key is reported at startup as well.
+**A filter naming nothing in the source refuses every read.** A key must name a table or view in mnemiq's snapshot of the source, so a real table whose profiling failed counts as unknown too; a misspelt key would otherwise drop its filter silently. An identity's roles merge into one policy, so the refusal covers everything that identity reads, including what its other roles grant. The key is reported at startup as well.
