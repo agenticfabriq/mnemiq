@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import sqlglot
 from sqlglot import exp
 
@@ -10,6 +12,8 @@ from mnemiq.sql.verdict import Refusal, RefusalCode
 # A view nested deeper than this is either a cycle the stack missed or a schema nobody should
 # be governing by reading definitions. Refusing beats walking forever.
 MAX_DEPTH = 8
+
+logger = logging.getLogger(__name__)
 
 
 def body_of(view: ViewDefinition) -> exp.Expression | None:
@@ -222,8 +226,17 @@ def check_views(
     views: dict[str, ViewDefinition],
     filtered: set[str],
     known: set[str] | None = None,
+    granted: set[str] | None = None,
 ) -> Refusal | None:
     """Refuse a granted view that reads a row-filtered table, and one this engine cannot read.
+
+    **What a refusal names (M53, with M145 merged into it).** The message goes to the model as
+    repair text and, once retries run out, to the caller -- so it names the view the QUERY read,
+    which the caller is granted, and a dependency only where `granted` holds it. It used to name
+    the base table and say it was row-filtered for the caller, to a caller granted only the
+    view; and a nested view, an unknown object or a cycle's whole chain the same way. The full
+    detail goes to the server log. `granted` is the caller's visible objects; None names nothing
+    beyond the view the query read -- the safe direction for a caller that does not pass it.
 
     M27: a view's rows are defined by SQL held in the source, so a filter on its base table
     reaches nothing -- the decider refused the base table correctly, and the repair loop used
@@ -260,7 +273,15 @@ def check_views(
                 "reachable; this is not a limit on your grants."
             ),
         )
-    return _walk(ast, views, filtered, known or set(), (), 0, "")
+    return _walk(ast, views, filtered, known or set(), (), 0, "", "",
+                 spellings(granted) if granted else set())
+
+
+def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
+    """A view refusal naming only the view the query read; the dependency it is about goes to the
+    operator's log, never to the model or the caller (M53)."""
+    logger.info("view %r refused (%s): %s", view, code.value, detail)
+    return Refusal(code=code, message=message, subject=view)
 
 
 def _walk(
@@ -271,6 +292,8 @@ def _walk(
     stack: tuple[str, ...],
     depth: int,
     catalog: str,
+    top: str,
+    granted: set[str],
 ) -> Refusal | None:
     for node in ast.find_all(exp.Table):
         name = object_key(node)
@@ -314,41 +337,30 @@ def _walk(
                     break
         if view is None:
             continue
+        here = top or name  # the view the query read: named in every refusal below
+        # Only the view the query read, which the caller holds. `it` names the view the
+        # problem is in where that is the same view, and says "a view it reads" where not.
+        it = repr(here) if name == here else f"a view {here!r} reads"
         if name in stack:
-            return Refusal(
-                code=RefusalCode.UNRESOLVABLE_VIEW,
-                message=(
-                    f"The view {name!r} is defined in terms of itself "
-                    f"({' -> '.join((*stack, name))}), so it cannot be resolved."
-                ),
-                subject=name,
-            )
+            return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
+                           f"{it} is defined in terms of itself, so it cannot be resolved.",
+                           f"cycle {' -> '.join((*stack, name))}")
         if depth >= MAX_DEPTH:
-            return Refusal(
-                code=RefusalCode.UNRESOLVABLE_VIEW,
-                message=f"The view {name!r} nests deeper than this engine will resolve.",
-                subject=name,
-            )
+            return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
+                           f"{here!r} nests views deeper than this engine will resolve.",
+                           f"depth {depth} at {name!r}")
         body = body_of(view)
         if body is None:
-            return Refusal(
-                code=RefusalCode.UNRESOLVABLE_VIEW,
-                message=(
-                    f"{name!r} is a view whose definition this engine cannot read, so it "
-                    "cannot confirm the row policy on the tables behind it."
-                ),
-                subject=name,
-            )
+            return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
+                           f"{it} has a definition this engine cannot read, so it cannot confirm "
+                           "the row policy on the tables behind it.",
+                           f"no readable body for {name!r}")
         unrecognised = unrecognised_source(body)
         if unrecognised is not None:
-            return Refusal(
-                code=RefusalCode.UNRESOLVABLE_VIEW,
-                message=(
-                    f"{name!r} reads through a {unrecognised.lower()} rather than a named "
-                    "table, so this engine cannot tell which tables it touches."
-                ),
-                subject=name,
-            )
+            return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
+                           f"{it} reads through a {unrecognised.lower()} rather than a named "
+                           "table, so this engine cannot tell which tables it touches.",
+                           f"{name!r} reads through a {unrecognised.lower()}")
         # The filtered set is widened the same way and by its bare last segment, so a body
         # saying `customer` still matches a filter keyed `public.customer`. Both directions,
         # because a miss here means not refusing.
@@ -378,28 +390,24 @@ def _walk(
                 if not (spellings({object_key(x)}) & recognised)
             )
             if unknown:
-                return Refusal(
-                    code=RefusalCode.UNRESOLVABLE_VIEW,
-                    message=(
-                        f"{name!r} reads {unknown[0]!r}, which is not an object in this source, "
-                        "so this engine cannot tell what policy applies to it."
-                    ),
-                    subject=name,
-                )
+                return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
+                               f"{it} reads an object that is not in this source, so this engine "
+                               "cannot tell what policy applies to it.",
+                               f"{name!r} reads unknown {unknown[0]!r}")
         reached = sorted(_mentions(body) & wanted)
         if reached:
-            return Refusal(
-                code=RefusalCode.UNGOVERNED_VIEW,
-                message=(
-                    f"{name!r} reads {reached[0]!r}, which is row-filtered for you, and this "
-                    "engine cannot apply that filter through a view. Query the table directly."
-                ),
-                subject=name,
-            )
+            base = reached[0]
+            # The table is named, and offered as the repair, only to a caller who reads it.
+            repair = (f" Query {base!r} directly." if spellings({base}) & granted
+                      else "")
+            return _refuse(RefusalCode.UNGOVERNED_VIEW, here,
+                           f"{it} reads a table that is row-filtered for you, and this engine "
+                           f"cannot apply that filter through a view.{repair}",
+                           f"{name!r} reads row-filtered {base!r}")
         # The body's own catalog carries into it: a view two levels down is still written in
         # the source's naming, not the federation's.
         nested = _walk(body, views, filtered, known, (*stack, name), depth + 1,
-                       name.rsplit(".", 1)[0] if "." in name else catalog)
+                       name.rsplit(".", 1)[0] if "." in name else catalog, here, granted)
         if nested is not None:
             return nested
     return None

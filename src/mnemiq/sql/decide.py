@@ -125,7 +125,8 @@ def decide(
     # A row filter cannot be applied through a view, so a view that reads a filtered table is
     # declined rather than answered past. The floor, deliberately -- see `check_views` (M27).
     ungoverned = check_views(shaped, {} if views is None else views, set(policy.row_filters),
-                             known=set(policy.policy_schema))
+                             known=set(policy.policy_schema),
+                             granted=set(visible))
     if ungoverned is not None:
         return ungoverned
 

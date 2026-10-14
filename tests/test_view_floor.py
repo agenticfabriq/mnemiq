@@ -103,8 +103,20 @@ def test_a_qualified_base_is_recognised_as_the_filtered_table():
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW
 
 
-def test_the_refusal_names_the_table_and_says_what_to_do_instead():
+def test_a_caller_granted_only_the_view_is_not_told_what_it_reads():
+    """M53: the refusal named the base table and said it was row-filtered for the caller, to a
+    caller granted only the view -- two facts about an object it may not see, sent to the model
+    as repair text and to the caller once retries run out. It names the view the query read."""
     verdict = plan("SELECT a FROM v", view("SELECT * FROM customer"), FILTERED)
+    assert verdict.code is RefusalCode.UNGOVERNED_VIEW
+    assert "'v'" in verdict.message and "customer" not in verdict.message
+    assert "directly" not in verdict.message
+
+
+def test_a_caller_who_reads_the_table_is_told_to_query_it_directly():
+    """The control: where the caller holds the base table, naming it is the repair."""
+    verdict = decide("SELECT a FROM v", {**GRANTED, "customer": SCHEMA["customer"]}, dialect=D,
+                     target=D, policy=FILTERED, views=view("SELECT * FROM customer"))
     assert "customer" in verdict.message and "directly" in verdict.message
 
 
