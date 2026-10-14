@@ -400,13 +400,23 @@ def _walk(
                                f"{name!r} reads unknown {unknown[0]!r}")
         reached = sorted(_mentions(body) & wanted)
         if reached:
-            base = reached[0]
-            # The table is named, and offered as the repair, only to a caller who reads it.
-            repair = f" Query {base!r} directly." if base.lower() in granted else ""
+            # The table is offered as the repair only when the view reaches exactly ONE filtered
+            # policy key, the body wrote that key exactly, and the caller holds it. Not by any
+            # widened spelling: `spellings` folds to the bare segment, which is right for refusing
+            # and wrong for naming -- a body reading `sales.customer` reaches a filtered
+            # `public.customer` that way, and the repair would send the model to a different
+            # table's rows. Not by the view's name prefix either: a prefix may be a schema, not a
+            # catalog, and nothing here can tell which. A federated body writes `customer` where
+            # the key is `pg.customer`, so it gets no hint -- fail closed, the refusal still holds.
+            keys = sorted(f for f in filtered if spellings({f}) & _mentions(body))
+            written = {object_key(t).lower() for t in body.find_all(exp.Table)}
+            held = (keys[0] if len(keys) == 1 and keys[0].lower() in written
+                    and keys[0].lower() in granted else None)
+            repair = f" Query {held!r} directly." if held else ""
             return _refuse(RefusalCode.UNGOVERNED_VIEW, here,
                            f"{it} reads a table that is row-filtered for you, and this engine "
                            f"cannot apply that filter through a view.{repair}",
-                           f"{name!r} reads row-filtered {base!r}")
+                           f"{name!r} reads row-filtered {keys or reached}, offered {held!r}")
         # The body's own catalog carries into it: a view two levels down is still written in
         # the source's naming, not the federation's.
         nested = _walk(body, views, filtered, known, (*stack, name), depth + 1,

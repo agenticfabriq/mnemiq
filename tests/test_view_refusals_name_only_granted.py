@@ -109,4 +109,58 @@ def test_a_grant_on_a_same_named_table_elsewhere_does_not_name_it():
     filtered `customer` the view reads -- a table this caller does not hold."""
     verdict = _read(_views(v="SELECT id FROM customer"),
                     visible={"v": {"id"}, "sales.customer": {"id"}})
+    assert verdict.code is RefusalCode.UNGOVERNED_VIEW
     assert "customer" not in verdict.message and "directly" not in verdict.message
+
+
+def test_a_federated_body_spelling_gets_no_hint():
+    """Federation keys every object `catalog.object_id`, so the grant is `pg.customer` while the
+    view body says `customer`. Reading the view's prefix as the catalog would name it, and the
+    same guess names the wrong table when the prefix is a schema (the next test), so neither is
+    named: the refusal stands without a repair."""
+    schema = {"pg.customer": {"id", "store_id"}, "pg.v": {"id"}}
+    policy = AccessPolicy(row_filters={"pg.customer": "store_id = 1"}, policy_schema=schema)
+    views = {"pg.v": ViewDefinition(object_id="pg.v", dialect=D, definition="SELECT id FROM customer")}
+    verdict = decide("SELECT id FROM pg.v", schema, dialect=D, target=D, policy=policy, views=views)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW
+    assert "directly" not in verdict.message
+
+
+def test_a_schema_prefix_is_never_taken_for_the_table_to_offer():
+    """Review gate, the blocker on a draft: reading the view's prefix as a catalog offered
+    `sales.customer` as the repair for a view reading the filtered `public.customer`."""
+    schema = {"public.customer": {"id", "store_id"}, "sales.customer": {"id"}, "sales.v": {"id"}}
+    policy = AccessPolicy(row_filters={"public.customer": "store_id = 1"}, policy_schema=schema)
+    for body in ("SELECT id FROM public.customer", "SELECT id FROM customer"):
+        views = {"sales.v": ViewDefinition(object_id="sales.v", dialect=D, definition=body)}
+        verdict = decide("SELECT id FROM sales.v", {"sales.v": {"id"}, "sales.customer": {"id"}},
+                         dialect=D, target=D, policy=policy, views=views)
+        assert isinstance(verdict, Refusal), verdict
+        assert "sales.customer" not in verdict.message and "directly" not in verdict.message
+
+
+def test_a_bare_segment_match_is_never_offered_as_the_repair():
+    """The refusal widens to the bare segment, so a body reading `sales.customer` is refused over
+    a filtered `public.customer`. Refusing is the safe side; offering `public.customer` as the
+    repair names a table the view does not read."""
+    schema = {"public.customer": {"id", "store_id"}, "sales.customer": {"id"}, "v": {"id"}}
+    policy = AccessPolicy(row_filters={"public.customer": "store_id = 1"}, policy_schema=schema)
+    verdict = decide("SELECT id FROM v", {"v": {"id"}, "public.customer": {"id", "store_id"}},
+                     dialect=D, target=D, policy=policy,
+                     views=_views(v="SELECT id FROM sales.customer"))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW
+    assert "directly" not in verdict.message
+
+
+def test_a_view_reaching_two_filtered_tables_offers_neither():
+    """One table offered as the repair while the view also reads another filtered one would send
+    the model somewhere the caller still cannot answer from."""
+    schema = {**SCHEMA, "payment": {"id"}}
+    policy = AccessPolicy(row_filters={"customer": "store_id = 1", "payment": "id > 0"},
+                          policy_schema=schema)
+    # The caller holds BOTH, so only the count of filtered tables reached withholds the hint.
+    visible = {"v": {"id"}, "customer": {"id", "store_id"}, "payment": {"id"}}
+    verdict = decide("SELECT id FROM v", visible, dialect=D, target=D, policy=policy,
+                     views=_views(v="SELECT c.id FROM customer c JOIN payment p ON p.id = c.id"))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW
+    assert "directly" not in verdict.message
