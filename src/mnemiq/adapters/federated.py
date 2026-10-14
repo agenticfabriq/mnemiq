@@ -5,6 +5,7 @@ import threading
 import pyarrow as pa
 
 from mnemiq.adapters.duckdb import (
+    UnparseableDSN,
     attach_literal,
     attach_postgres,
     duckdb_builtin_functions,
@@ -63,7 +64,11 @@ class FederatedAdapter:
             clause = f"(TYPE {attach_type}, READ_ONLY)" if read_only else f"(TYPE {attach_type})"
             # Each Postgres catalog bounded server-side, as the single-source path is (M152).
             if attach_type == "POSTGRES":
-                attach_postgres(self._con, spec.target, spec.catalog, clause, statement_timeout_s)
+                try:
+                    attach_postgres(self._con, spec.target, spec.catalog, clause,
+                                    statement_timeout_s)
+                except UnparseableDSN as exc:  # name the source, as the single-source door does
+                    raise UnparseableDSN(f"source {spec.id!r}: {exc}") from None
             else:
                 self._con.execute(f"ATTACH {attach_literal(spec.target)} AS {spec.catalog} {clause}")
         # No single USE: every query is catalog-qualified (catalog.schema.table).

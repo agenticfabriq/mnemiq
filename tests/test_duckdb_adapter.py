@@ -36,5 +36,6 @@ def test_duckdb_postgres_adapter_is_a_thin_compat_subclass():
     assert DuckDBPostgresAdapter.dialect == "duckdb"
     params = list(inspect.signature(DuckDBPostgresAdapter.__init__).parameters)
     # + read_only for the write path; + local_only so `mnemiq eval` and the scripts, which build this
-    # subclass directly, install no extension by download under MNEMIQ_LOCAL_ONLY (M107).
-    assert params == ["self", "dsn", "schema", "read_only", "local_only"]
+    # subclass directly, install no extension by download under MNEMIQ_LOCAL_ONLY (M107); +
+    # statement_timeout_s so a caller building it can bound its queries server-side (M152).
+    assert params == ["self", "dsn", "schema", "read_only", "local_only", "statement_timeout_s"]
