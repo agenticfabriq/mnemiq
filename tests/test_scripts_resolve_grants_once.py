@@ -35,9 +35,13 @@ def test_grants_are_resolved_once_and_handed_to_retrieval_and_the_planner(path):
     passed = {k.arg: k.value for k in retrieve.keywords}
     assert isinstance(passed.get("grants"), ast.Name), "retrieve must be handed the resolved grants"
     name = passed["grants"].id
-    assigned = [n for n in ast.walk(tree) if isinstance(n, ast.Assign)
-                and any(isinstance(t, ast.Name) and t.id == name for t in n.targets)]
-    assert len(assigned) == 1, "one binding, so retrieval and the planner see one set"
+    bindings = [n for n in ast.walk(tree) if isinstance(n, ast.Name) and n.id == name
+                and isinstance(n.ctx, ast.Store)]  # every form: =, :, |=, :=, for, tuple targets
+    assert len(bindings) == 1, "one binding, so retrieval and the planner see one set"
+    (binding,) = [n for n in ast.walk(tree) if isinstance(n, ast.Assign) and n.targets
+                  and isinstance(n.targets[0], ast.Name) and n.targets[0].id == name]
+    assert isinstance(binding.value, ast.Call) and \
+        getattr(binding.value.func, "attr", None) == "grants_for", "the binding IS the resolution"
     (consumer,) = _calls(tree, CONSUMERS[path])
     assert any(isinstance(a, ast.Name) and a.id == name for a in consumer.args), \
         "the planner must be handed the same grants retrieval was"
