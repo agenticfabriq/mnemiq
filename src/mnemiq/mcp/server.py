@@ -132,7 +132,10 @@ def build_mcp(runtime: Runtime | Callable[[], Runtime], identity: IdentityContex
         answer, the SQL run, and an auditable trace; defers honestly when it cannot answer.
         mode: 'instant' (cheapest, no retries), 'thinking' (default, self-repairing), or
         'deep' (5 candidates + judge + agreement gate -- highest precision, ~6x cost)."""
-        return _db_read(get_runtime(), identity, question, mode=mode)
+        try:
+            return _db_read(get_runtime(), identity, question, mode=mode)
+        except UnknownMode as exc:  # a mistyped `mode` on this call: its message lists the valid ones
+            raise tool_error(str(exc)) from exc
 
     @mcp.tool()
     def db_write(sql: str) -> dict:

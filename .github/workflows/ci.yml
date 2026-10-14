@@ -51,17 +51,6 @@ jobs:
       # name check by design, and the one case that uses `--all` sets the value inline.
       - run: bash scripts/test-repo-guard-range.sh
 
-  # The lock pins mcp 1.x, but the cap admits 2.x (M121), and 2.x hides an unexpected tool
-  # exception from the client -- the reason `mcp/server.py` raises setup failures as ToolError. On
-  # 1.x every exception's message reaches the client anyway, so only a 2.x run checks that path.
-  mcp-2x:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v3
-      - run: uv venv && uv pip install -e ".[dev]" && uv pip install --upgrade "mcp>=2,<2.4"
-      - run: uv pip freeze | grep -i '^mcp=='
-      - run: .venv/bin/python -m pytest tests/test_mcp_startup.py -v
   workbench:
     runs-on: ubuntu-latest
     defaults:

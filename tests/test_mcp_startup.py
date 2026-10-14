@@ -69,3 +69,29 @@ def test_a_mistyped_mode_reaches_the_client_as_its_instruction(tmp_path):
                     assert "thinkin" in result.content[0].text, result.content[0].text
 
     anyio.run(check)
+
+
+def test_a_mistyped_mode_on_one_call_reaches_the_client_as_its_instruction():
+    """The per-call `mode` of `db_read`, routed after the runtime is built: an `UnknownMode` there
+    lists the valid modes, and on mcp 2.x it reached an agent as `Error executing tool db_read`
+    unless carried as ToolError (review gate on M121)."""
+    from mnemiq.agent.route import UnknownMode
+    from mnemiq.contract import IdentityContext
+    from mnemiq.mcp.server import _mcp_classes, build_mcp
+
+    class _Runtime:
+        def ask(self, question, identity, mode=None):
+            raise UnknownMode(f"mode {mode!r} names no mode; valid modes: instant, thinking, deep")
+
+    server = build_mcp(_Runtime(), IdentityContext(principal_id="p", tenant_id="t"))
+    _, tool_error = _mcp_classes()
+
+    async def call():
+        await server.call_tool("db_read", {"question": "q", "mode": "thinkin"})
+
+    try:
+        anyio.run(call)
+    except tool_error as exc:
+        assert "valid modes" in str(exc), str(exc)
+    else:
+        raise AssertionError("a mistyped mode was answered")
