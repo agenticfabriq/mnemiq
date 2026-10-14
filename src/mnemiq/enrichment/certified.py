@@ -607,7 +607,7 @@ def _classify_dimension_columns(columns: list, dimensions: list) -> tuple[list, 
 
 
 # The overlaid fields copied as the record states them. `pii_level` and `coded_values` are
-# overlaid too, through the checks above.
+# overlaid too, through the M1/M41 checks and the coded-value rebuild in `apply_certified`.
 _MEANING_AS_STATED = ("description", "semantic_type", "code_scheme")
 
 
@@ -615,7 +615,10 @@ def apply_certified(snapshot: Snapshot, records: list[CertifiedRecord]) -> Snaps
     """Overlay certified MEANING onto locally-profiled STRUCTURE.
 
     A column's meaning (description, semantic_type, pii_level, coded_values, code_scheme) comes
-    from the certified record; its structure (data_type, row/distinct/null counts) stays local.
+    from the certified record, for each field the record STATES; a field it omits keeps its local
+    value, and so does a null `pii_level` (M42 -- silence is not an assertion, and None reads as
+    "not sensitive" to every consumer). Its structure (data_type, row/distinct/null counts) stays
+    local.
     Standalone objects (definition/metric/...) are appended to their lists. A certified column
     with no local counterpart is dropped -- mnemiq grounds what is physically in the DB.
 
