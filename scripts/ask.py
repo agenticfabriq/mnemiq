@@ -113,7 +113,7 @@ def main() -> int:
 
     print(f"\ntables: {outcome.tables}")
     print(f"columns: {outcome.columns}")
-    print(f"\nSQL:\n{outcome.target_sql}")
+    print(f"\nSQL:\n{outcome.asked_sql}")  # M51: as asked, not the policy's rewrite
     return 0
 
 
