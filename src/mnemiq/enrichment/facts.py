@@ -28,7 +28,6 @@ def _expr_columns_ok(expr: str, allowed: set[str]) -> bool:
     return all(c.name in allowed for c in tree.find_all(exp.Column))
 
 
-_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*")
 
 
 def _vocabulary(table: str, columns: set[str],
@@ -56,15 +55,19 @@ def _vocabulary(table: str, columns: set[str],
 
 
 def _named(text: str, vocab: dict[str, set[str]]) -> set[str]:
-    """Every dependency the text names, by any dotted suffix of any identifier-like token."""
-    found: set[str] = set()
-    for token in _NAME.findall(text):
-        parts = token.lower().split(".")
-        for i in range(len(parts)):
-            found |= vocab.get(".".join(parts[i:]), set())
-        for part in parts:
-            found |= vocab.get(part, set())
-    return found
+    """Every dependency the text names: each known name matched WHOLE, case folded.
+
+    Not by splitting the text into identifier tokens, which read `secret code` as two words and
+    matched neither -- a quoted identifier with a space, or with punctuation such as
+    `Enrollment (K-12)`, was never found, and the fact went out with an empty list to every
+    identity (Codex's review of #130). A name counts where no word character touches either end,
+    so `id` is not found in `idle`; a dot before it does not stop it, so a qualified mention still
+    names the bare column. Over-matching only withholds more.
+    """
+    low = text.lower()
+    return {dep for name, deps in vocab.items()
+            if name and re.search(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])", low)
+            for dep in deps}
 
 
 def _declared(names, vocab: dict[str, set[str]]) -> set[str] | None:
