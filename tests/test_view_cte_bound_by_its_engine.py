@@ -57,8 +57,8 @@ def test_a_reference_the_engine_binds_to_a_table_is_still_refused(dialect, body)
 
 def test_a_later_cte_in_the_other_case_of_a_non_ascii_letter_does_not_bind_the_read():
     """Codex's review of #144: SQLite folds ASCII letters only, so a later CTE `Ä` does not bind
-    a read of `ä` -- measured on SQLite 3.50, the table's 40 -- and the widened binding exempted
-    it while the resolver folded every letter."""
+    a read of `ä` -- measured on SQLite 3.50, the table's 40. Reviewed on top of the resolver as it
+    was, folding every letter, the widened binding exempted it; #147 narrowed the fold first."""
     verdict = _decide("WITH a AS (SELECT id FROM ä), Ä AS (SELECT 1 AS id) SELECT id FROM a",
                       "sqlite")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW, verdict
