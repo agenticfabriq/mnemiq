@@ -50,22 +50,23 @@ class IdentifierRules:
 _ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
 
 
-def _ascii_lower(text: str) -> str:
+def ascii_lower(text: str) -> str:
+    """Fold ASCII letters only, as DuckDB, SQLite and Postgres fold an identifier."""
     return text.translate(_ASCII_LOWER)
 
 
 _RULES: dict[str, IdentifierRules] = {
-    "postgres": IdentifierRules(_ascii_lower, True),
+    "postgres": IdentifierRules(ascii_lower, True),
     "oracle": IdentifierRules(str.upper, True),
-    "duckdb": IdentifierRules(_ascii_lower, False),
-    "sqlite": IdentifierRules(_ascii_lower, False),
+    "duckdb": IdentifierRules(ascii_lower, False),
+    "sqlite": IdentifierRules(ascii_lower, False),
 }
 
 # An unknown dialect gets the STRICTEST reading, not a guess. Treating quoting as significant, and
 # folding ASCII alone, can only make two spellings look like two objects, and this package's
 # consumers all fail closed on that -- an extra table node reaches the grant check rather than
 # slipping past it.
-_UNKNOWN = IdentifierRules(_ascii_lower, True)
+_UNKNOWN = IdentifierRules(ascii_lower, True)
 
 
 def rules_for(dialect: str | None) -> IdentifierRules:
