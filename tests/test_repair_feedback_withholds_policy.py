@@ -166,7 +166,8 @@ def test_a_word_the_caller_wrote_too_is_not_the_policy_s():
 
 def test_a_granted_column_only_the_rewrite_names_is_withheld_too():
     # `region` is granted, but only the policy's derived table names it here. An error naming it
-    # came from the policy's part, which reads rows the filter removes (see the docstring).
+    # came from the policy's part, which reads rows the filter removes (see the docstring). The
+    # predicate-reads-it case runs end to end in the `CAST(region AS INTEGER) > 0` policy above.
     detail = 'Binder Error: Referenced column "regoin" not found\nCandidate bindings: "region"'
     assert withhold_policy_words(detail, asked=ASKED, executed=EXECUTED, dialect="duckdb") is None
 

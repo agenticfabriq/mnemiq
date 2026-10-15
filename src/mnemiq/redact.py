@@ -113,6 +113,12 @@ def withhold_policy_words(detail: str | None, *, asked: str | None, executed: st
     filter, and only on a stale snapshot: against a current one the decider refuses the name
     itself, in our own words, before the source sees it.
 
+    Not covered: that same raising policy, over a column the caller names too. Its error then
+    names only the caller's words and is kept, with a value that may come from a removed row. The
+    caller's own predicates did not reach removed rows in 24 DuckDB shapes measured 2026-10-15
+    (the policy filtered first every time), so this needs a policy predicate that can raise on
+    data, and refusing such a policy belongs to the policy's validation, not to this text.
+
     With `asked == executed` the policy changed nothing and `detail` comes back untouched, so a
     benchmark, which clears every policy, sends the same bytes. With no record of `asked`, or an
     `executed` that will not parse, the policy's words cannot be told from the caller's, and
