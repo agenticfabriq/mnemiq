@@ -502,7 +502,8 @@ class Agent:
         groups = cluster([table for _, table in executed])
         views = [
             ClusterView(
-                sql=executed[group[0]][0].plan_sql,
+                # As asked, not the policy's rewrite: the selector is a model call (M156).
+                sql=executed[group[0]][0].model_sql(),
                 preview=render_result(executed[group[0]][1], max_rows=5),
                 size=len(group),
             )
@@ -631,8 +632,10 @@ class Agent:
     ) -> AgentAnswer:
         cut = _cut(approved, table)
         with step(emit, Stage.SYNTHESIZE, forced=forced):
+            # As asked, not the policy's rewrite (M156): the synthesizer is a model call, and the
+            # policy's predicate is not the caller's to read in the prose either.
             answer = self.synthesizer.answer(
-                packet.question, approved.plan_sql, render_result(table, cut_at=cut), forced=forced,
+                packet.question, approved.model_sql(), render_result(table, cut_at=cut), forced=forced,
                 row_count=table.num_rows,
             )
         trace = build_trace(

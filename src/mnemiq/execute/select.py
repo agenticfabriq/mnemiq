@@ -17,7 +17,10 @@ _INT = re.compile(r"-?\d+")
 class ClusterView:
     """One executed result-cluster, as the judge sees it."""
 
-    sql: str  # the representative candidate's plan_sql
+    # The representative candidate's statement as asked (`Approved.model_sql()`), never the
+    # policy-rewritten plan_sql: under a row filter that carries the policy's predicate, which a
+    # judge reads as an unasked filter (M156). With nothing narrowed the two are the same bytes.
+    sql: str
     preview: str  # a few rendered rows + total row count
     size: int  # how many candidates landed in this cluster
 

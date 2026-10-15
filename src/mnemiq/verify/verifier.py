@@ -116,13 +116,18 @@ class Verifier:
             # than assumed broken, the same way the counter version treated a judge with no
             # counters.
             reader = getattr(self.judge, "read", None)
+            # The statement as asked, never `plan_sql` (M156): under a row filter the plan wraps the
+            # table in the policy's own predicate, which the judge reads as a filter the question never
+            # implied -- measured, it withdrew 9 of 9 answers on a filtered table -- and under an
+            # entitlements filter it names tables the role is not granted.
+            sql = approved.model_sql()
             if reader is not None:
-                got = reader(packet.question, _judge_schema(packet), approved.plan_sql,
+                got = reader(packet.question, _judge_schema(packet), sql,
                              render_result(table, max_rows=5))
                 c, fell_open, why = got.score, got.fell_open, got.reason
             else:
                 c, fell_open, why = self.judge.score(
-                    packet.question, _judge_schema(packet), approved.plan_sql,
+                    packet.question, _judge_schema(packet), sql,
                     render_result(table, max_rows=5)
                 ), False, "ok"
             if fell_open:
