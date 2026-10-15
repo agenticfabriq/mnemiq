@@ -188,3 +188,34 @@ def test_an_executed_statement_that_will_not_parse_withholds():
 
 def test_no_detail_stays_none():
     assert withhold_policy_words(None, asked=ASKED, executed=EXECUTED, dialect="duckdb") is None
+
+
+# Every row but one is hidden by each policy below, and every hidden row would fail the caller's cast
+# with a value spelled `hidden_<n>`. DuckDB keeps no promise to filter by the policy first; this holds
+# that it does, because `withhold_policy_words` keeps a cut remainder naming only the caller's words,
+# which is safe only while the caller's predicate never sees a removed row.
+HIDING = ["region = 'west'", "region LIKE 'w%'", "length(region) = 4", "upper(region) = 'WEST'",
+          "id = 1", "id % 20000 = 1", "region IN ('west', 'nowhere')", "starts_with(region, 'we')"]
+CASTS = ["SELECT id FROM claim WHERE CAST(amount AS INTEGER) > 0",
+         "SELECT id FROM claim WHERE TRY_CAST(region AS INTEGER) IS NULL AND CAST(amount AS INTEGER) > 0",
+         "SELECT id FROM claim WHERE CAST(amount AS INTEGER) > 0 AND id > 0"]
+
+
+@pytest.fixture(scope="module")
+def hiding_adapter(tmp_path_factory):
+    path = str(tmp_path_factory.mktemp("hiding") / "s.duckdb")
+    con = duckdb.connect(path)
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, amount VARCHAR);"
+                "CREATE TABLE entitlement(id INT, who VARCHAR);"
+                "INSERT INTO claim SELECT i, CASE WHEN i = 1 THEN 'west' ELSE 'hidden_' || i END, "
+                "CASE WHEN i = 1 THEN '10' ELSE 'hidden_' || i END FROM range(1, 20000) t(i)")
+    con.close()
+    return DuckDBAdapter.duckdb(path)
+
+
+@pytest.mark.parametrize("cast", CASTS)
+@pytest.mark.parametrize("policy", HIDING)
+def test_a_caller_s_predicate_never_raises_on_a_row_the_policy_removes(hiding_adapter, policy, cast):
+    answer, calls = _ask(hiding_adapter, sql=cast, row_filter=policy)
+    assert not answer.failed and not answer.deferred, (answer.answer, calls)
+    assert calls == [None], "the one visible row casts cleanly, so nothing was ever repaired"
