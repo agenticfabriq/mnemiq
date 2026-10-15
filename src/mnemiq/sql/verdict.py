@@ -201,6 +201,15 @@ class Approved:
     # is when `narrowed` is empty. None where no decider set it, so a caller is shown nothing
     # rather than the executed statement by default.
     asked_sql: str | None = None
+    # The same statement as asked, in the PLAN's dialect: what a MODEL call is shown -- the judge,
+    # the selector, the synthesizer. Shown the rewritten `plan_sql`, the judge read the policy's
+    # own predicate as a filter the question never implied and withdrew every answer under a row
+    # filter (measured by the ui lane, M156), and an entitlements predicate would carry tables and
+    # literals the role is not granted to the model server. Equal to `plan_sql` when nothing was
+    # narrowed, so a prompt with no policy is byte-identical. Not `asked_sql`: that is the
+    # target's dialect, which would change every prompt on a source whose target differs. Never
+    # what runs. None where no decider set it.
+    asked_plan: str | None = None
 
 
 @dataclass

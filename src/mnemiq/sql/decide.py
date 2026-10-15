@@ -233,4 +233,4 @@ def decide(
 
     return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables,
                     lineage=lineage, columns=columns, narrowed=narrowed, row_cap=row_cap,
-                    asked_sql=asked_sql)
+                    asked_sql=asked_sql, asked_plan=asked_plan)
