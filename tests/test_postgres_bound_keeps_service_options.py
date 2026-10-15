@@ -68,6 +68,15 @@ def test_a_plain_dsn_still_carries_pgoptions(monkeypatch):
     assert _options(bounded_dsn("host=h", 30)) == "-c statement_timeout=30000 -c work_mem=64MB"
 
 
+@pytest.mark.parametrize("dsn", ["host=h options=''", "postgresql://h/d?options=",
+                                 "service=prod options=''"])
+def test_an_explicitly_empty_options_keeps_pgoptions_out(dsn, monkeypatch):
+    """Codex's review of #142: libpq takes an empty `options` as SET and never reads PGOPTIONS
+    then -- a service's options neither -- so the bounded connection carries the bound alone."""
+    monkeypatch.setenv("PGOPTIONS", "-c role=admin -c app.tenant_id=99")
+    assert _options(bounded_dsn(dsn, 30)) == "-c statement_timeout=30000"
+
+
 class _Con:
     """Records what the adapter executes; `limit` is the source's own statement_timeout in ms."""
 
@@ -165,3 +174,30 @@ def test_a_live_dsn_keeps_its_custom_setting_and_gains_the_bound():
     params["options"] = "-c search_path=from_dsn -c app.tenant_id=42"
     adapter = DuckDBAdapter.postgres(make_conninfo(**params), statement_timeout_s=30)
     assert adapter.execute(_SETTINGS) == [("from_dsn", "42", "30s")]
+
+
+@pytest.mark.skipif(not os.getenv("MNEMIQ_PG_DSN"), reason="no Postgres configured")
+@pytest.mark.parametrize("empty", ["keyword", "uri"])
+def test_a_live_empty_options_suppresses_pgoptions_bounded_as_configured(empty, monkeypatch):
+    """Live, through DuckDB's own libpq: the configured connection and the bounded one agree."""
+    from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+
+    params = conninfo_to_dict(os.environ["MNEMIQ_PG_DSN"])
+    params.pop("options", None)
+    if empty == "keyword":
+        dsn = make_conninfo(**params) + " options=''"
+    else:
+        from urllib.parse import quote
+
+        if not {"user", "host", "dbname"} <= params.keys():
+            pytest.skip("the URI form needs user, host and dbname in MNEMIQ_PG_DSN")
+        dsn = (f"postgresql://{quote(params['user'], safe='')}:"
+               f"{quote(params.get('password', ''), safe='')}@{params['host']}:"
+               f"{params.get('port', 5432)}/{quote(params['dbname'], safe='')}?options=")
+    monkeypatch.setenv("PGOPTIONS", "-c app.tenant_id=99")
+    unbounded = DuckDBAdapter.postgres(dsn).execute(_SETTINGS)
+    bounded = DuckDBAdapter.postgres(dsn, statement_timeout_s=30).execute(_SETTINGS)
+    assert unbounded[0][1] is None and bounded[0][1] is None, (unbounded, bounded)
+    assert bounded[0][2] == "30s"
