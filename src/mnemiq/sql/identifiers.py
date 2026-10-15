@@ -60,7 +60,10 @@ def ascii_lower(text: str) -> str:
 
 def _oracle_upper(text: str) -> str:
     """Fold as Oracle does: each letter to its uppercase where that is ONE character, and a letter
-    whose uppercase is longer -- `ß`, whose is `SS` -- kept as it is.
+    whose uppercase is longer -- `ß`, whose is `SS` -- kept as it is. Letters only: a circled
+    letter, a small Roman numeral and the combining ypogegrammeni (U+0345) have a one-character
+    uppercase too, and no measurement says Oracle folds them, so they are kept -- keeping only
+    makes two spellings look like two.
 
     Swept on Oracle Free (AL32UTF8), each letter as an unquoted alias whose folded name the driver
     reports: of the 5,781 letters below U+3000 Oracle accepts, and all 898 cased letters above it,
@@ -70,7 +73,7 @@ def _oracle_upper(text: str) -> str:
     The sweep is `test_live_oracle_sweep_never_folds_a_letter_oracle_keeps`, and a table name
     folds as an alias does (`test_live_oracle_folds_table_names_and_aliases_alike`).
     """
-    return "".join(u if len(u := c.upper()) == 1 else c for c in text)
+    return "".join(u if c.isalpha() and len(u := c.upper()) == 1 else c for c in text)
 
 
 _RULES: dict[str, IdentifierRules] = {

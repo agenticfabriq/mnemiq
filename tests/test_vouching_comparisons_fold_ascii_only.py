@@ -116,6 +116,16 @@ def test_oracle_folds_each_letter_by_its_one_character_uppercase():
     assert oracle("straße") != oracle("strasse")
 
 
+@pytest.mark.parametrize("kept", ["\u2170", "\u24d0", "\u0345"])  # ⅰ, ⓐ, combining ypogegrammeni
+def test_oracle_keeps_a_non_letter_whose_uppercase_is_one_character(kept):
+    """No measurement says Oracle folds a small Roman numeral, a circled letter or a combining
+    mark, so the rule keeps each -- the narrowing direction -- though Python uppercases them."""
+    from mnemiq.sql.identifiers import resolve
+
+    assert len(kept.upper()) == 1 and kept.upper() != kept
+    assert resolve(kept, quoted=False, dialect="oracle") == kept
+
+
 @pytest.mark.parametrize("known,body,refused", [
     ("STRASSE", "SELECT id FROM straße", True),   # Oracle keeps ß: an unknown object
     ("ORDERS", "SELECT id FROM orderſ", False),   # Oracle folds ſ to S: the known one
@@ -199,7 +209,11 @@ def test_live_oracle_sweep_never_folds_a_letter_oracle_keeps():
         for i in range(0, len(letters), 200):
             folded.update(_alias_folds(cur, oracledb, letters[i:i + 200]))
     ours = {c: resolve(c, quoted=False, dialect="oracle") for c, v in folded.items() if v}
+    # A floor, or a session that refuses everything -- a non-AL32UTF8 charset, a lost connection --
+    # compares nothing and passes. 6,679 answered on Oracle Free 23 (AL32UTF8).
+    assert len(ours) >= 6679 and {"ſ", "ä", "ı"} <= ours.keys(), len(ours)
     wider = [c for c in ours if folded[c] == c and ours[c] != c]
     differ = {c for c in ours if ours[c] != folded[c]}
     assert not wider, [f"U+{ord(c):04X}" for c in wider]
-    assert differ <= {chr(cp) for cp in range(0x1F80, 0x1FFD)}, sorted(differ)[:10]
+    two_char_greek = {chr(cp) for cp in range(0x1F80, 0x2000) if len(chr(cp).upper()) > 1}
+    assert differ <= two_char_greek, sorted(f"U+{ord(c):04X}" for c in differ - two_char_greek)
