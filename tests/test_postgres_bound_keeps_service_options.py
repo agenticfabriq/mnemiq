@@ -189,8 +189,13 @@ def test_a_live_empty_options_suppresses_pgoptions_bounded_as_configured(empty, 
     if empty == "keyword":
         dsn = make_conninfo(**params) + " options=''"
     else:
-        dsn = (f"postgresql://{params['user']}:{params.get('password', '')}@{params['host']}:"
-               f"{params.get('port', 5432)}/{params['dbname']}?options=")
+        from urllib.parse import quote
+
+        if not {"user", "host", "dbname"} <= params.keys():
+            pytest.skip("the URI form needs user, host and dbname in MNEMIQ_PG_DSN")
+        dsn = (f"postgresql://{quote(params['user'], safe='')}:"
+               f"{quote(params.get('password', ''), safe='')}@{params['host']}:"
+               f"{params.get('port', 5432)}/{quote(params['dbname'], safe='')}?options=")
     monkeypatch.setenv("PGOPTIONS", "-c app.tenant_id=99")
     unbounded = DuckDBAdapter.postgres(dsn).execute(_SETTINGS)
     bounded = DuckDBAdapter.postgres(dsn, statement_timeout_s=30).execute(_SETTINGS)
