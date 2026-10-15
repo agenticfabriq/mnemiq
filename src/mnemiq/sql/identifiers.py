@@ -6,11 +6,17 @@ commits; `scope.py` ignored quoting entirely, which let a quoted CTE hide a base
 grant check (M79); `qualify.py` folds case and says so, naming this as the fix; `views.py` widens a
 set of spellings and is not yet here.
 
-Two rules, and a dialect needs both:
+Three rules, and a dialect needs all of them:
 
   * WHICH WAY unquoted names fold. Oracle folds them UP where the others fold them down, so one
     hardcoded direction is wrong for one of them -- and wrong in the direction that VOUCHES, since
     a name that matches too widely lets a local alias stand in for a real table.
+  * HOW FAR the fold reaches. DuckDB, SQLite and Postgres fold ASCII letters only: measured,
+    with a table `ä` and a CTE `Ä`, `... FROM ä` read the table on SQLite 3.50, DuckDB and
+    Postgres 16 (UTF8). Oracle folds `ä` to `Ä` (it stores it so, and a CTE `Ä` binds `ä`).
+    Python's `str.lower` folds every letter -- and the Kelvin sign to `k` -- so it merged two
+    objects those engines keep apart, and a CTE vouched for a table read past the view check
+    (Codex's review of #144).
   * WHETHER quoting makes a name case-SENSITIVE. Postgres and Oracle preserve a quoted name, so
     `"Claim"` and `Claim` are two objects. DuckDB and SQLite fold quoted names too, so they are one.
     Measured on duckdb 1.5.4: `WITH claim AS (...) SELECT * FROM "CLAIM"` reads the CTE.
@@ -24,6 +30,7 @@ refused.
 
 from __future__ import annotations
 
+import string
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -36,17 +43,25 @@ class IdentifierRules:
     quoting_preserves_case: bool
 
 
+_ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def _ascii_lower(text: str) -> str:
+    return text.translate(_ASCII_LOWER)
+
+
 _RULES: dict[str, IdentifierRules] = {
-    "postgres": IdentifierRules(str.lower, True),
+    "postgres": IdentifierRules(_ascii_lower, True),
     "oracle": IdentifierRules(str.upper, True),
-    "duckdb": IdentifierRules(str.lower, False),
-    "sqlite": IdentifierRules(str.lower, False),
+    "duckdb": IdentifierRules(_ascii_lower, False),
+    "sqlite": IdentifierRules(_ascii_lower, False),
 }
 
-# An unknown dialect gets the STRICTEST reading, not a guess. Treating quoting as significant can
-# only make two spellings look like two objects, and this package's consumers all fail closed on
-# that -- an extra table node reaches the grant check rather than slipping past it.
-_UNKNOWN = IdentifierRules(str.lower, True)
+# An unknown dialect gets the STRICTEST reading, not a guess. Treating quoting as significant, and
+# folding ASCII alone, can only make two spellings look like two objects, and this package's
+# consumers all fail closed on that -- an extra table node reaches the grant check rather than
+# slipping past it.
+_UNKNOWN = IdentifierRules(_ascii_lower, True)
 
 
 def rules_for(dialect: str | None) -> IdentifierRules:
