@@ -14,9 +14,9 @@ import type { Narrowed } from "../lib/types";
 export function SqlBlock({ sql, narrowed }: { sql: string; narrowed?: Narrowed[] | null }) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
-  const withheld = (narrowed ?? []).filter((n) => n.rows).map((n) => n.object);
+  const filtered = (narrowed ?? []).filter((n) => n.rows).map((n) => n.object);
   const masked = (narrowed ?? []).filter((n) => n.columns).map((n) => n.object);
-  const applied = withheld.length > 0 || masked.length > 0;
+  const applied = filtered.length > 0 || masked.length > 0;
 
   const copy = async () => {
     try {
@@ -52,11 +52,12 @@ export function SqlBlock({ sql, narrowed }: { sql: string; narrowed?: Narrowed[]
       </div>
       {applied && (
         // Outside the toggle: what the policy did is part of the answer, not a detail to open.
-        // "Referenced on", not "masked on": the flag can name a table whose column the caller
-        // never read, where ownership does not resolve.
+        // Only what the flags record (Codex's review of #145): a filter was APPLIED -- the engine
+        // never measures whether it removed a row -- and the query referenced a column NAME a
+        // table masks, which can name a table whose column the caller never read.
         <div className={`bg-brass-wash px-2.5 py-2 text-[12px] ${open ? "border-b border-rule" : ""}`}>
-          {withheld.length > 0 && <p>Rows withheld from: {withheld.join(", ")}.</p>}
-          {masked.length > 0 && <p>Masked columns referenced on: {masked.join(", ")}.</p>}
+          {filtered.length > 0 && <p>Row filter applied to: {filtered.join(", ")}.</p>}
+          {masked.length > 0 && <p>Masked column names referenced, on: {masked.join(", ")}.</p>}
           <p className="meta mt-1">
             The statement that ran also applied the policy, which is not shown here.
           </p>
