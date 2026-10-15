@@ -35,6 +35,13 @@ def _fold(name: str) -> str:
     return " ".join(name.split()).lower()
 
 
+# A quote inside a quoted name is written doubled -- `"patient""code"`, `` `pa``tient` ``,
+# `[pa]]tient]`, and `''` in a string literal -- so a name holding one is known by that spelling
+# too. Matched only raw, a fact naming the column the way SQL quotes it recorded nothing, and
+# reached every identity (Codex's review of #139).
+_ESCAPES = (('"', '""'), ("`", "``"), ("]", "]]"), ("'", "''"))
+
+
 def _vocabulary(table: str, columns: set[str],
                 related_tables: Mapping[str, set[str]]) -> dict[str, set[str]]:
     """Each name a fact may use, folded, to the dependencies it may mean: an own column to
@@ -44,7 +51,8 @@ def _vocabulary(table: str, columns: set[str],
     vocab: dict[str, set[str]] = {}
 
     def add(name: str, dep: str) -> None:
-        vocab.setdefault(_fold(name), set()).add(dep)
+        for spelled in {name, *(name.replace(q, doubled) for q, doubled in _ESCAPES if q in name)}:
+            vocab.setdefault(_fold(spelled), set()).add(dep)
 
     for column in columns:
         add(column, f"{table}.{column}")

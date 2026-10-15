@@ -54,7 +54,7 @@ def test_the_runtime_threads_it_from_the_verdict_rather_than_defaulting():
 def test_the_write_surfaces_render_the_same_sentence_as_the_read_path():
     """One renderer, so a governed DELETE and a governed SELECT cannot disagree about wording."""
     assert disclosure_sentence([Narrowed(object="claim", rows=True, columns=False)]) == (
-        "Some rows were withheld by policy.")
+        "Row filter applied to: claim.")
 
 
 def test_both_write_surfaces_report_it_structurally():

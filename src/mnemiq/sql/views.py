@@ -6,6 +6,7 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.contract import ViewDefinition
+from mnemiq.sql.identifiers import rules_for
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import cte_references
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -93,18 +94,22 @@ def unrecognised_source(body: exp.Expression) -> str | None:
     return None
 
 
-def spellings(names: set[str]) -> set[str]:
+def spellings(names: set[str], fold=str.lower) -> set[str]:
     """Every spelling a name might be written in: itself, folded, and its bare last segment.
 
     One function for both comparisons -- what a body MENTIONS and what the source KNOWS -- 
     because when only the filtered set was widened, the known-object check refused every
     qualified reference it should have accepted. Two sets compared against each other must be
     normalised the same way or the comparison is between two different vocabularies.
+
+    `fold` folds every letter by default, which only ADDS matches -- right for what a body
+    mentions, where a match refuses. The known-object check passes the view's own dialect fold
+    instead, since there a match VOUCHES (M154).
     """
     out: set[str] = set()
     for name in names:
         bare = name.rsplit(".", 1)[-1]
-        out |= {name, name.lower(), bare, bare.lower()}
+        out |= {name, fold(name), bare, fold(bare)}
     return out
 
 
@@ -391,19 +396,23 @@ def _walk(
             # not by name: pooling every alias in the body and matching it by bare name let
             # `WITH secret AS (...) SELECT ... FROM main.secret` read a real table the snapshot
             # does not know, and a `secret` read outside the CTE's scope too, with any inventory
-            # (Codex's review of #132). `cte_references` is the deciders' own binding -- DuckDB's,
-            # the narrowest of the engines measured, so it never exempts a read an engine makes
-            # of the table -- and never excuses a qualified name. `_mentions` still collects
-            # every alias, so a CTE named after a filtered table still trips the filtered check.
-            bound = {id(t) for t in cte_references(body, view.dialect)}
-            recognised = spellings(known) | spellings(set(views))
+            # (Codex's review of #132). Bound as the view's OWN engine binds it, since its source
+            # runs the body: SQLite binds a later sibling, and DuckDB's rule refused such a view
+            # (Codex's review of #138). Never a qualified name. `_mentions` still collects every
+            # alias, so a CTE named after a filtered table still trips the filtered check.
+            bound = {id(t) for t in cte_references(body, view.dialect, engine=view.dialect)}
+            # Folded as the VIEW's engine folds, never wider: a match here vouches that a read is
+            # of a known object, and folding every letter let a known `Ä` vouch for an unknown `ä`
+            # that DuckDB, SQLite and Postgres keep apart (Codex's review of #147, M154).
+            fold = rules_for(view.dialect).fold
+            recognised = spellings(known, fold) | spellings(set(views), fold)
             # BOTH sides normalised. Widening only the known set still rejected `public.film`
             # against a snapshot that keys it `film`: a name is known when ANY of its spellings
             # matches any recognised one, not when its exact text appears.
             unknown = sorted(
                 object_key(x)
                 for x in body.find_all(exp.Table)
-                if id(x) not in bound and not (spellings({object_key(x)}) & recognised)
+                if id(x) not in bound and not (spellings({object_key(x)}, fold) & recognised)
             )
             if unknown:
                 return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
