@@ -791,11 +791,15 @@ class OracleAdapter:
         if not candidates:
             return sorted(defined), []
         over_links = self._synonyms_reaching_a_link()
+        # NAME_RESOLVE takes the NAME, and Oracle resolves a name to this schema's synonym before
+        # a PUBLIC one -- so a PUBLIC candidate sharing its name with a private link synonym would
+        # be resolved across that link (the review gate). Such a name is never resolved at all.
+        private_links = {stored for owner, stored in over_links if owner == self._schema}
         unresolvable: set[str] = set()
         oracle_owned: set[str] | None = None
         for owner, stored in sorted(candidates):
             name = stored.lower()
-            if (owner, stored) in over_links:
+            if (owner, stored) in over_links or stored in private_links:
                 unresolvable.add(name)
                 continue
             resolved = self._name_resolve(stored)

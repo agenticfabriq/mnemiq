@@ -165,3 +165,10 @@ def test_any_other_resolver_error_raises():
     a._with_cursor = lambda work, timeout: work(_Cursor())
     with pytest.raises(_Error):
         a._name_resolve("S")
+
+
+def test_a_public_synonym_sharing_a_name_with_a_private_link_synonym_is_never_resolved():
+    """Oracle resolves the name to this schema's synonym first, so resolving the PUBLIC one would
+    follow the private one across its link (the review gate)."""
+    d = _Dictionary(synonyms=[("APP", "X", "APP", "F", "ERP"), ("PUBLIC", "X", "APP2", "F", None)])
+    assert _adapter(d, {}).resolve_called_functions(["x"]) == ([], ["x"])
