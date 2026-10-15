@@ -6,7 +6,7 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.contract import ViewDefinition
-from mnemiq.redact import withhold_policy_words
+from mnemiq.redact import policy_safe_detail
 from mnemiq.sql.functions import (
     UnreadableCalls,
     called_names,
@@ -244,10 +244,10 @@ def decide(
         # the source understands -- `EXPLAIN` is not Oracle syntax (see mnemiq.sql.prove).
         refused = prove(adapter, target_sql)
         if refused is not None:
-            # What the source refused is the policy's rewrite, so its words can quote the policy,
-            # and the model repairs against them (Codex's review of #152). `prove` has logged them
-            # whole; the refusal keeps only what names nothing the policy alone wrote.
-            return replace(refused, source_detail=withhold_policy_words(
+            # What the source refused is the policy's rewrite, so its words can quote the policy and
+            # the rows it removes, and the model repairs against them. `prove` has logged them
+            # whole; under a policy the refusal keeps the error's class only (`policy_safe_detail`).
+            return replace(refused, source_detail=policy_safe_detail(
                 refused.source_detail, asked=asked_sql, executed=target_sql, dialect=target))
 
     return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables,

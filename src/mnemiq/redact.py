@@ -26,9 +26,9 @@ launder. Two grammars, never a guess at what looks secret:
 The server log keeps the full error (`ExecutionError.full_text`): it is the operator's record,
 and the operator holds the credential anyway.
 
-The access policy is the other thing a source's words can carry (Codex's review of #152). The source
-runs the policy's rewrite, so its error can quote the predicate, and `withhold_policy_words` keeps
-from the model whatever names a word only the policy wrote. Same log rule: the operator reads it all.
+The access policy is the other thing a source's words can carry (Codex's reviews of #152 and #153).
+The source runs the policy's rewrite, so under a policy `policy_safe_detail` lets the model read the
+engine's error class and nothing else of the source's. Same log rule: the operator reads it all.
 """
 
 from __future__ import annotations
@@ -87,74 +87,47 @@ def _value_end(text: str, value: int) -> int | None:
     return min(end, len(text)) if end > value else None
 
 
-# Postgres and DuckDB quote the statement after the message, as `LINE <n>: <window>` and a line
-# holding only the caret under the error's position.
-_ECHO = re.compile(r"^\s*LINE \d+:.*$|^\s*\^\s*$")
+# Each engine's own class, read only at the very start where that engine writes it, so neither
+# pattern can reach into the message that follows: DuckDB begins every message with its exception
+# type, letters and spaces then ` Error:`; Oracle's driver with the server's code or its own. Keyed
+# on the engine, never on the text's shape -- another engine whose messages happened to begin the
+# same way would hand the model whatever words led them. An engine missing here keeps nothing.
+_ERROR_CLASS = {
+    "duckdb": re.compile(r"(?:[A-Za-z]+ ){0,3}[A-Za-z]+ Error(?=:)"),
+    "oracle": re.compile(r"(?:ORA|DPY)-\d{4,5}\b"),
+}
 
 
-def withhold_policy_words(detail: str | None, *, asked: str | None, executed: str,
-                          dialect: str) -> str | None:
+def policy_safe_detail(detail: str | None, *, asked: str | None, executed: str,
+                       dialect: str) -> str | None:
     """`detail` as the model may read it when the source ran `executed` in place of `asked`.
 
-    The source raised its error running the policy's rewrite, so its words can quote the policy:
-    Postgres and DuckDB echo a window of the statement, MySQL quotes it after `near`, and DuckDB
-    lists candidate names from the scope that failed. The policy's predicate names tables and
-    literals the caller is not granted, and the prompt is not a place they may go. So the echo is
-    cut, and the rest is withheld whole (None) if it names any identifier, function or literal that
-    `executed` has and `asked` does not. Matched as whole words, case-insensitively: a remainder
-    that names a policy-only word in any spelling loses the source's words, and the repair keeps
-    our own sentence. Under-telling the model costs a retry; over-telling cannot be taken back.
+    Under a policy, the engine's error class (`Conversion Error`, `ORA-01722`) and nothing more;
+    None where the text does not begin with `dialect`'s class. Fail-closed, because no reading of
+    the rest can tell data from words. #153 tried: it cut the statement's echo and withheld text
+    naming any word only the policy wrote, and Codex's review of it measured the hole -- a policy
+    that raises on data with its column wrapped (`CAST(UPPER(region) AS INTEGER) > 0`) gets
+    "Could not convert string 'SECRET_HIDDEN_VALUE' to INT32", a row the caller may not see, naming
+    no column at all. DuckDB prints values unquoted too ("with value 31337"), and Oracle runs the
+    caller's own predicate on rows the policy removes and quotes a character of them (M160), so
+    neither the policy's words nor quotation marks find the data. A class is the engine's fixed
+    vocabulary: it says what kind of rewrite to try and carries no row.
 
-    That includes GRANTED columns the caller never wrote, which the rewrite's derived table
-    projects or its predicate reads. Deliberately: an error naming a column only the policy reads
-    was raised in the policy's part, which runs over the rows the filter removes, so its values
-    can be ones the caller may not see (`CAST(region AS INTEGER) > 0` as the policy quotes
-    `'west'` from any row). The cost is DuckDB's candidate list for a mistyped column under a
-    filter, and only on a stale snapshot: against a current one the decider refuses the name
-    itself, in our own words, before the source sees it.
+    Costs the repair the source's detail on every statement a policy changed -- the candidate list,
+    the column a cast failed on -- and only there: most of what a repair fixes is refused by the
+    decider in our own words before the source sees it. The full text is in the operator's log on
+    both paths. It does not close M160's channel, which is whether an error fires at all; the
+    policy fence that bounds the caller's predicates is the rewrite's, and a policy that raises on
+    data stays M159's to refuse.
 
-    Not covered: that same raising policy, over a column the caller names too. Its error then
-    names only the caller's words and is kept, with a value that may come from a removed row.
-    Nothing refuses such a policy today: an open gap in policy validation, not this text's to guess
-    at. The caller's own predicates do not reach removed rows on DuckDB, which filters by the
-    policy first, for scalar, IN-subquery and correlated EXISTS policies alike:
-    `test_a_caller_s_predicate_never_raises_on_a_row_the_policy_removes` holds that, so an engine
-    upgrade that reorders the two fails there rather than here.
-
-    With `asked == executed` the policy changed nothing and `detail` comes back untouched, so a
-    benchmark, which clears every policy, sends the same bytes. With no record of `asked`, or an
-    `executed` that will not parse, the policy's words cannot be told from the caller's, and
-    nothing of the source's is kept.
+    `asked == executed`: the policy changed nothing and `detail` comes back untouched, so a
+    benchmark, which clears every policy, sends the same bytes. No record of `asked` cannot say so,
+    and counts as changed.
     """
-    if detail is None or asked == executed:
+    if detail is None or (asked is not None and asked == executed):
         return detail
-    if asked is None:
+    pattern = _ERROR_CLASS.get(dialect)
+    found = pattern.match(detail) if pattern is not None else None
+    if found is None:
         return None
-    try:
-        policy_words = _words(executed, dialect) - _words(asked, dialect)
-    except Exception:  # sqlglot raises several types; any of them means "cannot tell"
-        return None
-    kept = "\n".join(line for line in detail.splitlines() if not _ECHO.match(line)).strip()
-    if not kept or any(_mentions(kept, word) for word in policy_words):
-        return None
-    return kept
-
-
-def _words(sql: str, dialect: str) -> set[str]:
-    """Every identifier, function name and literal value `sql` spells, folded to lower case."""
-    import sqlglot
-    from sqlglot import exp
-
-    tree = sqlglot.parse_one(sql, read=dialect)
-    words = {node.name for node in tree.find_all(exp.Identifier)}
-    words |= {node.name for node in tree.find_all(exp.Literal)}
-    words |= {node.name for node in tree.find_all(exp.Anonymous)}
-    return {w.lower() for w in words if w}
-
-
-def _mentions(text: str, word: str) -> bool:
-    # A word boundary only where the word itself starts or ends with a word character: a literal
-    # like `a-b` or `%x%` is still found inside other punctuation.
-    left = r"(?<!\w)" if re.match(r"\w", word) else ""
-    right = r"(?!\w)" if re.search(r"\w$", word) else ""
-    return re.search(f"(?i){left}{re.escape(word)}{right}", text) is not None
+    return f"Error class: {found.group(0)}. The rest of the source's message is not shown."
