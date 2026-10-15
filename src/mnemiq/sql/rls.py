@@ -15,6 +15,14 @@ from mnemiq.sql.verdict import Refusal, RefusalCode
 # query it becomes. Chosen to be unspellable in SQL a policy author would write.
 _SUBJECT = "__mnemiq_filtered__"
 
+# Engines that may evaluate a statement's own predicates on rows a row filter removes, and the
+# derived tables for which therefore carry a fence (M160). Oracle merges a filtered derived table
+# into the outer query, or pushes the outer predicates into it, so the caller's condition can run
+# before the policy's: measured on Oracle Free 23, where a `NO_MERGE` hint did not stop it. A view
+# reading ROWNUM is neither merged nor has predicates pushed into it, and `ROWNUM > 0` holds for
+# every row, so the fence changes which rows the outer query sees first and never which rows.
+_FENCED = frozenset({"oracle"})
+
 
 def _validate_filter(
     filt: str,
@@ -95,9 +103,13 @@ def _validate_filter(
 
 
 def _derived_table(
-    table: str, alias: str, cols: set[str], masked_cols: set[str], filt: exp.Expression | None
+    table: str, alias: str, cols: set[str], masked_cols: set[str], filt: exp.Expression | None,
+    fence: bool = False,
 ) -> exp.Subquery:
-    """(SELECT <cols, masked->NULL AS c> FROM table [WHERE filt]) AS alias."""
+    """(SELECT <cols, masked->NULL AS c> FROM table [WHERE filt [AND ROWNUM > 0]]) AS alias.
+
+    `fence` only where there is a filter: a mask removes no row, and a merged mask still reads
+    NULL, so only a filter has rows for the outer predicates to reach first (`_FENCED`)."""
     projections: list[exp.Expression] = []
     # Folded on both sides: `cols` carries the snapshot's column spelling and `masked_cols` the
     # policy's, and a mask that matches the table but not the column name nulls nothing.
@@ -110,6 +122,8 @@ def _derived_table(
     inner = exp.select(*projections).from_(exp.to_table(table))
     if filt is not None:
         inner = inner.where(filt)
+        if fence:
+            inner = inner.where(exp.GT(this=exp.column("ROWNUM"), expression=exp.Literal.number(0)))
     return exp.Subquery(this=inner, alias=exp.TableAlias(this=exp.to_identifier(alias)))
 
 
@@ -313,7 +327,9 @@ def apply_row_and_mask(
             # Missing it left `needs_mask` correctly true while the column set handed to
             # the projection was EMPTY, so the masked column was emitted as its real
             # value instead of NULL -- the mask silently doing nothing.
-            masked_by_table.get(name.lower(), set()), filt
+            masked_by_table.get(name.lower(), set()), filt,
+            # The engine that RUNS it, as everywhere else here: the fence is about its optimizer.
+            fence=(executes_as or dialect).lower() in _FENCED,
         )
         table_node.replace(derived)
         _record(narrowed, Narrowing(object=name, rows=needs_filter, columns=needs_mask))
@@ -370,6 +386,19 @@ def apply_row_filters_to_write(
         return Refusal(
             code=RefusalCode.INVALID_ROW_FILTER,
             message=f"The row-access policy for {name!r} is not a valid predicate.",
+            subject=name,
+        ), []
+    if (executes_as or dialect).lower() in _FENCED:
+        # The target is filtered by conjunction, and a conjunction is not a fence: the engine may
+        # still evaluate the statement's own WHERE on rows the filter removes (M160, measured on
+        # Oracle for an UPDATE). Refused until a write shape is found that fences it. The owner's
+        # decision, 2026-10-15: reads fenced, these writes refused.
+        return Refusal(
+            code=RefusalCode.POLICY_TARGET_UNSUPPORTED,
+            message=(f"An UPDATE or DELETE of {name!r}, which has a row filter, is refused on "
+                     "this source: the engine cannot be made to apply the filter before the "
+                     "statement's own conditions. This is a limit of this deployment, not of "
+                     "your grants."),
             subject=name,
         ), []
     existing = ast.args.get("where")
