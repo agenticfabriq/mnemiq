@@ -345,7 +345,9 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None,
     claim) FROM claim` declares `claim` inside a scalar subquery, and the outer `FROM claim` is
     the real table -- matched by name, it was skipped, never grant-checked, and the write was
     approved with `claim` ungranted on the locked sqlglot (M122). Inside a WITH's own CTE bodies
-    only earlier siblings are visible, plus the CTE itself when the WITH is RECURSIVE (M31's rule).
+    only earlier siblings are visible, plus the CTE itself when the WITH is RECURSIVE (M31's rule,
+    DuckDB's) -- unless `engine` is one in `_EVERY_SIBLING`, which binds every CTE of the WITH there,
+    the CTE itself included: how a view body is bound when its source engine runs it.
     A qualified reference (`main.claim`) is never a CTE -- a CTE has no schema -- and names are
     resolved by `mnemiq.sql.identifiers`, the shared resolver (M55) -- which `authz_guard`'s and
     `cls`'s own CTE name sets do not use yet, so they may still disagree with this one: matching lowercased bare names excused `FROM
