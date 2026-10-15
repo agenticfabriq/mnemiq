@@ -196,9 +196,9 @@ def test_no_detail_stays_none():
 # which is safe only while the caller's predicate never sees a removed row.
 HIDING = ["region = 'west'", "region LIKE 'w%'", "length(region) = 4", "upper(region) = 'WEST'",
           "id = 1", "id % 20000 = 1", "region IN ('west', 'nowhere')", "starts_with(region, 'we')",
-          # The entitlements shape, which DuckDB plans as a semi-join. Its correlated EXISTS spelling
-          # is refused by the policy validator, so it never runs.
-          ENTITLED]
+          # Subquery policies: the entitlements IN, which DuckDB plans as a semi-join, and a correlated
+          # EXISTS in the unqualified spelling the policy validator admits (it refuses `claim.region`).
+          ENTITLED, "EXISTS (SELECT 1 FROM entitlement e WHERE e.who = 'secret_role_42' AND region = 'west')"]
 CASTS = ["SELECT id FROM claim WHERE CAST(amount AS INTEGER) > 0",
          "SELECT id FROM claim WHERE TRY_CAST(region AS INTEGER) IS NULL AND CAST(amount AS INTEGER) > 0",
          "SELECT id FROM claim WHERE CAST(amount AS INTEGER) > 0 AND id > 0"]

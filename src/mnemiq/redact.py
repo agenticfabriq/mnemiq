@@ -117,7 +117,7 @@ def withhold_policy_words(detail: str | None, *, asked: str | None, executed: st
     names only the caller's words and is kept, with a value that may come from a removed row.
     Nothing refuses such a policy today: an open gap in policy validation, not this text's to guess
     at. The caller's own predicates do not reach removed rows on DuckDB, which filters by the
-    policy first, scalar and subquery policies alike:
+    policy first, for scalar, IN-subquery and correlated EXISTS policies alike:
     `test_a_caller_s_predicate_never_raises_on_a_row_the_policy_removes` holds that, so an engine
     upgrade that reorders the two fails there rather than here.
 
