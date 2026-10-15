@@ -161,21 +161,22 @@ EXECUTED = ("SELECT id FROM (SELECT amount, id, region FROM claim WHERE id IN (S
             "entitlement WHERE who = 'secret_role_42')) AS claim LIMIT 1000")
 
 
-@pytest.mark.parametrize("detail, label", [
+@pytest.mark.parametrize("detail, dialect, label", [
     # DuckDB: `<type> Error:` leads every message, whatever follows -- quoted, unquoted, echoed.
-    ("Conversion Error: Could not convert string 'SECRET_HIDDEN_VALUE' to INT32", "Conversion Error"),
+    ("Conversion Error: Could not convert string 'SECRET_HIDDEN_VALUE' to INT32", "duckdb",
+     "Conversion Error"),
     ("Conversion Error: Type INT32 with value 31337 can't be cast because the value is out of range "
-     "for the destination type INT8 when casting from source column amount", "Conversion Error"),
-    ("Out of Range Error: Overflow in multiplication of INT16 (31337 * 2)!", "Out of Range Error"),
+     "for the destination type INT8 when casting from source column amount", "duckdb", "Conversion Error"),
+    ("Out of Range Error: Overflow in multiplication of INT16 (31337 * 2)!", "duckdb", "Out of Range Error"),
     ('Binder Error: Referenced column "whom" not found in FROM clause!\nCandidate bindings: "who"\n\n'
-     "LINE 1: ... WHERE whom = 'secret_role_42')) AS claim\n         ^", "Binder Error"),
+     "LINE 1: ... WHERE whom = 'secret_role_42')) AS claim\n         ^", "duckdb", "Binder Error"),
     # Oracle 23 quotes one character of the value it could not convert (M160), and links help.
     ("ORA-01722: unable to convert string value containing 'h' to a number: REGION\n"
-     "Help: https://docs.oracle.com/error-help/db/ora-01722/", "ORA-01722"),
-    ("DPY-4011: the database or network closed the connection", "DPY-4011"),
+     "Help: https://docs.oracle.com/error-help/db/ora-01722/", "oracle", "ORA-01722"),
+    ("DPY-4011: the database or network closed the connection", "oracle", "DPY-4011"),
 ])
-def test_under_a_policy_only_the_error_class_is_kept(detail, label):
-    assert (policy_safe_detail(detail, asked=ASKED, executed=EXECUTED)
+def test_under_a_policy_only_the_error_class_is_kept(detail, dialect, label):
+    assert (policy_safe_detail(detail, asked=ASKED, executed=EXECUTED, dialect=dialect)
             == f"Error class: {label}.{WITHHELD}")
 
 
@@ -186,19 +187,66 @@ def test_under_a_policy_only_the_error_class_is_kept(detail, label):
     "Conversion Error",  # no colon, so not DuckDB's `<type> Error: <message>` shape
 ])
 def test_text_with_no_recognised_class_is_withheld_whole(detail):
-    assert policy_safe_detail(detail, asked=ASKED, executed=EXECUTED) is None
+    for dialect in ("duckdb", "oracle"):
+        assert policy_safe_detail(detail, asked=ASKED, executed=EXECUTED, dialect=dialect) is None
+
+
+@pytest.mark.parametrize("detail, dialect", [
+    # A class is read in the shape its OWN engine writes, never another's: text from an engine whose
+    # messages are not known to lead with a fixed class is withheld whole, whatever it looks like.
+    ("Conversion Error: x", "oracle"), ("ORA-01722: x", "duckdb"),
+    ("Conversion Error: x", "sqlite"), ("Conversion Error: x", "postgres"), ("ORA-01722: x", "mysql"),
+])
+def test_a_class_is_read_only_in_its_own_engine_s_shape(detail, dialect):
+    assert policy_safe_detail(detail, asked=ASKED, executed=EXECUTED, dialect=dialect) is None
 
 
 def test_with_nothing_narrowed_the_detail_is_returned_untouched():
     detail = "Binder Error: x\n\nLINE 1: SELECT id FROM claim\n               ^"
-    assert policy_safe_detail(detail, asked=ASKED, executed=ASKED) == detail
+    assert policy_safe_detail(detail, asked=ASKED, executed=ASKED, dialect="duckdb") == detail
 
 
 def test_an_unknown_asked_statement_counts_as_narrowed():
     # No record of what was asked means no way to say the policy changed nothing.
-    assert (policy_safe_detail("Binder Error: x", asked=None, executed=EXECUTED)
+    assert (policy_safe_detail("Binder Error: x", asked=None, executed=EXECUTED, dialect="duckdb")
             == f"Error class: Binder Error.{WITHHELD}")
 
 
 def test_no_detail_stays_none():
-    assert policy_safe_detail(None, asked=ASKED, executed=EXECUTED) is None
+    assert policy_safe_detail(None, asked=ASKED, executed=EXECUTED, dialect="duckdb") is None
+
+
+# M160's channel on DuckDB: whether an error fires at all says whether a removed row exists, if the
+# caller's predicate ever runs on one. Oracle does (measured by the e2e lane); DuckDB keeps no promise
+# not to, and this holds that it filters by the policy first. Every row but one is hidden by each
+# policy below, and every hidden row would fail the caller's cast, so an engine upgrade that
+# reorders the two turns this red rather than opening the channel quietly.
+HIDING = ["region = 'west'", "region LIKE 'w%'", "length(region) = 4", "upper(region) = 'WEST'",
+          "id = 1", "id % 20000 = 1", "region IN ('west', 'nowhere')", "starts_with(region, 'we')",
+          # Subquery policies: the entitlements IN, which DuckDB plans as a semi-join, and a correlated
+          # EXISTS in the unqualified spelling the policy validator admits (it refuses `claim.region`).
+          ENTITLED, "EXISTS (SELECT 1 FROM entitlement e WHERE e.who = 'secret_role_42' AND region = 'west')"]
+CASTS = ["SELECT id FROM claim WHERE CAST(amount AS INTEGER) > 0",
+         "SELECT id FROM claim WHERE TRY_CAST(region AS INTEGER) IS NULL AND CAST(amount AS INTEGER) > 0",
+         "SELECT id FROM claim WHERE CAST(amount AS INTEGER) > 0 AND id > 0"]
+
+
+@pytest.fixture(scope="module")
+def hiding_adapter(tmp_path_factory):
+    path = str(tmp_path_factory.mktemp("hiding") / "s.duckdb")
+    con = duckdb.connect(path)
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, amount VARCHAR);"
+                "CREATE TABLE entitlement(id INT, who VARCHAR);"
+                "INSERT INTO claim SELECT i, CASE WHEN i = 1 THEN 'west' ELSE 'hidden_' || i END, "
+                "CASE WHEN i = 1 THEN '10' ELSE 'hidden_' || i END FROM range(1, 20000) t(i);"
+                "INSERT INTO entitlement VALUES (1, 'secret_role_42')")
+    con.close()
+    return DuckDBAdapter.duckdb(path)
+
+
+@pytest.mark.parametrize("cast", CASTS)
+@pytest.mark.parametrize("policy", HIDING)
+def test_a_caller_s_predicate_never_raises_on_a_row_the_policy_removes(hiding_adapter, policy, cast):
+    answer, calls = _ask(hiding_adapter, sql=cast, row_filter=policy)
+    assert not answer.failed and not answer.deferred, (answer.answer, calls)
+    assert calls == [None], "the one visible row casts cleanly, so nothing was ever repaired"

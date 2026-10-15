@@ -87,17 +87,23 @@ def _value_end(text: str, value: int) -> int | None:
     return min(end, len(text)) if end > value else None
 
 
-# DuckDB begins every message with its exception type, letters and spaces then ` Error:`; Oracle's
-# driver begins with the server's or its own code. Read only at the very start, where the engine
-# writes them, so neither pattern can reach into the message that follows.
-_ERROR_CLASS = (re.compile(r"(?:[A-Za-z]+ ){0,3}[A-Za-z]+ Error(?=:)"), re.compile(r"(?:ORA|DPY)-\d{4,5}\b"))
+# Each engine's own class, read only at the very start where that engine writes it, so neither
+# pattern can reach into the message that follows: DuckDB begins every message with its exception
+# type, letters and spaces then ` Error:`; Oracle's driver with the server's code or its own. Keyed
+# on the engine, never on the text's shape -- another engine whose messages happened to begin the
+# same way would hand the model whatever words led them. An engine missing here keeps nothing.
+_ERROR_CLASS = {
+    "duckdb": re.compile(r"(?:[A-Za-z]+ ){0,3}[A-Za-z]+ Error(?=:)"),
+    "oracle": re.compile(r"(?:ORA|DPY)-\d{4,5}\b"),
+}
 
 
-def policy_safe_detail(detail: str | None, *, asked: str | None, executed: str) -> str | None:
+def policy_safe_detail(detail: str | None, *, asked: str | None, executed: str,
+                       dialect: str) -> str | None:
     """`detail` as the model may read it when the source ran `executed` in place of `asked`.
 
     Under a policy, the engine's error class (`Conversion Error`, `ORA-01722`) and nothing more;
-    None where the text begins with no class this recognises. Fail-closed, because no reading of
+    None where the text does not begin with `dialect`'s class. Fail-closed, because no reading of
     the rest can tell data from words. #153 tried: it cut the statement's echo and withheld text
     naming any word only the policy wrote, and Codex's review of it measured the hole -- a policy
     that raises on data with its column wrapped (`CAST(UPPER(region) AS INTEGER) > 0`) gets
@@ -120,8 +126,8 @@ def policy_safe_detail(detail: str | None, *, asked: str | None, executed: str) 
     """
     if detail is None or (asked is not None and asked == executed):
         return detail
-    for pattern in _ERROR_CLASS:
-        found = pattern.match(detail)
-        if found:
-            return f"Error class: {found.group(0)}. The rest of the source's message is not shown."
-    return None
+    pattern = _ERROR_CLASS.get(dialect)
+    found = pattern.match(detail) if pattern is not None else None
+    if found is None:
+        return None
+    return f"Error class: {found.group(0)}. The rest of the source's message is not shown."

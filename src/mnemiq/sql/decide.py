@@ -248,7 +248,7 @@ def decide(
             # the rows it removes, and the model repairs against them. `prove` has logged them
             # whole; under a policy the refusal keeps the error's class only (`policy_safe_detail`).
             return replace(refused, source_detail=policy_safe_detail(
-                refused.source_detail, asked=asked_sql, executed=target_sql))
+                refused.source_detail, asked=asked_sql, executed=target_sql, dialect=target))
 
     return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables,
                     lineage=lineage, columns=columns, narrowed=narrowed, row_cap=row_cap,

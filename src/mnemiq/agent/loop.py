@@ -372,7 +372,7 @@ class Agent:
                 # rows it removes: under a policy the model reads the error's class and nothing
                 # else (`policy_safe_detail`). The log above keeps the whole text.
                 detail = policy_safe_detail(exc.source_detail, asked=approved.asked_sql,
-                                            executed=approved.target_sql)
+                                            executed=approved.target_sql, dialect=self.dialect)
                 shown = ExecutionError(exc.message, source_detail=detail)
                 feedback = Feedback(shown.repair_text, from_source=detail is not None)
                 continue
