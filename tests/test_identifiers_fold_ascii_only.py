@@ -25,14 +25,14 @@ from mnemiq.sql.verdict import Refusal, RefusalCode
 KELVIN = "K"  # folds to an ASCII `k` under str.lower
 
 
-@pytest.mark.parametrize("dialect", ["duckdb", "sqlite", "postgres", "snowflake"])
+@pytest.mark.parametrize("dialect", ["duckdb", "sqlite", "postgres", "unknown"])
 @pytest.mark.parametrize("upper,lower", [("Ä", "ä"), (KELVIN, "k")])
 def test_a_non_ascii_letter_is_not_folded(dialect, upper, lower):
     assert resolve(upper, quoted=False, dialect=dialect) != resolve(lower, quoted=False,
                                                                     dialect=dialect)
 
 
-@pytest.mark.parametrize("dialect", ["duckdb", "sqlite", "postgres", "snowflake"])
+@pytest.mark.parametrize("dialect", ["duckdb", "sqlite", "postgres", "unknown"])
 def test_ascii_letters_still_fold(dialect):
     assert resolve("Claim", quoted=False, dialect=dialect) == "claim"
 

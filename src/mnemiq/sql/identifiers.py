@@ -16,7 +16,9 @@ Three rules, and a dialect needs all of them:
     Postgres 16 (UTF8). Oracle folds `ä` to `Ä` (it stores it so, and a CTE `Ä` binds `ä`).
     Python's `str.lower` folds every letter -- and the Kelvin sign to `k` -- so it merged two
     objects those engines keep apart, and a CTE vouched for a table read past the view check
-    (Codex's review of #144).
+    (Codex's review of #144). This resolver only: `qualify.names_one_object` and the write
+    path's CTE match still fold every letter, which over-matches, so they refuse more rather than
+    vouch -- the normalisation design (M55) owns bringing them here.
   * WHETHER quoting makes a name case-SENSITIVE. Postgres and Oracle preserve a quoted name, so
     `"Claim"` and `Claim` are two objects. DuckDB and SQLite fold quoted names too, so they are one.
     Measured on duckdb 1.5.4: `WITH claim AS (...) SELECT * FROM "CLAIM"` reads the CTE.
