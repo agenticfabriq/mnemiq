@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, JoinKey, Relationship
 from mnemiq.enrichment.facts import parse_facts
@@ -82,3 +84,34 @@ def test_a_name_with_a_run_of_whitespace_is_found():
     tf = parse_facts(json.dumps({"gotchas": [{"text": "secret code holds x", "reads": []}]}),
                      "orders", {"secret  code"}, set(), related_tables={})
     assert tf.reads["secret code holds x"] == ["orders.secret  code"]
+
+
+@pytest.mark.parametrize("column,text", [
+    ('patient"code', '"patient""code" contains diagnoses'),
+    ("pa`tient", "`pa``tient` contains diagnoses"),
+    ("pa]tient", "[pa]]tient] contains diagnoses"),
+    ("patient's code", "'patient''s code' contains diagnoses"),
+])
+def test_a_name_written_with_its_quote_doubled_is_found(column, text):
+    """Codex's review of #139: SQL writes a quote inside a quoted name doubled, and the scan
+    matched only the raw name, so the fact recorded nothing."""
+    tf = parse_facts(json.dumps({"gotchas": [{"text": text, "reads": []}]}), "orders",
+                     {"id", column}, set(), related_tables={})
+    assert tf.reads[text] == [f"orders.{column}"]
+
+
+def test_a_fact_naming_an_escaped_phi_column_never_reaches_an_identity_without_clearance():
+    text = '"patient""code" contains diagnoses'
+    tf = parse_facts(json.dumps({"gotchas": [{"text": text, "reads": []}]}), "orders",
+                     {"id", 'patient"code'}, set(), related_tables={})
+    columns = [Column(id="orders.id", object_id="orders", name="id"),
+               Column(id='orders.patient"code', object_id="orders", name='patient"code',
+                      pii_level="phi")]
+
+    def block(grants):
+        card = RetrievedCard(object_id="orders", card="TABLE orders", score=1.0)
+        _attach_facts([card], [tf], grants=grants, columns=columns, relationships=[])
+        return card.card
+
+    assert "diagnoses" not in block(GrantSet(frozenset({"orders"})))
+    assert "diagnoses" in block(GrantSet(frozenset({"orders"}), pii_clearance=frozenset({"phi"})))
