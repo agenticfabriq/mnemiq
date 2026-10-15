@@ -15,25 +15,19 @@ import { Thread } from "./Thread";
  * said "Executed SQL", which was false exactly when a policy narrowed the answer -- and `narrowed`,
  * which says so, reached the browser and nothing read it.
  *
- * The note claims only what the flags record (`Narrowing` in src/mnemiq/sql/rls.py). `rows` is "a
- * row filter was applied to it": the engine never measures whether the filter removed anything, so
- * the note says a filter was applied, never that rows were withheld. `columns` is "the query
- * referenced a column name this table masks", and where ownership does not resolve it can name a
- * table whose column the caller never read, so the note names column NAMES, not masked columns
- * (Codex's review of #145).
- *
- * The engine appends the same sentence to an ANSWERED result's text (M155, #150), so there the note
- * leaves the list to the answer and keeps only what the answer does not say: that the statement shown
- * is not the one that ran. A refused answer carries no such sentence, so there the note lists them.
+ * What the policy narrowed is the ENGINE's to state: since #150 (M155) it ends every answered
+ * result's text with "Row filter applied to: ..." / "Masked column names referenced, on: ...". So
+ * the block says only what the answer does not -- that the statement shown is not the one that ran
+ * -- and never repeats the list. A refusal carries no trace, hence no `sql` and no `narrowed`, and
+ * shows no SQL block at all.
  */
 const SQL = "SELECT COUNT(*) FROM claim JOIN person ON person.id = claim.person_id";
 
 describe("SqlBlock", () => {
-  it("names what a policy narrowed, before the statement is opened", () => {
+  it("says the statement shown did not run, before it is opened, when a policy narrowed the answer", () => {
     render(
       <SqlBlock
         sql={SQL}
-        listNarrowed
         narrowed={[
           { object: "claim", rows: true, columns: false },
           { object: "person", rows: false, columns: true },
@@ -42,65 +36,30 @@ describe("SqlBlock", () => {
     );
     expect(screen.getByRole("button", { name: /SQL as asked/ })).toBeInTheDocument();
     expect(screen.queryByText(/Executed SQL/)).not.toBeInTheDocument();
-    expect(screen.getByText("Row filter applied to: claim.")).toBeInTheDocument();
-    expect(screen.getByText("Masked column names referenced, on: person.")).toBeInTheDocument();
     expect(screen.getByText(/The statement that ran also applied the policy/)).toBeInTheDocument();
-    // Collapsed: the policy is stated without opening the statement.
+    // Collapsed: the fact is stated without opening the statement.
     expect(screen.queryByText(SQL)).not.toBeInTheDocument();
   });
 
-  it("claims a filter ran, never that it removed rows, nor that a named table's column was read", () => {
-    // A filter every row passes sets `rows` exactly as one that removes most of them does, and an
-    // unresolved column name sets `columns` on every table that masks that name.
-    render(
-      <SqlBlock
-        sql={SQL}
-        listNarrowed
-        narrowed={[
-          { object: "claim", rows: true, columns: true },
-          { object: "person", rows: false, columns: true },
-        ]}
-      />,
-    );
-    expect(screen.queryByText(/withheld|removed|excluded/i)).not.toBeInTheDocument();
-    expect(screen.queryByText(/masked columns|columns (were )?masked/i)).not.toBeInTheDocument();
-  });
-
-  it("lists an object under each flag it carries, in the engine's order", () => {
-    render(
-      <SqlBlock
-        sql={SQL}
-        listNarrowed
-        narrowed={[
-          { object: "claim", rows: true, columns: true },
-          { object: "policy", rows: true, columns: false },
-        ]}
-      />,
-    );
-    expect(screen.getByText("Row filter applied to: claim, policy.")).toBeInTheDocument();
-    expect(screen.getByText("Masked column names referenced, on: claim.")).toBeInTheDocument();
-  });
-
-  it("leaves the list to the answer when asked to, and still says the statement shown did not run", () => {
-    render(<SqlBlock sql={SQL} narrowed={[{ object: "claim", rows: true, columns: true }]} listNarrowed={false} />);
-    expect(screen.getByRole("button", { name: /SQL as asked/ })).toBeInTheDocument();
-    expect(screen.getByText(/The statement that ran also applied the policy/)).toBeInTheDocument();
-    expect(screen.queryByText(/Row filter applied to|Masked column names referenced/)).not.toBeInTheDocument();
+  it("leaves naming what was narrowed to the answer, and never claims rows were removed", () => {
+    render(<SqlBlock sql={SQL} narrowed={[{ object: "claim", rows: true, columns: true }]} />);
+    expect(screen.queryByText(/claim/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/withheld|removed|excluded|masked columns/i)).not.toBeInTheDocument();
   });
 
   it("calls the statement executed when the policy narrowed nothing", () => {
     // Every rewrite records a narrowing, so with none the statement as asked IS the one that ran.
-    render(<SqlBlock sql={SQL} narrowed={[]} listNarrowed />);
+    render(<SqlBlock sql={SQL} narrowed={[]} />);
     expect(screen.getByRole("button", { name: /Executed SQL/ })).toBeInTheDocument();
-    expect(screen.queryByText(/filter|masked|policy/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/policy/i)).not.toBeInTheDocument();
   });
 
   it("claims no narrowing when the engine did not evaluate one or did not report it", () => {
     // `null` is "not evaluated"; absent is an engine from before the field. Neither is a claim.
     for (const narrowed of [null, undefined]) {
-      const { unmount } = render(<SqlBlock sql={SQL} narrowed={narrowed} listNarrowed />);
+      const { unmount } = render(<SqlBlock sql={SQL} narrowed={narrowed} />);
       expect(screen.getByRole("button", { name: /Executed SQL/ })).toBeInTheDocument();
-      expect(screen.queryByText(/filter|masked|policy/i)).not.toBeInTheDocument();
+      expect(screen.queryByText(/policy/i)).not.toBeInTheDocument();
       unmount();
     }
   });
@@ -150,17 +109,5 @@ describe("the transcript", () => {
     expect(screen.getByRole("button", { name: /SQL as asked/ })).toBeInTheDocument();
     expect(screen.getByText(/The statement that ran also applied the policy/)).toBeInTheDocument();
     expect(screen.getAllByText(/Row filter applied to: policy\./)).toHaveLength(1);
-  });
-
-  it("lists a refused answer's narrowing under the SQL, since the engine adds no sentence to a refusal", () => {
-    store({
-      ...SCALAR_ANSWER,
-      deferred: true,
-      reason_code: "verification",
-      answer: "The result may not correctly answer the question.",
-      narrowed: NARROWED,
-    });
-    render(<Workbench />);
-    expect(screen.getByText("Row filter applied to: policy.")).toBeInTheDocument();
   });
 });

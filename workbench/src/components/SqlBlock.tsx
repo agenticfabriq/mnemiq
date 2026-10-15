@@ -5,28 +5,19 @@
  * policy's own tables and literals, and stays in the audit trace. When `narrowed` says the policy
  * changed something, the header says so and a note says the statement that ran is not shown;
  * otherwise nothing was rewritten (every rewrite records a narrowing) and it is the one that ran.
- * The note names the objects only when `listNarrowed`: the engine appends the same sentence to an
- * answered result's text (M155), so there the answer already says it.
+ * What was narrowed is named by the engine at the end of the answer's text (M155), so it is not
+ * repeated here.
  */
 
 import { useState } from "react";
 
 import type { Narrowed } from "../lib/types";
 
-export function SqlBlock({
-  sql,
-  narrowed,
-  listNarrowed,
-}: {
-  sql: string;
-  narrowed?: Narrowed[] | null;
-  listNarrowed: boolean;
-}) {
+export function SqlBlock({ sql, narrowed }: { sql: string; narrowed?: Narrowed[] | null }) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
-  const filtered = (narrowed ?? []).filter((n) => n.rows).map((n) => n.object);
-  const masked = (narrowed ?? []).filter((n) => n.columns).map((n) => n.object);
-  const applied = filtered.length > 0 || masked.length > 0;
+  // Applied when a row filter or a masked column name touched any object: every rewrite sets one.
+  const applied = (narrowed ?? []).some((n) => n.rows || n.columns);
 
   const copy = async () => {
     try {
@@ -61,19 +52,11 @@ export function SqlBlock({
         )}
       </div>
       {applied && (
-        // Outside the toggle: what the policy did is part of the answer, not a detail to open.
-        // Only what the flags record (Codex's review of #145): a filter was APPLIED -- the engine
-        // never measures whether it removed a row -- and the query referenced a column NAME a
-        // table masks, which can name a table whose column the caller never read.
-        <div className={`bg-brass-wash px-2.5 py-2 text-[12px] ${open ? "border-b border-rule" : ""}`}>
-          {listNarrowed && filtered.length > 0 && <p>Row filter applied to: {filtered.join(", ")}.</p>}
-          {listNarrowed && masked.length > 0 && (
-            <p>Masked column names referenced, on: {masked.join(", ")}.</p>
-          )}
-          <p className={listNarrowed ? "meta mt-1" : "meta"}>
-            The statement that ran also applied the policy, which is not shown here.
-          </p>
-        </div>
+        // Outside the toggle: that the statement shown is not the one that ran is part of the
+        // answer, not a detail to open.
+        <p className={`meta bg-brass-wash px-2.5 py-2 ${open ? "border-b border-rule" : ""}`}>
+          The statement that ran also applied the policy, which is not shown here.
+        </p>
       )}
       {open && (
         // Wrap rather than scroll: a statement is read, not scrubbed sideways, and a

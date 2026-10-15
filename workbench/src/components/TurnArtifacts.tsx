@@ -67,11 +67,7 @@ export function TurnArtifacts({ data }: DataMessagePartProps<Turn>) {
   return (
     <div className="flex flex-col gap-2.5">
       {refused && <DeferralCard answer={answer} />}
-      {/* The engine names what a policy narrowed at the end of an answered result's text, never a
-          refusal's, so the SQL block lists it only for a refusal. */}
-      {answer.sql && (
-        <SqlBlock sql={answer.sql} narrowed={answer.narrowed} listNarrowed={refused} />
-      )}
+      {answer.sql && <SqlBlock sql={answer.sql} narrowed={answer.narrowed} />}
       {answer.preview && <ResultView preview={answer.preview} />}
       <Badges answer={answer} />
       <RunDetails answer={answer} steps={steps} />
