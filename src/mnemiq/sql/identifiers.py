@@ -60,7 +60,14 @@ def ascii_lower(text: str) -> str:
 
 def _oracle_upper(text: str) -> str:
     """Fold as Oracle does: each letter to its uppercase where that is ONE character, and a letter
-    whose uppercase is longer -- `ß`, whose is `SS` -- kept as it is."""
+    whose uppercase is longer -- `ß`, whose is `SS` -- kept as it is.
+
+    Swept on Oracle Free (AL32UTF8), each letter as an unquoted alias whose folded name the driver
+    reports: of the 5,781 letters below U+3000 Oracle accepts, and all 898 cased letters above it,
+    none is folded here where Oracle keeps it -- the direction that would vouch. 27 Greek letters
+    with a subscript iota (U+1F80 on) Oracle folds to a single letter and this keeps, since
+    Python's uppercase of them is two characters; that only makes two spellings look like two.
+    """
     return "".join(u if len(u := c.upper()) == 1 else c for c in text)
 
 

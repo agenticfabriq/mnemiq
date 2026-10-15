@@ -128,25 +128,20 @@ def test_an_oracle_view_s_known_objects_fold_as_oracle_does(known, body, refused
 
 @pytest.mark.skipif(not os.environ.get("MNEMIQ_ORACLE_TEST_DSN"),
                     reason="set MNEMIQ_ORACLE_TEST_DSN to run against Oracle")
-def test_live_oracle_folds_long_s_and_keeps_sharp_s():
-    """Live: the measurement the Oracle rule rests on, kept."""
+def test_live_oracle_folds_identifiers_as_the_rule_says():
+    """Live: Oracle's own folding of each letter, read back as the name of an unquoted alias, so
+    no table is created. `ſ`, `ä` and dotless `ı` fold; `ß` is kept; a Greek letter with a
+    subscript iota folds where this rule keeps it, the one measured direction it differs in."""
+    from mnemiq.sql.identifiers import resolve
+
     oracledb = pytest.importorskip("oracledb")
-    con = oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
-                           password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", ""),
-                           dsn=os.environ["MNEMIQ_ORACLE_TEST_DSN"])
-    cur = con.cursor()
-    try:
-        cur.execute("CREATE TABLE fold_probe_s (id NUMBER)")
-        cur.execute("INSERT INTO fold_probe_s VALUES (40)")
-        cur.execute("SELECT id FROM fold_probe_ſ")
-        assert cur.fetchall() == [(40,)]
-        cur.execute("CREATE TABLE fold_probe_ß (id NUMBER)")
-        cur.execute("SELECT table_name FROM user_tables WHERE table_name LIKE 'FOLD_PROBE_%'")
-        assert sorted(r[0] for r in cur.fetchall()) == ["FOLD_PROBE_S", "FOLD_PROBE_ß"]
-    finally:
-        for table in ("fold_probe_s", "fold_probe_ß"):
-            try:
-                cur.execute(f"DROP TABLE {table} PURGE")
-            except oracledb.DatabaseError:
-                pass
-        con.close()
+    letters = ["ſ", "ä", "ı", "ß", "\u1f80"]
+    with oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
+                          password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", ""),
+                          dsn=os.environ["MNEMIQ_ORACLE_TEST_DSN"]) as con:
+        cur = con.cursor()
+        cur.execute("SELECT " + ", ".join(f"1 AS x{c}" for c in letters) + " FROM dual")
+        oracle = {c: d[0][1:] for c, d in zip(letters, cur.description)}
+    assert oracle == {"ſ": "S", "ä": "Ä", "ı": "I", "ß": "ß", "\u1f80": "\u1f88"}
+    ours = {c: resolve(c, quoted=False, dialect="oracle") for c in letters}
+    assert ours == {**oracle, "\u1f80": "\u1f80"}  # the one difference: ours keeps, Oracle folds
