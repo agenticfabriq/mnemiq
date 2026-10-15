@@ -3,6 +3,7 @@ import { AssistantRuntimeProvider } from "@assistant-ui/react";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 
 import { SCALAR_ANSWER } from "../test/fixtures";
+import type { AnswerPayload } from "../lib/types";
 import { useWorkbench } from "../lib/runtime";
 import { save } from "../lib/threads";
 import { SqlBlock } from "./SqlBlock";
@@ -20,6 +21,10 @@ import { Thread } from "./Thread";
  * referenced a column name this table masks", and where ownership does not resolve it can name a
  * table whose column the caller never read, so the note names column NAMES, not masked columns
  * (Codex's review of #145).
+ *
+ * The engine appends the same sentence to an ANSWERED result's text (M155, #150), so there the note
+ * leaves the list to the answer and keeps only what the answer does not say: that the statement shown
+ * is not the one that ran. A refused answer carries no such sentence, so there the note lists them.
  */
 const SQL = "SELECT COUNT(*) FROM claim JOIN person ON person.id = claim.person_id";
 
@@ -28,6 +33,7 @@ describe("SqlBlock", () => {
     render(
       <SqlBlock
         sql={SQL}
+        listNarrowed
         narrowed={[
           { object: "claim", rows: true, columns: false },
           { object: "person", rows: false, columns: true },
@@ -49,6 +55,7 @@ describe("SqlBlock", () => {
     render(
       <SqlBlock
         sql={SQL}
+        listNarrowed
         narrowed={[
           { object: "claim", rows: true, columns: true },
           { object: "person", rows: false, columns: true },
@@ -63,6 +70,7 @@ describe("SqlBlock", () => {
     render(
       <SqlBlock
         sql={SQL}
+        listNarrowed
         narrowed={[
           { object: "claim", rows: true, columns: true },
           { object: "policy", rows: true, columns: false },
@@ -73,9 +81,16 @@ describe("SqlBlock", () => {
     expect(screen.getByText("Masked column names referenced, on: claim.")).toBeInTheDocument();
   });
 
+  it("leaves the list to the answer when asked to, and still says the statement shown did not run", () => {
+    render(<SqlBlock sql={SQL} narrowed={[{ object: "claim", rows: true, columns: true }]} listNarrowed={false} />);
+    expect(screen.getByRole("button", { name: /SQL as asked/ })).toBeInTheDocument();
+    expect(screen.getByText(/The statement that ran also applied the policy/)).toBeInTheDocument();
+    expect(screen.queryByText(/Row filter applied to|Masked column names referenced/)).not.toBeInTheDocument();
+  });
+
   it("calls the statement executed when the policy narrowed nothing", () => {
     // Every rewrite records a narrowing, so with none the statement as asked IS the one that ran.
-    render(<SqlBlock sql={SQL} narrowed={[]} />);
+    render(<SqlBlock sql={SQL} narrowed={[]} listNarrowed />);
     expect(screen.getByRole("button", { name: /Executed SQL/ })).toBeInTheDocument();
     expect(screen.queryByText(/filter|masked|policy/i)).not.toBeInTheDocument();
   });
@@ -83,7 +98,7 @@ describe("SqlBlock", () => {
   it("claims no narrowing when the engine did not evaluate one or did not report it", () => {
     // `null` is "not evaluated"; absent is an engine from before the field. Neither is a claim.
     for (const narrowed of [null, undefined]) {
-      const { unmount } = render(<SqlBlock sql={SQL} narrowed={narrowed} />);
+      const { unmount } = render(<SqlBlock sql={SQL} narrowed={narrowed} listNarrowed />);
       expect(screen.getByRole("button", { name: /Executed SQL/ })).toBeInTheDocument();
       expect(screen.queryByText(/filter|masked|policy/i)).not.toBeInTheDocument();
       unmount();
@@ -111,9 +126,7 @@ describe("the transcript", () => {
   });
   afterEach(() => localStorage.clear());
 
-  it("carries an answer's narrowing from the stored turn to the SQL block", () => {
-    // The path a real answer takes: the stored turn, the runtime's message conversion, the
-    // `mnemiq.turn` data part dispatched by name, TurnArtifacts, SqlBlock -- no part props faked.
+  function store(answer: AnswerPayload) {
     save([
       {
         id: "thread-1",
@@ -121,18 +134,33 @@ describe("the transcript", () => {
         createdAt: 0,
         turns: [
           { id: "q1", role: "user", text: "How many policies?", status: "complete" },
-          {
-            id: "a1",
-            role: "assistant",
-            text: SCALAR_ANSWER.answer,
-            status: "complete",
-            answer: { ...SCALAR_ANSWER, narrowed: [{ object: "policy", rows: true, columns: false }] },
-          },
+          { id: "a1", role: "assistant", text: answer.answer, status: "complete", answer },
         ],
       },
     ]);
+  }
+  const NARROWED = [{ object: "policy", rows: true, columns: false }];
+
+  it("states an answered result's narrowing once: in the answer, not again under the SQL", () => {
+    // The path a real answer takes: the stored turn, the runtime's message conversion, the
+    // `mnemiq.turn` data part dispatched by name, TurnArtifacts, SqlBlock -- no part props faked.
+    // The text ends with the engine's own sentence, as an answered result's does since #150.
+    store({ ...SCALAR_ANSWER, answer: "west: 16,666 policies.\n\nRow filter applied to: policy.", narrowed: NARROWED });
     render(<Workbench />);
     expect(screen.getByRole("button", { name: /SQL as asked/ })).toBeInTheDocument();
+    expect(screen.getByText(/The statement that ran also applied the policy/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Row filter applied to: policy\./)).toHaveLength(1);
+  });
+
+  it("lists a refused answer's narrowing under the SQL, since the engine adds no sentence to a refusal", () => {
+    store({
+      ...SCALAR_ANSWER,
+      deferred: true,
+      reason_code: "verification",
+      answer: "The result may not correctly answer the question.",
+      narrowed: NARROWED,
+    });
+    render(<Workbench />);
     expect(screen.getByText("Row filter applied to: policy.")).toBeInTheDocument();
   });
 });

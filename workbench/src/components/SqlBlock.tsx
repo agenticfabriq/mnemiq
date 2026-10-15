@@ -3,15 +3,25 @@
  *
  * It is the statement as ASKED (M51): under a row or column policy the executed one names the
  * policy's own tables and literals, and stays in the audit trace. When `narrowed` says the policy
- * changed something, the header says so and a note names the objects; otherwise nothing was
- * rewritten (every rewrite records a narrowing) and the statement shown is the one that ran.
+ * changed something, the header says so and a note says the statement that ran is not shown;
+ * otherwise nothing was rewritten (every rewrite records a narrowing) and it is the one that ran.
+ * The note names the objects only when `listNarrowed`: the engine appends the same sentence to an
+ * answered result's text (M155), so there the answer already says it.
  */
 
 import { useState } from "react";
 
 import type { Narrowed } from "../lib/types";
 
-export function SqlBlock({ sql, narrowed }: { sql: string; narrowed?: Narrowed[] | null }) {
+export function SqlBlock({
+  sql,
+  narrowed,
+  listNarrowed,
+}: {
+  sql: string;
+  narrowed?: Narrowed[] | null;
+  listNarrowed: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const filtered = (narrowed ?? []).filter((n) => n.rows).map((n) => n.object);
@@ -56,9 +66,11 @@ export function SqlBlock({ sql, narrowed }: { sql: string; narrowed?: Narrowed[]
         // never measures whether it removed a row -- and the query referenced a column NAME a
         // table masks, which can name a table whose column the caller never read.
         <div className={`bg-brass-wash px-2.5 py-2 text-[12px] ${open ? "border-b border-rule" : ""}`}>
-          {filtered.length > 0 && <p>Row filter applied to: {filtered.join(", ")}.</p>}
-          {masked.length > 0 && <p>Masked column names referenced, on: {masked.join(", ")}.</p>}
-          <p className="meta mt-1">
+          {listNarrowed && filtered.length > 0 && <p>Row filter applied to: {filtered.join(", ")}.</p>}
+          {listNarrowed && masked.length > 0 && (
+            <p>Masked column names referenced, on: {masked.join(", ")}.</p>
+          )}
+          <p className={listNarrowed ? "meta mt-1" : "meta"}>
             The statement that ran also applied the policy, which is not shown here.
           </p>
         </div>
