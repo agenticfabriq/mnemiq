@@ -22,6 +22,7 @@ from mnemiq.semantic.measures import (
     select_dimensions,
     select_metrics,
 )
+from mnemiq.sql.identifiers import ascii_lower
 
 logger = logging.getLogger(__name__)
 
@@ -146,33 +147,37 @@ def _scoped_facts(tf: TableFacts, grants, columns: Sequence[Column],
     if time and not expression_reads_raw(time, tf.object_id, columns, grants):
         time = None
 
-    granted = {o.lower() for o in grants.objects}
+    # Every name here is matched to decide what is GRANTED, so it is folded no wider than the
+    # engine: ASCII letters only (M154). Folding every letter let a grant on `Ä` show a fact that
+    # depends on an ungranted `ä`. Narrower only makes a dependency name nothing, which is withheld.
+    fold = ascii_lower
+    granted = {fold(o) for o in grants.objects}
     by_key: dict[tuple[str, str], list[Column]] = {}
     tables: set[str] = set()
     for column in columns:
-        by_key.setdefault((column.object_id.lower(), column.name.lower()), []).append(column)
-        tables.add(column.object_id.lower())
+        by_key.setdefault((fold(column.object_id), fold(column.name)), []).append(column)
+        tables.add(fold(column.object_id))
 
     def visible(dep: str) -> bool:
         # `table.column` or `table`; a dotted table makes the two readings ambiguous, so each
         # one that names something must be visible, and one naming nothing sees no one.
-        table, _, name = dep.lower().rpartition(".")
+        table, _, name = fold(dep).rpartition(".")
         as_column = by_key.get((table, name)) if table else None
-        as_table = dep.lower() in tables
+        as_table = fold(dep) in tables
         if not as_column and not as_table:
             return False
         if as_column and not (table in granted and all(read_raw(c, grants) for c in as_column)):
             return False
-        return not as_table or dep.lower() in granted
+        return not as_table or fold(dep) in granted
 
     def unrestricted() -> bool:
         if relationships is None:
             return False
-        own = tf.object_id.lower()
-        related = {(r.to if r.from_.lower() == own else r.from_).lower()
-                   for r in relationships if own in (r.from_.lower(), r.to.lower())}
+        own = fold(tf.object_id)
+        related = {fold(r.to if fold(r.from_) == own else r.from_)
+                   for r in relationships if own in (fold(r.from_), fold(r.to))}
         return (own in granted and related <= granted
-                and all(read_raw(c, grants) for c in columns if c.object_id.lower() == own))
+                and all(read_raw(c, grants) for c in columns if fold(c.object_id) == own))
 
     def shown(text: str) -> bool:
         deps = tf.reads.get(text)

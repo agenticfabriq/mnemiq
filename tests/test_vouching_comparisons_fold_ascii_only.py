@@ -2,18 +2,25 @@
 
 DuckDB, SQLite and Postgres fold ASCII letters only (measured in `test_identifiers_fold_ascii_only`:
 a table `ä` behind a CTE `Ä` reads the table on all three); Oracle folds `ä` to `Ä`. Python's
-`str.lower` folds every letter, and two comparisons that vouch used it:
+`str.lower` folds every letter, and three comparisons that vouch used it, each reproduced:
 
 * `AccessPolicy.names`, which decides whether a card may name a table: a grant on `Ä` showed the
   `orders` card's join to an ungranted `ä`, its key column included.
 * The view check's known-object test: a known `Ä` vouched for a view body reading an unknown `ä`,
   and the view was approved (Codex's review of #147).
+* The facts grant check (`retrieval._scoped_facts`): a grant on `Ä` showed a fact depending on an
+  ungranted `ä` (the review gate).
+
+Oracle folds each letter to its ONE-character uppercase, and keeps `ß` (measured: `straße` is
+stored `STRAßE`), where Python's `str.upper` merges `straße` with `strasse`.
 
 Comparisons that RESTRICT -- a filter, a mask, a denial, what a body mentions -- keep the wide fold,
 which can only apply them to more.
 """
 
 from __future__ import annotations
+
+import os
 
 import pytest
 
@@ -70,3 +77,76 @@ def test_a_spelling_the_engine_folds_to_a_known_table_is_still_known(dialect, bo
     verdict = _decide_view(body, dialect)
     assert not (isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW), \
         verdict
+
+
+def _fact_shown(objects):
+    import json
+
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.enrichment.facts import parse_facts
+    from mnemiq.semantic.retrieval import RetrievedCard, _attach_facts
+
+    columns = [Column(id="orders.id", object_id="orders", name="id"),
+               Column(id="orders.rel_id", object_id="orders", name="rel_id"),
+               Column(id="ä.id", object_id="ä", name="id")]
+    rels = [Relationship(id="r", **{"from": "orders"}, to="ä", cardinality="many_to_one",
+                         join_keys=[JoinKey(left="rel_id", right="id")])]
+    text = "join ä for the secret plan"
+    tf = parse_facts(json.dumps({"gotchas": [{"text": text, "reads": []}]}), "orders",
+                     {"id", "rel_id"}, {"ä"}, related_tables={"ä": {"id"}})
+    assert tf.reads[text] == ["ä"]
+    card = RetrievedCard(object_id="orders", card="TABLE orders", score=1.0)
+    _attach_facts([card], [tf], grants=GrantSet(frozenset(objects)), columns=columns,
+                  relationships=rels)
+    return "secret plan" in card.card
+
+
+def test_a_grant_on_one_case_of_a_non_ascii_letter_does_not_show_a_fact_about_the_other():
+    assert not _fact_shown({"orders", "Ä"})
+    assert _fact_shown({"orders", "ä"})  # the control
+
+
+def test_oracle_folds_each_letter_by_its_one_character_uppercase():
+    from mnemiq.sql.identifiers import resolve
+
+    def oracle(name):
+        return resolve(name, quoted=False, dialect="oracle")
+
+    assert oracle("ä") == oracle("Ä") and oracle("orderſ") == oracle("ORDERS")
+    assert oracle("straße") != oracle("strasse")
+
+
+@pytest.mark.parametrize("known,body,refused", [
+    ("STRASSE", "SELECT id FROM straße", True),   # Oracle keeps ß: an unknown object
+    ("ORDERS", "SELECT id FROM orderſ", False),   # Oracle folds ſ to S: the known one
+])
+def test_an_oracle_view_s_known_objects_fold_as_oracle_does(known, body, refused):
+    verdict = _decide_view(body, "oracle", {"orders": {"id", "store_id"}, known: {"id"}})
+    unresolvable = isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW
+    assert unresolvable is refused, verdict
+
+
+@pytest.mark.skipif(not os.environ.get("MNEMIQ_ORACLE_TEST_DSN"),
+                    reason="set MNEMIQ_ORACLE_TEST_DSN to run against Oracle")
+def test_live_oracle_folds_long_s_and_keeps_sharp_s():
+    """Live: the measurement the Oracle rule rests on, kept."""
+    oracledb = pytest.importorskip("oracledb")
+    con = oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
+                           password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", ""),
+                           dsn=os.environ["MNEMIQ_ORACLE_TEST_DSN"])
+    cur = con.cursor()
+    try:
+        cur.execute("CREATE TABLE fold_probe_s (id NUMBER)")
+        cur.execute("INSERT INTO fold_probe_s VALUES (40)")
+        cur.execute("SELECT id FROM fold_probe_ſ")
+        assert cur.fetchall() == [(40,)]
+        cur.execute("CREATE TABLE fold_probe_ß (id NUMBER)")
+        cur.execute("SELECT table_name FROM user_tables WHERE table_name LIKE 'FOLD_PROBE_%'")
+        assert sorted(r[0] for r in cur.fetchall()) == ["FOLD_PROBE_S", "FOLD_PROBE_ß"]
+    finally:
+        for table in ("fold_probe_s", "fold_probe_ß"):
+            try:
+                cur.execute(f"DROP TABLE {table} PURGE")
+            except oracledb.DatabaseError:
+                pass
+        con.close()

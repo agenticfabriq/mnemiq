@@ -13,14 +13,17 @@ Three rules, and a dialect needs all of them:
     a name that matches too widely lets a local alias stand in for a real table.
   * HOW FAR the fold reaches. DuckDB, SQLite and Postgres fold ASCII letters only: measured,
     with a table `ä` and a CTE `Ä`, `... FROM ä` read the table on SQLite 3.50, DuckDB and
-    Postgres 16 (UTF8). Oracle folds `ä` to `Ä` (it stores it so, and a CTE `Ä` binds `ä`).
-    Python's `str.lower` folds every letter -- and the Kelvin sign to `k` -- so it merged two
-    objects those engines keep apart, and a CTE vouched for a table read past the view check
-    (Codex's review of #144). This resolver only. Other sites still fold every letter and are not
-    routed here -- among them `qualify.names_one_object` (policy lookups, and `AccessPolicy.names`,
-    which decides what a card may name), the read guard's CTE-name set, the write path's CTE match
-    and `views.py`'s spellings -- and over-matching there is NOT always the refusing direction.
-    The normalisation design (M55) owns bringing them here.
+    Postgres 16 (UTF8). Python's `str.lower` folds every letter -- and the Kelvin sign to `k` --
+    so it merged two objects those engines keep apart, and a CTE vouched for a table read past the
+    view check (Codex's review of #144). Oracle folds each letter UP by its one-character
+    uppercase: `ä` is stored `Ä`, and `orderſ` reads `ORDERS`; but `straße` is stored `STRAßE`,
+    where Python's `str.upper` gives `STRASSE`, one object with `strasse` (measured, Oracle Free).
+    The direction of a comparison decides how far it may fold: one that GRANTS or VOUCHES folds no
+    wider than the engine -- this resolver, `AccessPolicy.names`, the view check's known objects
+    and the facts grant check do (M154). Comparisons that only RESTRICT still fold every letter,
+    which applies a filter, mask or denial to more: `qualify.names_one_object`'s default,
+    `views.py`'s mention side, the write path's CTE match. The read guard's CTE-name set folds
+    every letter too, with no failure reproduced. The normalisation design (M55) owns the rest.
   * WHETHER quoting makes a name case-SENSITIVE. Postgres and Oracle preserve a quoted name, so
     `"Claim"` and `Claim` are two objects. DuckDB and SQLite fold quoted names too, so they are one.
     Measured on duckdb 1.5.4: `WITH claim AS (...) SELECT * FROM "CLAIM"` reads the CTE.
@@ -55,9 +58,15 @@ def ascii_lower(text: str) -> str:
     return text.translate(_ASCII_LOWER)
 
 
+def _oracle_upper(text: str) -> str:
+    """Fold as Oracle does: each letter to its uppercase where that is ONE character, and a letter
+    whose uppercase is longer -- `ß`, whose is `SS` -- kept as it is."""
+    return "".join(u if len(u := c.upper()) == 1 else c for c in text)
+
+
 _RULES: dict[str, IdentifierRules] = {
     "postgres": IdentifierRules(ascii_lower, True),
-    "oracle": IdentifierRules(str.upper, True),
+    "oracle": IdentifierRules(_oracle_upper, True),
     "duckdb": IdentifierRules(ascii_lower, False),
     "sqlite": IdentifierRules(ascii_lower, False),
 }
