@@ -53,6 +53,10 @@ export type HistoryTurn = {
   grant_fingerprint: string;
 };
 
+/** One object a row or column policy narrowed. Mirrors `Narrowing` in src/mnemiq/sql/rls.py, whose
+ *  field comments are the contract; `columns` in particular is not "your answer lost a column". */
+export type Narrowed = { object: string; rows: boolean; columns: boolean };
+
 export type AnswerPayload = {
   answer: string;
   deferred: boolean;
@@ -74,8 +78,13 @@ export type AnswerPayload = {
    *  corrector's surgical pass carried it (the decider rejected it). Two different judges. */
   attempts: number | null;
   corrected: boolean | null;
+  /** The statement as asked (M51), before a row or column policy rewrote it; the executed one
+   *  stays in the audit trace. */
   sql: string | null;
   tables_used: string[] | null;
+  /** What a policy narrowed, per object: `null` is "not evaluated", `[]` the claim that nothing
+   *  was. Optional, so an engine from before the field reads as not reported. */
+  narrowed?: Narrowed[] | null;
   enrichment_version: string | null;
   timing: Record<string, number> | null;
   preview: ResultPreview | null;
