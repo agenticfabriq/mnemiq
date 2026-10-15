@@ -744,6 +744,139 @@ class OracleAdapter:
         resolvable, _links = self._synonyms_reaching_functions()
         return sorted({r[0] for r in direct} | resolvable)
 
+    def resolve_called_functions(self, names) -> tuple[list[str], list[str]]:
+        """(defined, unresolvable) among `names`: what `user_functions` and `unresolvable_aliases`
+        say of exactly these names, asked of them alone (M101).
+
+        `user_functions` reads ALL_SYNONYMS whole, and that view costs its size however it is
+        filtered. Measured on Oracle Free 23.26.2 with 107,886 synonyms, medians of five: 2,155 ms
+        whole, 1,412 to 1,717 ms filtered by name, and 1,406 ms for USER_SYNONYMS holding no rows --
+        per `decide` attempt, so a large dictionary made every question slow. This asks O(names):
+        own functions and package members by name (0.6 ms), synonyms of those names here or PUBLIC
+        through ALL_OBJECTS (23 ms case-insensitive), the synonyms that reach a DB link, by TARGET
+        (1.4 ms, then 0.4 ms a hop), and Oracle's own resolver for the rest
+        (`DBMS_UTILITY.NAME_RESOLVE`, 0.2 to 0.5 ms a name), in the CURRENT_SCHEMA the adapter sets.
+
+        So a name is decided by Oracle's resolution, not by this engine's model of the synonym
+        graph -- the owner's decision, 2026-10-14. The model's fail-closed over-reports go (a
+        private alias credited with the function behind a PUBLIC synonym Oracle never consults for
+        it); every rule that refuses stays: an alias reaching a DB link is unresolvable, and a
+        PUBLIC alias counts only where it ends outside Oracle's own schemas.
+
+        **A synonym reaching a DB link is never resolved.** NAME_RESOLVE follows one to the remote
+        database: 77 ms over a live loopback link, and over a dead one 40 seconds and then
+        ORA-06564, "does not exist" -- which, read as "not a function", is the M102 leak. Those
+        synonyms are found first and reported unasked, and a synonym that exists and still does not
+        resolve is unresolvable too, never absent.
+        """
+        wanted = sorted({str(n).lower() for n in names})
+        if not wanted:
+            return [], []
+        defined: set[str] = set()
+        candidates: set[tuple[str, str]] = set()
+        for chunk in _chunks(wanted, 900):
+            binds = {f"n{i}": n for i, n in enumerate(chunk)}
+            listed = ", ".join(f":{k}" for k in binds)
+            defined.update(r[0] for r in self._rows(
+                "SELECT lower(object_name) FROM all_objects WHERE owner = :owner "
+                f"  AND object_type = 'FUNCTION' AND lower(object_name) IN ({listed}) "
+                "UNION "
+                "SELECT lower(procedure_name) FROM all_procedures WHERE owner = :owner "
+                f"  AND object_type = 'PACKAGE' AND lower(procedure_name) IN ({listed})",
+                owner=self._schema, **binds))
+            candidates.update(self._rows(
+                "SELECT owner, object_name FROM all_objects WHERE object_type = 'SYNONYM' "
+                f"  AND owner IN (:owner, 'PUBLIC') AND lower(object_name) IN ({listed})",
+                owner=self._schema, **binds))
+        if not candidates:
+            return sorted(defined), []
+        over_links = self._synonyms_reaching_a_link()
+        unresolvable: set[str] = set()
+        oracle_owned: set[str] | None = None
+        for owner, stored in sorted(candidates):
+            name = stored.lower()
+            if (owner, stored) in over_links:
+                unresolvable.add(name)
+                continue
+            resolved = self._name_resolve(stored)
+            if resolved is _NOT_PLSQL:
+                continue  # it resolves, to a table or a view: no function behind the name
+            if resolved is _UNRESOLVED or resolved[1] is not None:
+                unresolvable.add(name)  # absent from the dictionary yet a synonym, or a link raced in
+                continue
+            if owner != "PUBLIC":
+                defined.add(name)  # this schema's own alias, whoever owns what it reaches
+                continue
+            if oracle_owned is None:
+                oracle_owned = {r[0] for r in self._rows(
+                    "SELECT username FROM all_users WHERE oracle_maintained = 'Y'")}
+            if resolved[0] not in oracle_owned:
+                defined.add(name)
+        # `names` wins an overlap, as in `_synonyms_reaching_functions`.
+        return sorted(defined), sorted(unresolvable - defined)
+
+    def _synonyms_reaching_a_link(self) -> set[tuple[str, str]]:
+        """(owner, synonym), as stored, for every synonym whose chain reaches a DB link -- the link
+        synonyms themselves included.
+
+        Backwards, by TARGET, which ALL_SYNONYMS answers cheaply where by NAME it costs its size.
+        A PUBLIC link synonym also claims every synonym naming its bare name as a target, since
+        Oracle falls back to the PUBLIC synonym when the named schema holds no such object; where
+        that schema does hold one, this over-reports, which only refuses a call. `found` is what
+        terminates a cycle.
+        """
+        found = set(self._rows(
+            "SELECT owner, synonym_name FROM all_synonyms WHERE db_link IS NOT NULL"))
+        frontier = set(found)
+        while frontier:
+            reached: set[tuple[str, str]] = set()
+            for chunk in _chunks(sorted(frontier), 400):
+                binds: dict[str, str] = {}
+                pairs = []
+                for i, (owner, name) in enumerate(chunk):
+                    binds[f"o{i}"], binds[f"n{i}"] = owner, name
+                    pairs.append(f"(:o{i}, :n{i})")
+                reached.update(self._rows(
+                    "SELECT owner, synonym_name FROM all_synonyms "
+                    f"WHERE (table_owner, table_name) IN ({', '.join(pairs)})", **binds))
+            for chunk in _chunks(sorted(n for o, n in frontier if o == "PUBLIC"), 900):
+                binds = {f"n{i}": n for i, n in enumerate(chunk)}
+                listed = ", ".join(f":{k}" for k in binds)
+                reached.update(self._rows(
+                    f"SELECT owner, synonym_name FROM all_synonyms WHERE table_name IN ({listed})",
+                    **binds))
+            frontier = reached - found
+            found |= frontier
+        return found
+
+    def _name_resolve(self, stored: str):
+        """Oracle's own resolution of the stored name, as a PL/SQL callable (context 1).
+
+        `(schema, db_link)` when it names a PL/SQL object, `_NOT_PLSQL` for ORA-04047 (it names a
+        table or a view), and `_UNRESOLVED` where the synonym does not resolve at all -- ORA-06564
+        (nothing Oracle can reach), ORA-00980 (a dangling synonym) and ORA-01775 (a cycle), each
+        measured on the fixture. Any other error RAISES, and `inventory_from` makes that the whole
+        answer's `unavailable`.
+        """
+        quoted = '"' + stored.replace('"', '""') + '"'
+
+        def _call(cur):
+            schema, part1, part2, link = (cur.var(str) for _ in range(4))
+            part1_type, object_number = cur.var(int), cur.var(int)
+            try:
+                cur.callproc("dbms_utility.name_resolve",
+                             [quoted, 1, schema, part1, part2, link, part1_type, object_number])
+            except self._oracledb.DatabaseError as exc:
+                code = getattr(exc.args[0], "code", None) if exc.args else None
+                if code == 4047:
+                    return _NOT_PLSQL
+                if code in _SYNONYM_DOES_NOT_RESOLVE:
+                    return _UNRESOLVED
+                raise
+            return schema.getvalue(), link.getvalue()
+
+        return self._with_cursor(_call, self._probe_timeout_ms)
+
     def unresolvable_aliases(self) -> list[str]:
         """Aliases over a DB LINK: they must refuse a call, and prove nothing about functions.
 
@@ -1499,6 +1632,21 @@ class ReadOnlyViolation(RuntimeError):
 
 _LEAD_COMMENT = re.compile(r"\A(?:\s+|--[^\n]*|/\*.*?\*/)+", re.S)
 _LEAD_WORD = re.compile(r"\A[A-Za-z_][A-Za-z_0-9]*")
+
+
+# What `_name_resolve` returns when Oracle resolves a name to something other than PL/SQL, or to
+# nothing; distinct objects, so neither can be mistaken for a resolution.
+_NOT_PLSQL = object()
+_UNRESOLVED = object()
+# ORA-06564 (does not exist), ORA-00980 (synonym translation no longer valid), ORA-01775 (looping
+# chain of synonyms): a synonym that does not resolve, which is never read as "not a function".
+_SYNONYM_DOES_NOT_RESOLVE = frozenset({6564, 980, 1775})
+
+
+def _chunks(items, size: int):
+    """`items` in slices of `size`: an Oracle IN list is capped at 1,000 (ORA-01795)."""
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
 
 
 def _leading_keyword(sql: str) -> str:
