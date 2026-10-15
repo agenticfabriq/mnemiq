@@ -121,16 +121,23 @@ def disclosure_sentence(narrowed: "list[Narrowed] | None") -> str:
     Empty when nothing was narrowed, and empty when nothing was EVALUATED -- silence is correct in
     both cases, because a disclosure is a claim and neither state supports one. What distinguishes
     them is `Trace.narrowed`, which a machine consumer reads.
+
+    It says what the record knows and no more (M155). `rows` means a row filter was APPLIED -- one
+    every row passes sets it too -- and `columns` that the query referenced a column NAME the
+    table masks, so "some rows were withheld" and "some columns were masked" claimed what nobody
+    measured. The wording is the workbench's (the owner's choice, 2026-10-14), and names each table
+    once, in the order the record gives them: tables the caller's own query named.
     """
     if not narrowed:
         return ""
-    rows = any(n.rows for n in narrowed)
-    cols = any(n.columns for n in narrowed)
-    if rows and cols:
-        return "Some rows were withheld and some columns masked by policy."
-    if rows:
-        return "Some rows were withheld by policy."
-    return "Some columns were masked by policy."
+    filtered = list(dict.fromkeys(n.object for n in narrowed if n.rows))
+    masked = list(dict.fromkeys(n.object for n in narrowed if n.columns))
+    parts = []
+    if filtered:
+        parts.append(f"Row filter applied to: {', '.join(filtered)}.")
+    if masked:
+        parts.append(f"Masked column names referenced, on: {', '.join(masked)}.")
+    return " ".join(parts)
 
 
 # Reason codes that describe the SOURCE, not the statement. Every one of them fires on almost
