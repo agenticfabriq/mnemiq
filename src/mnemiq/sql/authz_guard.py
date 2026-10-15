@@ -240,7 +240,10 @@ def check_unmodelled_calls(
         # guard written to use it: measured, a raising `user_functions()` on a source holding a
         # `median` macro left `SELECT median(id) FROM claim` approved.
         return _cannot_resolve(inventory)
-    if not (inventory.names or inventory.unresolvable):
+    # A whole-source answer naming nothing clears every statement. A narrow one (M101) says only
+    # that none of the names it was ASKED about is defined, so it clears nothing until the
+    # statement's own calls are known to be among them.
+    if inventory.asked_names is None and not (inventory.names or inventory.unresolvable):
         return None
 
     if inventory.may_shadow_a_builtin:
@@ -261,6 +264,11 @@ def check_unmodelled_calls(
         # reason -- an empty set read as "no calls" would clear all of them -- but its own
         # sentence: this one is about THIS statement, and blaming the adapter for it would
         # send the deployer to fix a catalogue method that is working.
+        return _cannot_resolve(inventory, unreadable=True)
+    if not inventory.answers_for(called):
+        # The answer was given for other names than this statement calls -- the decider asks
+        # about exactly these, so this is two renderings disagreeing, and an unasked name is
+        # nothing ruled out. The same verdict as an unreadable statement, for the same reason.
         return _cannot_resolve(inventory, unreadable=True)
 
     # UNRESOLVABLE FIRST, and with its own sentence. "Defined by this source itself" is false

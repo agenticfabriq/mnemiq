@@ -219,16 +219,21 @@ def _functions_in(ast) -> tuple[list[str], bool]:
     return out, saw_call
 
 
-def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=None) -> Lineage:
+def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=None,
+                called=None) -> Lineage:
     """The objects an answer read, and whether that list is the whole story.
 
     Order matters only in that UNKNOWN is not allowed to mask a demonstrable INCOMPLETE: a
     statement reading a view AND calling an unclassifiable function is reported INCOMPLETE, because
     naming the view is more use to an auditor than recording that something was unclear.
+
+    `called` is the statement's own called names, as the decider read them (`called_names`); a
+    narrow function inventory (M101) answers per name and needs them, and without them leaves the
+    statement's calls unconfirmed.
     """
 
 
-    from mnemiq.sql.functions import FunctionInventory, calls_are_confirmable
+    from mnemiq.sql.functions import FunctionInventory, calls_are_confirmable, names_called_in
     from mnemiq.sql.qualify import object_key
     from mnemiq.sql.scope import base_tables
     from mnemiq.sql.views import body_of, spellings, unrecognised_source
@@ -376,7 +381,8 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=No
         # Postgres view body runs server-side, where the adapter's catalogue does not reach.
         # A body's calls are judged by the VIEW licence: a Postgres body runs server-side,
         # where the adapter's catalogue never looked.
-        if body_saw_call and not calls_are_confirmable(inventory, in_view_body=True):
+        if body_saw_call and not calls_are_confirmable(
+                inventory, in_view_body=True, called=names_called_in(view.definition)):
             unconfirmed_calls.append(f"view-body:{name}")
         if reaches_past_the_list:
             _add(reaching_views, name)
@@ -394,7 +400,8 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=No
     caller_fns, caller_saw_call = _functions_in(ast)
     for fn in caller_fns:
         _add(unclassified, fn)
-    if caller_saw_call and not calls_are_confirmable(inventory, in_view_body=False):
+    if caller_saw_call and not calls_are_confirmable(inventory, in_view_body=False,
+                                                     called=called):
         unconfirmed_calls.append("statement")
 
     if unconfirmed_calls:

@@ -4,7 +4,12 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.contract import ViewDefinition
-from mnemiq.sql.functions import inventory_from, opaque_columns
+from mnemiq.sql.functions import (
+    UnreadableCalls,
+    called_names,
+    inventory_from,
+    opaque_columns,
+)
 from mnemiq.sql.authz_guard import (
     check_access,
     check_opaque_columns,
@@ -105,7 +110,14 @@ def decide(
     # cannot be decided, which is the true thing.
     # One inventory for the whole decision. `lineage_for` reads it too, and asking twice would
     # let the gate and the report disagree about the same source in the same statement.
-    functions = inventory_from(adapter)
+    # Asked about the names this statement calls, where per-name is sound (M101): reading a
+    # whole Oracle dictionary cost 4.8 s a decision at 107,886 synonyms. A statement whose calls
+    # cannot be read gets the whole-source answer, so the guard decides it as it always did.
+    try:
+        called = called_names(shaped, dialect, target)
+    except UnreadableCalls:
+        called = None
+    functions = inventory_from(adapter, called=called)
     # Both dialects, because `called_names` renders to find what the tree does not carry, and
     # more spellings can only over-refuse. `dialect` is what this was parsed as, `target` what
     # will run it.
@@ -198,7 +210,7 @@ def decide(
     # LIVE from the adapter, not the snapshot -- see `inventory_from` for why the two sources
     # differ.
     lineage = lineage_for(shaped, tables, {} if views is None else views,
-                          functions=functions,
+                          functions=functions, called=called,
                           scope_resolved=scope_resolved(shaped, target))
     columns = sorted({c.name for c in shaped.find_all(exp.Column)})
 

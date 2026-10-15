@@ -133,6 +133,13 @@ class FunctionInventory:
     # rename, because the binder would have to resolve it to do that, and the one engine that
     # produces these sets `binder_prefers_builtins` anyway.
     unresolvable: frozenset[str] = field(default_factory=frozenset)
+    # The names this answer is FOR, or None for a whole-source answer. M101: reading a whole
+    # Oracle dictionary cost 4.8 s a decision at 107,886 synonyms, so an adapter whose binder
+    # prefers builtins is asked only about the names a statement calls (`inventory_from(adapter,
+    # called=...)`), and `names` and `unresolvable` then speak for those alone -- empty means none
+    # of THEM is defined, not that the source defines nothing. Every reader goes through
+    # `answers_for` first, and a name outside this set is unknown, which refuses.
+    asked_names: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         # Normalised HERE, not only in `of()`. A dataclass hands out its plain constructor
@@ -155,6 +162,11 @@ class FunctionInventory:
         if isinstance(unresolvable, str):
             unresolvable = [unresolvable]
         object.__setattr__(self, "unresolvable", frozenset(n.lower() for n in unresolvable))
+        asked = self.asked_names
+        if asked is not None:
+            if isinstance(asked, str):
+                asked = [asked]
+            object.__setattr__(self, "asked_names", frozenset(n.lower() for n in asked))
         reachable = self.reachable
         if reachable is not None:
             if isinstance(reachable, str):
@@ -195,8 +207,14 @@ class FunctionInventory:
         return cls(available=True, asked=False)
 
     def defines(self, name: str) -> bool:
-        """True when THIS source is known to define `name` itself."""
-        return name.lower() in self.names
+        """True when THIS source is known to define `name` itself -- and, for an answer asked
+        about other names (`asked_names`), True for this one, since nothing rules it out."""
+        return name.lower() in self.names or not self.answers_for([name])
+
+    def answers_for(self, called) -> bool:
+        """Whether `names` and `unresolvable` speak for every one of `called`: always, for a
+        whole-source answer; for a narrow one (M101), only when it was asked about each."""
+        return self.asked_names is None or {n.lower() for n in called} <= self.asked_names
 
     @property
     def certain(self) -> bool:
@@ -249,7 +267,7 @@ class FunctionInventory:
         return bool(candidates & self.builtins)
 
 
-def inventory_from(adapter) -> FunctionInventory:
+def inventory_from(adapter, called=None) -> FunctionInventory:
     """Ask an adapter what it defines, in the one place, so two callers cannot drift.
 
     LIVE, not from the snapshot, which is where `inventory_for(views)` reads. The two differ
@@ -263,7 +281,15 @@ def inventory_from(adapter) -> FunctionInventory:
     Three answers, matching the three the type keeps apart. An adapter with no `user_functions`
     was never asked. One that raises was asked and could not answer. Anything else is an answer,
     including an empty one.
+
+    `called` is what the statement calls (`called_names`). Given it, an adapter that can answer
+    by name AND whose binder prefers builtins is asked about those names alone, plus what its
+    virtual columns call (M101). Per-name is sound only there: where a binder can rename a call
+    -- DuckDB's `COUNT(*)` reaching a macro named `count_star` -- no list of names a statement
+    spells is the whole question, so every other adapter still answers for the whole source.
     """
+    if called is not None and _answers_by_name(adapter):
+        return _inventory_for_names(adapter, called)
     if adapter is None or not hasattr(adapter, "user_functions"):
         return FunctionInventory.never_asked()
     try:
@@ -286,6 +312,46 @@ def inventory_from(adapter) -> FunctionInventory:
         binder_prefers_builtins=getattr(adapter, "binder_prefers_builtins", False),
         unresolvable=unresolvable,
     )
+
+
+def _answers_by_name(adapter) -> bool:
+    return (adapter is not None and hasattr(adapter, "resolve_called_functions")
+            and getattr(adapter, "binder_prefers_builtins", False))
+
+
+def _inventory_for_names(adapter, called) -> FunctionInventory:
+    """The narrow answer (M101): defined and unresolvable among the names asked about.
+
+    The virtual columns' calls are asked about too, because `opaque_columns` reads the same
+    inventory for them, and a name it was not asked about counts as defined there -- a virtual
+    column calling `upper` would otherwise be refused for want of a question. If they cannot be
+    read here, `opaque_columns` reads them again and fails closed on its own.
+    """
+    asked = frozenset(n.lower() for n in called) | _virtual_column_calls(adapter)
+    try:
+        defined, unresolvable = adapter.resolve_called_functions(asked)
+    except Exception as exc:
+        # The TYPE, never the message, as for `user_functions` (M94).
+        return FunctionInventory.unavailable(type(exc).__name__)
+    builtins, builtins_asked = _builtins_from(adapter)
+    return FunctionInventory.of(
+        defined,
+        asked_names=asked,
+        covers_view_bodies=getattr(adapter, "functions_cover_view_bodies", False),
+        builtins=builtins,
+        builtins_asked=builtins_asked,
+        binder_prefers_builtins=True,
+        unresolvable=unresolvable,
+    )
+
+
+def _virtual_column_calls(adapter) -> frozenset[str]:
+    if not hasattr(adapter, "virtual_columns"):
+        return frozenset()
+    try:
+        return frozenset().union(*(names_called_in(e) for _, _, e in adapter.virtual_columns()))
+    except Exception:
+        return frozenset()
 
 
 def _reachable_from(adapter) -> frozenset[str] | None:
@@ -395,11 +461,14 @@ def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str
         # over a LOCAL function is accepted -- so the refusal is about the link and no such
         # column can exist on a default instance. But that error names a SETTING, so with
         # `global_names=TRUE` it may be permitted, and the union costs nothing where it is not.
+        # And a name a narrow answer was not asked about (M101), which nothing has ruled out.
         if names_called_in(expression) & (inventory.names | inventory.unresolvable)
+        or not inventory.answers_for(names_called_in(expression))
     )
 
 
-def calls_are_confirmable(inventory: FunctionInventory, *, in_view_body: bool) -> bool:
+def calls_are_confirmable(inventory: FunctionInventory, *, in_view_body: bool,
+                          called=None) -> bool:
     """Whether a call in this statement can be taken for a builtin.
 
     ONE question about the SOURCE, not one per call, and that is the whole design. Three earlier
@@ -424,9 +493,24 @@ def calls_are_confirmable(inventory: FunctionInventory, *, in_view_body: bool) -
     Cruder than per-call matching, and sound, which the precise version was not. The cost is
     that a source defining one unrelated helper downgrades every answer. The benefit is that no
     spelling, rename or dialect quirk can make a UDF read as a builtin.
+
+    **Except where a narrow answer was given (M101, Oracle), which asks per name -- `called`, the
+    names `called_names` read off the statement as rendered.** Each of the three leaks above is
+    closed there by something other than coarseness: the rendering in both dialects is what the
+    source is handed, so a written spelling cannot hide an executed one; Oracle's binder prefers
+    a builtin to a user function of the same name (measured), so no rename reaches one; and a
+    view body is never licensed on Oracle, which does not claim `covers_view_bodies`. A link
+    alias counts here as well: in a whole-source answer it was kept out because a link to a
+    TABLE would downgrade every answer (M104), while a statement that CALLS one cannot be
+    confirmed. A name the answer was not asked about, or no `called` at all, is unconfirmed.
     """
     licensed = inventory.certain_for_view_bodies if in_view_body else inventory.certain
-    return licensed and not inventory.names
+    if inventory.asked_names is None:
+        return licensed and not inventory.names
+    if called is None or not inventory.answers_for(called):
+        return False
+    spelled = {n.lower() for n in called}
+    return licensed and not (spelled & (inventory.names | inventory.unresolvable))
 
 
 # An identifier immediately before an open paren. Deliberately crude: it over-collects, and

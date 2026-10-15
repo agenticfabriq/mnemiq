@@ -11,7 +11,12 @@ from mnemiq.sql.authz_guard import (
     check_unmodelled_calls,
     check_unmodelled_source,
 )
-from mnemiq.sql.functions import inventory_from, opaque_columns
+from mnemiq.sql.functions import (
+    UnreadableCalls,
+    called_names,
+    inventory_from,
+    opaque_columns,
+)
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove
@@ -347,7 +352,14 @@ def decide_write(
     # that stores what it read into a granted table. Both dialects, as on the read path: the
     # guard renders to find the names the source will be asked for, and `target` has already
     # been defaulted to `dialect` at the top of this function.
-    functions = inventory_from(adapter)
+    # Asked about the names this statement calls, where per-name is sound (M101): reading a
+    # whole Oracle dictionary cost 4.8 s a decision at 107,886 synonyms. A statement whose calls
+    # cannot be read gets the whole-source answer, so the guard decides it as it always did.
+    try:
+        called = called_names(shaped, dialect, target)
+    except UnreadableCalls:
+        called = None
+    functions = inventory_from(adapter, called=called)
     opaque = check_unmodelled_calls(shaped, functions, dialect, target)
     if opaque is not None:
         return opaque
