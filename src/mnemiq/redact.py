@@ -105,6 +105,14 @@ def withhold_policy_words(detail: str | None, *, asked: str | None, executed: st
     that names a policy-only word in any spelling loses the source's words, and the repair keeps
     our own sentence. Under-telling the model costs a retry; over-telling cannot be taken back.
 
+    That includes GRANTED columns the caller never wrote, which the rewrite's derived table
+    projects or its predicate reads. Deliberately: an error naming a column only the policy reads
+    was raised in the policy's part, which runs over the rows the filter removes, so its values
+    can be ones the caller may not see (`CAST(region AS INTEGER) > 0` as the policy quotes
+    `'west'` from any row). The cost is DuckDB's candidate list for a mistyped column under a
+    filter, and only on a stale snapshot: against a current one the decider refuses the name
+    itself, in our own words, before the source sees it.
+
     With `asked == executed` the policy changed nothing and `detail` comes back untouched, so a
     benchmark, which clears every policy, sends the same bytes. With no record of `asked`, or an
     `executed` that will not parse, the policy's words cannot be told from the caller's, and

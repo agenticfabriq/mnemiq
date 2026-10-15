@@ -368,9 +368,10 @@ class Agent:
                 logger.warning("execution attempt %d failed; the source said: %s",
                                _attempt + 1, exc.full_text)
                 failure = exc
-                # The source ran the policy's rewrite, so its words can quote the policy, whose
-                # tables and literals the caller is not granted: the model reads them only with
-                # those taken out (Codex's review of #152). The log above keeps the whole text.
+                # The source ran the policy's rewrite, so its words can quote the policy (Codex's
+                # review of #152). They reach the model only if they name no word the rewrite
+                # added, granted columns included -- see `withhold_policy_words` for why. The log
+                # above keeps the whole text.
                 detail = withhold_policy_words(exc.source_detail, asked=approved.asked_sql,
                                                executed=approved.target_sql, dialect=self.dialect)
                 shown = ExecutionError(exc.message, source_detail=detail)
