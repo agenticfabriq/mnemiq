@@ -91,9 +91,10 @@ def bounded_dsn(dsn: str, statement_timeout_s: float | None) -> str:
 
     The bound becomes the connection's `options`, which REPLACES whatever options libpq would
     otherwise apply -- from the DSN, a connection service, or PGOPTIONS. So they are carried
-    behind it, VERBATIM, and only where they are known exactly: the DSN's own `options`, else
-    PGOPTIONS, which libpq reads only when no service supplies options. A connection SERVICE
-    without options in the DSN is left unbounded, with a warning, and so is a `servicefile=` DSN.
+    behind it, VERBATIM, and only where they are known exactly: the DSN's own `options`, an
+    empty one included, else PGOPTIONS, which libpq reads only when neither the DSN nor a service
+    supplies options. A connection SERVICE without options in the DSN is left unbounded, with a
+    warning, and so is a `servicefile=` DSN.
     Its options come from a file this engine cannot reliably find (libpq's compiled-in directory,
     for one), and the server cannot report them either: `pg_settings` hides `role` and every
     custom setting -- measured on Postgres 16, `-c app.tenant_id=42` in effect and not listed. A
@@ -123,7 +124,10 @@ def bounded_dsn(dsn: str, statement_timeout_s: float | None) -> str:
             "`-c statement_timeout=...` in the service's options instead.", service)
         return dsn
     bound = f"-c statement_timeout={int(statement_timeout_s * 1000)}"
-    existing = parsed.get("options") or os.environ.get("PGOPTIONS")
+    # By the key's PRESENCE: libpq takes an explicitly empty `options=''` as set, and reads
+    # PGOPTIONS only when the key is absent -- measured, an empty value suppressed a PGOPTIONS
+    # tenant setting that `or` then carried into the bounded connection (Codex's review of #142).
+    existing = parsed["options"] if "options" in parsed else os.environ.get("PGOPTIONS")
     return make_conninfo(dsn, options=f"{bound} {existing}" if existing else bound)
 
 
