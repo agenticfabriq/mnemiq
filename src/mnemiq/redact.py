@@ -115,9 +115,9 @@ def withhold_policy_words(detail: str | None, *, asked: str | None, executed: st
 
     Not covered: that same raising policy, over a column the caller names too. Its error then
     names only the caller's words and is kept, with a value that may come from a removed row.
-    Nothing refuses such a policy today; that is the policy validation's to add (raised with the
-    governance lane 2026-10-15), not this text's to guess at. The caller's own predicates do not
-    reach removed rows on DuckDB, which filters by the policy first:
+    Nothing refuses such a policy today: an open gap in policy validation, not this text's to guess
+    at. The caller's own predicates do not reach removed rows on DuckDB, which filters by the
+    policy first, scalar and subquery policies alike:
     `test_a_caller_s_predicate_never_raises_on_a_row_the_policy_removes` holds that, so an engine
     upgrade that reorders the two fails there rather than here.
 
