@@ -67,6 +67,8 @@ def _oracle_upper(text: str) -> str:
     none is folded here where Oracle keeps it -- the direction that would vouch. 27 Greek letters
     with a subscript iota (U+1F80 on) Oracle folds to a single letter and this keeps, since
     Python's uppercase of them is two characters; that only makes two spellings look like two.
+    The sweep is `test_live_oracle_sweep_never_folds_a_letter_oracle_keeps`, and a table name
+    folds as an alias does (`test_live_oracle_folds_table_names_and_aliases_alike`).
     """
     return "".join(u if len(u := c.upper()) == 1 else c for c in text)
 

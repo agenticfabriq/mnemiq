@@ -126,22 +126,80 @@ def test_an_oracle_view_s_known_objects_fold_as_oracle_does(known, body, refused
     assert unresolvable is refused, verdict
 
 
-@pytest.mark.skipif(not os.environ.get("MNEMIQ_ORACLE_TEST_DSN"),
-                    reason="set MNEMIQ_ORACLE_TEST_DSN to run against Oracle")
-def test_live_oracle_folds_identifiers_as_the_rule_says():
-    """Live: Oracle's own folding of each letter, read back as the name of an unquoted alias, so
-    no table is created. `ſ`, `ä` and dotless `ı` fold; `ß` is kept; a Greek letter with a
-    subscript iota folds where this rule keeps it, the one measured direction it differs in."""
+_ORACLE = pytest.mark.skipif(not os.environ.get("MNEMIQ_ORACLE_TEST_DSN"),
+                             reason="set MNEMIQ_ORACLE_TEST_DSN to run against Oracle")
+
+
+def _oracle_connection():
+    oracledb = pytest.importorskip("oracledb")
+    return oracledb, oracledb.connect(
+        user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
+        password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", ""),
+        dsn=os.environ["MNEMIQ_ORACLE_TEST_DSN"])
+
+
+def _alias_folds(cur, oracledb, letters):
+    """Oracle's folding of each letter, read back as the name of an unquoted alias `x<letter>`;
+    None for a letter Oracle refuses unquoted. Halves a batch Oracle rejects."""
+    try:
+        cur.execute("SELECT " + ", ".join(f"1 AS x{c}" for c in letters) + " FROM dual")
+        return {c: d[0][1:] for c, d in zip(letters, cur.description)}
+    except oracledb.DatabaseError:
+        if len(letters) == 1:
+            return {letters[0]: None}
+        mid = len(letters) // 2
+        return {**_alias_folds(cur, oracledb, letters[:mid]),
+                **_alias_folds(cur, oracledb, letters[mid:])}
+
+
+@_ORACLE
+def test_live_oracle_folds_table_names_and_aliases_alike():
+    """Live: a TABLE name folds as an alias does, for the letters the rule turns on -- the
+    sweep reads aliases, and what the checks compare is object names."""
+    oracledb, con = _oracle_connection()
+    with con:
+        cur = con.cursor()
+        for table in ("fold_probe_s", "fold_probe_ß"):
+            try:  # a run killed before its own cleanup left the table behind
+                cur.execute(f"DROP TABLE {table} PURGE")
+            except oracledb.DatabaseError:
+                pass
+        try:
+            cur.execute("CREATE TABLE fold_probe_s (id NUMBER)")
+            cur.execute("INSERT INTO fold_probe_s VALUES (40)")
+            cur.execute("SELECT id FROM fold_probe_ſ")
+            assert cur.fetchall() == [(40,)]
+            cur.execute("CREATE TABLE fold_probe_ß (id NUMBER)")
+            cur.execute("SELECT table_name FROM user_tables WHERE table_name LIKE 'FOLD_PROBE_%'")
+            assert sorted(r[0] for r in cur.fetchall()) == ["FOLD_PROBE_S", "FOLD_PROBE_ß"]
+            assert _alias_folds(cur, oracledb, ["ſ", "ß"]) == {"ſ": "S", "ß": "ß"}
+        finally:
+            for table in ("fold_probe_s", "fold_probe_ß"):
+                try:
+                    cur.execute(f"DROP TABLE {table} PURGE")
+                except oracledb.DatabaseError:
+                    pass
+
+
+@_ORACLE
+def test_live_oracle_sweep_never_folds_a_letter_oracle_keeps():
+    """Live, the sweep the Oracle rule rests on: every letter below U+3000 and every cased letter
+    above it. None may be folded by the rule where Oracle keeps it -- the direction that vouches.
+    The one measured difference the other way is Greek with a subscript iota (U+1F80 on), which
+    Oracle folds and the rule keeps."""
     from mnemiq.sql.identifiers import resolve
 
-    oracledb = pytest.importorskip("oracledb")
-    letters = ["ſ", "ä", "ı", "ß", "\u1f80"]
-    with oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
-                          password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", ""),
-                          dsn=os.environ["MNEMIQ_ORACLE_TEST_DSN"]) as con:
+    letters = [chr(cp) for cp in range(0x80, 0x110000)
+               if not 0xD800 <= cp <= 0xDFFF and chr(cp).isalpha()
+               and (cp < 0x3000 or chr(cp).upper() != chr(cp) or chr(cp).lower() != chr(cp))]
+    oracledb, con = _oracle_connection()
+    with con:
         cur = con.cursor()
-        cur.execute("SELECT " + ", ".join(f"1 AS x{c}" for c in letters) + " FROM dual")
-        oracle = {c: d[0][1:] for c, d in zip(letters, cur.description)}
-    assert oracle == {"ſ": "S", "ä": "Ä", "ı": "I", "ß": "ß", "\u1f80": "\u1f88"}
-    ours = {c: resolve(c, quoted=False, dialect="oracle") for c in letters}
-    assert ours == {**oracle, "\u1f80": "\u1f80"}  # the one difference: ours keeps, Oracle folds
+        folded = {}
+        for i in range(0, len(letters), 200):
+            folded.update(_alias_folds(cur, oracledb, letters[i:i + 200]))
+    ours = {c: resolve(c, quoted=False, dialect="oracle") for c, v in folded.items() if v}
+    wider = [c for c in ours if folded[c] == c and ours[c] != c]
+    differ = {c for c in ours if ours[c] != folded[c]}
+    assert not wider, [f"U+{ord(c):04X}" for c in wider]
+    assert differ <= {chr(cp) for cp in range(0x1F80, 0x1FFD)}, sorted(differ)[:10]
