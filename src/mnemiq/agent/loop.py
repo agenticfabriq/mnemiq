@@ -18,6 +18,7 @@ from mnemiq.contract.seams import (
 from mnemiq.contract import DeferralReason, IdentityContext, Snapshot, Trace
 from mnemiq.llm.client import ContextTooLong, ModelUnavailable, PromptCut, seed_offset
 from mnemiq.progress import Emit, Stage, step
+from mnemiq.redact import withhold_policy_words
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
 from mnemiq.execute.runner import DEFAULT_TIMEOUT_S, ExecutionError, run
@@ -367,7 +368,14 @@ class Agent:
                 logger.warning("execution attempt %d failed; the source said: %s",
                                _attempt + 1, exc.full_text)
                 failure = exc
-                feedback = Feedback(exc.repair_text, from_source=exc.source_detail is not None)
+                # The source ran the policy's rewrite, so its words can quote the policy (Codex's
+                # review of #152). They reach the model only if they name no word the rewrite
+                # added, granted columns included -- see `withhold_policy_words` for why. The log
+                # above keeps the whole text.
+                detail = withhold_policy_words(exc.source_detail, asked=approved.asked_sql,
+                                               executed=approved.target_sql, dialect=self.dialect)
+                shown = ExecutionError(exc.message, source_detail=detail)
+                feedback = Feedback(shown.repair_text, from_source=detail is not None)
                 continue
 
             self.cache.put(key, to_ipc(result.table))
