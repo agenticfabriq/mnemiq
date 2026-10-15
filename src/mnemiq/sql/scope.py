@@ -273,10 +273,13 @@ def _scope_missed_a_read(ast: exp.Expression, walked: list[exp.Table], dialect: 
     return bool(_missed_reads(ast, walked, dialect))
 
 
-def cte_references(ast: exp.Expression, dialect: str | None = None) -> list[exp.Table]:
+def cte_references(ast: exp.Expression, dialect: str | None = None, *,
+                   engine: str | None = None) -> list[exp.Table]:
     """The table nodes that name a CTE in scope where they stand -- what the fallback over-reports
-    as reads when the walk missed one."""
-    return [table for table in ast.find_all(exp.Table) if _cte_in_scope(table, dialect)]
+    as reads when the walk missed one. `engine` is whose binding to model when it is not the
+    executor's: a view body is bound by its own source engine (Codex's review of #138). None is
+    DuckDB's rule, the one every decider needs."""
+    return [table for table in ast.find_all(exp.Table) if _cte_in_scope(table, dialect, engine)]
 
 
 def _missed_reads(ast: exp.Expression, walked: list[exp.Table], dialect: str | None) -> list[exp.Table]:
@@ -289,7 +292,7 @@ def _missed_reads(ast: exp.Expression, walked: list[exp.Table], dialect: str | N
 
 
 # The engines a row or column policy may be decided for (M150). `_cte_in_scope` models DuckDB's
-# binding of a name in a WITH: earlier siblings in scope, the CTE itself only under RECURSIVE, a
+# binding of a name in a WITH unless told another engine's: earlier siblings in scope, the CTE itself only under RECURSIVE, a
 # later sibling never. Postgres binds a later sibling under RECURSIVE and SQLite always, so there
 # the policy rewrite would wrap a CTE's output as if it were the table -- measured on Postgres 16,
 # `[40]` for `[1, 40]`. Oracle is on the list by measurement, not by modelling: it refuses a
@@ -324,7 +327,17 @@ def check_policy_target(ast: exp.Expression, policy, target: str | None):
     )
 
 
-def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
+# Engines that bind a name to ANY CTE of the WITH it is read inside: a later sibling, and the CTE
+# itself, RECURSIVE or not. Measured on SQLite 3.50, with a table `b` holding 40: `WITH a AS
+# (SELECT id FROM b), b AS (SELECT 1 AS id) SELECT id FROM a` read 1, from a subquery nested in
+# `a` too, and a self-reference was refused as circular. Not Postgres: it binds a later sibling
+# only under RECURSIVE, and `pg_get_viewdef`, where its view bodies come from, writes a RECURSIVE
+# WITH in dependency order (measured on 16), which the earlier-siblings rule already reads right.
+_EVERY_SIBLING = frozenset({"sqlite"})
+
+
+def _cte_in_scope(table: exp.Table, dialect: str | None = None,
+                  engine: str | None = None) -> bool:
     """Is a CTE of this table's name in scope where the table is read?
 
     Only a WITH on one of the table's ENCLOSING queries can stand in front of it. A name matched
@@ -332,7 +345,9 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
     claim) FROM claim` declares `claim` inside a scalar subquery, and the outer `FROM claim` is
     the real table -- matched by name, it was skipped, never grant-checked, and the write was
     approved with `claim` ungranted on the locked sqlglot (M122). Inside a WITH's own CTE bodies
-    only earlier siblings are visible, plus the CTE itself when the WITH is RECURSIVE (M31's rule).
+    only earlier siblings are visible, plus the CTE itself when the WITH is RECURSIVE (M31's rule,
+    DuckDB's) -- unless `engine` is one in `_EVERY_SIBLING`, which binds every CTE of the WITH there,
+    the CTE itself included: how a view body is bound when its source engine runs it.
     A qualified reference (`main.claim`) is never a CTE -- a CTE has no schema -- and names are
     resolved by `mnemiq.sql.identifiers`, the shared resolver (M55) -- which `authz_guard`'s and
     `cls`'s own CTE name sets do not use yet, so they may still disagree with this one: matching lowercased bare names excused `FROM
@@ -350,7 +365,9 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None) -> bool:
             last_cte = node
         for with_ in (v for v in node.args.values() if isinstance(v, exp.With)):
             names = [resolve_name(cte, dialect) for cte in with_.expressions]
-            if child is with_:  # the table sits inside one of this WITH's own CTE bodies
+            if child is with_ and (engine or "").lower() in _EVERY_SIBLING:
+                visible = names
+            elif child is with_:  # the table sits inside one of this WITH's own CTE bodies
                 at = next((i for i, cte in enumerate(with_.expressions) if cte is last_cte), 0)
                 visible = names[:at] + (names[at:at + 1] if with_.args.get("recursive") else [])
             else:

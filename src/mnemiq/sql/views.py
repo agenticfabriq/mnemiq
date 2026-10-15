@@ -391,11 +391,11 @@ def _walk(
             # not by name: pooling every alias in the body and matching it by bare name let
             # `WITH secret AS (...) SELECT ... FROM main.secret` read a real table the snapshot
             # does not know, and a `secret` read outside the CTE's scope too, with any inventory
-            # (Codex's review of #132). `cte_references` is the deciders' own binding -- DuckDB's,
-            # the narrowest of the engines measured, so it never exempts a read an engine makes
-            # of the table -- and never excuses a qualified name. `_mentions` still collects
-            # every alias, so a CTE named after a filtered table still trips the filtered check.
-            bound = {id(t) for t in cte_references(body, view.dialect)}
+            # (Codex's review of #132). Bound as the view's OWN engine binds it, since its source
+            # runs the body: SQLite binds a later sibling, and DuckDB's rule refused such a view
+            # (Codex's review of #138). Never a qualified name. `_mentions` still collects every
+            # alias, so a CTE named after a filtered table still trips the filtered check.
+            bound = {id(t) for t in cte_references(body, view.dialect, engine=view.dialect)}
             recognised = spellings(known) | spellings(set(views))
             # BOTH sides normalised. Widening only the known set still rejected `public.film`
             # against a snapshot that keys it `film`: a name is known when ANY of its spellings
