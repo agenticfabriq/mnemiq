@@ -40,7 +40,7 @@ def expand_tables(ast: exp.Expression, registry: dict[str, str]) -> None:
             table.set("db", exp.to_identifier(registry[db]))
 
 
-def names_one_object(name: str, candidates) -> bool:
+def names_one_object(name: str, candidates, *, fold=str.lower) -> bool:
     """Whether `name` and any of `candidates` are the same object id, ignoring case.
 
     Used by `AccessPolicy.denies` / `.masks` / `.row_filter_for` and by `check_values`, which
@@ -58,6 +58,13 @@ def names_one_object(name: str, candidates) -> bool:
     case-sensitive in Postgres, and nothing here can tell them apart because quoting is discarded
     before any caller reaches this. That is M55, and it is open -- when it is settled, this is the
     single function that has to learn about it.
+
+    `fold` is how far case is ignored, and the direction of the comparison decides it. The default
+    folds every letter, wider than DuckDB, SQLite and Postgres, which fold ASCII only; that only
+    over-matches, which is safe where a match RESTRICTS -- a filter, a mask or a denial applied to
+    more. Where a match GRANTS, over-matching vouches for an object the engine keeps apart, so
+    `AccessPolicy.names` passes `identifiers.ascii_lower`: with the wide fold, a grant on `Ä` let a
+    card name a join to an ungranted `ä` (M154).
     """
-    folded = name.lower()
-    return any(c.lower() == folded for c in candidates)
+    folded = fold(name)
+    return any(fold(c) == folded for c in candidates)

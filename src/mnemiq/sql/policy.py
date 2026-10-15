@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
+from mnemiq.sql.identifiers import ascii_lower
 from mnemiq.sql.qualify import names_one_object
 
 logger = logging.getLogger(__name__)
@@ -59,8 +60,11 @@ class AccessPolicy:
     # These sets hold a handful of entries; folding per call costs nothing worth this risk.
 
     def names(self, table: str) -> bool:
-        """Whether a card served to this caller may name `table`, folded like every lookup here."""
-        return self.visible is None or names_one_object(table, self.visible)
+        """Whether a card served to this caller may name `table`. The one lookup here that GRANTS,
+        so it folds ASCII letters only, never wider than the engine (M154): with every letter
+        folded, a grant on `Ä` let a card show a join to an ungranted `ä`. Oracle, which folds
+        `ä` to `Ä`, can only see a join hidden by this, never one shown."""
+        return self.visible is None or names_one_object(table, self.visible, fold=ascii_lower)
 
     def denies(self, table: str, column: str) -> bool:
         return any(names_one_object(table, [t]) and c.lower() == column.lower()
