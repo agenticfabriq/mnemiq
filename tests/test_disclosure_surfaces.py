@@ -15,7 +15,7 @@ from mnemiq.contract.seams import Narrowed, disclosure_sentence
 def test_the_sentence_is_the_wording_that_was_chosen():
     """Product voice, decided rather than derived -- and it states what the record knows: a row
     filter was APPLIED, which one every row passes sets as well, so "rows were withheld" claimed
-    what nobody measured (M155; the owner chose the workbench's wording, 2026-10-14)."""
+    what nobody measured (M155; the owner chose the wording of the workbench note in #145)."""
     assert disclosure_sentence([Narrowed(object="claim", rows=True, columns=False)]) == (
         "Row filter applied to: claim.")
 
