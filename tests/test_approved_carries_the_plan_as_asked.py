@@ -11,6 +11,8 @@ instead (the consumer change is the ui lane's); execution, the cache key and the
 
 from __future__ import annotations
 
+import pytest
+
 from mnemiq.sql.decide import decide
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved
@@ -45,3 +47,17 @@ def test_it_is_in_the_plan_dialect_not_the_targets():
                                       policy_schema=VISIBLE), target="oracle")
     assert "FETCH FIRST" in approved.asked_sql
     assert "LIMIT" in approved.asked_plan and "FETCH" not in approved.asked_plan
+
+
+def test_model_sql_is_the_statement_as_asked_under_a_policy():
+    approved = _approved(AccessPolicy(row_filters={"policy": "region = 'west'"},
+                                      policy_schema=VISIBLE))
+    assert approved.model_sql() == approved.asked_plan
+
+
+def test_model_sql_falls_back_to_the_plan_only_where_no_policy_was_evaluated():
+    """`verify_replay` builds `Approved` itself, with neither field set."""
+    assert Approved(plan_sql="SELECT 1", target_sql="SELECT 1").model_sql() == "SELECT 1"
+    evaluated = Approved(plan_sql="SELECT 1 WHERE region = 'west'", target_sql="x", narrowed=[])
+    with pytest.raises(ValueError):
+        evaluated.model_sql()

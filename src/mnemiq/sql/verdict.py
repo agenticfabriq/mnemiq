@@ -202,17 +202,28 @@ class Approved:
     # rather than the executed statement by default.
     asked_sql: str | None = None
     # The same statement as asked, in the PLAN's dialect, for the MODEL calls -- the judge, the
-    # selector, the synthesizer -- to read in place of `plan_sql`. Shown the rewritten `plan_sql`,
-    # the judge read the policy's own predicate as a filter the question never implied and withdrew
-    # every answer under a row filter (measured by the ui lane, M156), and an entitlements
-    # predicate would carry tables and literals the role is not granted to the model server. Equal
-    # to `plan_sql` when nothing was narrowed, so a prompt with no policy is byte-identical. Not
-    # `asked_sql`: that is the target's dialect, which would change every prompt on a source whose
-    # target differs. Never what runs. None where no decider set it. A reader may fall back to
-    # `plan_sql` ONLY where no policy was evaluated either (`narrowed` None, as in
-    # `eval/verify_replay.py`, which builds `Approved` itself): with a policy evaluated, a missing
-    # `asked_plan` must not become the rewritten plan, which is the leak this field closes.
+    # selector, the synthesizer -- to read through `model_sql()` in place of `plan_sql`. Shown the
+    # rewritten `plan_sql`, the judge read the policy's own predicate as a filter the question
+    # never implied and withdrew every answer under a row filter (measured by the ui lane, M156),
+    # and an entitlements predicate would carry tables and literals the role is not granted to the
+    # model server -- open until those calls read `model_sql()`. Equal to `plan_sql` when nothing
+    # was narrowed, so a prompt with no policy is byte-identical. Not `asked_sql`: that is the
+    # target's dialect, which would change every prompt on a source whose target differs. Never
+    # what runs. None where no decider set it.
     asked_plan: str | None = None
+
+    def model_sql(self) -> str:
+        """What a model call may be shown of this statement (M156): the statement as asked, or
+        `plan_sql` where no policy was evaluated (`narrowed` None, as `mnemiq.eval.verify_replay`
+        builds it). With a policy evaluated and no `asked_plan`, it RAISES rather than fall back:
+        the fallback would be the rewritten plan, the predicate and any entitlements literals
+        included, which is what this exists to keep from the model server."""
+        if self.asked_plan is not None:
+            return self.asked_plan
+        if self.narrowed is None:
+            return self.plan_sql
+        raise ValueError("a policy was evaluated but the statement as asked was not recorded, "
+                         "so there is no SQL a model call may be shown")
 
 
 @dataclass
