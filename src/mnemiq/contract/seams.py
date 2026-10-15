@@ -126,8 +126,8 @@ def disclosure_sentence(narrowed: "list[Narrowed] | None") -> str:
     every row passes sets it too -- and `columns` that the query referenced a column NAME the
     table masks, so "some rows were withheld" and "some columns were masked" claimed what nobody
     measured. The wording is the one the ui lane's workbench note takes in mnemiq #145 (the owner's
-    choice, 2026-10-14), and names each table
-    once, in the order the record gives them: tables the caller's own query named.
+    choice, 2026-10-14), and names each table once, in the order the record gives them: tables the
+    caller's own query named.
     """
     if not narrowed:
         return ""
