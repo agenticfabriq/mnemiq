@@ -13,10 +13,23 @@ from mnemiq.contract.seams import Narrowed, disclosure_sentence
 
 
 def test_the_sentence_is_the_wording_that_was_chosen():
-    """Product voice, decided rather than derived: honest and slightly alarming beats calm and
-    vague, because the caller's next action depends on knowing the answer is partial."""
+    """Product voice, decided rather than derived -- and it states what the record knows: a row
+    filter was APPLIED, which one every row passes sets as well, so "rows were withheld" claimed
+    what nobody measured (M155; the owner chose the wording of the workbench note in #145)."""
     assert disclosure_sentence([Narrowed(object="claim", rows=True, columns=False)]) == (
-        "Some rows were withheld by policy.")
+        "Row filter applied to: claim.")
+
+
+def test_each_table_is_named_once_in_the_order_the_record_gives():
+    narrowed = [Narrowed(object="policy", rows=True, columns=False),
+                Narrowed(object="claim", rows=True, columns=True),
+                Narrowed(object="policy", rows=True, columns=False)]
+    assert disclosure_sentence(narrowed) == (
+        "Row filter applied to: policy, claim. Masked column names referenced, on: claim.")
+
+
+def test_a_record_with_neither_flag_claims_nothing():
+    assert disclosure_sentence([Narrowed(object="claim", rows=False, columns=False)]) == ""
 
 
 def test_a_mask_and_a_filter_read_differently():
@@ -24,8 +37,8 @@ def test_a_mask_and_a_filter_read_differently():
     produces an identical set on both sides and passes any test that only counts disclosures."""
     mask = disclosure_sentence([Narrowed(object="claim", rows=False, columns=True)])
     both = disclosure_sentence([Narrowed(object="claim", rows=True, columns=True)])
-    assert mask == "Some columns were masked by policy."
-    assert both == "Some rows were withheld and some columns masked by policy."
+    assert mask == "Masked column names referenced, on: claim."
+    assert both == "Row filter applied to: claim. Masked column names referenced, on: claim."
     assert mask != both
 
 

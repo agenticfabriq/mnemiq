@@ -282,7 +282,7 @@ def test_policy_comes_before_engine_limits_in_the_answer():
         disclosure_sentence([Narrowed(object="claim", rows=True, columns=False)]),
         sentence("incomplete", ["v_totals"], []),
     )
-    assert out.index("withheld by policy") < out.index("v_totals")
+    assert out.index("Row filter applied to") < out.index("v_totals")
 
 
 class _Views(dict):
