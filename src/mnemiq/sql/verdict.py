@@ -206,7 +206,8 @@ class Approved:
     # rewritten `plan_sql`, the judge read the policy's own predicate as a filter the question
     # never implied and withdrew every answer under a row filter (measured by the ui lane, M156),
     # and an entitlements predicate would carry tables and literals the role is not granted to the
-    # model server -- open until those calls read `model_sql()`. Equal to `plan_sql` when nothing
+    # model server. All three read `model_sql()` (`Verifier.verify`, the selector's `ClusterView`s
+    # and `Agent`'s synthesis step); a new model call must too. Equal to `plan_sql` when nothing
     # was narrowed, so a prompt with no policy is byte-identical. Not `asked_sql`: that is the
     # target's dialect, which would change every prompt on a source whose target differs. Never
     # what runs. None where no decider set it.
