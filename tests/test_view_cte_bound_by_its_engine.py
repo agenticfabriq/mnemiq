@@ -55,6 +55,15 @@ def test_a_reference_the_engine_binds_to_a_table_is_still_refused(dialect, body)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW, verdict
 
 
+def test_a_later_cte_in_the_other_case_of_a_non_ascii_letter_does_not_bind_the_read():
+    """Codex's review of #144: SQLite folds ASCII letters only, so a later CTE `Ä` does not bind
+    a read of `ä` -- measured on SQLite 3.50, the table's 40 -- and the widened binding exempted
+    it while the resolver folded every letter."""
+    verdict = _decide("WITH a AS (SELECT id FROM ä), Ä AS (SELECT 1 AS id) SELECT id FROM a",
+                      "sqlite")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW, verdict
+
+
 def test_the_deciders_binding_is_not_the_dialect_s():
     """Model SQL written in SQLite's dialect still executes on DuckDB, which reads `b` as the
     table: only an explicit engine widens the binding, never the parse dialect."""
