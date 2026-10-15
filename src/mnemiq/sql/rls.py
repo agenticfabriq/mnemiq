@@ -256,8 +256,9 @@ def apply_row_and_mask(
     `exclude` skips ONE node, by identity. It exists for the target of an UPDATE/DELETE, which is
     the single position where a derived table is not SQL -- there is nothing to mutate through
     `UPDATE (SELECT ...) AS claim`. That target is filtered by conjunction instead, in
-    `apply_row_filters_to_write`, which is equivalent there because the target's rows ARE the rows
-    being mutated. By identity and never by name: `UPDATE claim ... WHERE id IN (SELECT id FROM
+    `apply_row_filters_to_write`, which selects the same rows because the target's rows ARE the
+    rows being mutated -- except on a `_FENCED` engine, where a conjunction does not order the
+    filter first and the write is refused there instead (M160). By identity and never by name: `UPDATE claim ... WHERE id IN (SELECT id FROM
     claim ...)` is two nodes with one name that need opposite treatment, and matching on the name
     would skip both -- the flat-name-set bypass M31 and the view rounds each paid for once.
     """
@@ -360,7 +361,8 @@ def apply_row_filters_to_write(
     wrapped by `apply_row_and_mask` unchanged. The UPDATE/DELETE target is conjoined, because it
     cannot be wrapped -- and it is conjoined with a predicate that went through the SAME
     `_validate_filter`, which is what closes the validation half rather than patching its five
-    symptoms one at a time.
+    symptoms one at a time. On a `_FENCED` engine (Oracle) a filtered target is refused instead:
+    the conjunction cannot be fenced, and the statement's own WHERE can run on removed rows (M160).
 
     An INSERT target is exempt and stays exempt: an INSERT does not read its target, and filtering
     rows on the way IN is not what a row filter means.
