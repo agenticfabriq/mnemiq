@@ -44,14 +44,15 @@ def _unknown_column(name: str, dialect: str | None) -> Refusal:
         # `WHERE ROWNUM <= 5 ORDER BY x` sorts five arbitrary rows, and `ROWNUM > 5` is always
         # empty -- both ran and answered wrong once it was admitted (the ui lane, measured on
         # Oracle 23). FETCH FIRST is the one bound that is right in either place, and the row cap
-        # reads it (M162). NULLS LAST because Oracle puts NULLs first on a descending key, which
-        # the logic lint refuses on a written limit (M161): one repair, not two.
+        # reads it (M162). NULLS LAST, on the FIRST key, because Oracle puts NULLs first on a
+        # descending key and the logic lint refuses that on a written limit, reading the first
+        # key only (M161): one repair, not two.
         return Refusal(
             code=RefusalCode.UNKNOWN_COLUMN,
             message=("ROWNUM is numbered before the ORDER BY of its own query block, so what it "
                      "returns depends on where it is written, and it cannot be checked against "
-                     "the row bound. For the first n rows in an order, write ORDER BY ... NULLS "
-                     "LAST FETCH FIRST n ROWS ONLY."),
+                     "the row bound. For the first n rows in an order, write ORDER BY with "
+                     "NULLS LAST on the first sort key, then FETCH FIRST n ROWS ONLY."),
             subject=name,
         )
     if (dialect or "").lower() == "oracle" and name.lower() == "rowid":

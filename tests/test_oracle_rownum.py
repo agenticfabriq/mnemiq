@@ -6,8 +6,9 @@ pseudo-column it is. The ui lane measured why not, on Oracle 23: admitted, the s
 runs and answers wrong in the shapes models write most. `WHERE ROWNUM <= 5 ORDER BY amount DESC`
 sorts five arbitrary rows, `ROWNUM > 5` is always empty, and a selected ROWNUM numbers rows in
 storage order, not the query's order. The owner's decision (2026-10-16): keep it refused, and say
-to write `ORDER BY ... NULLS LAST FETCH FIRST n ROWS ONLY`, the bound #156 keeps and the row cap
-reads, with NULLS LAST so M161's lint does not cost a second repair.
+to write ORDER BY with NULLS LAST on the first sort key, then FETCH FIRST n ROWS ONLY: the bound
+#156 keeps and the row cap reads, with NULLS LAST where M161's lint reads it, the first key, so it
+does not cost a second repair (the ui lane's review).
 
 ROWID is refused with its own reason: a physical row address is not data an answer reports, and
 Oracle cannot read it through the view a row policy puts over a table (ORA-01446, measured below).
@@ -44,7 +45,7 @@ def test_rownum_is_refused_with_the_bound_to_write_instead(sql, policy):
     verdict = _decide(sql, policy=policy)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
     assert verdict.repairable
-    assert "write ORDER BY ... NULLS LAST FETCH FIRST n ROWS ONLY" in verdict.message
+    assert "NULLS LAST on the first sort key, then FETCH FIRST n ROWS ONLY" in verdict.message
 
 
 @pytest.mark.parametrize("policy", [None, FILTERED])
@@ -52,9 +53,16 @@ def test_the_advised_bound_is_approved_as_written(policy):
     verdict = _decide(ADVISED, policy=policy)
     assert isinstance(verdict, Approved), verdict
     assert verdict.target_sql.endswith("FETCH FIRST 5 ROWS ONLY") and verdict.row_cap is None
-    # Why the advice says NULLS LAST: without it, M161's lint costs a second repair.
-    bare = _decide(ADVISED.replace(" NULLS LAST", ""), policy=policy)
-    assert isinstance(bare, Refusal) and bare.code is RefusalCode.LOGIC_LINT, bare
+    # Why the advice says NULLS LAST, and on the first key: M161's lint reads the first key only,
+    # so NULLS LAST missing, or written on a later key, costs a second repair.
+    for second_repair in (ADVISED.replace(" NULLS LAST", ""),
+                          "SELECT id FROM claim ORDER BY amount DESC, id NULLS LAST "
+                          "FETCH FIRST 5 ROWS ONLY"):
+        bare = _decide(second_repair, policy=policy)
+        assert isinstance(bare, Refusal) and bare.code is RefusalCode.LOGIC_LINT, second_repair
+    two_keys = _decide("SELECT id FROM claim ORDER BY amount DESC NULLS LAST, id "
+                       "FETCH FIRST 5 ROWS ONLY", policy=policy)
+    assert isinstance(two_keys, Approved), two_keys
 
 
 def test_a_write_bounded_by_rownum_is_refused_too():
