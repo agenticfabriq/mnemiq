@@ -69,7 +69,16 @@ class Lineage:
 # sqlglot leaves `Anonymous`. Deliberately short: an unlisted function is UNRESOLVED, so the list
 # growing is a decision someone makes rather than a default. A same-named UDF shadows an entry
 # here, which is the same registry problem the strict xfail pins from the other side.
-_PURE = frozenset({"now", "age", "current_timestamp", "current_date", "current_time", "today"})
+#
+# For Oracle that decision is made once, as a standing rule (the owner, 2026-10-15, M157): a
+# builtin joins when Oracle's SQL Language Reference confirms it computes from its arguments
+# alone, without a decision per name. `trunc` is the first: sqlglot leaves it `Anonymous` in its
+# one-argument Oracle form, and the reference gives TRUNC (datetime) and TRUNC (number) as
+# truncating the value passed. Outside the rule, and so not added: a function returning session
+# state that application code sets (`sys_context`, `userenv`), and the time-zone group (`from_tz`,
+# `tz_offset`, `new_time`, `sys_extract_utc`), which reads the database's time-zone data.
+_PURE = frozenset({"now", "age", "current_timestamp", "current_date", "current_time", "today",
+                   "trunc"})
 
 
 def _safe_label(label: str, fallback: str) -> str:
