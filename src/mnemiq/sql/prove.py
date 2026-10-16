@@ -55,3 +55,37 @@ def prove(adapter: Any, target_sql: str) -> Refusal | None:
             source_detail=str(exc),
         )
     return None
+
+
+def prove_governed(adapter: Any, target_sql: str, asked_sql: str) -> Refusal | None:
+    """`prove` the statement as it will run, and where the source refuses only what the access
+    policy added, say so instead (M158).
+
+    A row filter gone stale against its source -- a column renamed under it -- fails the proof of
+    every statement that reads its table. EXPLAIN_FAILED is repairable, so each attempt went back
+    to the model to repair a statement that was never wrong, and the caller was told the model had
+    failed. When the policy's rewrite is refused and the statement as asked is accepted, the fault
+    is in what the engine added: the policy, or the snapshot it was checked against. The cost is
+    one more proof, and only for a refused statement that a policy rewrote.
+
+    The second proof tells the caller one thing: that their own statement is valid. A working
+    policy would have told them the same. A proof reads the statement and the schema, never rows:
+    EXPLAIN plans without running, and Oracle's `validate` parses.
+    """
+    refused = prove(adapter, target_sql)
+    if refused is None or asked_sql == target_sql:
+        return refused
+    if prove(adapter, asked_sql) is not None:
+        return refused  # the statement itself is refused: the model's to repair, as before
+    # `prove` logged the source's words for the rewrite; this says whose they were.
+    logger.warning("The source accepts the statement as asked and refuses the access policy's "
+                   "rewrite of it: a row filter, or the snapshot it was checked against, no "
+                   "longer matches the source.")
+    return Refusal(
+        code=RefusalCode.POLICY_REWRITE_REJECTED,
+        message=("The source accepts this query as written but rejects it once your access policy "
+                 "is applied, so it cannot be run for you. A row filter, or the schema this "
+                 "deployment checked the policy against, no longer matches the source. This is a "
+                 "configuration fault for the operator, not a limit on your access; the server log "
+                 "has the source's error."),
+    )

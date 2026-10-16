@@ -36,7 +36,9 @@ from mnemiq.semantic.retrieval import ContextPacket, RetrievedCard
 
 ENTITLED = "id IN (SELECT id FROM entitlement WHERE who = 'secret_role_42')"
 # The same policy after a rename the snapshot has not caught up with: `whom` is in the snapshot, the
-# source has `who`, so the policy's own predicate is what EXPLAIN refuses.
+# source has `who`, so the policy's own predicate is what EXPLAIN refuses. The stale snapshot also
+# holds `claim.status`, which the source lacks, so a statement can fail on its own too: a refusal of
+# the policy's part alone goes to the operator, not the model (M158).
 STALE = "id IN (SELECT id FROM entitlement WHERE whom = 'secret_role_42')"
 # Fails at run time, in the caller's own WHERE -- past the policy's derived table in the statement,
 # which is where DuckDB's echo window then sits.
@@ -66,7 +68,8 @@ def adapter(tmp_path):
 
 def _snapshot(stale=False):
     names = [("claim", "id"), ("claim", "region"), ("claim", "amount"),
-             ("entitlement", "id"), ("entitlement", "who")] + ([("entitlement", "whom")] if stale else [])
+             ("entitlement", "id"), ("entitlement", "who")] + (
+                 [("entitlement", "whom"), ("claim", "status")] if stale else [])
     return Snapshot(version="v1", source_id="s", created_at="2026-10-15T00:00:00Z",
                     columns=[Column(id=f"{t}.{c}", object_id=t, name=c) for t, c in names])
 
@@ -107,7 +110,9 @@ def test_an_execution_error_reaches_the_model_as_its_class_only(adapter):
 
 
 def test_an_explain_refusal_reaches_the_model_as_its_class_only(adapter):
-    _, calls = _ask(adapter, sql="SELECT id FROM claim", row_filter=STALE, stale=True)
+    # `status` fails as asked too, so the refusal is the model's to repair; the source's words are
+    # still about the rewrite, which names `whom`.
+    _, calls = _ask(adapter, sql="SELECT status FROM claim", row_filter=STALE, stale=True)
     assert calls[1] == _class_only("Binder Error")
 
 
