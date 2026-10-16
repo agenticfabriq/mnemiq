@@ -36,8 +36,9 @@ def _null_before_ordered_limit(root: exp.Expression) -> Violation | None:
     """A top-N whose first sort key puts NULLs first returns NULLs instead of values.
 
     Where NULLs go is the ENGINE's, and the old rule assumed one answer -- ascending first -- that
-    neither engine mnemiq runs gives: DuckDB 1.5.4 sorts them last both ways, and Oracle 23 last
-    ascending and FIRST descending (measured, M161; `test_lint_null_order.py` pins both). sqlglot
+    neither engine production runs gives: DuckDB 1.5.4 sorts them last both ways, and Oracle 23 last
+    ascending and FIRST descending. SQLite does put them first ascending (measured, M161;
+    `test_lint_null_order.py` pins all three; Postgres, first descending, is not pinned). sqlglot
     records each key's order as `nulls_first`, from a written NULLS clause or the parse dialect's
     default, and a transpile writes the clause out where the target's default differs, so it is the
     order the statement runs with. A statement that writes a null order chose it, and is left alone.
