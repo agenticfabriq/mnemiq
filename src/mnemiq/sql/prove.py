@@ -66,7 +66,7 @@ def prove_governed(adapter: Any, target_sql: str, asked_sql: str) -> Refusal | N
     to the model to repair a statement that was never wrong, and the caller was told the model had
     failed. When the policy's rewrite is refused and the statement as asked is accepted, the fault
     is in what the engine added: the policy, or the snapshot it was checked against. The cost is
-    one more proof, and only for a refused statement that a policy rewrote.
+    one or two more proofs, and only for a refused statement that a policy rewrote.
 
     The second proof tells the caller one thing: that their own statement is valid. A working
     policy would have told them the same. A proof reads the statement and the schema, never rows:
@@ -75,8 +75,14 @@ def prove_governed(adapter: Any, target_sql: str, asked_sql: str) -> Refusal | N
     refused = prove(adapter, target_sql)
     if refused is None or asked_sql == target_sql:
         return refused
+    logger.info("Proving the statement as asked, without the access policy's rewrite.")
     if prove(adapter, asked_sql) is not None:
         return refused  # the statement itself is refused: the model's to repair, as before
+    # Once more before the policy is blamed: `prove` reads every exception as a refusal, so a
+    # dropped connection or a lock timeout on the first proof would otherwise land here, and a
+    # policy fault is not retried.
+    if prove(adapter, target_sql) is None:
+        return None
     # `prove` logged the source's words for the rewrite; this says whose they were.
     logger.warning("The source accepts the statement as asked and refuses the access policy's "
                    "rewrite of it: a row filter, or the snapshot it was checked against, no "

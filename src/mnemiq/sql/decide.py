@@ -245,9 +245,10 @@ def decide(
         # A refusal of what the policy added is the operator's, not the model's (M158).
         refused = prove_governed(adapter, target_sql, asked_sql)
         if refused is not None:
-            # What the source refused is the policy's rewrite, so its words can quote the policy and
-            # the rows it removes, and the model repairs against them. `prove` has logged them
-            # whole; under a policy the refusal keeps the error's class only (`policy_safe_detail`).
+            # EXPLAIN_FAILED: what the source refused is the policy's rewrite, so its words can
+            # quote the policy and the rows it removes, and the model repairs against them. `prove`
+            # has logged them whole; under a policy the refusal keeps the error's class only
+            # (`policy_safe_detail`). POLICY_REWRITE_REJECTED carries no source words at all.
             return replace(refused, source_detail=policy_safe_detail(
                 refused.source_detail, asked=asked_sql, executed=target_sql, dialect=target))
 

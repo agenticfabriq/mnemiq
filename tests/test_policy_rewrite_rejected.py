@@ -111,7 +111,7 @@ def test_a_statement_the_source_refuses_on_its_own_stays_the_model_s_to_repair(s
     assert verdict.code in REPAIRABLE
 
 
-def test_only_a_refused_rewrite_costs_a_second_proof(source):
+def test_only_a_refused_rewrite_costs_more_proofs(source):
     assert isinstance(_decide("SELECT id FROM claim", source, row_filter=ENTITLED), Approved)
     assert len(source.proofs) == 1, "a policy the source accepts: one proof, as before"
     source.proofs.clear()
@@ -122,7 +122,25 @@ def test_only_a_refused_rewrite_costs_a_second_proof(source):
     assert len(source.proofs) == 1, "nothing narrowed: no statement as asked to compare"
     source.proofs.clear()
     _decide("SELECT id FROM claim", source, row_filter=STALE)
-    assert len(source.proofs) == 2 and "whom" in source.proofs[0] and "whom" not in source.proofs[1]
+    # The rewrite, the statement as asked, and the rewrite once more before the policy is blamed.
+    assert [("whom" in proof) for proof in source.proofs] == [True, False, True], source.proofs
+
+
+class _OnceUnreachable(_Counting):
+    """The first proof fails as a dropped connection would; every later one reaches the source."""
+
+    def execute(self, sql):
+        if sql.startswith("EXPLAIN ") and not self.proofs:
+            self.proofs.append(sql)
+            raise ConnectionError("connection reset by peer")
+        return super().execute(sql)
+
+
+def test_a_first_proof_that_fails_for_another_reason_is_not_blamed_on_the_policy(tmp_path):
+    source = _OnceUnreachable(_source(tmp_path).inner)
+    verdict = _decide("SELECT id FROM claim", source, row_filter=ENTITLED, snapshot=_snapshot())
+    assert isinstance(verdict, Approved), verdict
+    assert len(source.proofs) == 3, "the rewrite, the statement as asked, the rewrite again"
 
 
 def test_a_write_under_a_stale_row_filter_is_refused_the_same_way(tmp_path):
