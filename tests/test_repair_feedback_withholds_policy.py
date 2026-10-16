@@ -111,17 +111,19 @@ def test_an_explain_refusal_reaches_the_model_as_its_class_only(adapter):
     assert calls[1] == _class_only("Binder Error")
 
 
-@pytest.mark.parametrize("policy", ["CAST(UPPER(region) AS INTEGER) > 0",
-                                    "CAST(region || '' AS INTEGER) > 0"])
+# Codex's two reproductions against #153 were raising conversions (`CAST(UPPER(region) AS INTEGER)`,
+# `CAST(region || '' AS INTEGER)`), which M159 now refuses before they run
+# (test_row_filter_raising_conversion.py). A raising expression that is not a conversion still
+# runs, so the class is still all the model may read: `error()` quotes the hidden value whole.
+@pytest.mark.parametrize("policy", ["CASE WHEN id = 2 THEN error(region) END IS NULL"])
 def test_a_raising_policy_s_hidden_value_never_reaches_the_model(tmp_path, policy, caplog):
-    # Codex's two reproductions against #153: the column is wrapped, so DuckDB's message names no
-    # column, only the hidden row's value. Row 1 passes the policy; row 2 is outside the caller's
-    # slice, and the policy raises on it instead of removing it.
+    # Row 1 passes the policy; row 2 is outside the caller's slice, and the policy raises on it
+    # instead of removing it, its message naming no column, only the hidden row's value.
     source = _source(tmp_path, "(1, '7', 10), (2, 'secret_hidden_value', 20)")
     with caplog.at_level(logging.WARNING):
         _, calls = _ask(source, sql="SELECT id FROM claim", row_filter=policy)
     assert "secret_hidden_value" in caplog.text.lower(), "control: the source did quote it"
-    assert calls[1] == _class_only("Conversion Error")
+    assert calls[1] == _class_only("Invalid Input Error")
 
 
 def test_with_nothing_narrowed_the_source_s_words_reach_the_model_whole(adapter):

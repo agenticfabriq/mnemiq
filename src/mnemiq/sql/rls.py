@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 import sqlglot
 from sqlglot import exp
@@ -9,6 +10,8 @@ from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import names_one_object, object_key
 from mnemiq.sql.scope import base_tables, column_tables, cte_references, scope_resolved
 from mnemiq.sql.verdict import Refusal, RefusalCode
+
+logger = logging.getLogger(__name__)
 
 
 # The stand-in for the table a filter is attached to, so the predicate can be validated as the
@@ -100,6 +103,200 @@ def _validate_filter(
         elif column.name not in schema.get(owner, set()):
             return None
     return expr
+
+
+# Conversions that raise on a value they cannot read (M159). A row filter runs over every row of
+# its table, the ones it removes included, so one bad value in a hidden row fails every question on
+# the table, and the error can quote that value. sqlglot's typed parses, and Oracle's conversions it
+# leaves untyped. TRY_CAST and a DEFAULT ... ON CONVERSION ERROR clause do not raise.
+_PARSES = (exp.ToNumber, exp.StrToDate, exp.StrToTime)
+_UNTYPED_CONVERSIONS = frozenset({"to_binary_double", "to_binary_float", "to_timestamp_tz",
+                                  "to_dsinterval", "to_yminterval"})
+# Text read as JSON, which DuckDB refuses on malformed text and quotes ("Input: ..."): every
+# scalar JSON reader in `duckdb_functions()` that does so in 1.5.4, measured, by how sqlglot parses
+# it (a test re-measures the list, at the arguments it knows for each reader). Oracle's JSON functions default to NULL ON ERROR, so this is
+# DuckDB's alone. Safe over a column the snapshot types JSON, or over `TRY_CAST(value AS JSON)`.
+_JSON_PARSES = (exp.JSONExtract, exp.JSONExtractScalar, exp.ParseJSON, exp.JSONKeys, exp.JSONType)
+_UNTYPED_JSON_PARSES = frozenset({
+    "from_json", "from_json_strict", "json_array_length", "json_contains", "json_deserialize_sql",
+    "json_exists", "json_merge_patch", "json_pretty", "json_structure", "json_transform",
+    "json_transform_strict", "json_value"})
+# A comparison converts a text column to the other side's type, row by row, in both engines:
+# DuckDB on `=`, `<>` and IN (its ordering comparisons refuse at bind, on no row's value), Oracle
+# on every comparison (an implicit TO_NUMBER or TO_DATE). Seen only where the snapshot types both
+# sides; an untyped column compared to a number is not.
+_COMPARISONS = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NullSafeEQ,
+                exp.NullSafeNEQ, exp.In, exp.Between)
+_ARITHMETIC = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.IntDiv)
+_INTEGER_RANK = {exp.DataType.Type.TINYINT: 1, exp.DataType.Type.SMALLINT: 2,
+                 exp.DataType.Type.INT: 3, exp.DataType.Type.BIGINT: 4,
+                 exp.DataType.Type.INT128: 5}
+# Every value of these renders as text, so a cast of one to unbounded text cannot fail (DuckDB).
+_RENDERS_AS_TEXT = (set(_INTEGER_RANK) | exp.DataType.NUMERIC_TYPES | exp.DataType.TEMPORAL_TYPES
+                    | exp.DataType.TEXT_TYPES | {exp.DataType.Type.BOOLEAN})
+# Each engine's non-raising spelling, as the refusal names it. Oracle's DEFAULT clause is kept by
+# sqlglot on CAST and TO_NUMBER only: given a format argument, `CAST(d AS DATE DEFAULT NULL ON
+# CONVERSION ERROR, 'YYYY-MM-DD')` is read as TO_DATE and rendered without the clause, and
+# TO_DATE's own DEFAULT does not parse.
+_SAFE_FORM = {
+    "duckdb": ("TRY_CAST(value AS type), which gives NULL where the value does not convert "
+               "(for JSON, read from TRY_CAST(value AS JSON))"),
+    "oracle": ("CAST(value AS type DEFAULT NULL ON CONVERSION ERROR) with no format argument, or "
+               "TO_NUMBER(value DEFAULT NULL ON CONVERSION ERROR)"),
+}
+
+
+def _cast_cannot_fail(source: str | None, to: exp.DataType, engine: str) -> bool:
+    """Whether every value of a column typed `source` converts to `to` without error."""
+    if source is None:
+        return False  # the snapshot did not say: unknown, and refused
+    try:
+        known = exp.DataType.build(source, dialect=engine)
+    except Exception:
+        return False
+    if known == to:
+        return True
+    if known.this in _INTEGER_RANK and to.this in _INTEGER_RANK:
+        return _INTEGER_RANK[known.this] <= _INTEGER_RANK[to.this]
+    return (engine == "duckdb" and to.this in (exp.DataType.Type.TEXT, exp.DataType.Type.VARCHAR)
+            and not to.expressions and known.this in _RENDERS_AS_TEXT)
+
+
+def _json_cannot_fail(source, type_of, engine: str) -> bool:
+    """Whether the text a JSON function reads is already JSON, or NULL where it is not."""
+    if source is None or source.find(exp.Column) is None:
+        return True  # a constant cannot fail on a row
+    if isinstance(source, exp.TryCast):
+        return True
+    if not isinstance(source, exp.Column):
+        return False
+    known = type_of(source)
+    try:
+        return known is not None and exp.DataType.build(known, dialect=engine).this == (
+            exp.DataType.Type.JSON)
+    except Exception:
+        return False
+
+
+def _known_type(value, type_of, engine: str) -> exp.DataType | None:
+    """`value`'s type where it is plain to see: a typed column, a literal, a cast, arithmetic."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if isinstance(value, exp.Boolean):
+        return exp.DataType.build("BOOLEAN")
+    if isinstance(value, exp.DateStrToDate):  # Oracle's DATE '...' literal
+        return exp.DataType.build("DATE")
+    if isinstance(value, exp.Column):
+        known = type_of(value)
+        try:
+            return None if known is None else exp.DataType.build(known, dialect=engine)
+        except Exception:
+            return None
+    if isinstance(value, exp.Cast):
+        return value.to
+    if isinstance(value, exp.Neg):
+        value = value.this
+    if isinstance(value, exp.Literal) and value.is_number or isinstance(value, _ARITHMETIC):
+        return exp.DataType.build("DOUBLE")
+    return None
+
+
+def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
+    """Whether a comparison sets a text column against a value of another type."""
+    if isinstance(node, exp.In):
+        sides = [node.this, *node.expressions]
+        query = node.args.get("query")
+        inner = query.this if isinstance(query, exp.Subquery) else query
+        if isinstance(inner, exp.Select) and len(inner.selects) == 1:
+            sides.append(inner.selects[0])
+    elif isinstance(node, exp.Between):
+        sides = [node.this, node.args.get("low"), node.args.get("high")]
+    else:
+        sides = [node.this, node.expression]
+    text = other = False
+    for side in sides:
+        known = _known_type(side, type_of, engine)
+        if known is None:
+            continue
+        if known.this in exp.DataType.TEXT_TYPES:
+            text = text or isinstance(side, exp.Column)
+        else:
+            other = True
+    return text and other
+
+
+def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy, *,
+                       executes_as: str | None = None) -> exp.Expression | None:
+    """The first conversion in `table`'s row filter that can raise on a row's value, else None.
+
+    For a filter `_validate_filter` accepted. Type-aware where the snapshot knows the operand's
+    type, which takes a bare column: `CAST(id AS BIGINT)` over an INTEGER cannot fail, and is
+    kept. An operand reading no column is a constant, which cannot fail on a row. Anything else
+    is refused: an expression's type, or a column's the snapshot does not record, is unknown.
+    """
+    engine = (executes_as or dialect).lower()
+    wrapped = sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {filt}", read=dialect)
+    owners = column_tables(wrapped, engine) or {}
+
+    def types_of(key: str) -> dict[str, str]:
+        key = table if key == _SUBJECT else key
+        return next((cols for obj, cols in policy.policy_types.items()
+                     if names_one_object(key, [obj])), {})
+
+    def type_of(column: exp.Column) -> str | None:
+        owner = owners.get(id(column))
+        if owner is None and not column.table:
+            # Unqualified, which the resolver leaves unowned: the one table of the column's own
+            # SELECT that has a column of that name, as `_validate_filter` reads it. None where no
+            # table or more than one does -- a correlated reference among them -- so it is unknown.
+            select = column.find_ancestor(exp.Select)
+            having = [key for key in {object_key(t) for t in base_tables(select, engine)}
+                      if column.name.lower() in types_of(key)] if select is not None else []
+            owner = having[0] if len(having) == 1 else None
+        return None if owner is None else types_of(owner).get(column.name.lower())
+
+    for node in wrapped.args["where"].walk():
+        if engine == "duckdb" and (isinstance(node, _JSON_PARSES) or (
+                isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_JSON_PARSES)):
+            # The typed readers parse their first argument; an untyped one may parse any (both of
+            # `json_contains` and `json_merge_patch` do), so each argument must be safe.
+            sources = [node.this] if isinstance(node, _JSON_PARSES) else node.expressions
+            if all(_json_cannot_fail(source, type_of, engine) for source in sources):
+                continue
+            return node
+        if isinstance(node, _COMPARISONS):
+            if _converts_a_text_column(node, type_of, engine):
+                return node
+            continue
+        untyped = isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_CONVERSIONS
+        if not (untyped or isinstance(node, (exp.Cast, *_PARSES))):
+            continue
+        if (isinstance(node, exp.TryCast) or node.args.get("safe")
+                or node.args.get("default") is not None):
+            continue  # TRY_CAST, or Oracle's DEFAULT ... ON CONVERSION ERROR
+        operands = node.expressions if untyped else [node.this]
+        if not any(arg.find(exp.Column) for arg in operands):
+            continue  # a constant cannot fail on a row
+        if (isinstance(node, exp.Cast) and isinstance(node.this, exp.Column)
+                and _cast_cannot_fail(type_of(node.this), node.to, engine)):
+            continue
+        return node
+    return None
+
+
+def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
+    safe = _SAFE_FORM.get(engine, "a form that cannot fail, or a column of the right type")
+    # The conversion is the policy's text, so it goes to the operator's log only.
+    logger.warning("row filter for %r: %s can raise on a row's value, which fails every read of "
+                   "the table and can quote that value in the error; write %s (M159)",
+                   table, node.sql(dialect=engine), safe)
+    return Refusal(
+        code=RefusalCode.INVALID_ROW_FILTER,
+        message=(f"The row-access policy for {table!r} converts a value in a way that can fail on "
+                 "the table's data, so it cannot be applied. The operator must rewrite the "
+                 f"conversion as {safe}; the server log names it."),
+        subject=table,
+    )
 
 
 def _derived_table(
@@ -322,6 +519,10 @@ def apply_row_and_mask(
                     message=f"The row-access policy for {name!r} is not a valid predicate.",
                     subject=name,
                 ), []
+            raising = raising_conversion(policy.row_filter_for(name), name, dialect, policy,
+                                         executes_as=executes_as)
+            if raising is not None:
+                return _raising_refusal(raising, name, (executes_as or dialect).lower()), []
         derived = _derived_table(
             name, table_node.alias_or_name, visible[name],
             # `.lower()`: this dict is keyed folded and `name` is the QUERY's spelling.
@@ -390,6 +591,9 @@ def apply_row_filters_to_write(
             message=f"The row-access policy for {name!r} is not a valid predicate.",
             subject=name,
         ), []
+    raising = raising_conversion(filt, name, dialect, policy, executes_as=executes_as)
+    if raising is not None:
+        return _raising_refusal(raising, name, (executes_as or dialect).lower()), []
     if (executes_as or dialect).lower() in _FENCED:
         # The target is filtered by conjunction, and a conjunction is not a fence: the engine may
         # still evaluate the statement's own WHERE on rows the filter removes (M160, measured on

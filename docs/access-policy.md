@@ -56,3 +56,13 @@ Check a multi-table total before trusting it. Nothing flags an intersection as w
 **A view over a filtered table is refused.** mnemiq cannot apply a table's filter through a view's own SQL, so a query reading such a view is refused. The refusal names only the view. When the view reads exactly one filtered table, its SQL names that table as the policy does (case aside), and the caller holds it, the caller is told to query it directly.
 
 **A filter naming nothing in the source refuses every read.** A key must name a table or view in mnemiq's snapshot of the source, so a real table whose profiling failed counts as unknown too; a misspelt key would otherwise drop its filter silently. An identity's roles merge into one policy, so the refusal covers everything that identity reads, including what its other roles grant. The key is reported at startup as well.
+
+**A filter whose conversion can fail is refused.** A filter runs over every row of its table, including the rows it removes. So a conversion that fails on one hidden row fails every read of the table, and the database's error can quote that row's value. mnemiq refuses a filter holding any of these:
+
+- an explicit conversion of a column: `CAST(region AS INTEGER)`, `TO_NUMBER(region)`, `TO_DATE(...)`. A cast is kept where the snapshot's column types show every value converts, such as an INTEGER cast to BIGINT. TO_NUMBER without its DEFAULT clause, and any TO_DATE, over a column are always refused;
+- a DuckDB JSON function reading text, unless the snapshot types the column as JSON;
+- a comparison that converts a column the snapshot types as text to another type, such as a number, a date or a boolean: `region = 7`.
+
+Write the form that gives NULL instead of failing. On DuckDB that is `TRY_CAST(value AS type)`, and a JSON function reads from `TRY_CAST(value AS JSON)`. On Oracle it is `CAST(value AS type DEFAULT NULL ON CONVERSION ERROR)` with no format argument, or `TO_NUMBER(value DEFAULT NULL ON CONVERSION ERROR)`.
+
+The check matches known spellings; it is not a proof. It does not catch an expression over a text column, such as `UPPER(region) > 0`; a comparison with a column the snapshot records no type for; or an expression that fails on data without converting anything. Such a filter still fails every read when a row trips it, and the model sees only the error's class, never its text.
