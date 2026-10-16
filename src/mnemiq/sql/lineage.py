@@ -169,7 +169,7 @@ def _add(out: list[str], value: str) -> None:
         out.append(admitted)
 
 
-def _functions_in(ast) -> tuple[list[str], bool]:
+def _functions_in(ast, inventory=None) -> tuple[list[str], bool]:
     """Callables this engine cannot resolve to a source identity, and whether ANY call was seen.
 
     Two returns because the two facts are different. A name is worth RECORDING when it is not a
@@ -183,6 +183,11 @@ def _functions_in(ast) -> tuple[list[str], bool]:
     unaccounted object, which would be noise. The same reasoning that stopped a view's lexical
     match from certifying identity applies here: the engine cannot tell a builtin from a
     same-named UDF, and a marker must not claim what it cannot establish.
+
+    And it spares a name only where `inventory` does not say the source may define it (M157,
+    Codex's review of #157): a source reporting its own `trunc`, or a narrow answer never asked
+    about it, makes the name the suspect, and the record keeps it. Without an inventory nothing
+    is known either way, and a listed builtin is spared as before.
 
     A QUOTED callable name is never admitted. `node.name` discards the delimiters, so a payload
     that already matches the identifier grammar -- `"sk_live_abc123"()` -- passed the guard
@@ -222,7 +227,8 @@ def _functions_in(ast) -> tuple[list[str], bool]:
             _add(out, "unnameable-function")
             continue
 
-        if not qualified and name in _PURE:
+        if not qualified and name in _PURE and not (
+                inventory is not None and inventory.defines(name)):
             continue
 
         label = name
@@ -389,7 +395,7 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=No
                 # correct and the rename bought nothing, since the collected keys were only ever
                 # read for truthiness.
                 reaches_past_the_list = True
-        body_fns, body_saw_call = _functions_in(parsed)
+        body_fns, body_saw_call = _functions_in(parsed, inventory)
         for fn in body_fns:
             _add(unclassified, fn)
         # A body's own text is in hand, so its calls can be named. `in_view_body` because a
@@ -412,7 +418,7 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=No
         _add(unclassified, f"unmodelled-source:{shape.lower()}")
 
     # UNCLASSIFIABLE reach: a function whose body this engine cannot see.
-    caller_fns, caller_saw_call = _functions_in(ast)
+    caller_fns, caller_saw_call = _functions_in(ast, inventory)
     for fn in caller_fns:
         _add(unclassified, fn)
     if caller_saw_call and not calls_are_confirmable(inventory, in_view_body=False,
