@@ -105,6 +105,7 @@ def test_every_duckdb_json_reader_that_quotes_malformed_text_is_refused():
     ("duckdb", "CAST(region AS INTEGER) > 0"),
     ("duckdb", "region::INTEGER > 0"),
     ("duckdb", "CAST(UPPER(region) AS INTEGER) > 0"),     # an expression's type is unknown
+    ("duckdb", "CAST(region || '' AS INTEGER) > 0"),      # Codex's second #153 reproduction
     ("duckdb", "CAST(big AS INTEGER) > 0"),               # narrowing can overflow
     ("duckdb", "strptime(region, '%Y') > TIMESTAMP '2000-01-01'"),
     ("duckdb", "json_extract_string(region, '$.a') = '1'"),
