@@ -4,11 +4,13 @@ A row filter runs over every row of its table, the ones it removes included. `CA
 INTEGER) > 0` over a hidden row holding 'north' failed every question on the table, and the error
 quoted the hidden value. The owner's decision (2026-10-15): reject raising conversions, type-aware
 where the snapshot knows the column's type, the refusal naming the engine's non-raising form --
-TRY_CAST in DuckDB, DEFAULT NULL ON CONVERSION ERROR in Oracle. DuckDB's JSON functions are the same
-class (text read as JSON, quoted on failure), measured here, and refused the same way.
+TRY_CAST in DuckDB, DEFAULT NULL ON CONVERSION ERROR in Oracle. Two more spellings of the class are
+measured here and refused the same way: DuckDB's JSON readers (text read as JSON, quoted on failure),
+and a comparison that converts a text column implicitly (`region = 7`).
 
-Not covered: a raising expression that is not a conversion (`error()`, and whatever else an engine
-raises on data). #154's redaction is what bounds those: the model reads the error class only.
+Not covered: an implicit conversion the snapshot cannot type (a column with no recorded type), and a
+raising expression that is not a conversion (`error()`, and whatever else an engine raises on data).
+#154's redaction is what bounds those: the model reads the error class only.
 """
 
 from __future__ import annotations
@@ -55,11 +57,43 @@ def test_a_raising_filter_reads_the_rows_it_removes_and_quotes_them_on_duckdb():
     con.execute("CREATE TABLE claim(id INT, region VARCHAR); "
                 "INSERT INTO claim VALUES (1, '7'), (2, 'north')")
     for raising, safe in (("CAST(region AS INTEGER) > 0", "TRY_CAST(region AS INTEGER) > 0"),
+                          ("region = 7", "TRY_CAST(region AS INTEGER) = 7"),
                           ("json_extract_string(region, '$.a') IS NULL",
                            "json_extract_string(TRY_CAST(region AS JSON), '$.a') IS NULL")):
         with pytest.raises(duckdb.Error, match="north"):
             con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
         assert con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall()  # runs, NULL for 'north'
+
+
+# Each JSON reader's arguments where it takes more than the text; the rest take the text alone.
+_JSON_ARGS = {"json_extract": "region, '$.a'", "json_extract_string": "region, '$.a'",
+              "json_extract_path": "region, '$.a'", "json_extract_path_text": "region, '$.a'",
+              "json_value": "region, '$.a'", "json_exists": "region, '$.a'",
+              "json_contains": "region, '1'", "from_json": "region, '\"INTEGER\"'",
+              "from_json_strict": "region, '\"INTEGER\"'", "json_transform": "region, '\"INTEGER\"'",
+              "json_transform_strict": "region, '\"INTEGER\"'"}
+
+
+def test_every_duckdb_json_reader_that_quotes_malformed_text_is_refused():
+    """Re-measured from `duckdb_functions()` each run, so a reader DuckDB adds fails here."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR); "
+                "INSERT INTO claim VALUES (1, '{\"a\": 1}'), (2, 'north')")
+    names = [r[0] for r in con.execute(
+        "SELECT DISTINCT function_name FROM duckdb_functions() "
+        "WHERE function_type IN ('scalar', 'macro') "  # `json` itself is a macro
+        "AND (function_name ILIKE 'json%' OR function_name ILIKE 'from_json%') ORDER BY 1").fetchall()]
+    quoting = []
+    for name in names:
+        call = f"{name}({_JSON_ARGS.get(name, 'region')})"
+        try:
+            con.execute(f"SELECT id FROM claim WHERE ({call}) IS NOT NULL").fetchall()
+        except duckdb.Error as e:
+            if "north" in str(e):
+                quoting.append(call)
+    assert len(quoting) >= 16, quoting  # control: the measurement found the readers
+    admitted = [c for c in quoting if not isinstance(_decide(f"({c}) IS NOT NULL"), Refusal)]
+    assert admitted == [], admitted
 
 
 # --- refused --------------------------------------------------------------------------------------
@@ -74,6 +108,13 @@ def test_a_raising_filter_reads_the_rows_it_removes_and_quotes_them_on_duckdb():
     ("duckdb", "region->>'$.a' = '1'"),
     ("duckdb", "from_json(region, '\"INTEGER\"') > 0"),
     ("duckdb", "id IN (SELECT id FROM entitlement WHERE CAST(who AS INTEGER) > 0)"),
+    ("duckdb", "json(region) IS NOT NULL"),
+    ("duckdb", "json_value(region, '$.a') = '1'"),
+    ("duckdb", "region = 7"),                             # converted implicitly, row by row
+    ("duckdb", "region IN (1, 2)"),
+    ("duckdb", "id = region"),
+    ("duckdb", "region IN (SELECT id FROM entitlement)"),
+    ("oracle", "region > 0"),                             # an implicit TO_NUMBER
     ("oracle", "CAST(region AS NUMBER) > 0"),
     ("oracle", "TO_NUMBER(region) > 0"),
     ("oracle", "TO_DATE(region, 'YYYY') > DATE '2000-01-01'"),
@@ -113,6 +154,9 @@ def test_a_column_the_snapshot_does_not_type_is_unknown_and_refused():
     ("duckdb", "json_extract_string(attrs, '$.a') = '1'"),  # typed JSON already
     ("duckdb", "json_extract_string(TRY_CAST(region AS JSON), '$.a') = '1'"),
     ("duckdb", "id IN (SELECT id FROM entitlement WHERE who = 'r')"),
+    ("duckdb", "region = '7'"),
+    ("duckdb", "id IN (1, 2)"),
+    ("duckdb", "amount = id"),
     ("oracle", "CAST(region AS NUMBER DEFAULT NULL ON CONVERSION ERROR) > 0"),
     ("oracle", "TO_NUMBER(region DEFAULT NULL ON CONVERSION ERROR) > 0"),
     ("oracle", "CAST(region AS DATE DEFAULT NULL ON CONVERSION ERROR) > DATE '2000-01-01'"),
@@ -177,8 +221,10 @@ def test_on_oracle_the_advised_forms_run_where_the_raising_one_fails():
     data = ("(SELECT 1 AS id, '7' AS region, 10 AS amount, 1 AS big, NULL AS attrs FROM dual "
             "UNION ALL SELECT 2, 'north', 20, 2, NULL FROM dual) claim")
     try:
-        with pytest.raises(oracledb.DatabaseError, match="ORA-01722"):
-            cur.execute(f"SELECT id FROM {data} WHERE CAST(region AS NUMBER) > 0").fetchall()
+        for raising in ("CAST(region AS NUMBER) > 0", "region > 0"):
+            with pytest.raises(oracledb.DatabaseError, match="ORA-01722"):
+                cur.execute(f"SELECT id FROM {data} WHERE {raising}").fetchall()
+            assert isinstance(_decide(raising, "oracle"), Refusal), raising
         for safe in ("CAST(region AS NUMBER DEFAULT NULL ON CONVERSION ERROR) > 0",
                      "TO_NUMBER(region DEFAULT NULL ON CONVERSION ERROR) > 0"):
             verdict = _decide(safe, "oracle")

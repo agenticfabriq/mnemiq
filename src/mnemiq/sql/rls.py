@@ -105,7 +105,6 @@ def _validate_filter(
     return expr
 
 
-
 # Conversions that raise on a value they cannot read (M159). A row filter runs over every row of
 # its table, the ones it removes included, so one bad value in a hidden row fails every question on
 # the table, and the error can quote that value. sqlglot's typed parses, and Oracle's conversions it
@@ -113,11 +112,22 @@ def _validate_filter(
 _PARSES = (exp.ToNumber, exp.StrToDate, exp.StrToTime)
 _UNTYPED_CONVERSIONS = frozenset({"to_binary_double", "to_binary_float", "to_timestamp_tz",
                                   "to_dsinterval", "to_yminterval"})
-# Text read as JSON, which DuckDB refuses on malformed text and quotes ("Input: ..."). Oracle's
-# JSON functions default to NULL ON ERROR, so this is DuckDB's alone. Safe over a column the
-# snapshot types JSON, or over `TRY_CAST(value AS JSON)`.
-_JSON_PARSES = (exp.JSONExtract, exp.JSONExtractScalar)
-_UNTYPED_JSON_PARSES = frozenset({"from_json"})
+# Text read as JSON, which DuckDB refuses on malformed text and quotes ("Input: ..."): every
+# scalar JSON reader in `duckdb_functions()` that does so in 1.5.4, measured, by how sqlglot parses
+# it (a test re-measures the list). Oracle's JSON functions default to NULL ON ERROR, so this is
+# DuckDB's alone. Safe over a column the snapshot types JSON, or over `TRY_CAST(value AS JSON)`.
+_JSON_PARSES = (exp.JSONExtract, exp.JSONExtractScalar, exp.ParseJSON, exp.JSONKeys, exp.JSONType)
+_UNTYPED_JSON_PARSES = frozenset({
+    "from_json", "from_json_strict", "json_array_length", "json_contains", "json_deserialize_sql",
+    "json_exists", "json_pretty", "json_structure", "json_transform", "json_transform_strict",
+    "json_value"})
+# A comparison converts a text column to the other side's type, row by row, in both engines:
+# DuckDB on `=`, `<>` and IN (its ordering comparisons refuse at bind, on no row's value), Oracle
+# on every comparison (an implicit TO_NUMBER or TO_DATE). Seen only where the snapshot types both
+# sides; an untyped column compared to a number is not.
+_COMPARISONS = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NullSafeEQ,
+                exp.NullSafeNEQ, exp.In, exp.Between)
+_ARITHMETIC = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.IntDiv)
 _INTEGER_RANK = {exp.DataType.Type.TINYINT: 1, exp.DataType.Type.SMALLINT: 2,
                  exp.DataType.Type.INT: 3, exp.DataType.Type.BIGINT: 4,
                  exp.DataType.Type.INT128: 5}
@@ -168,6 +178,47 @@ def _json_cannot_fail(source, type_of, engine: str) -> bool:
         return False
 
 
+def _known_type(value, type_of, engine: str) -> exp.DataType | None:
+    """`value`'s type where it is plain to see: a typed column, a literal, a cast, arithmetic."""
+    if isinstance(value, exp.Column):
+        known = type_of(value)
+        try:
+            return None if known is None else exp.DataType.build(known, dialect=engine)
+        except Exception:
+            return None
+    if isinstance(value, exp.Cast):
+        return value.to
+    if isinstance(value, exp.Neg):
+        value = value.this
+    if isinstance(value, exp.Literal) and value.is_number or isinstance(value, _ARITHMETIC):
+        return exp.DataType.build("DOUBLE")
+    return None
+
+
+def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
+    """Whether a comparison sets a text column against a value of another type."""
+    if isinstance(node, exp.In):
+        sides = [node.this, *node.expressions]
+        query = node.args.get("query")
+        inner = query.this if isinstance(query, exp.Subquery) else query
+        if isinstance(inner, exp.Select) and len(inner.selects) == 1:
+            sides.append(inner.selects[0])
+    elif isinstance(node, exp.Between):
+        sides = [node.this, node.args.get("low"), node.args.get("high")]
+    else:
+        sides = [node.this, node.expression]
+    text = other = False
+    for side in sides:
+        known = _known_type(side, type_of, engine)
+        if known is None:
+            continue
+        if known.this in exp.DataType.TEXT_TYPES:
+            text = text or isinstance(side, exp.Column)
+        else:
+            other = True
+    return text and other
+
+
 def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy, *,
                        executes_as: str | None = None) -> exp.Expression | None:
     """The first conversion in `table`'s row filter that can raise on a row's value, else None.
@@ -205,6 +256,10 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             if _json_cannot_fail(source, type_of, engine):
                 continue
             return node
+        if isinstance(node, _COMPARISONS):
+            if _converts_a_text_column(node, type_of, engine):
+                return node
+            continue
         untyped = isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_CONVERSIONS
         if not (untyped or isinstance(node, (exp.Cast, *_PARSES))):
             continue
@@ -234,6 +289,7 @@ def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
                  f"conversion as {safe}; the server log names it."),
         subject=table,
     )
+
 
 def _derived_table(
     table: str, alias: str, cols: set[str], masked_cols: set[str], filt: exp.Expression | None,
