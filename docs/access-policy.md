@@ -57,10 +57,12 @@ Check a multi-table total before trusting it. Nothing flags an intersection as w
 
 **A filter naming nothing in the source refuses every read.** A key must name a table or view in mnemiq's snapshot of the source, so a real table whose profiling failed counts as unknown too; a misspelt key would otherwise drop its filter silently. An identity's roles merge into one policy, so the refusal covers everything that identity reads, including what its other roles grant. The key is reported at startup as well.
 
-**A filter whose conversion can fail is refused.** A filter runs over every row of its table, including the rows it removes. So a conversion that fails on one hidden row fails every read of the table, and the database's error can quote that row's value. mnemiq refuses a filter holding any of these, unless the snapshot's column types show the conversion cannot fail:
+**A filter whose conversion can fail is refused.** A filter runs over every row of its table, including the rows it removes. So a conversion that fails on one hidden row fails every read of the table, and the database's error can quote that row's value. mnemiq refuses a filter holding any of these:
 
-- an explicit conversion: `CAST(region AS INTEGER)`, `TO_NUMBER(region)`, `TO_DATE(...)`;
-- a DuckDB JSON function reading text;
-- a comparison that converts a text column to a number or a date, such as `region = 7`.
+- an explicit conversion of a column: `CAST(region AS INTEGER)`, `TO_NUMBER(region)`, `TO_DATE(...)`. A cast is kept where the snapshot's column types show every value converts, such as an INTEGER cast to BIGINT. TO_NUMBER and TO_DATE over a column are always refused;
+- a DuckDB JSON function reading text, unless the snapshot types the column as JSON;
+- a comparison that converts a column the snapshot types as text to a number or a date, such as `region = 7`.
 
-Write the form that gives NULL instead of failing. On DuckDB that is `TRY_CAST(value AS type)`. On Oracle it is `CAST(value AS type DEFAULT NULL ON CONVERSION ERROR)` with no format argument, or `TO_NUMBER(value DEFAULT NULL ON CONVERSION ERROR)`. The check matches known spellings; it is not a proof. An expression over a text column, such as `UPPER(region) > 0`, is not caught.
+Write the form that gives NULL instead of failing. On DuckDB that is `TRY_CAST(value AS type)`, and a JSON function reads from `TRY_CAST(value AS JSON)`. On Oracle it is `CAST(value AS type DEFAULT NULL ON CONVERSION ERROR)` with no format argument, or `TO_NUMBER(value DEFAULT NULL ON CONVERSION ERROR)`.
+
+The check matches known spellings; it is not a proof. It does not catch an expression over a text column, such as `UPPER(region) > 0`; a comparison with a column the snapshot records no type for; or an expression that fails on data without converting anything. Such a filter still fails every read when a row trips it, and the model sees only the error's class, never its text.
