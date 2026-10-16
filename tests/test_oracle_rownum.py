@@ -44,7 +44,7 @@ def test_rownum_is_refused_with_the_bound_to_write_instead(sql, policy):
     verdict = _decide(sql, policy=policy)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
     assert verdict.repairable
-    assert "NULLS LAST FETCH FIRST n ROWS ONLY" in verdict.message
+    assert "write ORDER BY ... NULLS LAST FETCH FIRST n ROWS ONLY" in verdict.message
 
 
 @pytest.mark.parametrize("policy", [None, FILTERED])

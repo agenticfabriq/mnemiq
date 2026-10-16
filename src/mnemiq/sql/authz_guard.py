@@ -48,9 +48,10 @@ def _unknown_column(name: str, dialect: str | None) -> Refusal:
         # the logic lint refuses on a written limit (M161): one repair, not two.
         return Refusal(
             code=RefusalCode.UNKNOWN_COLUMN,
-            message=("ROWNUM is numbered before ORDER BY, so it cannot give the first rows of an "
-                     "order and cannot be checked against the row bound. For the first n rows "
-                     "in an order, write ORDER BY ... NULLS LAST FETCH FIRST n ROWS ONLY."),
+            message=("ROWNUM is numbered before the ORDER BY of its own query block, so what it "
+                     "returns depends on where it is written, and it cannot be checked against "
+                     "the row bound. For the first n rows in an order, write ORDER BY ... NULLS "
+                     "LAST FETCH FIRST n ROWS ONLY."),
             subject=name,
         )
     if (dialect or "").lower() == "oracle" and name.lower() == "rowid":
