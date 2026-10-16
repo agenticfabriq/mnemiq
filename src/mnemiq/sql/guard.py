@@ -88,7 +88,10 @@ def check_shape(
     # returned tree is the one that runs, and before `check_cls` ever sees it -- a qualified
     # reference is one that grant checking can rule on.
     _qualify_schema_resolved(ast, columns)
-    return _with_limit(ast, max_rows, executes_as or dialect)
+    shaped = _with_limit(ast, max_rows, executes_as or dialect)
+    if not isinstance(shaped, Refusal):
+        shaped.meta["null_order_written"] = _writes_null_order(sql, dialect)
+    return shaped
 
 
 def _output_selects(ast: exp.Expression) -> list[exp.Select]:
@@ -744,9 +747,14 @@ def _with_limit(ast: exp.Expression, max_rows: int, engine: str = "duckdb") -> e
     A limit the query set itself is the query's business: `LIMIT 10` for a top ten returns ten
     rows on purpose. One the guard imposed is a cut nobody asked for, and a result that fills it
     may have been cut -- so the tree carries `meta["row_cap"]` for the caller to say so.
+
+    It also carries `meta["wrote_limit"]`: whether the statement bounded itself, kept or clamped. A
+    reader asking whether the statement set a LIMIT cannot ask the tree, whose LIMIT may be the cap's,
+    nor `row_cap`, which also marks a clamped one (M161: the logic lint refused for the cap's LIMIT).
     """
     existing = ast.args.get("limit")
-    if existing is not None and not _states_no_bound(existing, engine):
+    wrote = existing is not None and not _states_no_bound(existing, engine)
+    if wrote:
         count = _written_count(existing)
         if count is None:
             # Replacing a bound we cannot read changes the answer: a top-5 WITH TIES became a
@@ -772,10 +780,24 @@ def _with_limit(ast: exp.Expression, max_rows: int, engine: str = "duckdb") -> e
                          "keep ties as well."),
             )
         if count <= max_rows:
+            ast.meta["wrote_limit"] = True
             return ast
     capped = ast.limit(max_rows)
     capped.meta["row_cap"] = max_rows
+    capped.meta["wrote_limit"] = wrote
     return capped
+
+
+def _writes_null_order(sql: str, dialect: str) -> bool:
+    """Does the statement write a NULLS FIRST or NULLS LAST anywhere? sqlglot records every sort key's
+    null order, written or the dialect's default, and keeps no mark of which; the logic lint leaves a
+    written one alone (M161). Anywhere, not per key: a miss here only spares a statement the lint."""
+    try:
+        tokens = sqlglot.tokenize(sql, read=dialect)
+    except Exception:
+        return False
+    return any(a.text.upper() == "NULLS" and b.text.upper() in ("FIRST", "LAST")
+               for a, b in zip(tokens, tokens[1:]))
 
 
 def _states_no_bound(limit: exp.Expression, engine: str) -> bool:

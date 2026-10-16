@@ -3,27 +3,31 @@ import sqlglot
 from mnemiq.sql.lint import Violation, lint
 
 
-def _ast(sql):
-    return sqlglot.parse_one(sql, read="duckdb")
+def _ast(sql, dialect="duckdb"):
+    return sqlglot.parse_one(sql, read=dialect)
 
 
-def test_ordered_limit_without_null_guard_fires():
-    v = lint(_ast("SELECT name FROM t ORDER BY score LIMIT 1"))
+# Where NULLs sort is the engine's (M161): Oracle puts them FIRST descending, SQLite ascending, and
+# DuckDB last both ways. `test_lint_null_order.py` pins each engine's order and the decider's use.
+def test_ordered_limit_without_null_guard_fires_where_nulls_sort_first():
+    v = lint(_ast("SELECT name FROM t ORDER BY score DESC FETCH FIRST 1 ROWS ONLY", "oracle"))
     assert isinstance(v, Violation) and v.code == "null_before_ordered_limit"
-    assert "IS NOT NULL" in v.message
+    assert "NULLS LAST" in v.message and "IS NOT NULL" not in v.message
 
 
 def test_ordered_limit_with_null_guard_does_not_fire():
-    assert lint(_ast("SELECT name FROM t WHERE score IS NOT NULL ORDER BY score LIMIT 1")) is None
+    assert lint(_ast("SELECT name FROM t WHERE score IS NOT NULL ORDER BY score DESC "
+                     "FETCH FIRST 1 ROWS ONLY", "oracle")) is None
 
 
-def test_order_by_desc_does_not_fire():
-    # DESC sorts NULLs last, so the LIMIT picks a real value -- not the trap
-    assert lint(_ast("SELECT name FROM t ORDER BY score DESC LIMIT 1")) is None
+def test_an_order_that_puts_nulls_last_does_not_fire():
+    assert lint(_ast("SELECT name FROM t ORDER BY score LIMIT 1")) is None  # DuckDB: last
+    assert lint(_ast("SELECT name FROM t ORDER BY score DESC LIMIT 1")) is None  # both ways
+    assert lint(_ast("SELECT name FROM t ORDER BY score FETCH FIRST 1 ROWS ONLY", "oracle")) is None
 
 
 def test_order_by_without_limit_does_not_fire():
-    assert lint(_ast("SELECT name FROM t ORDER BY score")) is None
+    assert lint(_ast("SELECT name FROM t ORDER BY score DESC", "oracle")) is None
 
 
 def test_plain_aggregate_does_not_fire():

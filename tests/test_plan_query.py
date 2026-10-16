@@ -35,9 +35,9 @@ def _packet() -> ContextPacket:
 _GRANTS = GrantSet(frozenset({"claim"}))
 
 
-def _plan(replies, **kw):
+def _plan(replies, target="duckdb", **kw):
     generator = FakeGenerator(replies)
-    outcome = plan_query(_packet(), _snapshot(), _GRANTS, generator, target="duckdb", **kw)
+    outcome = plan_query(_packet(), _snapshot(), _GRANTS, generator, target=target, **kw)
     return outcome, generator
 
 
@@ -122,18 +122,20 @@ def test_logic_lint_is_corrected_once_and_approved():
         grant_fingerprint="fp", enrichment_version="v1",
     )
     grants = GrantSet(frozenset({"claim"}))
-    gen = FakeGenerator(['{"sql": "SELECT name FROM claim ORDER BY score LIMIT 1"}'])
+    # Oracle puts NULLs first descending, so this top-1 can return a NULL (M161).
+    gen = FakeGenerator(
+        ['{"sql": "SELECT name FROM claim ORDER BY score DESC FETCH FIRST 1 ROWS ONLY"}'])
     corrector = FakeCorrector(
-        ["SELECT name FROM claim WHERE score IS NOT NULL ORDER BY score LIMIT 1"]
+        ["SELECT name FROM claim ORDER BY score DESC NULLS LAST FETCH FIRST 1 ROWS ONLY"]
     )
 
     verdict = plan_query(
-        packet, snapshot, grants, gen, adapter=None, target="duckdb", corrector=corrector
+        packet, snapshot, grants, gen, adapter=None, dialect="oracle", target="oracle",
+        corrector=corrector,
     )
     assert isinstance(verdict, Approved)
-    assert corrector.calls and "IS NOT NULL" not in corrector.calls[0][0]  # got the flawed SQL
-    # the corrected (null-guarded) form was approved; sqlglot renders it as "NOT score IS NULL"
-    assert "IS NULL" in verdict.plan_sql and "NOT" in verdict.plan_sql
+    assert corrector.calls and "NULLS LAST" not in corrector.calls[0][0]  # got the flawed SQL
+    assert "NULLS LAST" in verdict.plan_sql  # the corrected, reordered form was approved
 
 
 def test_value_grounding_is_corrected_once_and_approved():
@@ -194,11 +196,13 @@ def test_without_a_corrector_a_lint_falls_back_to_regenerate_then_defers():
     packet = ContextPacket(question="q", cards=[RetrievedCard(object_id="claim", card="c", score=1.0)],
                            grant_fingerprint="fp", enrichment_version="v1")
     grants = GrantSet(frozenset({"claim"}))
+    # Oracle puts NULLs first descending, so this top-1 can return a NULL (M161).
     gen = FakeGenerator([
-        '{"sql": "SELECT name FROM claim ORDER BY score LIMIT 1"}',
-        '{"sql": "SELECT name FROM claim ORDER BY score LIMIT 1"}',
+        '{"sql": "SELECT name FROM claim ORDER BY score DESC FETCH FIRST 1 ROWS ONLY"}',
+        '{"sql": "SELECT name FROM claim ORDER BY score DESC FETCH FIRST 1 ROWS ONLY"}',
     ])
-    out = plan_query(packet, snapshot, grants, gen, adapter=None, target="duckdb", max_attempts=2)
+    out = plan_query(packet, snapshot, grants, gen, adapter=None, dialect="oracle",
+                     target="oracle", max_attempts=2)
     assert isinstance(out, Deferred)  # lint fed back, never corrected, ran out of attempts
 
 
@@ -214,15 +218,16 @@ def test_a_plan_that_needed_no_repair_says_so():
 
 
 def test_a_plan_the_corrector_carried_records_it():
-    """An ORDER BY with a LIMIT and no NOT NULL guard is a lint refusal -- silently-wrong SQL
-    that runs fine and answers wrong, which is exactly what the corrector exists for."""
+    """A top-N whose sort puts NULLs first -- descending, on Oracle (M161) -- is a lint refusal:
+    silently-wrong SQL that runs fine and answers wrong, which is exactly what the corrector exists
+    for."""
 
     class _Corrector:
         def correct(self, sql, message):
-            return "SELECT status FROM claim WHERE NOT status IS NULL ORDER BY status"
+            return "SELECT status FROM claim ORDER BY status DESC NULLS LAST FETCH FIRST 5 ROWS ONLY"
 
     outcome, _ = _plan(
-        ['{"sql": "SELECT status FROM claim ORDER BY status"}'], corrector=_Corrector()
+        ['{"sql": "SELECT status FROM claim ORDER BY status DESC FETCH FIRST 5 ROWS ONLY"}'], corrector=_Corrector(), dialect="oracle", target="oracle"
     )
     assert isinstance(outcome, Approved)
     assert outcome.corrected is True
@@ -233,10 +238,10 @@ def test_a_correction_that_still_refuses_is_not_reported_as_corrected():
 
     class _Useless:
         def correct(self, sql, message):
-            return "SELECT status FROM claim ORDER BY status"  # the same lint violation
+            return "SELECT status FROM claim ORDER BY status DESC FETCH FIRST 5 ROWS ONLY"  # the same lint violation
 
     outcome, _ = _plan(
-        ['{"sql": "SELECT status FROM claim ORDER BY status"}'] * 3, corrector=_Useless()
+        ['{"sql": "SELECT status FROM claim ORDER BY status DESC FETCH FIRST 5 ROWS ONLY"}'] * 3, corrector=_Useless(), dialect="oracle", target="oracle"
     )
     assert isinstance(outcome, Deferred)
 

@@ -35,7 +35,8 @@ def _decide(sql, engine):
     ("duckdb", "LIMIT 5 OFFSET 2", "LIMIT 5 OFFSET 2"),
 ])
 def test_a_bound_the_statement_wrote_within_the_cap_is_kept(engine, tail, runs):
-    verdict = _decide(f"SELECT id FROM claim ORDER BY amount DESC {tail}", engine)
+    # NULLS LAST: an unguarded descending top-N on Oracle is the logic lint's to refuse (M161).
+    verdict = _decide(f"SELECT id FROM claim ORDER BY amount DESC NULLS LAST {tail}", engine)
     assert isinstance(verdict, Approved), verdict
     assert verdict.target_sql.endswith(runs), verdict.target_sql
     assert verdict.row_cap is None  # the statement's own bound: no cut to disclose
@@ -53,7 +54,7 @@ def test_fetch_first_row_only_is_one_row_not_the_cap():
 @pytest.mark.parametrize("engine,tail", [("oracle", "FETCH FIRST 5000 ROWS ONLY"),
                                          ("duckdb", "LIMIT 5000")])
 def test_a_bound_over_the_cap_is_clamped_and_marked(engine, tail):
-    verdict = _decide(f"SELECT id FROM claim ORDER BY amount DESC {tail}", engine)
+    verdict = _decide(f"SELECT id FROM claim ORDER BY amount DESC NULLS LAST {tail}", engine)
     assert isinstance(verdict, Approved), verdict
     assert verdict.row_cap == MAX_ROWS and str(MAX_ROWS) in verdict.target_sql
 
