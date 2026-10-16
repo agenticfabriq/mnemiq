@@ -52,6 +52,9 @@ def test_the_advised_bound_is_approved_as_written(policy):
     verdict = _decide(ADVISED, policy=policy)
     assert isinstance(verdict, Approved), verdict
     assert verdict.target_sql.endswith("FETCH FIRST 5 ROWS ONLY") and verdict.row_cap is None
+    # Why the advice says NULLS LAST: without it, M161's lint costs a second repair.
+    bare = _decide(ADVISED.replace(" NULLS LAST", ""), policy=policy)
+    assert isinstance(bare, Refusal) and bare.code is RefusalCode.LOGIC_LINT, bare
 
 
 def test_a_write_bounded_by_rownum_is_refused_too():
