@@ -753,14 +753,23 @@ def _with_limit(ast: exp.Expression, max_rows: int, engine: str = "duckdb") -> e
             # thousand rows, a percentage became a fixed count (M162). Keeping it uncapped is no
             # better -- ties and percentages are unbounded, and the adapters fetch every row. So
             # the statement states its bound as a count, which the cap can then be checked against.
+            #
+            # The share is counted in rows, not read off CUME_DIST: CUME_DIST gives a whole peer
+            # group its last row's share, so ten tied rows filtered at 50% kept none (Codex, #156).
+            # CEIL is Oracle's rounding of FETCH ... PERCENT, and it never empties a non-empty
+            # result, where DuckDB's own `LIMIT 10%` of 7 rows returns none. Multiplied before
+            # divided: in DuckDB's doubles `7 / 100.0 * 100` rounds up to 8.
             return Refusal(
                 code=RefusalCode.UNREADABLE_LIMIT,
                 message=(f"State the row limit as a plain number of rows, at most {max_rows:,}: "
                          "`LIMIT n`, or `FETCH FIRST n ROWS ONLY`. A limit given as a percentage, "
                          "WITH TIES, or an expression cannot be checked against this engine's "
                          f"{max_rows:,}-row bound. To keep ties, rank in a subquery and filter on "
-                         "`RANK() OVER (ORDER BY ...) <= n`; for a share of the rows, filter on "
-                         "`CUME_DIST() OVER (ORDER BY ...) <= p / 100.0`."),
+                         "`RANK() OVER (ORDER BY ...) <= n`. For a share of the rows, number "
+                         "them in a subquery with `ROW_NUMBER() OVER (ORDER BY ...) AS rn` and "
+                         "`COUNT(*) OVER () AS total`, and filter on "
+                         "`rn <= CEIL(total * p / 100.0)`; use RANK() in place of ROW_NUMBER() to "
+                         "keep ties as well."),
             )
         if count <= max_rows:
             return ast

@@ -12,6 +12,7 @@ The live half runs the kept bounds on Oracle; it skips without `MNEMIQ_ORACLE_TE
 from __future__ import annotations
 
 import os
+import re
 
 import pytest
 
@@ -102,12 +103,50 @@ def test_a_negative_limit_outside_sqlite_is_refused_not_capped(dialect):
     assert isinstance(shaped, Refusal) and shaped.code is RefusalCode.UNREADABLE_LIMIT, shaped
 
 
-def test_the_refusal_names_a_rewrite_that_keeps_ties_and_shares():
-    """Its repair must not drop the ties or the percentage the question asked for."""
-    verdict = _decide("SELECT id FROM claim ORDER BY amount DESC FETCH FIRST 5 ROWS WITH TIES",
-                      "oracle")
-    assert "RANK() OVER" in verdict.message and "CUME_DIST() OVER" in verdict.message
-    assert "p / 100.0" in verdict.message  # integer division would make the share zero rows
+# --- the rewrites the refusal suggests, run as written ---------------------------------------------
+
+def _advice(sql, engine):
+    """The ranking and share filters the refusal of `sql` suggests, read from its message."""
+    refused = _decide(sql, engine)
+    assert isinstance(refused, Refusal) and refused.code is RefusalCode.UNREADABLE_LIMIT, refused
+    ties = re.search(r"`(RANK\(\) OVER \(ORDER BY \.\.\.\)) <= n`", refused.message)
+    share = re.search(r"filter on `(rn <= [^`]+)`", refused.message)
+    assert ties and share and "ROW_NUMBER() OVER (ORDER BY ...) AS rn" in refused.message, refused
+    return ties.group(1), share.group(1)
+
+
+def _share_rewrite(share, p, *, rank=False):
+    number = "RANK()" if rank else "ROW_NUMBER()"
+    keep = re.sub(r"\bp\b", str(p), share)
+    return (f"SELECT id FROM (SELECT id, {number} OVER (ORDER BY amount DESC) AS rn, "
+            f"COUNT(*) OVER () AS total FROM claim) t WHERE {keep}")
+
+
+def _ties_rewrite(ties, n):
+    return (f"SELECT id FROM (SELECT id, {ties.replace('...', 'amount DESC')} AS rn FROM claim) t "
+            f"WHERE rn <= {n}")
+
+
+DUCK_ROWS = {"tied": "SELECT i AS id, 1 AS amount FROM range(10) r(i)",
+             "seven": "SELECT i AS id, i AS amount FROM range(7) r(i)",
+             "hundred": "SELECT i AS id, i AS amount FROM range(100) r(i)"}
+
+
+@pytest.mark.parametrize("rows,p,kept", [
+    ("tied", 50, 5),      # ten rows on one value: the CUME_DIST advice kept none (Codex, #156)
+    ("seven", 50, 4),     # rounded up, as Oracle's FETCH ... PERCENT is
+    ("seven", 10, 1),     # a positive share keeps a row; DuckDB's own `LIMIT 10%` returns none
+    ("hundred", 7, 7),    # divided before multiplied, DuckDB's doubles round 7% of 100 up to 8
+])
+def test_the_suggested_share_keeps_its_count_of_rows_on_duckdb(rows, p, kept):
+    import duckdb
+
+    _, share = _advice(f"SELECT id FROM claim ORDER BY amount DESC LIMIT {p}%", "duckdb")
+    verdict = _decide(_share_rewrite(share, p), "duckdb")
+    assert isinstance(verdict, Approved), verdict
+    con = duckdb.connect()
+    con.execute(f"CREATE TABLE claim AS {DUCK_ROWS[rows]}")
+    assert len(con.execute(verdict.target_sql).fetchall()) == kept, verdict.target_sql
 
 
 DSN = os.environ.get("MNEMIQ_ORACLE_TEST_DSN")
@@ -132,5 +171,47 @@ def test_on_oracle_the_kept_bound_returns_its_own_count(tail, rows):
         sql = verdict.target_sql.replace(
             "FROM claim", "FROM (SELECT level AS id FROM dual CONNECT BY level <= 50) claim")
         assert len(cur.execute(sql).fetchall()) == rows, sql
+    finally:
+        con.close()
+
+
+ORA_ROWS = {"tied": "SELECT level AS id, 1 AS amount FROM dual CONNECT BY level <= 10",
+            "seven": "SELECT level AS id, level AS amount FROM dual CONNECT BY level <= 7",
+            "hundred": "SELECT level AS id, level AS amount FROM dual CONNECT BY level <= 100",
+            # 9, 9, 9, then 8 down to 4: a peer group of three at the top
+            "mixed": "SELECT level AS id, CASE WHEN level <= 3 THEN 9 ELSE level END AS amount "
+                     "FROM dual CONNECT BY level <= 8"}
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not DSN, reason="set MNEMIQ_ORACLE_TEST_DSN to run against Oracle")
+@pytest.mark.parametrize("rows,tail", [
+    ("tied", "FETCH FIRST 50 PERCENT ROWS ONLY"),
+    ("seven", "FETCH FIRST 50 PERCENT ROWS ONLY"),
+    ("seven", "FETCH FIRST 10 PERCENT ROWS ONLY"),
+    ("hundred", "FETCH FIRST 7 PERCENT ROWS ONLY"),
+    ("mixed", "FETCH FIRST 1 ROWS WITH TIES"),
+    ("mixed", "FETCH FIRST 4 ROWS WITH TIES"),
+    ("mixed", "FETCH FIRST 30 PERCENT ROWS WITH TIES"),
+    ("mixed", "FETCH FIRST 50 PERCENT ROWS WITH TIES"),
+])
+def test_on_oracle_the_suggested_rewrite_returns_what_the_refused_bound_would(rows, tail):
+    oracledb = pytest.importorskip("oracledb")
+    count = int(re.search(r"FIRST (\d+)", tail).group(1))
+    ties, share = _advice(f"SELECT id FROM claim ORDER BY amount DESC {tail}", "oracle")
+    if "PERCENT" in tail:
+        rewrite = _share_rewrite(share, count, rank="WITH TIES" in tail)
+    else:
+        rewrite = _ties_rewrite(ties, count)
+    verdict = _decide(rewrite, "oracle")
+    assert isinstance(verdict, Approved), verdict
+    data = f"FROM ({ORA_ROWS[rows]}) claim"
+    con = oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
+                           password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"), dsn=DSN)
+    try:
+        cur = con.cursor()
+        written = len(cur.execute(f"SELECT id {data} ORDER BY amount DESC {tail}").fetchall())
+        suggested = len(cur.execute(verdict.target_sql.replace("FROM claim", data)).fetchall())
+        assert suggested == written, (tail, verdict.target_sql)
     finally:
         con.close()
