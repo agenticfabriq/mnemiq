@@ -111,7 +111,11 @@ def _advice(sql, engine):
     assert isinstance(refused, Refusal) and refused.code is RefusalCode.UNREADABLE_LIMIT, refused
     ties = re.search(r"`(RANK\(\) OVER \(ORDER BY \.\.\.\)) <= n`", refused.message)
     share = re.search(r"filter on `(rn <= [^`]+)`", refused.message)
-    assert ties and share and "ROW_NUMBER() OVER (ORDER BY ...) AS rn" in refused.message, refused
+    # The pieces `_share_rewrite` writes itself, so the advice cannot drift from what runs here.
+    for piece in ("ROW_NUMBER() OVER (ORDER BY ...) AS rn", "COUNT(*) OVER () AS total",
+                  "RANK() in place of ROW_NUMBER() to keep ties"):
+        assert piece in refused.message, (piece, refused.message)
+    assert ties and share, refused.message
     return ties.group(1), share.group(1)
 
 
