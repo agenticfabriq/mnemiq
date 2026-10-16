@@ -521,6 +521,8 @@ _RETRIED = {
     RefusalCode.UNRESOLVABLE_CALLS: DeferralReason.UNGOVERNABLE,
     RefusalCode.VIEW_INVENTORY_UNAVAILABLE: DeferralReason.UNGOVERNABLE,
     RefusalCode.INVALID_ROW_FILTER: DeferralReason.UNGOVERNABLE,
+    # M158: the source accepts the statement as asked and refuses only the policy's rewrite.
+    RefusalCode.POLICY_REWRITE_REJECTED: DeferralReason.UNGOVERNABLE,
     # Write-path codes. `decide_write` is called from the runtime, not through this loop, so
     # none of these can arrive here -- listed so a future caller that routes writes through
     # `plan_query` finds a decision already made rather than a default.
