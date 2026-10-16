@@ -18,6 +18,7 @@ from mnemiq.sql.authz_guard import (
     check_opaque_columns,
     check_unmodelled_calls,
     check_unmodelled_source,
+    is_pseudo_column,
 )
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.fanout_check import KeyFacts, check_fanout
@@ -97,7 +98,7 @@ def decide(
         return unsupported
     row_cap = shaped.meta.get("row_cap")  # read now: the rewrites below build new trees
 
-    refusal = check_access(shaped, visible, target)
+    refusal = check_access(shaped, visible, target, pseudo_columns=True)
     if refusal is not None:
         return refusal
     # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
@@ -215,7 +216,8 @@ def decide(
     lineage = lineage_for(shaped, tables, {} if views is None else views,
                           functions=functions, called=called,
                           scope_resolved=scope_resolved(shaped, target))
-    columns = sorted({c.name for c in shaped.find_all(exp.Column)})
+    columns = sorted({c.name for c in shaped.find_all(exp.Column)
+                      if not is_pseudo_column(c, target)})
 
     narrowed: list = []
     # M51: the statement as asked, kept before any policy rewrite -- what a caller is shown.
