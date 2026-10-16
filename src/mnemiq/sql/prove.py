@@ -68,7 +68,11 @@ def prove_governed(adapter: Any, target_sql: str, asked_sql: str) -> Refusal | N
     is in what the engine added: the policy, or the snapshot it was checked against. The cost is
     one or two more proofs, and only for a refused statement that a policy rewrote.
 
-    The second proof tells the caller one thing: that their own statement is valid. A working
+    The rewrite is proved once more before the policy is blamed, since `prove` reads any
+    exception as a refusal: a dropped connection that recovers between proofs is not the policy's.
+    One that fails the first and third proofs and not the second still reads as the policy's.
+
+    The proof of the statement as asked tells the caller one thing: that it is valid. A working
     policy would have told them the same. A proof reads the statement and the schema, never rows:
     EXPLAIN plans without running, and Oracle's `validate` parses.
     """
@@ -82,6 +86,8 @@ def prove_governed(adapter: Any, target_sql: str, asked_sql: str) -> Refusal | N
     # dropped connection or a lock timeout on the first proof would otherwise land here, and a
     # policy fault is not retried.
     if prove(adapter, target_sql) is None:
+        logger.info("The access policy's rewrite was accepted on a second proof; the first "
+                    "refusal was not the policy's.")
         return None
     # `prove` logged the source's words for the rewrite; this says whose they were.
     logger.warning("The source accepts the statement as asked and refuses the access policy's "
