@@ -62,6 +62,9 @@ class RefusalCode(StrEnum):
     # A row or column policy, decided for an engine whose binding of a CTE name the scope rule does
     # not model (M150). A deployment's configuration, not the statement: never repairable.
     POLICY_TARGET_UNSUPPORTED = "policy_target_unsupported"
+    # A LIMIT or FETCH that states no plain row count -- a percentage, WITH TIES, an expression --
+    # so the row cap can neither keep it nor replace it without changing the answer (M162).
+    UNREADABLE_LIMIT = "unreadable_limit"
 
 
 # A refusal the model can act on is a repair; a refusal it cannot act on is a dead end.
@@ -115,6 +118,8 @@ REPAIRABLE = frozenset(
         # The message names the table the join repeats and says how to restructure: aggregate
         # each table on its own, then join the aggregates.
         RefusalCode.FAN_OUT,
+        # The message says to state the bound as a plain count, which the same query can always do.
+        RefusalCode.UNREADABLE_LIMIT,
     }
 )
 
