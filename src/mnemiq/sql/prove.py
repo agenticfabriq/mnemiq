@@ -86,7 +86,7 @@ def prove_governed(adapter: Any, target_sql: str, asked_sql: str) -> Refusal | N
     # dropped connection or a lock timeout on the first proof would otherwise land here, and a
     # policy fault is not retried.
     if prove(adapter, target_sql) is None:
-        logger.info("The access policy's rewrite was accepted on a second proof; the first "
+        logger.info("The access policy's rewrite was accepted when proved again; its first "
                     "refusal was not the policy's.")
         return None
     # `prove` logged the source's words for the rewrite; this says whose they were.
