@@ -70,6 +70,46 @@ def test_a_bound_with_no_plain_count_is_refused_not_replaced(engine, tail):
     assert f"at most {MAX_ROWS:,}" in verdict.message
 
 
+@pytest.mark.parametrize("dialect,tail,runs", [
+    ("postgres", "LIMIT NULL", f"LIMIT {MAX_ROWS}"),
+    ("sqlite", "LIMIT -1", f"LIMIT {MAX_ROWS}"),
+    ("sqlite", "LIMIT -1 OFFSET 5", f"LIMIT {MAX_ROWS} OFFSET 5"),
+    ("postgres", "LIMIT ALL", f"LIMIT {MAX_ROWS}"),
+])
+def test_a_spelling_of_no_bound_takes_the_cap_as_if_none_were_written(dialect, tail, runs):
+    """On main SQLite's `LIMIT -1` was kept and ran uncapped (the ui lane's review of #156)."""
+    shaped = check_shape(f"SELECT id FROM claim ORDER BY amount DESC {tail}", dialect=dialect,
+                         executes_as=dialect)
+    assert not isinstance(shaped, Refusal), shaped
+    assert shaped.meta.get("row_cap") == MAX_ROWS
+    assert shaped.sql(dialect=dialect).endswith(runs), shaped.sql(dialect=dialect)
+
+
+@pytest.mark.parametrize("tail", ["LIMIT -(-5)", "LIMIT -0", "LIMIT -(5 + 1)"])
+def test_a_minus_over_anything_but_a_positive_number_is_refused_in_sqlite(tail):
+    """`-(-5)` is five rows and `-0` none: only a negative plain number is SQLite's no bound."""
+    shaped = check_shape(f"SELECT id FROM claim ORDER BY amount DESC {tail}", dialect="sqlite",
+                         executes_as="sqlite")
+    assert isinstance(shaped, Refusal) and shaped.code is RefusalCode.UNREADABLE_LIMIT, shaped
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "postgres", "oracle"])
+def test_a_negative_limit_outside_sqlite_is_refused_not_capped(dialect):
+    """Only SQLite reads a negative LIMIT as no bound; elsewhere it is an error the cap must not
+    turn into a thousand rows."""
+    shaped = check_shape("SELECT id FROM claim ORDER BY amount DESC LIMIT -1", dialect=dialect,
+                         executes_as=dialect)
+    assert isinstance(shaped, Refusal) and shaped.code is RefusalCode.UNREADABLE_LIMIT, shaped
+
+
+def test_the_refusal_names_a_rewrite_that_keeps_ties_and_shares():
+    """Its repair must not drop the ties or the percentage the question asked for."""
+    verdict = _decide("SELECT id FROM claim ORDER BY amount DESC FETCH FIRST 5 ROWS WITH TIES",
+                      "oracle")
+    assert "RANK() OVER" in verdict.message and "CUME_DIST() OVER" in verdict.message
+    assert "p / 100.0" in verdict.message  # integer division would make the share zero rows
+
+
 DSN = os.environ.get("MNEMIQ_ORACLE_TEST_DSN")
 
 

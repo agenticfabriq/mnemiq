@@ -88,7 +88,7 @@ def check_shape(
     # returned tree is the one that runs, and before `check_cls` ever sees it -- a qualified
     # reference is one that grant checking can rule on.
     _qualify_schema_resolved(ast, columns)
-    return _with_limit(ast, max_rows)
+    return _with_limit(ast, max_rows, executes_as or dialect)
 
 
 def _output_selects(ast: exp.Expression) -> list[exp.Select]:
@@ -738,7 +738,7 @@ def _has_projection_star(ast: exp.Expression, dialect: str,
     return _star_reaches_base(ast, {}, {}, columns, frozenset(), dialect)
 
 
-def _with_limit(ast: exp.Expression, max_rows: int) -> exp.Expression | Refusal:
+def _with_limit(ast: exp.Expression, max_rows: int, engine: str = "duckdb") -> exp.Expression | Refusal:
     """Bound the result, and mark the tree when the bound is ours (M118).
 
     A limit the query set itself is the query's business: `LIMIT 10` for a top ten returns ten
@@ -746,7 +746,7 @@ def _with_limit(ast: exp.Expression, max_rows: int) -> exp.Expression | Refusal:
     may have been cut -- so the tree carries `meta["row_cap"]` for the caller to say so.
     """
     existing = ast.args.get("limit")
-    if existing is not None:
+    if existing is not None and not _states_no_bound(existing, engine):
         count = _written_count(existing)
         if count is None:
             # Replacing a bound we cannot read changes the answer: a top-5 WITH TIES became a
@@ -758,13 +758,38 @@ def _with_limit(ast: exp.Expression, max_rows: int) -> exp.Expression | Refusal:
                 message=(f"State the row limit as a plain number of rows, at most {max_rows:,}: "
                          "`LIMIT n`, or `FETCH FIRST n ROWS ONLY`. A limit given as a percentage, "
                          "WITH TIES, or an expression cannot be checked against this engine's "
-                         f"{max_rows:,}-row bound."),
+                         f"{max_rows:,}-row bound. To keep ties, rank in a subquery and filter on "
+                         "`RANK() OVER (ORDER BY ...) <= n`; for a share of the rows, filter on "
+                         "`CUME_DIST() OVER (ORDER BY ...) <= p / 100.0`."),
             )
         if count <= max_rows:
             return ast
     capped = ast.limit(max_rows)
     capped.meta["row_cap"] = max_rows
     return capped
+
+
+def _states_no_bound(limit: exp.Expression, engine: str) -> bool:
+    """`LIMIT NULL` means no bound, and so does a negative number in SQLite, so the cap applies exactly
+    as if no LIMIT were written. On main (`70188c4`, before #156) SQLite's `LIMIT -1` was kept as
+    written and ran uncapped (the ui lane's review of #156). Only a negative PLAIN NUMBER: `-(-5)` is
+    five rows and `-0` none, so anything else under the minus is left to `_written_count`, which
+    refuses it. Keyed on the engine that runs the statement, like the rest of this module; elsewhere
+    a negative LIMIT is an error, and it is refused there too. `LIMIT ALL` parses as no limit."""
+    if isinstance(limit, exp.Fetch):
+        return False
+    if isinstance(limit.expression, exp.Null):
+        return True
+    minus = limit.expression
+    if not isinstance(minus, exp.Neg) or engine.lower() != "sqlite":
+        return False
+    number = minus.this
+    if not isinstance(number, exp.Literal) or number.is_string:
+        return False
+    try:
+        return int(number.name) > 0
+    except ValueError:
+        return False
 
 
 def _written_count(limit: exp.Expression) -> int | None:
