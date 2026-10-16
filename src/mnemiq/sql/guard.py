@@ -738,7 +738,7 @@ def _has_projection_star(ast: exp.Expression, dialect: str,
     return _star_reaches_base(ast, {}, {}, columns, frozenset(), dialect)
 
 
-def _with_limit(ast: exp.Expression, max_rows: int) -> exp.Expression:
+def _with_limit(ast: exp.Expression, max_rows: int) -> exp.Expression | Refusal:
     """Bound the result, and mark the tree when the bound is ours (M118).
 
     A limit the query set itself is the query's business: `LIMIT 10` for a top ten returns ten
@@ -747,11 +747,42 @@ def _with_limit(ast: exp.Expression, max_rows: int) -> exp.Expression:
     """
     existing = ast.args.get("limit")
     if existing is not None:
-        try:
-            if int(existing.expression.name) <= max_rows:
-                return ast
-        except (AttributeError, ValueError):
-            pass  # unreadable limit -> impose our own
+        count = _written_count(existing)
+        if count is None:
+            # Replacing a bound we cannot read changes the answer: a top-5 WITH TIES became a
+            # thousand rows, a percentage became a fixed count (M162). Keeping it uncapped is no
+            # better -- ties and percentages are unbounded, and the adapters fetch every row. So
+            # the statement states its bound as a count, which the cap can then be checked against.
+            return Refusal(
+                code=RefusalCode.UNREADABLE_LIMIT,
+                message=(f"State the row limit as a plain number of rows, at most {max_rows:,}: "
+                         "`LIMIT n`, or `FETCH FIRST n ROWS ONLY`. A limit given as a percentage, "
+                         "WITH TIES, or an expression cannot be checked against this engine's "
+                         f"{max_rows:,}-row bound."),
+            )
+        if count <= max_rows:
+            return ast
     capped = ast.limit(max_rows)
     capped.meta["row_cap"] = max_rows
     return capped
+
+
+def _written_count(limit: exp.Expression) -> int | None:
+    """The number of rows a LIMIT or FETCH clause states, or None where it states no plain count.
+
+    sqlglot keeps LIMIT's count in `expression` and FETCH's in `count`. Reading only the first, an
+    Oracle `FETCH FIRST 5 ROWS ONLY` counted as unreadable and ran as the 1,000-row cap (M162). A
+    percentage or WITH TIES is not a row count: DuckDB's `LIMIT 10%` read as ten rows and ran
+    uncapped. `FETCH FIRST ROW ONLY` states no count, and means one row."""
+    options = limit.args.get("limit_options")
+    if options is not None and (options.args.get("percent") or options.args.get("with_ties")):
+        return None
+    node = limit.args.get("count") if isinstance(limit, exp.Fetch) else limit.expression
+    if node is None:
+        return 1 if isinstance(limit, exp.Fetch) else None
+    if not isinstance(node, exp.Literal) or node.is_string:
+        return None
+    try:
+        return int(node.name)
+    except ValueError:
+        return None
