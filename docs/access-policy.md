@@ -56,3 +56,11 @@ Check a multi-table total before trusting it. Nothing flags an intersection as w
 **A view over a filtered table is refused.** mnemiq cannot apply a table's filter through a view's own SQL, so a query reading such a view is refused. The refusal names only the view. When the view reads exactly one filtered table, its SQL names that table as the policy does (case aside), and the caller holds it, the caller is told to query it directly.
 
 **A filter naming nothing in the source refuses every read.** A key must name a table or view in mnemiq's snapshot of the source, so a real table whose profiling failed counts as unknown too; a misspelt key would otherwise drop its filter silently. An identity's roles merge into one policy, so the refusal covers everything that identity reads, including what its other roles grant. The key is reported at startup as well.
+
+**A filter whose conversion can fail is refused.** A filter runs over every row of its table, including the rows it removes. So a conversion that fails on one hidden row fails every read of the table, and the database's error can quote that row's value. mnemiq refuses a filter holding any of these, unless the snapshot's column types show the conversion cannot fail:
+
+- an explicit conversion: `CAST(region AS INTEGER)`, `TO_NUMBER(region)`, `TO_DATE(...)`;
+- a DuckDB JSON function reading text;
+- a comparison that converts a text column to a number or a date, such as `region = 7`.
+
+Write the form that gives NULL instead of failing. On DuckDB that is `TRY_CAST(value AS type)`. On Oracle it is `CAST(value AS type DEFAULT NULL ON CONVERSION ERROR)` with no format argument, or `TO_NUMBER(value DEFAULT NULL ON CONVERSION ERROR)`. The check matches known spellings; it is not a proof. An expression over a text column, such as `UPPER(region) > 0`, is not caught.
