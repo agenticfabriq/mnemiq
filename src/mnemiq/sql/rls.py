@@ -114,13 +114,13 @@ _UNTYPED_CONVERSIONS = frozenset({"to_binary_double", "to_binary_float", "to_tim
                                   "to_dsinterval", "to_yminterval"})
 # Text read as JSON, which DuckDB refuses on malformed text and quotes ("Input: ..."): every
 # scalar JSON reader in `duckdb_functions()` that does so in 1.5.4, measured, by how sqlglot parses
-# it (a test re-measures the list). Oracle's JSON functions default to NULL ON ERROR, so this is
+# it (a test re-measures the list, at the arguments it knows for each reader). Oracle's JSON functions default to NULL ON ERROR, so this is
 # DuckDB's alone. Safe over a column the snapshot types JSON, or over `TRY_CAST(value AS JSON)`.
 _JSON_PARSES = (exp.JSONExtract, exp.JSONExtractScalar, exp.ParseJSON, exp.JSONKeys, exp.JSONType)
 _UNTYPED_JSON_PARSES = frozenset({
     "from_json", "from_json_strict", "json_array_length", "json_contains", "json_deserialize_sql",
-    "json_exists", "json_pretty", "json_structure", "json_transform", "json_transform_strict",
-    "json_value"})
+    "json_exists", "json_merge_patch", "json_pretty", "json_structure", "json_transform",
+    "json_transform_strict", "json_value"})
 # A comparison converts a text column to the other side's type, row by row, in both engines:
 # DuckDB on `=`, `<>` and IN (its ordering comparisons refuse at bind, on no row's value), Oracle
 # on every comparison (an implicit TO_NUMBER or TO_DATE). Seen only where the snapshot types both
@@ -180,6 +180,12 @@ def _json_cannot_fail(source, type_of, engine: str) -> bool:
 
 def _known_type(value, type_of, engine: str) -> exp.DataType | None:
     """`value`'s type where it is plain to see: a typed column, a literal, a cast, arithmetic."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if isinstance(value, exp.Boolean):
+        return exp.DataType.build("BOOLEAN")
+    if isinstance(value, exp.DateStrToDate):  # Oracle's DATE '...' literal
+        return exp.DataType.build("DATE")
     if isinstance(value, exp.Column):
         known = type_of(value)
         try:
@@ -252,8 +258,10 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
     for node in wrapped.args["where"].walk():
         if engine == "duckdb" and (isinstance(node, _JSON_PARSES) or (
                 isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_JSON_PARSES)):
-            source = node.this if isinstance(node, _JSON_PARSES) else (node.expressions or [None])[0]
-            if _json_cannot_fail(source, type_of, engine):
+            # The typed readers parse their first argument; an untyped one may parse any (both of
+            # `json_contains` and `json_merge_patch` do), so each argument must be safe.
+            sources = [node.this] if isinstance(node, _JSON_PARSES) else node.expressions
+            if all(_json_cannot_fail(source, type_of, engine) for source in sources):
                 continue
             return node
         if isinstance(node, _COMPARISONS):

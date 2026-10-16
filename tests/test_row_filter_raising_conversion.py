@@ -8,9 +8,11 @@ TRY_CAST in DuckDB, DEFAULT NULL ON CONVERSION ERROR in Oracle. Two more spellin
 measured here and refused the same way: DuckDB's JSON readers (text read as JSON, quoted on failure),
 and a comparison that converts a text column implicitly (`region = 7`).
 
-Not covered: an implicit conversion the snapshot cannot type (a column with no recorded type), and a
-raising expression that is not a conversion (`error()`, and whatever else an engine raises on data).
-#154's redaction is what bounds those: the model reads the error class only.
+Not covered, and not convergent by listing spellings: an implicit conversion of an EXPRESSION over a
+text column (`UPPER(region) > 0`, `coalesce(region, '0') = 7`, `region + 0 > 0`), one the snapshot
+cannot type (a column with no recorded type), and a raising expression that is not a conversion
+(`error()`, and whatever else an engine raises on data). #154's redaction is what bounds those: the
+model reads the error class only.
 """
 
 from __future__ import annotations
@@ -69,7 +71,8 @@ def test_a_raising_filter_reads_the_rows_it_removes_and_quotes_them_on_duckdb():
 _JSON_ARGS = {"json_extract": "region, '$.a'", "json_extract_string": "region, '$.a'",
               "json_extract_path": "region, '$.a'", "json_extract_path_text": "region, '$.a'",
               "json_value": "region, '$.a'", "json_exists": "region, '$.a'",
-              "json_contains": "region, '1'", "from_json": "region, '\"INTEGER\"'",
+              "json_contains": "region, '1'", "json_merge_patch": "region, '{}'",
+              "from_json": "region, '\"INTEGER\"'",
               "from_json_strict": "region, '\"INTEGER\"'", "json_transform": "region, '\"INTEGER\"'",
               "json_transform_strict": "region, '\"INTEGER\"'"}
 
@@ -91,7 +94,7 @@ def test_every_duckdb_json_reader_that_quotes_malformed_text_is_refused():
         except duckdb.Error as e:
             if "north" in str(e):
                 quoting.append(call)
-    assert len(quoting) >= 16, quoting  # control: the measurement found the readers
+    assert len(quoting) >= 19, quoting  # control: 19 in 1.5.4 at these arguments
     admitted = [c for c in quoting if not isinstance(_decide(f"({c}) IS NOT NULL"), Refusal)]
     assert admitted == [], admitted
 
@@ -110,7 +113,12 @@ def test_every_duckdb_json_reader_that_quotes_malformed_text_is_refused():
     ("duckdb", "id IN (SELECT id FROM entitlement WHERE CAST(who AS INTEGER) > 0)"),
     ("duckdb", "json(region) IS NOT NULL"),
     ("duckdb", "json_value(region, '$.a') = '1'"),
+    ("duckdb", "json_contains('[1]', region)"),         # its second argument is parsed too
+    ("duckdb", "json_merge_patch('{}', region) IS NOT NULL"),
     ("duckdb", "region = 7"),                             # converted implicitly, row by row
+    ("duckdb", "region = (7)"),
+    ("duckdb", "region = TRUE"),
+    ("oracle", "region = DATE '2000-01-01'"),             # an implicit TO_DATE
     ("duckdb", "region IN (1, 2)"),
     ("duckdb", "id = region"),
     ("duckdb", "region IN (SELECT id FROM entitlement)"),
