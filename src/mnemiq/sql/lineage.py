@@ -77,6 +77,12 @@ class Lineage:
 # truncating the value passed. Outside the rule, and so not added: a function returning session
 # state that application code sets (`sys_context`, `userenv`), and the time-zone group (`from_tz`,
 # `tz_offset`, `new_time`, `sys_extract_utc`), which reads the database's time-zone data.
+#
+# The set is one for every dialect, checked by name alone, so the rule's check covers only Oracle:
+# a name joining under it is spared in any dialect where sqlglot leaves it untyped, and must be a
+# builtin there too. `trunc` passes: sqlglot 30.12 types it in duckdb, postgres, sqlite, mysql,
+# snowflake, bigquery, tsql and the default dialect; of the nine probed, only Oracle leaves it
+# untyped.
 _PURE = frozenset({"now", "age", "current_timestamp", "current_date", "current_time", "today",
                    "trunc"})
 
