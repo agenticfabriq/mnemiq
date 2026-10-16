@@ -59,9 +59,9 @@ Check a multi-table total before trusting it. Nothing flags an intersection as w
 
 **A filter whose conversion can fail is refused.** A filter runs over every row of its table, including the rows it removes. So a conversion that fails on one hidden row fails every read of the table, and the database's error can quote that row's value. mnemiq refuses a filter holding any of these:
 
-- an explicit conversion of a column: `CAST(region AS INTEGER)`, `TO_NUMBER(region)`, `TO_DATE(...)`. A cast is kept where the snapshot's column types show every value converts, such as an INTEGER cast to BIGINT. TO_NUMBER and TO_DATE over a column are always refused;
+- an explicit conversion of a column: `CAST(region AS INTEGER)`, `TO_NUMBER(region)`, `TO_DATE(...)`. A cast is kept where the snapshot's column types show every value converts, such as an INTEGER cast to BIGINT. TO_NUMBER without its DEFAULT clause, and any TO_DATE, over a column are always refused;
 - a DuckDB JSON function reading text, unless the snapshot types the column as JSON;
-- a comparison that converts a column the snapshot types as text to a number or a date, such as `region = 7`.
+- a comparison that converts a column the snapshot types as text to another type, such as a number, a date or a boolean: `region = 7`.
 
 Write the form that gives NULL instead of failing. On DuckDB that is `TRY_CAST(value AS type)`, and a JSON function reads from `TRY_CAST(value AS JSON)`. On Oracle it is `CAST(value AS type DEFAULT NULL ON CONVERSION ERROR)` with no format argument, or `TO_NUMBER(value DEFAULT NULL ON CONVERSION ERROR)`.
 
