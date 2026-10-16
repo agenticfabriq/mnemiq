@@ -36,22 +36,25 @@ def check_unmodelled_source(ast: exp.Expression) -> Refusal | None:
     )
 
 
-# Names an engine answers itself rather than from a table, unqualified and unquoted. Oracle's
-# ROWNUM numbers the rows of the query block it appears in, so `WHERE ROWNUM <= 5` over an ordered
-# subquery is Oracle's classic top-N (M163). Measured on Oracle 23 through the policy rewrite: it
-# runs, fenced or not.
-_PSEUDO_COLUMNS = {"oracle": frozenset({"rownum"})}
-
-
-def is_pseudo_column(column: exp.Column, dialect: str | None) -> bool:
-    """Whether `column` is a name `dialect` answers itself, not a table's column."""
-    return (not column.table and not column.this.quoted
-            and column.name.lower() in _PSEUDO_COLUMNS.get((dialect or "").lower(), ()))
-
-
 def _unknown_column(name: str, dialect: str | None) -> Refusal:
+    """Refuse a name no table here has, saying what to write instead where the name is Oracle's
+    own pseudo-column (M163)."""
+    if (dialect or "").lower() == "oracle" and name.lower() == "rownum":
+        # Refused, not admitted. ROWNUM is numbered before the ORDER BY of its own block, so
+        # `WHERE ROWNUM <= 5 ORDER BY x` sorts five arbitrary rows, and `ROWNUM > 5` is always
+        # empty -- both ran and answered wrong once it was admitted (the ui lane, measured on
+        # Oracle 23). FETCH FIRST is the one bound that is right in either place, and the row cap
+        # reads it (M162). NULLS LAST because Oracle puts NULLs first on a descending key, which
+        # the logic lint refuses on a written limit (M161): one repair, not two.
+        return Refusal(
+            code=RefusalCode.UNKNOWN_COLUMN,
+            message=("ROWNUM is numbered before ORDER BY, so it cannot give the first rows of an "
+                     "order and cannot be checked against the row bound. For the first n rows "
+                     "in an order, write ORDER BY ... NULLS LAST FETCH FIRST n ROWS ONLY."),
+            subject=name,
+        )
     if (dialect or "").lower() == "oracle" and name.lower() == "rowid":
-        # Not admitted beside ROWNUM: a physical row address is not data an answer reports, and
+        # Not admitted either: a physical row address is not data an answer reports, and
         # Oracle cannot read it through the view an access policy puts over a table (ORA-01446,
         # measured), so admitting it would fail every governed statement that names it.
         return Refusal(
@@ -71,14 +74,10 @@ def _unknown_column(name: str, dialect: str | None) -> Refusal:
 
 
 def check_access(ast: exp.Expression, visible: dict[str, set[str]],
-                 dialect: str | None = None, *, pseudo_columns: bool = False) -> Refusal | None:
+                 dialect: str | None = None) -> Refusal | None:
     """Re-check every table and column the query touches against what the identity may see.
 
     `dialect` is the ENGINE that will run this, not the one it was parsed as. Identifier folding differs between them -- Oracle folds unquoted names up, the rest fold them down, and quoting is significant in Postgres and Oracle but not DuckDB -- so a resolver keyed on the wrong one answers for the wrong engine. Threading it to SOME call sites and not others is worse than either: `check_access` said a name was a CTE while the audit list said it was a base read, in the same statement.
-
-    `pseudo_columns` admits `dialect`'s pseudo-columns, and only the read decider asks for it: a
-    write bounded by ROWNUM (`DELETE FROM claim WHERE ROWNUM <= 5`) changes an arbitrary set of
-    rows, so a write still reads ROWNUM as an unknown column.
 
     Retrieval scoping (the semantic store) means the model was never *shown* a forbidden
     table. It can still *name* one -- `users`, `employees`, `salaries` are in every schema it
@@ -127,15 +126,15 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
             if table is None:
                 continue  # qualifier belongs to a CTE or a subquery alias
             if column.name not in visible[table]:
-                if (dialect or "").lower() == "oracle" and column.name.lower() == "rowid":
+                if (dialect or "").lower() == "oracle" and column.name.lower() in (
+                        "rowid", "rownum"):
                     return _unknown_column(column.name, dialect)
                 return Refusal(
                     code=RefusalCode.UNKNOWN_COLUMN,
                     message=f"{table!r} has no column {column.name!r}. Use only listed columns.",
                     subject=column.name,
                 )
-        elif column.name not in known_columns and not (
-                pseudo_columns and is_pseudo_column(column, dialect)):
+        elif column.name not in known_columns:
             return _unknown_column(column.name, dialect)
 
     return None
