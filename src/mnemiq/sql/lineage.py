@@ -189,7 +189,8 @@ def _functions_in(ast, inventory=None) -> tuple[list[str], bool]:
     about it, makes the name the suspect, and the record keeps it. An inventory never asked, or
     one that could not answer, spares it on purpose: it names no function at all, so the
     `function-inventory-*` reason already says every call is unconfirmed, and naming each listed
-    builtin beside it would be the noise this list exists to keep out.
+    builtin beside it would be the noise this list exists to keep out. `inventory=None`, which
+    only a direct caller passes (`lineage_for` supplies `never_asked()`), spares it as well.
 
     A QUOTED callable name is never admitted. `node.name` discards the delimiters, so a payload
     that already matches the identifier grammar -- `"sk_live_abc123"()` -- passed the guard
