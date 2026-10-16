@@ -186,8 +186,10 @@ def _functions_in(ast, inventory=None) -> tuple[list[str], bool]:
 
     And it spares a name only where `inventory` does not say the source may define it (M157,
     Codex's review of #157): a source reporting its own `trunc`, or a narrow answer never asked
-    about it, makes the name the suspect, and the record keeps it. Without an inventory nothing
-    is known either way, and a listed builtin is spared as before.
+    about it, makes the name the suspect, and the record keeps it. An inventory never asked, or
+    one that could not answer, spares it on purpose: it names no function at all, so the
+    `function-inventory-*` reason already says every call is unconfirmed, and naming each listed
+    builtin beside it would be the noise this list exists to keep out.
 
     A QUOTED callable name is never admitted. `node.name` discards the delimiters, so a payload
     that already matches the identifier grammar -- `"sk_live_abc123"()` -- passed the guard
