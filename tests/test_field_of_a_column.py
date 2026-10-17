@@ -307,6 +307,64 @@ def test_a_nearer_column_is_known_from_a_subquery_s_projection_and_from_the_poli
         assert isinstance(verdict, Refusal) and "two ways" in verdict.message, (policy, verdict)
 
 
+# M169 (Codex's review of #164): a star's projection is what it exposes. Measured on DuckDB:
+# `t.*` is t's columns, EXCLUDE drops a column (folded, `EXCLUDE (SECRET)` too), RENAME renames
+# one, REPLACE keeps every name, and COLUMNS(...) picks by pattern.
+STAR_EXPOSES_NO_SECRET = [
+    "SELECT p.* FROM plain p CROSS JOIN claim c",
+    "SELECT * EXCLUDE (secret) FROM claim",
+    "SELECT * RENAME (secret AS s2) FROM claim",
+    "SELECT c.* EXCLUDE (secret) FROM plain p CROSS JOIN claim c",
+    "SELECT * EXCLUDE (secret) FROM claim c, claim k",             # unqualified: every source
+    "SELECT * EXCLUDE (c.secret, k.secret) FROM claim c, claim k",
+    "SELECT COUNT(*) FROM claim",                                  # a star in a call is no star
+]
+STAR_EXPOSES_SECRET = [
+    "SELECT c.* FROM plain p CROSS JOIN claim c",
+    "SELECT * EXCLUDE (id) FROM claim",
+    "SELECT * REPLACE (id + 1 AS id) FROM claim",
+    "SELECT * RENAME (id AS secret) FROM plain",  # DuckDB then fails on `.status`: refused first
+    "SELECT zz.* FROM claim c",                   # names no source: read as every source's
+    "SELECT * EXCLUDE (c.secret) FROM claim c, claim k",       # k.secret stays (the gate's case)
+    "SELECT * RENAME (c.secret AS s2) FROM claim c, claim k",
+]
+
+
+def _through(projection):
+    return f"SELECT (SELECT secret.status FROM ({projection}) d LIMIT 1) FROM other secret"
+
+
+@pytest.mark.parametrize("projection", STAR_EXPOSES_NO_SECRET)
+def test_a_star_exposing_no_nearer_column_leaves_the_outer_source_read(con, projection):
+    sql = _through(projection)
+    assert con.execute(sql).fetchall() == [("other-status",)]  # the premise
+    # No policy: a RENAME of `secret` names the column, which a deny would refuse on its own.
+    verdict = decide(sql, SCOPES, dialect="duckdb", target="duckdb")
+    assert isinstance(verdict, Approved), (projection, verdict)
+    assert con.execute(verdict.target_sql).fetchall() == [("other-status",)]
+
+
+@pytest.mark.parametrize("projection", STAR_EXPOSES_SECRET)
+def test_a_star_exposing_the_nearer_column_is_still_ambiguous(projection):
+    # No policy, so the only refusal left is the ambiguity's: a deny would refuse `c.secret` in
+    # an EXCLUDE list on its own, and a leak would read as Approved.
+    verdict = decide(_through(projection), SCOPES, dialect="duckdb", target="duckdb")
+    assert isinstance(verdict, Refusal) and "two ways" in verdict.message, (projection, verdict)
+
+
+def test_columns_by_pattern_are_read_as_every_column():
+    tree = sqlglot.parse_one(_through("SELECT COLUMNS('sec.*') FROM claim"), read="duckdb")
+    refused = fields_as_members(tree, "duckdb", SCOPES)
+    assert isinstance(refused, Refusal) and "two ways" in refused.message, refused
+
+
+def test_an_exclude_is_folded_as_duckdb_folds_it():
+    # DuckDB reads `EXCLUDE (SECRET)` as excluding `secret` (measured). The column check later
+    # refuses the upper-case spelling on its own, so this is asked of the rewrite alone.
+    tree = sqlglot.parse_one(_through("SELECT * EXCLUDE (SECRET) FROM claim"), read="duckdb")
+    assert fields_as_members(tree, "duckdb", SCOPES) is None
+
+
 def test_a_scope_whose_sources_share_a_name_is_refused(con):
     # DuckDB runs it, and sqlglot cannot say which source a qualifier there names.
     sql = "SELECT 1 FROM claim c, (SELECT 1) c"
