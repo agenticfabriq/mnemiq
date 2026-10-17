@@ -444,7 +444,11 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None,
     it looks outward, so in `SELECT (SELECT secret.status FROM claim) FROM other secret` it reads
     `claim.secret`, not `other.status` (measured, a write's subquery too); Oracle reads the outer
     source (measured on 23), so there nothing changes. `columns` is what the decider is told each
-    table has (`known_columns`), and a subquery's or CTE's columns are its projection.
+    table has (`known_columns`), and a subquery's or CTE's columns are its projection, a star
+    (`*` or `t.*`) read through to every source its scope selects and a set operation through
+    each branch. A scope
+    whose sources share a name is refused on every engine: sqlglot cannot say which one a
+    qualifier there names, and DuckDB runs one (`FROM claim c, (SELECT 1) c`).
     """
     # Each name a source can be known by, as written -> as the engine resolves it. A scope keys
     # its sources by the written text, so this is how a key is resolved.
@@ -475,8 +479,16 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None,
     def columns_of(source) -> set[str]:
         if isinstance(source, exp.Table):
             return known.get(object_key(source), set())
-        selects = getattr(getattr(source, "expression", None), "named_selects", None) or []
-        return {resolve(name, quoted=False, dialect=dialect) for name in selects}
+        if source.union_scopes:
+            return set().union(*(columns_of(branch) for branch in source.union_scopes))
+        found: set[str] = set()
+        for select in source.expression.selects:
+            if isinstance(select, exp.Star) or isinstance(select.this, exp.Star):  # `*`, `t.*`
+                for _, inner in source.selected_sources.values():
+                    found |= columns_of(inner)
+            elif select.alias_or_name:
+                found.add(resolve(select.alias_or_name, quoted=False, dialect=dialect))
+        return found
 
     binds_nearer = (dialect or "").lower() != "oracle"
     seen: set[int] = set()

@@ -285,10 +285,19 @@ def test_a_cte_no_from_selects_is_no_source(visible, policy, code):
     assert isinstance(verdict, Refusal) and verdict.code is code and verdict.subject == "secret"
 
 
-def test_a_nearer_column_is_known_from_a_subquery_s_projection_and_from_the_policy():
-    derived = "SELECT (SELECT secret.status FROM (SELECT secret FROM claim) d) FROM other secret"
-    verdict = decide(derived, SCOPES, dialect="duckdb", target="duckdb")
-    assert isinstance(verdict, Refusal) and "two ways" in verdict.message, verdict
+def test_a_nearer_column_is_known_from_a_subquery_s_projection_and_from_the_policy(con):
+    # A star reads through: DuckDB returns the field through `SELECT *` (the gate's case).
+    assert con.execute("SELECT (SELECT secret.status FROM (SELECT * FROM claim WHERE id = 1) d) "
+                       "FROM other secret").fetchall() == [("ssn-123",)]
+    for derived in ("SELECT (SELECT secret.status FROM (SELECT secret FROM claim) d) FROM other secret",
+                    "SELECT (SELECT secret.status FROM (SELECT * FROM claim) d) FROM other secret",
+                    "SELECT (SELECT secret.status FROM (SELECT c.* FROM claim c) d) FROM other secret",
+                    "WITH w AS (SELECT * FROM claim) SELECT (SELECT secret.status FROM w) "
+                    "FROM other secret",
+                    "SELECT (SELECT secret.status FROM (SELECT id FROM plain UNION ALL "
+                    "SELECT * FROM claim) d) FROM other secret"):
+        verdict = decide(derived, SCOPES, dialect="duckdb", target="duckdb")  # no policy
+        assert isinstance(verdict, Refusal) and "two ways" in verdict.message, (derived, verdict)
     # `secret` left out of the grant, and known from the policy: its schema, or what it denies.
     told_by_policy = {**SCOPES, "claim": {"id", "amount"}}
     for policy in (DENIED, AccessPolicy(denied={("claim", "secret")}),
