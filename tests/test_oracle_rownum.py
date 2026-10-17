@@ -218,9 +218,11 @@ def test_on_oracle_rowid_reads_through_a_subquery_and_quoted_too():
             with pytest.raises(oracledb.DatabaseError, match="ORA-00904"):
                 run(f'SELECT "{name}" FROM claim')
     finally:
-        for probe in (table, quoted_probe):
+        try:
+            cur.execute(f"DROP TABLE {table} PURGE")
             try:
-                cur.execute(f"DROP TABLE {probe} PURGE")
+                cur.execute(f"DROP TABLE {quoted_probe} PURGE")
             except oracledb.DatabaseError:
-                pass  # the quoted probe exists only if Oracle accepted the column it must not
-        con.close()
+                pass  # it exists only if Oracle accepted the column it must not
+        finally:
+            con.close()

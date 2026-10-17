@@ -37,7 +37,7 @@ def check_unmodelled_source(ast: exp.Expression) -> Refusal | None:
 
 
 def _pseudo_column(ast: exp.Expression, dialect: str | None) -> Refusal | None:
-    """Every reference on Oracle to an unquoted ROWNUM, or to ROWID however it is spelled (M163).
+    """Every reference on Oracle to an unquoted ROWNUM, or to a name Oracle reads as ROWID (M163).
 
     Read before the column checks, not inside them, because those exempt three places where a
     name is not looked up -- a select alias, a qualifier naming a CTE or subquery, a statement
@@ -45,8 +45,7 @@ def _pseudo_column(ast: exp.Expression, dialect: str | None) -> Refusal | None:
     approved before this: `SELECT s.ROWID FROM (SELECT id FROM claim) s` and its CTE form ran and
     returned row addresses, and `s.ROWNUM` and `SELECT id AS rownum FROM claim WHERE rownum <= 5`
     were left for Oracle to reject (ORA-03050, ORA-00923), with the source's error where this
-    advice belongs (Codex's review of #161). A reference, not an alias's own name: `SELECT id AS
-    rownum FROM claim` names nothing, and Oracle rejects it (ORA-00923).
+    advice belongs (Codex's review of #161).
 
     Which spellings, also measured: Oracle folds an unquoted name to upper case and keeps a quoted
     one as written, and reads ROWID wherever the name comes out as ROWID -- `"ROWID"` returns row
