@@ -166,6 +166,7 @@ def test_a_reference_qualified_by_a_source_is_left_as_it_is(sql, dialect):
 # Oracle calls that ambiguous (ORA-00918). So a reference led by a source, with a source named
 # further along it too, is refused as ambiguous, whatever is granted.
 OTHER = {"other": {"id", "status"}}
+DEEPER = "SELECT c.secret.detail.code FROM claim c CROSS JOIN other secret"  # named second of three
 COLLIDING = [
     "SELECT c.secret.status FROM claim c CROSS JOIN (SELECT 1 AS status) secret",
     "SELECT c.secret.status FROM claim c CROSS JOIN other secret",
@@ -181,10 +182,11 @@ def test_the_premise_duckdb_reads_a_colliding_reference_as_the_field(con):
     for sql in COLLIDING[:-1]:
         assert sorted(con.execute(sql).fetchall()) == [("ssn-123",), ("ssn-456",)], sql
     assert con.execute(COLLIDING[-1]).fetchall() == [(1,), (20,)]  # the WHERE read the field
+    assert sorted(con.execute(DEEPER).fetchall()) == [("k-8",), ("k-9",)]
 
 
 @pytest.mark.parametrize("engine, sql", [
-    *(("duckdb", sql) for sql in COLLIDING),
+    *(("duckdb", sql) for sql in [*COLLIDING, DEEPER]),
     ("oracle", "SELECT c.secret.status FROM claim c CROSS JOIN other secret"),
     ("oracle", "WITH secret AS (SELECT id FROM other) SELECT c.secret.status FROM claim c "
                "CROSS JOIN secret"),
