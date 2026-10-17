@@ -40,14 +40,15 @@ def _catches_import_error(handler: ast.ExceptHandler) -> bool:
 
 
 def _run_at_load(body: list[ast.stmt]):
-    """The statements that run when the module loads: into ifs, withs, loops, trys and class bodies, never functions."""
+    """The statements that run when the module loads: into ifs, withs, loops, trys, matches and class bodies, never
+    functions."""
     for node in body:
         yield node
         if isinstance(node, ast.If):
             if not _is_type_checking(node.test):
                 yield from _run_at_load(node.body)
             yield from _run_at_load(node.orelse)
-        elif isinstance(node, ast.Try):
+        elif isinstance(node, (ast.Try, ast.TryStar)):
             if not any(_catches_import_error(h) for h in node.handlers):
                 yield from _run_at_load(node.body)
             for handler in node.handlers:
@@ -55,6 +56,9 @@ def _run_at_load(body: list[ast.stmt]):
             yield from _run_at_load(node.orelse + node.finalbody)
         elif isinstance(node, (ast.With, ast.For, ast.While, ast.ClassDef)):
             yield from _run_at_load(node.body + getattr(node, "orelse", []))
+        elif isinstance(node, ast.Match):
+            for case in node.cases:
+                yield from _run_at_load(case.body)
 
 
 def _load_time_imports(path: Path) -> set[str]:
@@ -87,10 +91,21 @@ def test_every_load_time_import_is_a_declared_dependency():
 def test_the_rule_sees_a_load_time_import(tmp_path):
     """The reader finds every import that runs at load, nested ones too, and leaves lazy and guarded ones alone."""
     source = tmp_path / "m.py"
-    source.write_text("import httpx\nfrom sqlglot import exp\nimport os\n"
-                      "if True:\n    import fastapi\n"
-                      "try:\n    import pyarrow\nfinally:\n    pass\n"
-                      "try:\n    import oracledb\nexcept ImportError:\n    oracledb = None\n"
-                      "if TYPE_CHECKING:\n    import duckdb\n"
-                      "def f():\n    import rdflib\n")
-    assert _load_time_imports(source) == {"httpx", "sqlglot", "fastapi", "pyarrow"}
+    loaded = {  # each module-level construct the reader must descend into, with the import it hides
+        "if": "if True:\n    import m_if\n",
+        "else": "if False:\n    pass\nelse:\n    import m_else\n",
+        "try body": "try:\n    import m_try\nfinally:\n    pass\n",
+        "handler": "try:\n    pass\nexcept ValueError:\n    import m_handler\n",
+        "try*": "try:\n    import m_trystar\nexcept* ValueError:\n    pass\n",
+        "with": "with x:\n    import m_with\n",
+        "for": "for i in x:\n    import m_for\n",
+        "while": "while x:\n    import m_while\n",
+        "class": "class C:\n    import m_class\n",
+        "match": "match x:\n    case 1:\n        import m_match\n",
+    }
+    exempt = ("try:\n    import m_guarded\nexcept ImportError:\n    pass\n"
+              "if TYPE_CHECKING:\n    import m_typing\n"
+              "def f():\n    import m_lazy\n")
+    source.write_text("import httpx\nfrom sqlglot import exp\nimport os\n" + "".join(loaded.values()) + exempt)
+    want = {"httpx", "sqlglot"} | {code.split("import ")[1].split()[0] for code in loaded.values()}
+    assert _load_time_imports(source) == want
