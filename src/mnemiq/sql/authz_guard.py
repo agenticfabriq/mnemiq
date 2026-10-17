@@ -36,10 +36,37 @@ def check_unmodelled_source(ast: exp.Expression) -> Refusal | None:
     )
 
 
-def _unknown_column(name: str, dialect: str | None) -> Refusal:
-    """Refuse a name no table here has, saying what to write instead where the name is Oracle's
-    own pseudo-column (M163)."""
-    if (dialect or "").lower() == "oracle" and name.lower() == "rownum":
+def _pseudo_column(ast: exp.Expression, dialect: str | None) -> Refusal | None:
+    """Every unquoted ROWNUM or ROWID on Oracle, wherever it is written (M163).
+
+    Read before the column checks, not inside them, because those exempt three places where a
+    name is not looked up -- a select alias, a qualifier naming a CTE or subquery, a statement
+    with no base table -- and Oracle reads the pseudo-column in each. Measured on Oracle 23, all
+    approved before this: `SELECT s.ROWID FROM (SELECT id FROM claim) s` and its CTE form ran and
+    returned row addresses, and `s.ROWNUM` and `SELECT id AS rownum FROM claim WHERE rownum <= 5`
+    were left for Oracle to reject (ORA-03050, ORA-00923), with the source's error where this
+    advice belongs (Codex's review of #161).
+
+    Which spellings, also measured: Oracle folds an unquoted name to upper case and keeps a quoted
+    one as written, and reads ROWID wherever the name comes out as ROWID -- `"ROWID"` returns row
+    addresses too, and no table can have that column (ORA-03050). ROWNUM it reads unquoted only:
+    quoted, `"ROWNUM"` is an ordinary name a table may have, decided below like any other.
+    """
+    if (dialect or "").lower() != "oracle":
+        return None
+    for column in ast.find_all(exp.Column):
+        identifier = column.this
+        if not isinstance(identifier, exp.Identifier):
+            continue
+        folded = identifier.name if identifier.quoted else identifier.name.upper()
+        if folded == "ROWID" or (folded == "ROWNUM" and not identifier.quoted):
+            return _pseudo_column_refusal(column.name)
+    return None
+
+
+def _pseudo_column_refusal(name: str) -> Refusal:
+    """ROWNUM or ROWID refused saying what to write instead, not as a column the table lacks."""
+    if name.lower() == "rownum":
         # Refused, not admitted. ROWNUM is numbered before the ORDER BY of its own block, so
         # `WHERE ROWNUM <= 5 ORDER BY x` sorts five arbitrary rows, and `ROWNUM > 5` is always
         # empty -- both ran and answered wrong once it was admitted (the ui lane, measured on
@@ -55,16 +82,18 @@ def _unknown_column(name: str, dialect: str | None) -> Refusal:
                      "NULLS LAST on the first sort key, then FETCH FIRST n ROWS ONLY."),
             subject=name,
         )
-    if (dialect or "").lower() == "oracle" and name.lower() == "rowid":
-        # Not admitted either: a physical row address is not data an answer reports, and
-        # Oracle cannot read it through the view an access policy puts over a table (ORA-01446,
-        # measured), so admitting it would fail every governed statement that names it.
-        return Refusal(
-            code=RefusalCode.UNKNOWN_COLUMN,
-            message=("ROWID is a row's physical address, not data an answer reports, and it "
-                     "cannot be read through an access policy. Leave it out."),
-            subject=name,
-        )
+    # Not admitted either: a physical row address is not data an answer reports, and Oracle
+    # cannot read it through the view an access policy puts over a table (ORA-01446, measured),
+    # so admitting it would fail every governed statement that names it.
+    return Refusal(
+        code=RefusalCode.UNKNOWN_COLUMN,
+        message=("ROWID is a row's physical address, not data an answer reports, and it "
+                 "cannot be read through an access policy. Leave it out."),
+        subject=name,
+    )
+
+
+def _unknown_column(name: str) -> Refusal:
     return Refusal(
         code=RefusalCode.UNKNOWN_COLUMN,
         message=(
@@ -100,6 +129,10 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
             )
         alias_to_table[table.alias_or_name] = name
 
+    pseudo = _pseudo_column(ast, dialect)
+    if pseudo is not None:
+        return pseudo
+
     if not alias_to_table:
         return None  # a query over CTEs alone; their sources were checked above
 
@@ -122,22 +155,19 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
                 # Unreadable scopes: fall back to the rule for an unqualified column rather
                 # than to the flat map that was the defect. Same guarantee, no worse.
                 if column.name not in known_columns:
-                    return _unknown_column(column.name, dialect)
+                    return _unknown_column(column.name)
                 continue
             table = resolved.get(id(column))
             if table is None:
                 continue  # qualifier belongs to a CTE or a subquery alias
             if column.name not in visible[table]:
-                if (dialect or "").lower() == "oracle" and column.name.lower() in (
-                        "rowid", "rownum"):
-                    return _unknown_column(column.name, dialect)
                 return Refusal(
                     code=RefusalCode.UNKNOWN_COLUMN,
                     message=f"{table!r} has no column {column.name!r}. Use only listed columns.",
                     subject=column.name,
                 )
         elif column.name not in known_columns:
-            return _unknown_column(column.name, dialect)
+            return _unknown_column(column.name)
 
     return None
 

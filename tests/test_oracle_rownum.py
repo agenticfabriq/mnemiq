@@ -89,6 +89,63 @@ def test_rowid_is_refused_with_its_own_reason(sql):
     assert verdict.repairable and "physical address" in verdict.message
 
 
+# Codex's review of #161: the column checks look nothing up for a select alias or for a column
+# qualified by a CTE or subquery, and Oracle reads the pseudo-column in both.
+EXEMPTED = [
+    ("SELECT id AS rownum FROM claim WHERE rownum <= 5 ORDER BY amount DESC NULLS LAST",
+     "FETCH FIRST n ROWS ONLY"),
+    ("SELECT s.ROWNUM FROM (SELECT id FROM claim) s", "FETCH FIRST n ROWS ONLY"),
+    ("WITH s AS (SELECT id FROM claim) SELECT s.ROWNUM FROM s", "FETCH FIRST n ROWS ONLY"),
+    ("SELECT id AS rowid FROM claim WHERE rowid IS NOT NULL", "physical address"),
+    ("SELECT s.ROWID FROM (SELECT id FROM claim) s", "physical address"),
+    ("WITH s AS (SELECT id FROM claim) SELECT s.ROWID FROM s", "physical address"),
+]
+
+
+@pytest.mark.parametrize("sql, says", EXEMPTED)
+@pytest.mark.parametrize("policy", [None, FILTERED])
+def test_a_pseudo_column_is_refused_where_no_column_is_looked_up(sql, says, policy):
+    verdict = _decide(sql, policy=policy)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    assert says in verdict.message
+
+
+def test_a_write_reading_rowid_through_a_subquery_is_refused():
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.sql.decide_write import decide_write
+
+    grants = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}))
+    verdict = decide_write("DELETE FROM claim WHERE id IN (SELECT s.rowid FROM "
+                           "(SELECT id FROM claim) s)", VISIBLE, grants, policy=AccessPolicy(),
+                           dialect="oracle", target="oracle", writes_enabled=True)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    assert "physical address" in verdict.message
+
+
+@pytest.mark.parametrize("sql", [
+    'SELECT "ROWID" FROM claim',
+    'SELECT s."ROWID" FROM (SELECT id FROM claim) s',
+    'SELECT id AS "ROWID" FROM claim WHERE "ROWID" IS NOT NULL',
+])
+def test_quoted_in_upper_case_rowid_is_still_the_pseudo_column(sql):
+    # Oracle reads `"ROWID"` as ROWID (measured below), so quoting it is no way past.
+    verdict = _decide(sql)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    assert "physical address" in verdict.message
+
+
+@pytest.mark.parametrize("name", ["ROWNUM", "rowid"])
+def test_quoted_otherwise_it_is_a_column_name_like_any_other(name):
+    # `"ROWNUM"` and `"rowid"` are ordinary names on Oracle, and a table may have either.
+    quoted = f'SELECT "{name}" FROM claim'
+    lacking = _decide(quoted)
+    assert isinstance(lacking, Refusal) and lacking.code is RefusalCode.UNKNOWN_COLUMN, lacking
+    assert f"{name!r}" in lacking.message and "FETCH FIRST" not in lacking.message
+    assert "physical address" not in lacking.message
+    having = decide(quoted, {"claim": {"id", name}}, dialect="oracle", target="oracle")
+    assert isinstance(having, Approved), having
+
+
 DSN = os.environ.get("MNEMIQ_ORACLE_TEST_DSN")
 
 
@@ -118,3 +175,50 @@ def test_on_oracle_rownum_answers_wrong_and_the_advised_bound_right():
             run(fenced.replace("SELECT id FROM", "SELECT id, ROWID FROM", 1))
     finally:
         con.close()
+
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not DSN, reason="set MNEMIQ_ORACLE_TEST_DSN to run against Oracle")
+def test_on_oracle_rowid_reads_through_a_subquery_and_quoted_too():
+    oracledb = pytest.importorskip("oracledb")
+    con = oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
+                           password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"), dsn=DSN)
+    cur = con.cursor()
+    # A stored table: ROWID is an address in one, and an inline view over dual has none.
+    table = "m163_rowid_probe"
+
+    def run(sql):
+        return cur.execute(sql.replace("FROM claim", f"FROM {table}")).fetchall()
+
+    try:
+        try:
+            cur.execute(f"DROP TABLE {table} PURGE")
+        except oracledb.DatabaseError:
+            pass
+        cur.execute(f"CREATE TABLE {table} (id NUMBER, amount NUMBER)")
+        cur.execute(f"INSERT INTO {table} SELECT level, MOD(level * 7, 20) FROM dual "
+                    "CONNECT BY level <= 20")
+        # What the two ROWID shapes approved before the fix returned: one address per row.
+        for sql in ("SELECT s.ROWID FROM (SELECT id FROM claim) s",
+                    "WITH s AS (SELECT id FROM claim) SELECT s.ROWID FROM s"):
+            addresses = run(sql)
+            assert len(addresses) == 20 and all(isinstance(a, str) and len(a) == 18
+                                                for (a,) in addresses), addresses
+        # The two ROWNUM shapes and the alias, Oracle rejected rather than answered.
+        for sql, error in (("SELECT s.ROWNUM FROM (SELECT id FROM claim) s", "ORA-03050"),
+                           ("SELECT id AS rownum FROM claim WHERE rownum <= 5", "ORA-00923")):
+            with pytest.raises(oracledb.DatabaseError, match=error):
+                run(sql)
+        # Quoted: `"ROWID"` is still ROWID and no table may have it, the rest are ordinary names.
+        assert run('SELECT "ROWID" FROM claim') == run("SELECT ROWID FROM claim")
+        with pytest.raises(oracledb.DatabaseError, match="ORA-03050"):
+            cur.execute('CREATE TABLE m163_quoted_probe ("ROWID" NUMBER)')
+        for name in ("rowid", "ROWNUM"):
+            with pytest.raises(oracledb.DatabaseError, match="ORA-00904"):
+                run(f'SELECT "{name}" FROM claim')
+    finally:
+        try:
+            cur.execute(f"DROP TABLE {table} PURGE")
+        finally:
+            con.close()
