@@ -321,6 +321,7 @@ STAR_EXPOSES_NO_SECRET = [
     # A RENAME of a column the picked source lacks is ignored (measured; Codex's review of #165).
     # Qualified, `p.amount`, the column check refuses the name itself, so only the bare one is here.
     "SELECT p.* RENAME (amount AS secret, secret AS s2) FROM plain p CROSS JOIN claim c",
+    "SELECT p.* RENAME (amount AS secret, id AS k) FROM plain p CROSS JOIN claim c",  # one applies
 ]
 STAR_EXPOSES_SECRET = [
     "SELECT c.* FROM plain p CROSS JOIN claim c",
