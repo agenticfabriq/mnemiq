@@ -160,6 +160,9 @@ PSEUDO_FIELDS = [
      "JSON_VALUE(c.payload, '$.ROWID')"),
     ("SELECT c.payload.rowid FROM claim c", "JSON_VALUE(c.payload, '$.rowid')"),   # ORA-03050
     ("SELECT c.payload.rownum FROM claim c", "JSON_VALUE(c.payload, '$.rownum')"),  # ORA-03050
+    # The name inside the path: the field read is the last step, so the advice reads that.
+    ("SELECT c.payload.a.rowid.b FROM claim c", "JSON_VALUE(c.payload, '$.a.rowid.b')"),
+    ('SELECT c.payload."ROWID".x FROM claim c', "JSON_VALUE(c.payload, '$.ROWID.x')"),
 ]
 
 

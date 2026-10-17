@@ -78,6 +78,10 @@ def _pseudo_column(ast: exp.Expression, dialect: str | None) -> Refusal | None:
 
 def _pseudo_field_refusal(field: exp.Dot, pseudo: str) -> Refusal:
     """A field named as a pseudo-column, refused saying to read it with JSON_VALUE (M165)."""
+    name = field.expression.name
+    # The path the statement read, which may go on past the name: `c.payload.a.rowid.b` is `b`.
+    while isinstance(field.parent, exp.Dot) and field.parent.this is field:
+        field = field.parent
     path, node = [], field
     while isinstance(node, exp.Dot) and isinstance(node.expression, exp.Identifier):
         path.insert(0, node.expression.name)
@@ -88,7 +92,6 @@ def _pseudo_field_refusal(field: exp.Dot, pseudo: str) -> Refusal:
     if (isinstance(node, exp.Column) and node.table and not node.args.get("db")
             and all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", step) for step in path)):
         read = f"JSON_VALUE({node.sql(dialect='oracle')}, '$.{'.'.join(path)}')"
-    name = field.expression.name
     return Refusal(
         code=RefusalCode.UNKNOWN_COLUMN,
         message=(f"{name!r} names a field here, and Oracle can read that name as its {pseudo} "
