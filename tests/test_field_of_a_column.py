@@ -50,8 +50,10 @@ def con():
                 "secret STRUCT(status VARCHAR, detail STRUCT(code VARCHAR)))")
     con.execute("INSERT INTO claim VALUES (1, 5, {'status': 'ssn-123', 'detail': {'code': 'k-9'}}), "
                 "(20, 6, {'status': 'ssn-456', 'detail': {'code': 'k-8'}})")
-    con.execute("CREATE TABLE other (id INT, status VARCHAR)")
-    con.execute("INSERT INTO other VALUES (1, 'other-status')")
+    con.execute("CREATE TABLE other (id INT, status VARCHAR, detail STRUCT(code VARCHAR))")
+    con.execute("INSERT INTO other VALUES (1, 'other-status', {'code': 'other-code'})")
+    con.execute("CREATE TABLE plain (id INT)")
+    con.execute("INSERT INTO plain VALUES (1)")
     return con
 
 
@@ -209,11 +211,13 @@ def test_a_schema_named_like_a_source_alias_is_ambiguous_too(sql):
     assert fields_as_members(sqlglot.parse_one("SELECT s.claim.id FROM s.claim"), "duckdb") is None
 
 
-def test_two_parts_read_the_source_s_column(con):
+@pytest.mark.parametrize("visible", [HIDDEN, GRANTED], ids=["hidden", "granted"])
+def test_two_parts_read_the_source_s_column(con, visible):
     # `secret.status` with a source `secret` is that source's column: DuckDB and Oracle return its
-    # 1 (measured), so two parts are left as they are.
+    # 1 (measured), so two parts are left as they are -- with `claim.secret` in the same scope too,
+    # since there the source of that name binds first.
     sql = "SELECT secret.status FROM claim CROSS JOIN (SELECT 1 AS status) secret"
-    verdict = decide(sql, {**HIDDEN, **OTHER}, dialect="duckdb", target="duckdb", policy=None)
+    verdict = decide(sql, {**visible, **OTHER}, dialect="duckdb", target="duckdb", policy=None)
     assert isinstance(verdict, Approved) and con.execute(verdict.target_sql).fetchall() == [(1,), (1,)]
 
 
@@ -240,6 +244,96 @@ def test_a_write_reads_a_field_as_its_column_too():
                 "(SELECT 1 FROM other secret WHERE c.secret.status = 'x')"):
         ambiguous = write(sql, {**GRANTED, **OTHER})
         assert isinstance(ambiguous, Refusal) and "two ways" in ambiguous.message, (sql, ambiguous)
+
+
+# M167: DuckDB binds a qualifier scope by scope, a source of that name and then a column of that
+# name among the scope's sources, before it looks outward. So a qualifier naming an outer source
+# reads a nearer column of that name where one exists (measured below), and Oracle reads the outer
+# source (measured live below). The source set also held every CTE a scope could see, not only
+# those it selects.
+SCOPES = {**GRANTED, "other": {"id", "status", "detail"}, "plain": {"id"}}
+NEARER = [
+    "SELECT (SELECT secret.status FROM claim WHERE id = 1) FROM other secret",
+    "SELECT (SELECT secret.detail.code FROM claim WHERE id = 1) FROM other secret",
+    "SELECT (SELECT (SELECT secret.status FROM plain) FROM claim WHERE id = 1) FROM other secret",
+    "WITH secret AS (SELECT id, status FROM other) "
+    "SELECT (SELECT secret.status FROM claim WHERE id = 1) FROM secret",
+    "SELECT id FROM other secret WHERE EXISTS (SELECT 1 FROM claim WHERE secret.status LIKE 'ssn%')",
+]
+UNSELECTED = "WITH secret AS (SELECT status FROM other) SELECT secret.status FROM claim"
+
+
+def test_the_premise_duckdb_reads_the_nearer_column(con):
+    for sql, read in zip(NEARER[:-1], ["ssn-123", "k-9", "ssn-123", "ssn-123"]):
+        assert con.execute(sql).fetchall() == [(read,)], sql
+    assert con.execute(NEARER[-1]).fetchall() == [(1,)]  # the EXISTS read claim's field
+    assert sorted(con.execute(UNSELECTED).fetchall()) == [("ssn-123",), ("ssn-456",)]
+
+
+@pytest.mark.parametrize("sql", NEARER)
+@pytest.mark.parametrize("policy", [DENIED, MASKED, None], ids=["denied", "masked", "granted"])
+def test_a_qualifier_a_nearer_column_shares_is_refused_as_ambiguous(sql, policy):
+    verdict = decide(sql, SCOPES, dialect="duckdb", target="duckdb", policy=policy)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    assert verdict.repairable and "two ways" in verdict.message and verdict.subject == "secret"
+
+
+@pytest.mark.parametrize("visible, policy, code", WITHHELD, ids=["hidden", "denied", "masked"])
+def test_a_cte_no_from_selects_is_no_source(visible, policy, code):
+    verdict = decide(UNSELECTED, {**visible, **OTHER}, dialect="duckdb", target="duckdb",
+                     policy=policy)
+    assert isinstance(verdict, Refusal) and verdict.code is code and verdict.subject == "secret"
+
+
+def test_a_nearer_column_is_known_from_a_subquery_s_projection_and_from_the_policy():
+    derived = "SELECT (SELECT secret.status FROM (SELECT secret FROM claim) d) FROM other secret"
+    verdict = decide(derived, SCOPES, dialect="duckdb", target="duckdb")
+    assert isinstance(verdict, Refusal) and "two ways" in verdict.message, verdict
+    # `secret` left out of the grant, and known from the policy: its schema, or what it denies.
+    told_by_policy = {**SCOPES, "claim": {"id", "amount"}}
+    for policy in (DENIED, AccessPolicy(denied={("claim", "secret")}),
+                   AccessPolicy(row_filters={"claim": "id <= 10"}, policy_schema=GRANTED)):
+        verdict = decide(NEARER[0], told_by_policy, dialect="duckdb", target="duckdb",
+                         policy=policy)
+        assert isinstance(verdict, Refusal) and "two ways" in verdict.message, (policy, verdict)
+
+
+def test_a_scope_whose_sources_share_a_name_is_refused(con):
+    # DuckDB runs it, and sqlglot cannot say which source a qualifier there names.
+    sql = "SELECT 1 FROM claim c, (SELECT 1) c"
+    assert con.execute(sql).fetchall()
+    verdict = decide(sql, SCOPES, dialect="duckdb", target="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNMODELLED_SOURCE, verdict
+    assert verdict.repairable
+
+
+def test_a_statement_with_no_scopes_counts_no_unselected_cte_as_a_source():
+    # Such a write is refused elsewhere (unscoped_cte); the fallback reads it right regardless.
+    tree = sqlglot.parse_one("WITH secret AS (SELECT status FROM other) "
+                             "UPDATE claim SET amount = 1 WHERE secret.status = 'x'", read="duckdb")
+    assert fields_as_members(tree, "duckdb") is None and tree.find(exp.Dot) is not None, tree
+
+
+def test_an_outer_qualifier_no_nearer_column_shares_reads_the_outer_source(con):
+    outer = decide("SELECT (SELECT secret.status FROM plain) FROM other secret", SCOPES,
+                   dialect="duckdb", target="duckdb", policy=DENIED)
+    assert isinstance(outer, Approved) and con.execute(outer.target_sql).fetchall() == [
+        ("other-status",)]
+    correlated = "SELECT o.id FROM claim o WHERE EXISTS (SELECT 1 FROM claim i WHERE i.id = o.id)"
+    assert isinstance(decide(correlated, SCOPES, dialect="duckdb", target="duckdb"), Approved)
+
+
+def test_on_oracle_the_outer_source_is_read_so_it_is_approved():
+    verdict = decide(NEARER[0], SCOPES, dialect="oracle", target="oracle", policy=DENIED)
+    assert isinstance(verdict, Approved), verdict
+
+
+def test_a_write_s_subquery_binds_the_nearer_column_too():
+    grants = GrantSet(frozenset({"claim", "other"}), writable=frozenset({"other"}))
+    verdict = decide_write("UPDATE other secret SET id = 2 WHERE EXISTS "
+                           "(SELECT 1 FROM claim WHERE secret.status = 'x')", SCOPES, grants,
+                           policy=DENIED, dialect="duckdb", target="duckdb", writes_enabled=True)
+    assert isinstance(verdict, Refusal) and "two ways" in verdict.message, verdict
 
 
 DSN = os.environ.get("MNEMIQ_ORACLE_TEST_DSN")
@@ -316,6 +410,40 @@ def test_on_oracle_a_colliding_reference_reads_the_field_and_is_refused():
         assert run(sql) == [("ssn-123",)]  # the premise: the field, not `secret`'s own column
         verdict = decide(sql, {"claim": {"id"}, **OTHER}, dialect="oracle", target="oracle")
         assert isinstance(verdict, Refusal) and "two ways" in verdict.message, verdict
+    finally:
+        try:
+            for name in (table, other):
+                cur.execute(f"DROP TABLE {name} PURGE")
+        finally:
+            con.close()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not DSN, reason="set MNEMIQ_ORACLE_TEST_DSN to run against Oracle")
+def test_on_oracle_a_qualifier_reads_the_outer_source_before_a_nearer_column():
+    oracledb = pytest.importorskip("oracledb")
+    con = oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
+                           password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"), dsn=DSN)
+    cur = con.cursor()
+    table, other = "m167_bind_claim", "m167_bind_other"
+
+    def run(sql):
+        sql = sql.replace("FROM claim", f"FROM {table}").replace("FROM other", f"FROM {other}")
+        return cur.execute(sql).fetchall()
+
+    try:
+        for name in (table, other):
+            try:
+                cur.execute(f"DROP TABLE {name} PURGE")
+            except oracledb.DatabaseError:
+                pass
+        cur.execute(f"CREATE TABLE {table} (id NUMBER, secret JSON) TABLESPACE users")
+        cur.execute(f"""INSERT INTO {table} VALUES (1, JSON('{{"status": "ssn-123"}}'))""")
+        cur.execute(f"CREATE TABLE {other} (id NUMBER, status VARCHAR2(20))")
+        cur.execute(f"INSERT INTO {other} VALUES (1, 'other-status')")
+        assert run(NEARER[0]) == [("other-status",)]  # the premise: the outer source's column
+        verdict = decide(NEARER[0], SCOPES, dialect="oracle", target="oracle", policy=DENIED)
+        assert run(verdict.target_sql) == [("other-status",)]
     finally:
         try:
             for name in (table, other):
