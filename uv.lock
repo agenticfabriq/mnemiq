@@ -753,6 +753,7 @@ source = { editable = "." }
 dependencies = [
     { name = "cachetools" },
     { name = "duckdb" },
+    { name = "httpx" },
     { name = "mcp" },
     { name = "openai" },
     { name = "psycopg", extra = ["binary"] },
@@ -770,7 +771,6 @@ databricks = [
 ]
 dev = [
     { name = "fastapi" },
-    { name = "httpx" },
     { name = "oracledb" },
     { name = "pytest" },
     { name = "ruff" },
@@ -812,7 +812,7 @@ requires-dist = [
     { name = "duckdb", specifier = ">=1.2" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.115" },
     { name = "fastapi", marker = "extra == 'server'", specifier = ">=0.115" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "mcp", specifier = ">=1.28,<2.4" },
     { name = "openai", specifier = ">=1.40" },
     { name = "oracledb", marker = "extra == 'dev'", specifier = ">=2" },
