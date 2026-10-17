@@ -5,7 +5,8 @@ the `dev` extra. `openai` brought it in until openai 3 dropped it; from then a p
 import its own model client. Nothing in the suite could see it, because the dev venv installs `httpx` for the test
 client, so this reads the source and pyproject.toml instead of importing anything.
 
-Every import that runs when the module loads counts, including one under a module-level `if`, `with` or class body.
+Every import that runs when the module loads counts, including one nested under a module-level `if`, `with`, loop,
+`try`, `match` or class body.
 Exempt by design: an import inside a function (lazy), in the body of a `try` that catches ImportError (guarded), or
 under `if TYPE_CHECKING:` (never runs). A module that only an extra serves is named in EXTRA_MODULES.
 """
@@ -95,11 +96,15 @@ def test_the_rule_sees_a_load_time_import(tmp_path):
         "if": "if True:\n    import m_if\n",
         "else": "if False:\n    pass\nelse:\n    import m_else\n",
         "try body": "try:\n    import m_try\nfinally:\n    pass\n",
+        "finally": "try:\n    pass\nfinally:\n    import m_finally\n",
+        "try else": "try:\n    pass\nexcept ValueError:\n    pass\nelse:\n    import m_tryelse\n",
         "handler": "try:\n    pass\nexcept ValueError:\n    import m_handler\n",
         "try*": "try:\n    import m_trystar\nexcept* ValueError:\n    pass\n",
         "with": "with x:\n    import m_with\n",
         "for": "for i in x:\n    import m_for\n",
+        "for else": "for i in x:\n    pass\nelse:\n    import m_forelse\n",
         "while": "while x:\n    import m_while\n",
+        "while else": "while x:\n    pass\nelse:\n    import m_whileelse\n",
         "class": "class C:\n    import m_class\n",
         "match": "match x:\n    case 1:\n        import m_match\n",
     }
