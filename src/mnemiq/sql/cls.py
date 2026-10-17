@@ -87,12 +87,14 @@ def check_cls(ast: exp.Expression, policy: AccessPolicy,
                 subject=name,
             )
         if any(policy.masks(t, name) for t in cands) and not _is_bare_projection(column):
-            return Refusal(
-                code=RefusalCode.MASKED_COLUMN_IN_PREDICATE,
-                message=(
-                    f"{name!r} is masked for you; it may only be selected, not used in a "
-                    "filter, join, grouping, ordering, or aggregate."
-                ),
-                subject=name,
-            )
+            if isinstance(column.parent, exp.Dot):
+                # A field of it (M165): the mask replaces the whole value, so no field of the
+                # value the caller may not see is readable either.
+                message = (f"{name!r} is masked for you, so its fields cannot be read either. "
+                           "Leave them out.")
+            else:
+                message = (f"{name!r} is masked for you; it may only be selected, not used in a "
+                           "filter, join, grouping, ordering, or aggregate.")
+            return Refusal(code=RefusalCode.MASKED_COLUMN_IN_PREDICATE, message=message,
+                           subject=name)
     return None

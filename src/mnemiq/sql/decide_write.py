@@ -21,7 +21,7 @@ from mnemiq.sql.cls import check_cls
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables, check_policy_target
+from mnemiq.sql.scope import base_tables, check_policy_target, fields_as_members
 from mnemiq.sql.rls import apply_row_filters_to_write, check_filter_targets, unplaceable_policy
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import check_views
@@ -328,6 +328,7 @@ def decide_write(
     shaped = check_write_shape(sql, dialect=dialect)
     if isinstance(shaped, Refusal):
         return shaped
+    fields_as_members(shaped, target)  # M165, as on the read side
     # M150, as on the read side: no policy is applied for an engine whose CTE binding it misreads.
     unsupported = check_policy_target(shaped, policy, target)
     if unsupported is not None:
