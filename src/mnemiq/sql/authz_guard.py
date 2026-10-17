@@ -88,8 +88,10 @@ def _pseudo_field_refusal(field: exp.Dot, pseudo: str) -> Refusal:
         node = node.this
     read = "JSON_VALUE on the column, with a path naming the field"
     # A path is written out only for a column behind an alias, the one form Oracle reads a field
-    # through, and only with plain names, which need no quoting in the path.
+    # through, only with plain names, which need no quoting in the path, and only where the path
+    # ends: an array step after it (`x[0]`) is not one this writes.
     if (isinstance(node, exp.Column) and node.table and not node.args.get("db")
+            and not isinstance(field.parent, exp.Bracket)
             and all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", step) for step in path)):
         read = f"JSON_VALUE({node.sql(dialect='oracle')}, '$.{'.'.join(path)}')"
     return Refusal(

@@ -177,6 +177,7 @@ def test_a_field_named_as_a_pseudo_column_is_refused_saying_how_to_read_it(sql, 
 @pytest.mark.parametrize("sql", [
     'SELECT x.y.z.w."ROWID" FROM claim c',         # led by no alias: no field on Oracle
     'SELECT c.payload."a b"."ROWID" FROM claim c',  # a key the path would have to quote
+    "SELECT c.payload.rowid.x[0] FROM claim c",     # an array step after it
 ])
 def test_a_field_whose_path_is_not_plain_is_refused_without_one(sql):
     verdict = decide(sql, JSON, dialect="oracle", target="oracle")
