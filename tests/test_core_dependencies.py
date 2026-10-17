@@ -5,8 +5,9 @@ the `dev` extra. `openai` brought it in until openai 3 dropped it; from then a p
 import its own model client. Nothing in the suite could see it, because the dev venv installs `httpx` for the test
 client, so this reads the source and pyproject.toml instead of importing anything.
 
-An import inside a function, a `try`, or an `if TYPE_CHECKING:` block is lazy or guarded by design, and the extras
-that serve one are their own business. A module that only an extra serves is named in EXTRA_MODULES.
+Every import that runs when the module loads counts, including one under a module-level `if`, `with` or class body.
+Exempt by design: an import inside a function (lazy), in the body of a `try` that catches ImportError (guarded), or
+under `if TYPE_CHECKING:` (never runs). A module that only an extra serves is named in EXTRA_MODULES.
 """
 
 from __future__ import annotations
@@ -28,11 +29,38 @@ def _name(requirement: str) -> str:
     return re.sub(r"[-_.]+", "-", re.split(r"[\[<>=!~ ;]", requirement, maxsplit=1)[0]).lower()
 
 
+def _is_type_checking(test: ast.expr) -> bool:
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING")
+
+
+def _catches_import_error(handler: ast.ExceptHandler) -> bool:
+    names = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+    return any(isinstance(n, ast.Name) and n.id in ("ImportError", "ModuleNotFoundError") for n in names)
+
+
+def _run_at_load(body: list[ast.stmt]):
+    """The statements that run when the module loads: into ifs, withs, loops, trys and class bodies, never functions."""
+    for node in body:
+        yield node
+        if isinstance(node, ast.If):
+            if not _is_type_checking(node.test):
+                yield from _run_at_load(node.body)
+            yield from _run_at_load(node.orelse)
+        elif isinstance(node, ast.Try):
+            if not any(_catches_import_error(h) for h in node.handlers):
+                yield from _run_at_load(node.body)
+            for handler in node.handlers:
+                yield from _run_at_load(handler.body)
+            yield from _run_at_load(node.orelse + node.finalbody)
+        elif isinstance(node, (ast.With, ast.For, ast.While, ast.ClassDef)):
+            yield from _run_at_load(node.body + getattr(node, "orelse", []))
+
+
 def _load_time_imports(path: Path) -> set[str]:
-    """Top-level names of third-party modules imported by a statement directly in the module body."""
-    tree = ast.parse(path.read_text())
+    """Top-level names of the third-party modules imported by a statement that runs when the module loads."""
     roots = set()
-    for node in tree.body:
+    for node in _run_at_load(ast.parse(path.read_text()).body):
         if isinstance(node, ast.Import):
             roots |= {alias.name.split(".")[0] for alias in node.names}
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
@@ -57,9 +85,12 @@ def test_every_load_time_import_is_a_declared_dependency():
 
 
 def test_the_rule_sees_a_load_time_import(tmp_path):
-    """The reader finds an import in the module body and leaves lazy and guarded ones alone."""
+    """The reader finds every import that runs at load, nested ones too, and leaves lazy and guarded ones alone."""
     source = tmp_path / "m.py"
     source.write_text("import httpx\nfrom sqlglot import exp\nimport os\n"
+                      "if True:\n    import fastapi\n"
+                      "try:\n    import pyarrow\nfinally:\n    pass\n"
                       "try:\n    import oracledb\nexcept ImportError:\n    oracledb = None\n"
+                      "if TYPE_CHECKING:\n    import duckdb\n"
                       "def f():\n    import rdflib\n")
-    assert _load_time_imports(source) == {"httpx", "sqlglot"}
+    assert _load_time_imports(source) == {"httpx", "sqlglot", "fastapi", "pyarrow"}
