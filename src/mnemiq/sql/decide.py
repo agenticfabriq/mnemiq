@@ -93,7 +93,9 @@ def decide(
         return shaped
     # M165: `c.secret.status` reads a field of `secret`, and every check below reads columns, so
     # the reference is made a field access over `secret` before any of them runs.
-    fields_as_members(shaped, target)
+    ambiguous = fields_as_members(shaped, target)
+    if ambiguous is not None:
+        return ambiguous
     # M150: before any policy is applied, refuse an engine whose CTE binding the rewrite misreads.
     unsupported = check_policy_target(shaped, policy, target)
     if unsupported is not None:

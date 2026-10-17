@@ -50,6 +50,8 @@ def con():
                 "secret STRUCT(status VARCHAR, detail STRUCT(code VARCHAR)))")
     con.execute("INSERT INTO claim VALUES (1, 5, {'status': 'ssn-123', 'detail': {'code': 'k-9'}}), "
                 "(20, 6, {'status': 'ssn-456', 'detail': {'code': 'k-8'}})")
+    con.execute("CREATE TABLE other (id INT, status VARCHAR)")
+    con.execute("INSERT INTO other VALUES (1, 'other-status')")
     return con
 
 
@@ -157,6 +159,62 @@ def test_a_reference_qualified_by_a_source_is_left_as_it_is(sql, dialect):
     assert tree.find(exp.Dot) is None and tree.sql(dialect=dialect) == before
 
 
+# Codex's review of #162: a source named like the column. `c.secret.status` was left a column of
+# the source `secret`, while both engines read it as a field of `c.secret` (measured below), so a
+# withheld `secret` was read past every rule. A name does not settle it the other way either:
+# DuckDB reads `s.claim.id` as schema `s`, table `claim`, with a source aliased `s` beside it, and
+# Oracle calls that ambiguous (ORA-00918). So a reference led by a source, with a source named
+# further along it too, is refused as ambiguous, whatever is granted.
+OTHER = {"other": {"id", "status"}}
+COLLIDING = [
+    "SELECT c.secret.status FROM claim c CROSS JOIN (SELECT 1 AS status) secret",
+    "SELECT c.secret.status FROM claim c CROSS JOIN other secret",
+    "SELECT claim.secret.status FROM claim CROSS JOIN (SELECT 1 AS status) secret",
+    "SELECT c.secret.status FROM claim c CROSS JOIN (SELECT 1 AS status) SECRET",
+    "WITH secret AS (SELECT 1 AS status) SELECT c.secret.status FROM claim c CROSS JOIN secret",
+    "SELECT (SELECT c.secret.status FROM (SELECT 1 AS status) secret) FROM claim c",
+    "SELECT id FROM claim c CROSS JOIN (SELECT 1 AS status) secret WHERE c.secret.status LIKE 'ssn%'",
+]
+
+
+def test_the_premise_duckdb_reads_a_colliding_reference_as_the_field(con):
+    for sql in COLLIDING[:-1]:
+        assert sorted(con.execute(sql).fetchall()) == [("ssn-123",), ("ssn-456",)], sql
+    assert con.execute(COLLIDING[-1]).fetchall() == [(1,), (20,)]  # the WHERE read the field
+
+
+@pytest.mark.parametrize("engine, sql", [
+    *(("duckdb", sql) for sql in COLLIDING),
+    ("oracle", "SELECT c.secret.status FROM claim c CROSS JOIN other secret"),
+    ("oracle", "WITH secret AS (SELECT id FROM other) SELECT c.secret.status FROM claim c "
+               "CROSS JOIN secret"),
+])
+@pytest.mark.parametrize("visible, policy", [(HIDDEN, None), (GRANTED, DENIED), (GRANTED, MASKED),
+                                             (GRANTED, None)],
+                         ids=["hidden", "denied", "masked", "granted"])
+def test_a_reference_two_sources_could_lead_is_refused_as_ambiguous(engine, sql, visible, policy):
+    verdict = decide(sql, {**visible, **OTHER}, dialect=engine, target=engine, policy=policy)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    assert verdict.repairable and "two ways" in verdict.message, verdict
+    assert verdict.subject == "secret", verdict
+
+
+@pytest.mark.parametrize("sql", ["SELECT s.claim.id FROM s.claim CROSS JOIN other s",
+                                 "SELECT s.claim.id FROM s.claim CROSS JOIN other S"])
+def test_a_schema_named_like_a_source_alias_is_ambiguous_too(sql):
+    refused = fields_as_members(sqlglot.parse_one(sql, read="duckdb"), "duckdb")
+    assert isinstance(refused, Refusal) and refused.subject == "claim", refused
+    assert fields_as_members(sqlglot.parse_one("SELECT s.claim.id FROM s.claim"), "duckdb") is None
+
+
+def test_two_parts_read_the_source_s_column(con):
+    # `secret.status` with a source `secret` is that source's column: DuckDB and Oracle return its
+    # 1 (measured), so two parts are left as they are.
+    sql = "SELECT secret.status FROM claim CROSS JOIN (SELECT 1 AS status) secret"
+    verdict = decide(sql, {**HIDDEN, **OTHER}, dialect="duckdb", target="duckdb", policy=None)
+    assert isinstance(verdict, Approved) and con.execute(verdict.target_sql).fetchall() == [(1,), (1,)]
+
+
 def test_a_write_reads_a_field_as_its_column_too():
     grants = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}))
 
@@ -174,6 +232,12 @@ def test_a_write_reads_a_field_as_its_column_too():
     upsert = ("INSERT INTO claim (id, amount) VALUES (1, 2) ON CONFLICT (id) DO UPDATE "
               "SET amount = excluded.amount")
     assert isinstance(write(upsert, HIDDEN), ApprovedWrite)
+    # A source named like the column, as on the read side: ambiguous, refused.
+    for sql in ("UPDATE claim c SET amount = 1 FROM other secret WHERE c.secret.status = 'x'",
+                "UPDATE claim c SET amount = 1 WHERE EXISTS "
+                "(SELECT 1 FROM other secret WHERE c.secret.status = 'x')"):
+        ambiguous = write(sql, {**GRANTED, **OTHER})
+        assert isinstance(ambiguous, Refusal) and "two ways" in ambiguous.message, (sql, ambiguous)
 
 
 DSN = os.environ.get("MNEMIQ_ORACLE_TEST_DSN")
@@ -219,5 +283,40 @@ def test_on_oracle_a_json_column_s_field_is_read_and_now_checked_as_the_column()
     finally:
         try:
             cur.execute(f"DROP TABLE {table} PURGE")
+        finally:
+            con.close()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(not DSN, reason="set MNEMIQ_ORACLE_TEST_DSN to run against Oracle")
+def test_on_oracle_a_colliding_reference_reads_the_field_and_is_refused():
+    oracledb = pytest.importorskip("oracledb")
+    con = oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
+                           password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"), dsn=DSN)
+    cur = con.cursor()
+    table, other = "m165_collide_claim", "m165_collide_other"
+
+    def run(sql):
+        sql = sql.replace("FROM claim", f"FROM {table}").replace("JOIN other", f"JOIN {other}")
+        return sorted(cur.execute(sql).fetchall())
+
+    try:
+        for name in (table, other):
+            try:
+                cur.execute(f"DROP TABLE {name} PURGE")
+            except oracledb.DatabaseError:
+                pass
+        cur.execute(f"CREATE TABLE {table} (id NUMBER, secret JSON) TABLESPACE users")
+        cur.execute(f"""INSERT INTO {table} VALUES (1, JSON('{{"status": "ssn-123"}}'))""")
+        cur.execute(f"CREATE TABLE {other} (id NUMBER, status VARCHAR2(20))")
+        cur.execute(f"INSERT INTO {other} VALUES (1, 'other-status')")
+        sql = "SELECT c.secret.status FROM claim c CROSS JOIN other secret"
+        assert run(sql) == [("ssn-123",)]  # the premise: the field, not `secret`'s own column
+        verdict = decide(sql, {"claim": {"id"}, **OTHER}, dialect="oracle", target="oracle")
+        assert isinstance(verdict, Refusal) and "two ways" in verdict.message, verdict
+    finally:
+        try:
+            for name in (table, other):
+                cur.execute(f"DROP TABLE {name} PURGE")
         finally:
             con.close()

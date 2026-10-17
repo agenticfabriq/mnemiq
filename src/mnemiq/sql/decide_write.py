@@ -328,7 +328,9 @@ def decide_write(
     shaped = check_write_shape(sql, dialect=dialect)
     if isinstance(shaped, Refusal):
         return shaped
-    fields_as_members(shaped, target)  # M165, as on the read side
+    ambiguous = fields_as_members(shaped, target)  # M165, as on the read side
+    if ambiguous is not None:
+        return ambiguous
     # M150, as on the read side: no policy is applied for an engine whose CTE binding it misreads.
     unsupported = check_policy_target(shaped, policy, target)
     if unsupported is not None:

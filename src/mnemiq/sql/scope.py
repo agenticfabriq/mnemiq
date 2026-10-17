@@ -394,7 +394,7 @@ def _written_targets(ast: exp.Expression) -> list[exp.Table]:
     return found
 
 
-def fields_as_members(ast: exp.Expression, dialect: str | None = None) -> None:
+def fields_as_members(ast: exp.Expression, dialect: str | None = None):
     """Rewrite, in place, every column reference that reads a FIELD of another column into a
     field access over that column, so each column rule reads the column (M165).
 
@@ -427,6 +427,14 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None) -> None:
     one scope, the subquery's, where `scratch` is no source. A column outside every scope, and
     every column of a statement whose scopes cannot be read, is read against every table, alias,
     CTE and subquery name in the statement, with `excluded` inside an ON CONFLICT clause.
+
+    A reference led by a source with a source named further along it is refused instead, and
+    returned, since the names do not settle which one the engine reads it through (Codex's review
+    of #162). Both engines read `c.secret.status` as a field of `c.secret` with a source `secret`
+    in the query, so leaving it a column of `secret` let a withheld `secret` be read; and DuckDB
+    reads `s.claim.id` as schema `s`, table `claim`, with a source aliased `s` in the query, which
+    Oracle calls ambiguous (ORA-00918; all measured). Two parts stay the source's column: there
+    both engines read `secret.status` as the column of the source `secret`.
     """
     # Each name a source can be known by, as written -> as the engine resolves it. A scope keys
     # its sources by the written text, so this is how a key is resolved.
@@ -457,22 +465,32 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None) -> None:
                 enclosing = enclosing.parent
             for column in list(getattr(scope, "columns", ())):
                 seen.add(id(column))
-                _as_member(column, names, dialect)
+                refused = _as_member(column, names, dialect)
+                if refused is not None:
+                    return refused
     for column in list(ast.find_all(exp.Column)):
         if id(column) not in seen:
             in_upsert = column.find_ancestor(exp.OnConflict) is not None
-            _as_member(column, upsert if in_upsert else every, dialect)
+            refused = _as_member(column, upsert if in_upsert else every, dialect)
+            if refused is not None:
+                return refused
+    return None
 
 
-def _as_member(column: exp.Column, sources: set[str], dialect: str | None) -> None:
-    if not column.table or resolve_identifier(column.args["table"], dialect) in sources:
-        return
+def _as_member(column: exp.Column, sources: set[str], dialect: str | None):
+    if not column.table:
+        return None
     parts = [column.args[key] for key in ("catalog", "db", "table") if column.args.get(key)]
-    if resolve_identifier(parts[0], dialect) in sources:
+    named = [resolve_identifier(part, dialect) in sources for part in parts]
+    if named[0] and len(parts) > 1:
+        if any(named[1:]):
+            return _two_readings(column, parts[named.index(True, 1)].name, dialect)
         base = exp.Column(this=parts[1].copy(), table=parts[0].copy())  # alias.column.field
         fields = parts[2:]
+    elif named[-1]:
+        return None  # a column of the source its qualifier names
     elif (dialect or "").lower() == "oracle":
-        return  # not a field on Oracle, see `fields_as_members`
+        return None  # not a field on Oracle, see `fields_as_members`
     else:
         base = exp.Column(this=parts[0].copy())  # column.field
         fields = parts[1:]
@@ -480,6 +498,21 @@ def _as_member(column: exp.Column, sources: set[str], dialect: str | None) -> No
     for field in [*fields, column.this]:
         member = exp.Dot(this=member, expression=field.copy())
     column.replace(member)
+    return None
+
+
+def _two_readings(column: exp.Column, other: str, dialect: str | None):
+    """A reference led by a source with another source named further along it, refused (Codex's
+    review of #162): which one the engine reads it through is not settled by the names."""
+    from mnemiq.sql.verdict import Refusal, RefusalCode
+
+    return Refusal(
+        code=RefusalCode.UNKNOWN_COLUMN,
+        message=(f"{column.sql(dialect=dialect)!r} can be read two ways here: as a field of a column of "
+                 f"{column.parts[0].name!r}, or through {other!r}, which this query also names. "
+                 f"Give {other!r} another alias, so that it reads one way."),
+        subject=other,
+    )
 
 
 def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, str] | None:
