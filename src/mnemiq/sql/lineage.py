@@ -69,7 +69,22 @@ class Lineage:
 # sqlglot leaves `Anonymous`. Deliberately short: an unlisted function is UNRESOLVED, so the list
 # growing is a decision someone makes rather than a default. A same-named UDF shadows an entry
 # here, which is the same registry problem the strict xfail pins from the other side.
-_PURE = frozenset({"now", "age", "current_timestamp", "current_date", "current_time", "today"})
+#
+# For Oracle that decision is made once, as a standing rule (the owner, 2026-10-15, M157): a
+# builtin joins when Oracle's SQL Language Reference confirms it computes from its arguments
+# alone, without a decision per name. `trunc` is the first: sqlglot leaves it `Anonymous` in its
+# one-argument Oracle form, and the reference gives TRUNC (datetime) and TRUNC (number) as
+# truncating the value passed. Outside the rule, and so not added: a function returning session
+# state that application code sets (`sys_context`, `userenv`), and the time-zone group (`from_tz`,
+# `tz_offset`, `new_time`, `sys_extract_utc`), which reads the database's time-zone data.
+#
+# The set is one for every dialect, checked by name alone, so the rule's check covers only Oracle:
+# a name joining under it is spared in any dialect where sqlglot leaves it untyped, and must be a
+# builtin there too. `trunc` passes: sqlglot 30.12 types it in duckdb, postgres, sqlite, mysql,
+# snowflake, bigquery, tsql and the default dialect; of the nine probed, only Oracle leaves it
+# untyped.
+_PURE = frozenset({"now", "age", "current_timestamp", "current_date", "current_time", "today",
+                   "trunc"})
 
 
 def _safe_label(label: str, fallback: str) -> str:
@@ -154,7 +169,7 @@ def _add(out: list[str], value: str) -> None:
         out.append(admitted)
 
 
-def _functions_in(ast) -> tuple[list[str], bool]:
+def _functions_in(ast, inventory=None) -> tuple[list[str], bool]:
     """Callables this engine cannot resolve to a source identity, and whether ANY call was seen.
 
     Two returns because the two facts are different. A name is worth RECORDING when it is not a
@@ -168,6 +183,14 @@ def _functions_in(ast) -> tuple[list[str], bool]:
     unaccounted object, which would be noise. The same reasoning that stopped a view's lexical
     match from certifying identity applies here: the engine cannot tell a builtin from a
     same-named UDF, and a marker must not claim what it cannot establish.
+
+    And it spares a name only where `inventory` does not say the source may define it (M157,
+    Codex's review of #157): a source reporting its own `trunc`, or a narrow answer never asked
+    about it, makes the name the suspect, and the record keeps it. An inventory never asked, or
+    one that could not answer, spares it on purpose: it names no function at all, so the
+    `function-inventory-*` reason already says every call is unconfirmed, and naming each listed
+    builtin beside it would be the noise this list exists to keep out. `inventory=None`, which
+    only a direct caller passes (`lineage_for` supplies `never_asked()`), spares it as well.
 
     A QUOTED callable name is never admitted. `node.name` discards the delimiters, so a payload
     that already matches the identifier grammar -- `"sk_live_abc123"()` -- passed the guard
@@ -207,7 +230,8 @@ def _functions_in(ast) -> tuple[list[str], bool]:
             _add(out, "unnameable-function")
             continue
 
-        if not qualified and name in _PURE:
+        if not qualified and name in _PURE and not (
+                inventory is not None and inventory.defines(name)):
             continue
 
         label = name
@@ -374,7 +398,7 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=No
                 # correct and the rename bought nothing, since the collected keys were only ever
                 # read for truthiness.
                 reaches_past_the_list = True
-        body_fns, body_saw_call = _functions_in(parsed)
+        body_fns, body_saw_call = _functions_in(parsed, inventory)
         for fn in body_fns:
             _add(unclassified, fn)
         # A body's own text is in hand, so its calls can be named. `in_view_body` because a
@@ -397,7 +421,7 @@ def lineage_for(ast, tables, views, *, scope_resolved: bool = True, functions=No
         _add(unclassified, f"unmodelled-source:{shape.lower()}")
 
     # UNCLASSIFIABLE reach: a function whose body this engine cannot see.
-    caller_fns, caller_saw_call = _functions_in(ast)
+    caller_fns, caller_saw_call = _functions_in(ast, inventory)
     for fn in caller_fns:
         _add(unclassified, fn)
     if caller_saw_call and not calls_are_confirmable(inventory, in_view_body=False,
