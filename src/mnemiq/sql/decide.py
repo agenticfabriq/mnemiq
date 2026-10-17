@@ -27,7 +27,8 @@ from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove
 from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.lineage import lineage_for
-from mnemiq.sql.scope import base_tables, check_policy_target, fields_as_members, scope_resolved
+from mnemiq.sql.scope import (base_tables, check_policy_target, fields_as_members, known_columns,
+                              scope_resolved)
 from mnemiq.sql.rls import apply_row_and_mask, check_filter_targets, unplaceable_policy
 from mnemiq.sql.values_check import check_values
 from mnemiq.sql.views import check_views
@@ -93,7 +94,7 @@ def decide(
         return shaped
     # M165: `c.secret.status` reads a field of `secret`, and every check below reads columns, so
     # the reference is made a field access over `secret` before any of them runs.
-    ambiguous = fields_as_members(shaped, target)
+    ambiguous = fields_as_members(shaped, target, known_columns(visible, policy))
     if ambiguous is not None:
         return ambiguous
     # M150: before any policy is applied, refuse an engine whose CTE binding the rewrite misreads.
