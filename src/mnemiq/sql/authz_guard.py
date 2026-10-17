@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
@@ -51,17 +53,53 @@ def _pseudo_column(ast: exp.Expression, dialect: str | None) -> Refusal | None:
     one as written, and reads ROWID wherever the name comes out as ROWID -- `"ROWID"` returns row
     addresses too, and no table can have that column (ORA-03050). ROWNUM it reads unquoted only:
     quoted, `"ROWNUM"` is an ordinary name a table may have, decided below like any other.
+
+    A field too, by the same names (M165). `c.payload."ROWID"` reaches here as a field of
+    `payload`, and Oracle reads that field as ROWID under the bound the row cap writes: measured on
+    23, `SELECT c.payload."ROWID" FROM claim c` returns the key's value, and the row addresses
+    with `FETCH FIRST n ROWS ONLY`. With an alias, or a deeper path, it returns the key. Those
+    are refused all the same, so that one rule covers every spelling: telling which ones Oracle
+    reads as ROWID would mean modelling how it names the columns of its FETCH FIRST rewrite.
+    `JSON_VALUE` reads the key under the bound, so the refusal says to use it.
     """
     if (dialect or "").lower() != "oracle":
         return None
-    for column in ast.find_all(exp.Column):
-        identifier = column.this
+    for node in ast.find_all(exp.Column, exp.Dot):
+        identifier = node.this if isinstance(node, exp.Column) else node.expression
         if not isinstance(identifier, exp.Identifier):
             continue
         folded = identifier.name if identifier.quoted else identifier.name.upper()
         if folded == "ROWID" or (folded == "ROWNUM" and not identifier.quoted):
-            return _pseudo_column_refusal(column.name)
+            if isinstance(node, exp.Dot):
+                return _pseudo_field_refusal(node, folded)
+            return _pseudo_column_refusal(node.name)
     return None
+
+
+def _pseudo_field_refusal(field: exp.Dot, pseudo: str) -> Refusal:
+    """A field named as a pseudo-column, refused saying to read it with JSON_VALUE (M165)."""
+    name = field.expression.name
+    # The path the statement read, which may go on past the name: `c.payload.a.rowid.b` is `b`.
+    while isinstance(field.parent, exp.Dot) and field.parent.this is field:
+        field = field.parent
+    path, node = [], field
+    while isinstance(node, exp.Dot) and isinstance(node.expression, exp.Identifier):
+        path.insert(0, node.expression.name)
+        node = node.this
+    read = "JSON_VALUE on the column, with a path naming the field"
+    # A path is written out only for a column behind an alias, the one form Oracle reads a field
+    # through, only with plain names, which need no quoting in the path, and only where the path
+    # ends: an array step after it (`x[0]`) is not one this writes.
+    if (isinstance(node, exp.Column) and node.table and not node.args.get("db")
+            and not isinstance(field.parent, exp.Bracket)
+            and all(re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", step) for step in path)):
+        read = f"JSON_VALUE({node.sql(dialect='oracle')}, '$.{'.'.join(path)}')"
+    return Refusal(
+        code=RefusalCode.UNKNOWN_COLUMN,
+        message=(f"{name!r} names a field here, and Oracle can read that name as its {pseudo} "
+                 f"pseudo-column instead. Read the field with {read}."),
+        subject=name,
+    )
 
 
 def _pseudo_column_refusal(name: str) -> Refusal:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlglot import exp
 from sqlglot.optimizer.scope import build_scope
 
-from mnemiq.sql.identifiers import resolve_identifier, resolve_name
+from mnemiq.sql.identifiers import resolve, resolve_identifier, resolve_name
 from mnemiq.sql.qualify import object_key
 
 
@@ -392,6 +392,127 @@ def _written_targets(ast: exp.Expression) -> list[exp.Table]:
         if isinstance(node, exp.Table):
             found.append(node)
     return found
+
+
+def fields_as_members(ast: exp.Expression, dialect: str | None = None):
+    """Rewrite, in place, every column reference that reads a FIELD of another column into a
+    field access over that column, so each column rule reads the column (M165).
+
+    sqlglot reads a dotted name left to right as catalog, db, table and column, so
+    `c.secret.status` is `Column(this=status, table=secret, db=c)` and `secret.status` is
+    `Column(this=status, table=secret)`: the qualifier is the column and the name is its field.
+    Every guard then saw a column called `status` qualified by something no scope defines, which
+    `check_access` reads as a CTE or subquery and skips, and `check_cls` and the mask rewrite never
+    saw `secret` at all. Measured on main `ec0ad7d`: with `secret` a DuckDB STRUCT or JSON column,
+    or an Oracle JSON one, `SELECT c.secret.status FROM claim c` was approved and returned the
+    field whether `secret` was left out of the grant, denied or masked, as did `secret.status`
+    and a WHERE on it -- while `SELECT c.secret` was refused.
+
+    So a reference whose qualifier names no source in its scope or an enclosing one becomes what
+    sqlglot's own optimizer makes of it (`qualify_columns` turns such a column into a `Dot`):
+    `c.secret.status` -> `Dot(Column(secret, table=c), status)` where `c` is a source, and
+    `secret.status` -> `Dot(Column(secret), status)` where it is not. The base column then meets
+    every rule a column meets, and a qualifier that names neither a source nor a column is an
+    unknown column, refused, where before it was skipped. Renders to the same SQL.
+
+    Names are compared as `dialect`, the engine, resolves them, so `C.id` against `claim c` is the
+    source it names on Oracle and DuckDB alike. And on Oracle only the first form is a field:
+    Oracle reads one only after a table alias -- `secret.status` and `claim.secret.status` are
+    ORA-00904 without one, and `seq.NEXTVAL` is a sequence (all measured on 23) -- so there a
+    reference not led by a source is left as written, as it was.
+
+    Scope by scope, the enclosing scopes' sources included for a correlated reference, and a
+    write's targets in every scope: `build_scope` models the subqueries of a write, not the write,
+    so `UPDATE scratch ... WHERE EXISTS (SELECT 1 FROM claim WHERE claim.id = scratch.id)` gives
+    one scope, the subquery's, where `scratch` is no source. A column outside every scope, and
+    every column of a statement whose scopes cannot be read, is read against every table, alias,
+    CTE and subquery name in the statement, with `excluded` inside an ON CONFLICT clause.
+
+    A reference led by a source with a source named further along it is refused instead, and
+    returned, since the names do not settle which one the engine reads it through (Codex's review
+    of #162). Both engines read `c.secret.status` as a field of `c.secret` with a source `secret`
+    in the query, so leaving it a column of `secret` let a withheld `secret` be read; and DuckDB
+    reads `s.claim.id` as schema `s`, table `claim`, with a source aliased `s` in the query, which
+    Oracle calls ambiguous (ORA-00918; all measured). Two parts stay the source's column: there
+    both engines read `secret.status` as the column of the source `secret`.
+    """
+    # Each name a source can be known by, as written -> as the engine resolves it. A scope keys
+    # its sources by the written text, so this is how a key is resolved.
+    spelled: dict[str, set[str]] = {}
+    for node in [*(a.this for a in ast.find_all(exp.TableAlias)),
+                 *(t.this for t in ast.find_all(exp.Table))]:
+        if isinstance(node, exp.Identifier) and node.name:
+            spelled.setdefault(node.name, set()).add(resolve_identifier(node, dialect))
+
+    def resolved(names) -> set[str]:
+        return {r for name in names
+                for r in spelled.get(name, {resolve(name, quoted=False, dialect=dialect)})}
+
+    every = {r for found in spelled.values() for r in found}
+    upsert = every | {resolve("excluded", quoted=False, dialect=dialect)}
+    targets = {t.alias_or_name for t in [*_target_reads(ast), *_written_targets(ast)]}
+    if isinstance(ast, exp.Merge):
+        targets |= {node.alias_or_name for node in (ast.this, ast.args.get("using")) if node}
+    targets = resolved(targets)
+    seen: set[int] = set()
+    root = _root_scope(ast)
+    if root is not None and not _unscoped_ctes(ast, root):
+        for scope in root.traverse():
+            names = set(targets)
+            enclosing = scope
+            while enclosing is not None:
+                names |= resolved(enclosing.sources)
+                enclosing = enclosing.parent
+            for column in list(getattr(scope, "columns", ())):
+                seen.add(id(column))
+                refused = _as_member(column, names, dialect)
+                if refused is not None:
+                    return refused
+    for column in list(ast.find_all(exp.Column)):
+        if id(column) not in seen:
+            in_upsert = column.find_ancestor(exp.OnConflict) is not None
+            refused = _as_member(column, upsert if in_upsert else every, dialect)
+            if refused is not None:
+                return refused
+    return None
+
+
+def _as_member(column: exp.Column, sources: set[str], dialect: str | None):
+    if not column.table:
+        return None
+    parts = [column.args[key] for key in ("catalog", "db", "table") if column.args.get(key)]
+    named = [resolve_identifier(part, dialect) in sources for part in parts]
+    if named[0] and len(parts) > 1:
+        if any(named[1:]):
+            return _two_readings(column, parts[named.index(True, 1)].name, dialect)
+        base = exp.Column(this=parts[1].copy(), table=parts[0].copy())  # alias.column.field
+        fields = parts[2:]
+    elif named[-1]:
+        return None  # a column of the source its qualifier names
+    elif (dialect or "").lower() == "oracle":
+        return None  # not a field on Oracle, see `fields_as_members`
+    else:
+        base = exp.Column(this=parts[0].copy())  # column.field
+        fields = parts[1:]
+    member: exp.Expression = base
+    for field in [*fields, column.this]:
+        member = exp.Dot(this=member, expression=field.copy())
+    column.replace(member)
+    return None
+
+
+def _two_readings(column: exp.Column, other: str, dialect: str | None):
+    """A reference led by a source with another source named further along it, refused (Codex's
+    review of #162): which one the engine reads it through is not settled by the names."""
+    from mnemiq.sql.verdict import Refusal, RefusalCode
+
+    return Refusal(
+        code=RefusalCode.UNKNOWN_COLUMN,
+        message=(f"{column.sql(dialect=dialect)!r} can be read two ways here: as a field of a column of "
+                 f"{column.parts[0].name!r}, or through {other!r}, which this query also names. "
+                 f"Give {other!r} another alias, so that it reads one way."),
+        subject=other,
+    )
 
 
 def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, str] | None:
