@@ -186,7 +186,7 @@ def test_on_oracle_rowid_reads_through_a_subquery_and_quoted_too():
                            password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"), dsn=DSN)
     cur = con.cursor()
     # A stored table: ROWID is an address in one, and an inline view over dual has none.
-    table = "m163_rowid_probe"
+    table, quoted_probe = "m163_rowid_probe", "m163_quoted_probe"
 
     def run(sql):
         return cur.execute(sql.replace("FROM claim", f"FROM {table}")).fetchall()
@@ -211,14 +211,16 @@ def test_on_oracle_rowid_reads_through_a_subquery_and_quoted_too():
             with pytest.raises(oracledb.DatabaseError, match=error):
                 run(sql)
         # Quoted: `"ROWID"` is still ROWID and no table may have it, the rest are ordinary names.
-        assert run('SELECT "ROWID" FROM claim') == run("SELECT ROWID FROM claim")
+        assert sorted(run('SELECT "ROWID" FROM claim')) == sorted(run("SELECT ROWID FROM claim"))
         with pytest.raises(oracledb.DatabaseError, match="ORA-03050"):
-            cur.execute('CREATE TABLE m163_quoted_probe ("ROWID" NUMBER)')
+            cur.execute(f'CREATE TABLE {quoted_probe} ("ROWID" NUMBER)')
         for name in ("rowid", "ROWNUM"):
             with pytest.raises(oracledb.DatabaseError, match="ORA-00904"):
                 run(f'SELECT "{name}" FROM claim')
     finally:
-        try:
-            cur.execute(f"DROP TABLE {table} PURGE")
-        finally:
-            con.close()
+        for probe in (table, quoted_probe):
+            try:
+                cur.execute(f"DROP TABLE {probe} PURGE")
+            except oracledb.DatabaseError:
+                pass  # the quoted probe exists only if Oracle accepted the column it must not
+        con.close()
