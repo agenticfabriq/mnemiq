@@ -444,9 +444,9 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None,
     it looks outward, so in `SELECT (SELECT secret.status FROM claim) FROM other secret` it reads
     `claim.secret`, not `other.status` (measured, a write's subquery too); Oracle reads the outer
     source (measured on 23), so there nothing changes. `columns` is what the decider is told each
-    table has (`known_columns`), and a subquery's or CTE's columns are its projection, a star
-    (`*` or `t.*`) read through to every source its scope selects and a set operation through
-    each branch. A scope
+    table has (`known_columns`), and a subquery's or CTE's columns are its projection: `*` read
+    through to every source its scope selects, `t.*` to `t` alone, EXCLUDE and RENAME applied
+    (DuckDB folds their names too, measured), and a set operation through each branch. A scope
     whose sources share a name is refused on every engine: sqlglot cannot say which one a
     qualifier there names, and DuckDB runs one (`FROM claim c, (SELECT 1) c`).
     """
@@ -478,14 +478,44 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None,
 
     def columns_of(source) -> set[str]:
         if isinstance(source, exp.Table):
-            return known.get(object_key(source), set())
+            return set(known.get(object_key(source), ()))  # a copy: EXCLUDE edits it per source
         if source.union_scopes:
             return set().union(*(columns_of(branch) for branch in source.union_scopes))
         found: set[str] = set()
         for select in source.expression.selects:
-            if isinstance(select, exp.Star) or isinstance(select.this, exp.Star):  # `*`, `t.*`
-                for _, inner in source.selected_sources.values():
-                    found |= columns_of(inner)
+            star = select if isinstance(select, exp.Star) else (
+                select.this if isinstance(select, exp.Column) and isinstance(select.this, exp.Star)
+                else None)
+            if star is None and isinstance(select, exp.Columns):
+                star = exp.Star()  # COLUMNS(...) picks by pattern: read as everything (M169)
+            if star is not None:
+                # `t.*` is t's columns; `*` and a `t` naming nothing are every source's (M169).
+                def named(qualifier) -> list[str]:
+                    return [name for name in source.selected_sources
+                            if not qualifier or resolved({name}) == resolved({qualifier})]
+
+                picked = named(getattr(select, "table", None)) or list(source.selected_sources)
+                exposed = {name: columns_of(source.selected_sources[name][1]) for name in picked}
+                # An EXCLUDE or RENAME item applies to the source its qualifier names, else to
+                # every source (measured: `EXCLUDE (c.secret) FROM claim c, claim k` keeps
+                # k.secret, `EXCLUDE (secret)` drops both). REPLACE keeps every name.
+                for item in star.args.get("except_") or ():
+                    column = item if isinstance(item, exp.Column) else exp.Column(this=item)
+                    for name in named(column.table):
+                        exposed.get(name, set()).discard(resolve_identifier(column.this, dialect))
+                # RENAME items (`old AS new`) all apply to the original names at once, so
+                # `RENAME (id AS secret, secret AS s2)` still exposes `secret`; one naming a column
+                # the picked source lacks is ignored, so `p.* RENAME (amount AS secret)` over
+                # plain p exposes plain's `id` alone (both measured; Codex's reviews of #165).
+                for name, columns in exposed.items():
+                    renames = [(resolve(item.this.name, quoted=False, dialect=dialect),
+                                resolve(item.alias, quoted=False, dialect=dialect))
+                               for item in star.args.get("rename") or ()
+                               if name in named(item.this.table)]
+                    renames = [(old, new) for old, new in renames if old in columns]
+                    exposed[name] = ((columns - {old for old, _ in renames})
+                                     | {new for _, new in renames})
+                found |= set().union(*exposed.values())
             elif select.alias_or_name:
                 found.add(resolve(select.alias_or_name, quoted=False, dialect=dialect))
         return found
