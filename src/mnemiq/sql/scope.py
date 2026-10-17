@@ -504,14 +504,17 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None,
                     for name in named(column.table):
                         exposed.get(name, set()).discard(resolve_identifier(column.this, dialect))
                 # RENAME items (`old AS new`) all apply to the original names at once, so
-                # `RENAME (id AS secret, secret AS s2)` still exposes `secret` (measured; Codex's
-                # review of #165). One at a time, the second would take back the first's name.
+                # `RENAME (id AS secret, secret AS s2)` still exposes `secret`; one naming a column
+                # the picked source lacks is ignored, so `p.* RENAME (amount AS secret)` over
+                # plain p exposes plain's `id` alone (both measured; Codex's reviews of #165).
                 for name, columns in exposed.items():
-                    renames = [item for item in star.args.get("rename") or ()
+                    renames = [(resolve(item.this.name, quoted=False, dialect=dialect),
+                                resolve(item.alias, quoted=False, dialect=dialect))
+                               for item in star.args.get("rename") or ()
                                if name in named(item.this.table)]
-                    old = {resolve(item.this.name, quoted=False, dialect=dialect) for item in renames}
-                    new = {resolve(item.alias, quoted=False, dialect=dialect) for item in renames}
-                    exposed[name] = (columns - old) | new
+                    renames = [(old, new) for old, new in renames if old in columns]
+                    exposed[name] = ((columns - {old for old, _ in renames})
+                                     | {new for _, new in renames})
                 found |= set().union(*exposed.values())
             elif select.alias_or_name:
                 found.add(resolve(select.alias_or_name, quoted=False, dialect=dialect))

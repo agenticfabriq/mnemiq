@@ -318,6 +318,9 @@ STAR_EXPOSES_NO_SECRET = [
     "SELECT * EXCLUDE (secret) FROM claim c, claim k",             # unqualified: every source
     "SELECT * EXCLUDE (c.secret, k.secret) FROM claim c, claim k",
     "SELECT COUNT(*) FROM claim",                                  # a star in a call is no star
+    # A RENAME of a column the picked source lacks is ignored (measured; Codex's review of #165).
+    # Qualified, `p.amount`, the column check refuses the name itself, so only the bare one is here.
+    "SELECT p.* RENAME (amount AS secret, secret AS s2) FROM plain p CROSS JOIN claim c",
 ]
 STAR_EXPOSES_SECRET = [
     "SELECT c.* FROM plain p CROSS JOIN claim c",
