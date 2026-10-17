@@ -503,11 +503,15 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None,
                     column = item if isinstance(item, exp.Column) else exp.Column(this=item)
                     for name in named(column.table):
                         exposed.get(name, set()).discard(resolve_identifier(column.this, dialect))
-                for item in star.args.get("rename") or ():  # `old AS new`
-                    for name in named(item.this.table):
-                        columns = exposed.get(name, set())
-                        columns.discard(resolve(item.this.name, quoted=False, dialect=dialect))
-                        columns.add(resolve(item.alias, quoted=False, dialect=dialect))
+                # RENAME items (`old AS new`) all apply to the original names at once, so
+                # `RENAME (id AS secret, secret AS s2)` still exposes `secret` (measured; Codex's
+                # review of #165). One at a time, the second would take back the first's name.
+                for name, columns in exposed.items():
+                    renames = [item for item in star.args.get("rename") or ()
+                               if name in named(item.this.table)]
+                    old = {resolve(item.this.name, quoted=False, dialect=dialect) for item in renames}
+                    new = {resolve(item.alias, quoted=False, dialect=dialect) for item in renames}
+                    exposed[name] = (columns - old) | new
                 found |= set().union(*exposed.values())
             elif select.alias_or_name:
                 found.add(resolve(select.alias_or_name, quoted=False, dialect=dialect))

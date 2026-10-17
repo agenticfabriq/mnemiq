@@ -324,6 +324,10 @@ STAR_EXPOSES_SECRET = [
     "SELECT * EXCLUDE (id) FROM claim",
     "SELECT * REPLACE (id + 1 AS id) FROM claim",
     "SELECT * RENAME (id AS secret) FROM plain",  # DuckDB then fails on `.status`: refused first
+    # Every RENAME applies to the original names at once: `secret` (the old `id`) stays, in
+    # either order (measured; Codex's review of #165).
+    "SELECT * RENAME (id AS secret, secret AS s2) FROM claim",
+    "SELECT * RENAME (secret AS s2, id AS secret) FROM claim",
     "SELECT zz.* FROM claim c",                   # names no source: read as every source's
     "SELECT * EXCLUDE (c.secret) FROM claim c, claim k",       # k.secret stays (the gate's case)
     "SELECT * RENAME (c.secret AS s2) FROM claim c, claim k",
