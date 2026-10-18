@@ -32,14 +32,14 @@ from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 
 TYPES = {("claim", "id"): "INTEGER", ("claim", "region"): "VARCHAR", ("claim", "amount"): "INTEGER",
-         ("claim", "big"): "BIGINT", ("claim", "attrs"): "JSON",
+         ("claim", "big"): "BIGINT", ("claim", "attrs"): "JSON", ("claim", "d"): "DATE",
          ("entitlement", "id"): "INTEGER", ("entitlement", "who"): "VARCHAR"}
 
 
 def _snapshot(types=TYPES, oracle=False):
     if oracle:
         types = {k: {"VARCHAR": "VARCHAR2(30)", "INTEGER": "NUMBER", "BIGINT": "NUMBER",
-                     "JSON": "VARCHAR2(4000)"}[v] for k, v in types.items()}
+                     "JSON": "VARCHAR2(4000)", "DATE": "DATE"}[v] for k, v in types.items()}
     return Snapshot(version="v1", source_id="s", created_at="2026-10-15T00:00:00Z",
                     columns=[Column(id=f"{t}.{c}", object_id=t, name=c, data_type=ty)
                              for (t, c), ty in types.items()])
@@ -133,10 +133,26 @@ RAISING_TYPED_FORMS = [
     "CASE WHEN id = 2 THEN region ELSE attrs END IS NOT NULL",
     "IF(id = 2, 'x', attrs) IS NOT NULL",
     "region = COALESCE(attrs, '{}')",  # region converted to JSON
+    # Codex's fifth review: a text literal beside a typed branch takes that type and is
+    # converted on the rows that take it; 'north' is no number, date, boolean or interval.
+    "CASE WHEN id = 1 THEN 7 ELSE 'north' END = 7",
+    "CASE WHEN id = 1 THEN d ELSE 'north' END = DATE '2000-01-01'",
+    "CASE WHEN id = 1 THEN TRUE ELSE 'x' END",
+    "CASE WHEN id = 1 THEN INTERVAL '1 day' ELSE 'x' END = INTERVAL '1 day'",
+    "IF(id = 1, 7, 'north') = 7",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
     "json_extract_string((attrs), '$.a') IS NOT NULL",
+    # A native typed value beside a JSON branch is serialised, not parsed (Codex's fifth review).
+    "COALESCE(attrs, 0) IS NOT NULL", "COALESCE(attrs, 1.5) IS NOT NULL", "COALESCE(attrs, []) IS NOT NULL",
+    "COALESCE(attrs, TRUE) IS NOT NULL", "COALESCE(attrs, DATE '2000-01-01') IS NOT NULL",
+    "COALESCE(attrs, {'a': 1}) IS NOT NULL", "COALESCE(attrs, id) IS NOT NULL", "COALESCE(attrs, d) IS NOT NULL",
+    "COALESCE(attrs, (SELECT attrs FROM claim WHERE id = 1)) IS NOT NULL",
+    "json_contains(COALESCE(attrs, []), '1')",
+    # A text literal that converts to the typed branch's type.
+    "CASE WHEN id = 1 THEN 7 ELSE '8' END = 7",
+    "CASE WHEN id = 1 THEN d ELSE '2000-01-02' END = DATE '2000-01-01'",
     "json_extract_string(coalesce(attrs, '{}'::JSON), '$.a') IS NOT NULL",
     "json_extract_string(coalesce(attrs, '{}'), '$.a') IS NOT NULL",  # a literal that is JSON
     "json_extract_string(coalesce(attrs, 'NaN'), '$.a') IS NOT NULL",  # JSON to DuckDB, measured
@@ -159,9 +175,9 @@ SAFE_TYPED_FORMS = [
 def test_codex_s_second_review_forms_raise_on_the_hidden_row_and_the_safe_ones_run():
     con = duckdb.connect()
     # The third row's NULL attrs is what makes a COALESCE read its other branch.
-    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON); "
-                "INSERT INTO claim VALUES (1, '7', '{\"a\": 1}'), (2, 'north', '{\"a\": \"north\"}'), "
-                "(3, 'south', NULL); "
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON, d DATE); "
+                "INSERT INTO claim VALUES (1, '7', '{\"a\": 1}', DATE '2000-01-01'), "
+                "(2, 'north', '{\"a\": \"north\"}', DATE '2000-01-02'), (3, 'south', NULL, NULL); "
                 "CREATE TABLE entitlement(id INT, who VARCHAR); INSERT INTO entitlement VALUES (7, 'r')")
     for raising in RAISING_TYPED_FORMS:
         # The list, struct and row forms quote the first row's value rather than the hidden one.
@@ -216,6 +232,16 @@ def test_a_json_literal_is_read_as_duckdb_s_reader_reads_it(literal):
     except duckdb.Error:
         reads = False
     assert _json_text(literal) is reads, (literal, reads)
+
+
+def test_a_literal_on_a_branch_never_taken_is_still_refused_where_it_cannot_convert():
+    # `COALESCE(NULL, 7, 'x')` never reads 'x' and runs on DuckDB; the checker does not evaluate
+    # which branch a row takes, so a literal that cannot convert to the branches' type is refused.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR); INSERT INTO claim VALUES (2, 'north')")
+    assert con.execute("SELECT id FROM claim WHERE COALESCE(NULL, 7, 'x') = 7").fetchall() == [(2,)]
+    assert isinstance(_decide("COALESCE(NULL, 7, 'x') = 7"), Refusal)
+    assert isinstance(_decide("COALESCE(NULL, 7, '8') = 7"), Approved)
 
 
 def test_a_literal_the_row_chooses_by_a_column_is_refused_without_evaluating_it():
@@ -421,9 +447,10 @@ def test_on_oracle_the_advised_forms_run_where_the_raising_one_fails():
                            password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"), dsn=DSN)
     cur = con.cursor()
     # Every visible column, since the policy's derived table projects them all.
-    data = ("(SELECT 1 AS id, '7' AS region, 10 AS amount, 1 AS big, NULL AS attrs FROM dual "
-            "UNION ALL SELECT 2, 'north', 20, 2, NULL FROM dual "
-            "UNION ALL SELECT NULL, 'south', 30, 3, NULL FROM dual) claim")  # NULL id: NVL reads region
+    data = ("(SELECT 1 AS id, '7' AS region, 10 AS amount, 1 AS big, NULL AS attrs, "
+            "DATE '2000-01-01' AS d FROM dual "
+            "UNION ALL SELECT 2, 'north', 20, 2, NULL, NULL FROM dual "
+            "UNION ALL SELECT NULL, 'south', 30, 3, NULL, NULL FROM dual) claim")  # NULL id: NVL reads region
     try:
         # (as run here, as decided): the snapshot knows entitlement, the database knows dual.
         for raising, decided in (("CAST(region AS NUMBER) > 0", None), ("region > 0", None),

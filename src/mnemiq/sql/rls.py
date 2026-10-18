@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import datetime
 import json
 import logging
 import threading
@@ -244,6 +245,12 @@ def _json_cannot_fail(source, type_of, engine: str, *, chosen_by_the_row: bool =
         # `COALESCE(attrs, '{}'::JSON)`: JSON on every branch, so JSON whichever is taken.
         return all(_json_cannot_fail(branch, type_of, engine, chosen_by_the_row=True)
                    for branch in _branches(source))
+    known = _known_type(source, type_of, engine)
+    if known is not None and known.this not in exp.DataType.TEXT_TYPES:
+        # A value of a known non-text type, JSON itself or a number, a boolean, a date, a list, a
+        # struct, a subquery of one of those: serialised to JSON, never parsed (measured,
+        # `json_contains(COALESCE(attrs, []), '1')` runs; Codex's fifth review of #160).
+        return True
     if not isinstance(source, exp.Column):
         return False
     known = type_of(source)
@@ -345,13 +352,69 @@ def _coerces_to_json(node: exp.Expression, type_of, engine: str) -> bool:
     branch to JSON on the rows that take it: `COALESCE(attrs, region)`, `COALESCE(attrs, 'x')`
     and `IF(c, 'x', attrs)` are Malformed JSON on those rows (measured; Codex's fourth review
     of #160), with no JSON reader around them. So beside a JSON branch every branch must be JSON
-    already, NULL or a literal that is JSON."""
+    already, NULL, a literal that is JSON, or a value of a known type that is not text: a
+    number, a boolean, a date, a list, a struct or a JSON-typed subquery is serialised, not
+    parsed (measured, `COALESCE(attrs, 0)`, `COALESCE(attrs, [])`, `COALESCE(attrs, d)` run;
+    Codex's fifth review). Text, and a value of unknown type, is parsed on the rows that take
+    it."""
     branches = _branches(node)
     typed = [_known_type(branch, type_of, engine) for branch in branches]
     if not any(known is not None and known.this == exp.DataType.Type.JSON for known in typed):
         return False
-    return not all(_json_cannot_fail(branch, type_of, engine, chosen_by_the_row=True)
-                   for branch in branches)
+    return not all(
+        (known is not None and known.this not in exp.DataType.TEXT_TYPES)
+        or _json_cannot_fail(branch, type_of, engine, chosen_by_the_row=True)
+        for branch, known in zip(branches, typed))
+
+
+def _literal_converts(text: str, to: exp.DataType) -> bool:
+    """Whether a text literal converts to `to` as DuckDB converts it: checked where the
+    conversion can be read here (a number, a boolean, an ISO date or timestamp), refused where it
+    cannot (an interval, a list, anything else), since a literal that does not convert fails on
+    the rows that take its branch."""
+    kind = to.this
+    text = text.strip()
+    try:
+        if kind in _INTEGER_RANK:
+            int(text)
+        elif kind in exp.DataType.NUMERIC_TYPES:
+            float(text)
+        elif kind == exp.DataType.Type.BOOLEAN:
+            return text.lower() in {"true", "false", "t", "f", "yes", "no", "y", "n", "1", "0"}
+        elif kind == exp.DataType.Type.DATE:
+            datetime.date.fromisoformat(text)
+        elif kind in exp.DataType.TEMPORAL_TYPES:
+            datetime.datetime.fromisoformat(text)
+        else:
+            return False
+    except ValueError:
+        return False
+    return True
+
+
+def _literal_cannot_convert(node: exp.Expression, type_of, engine: str) -> bool:
+    """A text literal on a branch beside a branch of a known non-text type takes that type, and
+    is converted on the rows that take it: `CASE WHEN id = 1 THEN 7 ELSE 'north' END = 7` runs
+    on the first row and fails on the second (measured on DuckDB; Codex's fifth review of #160),
+    as do a DATE, a BOOLEAN and an INTERVAL beside `'x'`. Refused where the literal does not
+    convert to the branches' type, or where that cannot be read here."""
+    branches = [branch for branch in _branches(node)]
+    literals, typed = [], []
+    for branch in branches:
+        while isinstance(branch, exp.Paren):
+            branch = branch.this
+        if isinstance(branch, exp.Literal) and branch.is_string:
+            literals.append(branch.this)
+        elif not isinstance(branch, exp.Null):
+            known = _known_type(branch, type_of, engine)
+            # Not JSON: a text literal beside a JSON branch is parsed as JSON, which
+            # `_coerces_to_json` reads through `_json_text`.
+            if (known is not None and known.this not in exp.DataType.TEXT_TYPES
+                    and known.this != exp.DataType.Type.JSON):
+                typed.append(known)
+    if not literals or not typed:
+        return False
+    return any(not _literal_converts(text, typed[0]) for text in literals)
 
 
 def _nvl_converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
@@ -438,8 +501,14 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             # SELECT that has a column of that name, as `_validate_filter` reads it. None where no
             # table or more than one does -- a correlated reference among them -- so it is unknown.
             select = column.find_ancestor(exp.Select)
-            having = [key for key in {object_key(t) for t in base_tables(select, engine)}
-                      if column.name.lower() in types_of(key)] if select is not None else []
+            # The SELECT's own sources, not a subquery's inside it: `COALESCE(attrs, (SELECT attrs
+            # FROM claim WHERE id = 1))` reads the outer `attrs` from the filtered table alone,
+            # and counting the subquery's `claim` beside it read the name as ambiguous and the
+            # JSON column as unknown (Codex's fifth review of #160).
+            own = [t for t in base_tables(select, engine)
+                   if t.find_ancestor(exp.Select) is select] if select is not None else []
+            having = [key for key in {object_key(t) for t in own}
+                      if column.name.lower() in types_of(key)]
             owner = having[0] if len(having) == 1 else None
         return None if owner is None else types_of(owner).get(column.name.lower())
 
@@ -464,8 +533,9 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             continue
         if engine == "oracle" and _nvl_converts_a_text_column(node, type_of, engine):
             return node
-        if engine == "duckdb" and isinstance(node, _BRANCHED) and _coerces_to_json(
-                node, type_of, engine):
+        if engine == "duckdb" and isinstance(node, _BRANCHED) and (
+                _coerces_to_json(node, type_of, engine)
+                or _literal_cannot_convert(node, type_of, engine)):
             return node
         untyped = isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_CONVERSIONS
         if not (untyped or isinstance(node, (exp.Cast, *_PARSES))):
