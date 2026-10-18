@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import datetime
 import json
 import logging
 import threading
@@ -187,8 +186,20 @@ def _branches(value: exp.Expression) -> list[exp.Expression]:
     return [value.this, *value.expressions]
 
 
-_JSON_READER_LOCK = threading.Lock()
-_JSON_READER = None
+_READER_LOCK = threading.Lock()
+_READER = None
+
+
+def _duckdb(sql: str, params=()):
+    """One value from DuckDB's own reading of a constant expression, through mnemiq's local-only
+    door (M107): what a literal or a cast means is the engine's to say, not Python's."""
+    global _READER
+    from mnemiq.duckdb_extensions import connect_duckdb
+
+    with _READER_LOCK:
+        if _READER is None:
+            _READER = connect_duckdb(local_only=True)
+        return _READER.execute(sql, list(params)).fetchone()[0]
 
 
 def _json_text(text: str) -> bool:
@@ -199,14 +210,8 @@ def _json_text(text: str) -> bool:
     `json_extract_string` on every literal measured. Through mnemiq's own door, local-only (the
     JSON functions are built in, so nothing is fetched; M107). Without the driver, Python's
     reader with every object pair kept and the result encoded, the stricter side."""
-    global _JSON_READER
     try:
-        from mnemiq.duckdb_extensions import connect_duckdb
-
-        with _JSON_READER_LOCK:
-            if _JSON_READER is None:
-                _JSON_READER = connect_duckdb(local_only=True)
-            return bool(_JSON_READER.execute("SELECT json_valid($1)", [text]).fetchone()[0])
+        return bool(_duckdb("SELECT json_valid($1)", [text]))
     except Exception:  # noqa: BLE001 -- no DuckDB here: Python's reader stands in
         try:
             json.dumps(json.loads(text, object_pairs_hook=lambda pairs: pairs),
@@ -367,54 +372,84 @@ def _coerces_to_json(node: exp.Expression, type_of, engine: str) -> bool:
         for branch, known in zip(branches, typed))
 
 
-def _literal_converts(text: str, to: exp.DataType) -> bool:
-    """Whether a text literal converts to `to` as DuckDB converts it: checked where the
-    conversion can be read here (a number, a boolean, an ISO date or timestamp), refused where it
-    cannot (an interval, a list, anything else), since a literal that does not convert fails on
-    the rows that take its branch."""
-    kind = to.this
-    text = text.strip()
+# What may be handed to DuckDB to type: a value expression of columns, literals, casts and
+# arithmetic, which binds without running anything once each column is a typed NULL. No function
+# call, no subquery: typing those would evaluate policy text on the validator's connection (a
+# table function reading a file, a subquery over a billion rows), which a validator must not do
+# (the review gate on #160); they keep the type reader here.
+_PURE = (exp.Column, exp.Identifier, exp.Literal, exp.Boolean, exp.Null, exp.Paren, exp.Neg,
+         exp.Cast, exp.DataType, exp.DataTypeParam, exp.Interval, exp.Var, exp.DateStrToDate,
+         *_ARITHMETIC)
+
+
+def _duckdb_type(branch: exp.Expression, type_of, engine: str) -> str | None:
+    """The type DuckDB gives a branch, in DuckDB's words. A column's is the snapshot's; a cast's
+    its target; a pure value expression's (`7`, `1.5`, `id + 1`, `INTERVAL '1 day'`) is asked of
+    DuckDB with each column replaced by a NULL of its snapshot type, so nothing runs and the
+    answer is the engine's (`typeof(7)` is INTEGER, `typeof(1.5)` DECIMAL(2,1), `typeof(id + 1)`
+    over an INTEGER id is INTEGER, where the type reader here says DOUBLE for each: the review
+    gate on #160); anything else, a subquery or a call, keeps the type reader's answer. None
+    where it cannot be told, or where it is text or JSON, which no literal converts to."""
+    while isinstance(branch, exp.Paren):
+        branch = branch.this
+    kind = None
+    if isinstance(branch, exp.Column):
+        kind = type_of(branch)
+    elif isinstance(branch, exp.Cast):
+        kind = branch.to.sql(dialect="duckdb")
+    elif all(isinstance(node, _PURE) for node in branch.walk()):
+        # The types are read off the original nodes, which the resolver knows by identity; the
+        # copy's are then replaced in the same traversal order.
+        declared = [type_of(column) for column in branch.find_all(exp.Column)]
+        typed_nulls = None if None in declared else branch.copy()
+        if typed_nulls is not None:
+            for column, kind_of in zip(list(typed_nulls.find_all(exp.Column)), declared):
+                column.replace(exp.Cast(this=exp.Null(),
+                                        to=exp.DataType.build(kind_of, dialect="duckdb")))
+            try:
+                kind = _duckdb(f"SELECT typeof({typed_nulls.sql(dialect='duckdb')})")
+            except Exception:  # noqa: BLE001 -- unreadable by DuckDB: the type reader's word
+                kind = None
+    if kind is None:
+        known = _known_type(branch, type_of, engine)
+        kind = None if known is None else known.sql(dialect="duckdb")
+    if kind is None:
+        return None
     try:
-        if kind in _INTEGER_RANK:
-            int(text)
-        elif kind in exp.DataType.NUMERIC_TYPES:
-            float(text)
-        elif kind == exp.DataType.Type.BOOLEAN:
-            return text.lower() in {"true", "false", "t", "f", "yes", "no", "y", "n", "1", "0"}
-        elif kind == exp.DataType.Type.DATE:
-            datetime.date.fromisoformat(text)
-        elif kind in exp.DataType.TEMPORAL_TYPES:
-            datetime.datetime.fromisoformat(text)
-        else:
-            return False
-    except ValueError:
-        return False
-    return True
+        built = exp.DataType.build(kind, dialect="duckdb")
+    except Exception:  # noqa: BLE001
+        return None
+    if built.this in exp.DataType.TEXT_TYPES or built.this == exp.DataType.Type.JSON:
+        return None  # text takes the literal as it is; JSON parses it, `_coerces_to_json`'s
+    return kind
 
 
 def _literal_cannot_convert(node: exp.Expression, type_of, engine: str) -> bool:
-    """A text literal on a branch beside a branch of a known non-text type takes that type, and
-    is converted on the rows that take it: `CASE WHEN id = 1 THEN 7 ELSE 'north' END = 7` runs
-    on the first row and fails on the second (measured on DuckDB; Codex's fifth review of #160),
-    as do a DATE, a BOOLEAN and an INTERVAL beside `'x'`. Refused where the literal does not
-    convert to the branches' type, or where that cannot be read here."""
-    branches = [branch for branch in _branches(node)]
-    literals, typed = [], []
-    for branch in branches:
+    """A text literal on a branch beside a branch of a known non-text type takes the branches'
+    type, and is converted on the rows that take it: `CASE WHEN id = 1 THEN 7 ELSE 'north' END =
+    7` runs on the first row and fails on the second (measured on DuckDB; Codex's fifth review of
+    #160), as do a DATE, a BOOLEAN and an INTERVAL beside `'x'`. Whether a literal converts is
+    DuckDB's to say, asked through TRY_CAST to the type DuckDB unifies the typed branches to
+    (Python's parsers take an out-of-range integer, Unicode digits, a basic ISO date and `nan`,
+    which DuckDB refuses: the review gate); refused where DuckDB cannot be asked."""
+    literals, kinds = [], []
+    for branch in _branches(node):
         while isinstance(branch, exp.Paren):
             branch = branch.this
         if isinstance(branch, exp.Literal) and branch.is_string:
             literals.append(branch.this)
         elif not isinstance(branch, exp.Null):
-            known = _known_type(branch, type_of, engine)
-            # Not JSON: a text literal beside a JSON branch is parsed as JSON, which
-            # `_coerces_to_json` reads through `_json_text`.
-            if (known is not None and known.this not in exp.DataType.TEXT_TYPES
-                    and known.this != exp.DataType.Type.JSON):
-                typed.append(known)
-    if not literals or not typed:
+            kind = _duckdb_type(branch, type_of, engine)
+            if kind is not None:
+                kinds.append(kind)
+    if not literals or not kinds:
         return False
-    return any(not _literal_converts(text, typed[0]) for text in literals)
+    try:
+        unified = _duckdb("SELECT typeof(COALESCE(" + ", ".join(f"NULL::{k}" for k in kinds) + "))")
+        return any(not _duckdb(f"SELECT TRY_CAST($1 AS {unified}) IS NOT NULL", [text])
+                   for text in literals)
+    except Exception:  # noqa: BLE001 -- unreadable: the literal may fail on a row, refused
+        return True
 
 
 def _nvl_converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:

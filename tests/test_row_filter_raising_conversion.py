@@ -140,6 +140,22 @@ RAISING_TYPED_FORMS = [
     "CASE WHEN id = 1 THEN TRUE ELSE 'x' END",
     "CASE WHEN id = 1 THEN INTERVAL '1 day' ELSE 'x' END = INTERVAL '1 day'",
     "IF(id = 1, 7, 'north') = 7",
+    # The review gate: a literal Python's parsers take and DuckDB's casts refuse, an integer out
+    # of range, Unicode digits, a basic ISO date, `nan` to a DECIMAL branch.
+    "CASE WHEN id = 2 THEN 7 ELSE '99999999999' END = 7",
+    "CASE WHEN id = 1 THEN big ELSE '99999999999999999999' END = 1",
+    "CASE WHEN id = 1 THEN id ELSE '٣' END = 7",
+    "CASE WHEN id = 1 THEN d ELSE '20000102' END = d",
+    "CASE WHEN id = 1 THEN 1.5 ELSE 'nan' END = 1",
+    # Codex's sixth review: INT32's bound, a DECIMAL's precision, a basic ISO date.
+    "CASE WHEN id = 1 THEN id ELSE '2147483648' END = 1",
+    "CASE WHEN id = 1 THEN CAST(1 AS DECIMAL(4,2)) ELSE '1000' END = 1",
+    "CASE WHEN id = 1 THEN d ELSE '20200101' END = DATE '2020-01-01'",
+    # The review gate: arithmetic typed as DuckDB types it (INTEGER, not DOUBLE), and a subquery
+    # branch typed by the reader here rather than run on the validator's connection.
+    "CASE WHEN id = 1 THEN id + 1 ELSE 'nan' END = 2",
+    "CASE WHEN id = 1 THEN id + 1 ELSE '3000000000' END = 2",
+    "CASE WHEN id = 1 THEN (SELECT 7 FROM entitlement LIMIT 1) ELSE 'north' END = 7",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -150,9 +166,12 @@ SAFE_TYPED_FORMS = [
     "COALESCE(attrs, {'a': 1}) IS NOT NULL", "COALESCE(attrs, id) IS NOT NULL", "COALESCE(attrs, d) IS NOT NULL",
     "COALESCE(attrs, (SELECT attrs FROM claim WHERE id = 1)) IS NOT NULL",
     "json_contains(COALESCE(attrs, []), '1')",
-    # A text literal that converts to the typed branch's type.
+    # A text literal that converts to the typed branch's type, as DuckDB converts it.
     "CASE WHEN id = 1 THEN 7 ELSE '8' END = 7",
     "CASE WHEN id = 1 THEN d ELSE '2000-01-02' END = DATE '2000-01-01'",
+    "CASE WHEN id = 1 THEN 1.5 ELSE '2.5' END = 1",
+    "CASE WHEN id = 1 THEN 7 ELSE ' 8 ' END = 7",
+    "CASE WHEN id = 1 THEN 7 ELSE '1e3' END = 7",  # DuckDB reads it as an integer, Python does not
     "json_extract_string(coalesce(attrs, '{}'::JSON), '$.a') IS NOT NULL",
     "json_extract_string(coalesce(attrs, '{}'), '$.a') IS NOT NULL",  # a literal that is JSON
     "json_extract_string(coalesce(attrs, 'NaN'), '$.a') IS NOT NULL",  # JSON to DuckDB, measured
@@ -175,16 +194,15 @@ SAFE_TYPED_FORMS = [
 def test_codex_s_second_review_forms_raise_on_the_hidden_row_and_the_safe_ones_run():
     con = duckdb.connect()
     # The third row's NULL attrs is what makes a COALESCE read its other branch.
-    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON, d DATE); "
-                "INSERT INTO claim VALUES (1, '7', '{\"a\": 1}', DATE '2000-01-01'), "
-                "(2, 'north', '{\"a\": \"north\"}', DATE '2000-01-02'), (3, 'south', NULL, NULL); "
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON, d DATE, big BIGINT); "
+                "INSERT INTO claim VALUES (1, '7', '{\"a\": 1}', DATE '2000-01-01', 1), "
+                "(2, 'north', '{\"a\": \"north\"}', DATE '2000-01-02', 2), (3, 'south', NULL, NULL, 3); "
                 "CREATE TABLE entitlement(id INT, who VARCHAR); INSERT INTO entitlement VALUES (7, 'r')")
     for raising in RAISING_TYPED_FORMS:
         # The list, struct and row forms quote the first row's value rather than the hidden one.
-        with pytest.raises(duckdb.Error, match="north|'7'|'x'|Malformed JSON") as caught:
+        # A conversion that fails on a row: quoting the row's value, or the literal the row chose.
+        with pytest.raises(duckdb.Error, match="Conversion Error|Malformed JSON"):
             con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
-        assert "Conversion Error" in str(caught.value) or "Malformed JSON" in str(caught.value), (
-            raising, caught.value)
     for safe in SAFE_TYPED_FORMS:
         con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall()
 
@@ -232,6 +250,25 @@ def test_a_json_literal_is_read_as_duckdb_s_reader_reads_it(literal):
     except duckdb.Error:
         reads = False
     assert _json_text(literal) is reads, (literal, reads)
+
+
+def test_the_validator_types_a_policy_without_running_it():
+    """A subquery over a trillion rows on a branch: typed by the reader here (a count is a
+    number), never evaluated on the validator's connection, so the verdict comes at once (the
+    review gate on #160); and a table function reading a file is never called."""
+    import time
+
+    started = time.monotonic()
+    verdict = _decide("CASE WHEN id = 1 THEN (SELECT count(*) FROM range(1000000000000)) "
+                      "ELSE 'x' END = 1")
+    assert isinstance(verdict, Refusal), verdict  # 'x' converts to no number
+    assert time.monotonic() - started < 5, "the subquery ran"
+    # A call's type is unknown here, so beside a literal the rule says nothing (the guide's "not
+    # a proof"); what this pins is that the call is never made while deciding.
+    verdict = _decide("CASE WHEN id = 1 THEN length(read_text('/nonexistent/never-read')) "
+                      "ELSE 'x' END = 1")
+    assert isinstance(verdict, (Approved, Refusal)), verdict
+    assert time.monotonic() - started < 5
 
 
 def test_a_literal_on_a_branch_never_taken_is_still_refused_where_it_cannot_convert():
