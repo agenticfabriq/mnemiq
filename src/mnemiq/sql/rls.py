@@ -283,8 +283,10 @@ def _branch_type(value, type_of, engine: str) -> exp.DataType | None:
         known.append(typed)
     # On DuckDB a JSON branch makes the whole value JSON, the other branches converted to it row
     # by row (measured: `COALESCE(attrs, region)` is JSON, and malformed text on the row that
-    # takes region; Codex's fourth review of #160): `_coerces_to_json` refuses that mix before
-    # this typing is consulted, so a JSON branch is only ever typed here beside JSON or NULL.
+    # takes region; Codex's fourth review of #160). The walk refuses that mix at the branched
+    # node itself, on DuckDB, through `_coerces_to_json`; the typing below reads a JSON branch
+    # beside text as text, which only a comparison visited earlier in the walk consults, and a
+    # refusal there or at the node is a refusal either way.
     text = [typed for typed in known if typed.this in exp.DataType.TEXT_TYPES]
     if text:
         return text[0]
