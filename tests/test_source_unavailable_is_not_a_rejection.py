@@ -203,10 +203,22 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
                   ora(3113, "ORA-03113: end-of-file on communication channel"),
                   ora(1013, "ORA-01013: user requested cancel of current operation"),
                   ora(3156, "ORA-03156: the call timed out"),
-                  # What a growing pool meets on acquire after the credentials changed under it.
+                  # What a growing pool meets on acquire: the credentials and the account, the
+                  # instance's state, the session and process limits (Codex's sixth review of
+                  # #159 found ORA-01045 among them).
                   ora(1017, "ORA-01017: invalid credential or not authorized; logon denied"),
+                  ora(1045, "ORA-01045: user APP lacks CREATE SESSION privilege; logon denied"),
                   ora(28000, "ORA-28000: The account is locked."),
                   ora(28001, "ORA-28001: the password has expired"),
+                  ora(1033, "ORA-01033: ORACLE initialization or shutdown in progress"),
+                  ora(1034, "ORA-01034: ORACLE not available"),
+                  ora(1035, "ORA-01035: ORACLE only available to users with RESTRICTED SESSION privilege"),
+                  ora(1089, "ORA-01089: immediate shutdown or close in progress - no operations are permitted"),
+                  ora(1090, "ORA-01090: shutdown in progress - connection is not permitted"),
+                  ora(1092, "ORA-01092: ORACLE instance terminated. Disconnection forced"),
+                  ora(18, "ORA-00018: maximum number of sessions exceeded"),
+                  ora(20, "ORA-00020: maximum number of processes (300) exceeded"),
+                  ora(2391, "ORA-02391: exceeded simultaneous SESSIONS_PER_USER limit"),
                   ora(12541, "ORA-12541: TNS:no listener"),
                   ora(12170, "ORA-12170: TNS:Connect timeout occurred")]
     assert [str(exc)[:9] for exc in refused if oracle_unavailable(exc)] == []

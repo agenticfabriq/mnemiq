@@ -1721,8 +1721,7 @@ def _is_timeout(exc: Exception) -> bool:
 # flag tells it from a parse refusal. Left out on purpose: the statement's own faults the same
 # classes hold (DPY-4004 invalid number, DPY-4007 cannot convert, the bind errors) and the cursor
 # and fetch states (DPY-1003, 1004, 1006). The ORA codes a growing pool meets on acquire are
-# beside the set: a wrong password, a locked account, an expired one (ORA-01017, ORA-28000,
-# ORA-28001).
+# beside the set, `_UNAVAILABLE_ORA`.
 _UNAVAILABLE_DPY = frozenset({
     "DPY-1001", "DPY-1002",  # not connected; pool not open
     "DPY-4005",  # timed out waiting for the pool: `_lease` under `wait_timeout`, pool exhausted
@@ -1768,7 +1767,14 @@ _UNAVAILABLE_DPY = frozenset({
     "DPY-4000", "DPY-4001", "DPY-4017", "DPY-4018", "DPY-4019", "DPY-4021", "DPY-4026",
     "DPY-4027", "DPY-4028", "DPY-4030", "DPY-4032", "DPY-4034",
 })
-_UNAVAILABLE_ORA = frozenset({1017, 3156, 28000, 28001})
+# The ORA codes a session cannot be had under, which a growing pool meets on acquire and no
+# statement causes: the call timeout (03156); the credentials and the account (01017 logon
+# denied, 01045 CREATE SESSION revoked, Codex's sixth review of #159; 28000 locked, 28001
+# expired); the instance not available, starting or shutting down (01033, 01034, 01089, 01090,
+# 01092) or open to restricted sessions alone (01035); and the session and process limits
+# (00018, 00020, 02391). The TNS ranges are matched beside this set.
+_UNAVAILABLE_ORA = frozenset({18, 20, 1017, 1033, 1034, 1035, 1045, 1089, 1090, 1092, 2391,
+                              3156, 28000, 28001})
 
 
 def unavailable_fault(exc: BaseException) -> bool:
@@ -1780,9 +1786,9 @@ def unavailable_fault(exc: BaseException) -> bool:
     them) and flags a dead session recoverable (DPY-4011, which it cross-references ORA-03113 to).
     Everything else it leaves a plain `DatabaseError`, `InterfaceError` or `InternalError`, so the
     rest is named: `_UNAVAILABLE_DPY`, read off the driver's error table, and among the ORA codes
-    `_UNAVAILABLE_ORA` (the call timeout ORA-03156, and the credentials a growing pool
-    authenticates with on acquire: ORA-01017, ORA-28000, ORA-28001) with the TNS ranges
-    (ORA-12150 to 12236, ORA-12500 to 12699) its list leaves out. A parse refusal (ORA-00904,
+    `_UNAVAILABLE_ORA` (the call timeout, and what a growing pool meets on acquire: the
+    credentials, the account, the instance's state, the session and process limits) with the
+    TNS ranges (ORA-12150 to 12236, ORA-12500 to 12699) its list leaves out. A parse refusal (ORA-00904,
     ORA-00942, ORA-00936) is none of these and keeps its reading, as do the driver's data faults
     (DPY-4004) and `ReadOnlyViolation`, this adapter's own refusal to parse DDL.
     """
