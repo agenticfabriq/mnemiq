@@ -4,7 +4,7 @@ from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables, candidate_tables, column_tables
+from mnemiq.sql.scope import base_tables, candidate_tables, column_tables, known_columns
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -21,15 +21,23 @@ def _is_bare_projection(column: exp.Column) -> bool:
 
 
 def check_cls(ast: exp.Expression, policy: AccessPolicy,
-              dialect: str | None = None) -> Refusal | None:
+              dialect: str | None = None,
+              columns: dict[str, set[str]] | None = None) -> Refusal | None:
     """Refuse a query that reads a denied column, or uses a masked column anywhere but a bare
-    projection (masking a filtered/aggregated column would silently change the answer)."""
+    projection (masking a filtered/aggregated column would silently change the answer).
+
+    `columns` is the schema a derived table's star is read through (M181): the grant's and the
+    policy's columns together, from `known_columns`, so `SELECT d.secret FROM (SELECT * FROM
+    claim) d` is claim's denied secret and a table the policy does not list cannot take the name
+    first (the review gate's case, a star over `wide JOIN claim`); without it, the policy's.
+    """
     if not policy.denied and not policy.masked:
         return None
     # resolve columns against every base table the query references (not just visible ones)
     tables = base_tables(ast, dialect)
     referenced = {object_key(t) for t in tables}
-    resolved = column_tables(ast, dialect)
+    resolved = column_tables(ast, dialect,
+                             columns if columns is not None else known_columns(None, policy))
     local = {cte.alias_or_name for cte in ast.find_all(exp.CTE)}
     aliased = local | {s.alias_or_name for s in ast.find_all(exp.Subquery) if s.alias_or_name}
 

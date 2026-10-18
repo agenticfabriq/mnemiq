@@ -144,8 +144,14 @@ def _unknown_column(name: str) -> Refusal:
 
 
 def check_access(ast: exp.Expression, visible: dict[str, set[str]],
-                 dialect: str | None = None) -> Refusal | None:
+                 dialect: str | None = None,
+                 columns: dict[str, set[str]] | None = None) -> Refusal | None:
     """Re-check every table and column the query touches against what the identity may see.
+
+    `columns` is the schema the resolver binds a derived table's star through (M181): the grant's
+    and the policy's columns together, from `known_columns`, so a column hidden from this
+    identity still binds to the table that has it and is refused as unknown there; without it,
+    the grant's alone.
 
     `dialect` is the ENGINE that will run this, not the one it was parsed as. Identifier folding differs between them -- Oracle folds unquoted names up, the rest fold them down, and quoting is significant in Postgres and Oracle but not DuckDB -- so a resolver keyed on the wrong one answers for the wrong engine. Threading it to SOME call sites and not others is worse than either: `check_access` said a name was a CTE while the audit list said it was a base read, in the same statement.
 
@@ -157,7 +163,7 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     # set of CTE names -- because a reference inside a CTE body naming that same CTE reads the
     # base table, and skipping it let an ungranted table through (M31).
     alias_to_table: dict[str, str] = {}
-    resolved = column_tables(ast, dialect)
+    resolved = column_tables(ast, dialect, columns if columns is not None else visible)
     for table in base_tables(ast, dialect):
         name = object_key(table)
         if name not in visible:
@@ -414,7 +420,8 @@ def check_unmodelled_calls(
     return None
 
 
-def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None) -> Refusal | None:
+def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None,
+                         columns: dict[str, set[str]] | None = None) -> Refusal | None:
     """Refuse a column whose stored expression this engine cannot attribute.
 
     A virtual column runs user code on read, and the statement never names it. MEASURED on
@@ -449,7 +456,14 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
     # Scope-aware, like `check_access` and `check_cls`. A flat alias map keyed on the written
     # case let `SELECT Q.leaked FROM vc_t Q` through while refusing the lowercase spelling, and
     # one alias meaning two tables across UNION branches changed the verdict with branch order.
-    resolved = column_tables(ast, dialect)
+    # The schema a derived star is read through (M181): the caller's (the grant's and the
+    # policy's columns, from `known_columns`) with the catalogue's pairs beside it, so a virtual
+    # column reached through `(SELECT * FROM plain JOIN vc_t) d` binds to the table that
+    # computes it rather than to a table the schema does not list, which would take any name.
+    schema: dict[str, set[str]] = {table: set(names) for table, names in (columns or {}).items()}
+    for table, name in opaque:
+        schema.setdefault(table, set()).add(name)
+    resolved = column_tables(ast, dialect, schema)
     local = {cte.alias_or_name for cte in ast.find_all(exp.CTE)}
     aliased = local | {s.alias_or_name for s in ast.find_all(exp.Subquery) if s.alias_or_name}
 

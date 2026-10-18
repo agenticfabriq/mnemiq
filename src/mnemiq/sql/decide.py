@@ -103,7 +103,7 @@ def decide(
         return unsupported
     row_cap = shaped.meta.get("row_cap")  # read now: the rewrites below build new trees
 
-    refusal = check_access(shaped, visible, target)
+    refusal = check_access(shaped, visible, target, columns=known_columns(visible, policy))
     if refusal is not None:
         return refusal
     # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
@@ -139,11 +139,13 @@ def decide(
     # Oracle, returning an SSN from an ungranted table while every check above passed it (M100).
     # Third shape of the same thing, after `count(*)` reaching `count_star` and `id + 1`
     # reaching a macro named `+`, and answered the same way: ask the source, do not enumerate.
-    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target)
+    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target,
+                                    columns=known_columns(visible, policy))
     if computed is not None:
         return computed
 
-    cls = check_cls(shaped, policy, target)  # column deny / mask-in-predicate
+    cls = check_cls(shaped, policy, target,  # column deny / mask-in-predicate
+                    columns=known_columns(visible, policy))
     if cls is not None:
         return cls
 

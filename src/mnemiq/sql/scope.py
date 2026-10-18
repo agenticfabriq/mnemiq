@@ -4,7 +4,8 @@ from sqlglot import exp
 from sqlglot.errors import OptimizeError
 from sqlglot.optimizer.scope import build_scope
 
-from mnemiq.sql.identifiers import resolve, resolve_identifier, resolve_name
+from mnemiq.sql.identifiers import (resolve, resolve_identifier, resolve_name, resolve_stored,
+                                    rules_for)
 from mnemiq.sql.qualify import object_key
 
 
@@ -651,7 +652,185 @@ def _two_readings(column: exp.Column, other: str, dialect: str | None):
     )
 
 
-def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, str] | None:
+# What a derived source exposes under a name: ("table", key) binds the column to a base table,
+# `_NAMED` says the source's own projection names it (checked in that scope), ("first", key) is
+# the fail-closed answer for a name no schema lists under a star (that table's check refuses it
+# as unknown), and None says nothing here exposes it, so the next scope out may (M182).
+_NAMED = ("named",)
+
+
+def _star_of(projection: exp.Expression) -> exp.Star | None:
+    """The star a projection is, qualified or not, COLUMNS(...) read as one (M169)."""
+    if isinstance(projection, exp.Star):
+        return projection
+    if isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star):
+        return projection.this
+    if isinstance(projection, exp.Columns):
+        return projection.this if isinstance(projection.this, exp.Star) else exp.Star()
+    return None
+
+
+def _schema_lists(columns, key: str, column: exp.Column, dialect: str | None) -> bool:
+    """Whether the schema lists table `key` with the column, compared as the engine compares names
+    (`check_access`'s rule, M170): both sides fold where the engine folds, as typed where quoting
+    keeps case."""
+    if columns is None or key not in columns:
+        return False
+    stored = columns[key]
+    if rules_for(dialect).quoting_preserves_case:
+        return column.name in stored
+    name = resolve_identifier(column.this, dialect)
+    return name in ({resolve_stored(n, dialect) for n in stored} | set(stored))
+
+
+def _names_item(item: exp.Expression, name: str, dialect: str | None) -> bool:
+    identifier = item.this if isinstance(item, exp.Column) else item
+    return resolve_identifier(identifier, dialect) == name
+
+
+def _item_sources(item: exp.Expression, picked: list[str], dialect: str | None) -> list[str]:
+    """The picked sources an EXCLUDE, RENAME or REPLACE item applies to: its qualifier's, else
+    every one (measured for EXCLUDE: `EXCLUDE (c.secret) FROM claim c, claim k` keeps k.secret)."""
+    qualifier = (resolve_identifier(item.args.get("table"), dialect)
+                 if isinstance(item, exp.Column) else None)
+    if not qualifier:
+        return picked
+    return [source for source in picked
+            if resolve(source, quoted=False, dialect=dialect) == qualifier]
+
+
+def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None,
+              seen: frozenset[int]):
+    """What `scope` (a derived table's or CTE's) exposes under `name`, in projection order (M181).
+
+    The first projection that can expose the name settles it, as DuckDB binds the first column
+    of a name in projection order (measured: `(SELECT *, 'NAMED' AS secret FROM claim) d` reads
+    claim's secret, `(SELECT 'NAMED' AS secret, * FROM claim) d` the literal). A named
+    projection settles it in its own scope. A star settles it on the first source under it, in
+    FROM order, that the schema lists with the name (DuckDB binds the first source that has it,
+    measured on a join of two tables both holding it), unless an EXCLUDE drops it or a RENAME
+    moves it away from that source; a RENAME to the name or a REPLACE of it is a named column,
+    its own nodes checked. A star whose sources are listed with the name nowhere still settles
+    it, on a base table under it: the first the schema does not list, which may well have it (a
+    partial schema, the eval criterion's or a policy's alone), else the first listed without it,
+    where the name is hidden or absent and that table's check refuses it as unknown. Read as
+    unexposed instead, the column would bind outward to a table that grants the name (the ui
+    lane's edges on M181), and an unlisted table taking the name FIRST let `wide` own `secret`
+    over a join with claim and dropped claim's mask (the review gate).
+    """
+    if not hasattr(scope, "expression"):
+        return _NAMED  # a table function or another source whose columns are its own
+    if id(scope) in seen:
+        return None  # a recursive CTE naming itself
+    seen = seen | {id(scope)}
+    if scope.union_scopes:
+        # The branches' names are the first branch's. A star in a branch binds by position,
+        # which no name can read: `check_shape` refuses it (M183); here, fail-closed, the first
+        # base table under the branches.
+        for branch in scope.union_scopes:
+            for projection in branch.expression.selects:
+                if _star_of(projection) is not None:
+                    first = next((object_key(source)
+                                  for _, source in branch.selected_sources.values()
+                                  if isinstance(source, exp.Table)), None)
+                    return ("first", first) if first else _NAMED
+        return _exposure(scope.union_scopes[0], name, column, columns, dialect, seen)
+    for projection in scope.expression.selects:
+        star = _star_of(projection)
+        if star is None:
+            alias = projection.alias_or_name
+            if alias and resolve(alias, quoted=False, dialect=dialect) == name:
+                return _NAMED
+            continue
+        qualifier = (resolve_identifier(projection.args.get("table"), dialect)
+                     if isinstance(projection, exp.Column) else None)
+        picked = [source for source in scope.selected_sources
+                  if not qualifier or resolve(source, quoted=False, dialect=dialect) == qualifier]
+        if any(item.alias and resolve(item.alias, quoted=False, dialect=dialect) == name
+               for item in star.args.get("replace") or ()):
+            return _NAMED  # `* REPLACE (id AS secret)`: the name holds the expression's nodes
+        unlisted = listed_without = None
+        for source in picked:
+            excluded = any(_names_item(item, name, dialect)
+                           for item in star.args.get("except_") or ()
+                           if source in _item_sources(item, picked, dialect))
+            renames = [item for item in star.args.get("rename") or ()
+                       if source in _item_sources(item.this, picked, dialect)]
+            if any(resolve(item.alias, quoted=False, dialect=dialect) == name for item in renames):
+                return _NAMED  # `RENAME (secret AS s2)`: `s2` is the column node `secret`, checked
+            if excluded or any(_names_item(item.this, name, dialect) for item in renames):
+                continue  # dropped, or moved away from this source
+            node, inner = scope.selected_sources[source]
+            if isinstance(inner, exp.Table) or (
+                    isinstance(node, exp.Table) and _is_base_read(node, scope, dialect)):
+                key = object_key(inner if isinstance(inner, exp.Table) else node)
+                if _schema_lists(columns, key, column, dialect):
+                    return ("table", key)
+                if columns is not None and key in columns:
+                    listed_without = listed_without or key
+                else:
+                    unlisted = unlisted or key
+                continue
+            found = _exposure(inner, name, column, columns, dialect, seen)
+            if found is None:
+                continue
+            if found[0] == "first":
+                listed_without = listed_without or found[1]
+                continue
+            return found
+        if unlisted or listed_without:
+            return ("first", unlisted or listed_without)  # the star may expose it: settled here
+    return None
+
+
+def _scope_names(scope, dialect: str | None):
+    """What a scope's qualifiers resolve to: `local`, the base tables it reads, by the alias's
+    resolved spelling; `by_alias`, every other source it selects from (a CTE's or derived
+    table's scope, a table function), the same way."""
+    # Built from `_is_base_read`, not from `sources` alone: a reference sqlglot bound to a
+    # same-named CTE that the ENGINE would not shadow is a base table, and reading `sources`
+    # here left it unattributed -- so `check_cls` treated a denied column's qualifier as a CTE
+    # and let it through, on the very statement `base_tables` had just called a real read.
+    # Keyed by what the alias RESOLVES to, and looked up the same way (M166): `C.secret FROM
+    # claim c` is `c.secret` to every engine (quoted `"C"` too, on Oracle), and matched as
+    # written it named nothing, which read as a derived table's alias and went unchecked.
+    local = {
+        resolve_identifier(table.args.get("alias") or table.this, dialect): object_key(table)
+        for table in scope.tables
+        if _is_base_read(table, scope, dialect)
+    }
+    by_alias = {}
+    for node in [*scope.tables, *scope.derived_tables, *scope.udtfs]:
+        alias = resolve_identifier(
+            node.args.get("alias") or (node.this if isinstance(node, exp.Table) else None),
+            dialect)
+        if alias is not None and alias not in local:
+            by_alias[alias] = scope.sources.get(node.alias_or_name)
+    return local, by_alias
+
+
+def _bound_outward(scope, qualifier: str, name: str, column: exp.Column, columns,
+                   dialect: str | None):
+    """Where the engine binds a qualifier its own scope names but whose source exposes nothing
+    under the column's name: the nearest enclosing scope naming it (M182). sqlglot lists such a
+    column in no enclosing scope, since the qualifier IS a source of its own, so the walk up is
+    made here: `SELECT (SELECT d.secret FROM (SELECT id FROM claim) d) FROM other d` reads
+    other's secret on DuckDB (measured), and read as unbound it reached no check."""
+    ancestor = scope.parent
+    while ancestor is not None:
+        local, by_alias = _scope_names(ancestor, dialect)
+        if qualifier in local:
+            return ("table", local[qualifier])
+        if qualifier in by_alias:
+            found = _exposure(by_alias[qualifier], name, column, columns, dialect, frozenset())
+            if found is not None:
+                return found
+        ancestor = ancestor.parent
+    return None
+
+
+def column_tables(ast: exp.Expression, dialect: str | None = None,
+                  columns: dict[str, set[str]] | None = None) -> dict[int, str] | None:
     """`id(column node)` -> the base table its qualifier names **in that column's own scope**,
     or **None** when the scopes could not be resolved at all.
 
@@ -661,8 +840,19 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
     let it through. That is the same collapse as M2's outage-versus-empty-policy and M34's
     missing-versus-unreadable baseline -- an absence and a failure wearing one value.
 
-    A missing entry within a returned map still means only "this qualifier names a CTE or a
-    derived table".
+    A missing entry within a returned map means "this qualifier names a CTE or a derived table
+    whose own projection names the column", or a column no scope settled.
+
+    `columns` is the schema the exposure walk reads, table key to column names: a caller passes
+    what it knows (the grant's and the policy's columns together, in `decide`); a table the
+    schema does not list owns a name only where no listed table under the same star has it. A
+    qualifier naming a derived table or CTE is bound
+    through what that source EXPOSES under the column's name (M181): the first star reaching a
+    base table that has the column binds it to that table, as `SELECT d.secret FROM (SELECT *
+    FROM claim) d` reads claim's secret, which a qualifier answered "derived, no table" let
+    through hidden, denied or masked; a source exposing nothing under the name leaves the column
+    for the next scope out, as the engine binds `SELECT (SELECT d.secret FROM (SELECT id FROM
+    claim) d) FROM other d` to other (M182), where an unbound column was read by no check.
 
     M31 made `base_tables` scope-aware and stopped there. Both consumers went on building ONE
     alias->table dictionary across every scope, so in
@@ -681,23 +871,10 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
     out: dict[int, str] = {}
     settled: set[int] = set()  # columns a scope has answered for, with a base table or without
     for scope in root.traverse():
-        # Built from `_is_base_read`, not from `sources` alone: a reference sqlglot bound to a
-        # same-named CTE that the ENGINE would not shadow is a base table, and reading `sources`
-        # here left it unattributed -- so `check_cls` treated a denied column's qualifier as a CTE
-        # and let it through, on the very statement `base_tables` had just called a real read.
-        # Keyed by what the alias RESOLVES to, and looked up the same way (M166): `C.secret FROM
-        # claim c` is `c.secret` to every engine (quoted `"C"` too, on Oracle), and matched as
-        # written it named nothing, which read as a derived table's alias and went unchecked.
-        local = {
-            resolve_identifier(table.args.get("alias") or table.this, dialect): object_key(table)
-            for table in scope.tables
-            if _is_base_read(table, scope, dialect)
-        }
-        # Every name the scope selects from, a CTE's or a derived table's included, resolved the
-        # same way: a qualifier naming one of those is answered here too, with no base table.
-        named = {resolve_identifier(node.args.get("alias")
-                                    or (node.this if isinstance(node, exp.Table) else None), dialect)
-                 for node in [*scope.tables, *scope.derived_tables, *scope.udtfs]} - {None}
+        # The base tables the scope reads, and every other source it selects from (a CTE's or a
+        # derived table's), each by its alias's resolved spelling: a qualifier naming one of the
+        # latter is answered by what that source exposes under the column's name (`_exposure`).
+        local, by_alias = _scope_names(scope, dialect)
         for column in getattr(scope, "columns", ()):
             # Bound once, in the nearest scope that names the qualifier, as every engine binds it
             # (`traverse` yields a scope after the scopes inside it). sqlglot lists a subquery's
@@ -714,8 +891,16 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
             if table is not None:
                 out[id(column)] = table
                 settled.add(id(column))
-            elif qualifier in named:
-                settled.add(id(column))  # a CTE's or derived table's column, checked in its scope
+            elif qualifier in by_alias:
+                name = resolve_identifier(column.this, dialect)
+                found = _exposure(by_alias[qualifier], name, column, columns, dialect, frozenset())
+                if found is None:
+                    found = _bound_outward(scope, qualifier, name, column, columns, dialect)
+                if found is None:
+                    continue  # no scope exposes it: the engine would refuse the reference
+                settled.add(id(column))
+                if found is not _NAMED:
+                    out[id(column)] = found[1]
 
     # Columns qualified by the write target resolve to it. `ON CONFLICT DO UPDATE SET amount =
     # scratch.amount + 1` reads `scratch.amount` from a table in no scope, so without this the

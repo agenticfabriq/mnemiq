@@ -295,11 +295,15 @@ def test_a_nearer_column_is_known_from_a_subquery_s_projection_and_from_the_poli
                     "SELECT (SELECT secret.status FROM (SELECT * FROM claim) d) FROM other secret",
                     "SELECT (SELECT secret.status FROM (SELECT c.* FROM claim c) d) FROM other secret",
                     "WITH w AS (SELECT * FROM claim) SELECT (SELECT secret.status FROM w) "
-                    "FROM other secret",
-                    "SELECT (SELECT secret.status FROM (SELECT id FROM plain UNION ALL "
-                    "SELECT * FROM claim) d) FROM other secret"):
+                    "FROM other secret"):
         verdict = decide(derived, SCOPES, dialect="duckdb", target="duckdb")  # no policy
         assert isinstance(verdict, Refusal) and "two ways" in verdict.message, (derived, verdict)
+    # A star in a branch of a set operation inside a derived table binds by position, so the
+    # shape check refuses it first (M183), before the two readings are weighed.
+    positional = decide("SELECT (SELECT secret.status FROM (SELECT id FROM plain UNION ALL "
+                        "SELECT * FROM claim) d) FROM other secret",
+                        SCOPES, dialect="duckdb", target="duckdb")
+    assert isinstance(positional, Refusal) and "position" in positional.message, positional
     # `secret` left out of the grant, and known from the policy: its schema, or what it denies.
     told_by_policy = {**SCOPES, "claim": {"id", "amount"}}
     for policy in (DENIED, AccessPolicy(denied={("claim", "secret")}),
