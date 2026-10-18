@@ -1709,21 +1709,43 @@ def _is_timeout(exc: Exception) -> bool:
     return "dpy-4011" in text or "ora-03156" in text or "timeout" in text
 
 
+# The driver's own codes that say the connection, the pool or the connect handshake failed, so no
+# session read the statement: read off the driver's whole error table once (python-oracledb 3.x,
+# `errors.ERR_MESSAGE_FORMATS`) rather than one code per incident, after two incidents (Codex's
+# second and third reviews of #159: DPY-4005, then DPY-4033). Each is a plain `DatabaseError`,
+# `InterfaceError` or `InternalError` with `isrecoverable` False, so neither the type nor the flag
+# tells it from a parse refusal. Left out on purpose: the statement's own faults the same classes
+# hold (DPY-4004 invalid number, DPY-4007 cannot convert, the bind errors), the cursor and
+# fetch states (DPY-1003, 1004, 1006), and DPY-5004, protocol data the driver could not read,
+# which may be one statement's response rather than the connection.
+_UNAVAILABLE_DPY = frozenset({
+    "DPY-1001", "DPY-1002",  # not connected; pool not open
+    "DPY-4005",  # timed out waiting for the pool: `_lease` under `wait_timeout`, pool exhausted
+    "DPY-4011",  # the database or network closed the connection (recoverable, named for the test)
+    "DPY-4024",  # call timeout exceeded
+    "DPY-4033",  # the database closed the connection: idle time exceeded
+    "DPY-4035",  # invalid server response to the connection request
+    "DPY-5005", "DPY-5006",  # listener refused in an unexpected format; data ends mid-message
+    # Connect-time configuration a growing pool can surface on acquire: tnsnames lookup,
+    # credentials, connect descriptor, protocol, wallet, server_type, TLS, password type.
+    "DPY-4000", "DPY-4001", "DPY-4017", "DPY-4018", "DPY-4019", "DPY-4021", "DPY-4026",
+    "DPY-4027", "DPY-4028", "DPY-4032", "DPY-4034",
+})
+
+
 def unavailable_fault(exc: BaseException) -> bool:
     """Whether a python-oracledb error says the source could not be asked, rather than that it
     answered no: the proof seam's `source_unavailable` (Codex's review of #159).
 
     The driver types its network faults `OperationalError` (its DPY-6xxx, and the ORA codes it
     lists as such: ORA-03113, ORA-03114 and ORA-01013, the cancel a call timeout surfaces as, among
-    them), flags a dead session recoverable (DPY-4011, which it cross-references ORA-03113 to), and
-    leaves its own call timeout, DPY-4024, a plain `DatabaseError`: named here, with ORA-03156 and
-    the TNS ranges (ORA-12150 to 12236, ORA-12500 to 12699) its list leaves out. So is the pool's
-    acquisition timeout, DPY-4005, which `_lease` raises when `wait_timeout` expires: a statement
-    the exhausted pool never handed a session was never parsed (Codex's second review of #159).
-    DPY-1001 and DPY-1002, the driver's `InterfaceError`s for a connection or pool already
-    closed, are the same reading, DuckDB's closed connection in this driver's words. A parse
-    refusal (ORA-00904, ORA-00942, ORA-00936) is none of these and keeps its reading, as does
-    `ReadOnlyViolation`, this adapter's own refusal to parse DDL.
+    them) and flags a dead session recoverable (DPY-4011, which it cross-references ORA-03113 to).
+    Everything else it leaves a plain `DatabaseError`, `InterfaceError` or `InternalError`, so the
+    rest is named: `_UNAVAILABLE_DPY`, read off the driver's whole error table, and among the ORA
+    codes ORA-03156 and the TNS ranges (ORA-12150 to 12236, ORA-12500 to 12699) its list leaves
+    out. A parse refusal (ORA-00904, ORA-00942, ORA-00936) is none of these and keeps its
+    reading, as do the driver's data faults (DPY-4004) and `ReadOnlyViolation`, this adapter's
+    own refusal to parse DDL.
     """
     if isinstance(exc, (ConnectionError, TimeoutError)):
         return True
@@ -1737,5 +1759,5 @@ def unavailable_fault(exc: BaseException) -> bool:
     if isinstance(exc, oracledb.OperationalError) or getattr(error, "isrecoverable", False):
         return True
     code = getattr(error, "code", 0) or 0
-    return (error.full_code in ("DPY-1001", "DPY-1002", "DPY-4005", "DPY-4011", "DPY-4024")
-            or code == 3156 or 12150 <= code <= 12236 or 12500 <= code <= 12699)
+    return (error.full_code in _UNAVAILABLE_DPY or code == 3156
+            or 12150 <= code <= 12236 or 12500 <= code <= 12699)

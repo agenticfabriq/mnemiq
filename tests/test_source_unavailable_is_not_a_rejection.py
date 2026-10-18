@@ -149,14 +149,24 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
         error = errors._Error(message=message, code=code)
         return error.exc_type(error)
 
+    from mnemiq.adapters.oracle import _UNAVAILABLE_DPY
+
+    # The driver's own faults that are the statement's or the caller's, by the same classes the
+    # unavailable ones carry: invalid number, cannot convert, a cursor not open, an unsupported
+    # Python type, protocol data the driver could not read.
     refused = [ora(904, 'ORA-00904: "WHOM": invalid identifier'),
                ora(942, "ORA-00942: table or view does not exist"),
                ora(936, "ORA-00936: missing expression"),
+               _dpy(4004), _dpy(4007), _dpy(1006), _dpy(3002), _dpy(5004),
                RuntimeError("refusing to validate a CREATE statement")]
-    # DPY-4005 is the pool's acquisition timeout, what `_lease` raises under contention, and a
-    # plain non-recoverable DatabaseError by the driver's typing (Codex's second review of #159).
-    # DPY-1001 and DPY-1002 are a connection and a pool already closed.
-    unanswered = [_dpy(4011), _dpy(4024), _dpy(6005), _dpy(4005), _dpy(1001), _dpy(1002),
+    # Every code the adapter names, listed here on its own so the two lists must agree, built as
+    # the driver builds it: the pool's acquisition timeout DPY-4005 (`_lease` under contention)
+    # and the idle disconnect DPY-4033 are plain non-recoverable DatabaseErrors by the driver's
+    # typing (Codex's second and third reviews of #159).
+    named = [_dpy(n) for n in (1001, 1002, 4000, 4001, 4005, 4011, 4017, 4018, 4019, 4021, 4024,
+                               4026, 4027, 4028, 4032, 4033, 4034, 4035, 5005, 5006)]
+    assert {str(exc)[:8] for exc in named} == _UNAVAILABLE_DPY
+    unanswered = [*named, _dpy(6005),
                   ora(3113, "ORA-03113: end-of-file on communication channel"),
                   ora(1013, "ORA-01013: user requested cancel of current operation"),
                   ora(3156, "ORA-03156: the call timed out"),
@@ -180,15 +190,17 @@ class _OracleScripted(_Scripted):
         return oracle_unavailable(exc)
 
 
+@pytest.mark.parametrize("code", [4005, 4033], ids=["pool exhausted", "idle disconnect"])
 @pytest.mark.parametrize("script", [
-    [4005], ["stale", 4005], ["stale", None, 4005],
+    ["fault"], ["stale", "fault"], ["stale", None, "fault"],
 ], ids=["first proof", "proof as asked", "re-proof of the rewrite"])
-def test_an_exhausted_oracle_pool_is_unavailable_at_every_proof_position(script):
-    """Before, DPY-4005 read as a refusal: EXPLAIN_FAILED at the first two positions, a
-    statement no session parsed sent to the model; POLICY_REWRITE_REJECTED at the third, the
-    operator told to fix a policy."""
+def test_an_exhausted_pool_or_an_idle_disconnect_is_unavailable_at_every_proof_position(
+        script, code):
+    """Before, DPY-4005 and DPY-4033 read as a refusal: EXPLAIN_FAILED at the first two
+    positions, a statement no session parsed sent to the model; POLICY_REWRITE_REJECTED at the
+    third, the operator told to fix a policy."""
     pytest.importorskip("oracledb")
-    faults = [_dpy(step) if isinstance(step, int) else (_stale() if step else None)
+    faults = [_dpy(code) if step == "fault" else (_stale() if step else None)
               for step in script]
     source = _OracleScripted(*faults)
     verdict = prove_governed(source, REWRITE, ASKED)
