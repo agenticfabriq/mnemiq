@@ -133,6 +133,14 @@ def test_duckdb_tells_a_closed_connection_and_an_interrupt_from_a_statement_s_fa
     assert duckdb_unavailable(ConnectionError("reset"))
 
 
+def _dpy(number):
+    """The driver's own exception for one of its DPY codes, typed as the driver types it."""
+    from oracledb import errors
+
+    error = errors._create_err(number)
+    return error.exc_type(error)
+
+
 def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal():
     pytest.importorskip("oracledb")
     from oracledb import errors
@@ -141,15 +149,14 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
         error = errors._Error(message=message, code=code)
         return error.exc_type(error)
 
-    def dpy(number):
-        error = errors._create_err(number)
-        return error.exc_type(error)
-
     refused = [ora(904, 'ORA-00904: "WHOM": invalid identifier'),
                ora(942, "ORA-00942: table or view does not exist"),
                ora(936, "ORA-00936: missing expression"),
                RuntimeError("refusing to validate a CREATE statement")]
-    unanswered = [dpy(4011), dpy(4024), dpy(6005),
+    # DPY-4005 is the pool's acquisition timeout, what `_lease` raises under contention, and a
+    # plain non-recoverable DatabaseError by the driver's typing (Codex's second review of #159).
+    # DPY-1001 and DPY-1002 are a connection and a pool already closed.
+    unanswered = [_dpy(4011), _dpy(4024), _dpy(6005), _dpy(4005), _dpy(1001), _dpy(1002),
                   ora(3113, "ORA-03113: end-of-file on communication channel"),
                   ora(1013, "ORA-01013: user requested cancel of current operation"),
                   ora(3156, "ORA-03156: the call timed out"),
@@ -157,6 +164,58 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
                   ora(12170, "ORA-12170: TNS:Connect timeout occurred")]
     assert [str(exc)[:9] for exc in refused if oracle_unavailable(exc)] == []
     assert [str(exc)[:9] for exc in unanswered if not oracle_unavailable(exc)] == []
+
+
+class _OracleScripted(_Scripted):
+    """A source proving as Oracle does (`validate`, the parse-only path) and reading its faults
+    with the Oracle adapter's own classifier."""
+
+    dialect = "oracle"
+
+    def validate(self, sql):
+        self.execute(sql)
+
+    @staticmethod
+    def source_unavailable(exc):
+        return oracle_unavailable(exc)
+
+
+@pytest.mark.parametrize("script", [
+    [4005], ["stale", 4005], ["stale", None, 4005],
+], ids=["first proof", "proof as asked", "re-proof of the rewrite"])
+def test_an_exhausted_oracle_pool_is_unavailable_at_every_proof_position(script):
+    """Before, DPY-4005 read as a refusal: EXPLAIN_FAILED at the first two positions, a
+    statement no session parsed sent to the model; POLICY_REWRITE_REJECTED at the third, the
+    operator told to fix a policy."""
+    pytest.importorskip("oracledb")
+    faults = [_dpy(step) if isinstance(step, int) else (_stale() if step else None)
+              for step in script]
+    source = _OracleScripted(*faults)
+    verdict = prove_governed(source, REWRITE, ASKED)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SOURCE_UNAVAILABLE, verdict
+    assert not verdict.repairable
+    assert len(source.proofs) == len(script), source.proofs
+
+
+def test_through_both_deciders_an_exhausted_oracle_pool_is_unavailable_not_the_model_s():
+    pytest.importorskip("oracledb")
+    snapshot = _snapshot()
+    grants = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}),
+                      row_filters={"claim": ENTITLED})
+    read = decide("SELECT id FROM claim", visible_schema(snapshot, grants),
+                  adapter=_OracleScripted(_dpy(4005)), dialect="oracle", target="oracle",
+                  policy=build_access_policy(snapshot, grants))
+    assert isinstance(read, Refusal) and read.code is RefusalCode.SOURCE_UNAVAILABLE, read
+    assert not read.repairable
+    # No row filter on the write: on Oracle an UPDATE of a filtered table is refused before any
+    # proof, as a limit of the deployment, so the proof is reached only on a plain grant.
+    plain = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}))
+    write = decide_write("UPDATE claim SET amount = 0 WHERE id = 1",
+                         visible_schema(snapshot, plain), plain,
+                         policy=build_access_policy(snapshot, plain),
+                         adapter=_OracleScripted(_dpy(4005)), dialect="oracle", target="oracle",
+                         writes_enabled=True)
+    assert isinstance(write, Refusal) and write.code is RefusalCode.SOURCE_UNAVAILABLE, write
 
 
 def test_postgres_tells_a_lost_connection_and_a_cancelled_statement_from_a_statement_s_faults():

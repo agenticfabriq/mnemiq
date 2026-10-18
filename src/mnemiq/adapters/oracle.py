@@ -1717,8 +1717,12 @@ def unavailable_fault(exc: BaseException) -> bool:
     lists as such: ORA-03113, ORA-03114 and ORA-01013, the cancel a call timeout surfaces as, among
     them), flags a dead session recoverable (DPY-4011, which it cross-references ORA-03113 to), and
     leaves its own call timeout, DPY-4024, a plain `DatabaseError`: named here, with ORA-03156 and
-    the TNS ranges (ORA-12150 to 12236, ORA-12500 to 12699) its list leaves out. A parse refusal
-    (ORA-00904, ORA-00942, ORA-00936) is none of these and keeps its reading, as does
+    the TNS ranges (ORA-12150 to 12236, ORA-12500 to 12699) its list leaves out. So is the pool's
+    acquisition timeout, DPY-4005, which `_lease` raises when `wait_timeout` expires: a statement
+    the exhausted pool never handed a session was never parsed (Codex's second review of #159).
+    DPY-1001 and DPY-1002, the driver's `InterfaceError`s for a connection or pool already
+    closed, are the same reading, DuckDB's closed connection in this driver's words. A parse
+    refusal (ORA-00904, ORA-00942, ORA-00936) is none of these and keeps its reading, as does
     `ReadOnlyViolation`, this adapter's own refusal to parse DDL.
     """
     if isinstance(exc, (ConnectionError, TimeoutError)):
@@ -1733,5 +1737,5 @@ def unavailable_fault(exc: BaseException) -> bool:
     if isinstance(exc, oracledb.OperationalError) or getattr(error, "isrecoverable", False):
         return True
     code = getattr(error, "code", 0) or 0
-    return (error.full_code in ("DPY-4011", "DPY-4024") or code == 3156
-            or 12150 <= code <= 12236 or 12500 <= code <= 12699)
+    return (error.full_code in ("DPY-1001", "DPY-1002", "DPY-4005", "DPY-4011", "DPY-4024")
+            or code == 3156 or 12150 <= code <= 12236 or 12500 <= code <= 12699)
