@@ -1710,16 +1710,19 @@ def _is_timeout(exc: Exception) -> bool:
 
 
 # The driver's own codes that say the connection, the pool or the connect handshake failed, so no
-# session read the statement: read off the driver's error table (`errors.ERR_MESSAGE_FORMATS`,
-# 190 entries in python-oracledb 4.0.2, the locked version; the taxonomy test pins that size so a
-# driver with a different table sends a maintainer back to it) rather than one code per
-# incident, after two incidents (Codex's second and third reviews of #159: DPY-4005, then
-# DPY-4033). Each is a plain `DatabaseError`, `InterfaceError` or `InternalError` with
-# `isrecoverable` False, so neither the type nor the flag tells it from a parse refusal. Left
-# out on purpose: the statement's own faults the same classes hold (DPY-4004 invalid number,
-# DPY-4007 cannot convert, the bind errors) and the cursor and fetch states (DPY-1003, 1004,
-# 1006). The ORA codes a growing pool meets on acquire are beside the set: a wrong password,
-# a locked account, an expired one (ORA-01017, ORA-28000, ORA-28001).
+# session read the statement. Read off the driver's error table (`errors.ERR_MESSAGE_FORMATS`,
+# python-oracledb 4.0.2, the locked version) code by code rather than one code per incident,
+# after two incidents (Codex's second and third reviews of #159: DPY-4005, then DPY-4033); the
+# taxonomy test classifies every code in that table, this set, the OperationalErrors or a
+# reviewed list of refusals, so a driver whose table differs fails it and sends a maintainer back
+# here. Each code here is a plain `DatabaseError`, `InterfaceError`, `ProgrammingError`,
+# `NotSupportedError` or `InternalError` with `isrecoverable` False, so neither the type nor the
+# flag tells it from a parse refusal. Left out on purpose: the statement's own faults the same
+# classes hold (DPY-4004 invalid number, DPY-4007 cannot convert, the bind errors), the cursor
+# and fetch states (DPY-1003, 1004, 1006), and DPY-5004 and DPY-5006, which the driver raises
+# decoding a fetched value (its vector, OSON and Arrow decoders, and a shared length check), so
+# they can be one statement's response. The ORA codes a growing pool meets on acquire are beside
+# the set: a wrong password, a locked account, an expired one (ORA-01017, ORA-28000, ORA-28001).
 _UNAVAILABLE_DPY = frozenset({
     "DPY-1001", "DPY-1002",  # not connected; pool not open
     "DPY-4005",  # timed out waiting for the pool: `_lease` under `wait_timeout`, pool exhausted
@@ -1727,13 +1730,12 @@ _UNAVAILABLE_DPY = frozenset({
     "DPY-4024",  # call timeout exceeded
     "DPY-4033",  # the database closed the connection: idle time exceeded
     "DPY-4035",  # invalid server response to the connection request
-    # Protocol faults: an answer the driver could not read is not an answer, and the session's
-    # wire state is unknown after it. The listener refusing in an unexpected format, data the
-    # driver did not expect, data ending mid-message.
-    "DPY-5005", "DPY-5004", "DPY-5006",
+    "DPY-5005",  # the listener refused the connection in an unexpected format (connect messages)
     # Connect-time configuration a growing pool can surface on acquire: tnsnames lookup and its
-    # include cycle, credentials, connect descriptor, protocol, wallet, server_type, TLS,
-    # password type.
+    # include cycle, credentials and an expired access token, connect descriptor and its address
+    # list, protocol and its handler, wallet, server_type, TLS, password type and its handler,
+    # a password verifier the driver cannot use.
+    "DPY-2018", "DPY-2033", "DPY-2049", "DPY-2056", "DPY-2057", "DPY-3015",
     "DPY-4000", "DPY-4001", "DPY-4017", "DPY-4018", "DPY-4019", "DPY-4021", "DPY-4026",
     "DPY-4027", "DPY-4028", "DPY-4030", "DPY-4032", "DPY-4034",
 })
