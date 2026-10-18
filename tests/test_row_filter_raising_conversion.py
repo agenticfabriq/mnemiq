@@ -156,6 +156,7 @@ RAISING_TYPED_FORMS = [
     "CASE WHEN id = 1 THEN id + 1 ELSE 'nan' END = 2",
     "CASE WHEN id = 1 THEN id + 1 ELSE '3000000000' END = 2",
     "CASE WHEN id = 1 THEN (SELECT 7 FROM entitlement LIMIT 1) ELSE 'north' END = 7",
+    "CASE WHEN id = 1 THEN (SELECT id + 1 FROM entitlement LIMIT 1) ELSE 'nan' END = 7",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -252,23 +253,44 @@ def test_a_json_literal_is_read_as_duckdb_s_reader_reads_it(literal):
     assert _json_text(literal) is reads, (literal, reads)
 
 
-def test_the_validator_types_a_policy_without_running_it():
-    """A subquery over a trillion rows on a branch: typed by the reader here (a count is a
-    number), never evaluated on the validator's connection, so the verdict comes at once (the
-    review gate on #160); and a table function reading a file is never called."""
-    import time
+def test_the_validator_types_a_policy_without_running_it(monkeypatch):
+    """What the validator hands DuckDB while deciding is read off the door itself (the review
+    gate on #160: a time bound could not tell a run from a fast one): a trillion-row subquery on a
+    branch is typed by the reader here (a count is a number) and never sent; a table function
+    reading a file is never sent; what is sent types literals and typed NULLs alone."""
+    from mnemiq.sql import rls
 
-    started = time.monotonic()
+    sent = []
+    real = rls._duckdb
+
+    def spy(sql, params=()):
+        sent.append(sql)
+        return real(sql, params)
+
+    monkeypatch.setattr(rls, "_duckdb", spy)
+    # A subquery's pure projection is typed with its column a typed NULL; its FROM is never sent.
+    verdict = _decide("CASE WHEN id = 1 THEN (SELECT id + 1 FROM entitlement LIMIT 1) "
+                      "ELSE 'nan' END = 7")
+    assert isinstance(verdict, Refusal), verdict  # 'nan' converts to no integer
+    # A table function on a branch is the filter validator's refusal before any typing.
     verdict = _decide("CASE WHEN id = 1 THEN (SELECT count(*) FROM range(1000000000000)) "
                       "ELSE 'x' END = 1")
+    assert isinstance(verdict, Refusal), verdict
+    # A subquery inside arithmetic is not a pure expression: the sum is typed by the reader
+    # here, and the subquery's FROM is never sent.
+    verdict = _decide("CASE WHEN id = 1 THEN (SELECT id FROM entitlement LIMIT 1) + 1 "
+                      "ELSE 'x' END = 7")
     assert isinstance(verdict, Refusal), verdict  # 'x' converts to no number
-    assert time.monotonic() - started < 5, "the subquery ran"
     # A call's type is unknown here, so beside a literal the rule says nothing (the guide's "not
-    # a proof"); what this pins is that the call is never made while deciding.
+    # a proof"); the call is never sent.
     verdict = _decide("CASE WHEN id = 1 THEN length(read_text('/nonexistent/never-read')) "
                       "ELSE 'x' END = 1")
     assert isinstance(verdict, (Approved, Refusal)), verdict
-    assert time.monotonic() - started < 5
+    assert sent, "DuckDB was asked for the literals' casts"
+    for sql in sent:
+        assert "entitlement" not in sql and "range(" not in sql and "read_text" not in sql, sql
+        assert " FROM " not in sql, sql
+        assert sql.startswith("SELECT typeof(") or sql.startswith("SELECT TRY_CAST("), sql
 
 
 def test_a_literal_on_a_branch_never_taken_is_still_refused_where_it_cannot_convert():

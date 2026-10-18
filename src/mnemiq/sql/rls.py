@@ -382,6 +382,28 @@ _PURE = (exp.Column, exp.Identifier, exp.Literal, exp.Boolean, exp.Null, exp.Par
          *_ARITHMETIC)
 
 
+def _pure_type(value: exp.Expression, type_of) -> str | None:
+    """DuckDB's type for a pure value expression (`_PURE`: columns, literals, casts, arithmetic),
+    each column replaced by a NULL of its snapshot type, so the expression binds and nothing
+    runs; None for anything else, or where a column's type is not known."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if not all(isinstance(node, _PURE) for node in value.walk()):
+        return None
+    # The types are read off the original nodes, which the resolver knows by identity; the
+    # copy's are then replaced in the same traversal order.
+    declared = [type_of(column) for column in value.find_all(exp.Column)]
+    if None in declared:
+        return None
+    typed_nulls = value.copy()
+    for column, kind_of in zip(list(typed_nulls.find_all(exp.Column)), declared):
+        column.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
+    try:
+        return _duckdb(f"SELECT typeof({typed_nulls.sql(dialect='duckdb')})")
+    except Exception:  # noqa: BLE001 -- unreadable by DuckDB: the type reader's word instead
+        return None
+
+
 def _duckdb_type(branch: exp.Expression, type_of, engine: str) -> str | None:
     """The type DuckDB gives a branch, in DuckDB's words. A column's is the snapshot's; a cast's
     its target; a pure value expression's (`7`, `1.5`, `id + 1`, `INTERVAL '1 day'`) is asked of
@@ -397,19 +419,15 @@ def _duckdb_type(branch: exp.Expression, type_of, engine: str) -> str | None:
         kind = type_of(branch)
     elif isinstance(branch, exp.Cast):
         kind = branch.to.sql(dialect="duckdb")
-    elif all(isinstance(node, _PURE) for node in branch.walk()):
-        # The types are read off the original nodes, which the resolver knows by identity; the
-        # copy's are then replaced in the same traversal order.
-        declared = [type_of(column) for column in branch.find_all(exp.Column)]
-        typed_nulls = None if None in declared else branch.copy()
-        if typed_nulls is not None:
-            for column, kind_of in zip(list(typed_nulls.find_all(exp.Column)), declared):
-                column.replace(exp.Cast(this=exp.Null(),
-                                        to=exp.DataType.build(kind_of, dialect="duckdb")))
-            try:
-                kind = _duckdb(f"SELECT typeof({typed_nulls.sql(dialect='duckdb')})")
-            except Exception:  # noqa: BLE001 -- unreadable by DuckDB: the type reader's word
-                kind = None
+    elif isinstance(branch, exp.Subquery):
+        # A scalar subquery is its one projection's type (the gate's `(SELECT id + 1 FROM
+        # entitlement LIMIT 1)` beside 'nan'); the projection alone is handed to DuckDB, never
+        # the subquery, whose FROM would run.
+        inner = branch.this
+        if isinstance(inner, exp.Select) and len(inner.selects) == 1:
+            kind = _pure_type(inner.selects[0].unalias(), type_of)
+    else:
+        kind = _pure_type(branch, type_of)
     if kind is None:
         known = _known_type(branch, type_of, engine)
         kind = None if known is None else known.sql(dialect="duckdb")
