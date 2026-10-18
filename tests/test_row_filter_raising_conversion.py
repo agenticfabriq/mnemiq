@@ -110,6 +110,8 @@ RAISING_TYPED_FORMS = [
     "json_extract_string(CASE WHEN region = 'north' THEN 'x' ELSE attrs END, '$.a') IS NOT NULL",
     "json_extract_string(CASE WHEN region = 'north' THEN 'x' || '' ELSE attrs END, '$.a') IS NOT NULL",
     "json_extract_string(coalesce(attrs, 'x'), '$.a') IS NOT NULL",
+    # A lone surrogate escape: Python's reader takes it, DuckDB's refuses it (the review gate).
+    "json_extract_string(coalesce(attrs, '\"\\ud800\"'), '$.a') IS NOT NULL",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -255,6 +257,12 @@ def test_every_duckdb_json_reader_that_quotes_malformed_text_is_refused():
     ("oracle", "NVL(region, id) = 7"),
     ("oracle", "region = NVL(id, 7)"),
     ("oracle", "region = (SELECT 7 FROM entitlement)"),
+    # NVL and NVL2 convert their other argument to the leading one's type, row by row: ORA-01722
+    # on a row whose id is NULL (measured); COALESCE and CASE refuse the mix at parse instead.
+    ("oracle", "NVL(id, region) IS NOT NULL"),
+    ("oracle", "region = NVL(id, region)"),
+    ("oracle", "NVL2(id, id, region) IS NOT NULL"),
+    ("oracle", "region = NVL2(id, id, 7)"),                  # typed by its second argument
 ])
 def test_a_conversion_that_can_raise_is_refused_naming_the_engine_s_safe_form(engine, row_filter,
                                                                                caplog):
@@ -298,6 +306,7 @@ def test_a_column_the_snapshot_does_not_type_is_unknown_and_refused():
     ("oracle", "CAST(region AS NUMBER DEFAULT NULL ON CONVERSION ERROR) > 0"),
     ("oracle", "TO_NUMBER(region DEFAULT NULL ON CONVERSION ERROR) > 0"),
     ("oracle", "CAST(region AS DATE DEFAULT NULL ON CONVERSION ERROR) > DATE '2000-01-01'"),
+    ("oracle", "NVL(region, id) IS NOT NULL"),                # text leads: id renders as text
 ])
 def test_a_conversion_that_cannot_raise_is_kept(engine, row_filter):
     assert isinstance(_decide(row_filter, engine), Approved), row_filter
@@ -357,11 +366,15 @@ def test_on_oracle_the_advised_forms_run_where_the_raising_one_fails():
     cur = con.cursor()
     # Every visible column, since the policy's derived table projects them all.
     data = ("(SELECT 1 AS id, '7' AS region, 10 AS amount, 1 AS big, NULL AS attrs FROM dual "
-            "UNION ALL SELECT 2, 'north', 20, 2, NULL FROM dual) claim")
+            "UNION ALL SELECT 2, 'north', 20, 2, NULL FROM dual "
+            "UNION ALL SELECT NULL, 'south', 30, 3, NULL FROM dual) claim")  # NULL id: NVL reads region
     try:
         # (as run here, as decided): the snapshot knows entitlement, the database knows dual.
         for raising, decided in (("CAST(region AS NUMBER) > 0", None), ("region > 0", None),
                                  ("NVL(region, id) = 7", None), ("region = NVL(id, 7)", None),
+                                 ("NVL(id, region) IS NOT NULL", None), ("region = NVL(id, region)", None),
+                                 ("NVL2(id, id, region) IS NOT NULL", None),
+                                 ("region = NVL2(id, id, 7)", None),
                                  ("region = (SELECT 7 FROM dual)", "region = (SELECT 7 FROM entitlement)")):
             with pytest.raises(oracledb.DatabaseError, match="ORA-01722"):
                 cur.execute(f"SELECT id FROM {data} WHERE {raising}").fetchall()

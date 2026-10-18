@@ -186,11 +186,12 @@ def _branches(value: exp.Expression) -> list[exp.Expression]:
 
 
 def _json_text(text: str) -> bool:
-    """Whether a literal is JSON as DuckDB reads it. Python's reader agrees on the edge measured:
-    both take NaN and Infinity."""
+    """Whether a literal is JSON as DuckDB reads it. Python's reader agrees on NaN and Infinity
+    (both take them) and differs on a lone surrogate escape, which it takes and DuckDB refuses
+    (the review gate on #160): encoding what was read catches that one."""
     try:
-        json.loads(text)
-    except ValueError:
+        json.dumps(json.loads(text), ensure_ascii=False).encode("utf-8")
+    except (ValueError, UnicodeEncodeError):
         return False
     return True
 
@@ -286,6 +287,8 @@ def _known_type(value, type_of, engine: str) -> exp.DataType | None:
         return None
     if isinstance(value, (exp.Nullif, exp.Max, exp.Min)):
         return _known_type(value.this, type_of, engine)
+    if isinstance(value, exp.Nvl2):
+        return _known_type(value.args["true"], type_of, engine)  # Oracle: its second argument's
     if isinstance(value, (exp.Count, exp.Sum, exp.Avg)):
         return exp.DataType.build("DOUBLE")
     if isinstance(value, _BRANCHED):
@@ -295,6 +298,25 @@ def _known_type(value, type_of, engine: str) -> exp.DataType | None:
     if isinstance(value, exp.Literal) and value.is_number or isinstance(value, _ARITHMETIC):
         return exp.DataType.build("DOUBLE")
     return None
+
+
+def _nvl_converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
+    """Oracle's NVL and NVL2 take their leading argument's type and convert the other argument
+    to it row by row: `NVL(id, region)` is ORA-01722 on a row whose id is NULL and whose region
+    is not a number (measured; the review gate on #160), where COALESCE and CASE refuse the mix
+    at parse, on no row's value."""
+    if isinstance(node, exp.Coalesce) and node.args.get("is_nvl"):
+        lead, others = node.this, node.expressions
+    elif isinstance(node, exp.Nvl2):
+        lead, others = node.args["true"], [node.args["false"]]
+    else:
+        return False
+    typed = _known_type(lead, type_of, engine)
+    if typed is None or typed.this in exp.DataType.TEXT_TYPES:
+        return False
+    return any((known := _known_type(other, type_of, engine)) is not None
+               and known.this in exp.DataType.TEXT_TYPES and other.find(exp.Column) is not None
+               for other in others)
 
 
 def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
@@ -375,6 +397,8 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             if _converts_a_text_column(node, type_of, engine):
                 return node
             continue
+        if engine == "oracle" and _nvl_converts_a_text_column(node, type_of, engine):
+            return node
         untyped = isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_CONVERSIONS
         if not (untyped or isinstance(node, (exp.Cast, *_PARSES))):
             continue
