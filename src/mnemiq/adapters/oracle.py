@@ -1729,14 +1729,31 @@ _UNAVAILABLE_DPY = frozenset({
     "DPY-4024",  # call timeout exceeded
     "DPY-4033",  # the database closed the connection: idle time exceeded
     "DPY-4035",  # invalid server response to the connection request
-    # The protocol faults, by where the driver's source (4.0.2) raises them. DPY-5005, the
-    # listener refusing in an unexpected format: the connect-time protocol message alone.
-    # DPY-5006, data ending mid-message: the read buffer and the connect-time protocol message,
-    # and the OSON value decoder. DPY-5004, data the driver did not expect: the connect-time
-    # protocol message, and the vector, OSON and Arrow value decoders. This classifier serves the
-    # proof seam alone, and a proof (`cursor.parse`) decodes no value, so at that seam each of
-    # the three is the wire's or the handshake's, never the statement's.
-    "DPY-5004", "DPY-5005", "DPY-5006",
+    # The protocol faults (InternalError), by the driver source files that raise each constant,
+    # as a code search of the driver's repository lists them (the installed wheel is compiled,
+    # so the files are named here rather than re-read on review; Codex's fourth review of #159
+    # found 5000 and 5009). ERR_MESSAGE_TYPE_UNKNOWN 5000, ERR_UNKNOWN_SERVER_PIGGYBACK 5009 and
+    # ERR_UNKNOWN_TRANSACTION_SYNC_VERSION 5014: impl/thin/messages/base.pyx, the response parser.
+    # ERR_UNKNOWN_TRANSACTION_STATE 5010: impl/thin/connection.pyx, the state the server sends.
+    # ERR_BUFFER_LENGTH_INSUFFICIENT 5001, ERR_INTEGER_TOO_LARGE 5002 and
+    # ERR_UNEXPECTED_NEGATIVE_INTEGER 5003: impl/thin/packet.pyx (the read buffer) and
+    # impl/base/buffer.pyx (the base buffer the value decoders share). ERR_UNEXPECTED_REFUSE
+    # 5005: impl/thin/messages/connect.pyx. ERR_UNEXPECTED_END_OF_DATA 5006: impl/base/utils.pyx,
+    # called from the protocol message, the read buffer and the OSON decoder. ERR_UNEXPECTED_DATA
+    # 5004: impl/thin/messages/network_services.pyx (connect time) and the vector, OSON and Arrow
+    # value decoders. Today the proof seam (`prove_outcome`, through `source_unavailable`) is
+    # this classifier's only caller, and a proof (`cursor.parse`) decodes no value, so there each
+    # of these is the wire's or the handshake's, never the statement's. M188 proposes a second
+    # caller, the runner reading a fault while running: there a value decoder can raise 5001 to
+    # 5006 on one statement's rows, which would then read as the source unavailable, a reading
+    # both lanes accepted in advance (a result the driver could not read is not the model's to
+    # repair either way, and the model sees the class alone); whoever wires it decides it there.
+    # Left out: ERR_UNEXPECTED_XML_TYPE 5007 (impl/thin/dbobject.pyx) and
+    # ERR_NUMBER_TOO_LARGE 5015 (impl/base/decoders.pyx), a value's; ERR_UNEXPECTED_PIPELINE_FAILURE
+    # 5011 (impl/base/pipeline.pyx), 5012 not implemented and 5013 creation, the driver's or the
+    # caller's.
+    "DPY-5000", "DPY-5001", "DPY-5002", "DPY-5003", "DPY-5004", "DPY-5005", "DPY-5006",
+    "DPY-5009", "DPY-5010", "DPY-5014",
     # Connect-time configuration a growing pool can surface on acquire: tnsnames lookup and its
     # include cycle, credentials and an expired access token, connect descriptor and its address
     # list, protocol and its handler, wallet, server_type, TLS, password type and its handler,
