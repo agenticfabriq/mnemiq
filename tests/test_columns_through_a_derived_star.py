@@ -379,6 +379,85 @@ def test_a_bare_name_that_is_the_query_s_own_alias_is_the_alias_where_the_engine
         assert con.execute(aliased.target_sql).fetchall() == rows
 
 
+@pytest.mark.parametrize("sql", [
+    # Codex's fourth review: DuckDB renames a later duplicate output name `secret_1`, so the
+    # star's claim.secret behind a literal of the same name is read under that name; and over a
+    # join, each later duplicate the same way.
+    "SELECT d.secret_1 FROM (SELECT 'SAFE' AS secret, * FROM claim) d",
+    "SELECT secret_1 FROM (SELECT 'SAFE' AS secret, * FROM claim) d",
+    "SELECT d.secret_1 FROM (SELECT * FROM other o JOIN claim c ON c.id = o.id) d",
+    # A second derived source beside the one with the star must not switch the bare binding off.
+    "SELECT secret FROM (SELECT *, 'SAFE' AS secret FROM claim) d CROSS JOIN (SELECT 1 AS x) e",
+    "SELECT secret FROM (SELECT 1 AS x) e CROSS JOIN (SELECT *, 'SAFE' AS secret FROM claim) d",
+])
+def test_a_renamed_duplicate_or_a_second_source_still_reaches_the_withheld_column(con, sql):
+    rows = con.execute(sql).fetchall()
+    assert rows == [("CLAIM-SECRET",)], rows  # the premise: DuckDB serves claim's secret
+    if "secret_1" in sql:
+        # A generated duplicate name binds to the table whose column it renames and is never a
+        # listed column there, so every reading stops at the column check: fail-closed, with the
+        # advice to name the columns distinctly.
+        for visible, kind in ((_hidden("claim", "secret"), None), (FULL, "denied"), (FULL, "masked")):
+            for schema in ({}, FULL):
+                extra = AccessPolicy(**{kind: {("claim", "secret")}}, policy_schema=schema) if kind \
+                    else AccessPolicy(policy_schema=schema)
+                verdict = _decide(sql, visible, policy=extra)
+                assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (
+                    sql, kind, verdict)
+    else:
+        _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
+        complete = _decide(sql, _hidden("claim", "secret"), policy=COMPLETE)
+        assert isinstance(complete, Refusal) and complete.code is RefusalCode.UNKNOWN_COLUMN, complete
+        granted = _decide(sql, FULL, policy=COMPLETE)  # the bare read of a granted column runs
+        assert isinstance(granted, Approved), granted
+        assert con.execute(granted.target_sql).fetchall() == [("CLAIM-SECRET",)]
+
+
+@pytest.mark.parametrize("sql", [
+    # The review gate: DuckDB's renaming of duplicates follows collision rules no count models
+    # (an explicit `secret_1` after the star is itself renamed; a taken `secret_1` moves the
+    # star's to `secret_2`; a duplicate one level down), so a derived output carrying a name
+    # twice leaves the statement unresolved and every pass falls closed.
+    "SELECT d.secret_1 FROM (SELECT 'SAFE' AS secret, *, 'X' AS secret_1 FROM claim) d",
+    "SELECT d.secret_2 FROM (SELECT 'A' AS secret, 'B' AS secret_1, * FROM claim) d",
+    "SELECT d.secret_1 FROM (SELECT * FROM (SELECT * FROM other o JOIN claim c ON c.id = o.id) x) d",
+])
+def test_a_derived_output_with_a_duplicate_name_falls_closed_under_the_complete_schema(con, sql):
+    assert con.execute(sql).fetchall() == [("CLAIM-SECRET",)]  # the premise
+    for visible, kind in ((_hidden("claim", "secret"), None), (FULL, "denied"), (FULL, "masked")):
+        policy = AccessPolicy(**{kind: {("claim", "secret")}}, policy_schema=FULL) if kind else COMPLETE
+        verdict = _decide(sql, visible, policy=policy)
+        if isinstance(verdict, Approved):
+            assert kind == "masked" and "CLAIM-SECRET" not in str(con.execute(verdict.target_sql).fetchall())
+        else:
+            assert verdict.code in (RefusalCode.UNKNOWN_COLUMN, RefusalCode.UNAUTHORIZED_COLUMN,
+                                    RefusalCode.MASKED_COLUMN_IN_PREDICATE), (sql, kind, verdict)
+
+
+def test_a_bare_name_no_source_of_its_scope_exposes_binds_outward(con):
+    # The review gate: `secret` names nothing in `d`, so the engine reads the enclosing scope's
+    # `other d`; a first repair had dropped this binding for bare names.
+    sql = "SELECT (SELECT secret FROM (SELECT id FROM claim) d) FROM other d"
+    _withheld_three_ways(con, sql, "other", "secret", "OTHER-SECRET")
+    verdict = _decide(sql, FULL)
+    assert isinstance(verdict, Approved), verdict
+    assert con.execute(verdict.target_sql).fetchall() == [("OTHER-SECRET",)]
+
+
+def test_a_generated_duplicate_name_is_refused_even_where_it_is_the_literal(con):
+    # `(SELECT *, 'SAFE' AS secret FROM claim) d`: the star's secret is first, the literal is the
+    # later duplicate, so DuckDB's `d.secret_1` is the literal. The engine's renaming is not
+    # modelled (its collision rules defeated a count), so any `name_k` read over an output that
+    # carries `name` falls closed, this one included; name the columns distinctly instead. An
+    # honest column named with a suffix, over an output without the base, reads directly.
+    sql = "SELECT d.secret_1 FROM (SELECT *, 'SAFE' AS secret FROM claim) d"
+    assert con.execute(sql).fetchall() == [("SAFE",)]
+    verdict = _decide(sql, FULL, policy=COMPLETE)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    honest = _decide("SELECT d.note_1 FROM (SELECT note AS note_1 FROM wide) d", FULL, policy=COMPLETE)
+    assert isinstance(honest, Approved), honest
+
+
 # --- M185: DuckDB's positional reference ------------------------------------------------------
 
 @pytest.mark.parametrize("sql", [
