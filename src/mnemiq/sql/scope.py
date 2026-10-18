@@ -912,6 +912,16 @@ def _output_names(scope, columns, dialect: str | None, seen: frozenset[int]) -> 
     return names
 
 
+def _own_alias(scope, column: exp.Column, dialect: str | None) -> bool:
+    """Whether a bare name is one of the scope's own projection aliases."""
+    name = resolve_identifier(column.this, dialect)
+    return any(
+        isinstance(projection, exp.Alias) and projection.alias
+        and resolve(projection.alias, quoted=bool(projection.args["alias"].args.get("quoted")),
+                    dialect=dialect) == name
+        for projection in getattr(scope.expression, "selects", ()))
+
+
 def _bound_outward_bare(scope, column: exp.Column, columns, dialect: str | None):
     """Where the engine binds a bare name no source of its own scope exposes: the nearest
     enclosing scope with a source that has it (`SELECT (SELECT secret FROM (SELECT id FROM
@@ -1027,21 +1037,31 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                     # column is bound in the scope whose SELECT holds it, walking outward from
                     # there, not where it is relisted.
                     continue
+                fallback = None
                 if local:
                     # A base table beside a derived source (Codex's fifth review of #167: `FROM
                     # wide w CROSS JOIN (SELECT *, 'SAFE' AS secret FROM claim) d` let a bare
-                    # `secret` through on the inner alias): a base table listed with the name
-                    # binds it, in FROM order with the derived sources; one listed without does
-                    # not, since the old rule for a base table's bare column still holds in
-                    # `check_access`, the grant's columns and the query's own aliases.
+                    # `secret` through on the inner alias). A base table listed with the name
+                    # binds it, checked before any derived source, which is harmless since the
+                    # engine refuses a name two sources expose as ambiguous. As under a star, a
+                    # table listed in full and lacking the name does not have it; one listed
+                    # from the grant alone, or not listed, may, and falls closed below once no
+                    # derived source exposes the name (the review gate: bound outward instead,
+                    # `SELECT (SELECT secret FROM claim c CROSS JOIN (SELECT id AS x FROM wide)
+                    # d LIMIT 1) FROM other o` read claim's secret through other's grant).
                     for source in scope.selected_sources:
                         if source in by_alias:
                             continue
                         key = local.get(resolve(source, quoted=False, dialect=dialect))
-                        if key is not None and _schema_lists(columns, key, column, dialect):
+                        if key is None:
+                            continue
+                        if _schema_lists(columns, key, column, dialect):
                             out[id(column)] = key
                             settled.add(id(column))
                             break
+                        if (columns is None or key not in columns
+                                or key not in getattr(columns, "complete", ())):
+                            fallback = fallback or key
                     if id(column) in settled:
                         continue
                 # A bare name in ORDER BY or HAVING that is the query's own alias never reaches
@@ -1057,6 +1077,14 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                 found = next((hit for source in by_alias.values()
                               if (hit := _exposed(source, column, columns, dialect)) is not None),
                              None)
+                if found is None and fallback is not None and not _own_alias(scope, column, dialect):
+                    # Not where the name is the query's own projection alias, which the engine
+                    # reads laterally in the SELECT list, WHERE and GROUP BY once no source has
+                    # it (the review gate: `SELECT c.id AS k, k + 1 FROM claim c CROSS JOIN
+                    # (SELECT id AS x FROM other) d` ran and was refused on claim from the
+                    # grant alone); such a name keeps `check_access`'s reading, the grant's
+                    # columns and the query's own aliases.
+                    found = ("first", fallback)
                 if found is None:
                     found = _bound_outward_bare(scope, column, columns, dialect)
                 if found is None:

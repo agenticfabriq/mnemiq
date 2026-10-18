@@ -487,6 +487,42 @@ def test_a_bare_name_beside_a_base_table_and_a_derived_source_resolves_in_from_o
     assert isinstance(settled, Approved), settled
 
 
+def test_a_grant_only_base_table_beside_a_derived_source_falls_closed_before_binding_outward(con):
+    # The review gate on f83a78c: claim granted without secret, other with it, and the bare
+    # `secret` of the inner scope, which the engine binds to claim, was bound outward to other.
+    sql = ("SELECT (SELECT secret FROM claim c CROSS JOIN (SELECT id AS x FROM wide) d LIMIT 1) "
+           "FROM other o")
+    assert con.execute(sql).fetchall() == [("CLAIM-SECRET",)]
+    _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
+    hidden = _decide(sql, _hidden("claim", "secret"))
+    assert isinstance(hidden, Refusal) and hidden.code is RefusalCode.UNKNOWN_COLUMN, hidden
+    assert "'claim'" in hidden.message, hidden.message
+    # A table listed in full and lacking the name does not have it, and the read goes outward,
+    # where the engine binds it: claim has no note, so this reads wide's.
+    outward = ("SELECT (SELECT note FROM claim c CROSS JOIN (SELECT id AS x FROM other) d LIMIT 1) "
+               "FROM wide w")
+    assert con.execute(outward).fetchall() == [("WIDE-NOTE",)]
+    hidden_outward = _decide(outward, _hidden("wide", "note"), policy=COMPLETE)
+    assert isinstance(hidden_outward, Refusal) and "'wide'" in hidden_outward.message, hidden_outward
+    assert isinstance(_decide(outward, FULL, policy=COMPLETE), Approved)
+    # From the grant alone, claim may hide a note, and the read falls closed on claim.
+    grant_only = _decide(outward, FULL)
+    assert isinstance(grant_only, Refusal) and "'claim'" in grant_only.message, grant_only
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT c.id AS k, k + 1 FROM claim c CROSS JOIN (SELECT id AS x FROM other) d",
+    "SELECT c.id AS k FROM claim c CROSS JOIN (SELECT id AS x FROM other) d WHERE k > 0",
+    "SELECT c.id AS k FROM claim c CROSS JOIN (SELECT id AS x FROM other) d GROUP BY k",
+])
+def test_the_query_s_own_alias_beside_a_grant_only_base_table_is_not_bound_to_it(con, sql):
+    # The review gate on the fallback: the engine reads a projection alias laterally once no
+    # source has the name, and the fallback had bound it to claim from the grant alone.
+    assert con.execute(sql).fetchall()
+    for policy in (None, COMPLETE):
+        assert isinstance(_decide(sql, FULL, policy=policy), Approved), (sql, policy)
+
+
 def test_a_generated_duplicate_name_is_refused_even_where_it_is_the_literal(con):
     # `(SELECT *, 'SAFE' AS secret FROM claim) d`: the star's secret is first, the literal is the
     # later duplicate, so DuckDB's `d.secret_1` is the literal. The engine's renaming is not
