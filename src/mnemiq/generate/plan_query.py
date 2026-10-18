@@ -77,6 +77,11 @@ _UNREPAIRABLE: dict[RefusalCode, tuple[DeferralReason, str | None]] = {
         DeferralReason.AUTHORIZATION,
         "Answering this would require access to a column you do not have.",
     ),
+    # The source could not be asked to prove the statement (#159). Its own reason, because the
+    # default, `ungovernable`, tells the caller the source or the policy cannot be governed and
+    # counts as a deferral, where this is an outage the agent reports as a failure (M6). The
+    # refusal's sentence is the engine's and names nothing, so it goes to the caller as it is.
+    RefusalCode.SOURCE_UNAVAILABLE: (DeferralReason.SOURCE_UNAVAILABLE, None),
 }
 
 

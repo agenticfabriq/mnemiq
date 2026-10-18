@@ -26,7 +26,7 @@ export function DeferralCard({ answer }: { answer: AnswerPayload }) {
   return (
     <section
       className={`border-l-2 ${edge} ${wash} px-3.5 py-3`}
-      // Not "Source failure": three codes ride `failed` and only one of them is the source.
+      // Not "Source failure": four codes ride `failed` and only two of them are the source.
       // The heading below names which.
       aria-label={failed ? "Failure" : "Deferral"}
     >

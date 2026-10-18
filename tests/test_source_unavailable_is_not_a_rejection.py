@@ -457,9 +457,9 @@ def test_through_both_deciders_a_closed_source_is_unavailable_not_the_model_s(tm
     assert isinstance(write, Refusal) and write.code is RefusalCode.SOURCE_UNAVAILABLE, write
 
 
-def test_through_the_agent_one_model_call_and_a_deferral_that_says_the_source_did_not_answer(tmp_path):
+def test_through_the_agent_one_model_call_and_a_failure_that_says_the_source_did_not_answer(tmp_path):
     """Before, the closed connection read as EXPLAIN_FAILED: three model calls repairing a sound
-    statement, and the caller told the model had failed."""
+    statement, and the caller told the model had failed. A failure, not a deferral: M6."""
     adapter = _closed_source(tmp_path)
     grants = GrantSet(frozenset({"claim"}), row_filters={"claim": ENTITLED})
     generator = FakeGenerator(['{"sql": "SELECT id FROM claim", "reason": "ok"}'] * 3)
@@ -471,6 +471,6 @@ def test_through_the_agent_one_model_call_and_a_deferral_that_says_the_source_di
     answer = agent.answer(packet, _snapshot(), grants,
                           IdentityContext(tenant_id="t", principal_id="u", roles=["r"]))
     assert len(generator.calls) == 1, generator.calls
-    assert answer.deferred, answer
+    assert answer.failed and not answer.deferred, answer
     assert "did not answer" in answer.answer, answer.answer
     assert "already closed" not in answer.answer, "the driver's words stay in the server log"
