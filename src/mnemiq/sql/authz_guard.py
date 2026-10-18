@@ -6,6 +6,7 @@ from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
 from mnemiq.sql.functions import FunctionInventory, UnreadableCalls, called_names
+from mnemiq.sql.identifiers import resolve_identifier, resolve_stored, rules_for
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -174,16 +175,35 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     if not alias_to_table:
         return None  # a query over CTEs alone; their sources were checked above
 
+    # Names are compared as the engine resolves them where that is exact (M170): DuckDB and
+    # SQLite keep a name's case without telling names apart by it, so `SECRET` and a stored
+    # `Secret` are one column, and both sides fold. Where quoting keeps case (Postgres, Oracle)
+    # both sides stay as typed, as before: folding the stored side would let an unquoted
+    # spelling meet a column created with quotes, which the engine reads as ANOTHER column (the
+    # review gate's case, `"Amount"` beside `amount`), and the catalog boundary there -- table
+    # keys and row filters are as typed too -- is one decision, deferred to the register.
+    folds = not rules_for(dialect).quoting_preserves_case
+
+    def as_engine(names) -> set[str]:
+        return {resolve_stored(n, dialect) for n in names} | set(names) if folds else set(names)
+
+    def written(identifier: exp.Expression | None, text: str) -> str:
+        if folds and isinstance(identifier, exp.Identifier):
+            return resolve_identifier(identifier, dialect) or text
+        return text
+
     referenced = set(alias_to_table.values())
-    known_columns = {c for t in referenced for c in visible[t]}
+    known_columns = as_engine({c for t in referenced for c in visible[t]})
 
     # A SELECT alias is a name the query invents for an expression, and GROUP BY / ORDER BY /
     # HAVING may refer to it: `SELECT year(d) AS y, count(*) FROM t GROUP BY y` is ordinary,
     # correct SQL -- and without this the engine could not answer "count X by year" at all.
     # It is safe: an alias can only be defined from columns that were themselves checked.
-    known_columns |= {alias.alias for alias in ast.find_all(exp.Alias) if alias.alias}
+    known_columns |= {written(alias.args.get("alias"), alias.alias)
+                      for alias in ast.find_all(exp.Alias) if alias.alias}
 
     for column in ast.find_all(exp.Column):
+        name = written(column.this, column.name)  # the refusal keeps the spelling written
         qualifier = column.table
         if qualifier:
             # Resolved per scope, not from one flat map: an alias can name two different
@@ -192,19 +212,19 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
             if resolved is None:
                 # Unreadable scopes: fall back to the rule for an unqualified column rather
                 # than to the flat map that was the defect. Same guarantee, no worse.
-                if column.name not in known_columns:
+                if name not in known_columns:
                     return _unknown_column(column.name)
                 continue
             table = resolved.get(id(column))
             if table is None:
                 continue  # qualifier belongs to a CTE or a subquery alias
-            if column.name not in visible[table]:
+            if name not in as_engine(visible[table]):
                 return Refusal(
                     code=RefusalCode.UNKNOWN_COLUMN,
                     message=f"{table!r} has no column {column.name!r}. Use only listed columns.",
                     subject=column.name,
                 )
-        elif column.name not in known_columns:
+        elif name not in known_columns:
             return _unknown_column(column.name)
 
     return None

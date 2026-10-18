@@ -540,6 +540,12 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None,
             levels = [selected[id(level)] for level in chain]
             names = set(targets).union(*levels)
             for column in list(getattr(scope, "columns", ())):
+                # Once, in the nearest scope that lists it. sqlglot lists a subquery's external
+                # columns in the enclosing scope too, and calls `D.secret` external when the
+                # source is `d`, matching the alias as written; read again against the outer
+                # sources it became a field of a column `D` (M166).
+                if id(column) in seen:
+                    continue
                 seen.add(id(column))
                 refused = (_nearer_column(column, chain, levels, targets, columns_of, dialect)
                            if binds_nearer else None) or _as_member(column, names, dialect)
@@ -678,14 +684,18 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
         # same-named CTE that the ENGINE would not shadow is a base table, and reading `sources`
         # here left it unattributed -- so `check_cls` treated a denied column's qualifier as a CTE
         # and let it through, on the very statement `base_tables` had just called a real read.
+        # Keyed by what the alias RESOLVES to, and looked up the same way (M166): `C.secret FROM
+        # claim c` is `c.secret` to every engine (quoted `"C"` too, on Oracle), and matched as
+        # written it named nothing, which read as a derived table's alias and went unchecked.
         local = {
-            table.alias_or_name: object_key(table)
+            resolve_identifier(table.args.get("alias") or table.this, dialect): object_key(table)
             for table in scope.tables
             if _is_base_read(table, scope, dialect)
         }
         for column in getattr(scope, "columns", ()):
-            table = local.get(column.table)
-            if column.table and table is not None:
+            qualifier = resolve_identifier(column.args.get("table"), dialect)
+            table = local.get(qualifier) if qualifier else None
+            if table is not None:
                 out[id(column)] = table
 
     # Columns qualified by the write target resolve to it. `ON CONFLICT DO UPDATE SET amount =
@@ -695,8 +705,10 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
     # source or CTE of the same name keeps its scoped answer.
     for target in _target_reads(ast):
         key = object_key(target)
+        known_as = resolve_identifier(target.args.get("alias") or target.this, dialect)
         for column in ast.find_all(exp.Column):
-            if column.table == target.alias_or_name and id(column) not in out:
+            if (known_as is not None and id(column) not in out
+                    and resolve_identifier(column.args.get("table"), dialect) == known_as):
                 out[id(column)] = key
     return out
 

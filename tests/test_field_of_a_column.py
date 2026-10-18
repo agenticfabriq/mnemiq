@@ -105,7 +105,9 @@ def test_a_field_of_a_subquery_s_column_is_that_column_s_rule_inside():
 
 
 @pytest.mark.parametrize("engine, sql", [
-    ("oracle", "SELECT C.ID FROM claim c"),
+    # The qualifier's case, not the column's: on Oracle a stored name is met as typed (M170's
+    # remainder), and `C.ID` passed here only while `C` went unchecked (M166).
+    ("oracle", "SELECT C.id FROM claim c"),
     ("oracle", "SELECT c.id FROM claim C"),
     ("duckdb", "SELECT C.id FROM claim c"),
     ("postgres", "SELECT C.id FROM claim c"),
