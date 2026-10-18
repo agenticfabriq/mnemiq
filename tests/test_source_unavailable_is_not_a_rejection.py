@@ -158,13 +158,13 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
     # (unavailable by type), or this list, reviewed as the statement's or the caller's. The
     # cursor and fetch states; the caller's usage (ProgrammingError) and the unsupported types,
     # less the connect-time ones among them; the data faults, bind errors and Arrow conversions;
-    # the driver's internal checks, among them DPY-5004 and DPY-5006, raised decoding a fetched
-    # value; the warning and the data errors. By exact span, so a code the driver adds,
-    # renumbers or removes fails the equality: re-read the table, then move both lists.
+    # the driver's internal checks, less the three protocol faults a proof can meet; the warning
+    # and the data errors. By exact span, so a code the driver adds, renumbers or removes fails
+    # the equality: re-read the table, then move both lists.
     refused_codes = spans((1003, 1007), (2000, 2017), (2019, 2023), (2025, 2032), (2034, 2048),
                           (2050, 2055), (2058, 2075), (3000, 3010), (3012, 3014), (3016, 3041),
-                          (4002, 4004), (4006, 4010), (4012, 4016), (4036, 4041), (5000, 5004),
-                          (5006, 5007), (5009, 5015), (8000, 8002)) | {4022, 4025, 4029, 4031, 7000}
+                          (4002, 4004), (4006, 4010), (4012, 4016), (4036, 4041), (5000, 5003),
+                          (5009, 5015), (8000, 8002)) | {4022, 4025, 4029, 4031, 5007, 7000}
     operational_codes = spans((6000, 6007))
     unavailable_codes = {int(code.removeprefix("DPY-")) for code in _UNAVAILABLE_DPY}
     assert unavailable_codes.isdisjoint(refused_codes)
@@ -176,12 +176,12 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
 
     # The driver's own faults that are the statement's or the caller's, by the same classes the
     # unavailable ones carry: invalid number, cannot convert, a cursor not open, an unsupported
-    # Python type, too many batch errors, a value the driver could not decode.
+    # Python type, too many batch errors, an unexpected XMLType flag.
     refused = [ora(904, 'ORA-00904: "WHOM": invalid identifier'),
                ora(942, "ORA-00942: table or view does not exist"),
                ora(936, "ORA-00936: missing expression"),
                ora(1, "ORA-00001: unique constraint violated"),
-               _dpy(4004), _dpy(4007), _dpy(1006), _dpy(3002), _dpy(4029), _dpy(5004), _dpy(5006),
+               _dpy(4004), _dpy(4007), _dpy(1006), _dpy(3002), _dpy(4029), _dpy(5007),
                RuntimeError("refusing to validate a CREATE statement")]
     # Every code the adapter names, listed here on its own so the two lists must agree, built as
     # the driver builds it: the pool's acquisition timeout DPY-4005 (`_lease` under contention)
@@ -189,7 +189,7 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
     # typing (Codex's second and third reviews of #159).
     named = [_dpy(n) for n in (1001, 1002, 2018, 2033, 2049, 2056, 2057, 3015, 4000, 4001, 4005,
                                4011, 4017, 4018, 4019, 4021, 4024, 4026, 4027, 4028, 4030, 4032,
-                               4033, 4034, 4035, 5005)]
+                               4033, 4034, 4035, 5004, 5005, 5006)]
     assert {str(exc)[:8] for exc in named} == _UNAVAILABLE_DPY
     unanswered = [*named, _dpy(6005),
                   ora(3113, "ORA-03113: end-of-file on communication channel"),

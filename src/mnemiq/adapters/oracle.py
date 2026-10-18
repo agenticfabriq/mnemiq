@@ -1718,11 +1718,10 @@ def _is_timeout(exc: Exception) -> bool:
 # here. Each code here is a plain `DatabaseError`, `InterfaceError`, `ProgrammingError`,
 # `NotSupportedError` or `InternalError` with `isrecoverable` False, so neither the type nor the
 # flag tells it from a parse refusal. Left out on purpose: the statement's own faults the same
-# classes hold (DPY-4004 invalid number, DPY-4007 cannot convert, the bind errors), the cursor
-# and fetch states (DPY-1003, 1004, 1006), and DPY-5004 and DPY-5006, which the driver raises
-# decoding a fetched value (its vector, OSON and Arrow decoders, and a shared length check), so
-# they can be one statement's response. The ORA codes a growing pool meets on acquire are beside
-# the set: a wrong password, a locked account, an expired one (ORA-01017, ORA-28000, ORA-28001).
+# classes hold (DPY-4004 invalid number, DPY-4007 cannot convert, the bind errors) and the cursor
+# and fetch states (DPY-1003, 1004, 1006). The ORA codes a growing pool meets on acquire are
+# beside the set: a wrong password, a locked account, an expired one (ORA-01017, ORA-28000,
+# ORA-28001).
 _UNAVAILABLE_DPY = frozenset({
     "DPY-1001", "DPY-1002",  # not connected; pool not open
     "DPY-4005",  # timed out waiting for the pool: `_lease` under `wait_timeout`, pool exhausted
@@ -1730,7 +1729,14 @@ _UNAVAILABLE_DPY = frozenset({
     "DPY-4024",  # call timeout exceeded
     "DPY-4033",  # the database closed the connection: idle time exceeded
     "DPY-4035",  # invalid server response to the connection request
-    "DPY-5005",  # the listener refused the connection in an unexpected format (connect messages)
+    # The protocol faults, by where the driver's source (4.0.2) raises them. DPY-5005, the
+    # listener refusing in an unexpected format: the connect-time protocol message alone.
+    # DPY-5006, data ending mid-message: the read buffer and the connect-time protocol message,
+    # and the OSON value decoder. DPY-5004, data the driver did not expect: the connect-time
+    # protocol message, and the vector, OSON and Arrow value decoders. This classifier serves the
+    # proof seam alone, and a proof (`cursor.parse`) decodes no value, so at that seam each of
+    # the three is the wire's or the handshake's, never the statement's.
+    "DPY-5004", "DPY-5005", "DPY-5006",
     # Connect-time configuration a growing pool can surface on acquire: tnsnames lookup and its
     # include cycle, credentials and an expired access token, connect descriptor and its address
     # list, protocol and its handler, wallet, server_type, TLS, password type and its handler,
