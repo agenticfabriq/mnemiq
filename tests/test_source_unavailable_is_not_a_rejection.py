@@ -163,7 +163,8 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
     # so a code the driver adds, renumbers or removes fails the equality: re-read the table, then
     # move both lists.
     refused_codes = spans((1003, 1007), (2000, 2017), (2019, 2023), (2025, 2032), (2034, 2048),
-                          (2050, 2055), (2058, 2075), (3000, 3010), (3012, 3014), (3016, 3041),
+                          (2050, 2055), (2058, 2075), (3000, 3007), (3009, 3010), (3012, 3014),
+                          (3016, 3041),
                           (4002, 4004), (4006, 4010), (4012, 4016), (4036, 4041), (5011, 5013),
                           (8000, 8002)) | {4022, 4025, 4029, 4031, 5007, 5015, 7000}
     operational_codes = spans((6000, 6007))
@@ -190,11 +191,13 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
     # the driver builds it: the pool's acquisition timeout DPY-4005 (`_lease` under contention)
     # and the idle disconnect DPY-4033 are plain non-recoverable DatabaseErrors by the driver's
     # typing (Codex's second and third reviews of #159); the response parser's unknown message
-    # type and piggyback opcode (DPY-5000, 5009) are InternalErrors (its fourth).
-    named = [_dpy(n) for n in (1001, 1002, 2018, 2033, 2049, 2056, 2057, 3015, 4000, 4001, 4005,
-                               4011, 4017, 4018, 4019, 4021, 4024, 4026, 4027, 4028, 4030, 4032,
-                               4033, 4034, 4035, 5000, 5001, 5002, 5003, 5004, 5005, 5006, 5009,
-                               5010, 5014)]
+    # type and piggyback opcode (DPY-5000, 5009) are InternalErrors (its fourth); the unsupported
+    # in-band notification the read buffer disconnects on (DPY-3008) a NotSupportedError (its
+    # fifth).
+    named = [_dpy(n) for n in (1001, 1002, 2018, 2033, 2049, 2056, 2057, 3008, 3015, 4000, 4001,
+                               4005, 4011, 4017, 4018, 4019, 4021, 4024, 4026, 4027, 4028, 4030,
+                               4032, 4033, 4034, 4035, 5000, 5001, 5002, 5003, 5004, 5005, 5006,
+                               5009, 5010, 5014)]
     assert {str(exc)[:8] for exc in named} == _UNAVAILABLE_DPY
     unanswered = [*named, _dpy(6005),
                   ora(3113, "ORA-03113: end-of-file on communication channel"),
@@ -224,9 +227,9 @@ class _OracleScripted(_Scripted):
         return oracle_unavailable(exc)
 
 
-@pytest.mark.parametrize("code", [4005, 4033, 5000, 5009],
+@pytest.mark.parametrize("code", [4005, 4033, 5000, 5009, 3008],
                          ids=["pool exhausted", "idle disconnect", "unknown message type",
-                              "unknown piggyback"])
+                              "unknown piggyback", "in-band notification disconnect"])
 @pytest.mark.parametrize("script", [
     ["fault"], ["stale", "fault"], ["stale", None, "fault"],
 ], ids=["first proof", "proof as asked", "re-proof of the rewrite"])

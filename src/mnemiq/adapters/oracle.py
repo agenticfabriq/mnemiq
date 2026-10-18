@@ -1709,8 +1709,9 @@ def _is_timeout(exc: Exception) -> bool:
     return "dpy-4011" in text or "ora-03156" in text or "timeout" in text
 
 
-# The driver's own codes that say the connection, the pool or the connect handshake failed, so no
-# session read the statement. Read off the driver's error table (`errors.ERR_MESSAGE_FORMATS`,
+# The driver's own codes that say the connection, the pool, the connect handshake or the wire
+# protocol failed, so no session read the statement and answered. Read off the driver's error
+# table (`errors.ERR_MESSAGE_FORMATS`,
 # python-oracledb 4.0.2, the locked version) code by code rather than one code per incident,
 # after two incidents (Codex's second and third reviews of #159: DPY-4005, then DPY-4033); the
 # taxonomy test classifies every code in that table, this set, the OperationalErrors or a
@@ -1729,6 +1730,11 @@ _UNAVAILABLE_DPY = frozenset({
     "DPY-4024",  # call timeout exceeded
     "DPY-4033",  # the database closed the connection: idle time exceeded
     "DPY-4035",  # invalid server response to the connection request
+    # An unsupported in-band notification, a NotSupportedError: the read buffer's
+    # `_check_connected` (impl/thin/packet.pyx) disconnects the transport before raising it,
+    # beside the idle-time and connection-closed raises, so the session is gone (Codex's fifth
+    # review of #159).
+    "DPY-3008",
     # The protocol faults (InternalError), by the driver source files that raise each constant,
     # as a code search of the driver's repository lists them (the installed wheel is compiled,
     # so the files are named here rather than re-read on review; Codex's fourth review of #159
