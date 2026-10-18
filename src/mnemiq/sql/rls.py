@@ -240,9 +240,12 @@ def _branch_type(value, type_of, engine: str) -> exp.DataType | None:
     literal take the other branches' type (`CASE WHEN c THEN 7 ELSE 'b' END` is INTEGER, and
     converts a text column it is compared with), a text column beside a number is a bind fault
     on no row's value, and the rest share a type. Unknown where any branch's type is. Measured
-    on Oracle too: a mixed CASE or COALESCE is ORA-00932 at parse, and NVL(id, region) runs;
-    read as text, a mixed value is caught where a comparison converts it (`NVL(region, id) = 7`,
-    ORA-01722 on the hidden row), through `_converts_a_text_column`."""
+    on Oracle too: a mixed CASE or COALESCE is ORA-00932 at parse. Oracle's NVL is not read
+    here as Oracle types it (its leading argument's type, the other converted row by row):
+    `_nvl_converts_a_text_column` refuses that conversion before this typing is consulted, so a
+    mixed NVL reads as text here only on a filter already refused, and a text-led NVL compared
+    with a number (`NVL(region, id) = 7`, ORA-01722 on the hidden row) is caught through
+    `_converts_a_text_column`."""
     known = []
     for branch in _branches(value):
         if isinstance(branch, exp.Null) or (isinstance(branch, exp.Literal) and branch.is_string):
@@ -352,10 +355,16 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
                        executes_as: str | None = None) -> exp.Expression | None:
     """The first conversion in `table`'s row filter that can raise on a row's value, else None.
 
-    For a filter `_validate_filter` accepted. Type-aware where the snapshot knows the operand's
-    type, which takes a bare column: `CAST(id AS BIGINT)` over an INTEGER cannot fail, and is
-    kept. An operand reading no column is a constant, which cannot fail on a row. Anything else
-    is refused: an expression's type, or a column's the snapshot does not record, is unknown.
+    For a filter `_validate_filter` accepted. Two rules, by the shape. An explicit conversion
+    (a cast, a parse) is type-aware where the snapshot knows the operand's type, which takes a
+    bare column: `CAST(id AS BIGINT)` over an INTEGER cannot fail, and is kept; an operand
+    reading no column is a constant, which cannot fail on a row; anything else is refused, an
+    expression's type, or a column's the snapshot does not record, being unknown. An implicit
+    conversion (a comparison, NULLIF, Oracle's NVL and NVL2) is refused only where both sides'
+    types are known and one is a text column or a text-typed value over one: a side of unknown
+    type (`UPPER(region) > 0`, `NVL(id, TRIM(region))`) is not counted, since refusing every
+    comparison with an untyped expression would refuse most filters, and the guide says so. The
+    check matches known spellings; it is not a proof.
     """
     engine = (executes_as or dialect).lower()
     wrapped = sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {filt}", read=dialect)
