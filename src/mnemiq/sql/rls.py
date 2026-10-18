@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import logging
 
 import sqlglot
@@ -168,14 +169,61 @@ def _cast_cannot_fail(source: str | None, to: exp.DataType, engine: str) -> bool
             and not to.expressions and known.this in _RENDERS_AS_TEXT)
 
 
-def _json_cannot_fail(source, type_of, engine: str) -> bool:
-    """Whether the text a JSON function reads is already JSON, or NULL where it is not."""
-    if source is None or source.find(exp.Column) is None:
+# A value that is one of several branches: CASE, COALESCE (IFNULL and NVL parse to it), IF.
+_BRANCHED = (exp.Case, exp.Coalesce, exp.If)
+
+
+def _branches(value: exp.Expression) -> list[exp.Expression]:
+    """The values a branched expression can be, its conditions left out."""
+    if isinstance(value, exp.Case):
+        default = value.args.get("default")
+        return ([branch.args["true"] for branch in value.args.get("ifs", [])]
+                + ([default] if default is not None else []))
+    if isinstance(value, exp.If):
+        return [branch for branch in (value.args.get("true"), value.args.get("false"))
+                if branch is not None]
+    return [value.this, *value.expressions]
+
+
+def _json_text(text: str) -> bool:
+    """Whether a literal is JSON as DuckDB reads it. Python's reader agrees on the edge measured:
+    both take NaN and Infinity."""
+    try:
+        json.loads(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _json_cannot_fail(source, type_of, engine: str, *, chosen_by_the_row: bool = False) -> bool:
+    """Whether the text a JSON function reads is already JSON, or NULL where it is not.
+
+    `chosen_by_the_row`: the source is one branch of a CASE, COALESCE or IF, so the row's data
+    decides whether it is read. A constant at the top is read on every row and fails every read
+    at once, which the operator sees; on a branch it fails on the rows that take the branch,
+    which can be the hidden ones (the review gate on #160), so there a constant is safe only
+    where it is JSON.
+    """
+    while isinstance(source, exp.Paren):
+        source = source.this  # `(attrs)` is `attrs` (Codex's second review of #160)
+    if source is None or isinstance(source, exp.Null):
+        return True
+    if source.find(exp.Column) is None and not chosen_by_the_row:
         return True  # a constant cannot fail on a row
-    if isinstance(source, exp.TryCast):
-        # NULL where the text is not JSON. To any other type it is text again, which the reader
-        # parses: `TRY_CAST(region AS VARCHAR)` raised as `region` does (Codex's review of #160).
-        return source.to.this == exp.DataType.Type.JSON
+    if isinstance(source, exp.Literal):
+        return source.is_string and _json_text(source.this)
+    if isinstance(source, exp.Cast):  # TryCast is a Cast
+        if source.to.this != exp.DataType.Type.JSON:
+            # To any other type it is text again, which the reader parses: `TRY_CAST(region AS
+            # VARCHAR)` raised as `region` does (Codex's review of #160).
+            return False
+        # TRY_CAST: NULL where the text is not JSON. CAST: JSON where what is cast is.
+        return isinstance(source, exp.TryCast) or _json_cannot_fail(
+            source.this, type_of, engine, chosen_by_the_row=True)
+    if isinstance(source, _BRANCHED):
+        # `COALESCE(attrs, '{}'::JSON)`: JSON on every branch, so JSON whichever is taken.
+        return all(_json_cannot_fail(branch, type_of, engine, chosen_by_the_row=True)
+                   for branch in _branches(source))
     if not isinstance(source, exp.Column):
         return False
     known = type_of(source)
@@ -186,14 +234,43 @@ def _json_cannot_fail(source, type_of, engine: str) -> bool:
         return False
 
 
+def _branch_type(value, type_of, engine: str) -> exp.DataType | None:
+    """The type of a branched value, from its branches: measured on DuckDB, NULL and a text
+    literal take the other branches' type (`CASE WHEN c THEN 7 ELSE 'b' END` is INTEGER, and
+    converts a text column it is compared with), a text column beside a number is a bind fault
+    on no row's value, and the rest share a type. Unknown where any branch's type is. Measured
+    on Oracle too: a mixed CASE or COALESCE is ORA-00932 at parse, and NVL(id, region) runs;
+    read as text, a mixed value is caught where a comparison converts it (`NVL(region, id) = 7`,
+    ORA-01722 on the hidden row), through `_converts_a_text_column`."""
+    known = []
+    for branch in _branches(value):
+        if isinstance(branch, exp.Null) or (isinstance(branch, exp.Literal) and branch.is_string):
+            continue
+        typed = _known_type(branch, type_of, engine)
+        if typed is None:
+            return None
+        known.append(typed)
+    text = [typed for typed in known if typed.this in exp.DataType.TEXT_TYPES]
+    return text[0] if text else (known[0] if known else None)
+
+
 def _known_type(value, type_of, engine: str) -> exp.DataType | None:
-    """`value`'s type where it is plain to see: a typed column, a literal, a cast, arithmetic."""
+    """`value`'s type where it is plain to see: a typed column, a literal, a cast, arithmetic, an
+    interval, a list, a struct or a row, a scalar subquery's one projection, a branched value
+    whose branches are typed, NULLIF's first argument (Codex's second review of #160)."""
     while isinstance(value, exp.Paren):
         value = value.this
     if isinstance(value, exp.Boolean):
         return exp.DataType.build("BOOLEAN")
     if isinstance(value, exp.DateStrToDate):  # Oracle's DATE '...' literal
         return exp.DataType.build("DATE")
+    if isinstance(value, exp.Interval):
+        return exp.DataType.build("INTERVAL")
+    if isinstance(value, exp.Array):
+        return exp.DataType(this=exp.DataType.Type.ARRAY)
+    if isinstance(value, (exp.Struct, exp.Tuple)) or (
+            isinstance(value, exp.Anonymous) and value.name.lower() == "row"):
+        return exp.DataType(this=exp.DataType.Type.STRUCT)
     if isinstance(value, exp.Column):
         known = type_of(value)
         try:
@@ -202,8 +279,19 @@ def _known_type(value, type_of, engine: str) -> exp.DataType | None:
             return None
     if isinstance(value, exp.Cast):
         return value.to
+    if isinstance(value, exp.Subquery):
+        inner = value.this
+        if isinstance(inner, exp.Select) and len(inner.selects) == 1:
+            return _known_type(inner.selects[0].unalias(), type_of, engine)
+        return None
+    if isinstance(value, (exp.Nullif, exp.Max, exp.Min)):
+        return _known_type(value.this, type_of, engine)
+    if isinstance(value, (exp.Count, exp.Sum, exp.Avg)):
+        return exp.DataType.build("DOUBLE")
+    if isinstance(value, _BRANCHED):
+        return _branch_type(value, type_of, engine)
     if isinstance(value, exp.Neg):
-        value = value.this
+        return _known_type(value.this, type_of, engine)  # `-id` is id's type
     if isinstance(value, exp.Literal) and value.is_number or isinstance(value, _ARITHMETIC):
         return exp.DataType.build("DOUBLE")
     return None
@@ -229,7 +317,10 @@ def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
         if known is None:
             continue
         if known.this in exp.DataType.TEXT_TYPES:
-            text = text or isinstance(side, exp.Column)
+            # A text side holding a column is converted row by row: the column itself, or a
+            # text-typed value over one (`NVL(region, id) = 7` on Oracle, `COALESCE(region, 'x')
+            # = 7` on DuckDB, measured). A text literal has no known type and is never counted.
+            text = text or side.find(exp.Column) is not None
         else:
             other = True
     return text and other
@@ -278,7 +369,9 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             if all(_json_cannot_fail(source, type_of, engine) for source in sources):
                 continue
             return node
-        if isinstance(node, _COMPARISONS):
+        if isinstance(node, (*_COMPARISONS, exp.Nullif)):
+            # NULLIF compares its two arguments as `=` does (measured: `NULLIF(region, 7)`
+            # converts the column, Codex's second review of #160).
             if _converts_a_text_column(node, type_of, engine):
                 return node
             continue
