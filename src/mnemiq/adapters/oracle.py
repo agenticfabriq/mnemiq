@@ -1294,6 +1294,10 @@ class OracleAdapter:
         # its own leased connection while it does.
         self._with_cursor(_parse, self._probe_timeout_ms)
 
+    def source_unavailable(self, exc: BaseException) -> bool:
+        """The proof seam's question: did the source not answer, rather than answer no."""
+        return unavailable_fault(exc)
+
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
         """Run a query and return Arrow, bounding it by the driver's own call timeout.
 
@@ -1703,3 +1707,31 @@ def _is_ddl_race(exc: Exception) -> bool:
 def _is_timeout(exc: Exception) -> bool:
     text = str(exc).lower()
     return "dpy-4011" in text or "ora-03156" in text or "timeout" in text
+
+
+def unavailable_fault(exc: BaseException) -> bool:
+    """Whether a python-oracledb error says the source could not be asked, rather than that it
+    answered no: the proof seam's `source_unavailable` (Codex's review of #159).
+
+    The driver types its network faults `OperationalError` (its DPY-6xxx, and the ORA codes it
+    lists as such: ORA-03113, ORA-03114 and ORA-01013, the cancel a call timeout surfaces as, among
+    them), flags a dead session recoverable (DPY-4011, which it cross-references ORA-03113 to), and
+    leaves its own call timeout, DPY-4024, a plain `DatabaseError`: named here, with ORA-03156 and
+    the TNS ranges (ORA-12150 to 12236, ORA-12500 to 12699) its list leaves out. A parse refusal
+    (ORA-00904, ORA-00942, ORA-00936) is none of these and keeps its reading, as does
+    `ReadOnlyViolation`, this adapter's own refusal to parse DDL.
+    """
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    error = exc.args[0] if getattr(exc, "args", None) else None
+    if error is None or not hasattr(error, "full_code"):
+        return False
+    try:
+        import oracledb
+    except ImportError:  # pragma: no cover -- an oracledb error exists only with the driver
+        return False
+    if isinstance(exc, oracledb.OperationalError) or getattr(error, "isrecoverable", False):
+        return True
+    code = getattr(error, "code", 0) or 0
+    return (error.full_code in ("DPY-4011", "DPY-4024") or code == 3156
+            or 12150 <= code <= 12236 or 12500 <= code <= 12699)

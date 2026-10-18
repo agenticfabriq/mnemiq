@@ -534,6 +534,9 @@ _RETRIED = {
     # M150: the deployment decides a governed CTE for an engine the scope rule does not model.
     RefusalCode.POLICY_TARGET_UNSUPPORTED: DeferralReason.UNGOVERNABLE,
     RefusalCode.UNSCOPED_CTE: DeferralReason.UNGOVERNABLE,
+    # The source could not be asked to prove the statement (Codex's review of #159): nobody's to
+    # repair, and deferred under the default reason until one for an unanswered source is chosen.
+    RefusalCode.SOURCE_UNAVAILABLE: DeferralReason.UNGOVERNABLE,
 }
 
 

@@ -136,11 +136,15 @@ class _OnceUnreachable(_Counting):
         return super().execute(sql)
 
 
-def test_a_first_proof_that_fails_for_another_reason_is_not_blamed_on_the_policy(tmp_path):
+def test_a_first_proof_the_source_does_not_answer_is_nobody_s_to_repair(tmp_path):
+    """Read as a refusal, it was proved twice more and approved when the source answered again,
+    and blamed on the policy when it did not (Codex's review of #159). Unanswered is its own
+    outcome now: not the model's, not the policy's, and no further proof to compare against."""
     source = _OnceUnreachable(_source(tmp_path).inner)
     verdict = _decide("SELECT id FROM claim", source, row_filter=ENTITLED, snapshot=_snapshot())
-    assert isinstance(verdict, Approved), verdict
-    assert len(source.proofs) == 3, "the rewrite, the statement as asked, the rewrite again"
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SOURCE_UNAVAILABLE, verdict
+    assert not verdict.repairable
+    assert len(source.proofs) == 1, source.proofs
 
 
 def test_a_write_under_a_stale_row_filter_is_refused_the_same_way(tmp_path):
