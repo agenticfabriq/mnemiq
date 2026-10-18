@@ -155,3 +155,96 @@ def test_a_write_reads_a_hidden_column_behind_a_qualifier_in_another_case_as_tha
         refused = write(sql, HIDDEN)
         assert isinstance(refused, Refusal) and refused.subject == "secret", (sql, refused)
         assert isinstance(write(sql, GRANTED), ApprovedWrite), sql
+
+
+# A qualifier is bound in the nearest scope that names it, as every engine binds it. sqlglot lists
+# a subquery's external columns in the enclosing scope as well, and calls `D.secret` external when
+# the source is `d`, so `other D` a scope up answered for a column the engine reads from `claim d`,
+# and a table granting the name let the hidden, denied or masked one through (Codex's review of
+# #167; the same statements were approved on main `dd781f3` through M166's door).
+NEAREST = [
+    "SELECT (SELECT D.secret FROM claim d WHERE d.id = 1) FROM other D",
+    "SELECT (SELECT d.secret FROM claim D WHERE D.id = 1) FROM other d",
+    "SELECT (SELECT D.secret FROM claim d WHERE d.id = 1) AS s FROM other D WHERE D.id = 1",
+    "SELECT (SELECT (SELECT D.secret FROM claim d WHERE d.id = 1) FROM other x WHERE x.id = 1) "
+    "FROM other D",
+    "SELECT D.id FROM other D WHERE D.id IN (SELECT d.id FROM claim d WHERE D.secret = 'ssn-123')",
+]
+TWO = {"claim": {"id", "amount", "secret"}, "other": {"id", "amount", "secret"}}
+CLAIM_HIDDEN = {"claim": {"id", "amount"}, "other": {"id", "amount", "secret"}}
+OTHER_HIDDEN = {"claim": {"id", "amount", "secret"}, "other": {"id", "amount"}}
+
+
+@pytest.fixture
+def two(con):
+    con.execute("CREATE TABLE other (id INT, amount INT, secret VARCHAR)")
+    con.execute("INSERT INTO other VALUES (1, 7, 'other-1'), (2, 8, 'other-2')")
+    return con
+
+
+@pytest.mark.parametrize("engine", ["duckdb", "oracle", "postgres"])
+@pytest.mark.parametrize("sql", NEAREST)
+def test_a_hidden_column_behind_a_qualifier_the_nearest_scope_names_is_refused(sql, engine):
+    verdict = _decide(sql, CLAIM_HIDDEN, engine)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (
+        engine, sql, verdict)
+    assert verdict.subject == "secret", verdict
+
+
+@pytest.mark.parametrize("sql", NEAREST)
+def test_a_denied_or_masked_column_behind_such_a_qualifier_is_not_read(two, sql):
+    denied = _decide(sql, TWO, "duckdb",
+                     policy=AccessPolicy(denied={("claim", "secret")}, policy_schema=TWO))
+    assert isinstance(denied, Refusal) and denied.code is RefusalCode.UNAUTHORIZED_COLUMN, (
+        sql, denied)
+    masked = _decide(sql, TWO, "duckdb",
+                     policy=AccessPolicy(masked={("claim", "secret")}, policy_schema=TWO))
+    if isinstance(masked, Approved):  # read in a projection: masked, and runs
+        assert "ssn-" not in str(two.execute(masked.target_sql).fetchall()), (sql, masked.target_sql)
+    else:  # read in a predicate: refused as such
+        assert masked.code is RefusalCode.MASKED_COLUMN_IN_PREDICATE, (sql, masked)
+
+
+@pytest.mark.parametrize("sql", NEAREST)
+def test_a_granted_column_behind_such_a_qualifier_is_approved_and_runs(two, sql):
+    verdict = _decide(sql, TWO, "duckdb")
+    assert isinstance(verdict, Approved), (sql, verdict)
+    assert two.execute(verdict.target_sql).fetchall() == two.execute(sql).fetchall()
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT (SELECT D.secret FROM (SELECT 1 AS secret) d) FROM other D",
+    "WITH d AS (SELECT 1 AS secret) SELECT (SELECT D.secret FROM d) FROM other D",
+])
+def test_a_qualifier_the_nearest_scope_names_as_a_derived_table_reads_that_table(two, sql):
+    # `other.secret` is not granted here, and not read: the engine binds `D` to the derived `d`
+    # first. Bound to `other` a scope up, it was refused.
+    verdict = _decide(sql, OTHER_HIDDEN, "duckdb")
+    assert isinstance(verdict, Approved), (sql, verdict)
+    assert two.execute(verdict.target_sql).fetchall() == [(1,), (1,)]
+
+
+def test_a_qualifier_no_nearer_scope_names_binds_outward(two):
+    # `D` names only the outer source, so `D.secret` is other's, granted here while claim's is not.
+    sql = "SELECT (SELECT D.secret FROM claim x WHERE x.id = D.id) FROM other D"
+    verdict = _decide(sql, CLAIM_HIDDEN, "duckdb")
+    assert isinstance(verdict, Approved), verdict
+    assert two.execute(verdict.target_sql).fetchall() == [("other-1",), ("other-2",)]
+
+
+def test_a_write_s_subquery_binds_a_qualifier_in_its_nearest_scope_too():
+    grants = GrantSet(frozenset({"claim", "other"}), writable=frozenset({"other"}))
+
+    def write(sql, visible):
+        return decide_write(sql, visible, grants, policy=AccessPolicy(),
+                            dialect="duckdb", target="duckdb", writes_enabled=True)
+
+    through_claim = ("UPDATE other D SET amount = (SELECT length(D.secret) FROM claim d) "
+                     "WHERE D.id = 1")
+    refused = write(through_claim, CLAIM_HIDDEN)
+    assert isinstance(refused, Refusal) and refused.subject == "secret", refused
+    assert isinstance(write(through_claim, TWO), ApprovedWrite)
+    # The target's alias does not answer for a qualifier a derived table in the subquery names.
+    shadowed = ("UPDATE other D SET amount = (SELECT D.secret FROM (SELECT 1 AS secret) d) "
+                "WHERE D.id = 1")
+    assert isinstance(write(shadowed, OTHER_HIDDEN), ApprovedWrite), write(shadowed, OTHER_HIDDEN)

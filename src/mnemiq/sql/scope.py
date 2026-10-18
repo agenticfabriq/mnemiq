@@ -679,6 +679,7 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
         return None  # the coverage `base_tables` falls back on is not trusted for columns either
 
     out: dict[int, str] = {}
+    settled: set[int] = set()  # columns a scope has answered for, with a base table or without
     for scope in root.traverse():
         # Built from `_is_base_read`, not from `sources` alone: a reference sqlglot bound to a
         # same-named CTE that the ENGINE would not shadow is a base table, and reading `sources`
@@ -692,22 +693,40 @@ def column_tables(ast: exp.Expression, dialect: str | None = None) -> dict[int, 
             for table in scope.tables
             if _is_base_read(table, scope, dialect)
         }
+        # Every name the scope selects from, a CTE's or a derived table's included, resolved the
+        # same way: a qualifier naming one of those is answered here too, with no base table.
+        named = {resolve_identifier(node.args.get("alias")
+                                    or (node.this if isinstance(node, exp.Table) else None), dialect)
+                 for node in [*scope.tables, *scope.derived_tables, *scope.udtfs]} - {None}
         for column in getattr(scope, "columns", ()):
+            # Bound once, in the nearest scope that names the qualifier, as every engine binds it
+            # (`traverse` yields a scope after the scopes inside it). sqlglot lists a subquery's
+            # external columns in the enclosing scope as well, and calls `D.secret` external when
+            # the source is `d`, so `SELECT (SELECT D.secret FROM claim d) FROM other D` was bound
+            # to `claim` here and then, a scope up, to `other`, whose grant of `secret` approved a
+            # read of claim's, deny and mask included (Codex's review of #167).
+            if id(column) in settled:
+                continue
             qualifier = resolve_identifier(column.args.get("table"), dialect)
-            table = local.get(qualifier) if qualifier else None
+            if not qualifier:
+                continue
+            table = local.get(qualifier)
             if table is not None:
                 out[id(column)] = table
+                settled.add(id(column))
+            elif qualifier in named:
+                settled.add(id(column))  # a CTE's or derived table's column, checked in its scope
 
     # Columns qualified by the write target resolve to it. `ON CONFLICT DO UPDATE SET amount =
     # scratch.amount + 1` reads `scratch.amount` from a table in no scope, so without this the
     # map has no entry and `check_cls` falls back to the referenced set -- checking a denied
-    # column against the wrong table. Only fills entries the scope walk did not, so a real
+    # column against the wrong table. Only fills entries the scope walk did not settle, so a real
     # source or CTE of the same name keeps its scoped answer.
     for target in _target_reads(ast):
         key = object_key(target)
         known_as = resolve_identifier(target.args.get("alias") or target.this, dialect)
         for column in ast.find_all(exp.Column):
-            if (known_as is not None and id(column) not in out
+            if (known_as is not None and id(column) not in settled
                     and resolve_identifier(column.args.get("table"), dialect) == known_as):
                 out[id(column)] = key
     return out
