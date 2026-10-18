@@ -22,7 +22,7 @@ export function disposition(turn: Turn): Disposition {
 export const DISPOSITION_LABEL: Record<Disposition, string> = {
   answered: "Answered",
   declined: "Declined",
-  // Three codes reach this disposition and only one of them is the source. It said
+  // Four codes reach this disposition and only two of them are the source. It said
   // "Source failed" over a model-provider outage before a verifier outage could reach
   // it too; the card below names which one broke.
   failed: "Could not answer",
