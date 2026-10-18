@@ -121,6 +121,11 @@ _UNTYPED_JSON_PARSES = frozenset({
     "from_json", "from_json_strict", "json_array_length", "json_contains", "json_deserialize_sql",
     "json_exists", "json_merge_patch", "json_pretty", "json_structure", "json_transform",
     "json_transform_strict", "json_value"})
+# The strict transforms raise where a WELL-FORMED value does not fit the structure asked for, and
+# quote it (measured: `json_transform_strict(attrs, '{"a":"INTEGER"}')` over a JSON column whose
+# `a` holds text; `json_transform` gives NULL there), so a typed column does not make them safe
+# (Codex's review of #160). Only a constant cannot fail on a row.
+_STRICT_JSON_TRANSFORMS = frozenset({"from_json_strict", "json_transform_strict"})
 # A comparison converts a text column to the other side's type, row by row, in both engines:
 # DuckDB on `=`, `<>` and IN (its ordering comparisons refuse at bind, on no row's value), Oracle
 # on every comparison (an implicit TO_NUMBER or TO_DATE). Seen only where the snapshot types both
@@ -140,7 +145,8 @@ _RENDERS_AS_TEXT = (set(_INTEGER_RANK) | exp.DataType.NUMERIC_TYPES | exp.DataTy
 # TO_DATE's own DEFAULT does not parse.
 _SAFE_FORM = {
     "duckdb": ("TRY_CAST(value AS type), which gives NULL where the value does not convert "
-               "(for JSON, read from TRY_CAST(value AS JSON))"),
+               "(for JSON, read from TRY_CAST(value AS JSON), and json_transform rather than "
+               "json_transform_strict)"),
     "oracle": ("CAST(value AS type DEFAULT NULL ON CONVERSION ERROR) with no format argument, or "
                "TO_NUMBER(value DEFAULT NULL ON CONVERSION ERROR)"),
 }
@@ -167,7 +173,9 @@ def _json_cannot_fail(source, type_of, engine: str) -> bool:
     if source is None or source.find(exp.Column) is None:
         return True  # a constant cannot fail on a row
     if isinstance(source, exp.TryCast):
-        return True
+        # NULL where the text is not JSON. To any other type it is text again, which the reader
+        # parses: `TRY_CAST(region AS VARCHAR)` raised as `region` does (Codex's review of #160).
+        return source.to.this == exp.DataType.Type.JSON
     if not isinstance(source, exp.Column):
         return False
     known = type_of(source)
@@ -215,6 +223,8 @@ def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
         sides = [node.this, node.expression]
     text = other = False
     for side in sides:
+        while isinstance(side, exp.Paren):
+            side = side.this  # `(region) = 7` converts the column as `region = 7` does (Codex, #160)
         known = _known_type(side, type_of, engine)
         if known is None:
             continue
@@ -261,6 +271,10 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             # The typed readers parse their first argument; an untyped one may parse any (both of
             # `json_contains` and `json_merge_patch` do), so each argument must be safe.
             sources = [node.this] if isinstance(node, _JSON_PARSES) else node.expressions
+            if isinstance(node, exp.Anonymous) and node.name.lower() in _STRICT_JSON_TRANSFORMS:
+                if any(source.find(exp.Column) for source in sources):
+                    return node  # raises on a well-formed value too, see _STRICT_JSON_TRANSFORMS
+                continue
             if all(_json_cannot_fail(source, type_of, engine) for source in sources):
                 continue
             return node

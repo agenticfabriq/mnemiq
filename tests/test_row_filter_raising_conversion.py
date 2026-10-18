@@ -67,6 +67,23 @@ def test_a_raising_filter_reads_the_rows_it_removes_and_quotes_them_on_duckdb():
         assert con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall()  # runs, NULL for 'north'
 
 
+def test_codex_s_three_shapes_raise_on_the_hidden_row_and_their_advised_forms_run():
+    # Codex's review of #160: each was approved, and each raised on the hidden row when run.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON); "
+                "INSERT INTO claim VALUES (1, '7', '{\"a\": 1}'), (2, 'north', '{\"a\": \"north\"}')")
+    for raising, safe in (("(region) = 7", "TRY_CAST(region AS INTEGER) = 7"),
+                          ("json_extract_string(TRY_CAST(region AS VARCHAR), '$.a') IS NULL",
+                           "json_extract_string(TRY_CAST(region AS JSON), '$.a') IS NULL"),
+                          ("json_transform_strict(attrs, '{\"a\":\"INTEGER\"}') IS NOT NULL",
+                           "json_transform(attrs, '{\"a\":\"INTEGER\"}') IS NOT NULL")):
+        with pytest.raises(duckdb.Error, match="north|Malformed JSON"):
+            con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
+        assert con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall()
+        assert isinstance(_decide(raising), Refusal), raising
+        assert isinstance(_decide(safe), Approved), safe
+
+
 # Each JSON reader's arguments where it takes more than the text; the rest take the text alone.
 _JSON_ARGS = {"json_extract": "region, '$.a'", "json_extract_string": "region, '$.a'",
               "json_extract_path": "region, '$.a'", "json_extract_path_text": "region, '$.a'",
@@ -118,6 +135,15 @@ def test_every_duckdb_json_reader_that_quotes_malformed_text_is_refused():
     ("duckdb", "json_merge_patch('{}', region) IS NOT NULL"),
     ("duckdb", "region = 7"),                             # converted implicitly, row by row
     ("duckdb", "region = (7)"),
+    ("duckdb", "(region) = 7"),                           # the column in parentheses (Codex, #160)
+    ("duckdb", "7 = ((region))"),
+    ("duckdb", "(region) IN (1, 2)"),
+    # TRY_CAST to text is text again, which the reader parses (Codex, #160)
+    ("duckdb", "json_extract_string(TRY_CAST(region AS VARCHAR), '$.a') = '1'"),
+    # The strict transforms raise on a well-formed value that does not fit (Codex, #160)
+    ("duckdb", "json_transform_strict(attrs, '{\"a\":\"INTEGER\"}') IS NOT NULL"),
+    ("duckdb", "from_json_strict(attrs, '{\"a\":\"INTEGER\"}') IS NOT NULL"),
+    ("duckdb", "json_transform_strict(TRY_CAST(region AS JSON), '{\"a\":\"INTEGER\"}') IS NOT NULL"),
     ("duckdb", "region = TRUE"),
     ("oracle", "region = DATE '2000-01-01'"),             # an implicit TO_DATE
     ("duckdb", "region IN (1, 2)"),
@@ -162,8 +188,12 @@ def test_a_column_the_snapshot_does_not_type_is_unknown_and_refused():
     ("duckdb", "id = CAST('7' AS INTEGER)"),              # a constant cannot fail on a row
     ("duckdb", "json_extract_string(attrs, '$.a') = '1'"),  # typed JSON already
     ("duckdb", "json_extract_string(TRY_CAST(region AS JSON), '$.a') = '1'"),
+    ("duckdb", "json_transform(attrs, '{\"a\":\"INTEGER\"}') IS NOT NULL"),  # NULL where strict raises
+    ("duckdb", "json_transform_strict('{\"a\":1}', '{\"a\":\"INTEGER\"}') IS NOT NULL"),  # a constant
     ("duckdb", "id IN (SELECT id FROM entitlement WHERE who = 'r')"),
     ("duckdb", "region = '7'"),
+    ("duckdb", "(region) = '7'"),                         # parentheses change no type
+    ("duckdb", "(id) = 7"),
     ("duckdb", "id IN (1, 2)"),
     ("duckdb", "amount = id"),
     ("oracle", "CAST(region AS NUMBER DEFAULT NULL ON CONVERSION ERROR) > 0"),
