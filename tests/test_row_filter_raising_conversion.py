@@ -112,6 +112,14 @@ RAISING_TYPED_FORMS = [
     "json_extract_string(coalesce(attrs, 'x'), '$.a') IS NOT NULL",
     # A lone surrogate escape: Python's reader takes it, DuckDB's refuses it (the review gate).
     "json_extract_string(coalesce(attrs, '\"\\ud800\"'), '$.a') IS NOT NULL",
+    # Codex's third review: a literal-only inner CASE is text, so the outer one stays text and
+    # reads region; and a duplicate key must not hide the first value's bad escape.
+    "CASE WHEN id > 0 THEN region ELSE CASE WHEN id = 0 THEN '0' ELSE '1' END END = 7",
+    "COALESCE(region, CASE WHEN id = 0 THEN '0' END) = 7",
+    "json_extract_string(coalesce(attrs, '{\"a\":\"\\ud800\",\"a\":1}'), '$.a') IS NOT NULL",
+    # A literal the row chooses by a column is read on the rows that choose it (the review
+    # gate): this one fails on the rows with id > 0, quoting the literal.
+    "CASE WHEN id > 0 THEN 'x' ELSE CAST(1 AS VARCHAR) END = 7",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -141,7 +149,7 @@ def test_codex_s_second_review_forms_raise_on_the_hidden_row_and_the_safe_ones_r
                 "CREATE TABLE entitlement(id INT, who VARCHAR); INSERT INTO entitlement VALUES (7, 'r')")
     for raising in RAISING_TYPED_FORMS:
         # The list, struct and row forms quote the first row's value rather than the hidden one.
-        with pytest.raises(duckdb.Error, match="north|'7'|Malformed JSON") as caught:
+        with pytest.raises(duckdb.Error, match="north|'7'|'x'|Malformed JSON") as caught:
             con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
         assert "Conversion Error" in str(caught.value) or "Malformed JSON" in str(caught.value), (
             raising, caught.value)
@@ -165,6 +173,7 @@ def test_json_or_text_on_every_branch_is_kept(row_filter):
     # it is read as text and not refused here; a reader over a text column on one branch is.
     "region = CASE WHEN id > 0 THEN 7 ELSE region END",
     "region = COALESCE(region, 7)",
+    "region = CASE WHEN id > 0 THEN 7 ELSE CASE WHEN id = 0 THEN '0' ELSE '1' END END",
 ])
 def test_a_text_column_mixed_with_a_number_fails_at_bind_and_is_not_this_class(row_filter):
     con = duckdb.connect()
@@ -172,6 +181,18 @@ def test_a_text_column_mixed_with_a_number_fails_at_bind_and_is_not_this_class(r
     with pytest.raises(duckdb.BinderException, match="Cannot mix"):
         con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
     assert isinstance(_decide(row_filter), Approved), row_filter
+
+
+def test_a_literal_the_row_chooses_by_a_column_is_refused_without_evaluating_it():
+    """`'0'` and `'1'` convert, so this runs on DuckDB; the checker does not evaluate literals,
+    so it is refused like the `'x'` form, and the operator writes the literals as numbers."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR); INSERT INTO claim VALUES (2, 'north')")
+    assert con.execute("SELECT id FROM claim WHERE CASE WHEN id > 0 THEN '0' ELSE '1' END = 7"
+                       ).fetchall() == []
+    assert isinstance(_decide("CASE WHEN id > 0 THEN '0' ELSE '1' END = 7"), Refusal)
+    assert isinstance(_decide("CASE WHEN id > 0 THEN 0 ELSE 1 END = 7"), Approved)
+    assert isinstance(_decide("CASE WHEN 1 = 1 THEN '0' ELSE '1' END = 7"), Approved), "no column"
 
 
 def test_a_reader_over_a_branch_that_can_be_text_is_refused():

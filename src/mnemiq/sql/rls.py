@@ -188,9 +188,12 @@ def _branches(value: exp.Expression) -> list[exp.Expression]:
 def _json_text(text: str) -> bool:
     """Whether a literal is JSON as DuckDB reads it. Python's reader agrees on NaN and Infinity
     (both take them) and differs on a lone surrogate escape, which it takes and DuckDB refuses
-    (the review gate on #160): encoding what was read catches that one."""
+    (the review gate on #160): encoding what was read catches that one. Every object pair is
+    kept, since a duplicate key would otherwise drop the first value before the encode saw it
+    (Codex's third review of #160)."""
     try:
-        json.dumps(json.loads(text), ensure_ascii=False).encode("utf-8")
+        json.dumps(json.loads(text, object_pairs_hook=lambda pairs: pairs),
+                   ensure_ascii=False).encode("utf-8")
     except (ValueError, UnicodeEncodeError):
         return False
     return True
@@ -245,17 +248,27 @@ def _branch_type(value, type_of, engine: str) -> exp.DataType | None:
     `_nvl_converts_a_text_column` refuses that conversion before this typing is consulted, so a
     mixed NVL reads as text here only on a filter already refused, and a text-led NVL compared
     with a number (`NVL(region, id) = 7`, ORA-01722 on the hidden row) is caught through
-    `_converts_a_text_column`."""
-    known = []
+    `_converts_a_text_column`. A value whose every branch is a text literal or NULL is text, not
+    a literal: DuckDB types it VARCHAR (measured: beside a number it is the bind fault, and an
+    outer CASE holding it beside a text column stays text, so the outer value is refused where
+    a comparison converts it; Codex's third review of #160)."""
+    known, literal = [], False
     for branch in _branches(value):
-        if isinstance(branch, exp.Null) or (isinstance(branch, exp.Literal) and branch.is_string):
+        if isinstance(branch, exp.Null):
+            continue
+        if isinstance(branch, exp.Literal) and branch.is_string:
+            literal = True
             continue
         typed = _known_type(branch, type_of, engine)
         if typed is None:
             return None
         known.append(typed)
     text = [typed for typed in known if typed.this in exp.DataType.TEXT_TYPES]
-    return text[0] if text else (known[0] if known else None)
+    if text:
+        return text[0]
+    if known:
+        return known[0]
+    return exp.DataType.build("VARCHAR") if literal else None
 
 
 def _known_type(value, type_of, engine: str) -> exp.DataType | None:
@@ -345,6 +358,11 @@ def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
             # A text side holding a column is converted row by row: the column itself, or a
             # text-typed value over one (`NVL(region, id) = 7` on Oracle, `COALESCE(region, 'x')
             # = 7` on DuckDB, measured). A text literal has no known type and is never counted.
+            # The column may sit in a condition: a literal the row chooses by a column is read on
+            # the rows that choose it, and whether it converts is not evaluated here, so
+            # `CASE WHEN id > 0 THEN 'x' ELSE '1' END = 7` is refused (it fails on the rows with
+            # id > 0, the review gate on #160) and so is the same with '0', which would run; the
+            # operator writes such literals in the other side's type.
             text = text or side.find(exp.Column) is not None
         else:
             other = True
