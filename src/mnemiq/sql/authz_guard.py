@@ -211,25 +211,27 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     for column in ast.find_all(exp.Column):
         name = written(column.this, column.name)  # the refusal keeps the spelling written
         qualifier = column.table
-        if qualifier:
-            # Resolved per scope, not from one flat map: an alias can name two different
-            # tables in one statement, and keeping only the last let a column be checked
-            # against the wrong one (Codex review, 2026-08-12).
-            if resolved is None:
-                # Unreadable scopes: fall back to the rule for an unqualified column rather
-                # than to the flat map that was the defect. Same guarantee, no worse.
-                if name not in known_columns:
-                    return _unknown_column(column.name)
-                continue
-            table = resolved.get(id(column))
-            if table is None:
-                continue  # qualifier belongs to a CTE or a subquery alias
+        # Resolved per scope, not from one flat map: an alias can name two different tables in
+        # one statement, and keeping only the last let a column be checked against the wrong
+        # one (Codex review, 2026-08-12). An unqualified column resolves too where its scope's
+        # only source is a derived table (M181), so both spellings of a read through a star
+        # meet the same table here.
+        table = resolved.get(id(column)) if resolved is not None else None
+        if table is not None:
             if name not in as_engine(visible[table]):
                 return Refusal(
                     code=RefusalCode.UNKNOWN_COLUMN,
                     message=f"{table!r} has no column {column.name!r}. Use only listed columns.",
                     subject=column.name,
                 )
+        elif qualifier:
+            if resolved is None:
+                # Unreadable scopes: fall back to the rule for an unqualified column rather
+                # than to the flat map that was the defect. Same guarantee, no worse.
+                if name not in known_columns:
+                    return _unknown_column(column.name)
+            # Else the qualifier names a CTE or a subquery alias whose own projection names the
+            # column, checked in that scope.
         elif name not in known_columns:
             return _unknown_column(column.name)
 

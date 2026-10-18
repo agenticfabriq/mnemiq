@@ -146,6 +146,40 @@ def test_the_eval_criterion_attributes_a_masked_column_read_through_a_derived_st
     assert result.unattributable == (), result
 
 
+COMPLETE = AccessPolicy(policy_schema=FULL)  # production's: every column of the snapshot's
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT d.rn FROM (SELECT *, 1 AS rn FROM claim) d",
+    "SELECT d.rn FROM (SELECT c.*, 1 AS rn FROM claim c) d",
+    "WITH d AS (SELECT *, 1 AS rn FROM claim) SELECT d.rn FROM d",
+    "SELECT rn FROM (SELECT *, 1 AS rn FROM claim) d",
+])
+def test_a_name_the_star_s_table_is_listed_in_full_without_is_the_later_projection_s(con, sql):
+    # The ui lane's replay of #167: three recorded statements refused when a listed table
+    # lacking the name fell closed. The policy schema lists claim in full, so claim has no `rn`
+    # and the engine reads the literal; the qualified and the bare spelling agree.
+    verdict = _decide(sql, FULL, policy=COMPLETE)
+    assert isinstance(verdict, Approved), (sql, verdict)
+    assert con.execute(verdict.target_sql).fetchall() == [(1,)]
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT secret FROM (SELECT *, 'NAMED' AS secret FROM claim) d",
+    "SELECT secret FROM (SELECT c.*, 'NAMED' AS secret FROM claim c) d",
+    "WITH w AS (SELECT *, 'NAMED' AS secret FROM claim) SELECT secret FROM w",
+    "SELECT x.s FROM (SELECT secret AS s FROM (SELECT *, 'NAMED' AS secret FROM claim) d) x",
+])
+@pytest.mark.parametrize("policy", [None, COMPLETE], ids=["grant alone", "complete schema"])
+def test_a_bare_column_named_after_a_star_reads_the_star_s_hidden_column_and_is_refused(sql, policy):
+    # The unqualified twin of M181 (the ui lane's replay): the engine binds the star's column
+    # first, so the later alias does not stand in for a hidden `secret`. Under the grant alone
+    # the table may hide the name and the read falls closed; under the complete schema claim is
+    # listed with it and the column binds there, unknown to this grant either way.
+    verdict = _decide(sql, _hidden("claim", "secret"), policy=policy)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
+
+
 def test_a_named_projection_before_the_star_answers_for_the_name(con):
     # DuckDB binds the first column of the name in projection order (measured): here the
     # literal, so claim's secret is not read and the statement is approved with it withheld.
@@ -268,6 +302,34 @@ def test_named_branches_and_a_list_over_named_projections_are_not_refused_as_pos
 def test_a_withheld_column_in_a_named_union_branch_is_checked_in_its_scope(con):
     sql = "SELECT d.secret FROM (SELECT id, secret FROM claim UNION ALL SELECT id, note FROM wide) d"
     _withheld_three_ways(con, sql, "wide", "note", "WIDE-NOTE")
+
+
+@pytest.mark.parametrize("sql", [
+    # Codex's review of #167 at 246cd30: a column list on a table REFERENCE renames by position
+    # too, over a base table and over a CTE whose body expands a star.
+    "SELECT d.id FROM claim d(secret, id)",
+    "WITH d AS (SELECT * FROM claim) SELECT e.id FROM d e(secret, id)",
+    # And COLUMNS with an alias template renames every expanded column by a pattern.
+    'SELECT d.x_secret FROM (SELECT COLUMNS(*) AS "x_\\0" FROM claim) d',
+])
+def test_a_column_list_on_a_table_reference_or_an_aliased_columns_expansion_is_refused(con, sql):
+    rows = con.execute(sql).fetchall()
+    assert rows == [("CLAIM-SECRET",)], rows  # the premise: the withheld column, under another name
+    for visible, policy in ((_hidden("claim", "secret"), None),
+                            (FULL, _policy("claim", "secret", "denied")),
+                            (FULL, _policy("claim", "secret", "masked")),
+                            (FULL, None)):
+        verdict = _decide(sql, visible, policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
+def test_a_column_list_on_a_reference_to_a_cte_of_named_projections_passes(con):
+    # The list renames column nodes checked in the CTE's scope: `x` is claim's secret there.
+    sql = "WITH d AS (SELECT id, secret FROM claim) SELECT e.x FROM d e(k, x)"
+    _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
+    verdict = _decide(sql, FULL)
+    assert isinstance(verdict, Approved), verdict
+    assert con.execute(verdict.target_sql).fetchall() == [("CLAIM-SECRET",)]
 
 
 # --- M185: DuckDB's positional reference ------------------------------------------------------

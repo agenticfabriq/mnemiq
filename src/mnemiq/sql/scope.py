@@ -627,14 +627,24 @@ def _sources_share_a_name():
     )
 
 
-def known_columns(visible, policy=None) -> dict[str, set[str]]:
+class KnownColumns(dict):
+    """A schema, table key to column names, that also says which tables it lists in full:
+    `complete` holds the policy schema's tables, every column of the snapshot's (M181). A table
+    listed in full that lacks a name does not have it; one listed from the grant alone may hide
+    it."""
+
+    complete: frozenset[str] = frozenset()
+
+
+def known_columns(visible, policy=None) -> KnownColumns:
     """Every column the decider is told a table has: the grant's, and the policy's (M167)."""
-    known = {table: set(names) for table, names in (visible or {}).items()}
+    known = KnownColumns({table: set(names) for table, names in (visible or {}).items()})
     if policy is not None:
         for table, names in (policy.policy_schema or {}).items():
             known.setdefault(table, set()).update(names)
         for table, name in (*policy.denied, *policy.masked):
             known.setdefault(table, set()).add(name)
+        known.complete = frozenset(policy.policy_schema or {})
     return known
 
 
@@ -660,7 +670,10 @@ _NAMED = ("named",)
 
 
 def _star_of(projection: exp.Expression) -> exp.Star | None:
-    """The star a projection is, qualified or not, COLUMNS(...) read as one (M169)."""
+    """The star a projection is, qualified or not, COLUMNS(...) read as one (M169), an alias
+    template over it too (`check_shape` refuses that one; here it still expands the sources)."""
+    if isinstance(projection, exp.Alias) and isinstance(projection.this, (exp.Columns, exp.Star)):
+        projection = projection.this
     if isinstance(projection, exp.Star):
         return projection
     if isinstance(projection, exp.Column) and isinstance(projection.this, exp.Star):
@@ -767,7 +780,13 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
                 if _schema_lists(columns, key, column, dialect):
                     return ("table", key)
                 if columns is not None and key in columns:
-                    listed_without = listed_without or key
+                    # Listed in full (the policy schema's, every column of the snapshot's) and
+                    # lacking the name: the table does not have it, and the engine reads on to a
+                    # later projection of that name (`SELECT d.rn FROM (SELECT *, 1 AS rn FROM
+                    # claim) d` reads the literal; the ui lane's replay, three statements refused
+                    # when this fell closed). Listed from the grant alone: it may hide the name.
+                    if key not in getattr(columns, "complete", ()):
+                        listed_without = listed_without or key
                 else:
                     unlisted = unlisted or key
                 continue
@@ -886,7 +905,15 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                 continue
             qualifier = resolve_identifier(column.args.get("table"), dialect)
             if not qualifier:
-                continue
+                # An unqualified column in a scope whose only source is a derived table or CTE
+                # reads it as a qualified one would, so both spellings resolve the same way:
+                # `SELECT secret FROM (SELECT *, 'NAMED' AS secret FROM claim) d` reads the
+                # star's column first, as `d.secret` does (the ui lane's replay of #167). With
+                # a base table among the sources the old rule stands: the grant's columns and
+                # the statement's own aliases, in `check_access`.
+                if local or len(by_alias) != 1:
+                    continue
+                qualifier = next(iter(by_alias))
             table = local.get(qualifier)
             if table is not None:
                 out[id(column)] = table

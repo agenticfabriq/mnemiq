@@ -133,8 +133,41 @@ def _bound_by_position(ast: exp.Expression, dialect: str,
                      "(a UNION ALL of one SELECT per column, or CASE expressions) instead."),
             subject=kind,
         )
+    for alias in ast.find_all(exp.Alias):
+        if isinstance(alias.this, exp.Columns):
+            # `COLUMNS(*) AS "x_\0"` renames every column it expands by a pattern, so the names
+            # the outer query reads are derived and no node names the column read (Codex's
+            # review of #167: `d.x_secret` over it returned a withheld secret).
+            return Refusal(
+                code=RefusalCode.SELECT_STAR,
+                message=("`COLUMNS(...)` with an alias template renames the columns it expands "
+                         "by a pattern, so the engine cannot tell which column a derived name "
+                         "reads. Name the columns, and alias each one."),
+                subject=alias.alias,
+            )
     ctes = _visible_ctes(ast, {}, dialect)
     memo: dict[int, bool] = {}
+    for table in ast.find_all(exp.Table):
+        alias = table.args.get("alias")
+        if alias is None or not alias.args.get("columns"):
+            continue
+        # A column list on a table REFERENCE renames by position too (Codex's review of #167):
+        # over a base table, `FROM claim d(secret, id)` serves secret as `d.id`; over a CTE
+        # whose body expands a star, the same. Over a CTE of named projections the list renames
+        # column nodes that are checked in the CTE's scope, and passes.
+        name = resolve_name(table, dialect)
+        if not table.db and not table.catalog and name in ctes:
+            body, body_scope = ctes[name]
+            if not _star_reaches_base(body, body_scope, memo, columns, frozenset(), dialect):
+                continue
+        return Refusal(
+            code=RefusalCode.SELECT_STAR,
+            message=(f"The column list on {table.alias_or_name!r} renames the columns of "
+                     f"{name!r} by position, so the new names say nothing about which columns "
+                     "are read. Name the columns in a SELECT instead of listing them on the "
+                     "alias."),
+            subject=table.alias_or_name or None,
+        )
     for node in ast.find_all(exp.Subquery, exp.CTE):
         body = node.this
         while isinstance(body, exp.Paren):
