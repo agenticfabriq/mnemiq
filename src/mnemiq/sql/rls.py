@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import logging
+import threading
 
 import sqlglot
 from sqlglot import exp
@@ -185,18 +186,33 @@ def _branches(value: exp.Expression) -> list[exp.Expression]:
     return [value.this, *value.expressions]
 
 
+_JSON_READER_LOCK = threading.Lock()
+_JSON_READER = None
+
+
 def _json_text(text: str) -> bool:
-    """Whether a literal is JSON as DuckDB reads it. Python's reader agrees on NaN and Infinity
-    (both take them) and differs on a lone surrogate escape, which it takes and DuckDB refuses
-    (the review gate on #160): encoding what was read catches that one. Every object pair is
-    kept, since a duplicate key would otherwise drop the first value before the encode saw it
-    (Codex's third review of #160)."""
+    """Whether a literal is JSON as DuckDB reads it: asked of DuckDB's own `json_valid`, since
+    it is DuckDB's reader that fails on the row. Python's grammar differs both ways (it takes a
+    lone surrogate escape DuckDB refuses; it refuses `[1,]` and `-NaN`, which DuckDB reads: the
+    review gate and Codex's fourth review of #160), and `json_valid` agreed with
+    `json_extract_string` on every literal measured. Through mnemiq's own door, local-only (the
+    JSON functions are built in, so nothing is fetched; M107). Without the driver, Python's
+    reader with every object pair kept and the result encoded, the stricter side."""
+    global _JSON_READER
     try:
-        json.dumps(json.loads(text, object_pairs_hook=lambda pairs: pairs),
-                   ensure_ascii=False).encode("utf-8")
-    except (ValueError, UnicodeEncodeError):
-        return False
-    return True
+        from mnemiq.duckdb_extensions import connect_duckdb
+
+        with _JSON_READER_LOCK:
+            if _JSON_READER is None:
+                _JSON_READER = connect_duckdb(local_only=True)
+            return bool(_JSON_READER.execute("SELECT json_valid($1)", [text]).fetchone()[0])
+    except Exception:  # noqa: BLE001 -- no DuckDB here: Python's reader stands in
+        try:
+            json.dumps(json.loads(text, object_pairs_hook=lambda pairs: pairs),
+                       ensure_ascii=False).encode("utf-8")
+        except (ValueError, UnicodeEncodeError):
+            return False
+        return True
 
 
 def _json_cannot_fail(source, type_of, engine: str, *, chosen_by_the_row: bool = False) -> bool:
@@ -254,6 +270,8 @@ def _branch_type(value, type_of, engine: str) -> exp.DataType | None:
     a comparison converts it; Codex's third review of #160)."""
     known, literal = [], False
     for branch in _branches(value):
+        while isinstance(branch, exp.Paren):
+            branch = branch.this  # `(NULL)` is NULL (Codex's fourth review of #160)
         if isinstance(branch, exp.Null):
             continue
         if isinstance(branch, exp.Literal) and branch.is_string:
@@ -263,6 +281,10 @@ def _branch_type(value, type_of, engine: str) -> exp.DataType | None:
         if typed is None:
             return None
         known.append(typed)
+    # On DuckDB a JSON branch makes the whole value JSON, the other branches converted to it row
+    # by row (measured: `COALESCE(attrs, region)` is JSON, and malformed text on the row that
+    # takes region; Codex's fourth review of #160): `_coerces_to_json` refuses that mix before
+    # this typing is consulted, so a JSON branch is only ever typed here beside JSON or NULL.
     text = [typed for typed in known if typed.this in exp.DataType.TEXT_TYPES]
     if text:
         return text[0]
@@ -314,6 +336,20 @@ def _known_type(value, type_of, engine: str) -> exp.DataType | None:
     if isinstance(value, exp.Literal) and value.is_number or isinstance(value, _ARITHMETIC):
         return exp.DataType.build("DOUBLE")
     return None
+
+
+def _coerces_to_json(node: exp.Expression, type_of, engine: str) -> bool:
+    """DuckDB types a CASE, COALESCE or IF with a JSON branch as JSON and converts every other
+    branch to JSON on the rows that take it: `COALESCE(attrs, region)`, `COALESCE(attrs, 'x')`
+    and `IF(c, 'x', attrs)` are Malformed JSON on those rows (measured; Codex's fourth review
+    of #160), with no JSON reader around them. So beside a JSON branch every branch must be JSON
+    already, NULL or a literal that is JSON."""
+    branches = _branches(node)
+    typed = [_known_type(branch, type_of, engine) for branch in branches]
+    if not any(known is not None and known.this == exp.DataType.Type.JSON for known in typed):
+        return False
+    return not all(_json_cannot_fail(branch, type_of, engine, chosen_by_the_row=True)
+                   for branch in branches)
 
 
 def _nvl_converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
@@ -425,6 +461,9 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
                 return node
             continue
         if engine == "oracle" and _nvl_converts_a_text_column(node, type_of, engine):
+            return node
+        if engine == "duckdb" and isinstance(node, _BRANCHED) and _coerces_to_json(
+                node, type_of, engine):
             return node
         untyped = isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_CONVERSIONS
         if not (untyped or isinstance(node, (exp.Cast, *_PARSES))):

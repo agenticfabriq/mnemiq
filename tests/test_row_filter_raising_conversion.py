@@ -120,6 +120,19 @@ RAISING_TYPED_FORMS = [
     # A literal the row chooses by a column is read on the rows that choose it (the review
     # gate): this one fails on the rows with id > 0, quoting the literal.
     "CASE WHEN id > 0 THEN 'x' ELSE CAST(1 AS VARCHAR) END = 7",
+    # Codex's fourth review: a parenthesised NULL or literal is still one; and a JSON branch
+    # makes the whole value JSON, every other branch converted to it on the rows that take it,
+    # with no JSON reader around.
+    "region = COALESCE((NULL), 7)",
+    "region = CASE WHEN id = 1 THEN 7 ELSE (NULL) END",
+    "region = CASE WHEN id = 1 THEN 7 ELSE ('b') END",
+    "COALESCE(CASE WHEN id = 2 THEN 'x' END, attrs) = '{}'",
+    "COALESCE(attrs, CASE WHEN id = 3 THEN 'x' END) IS NOT NULL",
+    "COALESCE(attrs, 'x') IS NOT NULL",
+    "COALESCE(attrs, region) IS NOT NULL",
+    "CASE WHEN id = 2 THEN region ELSE attrs END IS NOT NULL",
+    "IF(id = 2, 'x', attrs) IS NOT NULL",
+    "region = COALESCE(attrs, '{}')",  # region converted to JSON
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -127,6 +140,9 @@ SAFE_TYPED_FORMS = [
     "json_extract_string(coalesce(attrs, '{}'::JSON), '$.a') IS NOT NULL",
     "json_extract_string(coalesce(attrs, '{}'), '$.a') IS NOT NULL",  # a literal that is JSON
     "json_extract_string(coalesce(attrs, 'NaN'), '$.a') IS NOT NULL",  # JSON to DuckDB, measured
+    "json_extract_string(coalesce(attrs, '[1,]'), '$[0]') = '1'",  # DuckDB's grammar, not Python's
+    "json_extract_string(coalesce(attrs, '-NaN'), '$.a') IS NOT NULL",
+    "COALESCE(attrs, '{}') IS NOT NULL",  # JSON beside a JSON literal, no reader needed
     "json_extract_string(CASE WHEN id > 0 THEN attrs END, '$.a') IS NOT NULL",
     "json_extract_string(CASE WHEN id > 0 THEN '{\"a\": 1}'::JSON ELSE attrs END, '$.a') IS NOT NULL",
     "json_extract_string(IF(id > 0, attrs, NULL), '$.a') IS NOT NULL",
@@ -181,6 +197,25 @@ def test_a_text_column_mixed_with_a_number_fails_at_bind_and_is_not_this_class(r
     with pytest.raises(duckdb.BinderException, match="Cannot mix"):
         con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
     assert isinstance(_decide(row_filter), Approved), row_filter
+
+
+@pytest.mark.parametrize("literal", [
+    "[1,]", "-NaN", "NaN", '"\\ud800"', '{"a":"\\ud800","a":1}', "{}", "x", "", " {} ",
+    '{"a":1} x', "'quoted'", "[1,,2]", "{a:1}", "01", "1.", ".5", "+1", "true", "nul",
+])
+def test_a_json_literal_is_read_as_duckdb_s_reader_reads_it(literal):
+    """`_json_text` is DuckDB's own `json_valid`, so the two cannot drift; the differential is
+    against the reader that fails on the row. Python's grammar refuses `[1,]` and `-NaN`, which
+    DuckDB reads, and takes the lone surrogate, which DuckDB refuses."""
+    from mnemiq.sql.rls import _json_text
+
+    con = duckdb.connect()
+    try:
+        con.execute("SELECT json_extract_string($1::VARCHAR, '$')", [literal]).fetchone()
+        reads = True
+    except duckdb.Error:
+        reads = False
+    assert _json_text(literal) is reads, (literal, reads)
 
 
 def test_a_literal_the_row_chooses_by_a_column_is_refused_without_evaluating_it():
