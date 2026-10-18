@@ -153,19 +153,16 @@ def _bound_by_position(ast: exp.Expression, dialect: str,
             continue
         # A column list on a table REFERENCE renames by position too (Codex's review of #167):
         # over a base table, `FROM claim d(secret, id)` serves secret as `d.id`; over a CTE
-        # whose body expands a star, the same. Over a CTE of named projections the list renames
-        # column nodes that are checked in the CTE's scope, and passes.
-        name = resolve_name(table, dialect)
-        if not table.db and not table.catalog and name in ctes:
-            body, body_scope = ctes[name]
-            if not _star_reaches_base(body, body_scope, memo, columns, frozenset(), dialect):
-                continue
+        # whose body expands a star, the same; over a table function, its columns. Refused
+        # whatever stands behind the name: telling a CTE of named projections apart would need
+        # the CTE visible at the reference's own scope, and a lookup at the root let an inner
+        # WITH shadowing an outer name through (the review gate); no recorded statement lists
+        # columns on a reference (the ui lane's count).
         return Refusal(
             code=RefusalCode.SELECT_STAR,
-            message=(f"The column list on {table.alias_or_name!r} renames the columns of "
-                     f"{name!r} by position, so the new names say nothing about which columns "
-                     "are read. Name the columns in a SELECT instead of listing them on the "
-                     "alias."),
+            message=(f"The column list on {table.alias_or_name!r} renames what it reads by "
+                     "position, so the new names say nothing about which columns are read. "
+                     "Name the columns in a SELECT instead of listing them on the alias."),
             subject=table.alias_or_name or None,
         )
     for node in ast.find_all(exp.Subquery, exp.CTE):

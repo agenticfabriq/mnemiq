@@ -913,7 +913,24 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                 # the statement's own aliases, in `check_access`.
                 if local or len(by_alias) != 1:
                     continue
+                # A bare name in ORDER BY or HAVING that is the query's own alias never reaches
+                # here: sqlglot resolves it to the alias before listing the scope's columns, as
+                # the engine reads it (measured, a source column of the same name included). In
+                # the projection, a WHERE or a GROUP BY the engine reads the source's column
+                # whatever an alias is called (DuckDB groups `GROUP BY secret` by the source's
+                # secret beside `id AS secret`), so those bind below; a GROUP BY alias the source
+                # cannot be shown to lack falls closed, and the complete schema shows it.
                 qualifier = next(iter(by_alias))
+                name = resolve_identifier(column.this, dialect)
+                found = _exposure(by_alias[qualifier], name, column, columns, dialect, frozenset())
+                if found is None:
+                    found = _bound_outward(scope, qualifier, name, column, columns, dialect)
+                if found is None:
+                    continue
+                settled.add(id(column))
+                if found is not _NAMED:
+                    out[id(column)] = found[1]
+                continue
             table = local.get(qualifier)
             if table is not None:
                 out[id(column)] = table

@@ -323,13 +323,60 @@ def test_a_column_list_on_a_table_reference_or_an_aliased_columns_expansion_is_r
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
 
 
-def test_a_column_list_on_a_reference_to_a_cte_of_named_projections_passes(con):
-    # The list renames column nodes checked in the CTE's scope: `x` is claim's secret there.
-    sql = "WITH d AS (SELECT id, secret FROM claim) SELECT e.x FROM d e(k, x)"
+@pytest.mark.parametrize("sql", [
+    # Over a CTE of named projections too, and over a table function: refused whatever stands
+    # behind the name, since the CTE visible at the reference is not the root's (the review
+    # gate: an inner WITH shadowing an outer name slipped a root-level lookup).
+    "WITH d AS (SELECT id, secret FROM claim) SELECT e.x FROM d e(k, x)",
+    "WITH d AS (SELECT id FROM other) SELECT id FROM "
+    "(WITH d AS (SELECT * FROM claim) SELECT e.id FROM d e(secret, id)) z",
+    "SELECT i FROM range(3) t(i)",
+])
+def test_a_column_list_on_any_table_reference_is_refused(sql):
+    for visible, policy in ((_hidden("claim", "secret"), None), (FULL, COMPLETE),
+                            (FULL, _policy("claim", "secret", "denied"))):
+        verdict = _decide(sql, visible, policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
+@pytest.mark.parametrize("sql", [
+    # The review gate: an alias named after the hidden column must not switch the binding off
+    # where the engine reads the source's column, in the projection or a WHERE.
+    "SELECT secret AS secret FROM (SELECT * FROM claim) d",
+    "SELECT upper(secret) AS secret FROM (SELECT * FROM claim) d",
+    "SELECT id AS secret FROM (SELECT * FROM claim) d WHERE secret = 'CLAIM-SECRET'",
+    "SELECT id AS k FROM (SELECT * FROM claim) d ORDER BY (SELECT secret) ",
+])
+def test_an_alias_named_after_a_withheld_column_does_not_stand_in_for_it(con, sql):
     _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
-    verdict = _decide(sql, FULL)
-    assert isinstance(verdict, Approved), verdict
-    assert con.execute(verdict.target_sql).fetchall() == [("CLAIM-SECRET",)]
+
+
+def test_a_bare_name_that_is_the_query_s_own_alias_is_the_alias_where_the_engine_reads_it(con):
+    # Measured on DuckDB: ORDER BY and HAVING read an output alias before a source column of the
+    # name; GROUP BY reads the source column first. So `ORDER BY k` over `id AS k` is the alias
+    # under either schema, while `GROUP BY k` binds through the star and is the alias only where
+    # the complete schema says the source lacks `k`; under the grant alone it falls closed.
+    ordered = "SELECT id AS k FROM (SELECT * FROM claim) d ORDER BY k"
+    grouped = "SELECT id AS k, count(*) AS n FROM (SELECT * FROM claim) d GROUP BY k"
+    for policy in (None, COMPLETE):
+        verdict = _decide(ordered, {"claim": {"id"}}, policy=policy)
+        assert isinstance(verdict, Approved), (policy, verdict)
+        assert con.execute(verdict.target_sql).fetchall() == [(1,)]
+    assert isinstance(_decide(grouped, {"claim": {"id"}}, policy=COMPLETE), Approved)
+    closed = _decide(grouped, {"claim": {"id"}})
+    assert isinstance(closed, Refusal) and closed.code is RefusalCode.UNKNOWN_COLUMN, closed
+    # The alias wins in ORDER BY and HAVING even where the source has a column of the name
+    # (measured: `-id AS secret ... ORDER BY secret` sorts by the alias, `HAVING secret > 1`
+    # filters by it), so claim's hidden secret is not read. sqlglot drops the ORDER BY reference
+    # from the scope's columns itself; HAVING is the clause the skip decides.
+    for sql, rows in (("SELECT -id AS secret FROM (SELECT * FROM claim) d ORDER BY secret", [(-1,)]),
+                      ("SELECT id AS k, count(*) AS n FROM (SELECT * FROM claim) d GROUP BY id "
+                       "HAVING k > 0", [(1, 1)]),
+                      ("SELECT id AS secret, count(*) AS n FROM (SELECT * FROM claim) d GROUP BY id "
+                       "HAVING secret > 0", [(1, 1)])):
+        aliased = _decide(sql, _hidden("claim", "secret"))
+        assert isinstance(aliased, Approved), (sql, aliased)
+        assert con.execute(aliased.target_sql).fetchall() == rows
 
 
 # --- M185: DuckDB's positional reference ------------------------------------------------------
