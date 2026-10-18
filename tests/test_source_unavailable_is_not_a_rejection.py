@@ -151,25 +151,34 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
 
     from mnemiq.adapters.oracle import _UNAVAILABLE_DPY
 
+    # The set was read off this table. A driver whose table differs may name a connection fault
+    # the set does not, so its size is pinned: on a driver change, re-read the table, then move
+    # both numbers.
+    assert len(errors.ERR_MESSAGE_FORMATS) == 190, "the driver's error table changed: re-read it"
     # The driver's own faults that are the statement's or the caller's, by the same classes the
     # unavailable ones carry: invalid number, cannot convert, a cursor not open, an unsupported
-    # Python type, protocol data the driver could not read.
+    # Python type, too many batch errors.
     refused = [ora(904, 'ORA-00904: "WHOM": invalid identifier'),
                ora(942, "ORA-00942: table or view does not exist"),
                ora(936, "ORA-00936: missing expression"),
-               _dpy(4004), _dpy(4007), _dpy(1006), _dpy(3002), _dpy(5004),
+               ora(1, "ORA-00001: unique constraint violated"),
+               _dpy(4004), _dpy(4007), _dpy(1006), _dpy(3002), _dpy(4029),
                RuntimeError("refusing to validate a CREATE statement")]
     # Every code the adapter names, listed here on its own so the two lists must agree, built as
     # the driver builds it: the pool's acquisition timeout DPY-4005 (`_lease` under contention)
     # and the idle disconnect DPY-4033 are plain non-recoverable DatabaseErrors by the driver's
     # typing (Codex's second and third reviews of #159).
     named = [_dpy(n) for n in (1001, 1002, 4000, 4001, 4005, 4011, 4017, 4018, 4019, 4021, 4024,
-                               4026, 4027, 4028, 4032, 4033, 4034, 4035, 5005, 5006)]
+                               4026, 4027, 4028, 4030, 4032, 4033, 4034, 4035, 5004, 5005, 5006)]
     assert {str(exc)[:8] for exc in named} == _UNAVAILABLE_DPY
     unanswered = [*named, _dpy(6005),
                   ora(3113, "ORA-03113: end-of-file on communication channel"),
                   ora(1013, "ORA-01013: user requested cancel of current operation"),
                   ora(3156, "ORA-03156: the call timed out"),
+                  # What a growing pool meets on acquire after the credentials changed under it.
+                  ora(1017, "ORA-01017: invalid credential or not authorized; logon denied"),
+                  ora(28000, "ORA-28000: The account is locked."),
+                  ora(28001, "ORA-28001: the password has expired"),
                   ora(12541, "ORA-12541: TNS:no listener"),
                   ora(12170, "ORA-12170: TNS:Connect timeout occurred")]
     assert [str(exc)[:9] for exc in refused if oracle_unavailable(exc)] == []
