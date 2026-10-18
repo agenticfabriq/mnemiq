@@ -24,7 +24,8 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 
-FULL = {"claim": {"id", "secret"}, "other": {"id", "secret"}, "wide": {"id", "note"}}
+FULL = {"claim": {"id", "secret"}, "other": {"id", "secret"}, "wide": {"id", "note"},
+        "twin": {"id", "secret_1"}}
 ENGINES = ["duckdb", "oracle", "postgres"]
 
 
@@ -34,6 +35,9 @@ def con():
     con.execute("CREATE TABLE claim (id INT, secret VARCHAR); INSERT INTO claim VALUES (1, 'CLAIM-SECRET')")
     con.execute("CREATE TABLE other (id INT, secret VARCHAR); INSERT INTO other VALUES (1, 'OTHER-SECRET')")
     con.execute("CREATE TABLE wide (id INT, note VARCHAR); INSERT INTO wide VALUES (1, 'WIDE-NOTE')")
+    # `secret_1` on twin is a real column spelled like a name the engine generates (Codex's
+    # fifth review of #167): a generated-name read must not bind to it.
+    con.execute("CREATE TABLE twin (id INT, secret_1 VARCHAR); INSERT INTO twin VALUES (1, 'TWIN-S1')")
     return con
 
 
@@ -442,6 +446,45 @@ def test_a_bare_name_no_source_of_its_scope_exposes_binds_outward(con):
     verdict = _decide(sql, FULL)
     assert isinstance(verdict, Approved), verdict
     assert con.execute(verdict.target_sql).fetchall() == [("OTHER-SECRET",)]
+
+
+def test_a_generated_name_does_not_bind_to_a_table_that_happens_to_have_it(con):
+    # Codex's fifth review: twin has a real `secret_1`, granted, and the engine's `secret_1`
+    # over this derived table is claim's secret; bound to the first base table the read passed.
+    sql = "SELECT d.secret_1 FROM (SELECT 'SAFE' AS secret, c.* FROM twin t CROSS JOIN claim c) d"
+    assert con.execute(sql).fetchall() == [("CLAIM-SECRET",)]
+    for visible, kind in ((_hidden("claim", "secret"), None), (FULL, "denied"), (FULL, "masked")):
+        policy = AccessPolicy(**{kind: {("claim", "secret")}}, policy_schema=FULL) if kind else COMPLETE
+        verdict = _decide(sql, visible, policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (kind, verdict)
+        assert "makes up" in verdict.message
+    honest = _decide("SELECT t.secret_1 FROM twin t", FULL, policy=COMPLETE)
+    assert isinstance(honest, Approved), honest
+
+
+def test_a_bare_name_beside_a_base_table_and_a_derived_source_resolves_in_from_order(con):
+    # Codex's fifth review: a base table beside the derived source had switched the bare
+    # binding off, and the inner alias then stood in for the hidden column.
+    sql = "SELECT secret FROM wide w CROSS JOIN (SELECT *, 'SAFE' AS secret FROM claim) d"
+    assert con.execute(sql).fetchall() == [("CLAIM-SECRET",)]
+    _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
+    for policy in (None, COMPLETE):
+        hidden = _decide(sql, _hidden("claim", "secret"), policy=policy)
+        assert isinstance(hidden, Refusal) and hidden.code is RefusalCode.UNKNOWN_COLUMN, hidden
+    granted = _decide(sql, FULL, policy=COMPLETE)
+    assert isinstance(granted, Approved), granted
+    assert con.execute(granted.target_sql).fetchall() == [("CLAIM-SECRET",)]
+    # A base table listed with the name binds it ahead of a derived source in FROM order.
+    base_first = _decide("SELECT note FROM wide w CROSS JOIN (SELECT 'X' AS note FROM claim) d",
+                         _hidden("wide", "note"), policy=COMPLETE)
+    assert isinstance(base_first, Refusal) and base_first.code is RefusalCode.UNKNOWN_COLUMN, base_first
+    # And settles it: a derived source the grant alone cannot show to lack the name does not
+    # take it afterwards, since the engine refuses the name as ambiguous where both carry it
+    # rather than reading either (premise below), so the listed base table is the only reading.
+    with pytest.raises(duckdb.BinderException, match="Ambiguous"):
+        con.execute("SELECT id FROM wide w CROSS JOIN (SELECT * FROM other) d")
+    settled = _decide("SELECT note FROM wide w CROSS JOIN (SELECT * FROM other) d", FULL)
+    assert isinstance(settled, Approved), settled
 
 
 def test_a_generated_duplicate_name_is_refused_even_where_it_is_the_literal(con):

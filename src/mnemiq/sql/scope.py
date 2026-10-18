@@ -714,19 +714,12 @@ def _item_sources(item: exp.Expression, picked: list[str], dialect: str | None) 
             if resolve(source, quoted=False, dialect=dialect) == qualifier]
 
 
-def _first_base(scope) -> str | None:
-    """The first base table under a derived scope, in FROM order and depth first."""
-    if not hasattr(scope, "selected_sources"):
-        return None
-    for node, inner in scope.selected_sources.values():
-        if isinstance(inner, exp.Table):
-            return object_key(inner)
-        if isinstance(node, exp.Table) and _is_base_read(node, scope, dialect=None):
-            return object_key(node)
-        found = _first_base(inner)
-        if found is not None:
-            return found
-    return None
+# The owner `column_tables` reports for a column the engine named itself, a duplicate output
+# renamed `name_1`: no table, a refusal. `check_access` refuses it outright; no listed column
+# can carry it, and a table binding is not fail-closed where some table happens to have a column
+# of the generated name (Codex's fifth review of #167: `wide.secret_1`, granted, let `d.secret_1`
+# over `(SELECT 'SAFE' AS secret, c.* FROM wide w CROSS JOIN claim c) d` read claim's secret).
+GENERATED_NAME = "\0generated-name"
 
 
 def _exposed(source, column: exp.Column, columns, dialect: str | None):
@@ -736,9 +729,8 @@ def _exposed(source, column: exp.Column, columns, dialect: str | None):
     (measured: `(SELECT 'SAFE' AS secret, * FROM claim) d` exposes claim's secret as `secret_1`;
     an explicit `secret_1` after it is itself renamed; a taken `secret_1` moves the next to
     `secret_2`; Codex's fourth review of #167 and the gate read a withheld column through each).
-    So a name of that form is read fail-closed wherever the derived output carries its base
-    name, or where the output's names cannot be told: bound to the first base table under the
-    source, where no listed column has the generated name and the read is refused as unknown.
+    So a name of that form is read as the engine's own wherever the derived output carries its
+    base name, or where the output's names cannot be told: `GENERATED_NAME`, which is refused.
     A name of that form over an output that never carries the base is an honest column, read
     directly."""
     suffixed = re.fullmatch(r"(.+)_([1-9]\d*)", column.name)
@@ -746,17 +738,14 @@ def _exposed(source, column: exp.Column, columns, dialect: str | None):
         names = _output_names(source, columns, dialect, frozenset())
         base = resolve(suffixed[1], quoted=bool(column.this.args.get("quoted")), dialect=dialect)
         if names is None or base in names:
-            first = _first_base(source)
-            if first is not None:
-                return ("first", first)
+            return ("table", GENERATED_NAME)
     name = resolve_identifier(column.this, dialect)
     return _exposure(source, name, column, columns, dialect, frozenset())
 
 
 def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None,
-              seen: frozenset[int], skip: int = 0):
-    """What `scope` (a derived table's or CTE's) exposes under `name`, in projection order (M181);
-    with `skip`, the occurrence after that many earlier ones, for DuckDB's `name_k`.
+              seen: frozenset[int]):
+    """What `scope` (a derived table's or CTE's) exposes under `name`, in projection order (M181).
 
     The first projection that can expose the name settles it, as DuckDB binds the first column
     of a name in projection order (measured: `(SELECT *, 'NAMED' AS secret FROM claim) d` reads
@@ -789,15 +778,12 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
                                   for _, source in branch.selected_sources.values()
                                   if isinstance(source, exp.Table)), None)
                     return ("first", first) if first else _NAMED
-        return _exposure(scope.union_scopes[0], name, column, columns, dialect, seen, skip)
+        return _exposure(scope.union_scopes[0], name, column, columns, dialect, seen)
     for projection in scope.expression.selects:
         star = _star_of(projection)
         if star is None:
             alias = projection.alias_or_name
             if alias and resolve(alias, quoted=False, dialect=dialect) == name:
-                if skip:
-                    skip -= 1  # an earlier occurrence of the name, renamed by the engine
-                    continue
                 return _NAMED
             continue
         qualifier = (resolve_identifier(projection.args.get("table"), dialect)
@@ -806,9 +792,6 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
                   if not qualifier or resolve(source, quoted=False, dialect=dialect) == qualifier]
         if any(item.alias and resolve(item.alias, quoted=False, dialect=dialect) == name
                for item in star.args.get("replace") or ()):
-            if skip:
-                skip -= 1
-                continue
             return _NAMED  # `* REPLACE (id AS secret)`: the name holds the expression's nodes
         unlisted = listed_without = None
         for source in picked:
@@ -818,9 +801,6 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
             renames = [item for item in star.args.get("rename") or ()
                        if source in _item_sources(item.this, picked, dialect)]
             if any(resolve(item.alias, quoted=False, dialect=dialect) == name for item in renames):
-                if skip:
-                    skip -= 1
-                    continue
                 return _NAMED  # `RENAME (secret AS s2)`: `s2` is the column node `secret`, checked
             if excluded or any(_names_item(item.this, name, dialect) for item in renames):
                 continue  # dropped, or moved away from this source
@@ -829,9 +809,6 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
                     isinstance(node, exp.Table) and _is_base_read(node, scope, dialect)):
                 key = object_key(inner if isinstance(inner, exp.Table) else node)
                 if _schema_lists(columns, key, column, dialect):
-                    if skip:
-                        skip -= 1
-                        continue
                     return ("table", key)
                 if columns is not None and key in columns:
                     # Listed in full (the policy schema's, every column of the snapshot's) and
@@ -849,9 +826,6 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
                 continue
             if found[0] == "first":
                 listed_without = listed_without or found[1]
-                continue
-            if skip:
-                skip -= 1
                 continue
             return found
         if unlisted or listed_without:
@@ -1045,7 +1019,7 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                 # star's column first, as `d.secret` does (the ui lane's replay of #167). With
                 # a base table among the sources the old rule stands: the grant's columns and
                 # the statement's own aliases, in `check_access`.
-                if local or not by_alias:
+                if not by_alias:
                     continue
                 if column.find_ancestor(exp.Select, exp.SetOperation) is not scope.expression:
                     # sqlglot lists an inner scope's external columns in the enclosing scope too
@@ -1053,6 +1027,23 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                     # column is bound in the scope whose SELECT holds it, walking outward from
                     # there, not where it is relisted.
                     continue
+                if local:
+                    # A base table beside a derived source (Codex's fifth review of #167: `FROM
+                    # wide w CROSS JOIN (SELECT *, 'SAFE' AS secret FROM claim) d` let a bare
+                    # `secret` through on the inner alias): a base table listed with the name
+                    # binds it, in FROM order with the derived sources; one listed without does
+                    # not, since the old rule for a base table's bare column still holds in
+                    # `check_access`, the grant's columns and the query's own aliases.
+                    for source in scope.selected_sources:
+                        if source in by_alias:
+                            continue
+                        key = local.get(resolve(source, quoted=False, dialect=dialect))
+                        if key is not None and _schema_lists(columns, key, column, dialect):
+                            out[id(column)] = key
+                            settled.add(id(column))
+                            break
+                    if id(column) in settled:
+                        continue
                 # A bare name in ORDER BY or HAVING that is the query's own alias never reaches
                 # here: sqlglot resolves it to the alias before listing the scope's columns, as
                 # the engine reads it (measured, a source column of the same name included). In

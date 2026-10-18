@@ -8,7 +8,7 @@ from sqlglot.dialects.dialect import Dialect
 from mnemiq.sql.functions import FunctionInventory, UnreadableCalls, called_names
 from mnemiq.sql.identifiers import resolve_identifier, resolve_stored, rules_for
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables, candidate_tables, column_tables
+from mnemiq.sql.scope import GENERATED_NAME, base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -217,6 +217,15 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
         # only source is a derived table (M181), so both spellings of a read through a star
         # meet the same table here.
         table = resolved.get(id(column)) if resolved is not None else None
+        if table == GENERATED_NAME:
+            return Refusal(
+                code=RefusalCode.UNKNOWN_COLUMN,
+                message=(f"{column.name!r} is a name the engine makes up for a duplicate column "
+                         "of a subquery's output, which says nothing about which column is "
+                         "read. Alias each column of the subquery distinctly and read it by "
+                         "that name."),
+                subject=column.name,
+            )
         if table is not None:
             if name not in as_engine(visible[table]):
                 return Refusal(
