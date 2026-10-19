@@ -1132,7 +1132,11 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                 if name not in own:
                     return False
                 if isinstance(clause, exp.Order):
+                    # The bare alias, parentheses aside: `ORDER BY (secret) DESC` sorts by the
+                    # alias as `ORDER BY secret DESC` does (Codex's thirteenth review of #167).
                     ordered = column.parent
+                    while isinstance(ordered, exp.Paren):
+                        ordered = ordered.parent
                     return isinstance(ordered, exp.Ordered) and ordered.parent is clause
                 if isinstance(clause, exp.Having):
                     # In HAVING DuckDB reads the alias through scalar expressions, connectors,

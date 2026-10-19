@@ -366,6 +366,15 @@ def test_a_bare_name_that_is_the_query_s_own_alias_is_the_alias_where_the_engine
         verdict = _decide(ordered, {"claim": {"id"}}, policy=policy)
         assert isinstance(verdict, Approved), (policy, verdict)
         assert con.execute(verdict.target_sql).fetchall() == [(1,)]
+    # Parentheses around the bare alias change nothing (Codex's thirteenth review); an
+    # expression over it reads the source, which a hidden claim.secret refuses.
+    for spelling in ("ORDER BY (secret) DESC", "ORDER BY ((secret)) DESC"):
+        sql = f"SELECT id AS secret FROM (SELECT * FROM claim) d {spelling}"
+        assert con.execute(sql).fetchall() == [(1,)]
+        assert isinstance(_decide(sql, _hidden("claim", "secret"), policy=COMPLETE), Approved), spelling
+    expression = _decide("SELECT id AS secret FROM (SELECT * FROM claim) d ORDER BY secret || ''",
+                         _hidden("claim", "secret"), policy=COMPLETE)
+    assert isinstance(expression, Refusal) and expression.code is RefusalCode.UNKNOWN_COLUMN, expression
     assert isinstance(_decide(grouped, {"claim": {"id"}}, policy=COMPLETE), Approved)
     closed = _decide(grouped, {"claim": {"id"}})
     assert isinstance(closed, Refusal) and closed.code is RefusalCode.UNKNOWN_COLUMN, closed
