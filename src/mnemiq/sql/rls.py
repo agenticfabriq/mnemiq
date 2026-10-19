@@ -411,7 +411,9 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     runs; None for anything else, or where a column's type is not known."""
     while isinstance(value, exp.Paren):
         value = value.this
-    if not all(isinstance(node, _PURE) for node in value.walk()):
+    if not all(isinstance(node, _PURE) or (
+            isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_CONSTRUCTORS)
+            for node in value.walk()):
         return None
     # A MAP literal's keys are expressions DuckDB evaluates (`MAP {id: 1}` is keyed by the
     # column, MAP(INTEGER, INTEGER)), which sqlglot parses as struct-field identifiers, so they
@@ -454,7 +456,7 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
 # `_duckdb_type`'s answer for a text or JSON branch: a text literal beside it is taken as it is
 # (or the mix is a bind fault on no row's value), or parsed by `_coerces_to_json`'s rule.
 _TEXT = "text"
-_LIST_CONSTRUCTORS = frozenset({"array_value", "list_value", "list_pack"})
+_LIST_CONSTRUCTORS = frozenset({"array_value", "list_pack"})  # `list_value` parses as a list
 _CONTAINERS = (exp.DataType.Type.ARRAY, exp.DataType.Type.LIST, exp.DataType.Type.STRUCT,
                exp.DataType.Type.MAP)
 

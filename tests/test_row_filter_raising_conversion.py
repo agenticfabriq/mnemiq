@@ -198,6 +198,10 @@ RAISING_TYPED_FORMS = [
     "list_value(attrs, region)[2] IS NOT NULL",
     "list_pack(attrs, region)[2] IS NOT NULL",
     "MAP {'a': attrs, 'b': region}['b'] IS NOT NULL",
+    # The review gate on 2e09098: the call spelling on a branch or across a comparison is a
+    # list, typed by DuckDB as one.
+    "array_value(attrs) = array_value(region)",
+    "CASE WHEN id = 1 THEN list_pack(attrs) ELSE list_pack(region) END IS NOT NULL",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
