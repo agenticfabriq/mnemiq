@@ -295,9 +295,9 @@ def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refus
                 subject=dot.this.sql(),
             )
     for expansion in ast.find_all(exp.Columns):
-        if not write and (isinstance(expansion.parent, exp.Select)
-                          or expansion.find_ancestor(exp.Pivot) is not None):
-            continue  # a bare projection, read by the resolver; a PIVOT, refused as unmodelled
+        if expansion.find_ancestor(exp.Pivot) is not None or (
+                isinstance(expansion.parent, exp.Select) and _projection_is_read(expansion, write)):
+            continue  # a PIVOT's own refusal; a bare projection the resolver or star check reads
         return Refusal(
             code=RefusalCode.SELECT_STAR,
             message=("`COLUMNS(...)` inside an expression expands to columns no check can "
@@ -313,7 +313,7 @@ def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refus
                 subject=call.sql(),
             )
     for star in ast.find_all(exp.Star):
-        if _star_is_read(star, write):
+        if _projection_is_read(star, write):
             continue
         return Refusal(
             code=RefusalCode.SELECT_STAR,
@@ -326,26 +326,31 @@ def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refus
     return None
 
 
-def _star_is_read(star: exp.Star, write: bool) -> bool:
-    """Whether some check reads this star: `COUNT(*)`; the projection of an EXISTS; and, on
-    the read side only, the outermost query's (the star check), a derived table's or a CTE's
-    (the resolver, where the outer query names what it reads). A star anywhere else, a scalar
-    subquery, an IN list, a value in parentheses, an INSERT's source, is read by nothing."""
-    holder = star.parent
+def _projection_is_read(node: exp.Expression, write: bool) -> bool:
+    """Whether some check reads this star or bare COLUMNS: `COUNT(*)`; the projection of an
+    EXISTS, unless an INTERSECT or EXCEPT on the way compares the values (`EXISTS (SELECT *
+    FROM one INTERSECT SELECT 'Z')` is true only on the withheld value: Codex's third review of
+    #169); and, on the read side only, the outermost query's (the star check), a derived
+    table's or a CTE's (the resolver, where the outer query names what it reads). A star or
+    COLUMNS anywhere else, a scalar subquery (`WHERE (SELECT COLUMNS('secret') FROM one LIMIT
+    1) = 'Z'`, the same review), an IN list, a value in parentheses, an INSERT's source, is read
+    by nothing."""
+    holder = node.parent
     if isinstance(holder, exp.Column):
         holder = holder.parent  # `t.*`
     if isinstance(holder, exp.Count):
         return True
-    if star.find_ancestor(exp.Pivot) is not None:
+    if node.find_ancestor(exp.Pivot) is not None:
         return True  # a PIVOT or UNPIVOT source is refused as unmodelled, with its own code
     if not isinstance(holder, exp.Select):
         return False
-    query = holder
+    query, compared = holder, False
     while isinstance(query.parent, (exp.SetOperation, exp.Paren)):
         query = query.parent
+        compared = compared or isinstance(query, (exp.Intersect, exp.Except))
     outer = query.parent
     if isinstance(outer, exp.Exists):
-        return True
+        return not compared
     if write:
         return False
     if outer is None:

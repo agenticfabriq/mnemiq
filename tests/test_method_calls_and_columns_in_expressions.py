@@ -247,11 +247,44 @@ def test_a_star_in_a_scalar_or_in_subquery_is_refused_as_unnamed(con, sql):
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
 
 
+@pytest.mark.parametrize("sql", [
+    "SELECT id FROM claim WHERE (SELECT COLUMNS('ecr') FROM one LIMIT 1) = 'ONE-SECRET'",
+    "SELECT id FROM claim WHERE 'ONE-SECRET' IN (SELECT COLUMNS('ecr') FROM one)",
+    "SELECT id FROM claim WHERE EXISTS (SELECT * FROM one INTERSECT SELECT 'ONE-SECRET')",
+    "SELECT id FROM claim WHERE EXISTS (SELECT * FROM one EXCEPT SELECT 'NOT-IT')",
+    "SELECT id FROM claim WHERE EXISTS (SELECT COLUMNS('ecr') FROM one INTERSECT SELECT 'ONE-SECRET')",
+    "SELECT id FROM claim WHERE EXISTS ((SELECT * FROM one) INTERSECT (SELECT 'ONE-SECRET'))",
+    "SELECT id FROM claim WHERE EXISTS (SELECT * FROM one INTERSECT SELECT 'ONE-SECRET' UNION ALL SELECT 'x' WHERE FALSE)",
+])
+def test_a_predicate_oracle_through_a_bare_columns_or_an_exists_intersect_is_refused(con, sql):
+    # Codex's third review of #169: a bare COLUMNS in a scalar or IN subquery is a projection
+    # under a Select, and an EXISTS over an INTERSECT or EXCEPT compares its projections, so
+    # each returned a row for the withheld value and none for a wrong guess.
+    con.execute("CREATE TABLE one (secret VARCHAR); INSERT INTO one VALUES ('ONE-SECRET')")
+    assert con.execute(sql).fetchall() == [(1,)], sql
+    wrong = sql.replace("ONE-SECRET", "WRONG").replace("NOT-IT", "ONE-SECRET")
+    assert con.execute(wrong).fetchall() == [], wrong
+    schema = {**FULL, "one": {"secret"}}
+    hidden = _decide(sql, {**FULL, "one": set()}, policy=AccessPolicy(policy_schema=schema))
+    denied = _decide(sql, schema, policy=AccessPolicy(denied={("one", "secret")}, policy_schema=schema))
+    masked = _decide(sql, schema, policy=AccessPolicy(masked={("one", "secret")}, policy_schema=schema))
+    for verdict in (hidden, denied, masked):
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+    write = "INSERT INTO sink (i) " + sql
+    con.execute("CREATE TABLE sink (i INT, s VARCHAR, j STRUCT(ssn VARCHAR))")
+    con.execute(write)
+    assert con.execute("SELECT i FROM sink").fetchall() == [(1,)]
+    schema_w = {**schema, "sink": {"i", "s", "j"}}
+    verdict = _decide_write(write, schema_w, AccessPolicy(denied={("one", "secret")}, policy_schema=schema_w))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (write, verdict)
+
+
 def test_a_star_the_resolver_or_the_star_check_reads_is_left_to_them(con):
     con.execute("CREATE TABLE one (secret VARCHAR); INSERT INTO one VALUES ('ONE-SECRET')")
     schema = {**FULL, "one": {"secret"}}
     granted = AccessPolicy(policy_schema=schema)
     for sql in ("SELECT id FROM claim WHERE EXISTS (SELECT * FROM one)",
+                "SELECT id FROM claim WHERE EXISTS (SELECT * FROM one UNION ALL SELECT * FROM one)",
                 "SELECT d.secret FROM (SELECT * FROM one) d",
                 "WITH w AS (SELECT * FROM one) SELECT w.secret FROM w",
                 "SELECT d.secret FROM ((SELECT * FROM one)) d",
