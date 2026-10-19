@@ -615,16 +615,24 @@ def test_a_cte_or_lateral_column_list_names_its_output(con, sql):
     "WITH w(x) AS (SELECT 1 AS secret FROM wide) SELECT (SELECT w.secret FROM w) FROM claim w",
     "WITH w(x) AS (SELECT 1 AS secret FROM wide) SELECT (SELECT secret FROM w) FROM claim",
     "SELECT (SELECT l.secret FROM (SELECT 1 AS k) o, LATERAL (SELECT 1 AS secret FROM wide) l(x)) FROM claim l",
-], ids=["qualified by the CTE's name", "bare", "qualified by a LATERAL's alias"])
+    "SELECT (SELECT d.secret FROM (SELECT 1 AS secret) d(x)) FROM claim d",
+    "SELECT (SELECT secret FROM (SELECT 1 AS secret) d(x)) FROM claim",
+], ids=["qualified by the CTE's name", "bare", "qualified by a LATERAL's alias",
+        "qualified by a derived table's alias", "bare over a derived table's list"])
 def test_a_renamed_position_exposes_nothing_under_its_old_name(con, sql):
     # Codex's eighth review of #167: the list renames the projection, so the engine has no
     # `secret` in w and binds the reference outward, to the outer source of the same name; read
-    # as the CTE's named projection, the reference passed and claim's secret came back.
+    # as the CTE's named projection, the reference passed and claim's secret came back. Its
+    # ninth review: the same over a derived table's alias list, which was read nowhere.
     assert con.execute(sql).fetchall() == [("CLAIM-SECRET",)]
     _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
     hidden = _decide(sql, _hidden("claim", "secret"), policy=COMPLETE)
     assert isinstance(hidden, Refusal) and hidden.code is RefusalCode.UNKNOWN_COLUMN, hidden
     assert isinstance(_decide(sql, FULL, policy=COMPLETE), Approved)
+    honest = _decide("SELECT d.x FROM (SELECT secret AS s FROM claim) d(x)", FULL, policy=COMPLETE)
+    assert isinstance(honest, Approved), honest
+    listed_hidden = _decide("SELECT d.x FROM (SELECT secret AS s FROM claim) d(x)", _hidden("claim", "secret"))
+    assert isinstance(listed_hidden, Refusal) and listed_hidden.code is RefusalCode.UNKNOWN_COLUMN, listed_hidden
 
 
 @pytest.mark.parametrize("sql", [

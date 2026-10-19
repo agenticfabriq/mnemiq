@@ -910,12 +910,15 @@ def _column_list(scope, dialect: str | None) -> tuple[str, ...] | None:
     (`WITH w(n) AS (...)`, `LATERAL (...) l(x, y)`), resolved as the engine resolves names."""
     expression = getattr(scope, "expression", None)
     holder = expression if isinstance(expression, exp.Lateral) else getattr(expression, "parent", None)
-    while isinstance(holder, exp.SetOperation):
+    while isinstance(holder, (exp.SetOperation, exp.Paren)):
         # A recursive CTE's anchor, which sqlglot hands a self-reference inside the recursive
         # branch (the ui lane's replay: `WITH RECURSIVE m(a) AS (SELECT 1 UNION ALL SELECT a + 1
         # FROM m WHERE a < 3)` read nowhere else was refused on `a`).
         holder = holder.parent
-    if not isinstance(holder, (exp.CTE, exp.Lateral)):
+    # A derived table's alias carries a list too (`(SELECT 1 AS secret) d(x)`; Codex's ninth
+    # review of #167: left unread, the old name stayed exposed and `d.secret` passed where the
+    # engine binds it outward to a hidden column).
+    if not isinstance(holder, (exp.CTE, exp.Lateral, exp.Subquery)):
         return None
     alias = holder.args.get("alias")
     listed = alias.args.get("columns") if alias is not None else None
