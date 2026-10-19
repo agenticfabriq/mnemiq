@@ -737,6 +737,46 @@ def test_a_set_operation_s_or_a_window_s_order_by_reads_the_output_it_names(con,
         assert isinstance(_decide(sql, FULL, policy=policy), Approved), (sql, policy)
 
 
+def test_a_columns_pattern_expands_only_the_names_it_picks(con):
+    # Codex's fourteenth review of #167: `COLUMNS('id')` was read as a whole star, so a later
+    # literal of a name the pattern does not pick was refused on the hidden column, and an
+    # outward read through the expansion was bound to it.
+    literal = "SELECT d.secret FROM (SELECT COLUMNS('id'), 7 AS secret FROM claim) d"
+    assert con.execute(literal).fetchall() == [(7,)]
+    assert isinstance(_decide(literal, _hidden("claim", "secret"), policy=COMPLETE), Approved)
+    outward = "SELECT (SELECT secret FROM (SELECT COLUMNS('id') FROM claim) d) FROM claim"
+    assert con.execute(outward).fetchall() == [("CLAIM-SECRET",)]
+    hidden = _decide(outward, _hidden("claim", "secret"), policy=COMPLETE)
+    assert isinstance(hidden, Refusal), hidden  # the shape guard's refusal, before any binding
+    # A pattern that picks the name still exposes it (a search, case kept), and the generated
+    # name of a duplicate counts the picked names alone. The pattern is asked of DuckDB's own
+    # regular expressions against the stored spelling: a case-folded reference and a pattern
+    # Python reads differently (RE2 has no lookahead; `\pL` is RE2's alone) are read as DuckDB
+    # reads them, picking everything where DuckDB would refuse the pattern.
+    picked = "SELECT d.secret FROM (SELECT COLUMNS('e') FROM claim) d"
+    assert con.execute(picked).fetchall() == [("CLAIM-SECRET",)]
+    _withheld_three_ways(con, picked, "claim", "secret", "CLAIM-SECRET")
+    for pattern in ("\\pL", "(?=sec)", "(?i)SECRET", "[[:alpha:]]"):
+        sql = f"SELECT d.secret FROM (SELECT COLUMNS('{pattern}') FROM claim) d"
+        verdict = _decide(sql, _hidden("claim", "secret"), policy=COMPLETE)
+        assert isinstance(verdict, Refusal), (pattern, verdict)
+    # Over a derived source the output's stored spelling is not known, so the pattern keeps
+    # the whole-star reading and the star under it binds as any star does (fail-closed; the
+    # gate: a case-folding stand-in could be switched off by an inline flag in the pattern).
+    nested = "SELECT d.secret FROM (SELECT COLUMNS('id'), 'x' AS secret FROM (SELECT * FROM claim) i) d"
+    assert con.execute(nested).fetchall() == [("x",)]
+    assert isinstance(_decide(nested, _hidden("claim", "secret"), policy=COMPLETE), Refusal)
+    assert isinstance(_decide(nested, FULL, policy=COMPLETE), Approved)
+    con.execute('CREATE TABLE cased ("Secret" VARCHAR, id INT); INSERT INTO cased VALUES (\'CASED-SECRET\', 1)')
+    cased = "SELECT d.secret FROM (SELECT COLUMNS('S'), 7 AS secret FROM cased) d"
+    assert con.execute(cased).fetchall() == [("CASED-SECRET",)]
+    verdict = _decide(cased, {"cased": {"id"}}, policy=AccessPolicy(policy_schema={"cased": {"Secret", "id"}}))
+    assert isinstance(verdict, Refusal), verdict
+    honest = "SELECT d.secret_1 FROM (SELECT COLUMNS('id'), 1 AS secret_1 FROM claim) d"
+    assert con.execute(honest).fetchall() == [(1,)]
+    assert isinstance(_decide(honest, FULL, policy=COMPLETE), Approved)
+
+
 def test_a_recursive_cte_s_list_names_its_anchor_even_where_nothing_reads_the_cte(con):
     # The ui lane's replay: sqlglot hands the recursive branch the anchor's scope, whose parent
     # is the set operation, not the CTE, so the list was not found and `a` was refused on main.

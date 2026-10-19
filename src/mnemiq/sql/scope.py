@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 
 from sqlglot import exp
 from sqlglot.errors import OptimizeError
@@ -685,6 +686,54 @@ def _star_of(projection: exp.Expression) -> exp.Star | None:
     return None
 
 
+def _columns_pattern(projection: exp.Expression) -> str | None:
+    """The regular expression a `COLUMNS('...')` projection picks columns by, else None (a
+    `COLUMNS(*)`, a lambda, or no COLUMNS at all)."""
+    if isinstance(projection, exp.Alias):
+        projection = projection.this
+    if isinstance(projection, exp.Columns) and isinstance(projection.this, exp.Literal) \
+            and projection.this.is_string:
+        return projection.this.this
+    return None
+
+
+_REGEX_LOCK = threading.Lock()
+_REGEX_READER = None
+
+
+def _pattern_picks(pattern: str, candidates) -> bool:
+    """Whether DuckDB's `COLUMNS('regex')` picks a column of one of these stored spellings,
+    asked of DuckDB's own regular expressions (RE2, through `regexp_matches`, which `COLUMNS`
+    uses: a search, case kept; measured: `COLUMNS('i')` picks `id`, `COLUMNS('ID')` nothing),
+    never of Python's, which read some patterns differently (the review gate on #167). Any
+    error, DuckDB's refusal of the pattern among them, reads as picking, fail-closed. Only a
+    stored spelling can be asked: a derived source's output names are known folded alone, so a
+    pattern over one keeps the whole-star reading (the gate: a case-folding stand-in can be
+    switched off by an inline flag in the pattern)."""
+    global _REGEX_READER
+    try:
+        from mnemiq.duckdb_extensions import connect_duckdb
+
+        with _REGEX_LOCK:
+            if _REGEX_READER is None:
+                _REGEX_READER = connect_duckdb(local_only=True)
+            for candidate in candidates:
+                row = _REGEX_READER.execute("SELECT regexp_matches($1, $2)",
+                                            [candidate, pattern]).fetchone()
+                if row is not None and row[0]:
+                    return True
+        return False
+    except Exception:  # noqa: BLE001 -- unsure: the pattern may pick it
+        return True
+
+
+def _stored_matches(stored: str, name: str, dialect: str | None) -> bool:
+    """Whether a stored column spelling is the one a resolved reference name reads."""
+    if rules_for(dialect).quoting_preserves_case:
+        return stored == name
+    return resolve_stored(stored, dialect) == name or stored == name
+
+
 def _schema_lists(columns, key: str, column: exp.Column, dialect: str | None) -> bool:
     """Whether the schema lists table `key` with the column, compared as the engine compares names
     (`check_access`'s rule, M170): both sides fold where the engine folds, as typed where quoting
@@ -825,6 +874,12 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
             if alias and resolve(alias, quoted=False, dialect=dialect) == name:
                 return _NAMED
             continue
+        # `COLUMNS('id')` expands only the names its pattern picks, so a later projection of a
+        # name it does not pick is read as the engine reads it (Codex's fourteenth review of
+        # #167: `(SELECT COLUMNS('id'), 7 AS secret FROM claim) d` read `d.secret` through the
+        # expansion and refused the literal on a hidden claim.secret); asked per source below,
+        # against the stored spellings the schema lists.
+        pattern = _columns_pattern(projection)
         qualifier = (resolve_identifier(projection.args.get("table"), dialect)
                      if isinstance(projection, exp.Column) else None)
         picked = [source for source in scope.selected_sources
@@ -847,6 +902,10 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
             if isinstance(inner, exp.Table) or (
                     isinstance(node, exp.Table) and _is_base_read(node, scope, dialect)):
                 key = object_key(inner if isinstance(inner, exp.Table) else node)
+                if pattern is not None and columns is not None and key in columns:
+                    stored = [n for n in columns[key] if _stored_matches(n, name, dialect)]
+                    if stored and not _pattern_picks(pattern, stored):
+                        continue  # listed, and the pattern picks none of its spellings
                 if _schema_lists(columns, key, column, dialect):
                     return ("table", key)
                 if columns is not None and key in columns:
@@ -979,9 +1038,10 @@ def _projected_names(scope, columns, dialect: str | None, seen: frozenset[int]) 
                 return None
             names.append(resolve(alias, quoted=False, dialect=dialect))
             continue
-        if isinstance(projection, exp.Columns) or (
-                isinstance(projection, exp.Alias) and isinstance(projection.this, exp.Columns)):
-            return None  # a pattern picks an unknown subset
+        pattern = _columns_pattern(projection)
+        if pattern is None and (isinstance(projection, exp.Columns) or (
+                isinstance(projection, exp.Alias) and isinstance(projection.this, exp.Columns))):
+            return None  # a pattern that is no regular expression picks an unknown subset
         qualifier = (resolve_identifier(projection.args.get("table"), dialect)
                      if isinstance(projection, exp.Column) else None)
         picked = [source for source in scope.selected_sources
@@ -994,11 +1054,14 @@ def _projected_names(scope, columns, dialect: str | None, seen: frozenset[int]) 
                 if columns is None or key not in columns:
                     return None
                 folds = not rules_for(dialect).quoting_preserves_case
-                exposed = [resolve_stored(n, dialect) if folds else n for n in columns[key]]
+                stored = list(columns[key])
+                if pattern is not None:
+                    stored = [n for n in stored if _pattern_picks(pattern, [n])]
+                exposed = [resolve_stored(n, dialect) if folds else n for n in stored]
             else:
                 exposed = _output_names(inner, columns, dialect, seen)  # a nested list applies
-                if exposed is None:
-                    return None
+                if exposed is None or pattern is not None:
+                    return None  # a pattern over folded names picks an unknown subset
             dropped = {resolve_identifier(item.this if isinstance(item, exp.Column) else item,
                                           dialect)
                        for item in star.args.get("except_") or ()
