@@ -477,8 +477,9 @@ _TEXT = "text"
 _LIST_CONSTRUCTORS = frozenset({"array_value", "list_pack"})  # `list_value` parses as a list
 # A list searched for a value (the element type unified with the value's), or two lists searched
 # against each other; by sqlglot's node where it has one, by name where it does not.
-_LIST_SEARCHES = (exp.ArrayContains, exp.ArrayPosition, exp.ArrayOverlaps, exp.ArrayContainsAll)
-_LIST_PAIRS = (exp.ArrayOverlaps, exp.ArrayContainsAll)
+_LIST_SEARCHES = (exp.ArrayContains, exp.ArrayPosition, exp.ArrayOverlaps, exp.ArrayContainsAll,
+                  exp.Contains, exp.ArrayContainedBy)
+_LIST_PAIRS = (exp.ArrayOverlaps, exp.ArrayContainsAll, exp.ArrayContainedBy)
 _LIST_SEARCH_NAMES = frozenset({"list_has", "array_has", "list_position", "list_indexof",
                                 "array_indexof", "list_has_all", "array_has_all", "list_has_any",
                                 "array_has_any", "array_contains", "list_contains"})
@@ -792,14 +793,29 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
                 haystack, needle = (operands + [None, None])[:2]
             else:
                 haystack, needle = node.this, node.args.get("expression")
+            if isinstance(node, exp.Contains):
+                # DuckDB's `contains` searches a string as well as a list: a list search only
+                # where the reader types the first argument as a list (the review gate: over a
+                # JSON column it is the string search, and over a list a call returns it is
+                # left to the other rules).
+                kind = _type_of_value(haystack, type_of, engine) if haystack is not None else None
+                if kind is None or kind.this not in (exp.DataType.Type.ARRAY, exp.DataType.Type.LIST):
+                    haystack = None
             if haystack is not None and needle is not None:
-                probe = (needle if isinstance(node, _LIST_PAIRS) or (
+                pairs = isinstance(node, _LIST_PAIRS) or (
                     isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_PAIR_NAMES)
-                    else None)
                 element = exp.Bracket(this=haystack.copy(), expressions=[exp.Literal.number(1)])
                 element.parent = node
-                pair = [haystack, needle] if probe is not None else [element, needle]
+                pair = [haystack, needle] if pairs else [element, needle]
                 if _values_coerce_to_json(pair, type_of, engine) or _json_inside_a_container(pair, type_of):
+                    return node
+                lists = pair if pairs else [element]
+                if any(_type_of_value(value, type_of, engine) is None for value in lists):
+                    # A list the reader cannot type (`list_distinct([attrs])`, a call) may hold
+                    # JSON, and the search would parse what it looks for (the review gate on
+                    # e12b82d): refused, fail-closed. The value searched for, where untyped
+                    # beside a JSON element, is refused above, and beside a text element it
+                    # parses nothing.
                     return node
         if engine == "duckdb" and (isinstance(node, (exp.Array, exp.ToMap)) or (
                 isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_CONSTRUCTORS)):

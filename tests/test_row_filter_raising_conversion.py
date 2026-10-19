@@ -213,6 +213,10 @@ RAISING_TYPED_FORMS = [
     "list_position([attrs], region) > 0",
     "list_has_all([attrs], [region])",
     "array_has_all([attrs], [region])",
+    # The review gate on e12b82d: two more spellings, and a list the reader cannot type.
+    "contains([attrs], region)",
+    "[region] <@ [attrs]",
+    "list_contains(list_distinct([attrs]), region)",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -262,6 +266,11 @@ SAFE_TYPED_FORMS = [
     "CASE WHEN id = 1 THEN MAP {id: 1} ELSE MAP {id: 2} END IS NOT NULL",
     "list_contains([attrs], TRY_CAST(region AS JSON))",
     "list_contains([region], 'x')",
+    "contains(region, 'x')",
+    "contains(lower(region), 'x')",
+    "contains(attrs, 'x')",  # the string search over a JSON column (the review gate)
+    "contains(region, lower('X'))",
+    "list_contains([region], lower(region))",
     "COALESCE([attrs][1], attrs) IS NOT NULL",
     "CASE WHEN id = 1 THEN {'a': attrs, 'b': 1.5} ELSE {'a': attrs, 'b': 10.25} END IS NOT NULL",
     "CASE WHEN id = 1 THEN {'a': attrs, 'b': region} ELSE {'b': region, 'a': attrs} END IS NOT NULL",
@@ -385,7 +394,9 @@ def test_a_literal_beside_a_branch_the_validator_cannot_type_is_refused_though_i
                  "CASE WHEN id = 1 THEN lower(region) ELSE 'x' END = 'x'",
                  # TRY_CAST to a container cannot tell a converting literal from one that does
                  # not (the review gate), so a literal beside a container branch is refused too.
-                 "CASE WHEN id = 1 THEN [1, 2] ELSE '[3]' END IS NOT NULL"):
+                 "CASE WHEN id = 1 THEN [1, 2] ELSE '[3]' END IS NOT NULL",
+                 # A list a call returns cannot be typed, and may hold JSON (the review gate).
+                 "list_contains(list_distinct([region]), 'x')"):
         con.execute(f"SELECT id FROM claim WHERE {runs}").fetchall()
         verdict = _decide(runs)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, runs
