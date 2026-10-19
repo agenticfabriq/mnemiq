@@ -617,8 +617,14 @@ def test_a_cte_or_lateral_column_list_names_its_output(con, sql):
     "SELECT (SELECT l.secret FROM (SELECT 1 AS k) o, LATERAL (SELECT 1 AS secret FROM wide) l(x)) FROM claim l",
     "SELECT (SELECT d.secret FROM (SELECT 1 AS secret) d(x)) FROM claim d",
     "SELECT (SELECT secret FROM (SELECT 1 AS secret) d(x)) FROM claim",
+    "WITH w(x) AS ((SELECT 'SAFE' AS secret FROM wide WHERE id = 1)) SELECT (SELECT w.secret FROM w) FROM claim w",
+    "WITH w(x) AS ((SELECT 'SAFE' AS secret FROM wide WHERE id = 1) UNION ALL (SELECT 'SAFE' FROM wide WHERE false)) SELECT (SELECT w.secret FROM w) FROM claim w",
+    "SELECT (SELECT l.secret FROM (SELECT 1 AS k) o, LATERAL (SELECT 'SAFE' AS secret FROM wide WHERE id = 1 UNION ALL SELECT 'SAFE' FROM wide WHERE false) l(x)) FROM claim l",
+    "SELECT (SELECT d.secret FROM ((SELECT 1 AS secret)) d(x)) FROM claim d",
 ], ids=["qualified by the CTE's name", "bare", "qualified by a LATERAL's alias",
-        "qualified by a derived table's alias", "bare over a derived table's list"])
+        "qualified by a derived table's alias", "bare over a derived table's list",
+        "a parenthesised CTE body", "parenthesised union branches", "a LATERAL over a union",
+        "a doubly parenthesised derived table"])
 def test_a_renamed_position_exposes_nothing_under_its_old_name(con, sql):
     # Codex's eighth review of #167: the list renames the projection, so the engine has no
     # `secret` in w and binds the reference outward, to the outer source of the same name; read
@@ -663,7 +669,17 @@ def test_an_unaliased_derived_table_is_a_source(con, sql):
     "SELECT id AS secret, count(*) AS n FROM (SELECT * FROM claim) d GROUP BY id HAVING max(secret) = 'CLAIM-SECRET'",
     "WITH w AS (SELECT secret AS s FROM claim) SELECT count(*) AS n FROM w HAVING max(s) = 'CLAIM-SECRET'",
     "SELECT id AS secret FROM claim GROUP BY id ORDER BY max(secret) = 'CLAIM-SECRET'",
-], ids=["over the table", "through a derived star", "through a CTE alias", "an ORDER BY aggregate"])
+    # The ui lane's replay at cb90806: an ORDER BY expression, a window's argument, a FILTER, an
+    # aggregate sqlglot does not know as one, and QUALIFY, all read the source column.
+    "SELECT id AS secret FROM claim ORDER BY lower(secret) = 'claim-secret'",
+    "SELECT id AS secret FROM claim ORDER BY secret || '' = 'CLAIM-SECRET'",
+    "SELECT id AS secret FROM claim ORDER BY first_value(secret) OVER (PARTITION BY id) = 'CLAIM-SECRET'",
+    "SELECT id AS secret, count(*) AS n FROM claim GROUP BY id HAVING count(*) FILTER (WHERE secret = 'CLAIM-SECRET') > 0",
+    "SELECT id AS secret, count(*) AS n FROM claim GROUP BY id HAVING arbitrary(secret) = 'CLAIM-SECRET'",
+    "SELECT id AS secret FROM claim QUALIFY first_value(secret) OVER (PARTITION BY id) = 'CLAIM-SECRET'",
+], ids=["over the table", "through a derived star", "through a CTE alias", "an ORDER BY aggregate",
+        "an ORDER BY call", "an ORDER BY expression", "a window's argument", "a FILTER", "an aggregate sqlglot does not know",
+        "QUALIFY"])
 def test_a_source_column_inside_a_having_or_order_by_aggregate_is_read_in_its_scope(con, sql):
     # sqlglot lists no unqualified HAVING column in a scope, nor an ORDER BY one matching an
     # output name; DuckDB reads a source column inside an aggregate there (an output alias only

@@ -906,14 +906,19 @@ def _scope_names(scope, dialect: str | None):
 
 
 def _column_list(scope, dialect: str | None) -> tuple[str, ...] | None:
-    """The column list a CTE's or a LATERAL's alias puts on the scope's output, by position
-    (`WITH w(n) AS (...)`, `LATERAL (...) l(x, y)`), resolved as the engine resolves names."""
+    """The column list a CTE's, a LATERAL's or a derived table's alias puts on the scope's
+    output, by position (`WITH w(n) AS (...)`, `LATERAL (...) l(x, y)`, `(...) d(x, y)`),
+    resolved as the engine resolves names."""
     expression = getattr(scope, "expression", None)
     holder = expression if isinstance(expression, exp.Lateral) else getattr(expression, "parent", None)
-    while isinstance(holder, (exp.SetOperation, exp.Paren)):
+    while isinstance(holder, exp.SetOperation) or (
+            isinstance(holder, exp.Subquery) and not _alias_columns(holder)):
         # A recursive CTE's anchor, which sqlglot hands a self-reference inside the recursive
         # branch (the ui lane's replay: `WITH RECURSIVE m(a) AS (SELECT 1 UNION ALL SELECT a + 1
-        # FROM m WHERE a < 3)` read nowhere else was refused on `a`).
+        # FROM m WHERE a < 3)` read nowhere else was refused on `a`); a parenthesised body,
+        # branch or derived table, which sqlglot wraps in a subquery of its own, the list on the
+        # outermost (the replay at cb90806: `WITH w(x) AS ((SELECT 'SAFE' AS secret FROM wide))`
+        # kept `secret` exposed; the review gate: `((SELECT 1 AS secret)) d(x)` the same).
         holder = holder.parent
     # A derived table's alias carries a list too (`(SELECT 1 AS secret) d(x)`; Codex's ninth
     # review of #167: left unread, the old name stayed exposed and `d.secret` passed where the
@@ -925,6 +930,11 @@ def _column_list(scope, dialect: str | None) -> tuple[str, ...] | None:
     if not listed:
         return None
     return tuple(resolve_identifier(identifier, dialect) for identifier in listed)
+
+
+def _alias_columns(holder) -> list:
+    alias = holder.args.get("alias")
+    return (alias.args.get("columns") or []) if alias is not None else []
 
 
 def _lateral_inner(scope):
@@ -939,7 +949,8 @@ def _output_names(scope, columns, dialect: str | None, seen: frozenset[int]) -> 
     """The names a derived scope's output carries, in order, duplicates kept, or None where a
     source's names cannot be told (a table the schema does not list, a COLUMNS pattern). A star
     expands to each picked source's schema names less its EXCLUDEs and with its RENAMEs; a named
-    projection is its alias; a CTE's or a LATERAL's column list renames by position."""
+    projection is its alias; a CTE's, a LATERAL's or a derived table's column list renames by
+    position."""
     if not hasattr(scope, "expression"):
         return None
     listed = _column_list(scope, dialect)
@@ -1096,31 +1107,45 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
         # derived table's), each by its alias's resolved spelling: a qualifier naming one of the
         # latter is answered by what that source exposes under the column's name (`_exposure`).
         local, by_alias = _scope_names(scope, dialect)
-        # sqlglot lists no unqualified HAVING column in a scope (it reads them all as the
-        # query's own names), and no ORDER BY column matching one, where DuckDB reads an output
-        # alias for a bare item alone (measured: `HAVING secret > 0` beside `id AS secret`
-        # filters by the alias, `ORDER BY secret` sorts by it) and a source column inside an
-        # aggregate, or where no alias matches (`HAVING max(secret) = 'x'` and `ORDER BY
-        # max(secret) = 'x'` read claim's secret, M189; `HAVING sum(netpaid) > ...` over a CTE
-        # exposing netpaid went unvisited here and fell to the flat rule: TPC-DS q23 and q24,
-        # once that rule read a SELECT's own aliases alone). Those are read with the scope's
-        # columns.
+        # sqlglot lists no unqualified HAVING or QUALIFY column in a scope (it reads them all as
+        # the query's own names), no ORDER BY column matching one, and of a window only its own
+        # ORDER BY columns, where DuckDB reads an output alias for a bare ORDER BY item, or a
+        # bare HAVING name outside every call, alone (measured: `HAVING secret > 0` beside `id
+        # AS secret` filters by the alias, `ORDER BY secret` sorts by it) and the source column
+        # everywhere else: inside any call, aggregate, FILTER or window, or an ORDER BY
+        # expression (`HAVING max(secret) = 'x'`, `ORDER BY lower(secret)`, `ORDER BY
+        # first_value(secret) OVER (...)`, `HAVING count(*) FILTER (WHERE secret LIKE 'Z%') > 0`,
+        # `HAVING arbitrary(secret) ...`, `QUALIFY first_value(secret) OVER (...) ...` all read
+        # claim's secret, M189 and the ui lane's replay at cb90806; `HAVING sum(netpaid) > ...`
+        # over a CTE exposing netpaid went unvisited here and fell to the flat rule: TPC-DS q23
+        # and q24). Those are read with the scope's columns, fail-closed: where the engine reads
+        # the alias and this reads the source, the cost is a refusal, never a reading.
         in_having: list = []
         if isinstance(scope.expression, exp.Select):
             own = {resolve(projection.alias, quoted=False, dialect=dialect)
                    for projection in scope.expression.selects
                    if isinstance(projection, exp.Alias) and projection.alias}
             listed_ids = {id(column) for column in getattr(scope, "columns", ())}
-            for clause in (scope.expression.args.get("having"), scope.expression.args.get("order")):
+
+            def reads_the_alias(column: exp.Column, clause) -> bool:
+                if resolve_identifier(column.this, dialect) not in own:
+                    return False
+                if isinstance(clause, exp.Order):
+                    ordered = column.parent
+                    return isinstance(ordered, exp.Ordered) and ordered.parent is clause
+                if isinstance(clause, exp.Having):
+                    return column.find_ancestor(exp.Func, exp.Filter, exp.Window) is None
+                return False
+
+            for clause in (scope.expression.args.get("having"), scope.expression.args.get("order"),
+                           scope.expression.args.get("qualify")):
                 if clause is None:
                     continue
                 in_having += [
                     column for column in clause.find_all(exp.Column)
                     if not column.table and id(column) not in listed_ids
                     and column.find_ancestor(exp.Select) is scope.expression
-                    and column.find_ancestor(exp.Window, exp.WindowSpec) is None
-                    and (column.find_ancestor(exp.AggFunc) is not None
-                         or resolve_identifier(column.this, dialect) not in own)]
+                    and not reads_the_alias(column, clause)]
         for column in [*getattr(scope, "columns", ()), *in_having]:
             # Bound once, in the nearest scope that names the qualifier, as every engine binds it
             # (`traverse` yields a scope after the scopes inside it). sqlglot lists a subquery's
