@@ -11,7 +11,9 @@ from __future__ import annotations
 import duckdb
 import pytest
 
+from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.decide import decide
+from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 
@@ -132,6 +134,42 @@ def test_columns_inside_an_expression_is_refused_as_unnamed(con, sql):
                             (FULL, AccessPolicy(masked={("claim", "secret")}, policy_schema=FULL))):
         verdict = _decide(sql, visible, policy=policy)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
+class _OkAdapter:
+    def execute(self, sql):
+        return []  # the write decider's EXPLAIN succeeds
+
+
+SINK = {"sink": {"s"}}
+
+
+def _decide_write(sql, visible, policy):
+    grants = GrantSet(frozenset(visible), writable=frozenset(SINK))
+    return decide_write(sql, visible, grants, adapter=_OkAdapter(), dialect="duckdb", target="duckdb",
+                        writes_enabled=True, policy=policy)
+
+
+@pytest.mark.parametrize("sql, code", [
+    ("INSERT INTO sink SELECT secret.lower() FROM claim", RefusalCode.UNMODELLED_CALL),
+    ("INSERT INTO sink SELECT upper(COLUMNS('ecr')) FROM claim", RefusalCode.SELECT_STAR),
+    ("INSERT INTO sink SELECT secret FROM claim WHERE COLUMNS('ecr') LIKE 'CLAIM%'", RefusalCode.SELECT_STAR),
+    ("UPDATE sink SET s = (SELECT secret.max() FROM claim) WHERE s IS NOT NULL", RefusalCode.UNMODELLED_CALL),
+    ("DELETE FROM sink WHERE s IN (SELECT secret.lower() FROM claim)", RefusalCode.UNMODELLED_CALL),
+])
+def test_a_write_reading_through_either_spelling_is_refused(con, sql, code):
+    # Codex's first review of #169: the write decider has a shape check of its own, which had
+    # not run the guard, and an INSERT ... SELECT copied the denied value into a writable table.
+    con.execute("CREATE TABLE sink (s VARCHAR); INSERT INTO sink VALUES ('x')")
+    con.execute(sql)  # the engine accepts the spelling
+    assert "CLAIM-SECRET" in str(con.execute("SELECT s FROM sink").fetchall()).upper() or sql.startswith("DELETE")
+    hidden = _decide_write(sql, {**HIDDEN, **SINK}, AccessPolicy(policy_schema={**FULL, **SINK}))
+    denied = _decide_write(sql, {**FULL, **SINK},
+                           AccessPolicy(denied={("claim", "secret")}, policy_schema={**FULL, **SINK}))
+    masked = _decide_write(sql, {**FULL, **SINK},
+                           AccessPolicy(masked={("claim", "secret")}, policy_schema={**FULL, **SINK}))
+    for verdict in (hidden, denied, masked):
+        assert isinstance(verdict, Refusal) and verdict.code is code, (sql, verdict)
 
 
 def test_columns_as_a_bare_projection_of_a_derived_table_is_still_read(con):

@@ -18,6 +18,7 @@ from mnemiq.sql.functions import (
     opaque_columns,
 )
 from mnemiq.sql.cls import check_cls
+from mnemiq.sql.guard import unnamed_read
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import object_key
@@ -232,8 +233,11 @@ def _target_table(ast: exp.Expression) -> str | None:
     return object_key(node) if node is not None else None
 
 
-def check_write_shape(sql: str, dialect: str = "duckdb") -> exp.Expression | Refusal:
-    """One bounded DML statement, or a Refusal. UPDATE/DELETE must be bounded by a WHERE."""
+def check_write_shape(sql: str, dialect: str = "duckdb",
+                      executes_as: str | None = None) -> exp.Expression | Refusal:
+    """One bounded DML statement, or a Refusal. UPDATE/DELETE must be bounded by a WHERE. A
+    read no node names (a method call, a COLUMNS inside an expression) is refused here as on the
+    read side, before any check runs, for the engine that executes (M192, M193)."""
     try:
         statements = [s for s in sqlglot.parse(sql, read=dialect) if s is not None]
     except Exception:
@@ -276,6 +280,9 @@ def check_write_shape(sql: str, dialect: str = "duckdb") -> exp.Expression | Ref
             code=RefusalCode.UNBOUNDED_WRITE,
             message="An UPDATE or DELETE must have a WHERE clause; an unbounded mutation is refused.",
         )
+    unnamed = unnamed_read(ast, executes_as or dialect)
+    if unnamed is not None:
+        return unnamed
     return ast
 
 
@@ -325,7 +332,7 @@ def decide_write(
             ),
             subject=None,
         )
-    shaped = check_write_shape(sql, dialect=dialect)
+    shaped = check_write_shape(sql, dialect=dialect, executes_as=target)
     if isinstance(shaped, Refusal):
         return shaped
     ambiguous = fields_as_members(shaped, target, known_columns(visible, policy))  # M165, M167

@@ -66,7 +66,7 @@ def check_shape(
     # statement, and identifier folding belongs to the second: `decide` defaults to parsing duckdb
     # and targeting postgres, so keying the fold on the parse dialect answers for the wrong engine.
     # Production passes them equal, which is exactly why the mismatch would not have surfaced.
-    unnamed = _unnamed_read(ast, executes_as or dialect)
+    unnamed = unnamed_read(ast, executes_as or dialect)
     if unnamed is not None:
         return unnamed
     if _has_projection_star(ast, executes_as or dialect, columns) \
@@ -231,10 +231,12 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
     return []
 
 
-def _unnamed_read(ast: exp.Expression, engine: str) -> Refusal | None:
+def unnamed_read(ast: exp.Expression, engine: str) -> Refusal | None:
     """Two DuckDB spellings that read a column no node names, so no grant, deny or mask check
-    sees the read; refused before any check runs (M192, M193: measured on DuckDB 1.5.4, each
-    returned a withheld value under deny, under mask and hidden with the schema listing it).
+    sees the read; refused before any check runs, by both deciders (M192, M193: measured on
+    DuckDB 1.5.4, each returned a withheld value under deny, under mask and hidden with the
+    schema listing it; Codex's first review of #169 copied the denied value into a writable
+    table through the write decider's own shape check, which had not run this).
 
     Method-call syntax: `x.f()` is `f(x)` to DuckDB, and sqlglot reads `secret.lower()` as a Dot
     over an identifier and a call, with no Column node; `secret.max()`, `claim.secret.lower()`,
