@@ -15,7 +15,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 
-FULL = {"claim": {"id", "secret"}}
+FULL = {"claim": {"id", "secret", "info"}}
 COMPLETE = AccessPolicy(policy_schema=FULL)
 HIDDEN = {"claim": {"id"}}  # the grant lists only `id`; the policy's schema lists `secret`
 
@@ -23,7 +23,8 @@ HIDDEN = {"claim": {"id"}}  # the grant lists only `id`; the policy's schema lis
 @pytest.fixture
 def con():
     con = duckdb.connect()
-    con.execute("CREATE TABLE claim (id INT, secret VARCHAR); INSERT INTO claim VALUES (1, 'CLAIM-SECRET')")
+    con.execute("CREATE TABLE claim (id INT, secret VARCHAR, info STRUCT(ssn VARCHAR)); "
+                "INSERT INTO claim VALUES (1, 'CLAIM-SECRET', {'ssn': 'SSN-SECRET'})")
     return con
 
 
@@ -52,10 +53,18 @@ def _withheld(con, sql, value=None):
     "SELECT id FROM claim WHERE secret.starts_with('CLAIM')",
     "SELECT id, secret.lower() AS s FROM claim ORDER BY secret.lower()",
     "SELECT id FROM claim GROUP BY id HAVING secret.max() LIKE 'CLAIM%'",
+    # The ui lane's edge list: a chain, the left side's spellings, a struct column, a derived alias
+    "SELECT secret.lower().upper() AS s FROM claim",
+    "SELECT SECRET.lower() AS s FROM claim",
+    'SELECT "SECRET".lower() AS s FROM claim',
+    "SELECT (secret).lower() AS s FROM claim",
+    "SELECT info.struct_extract('ssn') AS s FROM claim",
+    "SELECT d.secret.lower() AS s FROM (SELECT * FROM claim) d",
 ])
 def test_a_method_call_on_a_column_is_refused_as_unnamed(con, sql):
-    projected = sql.startswith("SELECT secret") or sql.startswith("SELECT claim") or sql.startswith("SELECT c.")
-    _withheld(con, sql, "CLAIM-SECRET" if projected else None)
+    projected = sql.split(" FROM ")[0] != "SELECT id"
+    value = "SSN-SECRET" if "info" in sql else "CLAIM-SECRET"
+    _withheld(con, sql, value if projected else None)
     assert isinstance(_decide(sql, FULL, policy=COMPLETE), Refusal)  # granted or not: the spelling
 
 
@@ -87,7 +96,8 @@ def test_on_oracle_a_package_call_passes_and_an_alias_led_method_is_refused():
     granted = _decide(package, FULL, policy=COMPLETE, engine="oracle")
     assert not (isinstance(granted, Refusal) and granted.code is RefusalCode.UNMODELLED_CALL
                 and "method syntax" in granted.message), granted
-    for method in ("SELECT c.secret.lower() AS s FROM claim c", "SELECT claim.secret.lower() AS s FROM claim"):
+    for method in ("SELECT c.secret.lower() AS s FROM claim c", "SELECT claim.secret.lower() AS s FROM claim",
+                   "SELECT (secret).lower() AS s FROM claim"):
         for visible in (HIDDEN, FULL):
             verdict = _decide(method, visible, policy=COMPLETE, engine="oracle")
             assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNMODELLED_CALL, (method, verdict)

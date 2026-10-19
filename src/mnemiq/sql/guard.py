@@ -244,10 +244,13 @@ def _unnamed_read(ast: exp.Expression, engine: str) -> Refusal | None:
     lookup misses. Executed as DuckDB, every Dot whose right side is a call is refused, the
     schema-qualified `main.lower(note)` with it (the plain spelling exists, and the advice names
     it). Executed as Oracle, which has no method syntax on a bare column (a method of an
-    object-typed column is reached only through a table alias, `c.secret.f()`), a Dot or a
-    Column on the left is refused, and a bare identifier is a package or schema name
-    (`DBMS_LOB.SUBSTR(note, 10, 1)`), whose column sits in the arguments and is checked, and
-    whose function the inventory judges.
+    object-typed column is reached only through a table alias, `c.secret.f()`), anything but a
+    bare identifier on the left is refused (an alias-led Dot, a Column, a parenthesised
+    column), and a bare identifier is a package or schema name (`DBMS_LOB.SUBSTR(note, 10,
+    1)`), whose column sits in the arguments and is checked, and whose function the inventory
+    judges. The walk visits every Dot, so a chain (`secret.lower().upper()`) is refused at
+    its outer call; the left side's spelling (quoted, upper-cased, parenthesised, a struct
+    column, a derived table's alias) never matters.
 
     `COLUMNS(...)` inside an expression: as a projection on its own the resolver reads it, and
     among the outermost projections the star check refuses it, but inside a call, a WHERE, an
@@ -262,7 +265,7 @@ def _unnamed_read(ast: exp.Expression, engine: str) -> Refusal | None:
         if not isinstance(dot.expression, (exp.Anonymous, exp.Func)):
             continue
         left = dot.this
-        if engine == "duckdb" or isinstance(left, (exp.Dot, exp.Column)):
+        if engine == "duckdb" or not isinstance(left, exp.Identifier):
             # The same shape as a schema-qualified call (`public.customer_rows()`), which the
             # function inventory refuses as an unmodelled call: one code for both readings,
             # since the decider cannot tell what either reads.
