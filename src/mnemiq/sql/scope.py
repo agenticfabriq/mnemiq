@@ -1134,7 +1134,20 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                     ordered = column.parent
                     return isinstance(ordered, exp.Ordered) and ordered.parent is clause
                 if isinstance(clause, exp.Having):
-                    return column.find_ancestor(exp.Func, exp.Filter, exp.Window) is None
+                    # In HAVING the engine reads the alias through scalar expressions,
+                    # connectors, CASE and COALESCE (measured: `HAVING abs(secret) = 1`,
+                    # `HAVING secret > 0 OR secret = 1` beside `id AS secret` run on the
+                    # alias; Codex's eleventh review of #167 and the ui lane's replay at
+                    # 3f01ef8, where sqlglot's Or and Case being Funcs refused them) and the
+                    # source column inside an aggregate, a FILTER, a window, or a call it does
+                    # not know (`arbitrary`), fail-closed. The walk stops at the clause.
+                    node = column.parent
+                    while node is not None and node is not clause:
+                        if isinstance(node, (exp.AggFunc, exp.Filter, exp.Window, exp.WindowSpec,
+                                             exp.Anonymous)):
+                            return False
+                        node = node.parent
+                    return True
                 return False
 
             for clause in (scope.expression.args.get("having"), scope.expression.args.get("order"),

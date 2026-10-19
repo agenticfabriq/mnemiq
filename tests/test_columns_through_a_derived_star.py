@@ -376,6 +376,18 @@ def test_a_bare_name_that_is_the_query_s_own_alias_is_the_alias_where_the_engine
     for sql, rows in (("SELECT -id AS secret FROM (SELECT * FROM claim) d ORDER BY secret", [(-1,)]),
                       ("SELECT id AS k, count(*) AS n FROM (SELECT * FROM claim) d GROUP BY id "
                        "HAVING k > 0", [(1, 1)]),
+                      # Through scalar expressions and connectors too (Codex's eleventh review
+                      # and the ui lane's replay at 3f01ef8): abs() of the source would raise.
+                      ("SELECT id AS secret FROM (SELECT * FROM claim) d GROUP BY id "
+                       "HAVING secret > 0 OR secret = 1", [(1,)]),
+                      ("SELECT id AS secret FROM (SELECT * FROM claim) d GROUP BY id "
+                       "HAVING CASE WHEN secret = 1 THEN true ELSE false END", [(1,)]),
+                      ("SELECT id AS secret FROM (SELECT * FROM claim) d GROUP BY id "
+                       "HAVING COALESCE(secret, 0) = 1 AND abs(secret) = 1", [(1,)]),
+                      # The walk stops at the HAVING: an aggregate the whole subquery sits under
+                      # is not one the name sits in (the ui lane's replay at 3f01ef8).
+                      ("SELECT max((SELECT id AS secret FROM (SELECT * FROM claim) d GROUP BY id "
+                       "HAVING secret = 1)) FROM wide", [(1,)]),
                       ("SELECT id AS secret, count(*) AS n FROM (SELECT * FROM claim) d GROUP BY id "
                        "HAVING secret > 0", [(1, 1)])):
         aliased = _decide(sql, _hidden("claim", "secret"))
