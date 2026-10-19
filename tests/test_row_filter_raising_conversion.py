@@ -192,6 +192,12 @@ RAISING_TYPED_FORMS = [
     "MAP(['a', 'b'], [attrs, region]) IS NOT NULL",
     "MAP {'a': attrs, 'b': region} IS NOT NULL",
     "MAP {attrs: 1, region: 2} IS NOT NULL",
+    # The review gate on 3d52790: the list spelled as a call, and a map literal subscripted at
+    # once, are the same shapes.
+    "array_value(attrs, region)[2] IS NOT NULL",
+    "list_value(attrs, region)[2] IS NOT NULL",
+    "list_pack(attrs, region)[2] IS NOT NULL",
+    "MAP {'a': attrs, 'b': region}['b'] IS NOT NULL",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).

@@ -454,6 +454,7 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
 # `_duckdb_type`'s answer for a text or JSON branch: a text literal beside it is taken as it is
 # (or the mix is a bind fault on no row's value), or parsed by `_coerces_to_json`'s rule.
 _TEXT = "text"
+_LIST_CONSTRUCTORS = frozenset({"array_value", "list_value", "list_pack"})
 _CONTAINERS = (exp.DataType.Type.ARRAY, exp.DataType.Type.LIST, exp.DataType.Type.STRUCT,
                exp.DataType.Type.MAP)
 
@@ -752,17 +753,24 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
                 or _json_inside_a_container(_branches(node), type_of)
                 or _literal_cannot_convert(node, type_of, engine)):
             return node
-        if engine == "duckdb" and isinstance(node, (exp.Array, exp.ToMap)):
+        if engine == "duckdb" and (isinstance(node, (exp.Array, exp.ToMap)) or (
+                isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_CONSTRUCTORS)):
             # A list's elements, and a map's keys and its values, are unified to one type as a
             # branched value's branches are: `[attrs, region]` is JSON[], region parsed on every
             # row (Codex's ninth review of #160: indexed, wrapped in a struct, or as a map's
-            # values, approved and Malformed JSON on the hidden row).
-            if isinstance(node, exp.Array):
-                groups = [node.expressions]
-            else:
-                items = node.this.expressions if isinstance(node.this, exp.Struct) else []
+            # values, approved and Malformed JSON on the hidden row). The list spelled as a
+            # call (`array_value`, `list_value`, `list_pack`) and a map literal subscripted at
+            # once (`MAP {...}['b']`, whose struct sqlglot wraps in the bracket) are the same
+            # shapes (the review gate on 3d52790).
+            if isinstance(node, exp.ToMap):
+                struct = node.this
+                while isinstance(struct, (exp.Bracket, exp.Paren)):
+                    struct = struct.this
+                items = struct.expressions if isinstance(struct, exp.Struct) else []
                 groups = [[_map_key(item) for item in items if isinstance(item, exp.PropertyEQ)],
                           [item.expression for item in items if isinstance(item, exp.PropertyEQ)]]
+            else:
+                groups = [node.expressions]
             if any(_values_coerce_to_json(group, type_of, engine) or _json_inside_a_container(group, type_of)
                    for group in groups if group):
                 return node
