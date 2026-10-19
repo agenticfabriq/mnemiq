@@ -405,13 +405,56 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
         column.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
     try:
         return _duckdb(f"SELECT typeof({typed_nulls.sql(dialect='duckdb')})")
-    except Exception:  # noqa: BLE001 -- unreadable by DuckDB: the type reader's word instead
+    except Exception:  # noqa: BLE001 -- unreadable by DuckDB: the type cannot be told
         return None
 
 
 # `_duckdb_type`'s answer for a text or JSON branch: a text literal beside it is taken as it is
 # (or the mix is a bind fault on no row's value), or parsed by `_coerces_to_json`'s rule.
 _TEXT = "text"
+
+
+def _holds(kind: str, *types) -> bool | None:
+    """Whether a DuckDB type, in DuckDB's words, holds one of `types` at any depth (`JSON[]`
+    holds JSON, `STRUCT(a TEXT[])` holds text); None where the type cannot be read."""
+    try:
+        built = exp.DataType.build(kind, dialect="duckdb")
+    except Exception:  # noqa: BLE001
+        return None
+    return any(node.this in types for node in built.find_all(exp.DataType))
+
+
+def _json_inside_a_container(values, type_of) -> bool:
+    """Whether DuckDB's unification of `values` (a branched value's branches, a comparison's
+    sides) converts text to JSON inside a list or a struct, on the rows that take the branch
+    or on every row: `CASE WHEN id = 1 THEN [attrs] ELSE [region] END` is JSON[], and Malformed
+    JSON on the row that takes region, as are the struct twin and `[attrs] = [region]` (measured
+    on DuckDB 1.5.4; Codex's eighth review of #160), where `[id]` beside `[attrs]` is serialised
+    and runs. Each value's type is DuckDB's own (`_duckdb_type`, nothing runs), and so is the
+    unified type (`typeof(COALESCE(NULL::T1, ...))`): refused where it holds JSON and a value's
+    type differs from it and holds text, or cannot be told. A mix DuckDB cannot unify is a
+    bind fault on no row's value, not this class."""
+    kinds = []
+    for value in values:
+        while isinstance(value, exp.Paren):
+            value = value.this
+        if value is None or isinstance(value, exp.Null):
+            continue
+        kinds.append(_duckdb_type(value, type_of))
+    known = [kind for kind in kinds if kind is not None and kind is not _TEXT]
+    holding = [_holds(kind, exp.DataType.Type.JSON) for kind in known]
+    if None in holding:
+        return True  # a type the reader here cannot read: not shown safe
+    if not any(holding):
+        return False
+    if any(kind is None for kind in kinds):
+        return True  # a value of unknown type beside JSON: may hold text, parsed on its rows
+    try:
+        unified = _duckdb("SELECT typeof(COALESCE(" + ", ".join(f"NULL::{k}" for k in known) + "))")
+    except Exception:  # noqa: BLE001 -- DuckDB cannot unify them: a bind fault, not a row's
+        return False
+    return any(kind != unified and _holds(kind, *exp.DataType.TEXT_TYPES) is not False
+               for kind in known)
 
 
 def _duckdb_type(branch: exp.Expression, type_of) -> str | None:
@@ -512,20 +555,24 @@ def _nvl_converts_a_text_column(node: exp.Expression, type_of, engine: str) -> b
                for other in others)
 
 
-def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
-    """Whether a comparison sets a text column against a value of another type."""
+def _sides(node: exp.Expression) -> list:
+    """The values a comparison, NULLIF, IN or BETWEEN sets against each other."""
     if isinstance(node, exp.In):
         sides = [node.this, *node.expressions]
         query = node.args.get("query")
         inner = query.this if isinstance(query, exp.Subquery) else query
         if isinstance(inner, exp.Select) and len(inner.selects) == 1:
             sides.append(inner.selects[0])
-    elif isinstance(node, exp.Between):
-        sides = [node.this, node.args.get("low"), node.args.get("high")]
-    else:
-        sides = [node.this, node.expression]
+        return sides
+    if isinstance(node, exp.Between):
+        return [node.this, node.args.get("low"), node.args.get("high")]
+    return [node.this, node.expression]
+
+
+def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
+    """Whether a comparison sets a text column against a value of another type."""
     text = other = False
-    for side in sides:
+    for side in _sides(node):
         while isinstance(side, exp.Paren):
             side = side.this  # `(region) = 7` converts the column as `region = 7` does (Codex, #160)
         known = _known_type(side, type_of, engine)
@@ -606,11 +653,14 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             # converts the column, Codex's second review of #160).
             if _converts_a_text_column(node, type_of, engine):
                 return node
+            if engine == "duckdb" and _json_inside_a_container(_sides(node), type_of):
+                return node
             continue
         if engine == "oracle" and _nvl_converts_a_text_column(node, type_of, engine):
             return node
         if engine == "duckdb" and isinstance(node, _BRANCHED) and (
                 _coerces_to_json(node, type_of, engine)
+                or _json_inside_a_container(_branches(node), type_of)
                 or _literal_cannot_convert(node, type_of, engine)):
             return node
         untyped = isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_CONVERSIONS
@@ -631,7 +681,7 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
 
 def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
     safe = _SAFE_FORM.get(engine, "a form that cannot fail, or a column of the right type")
-    if isinstance(node, _BRANCHED):
+    if engine == "duckdb" and isinstance(node, _BRANCHED):
         safe += (", and a text literal on a branch as CAST('...' AS type): beside a branch of "
                  "another type it is converted to that type on the rows that take it, and beside "
                  "a call or an aggregate the type it would be converted to cannot be told")

@@ -167,6 +167,16 @@ RAISING_TYPED_FORMS = [
     "CASE WHEN id = 1 THEN (SELECT sum(id) FROM entitlement) ELSE 'nan' END IS NOT NULL",
     "CASE WHEN id = 1 THEN [1, 2] ELSE 'nan' END IS NOT NULL",
     "CASE WHEN id = 1 THEN {'a': 1} ELSE 'nan' END IS NOT NULL",
+    # Codex's eighth review: a JSON element or field makes the branches' unified type hold JSON
+    # there, and a text element or field of another branch is parsed to it on the rows that
+    # take the branch; a comparison of such containers converts on every row.
+    "CASE WHEN id = 1 THEN [attrs] ELSE [region] END IS NOT NULL",
+    "CASE WHEN id = 1 THEN {'a': attrs} ELSE {'a': region} END IS NOT NULL",
+    "CASE WHEN id = 1 THEN [[attrs]] ELSE [[region]] END IS NOT NULL",
+    "CASE WHEN id = 1 THEN [attrs] ELSE ['x'] END IS NOT NULL",
+    "CASE WHEN id = 1 THEN [attrs] ELSE [lower(region)] END IS NOT NULL",
+    "[attrs] = [region]",
+    "{'a': attrs} = {'a': region}",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -207,6 +217,12 @@ SAFE_TYPED_FORMS = [
     "CASE WHEN id = 1 THEN lower(region) ELSE CAST('x' AS VARCHAR) END = 'x'",
     "CASE WHEN id = 1 THEN [1, 2] ELSE '[3]' END IS NOT NULL",
     "CASE WHEN id = 1 THEN region WHEN id = 3 THEN lower(region) ELSE 'x' END = 'x'",
+    # A container of JSON beside one of a native type, or of JSON already, is serialised or
+    # taken as it is (Codex's eighth review).
+    "CASE WHEN id = 1 THEN [attrs] ELSE [TRY_CAST(region AS JSON)] END IS NOT NULL",
+    "CASE WHEN id = 1 THEN [attrs] ELSE [id] END IS NOT NULL",
+    "CASE WHEN id = 1 THEN {'a': attrs} ELSE {'a': 1} END IS NOT NULL",
+    "[attrs] = [TRY_CAST(region AS JSON)]",
 ]
 
 
@@ -324,6 +340,23 @@ def test_a_literal_beside_a_branch_the_validator_cannot_type_is_refused_though_i
         con.execute(f"SELECT id FROM claim WHERE {runs}").fetchall()
         verdict = _decide(runs)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, runs
+
+
+def test_the_branched_literal_advice_is_duckdb_s_alone(caplog):
+    # The operator's log names the cast a text literal on a branch should be written as; on
+    # Oracle the branched refusal is NVL's conversion, and the DuckDB advice does not apply
+    # (the review gate on b725c67).
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="mnemiq.sql.rls"):
+        duck = _decide("CASE WHEN id = 1 THEN 7 ELSE 'north' END = 7")
+        assert isinstance(duck, Refusal), duck
+        assert "CAST('...' AS type)" in caplog.text
+        caplog.clear()
+        oracle = _decide("NVL(id, region) IS NOT NULL", engine="oracle")  # the NVL is the node
+        assert isinstance(oracle, Refusal), oracle
+        assert "can raise on a row's value" in caplog.text
+        assert "CAST('...' AS type)" not in caplog.text
 
 
 def test_a_literal_on_a_branch_never_taken_is_still_refused_where_it_cannot_convert():
