@@ -151,6 +151,10 @@ def _ora(code, message):
 
 FORCED_LOGOFF = (2399, "ORA-02399: exceeded maximum connect time, you are being logged off")
 NO_AUTH_PROTOCOL = (28040, "ORA-28040: No matching authentication protocol")
+WRAPPED_REFUSAL = (604, "ORA-00604: error occurred at recursive SQL level 1\n"
+                        "ORA-00942: table or view does not exist")
+WRAPPED_OUTAGE = (604, "ORA-00604: error occurred at recursive SQL level 1\n"
+                       "ORA-03113: end-of-file on communication channel")
 
 
 def _fault(spec):
@@ -198,6 +202,11 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
     # a feature not implemented.
     refused = [ora(904, 'ORA-00904: "WHOM": invalid identifier'),
                ora(942, "ORA-00942: table or view does not exist"),
+               # A SERVERERROR trigger failing on a missing table wraps the statement's own
+               # refusal (Codex's eighth review): no outage among the wrapped errors.
+               ora(604, "ORA-00604: error occurred at recursive SQL level 1\n"
+                        "ORA-00942: table or view does not exist\n"
+                        "ORA-06512: at line 4"),
                ora(936, "ORA-00936: missing expression"),
                ora(1, "ORA-00001: unique constraint violated"),
                _dpy(4004), _dpy(4007), _dpy(1006), _dpy(3002), _dpy(4029), _dpy(5007), _dpy(5015),
@@ -239,6 +248,14 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
                   # protocol the server no longer accepts.
                   ora(2399, "ORA-02399: exceeded maximum connect time, you are being logged off"),
                   ora(28040, "ORA-28040: No matching authentication protocol"),
+                  # Codex's eighth review: ORA-00604 wraps the recursive SQL's own error, which
+                  # the driver's OperationalError typing of the outer code says nothing about.
+                  ora(604, "ORA-00604: error occurred at recursive SQL level 1\n"
+                           "ORA-03113: end-of-file on communication channel"),
+                  ora(604, "ORA-00604: error occurred at recursive SQL level 1\n"
+                           "ORA-00028: your session has been killed"),
+                  # Naming no other code, it keeps the driver's OperationalError reading.
+                  ora(604, "ORA-00604: error occurred at recursive SQL level 1"),
                   ora(12541, "ORA-12541: TNS:no listener"),
                   ora(12170, "ORA-12170: TNS:Connect timeout occurred")]
     assert [str(exc)[:9] for exc in refused if oracle_unavailable(exc)] == []
@@ -259,10 +276,12 @@ class _OracleScripted(_Scripted):
         return oracle_unavailable(exc)
 
 
-@pytest.mark.parametrize("code", [4005, 4033, 5000, 5009, 3008, FORCED_LOGOFF, NO_AUTH_PROTOCOL],
+@pytest.mark.parametrize("code", [4005, 4033, 5000, 5009, 3008, FORCED_LOGOFF, NO_AUTH_PROTOCOL,
+                                  WRAPPED_OUTAGE],
                          ids=["pool exhausted", "idle disconnect", "unknown message type",
                               "unknown piggyback", "in-band notification disconnect",
-                              "forced logoff", "no authentication protocol"])
+                              "forced logoff", "no authentication protocol",
+                              "ORA-00604 wrapping a lost channel"])
 @pytest.mark.parametrize("script", [
     ["fault"], ["stale", "fault"], ["stale", None, "fault"],
 ], ids=["first proof", "proof as asked", "re-proof of the rewrite"])
@@ -302,6 +321,28 @@ def test_through_both_deciders_an_exhausted_oracle_pool_is_unavailable_not_the_m
                          adapter=_OracleScripted(_fault(code)), dialect="oracle", target="oracle",
                          writes_enabled=True)
     assert isinstance(write, Refusal) and write.code is RefusalCode.SOURCE_UNAVAILABLE, write
+
+
+@pytest.mark.parametrize("script", [
+    ["fault"], ["stale", "fault"], ["stale", None, "fault"],
+], ids=["first proof", "proof as asked", "re-proof of the rewrite"])
+def test_a_statement_s_refusal_wrapped_in_ora_00604_keeps_its_reading(script):
+    """Codex's eighth review of #159: the driver types ORA-00604 OperationalError, and the
+    classifier read every OperationalError as the source being down, so a SERVERERROR trigger
+    failing on a missing table turned a refusal into an outage: repair suppressed, or a policy
+    rewrite blamed. Read by the errors it wraps instead; marked on acquire it is still the
+    source's."""
+    pytest.importorskip("oracledb")
+    faults = [_ora(*WRAPPED_REFUSAL) if step == "fault" else (_stale() if step else None)
+              for step in script]
+    source = _OracleScripted(*faults)
+    verdict = prove_governed(source, REWRITE, ASKED)
+    assert isinstance(verdict, Refusal) and verdict.code is not RefusalCode.SOURCE_UNAVAILABLE, verdict
+    from mnemiq.adapters.oracle import _mark_acquire_fault
+
+    marked = _ora(*WRAPPED_REFUSAL)
+    _mark_acquire_fault(marked)
+    assert oracle_unavailable(marked)
 
 
 def test_a_fault_on_the_pool_s_acquire_is_unavailable_whatever_its_code():

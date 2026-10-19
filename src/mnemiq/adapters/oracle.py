@@ -1784,9 +1784,10 @@ _UNAVAILABLE_DPY = frozenset({
 # 01092) or open to restricted sessions alone (01035); the session and process limits (00018,
 # 00020, 02391); the profile's connect time, which logs a session off mid-use (02399), and an
 # authentication protocol the server no longer accepts (28040); Codex's seventh review of #159
-# for the last two. The TNS ranges are matched beside this set, and a fault on the pool's
+# for the last two; and a session killed by the administrator (00028), met as the error ORA-00604
+# wraps (its eighth). The TNS ranges are matched beside this set, and a fault on the pool's
 # acquire is unavailable whatever its code (`_acquire_fault`).
-_UNAVAILABLE_ORA = frozenset({18, 20, 1017, 1033, 1034, 1035, 1045, 1089, 1090, 1092, 2391,
+_UNAVAILABLE_ORA = frozenset({18, 20, 28, 1017, 1033, 1034, 1035, 1045, 1089, 1090, 1092, 2391,
                               2399, 3156, 28000, 28001, 28040})
 
 
@@ -1814,13 +1815,16 @@ def unavailable_fault(exc: BaseException) -> bool:
     The driver types its network faults `OperationalError` (its DPY-6xxx, and the ORA codes it
     lists as such: ORA-03113, ORA-03114 and ORA-01013, the cancel a call timeout surfaces as, among
     them) and flags a dead session recoverable (DPY-4011, which it cross-references ORA-03113 to).
-    Everything else it leaves a plain `DatabaseError`, `InterfaceError` or `InternalError`, so the
-    rest is named: `_UNAVAILABLE_DPY`, read off the driver's error table, and among the ORA codes
-    `_UNAVAILABLE_ORA` (the call timeout, and what a growing pool meets on acquire: the
-    credentials, the account, the instance's state, the session and process limits) with the
-    TNS ranges (ORA-12150 to 12236, ORA-12500 to 12699) its list leaves out. A parse refusal (ORA-00904,
-    ORA-00942, ORA-00936) is none of these and keeps its reading, as do the driver's data faults
-    (DPY-4004) and `ReadOnlyViolation`, this adapter's own refusal to parse DDL.
+    One of its OperationalError codes says nothing by itself: ORA-00604 wraps the error a
+    recursive SQL raised, and is read by the codes in its message (Codex's eighth review of
+    #159). Everything else it leaves a plain `DatabaseError`, `InterfaceError` or
+    `InternalError`, so the rest is named: `_UNAVAILABLE_DPY`, read off the driver's error table,
+    and among the ORA codes `_UNAVAILABLE_ORA` (the call timeout, and what a growing pool meets
+    on acquire: the credentials, the account, the instance's state, the session and process
+    limits, a session killed) with the TNS ranges (ORA-12150 to 12236, ORA-12500 to 12699) its
+    list leaves out. A parse refusal (ORA-00904, ORA-00942, ORA-00936) is none of these and keeps
+    its reading, as do the driver's data faults (DPY-4004) and `ReadOnlyViolation`, this
+    adapter's own refusal to parse DDL.
     """
     if isinstance(exc, (ConnectionError, TimeoutError)) or _acquire_fault(exc):
         return True
@@ -1831,8 +1835,39 @@ def unavailable_fault(exc: BaseException) -> bool:
         import oracledb
     except ImportError:  # pragma: no cover -- an oracledb error exists only with the driver
         return False
-    if isinstance(exc, oracledb.OperationalError) or getattr(error, "isrecoverable", False):
+    if getattr(error, "isrecoverable", False):
         return True
     code = getattr(error, "code", 0) or 0
-    return (error.full_code in _UNAVAILABLE_DPY or code in _UNAVAILABLE_ORA
+    if code == 604:
+        # ORA-00604, an error at a recursive SQL level, is typed OperationalError by the driver
+        # and wraps whatever the recursive SQL raised: a SERVERERROR trigger failing on a
+        # missing table wraps ORA-00942, a statement's refusal (Codex's eighth review of #159).
+        # Read by the errors it wraps, the other ORA codes in its message: unavailable where one
+        # of them is, a refusal otherwise. A message naming no other code keeps the driver's
+        # reading below (the review gate).
+        nested = [int(n) for n in re.findall(r"ORA-(\d{5})", str(getattr(error, "message", "")))
+                  if int(n) != 604]
+        if nested:
+            return any(_ora_unavailable(n) for n in nested)
+    if isinstance(exc, oracledb.OperationalError):
+        return True
+    return error.full_code in _UNAVAILABLE_DPY or _ora_unavailable(code)
+
+
+def _operational_ora() -> frozenset[int]:
+    """The ORA codes the driver types OperationalError, read off the driver's own table, for a
+    code that ORA-00604 wraps, where the driver's typing of the outer code says nothing; the
+    installed driver's list, less 00604 itself, where the table cannot be read."""
+    try:
+        from oracledb import errors
+
+        return frozenset(int(code) for code in errors.ERR_OPERATIONAL_ERROR_CODES) - {604}
+    except Exception:  # noqa: BLE001 -- a driver without the table: python-oracledb 4.0.2's list
+        return frozenset({22, 378, 600, 602, 603, 609, 1012, 1013, 1033, 1034, 1041, 1043, 1089,
+                          1090, 1092, 3111, 3113, 3114, 3122, 3135, 12153, 12203, 12500, 12571,
+                          27146, 28511})
+
+
+def _ora_unavailable(code: int) -> bool:
+    return (code in _UNAVAILABLE_ORA or code in _operational_ora()
             or 12150 <= code <= 12236 or 12500 <= code <= 12699)
