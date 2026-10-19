@@ -476,7 +476,7 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
 # `_duckdb_type`'s answer for a text or JSON branch: a text literal beside it is taken as it is
 # (or the mix is a bind fault on no row's value), or parsed by `_coerces_to_json`'s rule.
 _TEXT = "text"
-_UNREADABLE = "unreadable"  # a column's declared type the reader here cannot parse
+_UNREADABLE = "unreadable"  # a declared or engine-reported type the reader here cannot parse
 _LIST_CONSTRUCTORS = frozenset({"array_value", "list_pack"})  # `list_value` parses as a list
 # Container accessors that build a value from their arguments and run nothing, typed by DuckDB
 # like the containers they read (Codex's twelfth review of #160: `map_values(MAP(['a'],
@@ -584,7 +584,9 @@ def _split_label(item: str) -> tuple[str | None, str]:
     parentheses separates the name, a quoted name kept whole)."""
     if item.startswith('"'):
         # A doubled quote inside the name is one quote (`"a""b" JSON` names a""b: Codex's
-        # sixteenth review of #160); the first lone quote closes the name.
+        # sixteenth review of #160); the first lone quote closes the name. Nothing after it
+        # means the quoted token is an unnamed field's TYPE, a keyword DuckDB quotes as a type
+        # name (`typeof(row(NULL, 1))` is `STRUCT("NULL", INTEGER)`: the review gate).
         name, position = [], 1
         while position < len(item):
             if item[position] == '"':
@@ -592,7 +594,10 @@ def _split_label(item: str) -> tuple[str | None, str]:
                     name.append('"')
                     position += 2
                     continue
-                return "".join(name), item[position + 1:].strip()
+                rest = item[position + 1:].strip()
+                if not rest or rest.startswith(("[", "(")):
+                    return None, item  # the type itself, with its array suffix or parameters
+                return "".join(name), rest
             name.append(item[position])
             position += 1
         raise ValueError(f"unterminated quoted name in {item!r}")
