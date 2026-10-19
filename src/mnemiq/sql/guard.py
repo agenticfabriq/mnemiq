@@ -319,6 +319,8 @@ def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refus
                 subject=call.sql(),
             )
     for star in ast.find_all(exp.Star):
+        if isinstance(star.parent, exp.Columns):
+            continue  # `COLUMNS(*)`: the COLUMNS loop above ruled on it (Codex's fifth review)
         if _projection_is_read(star, write):
             continue
         return Refusal(

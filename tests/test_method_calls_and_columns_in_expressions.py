@@ -430,6 +430,29 @@ def test_a_star_the_resolver_or_the_star_check_reads_is_left_to_them(con):
     assert isinstance(outermost, Refusal) and outermost.code is RefusalCode.SELECT_STAR, outermost
 
 
+def test_columns_star_as_a_bare_projection_is_judged_as_its_columns_node(con):
+    # Codex's fifth review of #169: the star inside `COLUMNS(*)` is part of the COLUMNS the
+    # COLUMNS loop already ruled on, not a star of its own.
+    con.execute("CREATE TABLE pair (id INT, secret VARCHAR); INSERT INTO pair VALUES (1, 'Z')")
+    schema = {**FULL, "pair": {"id", "secret"}}
+    granted = AccessPolicy(policy_schema=schema)
+    for sql in ("SELECT d.id FROM (SELECT COLUMNS(*) FROM pair) d",
+                "WITH w AS (SELECT COLUMNS(*) FROM pair) SELECT w.id FROM w",
+                "SELECT id FROM claim WHERE EXISTS (SELECT COLUMNS(*) FROM pair)"):
+        con.execute(sql)
+        assert isinstance(_decide(sql, schema, policy=granted), Approved), sql
+    denied = _decide("SELECT d.secret FROM (SELECT COLUMNS(*) FROM pair) d", schema,
+                     policy=AccessPolicy(denied={("pair", "secret")}, policy_schema=schema))
+    assert isinstance(denied, Refusal) and denied.code is not RefusalCode.SELECT_STAR, denied
+    for refused in ("SELECT COLUMNS(*) FROM pair", "SELECT id FROM claim WHERE (SELECT COLUMNS(*) FROM pair LIMIT 1) = 1"):
+        verdict = _decide(refused, schema, policy=granted)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (refused, verdict)
+    con.execute("CREATE TABLE sink (i INT, s VARCHAR, j STRUCT(ssn VARCHAR))")
+    schema_w = {**schema, "sink": {"i", "s", "j"}}
+    write = _decide_write("INSERT INTO sink (i, s) SELECT COLUMNS(*) FROM pair", schema_w, AccessPolicy(policy_schema=schema_w))
+    assert isinstance(write, Refusal) and write.code is RefusalCode.SELECT_STAR, write
+
+
 def test_columns_as_a_bare_projection_of_a_derived_table_is_still_read(con):
     # The resolver reads a bare COLUMNS projection (#167); only the expression spellings go.
     sql = "SELECT d.id FROM (SELECT COLUMNS('id') FROM claim) d"
