@@ -393,6 +393,10 @@ def test_a_bare_name_that_is_the_query_s_own_alias_is_the_alias_where_the_engine
         aliased = _decide(sql, _hidden("claim", "secret"))
         assert isinstance(aliased, Approved), (sql, aliased)
         assert con.execute(aliased.target_sql).fetchall() == rows
+    # Oracle reads no alias in HAVING, so the same name is the source column there (the gate).
+    oracle = _decide("SELECT id AS secret, count(*) AS n FROM (SELECT * FROM claim) d GROUP BY id "
+                     "HAVING abs(secret) = 1", _hidden("claim", "secret"), engine="oracle", policy=COMPLETE)
+    assert isinstance(oracle, Refusal) and oracle.code is RefusalCode.UNKNOWN_COLUMN, oracle
 
 
 @pytest.mark.parametrize("sql", [
@@ -689,9 +693,13 @@ def test_an_unaliased_derived_table_is_a_source(con, sql):
     "SELECT id AS secret, count(*) AS n FROM claim GROUP BY id HAVING count(*) FILTER (WHERE secret = 'CLAIM-SECRET') > 0",
     "SELECT id AS secret, count(*) AS n FROM claim GROUP BY id HAVING arbitrary(secret) = 'CLAIM-SECRET'",
     "SELECT id AS secret FROM claim QUALIFY first_value(secret) OVER (PARTITION BY id) = 'CLAIM-SECRET'",
+    # The review gate on 4fc447f: a grouped name is the source column in HAVING, bare or not,
+    # and the GROUP BY reference itself is checked in its scope.
+    "SELECT id AS secret FROM claim GROUP BY id, secret HAVING secret = 'CLAIM-SECRET'",
+    "SELECT id AS secret FROM claim GROUP BY id, secret HAVING lower(secret) = 'claim-secret'",
 ], ids=["over the table", "through a derived star", "through a CTE alias", "an ORDER BY aggregate",
         "an ORDER BY call", "an ORDER BY expression", "a window's argument", "a FILTER", "an aggregate sqlglot does not know",
-        "QUALIFY"])
+        "QUALIFY", "a grouped hidden name, refused at the GROUP BY", "the same in a HAVING call"])
 def test_a_source_column_inside_a_having_or_order_by_aggregate_is_read_in_its_scope(con, sql):
     # sqlglot lists no unqualified HAVING column in a scope, nor an ORDER BY one matching an
     # output name; DuckDB reads a source column inside an aggregate there (an output alias only

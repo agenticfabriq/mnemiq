@@ -1128,19 +1128,25 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
             listed_ids = {id(column) for column in getattr(scope, "columns", ())}
 
             def reads_the_alias(column: exp.Column, clause) -> bool:
-                if resolve_identifier(column.this, dialect) not in own:
+                name = resolve_identifier(column.this, dialect)
+                if name not in own:
                     return False
                 if isinstance(clause, exp.Order):
                     ordered = column.parent
                     return isinstance(ordered, exp.Ordered) and ordered.parent is clause
                 if isinstance(clause, exp.Having):
-                    # In HAVING the engine reads the alias through scalar expressions,
-                    # connectors, CASE and COALESCE (measured: `HAVING abs(secret) = 1`,
-                    # `HAVING secret > 0 OR secret = 1` beside `id AS secret` run on the
-                    # alias; Codex's eleventh review of #167 and the ui lane's replay at
-                    # 3f01ef8, where sqlglot's Or and Case being Funcs refused them) and the
-                    # source column inside an aggregate, a FILTER, a window, or a call it does
-                    # not know (`arbitrary`), fail-closed. The walk stops at the clause.
+                    # In HAVING DuckDB reads the alias through scalar expressions, connectors,
+                    # CASE and COALESCE (measured: `HAVING abs(secret) = 1`, `HAVING secret > 0
+                    # OR secret = 1` beside `id AS secret` run on the alias; Codex's eleventh
+                    # review of #167 and the ui lane's replay at 3f01ef8, where sqlglot's Or
+                    # and Case being Funcs refused them) and the source column inside an
+                    # aggregate, a FILTER, a window, or a call it does not know (`arbitrary`),
+                    # fail-closed; a grouped name is the source too (`GROUP BY id, secret
+                    # HAVING lower(secret) = ...`, the review gate on 4fc447f), and is checked
+                    # at the GROUP BY, which lists it among the scope's columns. Oracle reads
+                    # no alias in HAVING at all. The walk stops at the clause.
+                    if dialect != "duckdb":
+                        return False
                     node = column.parent
                     while node is not None and node is not clause:
                         if isinstance(node, (exp.AggFunc, exp.Filter, exp.Window, exp.WindowSpec,
