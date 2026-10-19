@@ -345,12 +345,38 @@ def test_a_derived_star_its_own_select_does_not_consume_is_still_resolved(con):
         assert not isinstance(denied, Refusal) or denied.code is not RefusalCode.SELECT_STAR, (sql, denied)
 
 
+@pytest.mark.parametrize("sql", [
+    "SELECT id FROM claim WHERE EXISTS (SELECT * FROM one UNION SELECT 'ONE-SECRET' OFFSET 1)",
+    "SELECT id FROM claim WHERE NOT EXISTS (SELECT * FROM one UNION SELECT 'ONE-SECRET' OFFSET 1)",
+    "SELECT id FROM claim WHERE EXISTS (SELECT DISTINCT * FROM one UNION SELECT 'ONE-SECRET' OFFSET 1)",
+    "SELECT id FROM claim WHERE EXISTS (SELECT * FROM one GROUP BY ALL HAVING count(*) = 1 INTERSECT SELECT 'ONE-SECRET')",
+])
+def test_an_exists_whose_set_deduplicates_the_star_is_refused(con, sql):
+    # Codex's fourth review of #169: a UNION deduplicates, so with an OFFSET the existence
+    # follows whether the withheld value equals the guess (a DISTINCT or GROUP BY the same).
+    con.execute("CREATE TABLE one (secret VARCHAR); INSERT INTO one VALUES ('ONE-SECRET')")
+    right, wrong = con.execute(sql).fetchall(), con.execute(sql.replace("ONE-SECRET", "WRONG")).fetchall()
+    assert right != wrong, (sql, right, wrong)  # an oracle on the engine
+    schema = {**FULL, "one": {"secret"}}
+    hidden = _decide(sql, {**FULL, "one": set()}, policy=AccessPolicy(policy_schema=schema))
+    denied = _decide(sql, schema, policy=AccessPolicy(denied={("one", "secret")}, policy_schema=schema))
+    masked = _decide(sql, schema, policy=AccessPolicy(masked={("one", "secret")}, policy_schema=schema))
+    for verdict in (hidden, denied, masked):
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+    write = "INSERT INTO sink (i) " + sql
+    con.execute("CREATE TABLE sink (i INT, s VARCHAR, j STRUCT(ssn VARCHAR))")
+    schema_w = {**schema, "sink": {"i", "s", "j"}}
+    verdict = _decide_write(write, schema_w, AccessPolicy(denied={("one", "secret")}, policy_schema=schema_w))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (write, verdict)
+
+
 def test_a_star_the_resolver_or_the_star_check_reads_is_left_to_them(con):
     con.execute("CREATE TABLE one (secret VARCHAR); INSERT INTO one VALUES ('ONE-SECRET')")
     schema = {**FULL, "one": {"secret"}}
     granted = AccessPolicy(policy_schema=schema)
     for sql in ("SELECT id FROM claim WHERE EXISTS (SELECT * FROM one)",
                 "SELECT id FROM claim WHERE EXISTS (SELECT * FROM one UNION ALL SELECT * FROM one)",
+                "SELECT id FROM claim WHERE EXISTS (SELECT * FROM one UNION ALL SELECT 'x' OFFSET 1)",
                 "SELECT d.secret FROM (SELECT * FROM one) d",
                 "WITH w AS (SELECT * FROM one) SELECT w.secret FROM w",
                 "SELECT d.secret FROM ((SELECT * FROM one)) d",

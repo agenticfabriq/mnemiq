@@ -336,7 +336,8 @@ def _projection_is_read(node: exp.Expression, write: bool) -> bool:
     """Whether some check reads this star or bare COLUMNS: `COUNT(*)`; the projection of an
     EXISTS, unless an INTERSECT or EXCEPT on the way compares the values (`EXISTS (SELECT *
     FROM one INTERSECT SELECT 'Z')` is true only on the withheld value: Codex's third review of
-    #169); and, on the read side only, the outermost query's (the star check), a derived
+    #169) or a DISTINCT, a GROUP BY or a UNION deduplicates them (`... UNION SELECT 'Z' OFFSET
+    1`: the fourth); and, on the read side only, the outermost query's (the star check), a derived
     table's or a CTE's (the resolver, where the outer query names what it reads). A star or
     COLUMNS anywhere else, a scalar subquery (`WHERE (SELECT COLUMNS('secret') FROM one LIMIT
     1) = 'Z'`, the same review), an IN list, a value in parentheses, an INSERT's source, is read
@@ -357,7 +358,13 @@ def _projection_is_read(node: exp.Expression, write: bool) -> bool:
         compared = compared or isinstance(query, (exp.Intersect, exp.Except))
     outer = query.parent
     if isinstance(outer, exp.Exists):
-        return not compared
+        # Existence reads the values where an INTERSECT or EXCEPT compares them, or where a
+        # deduplication or a grouping decides how many rows there are and an OFFSET or a
+        # HAVING then asks: `EXISTS (SELECT * FROM one UNION SELECT 'Z' OFFSET 1)` is true only
+        # where the withheld value differs from the guess (Codex's fourth review of #169).
+        return not compared and not any(_consumes_its_projection(wrapper) or (
+            isinstance(wrapper, exp.SetOperation) and bool(wrapper.args.get("distinct")))
+            for wrapper in wrappers)
     if write:
         return False
     if outer is None:
