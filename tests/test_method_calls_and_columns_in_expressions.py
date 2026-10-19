@@ -370,6 +370,26 @@ def test_an_exists_whose_set_deduplicates_the_star_is_refused(con, sql):
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (write, verdict)
 
 
+@pytest.mark.parametrize("sql", [
+    "SELECT id FROM claim WHERE EXISTS (SELECT DISTINCT * FROM dup OFFSET 1)",
+    "SELECT id FROM claim WHERE EXISTS (SELECT * FROM dup GROUP BY ALL OFFSET 1)",
+    "SELECT id FROM claim WHERE EXISTS (SELECT * FROM dup GROUP BY 1 HAVING count(*) = 2)",
+])
+def test_an_exists_whose_own_select_deduplicates_the_star_is_refused(con, sql):
+    # The DISTINCT and GROUP BY arm on its own (the review gate on the sixth round): existence
+    # answers whether two withheld rows are equal.
+    con.execute("CREATE TABLE dup (secret VARCHAR); INSERT INTO dup VALUES ('S'), ('S')")
+    equal = con.execute(sql).fetchall()
+    con.execute("UPDATE dup SET secret = 'T' WHERE rowid = 1")
+    assert con.execute(sql).fetchall() != equal, (sql, equal)
+    schema = {**FULL, "dup": {"secret"}}
+    for visible, policy in (({**FULL, "dup": set()}, AccessPolicy(policy_schema=schema)),
+                            (schema, AccessPolicy(denied={("dup", "secret")}, policy_schema=schema)),
+                            (schema, AccessPolicy(masked={("dup", "secret")}, policy_schema=schema))):
+        verdict = _decide(sql, visible, policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
 def test_a_star_the_resolver_or_the_star_check_reads_is_left_to_them(con):
     con.execute("CREATE TABLE one (secret VARCHAR); INSERT INTO one VALUES ('ONE-SECRET')")
     schema = {**FULL, "one": {"secret"}}

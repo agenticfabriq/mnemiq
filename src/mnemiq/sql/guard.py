@@ -336,8 +336,8 @@ def _projection_is_read(node: exp.Expression, write: bool) -> bool:
     """Whether some check reads this star or bare COLUMNS: `COUNT(*)`; the projection of an
     EXISTS, unless an INTERSECT or EXCEPT on the way compares the values (`EXISTS (SELECT *
     FROM one INTERSECT SELECT 'Z')` is true only on the withheld value: Codex's third review of
-    #169) or a DISTINCT, a GROUP BY or a UNION deduplicates them (`... UNION SELECT 'Z' OFFSET
-    1`: the fourth); and, on the read side only, the outermost query's (the star check), a derived
+    #169) or a DISTINCT, a GROUP BY, an ORDER BY by position or ALL, or a UNION without ALL
+    consumes them (`... UNION SELECT 'Z' OFFSET 1`: the fourth); and, on the read side only, the outermost query's (the star check), a derived
     table's or a CTE's (the resolver, where the outer query names what it reads). A star or
     COLUMNS anywhere else, a scalar subquery (`WHERE (SELECT COLUMNS('secret') FROM one LIMIT
     1) = 'Z'`, the same review), an IN list, a value in parentheses, an INSERT's source, is read
@@ -361,7 +361,10 @@ def _projection_is_read(node: exp.Expression, write: bool) -> bool:
         # Existence reads the values where an INTERSECT or EXCEPT compares them, or where a
         # deduplication or a grouping decides how many rows there are and an OFFSET or a
         # HAVING then asks: `EXISTS (SELECT * FROM one UNION SELECT 'Z' OFFSET 1)` is true only
-        # where the withheld value differs from the guess (Codex's fourth review of #169).
+        # where the withheld value differs from the guess (Codex's fourth review of #169). The
+        # rule is broader than the oracle, fail-closed: any consumer on the climb (a DISTINCT, a
+        # GROUP BY, an ORDER BY by position or ALL, a UNION without ALL) refuses, with or
+        # without the OFFSET, since a LIMIT, a QUALIFY or a HAVING can ask the same question.
         return not compared and not any(_consumes_its_projection(wrapper) or (
             isinstance(wrapper, exp.SetOperation) and bool(wrapper.args.get("distinct")))
             for wrapper in wrappers)
