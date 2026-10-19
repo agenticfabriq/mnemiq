@@ -329,7 +329,15 @@ class OracleAdapter:
             return
         # Bounded by `wait_timeout`: DPY-4005 rather than an unbounded wait. Measured on a max=1
         # pool, which raised after the configured 1.5s instead of blocking.
-        con = self._pool.acquire()
+        try:
+            con = self._pool.acquire()
+        except Exception as exc:
+            # No session was had, so no statement was asked: the fault is the source's whatever
+            # its code, and `unavailable_fault` reads the mark before any code list (Codex's
+            # seventh review of #159, so that a pool that cannot authenticate does not depend on
+            # the list naming its error).
+            _mark_acquire_fault(exc)
+            raise
         try:
             # Set rather than left alone, because a value can arrive on a pooled connection from
             # its last borrower: measured, `call_timeout` survives release and re-acquire. This
@@ -1771,15 +1779,35 @@ _UNAVAILABLE_DPY = frozenset({
 # statement causes: the call timeout (03156); the credentials and the account (01017 logon
 # denied, 01045 CREATE SESSION revoked, Codex's sixth review of #159; 28000 locked, 28001
 # expired); the instance not available, starting or shutting down (01033, 01034, 01089, 01090,
-# 01092) or open to restricted sessions alone (01035); and the session and process limits
-# (00018, 00020, 02391). The TNS ranges are matched beside this set.
+# 01092) or open to restricted sessions alone (01035); the session and process limits (00018,
+# 00020, 02391); the profile's connect time, which logs a session off mid-use (02399), and an
+# authentication protocol the server no longer accepts (28040); Codex's seventh review of #159
+# for the last two. The TNS ranges are matched beside this set, and a fault on the pool's
+# acquire is unavailable whatever its code (`_acquire_fault`).
 _UNAVAILABLE_ORA = frozenset({18, 20, 1017, 1033, 1034, 1035, 1045, 1089, 1090, 1092, 2391,
-                              3156, 28000, 28001})
+                              2399, 3156, 28000, 28001, 28040})
+
+
+_ACQUIRE_FAULT = "mnemiq_raised_on_acquire"
+
+
+def _mark_acquire_fault(exc: BaseException) -> None:
+    """Mark an exception the pool's `acquire` raised, on the instance; a class the mark cannot be
+    set on (a slotted one) is left as it is, and read by its code."""
+    try:
+        setattr(exc, _ACQUIRE_FAULT, True)
+    except Exception:  # noqa: BLE001 -- the mark is an aid to the reading, never its failure
+        pass
+
+
+def _acquire_fault(exc: BaseException) -> bool:
+    return getattr(exc, _ACQUIRE_FAULT, False) is True
 
 
 def unavailable_fault(exc: BaseException) -> bool:
     """Whether a python-oracledb error says the source could not be asked, rather than that it
-    answered no: the proof seam's `source_unavailable` (Codex's review of #159).
+    answered no: the proof seam's `source_unavailable` (Codex's review of #159). A fault the
+    pool's `acquire` raised is one whatever its code: no session was had.
 
     The driver types its network faults `OperationalError` (its DPY-6xxx, and the ORA codes it
     lists as such: ORA-03113, ORA-03114 and ORA-01013, the cancel a call timeout surfaces as, among
@@ -1792,7 +1820,7 @@ def unavailable_fault(exc: BaseException) -> bool:
     ORA-00942, ORA-00936) is none of these and keeps its reading, as do the driver's data faults
     (DPY-4004) and `ReadOnlyViolation`, this adapter's own refusal to parse DDL.
     """
-    if isinstance(exc, (ConnectionError, TimeoutError)):
+    if isinstance(exc, (ConnectionError, TimeoutError)) or _acquire_fault(exc):
         return True
     error = exc.args[0] if getattr(exc, "args", None) else None
     if error is None or not hasattr(error, "full_code"):

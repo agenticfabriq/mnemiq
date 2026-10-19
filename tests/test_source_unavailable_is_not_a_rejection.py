@@ -141,6 +141,22 @@ def _dpy(number):
     return error.exc_type(error)
 
 
+def _ora(code, message):
+    """The driver's exception for a server error, typed as the driver types it."""
+    from oracledb import errors
+
+    error = errors._Error(message=message, code=code)
+    return error.exc_type(error)
+
+
+FORCED_LOGOFF = (2399, "ORA-02399: exceeded maximum connect time, you are being logged off")
+NO_AUTH_PROTOCOL = (28040, "ORA-28040: No matching authentication protocol")
+
+
+def _fault(spec):
+    return _dpy(spec) if isinstance(spec, int) else _ora(*spec)
+
+
 def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal():
     pytest.importorskip("oracledb")
     from oracledb import errors
@@ -219,6 +235,10 @@ def test_oracle_tells_its_network_faults_and_call_timeout_from_a_parse_refusal()
                   ora(18, "ORA-00018: maximum number of sessions exceeded"),
                   ora(20, "ORA-00020: maximum number of processes (300) exceeded"),
                   ora(2391, "ORA-02391: exceeded simultaneous SESSIONS_PER_USER limit"),
+                  # Codex's seventh review: the profile's connect time, and an authentication
+                  # protocol the server no longer accepts.
+                  ora(2399, "ORA-02399: exceeded maximum connect time, you are being logged off"),
+                  ora(28040, "ORA-28040: No matching authentication protocol"),
                   ora(12541, "ORA-12541: TNS:no listener"),
                   ora(12170, "ORA-12170: TNS:Connect timeout occurred")]
     assert [str(exc)[:9] for exc in refused if oracle_unavailable(exc)] == []
@@ -239,19 +259,20 @@ class _OracleScripted(_Scripted):
         return oracle_unavailable(exc)
 
 
-@pytest.mark.parametrize("code", [4005, 4033, 5000, 5009, 3008],
+@pytest.mark.parametrize("code", [4005, 4033, 5000, 5009, 3008, FORCED_LOGOFF, NO_AUTH_PROTOCOL],
                          ids=["pool exhausted", "idle disconnect", "unknown message type",
-                              "unknown piggyback", "in-band notification disconnect"])
+                              "unknown piggyback", "in-band notification disconnect",
+                              "forced logoff", "no authentication protocol"])
 @pytest.mark.parametrize("script", [
     ["fault"], ["stale", "fault"], ["stale", None, "fault"],
 ], ids=["first proof", "proof as asked", "re-proof of the rewrite"])
 def test_a_pool_session_or_protocol_fault_is_unavailable_at_every_proof_position(script, code):
-    """Before, DPY-4005 and DPY-4033 (Codex's second and third reviews) and DPY-5000 and DPY-5009
-    (its fourth) read as a refusal: EXPLAIN_FAILED at the first two positions, a statement no
-    session parsed sent to the model; POLICY_REWRITE_REJECTED at the third, the operator told to
-    fix a policy."""
+    """Before, DPY-4005 and DPY-4033 (Codex's second and third reviews), DPY-5000 and DPY-5009
+    (its fourth) and ORA-02399 and ORA-28040 (its seventh) read as a refusal: EXPLAIN_FAILED at
+    the first two positions, a statement no session parsed sent to the model;
+    POLICY_REWRITE_REJECTED at the third, the operator told to fix a policy."""
     pytest.importorskip("oracledb")
-    faults = [_dpy(code) if step == "fault" else (_stale() if step else None)
+    faults = [_fault(code) if step == "fault" else (_stale() if step else None)
               for step in script]
     source = _OracleScripted(*faults)
     verdict = prove_governed(source, REWRITE, ASKED)
@@ -260,13 +281,15 @@ def test_a_pool_session_or_protocol_fault_is_unavailable_at_every_proof_position
     assert len(source.proofs) == len(script), source.proofs
 
 
-def test_through_both_deciders_an_exhausted_oracle_pool_is_unavailable_not_the_model_s():
+@pytest.mark.parametrize("code", [4005, FORCED_LOGOFF, NO_AUTH_PROTOCOL],
+                         ids=["pool exhausted", "forced logoff", "no authentication protocol"])
+def test_through_both_deciders_an_exhausted_oracle_pool_is_unavailable_not_the_model_s(code):
     pytest.importorskip("oracledb")
     snapshot = _snapshot()
     grants = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}),
                       row_filters={"claim": ENTITLED})
     read = decide("SELECT id FROM claim", visible_schema(snapshot, grants),
-                  adapter=_OracleScripted(_dpy(4005)), dialect="oracle", target="oracle",
+                  adapter=_OracleScripted(_fault(code)), dialect="oracle", target="oracle",
                   policy=build_access_policy(snapshot, grants))
     assert isinstance(read, Refusal) and read.code is RefusalCode.SOURCE_UNAVAILABLE, read
     assert not read.repairable
@@ -276,9 +299,35 @@ def test_through_both_deciders_an_exhausted_oracle_pool_is_unavailable_not_the_m
     write = decide_write("UPDATE claim SET amount = 0 WHERE id = 1",
                          visible_schema(snapshot, plain), plain,
                          policy=build_access_policy(snapshot, plain),
-                         adapter=_OracleScripted(_dpy(4005)), dialect="oracle", target="oracle",
+                         adapter=_OracleScripted(_fault(code)), dialect="oracle", target="oracle",
                          writes_enabled=True)
     assert isinstance(write, Refusal) and write.code is RefusalCode.SOURCE_UNAVAILABLE, write
+
+
+def test_a_fault_on_the_pool_s_acquire_is_unavailable_whatever_its_code():
+    """Codex's seventh review of #159: a pool that cannot authenticate should not depend on the
+    code list naming its error. No session was had, so no statement was asked: the lease marks
+    the exception and the classifier reads the mark before any list. The same error raised by a
+    statement keeps its reading."""
+    oracledb = pytest.importorskip("oracledb")
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    # A code the driver leaves a plain DatabaseError and no list names (ORA-00604 is typed
+    # OperationalError by the driver, unavailable on its own).
+    unlisted = (1, "ORA-00001: unique constraint violated")
+    assert not oracle_unavailable(_ora(*unlisted))
+
+    class _RaisingPool:
+        def acquire(self):
+            raise _ora(*unlisted)
+
+    adapter = OracleAdapter.over(object(), oracledb, schema="APP")
+    adapter._pool = _RaisingPool()
+    with pytest.raises(oracledb.DatabaseError) as caught:
+        with adapter._lease():
+            pytest.fail("no connection to lease")
+    assert oracle_unavailable(caught.value)
+    assert caught.value.args[0].code == 1
 
 
 def test_postgres_tells_a_lost_connection_and_a_cancelled_statement_from_a_statement_s_faults():
