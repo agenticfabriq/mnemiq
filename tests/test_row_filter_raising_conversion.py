@@ -202,6 +202,17 @@ RAISING_TYPED_FORMS = [
     # list, typed by DuckDB as one.
     "array_value(attrs) = array_value(region)",
     "CASE WHEN id = 1 THEN list_pack(attrs) ELSE list_pack(region) END IS NOT NULL",
+    # Codex's tenth review: a value read out of a container keeps the container's element
+    # type, and a list search unifies the element type with what it searches for.
+    "COALESCE([attrs][1], region) IS NOT NULL",
+    "COALESCE(({'a': attrs}).a, region) IS NOT NULL",
+    "list_contains([attrs], region)",
+    "array_position([attrs], region) > 0",
+    "list_has_any([attrs], [region])",
+    "array_contains([attrs], region)",
+    "list_position([attrs], region) > 0",
+    "list_has_all([attrs], [region])",
+    "array_has_all([attrs], [region])",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -249,6 +260,9 @@ SAFE_TYPED_FORMS = [
     "[attrs] = [TRY_CAST(region AS JSON)]",
     "CASE WHEN id = 1 THEN MAP {'a': attrs} ELSE MAP {'a': 1} END IS NOT NULL",
     "CASE WHEN id = 1 THEN MAP {id: 1} ELSE MAP {id: 2} END IS NOT NULL",
+    "list_contains([attrs], TRY_CAST(region AS JSON))",
+    "list_contains([region], 'x')",
+    "COALESCE([attrs][1], attrs) IS NOT NULL",
     "CASE WHEN id = 1 THEN {'a': attrs, 'b': 1.5} ELSE {'a': attrs, 'b': 10.25} END IS NOT NULL",
     "CASE WHEN id = 1 THEN {'a': attrs, 'b': region} ELSE {'b': region, 'a': attrs} END IS NOT NULL",
     "CASE WHEN id = 1 THEN [id] ELSE CAST('[2]' AS INTEGER[]) END IS NOT NULL",

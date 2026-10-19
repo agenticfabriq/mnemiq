@@ -378,11 +378,28 @@ def _map_key(item: exp.PropertyEQ) -> exp.Expression:
     return key
 
 
+def _type_of_value(value: exp.Expression, type_of, engine: str) -> exp.DataType | None:
+    """A value's type as the reader here knows it, else as DuckDB types a pure expression (a
+    list element or a struct field read out of a container, `[attrs][1]`, `({'a': attrs}).a`,
+    which the reader does not follow; Codex's tenth review of #160)."""
+    known = _known_type(value, type_of, engine)
+    if known is not None or engine != "duckdb":
+        return known
+    kind = _pure_type(value, type_of)
+    if kind is None:
+        return None
+    try:
+        return exp.DataType.build(kind, dialect="duckdb")
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _values_coerce_to_json(values, type_of, engine: str) -> bool:
     """`_coerces_to_json`'s reading over any values DuckDB unifies to one type: a branched
     value's branches, a list's elements, a map's keys or its values (Codex's ninth review of
-    #160: `[attrs, region]` is JSON[], region parsed on every row)."""
-    typed = [_known_type(value, type_of, engine) for value in values]
+    #160: `[attrs, region]` is JSON[], region parsed on every row), a list search's element and
+    argument."""
+    typed = [_type_of_value(value, type_of, engine) for value in values]
     if not any(known is not None and known.this == exp.DataType.Type.JSON for known in typed):
         return False
     return not all(
@@ -401,6 +418,7 @@ _PURE = (exp.Column, exp.Identifier, exp.Literal, exp.Boolean, exp.Null, exp.Par
          exp.Cast, exp.DataType, exp.DataTypeParam, exp.Interval, exp.Var, exp.DateStrToDate,
          exp.Case, exp.If, exp.Coalesce, exp.Nullif, exp.Array, exp.Struct, exp.PropertyEQ,
          exp.ToMap, exp.Map,  # `MAP {'a': attrs}`, `MAP(['a'], [attrs])` (the review gate)
+         exp.Bracket, exp.Dot,  # `[attrs][1]`, `({'a': attrs}).a` (Codex's tenth review)
          exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.And, exp.Or, exp.Not, exp.Is,
          exp.In, exp.Between, exp.Like, exp.ILike, *_ARITHMETIC)
 
@@ -457,6 +475,14 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
 # (or the mix is a bind fault on no row's value), or parsed by `_coerces_to_json`'s rule.
 _TEXT = "text"
 _LIST_CONSTRUCTORS = frozenset({"array_value", "list_pack"})  # `list_value` parses as a list
+# A list searched for a value (the element type unified with the value's), or two lists searched
+# against each other; by sqlglot's node where it has one, by name where it does not.
+_LIST_SEARCHES = (exp.ArrayContains, exp.ArrayPosition, exp.ArrayOverlaps, exp.ArrayContainsAll)
+_LIST_PAIRS = (exp.ArrayOverlaps, exp.ArrayContainsAll)
+_LIST_SEARCH_NAMES = frozenset({"list_has", "array_has", "list_position", "list_indexof",
+                                "array_indexof", "list_has_all", "array_has_all", "list_has_any",
+                                "array_has_any", "array_contains", "list_contains"})
+_LIST_PAIR_NAMES = frozenset({"list_has_all", "array_has_all", "list_has_any", "array_has_any"})
 _CONTAINERS = (exp.DataType.Type.ARRAY, exp.DataType.Type.LIST, exp.DataType.Type.STRUCT,
                exp.DataType.Type.MAP)
 
@@ -755,6 +781,26 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
                 or _json_inside_a_container(_branches(node), type_of)
                 or _literal_cannot_convert(node, type_of, engine)):
             return node
+        if engine == "duckdb" and (isinstance(node, _LIST_SEARCHES) or (
+                isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_SEARCH_NAMES)):
+            # A list search unifies the list's element type with what is searched for, or with
+            # the other list's elements: `list_contains([attrs], region)` and `array_position`
+            # parse region as JSON on every row (Codex's tenth review of #160). Read as the
+            # element (the list subscripted) beside the argument, or the two lists together.
+            if isinstance(node, exp.Anonymous):
+                operands = list(node.expressions)
+                haystack, needle = (operands + [None, None])[:2]
+            else:
+                haystack, needle = node.this, node.args.get("expression")
+            if haystack is not None and needle is not None:
+                probe = (needle if isinstance(node, _LIST_PAIRS) or (
+                    isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_PAIR_NAMES)
+                    else None)
+                element = exp.Bracket(this=haystack.copy(), expressions=[exp.Literal.number(1)])
+                element.parent = node
+                pair = [haystack, needle] if probe is not None else [element, needle]
+                if _values_coerce_to_json(pair, type_of, engine) or _json_inside_a_container(pair, type_of):
+                    return node
         if engine == "duckdb" and (isinstance(node, (exp.Array, exp.ToMap)) or (
                 isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_CONSTRUCTORS)):
             # A list's elements, and a map's keys and its values, are unified to one type as a
