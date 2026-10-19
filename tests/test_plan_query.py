@@ -526,6 +526,8 @@ _RETRIED = {
     RefusalCode.UNRESOLVABLE_CALLS: DeferralReason.UNGOVERNABLE,
     RefusalCode.VIEW_INVENTORY_UNAVAILABLE: DeferralReason.UNGOVERNABLE,
     RefusalCode.INVALID_ROW_FILTER: DeferralReason.UNGOVERNABLE,
+    # M158: the source accepts the statement as asked and refuses only the policy's rewrite.
+    RefusalCode.POLICY_REWRITE_REJECTED: DeferralReason.UNGOVERNABLE,
     # Write-path codes. `decide_write` is called from the runtime, not through this loop, so
     # none of these can arrive here -- listed so a future caller that routes writes through
     # `plan_query` finds a decision already made rather than a default.
@@ -537,6 +539,9 @@ _RETRIED = {
     # M150: the deployment decides a governed CTE for an engine the scope rule does not model.
     RefusalCode.POLICY_TARGET_UNSUPPORTED: DeferralReason.UNGOVERNABLE,
     RefusalCode.UNSCOPED_CTE: DeferralReason.UNGOVERNABLE,
+    # The source could not be asked to prove the statement (Codex's review of #159): nobody's to
+    # repair, and deferred under the default reason until one for an unanswered source is chosen.
+    RefusalCode.SOURCE_UNAVAILABLE: DeferralReason.UNGOVERNABLE,
 }
 
 

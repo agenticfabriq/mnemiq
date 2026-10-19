@@ -24,7 +24,7 @@ from mnemiq.sql.fanout_check import KeyFacts, check_fanout
 from mnemiq.sql.guard import MAX_ROWS, check_shape
 from mnemiq.sql.lint import lint
 from mnemiq.sql.policy import AccessPolicy
-from mnemiq.sql.prove import prove
+from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.lineage import lineage_for
 from mnemiq.sql.scope import (base_tables, check_policy_target, fields_as_members, known_columns,
@@ -248,11 +248,14 @@ def decide(
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof
         # the source understands -- `EXPLAIN` is not Oracle syntax (see mnemiq.sql.prove).
-        refused = prove(adapter, target_sql)
+        # A refusal of what the policy added is the operator's, not the model's (M158).
+        refused = prove_governed(adapter, target_sql, asked_sql)
         if refused is not None:
-            # What the source refused is the policy's rewrite, so its words can quote the policy and
-            # the rows it removes, and the model repairs against them. `prove` has logged them
-            # whole; under a policy the refusal keeps the error's class only (`policy_safe_detail`).
+            # EXPLAIN_FAILED: what the source refused is the policy's rewrite, so its words can
+            # quote the policy and the rows it removes, and the model repairs against them. `prove`
+            # has logged them whole; under a policy the refusal keeps the error's class only
+            # (`policy_safe_detail`). POLICY_REWRITE_REJECTED carries no source words at all;
+            # SOURCE_UNAVAILABLE carries the driver's, which name no row, kept to their class too.
             return replace(refused, source_detail=policy_safe_detail(
                 refused.source_detail, asked=asked_sql, executed=target_sql, dialect=target))
 

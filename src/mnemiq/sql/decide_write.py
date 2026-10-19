@@ -19,7 +19,7 @@ from mnemiq.sql.functions import (
 )
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.policy import AccessPolicy
-from mnemiq.sql.prove import prove
+from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import base_tables, check_policy_target, fields_as_members, known_columns
 from mnemiq.sql.rls import apply_row_filters_to_write, check_filter_targets, unplaceable_policy
@@ -460,7 +460,8 @@ def decide_write(
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof
         # the source understands -- `EXPLAIN` is not Oracle syntax (see mnemiq.sql.prove).
-        refused = prove(adapter, target_sql)
+        # A refusal of what the policy added is the operator's, not the caller's (M158).
+        refused = prove_governed(adapter, target_sql, asked_sql)
         if refused is not None:
             return refused
 

@@ -201,6 +201,20 @@ def execute_bounded(con, sql: str, timeout_s: float | None) -> pa.Table:
             timer.cancel()
 
 
+def unavailable_fault(exc: BaseException) -> bool:
+    """Whether a DuckDB error says the source could not be asked, rather than that it answered
+    no: the proof seam's `source_unavailable` (Codex's review of #159). DuckDB types a closed or
+    locked connection, an I/O fault, a remote fetch and a transaction conflict `OperationalError`,
+    and its interrupt, which is what a timeout raises here, apart from everything. A statement's
+    own faults are `ProgrammingError` (binder, catalog, parser) and keep their reading, a refusal
+    the repair loop handles. An I/O fault at the proof is the attached source's own (a moved file,
+    a lock): a statement reading a file by name, `read_parquet` or a path, is refused as an
+    unknown table before any proof (measured). Python's own connection and timeout errors count
+    as well, so a wrapper raising them is read the same way."""
+    return isinstance(exc, (duckdb.OperationalError, duckdb.InterruptException,
+                            ConnectionError, TimeoutError))
+
+
 class DuckDBAdapter:
     """DuckDB as the universal executor: ATTACH a source and read it via DuckDB's scanner.
 
@@ -458,6 +472,10 @@ class DuckDBAdapter:
         source only the server's statement timeout does (M152), so its cancellation is raised as
         the interrupt it is, and the runner's timed-out guidance reaches the model."""
         return execute_bounded(self._con, sql, timeout_s)
+
+    def source_unavailable(self, exc: BaseException) -> bool:
+        """The proof seam's question: did the source not answer, rather than answer no."""
+        return unavailable_fault(exc)
 
 
 class DuckDBPostgresAdapter(DuckDBAdapter):
