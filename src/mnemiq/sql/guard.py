@@ -407,8 +407,10 @@ def _consumes_its_projection(node: exp.Expression) -> bool:
         if ordered.find_ancestor(*_WRAPPERS) is not node:
             continue  # a subquery's own ORDER BY, judged with that subquery's projection
         key = ordered.this
-        while isinstance(key, exp.Paren):
-            key = key.this  # `ORDER BY (2)` and `((2))` are the position to DuckDB (the ui lane)
+        while isinstance(key, (exp.Paren, exp.Neg)):
+            # `ORDER BY (2)`, `((2))` (the ui lane) and `-(-2)` (Codex's sixth review) are the
+            # position to DuckDB; a sign is unwrapped as parentheses are, fail-closed.
+            key = key.this
         if isinstance(key, exp.Literal) or (isinstance(key, exp.Var) and key.name.upper() == "ALL"):
             return True
     return False

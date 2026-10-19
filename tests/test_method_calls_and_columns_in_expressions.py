@@ -313,6 +313,8 @@ def test_a_column_reached_by_position_in_a_write_is_refused(con, sql):
     "SELECT d.id FROM (SELECT * FROM pair UNION ALL SELECT * FROM pair ORDER BY 2 LIMIT 1) d",
     "SELECT d.id FROM (SELECT * FROM pair ORDER BY (2) LIMIT 1) d",  # a parenthesised position (the ui lane)
     "SELECT d.id FROM ((SELECT * FROM pair) ORDER BY ((2)) LIMIT 1) d",
+    "SELECT d.id FROM (SELECT * FROM pair ORDER BY -(-2) LIMIT 1) d",  # a signed position (Codex)
+    "SELECT d.id FROM (SELECT COLUMNS(*) FROM pair ORDER BY -(-2) LIMIT 1) d",
     "WITH w AS ((SELECT * FROM pair) ORDER BY 2 LIMIT 1) SELECT w.id FROM w",  # refused before the CTE branch
 ])
 def test_a_derived_star_consumed_by_its_own_select_is_refused(con, sql):
