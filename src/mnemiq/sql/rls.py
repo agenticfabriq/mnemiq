@@ -450,8 +450,7 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
                 as_column = exp.Column(this=item.this.copy())
                 as_column.parent = item  # read in the value's own SELECT, as the engine reads it
                 keys.append(as_column)
-            elif not isinstance(item.this, exp.Literal):
-                return None
+            # any other key (a literal, a cast such as `'{}'::JSON`) is a pure value of its own
     # The types are read off the original nodes, which the resolver knows by identity; the
     # copy's are then replaced in the same traversal order.
     declared = [type_of(column) for column in value.find_all(exp.Column)]
@@ -486,7 +485,8 @@ _LIST_SEARCH_NAMES = frozenset({"list_has", "array_has", "list_position", "list_
 _LIST_PAIR_NAMES = frozenset({"list_has_all", "array_has_all", "list_has_any", "array_has_any"})
 # A map looked up by a key, which DuckDB converts to the map's key type (Codex's eleventh
 # review of #160: `element_at(MAP([attrs], [1]), region)` parses region as JSON on every row).
-_MAP_LOOKUPS = frozenset({"element_at", "map_extract", "map_extract_value"})
+_MAP_LOOKUPS = frozenset({"element_at", "map_extract", "map_extract_value", "map_contains"})
+_MAP_ONLY_LOOKUPS = frozenset({"map_extract", "map_extract_value", "map_contains"})
 _CONTAINERS = (exp.DataType.Type.ARRAY, exp.DataType.Type.LIST, exp.DataType.Type.STRUCT,
                exp.DataType.Type.MAP)
 
@@ -785,13 +785,22 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
                 or _json_inside_a_container(_branches(node), type_of)
                 or _literal_cannot_convert(node, type_of, engine)):
             return node
-        if engine == "duckdb" and (isinstance(node, exp.Bracket) or (
-                isinstance(node, exp.Anonymous) and node.name.lower() in _MAP_LOOKUPS)):
+        if engine == "duckdb" and (isinstance(node, exp.Bracket)
+                                   or (isinstance(node, exp.ToMap) and isinstance(node.this, exp.Bracket))
+                                   or (isinstance(node, exp.Anonymous) and node.name.lower() in _MAP_LOOKUPS)):
             # A map looked up by a key: the key is converted to the map's key type, so a text
             # key beside a JSON-keyed map is parsed on every row (Codex's eleventh review of
             # #160). The map is typed by DuckDB; its key type stands in for the map beside
             # the key under both readings. A list subscripted by a number converts nothing.
-            if isinstance(node, exp.Bracket):
+            # A subscripted map literal is parsed with the bracket inside the map (the review
+            # gate on cd17747: `MAP {...}[region]`), so the map is rebuilt over its struct.
+            map_only = isinstance(node, exp.Anonymous) and node.name.lower() in _MAP_ONLY_LOOKUPS
+            if isinstance(node, exp.ToMap):
+                bracket = node.this
+                container = exp.ToMap(this=bracket.this.copy())
+                container.parent = node
+                key = bracket.expressions[0] if bracket.expressions else None
+            elif isinstance(node, exp.Bracket):
                 container, key = node.this, (node.expressions[0] if node.expressions else None)
             else:
                 operands = list(node.expressions)
@@ -804,6 +813,8 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
                 pair = [key_type, key]
                 if _values_coerce_to_json(pair, type_of, engine) or _json_inside_a_container(pair, type_of):
                     return node
+            elif key is not None and kind is None and map_only:
+                return node  # a map the reader cannot type may be keyed by JSON (the gate)
         if engine == "duckdb" and (isinstance(node, _LIST_SEARCHES) or (
                 isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_SEARCH_NAMES)):
             # A list search unifies the list's element type with what is searched for, or with

@@ -222,6 +222,9 @@ RAISING_TYPED_FORMS = [
     "map_extract_value(MAP(['{}'::JSON], [1]), region) = 1",
     "MAP(['{}'::JSON], [1])[region] = 1",
     "map_extract(MAP(['{}'::JSON], [1]), region) = [1]",
+    # The review gate on cd17747: a subscripted map literal, and map_contains.
+    "MAP {'{}'::JSON: 1}[region] = 1",
+    "map_contains(MAP(['{}'::JSON], [1]), region)",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -279,6 +282,8 @@ SAFE_TYPED_FORMS = [
     "element_at(MAP(['{}'::JSON], [1]), TRY_CAST(region AS JSON)) = [1]",
     "element_at(MAP([region], [1]), 'x') = [1]",
     "MAP([region], [1])['x'] = 1",
+    "MAP {'a': 1}[region] = 1",
+    "map_contains(MAP(['a'], [1]), region)",
     "[attrs][1] IS NOT NULL",
     "COALESCE([attrs][1], attrs) IS NOT NULL",
     "CASE WHEN id = 1 THEN {'a': attrs, 'b': 1.5} ELSE {'a': attrs, 'b': 10.25} END IS NOT NULL",
@@ -404,8 +409,10 @@ def test_a_literal_beside_a_branch_the_validator_cannot_type_is_refused_though_i
                  # TRY_CAST to a container cannot tell a converting literal from one that does
                  # not (the review gate), so a literal beside a container branch is refused too.
                  "CASE WHEN id = 1 THEN [1, 2] ELSE '[3]' END IS NOT NULL",
-                 # A list a call returns cannot be typed, and may hold JSON (the review gate).
-                 "list_contains(list_distinct([region]), 'x')"):
+                 # A list a call returns cannot be typed, and may hold JSON (the review gate);
+                 # a map a call returns the same, under a map-only lookup.
+                 "list_contains(list_distinct([region]), 'x')",
+                 "map_extract_value(map_from_entries([('a', 1)]), region) = 1"):
         con.execute(f"SELECT id FROM claim WHERE {runs}").fetchall()
         verdict = _decide(runs)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, runs
