@@ -533,6 +533,58 @@ def test_a_doubled_quote_in_a_member_name_is_read_and_an_unreadable_declared_typ
     assert _untypable(u2, unreadable, "duckdb") is False
 
 
+@pytest.mark.parametrize("row_filter", [
+    "list_contains([region], to_json(id))",
+    "region = to_json(id)",
+    "CASE WHEN id = 1 THEN region ELSE to_json(id) END IS NOT NULL",
+    "[to_json(id)] = [region]",
+    "CASE WHEN id = 1 THEN [region] ELSE [to_json(id)] END IS NOT NULL",
+    "region IN (to_json(id))",
+    "list_contains([region], json_object('a', id))",
+    "list_contains([region], json_extract(attrs, '$.a'))",
+    "[region] = [json_array(id)]",
+    # DuckDB's `->` inside a call's arguments or beside an operator is its JSON extract, which
+    # sqlglot reads as a lambda: refused as a statement the reader cannot see as DuckDB runs it.
+    "list_contains([region], attrs -> '$.a')",
+    "region = attrs -> '$.a'",
+    "list_has_any([region], [attrs -> '$.a'])",
+])
+def test_a_call_returning_json_beside_text_is_read_as_json(row_filter):
+    """Codex's nineteenth review of #160: `to_json(id)` was of unknown type, and unknown beside
+    text was approved, where DuckDB unifies the text to JSON and parses it on the row. A call
+    DuckDB answers with JSON is typed by name, so nothing runs; `[to_json(id)]` is a typed NULL
+    to the container probe."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON); "
+                "INSERT INTO claim VALUES (1, 'north', '{\"a\": 1}'::JSON)")
+    with pytest.raises(duckdb.Error, match="Malformed JSON"):
+        con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    verdict = _decide(row_filter)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (row_filter, verdict)
+
+
+def test_a_call_returning_text_beside_text_is_not_refused_for_being_unknown():
+    """The residual, by design: a call of unknown type beside text is not refused, since that
+    would refuse `lower(region) = 'x'`; a source-defined function returning JSON stays unknown."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON); "
+                "INSERT INTO claim VALUES (1, 'north', '{\"a\": 1}'::JSON)")
+    for row_filter in ("list_contains([region], lower(region))", "[region] = [lower(region)]",
+                       "lower(region) = 'north'", "list_contains([region], json_extract_string(attrs, '$.a'))",
+                       "list_transform([region], x -> upper(x))[1] = 'NORTH'",  # a lambda DuckDB takes
+                       "list_filter([region], x -> x = 'north')[1] = 'north'"):
+        assert con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall() is not None
+        assert isinstance(_decide(row_filter), Approved), row_filter
+    # The nineteenth round's tightening of the two-list search, both ways (the review gate): a
+    # list literal holding a call of unknown type is refused, and the JSON one it closes raises.
+    with pytest.raises(duckdb.Error, match="Malformed JSON"):
+        con.execute("SELECT id FROM claim WHERE [json_extract(attrs, '$.a')] && [region]").fetchall()
+    assert con.execute("SELECT id FROM claim WHERE list_has_any([lower(region)], ['x'])").fetchall() == []
+    for two_lists in ("[json_extract(attrs, '$.a')] && [region]", "list_has_any([lower(region)], ['x'])"):
+        verdict = _decide(two_lists)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (two_lists, verdict)
+
+
 def test_duckdb_s_types_are_read_in_duckdb_s_own_grammar():
     """The container reading parses DuckDB's type strings itself (the review gate on #160:
     sqlglot's DataType reads a nested unnamed struct as a struct literal). An unnamed struct's

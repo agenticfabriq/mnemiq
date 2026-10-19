@@ -308,10 +308,50 @@ def _branch_type(value, type_of, engine: str) -> exp.DataType | None:
     return exp.DataType.build("VARCHAR") if literal else None
 
 
+# DuckDB's calls that return JSON, typed by name so nothing runs (Codex's nineteenth review of
+# #160: `list_contains([region], to_json(id))`, `region = to_json(id)`, a CASE between them and
+# `[to_json(id)] = [region]` were of unknown type on the call's side and approved, where DuckDB
+# unifies the text to JSON and parses it). By sqlglot's node where it has one, by name where
+# it does not; a source-defined function returning JSON is still unknown here, and unknown
+# beside text is not refused, since that would refuse `lower(region) = 'x'` (a residual).
+_JSON_CALL_NODES = (exp.JSONExtract, exp.JSONObject, exp.JSONArray, exp.JSONArrayAgg,
+                    exp.JSONObjectAgg, exp.ParseJSON)
+_JSON_CALL_NAMES = frozenset({"to_json", "row_to_json", "json_quote", "json_object", "json_array",
+                              "json_merge_patch", "json_extract", "json_extract_path", "json",
+                              "json_value", "json_structure", "json_group_array",
+                              "json_group_object", "json_group_structure",
+                              "json_serialize_sql", "json_serialize_plan"})
+
+
+def _is_json_call(node: exp.Expression) -> bool:
+    return isinstance(node, _JSON_CALL_NODES) or (
+        isinstance(node, exp.Anonymous) and node.name.lower() in _JSON_CALL_NAMES)
+
+
+# The calls DuckDB hands a lambda to. Anywhere else `a -> b` is DuckDB's JSON extract, which
+# sqlglot reads as a lambda inside a call's arguments or beside an operator (`list_contains(
+# [region], attrs -> '$.a')`, `region = attrs -> '$.a'`: Codex's nineteenth review of #160), so the
+# reader here sees a statement the engine does not run; refused, with the plain spelling in the
+# advice (`json_extract(attrs, '$.a')`, which sqlglot reads as the extract everywhere).
+_LAMBDA_TAKERS = frozenset({"list_transform", "array_transform", "apply", "list_apply",
+                            "list_filter", "array_filter", "filter", "list_reduce", "array_reduce",
+                            "reduce", "list_any_value", "list_sort", "list_grade_up"})
+_LAMBDA_TAKER_NODES = (exp.Transform, exp.ArrayFilter, exp.Reduce)
+
+
+def _arrow_read_as_a_lambda(node: exp.Expression) -> bool:
+    if not isinstance(node, exp.Lambda):
+        return False
+    parent = node.parent
+    return not (isinstance(parent, _LAMBDA_TAKER_NODES) or (
+        isinstance(parent, exp.Anonymous) and parent.name.lower() in _LAMBDA_TAKERS))
+
+
 def _known_type(value, type_of, engine: str) -> exp.DataType | None:
     """`value`'s type where it is plain to see: a typed column, a literal, a cast, arithmetic, an
     interval, a list, a struct or a row, a scalar subquery's one projection, a branched value
-    whose branches are typed, NULLIF's first argument (Codex's second review of #160)."""
+    whose branches are typed, NULLIF's first argument (Codex's second review of #160). A call
+    DuckDB answers with JSON is typed through `_pure_type`, as a `NULL::JSON`."""
     while isinstance(value, exp.Paren):
         value = value.this
     if isinstance(value, exp.Boolean):
@@ -440,10 +480,15 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     runs; None for anything else, or where a column's type is not known."""
     while isinstance(value, exp.Paren):
         value = value.this
-    if not all(isinstance(node, (*_PURE, *_PURE_CALL_NODES)) or (
-            isinstance(node, exp.Anonymous)
-            and node.name.lower() in _LIST_CONSTRUCTORS | _PURE_CALLS)
-            for node in value.walk()):
+    # A call that returns JSON is a typed NULL to the probe, as a column is: nothing of it runs,
+    # and what it holds (`to_json(id)` beside `[region]`) is JSON to DuckDB's unification.
+    json_calls = [node for node in value.walk() if _is_json_call(node)]
+    inside_a_json_call = {id(inner) for call in json_calls for inner in call.walk() if inner is not call}
+    if not all(id(node) in inside_a_json_call or _is_json_call(node)
+               or isinstance(node, (*_PURE, *_PURE_CALL_NODES)) or (
+               isinstance(node, exp.Anonymous)
+               and node.name.lower() in _LIST_CONSTRUCTORS | _PURE_CALLS)
+               for node in value.walk()):
         return None
     # A MAP literal's keys are expressions DuckDB evaluates (`MAP {id: 1}` is keyed by the
     # column, MAP(INTEGER, INTEGER)), which sqlglot parses as struct-field identifiers, so they
@@ -465,11 +510,17 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
             # any other key (a literal, a cast such as `'{}'::JSON`) is a pure value of its own
     # The types are read off the original nodes, which the resolver knows by identity; the
     # copy's are then replaced in the same traversal order.
-    declared = [type_of(column) for column in value.find_all(exp.Column)]
+    declared = [type_of(column) for column in value.find_all(exp.Column)
+                if id(column) not in inside_a_json_call]
     key_types = [type_of(column) for column in keys]
     if None in declared or None in key_types:
         return None
     typed_nulls = value.copy()
+    if _is_json_call(typed_nulls):
+        typed_nulls = exp.Cast(this=exp.Null(), to=exp.DataType.build("JSON"))
+    for call in list(typed_nulls.find_all(*_JSON_CALL_NODES, exp.Anonymous)):
+        if _is_json_call(call):
+            call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build("JSON")))
     for column, kind_of in zip(list(typed_nulls.find_all(exp.Column)), declared):
         column.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
     copied_keys = [item.this for to_map in typed_nulls.find_all(exp.ToMap)
@@ -927,6 +978,8 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
         return None if owner is None else types_of(owner).get(column.name.lower())
 
     for node in wrapped.args["where"].walk():
+        if engine == "duckdb" and _arrow_read_as_a_lambda(node):
+            return node  # `attrs -> '$.a'` where DuckDB extracts JSON and sqlglot sees a lambda
         if engine == "duckdb" and (isinstance(node, _JSON_PARSES) or (
                 isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_JSON_PARSES)):
             # The typed readers parse their first argument; an untyped one may parse any (both of
@@ -1060,6 +1113,10 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
 
 def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
     safe = _SAFE_FORM.get(engine, "a form that cannot fail, or a column of the right type")
+    if engine == "duckdb" and isinstance(node, exp.Lambda):
+        safe = ("json_extract(value, path) in place of `value -> path` here: inside a call's "
+                "arguments or beside an operator the parser reads the arrow as a lambda where "
+                "DuckDB reads a JSON extract, so the filter cannot be checked as DuckDB runs it")
     if engine == "duckdb" and isinstance(node, _BRANCHED):
         safe += (", and a text literal on a branch as CAST('...' AS type): beside a branch of "
                  "another type it is converted to that type on the rows that take it, and beside "
