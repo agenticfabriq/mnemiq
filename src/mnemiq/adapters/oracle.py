@@ -1842,10 +1842,13 @@ def unavailable_fault(exc: BaseException) -> bool:
         # ORA-00604, an error at a recursive SQL level, is typed OperationalError by the driver
         # and wraps whatever the recursive SQL raised: a SERVERERROR trigger failing on a
         # missing table wraps ORA-00942, a statement's refusal (Codex's eighth review of #159).
-        # Read by the errors it wraps, the other ORA codes in its message: unavailable where one
-        # of them is, a refusal otherwise. A message naming no other code keeps the driver's
-        # reading below (the review gate).
-        nested = [int(n) for n in re.findall(r"ORA-(\d{5})", str(getattr(error, "message", "")))
+        # Read by the errors it wraps, the other entries of the error stack, each a line of its
+        # own in the message: unavailable where one of them is, a refusal otherwise. A code
+        # quoted inside an entry's text (`ORA-20001: ... see ORA-03113`, an application error
+        # raised by a trigger) is prose, not an entry (Codex's ninth review of #159). A message
+        # naming no other entry keeps the driver's reading below (the review gate).
+        nested = [int(n) for n in re.findall(r"^\s*ORA-(\d{5}):", str(getattr(error, "message", "")),
+                                             re.MULTILINE)
                   if int(n) != 604]
         if nested:
             return any(_ora_unavailable(n) for n in nested)
