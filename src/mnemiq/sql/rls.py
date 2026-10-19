@@ -323,26 +323,43 @@ def _branch_type(value, type_of, engine: str) -> exp.DataType | None:
 # #160: `list_contains([region], to_json(id))`, `region = to_json(id)`, a CASE between them and
 # `[to_json(id)] = [region]` were of unknown type on the call's side and approved, where DuckDB
 # unifies the text to JSON and parses it). By sqlglot's node where it has one, by name where
-# it does not: the json extension's returners as read here from DuckDB 1.5.4. `json_transform`
-# and `from_json` return the structure they are asked for and are not listed: typed JSON they
-# would pass beside a JSON value where they return text (the review gate on the twenty-first
-# round, which refused that at HEAD), so they stay unknown, refused beside JSON and approved
-# beside text. A name not listed, a built-in missed or a source-defined function, is unknown
-# here, and unknown beside text is not refused, since that would refuse `lower(region) = 'x'`
-# (the residual; the review gate on the twentieth round).
+# it does not: the names the local reader's own catalogue lists with a JSON or JSON[] return
+# (`_json_returners`; twelve on 1.5.4, the typed list below where the catalogue cannot be
+# asked). `json_transform`, `from_json` and `json_value` are not among them: the first two
+# return the structure they are asked for, the third VARCHAR, and typed JSON they would pass
+# beside a JSON value where they return text (the review gate on the twenty-first round, twice).
+# A name the catalogue does not list, a source-defined function among them, is unknown here,
+# and unknown beside text is not refused, since that would refuse `lower(region) = 'x'` (the
+# residual; the review gate on the twentieth round).
 _JSON_CALL_NODES = (exp.JSONExtract, exp.JSONObject, exp.JSONArray, exp.JSONArrayAgg,
                     exp.JSONObjectAgg, exp.ParseJSON)
-_JSON_CALL_NAMES = frozenset({"to_json", "row_to_json", "array_to_json", "json_quote",
-                              "json_object", "json_array", "json_merge_patch", "json_extract",
-                              "json_extract_path", "json", "json_value", "json_structure",
-                              "json_group_array", "json_group_object", "json_group_structure",
-                              "json_serialize_sql", "json_serialize_plan"})
+_JSON_RETURNERS_KNOWN = frozenset({"to_json", "row_to_json", "array_to_json", "json_quote",
+                                   "json_object", "json_array", "json_merge_patch",
+                                   "json_extract", "json_extract_path", "json_structure",
+                                   "json_serialize_sql", "json_serialize_plan"})
+_JSON_RETURNERS: frozenset[str] | None = None
 _JSON_EXTRACTS = frozenset({"json_extract", "json_extract_path"})
+
+
+def _json_returners() -> frozenset[str]:
+    """The calls the local reader's catalogue answers with JSON or JSON[] (any overload), the
+    typed list where the catalogue cannot be asked (logged: a missing name is an approval)."""
+    global _JSON_RETURNERS
+    if _JSON_RETURNERS is None:
+        try:
+            rows = _duckdb_rows("SELECT DISTINCT lower(function_name) FROM duckdb_functions() "
+                                "WHERE return_type IN ('JSON', 'JSON[]')")
+            _JSON_RETURNERS = frozenset(name for (name,) in rows) or _JSON_RETURNERS_KNOWN
+        except Exception:  # noqa: BLE001 -- the catalogue could not be asked: the typed list
+            logger.warning("DuckDB's catalogue could not be asked which calls return JSON; "
+                           "the typed list stands in (M159)")
+            _JSON_RETURNERS = _JSON_RETURNERS_KNOWN
+    return _JSON_RETURNERS
 
 
 def _is_json_call(node: exp.Expression) -> bool:
     return isinstance(node, _JSON_CALL_NODES) or (
-        isinstance(node, exp.Anonymous) and node.name.lower() in _JSON_CALL_NAMES)
+        isinstance(node, exp.Anonymous) and node.name.lower() in _json_returners())
 
 
 def _json_call_type(node: exp.Expression) -> str:
@@ -386,6 +403,8 @@ def _lambda_takers() -> frozenset[str]:
                                 "WHERE list_contains(parameter_types, 'LAMBDA')")
             _LAMBDA_TAKERS = frozenset(name for (name,) in rows) or _LAMBDA_TAKERS_KNOWN
         except Exception:  # noqa: BLE001 -- the catalogue could not be asked: the typed list
+            logger.warning("DuckDB's catalogue could not be asked which calls take a lambda; "
+                           "the typed list stands in (M159)")
             _LAMBDA_TAKERS = _LAMBDA_TAKERS_KNOWN
     return _LAMBDA_TAKERS
 

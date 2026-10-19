@@ -581,9 +581,15 @@ def test_a_call_returning_text_beside_text_is_not_refused_for_being_unknown():
                        "list_transform([region], x -> upper(x))[1] = 'NORTH'",  # a lambda DuckDB takes
                        "list_filter([region], x -> x = 'north')[1] = 'north'",
                        "array_apply([region], x -> upper(x))[1] = 'NORTH'",  # the catalogue's list, not a typed one
-                       "list_sort([region])[1] = region"):  # takes no lambda, reads the column
+                       "list_sort([region])[1] = region",  # takes no lambda, reads the column
+                       "json_value(attrs, '$.a') = region"):  # returns VARCHAR: the catalogue, not the json_ prefix
         assert con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall() is not None
         assert isinstance(_decide(row_filter), Approved), row_filter
+    # The typed lists stand in where the catalogue cannot be asked; on this engine they are it.
+    from mnemiq.sql.rls import _JSON_RETURNERS_KNOWN, _LAMBDA_TAKERS_KNOWN, _json_returners, _lambda_takers
+
+    assert _json_returners() == _JSON_RETURNERS_KNOWN
+    assert _lambda_takers() == _LAMBDA_TAKERS_KNOWN
     # Residuals the gate named (pre-existing): a lambda DuckDB takes is not read for JSON
     # unification inside its body, `list_transform([region], x -> x = to_json(id))[1]`, where
     # `x` is the list's element and the reader does not type a lambda's parameter; and
