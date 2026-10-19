@@ -555,6 +555,10 @@ def test_a_doubled_quote_in_a_member_name_is_read_and_an_unreadable_declared_typ
     "[region] = json_extract(attrs, ['$.a'])",
     "[[region]] = [json_extract(attrs, ['$.a'])]",
     "[region] = json_extract(attrs, ['$.a']::VARCHAR[])",  # a list of paths not spelled as a list
+    # Codex's twenty-second review: the json extension's aggregate macros carry no return type
+    # in the catalogue, and a text extract loses its type before an implicit conversion.
+    "region = (SELECT json_group_array(id) FROM claim)",
+    "list_contains([region], (SELECT json_group_structure(attrs) FROM claim))",
 ])
 def test_a_call_returning_json_beside_text_is_read_as_json(row_filter):
     """Codex's nineteenth review of #160: `to_json(id)` was of unknown type, and unknown beside
@@ -568,6 +572,23 @@ def test_a_call_returning_json_beside_text_is_read_as_json(row_filter):
         con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
     verdict = _decide(row_filter)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (row_filter, verdict)
+
+
+def test_a_text_extract_is_typed_text_so_a_conversion_beside_it_is_read():
+    """Codex's twenty-second review of #160: `(attrs ->> '$.a') = 7` was approved, the extract
+    being of unknown type, and DuckDB converts the extracted text to a number on the row."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON); "
+                "INSERT INTO claim VALUES (1, 'north', '{\"a\": \"hidden\"}'::JSON)")
+    for raising in ("(attrs ->> '$.a') = 7", "json_extract_string(attrs, '$.a') = 7",
+                    "json_extract_path_text(attrs, '$.a') = 1"):
+        with pytest.raises(duckdb.Error, match="Could not convert"):
+            con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
+        verdict = _decide(raising)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (raising, verdict)
+    for running in ("(attrs ->> '$.a') = 'x'", "json_extract_string(attrs, ['$.a']) = ['x']"):
+        assert con.execute(f"SELECT id FROM claim WHERE {running}").fetchall() == []
+        assert isinstance(_decide(running), Approved), running
 
 
 def test_a_call_returning_text_beside_text_is_not_refused_for_being_unknown():
@@ -586,9 +607,9 @@ def test_a_call_returning_text_beside_text_is_not_refused_for_being_unknown():
         assert con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall() is not None
         assert isinstance(_decide(row_filter), Approved), row_filter
     # The typed lists stand in where the catalogue cannot be asked; on this engine they are it.
-    from mnemiq.sql.rls import _JSON_RETURNERS_KNOWN, _LAMBDA_TAKERS_KNOWN, _json_returners, _lambda_takers
+    from mnemiq.sql.rls import _JSON_MACROS, _JSON_RETURNERS_KNOWN, _LAMBDA_TAKERS_KNOWN, _json_returners, _lambda_takers
 
-    assert _json_returners() == _JSON_RETURNERS_KNOWN
+    assert _json_returners() == _JSON_RETURNERS_KNOWN | _JSON_MACROS  # the macros carry no catalogue type
     assert _lambda_takers() == _LAMBDA_TAKERS_KNOWN
     # Residuals the gate named (pre-existing): a lambda DuckDB takes is not read for JSON
     # unification inside its body, `list_transform([region], x -> x = to_json(id))[1]`, where

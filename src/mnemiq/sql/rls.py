@@ -339,6 +339,14 @@ _JSON_RETURNERS_KNOWN = frozenset({"to_json", "row_to_json", "array_to_json", "j
                                    "json_serialize_sql", "json_serialize_plan"})
 _JSON_RETURNERS: frozenset[str] | None = None
 _JSON_EXTRACTS = frozenset({"json_extract", "json_extract_path"})
+# The json extension's aggregate macros, which the catalogue lists with no return type (Codex's
+# twenty-second review of #160: `region = (SELECT json_group_array(id) FROM claim)` approved,
+# region parsed as JSON on the row): typed JSON by name.
+_JSON_MACROS = frozenset({"json_group_array", "json_group_object", "json_group_structure"})
+# The extracts that return text, VARCHAR or VARCHAR[] by the path's shape (the same review:
+# `(attrs ->> '$.a') = 7` approved, the text converted to a number on the row).
+_TEXT_EXTRACT_NODES = (exp.JSONExtractScalar,)
+_TEXT_EXTRACT_NAMES = frozenset({"json_extract_string", "json_extract_path_text"})
 
 
 def _json_returners() -> frozenset[str]:
@@ -349,7 +357,7 @@ def _json_returners() -> frozenset[str]:
         try:
             rows = _duckdb_rows("SELECT DISTINCT lower(function_name) FROM duckdb_functions() "
                                 "WHERE return_type IN ('JSON', 'JSON[]')")
-            _JSON_RETURNERS = frozenset(name for (name,) in rows) or _JSON_RETURNERS_KNOWN
+            _JSON_RETURNERS = (frozenset(name for (name,) in rows) or _JSON_RETURNERS_KNOWN) | _JSON_MACROS
         except Exception:  # noqa: BLE001 -- the catalogue could not be asked: the typed list
             logger.warning("DuckDB's catalogue could not be asked which calls return JSON; "
                            "the typed list stands in (M159)")
@@ -362,20 +370,31 @@ def _is_json_call(node: exp.Expression) -> bool:
         isinstance(node, exp.Anonymous) and node.name.lower() in _json_returners())
 
 
+def _is_text_extract(node: exp.Expression) -> bool:
+    return isinstance(node, _TEXT_EXTRACT_NODES) or (
+        isinstance(node, exp.Anonymous) and node.name.lower() in _TEXT_EXTRACT_NAMES)
+
+
+def _is_typed_call(node: exp.Expression) -> bool:
+    """A call whose type is known here without running it: a JSON returner or a text extract."""
+    return _is_json_call(node) or _is_text_extract(node)
+
+
 def _json_call_type(node: exp.Expression) -> str:
     """JSON, or JSON[] for an extract whose path is anything but one string literal
     (`json_extract(x, ['$.a'])` is JSON[] to DuckDB, and so is a cast or a column holding a
     list of paths; typed as a scalar it unified with `[region]` as a list of text would not:
     the review gate on the twentieth and twenty-first rounds). A path of unknown shape is read
     as a list, fail-closed: a scalar extract beside text is then refused as a list would be."""
+    leaf = "VARCHAR" if _is_text_extract(node) else "JSON"
     path = None
-    if isinstance(node, exp.JSONExtract):
+    if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
         path = node.expression
-    elif isinstance(node, exp.Anonymous) and node.name.lower() in _JSON_EXTRACTS:
+    elif isinstance(node, exp.Anonymous) and node.name.lower() in _JSON_EXTRACTS | _TEXT_EXTRACT_NAMES:
         path = node.expressions[1] if len(node.expressions) > 1 else None
     if path is None or (isinstance(path, exp.Literal) and path.is_string) or isinstance(path, exp.JSONPath):
-        return "JSON"
-    return "JSON[]"
+        return leaf
+    return leaf + "[]"
 
 
 # The calls DuckDB hands a lambda to. Anywhere else `a -> b` is DuckDB's JSON extract, which
@@ -505,7 +524,13 @@ def _type_of_value(value: exp.Expression, type_of, engine: str) -> exp.DataType 
     known = _known_type(value, type_of, engine)
     if known is not None or engine != "duckdb":
         return known
-    kind = _pure_type(value, type_of)
+    if isinstance(value, exp.Subquery) and isinstance(value.this, exp.Select) and len(value.this.selects) == 1:
+        # A scalar subquery is its one projection's type, the projection alone handed to the
+        # probe, never the subquery, whose FROM would run (as `_duckdb_type` reads it): `region
+        # = (SELECT json_group_array(id) FROM claim)` (Codex's twenty-second review of #160).
+        kind = _pure_type(value.this.selects[0].unalias(), type_of)
+    else:
+        kind = _pure_type(value, type_of)
     if kind is None:
         return None
     try:
@@ -552,9 +577,9 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
         value = value.this
     # A call that returns JSON is a typed NULL to the probe, as a column is: nothing of it runs,
     # and what it holds (`to_json(id)` beside `[region]`) is JSON to DuckDB's unification.
-    json_calls = [node for node in value.walk() if _is_json_call(node)]
+    json_calls = [node for node in value.walk() if _is_typed_call(node)]
     inside_a_json_call = {id(inner) for call in json_calls for inner in call.walk() if inner is not call}
-    if not all(id(node) in inside_a_json_call or _is_json_call(node)
+    if not all(id(node) in inside_a_json_call or _is_typed_call(node)
                or isinstance(node, (*_PURE, *_PURE_CALL_NODES)) or (
                isinstance(node, exp.Anonymous)
                and node.name.lower() in _LIST_CONSTRUCTORS | _PURE_CALLS)
@@ -586,10 +611,10 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     if None in declared or None in key_types:
         return None
     typed_nulls = value.copy()
-    if _is_json_call(typed_nulls):
+    if _is_typed_call(typed_nulls):
         typed_nulls = exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(typed_nulls)))
-    for call in list(typed_nulls.find_all(*_JSON_CALL_NODES, exp.Anonymous)):
-        if _is_json_call(call):
+    for call in list(typed_nulls.find_all(*_JSON_CALL_NODES, *_TEXT_EXTRACT_NODES, exp.Anonymous)):
+        if _is_typed_call(call):
             call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(call))))
     for column, kind_of in zip(list(typed_nulls.find_all(exp.Column)), declared):
         column.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
