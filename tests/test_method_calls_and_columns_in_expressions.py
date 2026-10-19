@@ -172,6 +172,88 @@ def test_a_write_reading_through_either_spelling_is_refused(con, sql, code):
         assert isinstance(verdict, Refusal) and verdict.code is code, (sql, verdict)
 
 
+@pytest.mark.parametrize("sql", [
+    "INSERT INTO sink (s) SELECT COLUMNS('ecr') FROM claim",
+    "INSERT INTO sink (s) SELECT COLUMNS('ecr') FROM claim UNION ALL SELECT 'x'",
+    "INSERT INTO sink (s) SELECT * FROM (SELECT COLUMNS('ecr') FROM claim) d",
+    "WITH w AS (SELECT COLUMNS('ecr') FROM claim) INSERT INTO sink (s) SELECT * FROM w",
+    "INSERT INTO sink (s) SELECT d.secret FROM (SELECT COLUMNS('ecr') FROM claim) d",
+    "INSERT INTO sink SELECT * FROM claim",
+    "INSERT INTO sink SELECT c.* FROM claim c",
+    "INSERT INTO sink SELECT * FROM (SELECT * FROM claim) d",
+    "INSERT INTO sink (s) SELECT d.secret FROM (SELECT * FROM claim) d",
+    "WITH w AS (SELECT * FROM claim) INSERT INTO sink (s) SELECT w.secret FROM w",
+    "INSERT INTO sink (s) SELECT (SELECT * FROM (SELECT secret FROM claim) d)",
+    "UPDATE sink SET s = (SELECT * FROM (SELECT secret FROM claim) d) WHERE i = 1",
+    "DELETE FROM sink WHERE s IN (SELECT * FROM (SELECT secret FROM claim) d)",
+])
+def test_a_write_through_a_star_or_a_bare_columns_is_refused(con, sql):
+    # Codex's second review of #169 (a bare COLUMNS in an INSERT's source) and M195 (a star): a
+    # write's INSERT source has no outermost star check, so each of these copied the withheld
+    # value into a table the grant reads.
+    con.execute("CREATE TABLE sink (i INT, s VARCHAR, j STRUCT(ssn VARCHAR)); INSERT INTO sink VALUES (1, 'x', NULL)")
+    con.execute(sql)
+    assert "CLAIM-SECRET" in str(con.execute("SELECT s FROM sink").fetchall()).upper() or sql.startswith("DELETE")
+    schema = {**FULL, "sink": {"i", "s", "j"}}
+    hidden = _decide_write(sql, {**HIDDEN, "sink": {"i", "s", "j"}}, AccessPolicy(policy_schema=schema))
+    denied = _decide_write(sql, schema, AccessPolicy(denied={("claim", "secret")}, policy_schema=schema))
+    masked = _decide_write(sql, schema, AccessPolicy(masked={("claim", "secret")}, policy_schema=schema))
+    for verdict in (hidden, denied, masked):
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
+def test_a_write_naming_its_columns_keeps_count_star_and_exists_star(con):
+    con.execute("CREATE TABLE sink (i INT, s VARCHAR, j STRUCT(ssn VARCHAR)); INSERT INTO sink VALUES (1, 'x', NULL)")
+    schema = {**FULL, "sink": {"i", "s", "j"}}
+    for sql in ("INSERT INTO sink (i) SELECT COUNT(*) FROM claim",
+                "DELETE FROM sink WHERE EXISTS (SELECT * FROM claim WHERE claim.id = sink.i)",
+                "INSERT INTO sink (s) SELECT secret FROM claim"):
+        con.execute(sql)
+        verdict = _decide_write(sql, schema, AccessPolicy(policy_schema=schema))
+        assert not isinstance(verdict, Refusal), (sql, verdict)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT (SELECT * FROM one LIMIT 1) AS s FROM claim",
+    "SELECT id FROM claim WHERE (SELECT * FROM one LIMIT 1) LIKE 'ONE%'",
+    "SELECT id FROM claim WHERE secret IN (SELECT * FROM one)",
+    "SELECT id FROM claim WHERE secret = ANY (SELECT * FROM one)",
+    "SELECT (SELECT * FROM (SELECT secret FROM one) d LIMIT 1) AS s FROM claim",
+    "SELECT ((SELECT * FROM one LIMIT 1)) AS s FROM claim",
+])
+def test_a_star_in_a_scalar_or_in_subquery_is_refused_as_unnamed(con, sql):
+    # M196: a one-column table's star in a scalar subquery names no Column, and neither the
+    # outermost star check nor the resolver reads it, so the value came back under every case.
+    con.execute("CREATE TABLE one (secret VARCHAR); INSERT INTO one VALUES ('ONE-SECRET')")
+    rows = str(con.execute(sql).fetchall()).upper()
+    assert "ONE-SECRET" in rows or sql.split(" FROM ")[0] == "SELECT id", (sql, rows)
+    schema = {**FULL, "one": {"secret"}}
+    hidden = _decide(sql, {**FULL, "one": set()}, policy=AccessPolicy(policy_schema=schema))
+    denied = _decide(sql, schema, policy=AccessPolicy(denied={("one", "secret")}, policy_schema=schema))
+    masked = _decide(sql, schema, policy=AccessPolicy(masked={("one", "secret")}, policy_schema=schema))
+    for verdict in (hidden, denied, masked):
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
+def test_a_star_the_resolver_or_the_star_check_reads_is_left_to_them(con):
+    con.execute("CREATE TABLE one (secret VARCHAR); INSERT INTO one VALUES ('ONE-SECRET')")
+    schema = {**FULL, "one": {"secret"}}
+    granted = AccessPolicy(policy_schema=schema)
+    for sql in ("SELECT id FROM claim WHERE EXISTS (SELECT * FROM one)",
+                "SELECT d.secret FROM (SELECT * FROM one) d",
+                "WITH w AS (SELECT * FROM one) SELECT w.secret FROM w",
+                "SELECT d.secret FROM ((SELECT * FROM one)) d",
+                "SELECT id FROM claim, LATERAL (SELECT * FROM one) l",
+                "SELECT COUNT(*) AS n FROM one"):
+        con.execute(sql)
+        assert isinstance(_decide(sql, schema, policy=granted), Approved), sql
+    for sql in ("SELECT d.secret FROM (SELECT * FROM one) d", "WITH w AS (SELECT * FROM one) SELECT w.secret FROM w"):
+        denied = _decide(sql, schema, policy=AccessPolicy(denied={("one", "secret")}, policy_schema=schema))
+        assert isinstance(denied, Refusal) and denied.code is not RefusalCode.SELECT_STAR, (sql, denied)
+    outermost = _decide("SELECT * FROM one", schema, policy=granted)
+    assert isinstance(outermost, Refusal) and outermost.code is RefusalCode.SELECT_STAR, outermost
+
+
 def test_columns_as_a_bare_projection_of_a_derived_table_is_still_read(con):
     # The resolver reads a bare COLUMNS projection (#167); only the expression spellings go.
     sql = "SELECT d.id FROM (SELECT COLUMNS('id') FROM claim) d"

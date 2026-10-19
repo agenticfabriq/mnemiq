@@ -237,7 +237,8 @@ def check_write_shape(sql: str, dialect: str = "duckdb",
                       executes_as: str | None = None) -> exp.Expression | Refusal:
     """One bounded DML statement, or a Refusal. UPDATE/DELETE must be bounded by a WHERE. A
     read no node names (a method call, a COLUMNS inside an expression) is refused here as on the
-    read side, before any check runs, for the engine that executes (M192, M193)."""
+    read side, before any check runs, for the engine that executes (M192, M193); in a write every
+    star and every COLUMNS are, since no check expands them (M195)."""
     try:
         statements = [s for s in sqlglot.parse(sql, read=dialect) if s is not None]
     except Exception:
@@ -280,7 +281,7 @@ def check_write_shape(sql: str, dialect: str = "duckdb",
             code=RefusalCode.UNBOUNDED_WRITE,
             message="An UPDATE or DELETE must have a WHERE clause; an unbounded mutation is refused.",
         )
-    unnamed = unnamed_read(ast, executes_as or dialect)
+    unnamed = unnamed_read(ast, executes_as or dialect, write=True)
     if unnamed is not None:
         return unnamed
     return ast

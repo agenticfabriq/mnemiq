@@ -231,7 +231,7 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
     return []
 
 
-def unnamed_read(ast: exp.Expression, engine: str) -> Refusal | None:
+def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refusal | None:
     """Two DuckDB spellings that read a column no node names, so no grant, deny or mask check
     sees the read; refused before any check runs, by both deciders (M192, M193: measured on
     DuckDB 1.5.4, each returned a withheld value under deny, under mask and hidden with the
@@ -260,6 +260,20 @@ def unnamed_read(ast: exp.Expression, engine: str) -> Refusal | None:
     COLUMNS('ecr') LIKE 'Z%'`, `struct_pack(COLUMNS('e'))`, `concat(*COLUMNS('e'))`) the engine
     expands it into reads of columns that appear in no node. Every COLUMNS that is not a bare
     projection is refused, the qualified `x.COLUMNS(...)` spelling (a Dot over a call) with it.
+
+    A star is read by three things only: the outermost star check (`_has_projection_star`),
+    the resolver for a derived table or a CTE the outer query reads by name, and nothing else.
+    A star in a scalar subquery or an IN list is in none of them, and its Select names no
+    Column: `SELECT (SELECT * FROM one LIMIT 1) AS s FROM pub` over a one-column table
+    returned the withheld value hidden, denied and masked, and `WHERE (SELECT * FROM one LIMIT
+    1) LIKE 'Z%'` was an oracle (M196). Every star whose query is not the outermost one, a
+    derived table, a CTE, an EXISTS or `COUNT(*)` is refused. In a write (`write=True`, the
+    write decider's shape check) the outermost, derived and CTE readings do not exist either:
+    the INSERT's source has no outermost check, so `INSERT INTO sink SELECT * FROM claim` and
+    `INSERT INTO sink SELECT COLUMNS('secret') FROM claim` were approved and copied the
+    withheld value into a table the same grant reads (Codex's second review of #169; M195).
+    Every star but `COUNT(*)` and an EXISTS's, and every COLUMNS, is refused there: a write
+    names every column it reads.
     """
     for dot in ast.find_all(exp.Dot):
         if isinstance(dot.expression, exp.Anonymous) and str(dot.expression.this).upper() == "COLUMNS":
@@ -280,7 +294,8 @@ def unnamed_read(ast: exp.Expression, engine: str) -> Refusal | None:
                 subject=dot.this.sql(),
             )
     for expansion in ast.find_all(exp.Columns):
-        if isinstance(expansion.parent, exp.Select) or expansion.find_ancestor(exp.Pivot) is not None:
+        if not write and (isinstance(expansion.parent, exp.Select)
+                          or expansion.find_ancestor(exp.Pivot) is not None):
             continue  # a bare projection, read by the resolver; a PIVOT, refused as unmodelled
         return Refusal(
             code=RefusalCode.SELECT_STAR,
@@ -296,7 +311,51 @@ def unnamed_read(ast: exp.Expression, engine: str) -> Refusal | None:
                          "see. Use it only as a projection on its own, or name the columns."),
                 subject=call.sql(),
             )
+    for star in ast.find_all(exp.Star):
+        if _star_is_read(star, write):
+            continue
+        return Refusal(
+            code=RefusalCode.SELECT_STAR,
+            message=("`*` here expands to columns no check can see: a star is read only as the "
+                     "outermost projection, in a derived table or a CTE the query reads by "
+                     "name, under EXISTS or as COUNT(*), and in a write only as the last two. "
+                     "Name the columns in the subquery or the IN list instead."),
+            subject=star.parent.sql() if isinstance(star.parent, exp.Column) else star.sql(),
+        )
     return None
+
+
+def _star_is_read(star: exp.Star, write: bool) -> bool:
+    """Whether some check reads this star: `COUNT(*)`; the projection of an EXISTS; and, on
+    the read side only, the outermost query's (the star check), a derived table's or a CTE's
+    (the resolver, where the outer query names what it reads). A star anywhere else, a scalar
+    subquery, an IN list, a value in parentheses, an INSERT's source, is read by nothing."""
+    holder = star.parent
+    if isinstance(holder, exp.Column):
+        holder = holder.parent  # `t.*`
+    if isinstance(holder, exp.Count):
+        return True
+    if star.find_ancestor(exp.Pivot) is not None:
+        return True  # a PIVOT or UNPIVOT source is refused as unmodelled, with its own code
+    if not isinstance(holder, exp.Select):
+        return False
+    query = holder
+    while isinstance(query.parent, (exp.SetOperation, exp.Paren)):
+        query = query.parent
+    outer = query.parent
+    if isinstance(outer, exp.Exists):
+        return True
+    if write:
+        return False
+    if outer is None:
+        return True  # the outermost projection: `_has_projection_star` rules on it
+    if isinstance(outer, exp.CTE):
+        return True
+    while isinstance(outer, exp.Subquery) and isinstance(outer.parent, exp.Subquery):
+        outer = outer.parent  # `((SELECT ...)) d` nests Subquery in Subquery
+    if isinstance(outer, exp.Subquery):
+        return isinstance(outer.parent, (exp.From, exp.Join, exp.Lateral))
+    return False
 
 
 def _is_star(projection: exp.Expression) -> bool:
