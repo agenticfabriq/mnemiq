@@ -379,6 +379,15 @@ def _map_key(item: exp.PropertyEQ) -> exp.Expression:
     return key
 
 
+def _untypable(value: exp.Expression, type_of, engine: str) -> bool:
+    """Whether the value's type cannot be told (a call, a subquery with an aggregate) or cannot
+    be read: asked of DuckDB's own grammar where DuckDB executes, of the reader here elsewhere."""
+    if engine == "duckdb":
+        kind = _duckdb_type(value, type_of)
+        return kind is None or kind is _UNREADABLE
+    return _type_of_value(value, type_of, engine) is None
+
+
 def _type_of_value(value: exp.Expression, type_of, engine: str) -> exp.DataType | None:
     """A value's type as the reader here knows it, else as DuckDB types a pure expression (a
     list element or a struct field read out of a container, `[attrs][1]`, `({'a': attrs}).a`,
@@ -1003,12 +1012,14 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
                 if _values_coerce_to_json(pair, type_of, engine) or _json_inside_a_container(pair, type_of):
                     return node
                 lists = pair if pairs else [element]
-                if any(_type_of_value(value, type_of, engine) is None for value in lists):
+                if any(_untypable(value, type_of, engine) for value in lists):
                     # A list the reader cannot type (`list_distinct([attrs])`, a call) may hold
                     # JSON, and the search would parse what it looks for (the review gate on
                     # e12b82d): refused, fail-closed. The value searched for, where untyped
                     # beside a JSON element, is refused above, and beside a text element it
-                    # parses nothing.
+                    # parses nothing. Typed in DuckDB's own grammar: sqlglot's DataType does
+                    # not read `STRUCT(INTEGER, "NULL"[])`, which `row(id, [])` is, and the
+                    # valid search over it was refused (Codex's eighteenth review of #160).
                     return node
         if engine == "duckdb" and (isinstance(node, (exp.Array, exp.ToMap)) or (
                 isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_CONSTRUCTORS)):

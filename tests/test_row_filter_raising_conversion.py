@@ -515,18 +515,22 @@ def test_a_doubled_quote_in_a_member_name_is_read_and_an_unreadable_declared_typ
     assert _parse_type('STRUCT("NULL", INTEGER)') == ("struct", [(None, ("leaf", '"NULL"', "")), (None, ("leaf", "INTEGER", ""))])
     assert _parse_type('STRUCT(INTEGER, "NULL"[])') == ("struct", [(None, ("leaf", "INTEGER", "")), (None, ("array", ("leaf", '"NULL"', "")))])
     for valid in ("row(NULL, id) = row(NULL, 1)", "list_contains([row(NULL, id)], row(NULL, 1))",
-                  "CASE WHEN id = 1 THEN row(id, []) ELSE row(1, [2]) END IS NOT NULL"):
+                  "CASE WHEN id = 1 THEN row(id, []) ELSE row(1, [2]) END IS NOT NULL",
+                  # Codex's eighteenth review: the list search's element typed by sqlglot, not DuckDB
+                  "list_contains([row(id, [])], row(id, []))", "list_position([row(id, [])], row(1, [])) = 1"):
         assert con.execute(f"SELECT id FROM claim WHERE {valid}").fetchall() == [(1,)], valid
         assert isinstance(_decide(valid, snapshot=_snapshot(types)), Approved), valid
     # A declared type the reader cannot parse at all is refused, not read as an unknown value
     # (asked of the readers directly: a snapshot type sqlglot cannot parse never reaches them).
-    from mnemiq.sql.rls import _UNREADABLE, _duckdb_type, _json_inside_a_container
+    from mnemiq.sql.rls import _UNREADABLE, _duckdb_type, _json_inside_a_container, _untypable
     import sqlglot
 
     u1, u2 = (sqlglot.parse_one(name, read="duckdb") for name in ("u1", "u2"))
     unreadable = lambda column: "UNION(a JSON" if column.name == "u1" else declared["u2"]  # noqa: E731
     assert _duckdb_type(u1, unreadable) is _UNREADABLE
     assert _json_inside_a_container([u1, u2], unreadable) is True
+    assert _untypable(u1, unreadable, "duckdb") is True  # a list search over it is refused too
+    assert _untypable(u2, unreadable, "duckdb") is False
 
 
 def test_duckdb_s_types_are_read_in_duckdb_s_own_grammar():
