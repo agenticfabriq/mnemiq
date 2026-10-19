@@ -484,6 +484,9 @@ _LIST_SEARCH_NAMES = frozenset({"list_has", "array_has", "list_position", "list_
                                 "array_indexof", "list_has_all", "array_has_all", "list_has_any",
                                 "array_has_any", "array_contains", "list_contains"})
 _LIST_PAIR_NAMES = frozenset({"list_has_all", "array_has_all", "list_has_any", "array_has_any"})
+# A map looked up by a key, which DuckDB converts to the map's key type (Codex's eleventh
+# review of #160: `element_at(MAP([attrs], [1]), region)` parses region as JSON on every row).
+_MAP_LOOKUPS = frozenset({"element_at", "map_extract", "map_extract_value"})
 _CONTAINERS = (exp.DataType.Type.ARRAY, exp.DataType.Type.LIST, exp.DataType.Type.STRUCT,
                exp.DataType.Type.MAP)
 
@@ -782,6 +785,25 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
                 or _json_inside_a_container(_branches(node), type_of)
                 or _literal_cannot_convert(node, type_of, engine)):
             return node
+        if engine == "duckdb" and (isinstance(node, exp.Bracket) or (
+                isinstance(node, exp.Anonymous) and node.name.lower() in _MAP_LOOKUPS)):
+            # A map looked up by a key: the key is converted to the map's key type, so a text
+            # key beside a JSON-keyed map is parsed on every row (Codex's eleventh review of
+            # #160). The map is typed by DuckDB; its key type stands in for the map beside
+            # the key under both readings. A list subscripted by a number converts nothing.
+            if isinstance(node, exp.Bracket):
+                container, key = node.this, (node.expressions[0] if node.expressions else None)
+            else:
+                operands = list(node.expressions)
+                container, key = (operands + [None, None])[:2]
+            kind = _type_of_value(container, type_of, engine) if container is not None else None
+            if (key is not None and kind is not None and kind.this == exp.DataType.Type.MAP
+                    and kind.expressions and isinstance(kind.expressions[0], exp.DataType)):
+                key_type = exp.Cast(this=exp.Null(), to=kind.expressions[0].copy())
+                key_type.parent = node
+                pair = [key_type, key]
+                if _values_coerce_to_json(pair, type_of, engine) or _json_inside_a_container(pair, type_of):
+                    return node
         if engine == "duckdb" and (isinstance(node, _LIST_SEARCHES) or (
                 isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_SEARCH_NAMES)):
             # A list search unifies the list's element type with what is searched for, or with

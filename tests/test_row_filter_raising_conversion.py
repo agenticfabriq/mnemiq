@@ -217,6 +217,11 @@ RAISING_TYPED_FORMS = [
     "contains([attrs], region)",
     "[region] <@ [attrs]",
     "list_contains(list_distinct([attrs]), region)",
+    # Codex's eleventh review: a map looked up by a key converts the key to the map's key type.
+    "element_at(MAP(['{}'::JSON], [1]), region) = [1]",
+    "map_extract_value(MAP(['{}'::JSON], [1]), region) = 1",
+    "MAP(['{}'::JSON], [1])[region] = 1",
+    "map_extract(MAP(['{}'::JSON], [1]), region) = [1]",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -271,6 +276,10 @@ SAFE_TYPED_FORMS = [
     "contains(attrs, 'x')",  # the string search over a JSON column (the review gate)
     "contains(region, lower('X'))",
     "list_contains([region], lower(region))",
+    "element_at(MAP(['{}'::JSON], [1]), TRY_CAST(region AS JSON)) = [1]",
+    "element_at(MAP([region], [1]), 'x') = [1]",
+    "MAP([region], [1])['x'] = 1",
+    "[attrs][1] IS NOT NULL",
     "COALESCE([attrs][1], attrs) IS NOT NULL",
     "CASE WHEN id = 1 THEN {'a': attrs, 'b': 1.5} ELSE {'a': attrs, 'b': 10.25} END IS NOT NULL",
     "CASE WHEN id = 1 THEN {'a': attrs, 'b': region} ELSE {'b': region, 'a': attrs} END IS NOT NULL",
