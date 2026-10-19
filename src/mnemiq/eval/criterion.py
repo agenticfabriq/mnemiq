@@ -23,7 +23,7 @@ from sqlglot.schema import MappingSchema
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables, column_tables
+from mnemiq.sql.scope import base_tables, column_tables, known_columns
 
 # ("filter", object) | ("mask", object) -- option (a), table-granular, matching `Narrowing`.
 # The kind tag is not decoration: without it an implementation rendering a row-filtered object as
@@ -103,8 +103,9 @@ def touched(ast: exp.Expression, policy: AccessPolicy, schema=None, dialect=None
     """What the policy narrows in what the plan REFERENCED.
 
     `schema` is the caller's visible map -- the same one the disclosure path gets. Omitting it
-    measures the plan exactly as written, which reports every unqualified masked reference as
-    unattributable.
+    measures the plan with the policy's own pairs as the schema, which attributes an unqualified
+    masked reference to the one table of its scope the policy names with it, and reports it
+    unattributable where none or two do.
 
     `dialect` is the ENGINE the answer ran against, and it has to be the same one the disclosure
     path resolved with. Leaving it off made the instrument disagree with what it measures: a quoted
@@ -148,7 +149,11 @@ def touched(ast: exp.Expression, policy: AccessPolicy, schema=None, dialect=None
     # exactly what was. On `SELECT bogus.ssn FROM claim` it answers `{claim}`, a definite single
     # object, where `column_tables` records nothing; keying on it would mark the reference
     # attributable and score the answer green unmeasured.
-    owners = column_tables(ast, dialect)
+    # The schema the resolver binds a derived table's star through (M181): the visible map with
+    # the policy's columns, as the deciders read it, so `d.secret` over `(SELECT * FROM wide JOIN
+    # claim) d` is claim's masked column here as there, and the measurement agrees with the
+    # disclosure it scores (the review gate on #167).
+    owners = column_tables(ast, dialect, known_columns(schema, policy))
     unattributable: list[str] = []
     for column in ast.find_all(exp.Column):
         name = column.name.lower()

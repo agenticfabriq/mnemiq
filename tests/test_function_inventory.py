@@ -194,17 +194,20 @@ def test_decide_actually_asks_the_adapter(source_defining_nothing):
     assert "unconfirmed-function-identity" in blind.reasons
 
 
-@pytest.mark.parametrize("sql", [
+@pytest.mark.parametrize("sql, code", [
     # A column list is `ident(`, so counting tokens against the parser's call count inflated the
     # tally and hid one unnamed call. Both of these returned COMPLETE while executing a macro
-    # that read another table.
-    "SELECT replace(name, 'a', 'b') FROM customer AS c(id, name)",
-    "WITH x(name) AS (SELECT name FROM customer) SELECT replace(name, 'a', 'b') FROM x",
+    # that read another table. The list on a base table now falls to the shape check first: it
+    # renames the table's columns by position (M184), so the macro is never asked about.
+    ("SELECT replace(name, 'a', 'b') FROM customer AS c(id, name)", "SELECT_STAR"),
+    ("WITH x(name) AS (SELECT name FROM customer) SELECT replace(name, 'a', 'b') FROM x",
+     "UNRESOLVABLE_CALLS"),
     # Written `len`, executed `LENGTH`. The source binds what executes, and no source defines
     # `len`, so reading only the written spelling cleared a macro named `length`.
-    "SELECT len(name) FROM customer",
+    ("SELECT len(name) FROM customer", "UNRESOLVABLE_CALLS"),
 ])
-def test_a_shadowing_macro_is_caught_however_the_call_is_spelled(sql, source_with_a_shadowing_macro):
+def test_a_shadowing_macro_is_caught_however_the_call_is_spelled(sql, code,
+                                                                  source_with_a_shadowing_macro):
     """Three shapes that each returned `complete` while reading an SSN from another table.
 
     All three are M56, and all three were introduced by successive attempts to name the call:
@@ -224,7 +227,7 @@ def test_a_shadowing_macro_is_caught_however_the_call_is_spelled(sql, source_wit
     verdict = decide(sql, {"customer": {"id", "name"}},
                      adapter=DuckDBAdapter.duckdb(source_with_a_shadowing_macro),
                      dialect="duckdb", target="duckdb")
-    assert getattr(verdict, "code", None) is RefusalCode.UNRESOLVABLE_CALLS, verdict
+    assert getattr(verdict, "code", None) is RefusalCode[code], verdict
 
 
 @pytest.mark.parametrize("sql", [

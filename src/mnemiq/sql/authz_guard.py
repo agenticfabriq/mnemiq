@@ -6,8 +6,9 @@ from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
 from mnemiq.sql.functions import FunctionInventory, UnreadableCalls, called_names
+from mnemiq.sql.identifiers import resolve_identifier, resolve_stored, rules_for
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables, candidate_tables, column_tables
+from mnemiq.sql.scope import GENERATED_NAME, base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -143,8 +144,14 @@ def _unknown_column(name: str) -> Refusal:
 
 
 def check_access(ast: exp.Expression, visible: dict[str, set[str]],
-                 dialect: str | None = None) -> Refusal | None:
+                 dialect: str | None = None,
+                 columns: dict[str, set[str]] | None = None) -> Refusal | None:
     """Re-check every table and column the query touches against what the identity may see.
+
+    `columns` is the schema the resolver binds a derived table's star through (M181): the grant's
+    and the policy's columns together, from `known_columns`, so a column hidden from this
+    identity still binds to the table that has it and is refused as unknown there; without it,
+    the grant's alone.
 
     `dialect` is the ENGINE that will run this, not the one it was parsed as. Identifier folding differs between them -- Oracle folds unquoted names up, the rest fold them down, and quoting is significant in Postgres and Oracle but not DuckDB -- so a resolver keyed on the wrong one answers for the wrong engine. Threading it to SOME call sites and not others is worse than either: `check_access` said a name was a CTE while the audit list said it was a base read, in the same statement.
 
@@ -156,7 +163,8 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     # set of CTE names -- because a reference inside a CTE body naming that same CTE reads the
     # base table, and skipping it let an ungranted table through (M31).
     alias_to_table: dict[str, str] = {}
-    resolved = column_tables(ast, dialect)
+    named: set[int] = set()
+    resolved = column_tables(ast, dialect, columns if columns is not None else visible, named=named)
     for table in base_tables(ast, dialect):
         name = object_key(table)
         if name not in visible:
@@ -174,37 +182,110 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     if not alias_to_table:
         return None  # a query over CTEs alone; their sources were checked above
 
+    # Names are compared as the engine resolves them where that is exact (M170): DuckDB and
+    # SQLite keep a name's case without telling names apart by it, so `SECRET` and a stored
+    # `Secret` are one column, and both sides fold. Where quoting keeps case (Postgres, Oracle)
+    # both sides stay as typed, as before: folding the stored side would let an unquoted
+    # spelling meet a column created with quotes, which the engine reads as ANOTHER column (the
+    # review gate's case, `"Amount"` beside `amount`), and the catalog boundary there -- table
+    # keys and row filters are as typed too -- is one decision, deferred to the register.
+    folds = not rules_for(dialect).quoting_preserves_case
+
+    def as_engine(names) -> set[str]:
+        return {resolve_stored(n, dialect) for n in names} | set(names) if folds else set(names)
+
+    def written(identifier: exp.Expression | None, text: str) -> str:
+        if folds and isinstance(identifier, exp.Identifier):
+            return resolve_identifier(identifier, dialect) or text
+        return text
+
     referenced = set(alias_to_table.values())
-    known_columns = {c for t in referenced for c in visible[t]}
+    known_columns = as_engine({c for t in referenced for c in visible[t]})
 
     # A SELECT alias is a name the query invents for an expression, and GROUP BY / ORDER BY /
     # HAVING may refer to it: `SELECT year(d) AS y, count(*) FROM t GROUP BY y` is ordinary,
     # correct SQL -- and without this the engine could not answer "count X by year" at all.
-    # It is safe: an alias can only be defined from columns that were themselves checked.
-    known_columns |= {alias.alias for alias in ast.find_all(exp.Alias) if alias.alias}
+    # It is safe: an alias can only be defined from columns that were themselves checked. The
+    # aliases of the reference's OWN SELECT, since no engine resolves a name to another scope's
+    # alias (the ui lane's replay of #167: statement-wide, `SELECT (SELECT max(secret) FROM
+    # claim) AS secret FROM wide` let the inner hidden `secret` through on the outer alias). In
+    # ORDER BY and HAVING, which sqlglot resolves to the projections before listing a scope's
+    # columns so the resolver never visits them, a name is also any column the SELECT projects
+    # by name (`ORDER BY d_week_seq1` over `SELECT d_week_seq1 ... FROM (...) y`), itself
+    # checked as a projection.
+    # Where the scopes could not be resolved at all, the statement-wide set stands, the rule the
+    # fallback has always had (TPC-DS q23 and q24, and a WITH inside an UPDATE's SET).
+    statement_aliases = {written(alias.args.get("alias"), alias.alias)
+                         for alias in ast.find_all(exp.Alias) if alias.alias}
+    own_aliases: dict[int, set[str]] = {}
+    own_outputs: dict[int, set[str]] = {}
+
+    def aliases_of(column: exp.Column) -> set[str]:
+        if resolved is None:
+            return statement_aliases
+        select = column.find_ancestor(exp.Select, exp.SetOperation)
+        while isinstance(select, (exp.SetOperation, exp.Subquery, exp.Paren)):
+            # A set operation's ORDER BY names its output, which is the first branch's (the
+            # review gate: `SELECT id AS x FROM claim UNION SELECT id FROM other ORDER BY x`),
+            # a parenthesised branch unwrapped (sqlglot reads it as a subquery).
+            select = select.left if isinstance(select, exp.SetOperation) else select.this
+        if not isinstance(select, exp.Select):
+            return set()
+        clause = column.find_ancestor(exp.Order, exp.Having, exp.Select, exp.SetOperation)
+        # A window's ORDER BY inside OVER (...) binds to source columns, not the output.
+        ordering = isinstance(clause, (exp.Order, exp.Having, exp.SetOperation)) and not (
+            isinstance(clause, exp.Order) and isinstance(clause.parent, (exp.Window, exp.WindowSpec)))
+        store = own_outputs if ordering else own_aliases
+        names = store.get(id(select))
+        if names is None:
+            names = set()
+            for projection in select.selects:
+                if isinstance(projection, exp.Alias) and projection.alias:
+                    names.add(written(projection.args.get("alias"), projection.alias))
+                elif store is own_outputs and isinstance(projection, exp.Column):
+                    names.add(written(projection.this, projection.name))
+            store[id(select)] = names
+        return names
 
     for column in ast.find_all(exp.Column):
+        name = written(column.this, column.name)  # the refusal keeps the spelling written
         qualifier = column.table
-        if qualifier:
-            # Resolved per scope, not from one flat map: an alias can name two different
-            # tables in one statement, and keeping only the last let a column be checked
-            # against the wrong one (Codex review, 2026-08-12).
-            if resolved is None:
-                # Unreadable scopes: fall back to the rule for an unqualified column rather
-                # than to the flat map that was the defect. Same guarantee, no worse.
-                if column.name not in known_columns:
-                    return _unknown_column(column.name)
-                continue
-            table = resolved.get(id(column))
-            if table is None:
-                continue  # qualifier belongs to a CTE or a subquery alias
-            if column.name not in visible[table]:
+        # Resolved per scope, not from one flat map: an alias can name two different tables in
+        # one statement, and keeping only the last let a column be checked against the wrong
+        # one (Codex review, 2026-08-12). An unqualified column resolves too where its scope's
+        # only source is a derived table (M181), so both spellings of a read through a star
+        # meet the same table here.
+        table = resolved.get(id(column)) if resolved is not None else None
+        if table is None and id(column) in named:
+            # A named projection of its own derived source, or a CTE's or LATERAL's column-list
+            # name (`WITH w(n) AS (SELECT 1) ... SELECT n FROM w`): the nodes it stands for are
+            # checked in that scope, and the name says nothing about a base table here.
+            continue
+        if table == GENERATED_NAME:
+            return Refusal(
+                code=RefusalCode.UNKNOWN_COLUMN,
+                message=(f"{column.name!r} is a name the engine makes up for a duplicate column "
+                         "of a subquery's output, which says nothing about which column is "
+                         "read. Alias each column of the subquery distinctly and read it by "
+                         "that name."),
+                subject=column.name,
+            )
+        if table is not None:
+            if name not in as_engine(visible[table]):
                 return Refusal(
                     code=RefusalCode.UNKNOWN_COLUMN,
                     message=f"{table!r} has no column {column.name!r}. Use only listed columns.",
                     subject=column.name,
                 )
-        elif column.name not in known_columns:
+        elif qualifier:
+            if resolved is None:
+                # Unreadable scopes: fall back to the rule for an unqualified column rather
+                # than to the flat map that was the defect. Same guarantee, no worse.
+                if name not in known_columns and name not in aliases_of(column):
+                    return _unknown_column(column.name)
+            # Else the qualifier names a CTE or a subquery alias whose own projection names the
+            # column, checked in that scope.
+        elif name not in known_columns and name not in aliases_of(column):
             return _unknown_column(column.name)
 
     return None
@@ -394,7 +475,8 @@ def check_unmodelled_calls(
     return None
 
 
-def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None) -> Refusal | None:
+def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None,
+                         columns: dict[str, set[str]] | None = None) -> Refusal | None:
     """Refuse a column whose stored expression this engine cannot attribute.
 
     A virtual column runs user code on read, and the statement never names it. MEASURED on
@@ -429,7 +511,14 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
     # Scope-aware, like `check_access` and `check_cls`. A flat alias map keyed on the written
     # case let `SELECT Q.leaked FROM vc_t Q` through while refusing the lowercase spelling, and
     # one alias meaning two tables across UNION branches changed the verdict with branch order.
-    resolved = column_tables(ast, dialect)
+    # The schema a derived star is read through (M181): the caller's (the grant's and the
+    # policy's columns, from `known_columns`) with the catalogue's pairs beside it, so a virtual
+    # column reached through `(SELECT * FROM plain JOIN vc_t) d` binds to the table that
+    # computes it rather than to a table the schema does not list, which would take any name.
+    schema: dict[str, set[str]] = {table: set(names) for table, names in (columns or {}).items()}
+    for table, name in opaque:
+        schema.setdefault(table, set()).add(name)
+    resolved = column_tables(ast, dialect, schema)
     local = {cte.alias_or_name for cte in ast.find_all(exp.CTE)}
     aliased = local | {s.alias_or_name for s in ast.find_all(exp.Subquery) if s.alias_or_name}
 

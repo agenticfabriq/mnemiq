@@ -336,7 +336,8 @@ def decide_write(
     if unsupported is not None:
         return unsupported
 
-    refusal = check_access(shaped, visible, target)  # every referenced table readable, cols exist
+    refusal = check_access(shaped, visible, target,  # every referenced table readable, cols exist
+                           columns=known_columns(visible, policy))
     if refusal is not None:
         return refusal
     # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
@@ -370,12 +371,14 @@ def decide_write(
     # And the column form, for the reason above stated once more: a write is the worse place to
     # lose it. `INSERT INTO notes SELECT id, leaked FROM vc_t` stores what the virtual column's
     # expression returned into a table the caller may read forever (M100, the M30 shape).
-    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target)
+    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target,
+                                    columns=known_columns(visible, policy))
     if computed is not None:
         return computed
 
     # A write needs RAW access: a masked column is treated as denied for writes.
-    write_cls = check_cls(shaped, AccessPolicy(denied=policy.denied | policy.masked), target)
+    write_cls = check_cls(shaped, AccessPolicy(denied=policy.denied | policy.masked), target,
+                          columns=known_columns(visible, policy))
     if write_cls is not None:
         return write_cls
 

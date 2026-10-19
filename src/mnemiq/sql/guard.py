@@ -83,6 +83,10 @@ def check_shape(
             ),
         )
 
+    positional = _bound_by_position(ast, executes_as or dialect, columns)
+    if positional is not None:
+        return positional
+
     # The schema said which of these are columns; qualifying them is what makes that answer
     # checkable by the engine rather than taken on trust (M90). Before `_with_limit` so the
     # returned tree is the one that runs, and before `check_cls` ever sees it -- a qualified
@@ -94,6 +98,116 @@ def check_shape(
     if not isinstance(shaped, Refusal):
         shaped.meta["null_order_written"] = null_order_written
     return shaped
+
+
+def _bound_by_position(ast: exp.Expression, dialect: str,
+                       columns: dict[str, set[str]] | None) -> Refusal | None:
+    """A column the statement reaches by POSITION rather than by name, which no name-based check
+    can read: refused as unnamed, before any grant is consulted (M183 to M186).
+
+    The resolver binds a qualified column through a derived table by what the derived table
+    EXPOSES under the name. Three shapes expose columns by position instead, measured on DuckDB:
+    a star in a branch of a set operation inside a derived table or CTE lines the branches up by
+    position, so `(SELECT * FROM claim UNION ALL SELECT * FROM wide) d` serves wide's second
+    column under claim's name `secret` (M183); a column list over a star renames by position, so
+    `(SELECT * FROM claim) d(x, y)` serves `secret` as `y` (M184); and DuckDB's `#2` is the second
+    column whatever its name (M185). A PIVOT or UNPIVOT source has no projection the resolver
+    models, and traversing it was an AssertionError rather than a verdict (M186). Each is refused
+    with the advice to name the columns; a set operation of named branches, a column list over
+    named projections, and VALUES under either (the ui lane's 42 recorded statements) are not
+    these shapes and pass.
+    """
+    for positional in ast.find_all(exp.PositionalColumn):
+        return Refusal(
+            code=RefusalCode.SELECT_STAR,
+            message=(f"`#{positional.this.name}` names a column by its position, which the engine "
+                     "cannot check by name. Name the column instead."),
+            subject=f"#{positional.this.name}",
+        )
+    for pivot in ast.find_all(exp.Pivot):
+        kind = "UNPIVOT" if pivot.args.get("unpivot") else "PIVOT"
+        return Refusal(
+            code=RefusalCode.UNMODELLED_SOURCE,
+            message=(f"A {kind} source reshapes a table in a way the engine cannot attribute "
+                     "column by column. Write the reshaping as a query over named columns "
+                     "(a UNION ALL of one SELECT per column, or CASE expressions) instead."),
+            subject=kind,
+        )
+    for alias in ast.find_all(exp.Alias):
+        if isinstance(alias.this, exp.Columns):
+            # `COLUMNS(*) AS "x_\0"` renames every column it expands by a pattern, so the names
+            # the outer query reads are derived and no node names the column read (Codex's
+            # review of #167: `d.x_secret` over it returned a withheld secret).
+            return Refusal(
+                code=RefusalCode.SELECT_STAR,
+                message=("`COLUMNS(...)` with an alias template renames the columns it expands "
+                         "by a pattern, so the engine cannot tell which column a derived name "
+                         "reads. Name the columns, and alias each one."),
+                subject=alias.alias,
+            )
+    ctes = _visible_ctes(ast, {}, dialect)
+    memo: dict[int, bool] = {}
+    for table in ast.find_all(exp.Table):
+        alias = table.args.get("alias")
+        if alias is None or not alias.args.get("columns"):
+            continue
+        # A column list on a table REFERENCE renames by position too (Codex's review of #167):
+        # over a base table, `FROM claim d(secret, id)` serves secret as `d.id`; over a CTE
+        # whose body expands a star, the same; over a table function, its columns. Refused
+        # whatever stands behind the name: telling a CTE of named projections apart would need
+        # the CTE visible at the reference's own scope, and a lookup at the root let an inner
+        # WITH shadowing an outer name through (the review gate); no recorded statement lists
+        # columns on a reference (the ui lane's count).
+        return Refusal(
+            code=RefusalCode.SELECT_STAR,
+            message=(f"The column list on {table.alias_or_name!r} renames what it reads by "
+                     "position, so the new names say nothing about which columns are read. "
+                     "Name the columns in a SELECT instead of listing them on the alias."),
+            subject=table.alias_or_name or None,
+        )
+    for node in ast.find_all(exp.Subquery, exp.CTE, exp.Lateral):
+        body = node.this
+        if isinstance(node, exp.Lateral):
+            # A LATERAL's column list sits on the LATERAL's alias, over its subquery (the ui
+            # lane's replay of #167: `LATERAL (SELECT * FROM claim) l(x, y)` served secret as
+            # `l.y` under hidden, denied and masked alike).
+            body = body.this if isinstance(body, exp.Subquery) else body
+        while isinstance(body, exp.Paren):
+            body = body.this
+        if not isinstance(body, exp.Query):
+            continue
+        if body.find(exp.Table) is None:
+            # No table or CTE is named under it, so no star in it reaches a base table: `WITH
+            # t(a, b) AS (SELECT * FROM (VALUES (1, 2)))`, the shape of every recorded statement
+            # a column list appears in (the ui lane's count), where the star walk's fail-closed
+            # reading of VALUES would refuse it.
+            continue
+        alias = node.args.get("alias")
+        if isinstance(body, exp.SetOperation):
+            # The branches' stars, each asked whether it reaches a base table in its own scope.
+            for select in _output_selects(body):
+                inner = _visible_ctes(select, ctes, dialect)
+                for projection in select.expressions:
+                    if _is_star(projection) and _expands_a_base_table(
+                            select, projection, inner, columns, memo, frozenset(), dialect):
+                        return Refusal(
+                            code=RefusalCode.SELECT_STAR,
+                            message=("A `*` in a branch of a UNION, INTERSECT or EXCEPT inside a "
+                                     "subquery or CTE lines the branches' columns up by position, "
+                                     "so a name outside it can read another table's column. Name "
+                                     "the columns in every branch."),
+                            subject=node.alias_or_name or None,
+                        )
+        if alias is not None and alias.args.get("columns") and _star_reaches_base(
+                body, ctes, memo, columns, frozenset(), dialect):
+            return Refusal(
+                code=RefusalCode.SELECT_STAR,
+                message=(f"The column list on {node.alias_or_name!r} renames a `*` by position, "
+                         "so the new names say nothing about which columns are read. Name the "
+                         "columns in the SELECT instead of listing them on the alias."),
+                subject=node.alias_or_name or None,
+            )
+    return None
 
 
 def _output_selects(ast: exp.Expression) -> list[exp.Select]:
