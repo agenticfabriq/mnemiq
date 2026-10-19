@@ -66,6 +66,9 @@ def check_shape(
     # statement, and identifier folding belongs to the second: `decide` defaults to parsing duckdb
     # and targeting postgres, so keying the fold on the parse dialect answers for the wrong engine.
     # Production passes them equal, which is exactly why the mismatch would not have surfaced.
+    unnamed = _unnamed_read(ast, executes_as or dialect)
+    if unnamed is not None:
+        return unnamed
     if _has_projection_star(ast, executes_as or dialect, columns) \
             or _projects_a_row(ast, columns) \
             or _uses_a_row_outside_the_projection(ast, columns):
@@ -226,6 +229,69 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
     if isinstance(ast, exp.Subquery):
         return _output_selects(ast.this)  # redundant parentheses nest Subquery in Subquery
     return []
+
+
+def _unnamed_read(ast: exp.Expression, engine: str) -> Refusal | None:
+    """Two DuckDB spellings that read a column no node names, so no grant, deny or mask check
+    sees the read; refused before any check runs (M192, M193: measured on DuckDB 1.5.4, each
+    returned a withheld value under deny, under mask and hidden with the schema listing it).
+
+    Method-call syntax: `x.f()` is `f(x)` to DuckDB, and sqlglot reads `secret.lower()` as a Dot
+    over an identifier and a call, with no Column node; `secret.max()`, `claim.secret.lower()`,
+    `WHERE secret.starts_with('Z')`, `ORDER BY secret.lower()` and `HAVING secret.max() LIKE
+    'Z%'` the same. Whether the left side is a column is not for the decider to resolve: the
+    grant lists only the visible columns, so a hidden one is exactly the name a visible-schema
+    lookup misses. Executed as DuckDB, every Dot whose right side is a call is refused, the
+    schema-qualified `main.lower(note)` with it (the plain spelling exists, and the advice names
+    it). Executed as Oracle, which has no method syntax on a bare column (a method of an
+    object-typed column is reached only through a table alias, `c.secret.f()`), a Dot or a
+    Column on the left is refused, and a bare identifier is a package or schema name
+    (`DBMS_LOB.SUBSTR(note, 10, 1)`), whose column sits in the arguments and is checked, and
+    whose function the inventory judges.
+
+    `COLUMNS(...)` inside an expression: as a projection on its own the resolver reads it, and
+    among the outermost projections the star check refuses it, but inside a call, a WHERE, an
+    ORDER BY, a struct or a derived table's expression (`upper(COLUMNS('e'))`, `WHERE
+    COLUMNS('ecr') LIKE 'Z%'`, `struct_pack(COLUMNS('e'))`, `concat(*COLUMNS('e'))`) the engine
+    expands it into reads of columns that appear in no node. Every COLUMNS that is not a bare
+    projection is refused, the qualified `x.COLUMNS(...)` spelling (a Dot over a call) with it.
+    """
+    for dot in ast.find_all(exp.Dot):
+        if isinstance(dot.expression, exp.Anonymous) and str(dot.expression.this).upper() == "COLUMNS":
+            continue  # the qualified star spelling, refused below with the star's own code
+        if not isinstance(dot.expression, (exp.Anonymous, exp.Func)):
+            continue
+        left = dot.this
+        if engine == "duckdb" or isinstance(left, (exp.Dot, exp.Column)):
+            # The same shape as a schema-qualified call (`public.customer_rows()`), which the
+            # function inventory refuses as an unmodelled call: one code for both readings,
+            # since the decider cannot tell what either reads.
+            return Refusal(
+                code=RefusalCode.UNMODELLED_CALL,
+                message=(f"`{dot.sql()}` is a call the engine cannot see into: DuckDB's method "
+                         "syntax `x.f()` names the column where no check can read it, and a "
+                         "qualified call names a function the engine does not model. Write the "
+                         "call as `f(x)` over a plain column."),
+                subject=dot.this.sql(),
+            )
+    for expansion in ast.find_all(exp.Columns):
+        if isinstance(expansion.parent, exp.Select) or expansion.find_ancestor(exp.Pivot) is not None:
+            continue  # a bare projection, read by the resolver; a PIVOT, refused as unmodelled
+        return Refusal(
+            code=RefusalCode.SELECT_STAR,
+            message=("`COLUMNS(...)` inside an expression expands to columns no check can "
+                     "see. Use it only as a projection on its own, or name the columns."),
+            subject=expansion.sql(),
+        )
+    for call in ast.find_all(exp.Anonymous):
+        if str(call.this).upper() == "COLUMNS":
+            return Refusal(
+                code=RefusalCode.SELECT_STAR,
+                message=("`COLUMNS(...)` inside an expression expands to columns no check can "
+                         "see. Use it only as a projection on its own, or name the columns."),
+                subject=call.sql(),
+            )
+    return None
 
 
 def _is_star(projection: exp.Expression) -> bool:
