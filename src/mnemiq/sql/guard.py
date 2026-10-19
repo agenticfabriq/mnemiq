@@ -261,10 +261,11 @@ def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refus
     expands it into reads of columns that appear in no node. Every COLUMNS that is not a bare
     projection is refused, the qualified `x.COLUMNS(...)` spelling (a Dot over a call) with it.
 
-    A star is read by three things only: the outermost star check (`_has_projection_star`),
-    the resolver for a derived table or a CTE the outer query reads by name, and nothing else.
-    A star in a scalar subquery or an IN list is in none of them, and its Select names no
-    Column: `SELECT (SELECT * FROM one LIMIT 1) AS s FROM pub` over a one-column table
+    A star is read by the outermost star check (`_has_projection_star`), by the resolver for a
+    derived table or a CTE the outer query reads by name, and by nothing else; `COUNT(*)` and an
+    EXISTS's projection read no column, and a PIVOT or UNPIVOT source is refused as unmodelled
+    with its own code (`_star_is_read` is that whole list). A star in a scalar subquery, an IN
+    list or a RETURNING is read by none of them, and its Select names no Column: `SELECT (SELECT * FROM one LIMIT 1) AS s FROM pub` over a one-column table
     returned the withheld value hidden, denied and masked, and `WHERE (SELECT * FROM one LIMIT
     1) LIKE 'Z%'` was an oracle (M196). Every star whose query is not the outermost one, a
     derived table, a CTE, an EXISTS or `COUNT(*)` is refused. In a write (`write=True`, the
@@ -319,7 +320,7 @@ def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refus
             message=("`*` here expands to columns no check can see: a star is read only as the "
                      "outermost projection, in a derived table or a CTE the query reads by "
                      "name, under EXISTS or as COUNT(*), and in a write only as the last two. "
-                     "Name the columns in the subquery or the IN list instead."),
+                     "Name the columns instead."),
             subject=star.parent.sql() if isinstance(star.parent, exp.Column) else star.sql(),
         )
     return None

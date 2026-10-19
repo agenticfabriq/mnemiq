@@ -184,6 +184,8 @@ def test_a_write_reading_through_either_spelling_is_refused(con, sql, code):
     "INSERT INTO sink (s) SELECT d.secret FROM (SELECT * FROM claim) d",
     "WITH w AS (SELECT * FROM claim) INSERT INTO sink (s) SELECT w.secret FROM w",
     "INSERT INTO sink (s) SELECT (SELECT * FROM (SELECT secret FROM claim) d)",
+    "INSERT INTO sink (i, s) SELECT id, secret FROM claim RETURNING *",
+    "DELETE FROM sink WHERE i = 1 RETURNING *",
     "UPDATE sink SET s = (SELECT * FROM (SELECT secret FROM claim) d) WHERE i = 1",
     "DELETE FROM sink WHERE s IN (SELECT * FROM (SELECT secret FROM claim) d)",
 ])
@@ -194,12 +196,22 @@ def test_a_write_through_a_star_or_a_bare_columns_is_refused(con, sql):
     con.execute("CREATE TABLE sink (i INT, s VARCHAR, j STRUCT(ssn VARCHAR)); INSERT INTO sink VALUES (1, 'x', NULL)")
     con.execute(sql)
     assert "CLAIM-SECRET" in str(con.execute("SELECT s FROM sink").fetchall()).upper() or sql.startswith("DELETE")
+    if sql.endswith("RETURNING *"):
+        assert "CLAIM-SECRET" in str(con.execute(sql).fetchall()).upper() or sql.startswith("DELETE")
     schema = {**FULL, "sink": {"i", "s", "j"}}
     hidden = _decide_write(sql, {**HIDDEN, "sink": {"i", "s", "j"}}, AccessPolicy(policy_schema=schema))
     denied = _decide_write(sql, schema, AccessPolicy(denied={("claim", "secret")}, policy_schema=schema))
     masked = _decide_write(sql, schema, AccessPolicy(masked={("claim", "secret")}, policy_schema=schema))
     for verdict in (hidden, denied, masked):
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
+def test_count_distinct_star_in_a_write_is_refused_as_a_star(con):
+    # The review gate on the second round: its holder is a Distinct, not a Count, so it is a star.
+    sql = "INSERT INTO sink (i) SELECT COUNT(DISTINCT *) FROM claim"
+    schema = {**FULL, "sink": {"i", "s", "j"}}
+    verdict = _decide_write(sql, schema, AccessPolicy(policy_schema=schema))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, verdict
 
 
 def test_a_write_naming_its_columns_keeps_count_star_and_exists_star(con):
