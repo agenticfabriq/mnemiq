@@ -186,6 +186,12 @@ RAISING_TYPED_FORMS = [
     "CASE WHEN id = 1 THEN MAP {id: 1} ELSE '{north=1}' END IS NOT NULL",
     "CASE WHEN id = 1 THEN MAP(['a'], [id]) ELSE '{a=north}' END IS NOT NULL",
     "CASE WHEN id = 1 THEN [id] ELSE '[north]' END IS NOT NULL",
+    # Codex's ninth review: a list's elements and a map's values are unified as branches are.
+    "[attrs, region][2] IS NOT NULL",
+    "{'a': [attrs, region]} IS NOT NULL",
+    "MAP(['a', 'b'], [attrs, region]) IS NOT NULL",
+    "MAP {'a': attrs, 'b': region} IS NOT NULL",
+    "MAP {attrs: 1, region: 2} IS NOT NULL",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -236,6 +242,9 @@ SAFE_TYPED_FORMS = [
     "CASE WHEN id = 1 THEN {'a': attrs, 'b': 1.5} ELSE {'a': attrs, 'b': 10.25} END IS NOT NULL",
     "CASE WHEN id = 1 THEN {'a': attrs, 'b': region} ELSE {'b': region, 'a': attrs} END IS NOT NULL",
     "CASE WHEN id = 1 THEN [id] ELSE CAST('[2]' AS INTEGER[]) END IS NOT NULL",
+    "[attrs, 1][1] IS NOT NULL",
+    "[attrs, TRY_CAST(region AS JSON)][2] IS NOT NULL",
+    "[region, 'x'] IS NOT NULL",
 ]
 
 

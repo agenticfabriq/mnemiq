@@ -364,14 +364,31 @@ def _coerces_to_json(node: exp.Expression, type_of, engine: str) -> bool:
     parsed (measured, `COALESCE(attrs, 0)`, `COALESCE(attrs, [])`, `COALESCE(attrs, d)` run;
     Codex's fifth review). Text, and a value of unknown type, is parsed on the rows that take
     it."""
-    branches = _branches(node)
-    typed = [_known_type(branch, type_of, engine) for branch in branches]
+    return _values_coerce_to_json(_branches(node), type_of, engine)
+
+
+def _map_key(item: exp.PropertyEQ) -> exp.Expression:
+    """A MAP literal's key as the engine evaluates it: sqlglot parses `MAP {attrs: 1}`'s key as a
+    struct-field identifier, which stands for the column, read in the key's own SELECT."""
+    key = item.this
+    if isinstance(key, exp.Identifier):
+        as_column = exp.Column(this=key.copy())
+        as_column.parent = item
+        return as_column
+    return key
+
+
+def _values_coerce_to_json(values, type_of, engine: str) -> bool:
+    """`_coerces_to_json`'s reading over any values DuckDB unifies to one type: a branched
+    value's branches, a list's elements, a map's keys or its values (Codex's ninth review of
+    #160: `[attrs, region]` is JSON[], region parsed on every row)."""
+    typed = [_known_type(value, type_of, engine) for value in values]
     if not any(known is not None and known.this == exp.DataType.Type.JSON for known in typed):
         return False
     return not all(
         (known is not None and known.this not in exp.DataType.TEXT_TYPES)
-        or _json_cannot_fail(branch, type_of, engine, chosen_by_the_row=True)
-        for branch, known in zip(branches, typed))
+        or _json_cannot_fail(value, type_of, engine, chosen_by_the_row=True)
+        for value, known in zip(values, typed))
 
 
 # What may be handed to DuckDB to type: a value expression of columns, literals, casts,
@@ -735,6 +752,20 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
                 or _json_inside_a_container(_branches(node), type_of)
                 or _literal_cannot_convert(node, type_of, engine)):
             return node
+        if engine == "duckdb" and isinstance(node, (exp.Array, exp.ToMap)):
+            # A list's elements, and a map's keys and its values, are unified to one type as a
+            # branched value's branches are: `[attrs, region]` is JSON[], region parsed on every
+            # row (Codex's ninth review of #160: indexed, wrapped in a struct, or as a map's
+            # values, approved and Malformed JSON on the hidden row).
+            if isinstance(node, exp.Array):
+                groups = [node.expressions]
+            else:
+                items = node.this.expressions if isinstance(node.this, exp.Struct) else []
+                groups = [[_map_key(item) for item in items if isinstance(item, exp.PropertyEQ)],
+                          [item.expression for item in items if isinstance(item, exp.PropertyEQ)]]
+            if any(_values_coerce_to_json(group, type_of, engine) or _json_inside_a_container(group, type_of)
+                   for group in groups if group):
+                return node
         untyped = isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_CONVERSIONS
         if not (untyped or isinstance(node, (exp.Cast, *_PARSES))):
             continue
