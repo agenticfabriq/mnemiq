@@ -912,16 +912,6 @@ def _output_names(scope, columns, dialect: str | None, seen: frozenset[int]) -> 
     return names
 
 
-def _own_alias(scope, column: exp.Column, dialect: str | None) -> bool:
-    """Whether a bare name is one of the scope's own projection aliases."""
-    name = resolve_identifier(column.this, dialect)
-    return any(
-        isinstance(projection, exp.Alias) and projection.alias
-        and resolve(projection.alias, quoted=bool(projection.args["alias"].args.get("quoted")),
-                    dialect=dialect) == name
-        for projection in getattr(scope.expression, "selects", ()))
-
-
 def _bound_outward_bare(scope, column: exp.Column, columns, dialect: str | None):
     """Where the engine binds a bare name no source of its own scope exposes: the nearest
     enclosing scope with a source that has it (`SELECT (SELECT secret FROM (SELECT id FROM
@@ -1077,13 +1067,17 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                 found = next((hit for source in by_alias.values()
                               if (hit := _exposed(source, column, columns, dialect)) is not None),
                              None)
-                if found is None and fallback is not None and not _own_alias(scope, column, dialect):
-                    # Not where the name is the query's own projection alias, which the engine
-                    # reads laterally in the SELECT list, WHERE and GROUP BY once no source has
-                    # it (the review gate: `SELECT c.id AS k, k + 1 FROM claim c CROSS JOIN
-                    # (SELECT id AS x FROM other) d` ran and was refused on claim from the
-                    # grant alone); such a name keeps `check_access`'s reading, the grant's
-                    # columns and the query's own aliases.
+                if found is None and fallback is not None:
+                    # Also where the name is the query's own projection alias, which the engine
+                    # reads laterally in the SELECT list, WHERE and GROUP BY only once no source
+                    # has it: from the grant alone the resolver cannot tell whether the table
+                    # has the name, and the engine binds the source column first (Codex's sixth
+                    # review of #167: `SELECT c.id AS secret, secret FROM claim c CROSS JOIN
+                    # (SELECT id AS x FROM wide) d` read claim's hidden secret with claim granted
+                    # without it, once the alias was exempted). So `SELECT c.id AS k, k + 1 FROM
+                    # claim c CROSS JOIN (SELECT id AS x FROM other) d` is refused from the grant
+                    # alone and approved under the complete schema, which the shipped
+                    # `visible_schema` is.
                     found = ("first", fallback)
                 if found is None:
                     found = _bound_outward_bare(scope, column, columns, dialect)

@@ -515,12 +515,26 @@ def test_a_grant_only_base_table_beside_a_derived_source_falls_closed_before_bin
     "SELECT c.id AS k FROM claim c CROSS JOIN (SELECT id AS x FROM other) d WHERE k > 0",
     "SELECT c.id AS k FROM claim c CROSS JOIN (SELECT id AS x FROM other) d GROUP BY k",
 ])
-def test_the_query_s_own_alias_beside_a_grant_only_base_table_is_not_bound_to_it(con, sql):
-    # The review gate on the fallback: the engine reads a projection alias laterally once no
-    # source has the name, and the fallback had bound it to claim from the grant alone.
+def test_the_query_s_own_alias_beside_a_grant_only_base_table_needs_the_complete_schema(con, sql):
+    # The engine reads a projection alias laterally only once no source has the name, and from
+    # the grant alone the resolver cannot tell whether claim has it (the review gate asked for
+    # the alias reading here; Codex's sixth review read a hidden column through it, below). So
+    # the complete schema, which the shipped `visible_schema` is, approves these, and the grant
+    # alone refuses them on claim.
     assert con.execute(sql).fetchall()
+    assert isinstance(_decide(sql, FULL, policy=COMPLETE), Approved), sql
+    grant_only = _decide(sql, FULL)
+    assert isinstance(grant_only, Refusal) and "'claim'" in grant_only.message, grant_only
+
+
+def test_the_query_s_own_alias_does_not_read_a_hidden_source_column_beside_a_derived_source(con):
+    # Codex's sixth review: the engine binds the source column before the alias.
+    sql = "SELECT c.id AS secret, secret FROM claim c CROSS JOIN (SELECT id AS x FROM wide) d"
+    assert con.execute(sql).fetchall() == [(1, "CLAIM-SECRET")]
+    _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
     for policy in (None, COMPLETE):
-        assert isinstance(_decide(sql, FULL, policy=policy), Approved), (sql, policy)
+        hidden = _decide(sql, _hidden("claim", "secret"), policy=policy)
+        assert isinstance(hidden, Refusal) and hidden.code is RefusalCode.UNKNOWN_COLUMN, (policy, hidden)
 
 
 def test_a_generated_duplicate_name_is_refused_even_where_it_is_the_literal(con):
