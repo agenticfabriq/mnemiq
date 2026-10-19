@@ -460,8 +460,11 @@ def test_duckdb_s_types_are_read_in_duckdb_s_own_grammar():
     assert _parse_type("MAP(VARCHAR, DECIMAL(2,1))") == ("map", ("leaf", "VARCHAR"), ("leaf", "DECIMAL"))
     assert _text_becomes_json(_parse_type("STRUCT(VARCHAR)[]"), _parse_type("STRUCT(JSON)[]"))
     assert not _text_becomes_json(_parse_type("INTEGER[]"), _parse_type("JSON[]"))
-    cast = sqlglot.parse_one("CAST(region AS NVARCHAR)", read="duckdb")
-    assert _duckdb_type(cast, lambda column: "VARCHAR") is _TEXT
+    # A column the snapshot types in a text spelling other than VARCHAR (a cast's target is
+    # rendered VARCHAR or TEXT by sqlglot, so only the snapshot's word reaches the names).
+    column = sqlglot.parse_one("region", read="duckdb")
+    for spelling in ("NVARCHAR", "NCHAR", "NAME", "VARCHAR"):
+        assert _duckdb_type(column, lambda c, spelling=spelling: spelling) is _TEXT, spelling
     assert _duckdb_type(sqlglot.parse_one("CAST(id AS INT128)", read="duckdb"), lambda column: "INTEGER") == "INT128"
 
 
