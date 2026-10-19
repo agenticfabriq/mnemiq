@@ -527,6 +527,42 @@ def test_the_query_s_own_alias_beside_a_grant_only_base_table_needs_the_complete
     assert isinstance(grant_only, Refusal) and "'claim'" in grant_only.message, grant_only
 
 
+@pytest.mark.parametrize("sql", [
+    "SELECT id AS secret, secret FROM claim",
+    "SELECT d.leak FROM (SELECT id AS secret, secret AS leak FROM claim) d",
+    "SELECT id AS secret, (SELECT secret) AS leak FROM claim",
+    "SELECT 'x' AS secret, count(*) FROM claim GROUP BY secret",
+    "SELECT id AS secret FROM claim WHERE secret = 'CLAIM-SECRET'",
+], ids=["projection", "through a derived alias", "correlated scalar subquery", "GROUP BY", "WHERE"])
+def test_the_query_s_own_alias_does_not_read_a_hidden_source_column_over_base_tables_alone(con, sql):
+    # Codex's seventh review of #167: the engine binds the source column before the alias in
+    # the SELECT list, WHERE and GROUP BY, and `check_access`'s alias allowance passed the name
+    # over base tables alone. Under the complete schema, which the shipped deciding paths pass,
+    # the table listed with the name binds it; denied and masked hold through the policy's own
+    # schema. From the grant alone the alias reading over base tables alone is `check_access`'s,
+    # and the register's.
+    assert con.execute(sql).fetchall()
+    hidden = _decide(sql, _hidden("claim", "secret"), policy=COMPLETE)
+    assert isinstance(hidden, Refusal) and hidden.code is RefusalCode.UNKNOWN_COLUMN, hidden
+    assert "'claim'" in hidden.message, hidden.message
+    denied = _decide(sql, FULL, policy=_policy("claim", "secret", "denied"))
+    assert isinstance(denied, Refusal) and denied.code is RefusalCode.UNAUTHORIZED_COLUMN, denied
+    masked = _decide(sql, FULL, policy=_policy("claim", "secret", "masked"))
+    if isinstance(masked, Approved):
+        assert "CLAIM-SECRET" not in str(con.execute(masked.target_sql).fetchall()), masked.target_sql
+    else:
+        assert masked.code is RefusalCode.MASKED_COLUMN_IN_PREDICATE, masked
+    # A table listed in full and lacking the name does not have it, and the alias is read.
+    lateral = _decide("SELECT id AS k, k + 1 FROM claim WHERE k > 0 GROUP BY k", FULL, policy=COMPLETE)
+    assert isinstance(lateral, Approved), lateral
+    assert isinstance(_decide("SELECT id AS k, k + 1 FROM claim", FULL), Approved)
+    # And inside a subquery over base tables alone, from the grant alone (the review gate).
+    inner = "SELECT (SELECT id AS k FROM wide GROUP BY k LIMIT 1) FROM claim"
+    assert con.execute(inner).fetchall() == [(1,)]
+    for policy in (None, COMPLETE):
+        assert isinstance(_decide(inner, FULL, policy=policy), Approved), policy
+
+
 def test_the_query_s_own_alias_does_not_read_a_hidden_source_column_beside_a_derived_source(con):
     # Codex's sixth review: the engine binds the source column before the alias.
     sql = "SELECT c.id AS secret, secret FROM claim c CROSS JOIN (SELECT id AS x FROM wide) d"
@@ -535,6 +571,87 @@ def test_the_query_s_own_alias_does_not_read_a_hidden_source_column_beside_a_der
     for policy in (None, COMPLETE):
         hidden = _decide(sql, _hidden("claim", "secret"), policy=policy)
         assert isinstance(hidden, Refusal) and hidden.code is RefusalCode.UNKNOWN_COLUMN, (policy, hidden)
+
+
+def test_a_suffixed_name_over_an_output_carrying_its_base_once_is_an_honest_column(con):
+    # The ui lane's replay: `end_hour_24` beside one `end_hour` was refused as generated, and the
+    # engine renames only a duplicate. Over one `note`, `note_1` is the explicit alias.
+    sql = "SELECT d.note_1 FROM (SELECT note, id AS note_1 FROM wide) d"
+    assert con.execute(sql).fetchall() == [(1,)]
+    assert isinstance(_decide(sql, FULL, policy=COMPLETE), Approved)
+    assert isinstance(_decide(sql, FULL), Approved)
+    # Over two `note`s the engine renames the second to `note_1`, so the read is refused.
+    twice = "SELECT d.note_1 FROM (SELECT 'x' AS note, * FROM wide) d"
+    assert con.execute(twice).fetchall() == [("WIDE-NOTE",)]
+    verdict = _decide(twice, FULL, policy=COMPLETE)
+    assert isinstance(verdict, Refusal) and "makes up" in verdict.message, verdict
+    # A CTE's column list names its output, so the duplicate is counted through it too.
+    listed = "WITH w(note) AS (SELECT id FROM claim) SELECT d.note_1 FROM (SELECT 'x' AS note, * FROM w) d"
+    assert con.execute(listed).fetchall() == [(1,)]
+    verdict = _decide(listed, FULL, policy=COMPLETE)
+    assert isinstance(verdict, Refusal) and "makes up" in verdict.message, verdict
+
+
+@pytest.mark.parametrize("sql", [
+    "WITH w(n) AS (SELECT 1) SELECT (SELECT n FROM w) AS n FROM claim",
+    "WITH RECURSIVE p(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM p WHERE n < 3) SELECT p.n FROM p CROSS JOIN claim",
+    "WITH w(a, b) AS (SELECT 1, 2) SELECT b FROM w",
+    "SELECT l.a FROM (SELECT 1 AS k) o, LATERAL (SELECT 1, 2) l(a, b)",
+], ids=["scalar subquery over a listed CTE", "recursive CTE", "a list shorter than the output", "LATERAL list over values"])
+def test_a_cte_or_lateral_column_list_names_its_output(con, sql):
+    # The ui lane's replay: column-list names were known nowhere, so a bare read of one fell
+    # closed outward (and the recursive form was refused on main). Each name stands for the
+    # projection at its position, whose own nodes are checked in that scope.
+    assert con.execute(sql).fetchall()
+    for policy in (None, COMPLETE):
+        assert isinstance(_decide(sql, FULL, policy=policy), Approved), (sql, policy)
+    # A listed name over a hidden column is that column, checked where it is projected.
+    listed = "WITH w(x) AS (SELECT secret FROM claim) SELECT x FROM w"
+    _withheld_three_ways(con, listed, "claim", "secret", "CLAIM-SECRET")
+    assert isinstance(_decide(listed, FULL, policy=COMPLETE), Approved)
+
+
+@pytest.mark.parametrize("sql", [
+    "WITH w(secret) AS (SELECT 1) SELECT secret FROM claim",
+    "WITH w(secret) AS (SELECT 1) SELECT (SELECT secret FROM claim LIMIT 1) FROM w",
+], ids=["beside the CTE", "a subquery over the base table, from the CTE"])
+def test_a_cte_s_column_list_names_nothing_outside_the_cte(con, sql):
+    # The review gate on #167: the list's names made known statement-wide let a bare `secret`
+    # over claim pass as a known name. A list's name counts where a reference resolves to it.
+    assert con.execute(sql).fetchall() == [("CLAIM-SECRET",)]
+    _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
+    hidden = _decide(sql, _hidden("claim", "secret"), policy=COMPLETE)
+    assert isinstance(hidden, Refusal) and hidden.code is RefusalCode.UNKNOWN_COLUMN, hidden
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT l.y FROM (SELECT 1 AS k) o, LATERAL (SELECT * FROM claim) l(x, y)",
+    "SELECT l.y FROM (SELECT 1 AS k) o CROSS JOIN LATERAL (SELECT * FROM claim) AS l(x, y)",
+    "SELECT l.y FROM (SELECT 1 AS k) o JOIN LATERAL (SELECT * FROM claim) l(x, y) ON true",
+], ids=["comma", "CROSS JOIN LATERAL", "JOIN LATERAL ON true"])
+def test_a_column_list_on_a_lateral_over_a_star_is_refused_as_positional(con, sql):
+    # The ui lane's replay of #167: approved and returning the withheld value under hidden,
+    # denied and masked alike; the list sits on the LATERAL's alias, which the shape check read
+    # on subqueries and CTEs alone.
+    assert con.execute(sql).fetchall() == [("CLAIM-SECRET",)]
+    for visible, policy in ((_hidden("claim", "secret"), None), (_hidden("claim", "secret"), COMPLETE),
+                            (FULL, _policy("claim", "secret", "denied")), (FULL, _policy("claim", "secret", "masked")),
+                            (FULL, COMPLETE)):
+        verdict = _decide(sql, visible, policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (policy, verdict)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT l.secret FROM (SELECT 1 AS k) o, LATERAL (SELECT * FROM claim) l",
+    "SELECT l.y FROM (SELECT 1 AS k) o, LATERAL (SELECT id, secret FROM claim) l(x, y)",
+    "SELECT l.s FROM (SELECT 1 AS k) o, LATERAL (SELECT secret AS s FROM claim) l",
+], ids=["through a LATERAL star", "a LATERAL list over named projections", "a LATERAL alias"])
+def test_a_read_through_a_lateral_binds_through_the_derived_walk(con, sql):
+    # The ui lane's replay: a qualified read through a LATERAL star was bound through no derived
+    # walk and approved under hidden. A LATERAL source is its query, read as any derived source.
+    assert con.execute(sql).fetchall() == [("CLAIM-SECRET",)]
+    _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
+    assert isinstance(_decide(sql, FULL, policy=COMPLETE), Approved)
 
 
 def test_a_generated_duplicate_name_is_refused_even_where_it_is_the_literal(con):

@@ -730,21 +730,22 @@ def _exposed(source, column: exp.Column, columns, dialect: str | None):
     an explicit `secret_1` after it is itself renamed; a taken `secret_1` moves the next to
     `secret_2`; Codex's fourth review of #167 and the gate read a withheld column through each).
     So a name of that form is read as the engine's own wherever the derived output carries its
-    base name, or where the output's names cannot be told: `GENERATED_NAME`, which is refused.
-    A name of that form over an output that never carries the base is an honest column, read
-    directly."""
+    base name twice (the engine renames only a duplicate), or where the output's names cannot
+    be told: `GENERATED_NAME`, which is refused. A name of that form over an output that
+    carries the base once or never is an honest column, read directly (the ui lane's replay:
+    `end_hour_24` beside one `end_hour` was refused, and nothing was renamed)."""
     suffixed = re.fullmatch(r"(.+)_([1-9]\d*)", column.name)
     if suffixed is not None:
         names = _output_names(source, columns, dialect, frozenset())
         base = resolve(suffixed[1], quoted=bool(column.this.args.get("quoted")), dialect=dialect)
-        if names is None or base in names:
+        if names is None or names.count(base) > 1:
             return ("table", GENERATED_NAME)
     name = resolve_identifier(column.this, dialect)
     return _exposure(source, name, column, columns, dialect, frozenset())
 
 
 def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None,
-              seen: frozenset[int]):
+              seen: frozenset[int], listed: tuple[str, ...] | None = None):
     """What `scope` (a derived table's or CTE's) exposes under `name`, in projection order (M181).
 
     The first projection that can expose the name settles it, as DuckDB binds the first column
@@ -766,6 +767,34 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
         return _NAMED  # a table function or another source whose columns are its own
     if id(scope) in seen:
         return None  # a recursive CTE naming itself
+    if isinstance(scope.expression, exp.Lateral):
+        # A LATERAL source is its query, read as any derived source, under the alias's column
+        # list where there is one (the ui lane's replay of #167: `LATERAL (SELECT * FROM claim)
+        # l(x, y)` served secret as `l.y`, and `l.secret` through the star went unbound).
+        inner = _lateral_inner(scope)
+        if inner is None:
+            return None
+        listed = _column_list(scope, dialect) or listed
+        if not isinstance(getattr(inner, "expression", None), (exp.Select, exp.SetOperation)):
+            # VALUES or a table function under it: no table behind the list's names.
+            if listed and name in listed and inner.expression.find(exp.Table) is None:
+                return _NAMED
+            return None
+        return _exposure(inner, name, column, columns, dialect, seen, listed)
+    if listed is None:
+        listed = _column_list(scope, dialect)
+    if listed and name in listed:
+        # The list names the projection at the name's position (the ui lane's replay: `WITH w(n)
+        # AS (SELECT 1)` read bare and qualified went unexposed and fell closed outward); a star
+        # there is read by position, which `_bound_by_position` refuses where it reaches a base
+        # table, so nothing is exposed under the name here.
+        if scope.union_scopes:
+            return _exposure(scope.union_scopes[0], name, column, columns, dialect, seen, listed)
+        index = listed.index(name)
+        selects = scope.expression.selects
+        if index < len(selects) and _star_of(selects[index]) is None:
+            return _NAMED
+        return None
     seen = seen | {id(scope)}
     if scope.union_scopes:
         # The branches' names are the first branch's. A star in a branch binds by position,
@@ -859,18 +888,52 @@ def _scope_names(scope, dialect: str | None):
     return local, by_alias
 
 
+def _column_list(scope, dialect: str | None) -> tuple[str, ...] | None:
+    """The column list a CTE's or a LATERAL's alias puts on the scope's output, by position
+    (`WITH w(n) AS (...)`, `LATERAL (...) l(x, y)`), resolved as the engine resolves names."""
+    expression = getattr(scope, "expression", None)
+    holder = expression if isinstance(expression, exp.Lateral) else getattr(expression, "parent", None)
+    if not isinstance(holder, (exp.CTE, exp.Lateral)):
+        return None
+    alias = holder.args.get("alias")
+    listed = alias.args.get("columns") if alias is not None else None
+    if not listed:
+        return None
+    return tuple(resolve_identifier(identifier, dialect) for identifier in listed)
+
+
+def _lateral_inner(scope):
+    """The scope of the query under a LATERAL source (sqlglot keys it by an empty name)."""
+    subquery = scope.expression.this
+    return next((inner for inner in scope.sources.values()
+                 if getattr(inner, "expression", None) is not None
+                 and inner.expression.parent is subquery), None)
+
+
 def _output_names(scope, columns, dialect: str | None, seen: frozenset[int]) -> list[str] | None:
     """The names a derived scope's output carries, in order, duplicates kept, or None where a
     source's names cannot be told (a table the schema does not list, a COLUMNS pattern). A star
     expands to each picked source's schema names less its EXCLUDEs and with its RENAMEs; a named
-    projection is its alias."""
+    projection is its alias; a CTE's or a LATERAL's column list renames by position."""
     if not hasattr(scope, "expression"):
         return None
+    listed = _column_list(scope, dialect)
+    if isinstance(scope.expression, exp.Lateral):
+        inner = _lateral_inner(scope)
+        names = _output_names(inner, columns, dialect, seen) if inner is not None else None
+    else:
+        names = _projected_names(scope, columns, dialect, seen)
+    if names is not None and listed:
+        names[:len(listed)] = listed
+    return names
+
+
+def _projected_names(scope, columns, dialect: str | None, seen: frozenset[int]) -> list[str] | None:
     if id(scope) in seen:
         return None
     seen = seen | {id(scope)}
     if scope.union_scopes:
-        return _output_names(scope.union_scopes[0], columns, dialect, seen)
+        return _projected_names(scope.union_scopes[0], columns, dialect, seen)
     names: list[str] = []
     for projection in scope.expression.selects:
         star = _star_of(projection)
@@ -897,7 +960,7 @@ def _output_names(scope, columns, dialect: str | None, seen: frozenset[int]) -> 
                 folds = not rules_for(dialect).quoting_preserves_case
                 exposed = [resolve_stored(n, dialect) if folds else n for n in columns[key]]
             else:
-                exposed = _output_names(inner, columns, dialect, seen)
+                exposed = _output_names(inner, columns, dialect, seen)  # a nested list applies
                 if exposed is None:
                     return None
             dropped = {resolve_identifier(item.this if isinstance(item, exp.Column) else item,
@@ -957,9 +1020,15 @@ def _bound_outward(scope, qualifier: str, column: exp.Column, columns, dialect: 
 
 
 def column_tables(ast: exp.Expression, dialect: str | None = None,
-                  columns: dict[str, set[str]] | None = None) -> dict[int, str] | None:
+                  columns: dict[str, set[str]] | None = None,
+                  named: set[int] | None = None) -> dict[int, str] | None:
     """`id(column node)` -> the base table its qualifier names **in that column's own scope**,
-    or **None** when the scopes could not be resolved at all.
+    or **None** when the scopes could not be resolved at all. `named`, when given, collects the
+    ids of columns that resolve to a named projection of a derived source or a CTE's or
+    LATERAL's column-list name, whose own nodes are checked in that scope: `check_access` lets
+    those by and holds every other unbound bare name to the grant's columns and the query's own
+    aliases (the review gate on #167: a CTE's list names made known statement-wide let `WITH
+    w(secret) AS (SELECT 1) SELECT secret FROM claim` read a hidden column).
 
     None and `{}` are different answers and the difference is the finding. An empty map used to
     mean both "resolved, and no column resolves to a base table" and "the resolver failed", so
@@ -1019,8 +1088,6 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                 # star's column first, as `d.secret` does (the ui lane's replay of #167). With
                 # a base table among the sources the old rule stands: the grant's columns and
                 # the statement's own aliases, in `check_access`.
-                if not by_alias:
-                    continue
                 if column.find_ancestor(exp.Select, exp.SetOperation) is not scope.expression:
                     # sqlglot lists an inner scope's external columns in the enclosing scope too
                     # (a RENAME item's column inside a derived table's star among them); a bare
@@ -1029,16 +1096,28 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                     continue
                 fallback = None
                 if local:
-                    # A base table beside a derived source (Codex's fifth review of #167: `FROM
-                    # wide w CROSS JOIN (SELECT *, 'SAFE' AS secret FROM claim) d` let a bare
-                    # `secret` through on the inner alias). A base table listed with the name
-                    # binds it, checked before any derived source, which is harmless since the
-                    # engine refuses a name two sources expose as ambiguous. As under a star, a
-                    # table listed in full and lacking the name does not have it; one listed
-                    # from the grant alone, or not listed, may, and falls closed below once no
-                    # derived source exposes the name (the review gate: bound outward instead,
+                    # A base table listed with the name binds it, in every scope: the engine
+                    # binds a source column before the query's own alias of the same name in
+                    # the SELECT list, WHERE and GROUP BY, so `SELECT id AS secret, secret FROM
+                    # claim` reads claim's secret, hidden or not (Codex's seventh review of
+                    # #167, under the complete schema; `check_access`'s alias allowance passed
+                    # it). Checked before any derived source (Codex's fifth review: `FROM wide w
+                    # CROSS JOIN (SELECT *, 'SAFE' AS secret FROM claim) d` let a bare `secret`
+                    # through on the inner alias), which is harmless since the engine refuses a
+                    # name two sources expose as ambiguous. As under a star, a table listed in
+                    # full and lacking the name does not have it; one listed from the grant
+                    # alone, or not listed, may, and beside a derived source falls closed below
+                    # once none exposes the name (the review gate: bound outward instead,
                     # `SELECT (SELECT secret FROM claim c CROSS JOIN (SELECT id AS x FROM wide)
-                    # d LIMIT 1) FROM other o` read claim's secret through other's grant).
+                    # d LIMIT 1) FROM other o` read claim's secret through other's grant). Over
+                    # base tables alone, a name the grant lacks keeps `check_access`'s reading,
+                    # the grant's columns and the query's own aliases: refusing every lateral
+                    # alias for a caller deciding from the grant alone is a cost taken only
+                    # beside a derived source. The deciding paths that pass the policy decide
+                    # under its complete schema; the enrichment examples' validation passes
+                    # every column of the snapshot and no policy. The residual over base tables
+                    # alone from the grant alone is recorded in the internal register.
+                    listed_with = []
                     for source in scope.selected_sources:
                         if source in by_alias:
                             continue
@@ -1046,13 +1125,25 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                         if key is None:
                             continue
                         if _schema_lists(columns, key, column, dialect):
-                            out[id(column)] = key
-                            settled.add(id(column))
-                            break
-                        if (columns is None or key not in columns
-                                or key not in getattr(columns, "complete", ())):
+                            listed_with.append(key)
+                        elif by_alias and (columns is None or key not in columns
+                                           or key not in getattr(columns, "complete", ())):
                             fallback = fallback or key
-                    if id(column) in settled:
+                    if len(listed_with) == 1:
+                        out[id(column)] = listed_with[0]
+                        settled.add(id(column))
+                        continue
+                    if listed_with:
+                        # Two base tables listed with the name: the engine refuses the reference
+                        # as ambiguous and reads neither, and a binding here would be a guess
+                        # (eval's mask attribution keeps such a reference unmeasured).
+                        continue
+                    if not by_alias:
+                        # Over base tables alone and listed with the name nowhere: the flat rule,
+                        # not the outward walk, whose grant-only fallback refused `SELECT (SELECT
+                        # id AS k FROM wide GROUP BY k LIMIT 1) FROM claim` from the grant alone
+                        # (the review gate). A scope with no source at all binds outward below,
+                        # as the engine does.
                         continue
                 # A bare name in ORDER BY or HAVING that is the query's own alias never reaches
                 # here: sqlglot resolves it to the alias before listing the scope's columns, as
@@ -1088,6 +1179,8 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                 settled.add(id(column))
                 if found is not _NAMED:
                     out[id(column)] = found[1]
+                elif named is not None:
+                    named.add(id(column))
                 continue
             table = local.get(qualifier)
             if table is not None:
@@ -1102,6 +1195,8 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                 settled.add(id(column))
                 if found is not _NAMED:
                     out[id(column)] = found[1]
+                elif named is not None:
+                    named.add(id(column))
 
     # Columns qualified by the write target resolve to it. `ON CONFLICT DO UPDATE SET amount =
     # scratch.amount + 1` reads `scratch.amount` from a table in no scope, so without this the

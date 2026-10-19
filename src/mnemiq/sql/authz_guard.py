@@ -163,7 +163,8 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     # set of CTE names -- because a reference inside a CTE body naming that same CTE reads the
     # base table, and skipping it let an ungranted table through (M31).
     alias_to_table: dict[str, str] = {}
-    resolved = column_tables(ast, dialect, columns if columns is not None else visible)
+    named: set[int] = set()
+    resolved = column_tables(ast, dialect, columns if columns is not None else visible, named=named)
     for table in base_tables(ast, dialect):
         name = object_key(table)
         if name not in visible:
@@ -217,6 +218,11 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
         # only source is a derived table (M181), so both spellings of a read through a star
         # meet the same table here.
         table = resolved.get(id(column)) if resolved is not None else None
+        if table is None and id(column) in named:
+            # A named projection of its own derived source, or a CTE's or LATERAL's column-list
+            # name (`WITH w(n) AS (SELECT 1) ... SELECT n FROM w`): the nodes it stands for are
+            # checked in that scope, and the name says nothing about a base table here.
+            continue
         if table == GENERATED_NAME:
             return Refusal(
                 code=RefusalCode.UNKNOWN_COLUMN,

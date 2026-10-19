@@ -165,8 +165,13 @@ def _bound_by_position(ast: exp.Expression, dialect: str,
                      "Name the columns in a SELECT instead of listing them on the alias."),
             subject=table.alias_or_name or None,
         )
-    for node in ast.find_all(exp.Subquery, exp.CTE):
+    for node in ast.find_all(exp.Subquery, exp.CTE, exp.Lateral):
         body = node.this
+        if isinstance(node, exp.Lateral):
+            # A LATERAL's column list sits on the LATERAL's alias, over its subquery (the ui
+            # lane's replay of #167: `LATERAL (SELECT * FROM claim) l(x, y)` served secret as
+            # `l.y` under hidden, denied and masked alike).
+            body = body.this if isinstance(body, exp.Subquery) else body
         while isinstance(body, exp.Paren):
             body = body.this
         if not isinstance(body, exp.Query):

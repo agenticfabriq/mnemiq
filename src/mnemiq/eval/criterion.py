@@ -103,8 +103,9 @@ def touched(ast: exp.Expression, policy: AccessPolicy, schema=None, dialect=None
     """What the policy narrows in what the plan REFERENCED.
 
     `schema` is the caller's visible map -- the same one the disclosure path gets. Omitting it
-    measures the plan exactly as written, which reports every unqualified masked reference as
-    unattributable.
+    measures the plan with the policy's own pairs as the schema, which attributes an unqualified
+    masked reference to the one table of its scope the policy names with it, and reports it
+    unattributable where none or two do.
 
     `dialect` is the ENGINE the answer ran against, and it has to be the same one the disclosure
     path resolved with. Leaving it off made the instrument disagree with what it measures: a quoted
