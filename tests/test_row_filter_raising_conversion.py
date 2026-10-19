@@ -157,6 +157,16 @@ RAISING_TYPED_FORMS = [
     "CASE WHEN id = 1 THEN id + 1 ELSE '3000000000' END = 2",
     "CASE WHEN id = 1 THEN (SELECT 7 FROM entitlement LIMIT 1) ELSE 'north' END = 7",
     "CASE WHEN id = 1 THEN (SELECT id + 1 FROM entitlement LIMIT 1) ELSE 'nan' END = 7",
+    # Codex's seventh review: a nested CASE of integers and a counted subquery were typed DOUBLE
+    # by the reader here, where DuckDB types them INTEGER and BIGINT, and 'nan' converts to a
+    # DOUBLE alone; a list and a struct likewise took no literal.
+    "CASE WHEN id = 1 THEN CASE WHEN id > 0 THEN 1 ELSE 2 END ELSE 'nan' END IS NOT NULL",
+    "CASE WHEN id = 1 THEN CASE WHEN id > 0 THEN 1.5 ELSE 2 END ELSE 'nan' END IS NOT NULL",
+    "COALESCE(CASE WHEN id > 5 THEN 1 END, 'nan') IS NOT NULL",
+    "CASE WHEN id = 1 THEN (SELECT count(*) FROM entitlement) ELSE 'nan' END IS NOT NULL",
+    "CASE WHEN id = 1 THEN (SELECT sum(id) FROM entitlement) ELSE 'nan' END IS NOT NULL",
+    "CASE WHEN id = 1 THEN [1, 2] ELSE 'nan' END IS NOT NULL",
+    "CASE WHEN id = 1 THEN {'a': 1} ELSE 'nan' END IS NOT NULL",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -189,6 +199,14 @@ SAFE_TYPED_FORMS = [
     "region = (SELECT max(who) FROM entitlement)",
     "region = (SELECT '7')",
     "region = CAST(id AS VARCHAR)",
+    # A nested branched value is typed as DuckDB types it (Codex's seventh review), a literal
+    # beside a branch the validator cannot type is written as a cast, a list literal that is
+    # one, and a text branch beside a call keeps a literal as text.
+    "CASE WHEN id = 1 THEN CASE WHEN id > 0 THEN 1.5 ELSE 2 END ELSE '3' END = 1",
+    "CASE WHEN id = 1 THEN (SELECT avg(id) FROM entitlement) ELSE CAST('7' AS DOUBLE) END = 7",
+    "CASE WHEN id = 1 THEN lower(region) ELSE CAST('x' AS VARCHAR) END = 'x'",
+    "CASE WHEN id = 1 THEN [1, 2] ELSE '[3]' END IS NOT NULL",
+    "CASE WHEN id = 1 THEN region WHEN id = 3 THEN lower(region) ELSE 'x' END = 'x'",
 ]
 
 
@@ -255,9 +273,9 @@ def test_a_json_literal_is_read_as_duckdb_s_reader_reads_it(literal):
 
 def test_the_validator_types_a_policy_without_running_it(monkeypatch):
     """What the validator hands DuckDB while deciding is read off the door itself (the review
-    gate on #160: a time bound could not tell a run from a fast one): a trillion-row subquery on a
-    branch is typed by the reader here (a count is a number) and never sent; a table function
-    reading a file is never sent; what is sent types literals and typed NULLs alone."""
+    gate on #160: a time bound could not tell a run from a fast one): a trillion-row table
+    function on a branch is the filter validator's refusal and never sent; a call reading a file
+    is never sent; what is sent types literals and typed NULLs alone."""
     from mnemiq.sql import rls
 
     sent = []
@@ -276,21 +294,36 @@ def test_the_validator_types_a_policy_without_running_it(monkeypatch):
     verdict = _decide("CASE WHEN id = 1 THEN (SELECT count(*) FROM range(1000000000000)) "
                       "ELSE 'x' END = 1")
     assert isinstance(verdict, Refusal), verdict
-    # A subquery inside arithmetic is not a pure expression: the sum is typed by the reader
-    # here, and the subquery's FROM is never sent.
+    # A subquery inside arithmetic is not a pure expression, so the literal's target type
+    # cannot be told: refused, and the subquery's FROM is never sent.
     verdict = _decide("CASE WHEN id = 1 THEN (SELECT id FROM entitlement LIMIT 1) + 1 "
                       "ELSE 'x' END = 7")
-    assert isinstance(verdict, Refusal), verdict  # 'x' converts to no number
-    # A call's type is unknown here, so beside a literal the rule says nothing (the guide's "not
-    # a proof"); the call is never sent.
+    assert isinstance(verdict, Refusal), verdict
+    # A call's type is unknown here, so a literal beside it is refused (Codex's seventh review:
+    # the reader's guess is not taken instead); the call is never sent.
     verdict = _decide("CASE WHEN id = 1 THEN length(read_text('/nonexistent/never-read')) "
                       "ELSE 'x' END = 1")
-    assert isinstance(verdict, (Approved, Refusal)), verdict
+    assert isinstance(verdict, Refusal), verdict
     assert sent, "DuckDB was asked for the literals' casts"
     for sql in sent:
         assert "entitlement" not in sql and "range(" not in sql and "read_text" not in sql, sql
         assert " FROM " not in sql, sql
         assert sql.startswith("SELECT typeof(") or sql.startswith("SELECT TRY_CAST("), sql
+
+
+def test_a_literal_beside_a_branch_the_validator_cannot_type_is_refused_though_it_may_run():
+    # Codex's seventh review of #160: the type reader guessed DOUBLE for an aggregate and a nested
+    # CASE, and the guess let 'nan' through to an INTEGER. The validator now types a branch only
+    # as DuckDB does, without running anything, so a call or an aggregate beside a text literal
+    # leaves the literal's target unknown, and the filter is refused although these two run.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR); INSERT INTO claim VALUES (1, 'x'), (2, 'north'); "
+                "CREATE TABLE entitlement(id INT, who VARCHAR); INSERT INTO entitlement VALUES (7, 'r')")
+    for runs in ("CASE WHEN id = 1 THEN (SELECT avg(id) FROM entitlement) ELSE 'nan' END IS NOT NULL",
+                 "CASE WHEN id = 1 THEN lower(region) ELSE 'x' END = 'x'"):
+        con.execute(f"SELECT id FROM claim WHERE {runs}").fetchall()
+        verdict = _decide(runs)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, runs
 
 
 def test_a_literal_on_a_branch_never_taken_is_still_refused_where_it_cannot_convert():

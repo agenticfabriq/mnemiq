@@ -342,6 +342,8 @@ def _known_type(value, type_of, engine: str) -> exp.DataType | None:
     if isinstance(value, exp.Nvl2):
         return _known_type(value.args["true"], type_of, engine)  # Oracle: its second argument's
     if isinstance(value, (exp.Count, exp.Sum, exp.Avg)):
+        # A number of some width, which is all this reader's callers ask (text or not); the
+        # width is `_duckdb_type`'s to tell, and it never reads this answer.
         return exp.DataType.build("DOUBLE")
     if isinstance(value, _BRANCHED):
         return _branch_type(value, type_of, engine)
@@ -372,14 +374,17 @@ def _coerces_to_json(node: exp.Expression, type_of, engine: str) -> bool:
         for branch, known in zip(branches, typed))
 
 
-# What may be handed to DuckDB to type: a value expression of columns, literals, casts and
-# arithmetic, which binds without running anything once each column is a typed NULL. No function
-# call, no subquery: typing those would evaluate policy text on the validator's connection (a
-# table function reading a file, a subquery over a billion rows), which a validator must not do
-# (the review gate on #160); they keep the type reader here.
+# What may be handed to DuckDB to type: a value expression of columns, literals, casts,
+# arithmetic, lists, structs, branched values and the comparisons and boolean operators their
+# conditions are made of, which binds without running anything once each column is a typed
+# NULL. No function call, no subquery: typing those would evaluate policy text on the
+# validator's connection (a table function reading a file, a subquery over a billion rows),
+# which a validator must not do (the review gate on #160); their type is unknown here.
 _PURE = (exp.Column, exp.Identifier, exp.Literal, exp.Boolean, exp.Null, exp.Paren, exp.Neg,
          exp.Cast, exp.DataType, exp.DataTypeParam, exp.Interval, exp.Var, exp.DateStrToDate,
-         *_ARITHMETIC)
+         exp.Case, exp.If, exp.Coalesce, exp.Nullif, exp.Array, exp.Struct, exp.PropertyEQ,
+         exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.And, exp.Or, exp.Not, exp.Is,
+         exp.In, exp.Between, exp.Like, exp.ILike, *_ARITHMETIC)
 
 
 def _pure_type(value: exp.Expression, type_of) -> str | None:
@@ -404,14 +409,22 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
         return None
 
 
-def _duckdb_type(branch: exp.Expression, type_of, engine: str) -> str | None:
-    """The type DuckDB gives a branch, in DuckDB's words. A column's is the snapshot's; a cast's
-    its target; a pure value expression's (`7`, `1.5`, `id + 1`, `INTERVAL '1 day'`) is asked of
-    DuckDB with each column replaced by a NULL of its snapshot type, so nothing runs and the
-    answer is the engine's (`typeof(7)` is INTEGER, `typeof(1.5)` DECIMAL(2,1), `typeof(id + 1)`
-    over an INTEGER id is INTEGER, where the type reader here says DOUBLE for each: the review
-    gate on #160); anything else, a subquery or a call, keeps the type reader's answer. None
-    where it cannot be told, or where it is text or JSON, which no literal converts to."""
+# `_duckdb_type`'s answer for a text or JSON branch: a text literal beside it is taken as it is
+# (or the mix is a bind fault on no row's value), or parsed by `_coerces_to_json`'s rule.
+_TEXT = "text"
+
+
+def _duckdb_type(branch: exp.Expression, type_of) -> str | None:
+    """The type DuckDB gives a branch, in DuckDB's words, or `_TEXT`. A column's is the
+    snapshot's; a cast's its target; a pure value expression's (`7`, `1.5`, `id + 1`, `INTERVAL
+    '1 day'`, `[1, 2]`, a nested CASE) is asked of DuckDB with each column replaced by a NULL of
+    its snapshot type, so nothing runs and the answer is the engine's (`typeof(7)` is INTEGER,
+    `typeof(1.5)` DECIMAL(2,1), `typeof(id + 1)` over an INTEGER id is INTEGER, where the type
+    reader here says DOUBLE for each: the review gate on #160). None where it cannot be told
+    without running something: a call, a subquery whose projection is not pure. The type
+    reader's guess is not taken instead (Codex's seventh review of #160: it typed a nested CASE
+    of integers and a counted subquery DOUBLE, and 'nan' passed the cast to DOUBLE where DuckDB
+    converts it to INTEGER and BIGINT on the row that takes it, and fails)."""
     while isinstance(branch, exp.Paren):
         branch = branch.this
     kind = None
@@ -429,16 +442,13 @@ def _duckdb_type(branch: exp.Expression, type_of, engine: str) -> str | None:
     else:
         kind = _pure_type(branch, type_of)
     if kind is None:
-        known = _known_type(branch, type_of, engine)
-        kind = None if known is None else known.sql(dialect="duckdb")
-    if kind is None:
         return None
     try:
         built = exp.DataType.build(kind, dialect="duckdb")
     except Exception:  # noqa: BLE001
         return None
     if built.this in exp.DataType.TEXT_TYPES or built.this == exp.DataType.Type.JSON:
-        return None  # text takes the literal as it is; JSON parses it, `_coerces_to_json`'s
+        return _TEXT
     return kind
 
 
@@ -449,18 +459,31 @@ def _literal_cannot_convert(node: exp.Expression, type_of, engine: str) -> bool:
     #160), as do a DATE, a BOOLEAN and an INTERVAL beside `'x'`. Whether a literal converts is
     DuckDB's to say, asked through TRY_CAST to the type DuckDB unifies the typed branches to
     (Python's parsers take an out-of-range integer, Unicode digits, a basic ISO date and `nan`,
-    which DuckDB refuses: the review gate); refused where DuckDB cannot be asked."""
-    literals, kinds = [], []
+    which DuckDB refuses: the review gate); refused where DuckDB cannot be asked. A text branch
+    (a column, a cast) beside the literal means the value is text, or the mix is a bind fault on
+    no row's value, so no literal is converted. A branch whose type cannot be told without
+    running it, a call or a subquery with an aggregate, leaves the literal's target unknown,
+    and the literal is refused (Codex's seventh review of #160); a cast in its place, `CAST('7'
+    AS DOUBLE)`, is a typed branch and not a literal."""
+    literals, kinds, unknown = [], [], False
     for branch in _branches(node):
         while isinstance(branch, exp.Paren):
             branch = branch.this
         if isinstance(branch, exp.Literal) and branch.is_string:
             literals.append(branch.this)
         elif not isinstance(branch, exp.Null):
-            kind = _duckdb_type(branch, type_of, engine)
-            if kind is not None:
+            kind = _duckdb_type(branch, type_of)
+            if kind is None:
+                unknown = True
+            elif kind is _TEXT:
+                return False
+            else:
                 kinds.append(kind)
-    if not literals or not kinds:
+    if not literals:
+        return False
+    if unknown:
+        return True
+    if not kinds:
         return False
     try:
         unified = _duckdb("SELECT typeof(COALESCE(" + ", ".join(f"NULL::{k}" for k in kinds) + "))")
@@ -608,6 +631,10 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
 
 def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
     safe = _SAFE_FORM.get(engine, "a form that cannot fail, or a column of the right type")
+    if isinstance(node, _BRANCHED):
+        safe += (", and a text literal on a branch as CAST('...' AS type): beside a branch of "
+                 "another type it is converted to that type on the rows that take it, and beside "
+                 "a call or an aggregate the type it would be converted to cannot be told")
     # The conversion is the policy's text, so it goes to the operator's log only.
     logger.warning("row filter for %r: %s can raise on a row's value, which fails every read of "
                    "the table and can quote that value in the error; write %s (M159)",
