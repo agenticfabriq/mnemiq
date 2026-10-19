@@ -601,6 +601,17 @@ def _castable(node) -> str:
     return f"{'STRUCT' if kind == 'struct' else 'UNION'}({', '.join(fields)})"
 
 
+def _holds_union(node) -> bool:
+    kind = node[0]
+    if kind == "leaf":
+        return False
+    if kind == "array":
+        return _holds_union(node[1])
+    if kind == "map":
+        return _holds_union(node[1]) or _holds_union(node[2])
+    return kind == "union" or any(_holds_union(field) for _, field in node[1])
+
+
 def _holds_json(node) -> bool:
     kind = node[0]
     if kind == "leaf":
@@ -665,6 +676,15 @@ def _json_inside_a_container(values, type_of) -> bool:
         return False
     if any(kind is None for kind in kinds):
         return True  # a value of unknown type beside JSON: may hold text, parsed on its rows
+    if any(_holds_union(node) for node in known) and any(node != known[0] for node in known):
+        # Two UNION types unify by the operator and the operand order, not by their members
+        # (measured, DuckDB 1.5.4: COALESCE and a list keep the first operand's type, CASE and
+        # IF the last's, at the top level and inside a struct alike), so the COALESCE asked
+        # below answers for one operator only. Refused wherever the UNION sits: the operator
+        # that happens to keep the text member runs, a false refusal (Codex's fifteenth review
+        # of #160, and the review gate on the sixteenth round's draft, which exempted a branch
+        # and let the struct-nested pair and a list search through).
+        return True
     try:
         unified = _parse_type(_duckdb("SELECT typeof(COALESCE("
                                       + ", ".join(f"NULL::{_castable(node)}" for node in known) + "))"))

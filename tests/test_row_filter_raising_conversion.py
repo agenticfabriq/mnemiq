@@ -446,6 +446,38 @@ def test_a_literal_beside_a_branch_the_validator_cannot_type_is_refused_though_i
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, runs
 
 
+def test_a_union_whose_members_pair_text_with_json_is_refused_wherever_it_sits():
+    """Codex's fifteenth review of #160 ran `CASE WHEN id = 1 THEN u1 ELSE u2 END` over a
+    UNION(a JSON) and a UNION(a VARCHAR) and it ran. The sixteenth round's draft exempted a
+    UNION on a branch, and the commit gate refuted it: the same pair inside a struct raises, and
+    so does a list search. Measured (DuckDB 1.5.4): two UNION types unify by the operator and
+    the operand order, COALESCE and a list keeping the first operand's type and CASE and IF the
+    last's, so `u1 ELSE u2` is UNION(a VARCHAR) and runs, `s ELSE t` over STRUCT(x UNION(a
+    VARCHAR)) and STRUCT(x UNION(a JSON)) is the JSON one and parses; the walk's COALESCE probe
+    answers for COALESCE alone. A UNION beside JSON is refused wherever it sits, the operator
+    that keeps the text member a false refusal, accepted and documented."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, u1 UNION(a JSON), u2 UNION(a VARCHAR), "
+                "s STRUCT(x UNION(a VARCHAR)), t STRUCT(x UNION(a JSON))); "
+                "INSERT INTO claim VALUES (1, union_value(a := '{}'::JSON), union_value(a := 'x'), "
+                "{'x': union_value(a := 'x')}, {'x': union_value(a := '{}'::JSON)}), "
+                "(2, union_value(a := '{}'::JSON), union_value(a := 'north'), "
+                "{'x': union_value(a := 'north')}, {'x': union_value(a := '{}'::JSON)})")
+    types = {("claim", "id"): "INTEGER", ("claim", "u1"): "UNION(a JSON)", ("claim", "u2"): "UNION(a VARCHAR)",
+             ("claim", "s"): "STRUCT(x UNION(a VARCHAR))", ("claim", "t"): "STRUCT(x UNION(a JSON))"}
+    branched = "CASE WHEN id = 1 THEN u1 ELSE u2 END IS NOT NULL"
+    assert con.execute(f"SELECT id FROM claim WHERE {branched}").fetchall() == [(1,), (2,)]
+    unified = con.execute("SELECT typeof(CASE WHEN id = 1 THEN u1 ELSE u2 END) FROM claim").fetchall()
+    assert unified == [("UNION(a VARCHAR)",)] * 2, unified
+    raising = ("CASE WHEN id = 1 THEN s ELSE t END IS NOT NULL", "list_contains([u1], u2)", "u1 = u2", "[u1] = [u2]")
+    for row_filter in raising:
+        with pytest.raises(duckdb.Error, match="Malformed JSON"):
+            con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    for row_filter in (branched, *raising):
+        verdict = _decide(row_filter, snapshot=_snapshot(types))
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (row_filter, verdict)
+
+
 def test_duckdb_s_types_are_read_in_duckdb_s_own_grammar():
     """The container reading parses DuckDB's type strings itself (the review gate on #160:
     sqlglot's DataType reads a nested unnamed struct as a struct literal). An unnamed struct's
