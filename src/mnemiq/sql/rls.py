@@ -476,6 +476,7 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
 # `_duckdb_type`'s answer for a text or JSON branch: a text literal beside it is taken as it is
 # (or the mix is a bind fault on no row's value), or parsed by `_coerces_to_json`'s rule.
 _TEXT = "text"
+_UNREADABLE = "unreadable"  # a column's declared type the reader here cannot parse
 _LIST_CONSTRUCTORS = frozenset({"array_value", "list_pack"})  # `list_value` parses as a list
 # Container accessors that build a value from their arguments and run nothing, typed by DuckDB
 # like the containers they read (Codex's twelfth review of #160: `map_values(MAP(['a'],
@@ -541,6 +542,12 @@ def _parse_type(text: str):
     bracket = re.search(r"\[\d*\]$", text)
     if bracket is not None:
         return ("array", _parse_type(text[:bracket.start()]))
+    quoted = re.match(r'("(?:[^"]|"")*")\s*(?:\((.*)\))?$', text, re.S)
+    if quoted is not None:
+        # DuckDB quotes a type name that is a keyword (`typeof([])` is `"NULL"[]`): kept as
+        # spelled, so a cast target rebuilds, and read bare by `_bare` (Codex's sixteenth
+        # review of #160, whose fix refused every type the reader could not parse).
+        return ("leaf", quoted.group(1), f"({quoted.group(2)})" if quoted.group(2) is not None else "")
     head = re.match(r"([A-Za-z_][A-Za-z_0-9 ]*?)\s*(?:\((.*)\))?$", text, re.S)
     if head is None:
         raise ValueError(text)
@@ -565,12 +572,30 @@ def _parse_type(text: str):
     raise ValueError(text)
 
 
+def _bare(name: str) -> str:
+    """A leaf's name without DuckDB's quoting: `"NULL"` is NULL."""
+    if name.startswith('"') and name.endswith('"'):
+        return name[1:-1].replace('""', '"').upper()
+    return name
+
+
 def _split_label(item: str) -> tuple[str | None, str]:
     """A struct field or union member: `name TYPE` or, unnamed, `TYPE` (a space outside any
     parentheses separates the name, a quoted name kept whole)."""
     if item.startswith('"'):
-        close = item.index('"', 1)
-        return item[1:close], item[close + 1:].strip()
+        # A doubled quote inside the name is one quote (`"a""b" JSON` names a""b: Codex's
+        # sixteenth review of #160); the first lone quote closes the name.
+        name, position = [], 1
+        while position < len(item):
+            if item[position] == '"':
+                if item[position + 1:position + 2] == '"':
+                    name.append('"')
+                    position += 2
+                    continue
+                return "".join(name), item[position + 1:].strip()
+            name.append(item[position])
+            position += 1
+        raise ValueError(f"unterminated quoted name in {item!r}")
     depth = 0
     for position, ch in enumerate(item):
         if ch in "([":
@@ -596,7 +621,7 @@ def _castable(node) -> str:
         return _castable(node[1]) + "[]"
     if kind == "map":
         return f"MAP({_castable(node[1])}, {_castable(node[2])})"
-    fields = [f'"{name or f"f{position}"}" {_castable(field)}'
+    fields = [f'"{(name or f"f{position}").replace(chr(34), chr(34) * 2)}" {_castable(field)}'
               for position, (name, field) in enumerate(node[1], 1)]
     return f"{'STRUCT' if kind == 'struct' else 'UNION'}({', '.join(fields)})"
 
@@ -615,7 +640,7 @@ def _holds_union(node) -> bool:
 def _holds_json(node) -> bool:
     kind = node[0]
     if kind == "leaf":
-        return node[1] == "JSON"
+        return _bare(node[1]) == "JSON"
     if kind == "array":
         return _holds_json(node[1])
     if kind == "map":
@@ -631,7 +656,7 @@ def _text_becomes_json(kind, unified) -> bool:
     key and value with the value. Shapes that do not line up cannot be told, and are read as
     converting."""
     if unified[0] == "leaf":
-        return unified[1] == "JSON" and kind[0] == "leaf" and kind[1] in _TEXT_NAMES
+        return _bare(unified[1]) == "JSON" and kind[0] == "leaf" and _bare(kind[1]) in _TEXT_NAMES
     if kind[0] != unified[0]:
         return True
     if kind[0] == "array":
@@ -668,6 +693,8 @@ def _json_inside_a_container(values, type_of) -> bool:
         if value is None or isinstance(value, exp.Null):
             continue
         kinds.append(_duckdb_type(value, type_of))
+    if any(kind is _UNREADABLE for kind in kinds):
+        return True  # a declared type the reader cannot parse: not shown safe
     try:
         known = [_parse_type(kind) for kind in kinds if kind is not None and kind is not _TEXT]
     except ValueError:
@@ -729,8 +756,12 @@ def _duckdb_type(branch: exp.Expression, type_of) -> str | None:
     try:
         parsed = _parse_type(kind)  # DuckDB's own grammar: a nested unnamed struct reads too
     except ValueError:
-        return None
-    if parsed[0] == "leaf" and (parsed[1] in _TEXT_NAMES or parsed[1] == "JSON"):
+        # A declared type (a column's, from the snapshot; a cast's target) the reader cannot
+        # parse is not an unknown value: it may hold JSON, and reading it as unknown let a
+        # UNION("a""b" JSON) member pass (Codex's sixteenth review of #160). Refused by every
+        # reader of this answer.
+        return _UNREADABLE
+    if parsed[0] == "leaf" and (_bare(parsed[1]) in _TEXT_NAMES or _bare(parsed[1]) == "JSON"):
         return _TEXT
     return kind
 
@@ -756,7 +787,7 @@ def _literal_cannot_convert(node: exp.Expression, type_of, engine: str) -> bool:
             literals.append(branch.this)
         elif not isinstance(branch, exp.Null):
             kind = _duckdb_type(branch, type_of)
-            if kind is None:
+            if kind is None or kind is _UNREADABLE:
                 unknown = True
             elif kind is _TEXT:
                 return False

@@ -478,6 +478,48 @@ def test_a_union_whose_members_pair_text_with_json_is_refused_wherever_it_sits()
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (row_filter, verdict)
 
 
+def test_a_doubled_quote_in_a_member_name_is_read_and_an_unreadable_declared_type_is_refused():
+    """Codex's sixteenth review of #160: `_split_label` took the doubled quote in `UNION("a""b"
+    JSON)` for the closing one, the declared type failed to parse, the failure read as an
+    unknown value's type, and `u1 = u2` and `list_contains([u1], u2)` were approved where DuckDB
+    parses the text member. The name is read as DuckDB spells it in DESCRIBE, rebuilt with its
+    quote doubled, and a declared type the reader cannot parse is refused outright."""
+    from mnemiq.sql.rls import _castable, _parse_type
+
+    con = duckdb.connect()
+    con.execute('CREATE TABLE claim(id INT, u1 UNION("a""b" JSON), u2 UNION("a""b" VARCHAR), '
+                's STRUCT("a""b" JSON), t STRUCT("a""b" VARCHAR)); '
+                'INSERT INTO claim VALUES (1, union_value("a""b" := \'{}\'::JSON), union_value("a""b" := \'north\'), '
+                '{\'a"b\': \'{}\'::JSON}, {\'a"b\': \'north\'})')
+    declared = {name: kind for name, kind, *_ in con.execute("DESCRIBE claim").fetchall()}
+    assert declared["u1"] == 'UNION("a""b" JSON)', declared
+    for kind in (declared["u1"], declared["s"]):
+        parsed = _parse_type(kind)
+        assert parsed[1][0][0] == 'a"b', parsed
+        assert _castable(parsed) == kind, (kind, _castable(parsed))
+    types = {("claim", "id"): "INTEGER", **{("claim", name): kind for name, kind in declared.items() if name != "id"}}
+    # The CASE keeps the last branch's type (the sixteenth round), so the JSON struct goes last.
+    for raising in ("u1 = u2", "list_contains([u1], u2)", "CASE WHEN id = 1 THEN t ELSE s END IS NOT NULL"):
+        with pytest.raises(duckdb.Error, match="Malformed JSON"):
+            con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
+        verdict = _decide(raising, snapshot=_snapshot(types))
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (raising, verdict)
+    # DuckDB quotes a keyword used as a type name: `typeof([])` is `"NULL"[]`, read and rebuilt
+    # as spelled, so `COALESCE(attrs, [])` stays approved under the refusal below.
+    assert con.execute("SELECT typeof([])").fetchall() == [('"NULL"[]',)]
+    assert _parse_type('"NULL"[]') == ("array", ("leaf", '"NULL"', ""))
+    assert _castable(_parse_type('"NULL"[]')) == '"NULL"[]'
+    # A declared type the reader cannot parse at all is refused, not read as an unknown value
+    # (asked of the readers directly: a snapshot type sqlglot cannot parse never reaches them).
+    from mnemiq.sql.rls import _UNREADABLE, _duckdb_type, _json_inside_a_container
+    import sqlglot
+
+    u1, u2 = (sqlglot.parse_one(name, read="duckdb") for name in ("u1", "u2"))
+    unreadable = lambda column: "UNION(a JSON" if column.name == "u1" else declared["u2"]  # noqa: E731
+    assert _duckdb_type(u1, unreadable) is _UNREADABLE
+    assert _json_inside_a_container([u1, u2], unreadable) is True
+
+
 def test_duckdb_s_types_are_read_in_duckdb_s_own_grammar():
     """The container reading parses DuckDB's type strings itself (the review gate on #160:
     sqlglot's DataType reads a nested unnamed struct as a struct literal). An unnamed struct's
