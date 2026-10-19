@@ -66,6 +66,9 @@ def check_shape(
     # statement, and identifier folding belongs to the second: `decide` defaults to parsing duckdb
     # and targeting postgres, so keying the fold on the parse dialect answers for the wrong engine.
     # Production passes them equal, which is exactly why the mismatch would not have surfaced.
+    unnamed = unnamed_read(ast, executes_as or dialect)
+    if unnamed is not None:
+        return unnamed
     if _has_projection_star(ast, executes_as or dialect, columns) \
             or _projects_a_row(ast, columns) \
             or _uses_a_row_outside_the_projection(ast, columns):
@@ -83,7 +86,7 @@ def check_shape(
             ),
         )
 
-    positional = _bound_by_position(ast, executes_as or dialect, columns)
+    positional = bound_by_position(ast, executes_as or dialect, columns)
     if positional is not None:
         return positional
 
@@ -100,7 +103,7 @@ def check_shape(
     return shaped
 
 
-def _bound_by_position(ast: exp.Expression, dialect: str,
+def bound_by_position(ast: exp.Expression, dialect: str,
                        columns: dict[str, set[str]] | None) -> Refusal | None:
     """A column the statement reaches by POSITION rather than by name, which no name-based check
     can read: refused as unnamed, before any grant is consulted (M183 to M186).
@@ -226,6 +229,195 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
     if isinstance(ast, exp.Subquery):
         return _output_selects(ast.this)  # redundant parentheses nest Subquery in Subquery
     return []
+
+
+def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refusal | None:
+    """Two DuckDB spellings that read a column no node names, so no grant, deny or mask check
+    sees the read; refused before any check runs, by both deciders (M192, M193: measured on
+    DuckDB 1.5.4, each returned a withheld value under deny, under mask and hidden with the
+    schema listing it; Codex's first review of #169 copied the denied value into a writable
+    table through the write decider's own shape check, which had not run this).
+
+    Method-call syntax: `x.f()` is `f(x)` to DuckDB, and sqlglot reads `secret.lower()` as a Dot
+    over an identifier and a call, with no Column node; `secret.max()`, `claim.secret.lower()`,
+    `WHERE secret.starts_with('Z')`, `ORDER BY secret.lower()` and `HAVING secret.max() LIKE
+    'Z%'` the same. Whether the left side is a column is not for the decider to resolve: the
+    grant lists only the visible columns, so a hidden one is exactly the name a visible-schema
+    lookup misses. Executed as DuckDB, every Dot whose right side is a call is refused, the
+    schema-qualified `main.lower(note)` with it (the plain spelling exists, and the advice names
+    it). Executed as Oracle, which has no method syntax on a bare column (a method of an
+    object-typed column is reached only through a table alias, `c.secret.f()`), anything but a
+    bare identifier on the left is refused (an alias-led Dot, a Column, a parenthesised
+    column), and a bare identifier is a package or schema name (`DBMS_LOB.SUBSTR(note, 10,
+    1)`), whose column sits in the arguments and is checked, and whose function the inventory
+    judges. The walk visits every Dot, so a chain (`secret.lower().upper()`) is refused at
+    its outer call; the left side's spelling (quoted, upper-cased, parenthesised, a struct
+    column, a derived table's alias) never matters.
+
+    `COLUMNS(...)` inside an expression: as a projection on its own the resolver reads it, and
+    among the outermost projections the star check refuses it, but inside a call, a WHERE, an
+    ORDER BY, a struct or a derived table's expression (`upper(COLUMNS('e'))`, `WHERE
+    COLUMNS('ecr') LIKE 'Z%'`, `struct_pack(COLUMNS('e'))`, `concat(*COLUMNS('e'))`) the engine
+    expands it into reads of columns that appear in no node. Every COLUMNS that is not a bare
+    projection is refused, the qualified `x.COLUMNS(...)` spelling (a Dot over a call) with it.
+
+    A star, or a bare COLUMNS, is read by the outermost star check (`_has_projection_star`), by
+    the resolver for a derived table or a CTE the outer query reads by name and whose own Select
+    does not consume it (a DISTINCT, a GROUP BY, an ORDER BY ALL or by position reads every
+    column: `SELECT count(*) FROM (SELECT DISTINCT * FROM claim) d` answers by whether two
+    withheld values are equal, M198), and by nothing else; `COUNT(*)` and an EXISTS's projection
+    read no value, unless an INTERSECT or EXCEPT under the EXISTS compares it, and a PIVOT or
+    UNPIVOT source is refused as unmodelled with its own code (`_projection_is_read` is that
+    whole list). A star in a scalar subquery, an IN list or a RETURNING is read by none of them,
+    and its Select names no Column: `SELECT (SELECT * FROM one LIMIT 1) AS s FROM pub` over a one-column table
+    returned the withheld value hidden, denied and masked, and `WHERE (SELECT * FROM one LIMIT
+    1) LIKE 'Z%'` was an oracle (M196). Every star whose query is not the outermost one, a
+    derived table, a CTE, an EXISTS or `COUNT(*)` is refused. In a write (`write=True`, the
+    write decider's shape check) the outermost, derived and CTE readings do not exist either:
+    the INSERT's source has no outermost check, so `INSERT INTO sink SELECT * FROM claim` and
+    `INSERT INTO sink SELECT COLUMNS('secret') FROM claim` were approved and copied the
+    withheld value into a table the same grant reads (Codex's second review of #169; M195).
+    Every star and every COLUMNS but `COUNT(*)`'s and an EXISTS's is refused there: a write names
+    every column it reads. A column reached by position (`#2`) is the same read under another
+    spelling, refused on the read side by `bound_by_position` and, since M197, in the write
+    decider's shape check as well.
+    """
+    for dot in ast.find_all(exp.Dot):
+        if isinstance(dot.expression, exp.Anonymous) and str(dot.expression.this).upper() == "COLUMNS":
+            continue  # the qualified star spelling, refused below with the star's own code
+        if not isinstance(dot.expression, (exp.Anonymous, exp.Func)):
+            continue
+        left = dot.this
+        if engine == "duckdb" or not isinstance(left, exp.Identifier):
+            # The same shape as a schema-qualified call (`public.customer_rows()`), which the
+            # function inventory refuses as an unmodelled call: one code for both readings,
+            # since the decider cannot tell what either reads.
+            return Refusal(
+                code=RefusalCode.UNMODELLED_CALL,
+                message=(f"`{dot.sql()}` is a call the engine cannot see into: DuckDB's method "
+                         "syntax `x.f()` names the column where no check can read it, and a "
+                         "qualified call names a function the engine does not model. Write the "
+                         "call as `f(x)` over a plain column."),
+                subject=dot.this.sql(),
+            )
+    for expansion in ast.find_all(exp.Columns):
+        if expansion.find_ancestor(exp.Pivot) is not None or (
+                isinstance(expansion.parent, exp.Select) and _projection_is_read(expansion, write)):
+            continue  # a PIVOT's own refusal; a bare projection the resolver or star check reads
+        return Refusal(
+            code=RefusalCode.SELECT_STAR,
+            message=("`COLUMNS(...)` inside an expression expands to columns no check can "
+                     "see. Use it only as a projection on its own, or name the columns."),
+            subject=expansion.sql(),
+        )
+    for call in ast.find_all(exp.Anonymous):
+        if str(call.this).upper() == "COLUMNS":
+            return Refusal(
+                code=RefusalCode.SELECT_STAR,
+                message=("`COLUMNS(...)` inside an expression expands to columns no check can "
+                         "see. Use it only as a projection on its own, or name the columns."),
+                subject=call.sql(),
+            )
+    for star in ast.find_all(exp.Star):
+        if isinstance(star.parent, exp.Columns):
+            continue  # `COLUMNS(*)`: the COLUMNS loop above ruled on it (Codex's fifth review)
+        if _projection_is_read(star, write):
+            continue
+        return Refusal(
+            code=RefusalCode.SELECT_STAR,
+            message=("`*` here expands to columns no check can see: a star is read only as the "
+                     "outermost projection, in a derived table or a CTE the query reads by "
+                     "name, under EXISTS or as COUNT(*), and in a write only as the last two. "
+                     "Name the columns instead."),
+            subject=star.parent.sql() if isinstance(star.parent, exp.Column) else star.sql(),
+        )
+    return None
+
+
+def _projection_is_read(node: exp.Expression, write: bool) -> bool:
+    """Whether some check reads this star or bare COLUMNS: `COUNT(*)`; the projection of an
+    EXISTS, unless an INTERSECT or EXCEPT on the way compares the values (`EXISTS (SELECT *
+    FROM one INTERSECT SELECT 'Z')` is true only on the withheld value: Codex's third review of
+    #169) or a DISTINCT, a GROUP BY, an ORDER BY by position or ALL, or a UNION without ALL
+    consumes them (`... UNION SELECT 'Z' OFFSET 1`: the fourth); and, on the read side only, the outermost query's (the star check), a derived
+    table's or a CTE's (the resolver, where the outer query names what it reads). A star or
+    COLUMNS anywhere else, a scalar subquery (`WHERE (SELECT COLUMNS('secret') FROM one LIMIT
+    1) = 'Z'`, the same review), an IN list, a value in parentheses, an INSERT's source, is read
+    by nothing."""
+    holder = node.parent
+    if isinstance(holder, exp.Column):
+        holder = holder.parent  # `t.*`
+    if isinstance(holder, exp.Count):
+        return True
+    if node.find_ancestor(exp.Pivot) is not None:
+        return True  # a PIVOT or UNPIVOT source is refused as unmodelled, with its own code
+    if not isinstance(holder, exp.Select):
+        return False
+    query, compared, wrappers = holder, False, [holder]
+    while isinstance(query.parent, (exp.SetOperation, exp.Paren)):
+        query = query.parent
+        wrappers.append(query)
+        compared = compared or isinstance(query, (exp.Intersect, exp.Except))
+    outer = query.parent
+    if isinstance(outer, exp.Exists):
+        # Existence reads the values where an INTERSECT or EXCEPT compares them, or where a
+        # deduplication or a grouping decides how many rows there are and an OFFSET or a
+        # HAVING then asks: `EXISTS (SELECT * FROM one UNION SELECT 'Z' OFFSET 1)` is true only
+        # where the withheld value differs from the guess (Codex's fourth review of #169). The
+        # rule is broader than the oracle, fail-closed: any consumer on the climb (a DISTINCT, a
+        # GROUP BY, an ORDER BY by position or ALL, a UNION without ALL) refuses, with or
+        # without the OFFSET, since a LIMIT, a QUALIFY or a HAVING can ask the same question.
+        return not compared and not any(_consumes_its_projection(wrapper) or (
+            isinstance(wrapper, exp.SetOperation) and bool(wrapper.args.get("distinct")))
+            for wrapper in wrappers)
+    if write:
+        return False
+    if outer is None:
+        return True  # the outermost projection: `_has_projection_star` rules on it
+    if isinstance(outer, exp.CTE):
+        return not any(_consumes_its_projection(wrapper) for wrapper in wrappers)
+    while isinstance(outer, exp.Subquery) and isinstance(outer.parent, exp.Subquery):
+        wrappers.append(outer)
+        outer = outer.parent  # `((SELECT ...)) d` nests Subquery in Subquery
+    if not isinstance(outer, exp.Subquery) or not isinstance(outer.parent, (exp.From, exp.Join, exp.Lateral)):
+        return False
+    wrappers.append(outer)
+    return not any(_consumes_its_projection(wrapper) for wrapper in wrappers)  # M198
+
+
+_WRAPPERS = (exp.Select, exp.Subquery, exp.SetOperation, exp.Paren)
+
+
+def _consumes_its_projection(node: exp.Expression) -> bool:
+    """Whether the query, or a wrapper around it, reads every column of its projection, star
+    included: a DISTINCT (plain or ON) compares them, a GROUP BY (ALL, or by position: a star
+    under any other GROUP BY is DuckDB's own error) groups by them, an ORDER BY ALL or by
+    position orders by them, in the Select's own ORDER BY, a window's, or the ORDER BY sqlglot
+    hangs on a wrapping Subquery (`((SELECT * FROM pair) ORDER BY 2 LIMIT 1) d`: the review gate
+    on the fourth round) or on a set operation (`(SELECT * FROM pair UNION ALL SELECT * FROM
+    pair ORDER BY 2 LIMIT 1) d`, whose branches the positional check refuses as well). Measured on DuckDB 1.5.4: `SELECT count(*) FROM (SELECT DISTINCT *
+    FROM claim) d`, the GROUP BY ALL twin and the CTE spelling answer 1 or 2 by whether two
+    rows' withheld values are equal, and `(SELECT * FROM claim ORDER BY 2 LIMIT 1) d` serves the
+    id of the smallest (the ui lane's replay of #169; M198). A name in any of those clauses is a
+    Column the checks read; a position or ALL is not."""
+    if isinstance(node, exp.Select) and (node.args.get("distinct") is not None
+                                         or node.args.get("group") is not None):
+        return True  # a set operation's own DISTINCT is M183's: its branches bind by position
+    for ordered in node.find_all(exp.Ordered):
+        if ordered.find_ancestor(*_WRAPPERS) is not node:
+            continue  # a subquery's own ORDER BY, judged with that subquery's projection
+        key = ordered.this
+        while isinstance(key, exp.Paren):
+            key = key.this
+        if not isinstance(key, exp.Column):
+            # A key is left alone only as a bare column name, which the checks read. Every
+            # other spelling consumes the projection, fail-closed: a position (`2`, `(2)`,
+            # `-(-2)`, `2 COLLATE nocase`, each the position to DuckDB: the ui lane, Codex's
+            # sixth review and the gate found one after another), ALL, and a constant or an
+            # expression (`2::INT`, `id + 1`), which DuckDB reads otherwise and are refused
+            # all the same rather than told apart spelling by spelling.
+            return True
+    return False
 
 
 def _is_star(projection: exp.Expression) -> bool:

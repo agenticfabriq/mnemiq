@@ -835,7 +835,7 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
     if listed and name in listed:
         # The list names the projection at the name's position (the ui lane's replay: `WITH w(n)
         # AS (SELECT 1)` read bare and qualified went unexposed and fell closed outward); a star
-        # there is read by position, which `_bound_by_position` refuses where it reaches a base
+        # there is read by position, which `bound_by_position` refuses where it reaches a base
         # table, so nothing is exposed under the name here.
         if scope.union_scopes:
             return _exposure(scope.union_scopes[0], name, column, columns, dialect, seen, listed)
@@ -848,7 +848,7 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
     # AS id FROM wide)` has no `id`, and `w.id` inside a subquery over it binds outward, to an
     # outer source called w (Codex's eighth review of #167: read as the named projection, it let
     # claim's id through under the complete schema). A star among those positions is read by
-    # position, which `_bound_by_position` refuses where it reaches a base table.
+    # position, which `bound_by_position` refuses where it reaches a base table.
     renamed = len(listed) if listed else 0
     seen = seen | {id(scope)}
     if scope.union_scopes:
