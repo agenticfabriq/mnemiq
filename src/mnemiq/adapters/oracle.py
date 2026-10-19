@@ -331,11 +331,13 @@ class OracleAdapter:
         # pool, which raised after the configured 1.5s instead of blocking.
         try:
             con = self._pool.acquire()
-        except Exception as exc:
+        except (self._oracledb.Error, OSError) as exc:
             # No session was had, so no statement was asked: the fault is the source's whatever
             # its code, and `unavailable_fault` reads the mark before any code list (Codex's
             # seventh review of #159, so that a pool that cannot authenticate does not depend on
-            # the list naming its error).
+            # the list naming its error). The driver's errors and the socket's; a TypeError or
+            # an AttributeError is a bug, not an outage, and keeps its reading (the review
+            # gate).
             _mark_acquire_fault(exc)
             raise
         try:

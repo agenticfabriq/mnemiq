@@ -312,22 +312,31 @@ def test_a_fault_on_the_pool_s_acquire_is_unavailable_whatever_its_code():
     oracledb = pytest.importorskip("oracledb")
     from mnemiq.adapters.oracle import OracleAdapter
 
-    # A code the driver leaves a plain DatabaseError and no list names (ORA-00604 is typed
-    # OperationalError by the driver, unavailable on its own).
+    # A code no list names, typed IntegrityError by the driver (ORA-00604 is typed
+    # OperationalError, unavailable on its own).
     unlisted = (1, "ORA-00001: unique constraint violated")
     assert not oracle_unavailable(_ora(*unlisted))
 
     class _RaisingPool:
+        def __init__(self, exc):
+            self.exc = exc
+
         def acquire(self):
-            raise _ora(*unlisted)
+            raise self.exc
 
     adapter = OracleAdapter.over(object(), oracledb, schema="APP")
-    adapter._pool = _RaisingPool()
+    adapter._pool = _RaisingPool(_ora(*unlisted))
     with pytest.raises(oracledb.DatabaseError) as caught:
         with adapter._lease():
             pytest.fail("no connection to lease")
     assert oracle_unavailable(caught.value)
     assert caught.value.args[0].code == 1
+    # A bug in the pool, or in a stand-in for it, is not an outage (the review gate).
+    adapter._pool = _RaisingPool(TypeError("acquire() takes no arguments"))
+    with pytest.raises(TypeError) as bug:
+        with adapter._lease():
+            pytest.fail("no connection to lease")
+    assert not oracle_unavailable(bug.value)
 
 
 def test_postgres_tells_a_lost_connection_and_a_cancelled_statement_from_a_statement_s_faults():
