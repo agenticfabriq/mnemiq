@@ -237,7 +237,8 @@ def test_an_UNQUALIFIED_masked_reference_is_measured_not_invalidated():
 
     # With no schema and a second table, attribution to claim is not a guess: the policy's pair
     # is evidence that claim has ssn, and if person had it too the engine would refuse the bare
-    # name as ambiguous and run nothing, so claim's is the only reading that can run.
+    # name as ambiguous and run nothing, so claim's is the only reading that can run. That holds
+    # for an ON join; a USING or NATURAL join merges the name instead, which this does not cover.
     joined = touched(sqlglot.parse_one("SELECT ssn FROM claim JOIN person ON claim.id = person.id",
                                        read="duckdb"), policy)
     assert joined.entries == {("mask", "claim")} and not joined.unattributable

@@ -612,6 +612,101 @@ def test_a_cte_or_lateral_column_list_names_its_output(con, sql):
 
 
 @pytest.mark.parametrize("sql", [
+    "WITH w(x) AS (SELECT 1 AS secret FROM wide) SELECT (SELECT w.secret FROM w) FROM claim w",
+    "WITH w(x) AS (SELECT 1 AS secret FROM wide) SELECT (SELECT secret FROM w) FROM claim",
+    "SELECT (SELECT l.secret FROM (SELECT 1 AS k) o, LATERAL (SELECT 1 AS secret FROM wide) l(x)) FROM claim l",
+], ids=["qualified by the CTE's name", "bare", "qualified by a LATERAL's alias"])
+def test_a_renamed_position_exposes_nothing_under_its_old_name(con, sql):
+    # Codex's eighth review of #167: the list renames the projection, so the engine has no
+    # `secret` in w and binds the reference outward, to the outer source of the same name; read
+    # as the CTE's named projection, the reference passed and claim's secret came back.
+    assert con.execute(sql).fetchall() == [("CLAIM-SECRET",)]
+    _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
+    hidden = _decide(sql, _hidden("claim", "secret"), policy=COMPLETE)
+    assert isinstance(hidden, Refusal) and hidden.code is RefusalCode.UNKNOWN_COLUMN, hidden
+    assert isinstance(_decide(sql, FULL, policy=COMPLETE), Approved)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT secret FROM (SELECT *, 'SAFE' AS secret FROM claim)",
+    "SELECT (SELECT max(secret) FROM (SELECT * FROM claim)) FROM other",
+], ids=["bare over the star", "a scalar subquery over the star, from a table granting the name"])
+def test_an_unaliased_derived_table_is_a_source(con, sql):
+    # The ui lane's replay of #167: `FROM (SELECT ...)` with no alias, which DuckDB, SQLite and
+    # Oracle accept, was read as no source at all, so its bare names bound outward or fell to
+    # the flat rule, and claim's hidden secret came back where the aliased twin was refused.
+    assert con.execute(sql).fetchall() == [("CLAIM-SECRET",)]
+    _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
+    assert isinstance(_decide(sql, FULL, policy=COMPLETE), Approved)
+    # And a name it exposes by alias is its own: not refused on an outer table.
+    inner = "SELECT (SELECT secret FROM (SELECT 'SAFE' AS secret)) FROM claim"
+    assert con.execute(inner).fetchall() == [("SAFE",)]
+    for policy in (None, COMPLETE):
+        assert isinstance(_decide(inner, _hidden("claim", "secret"), policy=policy), Approved), policy
+    cte = ("WITH f AS (SELECT id FROM (SELECT id, 1 AS rn FROM wide) WHERE rn = 1) "
+           "SELECT f.id FROM f JOIN claim c ON c.id = f.id")
+    assert con.execute(cte).fetchall() == [(1,)]
+    for policy in (None, COMPLETE):
+        assert isinstance(_decide(cte, FULL, policy=policy), Approved), policy
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT id AS secret, count(*) AS n FROM claim GROUP BY id HAVING max(secret) = 'CLAIM-SECRET'",
+    "SELECT id AS secret, count(*) AS n FROM (SELECT * FROM claim) d GROUP BY id HAVING max(secret) = 'CLAIM-SECRET'",
+    "WITH w AS (SELECT secret AS s FROM claim) SELECT count(*) AS n FROM w HAVING max(s) = 'CLAIM-SECRET'",
+    "SELECT id AS secret FROM claim GROUP BY id ORDER BY max(secret) = 'CLAIM-SECRET'",
+], ids=["over the table", "through a derived star", "through a CTE alias", "an ORDER BY aggregate"])
+def test_a_source_column_inside_a_having_or_order_by_aggregate_is_read_in_its_scope(con, sql):
+    # sqlglot lists no unqualified HAVING column in a scope, nor an ORDER BY one matching an
+    # output name; DuckDB reads a source column inside an aggregate there (an output alias only
+    # for a bare item), so the hidden column answered the predicate or the order unchecked
+    # (TPC-DS q23 and q24 made the clause's reading necessary; the review gate, the ORDER BY).
+    assert con.execute(sql).fetchall() in ([(1, 1)], [(1,)])
+    hidden = _decide(sql, _hidden("claim", "secret"), policy=COMPLETE)
+    assert isinstance(hidden, Refusal) and hidden.code is RefusalCode.UNKNOWN_COLUMN, hidden
+    denied = _decide(sql, FULL, policy=_policy("claim", "secret", "denied"))
+    assert isinstance(denied, Refusal), denied
+    assert isinstance(_decide(sql, FULL, policy=COMPLETE), Approved)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT id AS x FROM claim UNION SELECT id FROM other ORDER BY x",
+    "SELECT id AS x FROM claim UNION ALL SELECT id FROM other ORDER BY x DESC LIMIT 5",
+    "(SELECT id AS x FROM claim) UNION (SELECT id FROM other) ORDER BY x",
+    "(SELECT id AS x FROM claim UNION SELECT id FROM other) UNION ALL SELECT id FROM wide ORDER BY x",
+    "SELECT id, sum(id) OVER (ORDER BY id) AS running FROM claim ORDER BY running",
+])
+def test_a_set_operation_s_or_a_window_s_order_by_reads_the_output_it_names(con, sql):
+    # The review gate: a set operation's ORDER BY hangs off the union, so no SELECT was found
+    # for it and ordinary sorted-UNION SQL was refused; its output is the first branch's.
+    assert con.execute(sql).fetchall()
+    for policy in (None, COMPLETE):
+        assert isinstance(_decide(sql, FULL, policy=policy), Approved), (sql, policy)
+
+
+def test_a_recursive_cte_s_list_names_its_anchor_even_where_nothing_reads_the_cte(con):
+    # The ui lane's replay: sqlglot hands the recursive branch the anchor's scope, whose parent
+    # is the set operation, not the CTE, so the list was not found and `a` was refused on main.
+    sql = ("WITH RECURSIVE m(a) AS (SELECT 1 UNION ALL SELECT a + 1 FROM m WHERE a < 3), "
+           "c AS (SELECT id FROM claim) SELECT count(*) AS n FROM c")
+    assert con.execute(sql).fetchall() == [(1,)]
+    for policy in (None, COMPLETE):
+        assert isinstance(_decide(sql, FULL, policy=policy), Approved), policy
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT (SELECT max(secret) FROM claim) AS secret FROM wide",
+    "SELECT (SELECT 1 AS secret), (SELECT max(secret) FROM claim) FROM wide",
+], ids=["the outer alias", "a sibling subquery's alias"])
+def test_an_alias_vouches_only_in_its_own_select(con, sql):
+    # The ui lane's replay: the alias allowance was statement-wide, and no engine resolves a
+    # name to another scope's alias, so the hidden `secret` passed on an alias elsewhere.
+    assert con.execute(sql).fetchall()[0][-1] == "CLAIM-SECRET"
+    _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
+    assert isinstance(_decide(sql, FULL, policy=COMPLETE), Approved)
+
+
+@pytest.mark.parametrize("sql", [
     "WITH w(secret) AS (SELECT 1) SELECT secret FROM claim",
     "WITH w(secret) AS (SELECT 1) SELECT (SELECT secret FROM claim LIMIT 1) FROM w",
 ], ids=["beside the CTE", "a subquery over the base table, from the CTE"])

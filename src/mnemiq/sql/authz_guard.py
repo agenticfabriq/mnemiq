@@ -205,9 +205,47 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     # A SELECT alias is a name the query invents for an expression, and GROUP BY / ORDER BY /
     # HAVING may refer to it: `SELECT year(d) AS y, count(*) FROM t GROUP BY y` is ordinary,
     # correct SQL -- and without this the engine could not answer "count X by year" at all.
-    # It is safe: an alias can only be defined from columns that were themselves checked.
-    known_columns |= {written(alias.args.get("alias"), alias.alias)
-                      for alias in ast.find_all(exp.Alias) if alias.alias}
+    # It is safe: an alias can only be defined from columns that were themselves checked. The
+    # aliases of the reference's OWN SELECT, since no engine resolves a name to another scope's
+    # alias (the ui lane's replay of #167: statement-wide, `SELECT (SELECT max(secret) FROM
+    # claim) AS secret FROM wide` let the inner hidden `secret` through on the outer alias). In
+    # ORDER BY and HAVING, which sqlglot resolves to the projections before listing a scope's
+    # columns so the resolver never visits them, a name is also any column the SELECT projects
+    # by name (`ORDER BY d_week_seq1` over `SELECT d_week_seq1 ... FROM (...) y`), itself
+    # checked as a projection.
+    # Where the scopes could not be resolved at all, the statement-wide set stands, the rule the
+    # fallback has always had (TPC-DS q23 and q24, and a WITH inside an UPDATE's SET).
+    statement_aliases = {written(alias.args.get("alias"), alias.alias)
+                         for alias in ast.find_all(exp.Alias) if alias.alias}
+    own_aliases: dict[int, set[str]] = {}
+    own_outputs: dict[int, set[str]] = {}
+
+    def aliases_of(column: exp.Column) -> set[str]:
+        if resolved is None:
+            return statement_aliases
+        select = column.find_ancestor(exp.Select, exp.SetOperation)
+        while isinstance(select, (exp.SetOperation, exp.Subquery, exp.Paren)):
+            # A set operation's ORDER BY names its output, which is the first branch's (the
+            # review gate: `SELECT id AS x FROM claim UNION SELECT id FROM other ORDER BY x`),
+            # a parenthesised branch unwrapped (sqlglot reads it as a subquery).
+            select = select.left if isinstance(select, exp.SetOperation) else select.this
+        if not isinstance(select, exp.Select):
+            return set()
+        clause = column.find_ancestor(exp.Order, exp.Having, exp.Select, exp.SetOperation)
+        # A window's ORDER BY inside OVER (...) binds to source columns, not the output.
+        ordering = isinstance(clause, (exp.Order, exp.Having, exp.SetOperation)) and not (
+            isinstance(clause, exp.Order) and isinstance(clause.parent, (exp.Window, exp.WindowSpec)))
+        store = own_outputs if ordering else own_aliases
+        names = store.get(id(select))
+        if names is None:
+            names = set()
+            for projection in select.selects:
+                if isinstance(projection, exp.Alias) and projection.alias:
+                    names.add(written(projection.args.get("alias"), projection.alias))
+                elif store is own_outputs and isinstance(projection, exp.Column):
+                    names.add(written(projection.this, projection.name))
+            store[id(select)] = names
+        return names
 
     for column in ast.find_all(exp.Column):
         name = written(column.this, column.name)  # the refusal keeps the spelling written
@@ -243,11 +281,11 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
             if resolved is None:
                 # Unreadable scopes: fall back to the rule for an unqualified column rather
                 # than to the flat map that was the defect. Same guarantee, no worse.
-                if name not in known_columns:
+                if name not in known_columns and name not in aliases_of(column):
                     return _unknown_column(column.name)
             # Else the qualifier names a CTE or a subquery alias whose own projection names the
             # column, checked in that scope.
-        elif name not in known_columns:
+        elif name not in known_columns and name not in aliases_of(column):
             return _unknown_column(column.name)
 
     return None
