@@ -86,7 +86,7 @@ def check_shape(
             ),
         )
 
-    positional = _bound_by_position(ast, executes_as or dialect, columns)
+    positional = bound_by_position(ast, executes_as or dialect, columns)
     if positional is not None:
         return positional
 
@@ -103,7 +103,7 @@ def check_shape(
     return shaped
 
 
-def _bound_by_position(ast: exp.Expression, dialect: str,
+def bound_by_position(ast: exp.Expression, dialect: str,
                        columns: dict[str, set[str]] | None) -> Refusal | None:
     """A column the statement reaches by POSITION rather than by name, which no name-based check
     can read: refused as unnamed, before any grant is consulted (M183 to M186).
@@ -261,11 +261,15 @@ def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refus
     expands it into reads of columns that appear in no node. Every COLUMNS that is not a bare
     projection is refused, the qualified `x.COLUMNS(...)` spelling (a Dot over a call) with it.
 
-    A star is read by the outermost star check (`_has_projection_star`), by the resolver for a
-    derived table or a CTE the outer query reads by name, and by nothing else; `COUNT(*)` and an
-    EXISTS's projection read no column, and a PIVOT or UNPIVOT source is refused as unmodelled
-    with its own code (`_star_is_read` is that whole list). A star in a scalar subquery, an IN
-    list or a RETURNING is read by none of them, and its Select names no Column: `SELECT (SELECT * FROM one LIMIT 1) AS s FROM pub` over a one-column table
+    A star, or a bare COLUMNS, is read by the outermost star check (`_has_projection_star`), by
+    the resolver for a derived table or a CTE the outer query reads by name and whose own Select
+    does not consume it (a DISTINCT, a GROUP BY, an ORDER BY ALL or by position reads every
+    column: `SELECT count(*) FROM (SELECT DISTINCT * FROM claim) d` answers by whether two
+    withheld values are equal, M198), and by nothing else; `COUNT(*)` and an EXISTS's projection
+    read no value, unless an INTERSECT or EXCEPT under the EXISTS compares it, and a PIVOT or
+    UNPIVOT source is refused as unmodelled with its own code (`_projection_is_read` is that
+    whole list). A star in a scalar subquery, an IN list or a RETURNING is read by none of them,
+    and its Select names no Column: `SELECT (SELECT * FROM one LIMIT 1) AS s FROM pub` over a one-column table
     returned the withheld value hidden, denied and masked, and `WHERE (SELECT * FROM one LIMIT
     1) LIKE 'Z%'` was an oracle (M196). Every star whose query is not the outermost one, a
     derived table, a CTE, an EXISTS or `COUNT(*)` is refused. In a write (`write=True`, the
@@ -273,8 +277,10 @@ def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refus
     the INSERT's source has no outermost check, so `INSERT INTO sink SELECT * FROM claim` and
     `INSERT INTO sink SELECT COLUMNS('secret') FROM claim` were approved and copied the
     withheld value into a table the same grant reads (Codex's second review of #169; M195).
-    Every star but `COUNT(*)` and an EXISTS's, and every COLUMNS, is refused there: a write
-    names every column it reads.
+    Every star and every COLUMNS but `COUNT(*)`'s and an EXISTS's is refused there: a write names
+    every column it reads. A column reached by position (`#2`) is the same read under another
+    spelling, refused on the read side by `_bound_by_position` and, since M197, in the write
+    decider's shape check as well.
     """
     for dot in ast.find_all(exp.Dot):
         if isinstance(dot.expression, exp.Anonymous) and str(dot.expression.this).upper() == "COLUMNS":
@@ -355,12 +361,34 @@ def _projection_is_read(node: exp.Expression, write: bool) -> bool:
         return False
     if outer is None:
         return True  # the outermost projection: `_has_projection_star` rules on it
+    if _consumes_its_projection(holder):
+        return False  # the derived Select reads every column itself (M198)
     if isinstance(outer, exp.CTE):
         return True
     while isinstance(outer, exp.Subquery) and isinstance(outer.parent, exp.Subquery):
         outer = outer.parent  # `((SELECT ...)) d` nests Subquery in Subquery
     if isinstance(outer, exp.Subquery):
         return isinstance(outer.parent, (exp.From, exp.Join, exp.Lateral))
+    return False
+
+
+def _consumes_its_projection(select: exp.Select) -> bool:
+    """Whether the Select reads every column of its own projection, star included: a DISTINCT
+    (plain or ON) compares them, a GROUP BY (ALL, or by position: a star under any other GROUP
+    BY is DuckDB's own error) groups by them, an ORDER BY ALL or by position orders by them,
+    in the Select's own ORDER BY or a window's. Measured on DuckDB 1.5.4: `SELECT count(*) FROM
+    (SELECT DISTINCT * FROM claim) d`, the GROUP BY ALL twin and the CTE spelling answer 1 or 2
+    by whether two rows' withheld values are equal, and `(SELECT * FROM claim ORDER BY 2 LIMIT
+    1) d` serves the id of the smallest (the ui lane's replay of #169; M198). A name in any of
+    those clauses is a Column the checks read; a position or ALL is not."""
+    if select.args.get("distinct") is not None or select.args.get("group") is not None:
+        return True
+    for ordered in select.find_all(exp.Ordered):
+        if ordered.find_ancestor(exp.Select) is not select:
+            continue  # a subquery's own ORDER BY, judged with that subquery's projection
+        key = ordered.this
+        if isinstance(key, exp.Literal) or (isinstance(key, exp.Var) and key.name.upper() == "ALL"):
+            return True
     return False
 
 

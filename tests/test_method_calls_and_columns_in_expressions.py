@@ -219,6 +219,7 @@ def test_a_write_naming_its_columns_keeps_count_star_and_exists_star(con):
     schema = {**FULL, "sink": {"i", "s", "j"}}
     for sql in ("INSERT INTO sink (i) SELECT COUNT(*) FROM claim",
                 "DELETE FROM sink WHERE EXISTS (SELECT * FROM claim WHERE claim.id = sink.i)",
+                "INSERT INTO sink (i) SELECT 1 WHERE EXISTS (SELECT COLUMNS('ecr') FROM claim)",
                 "INSERT INTO sink (s) SELECT secret FROM claim"):
         con.execute(sql)
         verdict = _decide_write(sql, schema, AccessPolicy(policy_schema=schema))
@@ -277,6 +278,66 @@ def test_a_predicate_oracle_through_a_bare_columns_or_an_exists_intersect_is_ref
     schema_w = {**schema, "sink": {"i", "s", "j"}}
     verdict = _decide_write(write, schema_w, AccessPolicy(denied={("one", "secret")}, policy_schema=schema_w))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (write, verdict)
+
+
+@pytest.mark.parametrize("sql", [
+    "INSERT INTO sink (i, s) SELECT id, #2 FROM claim",
+    "UPDATE sink SET s = (SELECT #2 FROM claim LIMIT 1) WHERE i = 1",
+    "INSERT INTO sink (i, s) SELECT d.x, d.y FROM (SELECT * FROM claim) d(x, y, z)",
+])
+def test_a_column_reached_by_position_in_a_write_is_refused(con, sql):
+    # M197 (the ui lane's replay of #169): the read side refuses `#2` and a renaming column
+    # list over a star (M184, M185); the write decider's shape check never ran that check.
+    con.execute("CREATE TABLE sink (i INT, s VARCHAR, j STRUCT(ssn VARCHAR)); INSERT INTO sink VALUES (1, 'x', NULL)")
+    con.execute(sql)
+    assert "CLAIM-SECRET" in str(con.execute("SELECT s FROM sink").fetchall()).upper()
+    schema = {**FULL, "sink": {"i", "s", "j"}}
+    hidden = _decide_write(sql, {**HIDDEN, "sink": {"i", "s", "j"}}, AccessPolicy(policy_schema=schema))
+    denied = _decide_write(sql, schema, AccessPolicy(denied={("claim", "secret")}, policy_schema=schema))
+    masked = _decide_write(sql, schema, AccessPolicy(masked={("claim", "secret")}, policy_schema=schema))
+    for verdict in (hidden, denied, masked):
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT count(*) AS n FROM (SELECT DISTINCT * FROM dup) d",
+    "SELECT count(*) AS n FROM (SELECT DISTINCT ON (1) * FROM dup) d",
+    "SELECT count(*) AS n FROM (SELECT * FROM dup GROUP BY ALL) d",
+    "SELECT count(*) AS n FROM (SELECT * FROM dup GROUP BY 1) d",
+    "WITH w AS (SELECT DISTINCT * FROM dup) SELECT count(*) AS n FROM w",
+    "SELECT d.id FROM (SELECT * FROM pair ORDER BY 2 LIMIT 1) d",
+    "SELECT d.id FROM (SELECT * EXCLUDE (id), id FROM pair ORDER BY ALL LIMIT 1) d",
+])
+def test_a_derived_star_consumed_by_its_own_select_is_refused(con, sql):
+    # M198 (the ui lane's replay of #169): the resolver reads a derived star only where the outer
+    # query names a column, but a DISTINCT, a GROUP BY or an ORDER BY ALL or by position in the
+    # derived Select reads every column itself: a count that says whether two withheld values
+    # are equal, or the id of the smallest.
+    con.execute("CREATE TABLE dup (secret VARCHAR); INSERT INTO dup VALUES ('S'), ('S'); "
+                "CREATE TABLE pair (id INT, secret VARCHAR); INSERT INTO pair VALUES (1, 'Z'), (2, 'A')")
+    first = con.execute(sql).fetchall()
+    con.execute("INSERT INTO dup VALUES ('T'); UPDATE pair SET secret = 'A' WHERE id = 1; UPDATE pair SET secret = 'Z' WHERE id = 2")
+    assert con.execute(sql).fetchall() != first, (sql, first)  # the answer follows the withheld values
+    table = "dup" if "dup" in sql else "pair"
+    schema = {**FULL, "dup": {"secret"}, "pair": {"id", "secret"}}
+    hidden = _decide(sql, {**schema, table: schema[table] - {"secret"}}, policy=AccessPolicy(policy_schema=schema))
+    denied = _decide(sql, schema, policy=AccessPolicy(denied={(table, "secret")}, policy_schema=schema))
+    masked = _decide(sql, schema, policy=AccessPolicy(masked={(table, "secret")}, policy_schema=schema))
+    for verdict in (hidden, denied, masked):
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
+def test_a_derived_star_its_own_select_does_not_consume_is_still_resolved(con):
+    con.execute("CREATE TABLE pair (id INT, secret VARCHAR); INSERT INTO pair VALUES (1, 'Z'), (2, 'A')")
+    schema = {**FULL, "pair": {"id", "secret"}}
+    for sql in ("SELECT d.id FROM (SELECT * FROM pair ORDER BY id LIMIT 1) d",
+                "SELECT d.id FROM (SELECT * FROM pair LIMIT 1) d",
+                "SELECT count(*) AS n FROM (SELECT * FROM pair) d",
+                "SELECT d.id FROM (SELECT * FROM pair WHERE id IN (SELECT id FROM pair ORDER BY 1)) d"):
+        con.execute(sql)
+        assert isinstance(_decide(sql, schema, policy=AccessPolicy(policy_schema=schema)), Approved), sql
+        denied = _decide(sql, schema, policy=AccessPolicy(denied={("pair", "secret")}, policy_schema=schema))
+        assert not isinstance(denied, Refusal) or denied.code is not RefusalCode.SELECT_STAR, (sql, denied)
 
 
 def test_a_star_the_resolver_or_the_star_check_reads_is_left_to_them(con):
