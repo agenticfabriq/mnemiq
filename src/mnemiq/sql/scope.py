@@ -1076,8 +1076,10 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
                     # (SELECT id AS x FROM wide) d` read claim's hidden secret with claim granted
                     # without it, once the alias was exempted). So `SELECT c.id AS k, k + 1 FROM
                     # claim c CROSS JOIN (SELECT id AS x FROM other) d` is refused from the grant
-                    # alone and approved under the complete schema, which the shipped
-                    # `visible_schema` is.
+                    # alone and approved under the complete schema: `build_access_policy`'s
+                    # `policy_schema`, every column of the snapshot, which both shipped deciding
+                    # paths pass (`visible_schema` alone marks no table complete; a `decide`
+                    # with no policy reads from the grant alone, the review gate).
                     found = ("first", fallback)
                 if found is None:
                     found = _bound_outward_bare(scope, column, columns, dialect)
