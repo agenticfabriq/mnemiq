@@ -548,6 +548,13 @@ def test_a_doubled_quote_in_a_member_name_is_read_and_an_unreadable_declared_typ
     "list_contains([region], attrs -> '$.a')",
     "region = attrs -> '$.a'",
     "list_has_any([region], [attrs -> '$.a'])",
+    # The review gate on the twentieth round: calls that take no lambda, returners the list had
+    # missed, and an extract over a list of paths, which is JSON[] and not JSON.
+    "list_contains([region], list_any_value(attrs -> ['$.a']))",
+    "list_contains([region], array_to_json([id]))",
+    "[region] = json_extract(attrs, ['$.a'])",
+    "[[region]] = [json_extract(attrs, ['$.a'])]",
+    "[region] = json_extract(attrs, ['$.a']::VARCHAR[])",  # a list of paths not spelled as a list
 ])
 def test_a_call_returning_json_beside_text_is_read_as_json(row_filter):
     """Codex's nineteenth review of #160: `to_json(id)` was of unknown type, and unknown beside
@@ -572,9 +579,16 @@ def test_a_call_returning_text_beside_text_is_not_refused_for_being_unknown():
     for row_filter in ("list_contains([region], lower(region))", "[region] = [lower(region)]",
                        "lower(region) = 'north'", "list_contains([region], json_extract_string(attrs, '$.a'))",
                        "list_transform([region], x -> upper(x))[1] = 'NORTH'",  # a lambda DuckDB takes
-                       "list_filter([region], x -> x = 'north')[1] = 'north'"):
+                       "list_filter([region], x -> x = 'north')[1] = 'north'",
+                       "array_apply([region], x -> upper(x))[1] = 'NORTH'",  # the catalogue's list, not a typed one
+                       "list_sort([region])[1] = region"):  # takes no lambda, reads the column
         assert con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall() is not None
         assert isinstance(_decide(row_filter), Approved), row_filter
+    # Residuals the gate named (pre-existing): a lambda DuckDB takes is not read for JSON
+    # unification inside its body, `list_transform([region], x -> x = to_json(id))[1]`, where
+    # `x` is the list's element and the reader does not type a lambda's parameter; and
+    # `json_transform` or `from_json` beside text, whose type is the structure they are asked
+    # for (typed JSON they would pass beside a JSON value where they return text).
     # The nineteenth round's tightening of the two-list search, both ways (the review gate): a
     # list literal holding a call of unknown type is refused, and the JSON one it closes raises.
     with pytest.raises(duckdb.Error, match="Malformed JSON"):

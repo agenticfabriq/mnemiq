@@ -203,6 +203,17 @@ def _duckdb(sql: str, params=()):
         return _READER.execute(sql, list(params)).fetchone()[0]
 
 
+def _duckdb_rows(sql: str, params=()):
+    """Every row of a catalogue question put to the same local-only reader."""
+    global _READER
+    from mnemiq.duckdb_extensions import connect_duckdb
+
+    with _READER_LOCK:
+        if _READER is None:
+            _READER = connect_duckdb(local_only=True)
+        return _READER.execute(sql, list(params)).fetchall()
+
+
 def _json_text(text: str) -> bool:
     """Whether a literal is JSON as DuckDB reads it: asked of DuckDB's own `json_valid`, since
     it is DuckDB's reader that fails on the row. Python's grammar differs both ways (it takes a
@@ -312,15 +323,21 @@ def _branch_type(value, type_of, engine: str) -> exp.DataType | None:
 # #160: `list_contains([region], to_json(id))`, `region = to_json(id)`, a CASE between them and
 # `[to_json(id)] = [region]` were of unknown type on the call's side and approved, where DuckDB
 # unifies the text to JSON and parses it). By sqlglot's node where it has one, by name where
-# it does not; a source-defined function returning JSON is still unknown here, and unknown
-# beside text is not refused, since that would refuse `lower(region) = 'x'` (a residual).
+# it does not: the json extension's returners as read here from DuckDB 1.5.4. `json_transform`
+# and `from_json` return the structure they are asked for and are not listed: typed JSON they
+# would pass beside a JSON value where they return text (the review gate on the twenty-first
+# round, which refused that at HEAD), so they stay unknown, refused beside JSON and approved
+# beside text. A name not listed, a built-in missed or a source-defined function, is unknown
+# here, and unknown beside text is not refused, since that would refuse `lower(region) = 'x'`
+# (the residual; the review gate on the twentieth round).
 _JSON_CALL_NODES = (exp.JSONExtract, exp.JSONObject, exp.JSONArray, exp.JSONArrayAgg,
                     exp.JSONObjectAgg, exp.ParseJSON)
-_JSON_CALL_NAMES = frozenset({"to_json", "row_to_json", "json_quote", "json_object", "json_array",
-                              "json_merge_patch", "json_extract", "json_extract_path", "json",
-                              "json_value", "json_structure", "json_group_array",
-                              "json_group_object", "json_group_structure",
+_JSON_CALL_NAMES = frozenset({"to_json", "row_to_json", "array_to_json", "json_quote",
+                              "json_object", "json_array", "json_merge_patch", "json_extract",
+                              "json_extract_path", "json", "json_value", "json_structure",
+                              "json_group_array", "json_group_object", "json_group_structure",
                               "json_serialize_sql", "json_serialize_plan"})
+_JSON_EXTRACTS = frozenset({"json_extract", "json_extract_path"})
 
 
 def _is_json_call(node: exp.Expression) -> bool:
@@ -328,15 +345,49 @@ def _is_json_call(node: exp.Expression) -> bool:
         isinstance(node, exp.Anonymous) and node.name.lower() in _JSON_CALL_NAMES)
 
 
+def _json_call_type(node: exp.Expression) -> str:
+    """JSON, or JSON[] for an extract whose path is anything but one string literal
+    (`json_extract(x, ['$.a'])` is JSON[] to DuckDB, and so is a cast or a column holding a
+    list of paths; typed as a scalar it unified with `[region]` as a list of text would not:
+    the review gate on the twentieth and twenty-first rounds). A path of unknown shape is read
+    as a list, fail-closed: a scalar extract beside text is then refused as a list would be."""
+    path = None
+    if isinstance(node, exp.JSONExtract):
+        path = node.expression
+    elif isinstance(node, exp.Anonymous) and node.name.lower() in _JSON_EXTRACTS:
+        path = node.expressions[1] if len(node.expressions) > 1 else None
+    if path is None or (isinstance(path, exp.Literal) and path.is_string) or isinstance(path, exp.JSONPath):
+        return "JSON"
+    return "JSON[]"
+
+
 # The calls DuckDB hands a lambda to. Anywhere else `a -> b` is DuckDB's JSON extract, which
 # sqlglot reads as a lambda inside a call's arguments or beside an operator (`list_contains(
 # [region], attrs -> '$.a')`, `region = attrs -> '$.a'`: Codex's nineteenth review of #160), so the
 # reader here sees a statement the engine does not run; refused, with the plain spelling in the
 # advice (`json_extract(attrs, '$.a')`, which sqlglot reads as the extract everywhere).
-_LAMBDA_TAKERS = frozenset({"list_transform", "array_transform", "apply", "list_apply",
-                            "list_filter", "array_filter", "filter", "list_reduce", "array_reduce",
-                            "reduce", "list_any_value", "list_sort", "list_grade_up"})
+_LAMBDA_TAKERS_KNOWN = frozenset({"list_transform", "array_transform", "apply", "list_apply",
+                                  "array_apply", "list_filter", "array_filter", "filter",
+                                  "list_reduce", "array_reduce", "reduce"})
 _LAMBDA_TAKER_NODES = (exp.Transform, exp.ArrayFilter, exp.Reduce)
+_LAMBDA_TAKERS: frozenset[str] | None = None
+
+
+def _lambda_takers() -> frozenset[str]:
+    """The calls DuckDB hands a lambda to, asked of the local reader's own catalogue
+    (`duckdb_functions()`, a LAMBDA among the parameter types: eleven names on 1.5.4), the
+    list above where the catalogue cannot be asked. A typed list missed `array_apply` and
+    listed `list_sort`, `list_any_value` and `list_grade_up`, which take none (the review gate
+    on the twentieth and twenty-first rounds)."""
+    global _LAMBDA_TAKERS
+    if _LAMBDA_TAKERS is None:
+        try:
+            rows = _duckdb_rows("SELECT DISTINCT lower(function_name) FROM duckdb_functions() "
+                                "WHERE list_contains(parameter_types, 'LAMBDA')")
+            _LAMBDA_TAKERS = frozenset(name for (name,) in rows) or _LAMBDA_TAKERS_KNOWN
+        except Exception:  # noqa: BLE001 -- the catalogue could not be asked: the typed list
+            _LAMBDA_TAKERS = _LAMBDA_TAKERS_KNOWN
+    return _LAMBDA_TAKERS
 
 
 def _arrow_read_as_a_lambda(node: exp.Expression) -> bool:
@@ -344,7 +395,7 @@ def _arrow_read_as_a_lambda(node: exp.Expression) -> bool:
         return False
     parent = node.parent
     return not (isinstance(parent, _LAMBDA_TAKER_NODES) or (
-        isinstance(parent, exp.Anonymous) and parent.name.lower() in _LAMBDA_TAKERS))
+        isinstance(parent, exp.Anonymous) and parent.name.lower() in _lambda_takers()))
 
 
 def _known_type(value, type_of, engine: str) -> exp.DataType | None:
@@ -517,10 +568,10 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
         return None
     typed_nulls = value.copy()
     if _is_json_call(typed_nulls):
-        typed_nulls = exp.Cast(this=exp.Null(), to=exp.DataType.build("JSON"))
+        typed_nulls = exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(typed_nulls)))
     for call in list(typed_nulls.find_all(*_JSON_CALL_NODES, exp.Anonymous)):
         if _is_json_call(call):
-            call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build("JSON")))
+            call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(call))))
     for column, kind_of in zip(list(typed_nulls.find_all(exp.Column)), declared):
         column.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
     copied_keys = [item.this for to_map in typed_nulls.find_all(exp.ToMap)
