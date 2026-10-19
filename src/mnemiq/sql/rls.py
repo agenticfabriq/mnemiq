@@ -419,6 +419,7 @@ _PURE = (exp.Column, exp.Identifier, exp.Literal, exp.Boolean, exp.Null, exp.Par
          exp.Case, exp.If, exp.Coalesce, exp.Nullif, exp.Array, exp.Struct, exp.PropertyEQ,
          exp.ToMap, exp.Map,  # `MAP {'a': attrs}`, `MAP(['a'], [attrs])` (the review gate)
          exp.Bracket, exp.Dot,  # `[attrs][1]`, `({'a': attrs}).a` (Codex's tenth review)
+         exp.Tuple,  # `('a', 1)`, a row value, as `map_from_entries` takes them
          exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.And, exp.Or, exp.Not, exp.Is,
          exp.In, exp.Between, exp.Like, exp.ILike, *_ARITHMETIC)
 
@@ -429,8 +430,9 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     runs; None for anything else, or where a column's type is not known."""
     while isinstance(value, exp.Paren):
         value = value.this
-    if not all(isinstance(node, _PURE) or (
-            isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_CONSTRUCTORS)
+    if not all(isinstance(node, (*_PURE, *_PURE_CALL_NODES)) or (
+            isinstance(node, exp.Anonymous)
+            and node.name.lower() in _LIST_CONSTRUCTORS | _PURE_CALLS)
             for node in value.walk()):
         return None
     # A MAP literal's keys are expressions DuckDB evaluates (`MAP {id: 1}` is keyed by the
@@ -474,6 +476,17 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
 # (or the mix is a bind fault on no row's value), or parsed by `_coerces_to_json`'s rule.
 _TEXT = "text"
 _LIST_CONSTRUCTORS = frozenset({"array_value", "list_pack"})  # `list_value` parses as a list
+# Container accessors that build a value from their arguments and run nothing, typed by DuckDB
+# like the containers they read (Codex's twelfth review of #160: `map_values(MAP(['a'],
+# [attrs])) = map_values(MAP(['a'], [region]))`, `list_extract([attrs], 1) = region` and the
+# struct and key twins were of unknown type on both sides, and parsed region as JSON on the
+# hidden row); by sqlglot's node where it has one, by name where it does not.
+_PURE_CALL_NODES = (exp.MapKeys, exp.StructExtract, exp.ArrayDistinct, exp.MapFromEntries,
+                    exp.ArraySlice, exp.SortArray, exp.Flatten)
+_PURE_CALLS = frozenset({"map_values", "map_entries", "list_extract", "array_extract", "list_element",
+                         "array_element", "list_slice", "list_reverse", "array_reverse",
+                         "list_unique", "list_distinct", "array_distinct", "map_keys",
+                         "struct_extract", "flatten", "list_sort", "map_from_entries"})
 # A list searched for a value (the element type unified with the value's), or two lists searched
 # against each other; by sqlglot's node where it has one, by name where it does not.
 _LIST_SEARCHES = (exp.ArrayContains, exp.ArrayPosition, exp.ArrayOverlaps, exp.ArrayContainsAll,
@@ -697,7 +710,7 @@ def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
     for side in _sides(node):
         while isinstance(side, exp.Paren):
             side = side.this  # `(region) = 7` converts the column as `region = 7` does (Codex, #160)
-        known = _known_type(side, type_of, engine)
+        known = _type_of_value(side, type_of, engine)  # a container accessor's, as DuckDB's
         if known is None:
             continue
         if known.this in exp.DataType.TEXT_TYPES:

@@ -225,6 +225,13 @@ RAISING_TYPED_FORMS = [
     # The review gate on cd17747: a subscripted map literal, and map_contains.
     "MAP {'{}'::JSON: 1}[region] = 1",
     "map_contains(MAP(['{}'::JSON], [1]), region)",
+    # Codex's twelfth review: a container accessor's value is typed as the container's.
+    "map_values(MAP(['a'], [attrs])) = map_values(MAP(['a'], [region]))",
+    "map_keys(MAP([COALESCE(attrs, '{}'::JSON)], [1])) = map_keys(MAP([region], [1]))",
+    "list_extract([attrs], 1) = region",
+    "struct_extract({'a': attrs}, 'a') = region",
+    "list_distinct([attrs]) = [region]",
+    "COALESCE(list_extract([attrs], 1), region) IS NOT NULL",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -284,6 +291,11 @@ SAFE_TYPED_FORMS = [
     "MAP([region], [1])['x'] = 1",
     "MAP {'a': 1}[region] = 1",
     "map_contains(MAP(['a'], [1]), region)",
+    "map_values(MAP(['a'], [region])) = ['x']",
+    "list_extract([region], 1) = 'x'",
+    # Typed now, so no longer refused as a list or a map the reader cannot type.
+    "list_contains(list_distinct([region]), 'x')",
+    "map_extract_value(map_from_entries([('a', 1)]), region) = 1",
     "[attrs][1] IS NOT NULL",
     "COALESCE([attrs][1], attrs) IS NOT NULL",
     "CASE WHEN id = 1 THEN {'a': attrs, 'b': 1.5} ELSE {'a': attrs, 'b': 10.25} END IS NOT NULL",
@@ -409,10 +421,11 @@ def test_a_literal_beside_a_branch_the_validator_cannot_type_is_refused_though_i
                  # TRY_CAST to a container cannot tell a converting literal from one that does
                  # not (the review gate), so a literal beside a container branch is refused too.
                  "CASE WHEN id = 1 THEN [1, 2] ELSE '[3]' END IS NOT NULL",
-                 # A list a call returns cannot be typed, and may hold JSON (the review gate);
-                 # a map a call returns the same, under a map-only lookup.
-                 "list_contains(list_distinct([region]), 'x')",
-                 "map_extract_value(map_from_entries([('a', 1)]), region) = 1"):
+                 # A list or a map a call the reader does not know returns cannot be typed,
+                 # and may hold JSON (the review gate); a list-only search or a map-only lookup
+                 # of one is refused.
+                 "list_contains(list_filter([region], x -> x IS NOT NULL), 'x')",
+                 "map_extract_value(map_from_entries(list_filter([('a', 1)], x -> true)), region) = 1"):
         con.execute(f"SELECT id FROM claim WHERE {runs}").fetchall()
         verdict = _decide(runs)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, runs
