@@ -279,7 +279,7 @@ def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refus
     withheld value into a table the same grant reads (Codex's second review of #169; M195).
     Every star and every COLUMNS but `COUNT(*)`'s and an EXISTS's is refused there: a write names
     every column it reads. A column reached by position (`#2`) is the same read under another
-    spelling, refused on the read side by `_bound_by_position` and, since M197, in the write
+    spelling, refused on the read side by `bound_by_position` and, since M197, in the write
     decider's shape check as well.
     """
     for dot in ast.find_all(exp.Dot):
@@ -350,9 +350,10 @@ def _projection_is_read(node: exp.Expression, write: bool) -> bool:
         return True  # a PIVOT or UNPIVOT source is refused as unmodelled, with its own code
     if not isinstance(holder, exp.Select):
         return False
-    query, compared = holder, False
+    query, compared, wrappers = holder, False, [holder]
     while isinstance(query.parent, (exp.SetOperation, exp.Paren)):
         query = query.parent
+        wrappers.append(query)
         compared = compared or isinstance(query, (exp.Intersect, exp.Except))
     outer = query.parent
     if isinstance(outer, exp.Exists):
@@ -361,30 +362,37 @@ def _projection_is_read(node: exp.Expression, write: bool) -> bool:
         return False
     if outer is None:
         return True  # the outermost projection: `_has_projection_star` rules on it
-    if _consumes_its_projection(holder):
-        return False  # the derived Select reads every column itself (M198)
     if isinstance(outer, exp.CTE):
-        return True
+        return not any(_consumes_its_projection(wrapper) for wrapper in wrappers)
     while isinstance(outer, exp.Subquery) and isinstance(outer.parent, exp.Subquery):
+        wrappers.append(outer)
         outer = outer.parent  # `((SELECT ...)) d` nests Subquery in Subquery
-    if isinstance(outer, exp.Subquery):
-        return isinstance(outer.parent, (exp.From, exp.Join, exp.Lateral))
-    return False
+    if not isinstance(outer, exp.Subquery) or not isinstance(outer.parent, (exp.From, exp.Join, exp.Lateral)):
+        return False
+    wrappers.append(outer)
+    return not any(_consumes_its_projection(wrapper) for wrapper in wrappers)  # M198
 
 
-def _consumes_its_projection(select: exp.Select) -> bool:
-    """Whether the Select reads every column of its own projection, star included: a DISTINCT
-    (plain or ON) compares them, a GROUP BY (ALL, or by position: a star under any other GROUP
-    BY is DuckDB's own error) groups by them, an ORDER BY ALL or by position orders by them,
-    in the Select's own ORDER BY or a window's. Measured on DuckDB 1.5.4: `SELECT count(*) FROM
-    (SELECT DISTINCT * FROM claim) d`, the GROUP BY ALL twin and the CTE spelling answer 1 or 2
-    by whether two rows' withheld values are equal, and `(SELECT * FROM claim ORDER BY 2 LIMIT
-    1) d` serves the id of the smallest (the ui lane's replay of #169; M198). A name in any of
-    those clauses is a Column the checks read; a position or ALL is not."""
-    if select.args.get("distinct") is not None or select.args.get("group") is not None:
-        return True
-    for ordered in select.find_all(exp.Ordered):
-        if ordered.find_ancestor(exp.Select) is not select:
+_WRAPPERS = (exp.Select, exp.Subquery, exp.SetOperation, exp.Paren)
+
+
+def _consumes_its_projection(node: exp.Expression) -> bool:
+    """Whether the query, or a wrapper around it, reads every column of its projection, star
+    included: a DISTINCT (plain or ON) compares them, a GROUP BY (ALL, or by position: a star
+    under any other GROUP BY is DuckDB's own error) groups by them, an ORDER BY ALL or by
+    position orders by them, in the Select's own ORDER BY, a window's, or the ORDER BY sqlglot
+    hangs on a wrapping Subquery (`((SELECT * FROM pair) ORDER BY 2 LIMIT 1) d`: the review gate
+    on the fourth round) or on a set operation (`(SELECT * FROM pair UNION ALL SELECT * FROM
+    pair ORDER BY 2 LIMIT 1) d`, whose branches the positional check refuses as well). Measured on DuckDB 1.5.4: `SELECT count(*) FROM (SELECT DISTINCT *
+    FROM claim) d`, the GROUP BY ALL twin and the CTE spelling answer 1 or 2 by whether two
+    rows' withheld values are equal, and `(SELECT * FROM claim ORDER BY 2 LIMIT 1) d` serves the
+    id of the smallest (the ui lane's replay of #169; M198). A name in any of those clauses is a
+    Column the checks read; a position or ALL is not."""
+    if isinstance(node, exp.Select) and (node.args.get("distinct") is not None
+                                         or node.args.get("group") is not None):
+        return True  # a set operation's own DISTINCT is M183's: its branches bind by position
+    for ordered in node.find_all(exp.Ordered):
+        if ordered.find_ancestor(*_WRAPPERS) is not node:
             continue  # a subquery's own ORDER BY, judged with that subquery's projection
         key = ordered.this
         if isinstance(key, exp.Literal) or (isinstance(key, exp.Var) and key.name.upper() == "ALL"):

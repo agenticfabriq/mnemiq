@@ -283,11 +283,12 @@ def test_a_predicate_oracle_through_a_bare_columns_or_an_exists_intersect_is_ref
 @pytest.mark.parametrize("sql", [
     "INSERT INTO sink (i, s) SELECT id, #2 FROM claim",
     "UPDATE sink SET s = (SELECT #2 FROM claim LIMIT 1) WHERE i = 1",
-    "INSERT INTO sink (i, s) SELECT d.x, d.y FROM (SELECT * FROM claim) d(x, y, z)",
+    "INSERT INTO sink (i, s) SELECT d.x, d.y FROM claim AS d(x, y, z)",
 ])
 def test_a_column_reached_by_position_in_a_write_is_refused(con, sql):
     # M197 (the ui lane's replay of #169): the read side refuses `#2` and a renaming column
-    # list over a star (M184, M185); the write decider's shape check never ran that check.
+    # list on a table reference (M184, M185); the write decider's shape check never ran that
+    # check (a column list over a derived STAR is refused by the star rule first).
     con.execute("CREATE TABLE sink (i INT, s VARCHAR, j STRUCT(ssn VARCHAR)); INSERT INTO sink VALUES (1, 'x', NULL)")
     con.execute(sql)
     assert "CLAIM-SECRET" in str(con.execute("SELECT s FROM sink").fetchall()).upper()
@@ -307,6 +308,10 @@ def test_a_column_reached_by_position_in_a_write_is_refused(con, sql):
     "WITH w AS (SELECT DISTINCT * FROM dup) SELECT count(*) AS n FROM w",
     "SELECT d.id FROM (SELECT * FROM pair ORDER BY 2 LIMIT 1) d",
     "SELECT d.id FROM (SELECT * EXCLUDE (id), id FROM pair ORDER BY ALL LIMIT 1) d",
+    "SELECT d.id FROM ((SELECT * FROM pair) ORDER BY 2 LIMIT 1) d",
+    "SELECT d.id FROM (((SELECT * FROM pair)) ORDER BY 2 LIMIT 1) d",
+    "SELECT d.id FROM (SELECT * FROM pair UNION ALL SELECT * FROM pair ORDER BY 2 LIMIT 1) d",
+    "WITH w AS ((SELECT * FROM pair) ORDER BY 2 LIMIT 1) SELECT w.id FROM w",  # refused before the CTE branch
 ])
 def test_a_derived_star_consumed_by_its_own_select_is_refused(con, sql):
     # M198 (the ui lane's replay of #169): the resolver reads a derived star only where the outer
