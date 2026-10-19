@@ -232,6 +232,13 @@ RAISING_TYPED_FORMS = [
     "struct_extract({'a': attrs}, 'a') = region",
     "list_distinct([attrs]) = [region]",
     "COALESCE(list_extract([attrs], 1), region) IS NOT NULL",
+    # Codex's thirteenth review: a row value built by a call, and the gate's array_reverse.
+    "row(attrs) = row(region)",
+    "struct_pack(a := attrs) = struct_pack(a := region)",
+    "array_reverse([attrs]) = array_reverse([region])",
+    # The review gate: an unnamed struct at any depth.
+    "[row(attrs)] = [row(region)]",
+    "row(row(attrs)) = row(row(region))",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -292,6 +299,7 @@ SAFE_TYPED_FORMS = [
     "MAP {'a': 1}[region] = 1",
     "map_contains(MAP(['a'], [1]), region)",
     "map_values(MAP(['a'], [region])) = ['x']",
+    "row(region) = row('x')",
     "list_extract([region], 1) = 'x'",
     # Typed now, so no longer refused as a list or a map the reader cannot type.
     "list_contains(list_distinct([region]), 'x')",

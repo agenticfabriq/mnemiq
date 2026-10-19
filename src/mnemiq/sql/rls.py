@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import logging
+import re
 import threading
 
 import sqlglot
@@ -482,11 +483,11 @@ _LIST_CONSTRUCTORS = frozenset({"array_value", "list_pack"})  # `list_value` par
 # struct and key twins were of unknown type on both sides, and parsed region as JSON on the
 # hidden row); by sqlglot's node where it has one, by name where it does not.
 _PURE_CALL_NODES = (exp.MapKeys, exp.StructExtract, exp.ArrayDistinct, exp.MapFromEntries,
-                    exp.ArraySlice, exp.SortArray, exp.Flatten)
+                    exp.ArraySlice, exp.SortArray, exp.Flatten, exp.ArrayReverse)
 _PURE_CALLS = frozenset({"map_values", "map_entries", "list_extract", "array_extract", "list_element",
-                         "array_element", "list_slice", "list_reverse", "array_reverse",
-                         "list_unique", "list_distinct", "array_distinct", "map_keys",
-                         "struct_extract", "flatten", "list_sort", "map_from_entries"})
+                         "array_element", "list_slice", "list_reverse", "list_unique",
+                         "list_distinct", "array_distinct", "map_keys", "struct_extract",
+                         "flatten", "list_sort", "map_from_entries", "row"})
 # A list searched for a value (the element type unified with the value's), or two lists searched
 # against each other; by sqlglot's node where it has one, by name where it does not.
 _LIST_SEARCHES = (exp.ArrayContains, exp.ArrayPosition, exp.ArrayOverlaps, exp.ArrayContainsAll,
@@ -500,51 +501,135 @@ _LIST_PAIR_NAMES = frozenset({"list_has_all", "array_has_all", "list_has_any", "
 # review of #160: `element_at(MAP([attrs], [1]), region)` parses region as JSON on every row).
 _MAP_LOOKUPS = frozenset({"element_at", "map_extract", "map_extract_value", "map_contains"})
 _MAP_ONLY_LOOKUPS = frozenset({"map_extract", "map_extract_value", "map_contains"})
-_CONTAINERS = (exp.DataType.Type.ARRAY, exp.DataType.Type.LIST, exp.DataType.Type.STRUCT,
-               exp.DataType.Type.MAP)
+_TEXT_NAMES = frozenset({"VARCHAR", "TEXT", "STRING", "CHAR", "BPCHAR"})
 
 
-def _holds(kind: str, *types) -> bool | None:
-    """Whether a DuckDB type, in DuckDB's words, holds one of `types` at any depth (`JSON[]`
-    holds JSON, `STRUCT(a TEXT[])` holds text); None where the type cannot be read."""
-    try:
-        built = exp.DataType.build(kind, dialect="duckdb")
-    except Exception:  # noqa: BLE001
-        return None
-    return any(node.this in types for node in built.find_all(exp.DataType))
+def _split_top(text: str) -> list[str]:
+    """`text` split on the commas outside any parentheses, brackets or quotes."""
+    parts, depth, quote, current = [], 0, None, []
+    for ch in text:
+        if quote:
+            current.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+    return [part for part in parts if part]
 
 
-def _text_becomes_json(kind: exp.DataType, unified: exp.DataType) -> bool:
+def _parse_type(text: str):
+    """A DuckDB type, in DuckDB's words, as a tree: `("leaf", NAME)`, `("array", element)`,
+    `("struct", [(name or None, field), ...])`, `("map", key, value)`, `("union", [(name,
+    member), ...])`. DuckDB's own grammar, read directly: sqlglot's DataType reads a nested
+    unnamed struct (`STRUCT(STRUCT(JSON))`, which `row(row(attrs))` gives) as a struct literal
+    (the review gate on #160). Parameters (`DECIMAL(2,1)`) are left off the leaf's name."""
+    text = text.strip()
+    bracket = re.search(r"\[\d*\]$", text)
+    if bracket is not None:
+        return ("array", _parse_type(text[:bracket.start()]))
+    head = re.match(r"([A-Za-z_][A-Za-z_ ]*?)\s*(?:\((.*)\))?$", text, re.S)
+    if head is None:
+        raise ValueError(text)
+    name, inner = head.group(1).strip().upper(), head.group(2)
+    if name == "STRUCT":
+        fields = []
+        for item in _split_top(inner or ""):
+            label, rest = _split_label(item)
+            fields.append((label, _parse_type(rest)))
+        return ("struct", fields)
+    if name == "MAP":
+        key, value = _split_top(inner or "")
+        return ("map", _parse_type(key), _parse_type(value))
+    if name == "UNION":
+        members = []
+        for item in _split_top(inner or ""):
+            label, rest = _split_label(item)
+            members.append((label, _parse_type(rest)))
+        return ("union", members)
+    return ("leaf", name)
+
+
+def _split_label(item: str) -> tuple[str | None, str]:
+    """A struct field or union member: `name TYPE` or, unnamed, `TYPE` (a space outside any
+    parentheses separates the name, a quoted name kept whole)."""
+    if item.startswith('"'):
+        close = item.index('"', 1)
+        return item[1:close], item[close + 1:].strip()
+    depth = 0
+    for position, ch in enumerate(item):
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == " " and depth == 0:
+            return item[:position], item[position + 1:].strip()
+    return None, item
+
+
+def _castable(node) -> str:
+    """The type back in DuckDB's words as a cast target, an unnamed struct's fields named by
+    position (`STRUCT(f1 JSON)`), which `row(attrs)` gives and no cast accepts (Codex's
+    thirteenth review of #160)."""
+    kind = node[0]
+    if kind == "leaf":
+        return node[1]
+    if kind == "array":
+        return _castable(node[1]) + "[]"
+    if kind == "map":
+        return f"MAP({_castable(node[1])}, {_castable(node[2])})"
+    fields = [f'"{name or f"f{position}"}" {_castable(field)}'
+              for position, (name, field) in enumerate(node[1], 1)]
+    return f"{'STRUCT' if kind == 'struct' else 'UNION'}({', '.join(fields)})"
+
+
+def _holds_json(node) -> bool:
+    kind = node[0]
+    if kind == "leaf":
+        return node[1] == "JSON"
+    if kind == "array":
+        return _holds_json(node[1])
+    if kind == "map":
+        return _holds_json(node[1]) or _holds_json(node[2])
+    return any(_holds_json(field) for _, field in node[1])
+
+
+def _text_becomes_json(kind, unified) -> bool:
     """Whether converting a value of type `kind` to `unified` parses text as JSON anywhere: the
-    two types walked side by side, a list's element with the element, a struct's field with the
-    field, a map's key with the key and value with the value (a map's keys are text in both, and
-    read as a text leaf anywhere they refused `MAP {'a': attrs}` beside `MAP {'a': 1}`, which
-    DuckDB serialises and runs: the review gate). Shapes that do not line up cannot be told, and
-    are read as converting."""
-    if unified.this == exp.DataType.Type.JSON:
-        return kind.this in exp.DataType.TEXT_TYPES
-    # Children of a type: a struct's fields are paired by name (DuckDB matches them so, and
-    # `{'a': attrs, 'b': region}` beside `{'b': region, 'a': attrs}` runs), the rest by
-    # position; a type's parameters (DECIMAL(2,1)) take no part (the review gate).
-    inner_fields = [child for child in kind.expressions if not isinstance(child, exp.DataTypeParam)]
-    outer_fields = [child for child in unified.expressions if not isinstance(child, exp.DataTypeParam)]
-    if len(inner_fields) != len(outer_fields):
+    two types walked side by side, a list's element with the element, a struct's fields paired
+    by name where both name them (DuckDB matches them so, and `{'a': attrs, 'b': region}`
+    beside `{'b': region, 'a': attrs}` runs) and by position otherwise, a map's key with the
+    key and value with the value. Shapes that do not line up cannot be told, and are read as
+    converting."""
+    if unified[0] == "leaf":
+        return unified[1] == "JSON" and kind[0] == "leaf" and kind[1] in _TEXT_NAMES
+    if kind[0] != unified[0]:
         return True
-    if all(isinstance(child, exp.ColumnDef) for child in inner_fields + outer_fields):
-        by_name = {child.name: child for child in outer_fields}
-        if len(by_name) != len(outer_fields) or any(child.name not in by_name for child in inner_fields):
+    if kind[0] == "array":
+        return _text_becomes_json(kind[1], unified[1])
+    if kind[0] == "map":
+        return _text_becomes_json(kind[1], unified[1]) or _text_becomes_json(kind[2], unified[2])
+    if len(kind[1]) != len(unified[1]):
+        return True
+    if all(name is not None for name, _ in kind[1]) and all(name is not None for name, _ in unified[1]):
+        by_name = {name: field for name, field in unified[1]}
+        if len(by_name) != len(unified[1]) or any(name not in by_name for name, _ in kind[1]):
             return True
-        pairs = [(child, by_name[child.name]) for child in inner_fields]
+        pairs = [(field, by_name[name]) for name, field in kind[1]]
     else:
-        pairs = list(zip(inner_fields, outer_fields))
-    for inner, outer in pairs:
-        inner = inner.args["kind"] if isinstance(inner, exp.ColumnDef) else inner
-        outer = outer.args["kind"] if isinstance(outer, exp.ColumnDef) else outer
-        if not isinstance(inner, exp.DataType) or not isinstance(outer, exp.DataType):
-            return True
-        if _text_becomes_json(inner, outer):
-            return True
-    return False
+        pairs = [(inner, outer) for (_, inner), (_, outer) in zip(kind[1], unified[1])]
+    return any(_text_becomes_json(inner, outer) for inner, outer in pairs)
 
 
 def _json_inside_a_container(values, type_of) -> bool:
@@ -565,24 +650,22 @@ def _json_inside_a_container(values, type_of) -> bool:
         if value is None or isinstance(value, exp.Null):
             continue
         kinds.append(_duckdb_type(value, type_of))
-    known = [kind for kind in kinds if kind is not None and kind is not _TEXT]
-    holding = [_holds(kind, exp.DataType.Type.JSON) for kind in known]
-    if None in holding:
+    try:
+        known = [_parse_type(kind) for kind in kinds if kind is not None and kind is not _TEXT]
+    except ValueError:
         return True  # a type the reader here cannot read: not shown safe
-    if not any(holding):
+    if not any(_holds_json(node) for node in known):
         return False
     if any(kind is None for kind in kinds):
         return True  # a value of unknown type beside JSON: may hold text, parsed on its rows
     try:
-        unified = _duckdb("SELECT typeof(COALESCE(" + ", ".join(f"NULL::{k}" for k in known) + "))")
+        unified = _parse_type(_duckdb("SELECT typeof(COALESCE("
+                                      + ", ".join(f"NULL::{_castable(node)}" for node in known) + "))"))
+    except ValueError:
+        return True
     except Exception:  # noqa: BLE001 -- DuckDB cannot unify them: a bind fault, not a row's
         return False
-    try:
-        target = exp.DataType.build(unified, dialect="duckdb")
-        return any(kind != unified and _text_becomes_json(exp.DataType.build(kind, dialect="duckdb"), target)
-                   for kind in known)
-    except Exception:  # noqa: BLE001 -- a type the reader here cannot read: not shown safe
-        return True
+    return any(node != unified and _text_becomes_json(node, unified) for node in known)
 
 
 def _duckdb_type(branch: exp.Expression, type_of) -> str | None:
@@ -658,8 +741,7 @@ def _literal_cannot_convert(node: exp.Expression, type_of, engine: str) -> bool:
         return False
     try:
         unified = _duckdb("SELECT typeof(COALESCE(" + ", ".join(f"NULL::{k}" for k in kinds) + "))")
-        target = exp.DataType.build(unified, dialect="duckdb")
-        if target.this in _CONTAINERS:
+        if _parse_type(unified)[0] != "leaf":
             # To a list, a struct or a map, TRY_CAST gives a container of NULLs where an
             # element does not convert (`TRY_CAST('[north]' AS INTEGER[])` is `[NULL]`), not
             # NULL, so it cannot say whether the literal converts; the literal is refused, and
@@ -716,7 +798,7 @@ def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
         if known.this in exp.DataType.TEXT_TYPES:
             # A text side holding a column is converted row by row: the column itself, or a
             # text-typed value over one (`NVL(region, id) = 7` on Oracle, `COALESCE(region, 'x')
-            # = 7` on DuckDB, measured). A text literal has no known type and is never counted.
+            # = 7` on DuckDB, measured). A text literal holds no column and is never counted.
             # The column may sit in a condition: a literal the row chooses by a column is read on
             # the rows that choose it, and whether it converts is not evaluated here, so
             # `CASE WHEN id > 0 THEN 'x' ELSE '1' END = 7` is refused (it fails on the rows with
