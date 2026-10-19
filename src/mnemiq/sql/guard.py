@@ -407,11 +407,15 @@ def _consumes_its_projection(node: exp.Expression) -> bool:
         if ordered.find_ancestor(*_WRAPPERS) is not node:
             continue  # a subquery's own ORDER BY, judged with that subquery's projection
         key = ordered.this
-        while isinstance(key, (exp.Paren, exp.Neg)):
-            # `ORDER BY (2)`, `((2))` (the ui lane) and `-(-2)` (Codex's sixth review) are the
-            # position to DuckDB; a sign is unwrapped as parentheses are, fail-closed.
+        while isinstance(key, exp.Paren):
             key = key.this
-        if isinstance(key, exp.Literal) or (isinstance(key, exp.Var) and key.name.upper() == "ALL"):
+        if not isinstance(key, exp.Column):
+            # A key is left alone only as a bare column name, which the checks read. Every
+            # other spelling consumes the projection, fail-closed: a position (`2`, `(2)`,
+            # `-(-2)`, `2 COLLATE nocase`, each the position to DuckDB: the ui lane, Codex's
+            # sixth review and the gate found one after another), ALL, and a constant or an
+            # expression (`2::INT`, `id + 1`), which DuckDB reads otherwise and are refused
+            # all the same rather than told apart spelling by spelling.
             return True
     return False
 

@@ -315,6 +315,7 @@ def test_a_column_reached_by_position_in_a_write_is_refused(con, sql):
     "SELECT d.id FROM ((SELECT * FROM pair) ORDER BY ((2)) LIMIT 1) d",
     "SELECT d.id FROM (SELECT * FROM pair ORDER BY -(-2) LIMIT 1) d",  # a signed position (Codex)
     "SELECT d.id FROM (SELECT COLUMNS(*) FROM pair ORDER BY -(-2) LIMIT 1) d",
+    "SELECT d.id FROM (SELECT * FROM pair ORDER BY 2 COLLATE nocase LIMIT 1) d",  # the gate's spelling
     "WITH w AS ((SELECT * FROM pair) ORDER BY 2 LIMIT 1) SELECT w.id FROM w",  # refused before the CTE branch
 ])
 def test_a_derived_star_consumed_by_its_own_select_is_refused(con, sql):
@@ -334,6 +335,20 @@ def test_a_derived_star_consumed_by_its_own_select_is_refused(con, sql):
     masked = _decide(sql, schema, policy=AccessPolicy(masked={(table, "secret")}, policy_schema=schema))
     for verdict in (hidden, denied, masked):
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
+def test_an_order_by_key_over_a_derived_star_is_left_alone_only_as_a_bare_column(con):
+    # Fail-closed: a constant or an expression key is refused too, rather than each positional
+    # spelling told apart from each constant one (`2::INT` is a constant to DuckDB, no oracle).
+    con.execute("CREATE TABLE pair (id INT, secret VARCHAR); INSERT INTO pair VALUES (1, 'Z'), (2, 'A')")
+    schema = {**FULL, "pair": {"id", "secret"}}
+    granted = AccessPolicy(policy_schema=schema)
+    for sql in ("SELECT d.id FROM (SELECT * FROM pair ORDER BY 2::INT LIMIT 1) d",
+                "SELECT d.id FROM (SELECT * FROM pair ORDER BY id + 1 LIMIT 1) d"):
+        con.execute(sql)
+        verdict = _decide(sql, schema, policy=granted)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+    assert isinstance(_decide("SELECT d.id FROM (SELECT * FROM pair ORDER BY (id) DESC LIMIT 1) d", schema, policy=granted), Approved)
 
 
 def test_a_derived_star_its_own_select_does_not_consume_is_still_resolved(con):
