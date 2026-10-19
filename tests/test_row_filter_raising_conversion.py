@@ -177,6 +177,15 @@ RAISING_TYPED_FORMS = [
     "CASE WHEN id = 1 THEN [attrs] ELSE [lower(region)] END IS NOT NULL",
     "[attrs] = [region]",
     "{'a': attrs} = {'a': region}",
+    # The review gate on 3070774: a MAP is a container too, keyed by what its keys evaluate to;
+    # and TRY_CAST to a container gives a container of NULLs where an element does not convert,
+    # so a text literal beside a container branch is refused.
+    "CASE WHEN id = 1 THEN MAP {'a': attrs} ELSE MAP {'a': region} END IS NOT NULL",
+    "MAP {'a': attrs} = MAP {'a': region}",
+    "CASE WHEN id = 1 THEN MAP {attrs: 1} ELSE MAP {region: 1} END IS NOT NULL",
+    "CASE WHEN id = 1 THEN MAP {id: 1} ELSE '{north=1}' END IS NOT NULL",
+    "CASE WHEN id = 1 THEN MAP(['a'], [id]) ELSE '{a=north}' END IS NOT NULL",
+    "CASE WHEN id = 1 THEN [id] ELSE '[north]' END IS NOT NULL",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -215,7 +224,6 @@ SAFE_TYPED_FORMS = [
     "CASE WHEN id = 1 THEN CASE WHEN id > 0 THEN 1.5 ELSE 2 END ELSE '3' END = 1",
     "CASE WHEN id = 1 THEN (SELECT avg(id) FROM entitlement) ELSE CAST('7' AS DOUBLE) END = 7",
     "CASE WHEN id = 1 THEN lower(region) ELSE CAST('x' AS VARCHAR) END = 'x'",
-    "CASE WHEN id = 1 THEN [1, 2] ELSE '[3]' END IS NOT NULL",
     "CASE WHEN id = 1 THEN region WHEN id = 3 THEN lower(region) ELSE 'x' END = 'x'",
     # A container of JSON beside one of a native type, or of JSON already, is serialised or
     # taken as it is (Codex's eighth review).
@@ -223,6 +231,11 @@ SAFE_TYPED_FORMS = [
     "CASE WHEN id = 1 THEN [attrs] ELSE [id] END IS NOT NULL",
     "CASE WHEN id = 1 THEN {'a': attrs} ELSE {'a': 1} END IS NOT NULL",
     "[attrs] = [TRY_CAST(region AS JSON)]",
+    "CASE WHEN id = 1 THEN MAP {'a': attrs} ELSE MAP {'a': 1} END IS NOT NULL",
+    "CASE WHEN id = 1 THEN MAP {id: 1} ELSE MAP {id: 2} END IS NOT NULL",
+    "CASE WHEN id = 1 THEN {'a': attrs, 'b': 1.5} ELSE {'a': attrs, 'b': 10.25} END IS NOT NULL",
+    "CASE WHEN id = 1 THEN {'a': attrs, 'b': region} ELSE {'b': region, 'a': attrs} END IS NOT NULL",
+    "CASE WHEN id = 1 THEN [id] ELSE CAST('[2]' AS INTEGER[]) END IS NOT NULL",
 ]
 
 
@@ -336,7 +349,10 @@ def test_a_literal_beside_a_branch_the_validator_cannot_type_is_refused_though_i
     con.execute("CREATE TABLE claim(id INT, region VARCHAR); INSERT INTO claim VALUES (1, 'x'), (2, 'north'); "
                 "CREATE TABLE entitlement(id INT, who VARCHAR); INSERT INTO entitlement VALUES (7, 'r')")
     for runs in ("CASE WHEN id = 1 THEN (SELECT avg(id) FROM entitlement) ELSE 'nan' END IS NOT NULL",
-                 "CASE WHEN id = 1 THEN lower(region) ELSE 'x' END = 'x'"):
+                 "CASE WHEN id = 1 THEN lower(region) ELSE 'x' END = 'x'",
+                 # TRY_CAST to a container cannot tell a converting literal from one that does
+                 # not (the review gate), so a literal beside a container branch is refused too.
+                 "CASE WHEN id = 1 THEN [1, 2] ELSE '[3]' END IS NOT NULL"):
         con.execute(f"SELECT id FROM claim WHERE {runs}").fetchall()
         verdict = _decide(runs)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, runs

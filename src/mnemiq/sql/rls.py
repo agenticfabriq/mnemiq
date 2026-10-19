@@ -375,7 +375,7 @@ def _coerces_to_json(node: exp.Expression, type_of, engine: str) -> bool:
 
 
 # What may be handed to DuckDB to type: a value expression of columns, literals, casts,
-# arithmetic, lists, structs, branched values and the comparisons and boolean operators their
+# arithmetic, lists, structs, maps, branched values and the comparisons and boolean operators their
 # conditions are made of, which binds without running anything once each column is a typed
 # NULL. No function call, no subquery: typing those would evaluate policy text on the
 # validator's connection (a table function reading a file, a subquery over a billion rows),
@@ -383,6 +383,7 @@ def _coerces_to_json(node: exp.Expression, type_of, engine: str) -> bool:
 _PURE = (exp.Column, exp.Identifier, exp.Literal, exp.Boolean, exp.Null, exp.Paren, exp.Neg,
          exp.Cast, exp.DataType, exp.DataTypeParam, exp.Interval, exp.Var, exp.DateStrToDate,
          exp.Case, exp.If, exp.Coalesce, exp.Nullif, exp.Array, exp.Struct, exp.PropertyEQ,
+         exp.ToMap, exp.Map,  # `MAP {'a': attrs}`, `MAP(['a'], [attrs])` (the review gate)
          exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.And, exp.Or, exp.Not, exp.Is,
          exp.In, exp.Between, exp.Like, exp.ILike, *_ARITHMETIC)
 
@@ -395,14 +396,38 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
         value = value.this
     if not all(isinstance(node, _PURE) for node in value.walk()):
         return None
+    # A MAP literal's keys are expressions DuckDB evaluates (`MAP {id: 1}` is keyed by the
+    # column, MAP(INTEGER, INTEGER)), which sqlglot parses as struct-field identifiers, so they
+    # are typed here as columns of the value's own SELECT (the review gate on #160: left as
+    # names, the map was typed MAP(VARCHAR, INTEGER), and `MAP {attrs: 1}` beside `MAP {region:
+    # 1}` read as one type where DuckDB parses region to JSON). A key of any other shape is not
+    # pure.
+    keys = []
+    for to_map in value.find_all(exp.ToMap):
+        if not isinstance(to_map.this, exp.Struct):
+            return None
+        for item in to_map.this.expressions:
+            if not isinstance(item, exp.PropertyEQ):
+                return None
+            if isinstance(item.this, exp.Identifier):
+                as_column = exp.Column(this=item.this.copy())
+                as_column.parent = item  # read in the value's own SELECT, as the engine reads it
+                keys.append(as_column)
+            elif not isinstance(item.this, exp.Literal):
+                return None
     # The types are read off the original nodes, which the resolver knows by identity; the
     # copy's are then replaced in the same traversal order.
     declared = [type_of(column) for column in value.find_all(exp.Column)]
-    if None in declared:
+    key_types = [type_of(column) for column in keys]
+    if None in declared or None in key_types:
         return None
     typed_nulls = value.copy()
     for column, kind_of in zip(list(typed_nulls.find_all(exp.Column)), declared):
         column.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
+    copied_keys = [item.this for to_map in typed_nulls.find_all(exp.ToMap)
+                   for item in to_map.this.expressions if isinstance(item.this, exp.Identifier)]
+    for key, kind_of in zip(copied_keys, key_types):
+        key.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
     try:
         return _duckdb(f"SELECT typeof({typed_nulls.sql(dialect='duckdb')})")
     except Exception:  # noqa: BLE001 -- unreadable by DuckDB: the type cannot be told
@@ -412,6 +437,8 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
 # `_duckdb_type`'s answer for a text or JSON branch: a text literal beside it is taken as it is
 # (or the mix is a bind fault on no row's value), or parsed by `_coerces_to_json`'s rule.
 _TEXT = "text"
+_CONTAINERS = (exp.DataType.Type.ARRAY, exp.DataType.Type.LIST, exp.DataType.Type.STRUCT,
+               exp.DataType.Type.MAP)
 
 
 def _holds(kind: str, *types) -> bool | None:
@@ -424,6 +451,39 @@ def _holds(kind: str, *types) -> bool | None:
     return any(node.this in types for node in built.find_all(exp.DataType))
 
 
+def _text_becomes_json(kind: exp.DataType, unified: exp.DataType) -> bool:
+    """Whether converting a value of type `kind` to `unified` parses text as JSON anywhere: the
+    two types walked side by side, a list's element with the element, a struct's field with the
+    field, a map's key with the key and value with the value (a map's keys are text in both, and
+    read as a text leaf anywhere they refused `MAP {'a': attrs}` beside `MAP {'a': 1}`, which
+    DuckDB serialises and runs: the review gate). Shapes that do not line up cannot be told, and
+    are read as converting."""
+    if unified.this == exp.DataType.Type.JSON:
+        return kind.this in exp.DataType.TEXT_TYPES
+    # Children of a type: a struct's fields are paired by name (DuckDB matches them so, and
+    # `{'a': attrs, 'b': region}` beside `{'b': region, 'a': attrs}` runs), the rest by
+    # position; a type's parameters (DECIMAL(2,1)) take no part (the review gate).
+    inner_fields = [child for child in kind.expressions if not isinstance(child, exp.DataTypeParam)]
+    outer_fields = [child for child in unified.expressions if not isinstance(child, exp.DataTypeParam)]
+    if len(inner_fields) != len(outer_fields):
+        return True
+    if all(isinstance(child, exp.ColumnDef) for child in inner_fields + outer_fields):
+        by_name = {child.name: child for child in outer_fields}
+        if len(by_name) != len(outer_fields) or any(child.name not in by_name for child in inner_fields):
+            return True
+        pairs = [(child, by_name[child.name]) for child in inner_fields]
+    else:
+        pairs = list(zip(inner_fields, outer_fields))
+    for inner, outer in pairs:
+        inner = inner.args["kind"] if isinstance(inner, exp.ColumnDef) else inner
+        outer = outer.args["kind"] if isinstance(outer, exp.ColumnDef) else outer
+        if not isinstance(inner, exp.DataType) or not isinstance(outer, exp.DataType):
+            return True
+        if _text_becomes_json(inner, outer):
+            return True
+    return False
+
+
 def _json_inside_a_container(values, type_of) -> bool:
     """Whether DuckDB's unification of `values` (a branched value's branches, a comparison's
     sides) converts text to JSON inside a list or a struct, on the rows that take the branch
@@ -432,8 +492,9 @@ def _json_inside_a_container(values, type_of) -> bool:
     on DuckDB 1.5.4; Codex's eighth review of #160), where `[id]` beside `[attrs]` is serialised
     and runs. Each value's type is DuckDB's own (`_duckdb_type`, nothing runs), and so is the
     unified type (`typeof(COALESCE(NULL::T1, ...))`): refused where it holds JSON and a value's
-    type differs from it and holds text, or cannot be told. A mix DuckDB cannot unify is a
-    bind fault on no row's value, not this class."""
+    type differs from it with text where the unified type has JSON (`_text_becomes_json`), or
+    cannot be told. A mix DuckDB cannot unify is a bind fault on no row's value, not this
+    class."""
     kinds = []
     for value in values:
         while isinstance(value, exp.Paren):
@@ -453,8 +514,12 @@ def _json_inside_a_container(values, type_of) -> bool:
         unified = _duckdb("SELECT typeof(COALESCE(" + ", ".join(f"NULL::{k}" for k in known) + "))")
     except Exception:  # noqa: BLE001 -- DuckDB cannot unify them: a bind fault, not a row's
         return False
-    return any(kind != unified and _holds(kind, *exp.DataType.TEXT_TYPES) is not False
-               for kind in known)
+    try:
+        target = exp.DataType.build(unified, dialect="duckdb")
+        return any(kind != unified and _text_becomes_json(exp.DataType.build(kind, dialect="duckdb"), target)
+                   for kind in known)
+    except Exception:  # noqa: BLE001 -- a type the reader here cannot read: not shown safe
+        return True
 
 
 def _duckdb_type(branch: exp.Expression, type_of) -> str | None:
@@ -530,6 +595,13 @@ def _literal_cannot_convert(node: exp.Expression, type_of, engine: str) -> bool:
         return False
     try:
         unified = _duckdb("SELECT typeof(COALESCE(" + ", ".join(f"NULL::{k}" for k in kinds) + "))")
+        target = exp.DataType.build(unified, dialect="duckdb")
+        if target.this in _CONTAINERS:
+            # To a list, a struct or a map, TRY_CAST gives a container of NULLs where an
+            # element does not convert (`TRY_CAST('[north]' AS INTEGER[])` is `[NULL]`), not
+            # NULL, so it cannot say whether the literal converts; the literal is refused, and
+            # `CAST('[1]' AS INTEGER[])` is a typed branch (the review gate on #160).
+            return True
         return any(not _duckdb(f"SELECT TRY_CAST($1 AS {unified}) IS NOT NULL", [text])
                    for text in literals)
     except Exception:  # noqa: BLE001 -- unreadable: the literal may fail on a row, refused
