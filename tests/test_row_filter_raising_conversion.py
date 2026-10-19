@@ -22,6 +22,7 @@ import os
 
 import duckdb
 import pytest
+import sqlglot
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Snapshot
@@ -300,6 +301,8 @@ SAFE_TYPED_FORMS = [
     "map_contains(MAP(['a'], [1]), region)",
     "map_values(MAP(['a'], [region])) = ['x']",
     "row(region) = row('x')",
+    "row(row(region)) = row(row('x'))",  # a nested unnamed struct, read in DuckDB's grammar
+    "row(d, region) = row(d, 'x')",
     "list_extract([region], 1) = 'x'",
     # Typed now, so no longer refused as a list or a map the reader cannot type.
     "list_contains(list_distinct([region]), 'x')",
@@ -437,6 +440,29 @@ def test_a_literal_beside_a_branch_the_validator_cannot_type_is_refused_though_i
         con.execute(f"SELECT id FROM claim WHERE {runs}").fetchall()
         verdict = _decide(runs)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, runs
+
+
+def test_duckdb_s_types_are_read_in_duckdb_s_own_grammar():
+    """The container reading parses DuckDB's type strings itself (the review gate on #160:
+    sqlglot's DataType reads a nested unnamed struct as a struct literal). An unnamed struct's
+    fields are named by position for the cast, at any depth; an unnamed field of a multi-word
+    type is a type, not a name; a type name may hold digits; the other text spellings are
+    text."""
+    from mnemiq.sql.rls import _TEXT, _castable, _duckdb_type, _parse_type, _text_becomes_json
+
+    assert _castable(_parse_type("STRUCT(JSON)")) == 'STRUCT("f1" JSON)'
+    assert _castable(_parse_type("STRUCT(STRUCT(JSON))[]")) == 'STRUCT("f1" STRUCT("f1" JSON))[]'
+    assert _castable(_parse_type("STRUCT(TIMESTAMP WITH TIME ZONE, JSON)")) == (
+        'STRUCT("f1" TIMESTAMP WITH TIME ZONE, "f2" JSON)')
+    assert _castable(_parse_type('STRUCT("a b" INTEGER, c TIMESTAMP WITH TIME ZONE)')) == (
+        'STRUCT("a b" INTEGER, "c" TIMESTAMP WITH TIME ZONE)')
+    assert _parse_type("INT128") == ("leaf", "INT128")
+    assert _parse_type("MAP(VARCHAR, DECIMAL(2,1))") == ("map", ("leaf", "VARCHAR"), ("leaf", "DECIMAL"))
+    assert _text_becomes_json(_parse_type("STRUCT(VARCHAR)[]"), _parse_type("STRUCT(JSON)[]"))
+    assert not _text_becomes_json(_parse_type("INTEGER[]"), _parse_type("JSON[]"))
+    cast = sqlglot.parse_one("CAST(region AS NVARCHAR)", read="duckdb")
+    assert _duckdb_type(cast, lambda column: "VARCHAR") is _TEXT
+    assert _duckdb_type(sqlglot.parse_one("CAST(id AS INT128)", read="duckdb"), lambda column: "INTEGER") == "INT128"
 
 
 def test_the_branched_literal_advice_is_duckdb_s_alone(caplog):

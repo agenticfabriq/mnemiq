@@ -501,7 +501,7 @@ _LIST_PAIR_NAMES = frozenset({"list_has_all", "array_has_all", "list_has_any", "
 # review of #160: `element_at(MAP([attrs], [1]), region)` parses region as JSON on every row).
 _MAP_LOOKUPS = frozenset({"element_at", "map_extract", "map_extract_value", "map_contains"})
 _MAP_ONLY_LOOKUPS = frozenset({"map_extract", "map_extract_value", "map_contains"})
-_TEXT_NAMES = frozenset({"VARCHAR", "TEXT", "STRING", "CHAR", "BPCHAR"})
+_TEXT_NAMES = frozenset({"VARCHAR", "TEXT", "STRING", "CHAR", "BPCHAR", "NVARCHAR", "NCHAR", "NAME"})
 
 
 def _split_top(text: str) -> list[str]:
@@ -539,7 +539,7 @@ def _parse_type(text: str):
     bracket = re.search(r"\[\d*\]$", text)
     if bracket is not None:
         return ("array", _parse_type(text[:bracket.start()]))
-    head = re.match(r"([A-Za-z_][A-Za-z_ ]*?)\s*(?:\((.*)\))?$", text, re.S)
+    head = re.match(r"([A-Za-z_][A-Za-z_0-9 ]*?)\s*(?:\((.*)\))?$", text, re.S)
     if head is None:
         raise ValueError(text)
     name, inner = head.group(1).strip().upper(), head.group(2)
@@ -574,7 +574,10 @@ def _split_label(item: str) -> tuple[str | None, str]:
         elif ch in ")]":
             depth -= 1
         elif ch == " " and depth == 0:
-            return item[:position], item[position + 1:].strip()
+            rest = item[position + 1:].strip()
+            if rest.upper().startswith(("WITH ", "WITHOUT ")):
+                return None, item  # an unnamed `TIMESTAMP WITH TIME ZONE` (the review gate)
+            return item[:position], rest
     return None, item
 
 
@@ -698,10 +701,10 @@ def _duckdb_type(branch: exp.Expression, type_of) -> str | None:
     if kind is None:
         return None
     try:
-        built = exp.DataType.build(kind, dialect="duckdb")
-    except Exception:  # noqa: BLE001
+        parsed = _parse_type(kind)  # DuckDB's own grammar: a nested unnamed struct reads too
+    except ValueError:
         return None
-    if built.this in exp.DataType.TEXT_TYPES or built.this == exp.DataType.Type.JSON:
+    if parsed[0] == "leaf" and (parsed[1] in _TEXT_NAMES or parsed[1] == "JSON"):
         return _TEXT
     return kind
 
