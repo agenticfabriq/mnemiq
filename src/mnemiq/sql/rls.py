@@ -534,7 +534,9 @@ def _parse_type(text: str):
     `("struct", [(name or None, field), ...])`, `("map", key, value)`, `("union", [(name,
     member), ...])`. DuckDB's own grammar, read directly: sqlglot's DataType reads a nested
     unnamed struct (`STRUCT(STRUCT(JSON))`, which `row(row(attrs))` gives) as a struct literal
-    (the review gate on #160). Parameters (`DECIMAL(2,1)`) are left off the leaf's name."""
+    (the review gate on #160). A leaf keeps its parameters beside its name (`DECIMAL(2,1)`,
+    `ENUM('x')`: without its labels an ENUM is no cast target, and the unification's failure
+    read as a bind fault let a struct holding one through; Codex's fourteenth review)."""
     text = text.strip()
     bracket = re.search(r"\[\d*\]$", text)
     if bracket is not None:
@@ -543,6 +545,8 @@ def _parse_type(text: str):
     if head is None:
         raise ValueError(text)
     name, inner = head.group(1).strip().upper(), head.group(2)
+    if name not in ("STRUCT", "MAP", "UNION"):
+        return ("leaf", name, f"({inner})" if inner is not None else "")
     if name == "STRUCT":
         fields = []
         for item in _split_top(inner or ""):
@@ -558,7 +562,7 @@ def _parse_type(text: str):
             label, rest = _split_label(item)
             members.append((label, _parse_type(rest)))
         return ("union", members)
-    return ("leaf", name)
+    raise ValueError(text)
 
 
 def _split_label(item: str) -> tuple[str | None, str]:
@@ -587,7 +591,7 @@ def _castable(node) -> str:
     thirteenth review of #160)."""
     kind = node[0]
     if kind == "leaf":
-        return node[1]
+        return node[1] + node[2]
     if kind == "array":
         return _castable(node[1]) + "[]"
     if kind == "map":
@@ -664,10 +668,12 @@ def _json_inside_a_container(values, type_of) -> bool:
     try:
         unified = _parse_type(_duckdb("SELECT typeof(COALESCE("
                                       + ", ".join(f"NULL::{_castable(node)}" for node in known) + "))"))
-    except ValueError:
+    except Exception:  # noqa: BLE001 -- not shown safe: the unification could not be asked
+        # A mix DuckDB cannot unify is a bind fault on no row's value, and was left alone; so was
+        # a cast target the reader here had rebuilt wrongly (an ENUM without its labels, Codex's
+        # fourteenth review), which is the fail-open side. Refused, fail-closed: the statement
+        # the engine cannot bind is refused either way.
         return True
-    except Exception:  # noqa: BLE001 -- DuckDB cannot unify them: a bind fault, not a row's
-        return False
     return any(node != unified and _text_becomes_json(node, unified) for node in known)
 
 

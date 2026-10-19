@@ -240,6 +240,9 @@ RAISING_TYPED_FORMS = [
     # The review gate: an unnamed struct at any depth.
     "[row(attrs)] = [row(region)]",
     "row(row(attrs)) = row(row(region))",
+    # Codex's fourteenth review: an ENUM field keeps its labels, which its cast target needs.
+    "{'a': attrs, 'b': CAST('x' AS ENUM('x'))} = {'a': region, 'b': CAST('x' AS ENUM('x'))}",
+    "[{'a': attrs, 'b': CAST('x' AS ENUM('x'))}] = [{'a': region, 'b': CAST('x' AS ENUM('x'))}]",
 ]
 SAFE_TYPED_FORMS = [
     # JSON on every branch, or text on every branch, cannot fail on a row (the medium finding).
@@ -302,6 +305,7 @@ SAFE_TYPED_FORMS = [
     "map_values(MAP(['a'], [region])) = ['x']",
     "row(region) = row('x')",
     "row(row(region)) = row(row('x'))",  # a nested unnamed struct, read in DuckDB's grammar
+    "{'a': region, 'b': CAST('x' AS ENUM('x'))} = {'a': 'y', 'b': CAST('x' AS ENUM('x'))}",
     "row(d, region) = row(d, 'x')",
     "list_extract([region], 1) = 'x'",
     # Typed now, so no longer refused as a list or a map the reader cannot type.
@@ -456,8 +460,9 @@ def test_duckdb_s_types_are_read_in_duckdb_s_own_grammar():
         'STRUCT("f1" TIMESTAMP WITH TIME ZONE, "f2" JSON)')
     assert _castable(_parse_type('STRUCT("a b" INTEGER, c TIMESTAMP WITH TIME ZONE)')) == (
         'STRUCT("a b" INTEGER, "c" TIMESTAMP WITH TIME ZONE)')
-    assert _parse_type("INT128") == ("leaf", "INT128")
-    assert _parse_type("MAP(VARCHAR, DECIMAL(2,1))") == ("map", ("leaf", "VARCHAR"), ("leaf", "DECIMAL"))
+    assert _parse_type("INT128") == ("leaf", "INT128", "")
+    assert _parse_type("MAP(VARCHAR, DECIMAL(2,1))") == ("map", ("leaf", "VARCHAR", ""), ("leaf", "DECIMAL", "(2,1)"))
+    assert _castable(_parse_type("STRUCT(a JSON, b ENUM('x', 'y'))")) == "STRUCT(\"a\" JSON, \"b\" ENUM('x', 'y'))"
     assert _text_becomes_json(_parse_type("STRUCT(VARCHAR)[]"), _parse_type("STRUCT(JSON)[]"))
     assert not _text_becomes_json(_parse_type("INTEGER[]"), _parse_type("JSON[]"))
     # A column the snapshot types in a text spelling other than VARCHAR (a cast's target is
@@ -466,6 +471,24 @@ def test_duckdb_s_types_are_read_in_duckdb_s_own_grammar():
     for spelling in ("NVARCHAR", "NCHAR", "NAME", "VARCHAR"):
         assert _duckdb_type(column, lambda c, spelling=spelling: spelling) is _TEXT, spelling
     assert _duckdb_type(sqlglot.parse_one("CAST(id AS INT128)", read="duckdb"), lambda column: "INTEGER") == "INT128"
+
+
+def test_a_container_mix_whose_unification_cannot_be_asked_is_refused(monkeypatch):
+    """The unification is DuckDB's answer; where it cannot be had (a cast target the reader
+    here rebuilt wrongly, which an ENUM without its labels was, Codex's fourteenth review of
+    #160), the mix is refused rather than read as a bind fault on no row's value."""
+    from mnemiq.sql import rls
+
+    real = rls._duckdb
+
+    def failing(sql, params=()):
+        if "COALESCE(" in sql:
+            raise RuntimeError("no unification today")
+        return real(sql, params)
+
+    monkeypatch.setattr(rls, "_duckdb", failing)
+    verdict = _decide("[attrs] = [id]")  # serialised, and approved when the engine can be asked
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
 
 
 def test_the_branched_literal_advice_is_duckdb_s_alone(caplog):
