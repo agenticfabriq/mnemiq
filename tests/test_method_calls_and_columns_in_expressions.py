@@ -311,6 +311,8 @@ def test_a_column_reached_by_position_in_a_write_is_refused(con, sql):
     "SELECT d.id FROM ((SELECT * FROM pair) ORDER BY 2 LIMIT 1) d",
     "SELECT d.id FROM (((SELECT * FROM pair)) ORDER BY 2 LIMIT 1) d",
     "SELECT d.id FROM (SELECT * FROM pair UNION ALL SELECT * FROM pair ORDER BY 2 LIMIT 1) d",
+    "SELECT d.id FROM (SELECT * FROM pair ORDER BY (2) LIMIT 1) d",  # a parenthesised position (the ui lane)
+    "SELECT d.id FROM ((SELECT * FROM pair) ORDER BY ((2)) LIMIT 1) d",
     "WITH w AS ((SELECT * FROM pair) ORDER BY 2 LIMIT 1) SELECT w.id FROM w",  # refused before the CTE branch
 ])
 def test_a_derived_star_consumed_by_its_own_select_is_refused(con, sql):
@@ -387,6 +389,23 @@ def test_an_exists_whose_own_select_deduplicates_the_star_is_refused(con, sql):
                             (schema, AccessPolicy(denied={("dup", "secret")}, policy_schema=schema)),
                             (schema, AccessPolicy(masked={("dup", "secret")}, policy_schema=schema))):
         verdict = _decide(sql, visible, policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+    con.execute("CREATE TABLE sink (i INT, s VARCHAR, j STRUCT(ssn VARCHAR))")
+    schema_w = {**schema, "sink": {"i", "s", "j"}}
+    verdict = _decide_write("INSERT INTO sink (i) " + sql, schema_w,
+                            AccessPolicy(denied={("dup", "secret")}, policy_schema=schema_w))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
+def test_an_exists_ordering_the_star_by_position_is_refused_fail_closed(con):
+    # Not an oracle on its own (the review gate on the seventh round): refused all the same,
+    # since a LIMIT, a QUALIFY or a HAVING beside it can ask the question the ORDER BY settles.
+    con.execute("CREATE TABLE one (secret VARCHAR); INSERT INTO one VALUES ('ONE-SECRET')")
+    schema = {**FULL, "one": {"secret"}}
+    for sql in ("SELECT id FROM claim WHERE EXISTS (SELECT * FROM one ORDER BY 1)",
+                "SELECT id FROM claim WHERE EXISTS (SELECT * FROM one ORDER BY (1) LIMIT 1)"):
+        con.execute(sql)
+        verdict = _decide(sql, schema, policy=AccessPolicy(denied={("one", "secret")}, policy_schema=schema))
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
 
 
