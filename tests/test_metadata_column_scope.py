@@ -366,10 +366,10 @@ def test_a_keyword_named_column_inside_a_subquery_still_requires_its_clearance()
         columns = [Column(id="orders.id", object_id="orders", name="id", data_type="int"),
                    Column(id=f"orders.{spelling}", object_id="orders", name=spelling, data_type="text",
                           pii_level="phi")]
-        expr = f"(SELECT {spelling} FROM orders)"
-        assert spelling in keyword_columns(expr), expr
-        assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=columns) == [], expr
-        assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=columns) == [_metric(expr)], expr
+        for expr in (f"(SELECT {spelling} FROM orders)", f"(SELECT r.{spelling} FROM orders r)"):
+            assert spelling in keyword_columns(expr), expr
+            assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=columns) == [], expr
+            assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=columns) == [_metric(expr)], expr
         unparsed = f"(SELECT max({spelling}) FROM orders)"
         for grants in (_UNCLEARED, _CLEARED):
             assert select_metrics(["orders"], [_metric(unparsed)], grants, columns=columns) == [], unparsed

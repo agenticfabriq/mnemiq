@@ -143,9 +143,11 @@ _KEYWORD_COLUMNS = (exp.Boolean, exp.CurrentDate, exp.CurrentTimestamp, exp.Curr
 # (`1e`, `1E`, `123e`, measured in the dimension tests; Codex's fourth review of #172):
 # sqlglot reads `1e` as a number, `1ea` as `1e AS a` and `123abc` as `123 AS abc`, a number
 # and an implicit alias, so the parse holds no node that names the column (the review gate on
-# the seventh commit). Read off the text, as the spelling fallback reads a bare expression; a
-# token naming no column decides nothing.
-_DIGIT_LED = re.compile(r"(?<![\w.])\d+[A-Za-z_]\w*")
+# the seventh commit). Read off the text, as the spelling fallback reads a bare expression,
+# qualified or not (`r.1ea` is `r.1e AS a` to the parser: the gate on the eighth commit), inside
+# quoted text and comments too, which withholds more and never less; a token naming no column
+# decides nothing.
+_DIGIT_LED = re.compile(r"(?<!\w)\d+[A-Za-z_]\w*")
 
 
 def _keyword_spelling(node: exp.Expression) -> str | None:
