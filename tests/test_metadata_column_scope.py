@@ -336,3 +336,28 @@ def test_a_qualified_source_is_its_own_relation_exactly():
     # The aliased path reads the relation the same way.
     assert expression_scope('(SELECT max(r.id) FROM "ORDERS" r)', "orders") == "foreign"
     assert expression_scope('(SELECT max(r.id) FROM "orders" r)', "orders") == "own"
+
+
+def test_a_keyword_named_column_inside_a_subquery_still_requires_its_clearance():
+    # Codex's third review of #172: `true` and `current_date` parse as constants, not columns,
+    # and inside a subquery the spelling fallback (which covers a bare expression alone) did
+    # not reach them, so a phi column named `true` was offered to the uncleared. Each keyword
+    # spelling is reported as a column it may be.
+    from mnemiq.semantic.expr_columns import columns_read, keyword_columns
+    for spelling in ("true", "current_date"):
+        columns = [Column(id="orders.id", object_id="orders", name="id", data_type="int"),
+                   Column(id=f"orders.{spelling}", object_id="orders", name=spelling, data_type="text",
+                          pii_level="phi")]
+        for expr in (f"(SELECT max({spelling}) FROM orders)",
+                     f"(SELECT id FROM orders ORDER BY {spelling} LIMIT 1)",
+                     f"(SELECT count(*) FROM orders WHERE {spelling})"):
+            assert spelling in keyword_columns(expr), expr
+            assert spelling not in {name for ref in columns_read(expr, "orders") for name in ref}, expr  # not a ref (the gate)
+            assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=columns) == [], expr
+            assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=columns) == [_metric(expr)], expr
+    # Where no column is so named the keyword is the constant it reads as, and decides nothing,
+    # for the selector and for the enrichment classifier alike (the gate: a ref naming no
+    # column would mark a personal dimension unresolved).
+    plain = "(SELECT count(*) FROM orders WHERE true)"
+    assert select_metrics(["orders"], [_metric(plain)], _UNCLEARED, columns=_COLUMNS) == [_metric(plain)]
+    assert columns_read("CASE WHEN secret_code IS NOT NULL THEN true ELSE false END", "orders") == {frozenset({"secret_code"})}

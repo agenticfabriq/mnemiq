@@ -133,6 +133,45 @@ def _source_aliases(node: exp.Expression, source: str) -> set[str]:
 _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest)
 
 
+# Constants an engine reads as a column where one is so named; `columns_read` reports their
+# spellings. A Boolean is `true` or `false`; the niladic functions their own name.
+_KEYWORD_COLUMNS = (exp.Boolean, exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime,
+                    exp.CurrentUser)
+
+
+def _keyword_spelling(node: exp.Expression) -> str | None:
+    if isinstance(node, exp.Boolean):
+        return "true" if node.this else "false"
+    if node.expressions or node.args.get("this"):
+        return None  # `current_date(...)` with arguments is a call, never a column
+    return node.sql().split("(")[0].strip().lower() or None
+
+
+def keyword_columns(expr: str) -> set[str]:
+    """The spellings of the keyword constants `expr` holds, anywhere in it, each a column the
+    engine reads instead where one is so named (`true` on sqlite, `current_date` on DuckDB,
+    measured in the dimension tests). They parse as constants, not columns, so inside a
+    subquery `(SELECT max(true) FROM orders)` over a phi column named `true` was read by
+    nothing and reached the uncleared (Codex's third review of #172). Kept apart from
+    `columns_read`, whose other caller marks a dimension unresolved when a ref names no
+    column (the review gate on the first draft): the raw-read check asks these only where
+    the table has the column, and a spelling naming none decides nothing."""
+    out: set[str] = set()
+    for dialect in _EXPR_DIALECTS:
+        try:
+            node = sqlglot.parse_one(expr, read=dialect)
+        except sqlglot.errors.SqlglotError:
+            continue
+        if node is None:
+            continue
+        for keyword in node.find_all(*_KEYWORD_COLUMNS):
+            spelling = _keyword_spelling(keyword)
+            if spelling:
+                out.add(spelling)
+        return out
+    return out
+
+
 def expression_scope(expr: str, source: str) -> str:
     """Whether `columns_read` can answer for `expr` over `source`: `"own"`, `"foreign"` or
     `"unparsed"` (M144, Codex's review of #121).
