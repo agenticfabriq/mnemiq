@@ -382,22 +382,35 @@ def _scalar_projections(node: exp.Expression) -> list[exp.Expression] | None:
     SELECT or set operation reads the same, never wrapped in a Subquery of its own, which would
     re-parent the live node and cut it off from the filter's tree (the review gate on the
     twenty-seventh round: a correlated column in a branch lost its SELECT's enclosing one)."""
+    columns = _set_columns(node)
+    return columns[0] if columns is not None and len(columns) == 1 else None
+
+
+def _set_columns(node: exp.Expression) -> list[list[exp.Expression]] | None:
+    """A query's projections by position, one list per output column holding each branch's
+    expression: a SELECT's own, a set operation's per branch, a VALUES list's per row (`region
+    = (VALUES (1))` was unknown, and the text converted on the row: Codex's twenty-fifth review
+    of #160); None where the branches' widths differ or a branch is no query."""
     if isinstance(node, exp.Subquery):
         node = node.this
-    if not isinstance(node, (exp.Select, exp.SetOperation)):
+    if not isinstance(node, (exp.Select, exp.SetOperation, exp.Values)):
         return None
-    branches, pending = [], [node]
+    rows, pending = [], [node]
     while pending:
         query = pending.pop()
         while isinstance(query, (exp.Subquery, exp.Paren)):
             query = query.this  # a parenthesised branch, `((SELECT ...) UNION ALL (SELECT ...))`
         if isinstance(query, exp.SetOperation):
             pending.extend((query.right, query.left))
-        elif isinstance(query, exp.Select) and len(query.selects) == 1:
-            branches.append(query.selects[0].unalias())
+        elif isinstance(query, exp.Select) and query.selects:
+            rows.append([projection.unalias() for projection in query.selects])
+        elif isinstance(query, exp.Values) and query.expressions:
+            rows.extend([list(row.expressions) for row in query.expressions if isinstance(row, exp.Tuple)])
         else:
             return None
-    return branches
+    if not rows or any(len(row) != len(rows[0]) for row in rows):
+        return None
+    return [[row[position] for row in rows] for position in range(len(rows[0]))]
 
 
 def _scalar_projection(node: exp.Expression) -> exp.Expression | None:
@@ -1175,11 +1188,11 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             # are unified, each branch converted to the unified type on the rows it yields:
             # `(SELECT attrs ... UNION ALL SELECT region ... LIMIT 1) IS NOT NULL` parsed region
             # as JSON (Codex's twenty-fourth review of #160).
-            branches = _scalar_projections(node)
-            if branches is not None and len(branches) > 1 and (
-                    _values_coerce_to_json(branches, type_of, engine)
-                    or _json_inside_a_container(branches, type_of)):
-                return node
+            columns = _set_columns(node)
+            if columns is not None and any(len(column) > 1 and (
+                    _values_coerce_to_json(column, type_of, engine)
+                    or _json_inside_a_container(column, type_of)) for column in columns):
+                return node  # per output position, whatever the width (the twenty-fifth review)
         if engine == "duckdb" and (isinstance(node, _JSON_PARSES) or (
                 isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_JSON_PARSES)):
             # The typed readers parse their first argument; an untyped one may parse any (both of

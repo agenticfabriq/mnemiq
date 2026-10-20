@@ -581,6 +581,10 @@ def test_a_doubled_quote_in_a_member_name_is_read_and_an_unreadable_declared_typ
     "region <> ALL(SELECT attrs FROM claim)",
     "region = SOME(SELECT attrs FROM claim)",
     "region = ((SELECT attrs FROM claim WHERE id = 2 LIMIT 1) UNION ALL (SELECT attrs FROM claim LIMIT 0))",
+    # Codex's twenty-fifth review: a set operation wider than one column, read per position.
+    "EXISTS (SELECT attrs, id FROM claim UNION ALL SELECT region, id FROM claim)",
+    "EXISTS (SELECT attrs, id FROM claim INTERSECT SELECT region, id FROM claim)",
+    "EXISTS (SELECT attrs, id FROM claim EXCEPT SELECT region, id FROM claim)",
 ])
 def test_a_call_returning_json_beside_text_is_read_as_json(row_filter):
     """Codex's nineteenth review of #160: `to_json(id)` was of unknown type, and unknown beside
@@ -606,6 +610,12 @@ def test_a_correlated_column_in_a_sourceless_subquery_keeps_its_type():
             con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
         verdict = _decide(raising)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (raising, verdict)
+    # A VALUES list is a query too (Codex's twenty-fifth review): `region = (VALUES (1))` converts.
+    with pytest.raises(duckdb.Error, match="Could not convert"):
+        con.execute("SELECT id FROM claim WHERE region = (VALUES (1))").fetchall()
+    verdict = _decide("region = (VALUES (1))")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    assert isinstance(_decide("region = (VALUES ('north'))"), Approved)
     running = "(SELECT region) = 'north'"
     assert con.execute(f"SELECT id FROM claim WHERE {running}").fetchall() == [(1,)]
     assert isinstance(_decide(running), Approved)
