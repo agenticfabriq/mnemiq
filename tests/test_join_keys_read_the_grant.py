@@ -293,3 +293,55 @@ def test_a_chain_the_parser_groups_differently_from_the_engine_is_refused_before
     oracle = decide("SELECT d.id FROM (SELECT 1 AS id FROM sink UNION ALL SELECT 2 AS id FROM sink INTERSECT SELECT 2 AS id FROM sink) d",
                     {"sink": {"I"}}, dialect="oracle", target="oracle", policy=AccessPolicy(policy_schema={"sink": {"I"}}))
     assert not (isinstance(oracle, Refusal) and oracle.code is RefusalCode.PARSE_ERROR), oracle
+
+
+def test_on_oracle_a_join_key_is_read_as_typed_and_as_the_engine_folds_it():
+    # Codex's fifth review: with a grant spelling the hidden column `SECRET`, `USING (secret)`
+    # and `USING (Secret)` were compared as typed and passed, where `USING (SECRET)` was
+    # refused; Oracle folds an unquoted name up. The review gate: a grant spelling it `secret`
+    # (this repo's own Oracle fixtures do) must hide it from every spelling too, and a granted
+    # `id` spelled either way must stay a usable key. So the key is read both ways. Decision
+    # only, as the Oracle dialect.
+    for stored in ("SECRET", "secret"):
+        id_ = "ID" if stored == "SECRET" else "id"
+        schema = {"claim": {id_, stored}, "pair": {id_, stored}, "sink": {"I"}}
+        hidden = {"claim": {id_}, "pair": {id_}, "sink": {"I"}}
+        complete = AccessPolicy(policy_schema=schema)
+        for key in ("secret", "Secret", "SECRET", '"SECRET"'):
+            sql = f"SELECT count(*) AS n FROM claim JOIN (SELECT chr(90) AS {key} FROM sink) e USING ({key})"
+            for policy in (complete, AccessPolicy()):
+                verdict = decide(sql, hidden, dialect="oracle", target="oracle", policy=policy)
+                assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (stored, sql, verdict)
+        # A granted key joins two granted tables: spelled either way with the complete schema
+        # (it is not hidden), and without it as the grant spells it, the as-typed reading a
+        # column gets on Oracle (the catalog boundary); over a derived table whose base lacks
+        # the key, the no-schema refusal is the documented cost, not this rule's.
+        for key in ("id", "ID"):
+            granted = f"SELECT count(*) AS n FROM claim JOIN pair USING ({key})"
+            assert isinstance(decide(granted, hidden, dialect="oracle", target="oracle", policy=complete), Approved), (stored, granted)
+            bare = decide(granted, hidden, dialect="oracle", target="oracle", policy=AccessPolicy())
+            assert isinstance(bare, Approved if key == id_ else Refusal), (stored, granted, bare)
+    # Quoted, a lower-case key keeps its case: beside a grant spelling the hidden column `SECRET`
+    # it names a column claim does not have and is left to the engine with the complete schema
+    # (refused without it); beside a grant spelling it `secret` it is the hidden name as typed.
+    quoted = 'SELECT count(*) AS n FROM claim JOIN (SELECT chr(90) AS "secret" FROM sink) e USING ("secret")'
+    upper = AccessPolicy(policy_schema={"claim": {"ID", "SECRET"}, "sink": {"I"}})
+    assert isinstance(decide(quoted, {"claim": {"ID"}, "sink": {"I"}}, dialect="oracle", target="oracle", policy=upper), Approved)
+    assert isinstance(decide(quoted, {"claim": {"ID"}, "sink": {"I"}}, dialect="oracle", target="oracle", policy=AccessPolicy()), Refusal)
+    lower = AccessPolicy(policy_schema={"claim": {"id", "secret"}, "sink": {"I"}})
+    assert isinstance(decide(quoted, {"claim": {"id"}, "sink": {"I"}}, dialect="oracle", target="oracle", policy=lower), Refusal)
+
+
+def test_a_misgrouped_chain_is_refused_on_every_engine_that_binds_intersect_tighter():
+    # The review gate on the ninth commit: Postgres documents INTERSECT binding tighter than
+    # UNION and EXCEPT, and MySQL from 8.0.31 does the same, so the parser's left fold reads
+    # those engines' chains wrongly too; SQLite and Oracle group left to right as the parser
+    # does. The shape check alone, by the executing engine.
+    from mnemiq.sql.guard import check_shape
+    chain = "SELECT d.id FROM (SELECT 1 AS id UNION ALL SELECT 2 AS id INTERSECT SELECT 2 AS id) d"
+    for engine in ("duckdb", "postgres", "mysql"):
+        verdict = check_shape(chain, dialect=engine, executes_as=engine)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.PARSE_ERROR, (engine, verdict)
+    for engine in ("oracle", "sqlite"):
+        verdict = check_shape(chain, dialect=engine, executes_as=engine)
+        assert not (isinstance(verdict, Refusal) and verdict.code is RefusalCode.PARSE_ERROR), (engine, verdict)

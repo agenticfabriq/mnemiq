@@ -234,11 +234,17 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
     return []
 
 
+# The engines that bind INTERSECT tighter than UNION and EXCEPT, against the parser's left fold.
+_INTERSECT_BINDS_TIGHTER = frozenset({"duckdb", "postgres", "postgresql", "mysql"})
+
+
 def misgrouped_set_chain(ast: exp.Expression, engine: str) -> Refusal | None:
     """Refuse a set-operation chain the parser groups differently from the engine: sqlglot folds
     an unparenthesised chain left to right, so `A UNION ALL B INTERSECT C` is an INTERSECT over a
     UNION, where DuckDB binds INTERSECT tighter and reads `A UNION ALL (B INTERSECT C)` (M203,
-    measured; Oracle groups left to right as the parser does, and is not refused). Every rule
+    measured; Postgres documents the same precedence and MySQL has it from 8.0.31, so both are
+    held to it unmeasured, the review gate on the ninth commit; Oracle and SQLite group left to
+    right as the parser does, and are not refused). Every rule
     over the tree then reads a shape the engine does not run. Not a cost alone: in a RECURSIVE
     body the resolver found no recursive part and read the CTE's own references as the base
     table, so a row filter on it was injected into them, and the approved statement answered
@@ -246,14 +252,14 @@ def misgrouped_set_chain(ast: exp.Expression, engine: str) -> Refusal | None:
     an INTERSECT whose bare left operand is a UNION or an EXCEPT; a parenthesised operand is a
     subquery to the parser and grouped as written. The corpus holds no such chain (the ui lane's
     count, 2026-10-19)."""
-    if (engine or "").lower() != "duckdb":
+    if (engine or "").lower() not in _INTERSECT_BINDS_TIGHTER:
         return None
     for node in ast.find_all(exp.Intersect):
         if isinstance(node.this, (exp.Union, exp.Except)):
             return Refusal(
                 code=RefusalCode.PARSE_ERROR,
                 message=("A UNION or EXCEPT followed by INTERSECT without parentheses is grouped "
-                         "one way by the parser and another by DuckDB, which binds INTERSECT "
+                         "one way by the parser and another by the engine, which binds INTERSECT "
                          "tighter, so the statement cannot be checked as it would run. Write the "
                          "parentheses: `A UNION ALL (B INTERSECT C)` or `(A UNION ALL B) INTERSECT C`."),
                 subject="INTERSECT",
