@@ -572,6 +572,15 @@ def test_a_doubled_quote_in_a_member_name_is_read_and_an_unreadable_declared_typ
     # Codex's twenty-third review: a set operation's subquery, and a correlated bare column.
     "COALESCE((SELECT attrs FROM claim UNION ALL SELECT attrs FROM claim LIMIT 1), region) IS NOT NULL",
     "[region] = [(SELECT attrs FROM claim UNION SELECT attrs FROM claim LIMIT 1)]",
+    # Codex's twenty-fourth review: the branches converted to the unified type, a set query under
+    # IN, a quantified comparison, and parenthesised branches.
+    "(SELECT attrs FROM claim UNION ALL SELECT region FROM claim LIMIT 1) IS NOT NULL",
+    "region IN (SELECT attrs FROM claim UNION ALL SELECT attrs FROM claim)",
+    "region = ANY(SELECT attrs FROM claim)",
+    "region = ALL(SELECT attrs FROM claim)",  # ALL and SOME wrap a bare SELECT in sqlglot (the gate)
+    "region <> ALL(SELECT attrs FROM claim)",
+    "region = SOME(SELECT attrs FROM claim)",
+    "region = ((SELECT attrs FROM claim WHERE id = 2 LIMIT 1) UNION ALL (SELECT attrs FROM claim LIMIT 0))",
 ])
 def test_a_call_returning_json_beside_text_is_read_as_json(row_filter):
     """Codex's nineteenth review of #160: `to_json(id)` was of unknown type, and unknown beside
@@ -611,11 +620,26 @@ def test_a_correlated_column_in_a_sourceless_subquery_keeps_its_type():
     assert con.execute(f"SELECT id FROM claim WHERE {derived_number}").fetchall() == [(1,)]
     assert isinstance(_decide(derived_number), Approved)
     # A set operation's branches are unified as DuckDB unifies them, not read as the first's.
-    mixed = "(SELECT id FROM claim UNION ALL SELECT region FROM claim ORDER BY 1 DESC LIMIT 1) = 7"
-    with pytest.raises(duckdb.Error, match="Could not convert"):
-        con.execute(f"SELECT id FROM claim WHERE {mixed}").fetchall()
-    verdict = _decide(mixed)
-    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    # Each a text value beside a number, refused as `region = 7` is; the engine raises on the
+    # rows it reaches (the reversed order and the sourceless branch happen to reach '1' and no
+    # row here, and are refused on the type alone, as the bare comparison is).
+    for mixed, raises in (("(SELECT id FROM claim UNION ALL SELECT region FROM claim ORDER BY 1 DESC LIMIT 1) = 7", True),
+                          ("(SELECT region FROM claim UNION ALL SELECT id FROM claim ORDER BY 1 LIMIT 1) = 7", False),
+                          # a correlated column inside a set operation's branch keeps its SELECT's
+                          # tree (the gate on the twenty-seventh round: a wrapper built around the
+                          # live node cut the branch off from the filter's SELECT)
+                          ("EXISTS (SELECT 1 FROM claim UNION ALL SELECT 1 WHERE region = 7)", True),
+                          ("EXISTS (SELECT 1 UNION ALL SELECT (SELECT region) = 7)", False)):
+        if raises:
+            with pytest.raises(duckdb.Error, match="Could not convert"):
+                con.execute(f"SELECT id FROM claim WHERE {mixed}").fetchall()
+        else:
+            con.execute(f"SELECT id FROM claim WHERE {mixed}").fetchall()
+        verdict = _decide(mixed)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (mixed, verdict)
+    for running in ("region IN (SELECT region FROM claim)", "region = ANY(SELECT region FROM claim)"):
+        assert con.execute(f"SELECT id FROM claim WHERE {running}").fetchall() == [(1,)]
+        assert isinstance(_decide(running), Approved), running
 
 
 def test_a_text_extract_is_typed_text_so_a_conversion_beside_it_is_read():

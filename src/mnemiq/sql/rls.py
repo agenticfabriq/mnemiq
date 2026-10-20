@@ -378,12 +378,19 @@ def _is_text_extract(node: exp.Expression) -> bool:
 def _scalar_projections(node: exp.Expression) -> list[exp.Expression] | None:
     """A scalar subquery's one projection per branch, unaliased, else None: one for a SELECT,
     one per branch of a set operation (Codex's twenty-third review of #160: `(SELECT attrs ...
-    UNION ALL SELECT attrs ... LIMIT 1)` was unknown, and JSON beside text approved)."""
-    if not isinstance(node, exp.Subquery):
+    UNION ALL SELECT attrs ... LIMIT 1)` was unknown, and JSON beside text approved). A bare
+    SELECT or set operation reads the same, never wrapped in a Subquery of its own, which would
+    re-parent the live node and cut it off from the filter's tree (the review gate on the
+    twenty-seventh round: a correlated column in a branch lost its SELECT's enclosing one)."""
+    if isinstance(node, exp.Subquery):
+        node = node.this
+    if not isinstance(node, (exp.Select, exp.SetOperation)):
         return None
-    branches, pending = [], [node.this]
+    branches, pending = [], [node]
     while pending:
         query = pending.pop()
+        while isinstance(query, (exp.Subquery, exp.Paren)):
+            query = query.this  # a parenthesised branch, `((SELECT ...) UNION ALL (SELECT ...))`
         if isinstance(query, exp.SetOperation):
             pending.extend((query.right, query.left))
         elif isinstance(query, exp.Select) and len(query.selects) == 1:
@@ -976,13 +983,11 @@ def _duckdb_type(branch: exp.Expression, type_of) -> str | None:
         kind = type_of(branch)
     elif isinstance(branch, exp.Cast):
         kind = branch.to.sql(dialect="duckdb")
-    elif isinstance(branch, exp.Subquery):
+    elif _scalar_projection(branch) is not None:
         # A scalar subquery is its one projection's type (the gate's `(SELECT id + 1 FROM
         # entitlement LIMIT 1)` beside 'nan'); the projection alone is handed to DuckDB, never
-        # the subquery, whose FROM would run.
-        inner = branch.this
-        if isinstance(inner, exp.Select) and len(inner.selects) == 1:
-            kind = _pure_type(inner.selects[0].unalias(), type_of)
+        # the subquery, whose FROM would run; a set operation's branches unified.
+        kind = _subquery_type(branch, type_of)
     else:
         kind = _pure_type(branch, type_of)
     if kind is None:
@@ -1071,13 +1076,20 @@ def _sides(node: exp.Expression) -> list:
     if isinstance(node, exp.In):
         sides = [node.this, *node.expressions]
         query = node.args.get("query")
-        inner = query.this if isinstance(query, exp.Subquery) else query
-        if isinstance(inner, exp.Select) and len(inner.selects) == 1:
-            sides.append(inner.selects[0])
+        if query is not None:
+            # The set query's one projection, a set operation's branches unified: typed as the
+            # scalar subquery it would be (`region IN (SELECT attrs ... UNION ALL SELECT attrs
+            # ...)` parsed region as JSON on the row, the query dropped as no plain SELECT:
+            # Codex's twenty-fourth review of #160). The node itself, never re-wrapped.
+            sides.append(query)
         return sides
     if isinstance(node, exp.Between):
         return [node.this, node.args.get("low"), node.args.get("high")]
-    return [node.this, node.expression]
+    # `= ANY (SELECT ...)`, `= ALL (...)` and `= SOME (...)` compare with each value the subquery
+    # yields (the same review: `region = ANY(SELECT attrs FROM claim)` approved and parsed);
+    # sqlglot wraps ANY's query in a Subquery and ALL's and SOME's in none, read alike.
+    return [side.this if isinstance(side, (exp.Any, exp.All)) else side
+            for side in (node.this, node.expression)]
 
 
 def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
@@ -1158,6 +1170,16 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
     for node in wrapped.args["where"].walk():
         if engine == "duckdb" and _arrow_read_as_a_lambda(node):
             return node  # `attrs -> '$.a'` where DuckDB extracts JSON and sqlglot sees a lambda
+        if engine == "duckdb" and isinstance(node, exp.SetOperation):
+            # A set operation unifies its branches' projections as a branched value's branches
+            # are unified, each branch converted to the unified type on the rows it yields:
+            # `(SELECT attrs ... UNION ALL SELECT region ... LIMIT 1) IS NOT NULL` parsed region
+            # as JSON (Codex's twenty-fourth review of #160).
+            branches = _scalar_projections(node)
+            if branches is not None and len(branches) > 1 and (
+                    _values_coerce_to_json(branches, type_of, engine)
+                    or _json_inside_a_container(branches, type_of)):
+                return node
         if engine == "duckdb" and (isinstance(node, _JSON_PARSES) or (
                 isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_JSON_PARSES)):
             # The typed readers parse their first argument; an untyped one may parse any (both of
