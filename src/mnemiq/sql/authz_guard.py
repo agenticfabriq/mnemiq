@@ -218,14 +218,19 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
         the engine scopes it: a reference inside a CTE's own body, or inside a sibling's, sees
         only the siblings declared before that CTE, so `WITH pair AS (SELECT * FROM pair)` reads
         the base table inside its body (the review gate's third round)."""
-        name = object_key(table)
-        enclosing = [c for c in table.iter_ancestors() if isinstance(c, exp.CTE)] if hasattr(table, "iter_ancestors") else []
-        if not enclosing:
-            node = table.parent
-            while node is not None:
-                if isinstance(node, exp.CTE):
-                    enclosing.append(node)
-                node = node.parent
+        # Names meet as the engine resolves them (M170): `WITH W AS (...) SELECT ... FROM w` reads
+        # the CTE on DuckDB, where a granted base table `w` would otherwise be read instead
+        # (Codex's third review of #170). A qualified reference (`pg.claim`) never names a CTE,
+        # whatever a CTE is called: it is the base table (the review gate on that fix, where
+        # folding the bare name alone let a CTE named `claim` capture it).
+        if table.args.get("db") or table.args.get("catalog"):
+            return None
+        name = written(table.this if isinstance(table.this, exp.Identifier) else None, object_key(table))
+        enclosing, above = [], table.parent
+        while above is not None:
+            if isinstance(above, exp.CTE):
+                enclosing.append(above)
+            above = above.parent
         node: exp.Expression | None = table
         while node is not None:
             with_ = node.args.get("with_") if isinstance(node, exp.Expression) else None
@@ -234,7 +239,9 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
                 own = next((c for c in enclosing if c.parent is with_), None)
                 candidates = ctes[:ctes.index(own)] if own is not None else ctes
                 for cte in candidates:
-                    if cte.alias_or_name == name:
+                    alias = cte.args.get("alias")
+                    declared = written(alias.this if isinstance(alias, exp.TableAlias) else None, cte.alias_or_name)
+                    if declared == name:
                         return cte.this
             node = node.parent
         return None

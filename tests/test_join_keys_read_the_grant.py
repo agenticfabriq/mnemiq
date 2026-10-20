@@ -16,8 +16,8 @@ from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
 
-SCHEMA = {"claim": {"id", "secret"}, "pair": {"id", "secret"}, "one": {"secret"}, "sink": {"i", "s"}}
-HIDDEN = {"claim": {"id"}, "pair": {"id"}, "one": set(), "sink": {"i", "s"}}
+SCHEMA = {"claim": {"id", "secret"}, "pair": {"id", "secret"}, "one": {"secret"}, "sink": {"i", "s"}, "w": {"id"}}
+HIDDEN = {"claim": {"id"}, "pair": {"id"}, "one": set(), "sink": {"i", "s"}, "w": {"id"}}
 COMPLETE = AccessPolicy(policy_schema=SCHEMA)
 
 
@@ -30,7 +30,8 @@ def worlds():
         con.execute(f"CREATE TABLE claim (id INT, secret VARCHAR); INSERT INTO claim VALUES (1, '{secret}'); "
                     f"CREATE TABLE pair (id INT, secret VARCHAR); INSERT INTO pair VALUES (1, '{secret}'), (2, 'Z'); "
                     f"CREATE TABLE one (secret VARCHAR); INSERT INTO one VALUES ('{secret}'); "
-                    "CREATE TABLE sink (i INT, s VARCHAR); INSERT INTO sink VALUES (1, 'x')")
+                    "CREATE TABLE sink (i INT, s VARCHAR); INSERT INTO sink VALUES (1, 'x'); "
+                    "CREATE TABLE w (id INT); INSERT INTO w VALUES (1)")
         made.append(con)
     return made
 
@@ -70,6 +71,10 @@ def _decide_write(sql, visible, policy=COMPLETE):
     "WITH w AS (SELECT * FROM pair), pair AS (SELECT * FROM w) SELECT count(*) AS n FROM pair JOIN (SELECT 'Z' AS secret) e USING (secret)",
     # A later sibling named after a base table is not visible inside an earlier body.
     "WITH a AS (SELECT * FROM pair), pair AS (SELECT i FROM sink) SELECT count(*) AS n FROM a JOIN (SELECT 'Z' AS secret) e USING (secret)",
+    # A CTE named in another case than its reference, beside a granted base table of the
+    # reference's spelling (Codex's third review): DuckDB folds, and reads the CTE.
+    "WITH W AS (SELECT * FROM claim) SELECT count(*) AS n FROM w JOIN (SELECT 'Z' AS secret) e USING (secret)",
+    "WITH W AS (SELECT * FROM claim) SELECT count(*) AS n FROM w NATURAL JOIN (SELECT 1 AS id, 'Z' AS secret) e",
     # An alias reused in another scope (Codex's second review): the alias map keeps one table
     # per alias, the outer one, so a join inside the subquery lost its table from the set.
     "SELECT count(*) AS n FROM sink t WHERE EXISTS (SELECT 1 FROM claim t JOIN (SELECT 'Z' AS secret) e USING (secret))",
@@ -126,6 +131,20 @@ def test_a_granted_join_key_is_read_as_before(worlds):
     worlds[0].execute(aside)
     assert isinstance(_decide(aside, SCHEMA, policy=AccessPolicy()), Approved)
     assert isinstance(_decide(aside, SCHEMA), Approved)
+
+
+def test_a_qualified_reference_is_the_base_table_whatever_a_cte_is_called():
+    # The review gate on the CTE folding: `pg.claim` is the base table even beside a CTE named
+    # `claim`, since a qualified name never names a CTE. A federated grant keyed `pg.claim`;
+    # the decision alone, with no engine behind the catalog name.
+    schema = {"pg.claim": {"id", "secret"}}
+    hidden = {"pg.claim": {"id"}}
+    for sql in ("WITH claim AS (SELECT 1 AS secret) SELECT count(*) AS n FROM pg.claim JOIN (SELECT 'Z' AS secret) e USING (secret)",
+                "WITH claim AS (SELECT 1 AS id) SELECT count(*) AS n FROM pg.claim NATURAL JOIN (SELECT 1 AS id, 'Z' AS secret) e"):
+        verdict = _decide(sql, hidden, policy=AccessPolicy(policy_schema=schema))
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
+    granted = _decide("SELECT count(*) AS n FROM pg.claim JOIN (SELECT 1 AS id) e USING (id)", schema, policy=AccessPolicy(policy_schema=schema))
+    assert isinstance(granted, Approved), granted
 
 
 def test_a_whole_row_as_an_order_by_key_over_a_derived_star_stays_refused(worlds):
