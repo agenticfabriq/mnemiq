@@ -1090,6 +1090,8 @@ def test_a_nested_extract_is_typed_from_the_original_node():
     "[json_extract_path_text(attrs, ['$.a'])] = [region]",
     "[region] = [[id]]",
     "{'a': region} = {'a': [id]}",
+    "{'a': region, 'b': 1} = {'b': 1, 'a': [id]}",   # fields paired by name (the review gate)
+    "{'b': 1, 'a': region} = {'a': [id], 'b': 1}",
 ])
 def test_text_beside_a_typed_container_inside_a_container_is_cast_on_the_row(row_filter):
     # VARCHAR[][] beside VARCHAR[]: DuckDB casts the text element to a list, and the hidden

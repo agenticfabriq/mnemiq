@@ -988,6 +988,15 @@ def _text_meets_a_typed_container(a, b) -> bool:
         if x[0] == "map" and y[0] == "map":
             return walk(x[1], y[1], depth + 1) or walk(x[2], y[2], depth + 1)
         if x[0] == "struct" and y[0] == "struct":
+            # Fields paired by name where both sides name every field, as DuckDB pairs them
+            # (`{'a': region, 'b': 1} = {'b': 1, 'a': [id]}` raised on the row where pairing
+            # by position read `region` against `1`: the review gate on the thirty-second
+            # round), by position otherwise; shapes that do not line up are read as the cast.
+            if all(n is not None for n, _ in x[1]) and all(n is not None for n, _ in y[1]):
+                by_name = {n: g for n, g in y[1]}
+                if len(by_name) != len(y[1]) or any(n not in by_name for n, _ in x[1]):
+                    return True
+                return any(walk(f, by_name[n], depth + 1) for n, f in x[1])
             return any(walk(f, g, depth + 1) for (_, f), (_, g) in zip(x[1], y[1]))
         return False
     return walk(a, b, 0)
