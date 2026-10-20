@@ -1092,6 +1092,9 @@ def test_a_nested_extract_is_typed_from_the_original_node():
     "{'a': region} = {'a': [id]}",
     "{'a': region, 'b': 1} = {'b': 1, 'a': [id]}",   # fields paired by name (the review gate)
     "{'b': 1, 'a': region} = {'a': [id], 'b': 1}",
+    "{'A': region} = {'a': [id]}",                    # names folded as DuckDB folds them
+    "[TRY_CAST([id] AS UNION(a INTEGER[]))] = [TRY_CAST(region AS UNION(a VARCHAR))]",  # Codex's 28th
+    "TRY_CAST([id] AS UNION(a INTEGER[])) = TRY_CAST(region AS UNION(a VARCHAR))",
 ])
 def test_text_beside_a_typed_container_inside_a_container_is_cast_on_the_row(row_filter):
     # VARCHAR[][] beside VARCHAR[]: DuckDB casts the text element to a list, and the hidden
@@ -1115,6 +1118,9 @@ def test_text_beside_a_typed_container_inside_a_container_is_cast_on_the_row(row
     "[region] = [7]",            # a number inside a container is serialised, not the text parsed
     "{'a': region} = {'a': 7}",
     "['x'] = [[id]]",            # a literal text cast to a list fails on no row's value
+    "{'A': region} = {'a': region}",   # names folded (Codex's twenty-eighth review: refused before)
+    "{'A': attrs} = {'a': attrs}",
+    "[TRY_CAST(region AS UNION(a VARCHAR))] = [TRY_CAST(region AS UNION(a VARCHAR))]",
 ])
 def test_a_literal_container_or_a_number_beside_text_inside_a_container_runs(row_filter):
     con = duckdb.connect()

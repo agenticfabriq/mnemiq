@@ -659,7 +659,8 @@ def _values_coerce_to_json(values, type_of, engine: str) -> bool:
 # validator's connection (a table function reading a file, a subquery over a billion rows),
 # which a validator must not do (the review gate on #160); their type is unknown here.
 _PURE = (exp.Column, exp.Identifier, exp.Literal, exp.Boolean, exp.Null, exp.Paren, exp.Neg,
-         exp.Cast, exp.DataType, exp.DataTypeParam, exp.Interval, exp.Var, exp.DateStrToDate,
+         exp.Cast, exp.DataType, exp.DataTypeParam, exp.ColumnDef,  # a UNION's or STRUCT's member
+         exp.Interval, exp.Var, exp.DateStrToDate,
          exp.Case, exp.If, exp.Coalesce, exp.Nullif, exp.Array, exp.Struct, exp.PropertyEQ,
          exp.ToMap, exp.Map,  # `MAP {'a': attrs}`, `MAP(['a'], [attrs])` (the review gate)
          exp.Bracket, exp.Dot,  # `[attrs][1]`, `({'a': attrs}).a` (Codex's tenth review)
@@ -958,10 +959,10 @@ def _text_becomes_json(kind, unified) -> bool:
     if len(kind[1]) != len(unified[1]):
         return True
     if all(name is not None for name, _ in kind[1]) and all(name is not None for name, _ in unified[1]):
-        by_name = {name: field for name, field in unified[1]}
-        if len(by_name) != len(unified[1]) or any(name not in by_name for name, _ in kind[1]):
+        by_name = {name.lower(): field for name, field in unified[1]}  # folded as DuckDB folds
+        if len(by_name) != len(unified[1]) or any(name.lower() not in by_name for name, _ in kind[1]):
             return True
-        pairs = [(field, by_name[name]) for name, field in kind[1]]
+        pairs = [(field, by_name[name.lower()]) for name, field in kind[1]]
     else:
         pairs = [(inner, outer) for (_, inner), (_, outer) in zip(kind[1], unified[1])]
     return any(_text_becomes_json(inner, outer) for inner, outer in pairs)
@@ -987,19 +988,32 @@ def _text_meets_a_typed_container(a, b) -> bool:
             return walk(x[1], y[1], depth + 1)
         if x[0] == "map" and y[0] == "map":
             return walk(x[1], y[1], depth + 1) or walk(x[2], y[2], depth + 1)
-        if x[0] == "struct" and y[0] == "struct":
+        if x[0] in ("struct", "union") and y[0] == x[0]:
             # Fields paired by name where both sides name every field, as DuckDB pairs them
             # (`{'a': region, 'b': 1} = {'b': 1, 'a': [id]}` raised on the row where pairing
             # by position read `region` against `1`: the review gate on the thirty-second
-            # round), by position otherwise; shapes that do not line up are read as the cast.
-            if all(n is not None for n, _ in x[1]) and all(n is not None for n, _ in y[1]):
-                by_name = {n: g for n, g in y[1]}
-                if len(by_name) != len(y[1]) or any(n not in by_name for n, _ in x[1]):
-                    return True
-                return any(walk(f, by_name[n], depth + 1) for n, f in x[1])
-            return any(walk(f, g, depth + 1) for (_, f), (_, g) in zip(x[1], y[1]))
+            # round), by position otherwise; a name on the left that the right lacks is read
+            # as the cast. A UNION type's members the same: `[TRY_CAST([id] AS UNION(a
+            # INTEGER[]))] = [TRY_CAST(region AS UNION(a VARCHAR))]` cast the text member to a
+            # list on the row (Codex's twenty-eighth review), unread while the walk stopped at
+            # the union. Names folded as DuckDB folds them (`{'A': region} = {'a': region}`
+            # runs, the same review).
+            pairs = _paired_fields(x[1], y[1])
+            return pairs is None or any(walk(f, g, depth + 1) for f, g in pairs)
         return False
     return walk(a, b, 0)
+
+
+def _paired_fields(left, right):
+    """A struct's or a union's fields paired as DuckDB pairs them: by folded name where both
+    sides name every field (None where a left name is missing on the right, or a name repeats),
+    by position otherwise."""
+    if all(n is not None for n, _ in left) and all(n is not None for n, _ in right):
+        by_name = {n.lower(): g for n, g in right}
+        if len(by_name) != len(right) or any(n.lower() not in by_name for n, _ in left):
+            return None
+        return [(f, by_name[n.lower()]) for n, f in left]
+    return [(f, g) for (_, f), (_, g) in zip(left, right)]
 
 
 _LITERAL_NODES = (exp.Literal, exp.Null, exp.Boolean, exp.Neg, exp.Paren, exp.Tuple, exp.Array,
