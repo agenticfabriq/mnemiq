@@ -18,6 +18,7 @@ from mnemiq.sql.functions import (
     opaque_columns,
 )
 from mnemiq.sql.cls import check_cls
+from mnemiq.sql.guard import bound_by_position, unnamed_read
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import object_key
@@ -232,8 +233,14 @@ def _target_table(ast: exp.Expression) -> str | None:
     return object_key(node) if node is not None else None
 
 
-def check_write_shape(sql: str, dialect: str = "duckdb") -> exp.Expression | Refusal:
-    """One bounded DML statement, or a Refusal. UPDATE/DELETE must be bounded by a WHERE."""
+def check_write_shape(sql: str, dialect: str = "duckdb", executes_as: str | None = None,
+                      columns: dict[str, set[str]] | None = None) -> exp.Expression | Refusal:
+    """One bounded DML statement, or a Refusal. UPDATE/DELETE must be bounded by a WHERE. A
+    read no node names (a method call, a COLUMNS inside an expression) is refused here as on the
+    read side, before any check runs, for the engine that executes (M192, M193); in a write every
+    star and every COLUMNS are, since no check expands them (M195), and so is a column reached by
+    position, `#2`, as on the read side (M197; `columns` is the grant's map, as `check_shape`
+    takes it)."""
     try:
         statements = [s for s in sqlglot.parse(sql, read=dialect) if s is not None]
     except Exception:
@@ -276,6 +283,15 @@ def check_write_shape(sql: str, dialect: str = "duckdb") -> exp.Expression | Ref
             code=RefusalCode.UNBOUNDED_WRITE,
             message="An UPDATE or DELETE must have a WHERE clause; an unbounded mutation is refused.",
         )
+    unnamed = unnamed_read(ast, executes_as or dialect, write=True)
+    if unnamed is not None:
+        return unnamed
+    for part in ast.iter_expressions():
+        if part is ast.this:
+            continue  # the target: an INSERT's alias column list names the columns written
+        positional = bound_by_position(part, executes_as or dialect, columns)
+        if positional is not None:
+            return positional
     return ast
 
 
@@ -325,7 +341,7 @@ def decide_write(
             ),
             subject=None,
         )
-    shaped = check_write_shape(sql, dialect=dialect)
+    shaped = check_write_shape(sql, dialect=dialect, executes_as=target, columns=visible)
     if isinstance(shaped, Refusal):
         return shaped
     ambiguous = fields_as_members(shaped, target, known_columns(visible, policy))  # M165, M167
@@ -336,7 +352,8 @@ def decide_write(
     if unsupported is not None:
         return unsupported
 
-    refusal = check_access(shaped, visible, target)  # every referenced table readable, cols exist
+    refusal = check_access(shaped, visible, target,  # every referenced table readable, cols exist
+                           columns=known_columns(visible, policy))
     if refusal is not None:
         return refusal
     # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
@@ -370,12 +387,14 @@ def decide_write(
     # And the column form, for the reason above stated once more: a write is the worse place to
     # lose it. `INSERT INTO notes SELECT id, leaked FROM vc_t` stores what the virtual column's
     # expression returned into a table the caller may read forever (M100, the M30 shape).
-    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target)
+    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target,
+                                    columns=known_columns(visible, policy))
     if computed is not None:
         return computed
 
     # A write needs RAW access: a masked column is treated as denied for writes.
-    write_cls = check_cls(shaped, AccessPolicy(denied=policy.denied | policy.masked), target)
+    write_cls = check_cls(shaped, AccessPolicy(denied=policy.denied | policy.masked), target,
+                          columns=known_columns(visible, policy))
     if write_cls is not None:
         return write_cls
 

@@ -221,18 +221,27 @@ def test_it_reports_WHICH_DIRECTION_failed():
 # --- the plan is model-written, so it is mostly UNQUALIFIED ---------------------------------
 
 def test_an_UNQUALIFIED_masked_reference_is_measured_not_invalidated():
-    """`column_tables` records an entry only for a qualified column, the approved plan is
-    model-written, and nothing in the pipeline qualifies it -- so without the criterion's own
-    qualification step a plain `SELECT ssn FROM claim` is unmeasurable and the zero threshold fails
-    a run that was measurable all along. The whole control is then unable to pass."""
+    """The approved plan is model-written and nothing in the pipeline qualifies it, so a plain
+    `SELECT ssn FROM claim` must be attributed by the resolver or the zero threshold fails a run
+    that was measurable all along. `column_tables` binds a bare name to the one table of its
+    scope that is listed with it (mnemiq #167): with a schema, claim's listing; with none, the
+    policy's own masked pair, which says claim HAS ssn. The whole control can then pass."""
     ast = sqlglot.parse_one("SELECT ssn FROM claim", read="duckdb")
     policy = AccessPolicy(masked={("claim", "ssn")})
 
-    bare = touched(ast, policy)                       # no schema: exactly as written
-    assert bare.unattributable == ("ssn",) and bare.entries == set()
+    bare = touched(ast, policy)                       # no schema: the policy's pair attributes it
+    assert bare.entries == {("mask", "claim")} and not bare.unattributable
 
-    with_schema = touched(ast, policy, _V)            # the spec's named fix
+    with_schema = touched(ast, policy, _V)            # the schema's listing attributes it
     assert with_schema.entries == {("mask", "claim")} and not with_schema.unattributable
+
+    # With no schema and a second table, attribution to claim is not a guess: the policy's pair
+    # is evidence that claim has ssn, and if person had it too the engine would refuse the bare
+    # name as ambiguous and run nothing, so claim's is the only reading that can run. That holds
+    # for an ON join; a USING or NATURAL join merges the name instead, which this does not cover.
+    joined = touched(sqlglot.parse_one("SELECT ssn FROM claim JOIN person ON claim.id = person.id",
+                                       read="duckdb"), policy)
+    assert joined.entries == {("mask", "claim")} and not joined.unattributable
 
     c = _end_to_end("SELECT ssn FROM claim", policy)
     assert c.agrees and c.measurable, (c.missing, c.spurious)
@@ -315,7 +324,9 @@ def test_a_qualification_failure_degrades_instead_of_propagating():
                  AccessPolicy(masked={("claim", "ssn")}), _V)
     assert t1.entries == {("mask", "claim")}, "qualified already, so still attributable"
 
-    # a schema carrying a table with no columns -- SchemaError, which is not an OptimizeError
+    # a schema carrying a table with no columns -- SchemaError under sqlglot's qualifier, which is
+    # not an OptimizeError; the resolver reads the schema table by table and attributes the
+    # reference to the one table that lists it (mnemiq #167), never raising
     t2 = touched(sqlglot.parse_one("SELECT ssn FROM claim", read="duckdb"),
                  AccessPolicy(masked={("claim", "ssn")}), {**_V, "empty": set()})
-    assert t2.unattributable == ("ssn",), "degraded to the unqualified reading, not raised"
+    assert t2.entries == {("mask", "claim")} and not t2.unattributable, "attributed, not raised"
