@@ -967,6 +967,54 @@ def _text_becomes_json(kind, unified) -> bool:
     return any(_text_becomes_json(inner, outer) for inner, outer in pairs)
 
 
+_CONTAINER_KINDS = frozenset({"array", "struct", "map"})
+
+
+def _text_meets_a_typed_container(a, b) -> bool:
+    """Whether the two types, walked side by side, put a text leaf against a list, a struct or
+    a map at a NESTED position: inside a container DuckDB casts the text to that type on the
+    row, and `'north'` is no list (measured: `[json_extract_string(attrs, ['$.a'])] = [region]`
+    raised quoting the hidden row's value, Codex's twenty-seventh review of #160; `[region] =
+    [[id]]` and the struct twin the same). Beside a number or a date inside a container the
+    number is serialised instead and the comparison runs, so only a container counts."""
+    def walk(x, y, depth):
+        if x[0] == "leaf" and y[0] == "leaf":
+            return False
+        if depth and ((x[0] == "leaf" and _bare(x[1]) in _TEXT_NAMES and y[0] in _CONTAINER_KINDS)
+                      or (y[0] == "leaf" and _bare(y[1]) in _TEXT_NAMES and x[0] in _CONTAINER_KINDS)):
+            return True
+        if x[0] == "array" and y[0] == "array":
+            return walk(x[1], y[1], depth + 1)
+        if x[0] == "map" and y[0] == "map":
+            return walk(x[1], y[1], depth + 1) or walk(x[2], y[2], depth + 1)
+        if x[0] == "struct" and y[0] == "struct":
+            return any(walk(f, g, depth + 1) for (_, f), (_, g) in zip(x[1], y[1]))
+        return False
+    return walk(a, b, 0)
+
+
+_LITERAL_NODES = (exp.Literal, exp.Null, exp.Boolean, exp.Neg, exp.Paren, exp.Tuple, exp.Array,
+                  exp.Struct, exp.PropertyEQ, exp.Identifier, exp.ToMap)
+
+
+def _pure_literal(value: exp.Expression) -> bool:
+    """A container written out of literals alone, which DuckDB coerces to the other side's
+    type (`[region] = [['x']]` runs); one holding a column, a call or a cast is typed as itself
+    and the other side is cast to it. By node class, since sqlglot's Array and Struct are
+    functions to `find`."""
+    return all(isinstance(node, _LITERAL_NODES) for node in value.walk())
+
+
+def _unwrapped(values) -> list:
+    out = []
+    for value in values:
+        while isinstance(value, exp.Paren):
+            value = value.this
+        if value is not None and not isinstance(value, exp.Null):
+            out.append(value)
+    return out
+
+
 def _json_inside_a_container(values, type_of) -> bool:
     """Whether DuckDB's unification of `values` (a branched value's branches, a comparison's
     sides) converts text to JSON inside a list or a struct, on the rows that take the branch
@@ -991,6 +1039,17 @@ def _json_inside_a_container(values, type_of) -> bool:
         known = [_parse_type(kind) for kind in kinds if kind is not None and kind is not _TEXT]
     except ValueError:
         return True  # a type the reader here cannot read: not shown safe
+    # Text against a typed container at a nested position, JSON or not: the text is cast to
+    # the container's type on the row. Both sides must be typed by something other than their
+    # literals: a literal side is coerced to the other (`[region] = [['x']]` runs, measured),
+    # and a literal text cast to a container fails on no row's value.
+    typed = [(value, _parse_type(kind)) for value, kind in zip(_unwrapped(values), kinds)
+             if kind is not None and kind is not _TEXT and kind is not _UNREADABLE]
+    for i, (left, kind_l) in enumerate(typed):
+        for right, kind_r in typed[i + 1:]:
+            if _text_meets_a_typed_container(kind_l, kind_r) and not (
+                    _pure_literal(left) or _pure_literal(right)):
+                return True
     if not any(_holds_json(node) for node in known):
         return False
     if any(kind is None for kind in kinds):

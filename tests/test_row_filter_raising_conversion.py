@@ -1081,3 +1081,44 @@ def test_a_nested_extract_is_typed_from_the_original_node():
     assert typed("[json_extract_string(attrs, paths)]") == "VARCHAR[][]"
     assert typed("[json_extract_string(attrs, '$.a')]") == "VARCHAR[]"
     assert typed("json_extract_string(attrs, paths)") == "VARCHAR[]"
+
+
+# --- text beside a typed container inside a container (Codex's twenty-seventh review of #160) ---
+
+@pytest.mark.parametrize("row_filter", [
+    "[json_extract_string(attrs, ['$.a'])] = [region]",
+    "[json_extract_path_text(attrs, ['$.a'])] = [region]",
+    "[region] = [[id]]",
+    "{'a': region} = {'a': [id]}",
+])
+def test_text_beside_a_typed_container_inside_a_container_is_cast_on_the_row(row_filter):
+    # VARCHAR[][] beside VARCHAR[]: DuckDB casts the text element to a list, and the hidden
+    # row's text is no list (measured, its value in the error); a row whose text parses as a
+    # list runs. The container check looked for JSON alone and approved it.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON); INSERT INTO claim VALUES (1, 'north', '{\"a\": \"7\"}')")
+    with pytest.raises(duckdb.ConversionException, match="north"):
+        con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    con.execute("DELETE FROM claim; INSERT INTO claim VALUES (1, '[7]', '{\"a\": \"7\"}')")
+    con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    verdict = _decide(row_filter)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+@pytest.mark.parametrize("row_filter", [
+    "[region] = [['x']]",        # a literal container is coerced to the text (measured)
+    "[['x']] = [region]",
+    "[region] = [{'a': 1}]",
+    "[[region]] = [[['x']]]",
+    "[region] = [7]",            # a number inside a container is serialised, not the text parsed
+    "{'a': region} = {'a': 7}",
+    "['x'] = [[id]]",            # a literal text cast to a list fails on no row's value
+])
+def test_a_literal_container_or_a_number_beside_text_inside_a_container_runs(row_filter):
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON); INSERT INTO claim VALUES (1, 'north', '{\"a\": \"7\"}')")
+    try:
+        con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    except duckdb.ConversionException as error:
+        assert "north" not in str(error)  # a literal's failure, on no row's value
+    assert isinstance(_decide(row_filter), Approved), row_filter
