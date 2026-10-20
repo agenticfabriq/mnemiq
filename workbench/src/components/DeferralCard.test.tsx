@@ -33,10 +33,15 @@ describe("DeferralCard", () => {
     expect(screen.getByLabelText("Deferral")).toBeInTheDocument();
     unmount();
 
-    // Three codes ride `failed` and only one of them IS the source. The label said
+    // Four codes ride `failed` and two of them are the source. The label said
     // "Source failure" over a model-provider outage before a verifier outage could reach it
     // too, so the region is named for the kind and the heading names which one broke.
-    for (const code of ["execution_failed", "model_unavailable", "verifier_unavailable"] as const) {
+    for (const code of [
+      "execution_failed",
+      "source_unavailable",
+      "model_unavailable",
+      "verifier_unavailable",
+    ] as const) {
       const view = render(<DeferralCard answer={withReason(code, true)} />);
       expect(screen.getByLabelText("Failure")).toBeInTheDocument();
       expect(screen.queryByLabelText("Source failure")).toBeNull();

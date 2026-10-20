@@ -540,8 +540,8 @@ _RETRIED = {
     RefusalCode.POLICY_TARGET_UNSUPPORTED: DeferralReason.UNGOVERNABLE,
     RefusalCode.UNSCOPED_CTE: DeferralReason.UNGOVERNABLE,
     # The source could not be asked to prove the statement (Codex's review of #159): nobody's to
-    # repair, and deferred under the default reason until one for an unanswered source is chosen.
-    RefusalCode.SOURCE_UNAVAILABLE: DeferralReason.UNGOVERNABLE,
+    # repair, and a reason of its own, which the agent reports as a failure rather than a deferral.
+    RefusalCode.SOURCE_UNAVAILABLE: DeferralReason.SOURCE_UNAVAILABLE,
 }
 
 
