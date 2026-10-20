@@ -680,14 +680,18 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
         # nothing and the probe would ask DuckDB for a column with no FROM (the review gate on
         # the twenty-fourth round: `[region] = [(SELECT attrs FROM claim LIMIT 1)]` approved).
         return type_of(value)
+    if _is_union_extract(value):
+        return _union_member_type(value, type_of)
     # A call that returns JSON is a typed NULL to the probe, as a column is: nothing of it runs,
     # and what it holds (`to_json(id)` beside `[region]`) is JSON to DuckDB's unification.
     # A scalar subquery with one pure projection is that projection to the probe: `[region] =
     # [(SELECT json_group_array(id) FROM claim)]` (the review gate on the twenty-third round),
     # the projection alone handed over, never the subquery, whose FROM would run.
-    json_calls = [node for node in value.walk() if _is_typed_call(node) or _scalar_projection(node) is not None]
+    json_calls = [node for node in value.walk() if _is_typed_call(node) or _scalar_projection(node) is not None
+                  or _is_union_extract(node)]
     inside_a_json_call = {id(inner) for call in json_calls for inner in call.walk() if inner is not call}
     if not all(id(node) in inside_a_json_call or _is_typed_call(node) or _scalar_projection(node) is not None
+               or _is_union_extract(node)
                or isinstance(node, (*_PURE, *_PURE_CALL_NODES)) or (
                isinstance(node, exp.Anonymous)
                and node.name.lower() in _LIST_CONSTRUCTORS | _PURE_CALLS)
@@ -736,6 +740,11 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     for original, call in zip(nested, copies):
         if _is_typed_call(original):
             call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(original, type_of))))
+        elif _is_union_extract(original):
+            member = _union_member_type(original, type_of)
+            if member is None:
+                return None  # a member the reader cannot name: the value is unknown, as before
+            call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(member, dialect="duckdb")))
     originals = [sq for sq in value.find_all(exp.Subquery)
                  if id(sq) not in inside_a_json_call and _scalar_projection(sq) is not None]
     inside_another = {id(inner) for sq in originals for inner in sq.walk() if inner is not sq}
@@ -776,7 +785,39 @@ _PURE_CALL_NODES = (exp.MapKeys, exp.StructExtract, exp.ArrayDistinct, exp.MapFr
 _PURE_CALLS = frozenset({"map_values", "map_entries", "list_extract", "array_extract", "list_element",
                          "array_element", "list_slice", "list_reverse", "list_unique",
                          "list_distinct", "array_distinct", "map_keys", "struct_extract",
-                         "flatten", "list_sort", "map_from_entries", "row"})
+                         "flatten", "list_sort", "map_from_entries", "row",
+                         "union_value"})  # typed by DuckDB from its argument's stand-in
+
+
+def _is_union_extract(node: exp.Expression) -> bool:
+    return (isinstance(node, exp.Anonymous) and node.name.lower() == "union_extract"
+            and len(node.expressions) == 2)
+
+
+def _union_member_type(call: exp.Expression, type_of) -> str | None:
+    """`union_extract(u, 'a')` is the type of u's member `a`, read off u's own type: DuckDB
+    types the extract of a NULL stand-in as NULL, so the probe cannot answer it, and left
+    unknown the call made its container unknown, `[union_extract(TRY_CAST(region AS UNION(a
+    VARCHAR)), 'a')] = [[id]]` casting the hidden text to a list unread (Codex's twenty-ninth
+    review of #160). None where the tag is no string literal or names no member."""
+    if not _is_union_extract(call):
+        return None
+    tag = call.expressions[1]
+    if not (isinstance(tag, exp.Literal) and tag.is_string):
+        return None
+    inner = _pure_type(call.expressions[0], type_of)
+    if inner is None:
+        return None
+    try:
+        kind = _parse_type(inner)
+    except ValueError:
+        return None
+    if kind[0] != "union":
+        return None
+    for name, member in kind[1]:
+        if name is not None and name.lower() == tag.name.lower():
+            return _castable(member)
+    return None
 # A list searched for a value (the element type unified with the value's), or two lists searched
 # against each other; by sqlglot's node where it has one, by name where it does not.
 _LIST_SEARCHES = (exp.ArrayContains, exp.ArrayPosition, exp.ArrayOverlaps, exp.ArrayContainsAll,

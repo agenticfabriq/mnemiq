@@ -1094,6 +1094,8 @@ def test_a_nested_extract_is_typed_from_the_original_node():
     "{'b': 1, 'a': region} = {'a': [id], 'b': 1}",
     "{'A': region} = {'a': [id]}",                    # names folded as DuckDB folds them
     "[TRY_CAST([id] AS UNION(a INTEGER[]))] = [TRY_CAST(region AS UNION(a VARCHAR))]",  # Codex's 28th
+    "[union_value(a := [id])] = [union_value(a := region)]",                          # Codex's 29th
+    "[union_extract(TRY_CAST(region AS UNION(a VARCHAR)), 'a')] = [[id]]",
     "TRY_CAST([id] AS UNION(a INTEGER[])) = TRY_CAST(region AS UNION(a VARCHAR))",
 ])
 def test_text_beside_a_typed_container_inside_a_container_is_cast_on_the_row(row_filter):
@@ -1121,6 +1123,8 @@ def test_text_beside_a_typed_container_inside_a_container_is_cast_on_the_row(row
     "{'A': region} = {'a': region}",   # names folded (Codex's twenty-eighth review: refused before)
     "{'A': attrs} = {'a': attrs}",
     "[TRY_CAST(region AS UNION(a VARCHAR))] = [TRY_CAST(region AS UNION(a VARCHAR))]",
+    "[union_value(a := region)] = [union_value(a := region)]",
+    "[union_extract(TRY_CAST(region AS UNION(a VARCHAR)), 'a')] = ['x']",
 ])
 def test_a_literal_container_or_a_number_beside_text_inside_a_container_runs(row_filter):
     con = duckdb.connect()
@@ -1130,3 +1134,19 @@ def test_a_literal_container_or_a_number_beside_text_inside_a_container_runs(row
     except duckdb.ConversionException as error:
         assert "north" not in str(error)  # a literal's failure, on no row's value
     assert isinstance(_decide(row_filter), Approved), row_filter
+
+
+def test_a_union_extract_at_the_top_level_is_typed_from_its_argument():
+    # The extract of a NULL stand-in is typed NULL by DuckDB, so the member is read off the
+    # argument's own type: beside a number the text member converts on the row (measured).
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR); INSERT INTO claim VALUES (1, 'north')")
+    raising = "union_extract(TRY_CAST(region AS UNION(a VARCHAR)), 'a') = 7"
+    with pytest.raises(duckdb.ConversionException, match="north"):
+        con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
+    verdict = _decide(raising)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    assert isinstance(_decide("union_extract(union_value(a := region), 'a') = 7"), Refusal)
+    running = "union_extract(TRY_CAST(region AS UNION(a VARCHAR)), 'a') = 'x'"
+    con.execute(f"SELECT id FROM claim WHERE {running}").fetchall()
+    assert isinstance(_decide(running), Approved)
