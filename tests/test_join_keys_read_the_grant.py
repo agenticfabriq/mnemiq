@@ -70,6 +70,11 @@ def _decide_write(sql, visible, policy=COMPLETE):
     "WITH w AS (SELECT * FROM pair), pair AS (SELECT * FROM w) SELECT count(*) AS n FROM pair JOIN (SELECT 'Z' AS secret) e USING (secret)",
     # A later sibling named after a base table is not visible inside an earlier body.
     "WITH a AS (SELECT * FROM pair), pair AS (SELECT i FROM sink) SELECT count(*) AS n FROM a JOIN (SELECT 'Z' AS secret) e USING (secret)",
+    # An alias reused in another scope (Codex's second review): the alias map keeps one table
+    # per alias, the outer one, so a join inside the subquery lost its table from the set.
+    "SELECT count(*) AS n FROM sink t WHERE EXISTS (SELECT 1 FROM claim t JOIN (SELECT 'Z' AS secret) e USING (secret))",
+    "SELECT count(*) AS n FROM sink t WHERE EXISTS (SELECT 1 FROM claim t NATURAL JOIN (SELECT 1 AS id, 'Z' AS secret) e)",
+    "SELECT count(*) AS n FROM claim t JOIN (SELECT 'Z' AS secret) e USING (secret) WHERE EXISTS (SELECT 1 FROM sink t)",
     "SELECT count(x.id) AS n FROM claim NATURAL LEFT JOIN (SELECT 1 AS id, 'Z' AS secret) x",
 ])
 def test_a_hidden_join_key_is_refused(worlds, sql):
@@ -89,6 +94,7 @@ def test_a_hidden_join_key_is_refused(worlds, sql):
     "INSERT INTO sink (i) SELECT count(*) FROM claim JOIN (SELECT 1 AS id, 'Z' AS secret) x USING (id, secret)",
     "INSERT INTO sink (i) SELECT count(*) FROM claim NATURAL JOIN (SELECT 1 AS id, 'Z' AS secret) x",
     "DELETE FROM sink WHERE i IN (SELECT x.id FROM claim JOIN (SELECT 1 AS id, 'Z' AS secret) x USING (id, secret))",
+    "INSERT INTO sink (i) SELECT count(*) FROM sink t WHERE EXISTS (SELECT 1 FROM claim t JOIN (SELECT 'Z' AS secret) e USING (secret))",
 ])
 def test_a_hidden_join_key_in_a_write_is_refused(worlds, sql):
     for con in worlds:

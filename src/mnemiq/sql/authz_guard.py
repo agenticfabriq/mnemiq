@@ -260,10 +260,16 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
         select = join.parent if isinstance(join.parent, exp.Select) else None
         if select is not None and select.args.get("from_") is not None:
             earlier = select.args.get("joins") or []
-            inputs = [select.args["from_"].this, *(j.this for j in earlier[:earlier.index(join)]), join.this]
-            reached = set().union(*(bases(i) for i in inputs)) & referenced
+            before = next(i for i, j in enumerate(earlier) if j is join)  # by identity: two
+            inputs = [select.args["from_"].this, *(j.this for j in earlier[:before]), join.this]  # equal joins
+            reached = set().union(*(bases(i) for i in inputs))
         else:
-            reached = bases(ast) & referenced
+            reached = bases(ast)
+        # Every base table here passed the grant above, whatever alias it carries: the alias map
+        # is one name per alias and a reused alias in another scope would drop a table from it
+        # (Codex's second review: `claim t JOIN ... USING (secret) WHERE EXISTS (SELECT 1 FROM
+        # sink t)` dropped claim), so the reached set is not narrowed by it.
+        reached = {t for t in reached if t in visible}
         hidden_on = {t: as_engine(set(listed.get(t, ())) - set(visible[t])) for t in reached}
         for key in join.args.get("using") or ():
             name = written(key, key.name) if hasattr(key, "name") else str(key)
