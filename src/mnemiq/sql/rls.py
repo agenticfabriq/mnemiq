@@ -786,7 +786,8 @@ _PURE_CALLS = frozenset({"map_values", "map_entries", "list_extract", "array_ext
                          "array_element", "list_slice", "list_reverse", "list_unique",
                          "list_distinct", "array_distinct", "map_keys", "struct_extract",
                          "flatten", "list_sort", "map_from_entries", "row",
-                         "union_value"})  # typed by DuckDB from its argument's stand-in
+                         "union_value",  # typed by DuckDB from its argument's stand-in
+                         "element_at"})  # a map looked up: a LIST of the value type (`V[]`), from stand-ins
 
 
 def _is_union_extract(node: exp.Expression) -> bool:
@@ -1083,6 +1084,13 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
     return kind[0] in _CONTAINER_KINDS
 
 
+def _bare_value(value: exp.Expression) -> bool:
+    """A value with no list, struct or map syntax at its top: what the engine casts whole."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    return not isinstance(value, (exp.Array, exp.Struct, exp.ToMap))
+
+
 def _pure_literal(value: exp.Expression) -> bool:
     """A container written out of literals alone, which DuckDB coerces to the other side's
     type (`[region] = [['x']]` runs); one holding a column, a call or a cast is typed as itself
@@ -1137,9 +1145,14 @@ def _json_inside_a_container(values, type_of) -> bool:
     # unknown operand read the rest as safe (Codex's thirty-first review of #160). Where the
     # untyped part meets text or a number, unknown stays approved by design (`[region] =
     # [lower(region)]` runs).
+    # A container of literals alone is coerced to the other side INSIDE a container only; at
+    # the top level DuckDB casts the untyped text to the literal's type on the row instead
+    # (`lower(region) = ['x']` raised, `[lower(region)] = ['x']` runs: the review gate on the
+    # thirty-seventh round), so an unknown value with no container syntax of its own is
+    # refused beside a literal container too.
     unknown = [value for value, kind in zip(_unwrapped(values), kinds) if kind is None]
-    if unknown and any(not _pure_literal(value) and any(_unknown_meets_a_container(u, parsed) for u in unknown)
-                       for value, parsed in typed):
+    if unknown and any(any(_unknown_meets_a_container(u, parsed) and (not _pure_literal(value) or _bare_value(u))
+                           for u in unknown) for value, parsed in typed):
         return True
     for i, (left, kind_l) in enumerate(typed):
         for right, kind_r in typed[i + 1:]:

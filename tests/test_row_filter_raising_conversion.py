@@ -1178,6 +1178,7 @@ def test_a_union_extract_with_a_non_literal_tag_is_refused_naming_the_tag(row_fi
     "[lower(region)] = [[id]]",
     "{'a': lower(region)} = {'a': [id]}",
     "lower(region) = [id]",    # at the top level the same: the untyped value meets a list
+    "lower(region) = ['x']",   # and a literal list too: at the top level the text is cast to it (the gate)
 ])
 def test_an_unknown_value_beside_a_typed_container_is_refused(row_filter):
     # Codex's thirty-first review: a call the reader cannot type was dropped from the container
@@ -1194,3 +1195,20 @@ def test_an_unknown_value_beside_a_typed_container_is_refused(row_filter):
     for running in ("[region] = [lower(region)]", "[lower(region)] = ['x']", "lower(region) = 'x'"):
         con.execute(f"SELECT id FROM claim WHERE {running}").fetchall()
         assert isinstance(_decide(running), Approved), running
+
+
+def test_a_map_lookup_is_typed_from_stand_ins():
+    # `element_at` joins the pure calls (the thirty-eighth round): DuckDB types it from NULL
+    # stand-ins as a LIST of the map's value type, so the suite's map-lookup filters beside a
+    # literal list stay typed rather than unknown, which the bare-unknown rule would refuse.
+    from sqlglot import exp, parse_one
+    from mnemiq.sql.rls import _pure_type
+
+    def typed(sql):
+        value = parse_one(sql, read="duckdb")
+        known = {id(c): TYPES.get(("claim", c.name)) for c in value.find_all(exp.Column)}
+        return _pure_type(value, lambda column: known.get(id(column)))
+
+    assert typed("element_at(MAP(['a'], [id]), 'a')") == "INTEGER[]"
+    assert typed("element_at(MAP([region], [1]), 'x')") == "INTEGER[]"
+    assert isinstance(_decide("element_at(MAP([region], [1]), 'x') = [1]"), Approved)
