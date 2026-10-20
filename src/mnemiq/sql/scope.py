@@ -341,6 +341,22 @@ def check_policy_target(ast: exp.Expression, policy, target: str | None):
 _EVERY_SIBLING = frozenset({"sqlite"})
 
 
+def _in_recursive_part(table: exp.Table, cte: exp.CTE | None) -> bool:
+    """Whether the reference sits in the recursive part of the CTE's body: the right side of
+    the body's top-level set operation. A body with no set operation has no recursive part."""
+    body = cte.this if cte is not None else None
+    while isinstance(body, (exp.Subquery, exp.Paren)):
+        body = body.this
+    if not isinstance(body, exp.SetOperation):
+        return False
+    node = table.parent
+    while node is not None and node is not body:
+        if node is body.right:
+            return True
+        node = node.parent
+    return False
+
+
 def _cte_in_scope(table: exp.Table, dialect: str | None = None,
                   engine: str | None = None) -> bool:
     """Is a CTE of this table's name in scope where the table is read?
@@ -374,7 +390,13 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None,
                 visible = names
             elif child is with_:  # the table sits inside one of this WITH's own CTE bodies
                 at = next((i for i, cte in enumerate(with_.expressions) if cte is last_cte), 0)
-                visible = names[:at] + (names[at:at + 1] if with_.args.get("recursive") else [])
+                # Under RECURSIVE the CTE's own name binds in its RECURSIVE part alone, the
+                # right side of its body's set operation; in the anchor it is the base table
+                # (DuckDB, measured: `WITH RECURSIVE claim AS (SELECT ... FROM claim UNION ALL
+                # ...)` read the base `claim` in the anchor, and a hidden join key went unread
+                # when the whole body was taken as the CTE: Codex's fourth review of #170).
+                itself = names[at:at + 1] if with_.args.get("recursive") and _in_recursive_part(table, last_cte) else []
+                visible = names[:at] + itself
             else:
                 visible = names
             if name in visible:

@@ -225,7 +225,10 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
         # folding the bare name alone let a CTE named `claim` capture it).
         if table.args.get("db") or table.args.get("catalog"):
             return None
-        name = written(table.this if isinstance(table.this, exp.Identifier) else None, object_key(table))
+        # Resolved by the shared identifier rules for every engine, not folded only where the
+        # engine folds: Oracle keeps a quoted `"claim"` and upper-folds an unquoted `claim`, so
+        # the two are different names there (Codex's fourth review of #170).
+        name = resolve_identifier(table.this, dialect) or object_key(table)
         enclosing, above = [], table.parent
         while above is not None:
             if isinstance(above, exp.CTE):
@@ -239,8 +242,7 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
                 own = next((c for c in enclosing if c.parent is with_), None)
                 candidates = ctes[:ctes.index(own)] if own is not None else ctes
                 for cte in candidates:
-                    alias = cte.args.get("alias")
-                    declared = written(alias.this if isinstance(alias, exp.TableAlias) else None, cte.alias_or_name)
+                    declared = resolve_identifier(cte.args.get("alias"), dialect) or cte.alias_or_name
                     if declared == name:
                         return cte.this
             node = node.parent

@@ -71,6 +71,10 @@ def _decide_write(sql, visible, policy=COMPLETE):
     "WITH w AS (SELECT * FROM pair), pair AS (SELECT * FROM w) SELECT count(*) AS n FROM pair JOIN (SELECT 'Z' AS secret) e USING (secret)",
     # A later sibling named after a base table is not visible inside an earlier body.
     "WITH a AS (SELECT * FROM pair), pair AS (SELECT i FROM sink) SELECT count(*) AS n FROM a JOIN (SELECT 'Z' AS secret) e USING (secret)",
+    # A recursive CTE named after the base table reads the base table in its anchor (Codex's
+    # fourth review): the whole body had been taken as the CTE and the statement as one over
+    # CTEs alone, so the grant check returned before the join arm ran.
+    "WITH RECURSIVE claim AS (SELECT id, secret FROM claim UNION ALL SELECT id, secret FROM claim WHERE false) SELECT count(*) AS n FROM claim JOIN (SELECT 'Z' AS secret) e USING (secret)",
     # A CTE named in another case than its reference, beside a granted base table of the
     # reference's spelling (Codex's third review): DuckDB folds, and reads the CTE.
     "WITH W AS (SELECT * FROM claim) SELECT count(*) AS n FROM w JOIN (SELECT 'Z' AS secret) e USING (secret)",
@@ -100,6 +104,7 @@ def test_a_hidden_join_key_is_refused(worlds, sql):
     "INSERT INTO sink (i) SELECT count(*) FROM claim NATURAL JOIN (SELECT 1 AS id, 'Z' AS secret) x",
     "DELETE FROM sink WHERE i IN (SELECT x.id FROM claim JOIN (SELECT 1 AS id, 'Z' AS secret) x USING (id, secret))",
     "INSERT INTO sink (i) SELECT count(*) FROM sink t WHERE EXISTS (SELECT 1 FROM claim t JOIN (SELECT 'Z' AS secret) e USING (secret))",
+    "WITH RECURSIVE claim AS (SELECT id, secret FROM claim UNION ALL SELECT id, secret FROM claim WHERE false) INSERT INTO sink (i) SELECT count(*) FROM claim JOIN (SELECT 'Z' AS secret) e USING (secret)",
 ])
 def test_a_hidden_join_key_in_a_write_is_refused(worlds, sql):
     for con in worlds:
@@ -145,6 +150,17 @@ def test_a_qualified_reference_is_the_base_table_whatever_a_cte_is_called():
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
     granted = _decide("SELECT count(*) AS n FROM pg.claim JOIN (SELECT 1 AS id) e USING (id)", schema, policy=AccessPolicy(policy_schema=schema))
     assert isinstance(granted, Approved), granted
+
+
+def test_on_oracle_a_quoted_cte_name_is_not_the_unquoted_reference():
+    # Codex's fourth review: Oracle keeps `"claim"` and upper-folds `claim`, so the quoted CTE
+    # does not stand in front of the base table the unquoted reference reads. Decision only.
+    schema = {"claim": {"ID", "SECRET"}, "sink": {"I"}}
+    hidden = {"claim": {"ID"}, "sink": {"I"}}
+    for sql in ('WITH "claim" AS (SELECT I FROM sink) SELECT count(*) AS n FROM claim NATURAL JOIN (SELECT 1 AS ID, chr(90) AS SECRET FROM sink) e',
+                'WITH "claim" AS (SELECT I FROM sink) SELECT count(*) AS n FROM claim JOIN (SELECT chr(90) AS SECRET FROM sink) e USING (SECRET)'):
+        verdict = decide(sql, hidden, dialect="oracle", target="oracle", policy=AccessPolicy(policy_schema=schema))
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
 
 
 def test_a_whole_row_as_an_order_by_key_over_a_derived_star_stays_refused(worlds):
