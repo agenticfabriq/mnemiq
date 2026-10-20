@@ -146,8 +146,9 @@ _KEYWORD_COLUMNS = (exp.Boolean, exp.CurrentDate, exp.CurrentTimestamp, exp.Curr
 # the seventh commit). Read off the text, as the spelling fallback reads a bare expression,
 # qualified or not (`r.1ea` is `r.1e AS a` to the parser: the gate on the eighth commit), inside
 # quoted text and comments too, which withholds more and never less; a token naming no column
-# decides nothing.
-_DIGIT_LED = re.compile(r"(?<!\w)\d+[A-Za-z_]\w*")
+# decides nothing. Any letter of any script after the digits, not ASCII alone: `1é` and
+# `1你好` are columns to MySQL and were read by nothing (Codex's fifth review of #172).
+_DIGIT_LED = re.compile(r"(?<!\w)\d+[^\W\d]\w*")
 
 
 def _keyword_spelling(node: exp.Expression) -> str | None:

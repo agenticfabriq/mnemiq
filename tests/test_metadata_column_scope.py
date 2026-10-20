@@ -362,7 +362,7 @@ def test_a_keyword_named_column_inside_a_subquery_still_requires_its_clearance()
     # `123abc` is `123 AS abc`: the gate) parses as a bare projection alone; the token is read
     # off the expression's own text. Inside a call or a WHERE it parses nowhere, and an
     # unparsed expression is withheld from everyone already.
-    for spelling in ("1ea", "123abc", "1_e"):
+    for spelling in ("1ea", "123abc", "1_e", "1é", "1你好"):  # any script's letters (Codex's fifth review)
         columns = [Column(id="orders.id", object_id="orders", name="id", data_type="int"),
                    Column(id=f"orders.{spelling}", object_id="orders", name=spelling, data_type="text",
                           pii_level="phi")]
