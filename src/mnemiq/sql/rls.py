@@ -375,11 +375,50 @@ def _is_text_extract(node: exp.Expression) -> bool:
         isinstance(node, exp.Anonymous) and node.name.lower() in _TEXT_EXTRACT_NAMES)
 
 
+def _scalar_projections(node: exp.Expression) -> list[exp.Expression] | None:
+    """A scalar subquery's one projection per branch, unaliased, else None: one for a SELECT,
+    one per branch of a set operation (Codex's twenty-third review of #160: `(SELECT attrs ...
+    UNION ALL SELECT attrs ... LIMIT 1)` was unknown, and JSON beside text approved)."""
+    if not isinstance(node, exp.Subquery):
+        return None
+    branches, pending = [], [node.this]
+    while pending:
+        query = pending.pop()
+        if isinstance(query, exp.SetOperation):
+            pending.extend((query.right, query.left))
+        elif isinstance(query, exp.Select) and len(query.selects) == 1:
+            branches.append(query.selects[0].unalias())
+        else:
+            return None
+    return branches
+
+
 def _scalar_projection(node: exp.Expression) -> exp.Expression | None:
-    """A scalar subquery's one projection, unaliased, else None."""
-    if isinstance(node, exp.Subquery) and isinstance(node.this, exp.Select) and len(node.this.selects) == 1:
-        return node.this.selects[0].unalias()
-    return None
+    """The first branch's projection (the walk's handle on the subquery), else None."""
+    branches = _scalar_projections(node)
+    return branches[0] if branches else None
+
+
+def _subquery_type(node: exp.Expression, type_of) -> str | None:
+    """A scalar subquery's type: its one projection's, each branch of a set operation typed and
+    the branches unified as DuckDB unifies them (`typeof((SELECT id ... UNION ALL SELECT region
+    ... LIMIT 1))` is VARCHAR, not the first branch's INTEGER: the review gate on the
+    twenty-sixth round), None where a branch cannot be typed."""
+    branches = _scalar_projections(node)
+    if not branches:
+        return None
+    kinds = [_pure_type(branch, type_of) for branch in branches]
+    if any(kind is None for kind in kinds):
+        return None
+    if len(set(kinds)) == 1:
+        return kinds[0]
+    try:
+        # Unified as a set operation unifies, not as COALESCE does: DuckDB refuses
+        # `COALESCE(NULL::INTEGER, NULL::VARCHAR)` and unions the two to VARCHAR.
+        branches_sql = " UNION ALL ".join(f"SELECT NULL::{k} AS x" for k in kinds)
+        return _duckdb(f"SELECT typeof(x) FROM ({branches_sql}) LIMIT 1")
+    except Exception:  # noqa: BLE001 -- the branches cannot be unified by the probe: unknown
+        return None
 
 
 def _is_typed_call(node: exp.Expression) -> bool:
@@ -473,7 +512,7 @@ def _known_type(value, type_of, engine: str) -> exp.DataType | None:
         inner = value.this
         if isinstance(inner, exp.Select) and len(inner.selects) == 1:
             return _known_type(inner.selects[0].unalias(), type_of, engine)
-        return None
+        return None  # a set operation's is typed through `_type_of_value`, by `_subquery_type`
     if isinstance(value, (exp.Nullif, exp.Max, exp.Min)):
         return _known_type(value.this, type_of, engine)
     if isinstance(value, exp.Nvl2):
@@ -531,11 +570,11 @@ def _type_of_value(value: exp.Expression, type_of, engine: str) -> exp.DataType 
     known = _known_type(value, type_of, engine)
     if known is not None or engine != "duckdb":
         return known
-    if isinstance(value, exp.Subquery) and isinstance(value.this, exp.Select) and len(value.this.selects) == 1:
-        # A scalar subquery is its one projection's type, the projection alone handed to the
-        # probe, never the subquery, whose FROM would run (as `_duckdb_type` reads it): `region
-        # = (SELECT json_group_array(id) FROM claim)` (Codex's twenty-second review of #160).
-        kind = _pure_type(value.this.selects[0].unalias(), type_of)
+    if _scalar_projection(value) is not None:
+        # A scalar subquery is its projection's type, the projection alone handed to the probe,
+        # never the subquery, whose FROM would run (as `_duckdb_type` reads it): `region =
+        # (SELECT json_group_array(id) FROM claim)` (Codex's twenty-second review of #160).
+        kind = _subquery_type(value, type_of)
     else:
         kind = _pure_type(value, type_of)
     if kind is None:
@@ -629,7 +668,7 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     if _is_typed_call(typed_nulls):
         return _json_call_type(typed_nulls)
     if _scalar_projection(value) is not None:
-        return _pure_type(_scalar_projection(value), type_of)
+        return _subquery_type(value, type_of)
     # Typed calls first, so a scalar subquery inside one goes with it (the review gate on the
     # twenty-fourth round: typing it from the copy, whose nodes `type_of` does not know, made
     # the whole value unknown and disarmed the typed-call reading); then each scalar subquery
@@ -642,7 +681,7 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
                  if id(sq) not in inside_a_json_call and _scalar_projection(sq) is not None]
     inside_another = {id(inner) for sq in originals for inner in sq.walk() if inner is not sq}
     originals = [sq for sq in originals if id(sq) not in inside_another]
-    projected = [_pure_type(_scalar_projection(sq), type_of) for sq in originals]
+    projected = [_subquery_type(sq, type_of) for sq in originals]
     if None in projected:
         return None
     copies = [sq for sq in typed_nulls.find_all(exp.Subquery) if _scalar_projection(sq) is not None]
@@ -1102,6 +1141,15 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             # JSON column as unknown (Codex's fifth review of #160).
             own = [t for t in base_tables(select, engine)
                    if t.find_ancestor(exp.Select) is select] if select is not None else []
+            while select is not None and select.args.get("from_") is None:
+                # A SELECT with no FROM at all reads the enclosing one's sources, as the engine
+                # resolves a correlated name (`(SELECT region) = 7`: Codex's twenty-third
+                # review of #160, the column unknown and the conversion unread). One with a
+                # FROM, a derived table among its sources, keeps its own, so a derived column
+                # is not read as the outer base column of the same name (the review gate).
+                select = select.find_ancestor(exp.Select)
+                own = [t for t in base_tables(select, engine)
+                       if t.find_ancestor(exp.Select) is select] if select is not None else []
             having = [key for key in {object_key(t) for t in own}
                       if column.name.lower() in types_of(key)]
             owner = having[0] if len(having) == 1 else None

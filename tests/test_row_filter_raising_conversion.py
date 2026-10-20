@@ -569,6 +569,9 @@ def test_a_doubled_quote_in_a_member_name_is_read_and_an_unreadable_declared_typ
     "[region] = [(SELECT attrs FROM claim LIMIT 1)]",
     "[region] = [(SELECT c.attrs FROM claim c LIMIT 1)]",
     "list_contains([region], (SELECT attrs FROM claim LIMIT 1))",
+    # Codex's twenty-third review: a set operation's subquery, and a correlated bare column.
+    "COALESCE((SELECT attrs FROM claim UNION ALL SELECT attrs FROM claim LIMIT 1), region) IS NOT NULL",
+    "[region] = [(SELECT attrs FROM claim UNION SELECT attrs FROM claim LIMIT 1)]",
 ])
 def test_a_call_returning_json_beside_text_is_read_as_json(row_filter):
     """Codex's nineteenth review of #160: `to_json(id)` was of unknown type, and unknown beside
@@ -577,11 +580,42 @@ def test_a_call_returning_json_beside_text_is_read_as_json(row_filter):
     to the container probe."""
     con = duckdb.connect()
     con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON); "
-                "INSERT INTO claim VALUES (1, 'north', '{\"a\": 1}'::JSON)")
+                "INSERT INTO claim VALUES (1, 'north', NULL), (2, 'south', '{\"a\": 1}'::JSON)")
     with pytest.raises(duckdb.Error, match="Malformed JSON"):
         con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
     verdict = _decide(row_filter)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (row_filter, verdict)
+
+
+def test_a_correlated_column_in_a_sourceless_subquery_keeps_its_type():
+    """Codex's twenty-third review of #160: `(SELECT region) = 7` was approved, the column
+    unknown in a SELECT with no sources, where DuckDB converts the text to a number on the row."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON); INSERT INTO claim VALUES (1, 'north', NULL)")
+    for raising in ("(SELECT region) = 7", "region = 7", "(SELECT (SELECT region)) = 7"):
+        with pytest.raises(duckdb.Error, match="Could not convert"):
+            con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
+        verdict = _decide(raising)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (raising, verdict)
+    running = "(SELECT region) = 'north'"
+    assert con.execute(f"SELECT id FROM claim WHERE {running}").fetchall() == [(1,)]
+    assert isinstance(_decide(running), Approved)
+    # A SELECT with a FROM keeps its own sources (the review gate): a derived column is not the
+    # outer base column of the same name, so the cast over the derived text is still refused and
+    # the derived number beside a number is still approved.
+    derived_text = "(SELECT CAST(id AS BIGINT) FROM (SELECT region AS id FROM claim) LIMIT 1) IS NOT NULL"
+    with pytest.raises(duckdb.Error, match="Could not convert"):
+        con.execute(f"SELECT id FROM claim WHERE {derived_text}").fetchall()
+    assert isinstance(_decide(derived_text), Refusal)
+    derived_number = "(SELECT region FROM (SELECT 7 AS region)) = 7"
+    assert con.execute(f"SELECT id FROM claim WHERE {derived_number}").fetchall() == [(1,)]
+    assert isinstance(_decide(derived_number), Approved)
+    # A set operation's branches are unified as DuckDB unifies them, not read as the first's.
+    mixed = "(SELECT id FROM claim UNION ALL SELECT region FROM claim ORDER BY 1 DESC LIMIT 1) = 7"
+    with pytest.raises(duckdb.Error, match="Could not convert"):
+        con.execute(f"SELECT id FROM claim WHERE {mixed}").fetchall()
+    verdict = _decide(mixed)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
 
 
 def test_a_text_extract_is_typed_text_so_a_conversion_beside_it_is_read():
