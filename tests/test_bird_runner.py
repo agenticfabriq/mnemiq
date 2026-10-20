@@ -683,6 +683,12 @@ def test_inheriting_exclusion_only_state_is_announced_not_silent():
 
     from mnemiq.eval.bird_runner import _save_meta, resume_state
 
+    def named(caught):
+        # This test failed twice in about a dozen full-suite runs and never alone, so a failure
+        # names every warning the block recorded and where it was raised: an unrelated warning
+        # recorded first would read as the runner's own.
+        return [f"{w.category.__name__} at {w.filename}:{w.lineno}: {w.message}" for w in caught]
+
     with tempfile.TemporaryDirectory() as d:
         path = f"{d}/results.jsonl"
         _save_meta(path, 500, 3, ["bird-4"], True, results_rows=0)
@@ -692,12 +698,13 @@ def test_inheriting_exclusion_only_state_is_announced_not_silent():
             assert resume_state(path, True)[1:] == (500, 3, ["bird-4"])
         assert caught, "inherited prior state without saying so"
         msg = str(caught[0].message)
-        assert "fresh --results path" in msg, "no route to starting clean"
-        assert "max-rows" in msg, "does not flag that exclusions were capped elsewhere"
+        assert "fresh --results path" in msg, f"no route to starting clean; caught {named(caught)}"
+        assert "max-rows" in msg, (
+            f"does not flag that exclusions were capped elsewhere; caught {named(caught)}")
 
         # And no noise when there is nothing to inherit.
         _save_meta(path, 0, 0, [], True, results_rows=0)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             resume_state(path, True)
-        assert not caught, "warned about inheriting nothing"
+        assert not caught, f"warned about inheriting nothing; caught {named(caught)}"
