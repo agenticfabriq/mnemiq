@@ -1061,6 +1061,28 @@ _LITERAL_NODES = (exp.Literal, exp.Null, exp.Boolean, exp.Neg, exp.Paren, exp.Tu
                   exp.Struct, exp.PropertyEQ, exp.Identifier, exp.ToMap)
 
 
+def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
+    """Whether a value the reader cannot type puts an untyped part against a list, a struct or
+    a map of the other side's type: its own list and struct syntax is walked beside the type,
+    and where the syntax ends in a part the reader could not type, that part meets whatever
+    the type holds there. `[lower(region)] = [region]` ends in text and runs; `[struct_insert(
+    {'a': id}, b := region)] = [{'a': id, 'b': [id]}]` and `list_transform([region], x -> x) =
+    [[id]]` end against a struct and a list, which the engine casts the text to on the row
+    (Codex's thirty-first review of #160)."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if isinstance(value, exp.Array) and kind[0] == "array":
+        return any(_unknown_meets_a_container(item, kind[1]) for item in value.expressions)
+    if isinstance(value, exp.Struct) and kind[0] == "struct":
+        items = [(item.this.name.lower() if isinstance(item, exp.PropertyEQ) and isinstance(item.this, exp.Identifier) else None,
+                  item.expression if isinstance(item, exp.PropertyEQ) else item) for item in value.expressions]
+        if all(name is not None for name, _ in items) and all(n is not None for n, _ in kind[1]):
+            by_name = {n.lower(): field for n, field in kind[1]}
+            return any(name not in by_name or _unknown_meets_a_container(part, by_name[name]) for name, part in items)
+        return any(_unknown_meets_a_container(part, field) for (_, part), (_, field) in zip(items, kind[1]))
+    return kind[0] in _CONTAINER_KINDS
+
+
 def _pure_literal(value: exp.Expression) -> bool:
     """A container written out of literals alone, which DuckDB coerces to the other side's
     type (`[region] = [['x']]` runs); one holding a column, a call or a cast is typed as itself
@@ -1109,6 +1131,16 @@ def _json_inside_a_container(values, type_of) -> bool:
     # and a literal text cast to a container fails on no row's value.
     typed = [(value, _parse_type(kind)) for value, kind in zip(_unwrapped(values), kinds)
              if kind is not None and kind is not _TEXT and kind is not _UNREADABLE]
+    # A value the reader cannot type, beside a container typed by something other than its
+    # literals, is refused where its untyped part meets a list, a struct or a map of that type:
+    # the engine casts whatever text the part holds to that shape on the row, and dropping the
+    # unknown operand read the rest as safe (Codex's thirty-first review of #160). Where the
+    # untyped part meets text or a number, unknown stays approved by design (`[region] =
+    # [lower(region)]` runs).
+    unknown = [value for value, kind in zip(_unwrapped(values), kinds) if kind is None]
+    if unknown and any(not _pure_literal(value) and any(_unknown_meets_a_container(u, parsed) for u in unknown)
+                       for value, parsed in typed):
+        return True
     for i, (left, kind_l) in enumerate(typed):
         for right, kind_r in typed[i + 1:]:
             if _text_meets_a_typed_container(kind_l, kind_r) and not (

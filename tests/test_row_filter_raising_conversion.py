@@ -1166,4 +1166,31 @@ def test_a_union_extract_with_a_non_literal_tag_is_refused_naming_the_tag(row_fi
         con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
     verdict = _decide(row_filter)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
-    assert "tag as one string literal" in verdict.message
+    # Inside a container the comparison's own refusal comes first (an unknown value beside a
+    # typed list, the thirty-seventh round); beside a number the tag's advice shows.
+    top = _decide("union_extract(union_value(a := region), 'a' || '') = 7")
+    assert isinstance(top, Refusal) and "tag as one string literal" in top.message, top
+
+
+@pytest.mark.parametrize("row_filter", [
+    "[struct_insert({'a': id}, b := region)] = [{'a': id, 'b': [id]}]",
+    "list_transform([region], x -> x) = [[id]]",
+    "[lower(region)] = [[id]]",
+    "{'a': lower(region)} = {'a': [id]}",
+    "lower(region) = [id]",    # at the top level the same: the untyped value meets a list
+])
+def test_an_unknown_value_beside_a_typed_container_is_refused(row_filter):
+    # Codex's thirty-first review: a call the reader cannot type was dropped from the container
+    # comparison and the rest read as safe, where the engine casts the text it holds to the
+    # container's shape on the row (measured, the hidden value in the error).
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR); INSERT INTO claim VALUES (1, 'north')")
+    with pytest.raises(duckdb.ConversionException, match="north"):
+        con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    verdict = _decide(row_filter)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    # Where the untyped part meets text, or the container is literals alone, unknown stays
+    # approved by design.
+    for running in ("[region] = [lower(region)]", "[lower(region)] = ['x']", "lower(region) = 'x'"):
+        con.execute(f"SELECT id FROM claim WHERE {running}").fetchall()
+        assert isinstance(_decide(running), Approved), running
