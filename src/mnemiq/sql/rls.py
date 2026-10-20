@@ -1183,7 +1183,7 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
     for node in wrapped.args["where"].walk():
         if engine == "duckdb" and _arrow_read_as_a_lambda(node):
             return node  # `attrs -> '$.a'` where DuckDB extracts JSON and sqlglot sees a lambda
-        if engine == "duckdb" and isinstance(node, exp.SetOperation):
+        if engine == "duckdb" and isinstance(node, (exp.SetOperation, exp.Values)):
             # A set operation unifies its branches' projections as a branched value's branches
             # are unified, each branch converted to the unified type on the rows it yields:
             # `(SELECT attrs ... UNION ALL SELECT region ... LIMIT 1) IS NOT NULL` parsed region
@@ -1192,7 +1192,8 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             if columns is not None and any(len(column) > 1 and (
                     _values_coerce_to_json(column, type_of, engine)
                     or _json_inside_a_container(column, type_of)) for column in columns):
-                return node  # per output position, whatever the width (the twenty-fifth review)
+                return node  # per output position, whatever the width (the twenty-fifth
+                # review); a VALUES list's rows unify as a set operation's branches do (the gate)
         if engine == "duckdb" and (isinstance(node, _JSON_PARSES) or (
                 isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_JSON_PARSES)):
             # The typed readers parse their first argument; an untyped one may parse any (both of

@@ -585,6 +585,7 @@ def test_a_doubled_quote_in_a_member_name_is_read_and_an_unreadable_declared_typ
     "EXISTS (SELECT attrs, id FROM claim UNION ALL SELECT region, id FROM claim)",
     "EXISTS (SELECT attrs, id FROM claim INTERSECT SELECT region, id FROM claim)",
     "EXISTS (SELECT attrs, id FROM claim EXCEPT SELECT region, id FROM claim)",
+    "EXISTS (VALUES (attrs), (region))",  # a VALUES list's rows unify as branches do (the gate)
 ])
 def test_a_call_returning_json_beside_text_is_read_as_json(row_filter):
     """Codex's nineteenth review of #160: `to_json(id)` was of unknown type, and unknown beside
