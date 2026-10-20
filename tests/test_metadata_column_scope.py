@@ -317,3 +317,11 @@ def test_a_qualified_source_is_its_own_relation_exactly():
     assert expression_scope("(SELECT max(id) FROM other.orders)", "pg.orders") == "foreign"
     assert expression_scope("(SELECT max(id) FROM private.orders)", "orders") == "foreign"
     assert expression_scope("(SELECT max(r.id) FROM pg.orders r)", "pg.orders") == "own"
+    # One direction only (the review gate): a bare source claims the unqualified table, so a
+    # qualified relation over it may be another schema's and is withheld; a bundle qualifying
+    # its tables registers its sources qualified.
+    assert expression_scope("(SELECT max(id) FROM pg.orders)", "orders") == "foreign"
+    # A quoted name keeps its case where quoting preserves it, and must match as written.
+    assert expression_scope('(SELECT max(id) FROM "ORDERS")', "orders") == "foreign"
+    assert expression_scope('(SELECT max(id) FROM "orders")', "orders") == "own"
+    assert expression_scope("(SELECT max(id) FROM ORDERS)", "orders") == "own"

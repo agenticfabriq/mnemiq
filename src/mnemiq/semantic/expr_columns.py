@@ -91,13 +91,20 @@ def _table_name(table: exp.Table) -> str:
     return ".".join(p for p in (table.catalog, table.db, table.name) if p)
 
 
-def _is_source(table_name: str, source: str) -> bool:
+def _is_source(table: exp.Table, source: str) -> bool:
     """Whether a RELATION is the source table: the same dotted name, or a bare name equal to the
     source's own last part. Not `_names_table`, whose suffix match serves column qualifiers,
     where matching more tables demands more clearance: as a relation test it admitted
     `private.orders` as `orders` (Codex's review of #172), another schema's table read as the
-    source and its columns checked against the source's grant."""
-    t, s = table_name.lower(), source.lower()
+    source and its columns checked against the source's grant. One direction only, on
+    purpose: a bare source claims the unqualified table, so a qualified relation over it
+    (`pg.orders` over `orders`) may be another schema's and is foreign, the metric withheld
+    (the review gate on the second commit); a bundle that qualifies its tables registers its
+    sources qualified. A quoted name keeps its case and must match as written (`"ORDERS"` is
+    not `orders` where quoting preserves case: the gate's second advisory)."""
+    quoted = bool(table.this.args.get("quoted")) if isinstance(table.this, exp.Identifier) else False
+    name = _table_name(table)
+    t, s = (name, source) if quoted else (name.lower(), source.lower())
     return t == s or ("." not in t and t == s.rpartition(".")[2])
 
 
@@ -105,7 +112,7 @@ def _source_aliases(node: exp.Expression, source: str) -> set[str]:
     """The aliases the expression's own subqueries give `source` (`FROM orders r`): a column `r`
     qualifies is a column of the source."""
     return {table.alias.lower() for table in node.find_all(exp.Table)
-            if table.alias and _is_source(_table_name(table), source)}
+            if table.alias and _is_source(table, source)}
 
 
 # A relation `columns_read` does not follow: a CTE, a LATERAL, a VALUES list, an UNNEST. A
@@ -147,8 +154,7 @@ def expression_scope(expr: str, source: str) -> str:
             # uncleared (the review gate on the first draft). COUNT(*) alone reads none.
             return "foreign"
         for table in node.find_all(exp.Table):
-            name = _table_name(table)
-            if not name or not _is_source(name, source):
+            if not _table_name(table) or not _is_source(table, source):
                 return "foreign"  # another table, or a table function, which has no name here
         if any(join.args.get("using") or (join.args.get("method") or "").upper() == "NATURAL"
                for join in node.find_all(exp.Join)):
