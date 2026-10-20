@@ -361,7 +361,7 @@ def _json_returners() -> frozenset[str]:
         except Exception:  # noqa: BLE001 -- the catalogue could not be asked: the typed list
             logger.warning("DuckDB's catalogue could not be asked which calls return JSON; "
                            "the typed list stands in (M159)")
-            _JSON_RETURNERS = _JSON_RETURNERS_KNOWN
+            _JSON_RETURNERS = _JSON_RETURNERS_KNOWN | _JSON_MACROS
     return _JSON_RETURNERS
 
 
@@ -373,6 +373,13 @@ def _is_json_call(node: exp.Expression) -> bool:
 def _is_text_extract(node: exp.Expression) -> bool:
     return isinstance(node, _TEXT_EXTRACT_NODES) or (
         isinstance(node, exp.Anonymous) and node.name.lower() in _TEXT_EXTRACT_NAMES)
+
+
+def _scalar_projection(node: exp.Expression) -> exp.Expression | None:
+    """A scalar subquery's one projection, unaliased, else None."""
+    if isinstance(node, exp.Subquery) and isinstance(node.this, exp.Select) and len(node.this.selects) == 1:
+        return node.this.selects[0].unalias()
+    return None
 
 
 def _is_typed_call(node: exp.Expression) -> bool:
@@ -577,9 +584,12 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
         value = value.this
     # A call that returns JSON is a typed NULL to the probe, as a column is: nothing of it runs,
     # and what it holds (`to_json(id)` beside `[region]`) is JSON to DuckDB's unification.
-    json_calls = [node for node in value.walk() if _is_typed_call(node)]
+    # A scalar subquery with one pure projection is that projection to the probe: `[region] =
+    # [(SELECT json_group_array(id) FROM claim)]` (the review gate on the twenty-third round),
+    # the projection alone handed over, never the subquery, whose FROM would run.
+    json_calls = [node for node in value.walk() if _is_typed_call(node) or _scalar_projection(node) is not None]
     inside_a_json_call = {id(inner) for call in json_calls for inner in call.walk() if inner is not call}
-    if not all(id(node) in inside_a_json_call or _is_typed_call(node)
+    if not all(id(node) in inside_a_json_call or _is_typed_call(node) or _scalar_projection(node) is not None
                or isinstance(node, (*_PURE, *_PURE_CALL_NODES)) or (
                isinstance(node, exp.Anonymous)
                and node.name.lower() in _LIST_CONSTRUCTORS | _PURE_CALLS)
@@ -612,10 +622,30 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
         return None
     typed_nulls = value.copy()
     if _is_typed_call(typed_nulls):
-        typed_nulls = exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(typed_nulls)))
+        return _json_call_type(typed_nulls)
+    if _scalar_projection(value) is not None:
+        return _pure_type(_scalar_projection(value), type_of)
+    # Typed calls first, so a scalar subquery inside one goes with it (the review gate on the
+    # twenty-fourth round: typing it from the copy, whose nodes `type_of` does not know, made
+    # the whole value unknown and disarmed the typed-call reading); then each scalar subquery
+    # outside a typed call and outside another, typed from the ORIGINAL node's projection and
+    # replaced in the copy in the same traversal order.
     for call in list(typed_nulls.find_all(*_JSON_CALL_NODES, *_TEXT_EXTRACT_NODES, exp.Anonymous)):
         if _is_typed_call(call):
             call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(call))))
+    originals = [sq for sq in value.find_all(exp.Subquery)
+                 if id(sq) not in inside_a_json_call and _scalar_projection(sq) is not None]
+    inside_another = {id(inner) for sq in originals for inner in sq.walk() if inner is not sq}
+    originals = [sq for sq in originals if id(sq) not in inside_another]
+    projected = [_pure_type(_scalar_projection(sq), type_of) for sq in originals]
+    if None in projected:
+        return None
+    copies = [sq for sq in typed_nulls.find_all(exp.Subquery) if _scalar_projection(sq) is not None]
+    copies = [sq for sq in copies if not any(sq is not other and sq.find_ancestor(exp.Subquery) is other for other in copies)]
+    if len(copies) != len(originals):
+        return None  # the copy and the original disagree on the subqueries: not shown safe
+    for subquery, kind_of in zip(copies, projected):
+        subquery.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
     for column, kind_of in zip(list(typed_nulls.find_all(exp.Column)), declared):
         column.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
     copied_keys = [item.this for to_map in typed_nulls.find_all(exp.ToMap)
