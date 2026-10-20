@@ -65,12 +65,13 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
             continue
         if node is None:
             continue
+        aliases = _source_aliases(node, source)
         for column in node.find_all(exp.Column):
             if not column.name:
                 continue
             qualifier = ".".join(p for p in (column.catalog, column.db, column.table) if p)
             names = set()
-            if _names_table(qualifier, source):
+            if _names_table(qualifier, source) or qualifier.lower() in aliases:
                 names.add(column.name.lower())
             path, _, last = column.name.rpartition(".")
             if path and last and _names_table(".".join(p for p in (qualifier, path) if p), source):
@@ -86,16 +87,39 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
     return {frozenset({name.lower()})} if name and _names_table(qualifier, source) else set()
 
 
+def _table_name(table: exp.Table) -> str:
+    return ".".join(p for p in (table.catalog, table.db, table.name) if p)
+
+
+def _source_aliases(node: exp.Expression, source: str) -> set[str]:
+    """The aliases the expression's own subqueries give `source` (`FROM orders r`): a column `r`
+    qualifies is a column of the source."""
+    return {table.alias.lower() for table in node.find_all(exp.Table)
+            if table.alias and _names_table(_table_name(table), source)}
+
+
+# A relation `columns_read` does not follow: a CTE, a LATERAL, a VALUES list, an UNNEST. A
+# subquery over the source itself it does follow, so only these make an expression foreign.
+_FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest)
+
+
 def expression_scope(expr: str, source: str) -> str:
     """Whether `columns_read` can answer for `expr` over `source`: `"own"`, `"foreign"` or
     `"unparsed"` (M144, Codex's review of #121).
 
     `columns_read` names the columns of SOURCE an expression reads, so an expression that reads
-    anything else -- a subquery, or a column another table qualifies -- reads columns it never
-    reports, and a check built on it passed `(SELECT count(p.secret_code) FROM patients p)` over
-    `orders`. That is `"foreign"`. `"unparsed"` is an expression no dialect parses, for which
-    `columns_read` falls back to its spelling; the caller decides whether that spelling names a
-    real column (a keyword-named one does) or nothing (a malformed expression does).
+    anything else -- another table, in a subquery or qualifying a column -- reads columns it
+    never reports, and a check built on it passed `(SELECT count(p.secret_code) FROM patients
+    p)` over `orders`. That is `"foreign"`. A subquery over the SOURCE ALONE is `"own"`: every
+    column it reads, aliased (`FROM orders r ... r.stamp`), unqualified or through a derived
+    table, is a column of the source, which `columns_read` reports, so the raw-read check still
+    covers each. Read as foreign for any subquery (the first gate), a certified metric carrying
+    the latest-version filter `x = (SELECT max(r.x) FROM own_table r WHERE r.id = own_table.id)`
+    was withheld from every identity, and four of a pilot bundle's five metrics never reached
+    the model (the ui lane's measurement, 2026-10-20). `"unparsed"` is an expression no dialect
+    parses, for which `columns_read` falls back to its spelling; the caller decides whether that
+    spelling names a real column (a keyword-named one does) or nothing (a malformed expression
+    does).
     """
     for dialect in _EXPR_DIALECTS:
         try:
@@ -104,11 +128,34 @@ def expression_scope(expr: str, source: str) -> str:
             continue
         if node is None:
             continue
-        if node.find(exp.Query) is not None:
+        if node.find(*_FOREIGN_RELATIONS) is not None:
             return "foreign"
+        if node.find(exp.Columns) is not None or any(
+                not isinstance(star.parent, exp.Count) for star in node.find_all(exp.Star)):
+            # A star reads columns no node names, so `columns_read` cannot report them: `(SELECT
+            # max(q.secret_code) FROM (SELECT * FROM orders) q)` reported nothing and passed the
+            # uncleared (the review gate on the first draft). COUNT(*) alone reads none.
+            return "foreign"
+        for table in node.find_all(exp.Table):
+            name = _table_name(table)
+            if not name or not _names_table(name, source):
+                return "foreign"  # another table, or a table function, which has no name here
+        if any(alias.args.get("columns") for alias in node.find_all(exp.TableAlias)):
+            # An alias column list renames by position (`FROM orders q(a, c)` makes `q.c` the
+            # second column, whichever that is), which `columns_read` reports under the new
+            # name: the review gate on the second draft, the withheld column read as `c`.
+            return "foreign"
+        source_aliases = _source_aliases(node, source)
+        aliases = source_aliases | {
+            derived.alias.lower() for derived in node.find_all(exp.Subquery) if derived.alias}
+        whole_row = source_aliases | {source.lower(), source.lower().rpartition(".")[2]}
         for column in node.find_all(exp.Column):
             qualifier = ".".join(p for p in (column.catalog, column.db, column.table) if p)
-            if qualifier and not _names_table(qualifier, source):
+            if qualifier and not _names_table(qualifier, source) and qualifier.lower() not in aliases:
+                return "foreign"
+            if not qualifier and column.name.lower() in whole_row:
+                # The whole row as a value (`to_json(r)`, `struct_pack(orders)`): every column,
+                # reported as none (the review gate on the first draft).
                 return "foreign"
         return "own"
     return "unparsed"

@@ -167,6 +167,59 @@ def test_an_expression_the_check_cannot_read_is_withheld_from_everyone(expr):
         assert select_metrics(["orders"], [_metric(expr)], grants, columns=_COLUMNS) == []
 
 
+# -- a subquery over the source alone is the source's own read (the ui lane, 2026-10-20) ---------
+
+_LATEST = "count(id) FILTER (WHERE orders.id = (SELECT max(r.id) FROM orders r WHERE r.id = orders.id))"
+_OWN_SUBQUERY = [
+    (_LATEST, False),                                                   # the latest-version filter: reads id alone
+    ("count(id) FILTER (WHERE id = (SELECT max(id) FROM orders))", False),
+    ("(SELECT max(r.secret_code) FROM orders r)", True),                 # aliased: reads the withheld column
+    ("(SELECT max(orders.secret_code) FROM orders)", True),
+    ("(SELECT max(secret_code) FROM orders)", True),
+    ("(SELECT max(x) FROM (SELECT secret_code AS x FROM orders) q)", True),  # through a derived table
+    ("(SELECT max(q.x) FROM (SELECT secret_code AS x FROM orders) q)", True),
+    ("(SELECT count(*) FROM orders)", False),                            # COUNT's star reads no column
+]
+
+
+@pytest.mark.parametrize("expr, reads_the_secret", _OWN_SUBQUERY)
+def test_a_subquery_over_the_source_alone_is_checked_as_the_sources_own_read(expr, reads_the_secret):
+    """Read as foreign for any subquery, a certified metric with the latest-version filter was
+    withheld from everyone, and four of a pilot bundle's five metrics never reached the model
+    (the ui lane's measurement). Every column such a subquery reads is a column of the source,
+    aliased, bare or through a derived table, so the raw-read check covers each as before."""
+    from mnemiq.semantic.expr_columns import columns_read, expression_scope
+    assert expression_scope(expr, "orders") == "own"
+    read = {name for ref in columns_read(expr, "orders") for name in ref}
+    assert ("secret_code" in read) is reads_the_secret, read
+    uncleared = select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=_COLUMNS)
+    assert uncleared == ([] if reads_the_secret else [_metric(expr)]), expr
+    assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=_COLUMNS) == [_metric(expr)]
+
+
+@pytest.mark.parametrize("expr", [
+    "(SELECT count(p.secret_code) FROM patients p)",
+    "(SELECT count(secret_code) FROM patients)",   # no qualifier: the table alone says it is foreign
+    "(SELECT max(id) FROM patients)",
+    "(SELECT max(id) FROM orders o JOIN patients p ON p.id = o.id)",
+    "(SELECT max(q.secret_code) FROM (SELECT * FROM orders) q)",  # a star names no column (the gate)
+    "(SELECT max(to_json(r)::text) FROM orders r)",               # the whole row as a value (the gate)
+    "(SELECT max(to_json(orders)::text) FROM orders)",
+    "(SELECT max(q.x) FROM (SELECT COLUMNS('s.*') AS x FROM orders) q)",
+    "(SELECT max(q.c) FROM orders q(a, c))",                       # renamed by position (the gate)
+    "(SELECT max(q.c) FROM (SELECT id, secret_code FROM orders) q(a, c))",
+    "(WITH w AS (SELECT id FROM orders) SELECT max(id) FROM w)",
+    "(SELECT max(id) FROM orders, LATERAL (SELECT 1 AS one) l)",
+    "(SELECT max(v.c) FROM (VALUES (1)) v(c))",
+    "(SELECT max(id) FROM read_csv('x'))",
+])
+def test_a_subquery_reading_any_other_relation_stays_foreign(expr):
+    from mnemiq.semantic.expr_columns import expression_scope
+    assert expression_scope(expr, "orders") == "foreign"
+    for grants in (_UNCLEARED, _CLEARED):
+        assert select_metrics(["orders"], [_metric(expr)], grants, columns=_COLUMNS) == []
+
+
 def test_a_keyword_named_column_still_reads_through_its_spelling():
     """The control for the rule above: an expression no dialect parses is withheld only when its
     spelling names no column. `orders.select` names one, as M136's gate measured."""
