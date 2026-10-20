@@ -18,7 +18,7 @@ from mnemiq.sql.functions import (
     opaque_columns,
 )
 from mnemiq.sql.cls import check_cls
-from mnemiq.sql.guard import bound_by_position, unnamed_read
+from mnemiq.sql.guard import bound_by_position, misgrouped_set_chain, unnamed_read
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import object_key
@@ -283,6 +283,9 @@ def check_write_shape(sql: str, dialect: str = "duckdb", executes_as: str | None
             code=RefusalCode.UNBOUNDED_WRITE,
             message="An UPDATE or DELETE must have a WHERE clause; an unbounded mutation is refused.",
         )
+    misgrouped = misgrouped_set_chain(ast, executes_as or dialect)
+    if misgrouped is not None:
+        return misgrouped
     unnamed = unnamed_read(ast, executes_as or dialect, write=True)
     if unnamed is not None:
         return unnamed

@@ -254,11 +254,7 @@ def test_a_recursive_body_outside_the_unions_last_branch_in_a_write_is_refused(w
 def test_a_mixed_set_operation_body_is_read_as_the_parser_groups_it(worlds):
     # The review gate on the sixth commit: sqlglot groups an unparenthesised chain left to
     # right, where DuckDB binds INTERSECT tighter than UNION and EXCEPT (measured). Where the
-    # two agree the shape is an oracle and refused. Where they differ, `A UNION ALL B INTERSECT
-    # C` is `A UNION ALL (B INTERSECT C)` to the engine, the CTE bound in both, while the
-    # parser's grouping has no recursive part and every self-reference is held to the grant:
-    # a refusal where nothing hidden is read, a cost and not a leak, since the engine reads
-    # less of the base table than modelled.
+    # two agree the shape is an oracle and refused as a hidden read.
     for sql in ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret INTERSECT SELECT id, secret FROM claim UNION ALL SELECT id, secret FROM claim WHERE secret = 'Q') SELECT secret FROM claim",
                 "WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret UNION ALL SELECT id, secret FROM claim WHERE secret = 'Q' EXCEPT SELECT id, secret FROM claim) SELECT secret FROM claim",
                 "WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret EXCEPT SELECT id, secret FROM claim UNION ALL SELECT id, secret FROM claim WHERE secret = 'Q') SELECT secret FROM claim"):
@@ -266,45 +262,34 @@ def test_a_mixed_set_operation_body_is_read_as_the_parser_groups_it(worlds):
         assert first != second, (sql, first, second)
         verdict = _decide(sql, HIDDEN)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
-    differing = "WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret UNION ALL SELECT id, secret FROM claim WHERE secret = 'Q' INTERSECT SELECT id, secret FROM claim) SELECT secret FROM claim"
-    assert [con.execute(differing).fetchall() for con in worlds] == [[("Z",)], [("Z",)]]
-    verdict = _decide(differing, HIDDEN)
-    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
-    assert isinstance(_decide(differing, SCHEMA), Approved)
 
 
-def test_on_oracle_a_join_key_is_read_as_typed_and_as_the_engine_folds_it():
-    # Codex's fifth review: with a grant spelling the hidden column `SECRET`, `USING (secret)`
-    # and `USING (Secret)` were compared as typed and passed, where `USING (SECRET)` was
-    # refused; Oracle folds an unquoted name up. The review gate: a grant spelling it `secret`
-    # (this repo's own Oracle fixtures do) must hide it from every spelling too, and a granted
-    # `id` spelled either way must stay a usable key. So the key is read both ways. Decision
-    # only, as the Oracle dialect.
-    for stored in ("SECRET", "secret"):
-        id_ = "ID" if stored == "SECRET" else "id"
-        schema = {"claim": {id_, stored}, "pair": {id_, stored}, "sink": {"I"}}
-        hidden = {"claim": {id_}, "pair": {id_}, "sink": {"I"}}
-        complete = AccessPolicy(policy_schema=schema)
-        for key in ("secret", "Secret", "SECRET", '"SECRET"'):
-            sql = f"SELECT count(*) AS n FROM claim JOIN (SELECT chr(90) AS {key} FROM sink) e USING ({key})"
-            for policy in (complete, AccessPolicy()):
-                verdict = decide(sql, hidden, dialect="oracle", target="oracle", policy=policy)
-                assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (stored, sql, verdict)
-        # A granted key joins two granted tables: spelled either way with the complete schema
-        # (it is not hidden), and without it as the grant spells it, the as-typed reading a
-        # column gets on Oracle (the catalog boundary); over a derived table whose base lacks
-        # the key, the no-schema refusal is the documented cost, not this rule's.
-        for key in ("id", "ID"):
-            granted = f"SELECT count(*) AS n FROM claim JOIN pair USING ({key})"
-            assert isinstance(decide(granted, hidden, dialect="oracle", target="oracle", policy=complete), Approved), (stored, granted)
-            bare = decide(granted, hidden, dialect="oracle", target="oracle", policy=AccessPolicy())
-            assert isinstance(bare, Approved if key == id_ else Refusal), (stored, granted, bare)
-    # Quoted, a lower-case key keeps its case: beside a grant spelling the hidden column `SECRET`
-    # it names a column claim does not have and is left to the engine with the complete schema
-    # (refused without it); beside a grant spelling it `secret` it is the hidden name as typed.
-    quoted = 'SELECT count(*) AS n FROM claim JOIN (SELECT chr(90) AS "secret" FROM sink) e USING ("secret")'
-    upper = AccessPolicy(policy_schema={"claim": {"ID", "SECRET"}, "sink": {"I"}})
-    assert isinstance(decide(quoted, {"claim": {"ID"}, "sink": {"I"}}, dialect="oracle", target="oracle", policy=upper), Approved)
-    assert isinstance(decide(quoted, {"claim": {"ID"}, "sink": {"I"}}, dialect="oracle", target="oracle", policy=AccessPolicy()), Refusal)
-    lower = AccessPolicy(policy_schema={"claim": {"id", "secret"}, "sink": {"I"}})
-    assert isinstance(decide(quoted, {"claim": {"id"}, "sink": {"I"}}, dialect="oracle", target="oracle", policy=lower), Refusal)
+def test_a_chain_the_parser_groups_differently_from_the_engine_is_refused_before_any_rewrite(worlds):
+    # Codex's sixth review of #170: `A UNION ALL B INTERSECT C` is `A UNION ALL (B INTERSECT C)`
+    # to DuckDB, the CTE bound in both, and `(A UNION ALL B) INTERSECT C` to sqlglot, with no
+    # recursive part; read as base-table references, B's and C's `claim` took the row filter
+    # and the approved statement answered differently from the original. Refused as a shape,
+    # as DuckDB, anywhere in the statement; parenthesised, grouped as written and read as before.
+    recursive = "WITH RECURSIVE claim AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM claim WHERE id < 3 INTERSECT SELECT id + 1 FROM claim) SELECT id FROM claim"
+    assert [con.execute(recursive).fetchall() for con in worlds] == [[(1,), (2,), (3,)]] * 2
+    filtered = AccessPolicy(row_filters={"claim": "id = 99"}, policy_schema=SCHEMA)
+    for policy in (COMPLETE, filtered, AccessPolicy()):
+        verdict = _decide(recursive, SCHEMA, policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.PARSE_ERROR, (policy, verdict)
+    derived = "SELECT d.id FROM (SELECT 1 AS id UNION ALL SELECT 2 AS id INTERSECT SELECT 2 AS id) d"
+    assert isinstance(_decide(derived, SCHEMA), Refusal)
+    except_first = "SELECT d.id FROM (SELECT 1 AS id EXCEPT SELECT 2 AS id INTERSECT SELECT 2 AS id) d"
+    assert isinstance(_decide(except_first, SCHEMA), Refusal)
+    write = "WITH RECURSIVE claim AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM claim WHERE id < 3 INTERSECT SELECT id + 1 FROM claim) INSERT INTO sink (i) SELECT id FROM claim"
+    assert isinstance(_decide_write(write, SCHEMA), Refusal)
+    # Grouped alike by both, or parenthesised: not this refusal.
+    for sql in ("SELECT d.id FROM (SELECT 1 AS id INTERSECT SELECT 1 AS id UNION ALL SELECT 2 AS id) d",
+                "SELECT d.id FROM (SELECT 1 AS id UNION ALL (SELECT 2 AS id INTERSECT SELECT 2 AS id)) d",
+                "SELECT d.id FROM ((SELECT 1 AS id UNION ALL SELECT 2 AS id) INTERSECT SELECT 2 AS id) d",
+                "WITH RECURSIVE claim AS (SELECT 1 AS id UNION ALL (SELECT id + 1 FROM claim WHERE id < 3 INTERSECT SELECT id + 1 FROM claim)) SELECT id FROM claim"):
+        worlds[0].execute(sql)
+        assert isinstance(_decide(sql, SCHEMA), Approved), sql
+    # Oracle groups left to right as the parser does: decision only, not refused as a shape.
+    oracle = decide("SELECT d.id FROM (SELECT 1 AS id FROM sink UNION ALL SELECT 2 AS id FROM sink INTERSECT SELECT 2 AS id FROM sink) d",
+                    {"sink": {"I"}}, dialect="oracle", target="oracle", policy=AccessPolicy(policy_schema={"sink": {"I"}}))
+    assert not (isinstance(oracle, Refusal) and oracle.code is RefusalCode.PARSE_ERROR), oracle

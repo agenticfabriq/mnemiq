@@ -69,6 +69,9 @@ def check_shape(
     unnamed = unnamed_read(ast, executes_as or dialect)
     if unnamed is not None:
         return unnamed
+    misgrouped = misgrouped_set_chain(ast, executes_as or dialect)
+    if misgrouped is not None:
+        return misgrouped
     if _has_projection_star(ast, executes_as or dialect, columns) \
             or _projects_a_row(ast, columns) \
             or _uses_a_row_outside_the_projection(ast, columns):
@@ -229,6 +232,33 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
     if isinstance(ast, exp.Subquery):
         return _output_selects(ast.this)  # redundant parentheses nest Subquery in Subquery
     return []
+
+
+def misgrouped_set_chain(ast: exp.Expression, engine: str) -> Refusal | None:
+    """Refuse a set-operation chain the parser groups differently from the engine: sqlglot folds
+    an unparenthesised chain left to right, so `A UNION ALL B INTERSECT C` is an INTERSECT over a
+    UNION, where DuckDB binds INTERSECT tighter and reads `A UNION ALL (B INTERSECT C)` (M203,
+    measured; Oracle groups left to right as the parser does, and is not refused). Every rule
+    over the tree then reads a shape the engine does not run. Not a cost alone: in a RECURSIVE
+    body the resolver found no recursive part and read the CTE's own references as the base
+    table, so a row filter on it was injected into them, and the approved statement answered
+    `[1]` where the original answers `[1, 2, 3]` (Codex's sixth review of #170). The shape is
+    an INTERSECT whose bare left operand is a UNION or an EXCEPT; a parenthesised operand is a
+    subquery to the parser and grouped as written. The corpus holds no such chain (the ui lane's
+    count, 2026-10-19)."""
+    if (engine or "").lower() != "duckdb":
+        return None
+    for node in ast.find_all(exp.Intersect):
+        if isinstance(node.this, (exp.Union, exp.Except)):
+            return Refusal(
+                code=RefusalCode.PARSE_ERROR,
+                message=("A UNION or EXCEPT followed by INTERSECT without parentheses is grouped "
+                         "one way by the parser and another by DuckDB, which binds INTERSECT "
+                         "tighter, so the statement cannot be checked as it would run. Write the "
+                         "parentheses: `A UNION ALL (B INTERSECT C)` or `(A UNION ALL B) INTERSECT C`."),
+                subject="INTERSECT",
+            )
+    return None
 
 
 def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refusal | None:
