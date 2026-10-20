@@ -1016,3 +1016,45 @@ def test_on_oracle_the_advised_forms_run_where_the_raising_one_fails():
             assert cur.execute(sql).fetchall() == [(1,)], sql
     finally:
         con.close()
+
+
+# --- an extract's path decides its shape (Codex's twenty-sixth review of #160) -------------------
+
+@pytest.mark.parametrize("row_filter", [
+    "json_extract_string(attrs, region) = 7",
+    "attrs ->> region = 7",
+    "json_extract_string(attrs, CAST(region AS VARCHAR)) = 7",
+])
+def test_a_text_column_as_the_path_makes_the_extract_one_text_value_converted_on_the_row(row_filter):
+    # Typed as a list for any path but one string literal, the extract beside a number read as
+    # a list beside a number and was approved, where DuckDB extracts one text value through a
+    # VARCHAR path and converts it on the row (measured, the hidden value in the error).
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON); "
+                "INSERT INTO claim VALUES (1, '$.a', '{\"a\": \"north\"}'), (2, '$.a', '{\"a\": \"7\"}')")
+    with pytest.raises(duckdb.ConversionException, match="north"):
+        con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    verdict = _decide(row_filter)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    assert "TRY_CAST(value AS type)" in verdict.message
+    for safe in ("json_extract_string(attrs, region) = 'x'", "json_extract_string(attrs, region) IS NOT NULL"):
+        assert con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall() is not None
+        assert isinstance(_decide(safe), Approved), safe
+
+
+@pytest.mark.parametrize("row_filter", [
+    "json_extract_string(attrs, lower(region)) = 'x'",
+    "json_extract_string(attrs, [region]) = 'x'",
+])
+def test_a_path_whose_shape_the_reader_cannot_tell_is_refused_naming_the_path(row_filter):
+    # A call, or a list of anything but string literals: scalar or list is the engine's call,
+    # and either reading approves a conversion the other refuses, so neither is taken.
+    verdict = _decide(row_filter)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    assert "one string literal, a list of string literals, or a text column" in verdict.message
+    # Beside a number the comparison's own refusal comes first, the walk being top-down.
+    beside_a_number = _decide(row_filter.replace("= 'x'", "= 7"))
+    assert isinstance(beside_a_number, Refusal) and beside_a_number.code is RefusalCode.INVALID_ROW_FILTER
+    # A list of string literals keeps the list reading: refused beside a list of text, as before.
+    assert isinstance(_decide("[json_extract(attrs, ['$.a'])] = [region]"), Refusal)
+    assert isinstance(_decide("list_contains([region], json_extract_string(attrs, ['$.a']))"), Approved)

@@ -446,21 +446,52 @@ def _is_typed_call(node: exp.Expression) -> bool:
     return _is_json_call(node) or _is_text_extract(node)
 
 
-def _json_call_type(node: exp.Expression) -> str:
-    """JSON, or JSON[] for an extract whose path is anything but one string literal
-    (`json_extract(x, ['$.a'])` is JSON[] to DuckDB, and so is a cast or a column holding a
-    list of paths; typed as a scalar it unified with `[region]` as a list of text would not:
-    the review gate on the twentieth and twenty-first rounds). A path of unknown shape is read
-    as a list, fail-closed: a scalar extract beside text is then refused as a list would be."""
-    leaf = "VARCHAR" if _is_text_extract(node) else "JSON"
-    path = None
+def _extract_path(node: exp.Expression) -> exp.Expression | None:
+    """The path argument of a JSON extract, or None where the call has none."""
     if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
-        path = node.expression
-    elif isinstance(node, exp.Anonymous) and node.name.lower() in _JSON_EXTRACTS | _TEXT_EXTRACT_NAMES:
-        path = node.expressions[1] if len(node.expressions) > 1 else None
+        return node.expression
+    if isinstance(node, exp.Anonymous) and node.name.lower() in _JSON_EXTRACTS | _TEXT_EXTRACT_NAMES:
+        return node.expressions[1] if len(node.expressions) > 1 else None
+    return None
+
+
+_SCALAR_PATH_TYPES = frozenset({"VARCHAR", "TEXT", "STRING", "CHAR", "BPCHAR"})
+
+
+def _path_shape(path: exp.Expression | None, type_of) -> str | None:
+    """Whether an extract's path makes it a scalar or a list, by the path's own type, as DuckDB
+    decides it: one string literal (or a parsed JSON path) is a scalar, a list literal of string
+    literals a list, a column or a cast by its declared type (a text column is one path, so
+    `json_extract_string(attrs, region)` is one VARCHAR, where a list reading let `= 7` through
+    and the engine converted the hidden row's value: Codex's twenty-sixth review of #160), and
+    anything else is None: the reader cannot tell the shape without running the call."""
+    while isinstance(path, exp.Paren):
+        path = path.this
     if path is None or (isinstance(path, exp.Literal) and path.is_string) or isinstance(path, exp.JSONPath):
-        return leaf
-    return leaf + "[]"
+        return "scalar"
+    if isinstance(path, exp.Array):
+        return "list" if all(isinstance(e, exp.Literal) and e.is_string for e in path.expressions) else None
+    declared = None
+    if isinstance(path, exp.Column):
+        declared = type_of(path)
+    elif isinstance(path, exp.Cast):
+        declared = path.to.sql(dialect="duckdb")
+    if declared is None:
+        return None
+    declared = declared.strip().upper()
+    if declared.endswith("[]"):
+        return "list" if declared[:-2].split("(")[0] in _SCALAR_PATH_TYPES else None
+    return "scalar" if declared.split("(")[0] in _SCALAR_PATH_TYPES else None
+
+
+def _json_call_type(node: exp.Expression, type_of) -> str:
+    """JSON (VARCHAR for a text extract), or the list of it for an extract whose path is a list
+    (`json_extract(x, ['$.a'])` is JSON[] to DuckDB, and so is a column holding a list of paths;
+    typed as a scalar it unified with `[region]` as a list of text would not: the review gate
+    on the twentieth and twenty-first rounds). The path's shape is read by `_path_shape`; one it
+    cannot read is refused by the walk before this type is relied on."""
+    leaf = "VARCHAR" if _is_text_extract(node) else "JSON"
+    return leaf + "[]" if _path_shape(_extract_path(node), type_of) == "list" else leaf
 
 
 # The calls DuckDB hands a lambda to. Anywhere else `a -> b` is DuckDB's JSON extract, which
@@ -685,8 +716,8 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     if None in declared or None in key_types:
         return None
     typed_nulls = value.copy()
-    if _is_typed_call(typed_nulls):
-        return _json_call_type(typed_nulls)
+    if _is_typed_call(value):
+        return _json_call_type(value, type_of)
     if _scalar_projection(value) is not None:
         return _subquery_type(value, type_of)
     # Typed calls first, so a scalar subquery inside one goes with it (the review gate on the
@@ -696,7 +727,7 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     # replaced in the copy in the same traversal order.
     for call in list(typed_nulls.find_all(*_JSON_CALL_NODES, *_TEXT_EXTRACT_NODES, exp.Anonymous)):
         if _is_typed_call(call):
-            call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(call))))
+            call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(call, type_of))))
     originals = [sq for sq in value.find_all(exp.Subquery)
                  if id(sq) not in inside_a_json_call and _scalar_projection(sq) is not None]
     inside_another = {id(inner) for sq in originals for inner in sq.walk() if inner is not sq}
@@ -1183,6 +1214,11 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
     for node in wrapped.args["where"].walk():
         if engine == "duckdb" and _arrow_read_as_a_lambda(node):
             return node  # `attrs -> '$.a'` where DuckDB extracts JSON and sqlglot sees a lambda
+        if engine == "duckdb" and _is_typed_call(node) and _extract_path(node) is not None \
+                and _path_shape(_extract_path(node), type_of) is None:
+            return _extract_path(node)  # the PATH, whose shape the reader cannot tell: scalar
+            # or list is the engine's call, and either reading approves a conversion the other
+            # refuses; returned rather than the call so the refusal names the path
         if engine == "duckdb" and isinstance(node, (exp.SetOperation, exp.Values)):
             # A set operation unifies its branches' projections as a branched value's branches
             # are unified, each branch converted to the unified type on the rows it yields:
@@ -1331,6 +1367,11 @@ def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
         safe = ("json_extract(value, path) in place of `value -> path` here: inside a call's "
                 "arguments or beside an operator the parser reads the arrow as a lambda where "
                 "DuckDB reads a JSON extract, so the filter cannot be checked as DuckDB runs it")
+    elif engine == "duckdb" and node.parent is not None and _is_typed_call(node.parent) \
+            and _extract_path(node.parent) is node:
+        safe = ("the extract's path as one string literal, a list of string literals, or a text "
+                "column: whether this path makes the extract one value or a list cannot be told "
+                "without running it, and the two are converted differently")
     if engine == "duckdb" and isinstance(node, _BRANCHED):
         safe += (", and a text literal on a branch as CAST('...' AS type): beside a branch of "
                  "another type it is converted to that type on the rows that take it, and beside "
