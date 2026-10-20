@@ -249,3 +249,25 @@ def test_a_recursive_body_outside_the_unions_last_branch_in_a_write_is_refused(w
         assert first != second, (sql, first, second)
         verdict = _decide_write(sql, HIDDEN)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
+
+
+def test_a_mixed_set_operation_body_is_read_as_the_parser_groups_it(worlds):
+    # The review gate on the sixth commit: sqlglot groups an unparenthesised chain left to
+    # right, where DuckDB binds INTERSECT tighter than UNION and EXCEPT (measured). Where the
+    # two agree the shape is an oracle and refused. Where they differ, `A UNION ALL B INTERSECT
+    # C` is `A UNION ALL (B INTERSECT C)` to the engine, the CTE bound in both, while the
+    # parser's grouping has no recursive part and every self-reference is held to the grant:
+    # a refusal where nothing hidden is read, a cost and not a leak, since the engine reads
+    # less of the base table than modelled.
+    for sql in ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret INTERSECT SELECT id, secret FROM claim UNION ALL SELECT id, secret FROM claim WHERE secret = 'Q') SELECT secret FROM claim",
+                "WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret UNION ALL SELECT id, secret FROM claim WHERE secret = 'Q' EXCEPT SELECT id, secret FROM claim) SELECT secret FROM claim",
+                "WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret EXCEPT SELECT id, secret FROM claim UNION ALL SELECT id, secret FROM claim WHERE secret = 'Q') SELECT secret FROM claim"):
+        first, second = (con.execute(sql).fetchall() for con in worlds)
+        assert first != second, (sql, first, second)
+        verdict = _decide(sql, HIDDEN)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
+    differing = "WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret UNION ALL SELECT id, secret FROM claim WHERE secret = 'Q' INTERSECT SELECT id, secret FROM claim) SELECT secret FROM claim"
+    assert [con.execute(differing).fetchall() for con in worlds] == [[("Z",)], [("Z",)]]
+    verdict = _decide(differing, HIDDEN)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    assert isinstance(_decide(differing, SCHEMA), Approved)

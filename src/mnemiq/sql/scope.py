@@ -407,10 +407,12 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None,
             elif child is with_:  # the table sits inside one of this WITH's own CTE bodies
                 at = next((i for i, cte in enumerate(with_.expressions) if cte is last_cte), 0)
                 # Under RECURSIVE the CTE's own name binds in its RECURSIVE part alone, the
-                # right side of its body's set operation; in the anchor it is the base table
-                # (DuckDB, measured: `WITH RECURSIVE claim AS (SELECT ... FROM claim UNION ALL
-                # ...)` read the base `claim` in the anchor, and a hidden join key went unread
-                # when the whole body was taken as the CTE: Codex's fourth review of #170).
+                # right side of its body's UNION (`_in_recursive_part`); in the anchor, in an
+                # earlier UNION ALL branch and anywhere in an INTERSECT or EXCEPT body it is the
+                # base table (DuckDB, measured: `WITH RECURSIVE claim AS (SELECT ... FROM claim
+                # UNION ALL ...)` read the base `claim` in the anchor, and a hidden join key
+                # went unread when the whole body was taken as the CTE: Codex's fourth review
+                # of #170; the other two shapes, the ui lane's replay at 3e98092).
                 itself = names[at:at + 1] if with_.args.get("recursive") and _in_recursive_part(table, last_cte) else []
                 visible = names[:at] + itself
             else:
