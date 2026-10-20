@@ -202,6 +202,90 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     referenced = set(alias_to_table.values())
     known_columns = as_engine({c for t in referenced for c in visible[t]})
 
+    # A JOIN KEY is not an `exp.Column`, and it reads the column all the same (M103 closed the
+    # denied and masked key in `check_cls`); a key HIDDEN from the grant was read by nothing
+    # (M200): `claim JOIN (SELECT 1 AS id, 'Z' AS secret) x USING (id, secret)` with `secret`
+    # absent from the grant was approved, and whether rows match says whether the hidden value
+    # is the guess, through a derived star the same. A USING key is refused where a base table
+    # the join's SELECT reaches (through a derived table or a CTE too) has it hidden, or is not
+    # listed in full so that hiding cannot be ruled out; a NATURAL join names nothing, so one
+    # over any such table with a hidden column, or not listed in full, is refused.
+    complete = getattr(columns, "complete", frozenset()) if columns is not None else frozenset()
+    listed = columns if columns is not None else visible
+    def cte_body(table: exp.Table) -> exp.Expression | None:
+        """The body of the CTE this reference names, from the nearest enclosing WITH that defines
+        the name outward (a name defined in two scopes is the inner one's: the review gate), as
+        the engine scopes it: a reference inside a CTE's own body, or inside a sibling's, sees
+        only the siblings declared before that CTE, so `WITH pair AS (SELECT * FROM pair)` reads
+        the base table inside its body (the review gate's third round)."""
+        name = object_key(table)
+        enclosing = [c for c in table.iter_ancestors() if isinstance(c, exp.CTE)] if hasattr(table, "iter_ancestors") else []
+        if not enclosing:
+            node = table.parent
+            while node is not None:
+                if isinstance(node, exp.CTE):
+                    enclosing.append(node)
+                node = node.parent
+        node: exp.Expression | None = table
+        while node is not None:
+            with_ = node.args.get("with_") if isinstance(node, exp.Expression) else None
+            if isinstance(with_, exp.With):
+                ctes = list(with_.expressions)
+                own = next((c for c in enclosing if c.parent is with_), None)
+                candidates = ctes[:ctes.index(own)] if own is not None else ctes
+                for cte in candidates:
+                    if cte.alias_or_name == name:
+                        return cte.this
+            node = node.parent
+        return None
+
+    def bases(node: exp.Expression, following: frozenset[int] = frozenset()) -> set[str]:
+        """The base tables an input reads, a CTE name followed to its body (a CTE defined in an
+        outer scope reads as a base table inside the join's own SELECT: the review gate); a
+        name whose body is already being followed is read as a base table of that name, never
+        dropped (fail-closed)."""
+        found: set[str] = set()
+        for table in base_tables(node, dialect):
+            body = cte_body(table)
+            if body is None or id(body) in following:
+                found.add(object_key(table))
+            else:
+                found |= bases(body, following | {id(body)})
+        return found
+
+    for join in ast.find_all(exp.Join):
+        # The join's own inputs: what stands left of it in its SELECT (the FROM and the joins
+        # before it) and its right side, each followed to the base tables it reads; not every
+        # table the SELECT mentions, a WHERE's subquery among them (the review gate).
+        select = join.parent if isinstance(join.parent, exp.Select) else None
+        if select is not None and select.args.get("from_") is not None:
+            earlier = select.args.get("joins") or []
+            inputs = [select.args["from_"].this, *(j.this for j in earlier[:earlier.index(join)]), join.this]
+            reached = set().union(*(bases(i) for i in inputs)) & referenced
+        else:
+            reached = bases(ast) & referenced
+        hidden_on = {t: as_engine(set(listed.get(t, ())) - set(visible[t])) for t in reached}
+        for key in join.args.get("using") or ():
+            name = written(key, key.name) if hasattr(key, "name") else str(key)
+            for table in sorted(reached):
+                if name in hidden_on[table] or (table not in complete and name not in as_engine(visible[table])):
+                    return Refusal(
+                        code=RefusalCode.UNKNOWN_COLUMN,
+                        message=(f"The join key {name!r} is not a column of {table!r} you may read. "
+                                 "Join with an explicit ON over the columns provided."),
+                        subject=name,
+                    )
+        if (join.args.get("method") or "").upper() == "NATURAL":
+            for table in sorted(reached):
+                if hidden_on[table] or table not in complete:
+                    return Refusal(
+                        code=RefusalCode.UNKNOWN_COLUMN,
+                        message=(f"A NATURAL join reads whatever columns these tables share, and "
+                                 f"{table!r} has columns you may not read, or is not listed in "
+                                 "full. Join with an explicit ON or USING naming the columns."),
+                        subject=table,
+                    )
+
     # A SELECT alias is a name the query invents for an expression, and GROUP BY / ORDER BY /
     # HAVING may refer to it: `SELECT year(d) AS y, count(*) FROM t GROUP BY y` is ordinary,
     # correct SQL -- and without this the engine could not answer "count X by year" at all.
