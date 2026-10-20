@@ -100,12 +100,21 @@ def _is_source(table: exp.Table, source: str) -> bool:
     purpose: a bare source claims the unqualified table, so a qualified relation over it
     (`pg.orders` over `orders`) may be another schema's and is foreign, the metric withheld
     (the review gate on the second commit); a bundle that qualifies its tables registers its
-    sources qualified. A quoted name keeps its case and must match as written (`"ORDERS"` is
-    not `orders` where quoting preserves case: the gate's second advisory)."""
-    quoted = bool(table.this.args.get("quoted")) if isinstance(table.this, exp.Identifier) else False
-    name = _table_name(table)
-    t, s = (name, source) if quoted else (name.lower(), source.lower())
-    return t == s or ("." not in t and t == s.rpartition(".")[2])
+    sources qualified. Each dotted part is compared on its own quoting: a quoted part keeps
+    its case and must match as written, an unquoted one folds (`"ORDERS"` is not `orders`,
+    nor is `"PG".orders` `pg.orders`, where quoting preserves case: the gate's second and
+    third advisories)."""
+    slots = [part for part in (table.args.get("catalog"), table.args.get("db"), table.this) if part is not None]
+    if not all(isinstance(part, exp.Identifier) for part in slots):
+        return False  # a four-part name puts its tail in the table slot as a Dot (the gate)
+    parts = [(part.name, bool(part.args.get("quoted"))) for part in slots]
+    wanted = source.split(".")
+    if len(parts) == 1 and len(wanted) > 1:
+        wanted = wanted[-1:]  # a bare name claims the source's own table
+    if len(parts) != len(wanted):
+        return False
+    return all(text == want if quoted else text.lower() == want.lower()
+               for (text, quoted), want in zip(parts, wanted))
 
 
 def _source_aliases(node: exp.Expression, source: str) -> set[str]:

@@ -325,3 +325,13 @@ def test_a_qualified_source_is_its_own_relation_exactly():
     assert expression_scope('(SELECT max(id) FROM "ORDERS")', "orders") == "foreign"
     assert expression_scope('(SELECT max(id) FROM "orders")', "orders") == "own"
     assert expression_scope("(SELECT max(id) FROM ORDERS)", "orders") == "own"
+    # Each dotted part on its own quoting (the gate's third advisory): a quoted schema part too.
+    assert expression_scope('(SELECT max(id) FROM "PG".orders)', "pg.orders") == "foreign"
+    assert expression_scope('(SELECT max(id) FROM pg."ORDERS")', "pg.orders") == "foreign"
+    assert expression_scope('(SELECT max(id) FROM "pg".orders)', "pg.orders") == "own"
+    assert expression_scope("(SELECT max(id) FROM PG.ORDERS)", "pg.orders") == "own"
+    # A four-part name's tail sits in the table slot as a dotted node: foreign, not shrunk.
+    assert expression_scope("(SELECT max(id) FROM pg.orders.x.y)", "pg.orders") == "foreign"
+    # The aliased path reads the relation the same way.
+    assert expression_scope('(SELECT max(r.id) FROM "ORDERS" r)', "orders") == "foreign"
+    assert expression_scope('(SELECT max(r.id) FROM "orders" r)', "orders") == "own"
