@@ -69,6 +69,9 @@ def check_shape(
     unnamed = unnamed_read(ast, executes_as or dialect)
     if unnamed is not None:
         return unnamed
+    misgrouped = misgrouped_set_chain(ast, executes_as or dialect)
+    if misgrouped is not None:
+        return misgrouped
     if _has_projection_star(ast, executes_as or dialect, columns) \
             or _projects_a_row(ast, columns) \
             or _uses_a_row_outside_the_projection(ast, columns):
@@ -229,6 +232,39 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
     if isinstance(ast, exp.Subquery):
         return _output_selects(ast.this)  # redundant parentheses nest Subquery in Subquery
     return []
+
+
+# The engines that bind INTERSECT tighter than UNION and EXCEPT, against the parser's left fold.
+_INTERSECT_BINDS_TIGHTER = frozenset({"duckdb", "postgres", "postgresql", "mysql"})
+
+
+def misgrouped_set_chain(ast: exp.Expression, engine: str) -> Refusal | None:
+    """Refuse a set-operation chain the parser groups differently from the engine: sqlglot folds
+    an unparenthesised chain left to right, so `A UNION ALL B INTERSECT C` is an INTERSECT over a
+    UNION, where DuckDB binds INTERSECT tighter and reads `A UNION ALL (B INTERSECT C)` (M203,
+    measured; Postgres documents the same precedence and MySQL has it from 8.0.31, so both are
+    held to it unmeasured, the review gate on the ninth commit; Oracle and SQLite group left to
+    right as the parser does, and are not refused). Every rule
+    over the tree then reads a shape the engine does not run. Not a cost alone: in a RECURSIVE
+    body the resolver found no recursive part and read the CTE's own references as the base
+    table, so a row filter on it was injected into them, and the approved statement answered
+    `[1]` where the original answers `[1, 2, 3]` (Codex's sixth review of #170). The shape is
+    an INTERSECT whose bare left operand is a UNION or an EXCEPT; a parenthesised operand is a
+    subquery to the parser and grouped as written. The corpus holds no such chain (the ui lane's
+    count, 2026-10-19)."""
+    if (engine or "").lower() not in _INTERSECT_BINDS_TIGHTER:
+        return None
+    for node in ast.find_all(exp.Intersect):
+        if isinstance(node.this, (exp.Union, exp.Except)):
+            return Refusal(
+                code=RefusalCode.PARSE_ERROR,
+                message=("A UNION or EXCEPT followed by INTERSECT without parentheses is grouped "
+                         "one way by the parser and another by the engine, which binds INTERSECT "
+                         "tighter, so the statement cannot be checked as it would run. Write the "
+                         "parentheses: `A UNION ALL (B INTERSECT C)` or `(A UNION ALL B) INTERSECT C`."),
+                subject="INTERSECT",
+            )
+    return None
 
 
 def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refusal | None:
@@ -799,6 +835,12 @@ def _sources(select: exp.Select) -> dict[str, exp.Expression]:
 # depending on quoting, and getting that wrong in either direction has a cost: too wide and a CTE
 # vouches for a base table, too narrow and ordinary SQL is refused.
 Scope = dict[str, tuple[exp.Expression, "Scope"]]
+# A key no CTE can be named, an object and not a string (a quoted identifier can spell any
+# string, and a CTE so named would have overwritten a string key: the review gate): under it a
+# scope carries the recursive parts of its RECURSIVE CTEs, (id of the recursive part's node, the
+# CTE's name, its entry), which `_scope_within` binds for a SELECT sitting in that part as the
+# star resolver descends into the body.
+_RECURSIVE_PARTS: object = object()
 
 
 def _visible_ctes(node: exp.Expression, outer: Scope, dialect: str) -> Scope:
@@ -832,13 +874,48 @@ def _visible_ctes(node: exp.Expression, outer: Scope, dialect: str) -> Scope:
     for cte in with_.expressions:
         key = resolve_name(cte, dialect)
         # snapshot BEFORE binding this name: the body sees the outer scope and its preceding
-        # siblings, plus itself only when the WITH is RECURSIVE
+        # siblings, plus itself only when the WITH is RECURSIVE, and then only in its RECURSIVE
+        # PART, the right side of the body's UNION: in the anchor the name is the base table
+        # (DuckDB, measured: `WITH RECURSIVE claim AS (SELECT * FROM claim UNION ALL ...)
+        # SELECT * FROM claim` returned the base table's hidden column, the anchor's star bound
+        # to the CTE and vouched for by nothing: M201). Only a UNION makes a CTE recursive: an
+        # INTERSECT or EXCEPT body is a plain CTE, its own name the base table everywhere in it
+        # (`... INTERSECT SELECT * FROM claim` expanded the CTE and returned the hidden column:
+        # the ui lane's replay of #170 at 3e98092), and a body with no UNION has no recursive
+        # part. The rule `_in_recursive_part` in `scope` states for the name resolver.
         body_scope: Scope = dict(scope)
         entry = (cte.this, body_scope)
-        if recursive:
-            body_scope[key] = entry
+        body = cte.this
+        while isinstance(body, (exp.Subquery, exp.Paren)):
+            body = body.this
+        if recursive and isinstance(body, exp.Union):
+            body_scope[_RECURSIVE_PARTS] = (*body_scope.get(_RECURSIVE_PARTS, ()), (id(body.right), key, entry))
         scope[key] = entry
     return scope
+
+
+def _scope_within(select: exp.Expression, scope: Scope) -> Scope:
+    """The scope a SELECT sees: `scope`, plus a RECURSIVE CTE's own name where the SELECT sits in
+    that CTE's recursive part."""
+    parts = scope.get(_RECURSIVE_PARTS, ())
+    if not parts:
+        return scope
+    above = {id(n) for n in [select, *_ancestors(select)]}
+    bound = [(key, entry) for part, key, entry in parts if part in above]
+    if not bound:
+        return scope
+    seen: Scope = dict(scope)
+    for key, entry in bound:
+        seen[key] = entry
+    return seen
+
+
+def _ancestors(node: exp.Expression) -> list[exp.Expression]:
+    out, node = [], node.parent
+    while node is not None:
+        out.append(node)
+        node = node.parent
+    return out
 
 
 def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
@@ -874,7 +951,7 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
     if selects:
         inner, within = _visible_ctes(node, ctes, dialect), stack | {id(node)}
         answer = any(
-            _expands_a_base_table(select, projection, inner, columns, memo, within, dialect)
+            _expands_a_base_table(select, projection, _scope_within(select, inner), columns, memo, within, dialect)
             for select in selects
             for projection in select.expressions
             # A row reference joins the walk too: naming a DERIVED TABLE is bounded by that

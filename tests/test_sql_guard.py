@@ -183,8 +183,18 @@ def test_a_cte_body_is_read_in_the_scope_it_was_WRITTEN_in():
     # body already on its own stack, answer "no base table reached", and permit it.
     assert _refused("WITH c AS (SELECT * FROM c) SELECT * FROM c").code == (
         RefusalCode.SELECT_STAR)
-    # WITH RECURSIVE genuinely does bind the name, and this shape reaches no base table at all
-    _ok("WITH RECURSIVE c AS (SELECT * FROM c) SELECT * FROM c")
+    # WITH RECURSIVE binds the name in the body's RECURSIVE PART alone; a body with no set
+    # operation has none, so this `c` is the base table and the star reaches it (M201; DuckDB
+    # refuses the shape as a circular reference):
+    assert _refused("WITH RECURSIVE c AS (SELECT * FROM c) SELECT * FROM c").code == (
+        RefusalCode.SELECT_STAR)
+    # and in the recursive part the name is the CTE, as a counter reads it:
+    _ok("WITH RECURSIVE c AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c")
+    # a CTE may carry any quoted name; none can collide with the scope's own bookkeeping, which
+    # a star over the CTE makes the resolver read (the review gate's shapes)
+    _ok('WITH "\x00recursive" AS (SELECT 1 AS n) SELECT * FROM "\x00recursive"')
+    _ok('WITH RECURSIVE "\x00recursive" AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM "\x00recursive" WHERE n < 3) '
+        'SELECT * FROM "\x00recursive"')
 
 
 def test_a_QUALIFIED_name_is_never_a_cte_reference():
@@ -344,7 +354,9 @@ def test_a_recursive_cte_terminates():
     recursive CTE projecting named columns returns before recursing, so it is not a control.
     Without the cycle guard these raise RecursionError instead of answering."""
     _ok("WITH RECURSIVE r AS (SELECT id FROM claim UNION ALL SELECT * FROM r) SELECT * FROM r")
-    _ok("WITH RECURSIVE r AS (SELECT * FROM r) SELECT * FROM r")
+    # A body with no set operation has no recursive part (M201): `r` is the base table and the
+    # star reaches it, so this answers with a refusal rather than recursing.
+    assert _refused("WITH RECURSIVE r AS (SELECT * FROM r) SELECT * FROM r").code == RefusalCode.SELECT_STAR
 
 
 def test_a_DENIED_column_cannot_come_back_through_a_wrapped_star():

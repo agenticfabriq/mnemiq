@@ -6,7 +6,7 @@ from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
 from mnemiq.sql.functions import FunctionInventory, UnreadableCalls, called_names
-from mnemiq.sql.identifiers import resolve_identifier, resolve_stored, rules_for
+from mnemiq.sql.identifiers import resolve, resolve_identifier, resolve_stored, rules_for
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import GENERATED_NAME, base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -188,7 +188,11 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     # both sides stay as typed, as before: folding the stored side would let an unquoted
     # spelling meet a column created with quotes, which the engine reads as ANOTHER column (the
     # review gate's case, `"Amount"` beside `amount`), and the catalog boundary there -- table
-    # keys and row filters are as typed too -- is one decision, deferred to the register.
+    # keys and row filters are as typed too -- is one decision, deferred to the register. One
+    # exception, in the HIDDEN direction alone: a USING key is also read as the engine folds it,
+    # against the hidden names folded the same way (below), since with the complete schema the
+    # key carries no positive check and a spelling the engine folds onto a hidden name passed
+    # as typed; that refuses more, never less. The grant side stays as typed, as here.
     folds = not rules_for(dialect).quoting_preserves_case
 
     def as_engine(names) -> set[str]:
@@ -201,6 +205,126 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
 
     referenced = set(alias_to_table.values())
     known_columns = as_engine({c for t in referenced for c in visible[t]})
+
+    # A JOIN KEY is not an `exp.Column`, and it reads the column all the same (M103 closed the
+    # denied and masked key in `check_cls`); a key HIDDEN from the grant was read by nothing
+    # (M200): `claim JOIN (SELECT 1 AS id, 'Z' AS secret) x USING (id, secret)` with `secret`
+    # absent from the grant was approved, and whether rows match says whether the hidden value
+    # is the guess, through a derived star the same. A USING key is refused where a base table
+    # the join's SELECT reaches (through a derived table or a CTE too) has it hidden, or is not
+    # listed in full so that hiding cannot be ruled out; a NATURAL join names nothing, so one
+    # over any such table with a hidden column, or not listed in full, is refused.
+    complete = getattr(columns, "complete", frozenset()) if columns is not None else frozenset()
+    listed = columns if columns is not None else visible
+    def cte_body(table: exp.Table) -> exp.Expression | None:
+        """The body of the CTE this reference names, from the nearest enclosing WITH that defines
+        the name outward (a name defined in two scopes is the inner one's: the review gate), as
+        the engine scopes it: a reference inside a CTE's own body, or inside a sibling's, sees
+        only the siblings declared before that CTE, so `WITH pair AS (SELECT * FROM pair)` reads
+        the base table inside its body (the review gate's third round)."""
+        # Names meet as the engine resolves them (M170): `WITH W AS (...) SELECT ... FROM w` reads
+        # the CTE on DuckDB, where a granted base table `w` would otherwise be read instead
+        # (Codex's third review of #170). A qualified reference (`pg.claim`) never names a CTE,
+        # whatever a CTE is called: it is the base table (the review gate on that fix, where
+        # folding the bare name alone let a CTE named `claim` capture it).
+        if table.args.get("db") or table.args.get("catalog"):
+            return None
+        # Resolved by the shared identifier rules for every engine, not folded only where the
+        # engine folds: Oracle keeps a quoted `"claim"` and upper-folds an unquoted `claim`, so
+        # the two are different names there (Codex's fourth review of #170).
+        name = resolve_identifier(table.this, dialect) or object_key(table)
+        enclosing, above = [], table.parent
+        while above is not None:
+            if isinstance(above, exp.CTE):
+                enclosing.append(above)
+            above = above.parent
+        node: exp.Expression | None = table
+        while node is not None:
+            with_ = node.args.get("with_") if isinstance(node, exp.Expression) else None
+            if isinstance(with_, exp.With):
+                ctes = list(with_.expressions)
+                own = next((c for c in enclosing if c.parent is with_), None)
+                candidates = ctes[:ctes.index(own)] if own is not None else ctes
+                for cte in candidates:
+                    declared = resolve_identifier(cte.args.get("alias"), dialect) or cte.alias_or_name
+                    if declared == name:
+                        return cte.this
+            node = node.parent
+        return None
+
+    def bases(node: exp.Expression, following: frozenset[int] = frozenset()) -> set[str]:
+        """The base tables an input reads, a CTE name followed to its body (a CTE defined in an
+        outer scope reads as a base table inside the join's own SELECT: the review gate); a
+        name whose body is already being followed is read as a base table of that name, never
+        dropped (fail-closed)."""
+        found: set[str] = set()
+        for table in base_tables(node, dialect):
+            body = cte_body(table)
+            if body is None or id(body) in following:
+                found.add(object_key(table))
+            else:
+                found |= bases(body, following | {id(body)})
+        return found
+
+    for join in ast.find_all(exp.Join):
+        # The join's own inputs: what stands left of it in its SELECT (the FROM and the joins
+        # before it) and its right side, each followed to the base tables it reads; not every
+        # table the SELECT mentions, a WHERE's subquery among them (the review gate).
+        select = join.parent if isinstance(join.parent, exp.Select) else None
+        if select is not None and select.args.get("from_") is not None:
+            earlier = select.args.get("joins") or []
+            before = next(i for i, j in enumerate(earlier) if j is join)  # by identity: two
+            inputs = [select.args["from_"].this, *(j.this for j in earlier[:before]), join.this]  # equal joins
+            reached = set().union(*(bases(i) for i in inputs))
+        else:
+            reached = bases(ast)
+        # Every base table here passed the grant above, whatever alias it carries: the alias map
+        # is one name per alias and a reused alias in another scope would drop a table from it
+        # (Codex's second review: `claim t JOIN ... USING (secret) WHERE EXISTS (SELECT 1 FROM
+        # sink t)` dropped claim), so the reached set is not narrowed by it.
+        reached = {t for t in reached if t in visible}
+        hidden_on = {t: as_engine(set(listed.get(t, ())) - set(visible[t])) for t in reached}
+
+        def folded(names) -> set[str]:
+            # Every hidden name as the engine would fold it typed unquoted: on Oracle a grant
+            # spells a column `secret` or `SECRET` as its author did (the catalog boundary
+            # above), and both are the one column an unquoted `USING (secret)` names. For the
+            # hidden set only: folding a stored name is fail-closed here and fail-open on the
+            # grant side (a quoted-case `"Amount"` granted would let `USING (amount)` through
+            # where the engine reads another column: the review gate).
+            return {resolve(n, quoted=False, dialect=dialect) for n in names}
+
+        for key in join.args.get("using") or ():
+            # Hidden under EITHER reading is refused: as the column check reads a column (typed,
+            # folded only where quoting does not preserve case), or as the engine resolves it,
+            # against the hidden names folded the same way. As typed alone, `USING (secret)`
+            # passed a hidden `SECRET` on Oracle with the complete schema, where `USING
+            # (SECRET)` was refused (Codex's fifth review); folded alone, a hidden `secret`
+            # spelled so was missed (the review gate). Without the complete schema the key is
+            # held to the grant as typed, as a column is.
+            spelled = key.name if hasattr(key, "name") else str(key)
+            typed = written(key, spelled)
+            as_engine_reads = resolve_identifier(key, dialect) or spelled
+            for table in sorted(reached):
+                hidden = typed in hidden_on[table] or as_engine_reads in folded(hidden_on[table])
+                granted = typed in as_engine(visible[table])
+                if hidden or (table not in complete and not granted):
+                    return Refusal(
+                        code=RefusalCode.UNKNOWN_COLUMN,
+                        message=(f"The join key {spelled!r} is not a column of {table!r} you may read. "
+                                 "Join with an explicit ON over the columns provided."),
+                        subject=spelled,
+                    )
+        if (join.args.get("method") or "").upper() == "NATURAL":
+            for table in sorted(reached):
+                if hidden_on[table] or table not in complete:
+                    return Refusal(
+                        code=RefusalCode.UNKNOWN_COLUMN,
+                        message=(f"A NATURAL join reads whatever columns these tables share, and "
+                                 f"{table!r} has columns you may not read, or is not listed in "
+                                 "full. Join with an explicit ON or USING naming the columns."),
+                        subject=table,
+                    )
 
     # A SELECT alias is a name the query invents for an expression, and GROUP BY / ORDER BY /
     # HAVING may refer to it: `SELECT year(d) AS y, count(*) FROM t GROUP BY y` is ordinary,
