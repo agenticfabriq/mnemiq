@@ -225,8 +225,8 @@ def test_a_recursive_ctes_own_name_is_the_base_table_outside_a_unions_last_branc
                    AccessPolicy(row_filters={"claim": "secret = 'Q'"}, policy_schema=SCHEMA)):
         verdict = _decide(sql, SCHEMA, policy=policy)
         if isinstance(verdict, Approved):
-            answers = [con.execute(verdict.target_sql).fetchall() for con in worlds]
-            assert answers[0] == answers[1], (sql, verdict.target_sql, answers)
+            answers = [sorted(con.execute(verdict.target_sql).fetchall(), key=repr) for con in worlds]
+            assert answers[0] == answers[1], (sql, verdict.target_sql, answers)  # as multisets: a UNION ALL's order is not fixed
 
 
 def test_a_unions_last_branch_binds_the_recursive_cte_itself(worlds):
