@@ -488,8 +488,10 @@ def _json_call_type(node: exp.Expression, type_of) -> str:
     """JSON (VARCHAR for a text extract), or the list of it for an extract whose path is a list
     (`json_extract(x, ['$.a'])` is JSON[] to DuckDB, and so is a column holding a list of paths;
     typed as a scalar it unified with `[region]` as a list of text would not: the review gate
-    on the twentieth and twenty-first rounds). The path's shape is read by `_path_shape`; one it
-    cannot read is refused by the walk before this type is relied on."""
+    on the twentieth and twenty-first rounds). The path's shape is read by `_path_shape` off the
+    ORIGINAL node, whose columns the resolver knows (a copy's are known to none, and read there
+    a column path has no shape); a path the reader cannot read is refused by the walk, which
+    reads the original too, before this type is relied on."""
     leaf = "VARCHAR" if _is_text_extract(node) else "JSON"
     return leaf + "[]" if _path_shape(_extract_path(node), type_of) == "list" else leaf
 
@@ -725,9 +727,14 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     # the whole value unknown and disarmed the typed-call reading); then each scalar subquery
     # outside a typed call and outside another, typed from the ORIGINAL node's projection and
     # replaced in the copy in the same traversal order.
-    for call in list(typed_nulls.find_all(*_JSON_CALL_NODES, *_TEXT_EXTRACT_NODES, exp.Anonymous)):
-        if _is_typed_call(call):
-            call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(call, type_of))))
+    # Each nested call is typed from the ORIGINAL node, as the subqueries below are: the copy's
+    # columns are known to no resolver, so a column path there read as no shape and the call
+    # fell to the scalar leaf (the review gate on the thirtieth round). Same traversal order.
+    nested = list(value.find_all(*_JSON_CALL_NODES, *_TEXT_EXTRACT_NODES, exp.Anonymous))
+    copies = list(typed_nulls.find_all(*_JSON_CALL_NODES, *_TEXT_EXTRACT_NODES, exp.Anonymous))
+    for original, call in zip(nested, copies):
+        if _is_typed_call(original):
+            call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(original, type_of))))
     originals = [sq for sq in value.find_all(exp.Subquery)
                  if id(sq) not in inside_a_json_call and _scalar_projection(sq) is not None]
     inside_another = {id(inner) for sq in originals for inner in sq.walk() if inner is not sq}

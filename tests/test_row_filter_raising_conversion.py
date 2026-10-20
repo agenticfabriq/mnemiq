@@ -1052,9 +1052,32 @@ def test_a_path_whose_shape_the_reader_cannot_tell_is_refused_naming_the_path(ro
     verdict = _decide(row_filter)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
     assert "one string literal, a list of string literals, or a text column" in verdict.message
-    # Beside a number the comparison's own refusal comes first, the walk being top-down.
+    # Beside a number the comparison's own refusal comes first, the walk being top-down: its
+    # advice is the conversion's, not the path's.
     beside_a_number = _decide(row_filter.replace("= 'x'", "= 7"))
     assert isinstance(beside_a_number, Refusal) and beside_a_number.code is RefusalCode.INVALID_ROW_FILTER
+    assert "TRY_CAST(value AS type)" in beside_a_number.message
     # A list of string literals keeps the list reading: refused beside a list of text, as before.
     assert isinstance(_decide("[json_extract(attrs, ['$.a'])] = [region]"), Refusal)
     assert isinstance(_decide("list_contains([region], json_extract_string(attrs, ['$.a']))"), Approved)
+
+
+def test_a_nested_extract_is_typed_from_the_original_node():
+    # The review gate on the thirtieth round: the nested-call loop typed the tree COPY's call,
+    # whose column path no resolver knows, so a list-typed column path read as no shape and
+    # the extract fell to the scalar leaf. Typed from the original, the list stays a list.
+    # (DuckDB binds a list-typed column path as an error, so the difference is in the type
+    # alone; pinned at the typing function.)
+    from sqlglot import exp, parse_one
+    from mnemiq.sql.rls import _pure_type
+
+    def typed(sql):
+        # Known by identity, as the resolver knows a statement's columns: a copy's are unknown.
+        value = parse_one(sql, read="duckdb")
+        known = {id(c): "VARCHAR[]" if c.name == "paths" else TYPES.get(("claim", c.name))
+                 for c in value.find_all(exp.Column)}
+        return _pure_type(value, lambda column: known.get(id(column)))
+
+    assert typed("[json_extract_string(attrs, paths)]") == "VARCHAR[][]"
+    assert typed("[json_extract_string(attrs, '$.a')]") == "VARCHAR[]"
+    assert typed("json_extract_string(attrs, paths)") == "VARCHAR[]"
