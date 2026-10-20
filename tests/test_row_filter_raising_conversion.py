@@ -565,6 +565,10 @@ def test_a_doubled_quote_in_a_member_name_is_read_and_an_unreadable_declared_typ
     "[region] = [to_json((SELECT id FROM claim LIMIT 1))]",
     "region = json_array((SELECT lower(region) FROM claim LIMIT 1))",
     "[region] = [json_array((SELECT lower(region) FROM claim LIMIT 1))]",
+    # A scalar subquery projecting a bare column (the gate on the twenty-fourth round).
+    "[region] = [(SELECT attrs FROM claim LIMIT 1)]",
+    "[region] = [(SELECT c.attrs FROM claim c LIMIT 1)]",
+    "list_contains([region], (SELECT attrs FROM claim LIMIT 1))",
 ])
 def test_a_call_returning_json_beside_text_is_read_as_json(row_filter):
     """Codex's nineteenth review of #160: `to_json(id)` was of unknown type, and unknown beside
@@ -618,15 +622,15 @@ def test_a_call_returning_text_beside_text_is_not_refused_for_being_unknown():
     assert _json_returners() == _JSON_RETURNERS_KNOWN | _JSON_MACROS  # the macros carry no catalogue type
     # Where the catalogue cannot be asked, the typed list stands in, the macros with it.
     import mnemiq.sql.rls as rls_module
-    saved = rls_module._JSON_RETURNERS
-    try:
-        rls_module._JSON_RETURNERS = None
-        original = rls_module._duckdb_rows
-        rls_module._duckdb_rows = lambda sql, params=(): (_ for _ in ()).throw(RuntimeError("no catalogue"))
+
+    def no_catalogue(sql, params=()):
+        raise RuntimeError("no catalogue")
+
+    with pytest.MonkeyPatch.context() as patched:
+        patched.setattr(rls_module, "_JSON_RETURNERS", None)
+        patched.setattr(rls_module, "_duckdb_rows", no_catalogue)
         assert _json_returners() == _JSON_RETURNERS_KNOWN | _JSON_MACROS
-    finally:
-        rls_module._duckdb_rows = original
-        rls_module._JSON_RETURNERS = saved
+    assert rls_module._JSON_RETURNERS == _JSON_RETURNERS_KNOWN | _JSON_MACROS  # the live reader again
     assert _lambda_takers() == _LAMBDA_TAKERS_KNOWN
     # Residuals the gate named (pre-existing): a lambda DuckDB takes is not read for JSON
     # unification inside its body, `list_transform([region], x -> x = to_json(id))[1]`, where

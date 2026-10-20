@@ -582,6 +582,11 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     runs; None for anything else, or where a column's type is not known."""
     while isinstance(value, exp.Paren):
         value = value.this
+    if isinstance(value, exp.Column):
+        # The value itself: its declared type, since replacing the root of the copy rebinds
+        # nothing and the probe would ask DuckDB for a column with no FROM (the review gate on
+        # the twenty-fourth round: `[region] = [(SELECT attrs FROM claim LIMIT 1)]` approved).
+        return type_of(value)
     # A call that returns JSON is a typed NULL to the probe, as a column is: nothing of it runs,
     # and what it holds (`to_json(id)` beside `[region]`) is JSON to DuckDB's unification.
     # A scalar subquery with one pure projection is that projection to the probe: `[region] =
