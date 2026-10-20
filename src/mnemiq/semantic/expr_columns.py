@@ -74,7 +74,11 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
             if _names_table(qualifier, source) or qualifier.lower() in aliases:
                 names.add(column.name.lower())
             path, _, last = column.name.rpartition(".")
-            if path and last and _names_table(".".join(p for p in (qualifier, path) if p), source):
+            dotted = ".".join(p for p in (qualifier, path) if p)
+            if path and last and (_names_table(dotted, source) or dotted.lower() in aliases):
+                # The quoted path's own qualifier may be an alias of the source as well
+                # (`\`r.secret_code\`` over `orders r`, one identifier to BigQuery's reader:
+                # Codex's second review of #172, the withheld column reported as nothing).
                 names.add(last.lower())
             if names:
                 refs.add(frozenset(names))
