@@ -179,6 +179,7 @@ _OWN_SUBQUERY = [
     ("(SELECT max(x) FROM (SELECT secret_code AS x FROM orders) q)", True),  # through a derived table
     ("(SELECT max(q.x) FROM (SELECT secret_code AS x FROM orders) q)", True),
     ("(SELECT count(*) FROM orders)", False),                            # COUNT's star reads no column
+    ("(SELECT count(*) FROM orders o JOIN orders r ON o.secret_code = r.secret_code)", True),  # keys named
 ]
 
 
@@ -207,6 +208,9 @@ def test_a_subquery_over_the_source_alone_is_checked_as_the_sources_own_read(exp
     "(SELECT max(to_json(orders)::text) FROM orders)",
     "(SELECT max(q.x) FROM (SELECT COLUMNS('s.*') AS x FROM orders) q)",
     "(SELECT max(q.c) FROM orders q(a, c))",                       # renamed by position (the gate)
+    "(SELECT count(*) FROM orders o JOIN orders r USING (secret_code))",  # a key no node names (Codex)
+    "(SELECT count(*) FROM orders o NATURAL JOIN orders r)",
+    "(SELECT max(id) FROM private.orders)",                        # another schema's table (Codex)
     "(SELECT max(q.c) FROM (SELECT id, secret_code FROM orders) q(a, c))",
     "(WITH w AS (SELECT id FROM orders) SELECT max(id) FROM w)",
     "(SELECT max(id) FROM orders, LATERAL (SELECT 1 AS one) l)",
@@ -301,3 +305,15 @@ def test_a_dimension_reading_another_table_is_withheld_from_everyone():
         kept = select_dimensions(["orders"], [dim("customer.region"), dim("id")], grants,
                                  columns=_COLUMNS)
         assert [d.expr for d in kept] == ["id"]
+
+
+def test_a_qualified_source_is_its_own_relation_exactly():
+    # Codex's review of #172: the column qualifier's suffix match is no relation test. The
+    # source's own dotted name, or a bare name equal to its last part, is the source; another
+    # schema's same-named table is not, and a qualified source read bare still is.
+    from mnemiq.semantic.expr_columns import expression_scope
+    assert expression_scope("(SELECT max(id) FROM pg.orders)", "pg.orders") == "own"
+    assert expression_scope("(SELECT max(id) FROM orders)", "pg.orders") == "own"
+    assert expression_scope("(SELECT max(id) FROM other.orders)", "pg.orders") == "foreign"
+    assert expression_scope("(SELECT max(id) FROM private.orders)", "orders") == "foreign"
+    assert expression_scope("(SELECT max(r.id) FROM pg.orders r)", "pg.orders") == "own"

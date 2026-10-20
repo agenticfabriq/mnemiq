@@ -91,11 +91,21 @@ def _table_name(table: exp.Table) -> str:
     return ".".join(p for p in (table.catalog, table.db, table.name) if p)
 
 
+def _is_source(table_name: str, source: str) -> bool:
+    """Whether a RELATION is the source table: the same dotted name, or a bare name equal to the
+    source's own last part. Not `_names_table`, whose suffix match serves column qualifiers,
+    where matching more tables demands more clearance: as a relation test it admitted
+    `private.orders` as `orders` (Codex's review of #172), another schema's table read as the
+    source and its columns checked against the source's grant."""
+    t, s = table_name.lower(), source.lower()
+    return t == s or ("." not in t and t == s.rpartition(".")[2])
+
+
 def _source_aliases(node: exp.Expression, source: str) -> set[str]:
     """The aliases the expression's own subqueries give `source` (`FROM orders r`): a column `r`
     qualifies is a column of the source."""
     return {table.alias.lower() for table in node.find_all(exp.Table)
-            if table.alias and _names_table(_table_name(table), source)}
+            if table.alias and _is_source(_table_name(table), source)}
 
 
 # A relation `columns_read` does not follow: a CTE, a LATERAL, a VALUES list, an UNNEST. A
@@ -138,8 +148,14 @@ def expression_scope(expr: str, source: str) -> str:
             return "foreign"
         for table in node.find_all(exp.Table):
             name = _table_name(table)
-            if not name or not _names_table(name, source):
+            if not name or not _is_source(name, source):
                 return "foreign"  # another table, or a table function, which has no name here
+        if any(join.args.get("using") or (join.args.get("method") or "").upper() == "NATURAL"
+               for join in node.find_all(exp.Join)):
+            # A USING key is no column node and a NATURAL join names nothing, so a self-join's
+            # keys are read by nothing: `(SELECT count(*) FROM orders o JOIN orders r
+            # USING (secret_code))` was offered to the uncleared (Codex's review of #172).
+            return "foreign"
         if any(alias.args.get("columns") for alias in node.find_all(exp.TableAlias)):
             # An alias column list renames by position (`FROM orders q(a, c)` makes `q.c` the
             # second column, whichever that is), which `columns_read` reports under the new
