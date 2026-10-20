@@ -136,20 +136,21 @@ _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest)
 # Constants an engine reads as a column where one is so named; `columns_read` reports their
 # spellings. A Boolean is `true` or `false`; the niladic functions their own name.
 _KEYWORD_COLUMNS = (exp.Boolean, exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime,
-                    exp.CurrentUser, exp.Literal)
+                    exp.CurrentUser)
 
 
-# A number sqlglot reads that MySQL reads as a column so named: digits and a dangling `e`
-# (`1e`, `1E`, `123e`, measured in the dimension tests; Codex's fourth review of #172).
-_DANGLING_EXPONENT = re.compile(r"\d+[eE]")
+# Any digit-led token of the expression's own text, which MySQL reads as a column so named
+# (`1e`, `1E`, `123e`, measured in the dimension tests; Codex's fourth review of #172):
+# sqlglot reads `1e` as a number, `1ea` as `1e AS a` and `123abc` as `123 AS abc`, a number
+# and an implicit alias, so the parse holds no node that names the column (the review gate on
+# the seventh commit). Read off the text, as the spelling fallback reads a bare expression; a
+# token naming no column decides nothing.
+_DIGIT_LED = re.compile(r"(?<![\w.])\d+[A-Za-z_]\w*")
 
 
 def _keyword_spelling(node: exp.Expression) -> str | None:
     if isinstance(node, exp.Boolean):
         return "true" if node.this else "false"
-    if isinstance(node, exp.Literal):
-        text = node.name
-        return text.lower() if node.is_number and _DANGLING_EXPONENT.fullmatch(text) else None
     if node.expressions or node.args.get("this"):
         return None  # `current_date(...)` with arguments is a call, never a column
     return node.sql().split("(")[0].strip().lower() or None
@@ -176,7 +177,8 @@ def keyword_columns(expr: str) -> set[str]:
             spelling = _keyword_spelling(keyword)
             if spelling:
                 out.add(spelling)
-        return out
+        break
+    out.update(token.lower() for token in _DIGIT_LED.findall(expr))
     return out
 
 

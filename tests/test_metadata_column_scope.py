@@ -341,6 +341,8 @@ def test_a_qualified_source_is_its_own_relation_exactly():
 def test_a_keyword_named_column_inside_a_subquery_still_requires_its_clearance():
     # Codex's third review of #172: `true` and `current_date` parse as constants, not columns,
     # and its fourth: `1e` and `123e` parse as numbers where MySQL reads a column so named;
+    # the gate: `1ea`, `123abc` and `1_e` parse as a number and an implicit alias, so the
+    # digit-led token is read off the expression's own text;
     # and inside a subquery the spelling fallback (which covers a bare expression alone) did
     # not reach them, so a phi column named `true` was offered to the uncleared. Each keyword
     # spelling is reported as a column it may be.
@@ -356,6 +358,21 @@ def test_a_keyword_named_column_inside_a_subquery_still_requires_its_clearance()
             assert spelling not in {name for ref in columns_read(expr, "orders") for name in ref}, expr  # not a ref (the gate)
             assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=columns) == [], expr
             assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=columns) == [_metric(expr)], expr
+    # A digit-led name sqlglot reads as a number and an implicit alias (`1ea` is `1e AS a`,
+    # `123abc` is `123 AS abc`: the gate) parses as a bare projection alone; the token is read
+    # off the expression's own text. Inside a call or a WHERE it parses nowhere, and an
+    # unparsed expression is withheld from everyone already.
+    for spelling in ("1ea", "123abc", "1_e"):
+        columns = [Column(id="orders.id", object_id="orders", name="id", data_type="int"),
+                   Column(id=f"orders.{spelling}", object_id="orders", name=spelling, data_type="text",
+                          pii_level="phi")]
+        expr = f"(SELECT {spelling} FROM orders)"
+        assert spelling in keyword_columns(expr), expr
+        assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=columns) == [], expr
+        assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=columns) == [_metric(expr)], expr
+        unparsed = f"(SELECT max({spelling}) FROM orders)"
+        for grants in (_UNCLEARED, _CLEARED):
+            assert select_metrics(["orders"], [_metric(unparsed)], grants, columns=columns) == [], unparsed
     # Where no column is so named the keyword is the constant it reads as, and decides nothing,
     # for the selector and for the enrichment classifier alike (the gate: a ref naming no
     # column would mark a personal dimension unresolved).
