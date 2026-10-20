@@ -6,7 +6,7 @@ from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
 from mnemiq.sql.functions import FunctionInventory, UnreadableCalls, called_names
-from mnemiq.sql.identifiers import resolve_identifier, resolve_stored, rules_for
+from mnemiq.sql.identifiers import resolve, resolve_identifier, resolve_stored, rules_for
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import GENERATED_NAME, base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -188,7 +188,11 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     # both sides stay as typed, as before: folding the stored side would let an unquoted
     # spelling meet a column created with quotes, which the engine reads as ANOTHER column (the
     # review gate's case, `"Amount"` beside `amount`), and the catalog boundary there -- table
-    # keys and row filters are as typed too -- is one decision, deferred to the register.
+    # keys and row filters are as typed too -- is one decision, deferred to the register. One
+    # exception, in the HIDDEN direction alone: a USING key is also read as the engine folds it,
+    # against the hidden names folded the same way (below), since with the complete schema the
+    # key carries no positive check and a spelling the engine folds onto a hidden name passed
+    # as typed; that refuses more, never less. The grant side stays as typed, as here.
     folds = not rules_for(dialect).quoting_preserves_case
 
     def as_engine(names) -> set[str]:
@@ -280,15 +284,36 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
         # sink t)` dropped claim), so the reached set is not narrowed by it.
         reached = {t for t in reached if t in visible}
         hidden_on = {t: as_engine(set(listed.get(t, ())) - set(visible[t])) for t in reached}
+
+        def folded(names) -> set[str]:
+            # Every hidden name as the engine would fold it typed unquoted: on Oracle a grant
+            # spells a column `secret` or `SECRET` as its author did (the catalog boundary
+            # above), and both are the one column an unquoted `USING (secret)` names. For the
+            # hidden set only: folding a stored name is fail-closed here and fail-open on the
+            # grant side (a quoted-case `"Amount"` granted would let `USING (amount)` through
+            # where the engine reads another column: the review gate).
+            return {resolve(n, quoted=False, dialect=dialect) for n in names}
+
         for key in join.args.get("using") or ():
-            name = written(key, key.name) if hasattr(key, "name") else str(key)
+            # Hidden under EITHER reading is refused: as the column check reads a column (typed,
+            # folded only where quoting does not preserve case), or as the engine resolves it,
+            # against the hidden names folded the same way. As typed alone, `USING (secret)`
+            # passed a hidden `SECRET` on Oracle with the complete schema, where `USING
+            # (SECRET)` was refused (Codex's fifth review); folded alone, a hidden `secret`
+            # spelled so was missed (the review gate). Without the complete schema the key is
+            # held to the grant as typed, as a column is.
+            spelled = key.name if hasattr(key, "name") else str(key)
+            typed = written(key, spelled)
+            as_engine_reads = resolve_identifier(key, dialect) or spelled
             for table in sorted(reached):
-                if name in hidden_on[table] or (table not in complete and name not in as_engine(visible[table])):
+                hidden = typed in hidden_on[table] or as_engine_reads in folded(hidden_on[table])
+                granted = typed in as_engine(visible[table])
+                if hidden or (table not in complete and not granted):
                     return Refusal(
                         code=RefusalCode.UNKNOWN_COLUMN,
-                        message=(f"The join key {name!r} is not a column of {table!r} you may read. "
+                        message=(f"The join key {spelled!r} is not a column of {table!r} you may read. "
                                  "Join with an explicit ON over the columns provided."),
-                        subject=name,
+                        subject=spelled,
                     )
         if (join.args.get("method") or "").upper() == "NATURAL":
             for table in sorted(reached):
