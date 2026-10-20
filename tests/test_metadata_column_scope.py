@@ -340,11 +340,12 @@ def test_a_qualified_source_is_its_own_relation_exactly():
 
 def test_a_keyword_named_column_inside_a_subquery_still_requires_its_clearance():
     # Codex's third review of #172: `true` and `current_date` parse as constants, not columns,
+    # and its fourth: `1e` and `123e` parse as numbers where MySQL reads a column so named;
     # and inside a subquery the spelling fallback (which covers a bare expression alone) did
     # not reach them, so a phi column named `true` was offered to the uncleared. Each keyword
     # spelling is reported as a column it may be.
     from mnemiq.semantic.expr_columns import columns_read, keyword_columns
-    for spelling in ("true", "current_date"):
+    for spelling in ("true", "current_date", "1e", "123e"):
         columns = [Column(id="orders.id", object_id="orders", name="id", data_type="int"),
                    Column(id=f"orders.{spelling}", object_id="orders", name=spelling, data_type="text",
                           pii_level="phi")]

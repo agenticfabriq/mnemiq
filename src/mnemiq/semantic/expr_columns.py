@@ -136,12 +136,20 @@ _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest)
 # Constants an engine reads as a column where one is so named; `columns_read` reports their
 # spellings. A Boolean is `true` or `false`; the niladic functions their own name.
 _KEYWORD_COLUMNS = (exp.Boolean, exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime,
-                    exp.CurrentUser)
+                    exp.CurrentUser, exp.Literal)
+
+
+# A number sqlglot reads that MySQL reads as a column so named: digits and a dangling `e`
+# (`1e`, `1E`, `123e`, measured in the dimension tests; Codex's fourth review of #172).
+_DANGLING_EXPONENT = re.compile(r"\d+[eE]")
 
 
 def _keyword_spelling(node: exp.Expression) -> str | None:
     if isinstance(node, exp.Boolean):
         return "true" if node.this else "false"
+    if isinstance(node, exp.Literal):
+        text = node.name
+        return text.lower() if node.is_number and _DANGLING_EXPONENT.fullmatch(text) else None
     if node.expressions or node.args.get("this"):
         return None  # `current_date(...)` with arguments is a call, never a column
     return node.sql().split("(")[0].strip().lower() or None
