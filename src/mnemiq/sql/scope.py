@@ -197,7 +197,18 @@ def _is_base_read(table: exp.Table, scope, dialect: str | None) -> bool:
     source = scope.sources.get(table.alias_or_name)
     if isinstance(source, exp.Table):
         return True
-    return source is not None and not _engine_shadows(table, source, dialect)
+    if source is None:
+        return False
+    if not _engine_shadows(table, source, dialect):
+        return True
+    # The spellings agree; WHERE the name binds may not. sqlglot binds a RECURSIVE CTE's own
+    # name across its whole body, the engine in its recursive part alone (`_cte_in_scope`,
+    # DuckDB's rule), so a reference in the anchor, in a UNION ALL branch short of the last or
+    # anywhere in an INTERSECT or EXCEPT body reads the base table. Left to sqlglot, the walk
+    # missed that read, and the column map's fallback held the name to the statement-wide
+    # aliases and known names instead of to the table's grant: the middle branch of three
+    # returned claim.secret hidden (the ui lane's replay of #170 at 3e98092).
+    return not _cte_in_scope(table, dialect)
 
 
 def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Table]:
@@ -343,11 +354,16 @@ _EVERY_SIBLING = frozenset({"sqlite"})
 
 def _in_recursive_part(table: exp.Table, cte: exp.CTE | None) -> bool:
     """Whether the reference sits in the recursive part of the CTE's body: the right side of
-    the body's top-level set operation. A body with no set operation has no recursive part."""
+    the body's top-level UNION, ALL or not. Only a UNION makes a CTE recursive; an INTERSECT or
+    EXCEPT body is a plain CTE to the engine, its own name the base table everywhere in it, and
+    of three UNION ALL branches only the LAST is the recursive part (DuckDB, measured on the ui
+    lane's replay of #170 at 3e98092: `WITH RECURSIVE claim AS (... INTERSECT SELECT id, secret
+    FROM claim)` and the middle branch of three each returned the hidden column). A body with
+    no UNION has no recursive part."""
     body = cte.this if cte is not None else None
     while isinstance(body, (exp.Subquery, exp.Paren)):
         body = body.this
-    if not isinstance(body, exp.SetOperation):
+    if not isinstance(body, exp.Union):
         return False
     node = table.parent
     while node is not None and node is not body:

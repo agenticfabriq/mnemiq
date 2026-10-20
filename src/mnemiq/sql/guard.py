@@ -839,17 +839,20 @@ def _visible_ctes(node: exp.Expression, outer: Scope, dialect: str) -> Scope:
         key = resolve_name(cte, dialect)
         # snapshot BEFORE binding this name: the body sees the outer scope and its preceding
         # siblings, plus itself only when the WITH is RECURSIVE, and then only in its RECURSIVE
-        # PART, the right side of the body's set operation: in the anchor the name is the base
-        # table (DuckDB, measured: `WITH RECURSIVE claim AS (SELECT * FROM claim UNION ALL ...)
+        # PART, the right side of the body's UNION: in the anchor the name is the base table
+        # (DuckDB, measured: `WITH RECURSIVE claim AS (SELECT * FROM claim UNION ALL ...)
         # SELECT * FROM claim` returned the base table's hidden column, the anchor's star bound
-        # to the CTE and vouched for by nothing: M201). A body with no set operation has no
-        # recursive part.
+        # to the CTE and vouched for by nothing: M201). Only a UNION makes a CTE recursive: an
+        # INTERSECT or EXCEPT body is a plain CTE, its own name the base table everywhere in it
+        # (`... INTERSECT SELECT * FROM claim` expanded the CTE and returned the hidden column:
+        # the ui lane's replay of #170 at 3e98092), and a body with no UNION has no recursive
+        # part. The rule `_in_recursive_part` in `scope` states for the name resolver.
         body_scope: Scope = dict(scope)
         entry = (cte.this, body_scope)
         body = cte.this
         while isinstance(body, (exp.Subquery, exp.Paren)):
             body = body.this
-        if recursive and isinstance(body, exp.SetOperation):
+        if recursive and isinstance(body, exp.Union):
             body_scope[_RECURSIVE_PARTS] = (*body_scope.get(_RECURSIVE_PARTS, ()), (id(body.right), key, entry))
         scope[key] = entry
     return scope

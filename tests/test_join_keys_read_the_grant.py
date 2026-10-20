@@ -189,3 +189,63 @@ def test_a_whole_row_as_an_order_by_key_over_a_derived_star_stays_refused(worlds
                 "SELECT d.id FROM (SELECT * FROM pair t ORDER BY t.* LIMIT 1) d"):
         verdict = _decide(sql, HIDDEN)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, (sql, verdict)
+
+
+# The ui lane's replay of #170 at 3e98092: the recursive rule bound a CTE's own name on the right
+# side of ANY set operation, and the name resolver bound it across the whole body as sqlglot does.
+# To DuckDB only a UNION makes a CTE recursive, and only the LAST branch is the recursive part;
+# everywhere else in the body the name is the base table (measured: each shape here is an oracle
+# on the hidden column).
+_OUTSIDE_THE_RECURSIVE_PART = [
+    ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret INTERSECT SELECT id, secret FROM claim) SELECT id FROM claim", RefusalCode.UNKNOWN_COLUMN),
+    ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret INTERSECT ALL SELECT id, secret FROM claim) SELECT id FROM claim", RefusalCode.UNKNOWN_COLUMN),
+    ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret EXCEPT SELECT id, secret FROM claim) SELECT id FROM claim", RefusalCode.UNKNOWN_COLUMN),
+    ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret EXCEPT ALL SELECT id, secret FROM claim) SELECT id FROM claim", RefusalCode.UNKNOWN_COLUMN),
+    ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret INTERSECT SELECT * FROM claim) SELECT id FROM claim", RefusalCode.SELECT_STAR),
+    ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret EXCEPT SELECT * FROM claim) SELECT id FROM claim", RefusalCode.SELECT_STAR),
+    ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret UNION ALL SELECT id, secret FROM claim UNION ALL SELECT id, secret FROM claim WHERE false) SELECT secret FROM claim", RefusalCode.UNKNOWN_COLUMN),
+    ("WITH RECURSIVE claim AS (SELECT 1 AS id UNION ALL SELECT id FROM claim WHERE secret = 'Z' UNION ALL SELECT id FROM claim WHERE false) SELECT id FROM claim", RefusalCode.UNKNOWN_COLUMN),
+    ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret UNION ALL SELECT * FROM claim UNION ALL SELECT * FROM claim WHERE false) SELECT secret FROM claim", RefusalCode.SELECT_STAR),
+    ("WITH RECURSIVE claim AS (SELECT id, secret FROM claim UNION ALL SELECT id, secret FROM claim WHERE false) SELECT secret FROM claim", RefusalCode.UNKNOWN_COLUMN),
+]
+
+
+@pytest.mark.parametrize("sql, code", _OUTSIDE_THE_RECURSIVE_PART)
+def test_a_recursive_ctes_own_name_is_the_base_table_outside_a_unions_last_branch(worlds, sql, code):
+    first, second = (con.execute(sql).fetchall() for con in worlds)
+    assert first != second, (sql, first, second)
+    for policy in (COMPLETE, AccessPolicy()):
+        verdict = _decide(sql, HIDDEN, policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is code, (sql, verdict)
+    denied = AccessPolicy(denied={("claim", "secret")}, policy_schema=SCHEMA)
+    assert isinstance(_decide(sql, SCHEMA, policy=denied), Refusal), sql
+    # Masked or row-filtered, the base read inside the body is rewritten at the source, or the
+    # statement is refused: either way the two worlds answer alike.
+    for policy in (AccessPolicy(masked={("claim", "secret")}, policy_schema=SCHEMA),
+                   AccessPolicy(row_filters={"claim": "secret = 'Q'"}, policy_schema=SCHEMA)):
+        verdict = _decide(sql, SCHEMA, policy=policy)
+        if isinstance(verdict, Approved):
+            answers = [con.execute(verdict.target_sql).fetchall() for con in worlds]
+            assert answers[0] == answers[1], (sql, verdict.target_sql, answers)
+
+
+def test_a_unions_last_branch_binds_the_recursive_cte_itself(worlds):
+    # The control: in the recursive part the name is the CTE, whose `secret` is the anchor's
+    # literal, so nothing hidden is read and the two worlds agree; a parenthesised right side
+    # is the recursive part whole.
+    for sql in ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret UNION ALL SELECT id, secret FROM claim WHERE secret = 'Q') SELECT secret FROM claim",
+                "WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret UNION SELECT id, secret FROM claim WHERE secret = 'Q') SELECT secret FROM claim",
+                "WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret UNION ALL (SELECT id, secret FROM claim WHERE secret = 'Q' UNION ALL SELECT id, secret FROM claim WHERE false)) SELECT secret FROM claim"):
+        assert [con.execute(sql).fetchall() for con in worlds] == [[("Z",)], [("Z",)]], sql
+        assert isinstance(_decide(sql, HIDDEN), Approved), sql
+
+
+def test_a_recursive_body_outside_the_unions_last_branch_in_a_write_is_refused(worlds):
+    for sql in ("WITH RECURSIVE claim AS (SELECT 1 AS id, 'Z' AS secret INTERSECT SELECT id, secret FROM claim) INSERT INTO sink (i) SELECT id FROM claim",
+                "WITH RECURSIVE claim AS (SELECT 1 AS id UNION ALL SELECT id FROM claim WHERE secret = 'Z' UNION ALL SELECT id FROM claim WHERE false) INSERT INTO sink (i) SELECT id FROM claim"):
+        for con in worlds:
+            con.execute(sql)
+        first, second = (con.execute("SELECT * FROM sink").fetchall() for con in worlds)
+        assert first != second, (sql, first, second)
+        verdict = _decide_write(sql, HIDDEN)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
