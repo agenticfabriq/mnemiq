@@ -1344,6 +1344,11 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
     for node in wrapped.args["where"].walk():
         if engine == "duckdb" and _arrow_read_as_a_lambda(node):
             return node  # `attrs -> '$.a'` where DuckDB extracts JSON and sqlglot sees a lambda
+        if engine == "duckdb" and _is_union_extract(node) and not (
+                isinstance(node.expressions[1], exp.Literal) and node.expressions[1].is_string):
+            return node.expressions[1]  # the TAG: a constant the engine resolves and the reader
+            # cannot (`'a' || ''`, `CAST('a' AS VARCHAR)`), which left the whole container
+            # unknown and a raising comparison approved (Codex's thirtieth review of #160)
         if engine == "duckdb" and _is_typed_call(node) and _extract_path(node) is not None \
                 and _path_shape(_extract_path(node), type_of) is None:
             return _extract_path(node)  # the PATH, whose shape the reader cannot tell: scalar
@@ -1497,6 +1502,11 @@ def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
         safe = ("json_extract(value, path) in place of `value -> path` here: inside a call's "
                 "arguments or beside an operator the parser reads the arrow as a lambda where "
                 "DuckDB reads a JSON extract, so the filter cannot be checked as DuckDB runs it")
+    elif engine == "duckdb" and node.parent is not None and _is_union_extract(node.parent) \
+            and node.parent.expressions[1] is node:
+        safe = ("the union member's tag as one string literal: a tag the engine resolves as a "
+                "constant and the reader cannot leaves the extract's type, and so the "
+                "conversion it meets, unread")
     elif engine == "duckdb" and node.parent is not None and _is_typed_call(node.parent) \
             and _extract_path(node.parent) is node:
         safe = ("the extract's path as one string literal, a list of string literals, or a text "

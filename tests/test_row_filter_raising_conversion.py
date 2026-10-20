@@ -1150,3 +1150,20 @@ def test_a_union_extract_at_the_top_level_is_typed_from_its_argument():
     running = "union_extract(TRY_CAST(region AS UNION(a VARCHAR)), 'a') = 'x'"
     con.execute(f"SELECT id FROM claim WHERE {running}").fetchall()
     assert isinstance(_decide(running), Approved)
+
+
+@pytest.mark.parametrize("row_filter", [
+    "[union_extract(union_value(a := region), 'a' || '')] = [[id]]",
+    "[union_extract(union_value(a := region), CAST('a' AS VARCHAR))] = [[id]]",
+])
+def test_a_union_extract_with_a_non_literal_tag_is_refused_naming_the_tag(row_filter):
+    # Codex's thirtieth review: a constant tag the engine resolves and the reader cannot left
+    # the whole container unknown, and the comparison, which casts the text to a list on the
+    # row, was approved (measured: raises quoting the hidden row's value).
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR); INSERT INTO claim VALUES (1, 'north')")
+    with pytest.raises(duckdb.ConversionException, match="north"):
+        con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    verdict = _decide(row_filter)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    assert "tag as one string literal" in verdict.message
