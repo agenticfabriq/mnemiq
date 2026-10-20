@@ -799,6 +799,12 @@ def _sources(select: exp.Select) -> dict[str, exp.Expression]:
 # depending on quoting, and getting that wrong in either direction has a cost: too wide and a CTE
 # vouches for a base table, too narrow and ordinary SQL is refused.
 Scope = dict[str, tuple[exp.Expression, "Scope"]]
+# A key no CTE can be named, an object and not a string (a quoted identifier can spell any
+# string, and a CTE so named would have overwritten a string key: the review gate): under it a
+# scope carries the recursive parts of its RECURSIVE CTEs, (id of the recursive part's node, the
+# CTE's name, its entry), which `_scope_within` binds for a SELECT sitting in that part as the
+# star resolver descends into the body.
+_RECURSIVE_PARTS: object = object()
 
 
 def _visible_ctes(node: exp.Expression, outer: Scope, dialect: str) -> Scope:
@@ -832,13 +838,45 @@ def _visible_ctes(node: exp.Expression, outer: Scope, dialect: str) -> Scope:
     for cte in with_.expressions:
         key = resolve_name(cte, dialect)
         # snapshot BEFORE binding this name: the body sees the outer scope and its preceding
-        # siblings, plus itself only when the WITH is RECURSIVE
+        # siblings, plus itself only when the WITH is RECURSIVE, and then only in its RECURSIVE
+        # PART, the right side of the body's set operation: in the anchor the name is the base
+        # table (DuckDB, measured: `WITH RECURSIVE claim AS (SELECT * FROM claim UNION ALL ...)
+        # SELECT * FROM claim` returned the base table's hidden column, the anchor's star bound
+        # to the CTE and vouched for by nothing: M201). A body with no set operation has no
+        # recursive part.
         body_scope: Scope = dict(scope)
         entry = (cte.this, body_scope)
-        if recursive:
-            body_scope[key] = entry
+        body = cte.this
+        while isinstance(body, (exp.Subquery, exp.Paren)):
+            body = body.this
+        if recursive and isinstance(body, exp.SetOperation):
+            body_scope[_RECURSIVE_PARTS] = (*body_scope.get(_RECURSIVE_PARTS, ()), (id(body.right), key, entry))
         scope[key] = entry
     return scope
+
+
+def _scope_within(select: exp.Expression, scope: Scope) -> Scope:
+    """The scope a SELECT sees: `scope`, plus a RECURSIVE CTE's own name where the SELECT sits in
+    that CTE's recursive part."""
+    parts = scope.get(_RECURSIVE_PARTS, ())
+    if not parts:
+        return scope
+    above = {id(n) for n in [select, *_ancestors(select)]}
+    bound = [(key, entry) for part, key, entry in parts if part in above]
+    if not bound:
+        return scope
+    seen: Scope = dict(scope)
+    for key, entry in bound:
+        seen[key] = entry
+    return seen
+
+
+def _ancestors(node: exp.Expression) -> list[exp.Expression]:
+    out, node = [], node.parent
+    while node is not None:
+        out.append(node)
+        node = node.parent
+    return out
 
 
 def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
@@ -874,7 +912,7 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
     if selects:
         inner, within = _visible_ctes(node, ctes, dialect), stack | {id(node)}
         answer = any(
-            _expands_a_base_table(select, projection, inner, columns, memo, within, dialect)
+            _expands_a_base_table(select, projection, _scope_within(select, inner), columns, memo, within, dialect)
             for select in selects
             for projection in select.expressions
             # A row reference joins the walk too: naming a DERIVED TABLE is bounded by that

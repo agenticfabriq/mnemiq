@@ -152,6 +152,25 @@ def test_a_qualified_reference_is_the_base_table_whatever_a_cte_is_called():
     assert isinstance(granted, Approved), granted
 
 
+def test_a_recursive_cte_named_after_the_base_table_expands_its_anchor_star_over_the_base_table(worlds):
+    # M201 (the review gate on #170's fourth commit): the star resolver bound the recursive
+    # name across the anchor too, so the star over the CTE was vouched for by nothing and the
+    # hidden column came back.
+    body = "WITH RECURSIVE claim AS (SELECT * FROM claim UNION ALL SELECT * FROM claim WHERE false) "
+    star = body + "SELECT * FROM claim"
+    assert [con.execute(star).fetchall() for con in worlds] == [[(1, "Z")], [(1, "A")]]
+    verdict = _decide(star, HIDDEN)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.SELECT_STAR, verdict
+    assert isinstance(_decide(star, SCHEMA), Refusal)  # as `SELECT * FROM claim` is
+    # A named read through the CTE is refused as well, by the positional rule (M183): the body
+    # is a set operation of stars, which bind by position.
+    for named in ("SELECT claim.id FROM claim", "SELECT claim.secret FROM claim"):
+        assert isinstance(_decide(body + named, HIDDEN), Refusal), named
+    counter = "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 3) SELECT n FROM t"
+    assert worlds[0].execute(counter).fetchall() == [(1,), (2,), (3,)]
+    assert isinstance(_decide(counter, HIDDEN), Approved)
+
+
 def test_on_oracle_a_quoted_cte_name_is_not_the_unquoted_reference():
     # Codex's fourth review: Oracle keeps `"claim"` and upper-folds `claim`, so the quoted CTE
     # does not stand in front of the base table the unquoted reference reads. Decision only.
