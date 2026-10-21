@@ -1329,14 +1329,18 @@ class OracleAdapter:
         # thread to race -- which is the concurrency bug removed rather than guarded.
         self._refuse_unless_read(sql)
 
+        started = [float("inf")]  # the bounded call's start: before it, no deadline has passed
+
+        armed = int(timeout_s * 1000) / 1000 if timeout_s is not None else None  # the driver's deadline, whole milliseconds
+
         def _fetch(cur):
             if timeout_s is not None:
                 cur.connection.call_timeout = int(timeout_s * 1000)
+            started[0] = time.monotonic()  # the call alone, not the lease's lock wait, its setup round trip or a DDL-race backoff (the gate on the second commit)
             cur.execute(sql)
             names = [d[0] for d in cur.description] if cur.description else []
             return names, cur.fetchall()
 
-        started = time.monotonic()
         try:
             names, rows = self._with_cursor(_fetch)
         except self._oracledb.DatabaseError as exc:
@@ -1345,7 +1349,7 @@ class OracleAdapter:
             # reach the caller as an opaque source error. ORA-01013 is the cancel itself, the
             # driver's at the deadline or anyone's on a connection the caller owns (`over`), so
             # it is a timeout only once the deadline has passed (Codex's first review of #176).
-            if timeout_s is not None and _is_timeout(exc, deadline_met=time.monotonic() - started >= timeout_s):
+            if timeout_s is not None and _is_timeout(exc, deadline_met=time.monotonic() - started[0] >= armed):
                 raise RuntimeError(f"query timed out after {timeout_s}s") from exc
             raise
 
@@ -1730,7 +1734,12 @@ def _is_ddl_race(exc: Exception) -> bool:
 # object (`full_code`) where the error carries one, so an application error whose message
 # quotes a timeout code (`ORA-20001: ... ORA-01013`) is not one (Codex's first review of
 # #176); an error with no code, a wrapped or a synthetic one, is read by its text, where the
-# word "timeout" alone counts too, the fallback the matcher has always had. ORA-01013 is the
+# word "timeout" alone counts too, the fallback the matcher has always had. A driver error
+# of another code whose message says "timeout" (ORA-12170, a connect timeout; ORA-12609, a
+# receive timeout) is not the query's timeout: the driver fills `full_code` from the code
+# its message leads with, so an error so led is read by its code, those being the
+# connection's and not a bounded call's end, and one whose message leads with no code goes
+# down the text branch (the gate on the second commit). ORA-01013 is the
 # cancel, which the deadline raises and anyone holding the connection may: a timeout only
 # once the deadline has passed (`deadline_met`), the cancel's own detail kept otherwise.
 _TIMEOUT_CODES = frozenset({"DPY-4011", "DPY-4024", "ORA-03156"})

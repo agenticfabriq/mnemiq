@@ -70,27 +70,48 @@ def test_the_code_is_the_errors_own_not_one_its_message_quotes():
     assert _is_timeout(oracledb.DatabaseError("a wrapped error whose text says timeout"))   # no code: text
 
 
+class _Cursor:
+    """A cursor whose execute raises, on a connection that takes a call timeout."""
+
+    def __init__(self, raising):
+        self.connection = type("Connection", (), {"call_timeout": 0})()
+        self._raising = raising
+
+    def execute(self, sql):
+        self._raising()
+
+
 def _bare_adapter(raising):
-    """`execute_arrow` alone, over a cursor that raises: no connection, no database."""
+    """`execute_arrow` alone, over a lease that waits (one tick of the clock) and a cursor
+    that raises: no connection, no database."""
     adapter = OracleAdapter.__new__(OracleAdapter)
     adapter._oracledb = oracledb
+
+    def with_cursor(work, timeout_ms=None):
+        time.monotonic()  # the lease's lock wait and setup round trip, before the call
+        return work(_Cursor(raising))
+
     adapter._refuse_unless_read = lambda sql: None
-    adapter._with_cursor = lambda work, timeout_ms=None: raising()
+    adapter._with_cursor = with_cursor
     return adapter
 
 
-@pytest.mark.parametrize("elapsed, timed_out", [(0.01, False), (5.0, True), (7.5, True)])
+@pytest.mark.parametrize("elapsed, timed_out", [(0.01, False), (4.9985, False), (4.9992, True), (5.0, True), (7.5, True)])
 def test_execute_arrow_reads_the_cancel_against_its_own_deadline(monkeypatch, elapsed, timed_out):
-    # The join: `execute_arrow` measures the call against `timeout_s` and hands the answer to
-    # the matcher, so a cancel before the deadline reaches the caller as the cancel it is.
+    # The join: `execute_arrow` measures the call against `timeout_s`, from right before the
+    # execute (the gate on the second commit: a clock started before the lease counted its
+    # lock wait, so a cancel queued behind a long wait read as the deadline), and hands the
+    # answer to the matcher, so a cancel before the deadline reaches the caller as the cancel
+    # it is.
     def raising():
         raise _driver_error("ORA-01013: user requested cancel of current operation", 1013, oracledb.OperationalError)
-    clock = iter([100.0, 100.0 + elapsed])
+    clock = iter([0.0, 100.0, 100.0 + elapsed])   # the lease's wait, the call's start, its end
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
     adapter = _bare_adapter(raising)
+    # the deadline is the driver's, armed in whole milliseconds: 4.9995 s arms 4999 ms (the gate)
     if timed_out:
-        with pytest.raises(RuntimeError, match="query timed out after 5"):
-            adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=5)
+        with pytest.raises(RuntimeError, match="query timed out after 4.9995"):
+            adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=4.9995)
     else:
         with pytest.raises(oracledb.OperationalError, match="ORA-01013"):
-            adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=5)
+            adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=4.9995)
