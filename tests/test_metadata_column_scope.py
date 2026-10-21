@@ -430,10 +430,14 @@ def test_a_column_the_parser_reads_as_a_unit_or_a_type_still_requires_its_cleara
     assert dates[0] != dates[1]  # the withheld value decides the result
     for expr in ("(SELECT max(date_trunc(secret_code, id)) FROM orders)",
                  '(SELECT max(date_trunc("secret_code", id)) FROM orders)',
-                 # DuckDB ends a name at Unicode whitespace, which MySQL's identifier class
-                 # holds (Codex's twentieth review): the token under both readings
+                 # DuckDB ends a name at eighteen characters MySQL's identifier class holds
+                 # (Codex's twentieth review), three of them outside Python's `\s` (the gate on
+                 # the twenty-ninth commit): the token under both classes
                  "(SELECT max(date_trunc(secret_code\u00a0, id)) FROM orders)",
                  "(SELECT max(date_trunc(secret_code\u2003, id)) FROM orders)",
+                 "(SELECT max(date_trunc(secret_code\u200b, id)) FROM orders)",
+                 "(SELECT max(date_trunc(secret_code\u2060, id)) FROM orders)",
+                 "(SELECT max(date_trunc(secret_code\ufeff, id)) FROM orders)",
                  "(SELECT max(extract(secret_code FROM id)) FROM orders)",
                  "(SELECT max(date_add(id, INTERVAL 1 secret_code)) FROM orders)",
                  "(SELECT max(last_day(id, secret_code)) FROM orders)",
@@ -541,6 +545,9 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
     assert select_dimensions(["orders"], [dim], _UNCLEARED, columns=columns) == []
     assert "secret code" in keyword_columns("id # `\n`secret code`")   # the `#` opener: a quote inside its comment pairs with nothing (the gate)
     assert "secret\n-- code" in keyword_columns("id --\u00a0`secret\n-- code`\n")   # a no-break space opens no MySQL comment: the name read whole (the gate)
+    # an engine not measured, reading `#` comments and ending a name as DuckDB does: the token
+    # classes pair with every comment reading (the gate on the twenty-ninth commit)
+    assert "secret_code" in keyword_columns('id # "\n secret_code\u200b"')
     assert "secret_code" in keyword_columns("U&\"secret!005fcode\" -- c\n UESCAPE /* d */ '!'")
     assert keyword_columns('U&"secret\\5f"') == {"u", "secret\\5f"}
     assert keyword_columns('U&"secret\\+00005"') == {"u", "secret\\+00005"}

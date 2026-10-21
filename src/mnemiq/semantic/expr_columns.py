@@ -203,12 +203,18 @@ _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest, exp.Pivot)
 # one: read with `--` always a comment, `` id --`secret<LF>-- code` `` split a quoted name
 # at the presumed comment (Codex's nineteenth review), so MySQL's openers are a reading too.
 # A token's characters: MySQL's identifier class (ASCII letters, digits, `_`, `$` and every
-# character from U+0080 up), and DuckDB's, which ends a name at Unicode whitespace: a no-break
-# space after `secret_code` was part of the token under MySQL's class alone, and DuckDB read
-# the column (Codex's twentieth review of #172), so the tokens are read under both classes.
+# character from U+0080 up), and DuckDB's, which ends a name at eighteen characters of that
+# range, measured over the Basic Multilingual Plane (`SELECT secret_code<c> FROM t` for each
+# code point): U+00A0, U+2000 to U+200B, U+202F, U+205F, U+2060, U+3000 and U+FEFF. Python's
+# `\s` is not that set: it misses the zero-width space, the word joiner and U+FEFF (the review
+# gate on the twenty-ninth commit) and holds four characters DuckDB keeps in a name (U+0085,
+# U+1680, U+2028, U+2029), where a split only withholds more. A no-break space after
+# `secret_code` was part of the token under MySQL's class alone, and DuckDB read the column
+# (Codex's twentieth review of #172), so the tokens are read under both classes.
+_DUCKDB_BOUNDARY = r"\s\u00a0\u2000-\u200b\u202f\u205f\u2060\u3000\ufeff"
 _IDENT_CHARS = {
     "mysql": r"[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff]",
-    "duckdb": r"(?:(?!\s)[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff])",
+    "duckdb": r"(?:(?![" + _DUCKDB_BOUNDARY + r"])[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff])",
 }
 
 
@@ -224,11 +230,12 @@ _LINE = {  # by (a carriage return ends a line comment, MySQL's openers)
 }
 _SCAN = {(cr_ends, mysql, boundary): re.compile(r"(?P<line>" + line + r")|(?P<block>/\*)" + _scan_tail(ident), re.S)
          for (cr_ends, mysql), line in _LINE.items() for boundary, ident in _IDENT_CHARS.items()}
-# The readings joined, each (nested block comments, a carriage return ends a line comment,
-# MySQL's openers, the token's characters): DuckDB's and Postgres's, SQLite's, MySQL's, and
-# mixed readings for an engine not measured.
-_READINGS = ((True, True, False, "duckdb"), (True, True, False, "mysql"), (False, False, False, "mysql"),
-             (False, False, True, "mysql"), (True, False, False, "mysql"), (False, True, False, "mysql"))
+# The comment readings joined, each (nested block comments, a carriage return ends a line
+# comment, MySQL's openers): DuckDB's and Postgres's, SQLite's, MySQL's, and two mixed, for an
+# engine not measured; each under both token classes, since an engine not measured may end a
+# name as DuckDB does under another comment reading (the gate on the twenty-ninth commit).
+_COMMENT_READINGS = ((True, True, False), (False, False, False), (False, False, True), (True, False, False), (False, True, False))
+_READINGS = tuple((nested, cr_ends, mysql, boundary) for nested, cr_ends, mysql in _COMMENT_READINGS for boundary in _IDENT_CHARS)
 _QUOTE = {"double": '"', "back": "`", "single": "'"}
 # Whitespace or a comment may stand between the closing quote and UESCAPE, and between it and
 # its character: Postgres reads the clause in the grammar, past comments (the review gate on
