@@ -24,17 +24,26 @@ SHAPES = {
     "having": "SELECT v AS x, count(*) AS n FROM claim GROUP BY v HAVING x > 10",
     "order": "SELECT id AS x FROM claim ORDER BY x",
     "select": "SELECT id AS x, x + 1 AS y FROM claim",
-    "qualify": "SELECT id AS x FROM claim QUALIFY row_number() OVER (ORDER BY x) = 1",
+    "qualify": "SELECT id AS x, row_number() OVER () AS r FROM claim QUALIFY x = 1",
     "join": "SELECT c.id AS x FROM claim c JOIN claim d ON x = d.id",
     "window": "SELECT id AS x, row_number() OVER (ORDER BY x) AS r FROM claim",
+    "order in an expression": "SELECT id AS x FROM claim ORDER BY x + 0",
+    "group in an expression": "SELECT v AS x, count(*) AS n FROM claim GROUP BY x + 0",
+    "having in an expression": "SELECT v AS x, count(*) AS n FROM claim GROUP BY v HAVING x + 0 > 10",
+    "qualify in an expression": "SELECT id AS x, row_number() OVER () AS r FROM claim QUALIFY x + 0 = 1",
 }
-# Where each engine reads the alias: DuckDB and SQLite measured in this file, Oracle's ORDER BY
-# measured in the register, Postgres and MySQL as documented.
+# Where each engine reads the alias: DuckDB and SQLite measured in this file, Oracle's bare
+# ORDER BY item measured in the register, Postgres and MySQL as documented, an output name
+# inside an expression read as an input column on Postgres (`ORDER BY xmin + 0` would read the
+# system column) and unmeasured on MySQL and Oracle, so not admitted; a predicate (WHERE,
+# HAVING, QUALIFY, ON) always holds the name inside an expression and is read as the clause.
 READS = {
-    "duckdb": {"where", "group", "having", "order", "select", "qualify", "window"},
-    "sqlite": {"where", "group", "having", "order", "join"},
+    "duckdb": {"where", "group", "having", "order", "select", "qualify", "window",
+               "order in an expression", "having in an expression", "qualify in an expression"},
+    "sqlite": {"where", "group", "having", "order", "join", "order in an expression", "group in an expression",
+               "having in an expression"},
     "postgres": {"group", "order"},
-    "mysql": {"group", "having", "order"},
+    "mysql": {"group", "having", "order", "having in an expression"},
     "oracle": {"order"},
 }
 
@@ -63,8 +72,8 @@ def test_duckdb_and_sqlite_read_the_alias_as_the_table_says(clause):
     lite.execute("CREATE TABLE claim (id INT, v INT)")
     lite.executemany("INSERT INTO claim VALUES (?, ?)", [(1, 10), (2, 20)])
     for engine, con in (("duckdb", duck), ("sqlite", lite)):
-        if engine == "sqlite" and clause == "qualify":
-            continue
+        if engine == "sqlite" and clause.startswith("qualify"):
+            continue  # SQLite has no QUALIFY
         try:
             con.execute(SHAPES[clause]).fetchall()
             ran = True
@@ -84,9 +93,17 @@ def test_oracles_leak_shapes_are_refused():
     assert isinstance(_decide("SELECT id AS mq_leak FROM claim ORDER BY mq_leak", "oracle"), Approved)
 
 
-def test_an_engine_not_listed_reads_the_alias_in_order_by_alone():
+def test_an_engine_not_listed_reads_the_alias_as_a_bare_order_by_item_alone():
     assert isinstance(_decide("SELECT id AS x FROM claim ORDER BY x", "snowflake"), Approved)
     assert isinstance(_decide("SELECT id AS x FROM claim WHERE x = 1", "snowflake"), Refusal)
+    assert isinstance(_decide("SELECT id AS x FROM claim ORDER BY x + 0", "snowflake"), Refusal)
+
+
+def test_postgres_reads_an_output_name_inside_an_expression_as_an_input_column():
+    # Documented, and the M164 class: `ORDER BY xmin + 0` would read the system column there.
+    verdict = _decide("SELECT id AS xmin FROM claim ORDER BY xmin + 0", "postgres")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    assert isinstance(_decide("SELECT id AS xmin FROM claim ORDER BY xmin", "postgres"), Approved)
 
 
 def test_a_set_operations_order_by_still_names_the_first_branchs_output():

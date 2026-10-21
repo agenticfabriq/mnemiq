@@ -143,17 +143,23 @@ def _unknown_column(name: str) -> Refusal:
     )
 
 
-# The clauses of its own SELECT in which each engine reads a select alias, measured on DuckDB
-# and SQLite (M164's fix: DuckDB reads one in a later projection, in WHERE, GROUP BY, HAVING,
-# QUALIFY, ORDER BY and inside a window's ORDER BY or PARTITION BY, not in a JOIN's ON; SQLite
-# in WHERE, GROUP BY, HAVING, ORDER BY and an ON, not in a projection or a window), on Oracle
-# 23 for ORDER BY (the register's measurement; GROUP BY and HAVING there not measured, so not
-# admitted), and as documented for Postgres and MySQL. An engine not listed reads an alias in
-# ORDER BY alone, which every engine does: fail-closed, since an alias admitted where the
-# engine reads a column, a pseudo-column or a function instead is M164's leak, and an alias
-# refused where the engine would read it costs a retry. Where a column and an alias share
-# the name the engine reads the column (measured on both), which is checked by its name.
-_ALIAS_CLAUSES: dict[str | None, frozenset[str]] = {
+# The clauses of its own SELECT in which each engine reads a select alias, as a bare item
+# (`ORDER BY x`, `GROUP BY x`) and inside an expression (`ORDER BY x + 0`, `WHERE x = 1`),
+# measured on DuckDB and SQLite (M164's fix: DuckDB reads one in a later projection, in WHERE,
+# GROUP BY, HAVING, QUALIFY, ORDER BY and inside a window's ORDER BY or PARTITION BY, not in
+# a JOIN's ON, and inside an expression everywhere but GROUP BY, where it fails to bind; SQLite
+# in WHERE, GROUP BY, HAVING, ORDER BY and an ON, bare and inside an expression alike, not in
+# a projection or a window), on Oracle 23 for a bare ORDER BY item (the register's measurement;
+# GROUP BY and HAVING there not measured, so not admitted), and as documented for Postgres
+# (GROUP BY and ORDER BY, where an output name is read as a bare item alone and inside an
+# expression as an input column: `ORDER BY xmin + 0` reads the system column, the review gate)
+# and MySQL (GROUP BY, HAVING and ORDER BY; inside an expression not measured, so not
+# admitted). An engine not listed reads a bare alias in ORDER BY alone, which every engine
+# does: fail-closed, since an alias admitted where the engine reads a column, a pseudo-column
+# or a function instead is M164's leak, and an alias refused where the engine would read it
+# costs a retry. Where a column and an alias share the name the engine reads the column
+# (measured on both), which is checked by its name.
+_ALIAS_BARE: dict[str | None, frozenset[str]] = {
     "duckdb": frozenset({"select", "where", "group", "having", "order", "qualify", "window"}),
     "sqlite": frozenset({"where", "group", "having", "order", "join"}),
     "postgres": frozenset({"group", "order"}),
@@ -162,24 +168,34 @@ _ALIAS_CLAUSES: dict[str | None, frozenset[str]] = {
     "oracle": frozenset({"order"}),
     None: frozenset({"order"}),
 }
+_ALIAS_IN_EXPRESSION: dict[str | None, frozenset[str]] = {
+    "duckdb": frozenset({"select", "where", "having", "order", "qualify", "window"}),
+    "sqlite": frozenset({"where", "group", "having", "order", "join"}),
+    None: frozenset(),
+}
 
 
-def _clause_of(column: exp.Column) -> str:
-    """The clause of its own SELECT a column sits in: `where`, `group`, `having`, `order`,
-    `qualify`, `join` (an ON), `window` (an OVER's own ORDER BY or PARTITION BY, which binds to
-    source columns), or `select`, the projection list; `set` for a set operation's ORDER BY."""
-    clause, node = None, column.parent
+def _clause_of(column: exp.Column) -> tuple[str, bool]:
+    """The clause of its own SELECT a column sits in, and whether it is the whole item there:
+    `where`, `group`, `having`, `order`, `qualify`, `join` (an ON), `window` (an OVER's own
+    ORDER BY or PARTITION BY, whatever clause holds it), or `select`, the projection list; a
+    set operation's ORDER BY is `order`, sqlglot holding it under the operation."""
+    clause, node, bare = None, column.parent, True
     while node is not None and not isinstance(node, (exp.Select, exp.SetOperation)):
         if isinstance(node, (exp.Window, exp.WindowSpec)):
-            return "window"  # an OVER's own ORDER BY or PARTITION BY, whatever clause holds it
-        for kind, name in ((exp.Where, "where"), (exp.Group, "group"), (exp.Having, "having"),
-                           (exp.Order, "order"), (exp.Qualify, "qualify"), (exp.Join, "join")):
-            if clause is None and isinstance(node, kind):
-                clause = name
+            return "window", bare
+        kind = next((name for cls, name in ((exp.Where, "where"), (exp.Group, "group"), (exp.Having, "having"),
+                                            (exp.Order, "order"), (exp.Qualify, "qualify"), (exp.Join, "join"))
+                     if isinstance(node, cls)), None)
+        if kind is not None:
+            if clause is None:
+                clause = kind
+        elif not isinstance(node, (exp.Ordered, exp.Alias)):
+            bare = False  # the column sits inside an expression of the clause
         node = node.parent
-    if clause is not None:
-        return clause
-    return "set" if isinstance(node, exp.SetOperation) else "select"
+    if clause in ("where", "having", "qualify", "join"):
+        bare = True  # a predicate: an output name there is always inside an expression
+    return clause or "select", bare
 
 
 def check_access(ast: exp.Expression, visible: dict[str, set[str]],
@@ -367,8 +383,9 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
 
     # A SELECT alias is a name the query invents for an expression, and GROUP BY / ORDER BY /
     # HAVING may refer to it: `SELECT year(d) AS y, count(*) FROM t GROUP BY y` is ordinary,
-    # correct SQL -- and without this the engine could not answer "count X by year" at all.
-    # It is safe: an alias can only be defined from columns that were themselves checked. The
+    # correct SQL -- and without this the engine could not answer "count X by year" at all,
+    # on the engines that read an alias there (`_ALIAS_BARE`, `_ALIAS_IN_EXPRESSION`: on Oracle
+    # a bare name in WHERE is a column, a pseudo-column or a function, M164). The
     # aliases of the reference's OWN SELECT, since no engine resolves a name to another scope's
     # alias (the ui lane's replay of #167: statement-wide, `SELECT (SELECT max(secret) FROM
     # claim) AS secret FROM wide` let the inner hidden `secret` through on the outer alias). In
@@ -386,7 +403,9 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     def aliases_of(column: exp.Column) -> set[str]:
         if resolved is None:
             return statement_aliases
-        if _clause_of(column) not in _ALIAS_CLAUSES.get((dialect or "").lower(), _ALIAS_CLAUSES[None]):
+        clause, bare = _clause_of(column)
+        reads = _ALIAS_BARE if bare else _ALIAS_IN_EXPRESSION
+        if clause not in reads.get((dialect or "").lower(), reads[None]):
             # The engine reads no select alias in this clause, so the name is a column, a
             # pseudo-column or a no-argument function to it: on Oracle, `SELECT id AS mq_leak
             # FROM claim WHERE mq_leak = 1` ran a function of that name and returned every row
