@@ -72,14 +72,19 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
             qualifier = ".".join(p for p in (column.catalog, column.db, column.table) if p)
             names = set()
             if _names_table(qualifier, source) or qualifier.lower() in aliases:
-                names.add(column.name.lower())
-            path, _, last = column.name.rpartition(".")
-            dotted = ".".join(p for p in (qualifier, path) if p)
-            if path and last and (_names_table(dotted, source) or dotted.lower() in aliases):
-                # The quoted path's own qualifier may be an alias of the source as well
-                # (`\`r.secret_code\`` over `orders r`, one identifier to BigQuery's reader:
-                # Codex's second review of #172, the withheld column reported as nothing).
-                names.add(last.lower())
+                names.add(column.name.lower())  # the whole name as read, dotted or not
+            # A dotted name, qualified by the parser or read whole by a dialect, is walked prefix
+            # by prefix as well, both readings kept: the part right
+            # after a prefix that names the source, or an alias the expression gives it, is the
+            # column, whatever follows it (`\`r.secret_code.value\`` over `orders r` is a
+            # nested field path to BigQuery's reader, and split on its last dot it named
+            # nothing: Codex's sixth review of #172; `\`r.secret_code\`` the same on its
+            # second). Every prefix is tried, since the whole reading above may be a name too.
+            parts = [p for p in (qualifier.split(".") if qualifier else []) + column.name.split(".") if p]
+            for k in range(1, len(parts)):
+                head = ".".join(parts[:k])
+                if _names_table(head, source) or (k == 1 and head.lower() in aliases):
+                    names.add(parts[k].lower())
             if names:
                 refs.add(frozenset(names))
     if refs:

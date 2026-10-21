@@ -179,6 +179,8 @@ _OWN_SUBQUERY = [
     ("(SELECT max(x) FROM (SELECT secret_code AS x FROM orders) q)", True),  # through a derived table
     ("(SELECT max(q.x) FROM (SELECT secret_code AS x FROM orders) q)", True),
     ("(SELECT max(`r.secret_code`) FROM orders r)", True),              # one quoted identifier to one reader (Codex)
+    ("(SELECT max(`r.secret_code.value`) FROM orders r)", True),        # a nested field path (Codex's sixth)
+    ("(SELECT max(`orders.secret_code.value`) FROM orders)", True),
     ("(SELECT count(*) FROM orders)", False),                            # COUNT's star reads no column
     ("(SELECT count(*) FROM orders o JOIN orders r ON o.secret_code = r.secret_code)", True),  # keys named
 ]
