@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 import json
 import logging
 import re
@@ -1014,20 +1013,29 @@ def _text_becomes_json(kind, unified) -> bool:
 _CONTAINER_KINDS = frozenset({"array", "struct", "map"})
 
 
-@lru_cache(maxsize=256)
+_PULLS_TEXT: dict[str, bool] = {}  # the leaf types asked and found not to pull text
+
+
 def _pulls_text(castable: str) -> bool:
-    """Whether DuckDB converts text to this leaf type where the two meet inside a container,
-    rather than serialising the typed value: `[TRY_CAST(region AS BIT)] = [region]` cast
-    'north' to BIT and raised, UUID and VARINT the same, where INTEGER, BOOLEAN, DATE, BLOB
-    and the rest are serialised and the comparison runs (measured, DuckDB 1.5.4; Codex's
-    thirty-eighth review of #160, through a lambda). Asked of DuckDB with no data: a text that
-    converts to nothing beside a NULL of the type, inside a list, binds only where the text is
-    kept as text. Not shown safe where it cannot be asked."""
-    try:
-        _duckdb(f"SELECT [chr(1)] = [NULL::{castable}]")
-    except Exception:  # noqa: BLE001 -- the text may be converted: not shown safe
-        return True
-    return False
+    """Whether a text beside this leaf type inside a container can fail to convert on the
+    row: `[TRY_CAST(region AS BIT)] = [region]` cast 'north' to BIT and raised, UUID and
+    VARINT the same, where INTEGER, BOOLEAN, DATE and the rest are serialised and the
+    comparison runs (measured, DuckDB 1.5.4; Codex's thirty-eighth review of #160, through a
+    lambda). Asked of DuckDB with no data: a text no type accepts but one that accepts every
+    text (a text or a blob type, beside which no row can fail), beside a NULL of the type
+    inside a list, binds only where the text is kept as text or accepted whole (the gate on
+    the forty-fifth round: the probe tells "serialised" from "converted whole" by nothing,
+    and need not). Not shown safe where it cannot be asked; only the answer "no" is kept,
+    so a failure of the reader does not stick for the process (the same gate)."""
+    if castable not in _PULLS_TEXT:
+        try:
+            _duckdb(f"SELECT [chr(1)] = [NULL::{castable}]")
+        except Exception:  # noqa: BLE001 -- the text may be converted: not shown safe
+            return True
+        if len(_PULLS_TEXT) >= 256:
+            _PULLS_TEXT.clear()  # the keys are cast targets written in filters: bounded
+        _PULLS_TEXT[castable] = False
+    return _PULLS_TEXT[castable]
 
 
 def _text_pulled(x, y) -> bool:
@@ -1076,8 +1084,7 @@ def _text_meets_a_typed_container(a, b) -> bool:
             # Fields paired by name where both sides name every field, as DuckDB pairs them
             # (`{'a': region, 'b': 1} = {'b': 1, 'a': [id]}` raised on the row where pairing
             # by position read `region` against `1`: the review gate on the thirty-second
-            # round), by position otherwise; a name on the left that the right lacks is read
-            # as the cast. A UNION type's members the same: `[TRY_CAST([id] AS UNION(a
+            # round), by position otherwise; a struct field the other side lacks reads NULL (`_named_pairs`). A UNION type's members the same: `[TRY_CAST([id] AS UNION(a
             # INTEGER[]))] = [TRY_CAST(region AS UNION(a VARCHAR))]` cast the text member to a
             # list on the row (Codex's twenty-eighth review), unread while the walk stopped at
             # the union. Names folded as DuckDB folds them (`{'A': region} = {'a': region}`
@@ -1106,62 +1113,195 @@ _LITERAL_NODES = (exp.Literal, exp.Null, exp.Boolean, exp.Neg, exp.Paren, exp.Tu
                   exp.Struct, exp.PropertyEQ, exp.Identifier, exp.ToMap)
 
 
-def _syntax_parts(value: exp.Expression):
-    """The parts a value's own container syntax holds, through any depth: a list literal's or
-    constructor's items, a builder's arguments (a lambda's body for a transform, the list for
-    a slice), a map's keys and values, a map entry's parts, a row's parts, a struct's fields.
-    A part that is no such syntax is yielded itself."""
+class _JsonMeetsText(Exception):
+    """A JSON part and a text or untyped part unified by the value's own syntax."""
+
+
+def _shape_from_type(node):
+    """A parsed type in the shape form `_shape_of` builds: a leaf is `json`, `text` or `other`."""
+    kind = node[0]
+    if kind == "leaf":
+        name = _bare(node[1])
+        return ("leaf", "json" if name == "JSON" else "text" if name in _TEXT_NAMES else "other")
+    if kind == "array":
+        return ("array", _shape_from_type(node[1]))
+    if kind == "map":
+        return ("map", _shape_from_type(node[1]), _shape_from_type(node[2]))
+    return ("struct", [(name, _shape_from_type(field)) for name, field in node[1]])
+
+
+def _unify(a, b):
+    """The shape DuckDB gives two shapes it unifies: a list's items, a builder's list and
+    element, a map's keys with the keys and its values with the values, a struct's fields
+    paired by folded name where both sides name every field and by position otherwise (as
+    `_named_pairs` pairs them; a named field one side lacks kept as it is). JSON wins a
+    leaf and text is kept over the rest, so a JSON leaf meeting a text one, at any depth,
+    is a text parsed as JSON on the row (`_JsonMeetsText`); a part the reader cannot read
+    meets nothing safely; shapes of different kinds are left as the first, a bind fault on
+    no row's value."""
+    if a[0] == "leaf" and b[0] == "leaf":
+        if {a[1], b[1]} == {"json", "text"} or "unreadable" in (a[1], b[1]):
+            raise _JsonMeetsText
+        return ("leaf", "json" if "json" in (a[1], b[1]) else "text" if "text" in (a[1], b[1]) else "other")
+    if a[0] != b[0]:
+        return a
+    if a[0] == "array":
+        return ("array", _unify(a[1], b[1]))
+    if a[0] == "map":
+        return ("map", _unify(a[1], b[1]), _unify(a[2], b[2]))
+    if all(n is not None for n, _ in a[1]) and all(n is not None for n, _ in b[1]):
+        fields = list(a[1])
+        for name, g in b[1]:
+            i = next((k for k, (n, _) in enumerate(fields) if n.lower() == name.lower()), None)
+            if i is None:
+                fields.append((name, g))
+            else:
+                fields[i] = (fields[i][0], _unify(fields[i][1], g))
+        return ("struct", fields)
+    # By position where a side leaves a field unnamed (`row(...)`): the review gate on the
+    # forty-sixth round, where a row's JSON part met nothing and `list_append([row(
+    # lower(region))], row(attrs))` was approved, raising Malformed JSON on the row.
+    paired = [(n, _unify(f, g)) for (n, f), (_, g) in zip(a[1], b[1])]
+    longer = a[1] if len(a[1]) >= len(b[1]) else b[1]
+    return ("struct", paired + list(longer[len(paired):]))
+
+
+def _unify_all(shapes):
+    out = None
+    for shape in shapes:
+        out = shape if out is None else _unify(out, shape)
+    return out if out is not None else ("leaf", "other")
+
+
+def _element_of(shape):
+    return shape[1] if shape[0] == "array" else shape
+
+
+def _shape_of(value: exp.Expression, type_of):
+    """The shape of a value the reader cannot type, its own container syntax walked and
+    unified as DuckDB unifies it (`_unify`): a list literal's or constructor's items, a
+    builder's list and element (an appended value one element, a concatenated list's
+    elements, a transform's lambda body, a slice's list), a map's keys and its values, a
+    struct's or a row's fields each its own. A part that is no such syntax is its declared
+    type's shape where the reader has one, and a `text` leaf otherwise, a text it may be. A
+    struct's fields and a row's parts never unify with each other, nor a map's keys with its
+    values: `{'a': lower(region), 'b': attrs}` and `MAP {lower(region): attrs}` run (the
+    review gate on the forty-fifth round, which read every part of a value as one group),
+    where `[{'a': lower(region)}, {'a': attrs}]` and `MAP {lower(region): 1, attrs: 2}` raise
+    Malformed JSON on the row (measured)."""
     while isinstance(value, exp.Paren):
         value = value.this
     if _is_list_builder(value):
         args = _builder_arguments(value)
         if _is_slice(value):
-            inner = args[:1]
-        elif _is_transform(value):
-            inner = [arg.this for arg in args if isinstance(arg, exp.Lambda)]
-        else:
-            inner = args
-    elif isinstance(value, exp.Array) or _is_list_call(value) or _is_row(value):
-        inner = list(value.expressions)
-    elif isinstance(value, exp.ToMap) and isinstance(value.this, exp.Struct):
-        inner = [part for item in value.this.expressions if isinstance(item, exp.PropertyEQ)
-                 for part in (item.this, item.expression)]
-    elif isinstance(value, exp.Map):
-        inner = [value.args.get("keys"), value.args.get("values")]
-    elif isinstance(value, exp.MapFromEntries):
-        inner = [value.this]
-    elif isinstance(value, exp.Struct):
-        inner = [item.expression if isinstance(item, exp.PropertyEQ) else item for item in value.expressions]
-    else:
-        yield value
-        return
-    for part in inner:
-        if part is not None:
-            yield from _syntax_parts(part)
+            return _shape_of(args[0], type_of) if args else ("leaf", "other")
+        if _is_transform(value):
+            return ("array", _unify_all(_shape_of(arg.this, type_of) for arg in args if isinstance(arg, exp.Lambda)))
+        if _is_append_or_prepend(value) and len(args) >= 2:
+            if isinstance(value, exp.Anonymous):
+                lst, element = (args[0], args[1]) if _is_append(value) else (args[1], args[0])
+            else:
+                lst, element = value.this, value.args.get("expression")
+            return ("array", _unify(_element_of(_shape_of(lst, type_of)), _shape_of(element, type_of)))
+        return ("array", _unify_all(_element_of(_shape_of(arg, type_of)) for arg in args))
+    if isinstance(value, exp.Array) or _is_list_call(value):
+        return ("array", _unify_all(_shape_of(item, type_of) for item in value.expressions))
+    if isinstance(value, exp.ToMap) and isinstance(value.this, exp.Struct):
+        entries = [item for item in value.this.expressions if isinstance(item, exp.PropertyEQ)]
+        return ("map", _unify_all(_shape_of(item.this, type_of) for item in entries),
+                _unify_all(_shape_of(item.expression, type_of) for item in entries))
+    if isinstance(value, exp.Map):
+        keys, values = value.args.get("keys"), value.args.get("values")
+        return ("map", _element_of(_shape_of(keys, type_of)) if keys is not None else ("leaf", "other"),
+                _element_of(_shape_of(values, type_of)) if values is not None else ("leaf", "other"))
+    if isinstance(value, exp.MapFromEntries) and isinstance(value.this, exp.Array):
+        parts = []
+        for entry in value.this.expressions:
+            if isinstance(entry, exp.Struct):
+                parts.append([item.expression if isinstance(item, exp.PropertyEQ) else item for item in entry.expressions])
+            else:
+                parts.append(list(entry.expressions) if _is_row(entry) else [])
+        return ("map", _unify_all(_shape_of(p[0], type_of) for p in parts if len(p) == 2),
+                _unify_all(_shape_of(p[1], type_of) for p in parts if len(p) == 2))
+    if _is_row(value):
+        return ("struct", [(None, _shape_of(part, type_of)) for part in value.expressions])
+    if isinstance(value, exp.Struct):
+        return ("struct", [(item.this.name if isinstance(item, exp.PropertyEQ) and isinstance(item.this, exp.Identifier) else None,
+                            _shape_of(item.expression if isinstance(item, exp.PropertyEQ) else item, type_of))
+                           for item in value.expressions])
+    kind = _duckdb_type(value, type_of, json_as_text=False)
+    if kind is None or kind is _TEXT:
+        return ("leaf", "text")
+    if kind is _UNREADABLE:
+        return ("leaf", "unreadable")  # not shown safe, wherever it sits
+    try:
+        return _shape_from_type(_parse_type(kind))
+    except ValueError:
+        return ("leaf", "unreadable")
+
+
+def _unknown_meets_json(unknown, values, type_of) -> bool:
+    """Whether a value of unknown type beside a typed one holding JSON puts text, or a part
+    the reader cannot type, where the JSON is, or JSON where the typed one holds text
+    (`_text_meets_json` over `_shape_of`), the text parsed as JSON on the row. The typed
+    sides are read with JSON kept apart from text, since `_duckdb_type` folds a bare JSON
+    column into text and `lower(region) = attrs` was approved and raised Malformed JSON on
+    the row (measured while taking the gate's advisories on the forty-fifth round). Refused
+    whole before, wherever a typed side held JSON (the same gate): `{'a': lower(region),
+    'b': attrs} = {'a': 'x', 'b': attrs}` runs, the fields never meeting, where `{'a':
+    lower(region)} = {'a': attrs}` raises. A typed side the reader cannot parse is not
+    shown safe."""
+    typed = []
+    for value in _unwrapped(values):
+        kind = _duckdb_type(value, type_of, json_as_text=False)
+        if kind is None or kind is _TEXT:
+            continue
+        if kind is _UNREADABLE:
+            return True
+        try:
+            node = _parse_type(kind)
+        except ValueError:
+            return True
+        if _holds_json(node):
+            typed.append(node)
+    return any(_text_meets_json(_shape_of(u, type_of), node) for u in unknown for node in typed)
+
+
+def _text_meets_json(shape, kind) -> bool:
+    """Whether an unknown value's shape (`_shape_of`) puts text, or a part the reader cannot
+    type, where the typed side holds JSON, or JSON where it holds text, walked side by side
+    as DuckDB unifies the two (a struct's fields by name, a field one side lacks reading
+    NULL): the text is parsed as JSON on the row, at the top (`lower(region) = attrs`) as
+    inside a container. Shapes that do not line up are not shown safe."""
+    if shape[0] == "leaf" and shape[1] == "unreadable":
+        return True  # a part the reader cannot read: not shown safe (the gate on the forty-sixth round)
+    if shape[0] == "leaf" and kind[0] == "leaf":
+        name = _bare(kind[1])
+        return (shape[1] == "text" and name == "JSON") or (shape[1] == "json" and name in _TEXT_NAMES)
+    if shape[0] != kind[0]:
+        return True
+    if shape[0] == "array":
+        return _text_meets_json(shape[1], kind[1])
+    if shape[0] == "map":
+        return _text_meets_json(shape[1], kind[1]) or _text_meets_json(shape[2], kind[2])
+    return any(_text_meets_json(f, g) for f, g in _named_pairs(shape[1], kind[1]))
 
 
 def _json_part_beside_text(value: exp.Expression, type_of) -> bool:
-    """Whether a value the reader cannot type holds, in its own container syntax, a part whose
-    type holds JSON beside a part that is text or that the reader cannot type: the builder
-    or constructor unifies its parts' types as a comparison's sides are unified, the text is
+    """Whether a value the reader cannot type unifies, in its own container syntax, a part
+    whose type holds JSON with a part that is text or that the reader cannot type: the
+    builder or constructor unifies them as a comparison's sides are unified, the text is
     parsed as JSON on the row, and the value raises by itself, whatever it is compared to.
     `list_append([lower(region)], attrs) = ['north', '{}']` raised Malformed JSON and was
     approved, the literal side's exemption dropping the walk's finding (Codex's
     thirty-eighth review of #160), and so was the same beside another unknown. Beside a
-    number the JSON value is serialised: `list_append([id], attrs) = [1, 2]` runs."""
-    json_part = textish = False
-    for part in _syntax_parts(value):
-        kind = _duckdb_type(part, type_of, json_as_text=False)
-        if kind is None or kind is _TEXT:
-            textish = True
-        elif kind is _UNREADABLE:
-            json_part = True  # not shown safe
-        else:
-            try:
-                json_part = json_part or _holds_json(_parse_type(kind))
-            except ValueError:
-                json_part = True
-    return json_part and textish
+    number the JSON value is serialised: `list_append([id], attrs) = [1, 2]` runs. Which
+    parts unify is DuckDB's (`_shape_of`)."""
+    try:
+        _shape_of(value, type_of)
+    except _JsonMeetsText:
+        return True
+    return False
 
 
 def _shape_differs(x, y) -> bool:
@@ -1196,19 +1336,20 @@ def _typed_part_meets(part: str, kind) -> bool:
     (`_shape_differs`). `TRY_CAST([region] AS VARCHAR[])` appended to `[[lower(region)]]`
     beside `[[region], [region]]` is a list against a list and runs, and was refused as an
     untyped part meeting a list (Codex's thirty-seventh review of #160). A part whose type
-    holds JSON is refused: the unknown's own type holds JSON then, and an untyped sibling's
-    text is parsed as JSON on the row (`list_append([lower(region)], attrs) = [region,
-    region]` raised Malformed JSON on the row and was approved; measured while fixing the
-    review's finding). The part's type is asked with JSON kept apart from text, which
-    `_duckdb_type` folds together for the comparisons it answers for. A type the reader
-    cannot read is not shown safe."""
+    holds JSON where its slot holds text is refused, the slot's text parsed as JSON on the
+    row (`list_append([id], attrs) = [region, region]`); beside a JSON slot it is JSON
+    against JSON and runs (`MAP {lower(region): attrs} = MAP {'x': attrs}`: the gate on the
+    forty-fifth round, where any JSON part was refused). A JSON part beside the unknown's
+    own text is `_json_part_beside_text`'s. The part's type is asked with JSON kept apart
+    from text, which `_duckdb_type` folds together for the comparisons it answers for. A
+    type the reader cannot read is not shown safe."""
     if part is _UNREADABLE:
         return True
     try:
         parsed = _parse_type(part)
     except ValueError:
         return True
-    return _holds_json(parsed) or _shape_differs(parsed, kind)
+    return (_holds_json(parsed) and _text_becomes_json(kind, parsed)) or _shape_differs(parsed, kind)
 
 
 def _unknown_meets_a_container(value: exp.Expression, kind, type_of) -> bool:
@@ -1306,7 +1447,9 @@ def _unknown_meets_a_container(value: exp.Expression, kind, type_of) -> bool:
                   item.expression if isinstance(item, exp.PropertyEQ) else item) for item in value.expressions]
         if all(name is not None for name, _ in items) and all(n is not None for n, _ in kind[1]):
             by_name = {n.lower(): field for n, field in kind[1]}
-            return any(name not in by_name or _unknown_meets_a_container(part, by_name[name], type_of) for name, part in items)
+            # A field the other side lacks reads NULL, no cast (`_named_pairs`; the gate on the
+            # forty-fifth round: `[{'a': lower(region)}, {'b': attrs}]` runs).
+            return any(name in by_name and _unknown_meets_a_container(part, by_name[name], type_of) for name, part in items)
         return any(_unknown_meets_a_container(part, field, type_of) for (_, part), (_, field) in zip(items, kind[1]))
     part = _duckdb_type(value, type_of, json_as_text=False)
     if part is None or part is _TEXT:
@@ -1451,6 +1594,8 @@ def _json_inside_a_container(values, type_of) -> bool:
     unknown = [value for value, kind in zip(_unwrapped(values), kinds) if kind is None]
     if any(_json_part_beside_text(u, type_of) for u in unknown):
         return True  # the value raises by itself, whatever it is compared to
+    if unknown and _unknown_meets_json(unknown, values, type_of):
+        return True
     if unknown and any(any(_unknown_meets_a_container(u, parsed, type_of) and (not _pure_literal(value) or _bare_value(u))
                            for u in unknown) for value, parsed in typed):
         return True
@@ -1461,8 +1606,6 @@ def _json_inside_a_container(values, type_of) -> bool:
                 return True
     if not any(_holds_json(node) for node in known):
         return False
-    if any(kind is None for kind in kinds):
-        return True  # a value of unknown type beside JSON: may hold text, parsed on its rows
     if any(_holds_union(node) for node in known) and any(node != known[0] for node in known):
         # Two UNION types unify by the operator and the operand order, not by their members
         # (measured, DuckDB 1.5.4: COALESCE and a list keep the first operand's type, CASE and

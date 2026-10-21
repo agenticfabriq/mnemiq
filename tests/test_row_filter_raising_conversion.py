@@ -1216,6 +1216,14 @@ def test_a_typed_part_meeting_a_container_or_holding_json_is_refused(row_filter)
 
 
 _PART_RULES_RUN = [
+    "{'a': lower(region), 'b': attrs} = {'a': 'x', 'b': attrs}",   # a struct's fields never unify with each other (the gate on round 45)
+    "row(lower(region), attrs) = row('x', attrs)",
+    "(lower(region), attrs) = ('x', attrs)",
+    "MAP {lower(region): attrs} = MAP {'x': attrs}",              # nor a map's keys with its values
+    "map_from_entries([(lower(region), attrs)]) = map_from_entries([('x', attrs)])",
+    "list_append([{'a': lower(region), 'b': attrs}], {'a': 'x', 'b': attrs}) = [{'a': 'x', 'b': attrs}]",
+    "list_concat([{'a': lower(region)}], [{'b': attrs}]) = [{'a': 'x', 'b': attrs}]",   # a field the other lacks reads NULL
+    "[{'a': lower(region)}, {'b': attrs}] = [{'a': 'x', 'b': attrs}]",
     "list_append([id], attrs) = [1, 2]",                      # a JSON part beside a number is serialised
     "[TRY_CAST(region AS INTEGER)] = [region]",              # the typed side serialised beside text
     "[TRY_CAST(region AS BOOLEAN)] = [region]",
@@ -1227,6 +1235,21 @@ _PART_RULES_RUN = [
     "list_transform([lower(region)], x -> TRY_CAST({'a': region} AS STRUCT(a VARCHAR))) = [{'b': [id]}]",
 ]
 _PART_RULES_RAISE = [
+    "[{'a': lower(region)}, {'a': attrs}] = [{'a': 'x'}]",    # a list unifies its items field-wise (the gate on round 45)
+    "list_append([{'a': lower(region)}], {'a': attrs}) = [{'a': 'x'}]",
+    "[[lower(region)], [attrs]] = [['x']]",
+    "array_value({'a': lower(region)}, {'a': attrs}) = [{'a': 'x'}]",   # the call-form constructor unifies its items too
+    "list_append([{'b': 1}, {'a': lower(region)}], {'a': attrs}) = [{'a': attrs}]",   # the items' unified shape, not the first's, meets the element
+    "[attrs, 1, lower(region)] = [attrs, '1', 'x']",          # JSON wins the leaf, the text parsed
+    "lower(region) = attrs",                                  # an unknown beside JSON: text where JSON is, at the top
+    "[lower(region)] = [attrs]",
+    "{'a': lower(region)} = {'a': attrs}",                    # and by field name
+    "list_append([id], attrs) = [region, region]",            # a JSON part where the slot holds text
+    "MAP {1: lower(region), 2: attrs} = MAP {1: 'x', 2: attrs}",   # a map's values with the values
+    "MAP {lower(region): 1, attrs: 2} = MAP {'x': 1, attrs: 2}",   # and its keys with the keys
+    "[row(lower(region), 1), row(attrs, 2)] = [row('x', 1)]",
+    "list_append([row(lower(region))], row(attrs)) = [row(lower(region))]",   # a row's parts by position (the gate on round 46)
+    "list_concat([row(lower(region))], [row(attrs)]) = [row(lower(region))]",
     "list_append([lower(region)], attrs) = ['north', '{}']",  # a JSON part beside text raises by itself (Codex's 38th)
     "list_append([region], attrs) = ['x']",
     "list_append([lower(region)], attrs) = list_append([region], attrs)",
