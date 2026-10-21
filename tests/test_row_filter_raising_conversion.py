@@ -1201,6 +1201,8 @@ _TYPED_PART_RUNS = [
     "list_filter([id], x -> x = 1) = [id]",
     "list_filter(tags, x -> x = 'north') = tags",
     "list_reduce(tags, (acc, x) -> acc || x, 'z') = 'znorth'",    # the accumulator typed from the initial value (the gate)
+    "list_reduce(tags, (acc, x) -> acc || x, region) = 'northnorth'",   # a text initial, the accumulator text (round 48)
+    "list_reduce(tags, (acc, x) -> CASE WHEN acc = 'z' THEN acc ELSE acc END, lower(region)) IS NOT NULL",   # an untyped text initial, by its shape
     # the literal rule's operators: LIKE reads JSON as text and runs, and a literal JSON parses
     "attrs LIKE 'a'",
     "attrs = '\"a\"'",
@@ -1252,6 +1254,9 @@ _TYPED_PART_RAISES = [
     # the accumulator typed from the initial value, and a parameter over a JSON-holding list the
     # reader cannot type (the gate's round on the fourth draft)
     "list_reduce(tags, (acc, x) -> CASE WHEN acc = 'z' THEN acc ELSE acc END, attrs) = attrs",
+    "list_reduce(tags, (acc, x) -> CASE WHEN acc = id THEN acc ELSE acc END, region) IS NOT NULL",   # a text initial beside a number (round 48)
+    "list_reduce(tags, (acc, x) -> CASE WHEN acc = 1 THEN acc ELSE acc END, region) IS NOT NULL",
+    "list_reduce(tags, (acc, x) -> CASE WHEN acc = 'z' THEN acc ELSE acc END, TRY_CAST(lower(region) AS JSON)) IS NOT NULL",   # an untyped JSON initial, by its shape
     "list_filter([TRY_CAST(lower(region) AS JSON)], x -> x = 'zz') IS NOT NULL",
     "list_filter([TRY_CAST(lower(region) AS JSON)], x -> x = region) IS NOT NULL",
     # the literal rule's operators, each a conversion of the literal to JSON

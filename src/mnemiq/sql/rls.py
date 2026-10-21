@@ -1822,7 +1822,9 @@ def _lambda_parameter_type(node: exp.Expression, type_of) -> str | None:
                 # type (the gate: read as the element's, `acc = 'z'` over a JSON initial was
                 # text against text and approved, Malformed JSON on the row).
                 kind = _duckdb_type(args[2], type_of, json_as_text=False)
-                return None if kind is None or kind is _TEXT else kind
+                if kind is _TEXT:
+                    return "VARCHAR"  # a text initial: `acc = id` converts the text on the row (the gate on the forty-seventh commit)
+                return kind
             kind = _duckdb_type(walked, type_of, json_as_text=False)
             if kind is None or kind is _TEXT:
                 # A list the reader cannot type is read by its shape, which carries the JSON
