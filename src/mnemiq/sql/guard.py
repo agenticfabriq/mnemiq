@@ -244,21 +244,22 @@ _NILADIC = (exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime, exp.Localtim
             exp.Localtimestamp, exp.SessionUser, exp.CurrentCatalog, exp.CurrentUser)
 
 
-# The call spelling each dialect keeps as a call, for the repair, in the dialect the model
-# writes in (the statement it retries with is parsed as `dialect` and transpiled to the
-# target, so a target's spelling could be a column to the parser: the review gate). DuckDB
-# prints `current_date()` bare again, so a function with no bare form is named; Oracle reads
-# every bare name as the function and has no `now()`; Postgres and SQLite reject
-# `current_date()` outright (the gate), so each gets its own. An engine not listed is told to
-# write a call with no example (the ui lane's read of the repair loop: the message is what
-# the model retries with).
+# The call spelling each dialect parses as a call and NOT as one of the niladic nodes, for
+# the repair, in the dialect the model writes in (the statement it retries with is parsed as
+# `dialect` and transpiled to the target, so a target's spelling could be a column to the
+# parser: the review gate). Measured on sqlglot's parse: `today()` on DuckDB, `now()` on
+# Postgres, `curdate()` on MySQL and `SYSDATE` on Oracle each parse to a refused node, so a
+# retry with them meets the same refusal (the gate, which caught `curdate()`); the spellings
+# here parse to a plain call. Postgres and SQLite reject `current_date()` outright, so an
+# engine not listed is told to write a call with no example (the ui lane's read of the repair
+# loop: the message is what the model retries with).
 _FUNCTION_CALL_ADVICE = {
     "duckdb": "now() or get_current_timestamp()",
-    "postgres": "now() or clock_timestamp()",
-    "postgresql": "now() or clock_timestamp()",
-    "mysql": "now() or curdate()",
-    "sqlite": "datetime('now') or date('now')",
-    "oracle": "SYSDATE or SYSTIMESTAMP",
+    "postgres": "clock_timestamp()",
+    "postgresql": "clock_timestamp()",
+    "mysql": "now() or sysdate()",
+    "sqlite": "datetime('now')",
+    "oracle": "SYSTIMESTAMP",
 }
 
 
@@ -278,8 +279,9 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None) -> R
     CURRENT_DATE or CURRENT_TIMESTAMP, in the register), fail-closed; where no known table has
     one the name is the function to every engine measured. With no schema beyond the grant a
     withheld column is unknown here, a residual the register records. The repair names the
-    column with its table, and a call this engine keeps as a call, in the engine's own
-    spelling (`_FUNCTION_CALL_ADVICE`)."""
+    column with its table, and a call the dialect the query is written in parses as a call
+    and not as a niladic node (`_FUNCTION_CALL_ADVICE`), since the retry is parsed as that
+    dialect."""
     calls = _FUNCTION_CALL_ADVICE.get((dialect or "").lower())
     advice = f"such as {calls}" if calls else "with its own name and parentheses"
     for node in ast.find_all(*_NILADIC):
@@ -289,10 +291,10 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None) -> R
         if owners:
             return Refusal(
                 code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
-                message=(f"{name!r} names a column of {owners[0]!r} and a SQL function, and this "
+                message=(f"{name!r} names a column of {owners[0]!r} and a SQL function, and the "
                          f"engine reads the column where that table is in the FROM. Write "
-                         f"{owners[0]}.{name} for the column, or for the function a call this engine "
-                         f"keeps as a call, {advice}."),
+                         f"{owners[0]}.{name} for the column, or for the function a call written "
+                         f"as one in this query's dialect, {advice}."),
                 subject=name,
             )
     return None

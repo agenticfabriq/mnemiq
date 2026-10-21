@@ -126,18 +126,25 @@ def test_the_broad_form_refuses_the_name_over_another_table_too():
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
 
 
-@pytest.mark.parametrize("dialect, call", [("duckdb", "now()"), ("postgres", "clock_timestamp()"),
-                                           ("mysql", "curdate()"), ("sqlite", "datetime('now')"), ("oracle", "SYSDATE")])
-def test_the_repair_names_a_call_the_dialect_keeps_in_its_own_spelling(dialect, call):
+@pytest.mark.parametrize("dialect, calls", [("duckdb", ("now()", "get_current_timestamp()")),
+                                            ("postgres", ("clock_timestamp()",)), ("mysql", ("now()", "sysdate()")),
+                                            ("sqlite", ("datetime('now')",)), ("oracle", ("SYSTIMESTAMP",))])
+def test_the_repair_names_a_call_the_dialect_parses_as_one(dialect, calls):
     # The message is what the model retries with (the repair loop), so each dialect's advice
-    # must parse there as a call: DuckDB has no SYSDATE, Oracle no now(), and Postgres and
-    # SQLite reject `current_date()` outright (the gate).
+    # must parse there as a call and not as a refused node: `today()` on DuckDB, `now()` on
+    # Postgres, `curdate()` on MySQL and `SYSDATE` on Oracle parse to the niladic nodes and a
+    # retry with them meets the same refusal (the gate); DuckDB has no SYSTIMESTAMP, Oracle no
+    # now(), Postgres and SQLite reject `current_date()`.
+    from mnemiq.sql.guard import _NILADIC
     verdict = decide("SELECT current_date FROM kw", HIDDEN, dialect=dialect, target=dialect, policy=WITH_SCHEMA)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
-    assert call in verdict.message and "kw.current_date" in verdict.message, verdict.message
-    parsed = sqlglot.parse_one(f"SELECT {call} FROM kw", read=dialect)
-    assert not isinstance(parsed.selects[0], exp.Column), (dialect, call)  # a call, not a column
-    assert not parsed.selects[0].find(exp.Column), (dialect, call)
+    assert "kw.current_date" in verdict.message and all(call in verdict.message for call in calls), verdict.message
+    for call in calls:
+        parsed = sqlglot.parse_one(f"SELECT {call} FROM kw", read=dialect).selects[0]
+        assert not isinstance(parsed, _NILADIC) and parsed.find(*_NILADIC) is None, (dialect, call)
+        assert not isinstance(parsed, exp.Column) and parsed.find(exp.Column) is None, (dialect, call)
+        retry = decide(f"SELECT {call} FROM kw", HIDDEN, dialect=dialect, target=dialect, policy=WITH_SCHEMA)
+        assert not (isinstance(retry, Refusal) and retry.code is RefusalCode.AMBIGUOUS_NILADIC_NAME), (dialect, call, retry)
 
 
 def test_the_advice_is_in_the_dialect_the_model_writes_not_the_targets():
