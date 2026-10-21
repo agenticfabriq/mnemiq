@@ -1714,9 +1714,19 @@ def _is_ddl_race(exc: Exception) -> bool:
     return "ora-01466" in str(exc).lower()
 
 
+# The spellings a bounded call's end takes, by the driver's own error list (python-oracledb
+# 4.0.2, the locked version): DPY-4024, the thin-mode call timeout ("call timeout of 300 ms
+# exceeded", measured on Oracle Free 23); ORA-01013, the cancel a call timeout surfaces as in
+# thick mode and under a server-side cancel, which reached the runner as a plain source fault
+# while it was unmatched (M187, the ui lane); ORA-03156, the server's own statement timeout;
+# and DPY-4011, a closed connection, read as a timeout until the runner reads the adapter's
+# own outage classification after its timeout branch (M188).
+_TIMEOUT_SPELLINGS = ("dpy-4011", "ora-01013", "ora-03156", "timeout")
+
+
 def _is_timeout(exc: Exception) -> bool:
     text = str(exc).lower()
-    return "dpy-4011" in text or "ora-03156" in text or "timeout" in text
+    return any(spelling in text for spelling in _TIMEOUT_SPELLINGS)
 
 
 # The driver's own codes that say the connection, the pool, the connect handshake or the wire
