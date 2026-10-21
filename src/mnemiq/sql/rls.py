@@ -1072,7 +1072,10 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
     (Codex's thirty-first review of #160)."""
     while isinstance(value, exp.Paren):
         value = value.this
-    if isinstance(value, exp.Array) and kind[0] == "array":
+    if (isinstance(value, exp.Array) or _is_list_call(value)) and kind[0] == "array":
+        # `[a, b]`, and the call forms `array_value(a, b)`, `list_value(...)`, `list_pack(...)`
+        # (Codex's thirty-fourth review of #160: `array_value(lower(region)) = [region]` runs
+        # and was refused as a bare unknown).
         return any(_unknown_meets_a_container(item, kind[1]) for item in value.expressions)
     if isinstance(value, exp.ToMap) and isinstance(value.this, exp.Struct) and kind[0] == "map":
         # `MAP {k: v}`: each key against the key type, each value against the value type
@@ -1115,6 +1118,10 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
     return kind[0] in _CONTAINER_KINDS
 
 
+def _is_list_call(value: exp.Expression) -> bool:
+    return isinstance(value, exp.Anonymous) and value.name.lower() in _LIST_CONSTRUCTORS
+
+
 def _is_row(value: exp.Expression) -> bool:
     return isinstance(value, exp.Tuple) or (isinstance(value, exp.Anonymous) and value.name.lower() == "row")
 
@@ -1123,7 +1130,8 @@ def _bare_value(value: exp.Expression) -> bool:
     """A value with no list, struct, map or row syntax at its top: what the engine casts whole."""
     while isinstance(value, exp.Paren):
         value = value.this
-    return not (isinstance(value, (exp.Array, exp.Struct, exp.ToMap, exp.Map, exp.MapFromEntries)) or _is_row(value))
+    return not (isinstance(value, (exp.Array, exp.Struct, exp.ToMap, exp.Map, exp.MapFromEntries))
+                or _is_row(value) or _is_list_call(value))
 
 
 def _pure_literal(value: exp.Expression) -> bool:

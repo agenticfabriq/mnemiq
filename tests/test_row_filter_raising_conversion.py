@@ -1182,6 +1182,7 @@ def test_a_union_extract_with_a_non_literal_tag_is_refused_naming_the_tag(row_fi
     "MAP {1: lower(region)} = MAP {1: [id]}",   # a map's value and a row's field walked too (Codex's 32nd)
     "MAP {lower(region): 1} = MAP {[id]: 1}",
     "row(lower(region)) = row([id])",
+    "list_pack(lower(region)) = [[id]]",              # the call-form list constructors walked (Codex's 34th)
     "MAP([1], [lower(region)]) = MAP([1], [[id]])",   # the call-form constructors walked too (Codex's 33rd)
     "MAP([lower(region)], [1]) = MAP([[id]], [1])",
     "map_from_entries([(1, lower(region))]) = map_from_entries([(1, [id])])",
@@ -1204,6 +1205,7 @@ def test_an_unknown_value_beside_a_typed_container_is_refused(row_filter):
     for running in ("[region] = [lower(region)]", "[lower(region)] = ['x']", "lower(region) = 'x'",
                     "MAP {1: lower(region)} = MAP {1: region}", "row(lower(region)) = row(region)",
                     "(lower(region), 1) = (region, 1)",
+                    "array_value(lower(region)) = [region]", "list_pack(lower(region)) = [region]",
                     "MAP([1], [lower(region)]) = MAP([1], [region])",
                     "map_from_entries([(1, lower(region))]) = map_from_entries([(1, region)])",
                     "map_from_entries([{'key': lower(region), 'value': 1}]) = map_from_entries([{'key': region, 'value': 1}])"):
