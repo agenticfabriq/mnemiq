@@ -92,13 +92,20 @@ def test_an_aggregates_own_order_by_and_a_limit_read_no_alias():
     duck = duckdb.connect()
     duck.execute("CREATE TABLE claim (id INT, v INT, secret INT); INSERT INTO claim VALUES (1, 10, 2), (2, 20, 1)")
     assert duck.execute("SELECT 0 AS secret, list(id ORDER BY secret) FROM claim").fetchall() == [(0, [2, 1])]
-    for sql in ("SELECT 1 AS x FROM claim LIMIT x", "SELECT 1 AS x FROM claim LIMIT 1 OFFSET x", "SELECT 0 AS x, list(id ORDER BY x) FROM claim"):
-        with pytest.raises(duckdb.Error):
-            duck.execute(sql.replace(", secret", "")).fetchall()
+    # WITHIN GROUP (ORDER BY ...) orders by the source column the same, and is no Func node
+    # to sqlglot (the gate on the second commit)
+    assert duck.execute("SELECT 0 AS secret, percentile_disc(0.5) WITHIN GROUP (ORDER BY secret) FROM claim").fetchall() == [(0, 1)]
+    for sql in ("SELECT 1 AS x FROM claim LIMIT x", "SELECT 1 AS x FROM claim LIMIT 1 OFFSET x", "SELECT 0 AS x, list(id ORDER BY x) FROM claim",
+                "SELECT 0 AS x, percentile_disc(0.5) WITHIN GROUP (ORDER BY x) FROM claim"):
+        with pytest.raises(duckdb.Error):   # no source column of the name: the alias binds nowhere here
+            duck.execute(sql).fetchall()
     full = AccessPolicy(policy_schema={"claim": {"id", "v", "secret"}})
-    for policy in (None, full):
-        verdict = _decide("SELECT 0 AS secret, list(id ORDER BY secret) FROM claim", "duckdb", policy=policy)
-        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (policy, verdict)
+    for sql in ("SELECT 0 AS secret, list(id ORDER BY secret) FROM claim",
+                "SELECT 0 AS secret, percentile_disc(0.5) WITHIN GROUP (ORDER BY secret) AS p FROM claim",
+                "SELECT 0 AS secret, mode() WITHIN GROUP (ORDER BY secret) AS p FROM claim"):
+        for policy in (None, full):
+            verdict = _decide(sql, "duckdb", policy=policy)
+            assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, policy, verdict)
     # the guard itself refuses an alias in LIMIT or OFFSET (the shape check refuses an
     # unreadable LIMIT before it through `decide`)
     import sqlglot

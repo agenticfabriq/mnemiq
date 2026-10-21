@@ -193,8 +193,8 @@ def _clause_of(column: exp.Column) -> tuple[str, bool]:
     while node is not None and not isinstance(node, (exp.Select, exp.SetOperation)):
         if isinstance(node, (exp.Window, exp.WindowSpec)):
             return "window", bare
-        if isinstance(node, exp.Order) and isinstance(node.parent, exp.Func):
-            return "aggregate", False
+        if isinstance(node, exp.Order) and isinstance(node.parent, (exp.Func, exp.WithinGroup)):
+            return "aggregate", False  # WITHIN GROUP (ORDER BY ...) is no Func to sqlglot (the gate on the second commit)
         if isinstance(node, (exp.Limit, exp.Offset)):
             return "limit", False
         kind = next((name for cls, name in ((exp.Where, "where"), (exp.Group, "group"), (exp.Having, "having"),
