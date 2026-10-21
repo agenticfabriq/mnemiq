@@ -1087,6 +1087,17 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
             return not (args and _is_list_shaped(args[0])) or _unknown_meets_a_container(args[0], kind)
         if _is_transform(value):
             return any(_unknown_meets_a_container(arg.this, kind[1]) for arg in args if isinstance(arg, exp.Lambda))
+        if _is_append_or_prepend(value) and len(args) >= 2:
+            # By position, not by shape: an appended or prepended list is ONE element of the
+            # result (`list_append([[region]], [lower(region)])`, Codex's thirty-sixth review of
+            # #160, refused where it runs). sqlglot's node holds the list in `this` and the
+            # element in `expression` for both, prepend's written order turned around; the
+            # anonymous spellings keep the written order, `list_prepend(element, list)`.
+            if isinstance(value, exp.Anonymous):
+                lst, element = (args[0], args[1]) if _is_append(value) else (args[1], args[0])
+            else:
+                lst, element = value.this, value.args.get("expression")
+            return _unknown_meets_a_container(lst, kind) or (element is not None and _unknown_meets_a_container(element, kind[1]))
         for arg in args:
             if _is_list_shaped(arg):
                 if _unknown_meets_a_container(arg, kind):
@@ -1158,6 +1169,16 @@ def _is_slice(value: exp.Expression) -> bool:
 def _is_transform(value: exp.Expression) -> bool:
     return isinstance(value, exp.Transform) or (
         isinstance(value, exp.Anonymous) and value.name.lower() in ("list_transform", "array_transform", "apply", "list_apply", "array_apply"))
+
+
+def _is_append(value: exp.Expression) -> bool:
+    return isinstance(value, exp.ArrayAppend) or (
+        isinstance(value, exp.Anonymous) and value.name.lower() in ("list_append", "array_append"))
+
+
+def _is_append_or_prepend(value: exp.Expression) -> bool:
+    return _is_append(value) or isinstance(value, exp.ArrayPrepend) or (
+        isinstance(value, exp.Anonymous) and value.name.lower() in ("list_prepend", "array_prepend"))
 
 
 def _is_list_builder(value: exp.Expression) -> bool:

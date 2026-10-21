@@ -1184,6 +1184,8 @@ def test_a_union_extract_with_a_non_literal_tag_is_refused_naming_the_tag(row_fi
     "row(lower(region)) = row([id])",
     "list_pack(lower(region)) = [[id]]",              # the call-form list constructors walked (Codex's 34th)
     "list_append([region], lower(region)) = [[id], [id]]",   # the list-building calls walked (Codex's 35th)
+    "list_append([[region]], [lower(region)]) = [[[id]]]",   # an appended list is one element (Codex's 36th)
+    "list_prepend([lower(region)], [[region]]) = [[[id]]]",
     "list_transform([region], x -> lower(x)) = [[id]]",
     "list_transform([[id]], x -> lower(region)) = [[id]]",   # the lambda's body alone meets the list
     "list_concat([region], [lower(region)]) = [[id]]",
@@ -1214,6 +1216,9 @@ def test_an_unknown_value_beside_a_typed_container_is_refused(row_filter):
                     "list_concat([region], [lower(region)]) = [region, region]", "array_slice([lower(region)], 1, 1) = [region]",
                     "list_slice([lower(region)], 1, 1) = [region]", "list_transform([region], x -> lower(x)) = [region]",
                     "list_slice(list_slice([lower(region)], 1, 1), 1, 1) = [region]",
+                    "list_append([[region]], [lower(region)]) = [[region], [region]]",
+                    "list_prepend([lower(region)], [[region]]) = [[region], [region]]",
+                    "array_prepend([lower(region)], [[region]]) = [[region], [region]]",
                     "list_transform([[id]], x -> lower(region)) = [region]",   # the input list says nothing of the output
                     "MAP([1], [lower(region)]) = MAP([1], [region])",
                     "map_from_entries([(1, lower(region))]) = map_from_entries([(1, region)])",
