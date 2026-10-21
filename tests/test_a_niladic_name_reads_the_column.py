@@ -179,6 +179,20 @@ def test_the_advice_is_a_call_the_decider_approves_whatever_names_the_table_hold
     assert isinstance(retry, Approved), (dialect, taken, advised.group(1), retry)
 
 
+def test_a_niladic_node_is_named_by_its_class_not_its_printing(worlds):
+    # The gate on the seventh commit: Oracle's `SYSDATE` parses to the CURRENT_TIMESTAMP node
+    # with a time zone, printed `current_timestamp at time zone 'utc'`, a name no column
+    # matched, and written as Oracle for a DuckDB target the bare CURRENT_TIMESTAMP printed
+    # bound to the column there.
+    schema = {"kw": {"id", "current_timestamp"}}
+    verdict = decide("SELECT SYSDATE FROM kw", {"kw": {"id"}}, dialect="oracle", target="duckdb", policy=AccessPolicy(policy_schema=schema))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+    from mnemiq.sql.guard import _NILADIC, _niladic_name
+    for spelling, dialect in (("SYSDATE", "oracle"), ("current_timestamp", "duckdb"), ("now()", "postgres"), ("curdate()", "mysql"), ("today()", "duckdb")):
+        node = sqlglot.parse_one(f"SELECT {spelling}", read=dialect).selects[0]
+        assert isinstance(node, _NILADIC) and _niladic_name(node) in {"current_timestamp", "current_date"}, (spelling, _niladic_name(node))
+
+
 def test_an_unmodelled_spelling_is_never_advised(monkeypatch):
     # The guard itself, since no spelling in the tables is unmodelled any more: were one
     # listed first, as `clock_timestamp()` was, the advice passes over it.

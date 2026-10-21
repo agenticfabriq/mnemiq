@@ -246,8 +246,19 @@ _INTERSECT_BINDS_TIGHTER = frozenset({"duckdb", "postgres", "postgresql", "mysql
 # SQL on DuckDB; the bare spelling there reads the column, the review gate). The other
 # names print bare, which is the leak; one that came to print with parentheses would leave
 # this tuple on the same measurement, not on reasoning.
-_NILADIC = (exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime, exp.Localtime,
-            exp.Localtimestamp, exp.SessionUser, exp.CurrentCatalog)
+# Each niladic node and the bare name the engine binds to a column: by the node's class, not
+# its printed SQL, since Oracle's `SYSDATE` parses to the CURRENT_TIMESTAMP node with a time
+# zone and printed `current_timestamp at time zone 'utc'`, a name no column matches, so
+# `SELECT SYSDATE FROM kw` written as Oracle and run on DuckDB printed a bare
+# `CURRENT_TIMESTAMP` that DuckDB bound to the column (the review gate on the seventh
+# commit, pre-existing).
+_NILADIC_NAMES: dict[type, str] = {
+    exp.CurrentDate: "current_date", exp.CurrentTimestamp: "current_timestamp",
+    exp.CurrentTime: "current_time", exp.Localtime: "localtime",
+    exp.Localtimestamp: "localtimestamp", exp.SessionUser: "session_user",
+    exp.CurrentCatalog: "current_catalog",
+}
+_NILADIC = tuple(_NILADIC_NAMES)
 
 
 # The call spellings the repair may name, per dialect the model writes in (the statement it
@@ -262,7 +273,9 @@ _NILADIC = (exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime, exp.Localtim
 # first review of #175); `today()` on DuckDB, `curdate()` on MySQL and `SYSDATE` on Oracle
 # parse to niladic nodes too (the gate), `get_current_timestamp()` is unmodelled, and
 # `current_date()` reads the column on DuckDB (the ui lane's replay). A table holding every
-# candidate's name leaves the repair with no example. An engine not listed the same.
+# candidate's name leaves the repair with no example. An engine not listed the same. Only
+# Postgres ever falls through to a second spelling: the first elsewhere is a plain call the
+# guard models or a typed node that is no niladic one, and always wins (the gate).
 _CALL_ADVICE: dict[str, tuple[str, ...]] = {
     "duckdb": ("now()", "localtimestamp"),
     "postgres": ("now()", "localtimestamp"),
@@ -274,7 +287,7 @@ _CALL_ADVICE: dict[str, tuple[str, ...]] = {
 
 
 def _niladic_name(node: exp.Expression) -> str:
-    return node.sql(dialect="duckdb").split("(")[0].strip().lower()
+    return next(name for cls, name in _NILADIC_NAMES.items() if isinstance(node, cls))
 
 
 def _call_advice(dialect: str | None, taken: frozenset[str]) -> str | None:
@@ -316,8 +329,9 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
     corpus schema having such a column). Where no table read has one the name is the
     function to every engine measured. With no schema beyond the grant a withheld column is
     unknown here, a residual the register records. The repair names the column with its
-    table, and a call the dialect the query is written in parses as a call that is not the
-    refused name's node (`_call_advice`), since the retry is parsed as that dialect. The
+    table, and a call the dialect the query is written in parses as a call the function
+    guard models and that is no niladic node whose name a table read has as a column
+    (`_call_advice`), since the retry is parsed as that dialect. The
     tables read are found as the engine that runs the query binds them (`target`), as the
     decider finds them: whether a CTE stands in front of a base table folds names by the
     engine's rule (the review gate on the fifth commit)."""
