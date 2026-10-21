@@ -384,3 +384,19 @@ def test_a_keyword_named_column_inside_a_subquery_still_requires_its_clearance()
     plain = "(SELECT count(*) FROM orders WHERE true)"
     assert select_metrics(["orders"], [_metric(plain)], _UNCLEARED, columns=_COLUMNS) == [_metric(plain)]
     assert columns_read("CASE WHEN secret_code IS NOT NULL THEN true ELSE false END", "orders") == {frozenset({"secret_code"})}
+
+
+def test_a_struct_column_named_like_the_source_keeps_its_root_reading():
+    # Codex's eighth review of #172: with a phi struct column named `orders` on `orders`, the
+    # parser reads `orders.value` as a qualifier and a column, and the root reading was kept
+    # for unqualified paths alone, so the struct reached the uncleared.
+    columns = [Column(id="orders.id", object_id="orders", name="id", data_type="int"),
+               Column(id="orders.orders", object_id="orders", name="orders", data_type="struct",
+                      pii_level="phi")]
+    for expr in ("(SELECT max(orders.value) FROM orders r)", "(SELECT max(orders.value) FROM orders)",
+                 "(SELECT max(r.orders.value) FROM orders r)"):
+        assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=columns) == [], expr
+        assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=columns) == [_metric(expr)], expr
+    # Without such a column the root names nothing and decides nothing: offered to everyone.
+    plain = "(SELECT max(orders.id) FROM orders)"
+    assert select_metrics(["orders"], [_metric(plain)], _UNCLEARED, columns=_COLUMNS) == [_metric(plain)]

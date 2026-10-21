@@ -81,11 +81,13 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
             # an alias the expression gives it, is the column, whatever follows it
             # (`\`r.secret_code.value\`` over `orders r` is a nested field path to BigQuery's
             # reader, and split on its last dot it named nothing: Codex's sixth review of #172;
-            # `\`r.secret_code\`` the same on its second). An unqualified path's first part is
-            # the column it may be as a struct whose field follows (`\`secret_code.value\``:
-            # the seventh review). Every prefix is tried, the whole reading kept beside them.
+            # `\`r.secret_code\`` the same on its second). A dotted path's first part is the
+            # column it may be as a struct whose field follows, qualified by the parser or not
+            # (`\`secret_code.value\``: the seventh review; `orders.value` over `orders r` with a
+            # struct column named `orders`, which the parser reads as a qualifier: the eighth).
+            # Every prefix is tried, the whole reading kept beside them.
             parts = [p for p in (qualifier.split(".") if qualifier else []) + column.name.split(".") if p]
-            if not qualifier and len(parts) > 1:
+            if len(parts) > 1:
                 names.add(parts[0].lower())
             for k in range(1, len(parts)):
                 head = ".".join(parts[:k])
