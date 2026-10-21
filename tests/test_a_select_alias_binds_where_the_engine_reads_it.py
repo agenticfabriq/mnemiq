@@ -146,6 +146,41 @@ def test_a_grouping_set_wrapper_keeps_a_bare_alias(sql):
     assert isinstance(_decide(sql, "postgres"), Approved), sql
 
 
+def test_distinct_on_reads_a_bare_alias_and_a_source_column_inside_an_expression():
+    # Codex's second review of #177: `SELECT DISTINCT ON (secret + 0) id AS secret FROM claim`
+    # deduplicates on the hidden source column (measured: two rows of three), where the
+    # classifier fell through to the projection list, whose DuckDB table admits an alias inside
+    # an expression; a bare `DISTINCT ON (secret)` reads the alias (three rows). Its own clause
+    # now: a bare alias admitted on DuckDB, an expression's name held to the source's columns.
+    duck = duckdb.connect()
+    duck.execute("CREATE TABLE claim (id INT, v INT, secret INT); INSERT INTO claim VALUES (1, 10, 2), (2, 20, 1), (3, 30, 2)")
+    assert duck.execute("SELECT DISTINCT ON (secret + 0) id AS secret FROM claim ORDER BY id").fetchall() == [(1,), (2,)]
+    assert duck.execute("SELECT DISTINCT ON (secret) id AS secret FROM claim ORDER BY id").fetchall() == [(1,), (2,), (3,)]
+    full = AccessPolicy(policy_schema={"claim": {"id", "v", "secret"}})
+    for policy in (None, full):
+        for sql in ("SELECT DISTINCT ON (secret + 0) id AS secret FROM claim ORDER BY id",
+                    "SELECT DISTINCT ON (abs(secret)) id AS secret FROM claim ORDER BY id"):
+            verdict = _decide(sql, "duckdb", policy=policy)
+            assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, policy, verdict)
+        assert isinstance(_decide("SELECT DISTINCT ON (secret) id AS secret FROM claim ORDER BY id", "duckdb", policy=policy), Approved)
+    # an alias of no source column's name, bare and inside an expression, as the table says
+    assert isinstance(_decide("SELECT DISTINCT ON (x) id AS x FROM claim ORDER BY id", "duckdb"), Approved)
+    verdict = _decide("SELECT DISTINCT ON (x + 0) id AS x FROM claim ORDER BY id", "duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    # an aggregate's own DISTINCT is the same node to sqlglot and is its clause's expression
+    # (the gate): SQLite reads the alias inside it in HAVING and ORDER BY, measured, and the
+    # guard admits it there; DuckDB's table admits it in HAVING too, where the engine rejects
+    # an alias inside an aggregate's argument, an error on no row's value
+    lite = sqlite3.connect(":memory:")
+    lite.execute("CREATE TABLE claim (id INT, v INT)")
+    lite.executemany("INSERT INTO claim VALUES (?, ?)", [(1, 10), (2, 20)])
+    for sql in ("SELECT v AS x FROM claim GROUP BY v HAVING count(DISTINCT x) > 0",
+                "SELECT v AS x FROM claim GROUP BY v ORDER BY count(DISTINCT x)"):
+        assert lite.execute(sql).fetchall() == [(10,), (20,)], sql
+        for engine in ("sqlite", "duckdb"):
+            assert isinstance(_decide(sql, engine), Approved), (engine, sql)
+
+
 def test_oracles_leak_shapes_are_refused():
     # The register's shapes: a no-argument function and a pseudo-column reached through the
     # alias in WHERE; the same alias in ORDER BY is Oracle's own reading and stays approved.

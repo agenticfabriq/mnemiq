@@ -160,7 +160,7 @@ def _unknown_column(name: str) -> Refusal:
 # costs a retry. Where a column and an alias share the name the engine reads the column
 # (measured on both), which is checked by its name.
 _ALIAS_BARE: dict[str | None, frozenset[str]] = {
-    "duckdb": frozenset({"select", "where", "group", "having", "order", "qualify", "window"}),
+    "duckdb": frozenset({"select", "where", "group", "having", "order", "qualify", "window", "distinct"}),
     "sqlite": frozenset({"where", "group", "having", "order", "join"}),
     "postgres": frozenset({"group", "order"}),
     "postgresql": frozenset({"group", "order"}),
@@ -175,6 +175,14 @@ _ALIAS_IN_EXPRESSION: dict[str | None, frozenset[str]] = {
 }
 
 
+def _is_distinct_on(node: exp.Expression | None) -> bool:
+    """A SELECT's own `DISTINCT ON (...)`: sqlglot wraps an aggregate's DISTINCT in the same node
+    (`count(DISTINCT x)`), which is part of its clause's expression (the review gate on the
+    fourth commit of #177, where every alias inside one was read as a DISTINCT ON item and
+    `HAVING count(DISTINCT x) > 0` refused on SQLite, which runs it)."""
+    return isinstance(node, exp.Distinct) and isinstance(node.parent, exp.Select) and node.args.get("on") is not None
+
+
 def _clause_of(column: exp.Column) -> tuple[str, bool]:
     """The clause of its own SELECT a column sits in, and whether it is the whole item there:
     `where`, `group`, `having`, `order`, `qualify`, `join` (an ON), `window` (an OVER's own
@@ -182,10 +190,15 @@ def _clause_of(column: exp.Column) -> tuple[str, bool]:
     BY, which binds to source columns alone: DuckDB rejects an alias there, measured, and with
     a hidden column of the alias's name read it, Codex's first review of #177), `limit` (a
     LIMIT or OFFSET, where no engine measured reads an alias), or `select`, the projection
-    list; a set operation's ORDER BY is `order`, sqlglot holding it under the operation. A
-    ROLLUP, CUBE or GROUPING SETS wrapper and a grouping set's parentheses are structure, not
-    an expression: `GROUP BY ROLLUP(x)` is a bare item (the same review, where the wrapper
-    made it an expression and DuckDB's table refused it). Where an alias and a source column
+    list, or `distinct` (the SELECT's own DISTINCT ON item, `_is_distinct_on`: DuckDB reads a
+    bare alias there and the source column inside an expression, measured, where `DISTINCT ON
+    (secret + 0)` beside an alias `secret` deduplicated on the hidden column and was admitted
+    as the projection list's expression, Codex's second review of #177; an aggregate's own
+    DISTINCT is its clause's expression); a set operation's ORDER BY is `order`,
+    sqlglot holding it under the operation. A ROLLUP, CUBE or GROUPING SETS wrapper, a
+    grouping set's parentheses and a DISTINCT ON list's are structure, not an expression:
+    `GROUP BY ROLLUP(x)` is a bare item (the same review, where the wrapper made it an
+    expression and DuckDB's table refused it). Where an alias and a source column
     share a name the engine reads the column first everywhere but a bare ORDER BY item (and
     HAVING on DuckDB), measured, which the resolver binds under the complete schema and the
     grant alone cannot see: the register's residual, recorded at #167."""
@@ -200,11 +213,13 @@ def _clause_of(column: exp.Column) -> tuple[str, bool]:
         kind = next((name for cls, name in ((exp.Where, "where"), (exp.Group, "group"), (exp.Having, "having"),
                                             (exp.Order, "order"), (exp.Qualify, "qualify"), (exp.Join, "join"))
                      if isinstance(node, cls)), None)
+        if kind is None and _is_distinct_on(node):
+            kind = "distinct"  # the SELECT's own DISTINCT ON, not an aggregate's DISTINCT (`count(DISTINCT x)`), the same node to sqlglot (the gate)
         if kind is not None:
             if clause is None:
                 clause = kind
-        elif isinstance(node, (exp.Tuple, exp.Paren)) and isinstance(node.parent, (exp.Rollup, exp.Cube, exp.GroupingSets)):
-            pass  # a grouping set's parentheses, a one-item set among them (`GROUPING SETS ((x), ())` parses `(x)` as a Paren)
+        elif isinstance(node, (exp.Tuple, exp.Paren)) and (isinstance(node.parent, (exp.Rollup, exp.Cube, exp.GroupingSets)) or _is_distinct_on(node.parent)):
+            pass  # a grouping set's or a DISTINCT ON list's parentheses, a one-item set among them (`GROUPING SETS ((x), ())` parses `(x)` as a Paren)
         elif not isinstance(node, (exp.Ordered, exp.Alias, exp.Rollup, exp.Cube, exp.GroupingSets)):
             bare = False  # the column sits inside an expression of the clause
         node = node.parent
