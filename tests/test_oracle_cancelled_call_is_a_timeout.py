@@ -18,6 +18,7 @@ oracledb = pytest.importorskip("oracledb")
 
 from oracledb import errors as oracledb_errors  # noqa: E402
 
+from mnemiq.adapters.base import QueryCancelled  # noqa: E402
 from mnemiq.adapters.oracle import OracleAdapter, _is_timeout  # noqa: E402
 
 
@@ -56,6 +57,12 @@ def test_the_cancel_is_a_timeout_only_once_the_deadline_has_passed():
     assert _is_timeout(cancel, deadline_met=True)
     assert not _is_timeout(cancel, deadline_met=False)
     assert not _is_timeout(oracledb.DatabaseError("ORA-01013: user requested cancel of current operation"), deadline_met=False)
+    # A closed connection reads as the cancel does (M188): the bound's end at the deadline, and the
+    # source's before it, an outage the runner reports through the adapter's own classifier.
+    closed = _driver_error("DPY-4011: the database or network closed the connection", 4011)
+    assert _is_timeout(closed, deadline_met=True)
+    assert not _is_timeout(closed, deadline_met=False)
+    assert not _is_timeout(oracledb.DatabaseError("DPY-4011: the database or network closed the connection"), deadline_met=False)
     # the driver's own timeout codes do not depend on the clock
     assert _is_timeout(_driver_error("DPY-4024: call timeout of 300 ms exceeded", 4024), deadline_met=False)
     assert _is_timeout(_driver_error("ORA-03156: the statement timed out", 3156), deadline_met=False)
@@ -113,5 +120,9 @@ def test_execute_arrow_reads_the_cancel_against_its_own_deadline(monkeypatch, el
         with pytest.raises(RuntimeError, match="query timed out after 4.9995"):
             adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=4.9995)
     else:
-        with pytest.raises(oracledb.OperationalError, match="ORA-01013"):
+        # Before the deadline the cancel is anyone's: raised as the cancel it is, the driver's
+        # ORA-01013 its cause, so the runner neither reads it as an outage nor re-runs it (the
+        # review gate on M188).
+        with pytest.raises(QueryCancelled, match="ORA-01013") as caught:
             adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=4.9995)
+        assert isinstance(caught.value.__cause__, oracledb.OperationalError)

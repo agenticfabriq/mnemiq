@@ -21,7 +21,7 @@ from mnemiq.progress import Emit, Stage, step
 from mnemiq.redact import policy_safe_detail
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
-from mnemiq.execute.runner import DEFAULT_TIMEOUT_S, ExecutionError, run
+from mnemiq.execute.runner import DEFAULT_TIMEOUT_S, ExecutionError, SourceUnavailableError, run
 from mnemiq.execute.select import (
     ClusterView,
     SelectorRead,
@@ -362,7 +362,14 @@ class Agent:
 
             try:
                 with step(emit, Stage.EXECUTE):
-                    result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
+                    result = self._run(approved)
+            except SourceUnavailableError as exc:
+                # Not the statement's failure, so not fed back: the model would rewrite a correct
+                # query because the network failed (M188). A failure, not a deferral (M6), as the
+                # proof seam reports the same fault before the run.
+                logger.warning("the source did not answer the re-run either: %s", exc.full_text)
+                return AgentAnswer(answer=exc.message, failed=True,
+                                   reason_code=DeferralReason.SOURCE_UNAVAILABLE)
             except ExecutionError as exc:
                 # The database is the one authority that cannot be wrong about itself: its
                 # complaint is the cheapest accuracy lever we have. Feed it back and retry.
@@ -425,14 +432,33 @@ class Agent:
             reason_code=DeferralReason.EXECUTION_FAILED,
         )
 
+    def _run(self, approved: Approved):
+        """Run the approved statement, and once more where the source did not answer (M188).
+
+        The same statement, no model call: measured on the Postgres attach, a connection killed
+        mid-statement raised the fault an outage raises, and the very next run reconnected and
+        answered. A source that is down fails the second run as fast as the first, and that
+        `SourceUnavailableError` reaches the caller, which ends the turn on it.
+        """
+        try:
+            return run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
+        except SourceUnavailableError as exc:
+            logger.warning("the source did not answer while a query ran; running it once more. "
+                           "The source said: %s", exc.full_text)
+            return run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
+
     def _execute(self, approved: Approved, grants: GrantSet, packet: ContextPacket):
-        """Cache-or-run one plan; None on execution error (this candidate just drops out)."""
+        """Cache-or-run one plan; None on execution error (this candidate just drops out). A
+        source that did not answer its re-run raises `SourceUnavailableError`, which ends the
+        turn rather than this candidate alone."""
         key = cache_key(approved.plan_sql, grants.fingerprint, packet.enrichment_version)
         hit = self.cache.get(key)
         if hit is not None:
             return from_ipc(hit)
         try:
-            result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
+            result = self._run(approved)
+        except SourceUnavailableError:
+            raise
         except ExecutionError as exc:
             # This candidate drops out of the vote. Logged for the same reason the single-answer
             # path logs: when three of five candidates are rejected by the source and two
@@ -501,7 +527,17 @@ class Agent:
                     if getattr(outcome, "code", None) == DeferralReason.UNDEFINED_TERM:
                         undefined = outcome
                     continue
-                table = self._execute(outcome, grants, packet)
+                try:
+                    table = self._execute(outcome, grants, packet)
+                except SourceUnavailableError as exc:
+                    # The run-time half of the stop above (M188): the source did not answer this
+                    # candidate's run or its re-run, so it would not answer the next candidate's,
+                    # and dropping it would ask every later candidate and then the single path.
+                    logger.warning("the source did not answer the re-run either: %s", exc.full_text)
+                    return AgentAnswer(answer=exc.message, failed=True,
+                                       reason_code=DeferralReason.SOURCE_UNAVAILABLE,
+                                       candidates_executed=len(executed),
+                                       narrowed=_narrowed_of(executed))
             if table is not None:
                 executed.append((outcome, table))
 

@@ -5,6 +5,9 @@ from dataclasses import dataclass
 
 import pyarrow as pa
 
+from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
+from mnemiq.sql.prove import source_did_not_answer
+
 DEFAULT_TIMEOUT_S = 30.0
 
 
@@ -41,6 +44,15 @@ class ExecutionError(Exception):
         return f"{self.message} {self.source_detail}" if self.source_detail else self.message
 
 
+class SourceUnavailableError(ExecutionError):
+    """The source did not answer while the statement ran: a connection that dropped after the
+    proof, or mid-fetch (M188). The proof seam reads the same fault before the run as
+    SOURCE_UNAVAILABLE; here it reached the model as "The source rejected this query." and was
+    repaired, a correct query rewritten because the network failed. Not the statement's failure,
+    so never the model's to repair. An `ExecutionError` still, so every caller catching that
+    keeps its reading, a statement that produced no table."""
+
+
 @dataclass
 class ExecutionResult:
     table: pa.Table
@@ -59,10 +71,29 @@ def run(adapter, sql: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> ExecutionRes
         # somewhere in the string.
         raise
     except Exception as exc:
-        if "interrupt" in type(exc).__name__.lower() or "interrupt" in str(exc).lower():
+        # The timeout first: DuckDB's classifier calls its interrupt unavailable, the proof seam's
+        # reading of a proof that never came back, and here it is the statement's cost.
+        if (isinstance(exc, QueryTimedOut) or "interrupt" in type(exc).__name__.lower()
+                or "interrupt" in str(exc).lower()):
             raise ExecutionError(
                 f"The query timed out after {timeout_s}s. Make it cheaper: fewer joins, "
                 "narrower filters, or an aggregate instead of raw rows."
+            ) from exc
+        if isinstance(exc, QueryCancelled):
+            # Before the outage question, which the driver's classifier answers yes for its own
+            # cancel: read as an outage, the statement someone stopped would be run again.
+            raise ExecutionError(
+                "The source cancelled this query before it finished: an operator or another "
+                "session stopped it. If it was too expensive, make it cheaper: fewer joins, "
+                "narrower filters, or an aggregate instead of raw rows.",
+                source_detail=str(exc),
+            ) from exc
+        if source_did_not_answer(adapter, exc):
+            raise SourceUnavailableError(
+                "The source did not answer while this query ran. That is not about the query. "
+                "Try again, and tell the operator if it persists; the server log has the "
+                "source's error.",
+                source_detail=str(exc),
             ) from exc
         raise ExecutionError("The source rejected this query.", source_detail=str(exc)) from exc
 
