@@ -474,6 +474,10 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
                            # a quote inside a comment pairs with nothing (Codex's thirteenth review)
                            ("secret code", '/* " */ "secret code"'), ("secret code", '"secret code" /* " */'),
                            ("secret code", "-- '\n'secret code'"),
+                           # a line comment ends at a carriage return to DuckDB and Postgres (Codex's
+                           # eighteenth review) and at a line feed alone to MySQL and SQLite (the gate):
+                           # both readings, joined
+                           ("secret code", '-- "\r"secret code"'), ("secret code", "-- '\r\n'secret code'"),
                            # a comment's text is code to an engine that runs it (the gate): MySQL reads
                            # `--secret_code` as two minus signs and the column, and runs `/*! ... */`
                            ("secret_code", "id --secret_code\n"), ("secret_code", "id /*! + secret_code */"),
@@ -511,6 +515,12 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
     # A comment may stand between the closing quote and UESCAPE, or between it and its
     # character (the gate on the twenty-second commit); an escape short of its digits is none
     assert "secret_code" in keyword_columns("U&\"secret!005fcode\" /* c */ UESCAPE '!'")
+    assert "secret_code" in keyword_columns("U&\"secret!005fcode\" -- c\r UESCAPE '!'")   # the comment ends at the carriage return
+    # MySQL's reading, the comment running past the carriage return to the line feed, reads the
+    # name whole (the gate); sqlglot parses neither spelling, so the expression is withheld
+    # from everyone, and the spelling is still read
+    assert "secret code" in keyword_columns("-- \r` \n`secret code`")
+    assert "secret code" in keyword_columns('-- \r" \n"secret code"')
     assert "secret_code" in keyword_columns("U&\"secret!005fcode\" -- c\n UESCAPE /* d */ '!'")
     assert keyword_columns('U&"secret\\5f"') == {"u", "secret\\5f"}
     assert keyword_columns('U&"secret\\+00005"') == {"u", "secret\\+00005"}

@@ -192,16 +192,24 @@ _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest, exp.Pivot)
 # name that opens inside the region and closes after it (`` `secret */ code` ``, read whole by
 # MySQL) is split. The text is scanned under both readings and the spellings joined, which
 # withholds more and never less; a comment's own text is scanned as code under each, so what
-# one reading hides the other reads. An open comment runs to the end of the text.
+# one reading hides the other reads. An open comment runs to the end of the text. A line
+# comment ends at a carriage return to DuckDB and Postgres and at a line feed alone to MySQL
+# and SQLite, so the text is scanned under both endings too and the spellings joined:
+# ended at the line feed alone, `-- "<CR>"secret code"` paired the comment's quote with the
+# name's opening one on DuckDB (Codex's eighteenth review of #172); ended at the carriage
+# return alone, `` -- <CR>` <LF>`secret code` `` did the same on MySQL (the review gate).
 _IDENT_CHAR = r"[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff]"
-_SCAN = re.compile(r"(?P<line>--[^\n]*)|(?P<block>/\*)"
-                   r'|"(?P<double>(?:[^"]|"")+)"|`(?P<back>(?:[^`]|``)+)`|\'(?P<single>(?:[^\']|\'\')+)\''
-                   r"|(?P<token>(?![0-9]+(?!" + _IDENT_CHAR + r"))" + _IDENT_CHAR + r"+)", re.S)
+_SCAN_TAIL = (r'|"(?P<double>(?:[^"]|"")+)"|`(?P<back>(?:[^`]|``)+)`|\'(?P<single>(?:[^\']|\'\')+)\''
+              r"|(?P<token>(?![0-9]+(?!" + _IDENT_CHAR + r"))" + _IDENT_CHAR + r"+)")
+_SCAN = {  # by whether a carriage return ends a line comment
+    True: re.compile(r"(?P<line>--[^\r\n]*)|(?P<block>/\*)" + _SCAN_TAIL, re.S),
+    False: re.compile(r"(?P<line>--[^\n]*)|(?P<block>/\*)" + _SCAN_TAIL, re.S),
+}
 _QUOTE = {"double": '"', "back": "`", "single": "'"}
 # Whitespace or a comment may stand between the closing quote and UESCAPE, and between it and
 # its character: Postgres reads the clause in the grammar, past comments (the review gate on
 # the twenty-second commit). An escape is exactly four or six hex digits.
-_GAP = r"(?:\s|/\*.*?\*/|--[^\n]*(?:\n|$))*"
+_GAP = r"(?:\s|/\*.*?\*/|--[^\r\n]*(?:[\r\n]|$))*"
 _UESCAPE = re.compile(_GAP + r"UESCAPE" + _GAP + r"'(?P<esc>[^'])'", re.I | re.S)
 _HEX4 = re.compile(r"[0-9A-Fa-f]{4}")
 _HEX6 = re.compile(r"[0-9A-Fa-f]{6}")
@@ -229,7 +237,8 @@ def keyword_columns(expr: str) -> set[str]:
     their limits, DuckDB has none. The spelling is cut as written and lowercased after, since
     lowercasing changes some characters' byte length (the review gate on that round: `İ` is
     two bytes and its lowercase three)."""
-    spellings = _scan(expr, nested=True) | _scan(expr, nested=False)
+    spellings = set().union(*(_scan(expr, nested=nested, cr_ends=cr_ends)
+                              for nested in (True, False) for cr_ends in (True, False)))
     cuts = {cut for spelling in spellings for cut in _cuts_to_postgres_limit(spelling)}
     return {spelling.lower() for spelling in spellings | cuts}
 
@@ -260,12 +269,14 @@ def _cuts_to_postgres_limit(spelling: str) -> set[str]:
     return out
 
 
-def _scan(expr: str, nested: bool) -> set[str]:
-    """`keyword_columns` under one reading of a block comment: nested (DuckDB, Postgres) or
-    ended at the first `*/` (MySQL). The spellings as written; `keyword_columns` lowercases."""
+def _scan(expr: str, nested: bool, cr_ends: bool) -> set[str]:
+    """`keyword_columns` under one reading of a block comment, nested (DuckDB, Postgres) or
+    ended at the first `*/` (MySQL), and of a line comment, ended at a carriage return too
+    (DuckDB, Postgres) or at a line feed alone (MySQL, SQLite). The spellings as written;
+    `keyword_columns` lowercases."""
     out: set[str] = set()
     pos = 0
-    while (match := _SCAN.search(expr, pos)) is not None:
+    while (match := _SCAN[cr_ends].search(expr, pos)) is not None:
         kind, pos = match.lastgroup, match.end()
         if kind == "token":
             if match.group().lower() not in _NEVER_A_COLUMN:
@@ -277,10 +288,10 @@ def _scan(expr: str, nested: bool) -> set[str]:
             if decoded is not None:
                 out.add(decoded)
         elif kind == "line":
-            out |= _scan(match.group()[2:], nested)
+            out |= _scan(match.group()[2:], nested, cr_ends)
         else:
             pos, closed = _block_end(expr, match.start(), nested)
-            out |= _scan(expr[match.start() + 2:pos - 2 if closed else pos], nested)
+            out |= _scan(expr[match.start() + 2:pos - 2 if closed else pos], nested, cr_ends)
     return out
 
 
