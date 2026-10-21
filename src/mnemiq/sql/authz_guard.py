@@ -256,9 +256,16 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
         """The base tables an input reads, a CTE name followed to its body (a CTE defined in an
         outer scope reads as a base table inside the join's own SELECT: the review gate); a
         name whose body is already being followed is read as a base table of that name, never
-        dropped (fail-closed)."""
+        dropped (fail-closed). Every table reference of the input, not the scope walk's base
+        reads alone: that walk, over the input on its own, dropped a reference the engine
+        binds to a CTE of an OUTER scope (`WITH R AS (SELECT * FROM claim) ... (WITH r AS
+        (SELECT * FROM r) SELECT * FROM r) d JOIN ... USING (secret)`, where the inner body's
+        `r` is the outer `R` folded), whose scope the input's tree does not hold, so the
+        input read no base table and the hidden key went unchecked (Codex's third review of
+        #174). `cte_body` reads the enclosing WITHs outward from the reference, the outer
+        one included, and a name no WITH declares is the base table."""
         found: set[str] = set()
-        for table in base_tables(node, dialect):
+        for table in node.find_all(exp.Table):
             body = cte_body(table)
             if body is None or id(body) in following:
                 found.add(object_key(table))

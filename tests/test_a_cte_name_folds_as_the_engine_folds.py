@@ -149,6 +149,24 @@ def test_a_recursive_ctes_own_reference_binds_to_its_anchor_as_sqlglot_binds_it(
     assert isinstance(recursive.sources["R"], exp.Table)
 
 
+def test_a_hidden_join_key_behind_a_folded_outer_cte_is_refused():
+    # Codex's third review of #174: the join-key check read the derived input on its own,
+    # where the inner body's `r` is the outer `R` folded, a CTE whose scope the input's tree
+    # does not hold, so the input read no base table and `claim.secret`, hidden, went
+    # unchecked; the approved SQL answered 1 for the hidden value and 0 for another.
+    sql = ("WITH R AS (SELECT * FROM claim) SELECT count(*) FROM (WITH r AS (SELECT * FROM r) SELECT * FROM r) d "
+           "JOIN (SELECT 'Z' AS secret) e USING (secret)")
+    for secret, expected in (("Z", 1), ("A", 0)):
+        con = duckdb.connect()
+        con.execute(f"CREATE TABLE claim (id INT, secret VARCHAR); INSERT INTO claim VALUES (1, '{secret}')")
+        assert con.execute(sql).fetchall() == [(expected,)]   # the count is an oracle on the hidden value
+    for visible, policy in (({"claim": {"id"}}, None), ({"claim": {"id"}}, AccessPolicy(policy_schema={"claim": {"id", "secret"}}))):
+        verdict = _decide(sql, visible, policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (visible, policy, verdict)
+    # the same shape with the key granted stands
+    assert isinstance(_decide(sql, {"claim": {"id", "secret"}}, AccessPolicy(policy_schema={"claim": {"id", "secret"}})), Approved)
+
+
 def test_the_fold_is_the_engines_own():
     # Postgres keeps a quoted name's case and folds the unquoted reference to `w`, so `"W"` and
     # `w` are different objects there and `FROM w` reads the granted base table.
