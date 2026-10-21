@@ -74,6 +74,10 @@ class RefusalCode(StrEnum):
     # A LIMIT or FETCH that states no plain row count -- a percentage, WITH TIES, an expression --
     # so the row cap can neither keep it nor replace it without changing the answer (M162).
     UNREADABLE_LIMIT = "unreadable_limit"
+    # A bare niladic name (`current_date`, `session_user`) where a table the decider knows has
+    # a column so named: this engine reads the column, and no check sees a column through the
+    # function's node (M194). Repairable: the column qualified, or a call the engine keeps.
+    AMBIGUOUS_NILADIC_NAME = "ambiguous_niladic_name"
 
 
 # A refusal the model can act on is a repair; a refusal it cannot act on is a dead end.
@@ -88,6 +92,7 @@ REPAIRABLE = frozenset(
         RefusalCode.UNKNOWN_TABLE,
         RefusalCode.UNKNOWN_COLUMN,
         RefusalCode.EXPLAIN_FAILED,
+        RefusalCode.AMBIGUOUS_NILADIC_NAME,
         # Repairable on purpose. The measured cost of this guard is a legitimate scalar
         # function sqlglot does not model -- Postgres `age()` was the one case in 459 --
         # and the repair loop can rewrite that into arithmetic the engine does model.

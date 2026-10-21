@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import collections
+import logging
+import re
+
 import sqlglot
 from sqlglot import exp
 
 from mnemiq.sql.identifiers import resolve_name
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.verdict import Refusal, RefusalCode
+
+logger = logging.getLogger(__name__)
 
 MAX_ROWS = 1000
 
@@ -236,6 +242,158 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
 
 # The engines that bind INTERSECT tighter than UNION and EXCEPT, against the parser's left fold.
 _INTERSECT_BINDS_TIGHTER = frozenset({"duckdb", "postgres", "postgresql", "mysql"})
+
+
+# The niladic names sqlglot reads as a function with no Column node, which DuckDB binds to a
+# same-named column of the query's own FROM before the function (M194). Not `current_user`,
+# for one reason only: sqlglot prints `exp.CurrentUser` with its parentheses for DuckDB,
+# MySQL, SQLite and Oracle, and bare for Postgres, where the word is reserved, so the target
+# SQL reads the function on each (the ui lane's replay of #175, measured through the target
+# SQL on DuckDB; the bare spelling there reads the column, the review gate). The other
+# names print bare, which is the leak; one that came to print with parentheses would leave
+# this tuple on the same measurement, not on reasoning.
+# The bare niladic words an engine binds to a column of that name where the table has one,
+# read off the statement AS PRINTED FOR THE TARGET: what reaches the engine is the printed
+# text, not the class the parser chose. Oracle's `SYSDATE` parses to the CURRENT_TIMESTAMP
+# node with a time zone and prints a bare `CURRENT_TIMESTAMP` on DuckDB, which bound the
+# column while the node's printed name matched nothing (the review gate on the seventh
+# commit); MySQL's `UTC_TIMESTAMP()` parses to a node of its own and prints the same bare
+# word (the gate on the eighth); and `now()` written as MySQL prints `NOW()` for Postgres,
+# a call there, which the Postgres parser reads back as the CURRENT_TIMESTAMP node and a
+# re-parse of the printing refused (the gate on the same round). A word is bare where no
+# word character, dollar or dot precedes it and no word character or `(` follows, outside
+# every quoted span and comment (`_QUOTED_OR_COMMENT`, cut before the scan: `'a
+# current_timestamp'` was refused with the scan over the whole text, the gate): `kw.current_date`
+# and `"current_date"` are columns the grant check reads, and `current_date()` is the call.
+_NILADIC_WORDS = ("current_date", "current_timestamp", "current_time", "localtime",
+                  "localtimestamp", "session_user", "current_catalog")
+_BARE_NILADIC = re.compile(r"(?<![\w$.])(" + "|".join(_NILADIC_WORDS) + r")(?![\w(])", re.I)
+_QUOTED_OR_COMMENT = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|`(?:[^`]|``)*`|/\*.*?\*/|--[^\n]*", re.S)
+
+
+def _bare_niladic_words(sql: str) -> collections.Counter:
+    """How many times `sql` holds each niladic word bare, lowercased, quoted spans and
+    comments cut."""
+    return collections.Counter(match.group(1).lower() for match in _BARE_NILADIC.finditer(_QUOTED_OR_COMMENT.sub(" ", sql)))
+
+
+# The call spellings the repair may name, per dialect the model writes in (the statement it
+# retries with is parsed as `dialect` and printed for the target, so a target's spelling
+# could be a column to the parser: the review gate), in order of preference; the first the
+# decider approves as the retry is named (`_call_advice`): parsed as a call the function
+# guard models, and printed for the target with no bare niladic word a table the statement
+# reads has as a column. Measured: `now()` on DuckDB and MySQL is a plain call the guard
+# models; Postgres's `now()` parses to the CURRENT_TIMESTAMP node and `localtimestamp` to
+# its own, where `clock_timestamp()` is unmodelled without an adapter's function inventory
+# and was advised beside a column named `current_timestamp`, then refused on the retry
+# (Codex's first review of #175); `today()` on DuckDB, `curdate()` on MySQL and `SYSDATE` on
+# Oracle parse to niladic nodes too (the gate), `get_current_timestamp()` is unmodelled, and
+# `current_date()` reads the column on DuckDB (the ui lane's replay). A table holding every
+# candidate's name leaves the repair with no example. An engine not listed the same. Only
+# Postgres ever falls through to a second spelling: the first elsewhere is a plain call the
+# guard models, and wins wherever it prints as one (the gate).
+_CALL_ADVICE: dict[str, tuple[str, ...]] = {
+    "duckdb": ("now()", "localtimestamp"),
+    "postgres": ("now()", "localtimestamp"),
+    "postgresql": ("now()", "localtimestamp"),
+    "mysql": ("now()", "sysdate()"),
+    "sqlite": ("datetime('now')", "date('now')"),
+    "oracle": ("SYSTIMESTAMP", "SYSDATE"),
+}
+
+
+def _call_advice(dialect: str | None, target: str | None, taken: frozenset[str]) -> str | None:
+    """The first of the dialect's call spellings the decider approves as the retry: a call the
+    function guard models (a typed node, or a name on its allow-list) whose printing for the
+    target holds no bare niladic word in `taken`, the words the tables read have as columns."""
+    from mnemiq.sql.authz_guard import _KNOWN_FUNCTIONS  # authz_guard imports this module
+
+    for call in _CALL_ADVICE.get((dialect or "").lower(), ()):
+        try:
+            node = sqlglot.parse_one(f"SELECT {call}", read=dialect).selects[0]
+            printed = node.sql(dialect=target)
+        except Exception:  # noqa: BLE001 -- a spelling the dialect cannot parse or the target cannot print is no advice
+            continue
+        if isinstance(node, exp.Anonymous) and str(node.this).upper() not in _KNOWN_FUNCTIONS:
+            continue
+        if set(_bare_niladic_words(printed)) & taken:
+            continue
+        return call
+    return None
+
+
+def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
+                  target: str | None = None) -> Refusal | None:
+    """A column named like a niladic SQL function is read through the function's node, which
+    no grant, deny or mask check sees: DuckDB binds a bare `current_date` to a same-named
+    column of the query's own FROM before the function, and sqlglot reads the name as
+    `CurrentDate` with no Column node, so bare `current_date`, `current_timestamp`,
+    `current_time`, `localtime`, `localtimestamp`, `session_user` and `current_catalog`, in a
+    projection, an aggregate, a WHERE, an ORDER BY, a derived table, a CTE and a write, each
+    returned a withheld column's value or an oracle on it (M194, the ui lane's replay of #169).
+    The call form is no safer: `current_date()` and `today()` parse to the same node and the
+    target SQL prints the bare name, which the engine binds to the column. Refused where a
+    table the statement reads has a column so named: DuckDB binds the column only from the
+    query's own FROM, and every path to it (a derived star, a CTE star, USING, LATERAL)
+    reaches a base table the statement reads, so a known table the statement never reads
+    fires nothing, nor does a query with no FROM (the ui lane's replay of #175: the broad
+    form over every known table was cost there; measured cost of that broader form, 0 of
+    2,803 corpus statements using CURRENT_DATE or CURRENT_TIMESTAMP, the register, no
+    corpus schema having such a column). Where no table read has one the name is the
+    function to every engine measured. With no schema beyond the grant a withheld column is
+    unknown here, a residual the register records. The repair names the column with its
+    table, and a call the dialect the query is written in parses as a call the function
+    guard models and that prints for the target with no bare niladic word a table read has
+    as a column (`_call_advice`), since the retry is parsed as that dialect. The tables read
+    are found as the engine that runs the query binds them (`target`), as the decider finds
+    them: whether a CTE stands in front of a base table folds names by the engine's rule
+    (the review gate on the fifth commit). The words are read off the statement as printed
+    for the target (`_bare_niladic_words`), what the engine binds; a statement the target
+    cannot print is read as printed for the dialect and the fall-back logged, and the
+    decider's own printing for the target fails the statement after this."""
+    from mnemiq.sql.scope import base_tables  # scope imports this module's checks
+
+    engine = target or dialect
+    referenced = {object_key(table) for table in base_tables(ast, engine)}
+
+    def columns_of(table: str) -> set[str]:
+        # Every inventory keyed by a spelling that folds onto the table's: a grant keyed `KW`
+        # and a policy keyed `kw` are one table to DuckDB, and read under the grant's key
+        # alone the policy's `current_date` was unseen and the bare name approved (Codex's
+        # first review of #175). Folded on every engine, which refuses more where quoting
+        # keeps `"KW"` and `kw` apart, never less.
+        return {n.lower() for key, names in (columns or {}).items() if key.lower() == table.lower() for n in names}
+
+    taken = frozenset(name for table in referenced for name in columns_of(table))
+    try:
+        printed = ast.sql(dialect=engine)
+    except Exception as exc:  # noqa: BLE001 -- the decider's own printing fails the statement after this
+        logger.warning("niladic rule: the statement could not be printed for %s (%s); read as printed for %s", engine, exc, dialect)
+        printed = ast.sql(dialect=dialect)
+    # A word the dialect's parser reads as a column (`localtimestamp` on SQLite, which has no
+    # such keyword) is the column, and the grant check reads it: each such column reference
+    # that prints bare accounts for one bare occurrence, and the occurrences beyond them are
+    # the function's spelling. By occurrence, not by word: taken off for the whole statement,
+    # a quoted `"current_timestamp"` read in a subquery switched the rule off for the bare
+    # word beside it and the column leaked (the gate's second round on this commit).
+    bare = _bare_niladic_words(printed)
+    as_columns = collections.Counter(
+        column.name.lower() for column in ast.find_all(exp.Column)
+        if not column.table and _bare_niladic_words(column.sql(dialect=engine)))
+    for name in sorted(name for name, count in bare.items() if count > as_columns[name]):
+        owners = sorted(table for table in referenced if name in columns_of(table))
+        if owners:
+            call = _call_advice(dialect, engine, taken)
+            advice = f"such as {call}" if call else "with its own name and parentheses"
+            return Refusal(
+                code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
+                message=(f"{name!r} names a column of {owners[0]!r} and a SQL function, and the "
+                         f"engine reads the column where that table is in the FROM. Write "
+                         f"{owners[0]}.{name} for the column, or for the function a call written "
+                         f"as one in this query's dialect, {advice}."),
+                subject=name,
+            )
+    return None
 
 
 def misgrouped_set_chain(ast: exp.Expression, engine: str) -> Refusal | None:
