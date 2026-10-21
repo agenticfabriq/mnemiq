@@ -10,6 +10,7 @@ from __future__ import annotations
 import duckdb
 import pytest
 import sqlglot
+from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.decide import decide
@@ -123,6 +124,18 @@ def test_the_broad_form_refuses_the_name_over_another_table_too():
     # same (its measured cost: none in the corpora), naming the column's table in the repair.
     verdict = _decide("SELECT current_date FROM claim", HIDDEN, WITH_SCHEMA)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+
+
+@pytest.mark.parametrize("dialect, call", [("duckdb", "now()"), ("oracle", "SYSDATE")])
+def test_the_repair_names_a_call_the_engine_keeps_in_its_own_spelling(dialect, call):
+    # The message is what the model retries with (the repair loop), so each engine's advice
+    # must parse there as a call: DuckDB has no SYSDATE and Oracle no now().
+    verdict = decide("SELECT current_date FROM kw", HIDDEN, dialect=dialect, target=dialect, policy=WITH_SCHEMA)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+    assert call in verdict.message and "kw.current_date" in verdict.message, verdict.message
+    parsed = sqlglot.parse_one(f"SELECT {call} FROM kw", read=dialect)
+    assert not isinstance(parsed.selects[0], exp.Column), (dialect, call)  # a call, not a column
+    assert not parsed.selects[0].find(exp.Column), (dialect, call)
 
 
 def test_the_column_is_matched_as_the_engine_folds_it():

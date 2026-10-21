@@ -244,7 +244,14 @@ _NILADIC = (exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime, exp.Localtim
             exp.Localtimestamp, exp.SessionUser, exp.CurrentCatalog, exp.CurrentUser)
 
 
-def niladic_names(ast: exp.Expression, columns) -> Refusal | None:
+# The call spelling each engine keeps as a call through the transpile, for the repair: DuckDB
+# prints `current_date()` bare again, so the advice names a function with no bare form; Oracle
+# reads every bare name as the function and has no `now()`, so its own pseudo-functions are
+# named (the ui lane's read of the repair loop: the message is what the model retries with).
+_FUNCTION_CALL_ADVICE = {"duckdb": "now() or get_current_timestamp()", "oracle": "SYSDATE or SYSTIMESTAMP"}
+
+
+def niladic_names(ast: exp.Expression, columns, dialect: str | None = None) -> Refusal | None:
     """A column named like a niladic SQL function is read through the function's node, which
     no grant, deny or mask check sees: DuckDB binds a bare `current_date` to a same-named
     column of the query's own FROM before the function, and sqlglot reads the name as
@@ -260,7 +267,10 @@ def niladic_names(ast: exp.Expression, columns) -> Refusal | None:
     CURRENT_DATE or CURRENT_TIMESTAMP, in the register), fail-closed; where no known table has
     one the name is the function to every engine measured. With no schema beyond the grant a
     withheld column is unknown here, a residual the register records. The repair names the
-    column with its table, and a call this engine keeps as a call."""
+    column with its table, and a call this engine keeps as a call, in the engine's own
+    spelling (`_FUNCTION_CALL_ADVICE`)."""
+    calls = _FUNCTION_CALL_ADVICE.get((dialect or "").lower())
+    advice = f"such as {calls}" if calls else "with its own name and parentheses"
     for node in ast.find_all(*_NILADIC):
         name = node.sql(dialect="duckdb").split("(")[0].strip().lower()
         owners = sorted(table for table, names in (columns or {}).items()
@@ -271,7 +281,7 @@ def niladic_names(ast: exp.Expression, columns) -> Refusal | None:
                 message=(f"{name!r} names a column of {owners[0]!r} and a SQL function, and this "
                          f"engine reads the column where that table is in the FROM. Write "
                          f"{owners[0]}.{name} for the column, or for the function a call this engine "
-                         "keeps as a call, such as now() or get_current_timestamp()."),
+                         f"keeps as a call, {advice}."),
                 subject=name,
             )
     return None

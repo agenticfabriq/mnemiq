@@ -99,7 +99,7 @@ def decide(
         return ambiguous
     # M194: a bare `current_date` where a known table has a column so named reads the column
     # through the function's node, which no check below sees.
-    named = niladic_names(shaped, known_columns(visible, policy))
+    named = niladic_names(shaped, known_columns(visible, policy), target)
     if named is not None:
         return named
     # M150: before any policy is applied, refuse an engine whose CTE binding the rewrite misreads.
