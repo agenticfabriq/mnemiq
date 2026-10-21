@@ -95,6 +95,44 @@ def test_three_chained_ctes_are_followed_to_the_base_column():
     _refused_on_doc("WITH a AS (SELECT 1 AS k), b AS (SELECT doc FROM t), c AS (SELECT doc FROM b) SELECT count(*) FROM c WHERE doc = 'west'")
 
 
+def test_a_star_before_a_projection_of_the_same_name_yields_the_name_first():
+    # Codex's first review of #178: `SELECT *, region AS doc FROM t` names `doc` twice and the
+    # engine keeps the star's, renaming the later one (`doc_1` on DuckDB), so `t.doc` is
+    # `t.doc`; the walk matched the alias by name and checked `t.region`, refusing 'a' and
+    # passing 'west'. A star after the projection leaves the projection first.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east')")
+    assert con.execute("WITH t AS (SELECT *, region AS doc FROM t) SELECT t.doc FROM t WHERE t.doc = 'a'").fetchall() == [("a",)]
+    assert con.execute("WITH t AS (SELECT region AS doc, * FROM t) SELECT t.doc FROM t WHERE t.doc = 'west'").fetchall() == [("west",)]
+    assert _check("WITH t AS (SELECT *, region AS doc FROM t) SELECT count(*) FROM t WHERE t.doc = 'a'") is None
+    _refused_on_doc("WITH t AS (SELECT *, region AS doc FROM t) SELECT count(*) FROM t WHERE t.doc = 'west'")
+    assert _check("WITH t AS (SELECT region AS doc, * FROM t) SELECT count(*) FROM t WHERE t.doc = 'west'") is None
+    # a star whose source lacks the name leaves it to the later projection: `t.k` is `t.doc`
+    _refused_on_doc("WITH t AS (SELECT *, doc AS k FROM t) SELECT count(*) FROM t WHERE t.k = 'west'")
+    assert _check("WITH t AS (SELECT *, doc AS k FROM t) SELECT count(*) FROM t WHERE t.k = 'a'") is None
+    # a star over two sources before the name: not known either way, nothing checked
+    assert _check("WITH t AS (SELECT *, u.region AS doc FROM t JOIN t u USING (doc)) SELECT count(*) FROM t WHERE t.doc = 'zzz'") is None
+
+
+def test_a_base_table_alias_column_list_renames_by_position_and_is_not_placed():
+    # The same review: `FROM t q(region, doc)` makes `q.doc` the second column, `t.region`;
+    # the walk answered `t.doc` and refused 'west', which the engine returns.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east')")
+    assert con.execute("WITH t AS (SELECT q.doc FROM t q(region, doc)) SELECT t.doc FROM t WHERE t.doc = 'west'").fetchall() == [("west",)]
+    assert _check("WITH t AS (SELECT q.doc FROM t q(region, doc)) SELECT count(*) FROM t WHERE t.doc = 'west'") is None
+    assert _check("SELECT count(*) FROM t q(region, doc) WHERE q.doc = 'west'") is None
+    assert _check("SELECT count(*) FROM t q(region, doc) WHERE doc = 'west'") is None
+
+
+def test_names_meet_as_the_engine_folds_them():
+    # The ui lane's probe of #178: Postgres reads `x.DOC` as `doc`, and the walk's exact
+    # comparison answered nothing, a skip; the column list the same.
+    _refused_on_doc("WITH x AS (SELECT doc FROM t) SELECT count(*) FROM x WHERE x.DOC = 'west'")
+    _refused_on_doc("WITH x(DOC) AS (SELECT doc FROM t) SELECT count(*) FROM x WHERE x.doc = 'west'")
+    _refused_on_doc("WITH x AS (SELECT * FROM t) SELECT count(*) FROM x WHERE x.Doc = 'west'")
+
+
 def test_a_cte_named_after_its_own_base_table_is_the_scopes_answer():
     sql = "WITH t AS (SELECT doc FROM t) SELECT count(*) FROM t WHERE t.doc = 'west'"
     _runs_to_zero(sql)

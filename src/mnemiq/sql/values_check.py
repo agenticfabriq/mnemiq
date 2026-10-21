@@ -58,7 +58,16 @@ def _column_list(source: Scope) -> list[str] | None:
     return [c.name for c in columns] if columns else None
 
 
-def _through_scopes(column: exp.Column, scope: Scope, depth: int = 0) -> tuple[str, str] | None:
+def _folded(name: str) -> str:
+    """Names meet as the engine folds an unquoted one: Postgres reads `x.CURRENCY_CODE` as
+    `currency_code` where the walk compared exactly and answered nothing, a skip (the ui
+    lane's probe of #178). A quoted mixed-case name beside its folded twin is the one shape
+    this misreads, and the grant check refuses an unknown spelling on a base table first."""
+    return name.lower()
+
+
+def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str]],
+                    depth: int = 0) -> tuple[str, str] | None:
     """The base table and column a qualified column reads, followed through each CTE or derived
     table that projects it (M141). Only a projection that IS a column is followed, renamed or
     not; a function, a literal or a union has no single base column, so None, and the check
@@ -75,38 +84,66 @@ def _through_scopes(column: exp.Column, scope: Scope, depth: int = 0) -> tuple[s
     projection carries comes through a star, into the scope's one selected source the same
     way (the review gate: an unqualified `doc` through `SELECT * FROM t` lost its owner once
     the statement-wide lookup became the fallback), a star with an EXCLUDE, a REPLACE or a
-    RENAME excepted, which the walk gives up on (`_is_star`). Where this answers nothing, the caller
-    keeps the statement-wide reading it had: a star over a join, a set operation, a recursive
-    CTE and a correlated name each resolved there and nowhere here (the gate's second round)."""
+    RENAME excepted, which the walk gives up on (`_is_star`). The projections are read in
+    order, as the engine names the output: a plain star BEFORE a projection of the asked name
+    yields that name first where its source has the column, and the later projection is
+    renamed (`WITH t AS (SELECT *, region AS doc FROM t)` keeps the star's `doc`, DuckDB's
+    `doc_1` for the other: Codex's first review of #178, where the walk matched the alias by
+    name and checked `t.region`); a star whose source the walk cannot read, or a modified one,
+    before the name answers nothing. A base table under an alias column list (`FROM t
+    q(region, doc)`) renames its columns by position, which a set of names cannot place, so
+    the walk answers nothing there (the same review: `q.doc` is `t.region`, and the walk said
+    `t.doc`). Names meet folded (`_folded`). Where this answers nothing, the caller keeps the
+    statement-wide reading it had: a star over a join, a set operation, a recursive CTE and a
+    correlated name each resolved there and nowhere here (the gate's second round)."""
     source = scope.sources.get(column.table) if column.table else None
     if isinstance(source, exp.Table):
-        return (source.name, column.name)
+        alias = source.args.get("alias")
+        if isinstance(alias, exp.TableAlias) and alias.columns:
+            return None  # renamed by position: a set of names cannot place them
+        stored = next((c for c in visible.get(source.name, ()) if _folded(c) == _folded(column.name)), None)
+        return (source.name, stored if stored is not None else column.name)
     if not isinstance(source, Scope) or depth > 32:
         return None
     if not isinstance(source.expression, exp.Select):
         return None
     selects = source.expression.selects
-    listed = _column_list(source) or []
+    listed = [_folded(name) for name in _column_list(source) or []]
+    wanted = _folded(column.name)
     if any(isinstance(p.this if isinstance(p, exp.Column) else p, exp.Star) for p in selects[:len(listed)]):
         return None  # a star among the listed positions: a column per source column, positions unknown
-    if column.name in listed[:len(selects)]:
-        projection = selects[listed.index(column.name)]  # renamed by position
+    if wanted in listed[:len(selects)]:
+        projection = selects[listed.index(wanted)]  # renamed by position
     else:
         # A list names the first projections alone and the engine keeps the rest by their own
         # names (`WITH x(k) AS (SELECT region, doc FROM t)` keeps `doc`: the review gate's
-        # fourth round), so the projections past the list are matched by name.
-        projection = next((p for p in selects[len(listed):] if p.alias_or_name == column.name), None)
+        # fourth round), so the projections past the list are matched by name, in order, a
+        # star met first followed into the scope's one selected source.
+        projection = None
+        for candidate in selects[len(listed):]:
+            star = candidate.this if isinstance(candidate, exp.Column) else candidate
+            if isinstance(star, exp.Star):
+                if not _is_star(candidate) or len(source.selected_sources) != 1:
+                    return None
+                (alias,) = source.selected_sources
+                through = _through_scopes(exp.column(column.name, table=alias), source, visible, depth + 1)
+                if through is None:
+                    return None  # the star may yield the name: not known either way
+                table, name = through
+                if any(_folded(c) == _folded(name) for c in visible.get(table, ())):
+                    return through  # the star yields the name first
+                continue  # the star's source lacks it: the name is a later projection's
+            if _folded(candidate.alias_or_name) == wanted:
+                projection = candidate
+                break
         if projection is None:
-            if not any(_is_star(p) for p in selects[len(listed):]) or len(source.selected_sources) != 1:
-                return None
-            (alias,) = source.selected_sources
-            return _through_scopes(exp.column(column.name, table=alias), source, depth + 1)
+            return None
     inner = projection.unalias()
     if isinstance(inner, exp.Column) and inner.table:
-        return _through_scopes(inner, source, depth + 1)
+        return _through_scopes(inner, source, visible, depth + 1)
     if isinstance(inner, exp.Column) and len(source.selected_sources) == 1:
         (alias,) = source.selected_sources
-        return _through_scopes(exp.column(inner.name, table=alias), source, depth + 1)
+        return _through_scopes(exp.column(inner.name, table=alias), source, visible, depth + 1)
     return None
 
 
@@ -141,6 +178,9 @@ def check_values(
     cte = {c.alias_or_name for c in ast.find_all(exp.CTE)}
     alias_to_table: dict[str, str] = {}
     for table in ast.find_all(exp.Table):
+        alias = table.args.get("alias")
+        if isinstance(alias, exp.TableAlias) and alias.columns:
+            continue  # renamed by position (`t q(region, doc)`): a set of names cannot place them
         if table.name not in cte:
             alias_to_table[table.alias_or_name] = table.name
     referenced = set(alias_to_table.values())
@@ -156,7 +196,7 @@ def check_values(
             # An unqualified name is read among the scope's selected sources, a base table
             # holding it or a local source projecting it, one owner or no answer.
             if qualifier:
-                found = _through_scopes(column, scope)
+                found = _through_scopes(column, scope, visible)
                 if found is not None:
                     return found
                 if isinstance(scope.sources.get(qualifier), Scope):
@@ -165,10 +205,11 @@ def check_values(
                 owners: list[tuple[str, str]] = []
                 for alias, (_, source) in scope.selected_sources.items():
                     if isinstance(source, exp.Table):
-                        if column.name in visible.get(source.name, set()):
-                            owners.append((source.name, column.name))
+                        found = _through_scopes(exp.column(column.name, table=alias), scope, visible)
+                        if found is not None and any(_folded(c) == _folded(column.name) for c in visible.get(source.name, ())):
+                            owners.append(found)
                     else:
-                        found = _through_scopes(exp.column(column.name, table=alias), scope)
+                        found = _through_scopes(exp.column(column.name, table=alias), scope, visible)
                         if found is not None:
                             owners.append(found)
                 if len(owners) == 1:
