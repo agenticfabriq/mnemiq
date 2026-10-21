@@ -737,8 +737,13 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     for node in value.walk():
         if not isinstance(node, (exp.Identifier, exp.Column)) or node.args.get("table"):
             continue
+        # The nearest lambda DECLARING the name, through every enclosing one: inside `y ->
+        # ...` a reference bound by the outer `x -> ...` read only the nearest lambda and was
+        # skipped, its parts and containers untyped (Codex's fortieth review of #160).
         lam = node.find_ancestor(exp.Lambda)
-        if lam is None or node.name not in {p.name for p in lam.expressions} or any(n is lam for n in value.walk()):
+        while lam is not None and node.name not in {p.name for p in lam.expressions}:
+            lam = lam.find_ancestor(exp.Lambda)
+        if lam is None or any(n is lam for n in value.walk()):
             continue
         kind_of = _lambda_parameter_type(node, type_of)
         if kind_of is None or kind_of is _UNREADABLE:
@@ -748,7 +753,9 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     for node in list(typed_nulls.walk()):
         if isinstance(node, (exp.Identifier, exp.Column)) and not node.args.get("table") and node.name in free:
             lam = node.find_ancestor(exp.Lambda)
-            if lam is None or node.name not in {p.name for p in lam.expressions}:
+            while lam is not None and node.name not in {p.name for p in lam.expressions}:
+                lam = lam.find_ancestor(exp.Lambda)  # declared inside the copy: DuckDB binds it
+            if lam is None:
                 try:
                     node.replace(sqlglot.parse_one(_stand_in(free[node.name]), read="duckdb"))
                 except Exception:  # noqa: BLE001 -- a type the reader cannot stand in for: unknown

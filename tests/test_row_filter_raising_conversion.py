@@ -1200,6 +1200,10 @@ _TYPED_PART_RUNS = [
     "list_filter(tags, x -> TRY_CAST(x AS INT) = 1) = tags",
     "list_filter([id], x -> x = 1) = [id]",
     "list_filter(tags, x -> x = 'north') = tags",
+    # a parameter captured from an outer lambda, through the inner one (Codex's fortieth review)
+    "list_transform([attrs], x -> list_transform(tags, y -> x = attrs)) IS NOT NULL",
+    "list_transform(tags, x -> list_transform(tags, y -> x = y)) IS NOT NULL",
+    "list_transform([attrs], x -> list_transform(tags, x -> x = region)) IS NOT NULL",   # the inner x shadows: text
     "list_reduce(tags, (acc, x) -> acc || x, 'z') = 'znorth'",    # the accumulator typed from the initial value (the gate)
     "list_reduce(tags, (acc, x) -> acc || x, region) = 'northnorth'",   # a text initial, the accumulator text (round 48)
     "list_reduce(tags, (acc, x) -> CASE WHEN acc = 'z' THEN acc ELSE acc END, lower(region)) IS NOT NULL",   # an untyped text initial, by its shape
@@ -1250,6 +1254,11 @@ _TYPED_PART_RAISES = [
     "list_transform(tags, x -> x = id) = [true]",
     "len(list_filter(tags, x -> x = id)) = 1",
     "list_filter([[attrs]], x -> x = [region]) = [[attrs]]",     # the parameter no literal side to exempt
+    # a parameter captured from an outer lambda, its parts and containers inside the inner one
+    # (Codex's fortieth review: the free-parameter probe read the nearest lambda alone)
+    "list_transform([[attrs]], x -> list_transform(tags, y -> x[1] = region)) IS NOT NULL",
+    "list_transform([{'k': attrs}], x -> list_transform(tags, y -> x.k = region)) IS NOT NULL",
+    "list_transform([attrs], x -> list_transform(tags, y -> [x] = [y])) IS NOT NULL",
     "list_filter([tags], x -> x = [attrs]) = [tags]",
     # the accumulator typed from the initial value, and a parameter over a JSON-holding list the
     # reader cannot type (the gate's round on the fourth draft)
