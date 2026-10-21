@@ -251,23 +251,21 @@ def test_the_measuring_instrument_resolves_the_way_the_measured_path_does():
     assert filtered.measurable, "the filter half has no masked-column reference to lose"
 
 
-def test_sqlglot_binds_by_exact_text_which_over_reports_rather_than_under():
-    """Recorded, not fixed. `scope.sources` is keyed by the name as typed, so a reference the
-    ENGINE would fold onto a CTE -- `WITH "Claim" AS (...) ... FROM claim` on duckdb -- is bound to
-    no source and reported as a real read.
-
-    That direction only ever adds a table to the list the grant check walks, so it costs a refusal
-    or a redundant mask, never a leak. Closing it means re-binding sources by resolved name instead
-    of using sqlglot's, which is a deeper change than the one this file makes."""
-    from mnemiq.sql.policy import AccessPolicy
-
-    sql = 'WITH "Claim" AS (SELECT id FROM policy) SELECT claim.ssn FROM claim'
-    result = decide(sql, {"claim": {"id", "ssn"}, "policy": {"id"}},
-                    target="duckdb", dialect="duckdb",
-                    policy=AccessPolicy(masked={("claim", "ssn")}))
-    assert type(result).__name__ == "Approved"
-    assert "claim" in result.tables, "reported as a read the engine would have shadowed"
-    assert result.narrowed, "and masked accordingly -- redundant, not permissive"
+def test_a_reference_the_engine_folds_onto_a_cte_binds_to_it():
+    """Fixed (M202). This was recorded here as the over-report that cost a refusal or a
+    redundant mask and never a leak: `scope.sources` is keyed by the name as typed, so a
+    reference the ENGINE would fold onto a CTE -- `WITH "Claim" AS (...) ... FROM claim` on
+    duckdb -- was bound to no source and reported as a real read. It leaked once a granted
+    table shared the CTE's folded name: the column check read the granted table while the
+    engine read the CTE. A reference sqlglot matches to no source binds to the CTE the engine
+    folds its name to now (`_cte_binding`), so the read list names what the CTE reads; on
+    postgres, which keeps the quoted case, `claim` is the base table still."""
+    sql = 'WITH "Claim" AS (SELECT id FROM policy) SELECT claim.id FROM claim'
+    visible = {"claim": {"id"}, "policy": {"id"}}
+    on_duckdb = decide(sql, visible, target="duckdb", dialect="duckdb")
+    assert type(on_duckdb).__name__ == "Approved" and on_duckdb.tables == ["policy"], on_duckdb
+    on_postgres = decide(sql, visible, target="postgres", dialect="postgres")
+    assert type(on_postgres).__name__ == "Approved" and "claim" in on_postgres.tables, on_postgres
 
 
 def test_a_source_whose_definer_cannot_be_IDENTIFIED_is_checked_not_assumed_local():

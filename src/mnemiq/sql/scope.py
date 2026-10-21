@@ -196,7 +196,15 @@ def _is_base_read(table: exp.Table, scope, dialect: str | None) -> bool:
     """
     source = scope.sources.get(table.alias_or_name)
     if isinstance(source, exp.Table):
-        return True
+        # sqlglot matched no local source by this spelling; the engine folds names and may bind
+        # a CTE all the same: with `w(id, secret)` granted and `claim.secret` withheld, `WITH W AS
+        # (SELECT * FROM claim) SELECT w.secret FROM w` read the granted base table `w` here and
+        # the CTE on DuckDB, hidden, denied and masked alike (M202). A CTE the engine binds by
+        # the shared resolver's folding (`_cte_binding`) stands in front of the table: one
+        # declared within the expression this scope was built for, as sqlglot's own matching
+        # sees no further (the join check reads a CTE body on its own and follows the names
+        # it reads to their bodies, which a WITH above the body must not hide).
+        return _cte_binding(table, dialect, stop=_root_expression(scope)) is None
     if source is None:
         return False
     if not _engine_shadows(table, source, dialect):
@@ -375,7 +383,34 @@ def _in_recursive_part(table: exp.Table, cte: exp.CTE | None) -> bool:
 
 def _cte_in_scope(table: exp.Table, dialect: str | None = None,
                   engine: str | None = None) -> bool:
-    """Is a CTE of this table's name in scope where the table is read?
+    """Is a CTE of this table's name in scope where the table is read? (`_cte_binding`.)"""
+    return _cte_binding(table, dialect, engine) is not None
+
+
+def _root_expression(scope) -> exp.Expression:
+    """The expression the scope tree holding `scope` was built for."""
+    while scope.parent is not None:
+        scope = scope.parent
+    return scope.expression
+
+
+def _cte_scope(scope, cte: exp.CTE):
+    """The sqlglot scope built for `cte`'s body, found from `scope` outward: the scopes sqlglot
+    keys by the CTE's spelling as written, which is why a reference the engine folds to it
+    was never matched to it (M202). None where no enclosing scope holds it."""
+    anc = scope
+    while anc is not None:
+        found = anc.cte_sources.get(cte.alias_or_name)
+        if found is not None and found.expression is cte.this:
+            return found
+        anc = anc.parent
+    return None
+
+
+def _cte_binding(table: exp.Table, dialect: str | None = None,
+                 engine: str | None = None, stop: exp.Expression | None = None) -> exp.CTE | None:
+    """The CTE in scope where the table is read that the engine binds this name to, or None;
+    `stop` ends the walk at that enclosing expression, the last one looked at.
 
     Only a WITH on one of the table's ENCLOSING queries can stand in front of it. A name matched
     anywhere in the statement is not enough: `UPDATE t SET a = (WITH claim AS (...) SELECT a FROM
@@ -392,16 +427,16 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None,
     Structural, never by arg name. In doubt the answer is False, which over-reports: a refusal.
     """
     if table.db or table.catalog:
-        return False
+        return None
     name = resolve_name(table, dialect)
     if name is None:
-        return False
+        return None
     child, node, last_cte = table, table.parent, None
     while node is not None:
         if isinstance(node, exp.CTE):
             last_cte = node
         for with_ in (v for v in node.args.values() if isinstance(v, exp.With)):
-            names = [resolve_name(cte, dialect) for cte in with_.expressions]
+            names = [(resolve_name(cte, dialect), cte) for cte in with_.expressions]
             if child is with_ and (engine or "").lower() in _EVERY_SIBLING:
                 visible = names
             elif child is with_:  # the table sits inside one of this WITH's own CTE bodies
@@ -417,10 +452,13 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None,
                 visible = names[:at] + itself
             else:
                 visible = names
-            if name in visible:
-                return True
+            for visible_name, cte in visible:
+                if visible_name == name:
+                    return cte
+        if node is stop:
+            break
         child, node = node, node.parent
-    return False
+    return None
 
 
 def _written_targets(ast: exp.Expression) -> list[exp.Table]:
@@ -1000,7 +1038,14 @@ def _scope_names(scope, dialect: str | None):
             # AS secret FROM claim)` reading claim's secret, which the aliased twin refused).
             alias = ""
         if alias is not None and alias not in local:
-            by_alias[alias] = scope.sources.get(node.alias_or_name)
+            source = scope.sources.get(node.alias_or_name)
+            if isinstance(source, exp.Table):
+                # A table node that is no base read binds to the CTE the engine folds its
+                # name to (M202): the CTE's scope answers for what it exposes, as a CTE
+                # matched by spelling does.
+                cte = _cte_binding(node, dialect, stop=_root_expression(scope))
+                source = _cte_scope(scope, cte) if cte is not None else source
+            by_alias[alias] = source
     return local, by_alias
 
 
