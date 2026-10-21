@@ -110,6 +110,11 @@ def test_a_star_before_a_projection_of_the_same_name_yields_the_name_first():
     # a star whose source lacks the name leaves it to the later projection: `t.k` is `t.doc`
     _refused_on_doc("WITH t AS (SELECT *, doc AS k FROM t) SELECT count(*) FROM t WHERE t.k = 'west'")
     assert _check("WITH t AS (SELECT *, doc AS k FROM t) SELECT count(*) FROM t WHERE t.k = 'a'") is None
+    # a star over a CTE projecting the name from a column outside the grant yields it (the
+    # gate on the second round): the later projection is renamed, and nothing is checked
+    assert _check("WITH a AS (SELECT hidden AS k, doc AS d FROM t), b AS (SELECT *, d AS k FROM a) SELECT count(*) FROM b WHERE b.k = 'west'") is None
+    # and where the star's source is the base table itself, its columns decide
+    _refused_on_doc("WITH b AS (SELECT *, doc AS k FROM t) SELECT count(*) FROM b WHERE b.k = 'west'")
     # a star over two sources before the name: not known either way, nothing checked
     assert _check("WITH t AS (SELECT *, u.region AS doc FROM t JOIN t u USING (doc)) SELECT count(*) FROM t WHERE t.doc = 'zzz'") is None
 
@@ -123,6 +128,11 @@ def test_a_base_table_alias_column_list_renames_by_position_and_is_not_placed():
     assert _check("WITH t AS (SELECT q.doc FROM t q(region, doc)) SELECT count(*) FROM t WHERE t.doc = 'west'") is None
     assert _check("SELECT count(*) FROM t q(region, doc) WHERE q.doc = 'west'") is None
     assert _check("SELECT count(*) FROM t q(region, doc) WHERE doc = 'west'") is None
+    # the base table read elsewhere in the statement too (the gate on the second round): the
+    # statement-wide reading would place the unqualified name by it, and does not
+    assert con.execute("SELECT count(*) FROM t q(region, doc) WHERE doc = 'west' AND EXISTS (SELECT 1 FROM t)").fetchall() == [(1,)]
+    assert _check("SELECT count(*) FROM t q(region, doc) WHERE doc = 'west' AND EXISTS (SELECT 1 FROM t)") is None
+    assert _check("SELECT count(*) FROM t q(region, doc) WHERE doc = 'west' UNION ALL SELECT count(*) FROM t") is None
 
 
 def test_names_meet_as_the_engine_folds_them():

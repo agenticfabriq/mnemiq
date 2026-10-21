@@ -62,7 +62,10 @@ def _folded(name: str) -> str:
     """Names meet as the engine folds an unquoted one: Postgres reads `x.CURRENCY_CODE` as
     `currency_code` where the walk compared exactly and answered nothing, a skip (the ui
     lane's probe of #178). A quoted mixed-case name beside its folded twin is the one shape
-    this misreads, and the grant check refuses an unknown spelling on a base table first."""
+    this misreads, on a base table (where the grant check refuses an unknown spelling first)
+    and in a CTE's column list or projections alike, where a quoted `"DOC"` beside `doc`
+    would meet the wrong projection: a cost taken for the fold, the shape unseen in any
+    corpus."""
     return name.lower()
 
 
@@ -130,7 +133,11 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
                 if through is None:
                     return None  # the star may yield the name: not known either way
                 table, name = through
-                if any(_folded(c) == _folded(name) for c in visible.get(table, ())):
+                # A local source answers only where it projects the name; a base table answers
+                # for any name, so its columns say whether the star yields it (the review gate
+                # on the second round: held to the grant, a name a CTE projects from a column
+                # outside it fell to the later projection).
+                if not isinstance(source.sources.get(alias), exp.Table) or any(_folded(c) == _folded(name) for c in visible.get(table, ())):
                     return through  # the star yields the name first
                 continue  # the star's source lacks it: the name is a later projection's
             if _folded(candidate.alias_or_name) == wanted:
@@ -214,6 +221,9 @@ def check_values(
                             owners.append(found)
                 if len(owners) == 1:
                     return owners[0]
+                if any(isinstance(source, exp.Table) and isinstance(source.args.get("alias"), exp.TableAlias)
+                       and source.args["alias"].columns for _, source in scope.selected_sources.values()):
+                    return None  # a source renamed by position: the statement-wide reading would place the name by it (the gate on the second round)
         # The statement-wide reading, as before M174, where the scope answers nothing: a star
         # over a join, a set operation, a recursive CTE, a correlated name, a column sqlglot
         # lists in no scope (the review gate's second round, each refused here and skipped by
