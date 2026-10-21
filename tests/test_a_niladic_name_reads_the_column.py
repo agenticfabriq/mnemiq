@@ -164,13 +164,34 @@ def test_the_advice_is_in_the_dialect_the_model_writes_not_the_targets():
     assert isinstance(verdict, Refusal) and "now()" in verdict.message and "SYSTIMESTAMP" not in verdict.message, verdict.message
 
 
-def test_current_user_reads_the_function_and_is_not_refused(worlds):
-    # Measured by the ui lane on DuckDB and in the register on Oracle: `current_user` reads
-    # the function beside a same-named column, so it is no longer among the names refused.
+def test_current_user_prints_with_its_parentheses_and_reads_the_function():
+    # Not among the names refused, for one reason: sqlglot prints `CURRENT_USER()` for DuckDB,
+    # so the target SQL reads the function beside a same-named column (the ui lane's replay),
+    # where the bare spelling reads the column (the gate). Measured here, on the target SQL.
+    con = duckdb.connect()
+    con.execute('CREATE TABLE kw (id INT, "current_user" VARCHAR); INSERT INTO kw VALUES (1, \'Z\')')
+    assert con.execute("SELECT current_user FROM kw").fetchall() == [("Z",)]  # bare: the column
     schema = {"kw": {"id", "current_user"}}
     for sql in ("SELECT current_user FROM kw", "SELECT id FROM kw WHERE current_user LIKE 'Z%'"):
         verdict = decide(sql, {"kw": {"id"}}, dialect="duckdb", target="duckdb", policy=AccessPolicy(policy_schema=schema))
         assert isinstance(verdict, Approved), (sql, verdict)
+        assert "CURRENT_USER()" in verdict.target_sql, verdict.target_sql
+        assert "Z" not in str(con.execute(verdict.target_sql).fetchall())  # the function, not the column
+
+
+def test_the_tables_read_are_found_as_the_engine_binds_them():
+    # A quoted CTE named like the table with the column, referenced unquoted in the same
+    # spelling, which sqlglot matches: Postgres keeps the quoted name's case and folds the
+    # reference, so the two differ and the base table is read, and the rule fires as the
+    # engine would read the column; DuckDB folds both to one name and reads the CTE, whose
+    # column list names no such column. The grant spells the table as written (its key is
+    # read as written, a rule of its own).
+    schema = {"Kw": {"id", "current_date"}, "sink": {"i", "s"}}
+    sql = 'WITH "Kw" AS (SELECT id FROM sink) SELECT current_date FROM Kw'
+    on_postgres = decide(sql, {"Kw": {"id"}, "sink": {"i", "s"}}, dialect="duckdb", target="postgres", policy=AccessPolicy(policy_schema=schema))
+    assert isinstance(on_postgres, Refusal) and on_postgres.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, on_postgres
+    on_duckdb = decide(sql, {"Kw": {"id"}, "sink": {"i", "s"}}, dialect="duckdb", target="duckdb", policy=AccessPolicy(policy_schema=schema))
+    assert not (isinstance(on_duckdb, Refusal) and on_duckdb.code is RefusalCode.AMBIGUOUS_NILADIC_NAME), on_duckdb
 
 
 def test_the_column_is_matched_as_the_engine_folds_it():

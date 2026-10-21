@@ -350,7 +350,7 @@ def decide_write(
     ambiguous = fields_as_members(shaped, target, known_columns(visible, policy))  # M165, M167
     if ambiguous is not None:
         return ambiguous
-    named = niladic_names(shaped, known_columns(visible, policy), dialect)  # M194: the write path leaks the same names
+    named = niladic_names(shaped, known_columns(visible, policy), dialect, target)  # M194: the write path leaks the same names
     if named is not None:
         return named
     if ambiguous is not None:

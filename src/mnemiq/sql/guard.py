@@ -239,9 +239,13 @@ _INTERSECT_BINDS_TIGHTER = frozenset({"duckdb", "postgres", "postgresql", "mysql
 
 
 # The niladic names sqlglot reads as a function with no Column node, which DuckDB binds to a
-# same-named column of the query's own FROM before the function (M194). Not `current_user`:
-# DuckDB reads the function beside a same-named column (the ui lane's replay of #175), as
-# Oracle does for every bare name (the register), so refusing it was cost alone.
+# same-named column of the query's own FROM before the function (M194). Not `current_user`,
+# for one reason only: sqlglot prints `exp.CurrentUser` with its parentheses for DuckDB,
+# MySQL, SQLite and Oracle, and bare for Postgres, where the word is reserved, so the target
+# SQL reads the function on each (the ui lane's replay of #175, measured through the target
+# SQL on DuckDB; the bare spelling there reads the column, the review gate). The other
+# names print bare, which is the leak; one that came to print with parentheses would leave
+# this tuple on the same measurement, not on reasoning.
 _NILADIC = (exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime, exp.Localtime,
             exp.Localtimestamp, exp.SessionUser, exp.CurrentCatalog)
 
@@ -283,7 +287,8 @@ def _call_advice(dialect: str | None, name: str) -> str | None:
     return None
 
 
-def niladic_names(ast: exp.Expression, columns, dialect: str | None = None) -> Refusal | None:
+def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
+                  target: str | None = None) -> Refusal | None:
     """A column named like a niladic SQL function is read through the function's node, which
     no grant, deny or mask check sees: DuckDB binds a bare `current_date` to a same-named
     column of the query's own FROM before the function, and sqlglot reads the name as
@@ -303,10 +308,13 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None) -> R
     function to every engine measured. With no schema beyond the grant a withheld column is
     unknown here, a residual the register records. The repair names the column with its
     table, and a call the dialect the query is written in parses as a call that is not the
-    refused name's node (`_call_advice`), since the retry is parsed as that dialect."""
+    refused name's node (`_call_advice`), since the retry is parsed as that dialect. The
+    tables read are found as the engine that runs the query binds them (`target`), as the
+    decider finds them: whether a CTE stands in front of a base table folds names by the
+    engine's rule (the review gate on the fifth commit)."""
     from mnemiq.sql.scope import base_tables  # scope imports this module's checks
 
-    referenced = {object_key(table) for table in base_tables(ast, dialect)}
+    referenced = {object_key(table) for table in base_tables(ast, target or dialect)}
     for node in ast.find_all(*_NILADIC):
         name = _niladic_name(node)
         owners = sorted(table for table in referenced
