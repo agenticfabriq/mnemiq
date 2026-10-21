@@ -222,31 +222,42 @@ def keyword_columns(expr: str) -> set[str]:
     none decides nothing. An unquoted `null` is left out, the constant to every engine; a
     quoted name is read whole; a comment's text is scanned as code in its turn (`_SCAN`).
     Each spelling longer than Postgres's identifier limit is read cut to it as well
-    (`_cut_to_postgres_limit`): Postgres truncates an identifier, quoted or not, to its first
-    63 bytes, so a 64-byte spelling reads the column named by its first 63 (Codex's sixteenth
-    review of #172, where the longer spelling named nothing and the phi column so named
-    reached the uncleared through both selectors); MySQL and Oracle refuse a name past their
-    limits, DuckDB has none. The spelling is cut as written and lowercased after, since
-    lowercasing changes some characters' byte length (the review gate on this round: `İ` is
+    (`_cuts_to_postgres_limit`): Postgres truncates an identifier, quoted or not, to its
+    first 63 bytes, so a 64-byte spelling reads the column named by its first 63 (Codex's
+    sixteenth review of #172, where the longer spelling named nothing and the phi column so
+    named reached the uncleared through both selectors); MySQL and Oracle refuse a name past
+    their limits, DuckDB has none. The spelling is cut as written and lowercased after, since
+    lowercasing changes some characters' byte length (the review gate on that round: `İ` is
     two bytes and its lowercase three)."""
     spellings = _scan(expr, nested=True) | _scan(expr, nested=False)
-    cuts = {cut for cut in map(_cut_to_postgres_limit, spellings) if cut is not None}
+    cuts = {cut for spelling in spellings for cut in _cuts_to_postgres_limit(spelling)}
     return {spelling.lower() for spelling in spellings | cuts}
 
 
 _POSTGRES_IDENTIFIER_BYTES = 63  # NAMEDATALEN - 1, the default build
+_WIDEST_CHARACTER_BYTES = 4  # the widest a character is in any Postgres server encoding
 
 
-def _cut_to_postgres_limit(spelling: str) -> str | None:
-    """`spelling` cut to the first 63 bytes of its UTF-8, whole characters only, as Postgres
-    truncates an identifier (`pg_mbcliplen`), or None where it fits. A lone surrogate, which
-    the identifier class admits, is carried through rather than refused (the review gate on
-    this round: encoded strictly, one such spelling raised for every question over the
-    source)."""
-    encoded = spelling.encode("utf-8", "surrogatepass")
-    if len(encoded) <= _POSTGRES_IDENTIFIER_BYTES:
-        return None
-    return encoded[:_POSTGRES_IDENTIFIER_BYTES].decode("utf-8", "ignore")
+def _cuts_to_postgres_limit(spelling: str) -> set[str]:
+    """Every prefix Postgres may truncate `spelling` to, whole characters only: it cuts an
+    identifier to its first 63 bytes in the SERVER encoding (`pg_mbcliplen`), which the reader
+    here does not know, and the same character is three bytes in UTF-8 and two in EUC_JP, so
+    a cut made in UTF-8 alone missed the column named by the EUC_JP cut (Codex's seventeenth
+    review of #172). An ASCII character is one byte in every server encoding and any other
+    one to four, so a prefix is a possible cut where its shortest length fits the limit and
+    the longest length of one character more does not. The prefixes decide nothing where the
+    catalog has no column so named, so the extra ones withhold more and never less. A lone
+    surrogate, which the identifier class admits, is a character here, nothing encoded (the
+    review gate on the sixteenth round: encoded strictly, one such spelling raised for every
+    question over the source)."""
+    out: set[str] = set()
+    widths = [1 if ord(char) < 128 else _WIDEST_CHARACTER_BYTES for char in spelling]
+    longest = 0  # of the prefix one character longer, at its widest
+    for count, width in enumerate(widths, start=1):
+        longest += width
+        if count > 1 and count - 1 <= _POSTGRES_IDENTIFIER_BYTES < longest:
+            out.add(spelling[:count - 1])
+    return out
 
 
 def _scan(expr: str, nested: bool) -> set[str]:

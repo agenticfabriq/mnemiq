@@ -524,10 +524,15 @@ def test_a_spelling_past_postgres_identifier_limit_reads_the_column_named_by_its
     from mnemiq.contract import Dimension
     from mnemiq.semantic.expr_columns import expression_scope, keyword_columns
     from mnemiq.semantic.measures import select_dimensions
-    ascii_name, wide_name = "s" * 63, "é" * 31
+    # The server encoding is unknown here and the cut falls where it says: `あ` is three bytes
+    # in UTF-8 and two in EUC_JP, so a name of 31 `あ` and an `a` (63 bytes there) is reached
+    # by that name and one more `あ` (Codex's seventeenth review); every prefix the cut may
+    # fall on is read, which for an ASCII spelling is its first 63 characters alone.
+    ascii_name, wide_name, euc_name = "s" * 63, "é" * 31, "あ" * 31 + "a"
     for name, spelling in ((ascii_name, '"' + ascii_name + 'x"'), (ascii_name, ascii_name + "x"),
                            (wide_name, '"' + wide_name + "é" + '"'), (wide_name, wide_name + "é"),
-                           (ascii_name, 'U&"' + "s" * 62 + '\\0073x"')):
+                           (ascii_name, 'U&"' + "s" * 62 + '\\0073x"'),
+                           (euc_name, '"' + euc_name + "あ" + '"'), (euc_name, euc_name + "あ")):
         columns = [Column(id="orders.id", object_id="orders", name="id", data_type="date"),
                    Column(id=f"orders.{name}", object_id="orders", name=name, data_type="text", pii_level="phi")]
         expr = f"(SELECT max({spelling}) FROM orders)"
@@ -538,9 +543,18 @@ def test_a_spelling_past_postgres_identifier_limit_reads_the_column_named_by_its
         dim = Dimension(id="d", label=expr, source="orders", expr=expr)
         assert select_dimensions(["orders"], [dim], _UNCLEARED, columns=columns) == [], expr
         assert select_dimensions(["orders"], [dim], _CLEARED, columns=columns) == [dim], expr
-    # a spelling that fits is not cut: 63 bytes exactly, and a shorter one
+    # a spelling that fits in every encoding is not cut, and an ASCII spelling one past the
+    # limit reads one prefix; a non-ASCII spelling reads its prefixes down to where four bytes
+    # a character would cut it, each a prefix of the spelling and nothing else
     assert keyword_columns('"' + ascii_name + '"') == {ascii_name}
-    assert keyword_columns('"' + wide_name + 'x"') == {wide_name + "x"}   # 63 bytes
+    assert keyword_columns('"' + ascii_name + 'x"') == {ascii_name + "x", ascii_name}
+    wide = keyword_columns('"' + wide_name + 'x"')
+    assert wide_name + "x" in wide and all((wide_name + "x").startswith(w) and len(w) >= 15 for w in wide), wide
+    # a character four bytes wide in some server encoding (EUC_TW's later planes,
+    # MULE_INTERNAL) cuts sixteen of them at fifteen, where UTF-8 alone, three bytes each,
+    # would cut nothing
+    assert "あ" * 15 in keyword_columns('"' + "あ" * 16 + '"')
+    assert "あ" * 14 not in keyword_columns('"' + "あ" * 16 + '"')
     # cut as written, lowercased after (the gate): `İ` is two bytes, its lowercase three, so
     # Postgres reads `s` * 62 (the `İ` not whole at 63) where the lowercased spelling cut at
     # another boundary; a lone surrogate, which the identifier class admits, raises nothing
