@@ -171,13 +171,21 @@ _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest, exp.Pivot)
 # own characters for an unquoted identifier, ASCII letters, digits, `_` and `$` and anything
 # in U+0080 to U+FFFF (combining marks and currency symbols among them: `1é`, `1你好`, `1$`,
 # `1€` and the decomposed `1e\u0301x` were missed or cut short under Python's word class; the
-# fifth review, the gate on the tenth commit), that is not digits alone, a number to every
-# engine.
-_IDENT_CHAR = r"[A-Za-z0-9_$\u0080-\uffff]"
+# fifth review, the gate on the tenth commit) and beyond it, since sqlglot reads an unquoted
+# astral character in a unit position as a string too (`date_trunc(💩, id)`: Codex's twelfth
+# review), that is not digits alone, a number to every engine. A QUOTED name is read whole
+# besides, with its doubled quotes undoubled: `date_trunc("secret code", id)`, `"secret.code"`,
+# `"123"`, `"null"` and `"se""cret"` each parse as the unit string, and the token rule split or
+# dropped the name (the same review), so each quoted span of the text, double-quoted,
+# backticked or single-quoted (sqlite reads a single-quoted name as the column where no
+# string fits), is a column it may be as written.
+_IDENT_CHAR = r"[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff]"
 _IDENT_TOKEN = re.compile(r"(?<!" + _IDENT_CHAR + r")(?![0-9]+(?!" + _IDENT_CHAR + r"))" + _IDENT_CHAR + r"+")
+_QUOTED = re.compile(r'"((?:[^"]|"")+)"|`((?:[^`]|``)+)`|\'((?:[^\']|\'\')+)\'')
 # The one spelling every engine reads as the constant unquoted, never as a column so named: a
 # dimension `null` over a table with a phi column `null` is shown to the uncleared (the
 # dimension tests), where `true` on sqlite and `current_date` on DuckDB read the column.
+# Quoted, `"null"` is the column (the review gate on the seventeenth commit).
 _NEVER_A_COLUMN = frozenset({"null"})
 
 
@@ -187,8 +195,14 @@ def keyword_columns(expr: str) -> set[str]:
     type among them (`_IDENT_TOKEN`). Kept apart from `columns_read`, whose other caller marks
     a dimension unresolved when a ref names no column (the review gate on the first draft):
     the raw-read check asks these only where the table has the column, and a spelling naming
-    none decides nothing. `null` is left out, the constant to every engine."""
-    return {token.lower() for token in _IDENT_TOKEN.findall(expr)} - _NEVER_A_COLUMN
+    none decides nothing. An unquoted `null` is left out, the constant to every engine; a
+    quoted name is read whole (`_QUOTED`)."""
+    tokens = {token.lower() for token in _IDENT_TOKEN.findall(expr)} - _NEVER_A_COLUMN
+    for double, back, single in _QUOTED.findall(expr):
+        for name, quote in ((double, '"'), (back, "`"), (single, "'")):
+            if name:
+                tokens.add(name.replace(quote * 2, quote).lower())
+    return tokens
 
 
 def expression_scope(expr: str, source: str) -> str:

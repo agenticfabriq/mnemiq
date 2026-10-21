@@ -448,6 +448,36 @@ def test_a_column_the_parser_reads_as_a_unit_or_a_type_still_requires_its_cleara
     assert select_metrics(["orders"], [_metric(limited)], _UNCLEARED, columns=columns) == [_metric(limited)]
 
 
+def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
+    # Codex's twelfth review of #172: `date_trunc("secret code", id)` parses as the unit string
+    # too, and the token rule split the quoted name at its space (`"secret.code"` at its dot),
+    # dropped `"123"` as digits and `"null"` as the constant, and knew no character of `"💩"`,
+    # so each phi column so named was offered to the uncleared through the metric and the
+    # dimension selectors alike, DuckDB reading the unit column. A quoted span is a column it
+    # may be as written, doubled quotes undoubled; an unquoted astral character is a token.
+    from mnemiq.contract import Dimension
+    from mnemiq.semantic.expr_columns import expression_scope, keyword_columns
+    from mnemiq.semantic.measures import select_dimensions
+    con = duckdb.connect(":memory:")
+    con.execute('CREATE TABLE orders(id DATE, "secret code" TEXT)')
+    con.execute("INSERT INTO orders VALUES ('2026-03-15', 'year'), ('2026-03-15', 'day')")
+    dates = con.execute('SELECT date_trunc("secret code", id) FROM orders ORDER BY "secret code"').fetchall()
+    assert dates[0] != dates[1]
+    for name, spelling in (("secret code", '"secret code"'), ("secret.code", '"secret.code"'), ("💩", '"💩"'),
+                           ("💩", "💩"), ("123", '"123"'), ("null", '"null"'), ('se"cret', '"se""cret"'),
+                           ("secret code", "`secret code`"), ("secret code", "'secret code'")):
+        columns = [Column(id="orders.id", object_id="orders", name="id", data_type="date"),
+                   Column(id=f"orders.{name}", object_id="orders", name=name, data_type="text", pii_level="phi")]
+        expr = f"(SELECT max(date_trunc({spelling}, id)) FROM orders)"
+        assert expression_scope(expr, "orders") == "own", expr
+        assert name in keyword_columns(expr), expr
+        assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=columns) == [], expr
+        assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=columns) == [_metric(expr)], expr
+        dim = Dimension(id="d", label=expr, source="orders", expr=expr)
+        assert select_dimensions(["orders"], [dim], _UNCLEARED, columns=columns) == [], expr
+        assert select_dimensions(["orders"], [dim], _CLEARED, columns=columns) == [dim], expr
+
+
 def test_a_struct_column_named_like_the_source_keeps_its_root_reading():
     # Codex's eighth review of #172: with a phi struct column named `orders` on `orders`, the
     # parser reads `orders.value` as a qualifier and a column, and the root reading was kept
