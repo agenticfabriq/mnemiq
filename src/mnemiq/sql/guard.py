@@ -252,22 +252,24 @@ _NILADIC = (exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime, exp.Localtim
 
 # The call spellings the repair may name, per dialect the model writes in (the statement it
 # retries with is parsed as `dialect` and transpiled to the target, so a target's spelling
-# could be a column to the parser: the review gate), in order of preference; the first whose
-# node is not the refused name's is named (`_call_advice`). Each is approved by the decider
-# with no adapter's function inventory, measured at the fourth commit, but Postgres's
-# `clock_timestamp()`, which needs one: Postgres's `now()` parses to the CURRENT_TIMESTAMP
-# node, so it serves unless `current_timestamp` is the refused name itself. `today()` on
-# DuckDB, `curdate()` on MySQL and `SYSDATE` on Oracle parse to refused nodes (the gate), and
-# `get_current_timestamp()` is unmodelled without an inventory and `current_date()` reads the
-# column on DuckDB (the ui lane's replay). An engine not listed is told to write a call with
-# no example.
+# could be a column to the parser: the review gate), in order of preference; the first the
+# decider approves as the retry is named (`_call_advice`): parsed as a call the function
+# guard models, and not one of the niladic nodes whose name a table the statement reads has
+# as a column. Measured: `now()` on DuckDB and MySQL is a plain call the guard models;
+# Postgres's `now()` parses to the CURRENT_TIMESTAMP node and `localtimestamp` to its own,
+# where `clock_timestamp()` is unmodelled without an adapter's function inventory and was
+# advised beside a column named `current_timestamp`, then refused on the retry (Codex's
+# first review of #175); `today()` on DuckDB, `curdate()` on MySQL and `SYSDATE` on Oracle
+# parse to niladic nodes too (the gate), `get_current_timestamp()` is unmodelled, and
+# `current_date()` reads the column on DuckDB (the ui lane's replay). A table holding every
+# candidate's name leaves the repair with no example. An engine not listed the same.
 _CALL_ADVICE: dict[str, tuple[str, ...]] = {
-    "duckdb": ("now()",),
-    "postgres": ("now()", "clock_timestamp()"),
-    "postgresql": ("now()", "clock_timestamp()"),
-    "mysql": ("now()", "sysdate()"),
-    "sqlite": ("datetime('now')",),
-    "oracle": ("SYSTIMESTAMP",),
+    "duckdb": ("now()", "localtimestamp"),
+    "postgres": ("now()", "localtimestamp"),
+    "postgresql": ("now()", "localtimestamp"),
+    "mysql": ("now()", "sysdate()", "utc_timestamp()"),
+    "sqlite": ("datetime('now')", "date('now')"),
+    "oracle": ("SYSTIMESTAMP", "SYSDATE"),
 }
 
 
@@ -275,15 +277,22 @@ def _niladic_name(node: exp.Expression) -> str:
     return node.sql(dialect="duckdb").split("(")[0].strip().lower()
 
 
-def _call_advice(dialect: str | None, name: str) -> str | None:
-    """The first of the dialect's call spellings whose parse is not the refused name's node."""
+def _call_advice(dialect: str | None, taken: frozenset[str]) -> str | None:
+    """The first of the dialect's call spellings the decider approves as the retry: a call the
+    function guard models (a typed node, or a name on its allow-list), and not a niladic node
+    whose name is in `taken`, the niladic names the tables read have as columns."""
+    from mnemiq.sql.authz_guard import _KNOWN_FUNCTIONS  # authz_guard imports this module
+
     for call in _CALL_ADVICE.get((dialect or "").lower(), ()):
         try:
             node = sqlglot.parse_one(f"SELECT {call}", read=dialect).selects[0]
         except Exception:  # noqa: BLE001 -- a spelling the dialect cannot parse is no advice
             continue
-        if not (isinstance(node, _NILADIC) and _niladic_name(node) == name):
-            return call
+        if isinstance(node, exp.Anonymous) and str(node.this).upper() not in _KNOWN_FUNCTIONS:
+            continue
+        if isinstance(node, _NILADIC) and _niladic_name(node) in taken:
+            continue
+        return call
     return None
 
 
@@ -315,12 +324,21 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
     from mnemiq.sql.scope import base_tables  # scope imports this module's checks
 
     referenced = {object_key(table) for table in base_tables(ast, target or dialect)}
+
+    def columns_of(table: str) -> set[str]:
+        # Every inventory keyed by a spelling that folds onto the table's: a grant keyed `KW`
+        # and a policy keyed `kw` are one table to DuckDB, and read under the grant's key
+        # alone the policy's `current_date` was unseen and the bare name approved (Codex's
+        # first review of #175). Folded on every engine, which refuses more where quoting
+        # keeps `"KW"` and `kw` apart, never less.
+        return {n.lower() for key, names in (columns or {}).items() if key.lower() == table.lower() for n in names}
+
+    taken = frozenset(name for table in referenced for name in columns_of(table))
     for node in ast.find_all(*_NILADIC):
         name = _niladic_name(node)
-        owners = sorted(table for table in referenced
-                        if any(n.lower() == name for n in (columns or {}).get(table, ())))
+        owners = sorted(table for table in referenced if name in columns_of(table))
         if owners:
-            call = _call_advice(dialect, name)
+            call = _call_advice(dialect, taken)
             advice = f"such as {call}" if call else "with its own name and parentheses"
             return Refusal(
                 code=RefusalCode.AMBIGUOUS_NILADIC_NAME,

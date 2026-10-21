@@ -7,6 +7,8 @@ has a column so named, fail-closed, on the read and the write path.
 
 from __future__ import annotations
 
+import re
+
 import duckdb
 import pytest
 import sqlglot
@@ -143,18 +145,59 @@ def test_the_repair_names_a_call_the_decider_approves_in_that_dialect(dialect, c
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
     assert "kw.current_date" in verdict.message and call in verdict.message, verdict.message
     assert "current_date()" not in verdict.message and "get_current_timestamp" not in verdict.message
+    assert "clock_timestamp" not in verdict.message
     retry = decide(f"SELECT {call} FROM kw", {"kw": {"id"}, "sink": {"i", "s"}}, dialect=dialect, target=dialect, policy=policy)
     assert isinstance(retry, Approved), (dialect, call, retry)
 
 
-def test_postgres_is_told_clock_timestamp_where_now_is_the_refused_name():
-    # Postgres's `now()` parses to the CURRENT_TIMESTAMP node, so beside a column named
-    # `current_timestamp` it would meet the same refusal; `clock_timestamp()` is a plain call
-    # there, modelled only with an adapter's function inventory.
-    schema = {"kw": {"id", "current_timestamp"}}
-    verdict = decide("SELECT current_timestamp FROM kw", {"kw": {"id"}}, dialect="postgres", target="postgres",
-                     policy=AccessPolicy(policy_schema=schema))
-    assert isinstance(verdict, Refusal) and "clock_timestamp()" in verdict.message and "now()" not in verdict.message, verdict
+@pytest.mark.parametrize("dialect", ["duckdb", "postgres", "mysql", "sqlite", "oracle"])
+@pytest.mark.parametrize("taken", [{"current_date"}, {"current_timestamp"}, {"localtimestamp"},
+                                   {"current_timestamp", "localtimestamp"}, {"current_date", "current_timestamp", "localtimestamp"}])
+def test_the_advice_is_a_call_the_decider_approves_whatever_names_the_table_holds(dialect, taken):
+    # Codex's first review of #175: Postgres's `now()` parses to the CURRENT_TIMESTAMP node,
+    # so beside a column named `current_timestamp` it met the same refusal, and the
+    # `clock_timestamp()` advised instead is unmodelled without an adapter's function
+    # inventory, refused on the retry. The advice is verified as the decider verifies the
+    # retry: a modelled call, not a niladic node whose name the table holds; where every
+    # candidate's name is held, no example is given.
+    from mnemiq.sql.guard import _NILADIC
+    schema = {"kw": {"id", *taken}}
+    policy = AccessPolicy(policy_schema=schema)
+    name = sorted(taken)[0]
+    verdict = decide(f"SELECT {name} FROM kw", {"kw": {"id"}}, dialect=dialect, target=dialect, policy=policy)
+    if not isinstance(sqlglot.parse_one(f"SELECT {name}", read=dialect).selects[0], _NILADIC):
+        # the dialect reads the spelling as a column (`localtimestamp` on SQLite): the grant check
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+        return
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+    advised = re.search(r"such as (.+?)\.$", verdict.message)
+    if advised is None:
+        assert "with its own name and parentheses" in verdict.message, verdict.message
+        assert dialect == "postgres" and taken >= {"current_timestamp", "localtimestamp"}, (dialect, taken)
+        return
+    retry = decide(f"SELECT {advised.group(1)} FROM kw", {"kw": {"id"}}, dialect=dialect, target=dialect, policy=policy)
+    assert isinstance(retry, Approved), (dialect, taken, advised.group(1), retry)
+
+
+def test_an_unmodelled_spelling_is_never_advised(monkeypatch):
+    # The guard itself, since no spelling in the tables is unmodelled any more: were one
+    # listed first, as `clock_timestamp()` was, the advice passes over it.
+    import mnemiq.sql.guard as guard
+    monkeypatch.setitem(guard._CALL_ADVICE, "postgres", ("clock_timestamp()", "now()"))
+    assert guard._call_advice("postgres", frozenset({"current_date"})) == "now()"
+    assert guard._call_advice("postgres", frozenset({"current_timestamp"})) is None
+
+
+def test_a_grant_and_a_policy_keyed_in_different_cases_are_one_table_to_the_rule(worlds):
+    # The same review: a grant keyed `KW` beside a policy keyed `kw` read the grant's columns
+    # alone, so the policy's `current_date` was unseen and the bare name approved, the
+    # column's value returned on DuckDB, which folds both.
+    policy = AccessPolicy(denied={("kw", "current_date")}, policy_schema={"kw": {"id", "current_date"}})
+    verdict = decide("SELECT current_date FROM KW", {"KW": {"id"}}, dialect="duckdb", target="duckdb", policy=policy)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+    verdict = decide("SELECT current_date FROM kw", {"kw": {"id"}}, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(policy_schema={"KW": {"id", "current_date"}}))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
 
 
 def test_the_advice_is_in_the_dialect_the_model_writes_not_the_targets():
