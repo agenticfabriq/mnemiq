@@ -20,36 +20,93 @@ def _column_and_string(a: exp.Expression, b: exp.Expression) -> tuple[exp.Column
 
 
 def _scopes(ast: exp.Expression) -> dict[int, Scope]:
-    """Each column node's own scope, by identity. Empty where sqlglot cannot build the scopes,
-    which leaves every column to the base-table resolution below, as before M141."""
+    """Each column node's own scope, by identity: the INNERMOST that lists it, since sqlglot
+    lists an inner subquery's unqualified column in the outer scope as well, and the outer
+    one read `doc` in `EXISTS (SELECT 1 FROM u WHERE doc = 'z')` among t's sources and refused
+    the right literal naming `t.doc` (the review gate's third round on M174; `traverse_scope`
+    yields the inner scopes first). Empty where sqlglot cannot build the scopes, which leaves
+    every column to the statement-wide resolution below, as before M141."""
     try:
-        return {id(c): scope for scope in traverse_scope(ast) for c in scope.columns}
+        out: dict[int, Scope] = {}
+        for scope in traverse_scope(ast):
+            for c in scope.columns:
+                out.setdefault(id(c), scope)
+        return out
     except (SqlglotError, RecursionError):
         return {}
 
 
-def _through_scopes(
-    column: exp.Column, scope: Scope, cte: set[str], depth: int = 0
-) -> tuple[str, str] | None:
-    """The base table and column a qualified column reads, followed through each CTE or derived table that
-    projects it (M141). Only a projection that IS a column is followed, renamed or not; a
-    function, a literal or a union has no single base column, so None, and the check skips."""
+def _is_star(projection: exp.Expression) -> bool:
+    """A star that passes the source's columns through as they are: one with an EXCLUDE, a
+    REPLACE or a RENAME changes what a name reaches (`* REPLACE (upper(doc) AS doc)` is no
+    longer `t.doc`, `* RENAME (region AS doc)` is `t.region`), and the walk gives up on it
+    rather than guess (the review gate's fourth round on M174)."""
+    star = projection.this if isinstance(projection, exp.Column) else projection
+    return isinstance(star, exp.Star) and not any(star.args.get(k) for k in ("except_", "replace", "rename"))
+
+
+def _column_list(source: Scope) -> list[str] | None:
+    """The column list a CTE's or a derived table's alias puts on the scope's output, by
+    position (`WITH x(region, doc) AS (...)`, `(...) d(a, b)`), or None where it has none."""
+    holder = source.expression.parent
+    while isinstance(holder, exp.Paren):
+        holder = holder.parent
+    if not isinstance(holder, (exp.CTE, exp.Subquery)):
+        return None
+    alias = holder.args.get("alias")
+    columns = alias.columns if isinstance(alias, exp.TableAlias) else None
+    return [c.name for c in columns] if columns else None
+
+
+def _through_scopes(column: exp.Column, scope: Scope, depth: int = 0) -> tuple[str, str] | None:
+    """The base table and column a qualified column reads, followed through each CTE or derived
+    table that projects it (M141). Only a projection that IS a column is followed, renamed or
+    not; a function, a literal or a union has no single base column, so None, and the check
+    skips. The scope's own answer says whether the qualifier is a base table or a local source:
+    a CTE named after the base table it reads (`WITH t AS (SELECT doc FROM t)`) was discarded by
+    a statement-wide CTE-name set, and a wrong literal against it passed (M174, Codex's review
+    of #128). A column list renames by POSITION: `WITH x(region, doc) AS (SELECT doc, region
+    FROM t)` makes `x.doc` the second projection, `t.region`, where matching by name checked it
+    against `t.doc`'s values (the same finding); a star among the listed positions yields a
+    column per column of its source, so the positions are unknown and the walk gives up (the
+    review gate's fifth round). A projection without a qualifier is followed
+    into the scope's one SELECTED source, not its one visible definition: three chained CTEs
+    count every earlier CTE among `sources` and skipped the walk (the same finding). A name no
+    projection carries comes through a star, into the scope's one selected source the same
+    way (the review gate: an unqualified `doc` through `SELECT * FROM t` lost its owner once
+    the statement-wide lookup became the fallback), a star with an EXCLUDE, a REPLACE or a
+    RENAME excepted, which the walk gives up on (`_is_star`). Where this answers nothing, the caller
+    keeps the statement-wide reading it had: a star over a join, a set operation, a recursive
+    CTE and a correlated name each resolved there and nowhere here (the gate's second round)."""
     source = scope.sources.get(column.table) if column.table else None
     if isinstance(source, exp.Table):
-        return None if source.name in cte else (source.name, column.name)
+        return (source.name, column.name)
     if not isinstance(source, Scope) or depth > 32:
         return None
     if not isinstance(source.expression, exp.Select):
         return None
-    for projection in source.expression.selects:
-        if projection.alias_or_name == column.name:
-            inner = projection.unalias()
-            if isinstance(inner, exp.Column) and inner.table:
-                return _through_scopes(inner, source, cte, depth + 1)
-            if isinstance(inner, exp.Column) and len(source.sources) == 1:
-                (alias,) = source.sources
-                return _through_scopes(exp.column(inner.name, table=alias), source, cte, depth + 1)
-            return None
+    selects = source.expression.selects
+    listed = _column_list(source) or []
+    if any(isinstance(p.this if isinstance(p, exp.Column) else p, exp.Star) for p in selects[:len(listed)]):
+        return None  # a star among the listed positions: a column per source column, positions unknown
+    if column.name in listed[:len(selects)]:
+        projection = selects[listed.index(column.name)]  # renamed by position
+    else:
+        # A list names the first projections alone and the engine keeps the rest by their own
+        # names (`WITH x(k) AS (SELECT region, doc FROM t)` keeps `doc`: the review gate's
+        # fourth round), so the projections past the list are matched by name.
+        projection = next((p for p in selects[len(listed):] if p.alias_or_name == column.name), None)
+        if projection is None:
+            if not any(_is_star(p) for p in selects[len(listed):]) or len(source.selected_sources) != 1:
+                return None
+            (alias,) = source.selected_sources
+            return _through_scopes(exp.column(column.name, table=alias), source, depth + 1)
+    inner = projection.unalias()
+    if isinstance(inner, exp.Column) and inner.table:
+        return _through_scopes(inner, source, depth + 1)
+    if isinstance(inner, exp.Column) and len(source.selected_sources) == 1:
+        (alias,) = source.selected_sources
+        return _through_scopes(exp.column(inner.name, table=alias), source, depth + 1)
     return None
 
 
@@ -79,6 +136,8 @@ def check_values(
     answers whether a raw value exists, which the mask exists to withhold.
     """
     row_filtered = row_filtered or set()
+    # The statement-wide reading, the fallback where the scope answers nothing: every table
+    # node, a CTE's name excluded by a statement-wide set, as before M141.
     cte = {c.alias_or_name for c in ast.find_all(exp.CTE)}
     alias_to_table: dict[str, str] = {}
     for table in ast.find_all(exp.Table):
@@ -89,17 +148,40 @@ def check_values(
 
     def resolve(column: exp.Column) -> tuple[str, str] | None:
         qualifier = column.table
+        scope = scopes.get(id(column))
+        if scope is not None:
+            # The scope's own answer first (M141, M174): a base table, or a local source
+            # followed to the column it projects, the column renamed included -- `x.doc` may be
+            # `t.region`, and read by its name it would be checked against `t.doc`'s values.
+            # An unqualified name is read among the scope's selected sources, a base table
+            # holding it or a local source projecting it, one owner or no answer.
+            if qualifier:
+                found = _through_scopes(column, scope)
+                if found is not None:
+                    return found
+                if isinstance(scope.sources.get(qualifier), Scope):
+                    return None  # a local source projecting no such column: nothing to check
+            else:
+                owners: list[tuple[str, str]] = []
+                for alias, (_, source) in scope.selected_sources.items():
+                    if isinstance(source, exp.Table):
+                        if column.name in visible.get(source.name, set()):
+                            owners.append((source.name, column.name))
+                    else:
+                        found = _through_scopes(exp.column(column.name, table=alias), scope)
+                        if found is not None:
+                            owners.append(found)
+                if len(owners) == 1:
+                    return owners[0]
+        # The statement-wide reading, as before M174, where the scope answers nothing: a star
+        # over a join, a set operation, a recursive CTE, a correlated name, a column sqlglot
+        # lists in no scope (the review gate's second round, each refused here and skipped by
+        # the scope alone).
         if qualifier:
-            scope = scopes.get(id(column))
-            if scope is not None and isinstance(scope.sources.get(qualifier), Scope):
-                # A CTE or a derived table: followed to the column it projects, the column
-                # renamed included -- `x.doc` may be `t.region`, and read by its name it would
-                # be checked against `t.doc`'s values.
-                return _through_scopes(column, scope, cte)
             table = alias_to_table.get(qualifier)
             return (table, column.name) if table else None
-        owners = [t for t in referenced if column.name in visible.get(t, set())]
-        return (owners[0], column.name) if len(owners) == 1 else None  # ambiguous -> skip
+        owners_wide = [t for t in referenced if column.name in visible.get(t, set())]
+        return (owners_wide[0], column.name) if len(owners_wide) == 1 else None  # ambiguous -> skip
 
     def violation(column: exp.Column, literal: str) -> Refusal | None:
         resolved = resolve(column)
