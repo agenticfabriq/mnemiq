@@ -1336,12 +1336,16 @@ class OracleAdapter:
             names = [d[0] for d in cur.description] if cur.description else []
             return names, cur.fetchall()
 
+        started = time.monotonic()
         try:
             names, rows = self._with_cursor(_fetch)
         except self._oracledb.DatabaseError as exc:
-            # DPY-4024, ORA-01013, ORA-03156 and DPY-4011 surface a bounded call's end (`_TIMEOUT_SPELLINGS`); report it as a timeout rather than
-            # letting a driver code reach the caller as an opaque source error.
-            if timeout_s is not None and _is_timeout(exc):
+            # DPY-4024, ORA-01013, ORA-03156 and DPY-4011 surface a bounded call's end
+            # (`_TIMEOUT_SPELLINGS`); report it as a timeout rather than letting a driver code
+            # reach the caller as an opaque source error. ORA-01013 is the cancel itself, the
+            # driver's at the deadline or anyone's on a connection the caller owns (`over`), so
+            # it is a timeout only once the deadline has passed (Codex's first review of #176).
+            if timeout_s is not None and _is_timeout(exc, deadline_met=time.monotonic() - started >= timeout_s):
                 raise RuntimeError(f"query timed out after {timeout_s}s") from exc
             raise
 
@@ -1714,7 +1718,7 @@ def _is_ddl_race(exc: Exception) -> bool:
     return "ora-01466" in str(exc).lower()
 
 
-# The spellings a bounded call's end takes, by the driver's own error list (python-oracledb
+# The codes a bounded call's end takes, by the driver's own error list (python-oracledb
 # 4.0.2, the locked version), each by its code so a reworded message changes nothing: DPY-4024,
 # the thin-mode call timeout ("call timeout of 300 ms exceeded", measured on Oracle Free 23);
 # ORA-01013, the cancel a call timeout surfaces as in thick mode and under a server-side
@@ -1722,13 +1726,25 @@ def _is_ddl_race(exc: Exception) -> bool:
 # lane); ORA-03156, the server's own statement timeout; and DPY-4011, a closed connection,
 # read as a timeout until the runner reads the adapter's own outage classification after its
 # timeout branch (M188). What the runner makes of the "query timed out" this raises is the
-# runner's (M188): it reads "interrupt" alone today.
-_TIMEOUT_SPELLINGS = ("dpy-4011", "dpy-4024", "ora-01013", "ora-03156", "timeout")
+# runner's (M188): it reads "interrupt" alone today. The code is read off the driver's error
+# object (`full_code`) where the error carries one, so an application error whose message
+# quotes a timeout code (`ORA-20001: ... ORA-01013`) is not one (Codex's first review of
+# #176); an error with no code, a wrapped or a synthetic one, is read by its text, where the
+# word "timeout" alone counts too, the fallback the matcher has always had. ORA-01013 is the
+# cancel, which the deadline raises and anyone holding the connection may: a timeout only
+# once the deadline has passed (`deadline_met`), the cancel's own detail kept otherwise.
+_TIMEOUT_CODES = frozenset({"DPY-4011", "DPY-4024", "ORA-03156"})
+_CANCEL_CODE = "ORA-01013"
+_TIMEOUT_SPELLINGS = tuple(code.lower() for code in sorted(_TIMEOUT_CODES)) + ("timeout",)
 
 
-def _is_timeout(exc: Exception) -> bool:
+def _is_timeout(exc: Exception, deadline_met: bool = True) -> bool:
+    code = getattr(exc.args[0], "full_code", None) if exc.args else None
+    if isinstance(code, str) and code:
+        return code.upper() in _TIMEOUT_CODES or (code.upper() == _CANCEL_CODE and deadline_met)
     text = str(exc).lower()
-    return any(spelling in text for spelling in _TIMEOUT_SPELLINGS)
+    return any(spelling in text for spelling in _TIMEOUT_SPELLINGS) or (
+        _CANCEL_CODE.lower() in text and deadline_met)
 
 
 # The driver's own codes that say the connection, the pool, the connect handshake or the wire
