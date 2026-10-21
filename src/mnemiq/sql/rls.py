@@ -1074,6 +1074,15 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
         value = value.this
     if isinstance(value, exp.Array) and kind[0] == "array":
         return any(_unknown_meets_a_container(item, kind[1]) for item in value.expressions)
+    if isinstance(value, exp.ToMap) and isinstance(value.this, exp.Struct) and kind[0] == "map":
+        # `MAP {k: v}`: each key against the key type, each value against the value type
+        # (`MAP {1: lower(region)} = MAP {1: region}` runs and was refused as a bare unknown:
+        # Codex's thirty-second review of #160).
+        return any(_unknown_meets_a_container(item.this, kind[1]) or _unknown_meets_a_container(item.expression, kind[2])
+                   for item in value.this.expressions if isinstance(item, exp.PropertyEQ))
+    if _is_row(value) and kind[0] == "struct":
+        # `row(a, b)` and `(a, b)`: positional fields against the struct's (the same review).
+        return any(_unknown_meets_a_container(part, field) for part, (_, field) in zip(value.expressions, kind[1]))
     if isinstance(value, exp.Struct) and kind[0] == "struct":
         items = [(item.this.name.lower() if isinstance(item, exp.PropertyEQ) and isinstance(item.this, exp.Identifier) else None,
                   item.expression if isinstance(item, exp.PropertyEQ) else item) for item in value.expressions]
@@ -1084,11 +1093,15 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
     return kind[0] in _CONTAINER_KINDS
 
 
+def _is_row(value: exp.Expression) -> bool:
+    return isinstance(value, exp.Tuple) or (isinstance(value, exp.Anonymous) and value.name.lower() == "row")
+
+
 def _bare_value(value: exp.Expression) -> bool:
-    """A value with no list, struct or map syntax at its top: what the engine casts whole."""
+    """A value with no list, struct, map or row syntax at its top: what the engine casts whole."""
     while isinstance(value, exp.Paren):
         value = value.this
-    return not isinstance(value, (exp.Array, exp.Struct, exp.ToMap))
+    return not (isinstance(value, (exp.Array, exp.Struct, exp.ToMap)) or _is_row(value))
 
 
 def _pure_literal(value: exp.Expression) -> bool:

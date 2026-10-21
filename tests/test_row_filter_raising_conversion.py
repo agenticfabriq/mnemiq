@@ -1179,6 +1179,9 @@ def test_a_union_extract_with_a_non_literal_tag_is_refused_naming_the_tag(row_fi
     "{'a': lower(region)} = {'a': [id]}",
     "lower(region) = [id]",    # at the top level the same: the untyped value meets a list
     "lower(region) = ['x']",   # and a literal list too: at the top level the text is cast to it (the gate)
+    "MAP {1: lower(region)} = MAP {1: [id]}",   # a map's value and a row's field walked too (Codex's 32nd)
+    "MAP {lower(region): 1} = MAP {[id]: 1}",
+    "row(lower(region)) = row([id])",
 ])
 def test_an_unknown_value_beside_a_typed_container_is_refused(row_filter):
     # Codex's thirty-first review: a call the reader cannot type was dropped from the container
@@ -1192,7 +1195,9 @@ def test_an_unknown_value_beside_a_typed_container_is_refused(row_filter):
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
     # Where the untyped part meets text, or the container is literals alone, unknown stays
     # approved by design.
-    for running in ("[region] = [lower(region)]", "[lower(region)] = ['x']", "lower(region) = 'x'"):
+    for running in ("[region] = [lower(region)]", "[lower(region)] = ['x']", "lower(region) = 'x'",
+                    "MAP {1: lower(region)} = MAP {1: region}", "row(lower(region)) = row(region)",
+                    "(lower(region), 1) = (region, 1)"):
         con.execute(f"SELECT id FROM claim WHERE {running}").fetchall()
         assert isinstance(_decide(running), Approved), running
 
