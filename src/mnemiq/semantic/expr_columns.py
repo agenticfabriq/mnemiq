@@ -198,6 +198,8 @@ _SCAN = re.compile(r"(?P<line>--[^\n]*)|(?P<block>/\*)"
                    r'|"(?P<double>(?:[^"]|"")+)"|`(?P<back>(?:[^`]|``)+)`|\'(?P<single>(?:[^\']|\'\')+)\''
                    r"|(?P<token>(?![0-9]+(?!" + _IDENT_CHAR + r"))" + _IDENT_CHAR + r"+)", re.S)
 _QUOTE = {"double": '"', "back": "`", "single": "'"}
+_UESCAPE = re.compile(r"\s*UESCAPE\s*'(?P<esc>[^'])'", re.I | re.S)
+_HEX = re.compile(r"[0-9A-Fa-f]+")
 # The one spelling every engine reads as the constant unquoted, never as a column so named: a
 # dimension `null` over a table with a phi column `null` is shown to the uncleared (the
 # dimension tests), where `true` on sqlite and `current_date` on DuckDB read the column.
@@ -228,13 +230,53 @@ def _scan(expr: str, nested: bool) -> set[str]:
             if match.group().lower() not in _NEVER_A_COLUMN:
                 out.add(match.group().lower())
         elif kind in _QUOTE:
-            out.add(match.group(kind).replace(_QUOTE[kind] * 2, _QUOTE[kind]).lower())
+            span = match.group(kind).replace(_QUOTE[kind] * 2, _QUOTE[kind])
+            out.add(span.lower())
+            decoded = _unicode_escaped(expr, match, span)
+            if decoded is not None:
+                out.add(decoded.lower())
         elif kind == "line":
             out |= _scan(match.group()[2:], nested)
         else:
             pos, closed = _block_end(expr, match.start(), nested)
             out |= _scan(expr[match.start() + 2:pos - 2 if closed else pos], nested)
     return out
+
+
+def _unicode_escaped(expr: str, match: re.Match, span: str) -> str | None:
+    """The name a Postgres Unicode-escaped span decodes to, or None where the span is not one
+    or the escapes are not Postgres's: `U&` touching the opening quote marks it (`U& "x"` is
+    the `&` operator over a column `U`, which DuckDB binds), the escape character `\\` unless
+    a `UESCAPE 'c'` follows the closing quote, `\\XXXX` and `\\+XXXXXX` a code point each,
+    the escape doubled the character itself, a surrogate pair one character. `U&"secret\\005fcode"`
+    is `secret_code` to Postgres (Codex's fifteenth review of #172), where the spellings
+    read were `u` and the span as written and the phi column so named was offered through
+    the metric and the dimension selectors alike; DuckDB refuses the spelling, MySQL and
+    SQLite read the operator. The span as written stays a spelling too."""
+    if expr[max(match.start() - 2, 0):match.start()].lower() != "u&":
+        return None
+    tail = _UESCAPE.match(expr, match.end())
+    esc = tail.group("esc") if tail else "\\"
+    out, i = [], 0
+    try:
+        while i < len(span):
+            if span[i] != esc:
+                out.append(span[i])
+                i += 1
+            elif span.startswith(esc, i + 1):
+                out.append(esc)
+                i += 2
+            elif span[i + 1:i + 2] == "+" and _HEX.fullmatch(span[i + 2:i + 8]):
+                out.append(chr(int(span[i + 2:i + 8], 16)))
+                i += 8
+            elif _HEX.fullmatch(span[i + 1:i + 5]):
+                out.append(chr(int(span[i + 1:i + 5], 16)))
+                i += 5
+            else:
+                return None  # an escape Postgres refuses: no name is read
+        return "".join(out).encode("utf-16", "surrogatepass").decode("utf-16")
+    except (ValueError, UnicodeError):
+        return None  # a code point or a lone surrogate no name holds
 
 
 def _block_end(text: str, start: int, nested: bool) -> tuple[int, bool]:

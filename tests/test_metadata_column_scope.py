@@ -482,7 +482,13 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
                            ("secret code", '/* /* */ " */ "secret code"'), ("secret code", '/* /* /* */ */ " */ "secret code"'),
                            ("secret code", '/* /* " */ "secret code"'),
                            # and does not nest to MySQL, which reads a name across the nested region whole
-                           ("secret */ code", "/* /* */ `secret */ code`")):
+                           ("secret */ code", "/* /* */ `secret */ code`"),
+                           # a Postgres Unicode-escaped span decodes to the name (Codex's fifteenth review):
+                           # `\XXXX` and `\+XXXXXX` a code point each, a surrogate pair one character,
+                           # the escape doubled itself; `U&` touching the quote, in either case
+                           ("secret_code", 'U&"secret\\005fcode"'), ("secret_code", "u&'secret\\005fcode'"),
+                           ("secret_code", 'U&"secret\\+00005fcode"'), ("😄", 'U&"\\d83d\\de04"'),
+                           ("secret\\code", 'U&"secret\\\\code"'), ("secret_code", 'U&"secret_code"')):
         columns = [Column(id="orders.id", object_id="orders", name="id", data_type="date"),
                    Column(id=f"orders.{name}", object_id="orders", name=name, data_type="text", pii_level="phi")]
         expr = f"(SELECT max(date_trunc({spelling}, id)) FROM orders)"
@@ -493,6 +499,15 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
         dim = Dimension(id="d", label=expr, source="orders", expr=expr)
         assert select_dimensions(["orders"], [dim], _UNCLEARED, columns=columns) == [], expr
         assert select_dimensions(["orders"], [dim], _CLEARED, columns=columns) == [dim], expr
+    # A `UESCAPE 'c'` after the closing quote changes the escape character; sqlglot cannot parse
+    # the clause, so the expression is unparsed and withheld from everyone, and the spelling is
+    # still read. `U& "x"`, the quote not touched, is the `&` operator over a column `U`, which
+    # DuckDB binds (measured: a binder error naming `U`), and decodes to nothing.
+    assert "secret_code" in keyword_columns("U&\"secret!005fcode\" UESCAPE '!'")
+    assert "secret_code" in keyword_columns("u&'secret!005fcode'uescape'!'")
+    assert "secret!code" in keyword_columns("U&\"secret!!code\" UESCAPE '!'")
+    assert "secret_code" not in keyword_columns('U& "secret\\005fcode"')
+    assert "secret_code" not in keyword_columns('U&"secret\\zzzzcode"')   # an escape Postgres refuses
 
 
 def test_a_struct_column_named_like_the_source_keeps_its_root_reading():
