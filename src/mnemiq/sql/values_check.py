@@ -88,25 +88,33 @@ def _stored_match(column: exp.Column, stored: set[str] | frozenset[str], dialect
     return next((c for c in sorted(stored) if written in _stored(c, dialect)), None)
 
 
+def _projects_a_star(projection: exp.Expression) -> bool:
+    return isinstance(projection.this if isinstance(projection, exp.Column) else projection, exp.Star)
+
+
 def _projects(source: Scope, wanted: str, dialect: str | None) -> bool:
     """Whether a local source names the column in its own output, as `_through_scopes` reads
     the output: a column list naming it by position (`WITH x(doc) AS (SELECT upper(region) FROM
     t)`, where the projection's own name never met and the statement-wide reading placed `doc`
     by `t`: the review gate on the fifth round), or a projection past the list so named, since
     the list renames the first projections away (`WITH x(k) AS (SELECT doc FROM t)` has no
-    `doc`); a star among the listed positions leaves the positions unknown, and a star or a set
-    operation leaves the statement-wide reading as before (a star over a join inside a CTE, a
-    union's output: the gate's second round on M174; a list over a star, the gate's sixth)."""
+    `doc`). A star among the listed positions leaves the positions unknown, and a listed name
+    is then the source's own with its base column unknown, as the qualified reference reads
+    it: `WITH x(region, doc) AS (SELECT * FROM t)` has `doc` for `t.region`, and read
+    statement-wide it was `t.doc`, a value the engine returns refused naming that column
+    (Codex's fourth review of #178; the gate's sixth round kept the statement-wide reading for
+    `x(doc) AS (SELECT * FROM t)`, right there by the position alone). A star outside the list
+    or a set operation leaves the statement-wide reading as before (a star over a join inside a
+    CTE, a union's output: the gate's second round on M174)."""
     if not isinstance(source.expression, exp.Select):
         return False
     selects = source.expression.selects
     listed = _column_list(source, dialect) or []
-    if any(isinstance(p.this if isinstance(p, exp.Column) else p, exp.Star) for p in selects[:len(listed)]):
-        return False
+    if any(_projects_a_star(p) for p in selects[:len(listed)]):
+        return wanted in listed or any(_projection_name(p, dialect) == wanted for p in selects if not _projects_a_star(p))
     if wanted in listed[:len(selects)]:
         return True
-    return any(_projection_name(p, dialect) == wanted for p in selects[len(listed):]
-               if not isinstance(p.this if isinstance(p, exp.Column) else p, exp.Star))
+    return any(_projection_name(p, dialect) == wanted for p in selects[len(listed):] if not _projects_a_star(p))
 
 
 def _same_column(column: exp.Column, alias: str) -> exp.Column:

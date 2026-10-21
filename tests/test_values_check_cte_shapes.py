@@ -254,11 +254,24 @@ def test_a_local_sources_name_the_walk_cannot_follow_stays_unresolved():
     for literal in ("west", "WEST", "a"):
         assert _check(f"WITH x(doc) AS (SELECT upper(region) FROM t) SELECT count(*) FROM x WHERE doc = '{literal}'") is None, literal
         assert _check(f"SELECT count(*) FROM (SELECT upper(region) FROM t) AS x(doc) WHERE doc = '{literal}'") is None, literal
-    # a list over a star leaves the positions unknown and the statement-wide reading on (the
-    # gate's sixth round): `x.doc` is `t.doc`, the first column, and the count is 0
+    # a list over a star leaves the positions unknown, and a listed name is the source's own
+    # (Codex's fourth review of #178): `x(region, doc)` has `doc` for `t.region`, where the
+    # statement-wide reading refused 'west' naming `t.doc`; `x(doc)` is `t.doc` by the position
+    # alone, which the walk cannot know, so it skips too, as `x.doc` did (the gate's sixth
+    # round had kept its refusal)
+    assert con.execute("WITH x(region, doc) AS (SELECT * FROM t) SELECT count(*) FROM x WHERE doc = 'west'").fetchall() == [(1,)]
     assert con.execute("WITH x(doc) AS (SELECT * FROM t) SELECT count(*) FROM x WHERE doc = 'west'").fetchall() == [(0,)]
-    _refused_on_doc("WITH x(doc) AS (SELECT * FROM t) SELECT count(*) FROM x WHERE doc = 'west'")
-    _refused_on_doc("SELECT count(*) FROM (SELECT * FROM t) d(doc, region) WHERE doc = 'west'")
+    for shape in ("WITH x(region, doc) AS (SELECT * FROM t) SELECT count(*) FROM x WHERE {} = '{}'",
+                  "SELECT count(*) FROM (SELECT * FROM t) x(region, doc) WHERE {} = '{}'",
+                  "WITH x(region, doc) AS (SELECT *, 1 AS k FROM t) SELECT count(*) FROM x WHERE {} = '{}'",
+                  "WITH x(doc) AS (SELECT * FROM t) SELECT count(*) FROM x WHERE {} = '{}'"):
+        for spelling in ("doc", "x.doc"):
+            for literal in ("west", "a"):
+                assert _check(shape.format(spelling, literal)) is None, (shape, spelling, literal)
+    # a projection past the star keeps its own name, the source's: `doc` is `upper(region)`
+    assert con.execute("WITH x(k) AS (SELECT *, upper(region) AS doc FROM t) SELECT count(*) FROM x WHERE doc = 'WEST'").fetchall() == [(1,)]
+    for literal in ("WEST", "a"):
+        assert _check(f"WITH x(k) AS (SELECT *, upper(region) AS doc FROM t) SELECT count(*) FROM x WHERE doc = '{literal}'") is None, literal
     # a list renames the first projections away: x has no `doc`, and `doc` is t's
     assert con.execute("WITH x(k) AS (SELECT doc FROM t) SELECT count(*) FROM x, t WHERE doc = 'west'").fetchall() == [(0,)]
     _refused_on_doc("WITH x(k) AS (SELECT doc FROM t) SELECT count(*) FROM x, t WHERE doc = 'west'")
