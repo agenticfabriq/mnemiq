@@ -21,7 +21,7 @@ from mnemiq.sql.authz_guard import (
 )
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.fanout_check import KeyFacts, check_fanout
-from mnemiq.sql.guard import MAX_ROWS, check_shape
+from mnemiq.sql.guard import MAX_ROWS, check_shape, niladic_names
 from mnemiq.sql.lint import lint
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove_governed
@@ -97,6 +97,11 @@ def decide(
     ambiguous = fields_as_members(shaped, target, known_columns(visible, policy))
     if ambiguous is not None:
         return ambiguous
+    # M194: a bare `current_date` where a known table has a column so named reads the column
+    # through the function's node, which no check below sees.
+    named = niladic_names(shaped, known_columns(visible, policy))
+    if named is not None:
+        return named
     # M150: before any policy is applied, refuse an engine whose CTE binding the rewrite misreads.
     unsupported = check_policy_target(shaped, policy, target)
     if unsupported is not None:

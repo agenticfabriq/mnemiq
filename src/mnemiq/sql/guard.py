@@ -238,6 +238,45 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
 _INTERSECT_BINDS_TIGHTER = frozenset({"duckdb", "postgres", "postgresql", "mysql"})
 
 
+# The niladic names sqlglot reads as a function with no Column node, which DuckDB binds to a
+# same-named column of the query's own FROM before the function (M194).
+_NILADIC = (exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime, exp.Localtime,
+            exp.Localtimestamp, exp.SessionUser, exp.CurrentCatalog, exp.CurrentUser)
+
+
+def niladic_names(ast: exp.Expression, columns) -> Refusal | None:
+    """A column named like a niladic SQL function is read through the function's node, which
+    no grant, deny or mask check sees: DuckDB binds a bare `current_date` to a same-named
+    column of the query's own FROM before the function, and sqlglot reads the name as
+    `CurrentDate` with no Column node, so bare `current_date`, `current_timestamp`,
+    `current_time`, `localtime`, `localtimestamp`, `session_user` and `current_catalog`, in a
+    projection, an aggregate, a WHERE, an ORDER BY, a derived table, a CTE and a write, each
+    returned a withheld column's value or an oracle on it (M194, the ui lane's replay of #169).
+    The call form is no safer: `current_date()` and `today()` parse to the same node and the
+    target SQL prints the bare name, which the engine binds to the column. Refused where any
+    table the decider knows has a column so named, the broad form (DuckDB binds the column only
+    where that table is in the query's own FROM, through a derived star, a CTE star, USING or
+    LATERAL too; measured cost of the broad form: 0 of 2,803 corpus statements using
+    CURRENT_DATE or CURRENT_TIMESTAMP, in the register), fail-closed; where no known table has
+    one the name is the function to every engine measured. With no schema beyond the grant a
+    withheld column is unknown here, a residual the register records. The repair names the
+    column with its table, and a call this engine keeps as a call."""
+    for node in ast.find_all(*_NILADIC):
+        name = node.sql(dialect="duckdb").split("(")[0].strip().lower()
+        owners = sorted(table for table, names in (columns or {}).items()
+                        if any(n.lower() == name for n in names))
+        if owners:
+            return Refusal(
+                code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
+                message=(f"{name!r} names a column of {owners[0]!r} and a SQL function, and this "
+                         f"engine reads the column where that table is in the FROM. Write "
+                         f"{owners[0]}.{name} for the column, or for the function a call this engine "
+                         "keeps as a call, such as now() or get_current_timestamp()."),
+                subject=name,
+            )
+    return None
+
+
 def misgrouped_set_chain(ast: exp.Expression, engine: str) -> Refusal | None:
     """Refuse a set-operation chain the parser groups differently from the engine: sqlglot folds
     an unparenthesised chain left to right, so `A UNION ALL B INTERSECT C` is an INTERSECT over a

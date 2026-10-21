@@ -18,7 +18,7 @@ from mnemiq.sql.functions import (
     opaque_columns,
 )
 from mnemiq.sql.cls import check_cls
-from mnemiq.sql.guard import bound_by_position, misgrouped_set_chain, unnamed_read
+from mnemiq.sql.guard import bound_by_position, misgrouped_set_chain, niladic_names, unnamed_read
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import object_key
@@ -348,6 +348,11 @@ def decide_write(
     if isinstance(shaped, Refusal):
         return shaped
     ambiguous = fields_as_members(shaped, target, known_columns(visible, policy))  # M165, M167
+    if ambiguous is not None:
+        return ambiguous
+    named = niladic_names(shaped, known_columns(visible, policy))  # M194: the write path leaks the same names
+    if named is not None:
+        return named
     if ambiguous is not None:
         return ambiguous
     # M150, as on the read side: no policy is applied for an engine whose CTE binding it misreads.
