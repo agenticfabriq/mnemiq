@@ -50,10 +50,12 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
     read as one identifier -- BigQuery's `` `customer.ssn` `` is one name to sqlite (Codex's review
     of the option-A change, which measured it leaving `ssn` open) -- so it is also walked prefix
     by prefix: the part after a prefix naming the source or its alias is the column, whatever
-    follows (`r.secret_code.value`, a nested field path), and an unqualified path's first part is
-    the column it may be as a struct (`secret_code.value`: Codex's seventh review of #172). Every
-    reading is kept, the whole name a column may truly be named among them, and a reference is
-    one set of the names it could be.
+    follows (`r.secret_code.value`, a nested field path), and any dotted path's first part is the
+    column it may be as a struct, qualified by the parser or not (`secret_code.value`, and
+    `orders.value` over a struct column named like the source: Codex's seventh and eighth
+    reviews of #172). Every reading is kept, the whole name a column may truly be named among
+    them, and a reference is one set of the names it could be; a name among them that names no
+    column decides nothing, so the extra readings withhold more, never less.
 
     Where no dialect reads a column, the spelling read: the last dotted part, if what precedes it
     -- its quotes off -- names the table. sqlglot reads an unquoted `comment` as a command and
@@ -230,10 +232,13 @@ def expression_scope(expr: str, source: str) -> str:
         if node.find(*_FOREIGN_RELATIONS) is not None:
             return "foreign"
         if node.find(exp.Columns) is not None or any(
-                not isinstance(star.parent, exp.Count) for star in node.find_all(exp.Star)):
+                not (isinstance(star.parent, exp.Count) and not any(star.args.values()))
+                for star in node.find_all(exp.Star)):
             # A star reads columns no node names, so `columns_read` cannot report them: `(SELECT
             # max(q.secret_code) FROM (SELECT * FROM orders) q)` reported nothing and passed the
-            # uncleared (the review gate on the first draft). COUNT(*) alone reads none.
+            # uncleared (the review gate on the first draft). A bare COUNT(*) alone reads none;
+            # a star with a modifier (`count(* EXCLUDE (id))`) reads the rest of the row, and
+            # rode the exemption to the uncleared (Codex's ninth review of #172).
             return "foreign"
         for table in node.find_all(exp.Table):
             if not _table_name(table) or not _is_source(table, source):

@@ -212,6 +212,8 @@ def test_a_subquery_over_the_source_alone_is_checked_as_the_sources_own_read(exp
     "(SELECT max(to_json(orders)::text) FROM orders)",
     "(SELECT max(q.x) FROM (SELECT COLUMNS('s.*') AS x FROM orders) q)",
     "(SELECT max(q.c) FROM orders q(a, c))",                       # renamed by position (the gate)
+    "(SELECT count(* EXCLUDE (id)) FROM orders)",                   # a modified star reads the rest (Codex's ninth)
+    "(SELECT count(* REPLACE (id AS secret_code)) FROM orders)",
     "(SELECT count(*) FROM orders o JOIN orders r USING (secret_code))",  # a key no node names (Codex)
     "(SELECT count(*) FROM orders o NATURAL JOIN orders r)",
     "(SELECT max(id) FROM private.orders)",                        # another schema's table (Codex)
