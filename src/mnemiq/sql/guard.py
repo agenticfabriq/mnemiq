@@ -239,28 +239,48 @@ _INTERSECT_BINDS_TIGHTER = frozenset({"duckdb", "postgres", "postgresql", "mysql
 
 
 # The niladic names sqlglot reads as a function with no Column node, which DuckDB binds to a
-# same-named column of the query's own FROM before the function (M194).
+# same-named column of the query's own FROM before the function (M194). Not `current_user`:
+# DuckDB reads the function beside a same-named column (the ui lane's replay of #175), as
+# Oracle does for every bare name (the register), so refusing it was cost alone.
 _NILADIC = (exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime, exp.Localtime,
-            exp.Localtimestamp, exp.SessionUser, exp.CurrentCatalog, exp.CurrentUser)
+            exp.Localtimestamp, exp.SessionUser, exp.CurrentCatalog)
 
 
-# The call spelling each dialect parses as a call and NOT as one of the niladic nodes, for
-# the repair, in the dialect the model writes in (the statement it retries with is parsed as
-# `dialect` and transpiled to the target, so a target's spelling could be a column to the
-# parser: the review gate). Measured on sqlglot's parse: `today()` on DuckDB, `now()` on
-# Postgres, `curdate()` on MySQL and `SYSDATE` on Oracle each parse to a refused node, so a
-# retry with them meets the same refusal (the gate, which caught `curdate()`); the spellings
-# here parse to a plain call. Postgres and SQLite reject `current_date()` outright, so an
-# engine not listed is told to write a call with no example (the ui lane's read of the repair
-# loop: the message is what the model retries with).
-_FUNCTION_CALL_ADVICE = {
-    "duckdb": "now() or get_current_timestamp()",
-    "postgres": "clock_timestamp()",
-    "postgresql": "clock_timestamp()",
-    "mysql": "now() or sysdate()",
-    "sqlite": "datetime('now')",
-    "oracle": "SYSTIMESTAMP",
+# The call spellings the repair may name, per dialect the model writes in (the statement it
+# retries with is parsed as `dialect` and transpiled to the target, so a target's spelling
+# could be a column to the parser: the review gate), in order of preference; the first whose
+# node is not the refused name's is named (`_call_advice`). Each is approved by the decider
+# with no adapter's function inventory, measured at the fourth commit, but Postgres's
+# `clock_timestamp()`, which needs one: Postgres's `now()` parses to the CURRENT_TIMESTAMP
+# node, so it serves unless `current_timestamp` is the refused name itself. `today()` on
+# DuckDB, `curdate()` on MySQL and `SYSDATE` on Oracle parse to refused nodes (the gate), and
+# `get_current_timestamp()` is unmodelled without an inventory and `current_date()` reads the
+# column on DuckDB (the ui lane's replay). An engine not listed is told to write a call with
+# no example.
+_CALL_ADVICE: dict[str, tuple[str, ...]] = {
+    "duckdb": ("now()",),
+    "postgres": ("now()", "clock_timestamp()"),
+    "postgresql": ("now()", "clock_timestamp()"),
+    "mysql": ("now()", "sysdate()"),
+    "sqlite": ("datetime('now')",),
+    "oracle": ("SYSTIMESTAMP",),
 }
+
+
+def _niladic_name(node: exp.Expression) -> str:
+    return node.sql(dialect="duckdb").split("(")[0].strip().lower()
+
+
+def _call_advice(dialect: str | None, name: str) -> str | None:
+    """The first of the dialect's call spellings whose parse is not the refused name's node."""
+    for call in _CALL_ADVICE.get((dialect or "").lower(), ()):
+        try:
+            node = sqlglot.parse_one(f"SELECT {call}", read=dialect).selects[0]
+        except Exception:  # noqa: BLE001 -- a spelling the dialect cannot parse is no advice
+            continue
+        if not (isinstance(node, _NILADIC) and _niladic_name(node) == name):
+            return call
+    return None
 
 
 def niladic_names(ast: exp.Expression, columns, dialect: str | None = None) -> Refusal | None:
@@ -272,23 +292,28 @@ def niladic_names(ast: exp.Expression, columns, dialect: str | None = None) -> R
     projection, an aggregate, a WHERE, an ORDER BY, a derived table, a CTE and a write, each
     returned a withheld column's value or an oracle on it (M194, the ui lane's replay of #169).
     The call form is no safer: `current_date()` and `today()` parse to the same node and the
-    target SQL prints the bare name, which the engine binds to the column. Refused where any
-    table the decider knows has a column so named, the broad form (DuckDB binds the column only
-    where that table is in the query's own FROM, through a derived star, a CTE star, USING or
-    LATERAL too; measured cost of the broad form: 0 of 2,803 corpus statements using
-    CURRENT_DATE or CURRENT_TIMESTAMP, in the register), fail-closed; where no known table has
-    one the name is the function to every engine measured. With no schema beyond the grant a
-    withheld column is unknown here, a residual the register records. The repair names the
-    column with its table, and a call the dialect the query is written in parses as a call
-    and not as a niladic node (`_FUNCTION_CALL_ADVICE`), since the retry is parsed as that
-    dialect."""
-    calls = _FUNCTION_CALL_ADVICE.get((dialect or "").lower())
-    advice = f"such as {calls}" if calls else "with its own name and parentheses"
+    target SQL prints the bare name, which the engine binds to the column. Refused where a
+    table the statement reads has a column so named: DuckDB binds the column only from the
+    query's own FROM, and every path to it (a derived star, a CTE star, USING, LATERAL)
+    reaches a base table the statement reads, so a known table the statement never reads
+    fires nothing, nor does a query with no FROM (the ui lane's replay of #175: the broad
+    form over every known table was cost there; measured cost of that broader form, 0 of
+    2,803 corpus statements using CURRENT_DATE or CURRENT_TIMESTAMP, the register, no
+    corpus schema having such a column). Where no table read has one the name is the
+    function to every engine measured. With no schema beyond the grant a withheld column is
+    unknown here, a residual the register records. The repair names the column with its
+    table, and a call the dialect the query is written in parses as a call that is not the
+    refused name's node (`_call_advice`), since the retry is parsed as that dialect."""
+    from mnemiq.sql.scope import base_tables  # scope imports this module's checks
+
+    referenced = {object_key(table) for table in base_tables(ast, dialect)}
     for node in ast.find_all(*_NILADIC):
-        name = node.sql(dialect="duckdb").split("(")[0].strip().lower()
-        owners = sorted(table for table, names in (columns or {}).items()
-                        if any(n.lower() == name for n in names))
+        name = _niladic_name(node)
+        owners = sorted(table for table in referenced
+                        if any(n.lower() == name for n in (columns or {}).get(table, ())))
         if owners:
+            call = _call_advice(dialect, name)
+            advice = f"such as {call}" if call else "with its own name and parentheses"
             return Refusal(
                 code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
                 message=(f"{name!r} names a column of {owners[0]!r} and a SQL function, and the "

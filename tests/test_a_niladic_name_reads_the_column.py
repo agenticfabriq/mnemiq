@@ -10,7 +10,6 @@ from __future__ import annotations
 import duckdb
 import pytest
 import sqlglot
-from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.decide import decide
@@ -119,39 +118,59 @@ def test_where_no_known_table_has_the_column_the_name_is_the_function(worlds):
     assert isinstance(write, ApprovedWrite), write
 
 
-def test_the_broad_form_refuses_the_name_over_another_table_too():
-    # DuckDB reads the function here, kw not being in the FROM; the broad form refuses all the
-    # same (its measured cost: none in the corpora), naming the column's table in the repair.
-    verdict = _decide("SELECT current_date FROM claim", HIDDEN, WITH_SCHEMA)
-    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
+def test_a_table_the_statement_does_not_read_fires_nothing(worlds):
+    # DuckDB binds the column only from the query's own FROM: with kw elsewhere in the schema,
+    # `SELECT current_date FROM claim` reads the function, and a query with no FROM at all too
+    # (the ui lane's replay of #175, where the broader form over every known table refused
+    # both).
+    for sql in ("SELECT current_date FROM claim", "SELECT current_date"):
+        verdict = _decide(sql, HIDDEN, WITH_SCHEMA)
+        assert isinstance(verdict, Approved), (sql, verdict)
+        assert [con.execute(verdict.target_sql).fetchall() for con in worlds][0] == [con.execute(verdict.target_sql).fetchall() for con in worlds][1]
 
 
-@pytest.mark.parametrize("dialect, calls", [("duckdb", ("now()", "get_current_timestamp()")),
-                                            ("postgres", ("clock_timestamp()",)), ("mysql", ("now()", "sysdate()")),
-                                            ("sqlite", ("datetime('now')",)), ("oracle", ("SYSTIMESTAMP",))])
-def test_the_repair_names_a_call_the_dialect_parses_as_one(dialect, calls):
-    # The message is what the model retries with (the repair loop), so each dialect's advice
-    # must parse there as a call and not as a refused node: `today()` on DuckDB, `now()` on
-    # Postgres, `curdate()` on MySQL and `SYSDATE` on Oracle parse to the niladic nodes and a
-    # retry with them meets the same refusal (the gate); DuckDB has no SYSTIMESTAMP, Oracle no
-    # now(), Postgres and SQLite reject `current_date()`.
-    from mnemiq.sql.guard import _NILADIC
-    verdict = decide("SELECT current_date FROM kw", HIDDEN, dialect=dialect, target=dialect, policy=WITH_SCHEMA)
+@pytest.mark.parametrize("dialect, call", [("duckdb", "now()"), ("postgres", "now()"), ("mysql", "now()"),
+                                           ("sqlite", "datetime('now')"), ("oracle", "SYSTIMESTAMP")])
+def test_the_repair_names_a_call_the_decider_approves_in_that_dialect(dialect, call):
+    # The message is what the model retries with (the repair loop), so the advised call must
+    # be approved by the decider as the retry, with no adapter's function inventory, in the
+    # dialect the query is written in: measured, `get_current_timestamp()` on DuckDB and
+    # every plain call on Postgres are unmodelled there, `today()`, `curdate()` and `SYSDATE`
+    # parse to refused nodes, and `current_date()` reads the column on DuckDB (the ui lane).
+    schema = {"kw": {"id", "current_date"}, "sink": {"i", "s"}}
+    policy = AccessPolicy(policy_schema=schema)
+    verdict = decide("SELECT current_date FROM kw", {"kw": {"id"}, "sink": {"i", "s"}}, dialect=dialect, target=dialect, policy=policy)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
-    assert "kw.current_date" in verdict.message and all(call in verdict.message for call in calls), verdict.message
-    for call in calls:
-        parsed = sqlglot.parse_one(f"SELECT {call} FROM kw", read=dialect).selects[0]
-        assert not isinstance(parsed, _NILADIC) and parsed.find(*_NILADIC) is None, (dialect, call)
-        assert not isinstance(parsed, exp.Column) and parsed.find(exp.Column) is None, (dialect, call)
-        retry = decide(f"SELECT {call} FROM kw", HIDDEN, dialect=dialect, target=dialect, policy=WITH_SCHEMA)
-        assert not (isinstance(retry, Refusal) and retry.code is RefusalCode.AMBIGUOUS_NILADIC_NAME), (dialect, call, retry)
+    assert "kw.current_date" in verdict.message and call in verdict.message, verdict.message
+    assert "current_date()" not in verdict.message and "get_current_timestamp" not in verdict.message
+    retry = decide(f"SELECT {call} FROM kw", {"kw": {"id"}, "sink": {"i", "s"}}, dialect=dialect, target=dialect, policy=policy)
+    assert isinstance(retry, Approved), (dialect, call, retry)
+
+
+def test_postgres_is_told_clock_timestamp_where_now_is_the_refused_name():
+    # Postgres's `now()` parses to the CURRENT_TIMESTAMP node, so beside a column named
+    # `current_timestamp` it would meet the same refusal; `clock_timestamp()` is a plain call
+    # there, modelled only with an adapter's function inventory.
+    schema = {"kw": {"id", "current_timestamp"}}
+    verdict = decide("SELECT current_timestamp FROM kw", {"kw": {"id"}}, dialect="postgres", target="postgres",
+                     policy=AccessPolicy(policy_schema=schema))
+    assert isinstance(verdict, Refusal) and "clock_timestamp()" in verdict.message and "now()" not in verdict.message, verdict
 
 
 def test_the_advice_is_in_the_dialect_the_model_writes_not_the_targets():
-    # The retry is parsed as `dialect` and transpiled to `target`: told SYSDATE for an Oracle
-    # target while writing DuckDB, the model would write a column (the gate).
+    # The retry is parsed as `dialect` and transpiled to `target`: told SYSTIMESTAMP for an
+    # Oracle target while writing DuckDB, the model would write a column (the gate).
     verdict = decide("SELECT current_date FROM kw", HIDDEN, dialect="duckdb", target="oracle", policy=WITH_SCHEMA)
-    assert isinstance(verdict, Refusal) and "now()" in verdict.message and "SYSDATE" not in verdict.message, verdict.message
+    assert isinstance(verdict, Refusal) and "now()" in verdict.message and "SYSTIMESTAMP" not in verdict.message, verdict.message
+
+
+def test_current_user_reads_the_function_and_is_not_refused(worlds):
+    # Measured by the ui lane on DuckDB and in the register on Oracle: `current_user` reads
+    # the function beside a same-named column, so it is no longer among the names refused.
+    schema = {"kw": {"id", "current_user"}}
+    for sql in ("SELECT current_user FROM kw", "SELECT id FROM kw WHERE current_user LIKE 'Z%'"):
+        verdict = decide(sql, {"kw": {"id"}}, dialect="duckdb", target="duckdb", policy=AccessPolicy(policy_schema=schema))
+        assert isinstance(verdict, Approved), (sql, verdict)
 
 
 def test_the_column_is_matched_as_the_engine_folds_it():
