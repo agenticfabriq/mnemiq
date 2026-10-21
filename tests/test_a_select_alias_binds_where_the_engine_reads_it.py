@@ -146,6 +146,27 @@ def test_a_grouping_set_wrapper_keeps_a_bare_alias(sql):
     assert isinstance(_decide(sql, "postgres"), Approved), sql
 
 
+def test_an_aggregates_filter_predicate_reads_no_alias():
+    # Codex's third review of #177: `count(*) FILTER (WHERE secret = 1)` beside an alias `secret`
+    # counted the hidden column's rows, the predicate read as the SELECT's WHERE, where DuckDB
+    # admits an alias; without the source column DuckDB rejects the query, so FILTER binds no
+    # alias (measured). Refused with and without the schema.
+    duck = duckdb.connect()
+    duck.execute("CREATE TABLE claim (id INT, v INT, secret INT); INSERT INTO claim VALUES (1, 10, 2), (2, 20, 1), (3, 30, 2)")
+    assert duck.execute("SELECT 0 AS secret, count(*) FILTER (WHERE secret = 1) FROM claim").fetchall() == [(0, 1)]
+    bare = duckdb.connect()
+    bare.execute("CREATE TABLE claim (id INT, v INT); INSERT INTO claim VALUES (1, 10), (2, 20)")
+    with pytest.raises(duckdb.Error):
+        bare.execute("SELECT 0 AS x, count(*) FILTER (WHERE x = 1) FROM claim").fetchall()
+    full = AccessPolicy(policy_schema={"claim": {"id", "v", "secret"}})
+    for policy in (None, full):
+        verdict = _decide("SELECT 0 AS secret, count(*) FILTER (WHERE secret = 1) FROM claim", "duckdb", policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (policy, verdict)
+    verdict = _decide("SELECT 0 AS x, count(*) FILTER (WHERE x = 1) FROM claim", "duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    assert isinstance(_decide("SELECT 0 AS x, count(*) FILTER (WHERE v = 10) FROM claim", "duckdb"), Approved)
+
+
 def test_distinct_on_reads_a_bare_alias_and_a_source_column_inside_an_expression():
     # Codex's second review of #177: `SELECT DISTINCT ON (secret + 0) id AS secret FROM claim`
     # deduplicates on the hidden source column (measured: two rows of three), where the

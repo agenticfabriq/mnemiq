@@ -187,8 +187,9 @@ def _clause_of(column: exp.Column) -> tuple[str, bool]:
     """The clause of its own SELECT a column sits in, and whether it is the whole item there:
     `where`, `group`, `having`, `order`, `qualify`, `join` (an ON), `window` (an OVER's own
     ORDER BY or PARTITION BY, whatever clause holds it), `aggregate` (an aggregate's own ORDER
-    BY, which binds to source columns alone: DuckDB rejects an alias there, measured, and with
-    a hidden column of the alias's name read it, Codex's first review of #177), `limit` (a
+    BY or FILTER predicate, which bind to source columns alone: DuckDB rejects an alias there,
+    measured, and with a hidden column of the alias's name read it, Codex's first and third
+    reviews of #177), `limit` (a
     LIMIT or OFFSET, where no engine measured reads an alias), or `select`, the projection
     list, or `distinct` (the SELECT's own DISTINCT ON item, `_is_distinct_on`: DuckDB reads a
     bare alias there and the source column inside an expression, measured, where `DISTINCT ON
@@ -208,6 +209,12 @@ def _clause_of(column: exp.Column) -> tuple[str, bool]:
             return "window", bare
         if isinstance(node, exp.Order) and isinstance(node.parent, (exp.Func, exp.WithinGroup)):
             return "aggregate", False  # WITHIN GROUP (ORDER BY ...) is no Func to sqlglot (the gate on the second commit)
+        if isinstance(node, exp.Where) and isinstance(node.parent, exp.Filter):
+            # An aggregate's FILTER (WHERE ...) binds to source columns alone, as its ORDER BY
+            # does: read as the SELECT's WHERE, where DuckDB admits an alias, `count(*) FILTER
+            # (WHERE secret = 1)` beside an alias `secret` counted the hidden column's rows, and
+            # DuckDB rejects the alias there with no such column (Codex's third review of #177).
+            return "aggregate", False
         if isinstance(node, (exp.Limit, exp.Offset)):
             return "limit", False
         kind = next((name for cls, name in ((exp.Where, "where"), (exp.Group, "group"), (exp.Having, "having"),
