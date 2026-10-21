@@ -244,11 +244,22 @@ _NILADIC = (exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime, exp.Localtim
             exp.Localtimestamp, exp.SessionUser, exp.CurrentCatalog, exp.CurrentUser)
 
 
-# The call spelling each engine keeps as a call through the transpile, for the repair: DuckDB
-# prints `current_date()` bare again, so the advice names a function with no bare form; Oracle
-# reads every bare name as the function and has no `now()`, so its own pseudo-functions are
-# named (the ui lane's read of the repair loop: the message is what the model retries with).
-_FUNCTION_CALL_ADVICE = {"duckdb": "now() or get_current_timestamp()", "oracle": "SYSDATE or SYSTIMESTAMP"}
+# The call spelling each dialect keeps as a call, for the repair, in the dialect the model
+# writes in (the statement it retries with is parsed as `dialect` and transpiled to the
+# target, so a target's spelling could be a column to the parser: the review gate). DuckDB
+# prints `current_date()` bare again, so a function with no bare form is named; Oracle reads
+# every bare name as the function and has no `now()`; Postgres and SQLite reject
+# `current_date()` outright (the gate), so each gets its own. An engine not listed is told to
+# write a call with no example (the ui lane's read of the repair loop: the message is what
+# the model retries with).
+_FUNCTION_CALL_ADVICE = {
+    "duckdb": "now() or get_current_timestamp()",
+    "postgres": "now() or clock_timestamp()",
+    "postgresql": "now() or clock_timestamp()",
+    "mysql": "now() or curdate()",
+    "sqlite": "datetime('now') or date('now')",
+    "oracle": "SYSDATE or SYSTIMESTAMP",
+}
 
 
 def niladic_names(ast: exp.Expression, columns, dialect: str | None = None) -> Refusal | None:

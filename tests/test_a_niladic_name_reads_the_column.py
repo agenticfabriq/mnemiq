@@ -126,16 +126,25 @@ def test_the_broad_form_refuses_the_name_over_another_table_too():
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
 
 
-@pytest.mark.parametrize("dialect, call", [("duckdb", "now()"), ("oracle", "SYSDATE")])
-def test_the_repair_names_a_call_the_engine_keeps_in_its_own_spelling(dialect, call):
-    # The message is what the model retries with (the repair loop), so each engine's advice
-    # must parse there as a call: DuckDB has no SYSDATE and Oracle no now().
+@pytest.mark.parametrize("dialect, call", [("duckdb", "now()"), ("postgres", "clock_timestamp()"),
+                                           ("mysql", "curdate()"), ("sqlite", "datetime('now')"), ("oracle", "SYSDATE")])
+def test_the_repair_names_a_call_the_dialect_keeps_in_its_own_spelling(dialect, call):
+    # The message is what the model retries with (the repair loop), so each dialect's advice
+    # must parse there as a call: DuckDB has no SYSDATE, Oracle no now(), and Postgres and
+    # SQLite reject `current_date()` outright (the gate).
     verdict = decide("SELECT current_date FROM kw", HIDDEN, dialect=dialect, target=dialect, policy=WITH_SCHEMA)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
     assert call in verdict.message and "kw.current_date" in verdict.message, verdict.message
     parsed = sqlglot.parse_one(f"SELECT {call} FROM kw", read=dialect)
     assert not isinstance(parsed.selects[0], exp.Column), (dialect, call)  # a call, not a column
     assert not parsed.selects[0].find(exp.Column), (dialect, call)
+
+
+def test_the_advice_is_in_the_dialect_the_model_writes_not_the_targets():
+    # The retry is parsed as `dialect` and transpiled to `target`: told SYSDATE for an Oracle
+    # target while writing DuckDB, the model would write a column (the gate).
+    verdict = decide("SELECT current_date FROM kw", HIDDEN, dialect="duckdb", target="oracle", policy=WITH_SCHEMA)
+    assert isinstance(verdict, Refusal) and "now()" in verdict.message and "SYSDATE" not in verdict.message, verdict.message
 
 
 def test_the_column_is_matched_as_the_engine_folds_it():
