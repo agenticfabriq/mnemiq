@@ -30,8 +30,8 @@ class _Index:
         return sorted(self.data.get((table, column), set()))[:k]
 
 
-def _check(sql: str):
-    return check_values(sqlglot.parse_one(sql, read="duckdb"), VISIBLE, _Index())
+def _check(sql: str, dialect: str = "duckdb"):
+    return check_values(sqlglot.parse_one(sql, read=dialect), VISIBLE, _Index(), dialect=dialect)
 
 
 def _refused_on_doc(sql: str) -> None:
@@ -138,9 +138,121 @@ def test_a_base_table_alias_column_list_renames_by_position_and_is_not_placed():
 def test_names_meet_as_the_engine_folds_them():
     # The ui lane's probe of #178: Postgres reads `x.DOC` as `doc`, and the walk's exact
     # comparison answered nothing, a skip; the column list the same.
-    _refused_on_doc("WITH x AS (SELECT doc FROM t) SELECT count(*) FROM x WHERE x.DOC = 'west'")
-    _refused_on_doc("WITH x(DOC) AS (SELECT doc FROM t) SELECT count(*) FROM x WHERE x.doc = 'west'")
-    _refused_on_doc("WITH x AS (SELECT * FROM t) SELECT count(*) FROM x WHERE x.Doc = 'west'")
+    for dialect in ("duckdb", "postgres"):
+        for sql in ("WITH x AS (SELECT doc FROM t) SELECT count(*) FROM x WHERE x.DOC = 'west'",
+                    "WITH x(DOC) AS (SELECT doc FROM t) SELECT count(*) FROM x WHERE x.doc = 'west'",
+                    "WITH x AS (SELECT * FROM t) SELECT count(*) FROM x WHERE x.Doc = 'west'"):
+            verdict = _check(sql, dialect)
+            assert isinstance(verdict, Refusal) and "t.doc" in verdict.message, (dialect, sql, verdict)
+
+
+def test_a_quoted_name_meets_as_the_engine_resolves_it():
+    # The ui lane's probe of #178 at `20753d6`, nine rows: Postgres keeps a quoted name's case,
+    # so `"DOC"` beside `doc` is another column there, and the fold by `.lower()` read the
+    # wrong projection (a present literal refused, an absent one approved, the wrong column
+    # named); DuckDB folds a quoted name too and reads the first projection. The shared
+    # resolver answers for each. Postgres's reading is the ui lane's measurement on its engine;
+    # DuckDB's is run here.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east')")
+    shapes = [
+        # Postgres compares t.doc; DuckDB the first projection, t.region
+        ('WITH x AS (SELECT region AS "DOC", doc FROM t) SELECT count(*) FROM x WHERE x.doc = \'west\'', 1),
+        ('WITH x("DOC", doc) AS (SELECT region, doc FROM t) SELECT count(*) FROM x WHERE x.doc = \'west\'', 1),
+        ('WITH x AS (SELECT region AS doc, doc AS "DOC" FROM t) SELECT count(*) FROM x WHERE x."DOC" = \'west\'', 1),
+    ]
+    for sql, duck_rows in shapes:
+        assert con.execute(sql).fetchall() == [(duck_rows,)], sql
+        assert _check(sql, "duckdb") is None, sql                      # t.region holds 'west'
+        verdict = _check(sql, "postgres")
+        assert isinstance(verdict, Refusal) and "t.doc" in verdict.message, (sql, verdict)   # t.doc does not
+    # through a star, Postgres has no column `"DOC"` (the engine errors) and the check answers
+    # nothing; DuckDB reads `doc`
+    assert _check('WITH x AS (SELECT * FROM t) SELECT count(*) FROM x WHERE x."DOC" = \'west\'', "postgres") is None
+    _refused_on_doc('WITH x AS (SELECT * FROM t) SELECT count(*) FROM x WHERE x."DOC" = \'west\'')
+
+
+def test_a_catalog_name_meets_a_reference_as_created_and_as_the_engine_folds_it():
+    # A snapshot spells a column as its author did (`Country` in a BIRD world decided for
+    # SQLite, `region` for Oracle), so a stored name meets a reference as created and as the
+    # engine folds an unquoted one, the grant check's reading; a quoted reference keeps its
+    # case where the engine does (`"DOC"` names nothing on Postgres), and folds where it does not.
+    class _Index:
+        data = {("t", "Doc"): {"a", "b"}}
+
+        def has(self, table, column):
+            return (table, column) in self.data
+
+        def contains(self, table, column, literal):
+            return literal in self.data.get((table, column), set())
+
+        def nearest(self, table, column, literal, k=8):
+            return sorted(self.data.get((table, column), set()))[:k]
+
+    visible = {"t": {"Doc", "region"}}
+    for sql in ("SELECT count(*) FROM t WHERE doc = 'west'", "WITH x AS (SELECT * FROM t) SELECT count(*) FROM x WHERE x.doc = 'west'",
+                'SELECT count(*) FROM t WHERE "Doc" = \'west\'', 'SELECT count(*) FROM t WHERE DOC = \'west\''):
+        for dialect in ("postgres", "duckdb", "oracle", "sqlite"):
+            verdict = check_values(sqlglot.parse_one(sql, read=dialect), visible, _Index(), dialect=dialect)
+            assert isinstance(verdict, Refusal) and "t.Doc" in verdict.message, (dialect, sql, verdict)
+    quoted = 'SELECT count(*) FROM t WHERE "DOC" = \'west\''
+    assert check_values(sqlglot.parse_one(quoted, read="postgres"), visible, _Index(), dialect="postgres") is None
+    verdict = check_values(sqlglot.parse_one(quoted, read="duckdb"), visible, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and "t.Doc" in verdict.message, verdict
+
+
+def test_a_using_key_is_the_joins_side():
+    # Codex's second review of #178: the merged column of a USING join is the join's, and a
+    # RIGHT join takes the right side's, `q.doc`, which is `t.region`; the walk discarded q
+    # and took `t.doc` as the sole owner, refusing 'west' and passing 'a'. The ui lane
+    # measured the sides on Postgres and DuckDB: inner and LEFT the left input's, RIGHT the
+    # right's, FULL coalesced from both.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east')")
+    join = "FROM t {side} JOIN t q(region, doc) USING (doc) WHERE doc = '{literal}'"
+    assert con.execute("SELECT doc " + join.format(side="RIGHT", literal="west")).fetchall() == [("west",)]
+    assert con.execute("SELECT doc " + join.format(side="LEFT", literal="west")).fetchall() == []
+    assert con.execute("SELECT doc " + join.format(side="LEFT", literal="a")).fetchall() == [("a",)]
+    assert con.execute("SELECT doc " + join.format(side="FULL", literal="west")).fetchall() == [("west",)]
+    for literal in ("west", "a"):
+        assert _check("SELECT count(*) " + join.format(side="RIGHT", literal=literal)) is None, literal   # q's, renamed by position
+        assert _check("SELECT count(*) " + join.format(side="FULL", literal=literal)) is None, literal    # either side's
+    _refused_on_doc("SELECT count(*) " + join.format(side="LEFT", literal="west"))                       # t's
+    assert _check("SELECT count(*) " + join.format(side="LEFT", literal="a")) is None
+    _refused_on_doc("SELECT count(*) FROM t JOIN t q(region, doc) USING (doc) WHERE doc = 'west'")       # inner: the left input's
+    # a derived right side projecting the name from another column
+    _refused_on_doc("SELECT count(*) FROM t LEFT JOIN (SELECT region AS doc FROM t) q USING (doc) WHERE doc = 'west'")
+    assert _check("SELECT count(*) FROM t RIGHT JOIN (SELECT region AS doc FROM t) q USING (doc) WHERE doc = 'west'") is None
+    # a chain: the later RIGHT join decides (the gate on the fourth round)
+    chain = "FROM t JOIN t u(region, doc) USING (doc) RIGHT JOIN t v USING (doc) WHERE doc = 'west'"
+    assert con.execute("SELECT doc " + chain).fetchall() == []   # v's doc, t.doc: no 'west'
+    _refused_on_doc("SELECT count(*) " + chain)
+    # a USING join inside a subquery is another scope's, and leaves the outer column's check on
+    _refused_on_doc("SELECT count(*) FROM t WHERE doc = 'west' AND region IN (SELECT region FROM t a FULL JOIN t b USING (doc))")
+    _refused_on_doc("SELECT count(*) FROM t WHERE doc = 'west' AND region IN (SELECT region FROM t a RIGHT JOIN t b(region, doc) USING (doc))")
+
+
+def test_the_statement_wide_reading_returns_the_catalogs_spelling():
+    # The gate on the fourth round: matched by fold, the fallback returned the name as typed,
+    # which the index, keyed by the catalog's spelling, never held.
+    class _Index:
+        data = {("t", "Doc"): {"a", "b"}}
+
+        def has(self, table, column):
+            return (table, column) in self.data
+
+        def contains(self, table, column, literal):
+            return literal in self.data.get((table, column), set())
+
+        def nearest(self, table, column, literal, k=8):
+            return sorted(self.data.get((table, column), set()))[:k]
+
+    visible = {"t": {"Doc", "region"}}
+    sql = "SELECT count(*) FROM (SELECT * FROM t UNION ALL SELECT * FROM t) WHERE doc = 'west'"
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and "t.Doc" in verdict.message, (sql, verdict)
+    # qualified, the derived source's own answer is nothing (a set operation), and stays so
+    assert check_values(sqlglot.parse_one(sql.replace(") WHERE doc", ") u WHERE u.doc"), read="duckdb"), visible, _Index(), dialect="duckdb") is None
 
 
 def test_a_cte_named_after_its_own_base_table_is_the_scopes_answer():

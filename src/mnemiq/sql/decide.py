@@ -179,7 +179,7 @@ def decide(
         # M5: the index is unfiltered and this runs before the RLS rewrite below, so the
         # refusal must know which tables this identity only sees a slice of.
         grounding = check_values(shaped, visible, values, row_filtered=set(policy.row_filters),
-                                 masks=policy.masks)
+                                 masks=policy.masks, dialect=target)
         if grounding is not None:
             return grounding
 

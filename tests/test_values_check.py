@@ -26,33 +26,35 @@ def _ast(sql):
     return sqlglot.parse_one(sql, read="duckdb")
 
 
+# The BIRD world these shapes come from runs on SQLite, which folds a stored `Country` and an
+# unquoted reference alike; the check reads names as the engine it is told resolves them (#178).
 def test_missing_literal_is_flagged_with_the_nearest_values():
-    v = check_values(_ast("SELECT Country FROM gasstations WHERE Country = 'CZE'"), VISIBLE, IDX)
+    v = check_values(_ast("SELECT Country FROM gasstations WHERE Country = 'CZE'"), VISIBLE, IDX, dialect="sqlite")
     assert isinstance(v, Refusal) and v.code == RefusalCode.VALUE_GROUNDING
     assert "Czech Republic" in v.message and "gasstations.Country" in v.message
 
 
 def test_a_present_literal_passes():
     sql = "SELECT Country FROM gasstations WHERE Country = 'Czech Republic'"
-    assert check_values(_ast(sql), VISIBLE, IDX) is None
+    assert check_values(_ast(sql), VISIBLE, IDX, dialect="sqlite") is None
 
 
 def test_an_unindexed_column_passes():
-    assert check_values(_ast("SELECT * FROM gasstations WHERE Segment = 'X'"), VISIBLE, IDX) is None
+    assert check_values(_ast("SELECT * FROM gasstations WHERE Segment = 'X'"), VISIBLE, IDX, dialect="sqlite") is None
 
 
 def test_a_like_predicate_passes():
     sql = "SELECT * FROM gasstations WHERE Country LIKE 'CZ%'"
-    assert check_values(_ast(sql), VISIBLE, IDX) is None
+    assert check_values(_ast(sql), VISIBLE, IDX, dialect="sqlite") is None
 
 
 def test_a_numeric_literal_passes():
-    assert check_values(_ast("SELECT * FROM gasstations WHERE Country = 5"), VISIBLE, IDX) is None
+    assert check_values(_ast("SELECT * FROM gasstations WHERE Country = 5"), VISIBLE, IDX, dialect="sqlite") is None
 
 
 def test_an_in_list_flags_a_missing_member():
     sql = "SELECT * FROM gasstations WHERE Country IN ('CZE', 'Slovakia')"
-    v = check_values(_ast(sql), VISIBLE, IDX)
+    v = check_values(_ast(sql), VISIBLE, IDX, dialect="sqlite")
     assert isinstance(v, Refusal) and v.code == RefusalCode.VALUE_GROUNDING
 
 

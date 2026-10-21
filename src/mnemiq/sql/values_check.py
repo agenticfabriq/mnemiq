@@ -8,6 +8,7 @@ from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from mnemiq.semantic.values import shown
 from mnemiq.sql.qualify import names_one_object
+from mnemiq.sql.identifiers import resolve, resolve_identifier, resolve_stored
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -45,9 +46,10 @@ def _is_star(projection: exp.Expression) -> bool:
     return isinstance(star, exp.Star) and not any(star.args.get(k) for k in ("except_", "replace", "rename"))
 
 
-def _column_list(source: Scope) -> list[str] | None:
+def _column_list(source: Scope, dialect: str | None) -> list[str] | None:
     """The column list a CTE's or a derived table's alias puts on the scope's output, by
-    position (`WITH x(region, doc) AS (...)`, `(...) d(a, b)`), or None where it has none."""
+    position (`WITH x(region, doc) AS (...)`, `(...) d(a, b)`), each name as the engine
+    resolves it, or None where it has none."""
     holder = source.expression.parent
     while isinstance(holder, exp.Paren):
         holder = holder.parent
@@ -55,22 +57,54 @@ def _column_list(source: Scope) -> list[str] | None:
         return None
     alias = holder.args.get("alias")
     columns = alias.columns if isinstance(alias, exp.TableAlias) else None
-    return [c.name for c in columns] if columns else None
+    return [_written(c, dialect) for c in columns] if columns else None
 
 
-def _folded(name: str) -> str:
-    """Names meet as the engine folds an unquoted one: Postgres reads `x.CURRENCY_CODE` as
-    `currency_code` where the walk compared exactly and answered nothing, a skip (the ui
-    lane's probe of #178). A quoted mixed-case name beside its folded twin is the one shape
-    this misreads, on a base table (where the grant check refuses an unknown spelling first)
-    and in a CTE's column list or projections alike, where a quoted `"DOC"` beside `doc`
-    would meet the wrong projection: a cost taken for the fold, the shape unseen in any
-    corpus."""
-    return name.lower()
+def _written(node: exp.Expression | None, dialect: str | None) -> str:
+    """A reference's name as the engine resolves it: by its quoting under the dialect's rules,
+    the shared resolver (M55). `.lower()` read Postgres's quoted `"CURRENCY_CODE"` as
+    `currency_code`, a different column there, and refused, missed or named the wrong column
+    on nine rows the engine answers right (the ui lane's probe of #178 at `20753d6`), where
+    DuckDB folds a quoted name too and was right under the fold."""
+    return resolve_identifier(node, dialect) or (node.name if node is not None else "")
+
+
+def _stored(name: str, dialect: str | None) -> set[str]:
+    """The spellings a catalog name meets a reference under: as created, and as the engine folds
+    an unquoted reference (`resolve_stored`), since a snapshot spells a column as its author
+    did (`Country` in a BIRD world decided for SQLite, `region` for Oracle, whose catalog
+    would hold `REGION`): the grant check's reading (M170), which withholds more and never
+    less; a reference's own quoting is kept (`_written`)."""
+    return {name, resolve_stored(name, dialect)}
+
+
+def _stored_match(column: exp.Column, stored: set[str] | frozenset[str], dialect: str | None) -> str | None:
+    """The catalog spelling a reference meets, the exact one first: a catalog holding both
+    `"Amount"` and `amount` meets an unquoted `amount` by the latter, where a set's first
+    match depended on its order (the review gate on the fourth round)."""
+    written = _written(column.this, dialect)
+    if written in stored:
+        return written
+    return next((c for c in sorted(stored) if written in _stored(c, dialect)), None)
+
+
+def _same_column(column: exp.Column, alias: str) -> exp.Column:
+    """The column's name, quoting kept, under another qualifier: rebuilt by `exp.column(name,
+    table=...)` it was unquoted, which the engine folds where the written one it does not."""
+    return exp.Column(this=column.this.copy(), table=exp.to_identifier(alias))
+
+
+def _projection_name(projection: exp.Expression, dialect: str | None) -> str:
+    """The name a projection puts on the output, as the engine resolves it."""
+    if isinstance(projection, exp.Alias):
+        return _written(projection.args.get("alias"), dialect)
+    if isinstance(projection, exp.Column):
+        return _written(projection.this, dialect)
+    return resolve(projection.alias_or_name, quoted=False, dialect=dialect)
 
 
 def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str]],
-                    depth: int = 0) -> tuple[str, str] | None:
+                    dialect: str | None, depth: int = 0) -> tuple[str, str] | None:
     """The base table and column a qualified column reads, followed through each CTE or derived
     table that projects it (M141). Only a projection that IS a column is followed, renamed or
     not; a function, a literal or a union has no single base column, so None, and the check
@@ -96,7 +130,7 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     before the name answers nothing. A base table under an alias column list (`FROM t
     q(region, doc)`) renames its columns by position, which a set of names cannot place, so
     the walk answers nothing there (the same review: `q.doc` is `t.region`, and the walk said
-    `t.doc`). Names meet folded (`_folded`). Where this answers nothing, the caller keeps the
+    `t.doc`). Names meet as the engine resolves them (`_written`, `_stored`). Where this answers nothing, the caller keeps the
     statement-wide reading it had: a star over a join, a set operation, a recursive CTE and a
     correlated name each resolved there and nowhere here (the gate's second round)."""
     source = scope.sources.get(column.table) if column.table else None
@@ -104,15 +138,15 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
         alias = source.args.get("alias")
         if isinstance(alias, exp.TableAlias) and alias.columns:
             return None  # renamed by position: a set of names cannot place them
-        stored = next((c for c in visible.get(source.name, ()) if _folded(c) == _folded(column.name)), None)
+        stored = _stored_match(column, visible.get(source.name, ()), dialect)
         return (source.name, stored if stored is not None else column.name)
     if not isinstance(source, Scope) or depth > 32:
         return None
     if not isinstance(source.expression, exp.Select):
         return None
     selects = source.expression.selects
-    listed = [_folded(name) for name in _column_list(source) or []]
-    wanted = _folded(column.name)
+    listed = _column_list(source, dialect) or []
+    wanted = _written(column.this, dialect)
     if any(isinstance(p.this if isinstance(p, exp.Column) else p, exp.Star) for p in selects[:len(listed)]):
         return None  # a star among the listed positions: a column per source column, positions unknown
     if wanted in listed[:len(selects)]:
@@ -129,7 +163,7 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
                 if not _is_star(candidate) or len(source.selected_sources) != 1:
                     return None
                 (alias,) = source.selected_sources
-                through = _through_scopes(exp.column(column.name, table=alias), source, visible, depth + 1)
+                through = _through_scopes(_same_column(column, alias), source, visible, dialect, depth + 1)
                 if through is None:
                     return None  # the star may yield the name: not known either way
                 table, name = through
@@ -137,20 +171,20 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
                 # for any name, so its columns say whether the star yields it (the review gate
                 # on the second round: held to the grant, a name a CTE projects from a column
                 # outside it fell to the later projection).
-                if not isinstance(source.sources.get(alias), exp.Table) or any(_folded(c) == _folded(name) for c in visible.get(table, ())):
+                if not isinstance(source.sources.get(alias), exp.Table) or any(_stored(c, dialect) & _stored(name, dialect) for c in visible.get(table, ())):
                     return through  # the star yields the name first
                 continue  # the star's source lacks it: the name is a later projection's
-            if _folded(candidate.alias_or_name) == wanted:
+            if _projection_name(candidate, dialect) == wanted:
                 projection = candidate
                 break
         if projection is None:
             return None
     inner = projection.unalias()
     if isinstance(inner, exp.Column) and inner.table:
-        return _through_scopes(inner, source, visible, depth + 1)
+        return _through_scopes(inner, source, visible, dialect, depth + 1)
     if isinstance(inner, exp.Column) and len(source.selected_sources) == 1:
         (alias,) = source.selected_sources
-        return _through_scopes(exp.column(inner.name, table=alias), source, visible, depth + 1)
+        return _through_scopes(_same_column(inner, alias), source, visible, dialect, depth + 1)
     return None
 
 
@@ -160,6 +194,7 @@ def check_values(
     values,
     row_filtered: set[str] | None = None,
     masks: Callable[[str, str], bool] | None = None,
+    dialect: str | None = None,
 ) -> Refusal | None:
     """Flag an equality/IN filter whose string literal does not exist in its indexed column.
 
@@ -203,36 +238,65 @@ def check_values(
             # An unqualified name is read among the scope's selected sources, a base table
             # holding it or a local source projecting it, one owner or no answer.
             if qualifier:
-                found = _through_scopes(column, scope, visible)
+                found = _through_scopes(column, scope, visible, dialect)
                 if found is not None:
                     return found
                 if isinstance(scope.sources.get(qualifier), Scope):
                     return None  # a local source projecting no such column: nothing to check
             else:
+                wanted = _written(column.this, dialect)
+                # The merged column of a USING join is the join's: an inner or LEFT join's the
+                # left input's, a RIGHT join's the right input's, a FULL join's coalesced from
+                # both (measured by the ui lane on Postgres and DuckDB). `SELECT doc FROM t
+                # RIGHT JOIN t q(region, doc) USING (doc)` compares `q.doc`, `t.region`, where
+                # the walk discarded q and took `t.doc` as the sole owner (Codex's second
+                # review of #178); a FULL join's the same with the literal on q's side (the ui
+                # lane). The candidates are the join's side; a source renamed by position
+                # among them answers nothing, and so does a FULL join.
+                candidates = list(scope.selected_sources)
+                # This scope's own joins alone, in order, each USING the key narrowing the
+                # candidates in turn (a later RIGHT join decides over an earlier inner one): a
+                # join inside a subquery is another scope's, and read here it switched the check
+                # off for the outer column (the review gate on the fourth round).
+                for join in scope.expression.args.get("joins") or []:
+                    if not any(_written(key, dialect) == wanted for key in (join.args.get("using") or ())):
+                        continue
+                    side = (join.side or "").upper()
+                    if side == "FULL":
+                        return None
+                    right = join.this.alias_or_name
+                    candidates = [right] if side == "RIGHT" else [a for a in candidates if a != right]
+                # A source renamed by position among the candidates, before any sole owner: the
+                # statement-wide reading would place the name by it (the gate's second round).
+                if any(isinstance(source, exp.Table) and isinstance(source.args.get("alias"), exp.TableAlias)
+                       and source.args["alias"].columns for alias, (_, source) in scope.selected_sources.items()
+                       if alias in candidates):
+                    return None
                 owners: list[tuple[str, str]] = []
                 for alias, (_, source) in scope.selected_sources.items():
+                    if alias not in candidates:
+                        continue
                     if isinstance(source, exp.Table):
-                        found = _through_scopes(exp.column(column.name, table=alias), scope, visible)
-                        if found is not None and any(_folded(c) == _folded(column.name) for c in visible.get(source.name, ())):
+                        found = _through_scopes(_same_column(column, alias), scope, visible, dialect)
+                        if found is not None and any(wanted in _stored(c, dialect) for c in visible.get(source.name, ())):
                             owners.append(found)
                     else:
-                        found = _through_scopes(exp.column(column.name, table=alias), scope, visible)
+                        found = _through_scopes(_same_column(column, alias), scope, visible, dialect)
                         if found is not None:
                             owners.append(found)
                 if len(owners) == 1:
                     return owners[0]
-                if any(isinstance(source, exp.Table) and isinstance(source.args.get("alias"), exp.TableAlias)
-                       and source.args["alias"].columns for _, source in scope.selected_sources.values()):
-                    return None  # a source renamed by position: the statement-wide reading would place the name by it (the gate on the second round)
         # The statement-wide reading, as before M174, where the scope answers nothing: a star
         # over a join, a set operation, a recursive CTE, a correlated name, a column sqlglot
         # lists in no scope (the review gate's second round, each refused here and skipped by
         # the scope alone).
+        # The catalog's spelling is returned, as the scope's answer returns it: the index is
+        # keyed by it, and the name as typed met nothing there (the gate on the fourth round).
         if qualifier:
             table = alias_to_table.get(qualifier)
-            return (table, column.name) if table else None
-        owners_wide = [t for t in referenced if column.name in visible.get(t, set())]
-        return (owners_wide[0], column.name) if len(owners_wide) == 1 else None  # ambiguous -> skip
+            return (table, _stored_match(column, visible.get(table, ()), dialect) or column.name) if table else None
+        owners_wide = [t for t in referenced if _stored_match(column, visible.get(t, ()), dialect) is not None]
+        return (owners_wide[0], _stored_match(column, visible.get(owners_wide[0], ()), dialect)) if len(owners_wide) == 1 else None  # ambiguous -> skip
 
     def violation(column: exp.Column, literal: str) -> Refusal | None:
         resolved = resolve(column)
