@@ -521,6 +521,21 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
     # from everyone, and the spelling is still read
     assert "secret code" in keyword_columns("-- \r` \n`secret code`")
     assert "secret code" in keyword_columns('-- \r" \n"secret code"')
+    # MySQL opens a line comment with `-- ` and `#`, and `--` before a quote is subtraction and
+    # negation, the quoted name running on across the line feed (Codex's nineteenth review):
+    # the name with the line feed and the `--` inside it is a column it may be, under both
+    # selectors
+    name = "secret\n-- code"
+    columns = [Column(id="orders.id", object_id="orders", name="id", data_type="date"),
+               Column(id=f"orders.{name}", object_id="orders", name=name, data_type="text", pii_level="phi")]
+    expr = "(SELECT max(id --`secret\n-- code`\n) FROM orders)"
+    assert expression_scope(expr, "orders") == "own"
+    assert name in keyword_columns(expr)
+    assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=columns) == []
+    assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=columns) == [_metric(expr)]
+    dim = Dimension(id="d", label=expr, source="orders", expr=expr)
+    assert select_dimensions(["orders"], [dim], _UNCLEARED, columns=columns) == []
+    assert "secret code" in keyword_columns("id #`secret code`\n")   # a `#` comment's text is code to the scan
     assert "secret_code" in keyword_columns("U&\"secret!005fcode\" -- c\n UESCAPE /* d */ '!'")
     assert keyword_columns('U&"secret\\5f"') == {"u", "secret\\5f"}
     assert keyword_columns('U&"secret\\+00005"') == {"u", "secret\\+00005"}
