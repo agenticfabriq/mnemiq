@@ -268,6 +268,14 @@ def test_a_local_sources_name_the_walk_cannot_follow_stays_unresolved():
         for spelling in ("doc", "x.doc"):
             for literal in ("west", "a"):
                 assert _check(shape.format(spelling, literal)) is None, (shape, spelling, literal)
+    # the identity renaming skips too, its refusal, right by the position alone, given up on
+    # purpose: the walk cannot tell it from `x(region, doc)` (the gate's seventh round)
+    for literal in ("west", "a"):
+        assert _check(f"SELECT count(*) FROM (SELECT * FROM t) d(doc, region) WHERE doc = '{literal}'") is None, literal
+    # a projection the list renames away is no name of the output: `region AS doc` is `k`, and
+    # the output's `doc` is `t.doc` through the star, refused as the statement-wide reading says
+    assert con.execute("WITH x(k, m) AS (SELECT region AS doc, * FROM (SELECT region, doc FROM t) s) SELECT count(*) FROM x WHERE doc = 'west'").fetchall() == [(0,)]
+    _refused_on_doc("WITH x(k, m) AS (SELECT region AS doc, * FROM (SELECT region, doc FROM t) s) SELECT count(*) FROM x WHERE doc = 'west'")
     # a projection past the star keeps its own name, the source's: `doc` is `upper(region)`
     assert con.execute("WITH x(k) AS (SELECT *, upper(region) AS doc FROM t) SELECT count(*) FROM x WHERE doc = 'WEST'").fetchall() == [(1,)]
     for literal in ("WEST", "a"):

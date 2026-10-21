@@ -102,16 +102,21 @@ def _projects(source: Scope, wanted: str, dialect: str | None) -> bool:
     is then the source's own with its base column unknown, as the qualified reference reads
     it: `WITH x(region, doc) AS (SELECT * FROM t)` has `doc` for `t.region`, and read
     statement-wide it was `t.doc`, a value the engine returns refused naming that column
-    (Codex's fourth review of #178; the gate's sixth round kept the statement-wide reading for
-    `x(doc) AS (SELECT * FROM t)`, right there by the position alone). A star outside the list
-    or a set operation leaves the statement-wide reading as before (a star over a join inside a
-    CTE, a union's output: the gate's second round on M174)."""
+    (Codex's fourth review of #178). `x(doc) AS (SELECT * FROM t)` skips the same way, its
+    `doc` being `t.doc` by the position alone, which the gate's sixth round had read
+    statement-wide and refused. A projection the list renames away names nothing of the
+    output, so only those from the first star on are read, where the positions may run past
+    the list (the gate's seventh round). A star outside the list or a set operation leaves the
+    statement-wide reading as before (a star over a join inside a CTE, a union's output: the
+    gate's second round on M174)."""
     if not isinstance(source.expression, exp.Select):
         return False
     selects = source.expression.selects
     listed = _column_list(source, dialect) or []
-    if any(_projects_a_star(p) for p in selects[:len(listed)]):
-        return wanted in listed or any(_projection_name(p, dialect) == wanted for p in selects if not _projects_a_star(p))
+    first_star = next((i for i, p in enumerate(selects[:len(listed)]) if _projects_a_star(p)), None)
+    if first_star is not None:
+        return wanted in listed or any(_projection_name(p, dialect) == wanted
+                                       for p in selects[first_star:] if not _projects_a_star(p))
     if wanted in listed[:len(selects)]:
         return True
     return any(_projection_name(p, dialect) == wanted for p in selects[len(listed):] if not _projects_a_star(p))
@@ -176,7 +181,7 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     selects = source.expression.selects
     listed = _column_list(source, dialect) or []
     wanted = _written(column.this, dialect)
-    if any(isinstance(p.this if isinstance(p, exp.Column) else p, exp.Star) for p in selects[:len(listed)]):
+    if any(_projects_a_star(p) for p in selects[:len(listed)]):
         return None  # a star among the listed positions: a column per source column, positions unknown
     if wanted in listed[:len(selects)]:
         projection = selects[listed.index(wanted)]  # renamed by position
