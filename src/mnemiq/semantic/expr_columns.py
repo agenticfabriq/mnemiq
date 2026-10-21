@@ -178,14 +178,22 @@ _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest, exp.Pivot)
 # `"123"`, `"null"` and `"se""cret"` each parse as the unit string, and the token rule split or
 # dropped the name (the same review), so each quoted span of the text, double-quoted,
 # backticked or single-quoted (sqlite reads a single-quoted name as the column where no
-# string fits), is a column it may be as written.
+# string fits), is a column it may be as written. The text is scanned left to right, a
+# comment, a quoted span or a token at a time, so that a quote inside a comment pairs with
+# nothing: scanned for quoted spans alone, `/* " */ "secret code"` paired the comment's quote
+# with the name's opening one and the name fell to the token rule, split (Codex's thirteenth
+# review of #172). A comment contributes nothing; a comment the engine reads as code (MySQL's
+# `--x`, no space after the dashes) parses nowhere here and is withheld as unparsed.
 _IDENT_CHAR = r"[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff]"
-_IDENT_TOKEN = re.compile(r"(?<!" + _IDENT_CHAR + r")(?![0-9]+(?!" + _IDENT_CHAR + r"))" + _IDENT_CHAR + r"+")
-_QUOTED = re.compile(r'"((?:[^"]|"")+)"|`((?:[^`]|``)+)`|\'((?:[^\']|\'\')+)\'')
+_SCAN = re.compile(r"(?P<comment>--[^\n]*|/\*.*?\*/)"
+                   r'|"(?P<double>(?:[^"]|"")+)"|`(?P<back>(?:[^`]|``)+)`|\'(?P<single>(?:[^\']|\'\')+)\''
+                   r"|(?P<token>(?![0-9]+(?!" + _IDENT_CHAR + r"))" + _IDENT_CHAR + r"+)", re.S)
+_QUOTE = {"double": '"', "back": "`", "single": "'"}
 # The one spelling every engine reads as the constant unquoted, never as a column so named: a
 # dimension `null` over a table with a phi column `null` is shown to the uncleared (the
 # dimension tests), where `true` on sqlite and `current_date` on DuckDB read the column.
-# Quoted, `"null"` is the column (the review gate on the seventeenth commit).
+# Quoted, `"null"` is the column (the review gate on the seventeenth commit): the scan keeps
+# a quoted span apart from a token, and the constant is dropped from the tokens alone.
 _NEVER_A_COLUMN = frozenset({"null"})
 
 
@@ -196,13 +204,16 @@ def keyword_columns(expr: str) -> set[str]:
     a dimension unresolved when a ref names no column (the review gate on the first draft):
     the raw-read check asks these only where the table has the column, and a spelling naming
     none decides nothing. An unquoted `null` is left out, the constant to every engine; a
-    quoted name is read whole (`_QUOTED`)."""
-    tokens = {token.lower() for token in _IDENT_TOKEN.findall(expr)} - _NEVER_A_COLUMN
-    for double, back, single in _QUOTED.findall(expr):
-        for name, quote in ((double, '"'), (back, "`"), (single, "'")):
-            if name:
-                tokens.add(name.replace(quote * 2, quote).lower())
-    return tokens
+    quoted name is read whole; a comment is passed over (`_SCAN`)."""
+    out: set[str] = set()
+    for match in _SCAN.finditer(expr):
+        kind = match.lastgroup
+        if kind == "token":
+            if match.group().lower() not in _NEVER_A_COLUMN:
+                out.add(match.group().lower())
+        elif kind in _QUOTE:
+            out.add(match.group(kind).replace(_QUOTE[kind] * 2, _QUOTE[kind]).lower())
+    return out
 
 
 def expression_scope(expr: str, source: str) -> str:

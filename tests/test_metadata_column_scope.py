@@ -465,7 +465,10 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
     assert dates[0] != dates[1]
     for name, spelling in (("secret code", '"secret code"'), ("secret.code", '"secret.code"'), ("💩", '"💩"'),
                            ("💩", "💩"), ("123", '"123"'), ("null", '"null"'), ('se"cret', '"se""cret"'),
-                           ("secret code", "`secret code`"), ("secret code", "'secret code'")):
+                           ("secret code", "`secret code`"), ("secret code", "'secret code'"),
+                           # a quote inside a comment pairs with nothing (Codex's thirteenth review)
+                           ("secret code", '/* " */ "secret code"'), ("secret code", '"secret code" /* " */'),
+                           ("secret code", "-- '\n'secret code'")):
         columns = [Column(id="orders.id", object_id="orders", name="id", data_type="date"),
                    Column(id=f"orders.{name}", object_id="orders", name=name, data_type="text", pii_level="phi")]
         expr = f"(SELECT max(date_trunc({spelling}, id)) FROM orders)"
