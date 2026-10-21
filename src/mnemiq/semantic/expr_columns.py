@@ -208,7 +208,7 @@ _SCAN_TAIL = (r'|"(?P<double>(?:[^"]|"")+)"|`(?P<back>(?:[^`]|``)+)`|\'(?P<singl
 _LINE = {  # by (a carriage return ends a line comment, MySQL's openers)
     (True, False): r"--[^\r\n]*",
     (False, False): r"--[^\n]*",
-    (False, True): r"(?:--(?=[\s\x00-\x1f]|$)|#)[^\n]*",
+    (False, True): r"(?:--(?=[ \t\n\r\f\v\x00-\x1f]|$)|#)[^\n]*",  # ASCII whitespace and controls alone, MySQL's lexer's, not Unicode's (the gate)
 }
 _SCAN = {key: re.compile(r"(?P<line>" + line + r")|(?P<block>/\*)" + _SCAN_TAIL, re.S) for key, line in _LINE.items()}
 # The readings joined: nested block comments ending at a carriage return (DuckDB, Postgres),

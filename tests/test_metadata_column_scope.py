@@ -535,7 +535,8 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
     assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=columns) == [_metric(expr)]
     dim = Dimension(id="d", label=expr, source="orders", expr=expr)
     assert select_dimensions(["orders"], [dim], _UNCLEARED, columns=columns) == []
-    assert "secret code" in keyword_columns("id #`secret code`\n")   # a `#` comment's text is code to the scan
+    assert "secret code" in keyword_columns("id # `\n`secret code`")   # the `#` opener: a quote inside its comment pairs with nothing (the gate)
+    assert "secret\n-- code" in keyword_columns("id --\u00a0`secret\n-- code`\n")   # a no-break space opens no MySQL comment: the name read whole (the gate)
     assert "secret_code" in keyword_columns("U&\"secret!005fcode\" -- c\n UESCAPE /* d */ '!'")
     assert keyword_columns('U&"secret\\5f"') == {"u", "secret\\5f"}
     assert keyword_columns('U&"secret\\+00005"') == {"u", "secret\\+00005"}
