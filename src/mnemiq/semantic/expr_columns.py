@@ -48,9 +48,12 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
 
     Parsed by sqlglot in each of `_EXPR_DIALECTS`. A name read with a dot in it is a quoted path
     read as one identifier -- BigQuery's `` `customer.ssn` `` is one name to sqlite (Codex's review
-    of the option-A change, which measured it leaving `ssn` open) -- so it is also split: the last
-    part the column, the rest its qualifier. Both readings are kept, the split one and the whole
-    one a column may truly be named, and a reference is one set of the names it could be.
+    of the option-A change, which measured it leaving `ssn` open) -- so it is also walked prefix
+    by prefix: the part after a prefix naming the source or its alias is the column, whatever
+    follows (`r.secret_code.value`, a nested field path), and an unqualified path's first part is
+    the column it may be as a struct (`secret_code.value`: Codex's seventh review of #172). Every
+    reading is kept, the whole name a column may truly be named among them, and a reference is
+    one set of the names it could be.
 
     Where no dialect reads a column, the spelling read: the last dotted part, if what precedes it
     -- its quotes off -- names the table. sqlglot reads an unquoted `comment` as a command and
@@ -73,14 +76,17 @@ def columns_read(expr: str, source: str) -> set[frozenset[str]]:
             names = set()
             if _names_table(qualifier, source) or qualifier.lower() in aliases:
                 names.add(column.name.lower())  # the whole name as read, dotted or not
-            # A dotted name, qualified by the parser or read whole by a dialect, is walked prefix
-            # by prefix as well, both readings kept: the part right
-            # after a prefix that names the source, or an alias the expression gives it, is the
-            # column, whatever follows it (`\`r.secret_code.value\`` over `orders r` is a
-            # nested field path to BigQuery's reader, and split on its last dot it named
-            # nothing: Codex's sixth review of #172; `\`r.secret_code\`` the same on its
-            # second). Every prefix is tried, since the whole reading above may be a name too.
+            # A dotted name, qualified by the parser or read whole by a dialect, is walked
+            # prefix by prefix as well: the part right after a prefix that names the source, or
+            # an alias the expression gives it, is the column, whatever follows it
+            # (`\`r.secret_code.value\`` over `orders r` is a nested field path to BigQuery's
+            # reader, and split on its last dot it named nothing: Codex's sixth review of #172;
+            # `\`r.secret_code\`` the same on its second). An unqualified path's first part is
+            # the column it may be as a struct whose field follows (`\`secret_code.value\``:
+            # the seventh review). Every prefix is tried, the whole reading kept beside them.
             parts = [p for p in (qualifier.split(".") if qualifier else []) + column.name.split(".") if p]
+            if not qualifier and len(parts) > 1:
+                names.add(parts[0].lower())
             for k in range(1, len(parts)):
                 head = ".".join(parts[:k])
                 if _names_table(head, source) or (k == 1 and head.lower() in aliases):
