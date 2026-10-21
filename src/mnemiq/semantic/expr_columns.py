@@ -166,8 +166,8 @@ _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest, exp.Pivot)
 # column, a withheld `year` and `day` giving different dates (Codex's eleventh review). The
 # parse holds no node that names the column in any of these, and the parser's next rewrite is
 # not known in advance, so every token is read off the text, qualified or not (`r.1ea` is
-# `r.1e AS a` to the parser), inside quoted text and comments too, which withholds more and
-# never less: a token naming no column decides nothing. A token is a maximal run of MySQL's
+# `r.1e AS a` to the parser), inside comments too, which withholds more and never less: a
+# token naming no column decides nothing. A token is a maximal run of MySQL's
 # own characters for an unquoted identifier, ASCII letters, digits, `_` and `$` and anything
 # in U+0080 to U+FFFF (combining marks and currency symbols among them: `1é`, `1你好`, `1$`,
 # `1€` and the decomposed `1e\u0301x` were missed or cut short under Python's word class; the
@@ -179,11 +179,14 @@ _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest, exp.Pivot)
 # dropped the name (the same review), so each quoted span of the text, double-quoted,
 # backticked or single-quoted (sqlite reads a single-quoted name as the column where no
 # string fits), is a column it may be as written. The text is scanned left to right, a
-# comment, a quoted span or a token at a time, so that a quote inside a comment pairs with
-# nothing: scanned for quoted spans alone, `/* " */ "secret code"` paired the comment's quote
-# with the name's opening one and the name fell to the token rule, split (Codex's thirteenth
-# review of #172). A comment contributes nothing; a comment the engine reads as code (MySQL's
-# `--x`, no space after the dashes) parses nowhere here and is withheld as unparsed.
+# comment, a quoted span or a token at a time, so that a quote inside a comment pairs within
+# the comment alone: scanned for quoted spans alone, `/* " */ "secret code"` paired the
+# comment's quote with the name's opening one and the name fell to the token rule, split
+# (Codex's thirteenth review of #172). A comment's own text is scanned the same way, since an
+# engine may run it as code: MySQL reads `--secret_code` as two minus signs and the column
+# (no space after the dashes) and runs `/*! ... */` as SQL, while sqlglot drops both and the
+# expression parses as its own (the review gate on the nineteenth commit, where a comment
+# contributed nothing).
 _IDENT_CHAR = r"[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff]"
 _SCAN = re.compile(r"(?P<comment>--[^\n]*|/\*.*?\*/)"
                    r'|"(?P<double>(?:[^"]|"")+)"|`(?P<back>(?:[^`]|``)+)`|\'(?P<single>(?:[^\']|\'\')+)\''
@@ -204,7 +207,7 @@ def keyword_columns(expr: str) -> set[str]:
     a dimension unresolved when a ref names no column (the review gate on the first draft):
     the raw-read check asks these only where the table has the column, and a spelling naming
     none decides nothing. An unquoted `null` is left out, the constant to every engine; a
-    quoted name is read whole; a comment is passed over (`_SCAN`)."""
+    quoted name is read whole; a comment's text is scanned as code in its turn (`_SCAN`)."""
     out: set[str] = set()
     for match in _SCAN.finditer(expr):
         kind = match.lastgroup
@@ -213,6 +216,9 @@ def keyword_columns(expr: str) -> set[str]:
                 out.add(match.group().lower())
         elif kind in _QUOTE:
             out.add(match.group(kind).replace(_QUOTE[kind] * 2, _QUOTE[kind]).lower())
+        else:
+            text = match.group()
+            out |= keyword_columns(text[2:-2] if text.startswith("/*") else text[2:])
     return out
 
 

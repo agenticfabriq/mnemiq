@@ -468,7 +468,11 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
                            ("secret code", "`secret code`"), ("secret code", "'secret code'"),
                            # a quote inside a comment pairs with nothing (Codex's thirteenth review)
                            ("secret code", '/* " */ "secret code"'), ("secret code", '"secret code" /* " */'),
-                           ("secret code", "-- '\n'secret code'")):
+                           ("secret code", "-- '\n'secret code'"),
+                           # a comment's text is code to an engine that runs it (the gate): MySQL reads
+                           # `--secret_code` as two minus signs and the column, and runs `/*! ... */`
+                           ("secret_code", "id --secret_code\n"), ("secret_code", "id /*! + secret_code */"),
+                           ("secret code", 'id /* " */ --"secret code"\n')):
         columns = [Column(id="orders.id", object_id="orders", name="id", data_type="date"),
                    Column(id=f"orders.{name}", object_id="orders", name=name, data_type="text", pii_level="phi")]
         expr = f"(SELECT max(date_trunc({spelling}, id)) FROM orders)"
