@@ -114,12 +114,12 @@ def _bound_root(ast: exp.Expression, dialect: str | None):
 
 
 def _bind_folded_ctes(root, dialect: str | None) -> None:
-    """Re-bind, in every scope of the tree, a table reference sqlglot matched to no local
-    source to the CTE the engine folds its name to (`_cte_binding`) and whose scope the tree
-    holds (`_cte_scope`: a CTE above the tree, as the join check reads a CTE body on its own,
-    is bound by nothing here), so every consumer of the tree reads that CTE's scope as it does for a CTE
-    matched by spelling: the base-read predicate, the column path, the star expansion and
-    the output names alike. sqlglot keys a CTE's scope by its spelling as written and
+    """Re-bind, in every scope of the tree, each table reference to the CTE the engine folds
+    its name to (`_cte_binding`) and whose scope the tree holds (`_cte_scope`: a CTE above
+    the tree, as the join check reads a CTE body on its own, is bound by nothing here), so
+    every consumer of the tree reads that CTE's scope as it does for a CTE sqlglot matched
+    by spelling: the base-read predicate, the column path, the star expansion and the
+    output names alike. sqlglot keys a CTE's scope by its spelling as written and
     matches a reference by that spelling, where DuckDB and Oracle fold both (M202: with
     `w(id, secret)` granted and `claim.secret` withheld, `WITH W AS (SELECT * FROM claim)
     SELECT w.secret FROM w` read the granted base table here and the CTE there). Bound in
@@ -424,11 +424,20 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None,
 def _cte_scope(scope, cte: exp.CTE):
     """The sqlglot scope built for `cte`'s body, found from `scope` outward: the scopes sqlglot
     keys by the CTE's spelling as written, which is why a reference the engine folds to it
-    was never matched to it (M202). None where no enclosing scope holds it."""
+    was never matched to it (M202). None where no enclosing scope holds it. A RECURSIVE CTE's
+    own reference binds to the scope over its body's left operand, one step down (`A UNION
+    ALL B UNION ALL C` is `(A UNION ALL B) UNION ALL C`, and the reference binds to the scope
+    over `A UNION ALL B`), as sqlglot binds the reference spelled as written: bound to the
+    scope over the whole body, which holds the reference, the scope graph looped back on
+    itself, and a consumer walking sources with no visited set would never end (the review
+    gate on the second commit of #174); taken to the leftmost branch, a three-branch body
+    matched nothing nearer and fell back to the whole body (the gate's third round)."""
+    body = cte.this
+    anchor = body.left if isinstance(body, exp.SetOperation) else body
     anc = scope
     while anc is not None:
         found = anc.cte_sources.get(cte.alias_or_name)
-        if found is not None and found.expression is cte.this:
+        if found is not None and (found.expression is body or found.expression is anchor):
             return found
         anc = anc.parent
     return None

@@ -96,6 +96,32 @@ def test_without_a_cte_the_granted_table_is_read(worlds):
     assert [con.execute(verdict.target_sql).fetchall() for con in worlds] == [[("w-own",)], [("w-own",)]]
 
 
+def test_a_recursive_ctes_own_reference_binds_to_its_anchor_as_sqlglot_binds_it():
+    # The gate on the second commit: re-binding every reference bound the recursive branch's
+    # `r` to the scope over the whole body, which holds that branch, a loop in the scope
+    # graph; sqlglot binds it to the anchor's scope, and so does the fold, for `R` the same.
+    import sqlglot
+    from sqlglot.optimizer.scope import Scope
+    from mnemiq.sql.scope import _bound_root, _root_scope
+    # sqlglot binds it one step down, to the body's left operand: the anchor of a two-branch
+    # body, `SELECT 1 AS id UNION ALL SELECT 2 AS id` of a three-branch one (the gate's third
+    # round, where the leftmost branch matched nothing nearer and the whole body was taken).
+    for spelling in ("r", "R"):
+        for anchor in ("SELECT 1 AS id", "SELECT 1 AS id UNION ALL SELECT 2 AS id"):
+            sql = f"WITH RECURSIVE r AS ({anchor} UNION ALL SELECT id + 1 FROM {spelling} WHERE id < 3) SELECT * FROM r"
+            ast = sqlglot.parse_one(sql, read="duckdb")
+            root = _bound_root(ast, "duckdb")
+            recursive = next(s for s in root.traverse() if s.expression.sql().startswith("SELECT id + 1"))
+            bound = recursive.sources[spelling]
+            assert isinstance(bound, Scope) and bound.expression.sql() == anchor, (spelling, bound.expression.sql())
+            # not a scope over an expression that holds the branch itself
+            assert not any(node is recursive.expression for node in bound.expression.walk()), spelling
+            if spelling == "r":  # the same-case reference is left exactly as sqlglot bound it
+                plain = {id(s.expression): {n: id(getattr(v, "expression", v)) for n, v in s.sources.items()} for s in _root_scope(ast).traverse()}
+                rebound = {id(s.expression): {n: id(getattr(v, "expression", v)) for n, v in s.sources.items()} for s in _bound_root(ast, "duckdb").traverse()}
+                assert plain == rebound, anchor
+
+
 def test_the_fold_is_the_engines_own():
     # Postgres keeps a quoted name's case and folds the unquoted reference to `w`, so `"W"` and
     # `w` are different objects there and `FROM w` reads the granted base table.
