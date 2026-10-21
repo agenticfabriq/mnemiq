@@ -178,19 +178,34 @@ _ALIAS_IN_EXPRESSION: dict[str | None, frozenset[str]] = {
 def _clause_of(column: exp.Column) -> tuple[str, bool]:
     """The clause of its own SELECT a column sits in, and whether it is the whole item there:
     `where`, `group`, `having`, `order`, `qualify`, `join` (an ON), `window` (an OVER's own
-    ORDER BY or PARTITION BY, whatever clause holds it), or `select`, the projection list; a
-    set operation's ORDER BY is `order`, sqlglot holding it under the operation."""
+    ORDER BY or PARTITION BY, whatever clause holds it), `aggregate` (an aggregate's own ORDER
+    BY, which binds to source columns alone: DuckDB rejects an alias there, measured, and with
+    a hidden column of the alias's name read it, Codex's first review of #177), `limit` (a
+    LIMIT or OFFSET, where no engine measured reads an alias), or `select`, the projection
+    list; a set operation's ORDER BY is `order`, sqlglot holding it under the operation. A
+    ROLLUP, CUBE or GROUPING SETS wrapper and a grouping set's parentheses are structure, not
+    an expression: `GROUP BY ROLLUP(x)` is a bare item (the same review, where the wrapper
+    made it an expression and DuckDB's table refused it). Where an alias and a source column
+    share a name the engine reads the column first everywhere but a bare ORDER BY item (and
+    HAVING on DuckDB), measured, which the resolver binds under the complete schema and the
+    grant alone cannot see: the register's residual, recorded at #167."""
     clause, node, bare = None, column.parent, True
     while node is not None and not isinstance(node, (exp.Select, exp.SetOperation)):
         if isinstance(node, (exp.Window, exp.WindowSpec)):
             return "window", bare
+        if isinstance(node, exp.Order) and isinstance(node.parent, exp.Func):
+            return "aggregate", False
+        if isinstance(node, (exp.Limit, exp.Offset)):
+            return "limit", False
         kind = next((name for cls, name in ((exp.Where, "where"), (exp.Group, "group"), (exp.Having, "having"),
                                             (exp.Order, "order"), (exp.Qualify, "qualify"), (exp.Join, "join"))
                      if isinstance(node, cls)), None)
         if kind is not None:
             if clause is None:
                 clause = kind
-        elif not isinstance(node, (exp.Ordered, exp.Alias)):
+        elif isinstance(node, (exp.Tuple, exp.Paren)) and isinstance(node.parent, (exp.Rollup, exp.Cube, exp.GroupingSets)):
+            pass  # a grouping set's parentheses, a one-item set among them (`GROUPING SETS ((x), ())` parses `(x)` as a Paren)
+        elif not isinstance(node, (exp.Ordered, exp.Alias, exp.Rollup, exp.Cube, exp.GroupingSets)):
             bare = False  # the column sits inside an expression of the clause
         node = node.parent
     if clause in ("where", "having", "qualify", "join"):

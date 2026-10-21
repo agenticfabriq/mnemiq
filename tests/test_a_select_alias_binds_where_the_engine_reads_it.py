@@ -15,6 +15,7 @@ import duckdb
 import pytest
 
 from mnemiq.sql.decide import decide
+from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 
 VISIBLE = {"claim": {"id", "v"}}
@@ -48,8 +49,8 @@ READS = {
 }
 
 
-def _decide(sql, dialect):
-    return decide(sql, VISIBLE, dialect=dialect, target=dialect, policy=None)
+def _decide(sql, dialect, policy=None):
+    return decide(sql, VISIBLE, dialect=dialect, target=dialect, policy=policy)
 
 
 @pytest.mark.parametrize("engine", sorted(READS))
@@ -80,6 +81,62 @@ def test_duckdb_and_sqlite_read_the_alias_as_the_table_says(clause):
         except Exception:  # noqa: BLE001 -- the engine's own binder error is the measurement
             ran = False
         assert ran == (clause in READS[engine]), (engine, clause)
+
+
+def test_an_aggregates_own_order_by_and_a_limit_read_no_alias():
+    # Codex's first review of #177: `SELECT 0 AS secret, list(id ORDER BY secret) FROM claim`
+    # with `secret` hidden ordered by the hidden column, the aggregate's ORDER BY read as the
+    # SELECT's, where DuckDB reads an alias. Measured: DuckDB rejects an alias in an aggregate's
+    # ORDER BY with no source column of the name, and DuckDB and SQLite reject one in LIMIT;
+    # the guard admits neither, so the hidden name is refused with or without the schema.
+    duck = duckdb.connect()
+    duck.execute("CREATE TABLE claim (id INT, v INT, secret INT); INSERT INTO claim VALUES (1, 10, 2), (2, 20, 1)")
+    assert duck.execute("SELECT 0 AS secret, list(id ORDER BY secret) FROM claim").fetchall() == [(0, [2, 1])]
+    for sql in ("SELECT 1 AS x FROM claim LIMIT x", "SELECT 1 AS x FROM claim LIMIT 1 OFFSET x", "SELECT 0 AS x, list(id ORDER BY x) FROM claim"):
+        with pytest.raises(duckdb.Error):
+            duck.execute(sql.replace(", secret", "")).fetchall()
+    full = AccessPolicy(policy_schema={"claim": {"id", "v", "secret"}})
+    for policy in (None, full):
+        verdict = _decide("SELECT 0 AS secret, list(id ORDER BY secret) FROM claim", "duckdb", policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (policy, verdict)
+    # the guard itself refuses an alias in LIMIT or OFFSET (the shape check refuses an
+    # unreadable LIMIT before it through `decide`)
+    import sqlglot
+    from mnemiq.sql.authz_guard import check_access
+    for sql in ("SELECT 1 AS x FROM claim LIMIT x", "SELECT 1 AS x FROM claim LIMIT 1 OFFSET x"):
+        verdict = check_access(sqlglot.parse_one(sql, read="duckdb"), VISIBLE, "duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
+
+
+def test_a_source_column_named_like_the_alias_is_bound_under_the_complete_schema():
+    # The same review's collision, `SELECT id AS secret FROM claim WHERE secret = 1` with
+    # `secret` hidden: DuckDB and SQLite read the source column first in WHERE, the
+    # projection list and QUALIFY (measured), and so does the resolver under the complete
+    # schema, which every snapshot-built policy carries, refusing the hidden name; from the
+    # grant alone the alias reading stands, the register's residual recorded at #167.
+    duck = duckdb.connect()
+    duck.execute("CREATE TABLE claim (id INT, v INT, secret INT); INSERT INTO claim VALUES (1, 10, 2), (2, 20, 1)")
+    assert duck.execute("SELECT id AS secret FROM claim WHERE secret = 1").fetchall() == [(2,)]
+    full = AccessPolicy(policy_schema={"claim": {"id", "v", "secret"}})
+    for sql in ("SELECT id AS secret FROM claim WHERE secret = 1", "SELECT id AS secret, secret + 0 AS s FROM claim",
+                "SELECT id AS secret FROM claim QUALIFY row_number() OVER (ORDER BY secret) = 1"):
+        verdict = _decide(sql, "duckdb", policy=full)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
+        assert isinstance(_decide(sql, "duckdb"), Approved), sql   # the residual, from the grant alone
+
+
+@pytest.mark.parametrize("sql", ["SELECT v AS x, count(*) AS n FROM claim GROUP BY ROLLUP(x)",
+                                 "SELECT v AS x, count(*) AS n FROM claim GROUP BY CUBE(x)",
+                                 "SELECT v AS x, count(*) AS n FROM claim GROUP BY GROUPING SETS ((x), ())",
+                                 "SELECT v AS x, id AS y, count(*) AS n FROM claim GROUP BY GROUPING SETS ((x, y), (x))"])
+def test_a_grouping_set_wrapper_keeps_a_bare_alias(sql):
+    # The same review: `GROUP BY ROLLUP(x)` runs on DuckDB and the wrapper made the alias an
+    # expression, which DuckDB's GROUP BY table does not read, a false refusal.
+    duck = duckdb.connect()
+    duck.execute("CREATE TABLE claim (id INT, v INT); INSERT INTO claim VALUES (1, 10), (2, 20)")
+    duck.execute(sql).fetchall()
+    assert isinstance(_decide(sql, "duckdb"), Approved), sql
+    assert isinstance(_decide(sql, "postgres"), Approved), sql
 
 
 def test_oracles_leak_shapes_are_refused():
