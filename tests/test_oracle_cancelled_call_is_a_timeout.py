@@ -16,6 +16,7 @@ from mnemiq.adapters.oracle import _is_timeout  # noqa: E402
 @pytest.mark.parametrize("text", [
     "ORA-01013: user requested cancel of current operation",
     "DPY-4024: call timeout of 300 ms exceeded",
+    "DPY-4024: reworded by a later driver",   # the code, not the wording (the gate)
     "ORA-03156: the statement timed out",   # the code is what the matcher reads
     "DPY-4011: the database or network closed the connection",
 ])

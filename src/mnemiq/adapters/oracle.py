@@ -1339,7 +1339,7 @@ class OracleAdapter:
         try:
             names, rows = self._with_cursor(_fetch)
         except self._oracledb.DatabaseError as exc:
-            # DPY-4011/ORA-03156 surface a cancelled call; report it as a timeout rather than
+            # DPY-4024, ORA-01013, ORA-03156 and DPY-4011 surface a bounded call's end (`_TIMEOUT_SPELLINGS`); report it as a timeout rather than
             # letting a driver code reach the caller as an opaque source error.
             if timeout_s is not None and _is_timeout(exc):
                 raise RuntimeError(f"query timed out after {timeout_s}s") from exc
@@ -1715,13 +1715,15 @@ def _is_ddl_race(exc: Exception) -> bool:
 
 
 # The spellings a bounded call's end takes, by the driver's own error list (python-oracledb
-# 4.0.2, the locked version): DPY-4024, the thin-mode call timeout ("call timeout of 300 ms
-# exceeded", measured on Oracle Free 23); ORA-01013, the cancel a call timeout surfaces as in
-# thick mode and under a server-side cancel, which reached the runner as a plain source fault
-# while it was unmatched (M187, the ui lane); ORA-03156, the server's own statement timeout;
-# and DPY-4011, a closed connection, read as a timeout until the runner reads the adapter's
-# own outage classification after its timeout branch (M188).
-_TIMEOUT_SPELLINGS = ("dpy-4011", "ora-01013", "ora-03156", "timeout")
+# 4.0.2, the locked version), each by its code so a reworded message changes nothing: DPY-4024,
+# the thin-mode call timeout ("call timeout of 300 ms exceeded", measured on Oracle Free 23);
+# ORA-01013, the cancel a call timeout surfaces as in thick mode and under a server-side
+# cancel, which this raised as the driver's own error while it was unmatched (M187, the ui
+# lane); ORA-03156, the server's own statement timeout; and DPY-4011, a closed connection,
+# read as a timeout until the runner reads the adapter's own outage classification after its
+# timeout branch (M188). What the runner makes of the "query timed out" this raises is the
+# runner's (M188): it reads "interrupt" alone today.
+_TIMEOUT_SPELLINGS = ("dpy-4011", "dpy-4024", "ora-01013", "ora-03156", "timeout")
 
 
 def _is_timeout(exc: Exception) -> bool:
