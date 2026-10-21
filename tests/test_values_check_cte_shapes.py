@@ -232,6 +232,36 @@ def test_a_using_key_is_the_joins_side():
     _refused_on_doc("SELECT count(*) FROM t WHERE doc = 'west' AND region IN (SELECT region FROM t a RIGHT JOIN t b(region, doc) USING (doc))")
 
 
+def test_a_local_sources_name_the_walk_cannot_follow_stays_unresolved():
+    # Codex's third review of #178: the inner `doc` is the USING output of a join inside the
+    # derived table, which the walk cannot follow to one base column, and the outer unqualified
+    # `doc` fell to the statement-wide reading, `t.doc`, where the engine compares `q.doc`,
+    # `t.region`; qualified, `x.doc` was skipped, so the two spellings disagreed.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east')")
+    sql = "SELECT doc FROM (SELECT doc FROM t RIGHT JOIN t q(region, doc) USING (doc)) x WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [("west",)]
+    for spelling in ("doc", "x.doc"):
+        for literal in ("west", "a"):
+            assert _check(f"SELECT count(*) FROM (SELECT doc FROM t RIGHT JOIN t q(region, doc) USING (doc)) x WHERE {spelling} = '{literal}'") is None, (spelling, literal)
+    # a local source projecting the name from one base column still answers, and a star or a
+    # set operation leaves the statement-wide reading as before
+    _refused_on_doc("SELECT count(*) FROM (SELECT doc FROM t) x WHERE doc = 'west'")
+    _refused_on_doc("SELECT count(*) FROM (SELECT doc FROM t UNION ALL SELECT doc FROM t) x WHERE doc = 'west'")
+
+
+def test_a_natural_join_answers_nothing():
+    # The same review: a NATURAL join's keys are every name its sides share, and a RIGHT or
+    # FULL one takes the right side's; `t NATURAL RIGHT JOIN (SELECT region AS doc FROM t) q`
+    # compares `t.region` where the walk said `t.doc`.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east')")
+    assert con.execute("SELECT doc FROM t NATURAL RIGHT JOIN (SELECT region AS doc FROM t) q WHERE doc = 'west'").fetchall() == [("west",)]
+    for side in ("", "LEFT ", "RIGHT ", "FULL "):
+        for literal in ("west", "a"):
+            assert _check(f"SELECT count(*) FROM t NATURAL {side}JOIN (SELECT region AS doc FROM t) q WHERE doc = '{literal}'") is None, (side, literal)
+
+
 def test_the_statement_wide_reading_returns_the_catalogs_spelling():
     # The gate on the fourth round: matched by fold, the fallback returned the name as typed,
     # which the index, keyed by the catalog's spelling, never held.

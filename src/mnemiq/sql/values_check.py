@@ -88,6 +88,16 @@ def _stored_match(column: exp.Column, stored: set[str] | frozenset[str], dialect
     return next((c for c in sorted(stored) if written in _stored(c, dialect)), None)
 
 
+def _projects(source: Scope, wanted: str, dialect: str | None) -> bool:
+    """Whether a local source names the column in its own projections: a projection so named,
+    not a star and not a set operation, which the statement-wide reading answers for as before
+    (a star over a join inside a CTE, a union's output: the gate's second round on M174)."""
+    if not isinstance(source.expression, exp.Select):
+        return False
+    return any(_projection_name(p, dialect) == wanted for p in source.expression.selects
+               if not isinstance(p.this if isinstance(p, exp.Column) else p, exp.Star))
+
+
 def _same_column(column: exp.Column, alias: str) -> exp.Column:
     """The column's name, quoting kept, under another qualifier: rebuilt by `exp.column(name,
     table=...)` it was unquoted, which the engine folds where the written one it does not."""
@@ -257,8 +267,13 @@ def check_values(
                 # This scope's own joins alone, in order, each USING the key narrowing the
                 # candidates in turn (a later RIGHT join decides over an earlier inner one): a
                 # join inside a subquery is another scope's, and read here it switched the check
-                # off for the outer column (the review gate on the fourth round).
+                # off for the outer column (the review gate on the fourth round). A NATURAL
+                # join's keys are every name its sides share, which a set of granted names
+                # cannot settle, so the name answers nothing (Codex's third review of #178:
+                # `t NATURAL RIGHT JOIN (SELECT region AS doc FROM t) q` compares `t.region`).
                 for join in scope.expression.args.get("joins") or []:
+                    if (join.method or "").upper() == "NATURAL":
+                        return None
                     if not any(_written(key, dialect) == wanted for key in (join.args.get("using") or ())):
                         continue
                     side = (join.side or "").upper()
@@ -284,6 +299,14 @@ def check_values(
                         found = _through_scopes(_same_column(column, alias), scope, visible, dialect)
                         if found is not None:
                             owners.append(found)
+                        elif _projects(source, wanted, dialect):
+                            # A local source projecting the name that the walk could not follow
+                            # to a base column (a USING output of a join inside it, a function):
+                            # the name is that source's, not a base table's, and the statement-
+                            # wide reading placed it by one (Codex's third review of #178:
+                            # `(SELECT doc FROM t RIGHT JOIN t q(region, doc) USING (doc)) x
+                            # WHERE doc = 'west'` compares `t.region`, the walk said `t.doc`).
+                            return None
                 if len(owners) == 1:
                     return owners[0]
         # The statement-wide reading, as before M174, where the scope answers nothing: a star
