@@ -516,6 +516,39 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
     assert keyword_columns('U&"secret\\+00005"') == {"u", "secret\\+00005"}
 
 
+def test_a_spelling_past_postgres_identifier_limit_reads_the_column_named_by_its_first_63_bytes():
+    # Codex's sixteenth review of #172: Postgres truncates an identifier, quoted or not, to 63
+    # bytes, so a 64-character reference reads the phi column named by its first 63 and the
+    # spelling as written named nothing. Whole characters only: 32 two-byte characters are 64
+    # bytes and cut to 31. A Unicode-escaped span is cut after decoding.
+    from mnemiq.contract import Dimension
+    from mnemiq.semantic.expr_columns import expression_scope, keyword_columns
+    from mnemiq.semantic.measures import select_dimensions
+    ascii_name, wide_name = "s" * 63, "é" * 31
+    for name, spelling in ((ascii_name, '"' + ascii_name + 'x"'), (ascii_name, ascii_name + "x"),
+                           (wide_name, '"' + wide_name + "é" + '"'), (wide_name, wide_name + "é"),
+                           (ascii_name, 'U&"' + "s" * 62 + '\\0073x"')):
+        columns = [Column(id="orders.id", object_id="orders", name="id", data_type="date"),
+                   Column(id=f"orders.{name}", object_id="orders", name=name, data_type="text", pii_level="phi")]
+        expr = f"(SELECT max({spelling}) FROM orders)"
+        assert expression_scope(expr, "orders") == "own", expr
+        assert name in keyword_columns(expr), expr
+        assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=columns) == [], expr
+        assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=columns) == [_metric(expr)], expr
+        dim = Dimension(id="d", label=expr, source="orders", expr=expr)
+        assert select_dimensions(["orders"], [dim], _UNCLEARED, columns=columns) == [], expr
+        assert select_dimensions(["orders"], [dim], _CLEARED, columns=columns) == [dim], expr
+    # a spelling that fits is not cut: 63 bytes exactly, and a shorter one
+    assert keyword_columns('"' + ascii_name + '"') == {ascii_name}
+    assert keyword_columns('"' + wide_name + 'x"') == {wide_name + "x"}   # 63 bytes
+    # cut as written, lowercased after (the gate): `İ` is two bytes, its lowercase three, so
+    # Postgres reads `s` * 62 (the `İ` not whole at 63) where the lowercased spelling cut at
+    # another boundary; a lone surrogate, which the identifier class admits, raises nothing
+    assert "s" * 62 in keyword_columns('"' + "s" * 62 + 'İx"')
+    assert "a\ud800" in keyword_columns('max("a\ud800")')
+    assert "a" * 63 in keyword_columns('max("' + "a" * 63 + '\ud800")')
+
+
 def test_a_struct_column_named_like_the_source_keeps_its_root_reading():
     # Codex's eighth review of #172: with a phi struct column named `orders` on `orders`, the
     # parser reads `orders.value` as a qualifier and a column, and the root reading was kept

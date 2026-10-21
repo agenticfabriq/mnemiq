@@ -220,26 +220,51 @@ def keyword_columns(expr: str) -> set[str]:
     a dimension unresolved when a ref names no column (the review gate on the first draft):
     the raw-read check asks these only where the table has the column, and a spelling naming
     none decides nothing. An unquoted `null` is left out, the constant to every engine; a
-    quoted name is read whole; a comment's text is scanned as code in its turn (`_SCAN`)."""
-    return _scan(expr, nested=True) | _scan(expr, nested=False)
+    quoted name is read whole; a comment's text is scanned as code in its turn (`_SCAN`).
+    Each spelling longer than Postgres's identifier limit is read cut to it as well
+    (`_cut_to_postgres_limit`): Postgres truncates an identifier, quoted or not, to its first
+    63 bytes, so a 64-byte spelling reads the column named by its first 63 (Codex's sixteenth
+    review of #172, where the longer spelling named nothing and the phi column so named
+    reached the uncleared through both selectors); MySQL and Oracle refuse a name past their
+    limits, DuckDB has none. The spelling is cut as written and lowercased after, since
+    lowercasing changes some characters' byte length (the review gate on this round: `İ` is
+    two bytes and its lowercase three)."""
+    spellings = _scan(expr, nested=True) | _scan(expr, nested=False)
+    cuts = {cut for cut in map(_cut_to_postgres_limit, spellings) if cut is not None}
+    return {spelling.lower() for spelling in spellings | cuts}
+
+
+_POSTGRES_IDENTIFIER_BYTES = 63  # NAMEDATALEN - 1, the default build
+
+
+def _cut_to_postgres_limit(spelling: str) -> str | None:
+    """`spelling` cut to the first 63 bytes of its UTF-8, whole characters only, as Postgres
+    truncates an identifier (`pg_mbcliplen`), or None where it fits. A lone surrogate, which
+    the identifier class admits, is carried through rather than refused (the review gate on
+    this round: encoded strictly, one such spelling raised for every question over the
+    source)."""
+    encoded = spelling.encode("utf-8", "surrogatepass")
+    if len(encoded) <= _POSTGRES_IDENTIFIER_BYTES:
+        return None
+    return encoded[:_POSTGRES_IDENTIFIER_BYTES].decode("utf-8", "ignore")
 
 
 def _scan(expr: str, nested: bool) -> set[str]:
     """`keyword_columns` under one reading of a block comment: nested (DuckDB, Postgres) or
-    ended at the first `*/` (MySQL)."""
+    ended at the first `*/` (MySQL). The spellings as written; `keyword_columns` lowercases."""
     out: set[str] = set()
     pos = 0
     while (match := _SCAN.search(expr, pos)) is not None:
         kind, pos = match.lastgroup, match.end()
         if kind == "token":
             if match.group().lower() not in _NEVER_A_COLUMN:
-                out.add(match.group().lower())
+                out.add(match.group())
         elif kind in _QUOTE:
             span = match.group(kind).replace(_QUOTE[kind] * 2, _QUOTE[kind])
-            out.add(span.lower())
+            out.add(span)
             decoded = _unicode_escaped(expr, match, span)
             if decoded is not None:
-                out.add(decoded.lower())
+                out.add(decoded)
         elif kind == "line":
             out |= _scan(match.group()[2:], nested)
         else:
