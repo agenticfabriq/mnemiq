@@ -436,14 +436,20 @@ def test_a_literal_beside_a_branch_the_validator_cannot_type_is_refused_though_i
                  # TRY_CAST to a container cannot tell a converting literal from one that does
                  # not (the review gate), so a literal beside a container branch is refused too.
                  "CASE WHEN id = 1 THEN [1, 2] ELSE '[3]' END IS NOT NULL",
-                 # A list or a map a call the reader does not know returns cannot be typed,
-                 # and may hold JSON (the review gate); a list-only search or a map-only lookup
-                 # of one is refused.
-                 "list_contains(list_filter([region], x -> x IS NOT NULL), 'x')",
-                 "map_extract_value(map_from_entries(list_filter([('a', 1)], x -> true)), region) = 1"):
+                 # A map a call the reader does not know returns cannot be typed, and may hold
+                 # JSON (the review gate); a map-only lookup of one is refused.
+                 "map_extract_value(map_from_entries(list_zip(['a'], [1])), region) = 1"):
         con.execute(f"SELECT id FROM claim WHERE {runs}").fetchall()
         verdict = _decide(runs)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, runs
+    # A filtered list is typed by DuckDB from the list walked (round 47: Codex's thirty-ninth
+    # review), VARCHAR[] and MAP(VARCHAR, INTEGER) here, so the search over it and the lookup
+    # in it are read and run; refused before as a list or a map a call the reader did not
+    # know returns.
+    for runs in ("list_contains(list_filter([region], x -> x IS NOT NULL), 'x')",
+                 "map_extract_value(map_from_entries(list_filter([('a', 1)], x -> true)), region) = 1"):
+        con.execute(f"SELECT id FROM claim WHERE {runs}").fetchall()
+        assert isinstance(_decide(runs), Approved), runs
 
 
 def test_a_union_whose_members_pair_text_with_json_is_refused_wherever_it_sits():
@@ -1167,6 +1173,38 @@ _TYPED_PART_RUNS = [
     "list_slice(TRY_CAST([region] AS VARCHAR[]), 1, length(lower(region))) = [region]",
     "list_transform([lower(region)], x -> tags) = [[region]]",
     "list_append([{'a': lower(region)}], TRY_CAST(region AS STRUCT(a VARCHAR))) = [{'a': region}, {'a': region}]",
+    # a lambda's parameter is the element of the list walked, typed by DuckDB (Codex's 39th)
+    "list_transform([attrs], x -> x) = [attrs]",
+    "list_transform([tags], x -> x) = [tags]",
+    "list_transform([attrs], x -> CAST(x AS JSON)) = [attrs]",
+    "list_transform(tags, (x, i) -> i) = [1]",
+    "list_filter(tags, x -> true) = tags",                       # a filtered list is the list's type
+    "list_filter(tags, x -> x = 'north') = tags",
+    "list_transform([lower(region)], x -> x) = [region]",      # the parameter bound to a text element
+    "list_filter([lower(region)], x -> true) = [region]",
+    "list_transform(tags, x -> lower(x)) = tags",
+    # the body's own comparisons read the parameter typed (the gate on round 47)
+    "list_filter([attrs], x -> x = attrs) = [attrs]",
+    "list_filter(tags, x -> x = region) = tags",
+    "list_filter(tags, x -> x = 'a') = tags",
+    "list_transform(tags, (x, i) -> i = 1) = [true]",
+    "attrs = '{\"a\": 1}'",                                      # a literal JSON converts
+    # a part of the parameter, typed as DuckDB types the part of a typed NULL (the gate)
+    "list_filter([[attrs]], x -> x[1] = attrs) = [[attrs]]",
+    "list_filter([{'k': tags}], x -> x.k = tags) = [{'k': tags}]",
+    "list_filter([{'k': region}], x -> x['k'] = 'north') = [{'k': region}]",
+    "list_reduce([attrs], (acc, x) -> x) = attrs",                # reduce binds the element second
+    "list_reduce(tags, (acc, x) -> CASE WHEN x = region THEN x ELSE acc END) = region",   # the element compared in the body: text beside text; bound as the index, a number beside a text column
+    "list_reduce(tags, (acc, x, i) -> acc || x || i::VARCHAR) = 'northnorth1'",
+    # a text parameter reads the row, and is no constant and no literal (the gate's third round)
+    "list_filter(tags, x -> TRY_CAST(x AS INT) = 1) = tags",
+    "list_filter([id], x -> x = 1) = [id]",
+    "list_filter(tags, x -> x = 'north') = tags",
+    "list_reduce(tags, (acc, x) -> acc || x, 'z') = 'znorth'",    # the accumulator typed from the initial value (the gate)
+    # the literal rule's operators: LIKE reads JSON as text and runs, and a literal JSON parses
+    "attrs LIKE 'a'",
+    "attrs = '\"a\"'",
+    "attrs IN ('{}')",
 ]
 _TYPED_PART_RAISES = [
     "list_transform([[lower(region)]], x -> region) = [[region]]",   # a typed text against a list
@@ -1179,6 +1217,48 @@ _TYPED_PART_RAISES = [
     "list_concat([lower(region)], TRY_CAST(region AS JSON[])) = [region, region]",
     "list_append([lower(region)], TRY_CAST(region AS JSON)) = [region, region]",
     "list_append([lower(region)], attrs->'$.a') = [region, region]",
+    # a lambda's parameter bound to a JSON element meets text (Codex's 39th: approved, raising)
+    "list_transform([attrs], x -> x) = [region]",
+    "{'a': list_transform([attrs], x -> x)} = {'a': [region]}",
+    "list_transform([attrs], x -> x) = list_transform([region], x -> x)",
+    "list_transform([attrs, lower(region)], x -> x) = [attrs]",   # the list walked raises by itself
+    "list_transform([lower(region)], x -> x) = [attrs]",          # a text element where JSON is
+    "list_filter([lower(region)], x -> true) = [attrs]",
+    "list_filter(tags, x -> true) = [attrs]",
+    "list_transform([TRY_CAST(lower(region) AS JSON)], x -> x) = [region]",   # the parameter bound to a JSON element of a list the reader cannot type
+    "list_filter([TRY_CAST(lower(region) AS JSON)], x -> true) = [region]",
+    # the body's own comparisons, the parameter a JSON element (the gate on round 47)
+    "list_filter([attrs], x -> x = region) = [attrs]",
+    "list_filter([attrs], x -> x = 'a') = [attrs]",
+    "list_transform([attrs], x -> x = region) = [true]",
+    "len(list_filter([attrs], x -> x = region)) = 1",
+    "attrs = 'a'",                                              # a literal no JSON parses, beside JSON (the gate)
+    # a part of the parameter (the gate's second round)
+    "list_filter([[attrs]], x -> x[1] = region) = [[attrs]]",
+    "list_filter([{'k': attrs}], x -> x.k = region) = [{'k': attrs}]",
+    "list_filter([{'k': attrs}], x -> x['k'] = 'a') = [{'k': attrs}]",
+    "list_transform([[attrs]], x -> x[1] = region) = [true]",
+    "list_reduce([attrs], (acc, x) -> x) = region",
+    # a text parameter beside a number is converted on the row (the gate's third round)
+    "list_filter(tags, x -> x = id) = tags",
+    "list_filter(tags, x -> id = x) = tags",
+    "list_filter(tags, x -> x = 1) = tags",
+    "list_filter(tags, x -> x::INT = 1) = tags",
+    "list_filter([region], x -> x = id) = [region]",
+    "list_transform(tags, x -> x = id) = [true]",
+    "len(list_filter(tags, x -> x = id)) = 1",
+    "list_filter([[attrs]], x -> x = [region]) = [[attrs]]",     # the parameter no literal side to exempt
+    "list_filter([tags], x -> x = [attrs]) = [tags]",
+    # the accumulator typed from the initial value, and a parameter over a JSON-holding list the
+    # reader cannot type (the gate's round on the fourth draft)
+    "list_reduce(tags, (acc, x) -> CASE WHEN acc = 'z' THEN acc ELSE acc END, attrs) = attrs",
+    "list_filter([TRY_CAST(lower(region) AS JSON)], x -> x = 'zz') IS NOT NULL",
+    "list_filter([TRY_CAST(lower(region) AS JSON)], x -> x = region) IS NOT NULL",
+    # the literal rule's operators, each a conversion of the literal to JSON
+    "attrs <> 'a'",
+    "attrs > 'a'",
+    "attrs IN ('a')",
+    "'a' = attrs",
 ]
 
 
@@ -1233,6 +1313,7 @@ _PART_RULES_RUN = [
     "[{'a': region}] = [{'b': [id]}]",
     "list_transform([lower(region)], x -> TRY_CAST({'a': region} AS STRUCT(a VARCHAR))) = [{'b': region}]",
     "list_transform([lower(region)], x -> TRY_CAST({'a': region} AS STRUCT(a VARCHAR))) = [{'b': [id]}]",
+    "list_filter([{'a': lower(region), 'b': attrs}], x -> true) = [{'a': region, 'b': attrs}]",   # a filtered list is its list's shape (round 47)
 ]
 _PART_RULES_RAISE = [
     "[{'a': lower(region)}, {'a': attrs}] = [{'a': 'x'}]",    # a list unifies its items field-wise (the gate on round 45)
