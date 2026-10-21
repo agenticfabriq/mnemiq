@@ -152,6 +152,16 @@ def _source_aliases(node: exp.Expression, source: str) -> set[str]:
 # of #172); an UNPIVOT carries the rest of the row the same way, and DuckDB's own `PIVOT
 # orders ON status USING sum(id)` parses to the same node.
 _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest, exp.Pivot)
+# MySQL runs the text of `/*! ... */`, and of `/*!50000 ... */` from that server version, as
+# code (measured on MySQL 8: `SELECT 1 /*! + 1 */` is 2, DuckDB, SQLite and Postgres read 1),
+# and MariaDB runs `/*M! ... */` as documented, so a parse that reads the span as a comment
+# reads a subquery over another table inside it as nothing: `(SELECT max(id) /*! + (SELECT
+# max(secret_code) FROM patients) */ FROM orders)` was `own` and offered to a grant on `orders`
+# alone (Codex's twenty-first review of #172). MySQL lexes the span as code with comments of
+# its own inside (`/*! 1 /* x */ + 1 */` is 3, the comment closed before the span is), so an
+# expansion would have to lex as MySQL does; an expression holding the opener anywhere, a
+# string literal included, is withheld from everyone instead.
+_EXECUTABLE_COMMENT = re.compile(r"/\*M?!")
 
 
 # Any token of the expression's own text, which an engine reads as a column so named whatever
@@ -397,8 +407,11 @@ def expression_scope(expr: str, source: str) -> str:
     the model (the ui lane's measurement, 2026-10-20). `"unparsed"` is an expression no dialect
     parses, for which `columns_read` falls back to its spelling; the caller decides whether that
     spelling names a real column (a keyword-named one does) or nothing (a malformed expression
-    does).
+    does). An expression holding a MySQL executable comment's opener is `"foreign"`, whatever
+    the parse reads (`_EXECUTABLE_COMMENT`).
     """
+    if _EXECUTABLE_COMMENT.search(expr):
+        return "foreign"
     for dialect in _EXPR_DIALECTS:
         try:
             node = sqlglot.parse_one(expr, read=dialect)

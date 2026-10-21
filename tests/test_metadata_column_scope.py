@@ -413,6 +413,34 @@ def test_a_pivot_carries_the_rest_of_the_row_under_an_alias_that_is_no_source_al
             assert select_metrics(["orders"], [_metric(expr)], grants, columns=columns) == [], expr
 
 
+def test_a_mysql_executable_comment_is_withheld_from_everyone():
+    # Codex's twenty-first review of #172: MySQL runs `/*! ... */` (and `/*!50000 ... */` from
+    # that version) as code, measured, where every other engine reads a comment, so the parse
+    # said `own` for a subquery over another table inside one and the selector offered it to a
+    # grant on `orders` alone. MySQL lexes the span with comments of its own inside, so it is
+    # not expanded here: the opener anywhere, a string literal included, withholds.
+    from mnemiq.contract import Dimension
+    from mnemiq.semantic.expr_columns import expression_scope
+    from mnemiq.semantic.measures import select_dimensions
+    for expr in ("(SELECT max(id) /*! + (SELECT max(secret_code) FROM patients) */ FROM orders)",
+                 "max(id) /*!50000 + (SELECT max(secret_code) FROM patients) */",
+                 "max(id) /*!+(SELECT max(secret_code) FROM patients)*/",
+                 "max(id) /*! 1 /* x */ + (SELECT max(secret_code) FROM patients) */",
+                 "max(id) /*M! + (SELECT max(secret_code) FROM patients) */",
+                 "max(id) /*! + max(secret_code) */",
+                 "CASE WHEN id = '/*!' THEN 1 END"):
+        assert expression_scope(expr, "orders") == "foreign", expr
+        dim = Dimension(id=f"d:{expr}", label=expr, source="orders", expr=expr)
+        for grants in (_UNCLEARED, _CLEARED):
+            assert select_metrics(["orders"], [_metric(expr)], grants, columns=_COLUMNS) == [], expr
+            assert select_dimensions(["orders"], [dim], grants, columns=_COLUMNS) == [], expr
+    # a plain comment is one to every engine, its text read raw as before
+    plain = "(SELECT max(id) /* + (SELECT max(secret_code) FROM patients) */ FROM orders)"
+    assert expression_scope(plain, "orders") == "own"
+    assert select_metrics(["orders"], [_metric(plain)], _UNCLEARED, columns=_COLUMNS) == []
+    assert select_metrics(["orders"], [_metric(plain)], _CLEARED, columns=_COLUMNS) == [_metric(plain)]
+
+
 def test_a_column_the_parser_reads_as_a_unit_or_a_type_still_requires_its_clearance():
     # Codex's eleventh review of #172: sqlglot reads `date_trunc(secret_code, id)` as
     # `DATE_TRUNC('SECRET_CODE', id)`, a string where the column stood, so the parse held no
@@ -487,8 +515,9 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
                            # both readings, joined
                            ("secret code", '-- "\r"secret code"'), ("secret code", "-- '\r\n'secret code'"),
                            # a comment's text is code to an engine that runs it (the gate): MySQL reads
-                           # `--secret_code` as two minus signs and the column, and runs `/*! ... */`
-                           ("secret_code", "id --secret_code\n"), ("secret_code", "id /*! + secret_code */"),
+                           # `--secret_code` as two minus signs and the column (an executable comment,
+                           # `/*! ... */`, is withheld from everyone since Codex's twenty-first review)
+                           ("secret_code", "id --secret_code\n"),
                            ("secret code", 'id /* " */ --"secret code"\n'),
                            # a block comment nests, as DuckDB and Postgres read it (Codex's fourteenth)
                            ("secret code", '/* /* */ " */ "secret code"'), ("secret code", '/* /* /* */ */ " */ "secret code"'),
