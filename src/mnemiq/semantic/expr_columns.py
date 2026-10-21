@@ -186,9 +186,15 @@ _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest, exp.Pivot)
 # engine may run it as code: MySQL reads `--secret_code` as two minus signs and the column
 # (no space after the dashes) and runs `/*! ... */` as SQL, while sqlglot drops both and the
 # expression parses as its own (the review gate on the nineteenth commit, where a comment
-# contributed nothing).
+# contributed nothing). A block comment nests to DuckDB and Postgres and not to MySQL, which
+# ends it at the first `*/`: ended there, `/* /* */ " */ "secret code"` left a quote outside
+# the comment to pair with the name's opening one (Codex's fourteenth review), while nested, a
+# name that opens inside the region and closes after it (`` `secret */ code` ``, read whole by
+# MySQL) is split. The text is scanned under both readings and the spellings joined, which
+# withholds more and never less; a comment's own text is scanned as code under each, so what
+# one reading hides the other reads. An open comment runs to the end of the text.
 _IDENT_CHAR = r"[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff]"
-_SCAN = re.compile(r"(?P<comment>--[^\n]*|/\*.*?\*/)"
+_SCAN = re.compile(r"(?P<line>--[^\n]*)|(?P<block>/\*)"
                    r'|"(?P<double>(?:[^"]|"")+)"|`(?P<back>(?:[^`]|``)+)`|\'(?P<single>(?:[^\']|\'\')+)\''
                    r"|(?P<token>(?![0-9]+(?!" + _IDENT_CHAR + r"))" + _IDENT_CHAR + r"+)", re.S)
 _QUOTE = {"double": '"', "back": "`", "single": "'"}
@@ -208,18 +214,46 @@ def keyword_columns(expr: str) -> set[str]:
     the raw-read check asks these only where the table has the column, and a spelling naming
     none decides nothing. An unquoted `null` is left out, the constant to every engine; a
     quoted name is read whole; a comment's text is scanned as code in its turn (`_SCAN`)."""
+    return _scan(expr, nested=True) | _scan(expr, nested=False)
+
+
+def _scan(expr: str, nested: bool) -> set[str]:
+    """`keyword_columns` under one reading of a block comment: nested (DuckDB, Postgres) or
+    ended at the first `*/` (MySQL)."""
     out: set[str] = set()
-    for match in _SCAN.finditer(expr):
-        kind = match.lastgroup
+    pos = 0
+    while (match := _SCAN.search(expr, pos)) is not None:
+        kind, pos = match.lastgroup, match.end()
         if kind == "token":
             if match.group().lower() not in _NEVER_A_COLUMN:
                 out.add(match.group().lower())
         elif kind in _QUOTE:
             out.add(match.group(kind).replace(_QUOTE[kind] * 2, _QUOTE[kind]).lower())
+        elif kind == "line":
+            out |= _scan(match.group()[2:], nested)
         else:
-            text = match.group()
-            out |= keyword_columns(text[2:-2] if text.startswith("/*") else text[2:])
+            pos, closed = _block_end(expr, match.start(), nested)
+            out |= _scan(expr[match.start() + 2:pos - 2 if closed else pos], nested)
     return out
+
+
+def _block_end(text: str, start: int, nested: bool) -> tuple[int, bool]:
+    """Where the block comment opening at `start` ends, and whether a `*/` closed it: after
+    the `*/` that brings its depth back to zero where comments nest, after the first `*/`
+    where they do not, or at the end of the text where none does (the review gate on the
+    twenty-first commit: cut as if closed, an open comment lost its last two characters,
+    `/*! + secret_code */` inside one reading `secret_cod`)."""
+    depth, i = 0, start
+    while i < len(text):
+        if text.startswith("/*", i) and (nested or i == start):
+            depth, i = depth + 1, i + 2
+        elif text.startswith("*/", i):
+            depth, i = depth - 1, i + 2
+            if depth == 0:
+                return i, True
+        else:
+            i += 1
+    return len(text), False
 
 
 def expression_scope(expr: str, source: str) -> str:

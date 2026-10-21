@@ -439,6 +439,11 @@ def test_a_column_the_parser_reads_as_a_unit_or_a_type_still_requires_its_cleara
         assert "secret_code" in keyword_columns(expr), expr
         assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=_COLUMNS) == [], expr
         assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=_COLUMNS) == [_metric(expr)], expr
+    # An open comment runs to the end of the text, its last characters kept (the gate on the
+    # twenty-first commit: cut as if closed, `secret_code` read `secret_cod`).
+    for expr in ("id /* /* */ /*! + secret_code */", "id /* /* */ /*!+secret_code*/", "id /* /* */ + secret_code",
+                 "id /* /* */ /*!+secret_code"):   # open under both readings
+        assert "secret_code" in keyword_columns(expr), expr
     # Digits alone are a number to every engine, never a column: a phi column named `123`
     # withholds nothing from `LIMIT 123`.
     columns = _COLUMNS + [Column(id="orders.123", object_id="orders", name="123", data_type="text",
@@ -472,7 +477,12 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
                            # a comment's text is code to an engine that runs it (the gate): MySQL reads
                            # `--secret_code` as two minus signs and the column, and runs `/*! ... */`
                            ("secret_code", "id --secret_code\n"), ("secret_code", "id /*! + secret_code */"),
-                           ("secret code", 'id /* " */ --"secret code"\n')):
+                           ("secret code", 'id /* " */ --"secret code"\n'),
+                           # a block comment nests, as DuckDB and Postgres read it (Codex's fourteenth)
+                           ("secret code", '/* /* */ " */ "secret code"'), ("secret code", '/* /* /* */ */ " */ "secret code"'),
+                           ("secret code", '/* /* " */ "secret code"'),
+                           # and does not nest to MySQL, which reads a name across the nested region whole
+                           ("secret */ code", "/* /* */ `secret */ code`")):
         columns = [Column(id="orders.id", object_id="orders", name="id", data_type="date"),
                    Column(id=f"orders.{name}", object_id="orders", name=name, data_type="text", pii_level="phi")]
         expr = f"(SELECT max(date_trunc({spelling}, id)) FROM orders)"
