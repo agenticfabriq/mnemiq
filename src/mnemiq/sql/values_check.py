@@ -89,12 +89,23 @@ def _stored_match(column: exp.Column, stored: set[str] | frozenset[str], dialect
 
 
 def _projects(source: Scope, wanted: str, dialect: str | None) -> bool:
-    """Whether a local source names the column in its own projections: a projection so named,
-    not a star and not a set operation, which the statement-wide reading answers for as before
-    (a star over a join inside a CTE, a union's output: the gate's second round on M174)."""
+    """Whether a local source names the column in its own output, as `_through_scopes` reads
+    the output: a column list naming it by position (`WITH x(doc) AS (SELECT upper(region) FROM
+    t)`, where the projection's own name never met and the statement-wide reading placed `doc`
+    by `t`: the review gate on the fifth round), or a projection past the list so named, since
+    the list renames the first projections away (`WITH x(k) AS (SELECT doc FROM t)` has no
+    `doc`); a star among the listed positions leaves the positions unknown, and a star or a set
+    operation leaves the statement-wide reading as before (a star over a join inside a CTE, a
+    union's output: the gate's second round on M174; a list over a star, the gate's sixth)."""
     if not isinstance(source.expression, exp.Select):
         return False
-    return any(_projection_name(p, dialect) == wanted for p in source.expression.selects
+    selects = source.expression.selects
+    listed = _column_list(source, dialect) or []
+    if any(isinstance(p.this if isinstance(p, exp.Column) else p, exp.Star) for p in selects[:len(listed)]):
+        return False
+    if wanted in listed[:len(selects)]:
+        return True
+    return any(_projection_name(p, dialect) == wanted for p in selects[len(listed):]
                if not isinstance(p.this if isinstance(p, exp.Column) else p, exp.Star))
 
 

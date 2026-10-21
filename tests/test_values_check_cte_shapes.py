@@ -248,6 +248,20 @@ def test_a_local_sources_name_the_walk_cannot_follow_stays_unresolved():
     # set operation leaves the statement-wide reading as before
     _refused_on_doc("SELECT count(*) FROM (SELECT doc FROM t) x WHERE doc = 'west'")
     _refused_on_doc("SELECT count(*) FROM (SELECT doc FROM t UNION ALL SELECT doc FROM t) x WHERE doc = 'west'")
+    # a column list names the output by position, a function behind it (the gate on the fifth
+    # round): the engine compares `upper(t.region)`, and the statement-wide reading said `t.doc`
+    assert con.execute("WITH x(doc) AS (SELECT upper(region) FROM t) SELECT count(*) FROM x WHERE doc = 'WEST'").fetchall() == [(1,)]
+    for literal in ("west", "WEST", "a"):
+        assert _check(f"WITH x(doc) AS (SELECT upper(region) FROM t) SELECT count(*) FROM x WHERE doc = '{literal}'") is None, literal
+        assert _check(f"SELECT count(*) FROM (SELECT upper(region) FROM t) AS x(doc) WHERE doc = '{literal}'") is None, literal
+    # a list over a star leaves the positions unknown and the statement-wide reading on (the
+    # gate's sixth round): `x.doc` is `t.doc`, the first column, and the count is 0
+    assert con.execute("WITH x(doc) AS (SELECT * FROM t) SELECT count(*) FROM x WHERE doc = 'west'").fetchall() == [(0,)]
+    _refused_on_doc("WITH x(doc) AS (SELECT * FROM t) SELECT count(*) FROM x WHERE doc = 'west'")
+    _refused_on_doc("SELECT count(*) FROM (SELECT * FROM t) d(doc, region) WHERE doc = 'west'")
+    # a list renames the first projections away: x has no `doc`, and `doc` is t's
+    assert con.execute("WITH x(k) AS (SELECT doc FROM t) SELECT count(*) FROM x, t WHERE doc = 'west'").fetchall() == [(0,)]
+    _refused_on_doc("WITH x(k) AS (SELECT doc FROM t) SELECT count(*) FROM x, t WHERE doc = 'west'")
 
 
 def test_a_natural_join_answers_nothing():
@@ -260,6 +274,8 @@ def test_a_natural_join_answers_nothing():
     for side in ("", "LEFT ", "RIGHT ", "FULL "):
         for literal in ("west", "a"):
             assert _check(f"SELECT count(*) FROM t NATURAL {side}JOIN (SELECT region AS doc FROM t) q WHERE doc = '{literal}'") is None, (side, literal)
+    # a NATURAL join inside a subquery is another scope's, and leaves the outer column's check on
+    _refused_on_doc("SELECT count(*) FROM t WHERE doc = 'west' AND region IN (SELECT region FROM t NATURAL JOIN t u)")
 
 
 def test_the_statement_wide_reading_returns_the_catalogs_spelling():
