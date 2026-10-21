@@ -1152,6 +1152,69 @@ def test_a_union_extract_at_the_top_level_is_typed_from_its_argument():
     assert isinstance(_decide(running), Approved)
 
 
+_TYPED_PART_RUNS = [
+    "list_append([[lower(region)]], TRY_CAST([region] AS VARCHAR[])) = [[region], [region]]",  # Codex's 37th
+    "list_prepend(TRY_CAST([region] AS VARCHAR[]), [[lower(region)]]) = [[region], [region]]",
+    "list_append([[lower(region)]], tags) = [[region], [region]]",
+    "list_prepend(tags, [[lower(region)]]) = [[region], [region]]",
+    "list_append(tags, lower(region)) = [region, region]",
+    "list_concat([[lower(region)]], [tags]) = [[region], [region]]",
+    "list_concat([lower(region)], tags) = [region, region]",
+    "list_concat([[lower(region)]], TRY_CAST([[region]] AS VARCHAR[][])) = [[region], [region]]",  # a concatenated typed list is a list of the result's type
+    "list_slice(tags, 1, 1) = [region]",
+    "list_slice(TRY_CAST([region] AS VARCHAR[]), 1, 1) = [region]",
+    "list_slice(tags, 1, length(lower(region))) = [region]",   # the slice unknown by its index, its list typed
+    "list_slice(TRY_CAST([region] AS VARCHAR[]), 1, length(lower(region))) = [region]",
+    "list_transform([lower(region)], x -> tags) = [[region]]",
+    "list_append([{'a': lower(region)}], TRY_CAST(region AS STRUCT(a VARCHAR))) = [{'a': region}, {'a': region}]",
+]
+_TYPED_PART_RAISES = [
+    "list_transform([[lower(region)]], x -> region) = [[region]]",   # a typed text against a list
+    "list_transform([lower(region)], x -> TRY_CAST(x AS VARCHAR)) = [[region]]",
+    "list_transform([lower(region)], x -> id) = [[id]]",            # a typed number too (the gate)
+    "list_transform([lower(region)], x -> {'a': id}) = [[region]]",  # and a typed struct
+    "list_append([lower(region)], attrs) = [region, region]",       # a JSON part: the text sibling parsed on the row
+    "list_append([[lower(region)]], [attrs]) = [[region], [region]]",
+    "list_concat([lower(region)], [attrs]) = [region, region]",
+    "list_concat([lower(region)], TRY_CAST(region AS JSON[])) = [region, region]",
+    "list_append([lower(region)], TRY_CAST(region AS JSON)) = [region, region]",
+    "list_append([lower(region)], attrs->'$.a') = [region, region]",
+]
+
+
+def _typed_part_world():
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON, tags VARCHAR[]); "
+                "INSERT INTO claim VALUES (1, 'north', '{\"a\": 1}', ['north'])")
+    return con, _snapshot({**TYPES, ("claim", "tags"): "VARCHAR[]"})
+
+
+@pytest.mark.parametrize("row_filter", _TYPED_PART_RUNS)
+def test_a_typed_part_of_an_unknown_value_meets_its_slot_by_type(row_filter):
+    # Codex's thirty-seventh review: a list the reader can type, appended to an unknown list,
+    # was walked as an untyped part and refused where it meets the element's list type, though
+    # a list against a list runs. A typed part (a column, a cast, a pure value) meets its slot
+    # by type: a slice over a typed list and a concatenated typed list are lists of the
+    # result's type, a lambda returning a typed list too.
+    con, snapshot = _typed_part_world()
+    con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    assert isinstance(_decide(row_filter, snapshot=snapshot), Approved), row_filter
+
+
+@pytest.mark.parametrize("row_filter", _TYPED_PART_RAISES)
+def test_a_typed_part_meeting_a_container_or_holding_json_is_refused(row_filter):
+    # By shape, a typed leaf against a list slot is the cast on the row (`x -> region` returns
+    # VARCHAR, `x -> id` INTEGER, where a list is compared: the gate's round, the number
+    # approved by a walk that flagged text alone). A part whose type holds JSON makes the unknown's own
+    # type JSON, and an untyped sibling's text is parsed as JSON on the row: approved before
+    # this round and raising, measured while fixing the review's finding.
+    con, snapshot = _typed_part_world()
+    with pytest.raises(duckdb.ConversionException):
+        con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    verdict = _decide(row_filter, snapshot=snapshot)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
 @pytest.mark.parametrize("row_filter", [
     "[union_extract(union_value(a := region), 'a' || '')] = [[id]]",
     "[union_extract(union_value(a := region), CAST('a' AS VARCHAR))] = [[id]]",

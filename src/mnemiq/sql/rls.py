@@ -1062,14 +1062,60 @@ _LITERAL_NODES = (exp.Literal, exp.Null, exp.Boolean, exp.Neg, exp.Paren, exp.Tu
                   exp.Struct, exp.PropertyEQ, exp.Identifier, exp.ToMap)
 
 
-def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
+def _shape_differs(x, y) -> bool:
+    """Whether two parsed types differ in shape anywhere: a leaf against a list, a struct or a
+    map, or two containers of different kinds, at the top or inside. Inside a builder or a
+    lambda the engine casts the part to the slot's type on the row (`list_transform(
+    [lower(region)], x -> id) = [[id]]` raised Unimplemented type for cast (INTEGER ->
+    INTEGER[]) on the first row: the review gate on the forty-fourth round), where two typed
+    values at a comparison's top fail at bind time. Two leaves of different types are no
+    shape: the number is serialised beside text and the comparison runs."""
+    if x[0] == "leaf" or y[0] == "leaf":
+        return x[0] != y[0]
+    if x[0] != y[0]:
+        return True
+    if x[0] == "array":
+        return _shape_differs(x[1], y[1])
+    if x[0] == "map":
+        return _shape_differs(x[1], y[1]) or _shape_differs(x[2], y[2])
+    pairs = _paired_fields(x[1], y[1])  # a struct's or a union's fields, as DuckDB pairs them
+    return pairs is None or any(_shape_differs(f, g) for f, g in pairs)
+
+
+def _typed_part_meets(part: str, kind) -> bool:
+    """Whether a part of an unknown value that the reader CAN type (a column, a cast, a pure
+    value) meets `kind`, the type the other side holds at that part's slot: by shape, a leaf
+    against a container or two containers of different kinds refused at any depth, since the
+    part sits inside a builder or a lambda that casts it to the slot's type on the row
+    (`_shape_differs`). `TRY_CAST([region] AS VARCHAR[])` appended to `[[lower(region)]]`
+    beside `[[region], [region]]` is a list against a list and runs, and was refused as an
+    untyped part meeting a list (Codex's thirty-seventh review of #160). A part whose type
+    holds JSON is refused: the unknown's own type holds JSON then, and an untyped sibling's
+    text is parsed as JSON on the row (`list_append([lower(region)], attrs) = [region,
+    region]` raised Malformed JSON on the row and was approved; measured while fixing the
+    review's finding). The part's type is asked with JSON kept apart from text, which
+    `_duckdb_type` folds together for the comparisons it answers for. A type the reader
+    cannot read is not shown safe."""
+    if part is _UNREADABLE:
+        return True
+    try:
+        parsed = _parse_type(part)
+    except ValueError:
+        return True
+    return _holds_json(parsed) or _shape_differs(parsed, kind)
+
+
+def _unknown_meets_a_container(value: exp.Expression, kind, type_of) -> bool:
     """Whether a value the reader cannot type puts an untyped part against a list, a struct or
     a map of the other side's type: its own list and struct syntax is walked beside the type,
     and where the syntax ends in a part the reader could not type, that part meets whatever
     the type holds there. `[lower(region)] = [region]` ends in text and runs; `[struct_insert(
     {'a': id}, b := region)] = [{'a': id, 'b': [id]}]` and `list_transform([region], x -> x) =
     [[id]]` end against a struct and a list, which the engine casts the text to on the row
-    (Codex's thirty-first review of #160)."""
+    (Codex's thirty-first review of #160). A part the reader CAN type (a column, a cast, a
+    pure value) meets its slot by shape instead (`_typed_part_meets`): a typed list appended,
+    concatenated, sliced or returned by a lambda is a list, not text (Codex's thirty-seventh
+    review), and a typed number where a list is compared is the cast on the row."""
     while isinstance(value, exp.Paren):
         value = value.this
     if _is_list_builder(value) and kind[0] == "array":
@@ -1084,9 +1130,12 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
         # gate on the first draft, both).
         args = _builder_arguments(value)
         if _is_slice(value):
-            return not (args and _is_list_shaped(args[0])) or _unknown_meets_a_container(args[0], kind)
+            if args and _is_list_shaped(args[0]):
+                return _unknown_meets_a_container(args[0], kind, type_of)
+            part = _duckdb_type(args[0], type_of, json_as_text=False) if args else None
+            return part is None or part is _TEXT or _typed_part_meets(part, kind)  # a typed list: its type
         if _is_transform(value):
-            return any(_unknown_meets_a_container(arg.this, kind[1]) for arg in args if isinstance(arg, exp.Lambda))
+            return any(_unknown_meets_a_container(arg.this, kind[1], type_of) for arg in args if isinstance(arg, exp.Lambda))
         if _is_append_or_prepend(value) and len(args) >= 2:
             # By position, not by shape: an appended or prepended list is ONE element of the
             # result (`list_append([[region]], [lower(region)])`, Codex's thirty-sixth review of
@@ -1097,24 +1146,29 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
                 lst, element = (args[0], args[1]) if _is_append(value) else (args[1], args[0])
             else:
                 lst, element = value.this, value.args.get("expression")
-            return _unknown_meets_a_container(lst, kind) or (element is not None and _unknown_meets_a_container(element, kind[1]))
+            return _unknown_meets_a_container(lst, kind, type_of) or (element is not None and _unknown_meets_a_container(element, kind[1], type_of))
         for arg in args:
             if _is_list_shaped(arg):
-                if _unknown_meets_a_container(arg, kind):
+                if _unknown_meets_a_container(arg, kind, type_of):
                     return True
-            elif _unknown_meets_a_container(arg, kind[1]):
+                continue
+            part = _duckdb_type(arg, type_of, json_as_text=False)
+            if part is not None and part is not _TEXT:
+                if _typed_part_meets(part, kind):  # a typed argument is a list of the result's type
+                    return True
+            elif _unknown_meets_a_container(arg, kind[1], type_of):
                 return True
         return False
     if (isinstance(value, exp.Array) or _is_list_call(value)) and kind[0] == "array":
         # `[a, b]`, and the call forms `array_value(a, b)`, `list_value(...)`, `list_pack(...)`
         # (Codex's thirty-fourth review of #160: `array_value(lower(region)) = [region]` runs
         # and was refused as a bare unknown).
-        return any(_unknown_meets_a_container(item, kind[1]) for item in value.expressions)
+        return any(_unknown_meets_a_container(item, kind[1], type_of) for item in value.expressions)
     if isinstance(value, exp.ToMap) and isinstance(value.this, exp.Struct) and kind[0] == "map":
         # `MAP {k: v}`: each key against the key type, each value against the value type
         # (`MAP {1: lower(region)} = MAP {1: region}` runs and was refused as a bare unknown:
         # Codex's thirty-second review of #160).
-        return any(_unknown_meets_a_container(item.this, kind[1]) or _unknown_meets_a_container(item.expression, kind[2])
+        return any(_unknown_meets_a_container(item.this, kind[1], type_of) or _unknown_meets_a_container(item.expression, kind[2], type_of)
                    for item in value.this.expressions if isinstance(item, exp.PropertyEQ))
     if isinstance(value, exp.Map) and kind[0] == "map":
         # `MAP([k...], [v...])`: the keys list's items against the key type, the values list's
@@ -1123,8 +1177,8 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
         keys, values = value.args.get("keys"), value.args.get("values")
         if not (isinstance(keys, exp.Array) and isinstance(values, exp.Array)):
             return True  # a keys or values argument that is no list literal: unread, the cast (the gate)
-        return any(_unknown_meets_a_container(item, kind[1]) for item in keys.expressions) \
-            or any(_unknown_meets_a_container(item, kind[2]) for item in values.expressions)
+        return any(_unknown_meets_a_container(item, kind[1], type_of) for item in keys.expressions) \
+            or any(_unknown_meets_a_container(item, kind[2], type_of) for item in values.expressions)
     if isinstance(value, exp.MapFromEntries) and isinstance(value.this, exp.Array) and kind[0] == "map":
         # `map_from_entries([(k, v), ...])`: each entry's first part against the key type, its
         # second against the value type (the same review).
@@ -1135,20 +1189,23 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
                 parts = list(entry.expressions) if _is_row(entry) else []
             if len(parts) != 2:
                 return True  # an entry the walk cannot read: the cast (the gate)
-            if _unknown_meets_a_container(parts[0], kind[1]) or _unknown_meets_a_container(parts[1], kind[2]):
+            if _unknown_meets_a_container(parts[0], kind[1], type_of) or _unknown_meets_a_container(parts[1], kind[2], type_of):
                 return True
         return False
     if _is_row(value) and kind[0] == "struct":
         # `row(a, b)` and `(a, b)`: positional fields against the struct's (the same review).
-        return any(_unknown_meets_a_container(part, field) for part, (_, field) in zip(value.expressions, kind[1]))
+        return any(_unknown_meets_a_container(part, field, type_of) for part, (_, field) in zip(value.expressions, kind[1]))
     if isinstance(value, exp.Struct) and kind[0] == "struct":
         items = [(item.this.name.lower() if isinstance(item, exp.PropertyEQ) and isinstance(item.this, exp.Identifier) else None,
                   item.expression if isinstance(item, exp.PropertyEQ) else item) for item in value.expressions]
         if all(name is not None for name, _ in items) and all(n is not None for n, _ in kind[1]):
             by_name = {n.lower(): field for n, field in kind[1]}
-            return any(name not in by_name or _unknown_meets_a_container(part, by_name[name]) for name, part in items)
-        return any(_unknown_meets_a_container(part, field) for (_, part), (_, field) in zip(items, kind[1]))
-    return kind[0] in _CONTAINER_KINDS
+            return any(name not in by_name or _unknown_meets_a_container(part, by_name[name], type_of) for name, part in items)
+        return any(_unknown_meets_a_container(part, field, type_of) for (_, part), (_, field) in zip(items, kind[1]))
+    part = _duckdb_type(value, type_of, json_as_text=False)
+    if part is None or part is _TEXT:
+        return kind[0] in _CONTAINER_KINDS  # a part the reader cannot type, or text, meets whatever is there
+    return _typed_part_meets(part, kind)
 
 
 def _is_list_call(value: exp.Expression) -> bool:
@@ -1286,7 +1343,7 @@ def _json_inside_a_container(values, type_of) -> bool:
     # thirty-seventh round), so an unknown value with no container syntax of its own is
     # refused beside a literal container too.
     unknown = [value for value, kind in zip(_unwrapped(values), kinds) if kind is None]
-    if unknown and any(any(_unknown_meets_a_container(u, parsed) and (not _pure_literal(value) or _bare_value(u))
+    if unknown and any(any(_unknown_meets_a_container(u, parsed, type_of) and (not _pure_literal(value) or _bare_value(u))
                            for u in unknown) for value, parsed in typed):
         return True
     for i, (left, kind_l) in enumerate(typed):
@@ -1319,7 +1376,7 @@ def _json_inside_a_container(values, type_of) -> bool:
     return any(node != unified and _text_becomes_json(node, unified) for node in known)
 
 
-def _duckdb_type(branch: exp.Expression, type_of) -> str | None:
+def _duckdb_type(branch: exp.Expression, type_of, json_as_text: bool = True) -> str | None:
     """The type DuckDB gives a branch, in DuckDB's words, or `_TEXT`. A column's is the
     snapshot's; a cast's its target; a pure value expression's (`7`, `1.5`, `id + 1`, `INTERVAL
     '1 day'`, `[1, 2]`, a nested CASE) is asked of DuckDB with each column replaced by a NULL of
@@ -1329,7 +1386,9 @@ def _duckdb_type(branch: exp.Expression, type_of) -> str | None:
     without running something: a call, a subquery whose projection is not pure. The type
     reader's guess is not taken instead (Codex's seventh review of #160: it typed a nested CASE
     of integers and a counted subquery DOUBLE, and 'nan' passed the cast to DOUBLE where DuckDB
-    converts it to INTEGER and BIGINT on the row that takes it, and fails)."""
+    converts it to INTEGER and BIGINT on the row that takes it, and fails). A bare JSON is
+    `_TEXT` too, text to the comparisons this answers for, unless `json_as_text` is off: a
+    part of an unknown value's syntax that holds JSON decides the unknown's type."""
     while isinstance(branch, exp.Paren):
         branch = branch.this
     kind = None
@@ -1354,7 +1413,7 @@ def _duckdb_type(branch: exp.Expression, type_of) -> str | None:
         # UNION("a""b" JSON) member pass (Codex's sixteenth review of #160). Refused by every
         # reader of this answer.
         return _UNREADABLE
-    if parsed[0] == "leaf" and (_bare(parsed[1]) in _TEXT_NAMES or _bare(parsed[1]) == "JSON"):
+    if parsed[0] == "leaf" and (_bare(parsed[1]) in _TEXT_NAMES or (json_as_text and _bare(parsed[1]) == "JSON")):
         return _TEXT
     return kind
 
