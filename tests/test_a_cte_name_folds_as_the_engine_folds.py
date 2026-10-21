@@ -96,7 +96,7 @@ def test_without_a_cte_the_granted_table_is_read(worlds):
     assert [con.execute(verdict.target_sql).fetchall() for con in worlds] == [[("w-own",)], [("w-own",)]]
 
 
-def test_a_recursive_ctes_own_reference_binds_to_its_anchor_as_sqlglot_binds_it():
+def test_a_recursive_ctes_own_reference_binds_to_its_anchor_as_sqlglot_binds_it(monkeypatch):
     # The gate on the second commit: re-binding every reference bound the recursive branch's
     # `r` to the scope over the whole body, which holds that branch, a loop in the scope
     # graph; sqlglot binds it to the anchor's scope, and so does the fold, for `R` the same.
@@ -120,6 +120,33 @@ def test_a_recursive_ctes_own_reference_binds_to_its_anchor_as_sqlglot_binds_it(
                 plain = {id(s.expression): {n: id(getattr(v, "expression", v)) for n, v in s.sources.items()} for s in _root_scope(ast).traverse()}
                 rebound = {id(s.expression): {n: id(getattr(v, "expression", v)) for n, v in s.sources.items()} for s in _bound_root(ast, "duckdb").traverse()}
                 assert plain == rebound, anchor
+    # A parenthesised anchor (Codex's second review): sqlglot's scope is over the SELECT inside
+    # the parentheses, the wrapper matched nothing, the whole body was taken and
+    # `fields_as_members` recursed without end. No scope holds the reference it binds.
+    from mnemiq.sql.scope import fields_as_members
+    for spelling in ("r", "R"):
+        sql = f"WITH RECURSIVE r AS ((SELECT 1 AS id) UNION ALL SELECT id + 1 FROM {spelling} WHERE id < 3) SELECT (SELECT o.id FROM r) FROM (SELECT 1 AS id) o"
+        ast = sqlglot.parse_one(sql, read="duckdb")
+        assert fields_as_members(ast, "duckdb", {}) is None, spelling
+        root = _bound_root(ast, "duckdb")
+        for scope in root.traverse():
+            for table in scope.tables:
+                source = scope.sources.get(table.alias_or_name)
+                if isinstance(source, Scope):
+                    assert not any(node is table for node in source.expression.walk()), (spelling, table.sql())
+        recursive = next(s for s in root.traverse() if s.expression.sql().startswith("SELECT id + 1"))
+        assert recursive.sources[spelling].expression.sql() == "SELECT 1 AS id", spelling
+    # The guard itself: were the scope over the whole body answered for the reference, the
+    # binding is declined and the reference stays as sqlglot left it.
+    import mnemiq.sql.scope as scope_module
+    from sqlglot import exp
+    ast = sqlglot.parse_one("WITH RECURSIVE r AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM R WHERE id < 3) SELECT * FROM r", read="duckdb")
+    root = _root_scope(ast)
+    whole = next(s for s in root.traverse() if isinstance(s.expression, exp.Union))
+    monkeypatch.setattr(scope_module, "_cte_scope", lambda scope, cte: whole)
+    scope_module._bind_folded_ctes(root, "duckdb")
+    recursive = next(s for s in root.traverse() if s.expression.sql().startswith("SELECT id + 1"))
+    assert isinstance(recursive.sources["R"], exp.Table)
 
 
 def test_the_fold_is_the_engines_own():

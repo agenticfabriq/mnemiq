@@ -142,8 +142,11 @@ def _bind_folded_ctes(root, dialect: str | None) -> None:
                 continue
             cte = _cte_binding(table, dialect)
             bound = _cte_scope(scope, cte) if cte is not None else None
-            if bound is not None and scope.sources[name] is not bound:
-                scope.sources[name] = bound
+            if bound is None or scope.sources[name] is bound:
+                continue
+            if any(node is table for node in bound.expression.walk()):
+                continue  # a scope holding the reference itself: a loop no consumer may walk (Codex's second review of #174)
+            scope.sources[name] = bound
 
 
 def scope_resolved(ast: exp.Expression, dialect: str | None = None) -> bool:
@@ -431,9 +434,16 @@ def _cte_scope(scope, cte: exp.CTE):
     scope over the whole body, which holds the reference, the scope graph looped back on
     itself, and a consumer walking sources with no visited set would never end (the review
     gate on the second commit of #174); taken to the leftmost branch, a three-branch body
-    matched nothing nearer and fell back to the whole body (the gate's third round)."""
+    matched nothing nearer and fell back to the whole body (the gate's third round). A
+    parenthesised anchor, `((SELECT 1 AS id) UNION ALL ...)`, is read through its
+    parentheses, as sqlglot's scope is over the SELECT inside them (Codex's second review of
+    #174, where the wrapper matched nothing and the whole body was taken again, and
+    `fields_as_members` recursed without end). Never a scope whose expression holds the
+    reference itself (`_bind_folded_ctes`)."""
     body = cte.this
     anchor = body.left if isinstance(body, exp.SetOperation) else body
+    while isinstance(anchor, (exp.Subquery, exp.Paren)) and isinstance(anchor.this, exp.Expression):
+        anchor = anchor.this
     anc = scope
     while anc is not None:
         found = anc.cte_sources.get(cte.alias_or_name)
