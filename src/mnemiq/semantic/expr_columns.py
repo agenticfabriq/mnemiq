@@ -143,9 +143,15 @@ def _source_aliases(node: exp.Expression, source: str) -> set[str]:
             if table.alias and _is_source(table, source)}
 
 
-# A relation `columns_read` does not follow: a CTE, a LATERAL, a VALUES list, an UNNEST. A
-# subquery over the source itself it does follow, so only these make an expression foreign.
-_FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest)
+# A relation `columns_read` does not follow: a CTE, a LATERAL, a VALUES list, an UNNEST, a
+# PIVOT or UNPIVOT. A subquery over the source itself it does follow, so only these make an
+# expression foreign. A PIVOT keeps every column it neither aggregates nor pivots on as a
+# grouping column no node names, and its alias is no alias of the source, so `(SELECT
+# max(to_json(p)) FROM orders PIVOT (sum(id) FOR status IN ('x')) p)` passed the whole-row
+# guard and a phi column's value reached the uncleared inside the JSON (Codex's tenth review
+# of #172); an UNPIVOT carries the rest of the row the same way, and DuckDB's own `PIVOT
+# orders ON status USING sum(id)` parses to the same node.
+_FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest, exp.Pivot)
 
 
 # Constants an engine reads as a column where one is so named; `columns_read` reports their

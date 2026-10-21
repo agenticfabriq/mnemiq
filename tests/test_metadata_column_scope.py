@@ -222,6 +222,10 @@ def test_a_subquery_over_the_source_alone_is_checked_as_the_sources_own_read(exp
     "(SELECT max(id) FROM orders, LATERAL (SELECT 1 AS one) l)",
     "(SELECT max(v.c) FROM (VALUES (1)) v(c))",
     "(SELECT max(id) FROM read_csv('x'))",
+    "(SELECT count(*) FROM orders PIVOT (sum(id) FOR status IN ('x')))",  # grouping columns no node names (Codex's tenth)
+    "(SELECT max(to_json(p)) FROM orders PIVOT (sum(id) FOR status IN ('x')) p)",  # the whole row through the pivot's alias
+    "(SELECT count(*) FROM (PIVOT orders ON status USING sum(id)))",     # DuckDB's own spelling
+    "(SELECT max(v) FROM orders UNPIVOT (v FOR k IN (id, status)))",
 ])
 def test_a_subquery_reading_any_other_relation_stays_foreign(expr):
     from mnemiq.semantic.expr_columns import expression_scope
@@ -386,6 +390,27 @@ def test_a_keyword_named_column_inside_a_subquery_still_requires_its_clearance()
     plain = "(SELECT count(*) FROM orders WHERE true)"
     assert select_metrics(["orders"], [_metric(plain)], _UNCLEARED, columns=_COLUMNS) == [_metric(plain)]
     assert columns_read("CASE WHEN secret_code IS NOT NULL THEN true ELSE false END", "orders") == {frozenset({"secret_code"})}
+
+
+def test_a_pivot_carries_the_rest_of_the_row_under_an_alias_that_is_no_source_alias():
+    # Codex's tenth review of #172: a PIVOT keeps every column it neither aggregates nor pivots
+    # on as a grouping column, which no node names, and its alias is no alias of the source,
+    # so `to_json(p)` passed the whole-row guard: the expression was own, `id`, `status` and a
+    # bare `p` reported, the metric offered to the uncleared, and DuckDB returned the phi
+    # column's value inside the JSON. An UNPIVOT carries the rest of the row the same way. Both
+    # are foreign, in either spelling, and withheld from everyone.
+    from mnemiq.semantic.expr_columns import expression_scope
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE orders(id INT, status TEXT, secret_code TEXT)")
+    con.execute("INSERT INTO orders VALUES (1, 'x', 'WITHHELD')")
+    columns = _COLUMNS + [Column(id="orders.status", object_id="orders", name="status", data_type="text")]
+    for expr in ("(SELECT max(to_json(p)) FROM orders PIVOT (sum(id) FOR status IN ('x')) p)",
+                 "(SELECT max(to_json(p)) FROM (PIVOT orders ON status USING sum(id)) p)",
+                 "(SELECT max(to_json(u)) FROM orders UNPIVOT (v FOR k IN (id)) u)"):
+        assert "WITHHELD" in con.execute(f"SELECT {expr}").fetchone()[0], expr  # the leak, live
+        assert expression_scope(expr, "orders") == "foreign", expr
+        for grants in (_UNCLEARED, _CLEARED):
+            assert select_metrics(["orders"], [_metric(expr)], grants, columns=columns) == [], expr
 
 
 def test_a_struct_column_named_like_the_source_keeps_its_root_reading():
