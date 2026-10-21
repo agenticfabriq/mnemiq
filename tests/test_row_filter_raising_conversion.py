@@ -1182,6 +1182,12 @@ def test_a_union_extract_with_a_non_literal_tag_is_refused_naming_the_tag(row_fi
     "MAP {1: lower(region)} = MAP {1: [id]}",   # a map's value and a row's field walked too (Codex's 32nd)
     "MAP {lower(region): 1} = MAP {[id]: 1}",
     "row(lower(region)) = row([id])",
+    "MAP([1], [lower(region)]) = MAP([1], [[id]])",   # the call-form constructors walked too (Codex's 33rd)
+    "MAP([lower(region)], [1]) = MAP([[id]], [1])",
+    "map_from_entries([(1, lower(region))]) = map_from_entries([(1, [id])])",
+    "MAP(list_distinct([lower(region)]), [1]) = MAP([[id]], [1])",   # a keys argument that is no literal (the gate)
+    "map_from_entries([{'key': lower(region), 'value': 1}]) = map_from_entries([{'key': [id], 'value': 1}])",  # a struct entry
+    "map_from_entries([struct_pack(key := lower(region), value := 1)]) = map_from_entries([{'key': [id], 'value': 1}])",  # an entry the walk cannot read
 ])
 def test_an_unknown_value_beside_a_typed_container_is_refused(row_filter):
     # Codex's thirty-first review: a call the reader cannot type was dropped from the container
@@ -1197,7 +1203,10 @@ def test_an_unknown_value_beside_a_typed_container_is_refused(row_filter):
     # approved by design.
     for running in ("[region] = [lower(region)]", "[lower(region)] = ['x']", "lower(region) = 'x'",
                     "MAP {1: lower(region)} = MAP {1: region}", "row(lower(region)) = row(region)",
-                    "(lower(region), 1) = (region, 1)"):
+                    "(lower(region), 1) = (region, 1)",
+                    "MAP([1], [lower(region)]) = MAP([1], [region])",
+                    "map_from_entries([(1, lower(region))]) = map_from_entries([(1, region)])",
+                    "map_from_entries([{'key': lower(region), 'value': 1}]) = map_from_entries([{'key': region, 'value': 1}])"):
         con.execute(f"SELECT id FROM claim WHERE {running}").fetchall()
         assert isinstance(_decide(running), Approved), running
 
@@ -1217,3 +1226,11 @@ def test_a_map_lookup_is_typed_from_stand_ins():
     assert typed("element_at(MAP(['a'], [id]), 'a')") == "INTEGER[]"
     assert typed("element_at(MAP([region], [1]), 'x')") == "INTEGER[]"
     assert isinstance(_decide("element_at(MAP([region], [1]), 'x') = [1]"), Approved)
+
+
+def test_a_map_entry_the_walk_cannot_read_is_the_cast():
+    # An entry that is neither a two-part row nor a struct is read as the cast, fail-closed
+    # (the gate on the fortieth round: an empty walk passed it as safe). The engine rejects a
+    # three-part entry at bind time, so no row premise; the refusal is the rule's own.
+    verdict = _decide("map_from_entries([(1, lower(region), 2)]) = map_from_entries([(1, [id])])")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict

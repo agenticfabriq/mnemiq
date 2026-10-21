@@ -1080,6 +1080,28 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
         # Codex's thirty-second review of #160).
         return any(_unknown_meets_a_container(item.this, kind[1]) or _unknown_meets_a_container(item.expression, kind[2])
                    for item in value.this.expressions if isinstance(item, exp.PropertyEQ))
+    if isinstance(value, exp.Map) and kind[0] == "map":
+        # `MAP([k...], [v...])`: the keys list's items against the key type, the values list's
+        # against the value type (Codex's thirty-third review of #160: refused as a bare
+        # unknown where it runs).
+        keys, values = value.args.get("keys"), value.args.get("values")
+        if not (isinstance(keys, exp.Array) and isinstance(values, exp.Array)):
+            return True  # a keys or values argument that is no list literal: unread, the cast (the gate)
+        return any(_unknown_meets_a_container(item, kind[1]) for item in keys.expressions) \
+            or any(_unknown_meets_a_container(item, kind[2]) for item in values.expressions)
+    if isinstance(value, exp.MapFromEntries) and isinstance(value.this, exp.Array) and kind[0] == "map":
+        # `map_from_entries([(k, v), ...])`: each entry's first part against the key type, its
+        # second against the value type (the same review).
+        for entry in value.this.expressions:
+            if isinstance(entry, exp.Struct):  # `{'key': k, 'value': v}` entries are accepted too
+                parts = [item.expression if isinstance(item, exp.PropertyEQ) else item for item in entry.expressions]
+            else:
+                parts = list(entry.expressions) if _is_row(entry) else []
+            if len(parts) != 2:
+                return True  # an entry the walk cannot read: the cast (the gate)
+            if _unknown_meets_a_container(parts[0], kind[1]) or _unknown_meets_a_container(parts[1], kind[2]):
+                return True
+        return False
     if _is_row(value) and kind[0] == "struct":
         # `row(a, b)` and `(a, b)`: positional fields against the struct's (the same review).
         return any(_unknown_meets_a_container(part, field) for part, (_, field) in zip(value.expressions, kind[1]))
@@ -1101,7 +1123,7 @@ def _bare_value(value: exp.Expression) -> bool:
     """A value with no list, struct, map or row syntax at its top: what the engine casts whole."""
     while isinstance(value, exp.Paren):
         value = value.this
-    return not (isinstance(value, (exp.Array, exp.Struct, exp.ToMap)) or _is_row(value))
+    return not (isinstance(value, (exp.Array, exp.Struct, exp.ToMap, exp.Map, exp.MapFromEntries)) or _is_row(value))
 
 
 def _pure_literal(value: exp.Expression) -> bool:
