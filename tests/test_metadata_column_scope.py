@@ -413,6 +413,41 @@ def test_a_pivot_carries_the_rest_of_the_row_under_an_alias_that_is_no_source_al
             assert select_metrics(["orders"], [_metric(expr)], grants, columns=columns) == [], expr
 
 
+def test_a_column_the_parser_reads_as_a_unit_or_a_type_still_requires_its_clearance():
+    # Codex's eleventh review of #172: sqlglot reads `date_trunc(secret_code, id)` as
+    # `DATE_TRUNC('SECRET_CODE', id)`, a string where the column stood, so the parse held no
+    # node naming the phi column, the expression was own with `id` alone reported, and the
+    # metric was offered to the uncleared, where DuckDB reads the unit column: a withheld
+    # `year` and `day` give different dates (measured here). The same for the quoted name,
+    # EXTRACT's part, an INTERVAL's unit, LAST_DAY's and TIMESTAMP_TRUNC's unit and a CAST's
+    # type name. Every token of the text is a column it may be; a token naming none decides
+    # nothing.
+    from mnemiq.semantic.expr_columns import expression_scope, keyword_columns
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE orders(id DATE, secret_code TEXT)")
+    con.execute("INSERT INTO orders VALUES ('2026-03-15', 'year'), ('2026-03-15', 'day')")
+    dates = con.execute("SELECT date_trunc(secret_code, id) FROM orders ORDER BY secret_code").fetchall()
+    assert dates[0] != dates[1]  # the withheld value decides the result
+    for expr in ("(SELECT max(date_trunc(secret_code, id)) FROM orders)",
+                 '(SELECT max(date_trunc("secret_code", id)) FROM orders)',
+                 "(SELECT max(extract(secret_code FROM id)) FROM orders)",
+                 "(SELECT max(date_add(id, INTERVAL 1 secret_code)) FROM orders)",
+                 "(SELECT max(last_day(id, secret_code)) FROM orders)",
+                 "(SELECT max(timestamp_trunc(id, secret_code)) FROM orders)",
+                 "(SELECT max(cast(id AS secret_code)) FROM orders)"):
+        assert expression_scope(expr, "orders") == "own", expr
+        assert "secret_code" in keyword_columns(expr), expr
+        assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=_COLUMNS) == [], expr
+        assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=_COLUMNS) == [_metric(expr)], expr
+    # Digits alone are a number to every engine, never a column: a phi column named `123`
+    # withholds nothing from `LIMIT 123`.
+    columns = _COLUMNS + [Column(id="orders.123", object_id="orders", name="123", data_type="text",
+                                 pii_level="phi")]
+    limited = "(SELECT count(*) FROM (SELECT id FROM orders LIMIT 123) q)"
+    assert "123" not in keyword_columns(limited)
+    assert select_metrics(["orders"], [_metric(limited)], _UNCLEARED, columns=columns) == [_metric(limited)]
+
+
 def test_a_struct_column_named_like_the_source_keeps_its_root_reading():
     # Codex's eighth review of #172: with a phi struct column named `orders` on `orders`, the
     # parser reads `orders.value` as a qualifier and a column, and the root reading was kept

@@ -122,8 +122,9 @@ def _reads_raw(expr: str, source: str, by_key: dict, grants: GrantSet) -> bool:
             return False  # a spelling that names no column: malformed, so unchecked, so withheld
         if not all(read_raw(column, grants) for column in known):
             return False
-    # A keyword constant the engine reads as a column where one is so named (`true`,
-    # `current_date`): held to the raw read where the table has the column, nothing otherwise.
+    # Any token of the expression's text the engine reads as a column where one is so named
+    # (`true`, `current_date`, a unit the parser made a string of): held to the raw read where
+    # the table has the column, nothing otherwise.
     for name in keyword_columns(expr):
         if not all(read_raw(column, grants) for column in by_key.get((table, name), ())):
             return False

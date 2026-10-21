@@ -154,60 +154,41 @@ def _source_aliases(node: exp.Expression, source: str) -> set[str]:
 _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest, exp.Pivot)
 
 
-# Constants an engine reads as a column where one is so named; `columns_read` reports their
-# spellings. A Boolean is `true` or `false`; the niladic functions their own name.
-_KEYWORD_COLUMNS = (exp.Boolean, exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime,
-                    exp.CurrentUser)
-
-
-# Any digit-led token of the expression's own text, which MySQL reads as a column so named
-# (`1e`, `1E`, `123e`, measured in the dimension tests; Codex's fourth review of #172):
-# sqlglot reads `1e` as a number, `1ea` as `1e AS a` and `123abc` as `123 AS abc`, a number
-# and an implicit alias, so the parse holds no node that names the column (the review gate on
-# the seventh commit). Read off the text, as the spelling fallback reads a bare expression,
-# qualified or not (`r.1ea` is `r.1e AS a` to the parser: the gate on the eighth commit), inside
-# quoted text and comments too, which withholds more and never less; a token naming no column
-# decides nothing. The characters are MySQL's own rule for an unquoted identifier, ASCII
-# letters, digits, `_` and `$` and anything in U+0080 to U+FFFF (combining marks and currency
-# symbols among them), not Python's word class: `1é` and `1你好` were read by nothing (Codex's
-# fifth review of #172), and `1$`, `1€` and the decomposed `1e\u0301x` cut short or missed
-# under `\w` (the review gate on the tenth commit). Digits in the lead are ASCII, as MySQL's.
+# Any token of the expression's own text, which an engine reads as a column so named whatever
+# the parser made of it. A keyword constant parses as a constant (`true` on sqlite,
+# `current_date` on DuckDB, measured in the dimension tests; Codex's third review of #172); a
+# digit-led name as a number and an implicit alias (`1e` a number, `1ea` is `1e AS a`, `123abc`
+# is `123 AS abc`: the fourth review, the gate on the seventh and eighth commits); and an
+# argument the parser reads as a unit or a type as a string or a keyword: `date_trunc(
+# secret_code, id)` parses as `DATE_TRUNC('SECRET_CODE', id)`, the quoted name the same, as do
+# `extract(secret_code FROM id)`, `INTERVAL 1 secret_code`, `last_day(id, secret_code)`,
+# `timestamp_trunc(id, secret_code)` and `CAST(id AS secret_code)`, while DuckDB reads the unit
+# column, a withheld `year` and `day` giving different dates (Codex's eleventh review). The
+# parse holds no node that names the column in any of these, and the parser's next rewrite is
+# not known in advance, so every token is read off the text, qualified or not (`r.1ea` is
+# `r.1e AS a` to the parser), inside quoted text and comments too, which withholds more and
+# never less: a token naming no column decides nothing. A token is a maximal run of MySQL's
+# own characters for an unquoted identifier, ASCII letters, digits, `_` and `$` and anything
+# in U+0080 to U+FFFF (combining marks and currency symbols among them: `1é`, `1你好`, `1$`,
+# `1€` and the decomposed `1e\u0301x` were missed or cut short under Python's word class; the
+# fifth review, the gate on the tenth commit), that is not digits alone, a number to every
+# engine.
 _IDENT_CHAR = r"[A-Za-z0-9_$\u0080-\uffff]"
-_DIGIT_LED = re.compile(r"(?<!" + _IDENT_CHAR + r")[0-9]+[A-Za-z_$\u0080-\uffff]" + _IDENT_CHAR + r"*")
-
-
-def _keyword_spelling(node: exp.Expression) -> str | None:
-    if isinstance(node, exp.Boolean):
-        return "true" if node.this else "false"
-    if node.expressions or node.args.get("this"):
-        return None  # `current_date(...)` with arguments is a call, never a column
-    return node.sql().split("(")[0].strip().lower() or None
+_IDENT_TOKEN = re.compile(r"(?<!" + _IDENT_CHAR + r")(?![0-9]+(?!" + _IDENT_CHAR + r"))" + _IDENT_CHAR + r"+")
+# The one spelling every engine reads as the constant unquoted, never as a column so named: a
+# dimension `null` over a table with a phi column `null` is shown to the uncleared (the
+# dimension tests), where `true` on sqlite and `current_date` on DuckDB read the column.
+_NEVER_A_COLUMN = frozenset({"null"})
 
 
 def keyword_columns(expr: str) -> set[str]:
-    """The spellings of the keyword constants `expr` holds, anywhere in it, each a column the
-    engine reads instead where one is so named (`true` on sqlite, `current_date` on DuckDB,
-    measured in the dimension tests). They parse as constants, not columns, so inside a
-    subquery `(SELECT max(true) FROM orders)` over a phi column named `true` was read by
-    nothing and reached the uncleared (Codex's third review of #172). Kept apart from
-    `columns_read`, whose other caller marks a dimension unresolved when a ref names no
-    column (the review gate on the first draft): the raw-read check asks these only where
-    the table has the column, and a spelling naming none decides nothing."""
-    out: set[str] = set()
-    for dialect in _EXPR_DIALECTS:
-        try:
-            node = sqlglot.parse_one(expr, read=dialect)
-        except sqlglot.errors.SqlglotError:
-            continue
-        if node is None:
-            continue
-        for keyword in node.find_all(*_KEYWORD_COLUMNS):
-            spelling = _keyword_spelling(keyword)
-            if spelling:
-                out.add(spelling)
-        break
-    out.update(token.lower() for token in _DIGIT_LED.findall(expr))
-    return out
+    """The spellings of every token of `expr`'s own text, each a column the engine reads where
+    one is so named whatever the parser made of it, a keyword constant, a number, a unit or a
+    type among them (`_IDENT_TOKEN`). Kept apart from `columns_read`, whose other caller marks
+    a dimension unresolved when a ref names no column (the review gate on the first draft):
+    the raw-read check asks these only where the table has the column, and a spelling naming
+    none decides nothing. `null` is left out, the constant to every engine."""
+    return {token.lower() for token in _IDENT_TOKEN.findall(expr)} - _NEVER_A_COLUMN
 
 
 def expression_scope(expr: str, source: str) -> str:
