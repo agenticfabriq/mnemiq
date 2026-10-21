@@ -51,6 +51,13 @@ _FOLDED = [
     "WITH W AS (SELECT * FROM claim) SELECT d.secret FROM (SELECT * FROM w) d",
     "WITH W AS (SELECT * FROM claim), v AS (SELECT * FROM w) SELECT secret FROM v",
     "WITH W AS (SELECT * FROM claim) SELECT secret FROM (SELECT w.* FROM w) d",
+    # a nearer WITH declaring the name in another case shadows the outer CTE sqlglot matched
+    # by spelling (Codex's first review of #174): the engine binds the inner one
+    "WITH v AS (SELECT * FROM w) SELECT d.secret FROM (WITH V AS (SELECT * FROM claim) SELECT * FROM v) d",
+    "WITH v AS (SELECT * FROM w) SELECT d.secret FROM (WITH V AS (SELECT * FROM claim) SELECT v.secret FROM v) d",
+    "WITH v AS (SELECT * FROM w) SELECT secret FROM (WITH V AS (SELECT * FROM claim) SELECT secret FROM v) d",
+    "WITH v AS (SELECT * FROM w), u AS (WITH V AS (SELECT * FROM claim) SELECT * FROM v) SELECT secret FROM u",
+    "WITH V AS (SELECT * FROM w) SELECT d.secret FROM (WITH v AS (SELECT * FROM claim) SELECT * FROM V) d",
 ]
 
 

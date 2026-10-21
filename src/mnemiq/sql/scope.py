@@ -126,14 +126,24 @@ def _bind_folded_ctes(root, dialect: str | None) -> None:
     two consumers by hand first, a star over the folded reference (`(SELECT * FROM w) d`, a
     second CTE over it) still expanded from the granted table's columns (the review gate on
     the first commit): the tree is bound once instead. sqlglot computes `selected_sources`
-    from `sources` on first access, which no consumer makes before this."""
+    from `sources` on first access, which no consumer makes before this.
+
+    Every table reference of the scope is re-bound, not only one sqlglot left as a table: a
+    reference it matched by spelling to a CTE of an OUTER scope, where a nearer WITH declares
+    the name in another case, binds to the nearer one as the engine binds it (Codex's first
+    review of #174: `WITH w AS (SELECT * FROM safe) SELECT d.secret FROM (WITH W AS (SELECT *
+    FROM claim) SELECT * FROM w) d` read the outer `w` here, claim's secret on DuckDB, hidden,
+    denied and masked alike). Where `_cte_binding` names no CTE the binding sqlglot made
+    stands, as before."""
     for scope in root.traverse():
-        for name, source in list(scope.sources.items()):
-            if isinstance(source, exp.Table):
-                cte = _cte_binding(source, dialect)
-                bound = _cte_scope(scope, cte) if cte is not None else None
-                if bound is not None:
-                    scope.sources[name] = bound
+        for table in scope.tables:
+            name = table.alias_or_name
+            if name not in scope.sources:
+                continue
+            cte = _cte_binding(table, dialect)
+            bound = _cte_scope(scope, cte) if cte is not None else None
+            if bound is not None and scope.sources[name] is not bound:
+                scope.sources[name] = bound
 
 
 def scope_resolved(ast: exp.Expression, dialect: str | None = None) -> bool:
