@@ -47,6 +47,10 @@ _FOLDED = [
     'WITH "W" AS (SELECT * FROM claim) SELECT w.secret FROM w',
     "WITH w AS (SELECT * FROM claim) SELECT W.secret FROM W",
     "WITH W AS (SELECT * FROM claim) SELECT (SELECT w.secret FROM w) AS s FROM claim",
+    # a star over the folded reference expanded from the granted table's columns (the gate)
+    "WITH W AS (SELECT * FROM claim) SELECT d.secret FROM (SELECT * FROM w) d",
+    "WITH W AS (SELECT * FROM claim), v AS (SELECT * FROM w) SELECT secret FROM v",
+    "WITH W AS (SELECT * FROM claim) SELECT secret FROM (SELECT w.* FROM w) d",
 ]
 
 

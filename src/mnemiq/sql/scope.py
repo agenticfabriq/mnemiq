@@ -104,6 +104,38 @@ def _root_scope(ast: exp.Expression):
         return None
 
 
+def _bound_root(ast: exp.Expression, dialect: str | None):
+    """`_root_scope`, bound as the engine binds it before any consumer reads it
+    (`_bind_folded_ctes`); every consumer of the tree starts here."""
+    root = _root_scope(ast)
+    if root is not None:
+        _bind_folded_ctes(root, dialect)
+    return root
+
+
+def _bind_folded_ctes(root, dialect: str | None) -> None:
+    """Re-bind, in every scope of the tree, a table reference sqlglot matched to no local
+    source to the CTE the engine folds its name to (`_cte_binding`) and whose scope the tree
+    holds (`_cte_scope`: a CTE above the tree, as the join check reads a CTE body on its own,
+    is bound by nothing here), so every consumer of the tree reads that CTE's scope as it does for a CTE
+    matched by spelling: the base-read predicate, the column path, the star expansion and
+    the output names alike. sqlglot keys a CTE's scope by its spelling as written and
+    matches a reference by that spelling, where DuckDB and Oracle fold both (M202: with
+    `w(id, secret)` granted and `claim.secret` withheld, `WITH W AS (SELECT * FROM claim)
+    SELECT w.secret FROM w` read the granted base table here and the CTE there). Bound in
+    two consumers by hand first, a star over the folded reference (`(SELECT * FROM w) d`, a
+    second CTE over it) still expanded from the granted table's columns (the review gate on
+    the first commit): the tree is bound once instead. sqlglot computes `selected_sources`
+    from `sources` on first access, which no consumer makes before this."""
+    for scope in root.traverse():
+        for name, source in list(scope.sources.items()):
+            if isinstance(source, exp.Table):
+                cte = _cte_binding(source, dialect)
+                bound = _cte_scope(scope, cte) if cte is not None else None
+                if bound is not None:
+                    scope.sources[name] = bound
+
+
 def scope_resolved(ast: exp.Expression, dialect: str | None = None) -> bool:
     """Did the scope resolve, so that `base_tables` is a resolved answer rather than a fallback?
 
@@ -112,7 +144,7 @@ def scope_resolved(ast: exp.Expression, dialect: str | None = None) -> bool:
     `visible` and the query is refused. It is the wrong direction for an audit record, which would
     name an object the query never read. So the record needs to know, and the guard does not.
     """
-    ast_root = _root_scope(ast)
+    ast_root = _bound_root(ast, dialect)
     return (ast_root is not None and not _unscoped_ctes(ast, ast_root)
             and not _scope_missed_a_read(ast, _walked_reads(ast, ast_root, dialect), dialect))
 
@@ -196,15 +228,7 @@ def _is_base_read(table: exp.Table, scope, dialect: str | None) -> bool:
     """
     source = scope.sources.get(table.alias_or_name)
     if isinstance(source, exp.Table):
-        # sqlglot matched no local source by this spelling; the engine folds names and may bind
-        # a CTE all the same: with `w(id, secret)` granted and `claim.secret` withheld, `WITH W AS
-        # (SELECT * FROM claim) SELECT w.secret FROM w` read the granted base table `w` here and
-        # the CTE on DuckDB, hidden, denied and masked alike (M202). A CTE the engine binds by
-        # the shared resolver's folding (`_cte_binding`) stands in front of the table: one
-        # declared within the expression this scope was built for, as sqlglot's own matching
-        # sees no further (the join check reads a CTE body on its own and follows the names
-        # it reads to their bodies, which a WITH above the body must not hide).
-        return _cte_binding(table, dialect, stop=_root_expression(scope)) is None
+        return True  # bound as the engine binds, a CTE the name folds to among them (`_bind_folded_ctes`)
     if source is None:
         return False
     if not _engine_shadows(table, source, dialect):
@@ -235,7 +259,7 @@ def base_tables(ast: exp.Expression, dialect: str | None = None) -> list[exp.Tab
     deliberately the single answer to "is this node a real read", because three copies of a
     scope rule is how they came to disagree in the first place.
     """
-    root = _root_scope(ast)
+    root = _bound_root(ast, dialect)
     if root is None or _unscoped_ctes(ast, root):
         # Unresolvable scopes mean we cannot say which names are local, so every table node
         # is treated as a real read. That over-reports -- a CTE reference will not be in
@@ -387,13 +411,6 @@ def _cte_in_scope(table: exp.Table, dialect: str | None = None,
     return _cte_binding(table, dialect, engine) is not None
 
 
-def _root_expression(scope) -> exp.Expression:
-    """The expression the scope tree holding `scope` was built for."""
-    while scope.parent is not None:
-        scope = scope.parent
-    return scope.expression
-
-
 def _cte_scope(scope, cte: exp.CTE):
     """The sqlglot scope built for `cte`'s body, found from `scope` outward: the scopes sqlglot
     keys by the CTE's spelling as written, which is why a reference the engine folds to it
@@ -408,9 +425,8 @@ def _cte_scope(scope, cte: exp.CTE):
 
 
 def _cte_binding(table: exp.Table, dialect: str | None = None,
-                 engine: str | None = None, stop: exp.Expression | None = None) -> exp.CTE | None:
-    """The CTE in scope where the table is read that the engine binds this name to, or None;
-    `stop` ends the walk at that enclosing expression, the last one looked at.
+                 engine: str | None = None) -> exp.CTE | None:
+    """The CTE in scope where the table is read that the engine binds this name to, or None.
 
     Only a WITH on one of the table's ENCLOSING queries can stand in front of it. A name matched
     anywhere in the statement is not enough: `UPDATE t SET a = (WITH claim AS (...) SELECT a FROM
@@ -424,7 +440,7 @@ def _cte_binding(table: exp.Table, dialect: str | None = None,
     resolved by `mnemiq.sql.identifiers`, the shared resolver (M55) -- which `authz_guard`'s and
     `cls`'s own CTE name sets do not use yet, so they may still disagree with this one: matching lowercased bare names excused `FROM
     main.claim` behind a CTE `claim`, and Postgres's `claim` behind `"Claim"`.
-    Structural, never by arg name. In doubt the answer is False, which over-reports: a refusal.
+    Structural, never by arg name. In doubt the answer is None, which over-reports: a refusal.
     """
     if table.db or table.catalog:
         return None
@@ -455,8 +471,6 @@ def _cte_binding(table: exp.Table, dialect: str | None = None,
             for visible_name, cte in visible:
                 if visible_name == name:
                     return cte
-        if node is stop:
-            break
         child, node = node, node.parent
     return None
 
@@ -604,7 +618,7 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None,
 
     binds_nearer = (dialect or "").lower() != "oracle"
     seen: set[int] = set()
-    root = _root_scope(ast)
+    root = _bound_root(ast, dialect)
     if root is not None and not _unscoped_ctes(ast, root):
         scopes = list(root.traverse())
         try:
@@ -1038,14 +1052,7 @@ def _scope_names(scope, dialect: str | None):
             # AS secret FROM claim)` reading claim's secret, which the aliased twin refused).
             alias = ""
         if alias is not None and alias not in local:
-            source = scope.sources.get(node.alias_or_name)
-            if isinstance(source, exp.Table):
-                # A table node that is no base read binds to the CTE the engine folds its
-                # name to (M202): the CTE's scope answers for what it exposes, as a CTE
-                # matched by spelling does.
-                cte = _cte_binding(node, dialect, stop=_root_expression(scope))
-                source = _cte_scope(scope, cte) if cte is not None else source
-            by_alias[alias] = source
+            by_alias[alias] = scope.sources.get(node.alias_or_name)
     return local, by_alias
 
 
@@ -1242,7 +1249,7 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
     the second `q` overwrote the first and a denied column was resolved against the permitted
     table. The resolver was right; the map that consumed it was still flat.
     """
-    root = _root_scope(ast)
+    root = _bound_root(ast, dialect)
     if root is None or _unscoped_ctes(ast, root):
         return None
     if _scope_missed_a_read(ast, _walked_reads(ast, root, dialect), dialect):
