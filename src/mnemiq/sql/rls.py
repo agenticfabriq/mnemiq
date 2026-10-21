@@ -1072,6 +1072,28 @@ def _unknown_meets_a_container(value: exp.Expression, kind) -> bool:
     (Codex's thirty-first review of #160)."""
     while isinstance(value, exp.Paren):
         value = value.this
+    if _is_list_builder(value) and kind[0] == "array":
+        # A call that builds a list from lists and elements: `list_append`, `list_prepend`,
+        # `list_concat`, a slice, `list_transform` with a lambda (Codex's thirty-fifth review
+        # of #160: each refused as a bare unknown where it runs). A list-shaped argument is
+        # walked against the list's type, a lambda's body and any other argument against the
+        # element's. A slice is a list only over list-shaped syntax: over text it slices the
+        # text and is text (`array_slice(lower(region), 1, 1)` is VARCHAR), so any other first
+        # argument is read as the cast; its indices are not read. A transform's input list
+        # says nothing of its output's type, so its lambda body alone is walked (the review
+        # gate on the first draft, both).
+        args = _builder_arguments(value)
+        if _is_slice(value):
+            return not (args and _is_list_shaped(args[0])) or _unknown_meets_a_container(args[0], kind)
+        if _is_transform(value):
+            return any(_unknown_meets_a_container(arg.this, kind[1]) for arg in args if isinstance(arg, exp.Lambda))
+        for arg in args:
+            if _is_list_shaped(arg):
+                if _unknown_meets_a_container(arg, kind):
+                    return True
+            elif _unknown_meets_a_container(arg, kind[1]):
+                return True
+        return False
     if (isinstance(value, exp.Array) or _is_list_call(value)) and kind[0] == "array":
         # `[a, b]`, and the call forms `array_value(a, b)`, `list_value(...)`, `list_pack(...)`
         # (Codex's thirty-fourth review of #160: `array_value(lower(region)) = [region]` runs
@@ -1122,6 +1144,50 @@ def _is_list_call(value: exp.Expression) -> bool:
     return isinstance(value, exp.Anonymous) and value.name.lower() in _LIST_CONSTRUCTORS
 
 
+_LIST_BUILDER_NODES = (exp.ArrayAppend, exp.ArrayPrepend, exp.ArrayConcat, exp.ArraySlice, exp.Transform)
+_LIST_BUILDER_NAMES = frozenset({"list_slice", "array_slice", "list_append", "array_append", "list_prepend",
+                                 "array_prepend", "list_concat", "array_concat", "list_cat", "array_cat",
+                                 "list_transform", "array_transform", "apply", "list_apply", "array_apply"})
+
+
+def _is_slice(value: exp.Expression) -> bool:
+    return isinstance(value, exp.ArraySlice) or (
+        isinstance(value, exp.Anonymous) and value.name.lower() in ("list_slice", "array_slice"))
+
+
+def _is_transform(value: exp.Expression) -> bool:
+    return isinstance(value, exp.Transform) or (
+        isinstance(value, exp.Anonymous) and value.name.lower() in ("list_transform", "array_transform", "apply", "list_apply", "array_apply"))
+
+
+def _is_list_builder(value: exp.Expression) -> bool:
+    return isinstance(value, _LIST_BUILDER_NODES) or (
+        isinstance(value, exp.Anonymous) and value.name.lower() in _LIST_BUILDER_NAMES)
+
+
+def _builder_arguments(value: exp.Expression) -> list:
+    if isinstance(value, exp.Anonymous):
+        return list(value.expressions)
+    out = [value.this] if value.this is not None else []
+    expression = value.args.get("expression")
+    if expression is not None:
+        out.append(expression)
+    out.extend(value.expressions or [])
+    return out
+
+
+def _is_list_shaped(value: exp.Expression) -> bool:
+    """List syntax: a literal, a constructor, a builder, or a slice over one of these (a slice
+    over anything else slices text, through any depth of slicing: the gate's third round on
+    the forty-second commit, `list_slice(list_slice(lower(region), 1, 3), 1, 2)`)."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if _is_slice(value):
+        args = _builder_arguments(value)
+        return bool(args) and _is_list_shaped(args[0])
+    return isinstance(value, exp.Array) or _is_list_call(value) or _is_list_builder(value)
+
+
 def _is_row(value: exp.Expression) -> bool:
     return isinstance(value, exp.Tuple) or (isinstance(value, exp.Anonymous) and value.name.lower() == "row")
 
@@ -1130,8 +1196,13 @@ def _bare_value(value: exp.Expression) -> bool:
     """A value with no list, struct, map or row syntax at its top: what the engine casts whole."""
     while isinstance(value, exp.Paren):
         value = value.this
+    if _is_slice(value):
+        # A slice is list syntax only over list-shaped syntax, through any depth; over text it
+        # is text, and beside a literal list it is cast whole on the row (the gate on the
+        # forty-second round).
+        return not _is_list_shaped(value)
     return not (isinstance(value, (exp.Array, exp.Struct, exp.ToMap, exp.Map, exp.MapFromEntries))
-                or _is_row(value) or _is_list_call(value))
+                or _is_row(value) or _is_list_call(value) or _is_list_builder(value))
 
 
 def _pure_literal(value: exp.Expression) -> bool:

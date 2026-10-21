@@ -1183,6 +1183,10 @@ def test_a_union_extract_with_a_non_literal_tag_is_refused_naming_the_tag(row_fi
     "MAP {lower(region): 1} = MAP {[id]: 1}",
     "row(lower(region)) = row([id])",
     "list_pack(lower(region)) = [[id]]",              # the call-form list constructors walked (Codex's 34th)
+    "list_append([region], lower(region)) = [[id], [id]]",   # the list-building calls walked (Codex's 35th)
+    "list_transform([region], x -> lower(x)) = [[id]]",
+    "list_transform([[id]], x -> lower(region)) = [[id]]",   # the lambda's body alone meets the list
+    "list_concat([region], [lower(region)]) = [[id]]",
     "MAP([1], [lower(region)]) = MAP([1], [[id]])",   # the call-form constructors walked too (Codex's 33rd)
     "MAP([lower(region)], [1]) = MAP([[id]], [1])",
     "map_from_entries([(1, lower(region))]) = map_from_entries([(1, [id])])",
@@ -1206,6 +1210,11 @@ def test_an_unknown_value_beside_a_typed_container_is_refused(row_filter):
                     "MAP {1: lower(region)} = MAP {1: region}", "row(lower(region)) = row(region)",
                     "(lower(region), 1) = (region, 1)",
                     "array_value(lower(region)) = [region]", "list_pack(lower(region)) = [region]",
+                    "list_append([region], lower(region)) = [region, region]", "list_prepend(lower(region), [region]) = [region, region]",
+                    "list_concat([region], [lower(region)]) = [region, region]", "array_slice([lower(region)], 1, 1) = [region]",
+                    "list_slice([lower(region)], 1, 1) = [region]", "list_transform([region], x -> lower(x)) = [region]",
+                    "list_slice(list_slice([lower(region)], 1, 1), 1, 1) = [region]",
+                    "list_transform([[id]], x -> lower(region)) = [region]",   # the input list says nothing of the output
                     "MAP([1], [lower(region)]) = MAP([1], [region])",
                     "map_from_entries([(1, lower(region))]) = map_from_entries([(1, region)])",
                     "map_from_entries([{'key': lower(region), 'value': 1}]) = map_from_entries([{'key': region, 'value': 1}])"):
@@ -1235,4 +1244,21 @@ def test_a_map_entry_the_walk_cannot_read_is_the_cast():
     # (the gate on the fortieth round: an empty walk passed it as safe). The engine rejects a
     # three-part entry at bind time, so no row premise; the refusal is the rule's own.
     verdict = _decide("map_from_entries([(1, lower(region), 2)]) = map_from_entries([(1, [id])])")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+@pytest.mark.parametrize("row_filter", ["array_slice(lower(region), 1, 1) = [[id]]", "list_slice(lower(region), 1, 1) = [[id]]",
+                                        "array_slice(lower(region), 1, 1) = ['x']", "list_slice(lower(region), 1, 2) = ['x']",
+                                        "list_slice(list_slice(lower(region), 1, 3), 1, 2) = [[id]]",   # through any depth
+                                        "list_slice(list_slice(lower(region), 1, 3), 1, 2) = ['x']"])
+def test_a_slice_over_text_is_text_and_meets_a_list_as_the_cast(row_filter):
+    # The gate on the forty-second round: a slice over text slices the text and is text, so
+    # beside a list of lists the engine casts the sliced piece on the row (its first letter in
+    # the error here); read as a list it would have passed. Any first argument that is no list
+    # syntax is the cast.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR); INSERT INTO claim VALUES (1, 'north')")
+    with pytest.raises(duckdb.ConversionException, match="VARCHAR with value 'n"):  # 'n' or 'no', the slice
+        con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    verdict = _decide(row_filter)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
