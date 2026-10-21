@@ -1215,6 +1215,55 @@ def test_a_typed_part_meeting_a_container_or_holding_json_is_refused(row_filter)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
 
 
+_PART_RULES_RUN = [
+    "list_append([id], attrs) = [1, 2]",                      # a JSON part beside a number is serialised
+    "[TRY_CAST(region AS INTEGER)] = [region]",              # the typed side serialised beside text
+    "[TRY_CAST(region AS BOOLEAN)] = [region]",
+    "[TRY_CAST(region AS BLOB)] = [region]",
+    "list_transform([lower(region)], x -> TRY_CAST(region AS DATE)) = [region]",
+    "{'a': region} = {'b': [id]}",                            # a field the other side lacks reads NULL (Codex's 38th)
+    "[{'a': region}] = [{'b': [id]}]",
+    "list_transform([lower(region)], x -> TRY_CAST({'a': region} AS STRUCT(a VARCHAR))) = [{'b': region}]",
+    "list_transform([lower(region)], x -> TRY_CAST({'a': region} AS STRUCT(a VARCHAR))) = [{'b': [id]}]",
+]
+_PART_RULES_RAISE = [
+    "list_append([lower(region)], attrs) = ['north', '{}']",  # a JSON part beside text raises by itself (Codex's 38th)
+    "list_append([region], attrs) = ['x']",
+    "list_append([lower(region)], attrs) = list_append([region], attrs)",
+    "list_append([lower(region)], TRY_CAST(region AS JSON)) = ['x']",
+    "[TRY_CAST(region AS BIT)] = [region]",                  # a leaf DuckDB converts text to (Codex's 38th)
+    "[TRY_CAST(region AS UUID)] = [region]",
+    "[TRY_CAST(region AS VARINT)] = [region]",
+    "list_transform([lower(region)], x -> TRY_CAST(region AS BIT)) = [region]",
+    "{'a': region, 'c': 1} = {'b': 1, 'a': [id]}",            # the fields both sides name still pair
+    "list_transform([lower(region)], x -> TRY_CAST({'a': region, 'c': 1} AS STRUCT(a VARCHAR, c INTEGER))) = [{'b': 1, 'a': [id]}]",
+]
+
+
+@pytest.mark.parametrize("row_filter", _PART_RULES_RUN)
+def test_a_part_meets_its_slot_as_duckdb_unifies_them(row_filter):
+    # Codex's thirty-eighth review: a struct field the other side lacks is filled with NULL,
+    # not a shape mismatch; a number, a date or a boolean beside text inside a container is
+    # serialised; a JSON part beside a number too.
+    con, snapshot = _typed_part_world()
+    con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    assert isinstance(_decide(row_filter, snapshot=snapshot), Approved), row_filter
+
+
+@pytest.mark.parametrize("row_filter", _PART_RULES_RAISE)
+def test_a_part_duckdb_converts_on_the_row_is_refused(row_filter):
+    # The same review: a JSON part beside a text or untyped part makes the builder's own type
+    # JSON and the text is parsed on the row, whatever the value is compared to (a literal
+    # list, another unknown); a text leaf beside a BIT, UUID or VARINT leaf inside a
+    # container is cast to it on the row, asked of DuckDB with no data; the struct fields
+    # both sides name still pair by name.
+    con, snapshot = _typed_part_world()
+    with pytest.raises(duckdb.ConversionException):
+        con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+    verdict = _decide(row_filter, snapshot=snapshot)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
 @pytest.mark.parametrize("row_filter", [
     "[union_extract(union_value(a := region), 'a' || '')] = [[id]]",
     "[union_extract(union_value(a := region), CAST('a' AS VARCHAR))] = [[id]]",

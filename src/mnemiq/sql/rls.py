@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import json
 import logging
 import re
@@ -1013,6 +1014,44 @@ def _text_becomes_json(kind, unified) -> bool:
 _CONTAINER_KINDS = frozenset({"array", "struct", "map"})
 
 
+@lru_cache(maxsize=256)
+def _pulls_text(castable: str) -> bool:
+    """Whether DuckDB converts text to this leaf type where the two meet inside a container,
+    rather than serialising the typed value: `[TRY_CAST(region AS BIT)] = [region]` cast
+    'north' to BIT and raised, UUID and VARINT the same, where INTEGER, BOOLEAN, DATE, BLOB
+    and the rest are serialised and the comparison runs (measured, DuckDB 1.5.4; Codex's
+    thirty-eighth review of #160, through a lambda). Asked of DuckDB with no data: a text that
+    converts to nothing beside a NULL of the type, inside a list, binds only where the text is
+    kept as text. Not shown safe where it cannot be asked."""
+    try:
+        _duckdb(f"SELECT [chr(1)] = [NULL::{castable}]")
+    except Exception:  # noqa: BLE001 -- the text may be converted: not shown safe
+        return True
+    return False
+
+
+def _text_pulled(x, y) -> bool:
+    """Whether one of two leaf types is text and the other one DuckDB converts the text to
+    where they meet (`_pulls_text`); JSON is left to its own rule."""
+    for text, other in ((x, y), (y, x)):
+        if (_bare(text[1]) in _TEXT_NAMES and _bare(other[1]) not in _TEXT_NAMES
+                and _bare(other[1]) != "JSON" and _pulls_text(_castable(other))):
+            return True
+    return False
+
+
+def _named_pairs(left, right):
+    """A struct's fields paired by folded name where both sides name every field, a field the
+    other side lacks left out: DuckDB fills it with NULL (`{'a': region} = {'b': [id]}` runs,
+    `{'a': region, 'c': 1} = {'b': 1, 'a': [id]}` raises on `a`; measured in a comparison, a
+    COALESCE, a CASE and a list literal; Codex's thirty-eighth review of #160), by position
+    otherwise."""
+    if all(n is not None for n, _ in left) and all(n is not None for n, _ in right):
+        by_name = {n.lower(): g for n, g in right}
+        return [(f, by_name[n.lower()]) for n, f in left if n.lower() in by_name]
+    return [(f, g) for (_, f), (_, g) in zip(left, right)]
+
+
 def _text_meets_a_typed_container(a, b) -> bool:
     """Whether the two types, walked side by side, put a text leaf against a list, a struct or
     a map at a NESTED position: inside a container DuckDB casts the text to that type on the
@@ -1022,7 +1061,10 @@ def _text_meets_a_typed_container(a, b) -> bool:
     number is serialised instead and the comparison runs, so only a container counts."""
     def walk(x, y, depth):
         if x[0] == "leaf" and y[0] == "leaf":
-            return False
+            # Inside a container a text leaf beside a leaf DuckDB converts text to (BIT, UUID,
+            # VARINT, measured) is the cast on the row; beside a number, a date or a boolean
+            # the typed side is serialised and the comparison runs (`_text_pulled`).
+            return bool(depth) and _text_pulled(x, y)
         if depth and ((x[0] == "leaf" and _bare(x[1]) in _TEXT_NAMES and y[0] in _CONTAINER_KINDS)
                       or (y[0] == "leaf" and _bare(y[1]) in _TEXT_NAMES and x[0] in _CONTAINER_KINDS)):
             return True
@@ -1041,6 +1083,8 @@ def _text_meets_a_typed_container(a, b) -> bool:
             # the union. Names folded as DuckDB folds them (`{'A': region} = {'a': region}`
             # runs, the same review).
             pairs = _paired_fields(x[1], y[1])
+            if pairs is None and x[0] == "struct":
+                pairs = _named_pairs(x[1], y[1])  # a struct field the other side lacks reads NULL
             return pairs is None or any(walk(f, g, depth + 1) for f, g in pairs)
         return False
     return walk(a, b, 0)
@@ -1062,6 +1106,64 @@ _LITERAL_NODES = (exp.Literal, exp.Null, exp.Boolean, exp.Neg, exp.Paren, exp.Tu
                   exp.Struct, exp.PropertyEQ, exp.Identifier, exp.ToMap)
 
 
+def _syntax_parts(value: exp.Expression):
+    """The parts a value's own container syntax holds, through any depth: a list literal's or
+    constructor's items, a builder's arguments (a lambda's body for a transform, the list for
+    a slice), a map's keys and values, a map entry's parts, a row's parts, a struct's fields.
+    A part that is no such syntax is yielded itself."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if _is_list_builder(value):
+        args = _builder_arguments(value)
+        if _is_slice(value):
+            inner = args[:1]
+        elif _is_transform(value):
+            inner = [arg.this for arg in args if isinstance(arg, exp.Lambda)]
+        else:
+            inner = args
+    elif isinstance(value, exp.Array) or _is_list_call(value) or _is_row(value):
+        inner = list(value.expressions)
+    elif isinstance(value, exp.ToMap) and isinstance(value.this, exp.Struct):
+        inner = [part for item in value.this.expressions if isinstance(item, exp.PropertyEQ)
+                 for part in (item.this, item.expression)]
+    elif isinstance(value, exp.Map):
+        inner = [value.args.get("keys"), value.args.get("values")]
+    elif isinstance(value, exp.MapFromEntries):
+        inner = [value.this]
+    elif isinstance(value, exp.Struct):
+        inner = [item.expression if isinstance(item, exp.PropertyEQ) else item for item in value.expressions]
+    else:
+        yield value
+        return
+    for part in inner:
+        if part is not None:
+            yield from _syntax_parts(part)
+
+
+def _json_part_beside_text(value: exp.Expression, type_of) -> bool:
+    """Whether a value the reader cannot type holds, in its own container syntax, a part whose
+    type holds JSON beside a part that is text or that the reader cannot type: the builder
+    or constructor unifies its parts' types as a comparison's sides are unified, the text is
+    parsed as JSON on the row, and the value raises by itself, whatever it is compared to.
+    `list_append([lower(region)], attrs) = ['north', '{}']` raised Malformed JSON and was
+    approved, the literal side's exemption dropping the walk's finding (Codex's
+    thirty-eighth review of #160), and so was the same beside another unknown. Beside a
+    number the JSON value is serialised: `list_append([id], attrs) = [1, 2]` runs."""
+    json_part = textish = False
+    for part in _syntax_parts(value):
+        kind = _duckdb_type(part, type_of, json_as_text=False)
+        if kind is None or kind is _TEXT:
+            textish = True
+        elif kind is _UNREADABLE:
+            json_part = True  # not shown safe
+        else:
+            try:
+                json_part = json_part or _holds_json(_parse_type(kind))
+            except ValueError:
+                json_part = True
+    return json_part and textish
+
+
 def _shape_differs(x, y) -> bool:
     """Whether two parsed types differ in shape anywhere: a leaf against a list, a struct or a
     map, or two containers of different kinds, at the top or inside. Inside a builder or a
@@ -1069,9 +1171,11 @@ def _shape_differs(x, y) -> bool:
     [lower(region)], x -> id) = [[id]]` raised Unimplemented type for cast (INTEGER ->
     INTEGER[]) on the first row: the review gate on the forty-fourth round), where two typed
     values at a comparison's top fail at bind time. Two leaves of different types are no
-    shape: the number is serialised beside text and the comparison runs."""
+    shape, the number serialised beside text and the comparison run, unless the typed leaf
+    is one DuckDB converts text to (`_text_pulled`: `x -> TRY_CAST(region AS BIT)` where
+    `[region]` is compared raised on the row, Codex's thirty-eighth review)."""
     if x[0] == "leaf" or y[0] == "leaf":
-        return x[0] != y[0]
+        return x[0] != y[0] or _text_pulled(x, y)
     if x[0] != y[0]:
         return True
     if x[0] == "array":
@@ -1079,6 +1183,8 @@ def _shape_differs(x, y) -> bool:
     if x[0] == "map":
         return _shape_differs(x[1], y[1]) or _shape_differs(x[2], y[2])
     pairs = _paired_fields(x[1], y[1])  # a struct's or a union's fields, as DuckDB pairs them
+    if pairs is None and x[0] == "struct":
+        pairs = _named_pairs(x[1], y[1])  # a field the other side lacks reads NULL
     return pairs is None or any(_shape_differs(f, g) for f, g in pairs)
 
 
@@ -1343,6 +1449,8 @@ def _json_inside_a_container(values, type_of) -> bool:
     # thirty-seventh round), so an unknown value with no container syntax of its own is
     # refused beside a literal container too.
     unknown = [value for value, kind in zip(_unwrapped(values), kinds) if kind is None]
+    if any(_json_part_beside_text(u, type_of) for u in unknown):
+        return True  # the value raises by itself, whatever it is compared to
     if unknown and any(any(_unknown_meets_a_container(u, parsed, type_of) and (not _pure_literal(value) or _bare_value(u))
                            for u in unknown) for value, parsed in typed):
         return True
