@@ -12,6 +12,7 @@ import re
 import duckdb
 import pytest
 import sqlglot
+from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.decide import decide
@@ -160,14 +161,17 @@ def test_the_advice_is_a_call_the_decider_approves_whatever_names_the_table_hold
     # inventory, refused on the retry. The advice is verified as the decider verifies the
     # retry: a modelled call, not a niladic node whose name the table holds; where every
     # candidate's name is held, no example is given.
-    from mnemiq.sql.guard import _NILADIC
     schema = {"kw": {"id", *taken}}
     policy = AccessPolicy(policy_schema=schema)
     name = sorted(taken)[0]
     verdict = decide(f"SELECT {name} FROM kw", {"kw": {"id"}}, dialect=dialect, target=dialect, policy=policy)
-    if not isinstance(sqlglot.parse_one(f"SELECT {name}", read=dialect).selects[0], _NILADIC):
+    if isinstance(sqlglot.parse_one(f"SELECT {name}", read=dialect).selects[0], exp.Column):
         # the dialect reads the spelling as a column (`localtimestamp` on SQLite): the grant check
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+        return
+    if "(" in sqlglot.parse_one(f"SELECT {name}", read=dialect).sql(dialect=dialect):
+        # the dialect prints the spelling as a call (`CURRENT_TIMESTAMP()` on MySQL): the function
+        assert isinstance(verdict, Approved), verdict
         return
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
     advised = re.search(r"such as (.+?)\.$", verdict.message)
@@ -179,18 +183,54 @@ def test_the_advice_is_a_call_the_decider_approves_whatever_names_the_table_hold
     assert isinstance(retry, Approved), (dialect, taken, advised.group(1), retry)
 
 
-def test_a_niladic_node_is_named_by_its_class_not_its_printing(worlds):
-    # The gate on the seventh commit: Oracle's `SYSDATE` parses to the CURRENT_TIMESTAMP node
-    # with a time zone, printed `current_timestamp at time zone 'utc'`, a name no column
-    # matched, and written as Oracle for a DuckDB target the bare CURRENT_TIMESTAMP printed
-    # bound to the column there.
+def test_the_words_are_read_off_the_statement_as_printed_for_the_target():
+    # The gate on the seventh and eighth commits: Oracle's `SYSDATE` parses to the
+    # CURRENT_TIMESTAMP node with a time zone and MySQL's `UTC_TIMESTAMP()` to a node of its
+    # own, and each prints a bare CURRENT_TIMESTAMP on DuckDB, which bound the column while
+    # the node's class or printed name matched nothing; and `now()` written as MySQL or
+    # DuckDB prints `NOW()` for Postgres, a call there, which a re-parse of the printing read
+    # as the node and refused. The printed text decides, both ways.
     schema = {"kw": {"id", "current_timestamp"}}
-    verdict = decide("SELECT SYSDATE FROM kw", {"kw": {"id"}}, dialect="oracle", target="duckdb", policy=AccessPolicy(policy_schema=schema))
-    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
-    from mnemiq.sql.guard import _NILADIC, _niladic_name
-    for spelling, dialect in (("SYSDATE", "oracle"), ("current_timestamp", "duckdb"), ("now()", "postgres"), ("curdate()", "mysql"), ("today()", "duckdb")):
-        node = sqlglot.parse_one(f"SELECT {spelling}", read=dialect).selects[0]
-        assert isinstance(node, _NILADIC) and _niladic_name(node) in {"current_timestamp", "current_date"}, (spelling, _niladic_name(node))
+    policy = AccessPolicy(policy_schema=schema)
+    for sql, dialect in (("SELECT SYSDATE FROM kw", "oracle"), ("SELECT UTC_TIMESTAMP() FROM kw", "mysql")):
+        assert "CURRENT_TIMESTAMP" in sqlglot.parse_one(sql, read=dialect).sql(dialect="duckdb")
+        verdict = decide(sql, {"kw": {"id"}}, dialect=dialect, target="duckdb", policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, (sql, verdict)
+    for dialect in ("mysql", "duckdb"):
+        assert sqlglot.parse_one("SELECT now() FROM kw", read=dialect).sql(dialect="postgres") == "SELECT NOW() FROM kw"
+        verdict = decide("SELECT now() FROM kw", {"kw": {"id"}}, dialect=dialect, target="postgres", policy=policy)
+        assert isinstance(verdict, Approved), (dialect, verdict)
+    from mnemiq.sql.guard import _bare_niladic_words
+    assert dict(_bare_niladic_words("SELECT CURRENT_DATE, kw.current_date, \"current_date\", current_date(), 'current_date', x$current_date, current_datex FROM kw")) == {"current_date": 1}
+    assert dict(_bare_niladic_words("SELECT 'a current_date', \"x current_date\", current_date /* current_date */ -- current_date\n FROM kw")) == {"current_date": 1}
+    # a quoted column of the name elsewhere in the statement does not switch the rule off for
+    # the bare word beside it (the gate's second round): by occurrence, not by word
+    visible = {"kw": {"id"}, "t2": {"id", "current_timestamp"}}
+    policy = AccessPolicy(policy_schema={"kw": {"id", "current_timestamp"}, "t2": {"id", "current_timestamp"}})
+    for sql in ('SELECT (SELECT "current_timestamp" FROM t2 LIMIT 1) AS a, current_timestamp AS b FROM kw',
+                'SELECT id FROM kw WHERE id IN (SELECT id FROM t2 WHERE "current_timestamp" IS NOT NULL) AND current_timestamp IS NOT NULL'):
+        verdict = decide(sql, visible, dialect="duckdb", target="duckdb", policy=policy)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, (sql, verdict)
+    # a word inside a string literal is no spelling of the function (the gate)
+    assert isinstance(decide("SELECT 'a current_timestamp' FROM kw", {"kw": {"id"}}, dialect="duckdb", target="duckdb", policy=policy), Approved)
+
+
+@pytest.mark.parametrize("dialect", ["duckdb", "postgres", "mysql", "sqlite", "oracle"])
+@pytest.mark.parametrize("target", ["duckdb", "postgres", "mysql", "sqlite", "oracle"])
+def test_the_advice_is_approved_on_retry_for_every_target(dialect, target):
+    # The gate on the eighth commit: the advice was checked against the dialect's parse alone,
+    # and for a Postgres target it named the spelling just refused. Written as any dialect for
+    # any target, a refusal's advice is approved as the retry, or no example is given.
+    policy = AccessPolicy(policy_schema={"kw": {"id", "current_timestamp"}})
+    verdict = decide("SELECT current_timestamp FROM kw", {"kw": {"id"}}, dialect=dialect, target=target, policy=policy)
+    if not isinstance(verdict, Refusal) or verdict.code is not RefusalCode.AMBIGUOUS_NILADIC_NAME:
+        return  # printed as a call for this target, or read as a column by the dialect
+    advised = re.search(r"such as (.+?)\.$", verdict.message)
+    if advised is None:
+        assert "with its own name and parentheses" in verdict.message, verdict.message
+        return
+    retry = decide(f"SELECT {advised.group(1)} FROM kw", {"kw": {"id"}}, dialect=dialect, target=target, policy=policy)
+    assert isinstance(retry, Approved), (dialect, target, advised.group(1), retry)
 
 
 def test_an_unmodelled_spelling_is_never_advised(monkeypatch):
@@ -198,8 +238,18 @@ def test_an_unmodelled_spelling_is_never_advised(monkeypatch):
     # listed first, as `clock_timestamp()` was, the advice passes over it.
     import mnemiq.sql.guard as guard
     monkeypatch.setitem(guard._CALL_ADVICE, "postgres", ("clock_timestamp()", "now()"))
-    assert guard._call_advice("postgres", frozenset({"current_date"})) == "now()"
-    assert guard._call_advice("postgres", frozenset({"current_timestamp"})) is None
+    assert guard._call_advice("postgres", "postgres", frozenset({"current_date"})) == "now()"
+    assert guard._call_advice("postgres", "postgres", frozenset({"current_timestamp"})) is None
+
+
+def test_the_advice_is_verified_as_printed_for_the_target():
+    # Postgres's `now()` prints a bare CURRENT_TIMESTAMP for Postgres and `NOW()` for MySQL
+    # (measured), so beside a column named `current_timestamp` it serves a MySQL target and
+    # not a Postgres one, where `localtimestamp` is named instead.
+    from mnemiq.sql.guard import _call_advice
+    assert _call_advice("postgres", "mysql", frozenset({"current_timestamp"})) == "now()"
+    assert _call_advice("postgres", "postgres", frozenset({"current_timestamp"})) == "localtimestamp"
+    assert _call_advice("postgres", "duckdb", frozenset({"current_timestamp"})) == "localtimestamp"
 
 
 def test_a_grant_and_a_policy_keyed_in_different_cases_are_one_table_to_the_rule(worlds):
