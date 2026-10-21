@@ -202,19 +202,33 @@ _FOREIGN_RELATIONS = (exp.With, exp.Lateral, exp.Values, exp.Unnest, exp.Pivot)
 # subtraction and negation, the quoted name running on across a line feed) and `#` opens
 # one: read with `--` always a comment, `` id --`secret<LF>-- code` `` split a quoted name
 # at the presumed comment (Codex's nineteenth review), so MySQL's openers are a reading too.
-_IDENT_CHAR = r"[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff]"
-_SCAN_TAIL = (r'|"(?P<double>(?:[^"]|"")+)"|`(?P<back>(?:[^`]|``)+)`|\'(?P<single>(?:[^\']|\'\')+)\''
-              r"|(?P<token>(?![0-9]+(?!" + _IDENT_CHAR + r"))" + _IDENT_CHAR + r"+)")
+# A token's characters: MySQL's identifier class (ASCII letters, digits, `_`, `$` and every
+# character from U+0080 up), and DuckDB's, which ends a name at Unicode whitespace: a no-break
+# space after `secret_code` was part of the token under MySQL's class alone, and DuckDB read
+# the column (Codex's twentieth review of #172), so the tokens are read under both classes.
+_IDENT_CHARS = {
+    "mysql": r"[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff]",
+    "duckdb": r"(?:(?!\s)[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff])",
+}
+
+
+def _scan_tail(ident: str) -> str:
+    return (r'|"(?P<double>(?:[^"]|"")+)"|`(?P<back>(?:[^`]|``)+)`|\'(?P<single>(?:[^\']|\'\')+)\''
+            r"|(?P<token>(?![0-9]+(?!" + ident + r"))" + ident + r"+)")
+
+
 _LINE = {  # by (a carriage return ends a line comment, MySQL's openers)
     (True, False): r"--[^\r\n]*",
     (False, False): r"--[^\n]*",
     (False, True): r"(?:--(?=[ \t\n\r\f\v\x00-\x1f]|$)|#)[^\n]*",  # ASCII whitespace and controls alone, MySQL's lexer's, not Unicode's (the gate)
 }
-_SCAN = {key: re.compile(r"(?P<line>" + line + r")|(?P<block>/\*)" + _SCAN_TAIL, re.S) for key, line in _LINE.items()}
-# The readings joined: nested block comments ending at a carriage return (DuckDB, Postgres),
-# flat ones ending at a line feed with `--` always a comment (SQLite) and with MySQL's
-# openers (MySQL), and the two mixed readings, for an engine not measured.
-_READINGS = ((True, True, False), (False, False, False), (False, False, True), (True, False, False), (False, True, False))
+_SCAN = {(cr_ends, mysql, boundary): re.compile(r"(?P<line>" + line + r")|(?P<block>/\*)" + _scan_tail(ident), re.S)
+         for (cr_ends, mysql), line in _LINE.items() for boundary, ident in _IDENT_CHARS.items()}
+# The readings joined, each (nested block comments, a carriage return ends a line comment,
+# MySQL's openers, the token's characters): DuckDB's and Postgres's, SQLite's, MySQL's, and
+# mixed readings for an engine not measured.
+_READINGS = ((True, True, False, "duckdb"), (True, True, False, "mysql"), (False, False, False, "mysql"),
+             (False, False, True, "mysql"), (True, False, False, "mysql"), (False, True, False, "mysql"))
 _QUOTE = {"double": '"', "back": "`", "single": "'"}
 # Whitespace or a comment may stand between the closing quote and UESCAPE, and between it and
 # its character: Postgres reads the clause in the grammar, past comments (the review gate on
@@ -247,7 +261,7 @@ def keyword_columns(expr: str) -> set[str]:
     their limits, DuckDB has none. The spelling is cut as written and lowercased after, since
     lowercasing changes some characters' byte length (the review gate on that round: `İ` is
     two bytes and its lowercase three)."""
-    spellings = set().union(*(_scan(expr, nested, cr_ends, mysql) for nested, cr_ends, mysql in _READINGS))
+    spellings = set().union(*(_scan(expr, nested, cr_ends, mysql, boundary) for nested, cr_ends, mysql, boundary in _READINGS))
     cuts = {cut for spelling in spellings for cut in _cuts_to_postgres_limit(spelling)}
     return {spelling.lower() for spelling in spellings | cuts}
 
@@ -278,14 +292,15 @@ def _cuts_to_postgres_limit(spelling: str) -> set[str]:
     return out
 
 
-def _scan(expr: str, nested: bool, cr_ends: bool, mysql: bool) -> set[str]:
+def _scan(expr: str, nested: bool, cr_ends: bool, mysql: bool, boundary: str) -> set[str]:
     """`keyword_columns` under one reading of a block comment, nested (DuckDB, Postgres) or
-    ended at the first `*/` (MySQL), and of a line comment, ended at a carriage return too
+    ended at the first `*/` (MySQL), of a line comment, ended at a carriage return too
     (DuckDB, Postgres) or at a line feed alone (MySQL, SQLite), opened by `--` always or by
-    MySQL's `-- ` and `#`. The spellings as written; `keyword_columns` lowercases."""
+    MySQL's `-- ` and `#`, and of a token's characters (`_IDENT_CHARS`). The spellings as
+    written; `keyword_columns` lowercases."""
     out: set[str] = set()
     pos = 0
-    while (match := _SCAN[(cr_ends, mysql)].search(expr, pos)) is not None:
+    while (match := _SCAN[(cr_ends, mysql, boundary)].search(expr, pos)) is not None:
         kind, pos = match.lastgroup, match.end()
         if kind == "token":
             if match.group().lower() not in _NEVER_A_COLUMN:
@@ -297,10 +312,10 @@ def _scan(expr: str, nested: bool, cr_ends: bool, mysql: bool) -> set[str]:
             if decoded is not None:
                 out.add(decoded)
         elif kind == "line":
-            out |= _scan(match.group()[1 if match.group().startswith("#") else 2:], nested, cr_ends, mysql)
+            out |= _scan(match.group()[1 if match.group().startswith("#") else 2:], nested, cr_ends, mysql, boundary)
         else:
             pos, closed = _block_end(expr, match.start(), nested)
-            out |= _scan(expr[match.start() + 2:pos - 2 if closed else pos], nested, cr_ends, mysql)
+            out |= _scan(expr[match.start() + 2:pos - 2 if closed else pos], nested, cr_ends, mysql, boundary)
     return out
 
 

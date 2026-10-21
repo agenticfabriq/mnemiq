@@ -430,6 +430,10 @@ def test_a_column_the_parser_reads_as_a_unit_or_a_type_still_requires_its_cleara
     assert dates[0] != dates[1]  # the withheld value decides the result
     for expr in ("(SELECT max(date_trunc(secret_code, id)) FROM orders)",
                  '(SELECT max(date_trunc("secret_code", id)) FROM orders)',
+                 # DuckDB ends a name at Unicode whitespace, which MySQL's identifier class
+                 # holds (Codex's twentieth review): the token under both readings
+                 "(SELECT max(date_trunc(secret_code\u00a0, id)) FROM orders)",
+                 "(SELECT max(date_trunc(secret_code\u2003, id)) FROM orders)",
                  "(SELECT max(extract(secret_code FROM id)) FROM orders)",
                  "(SELECT max(date_add(id, INTERVAL 1 secret_code)) FROM orders)",
                  "(SELECT max(last_day(id, secret_code)) FROM orders)",
