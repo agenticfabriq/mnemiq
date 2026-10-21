@@ -177,6 +177,14 @@ def test_current_user_prints_with_its_parentheses_and_reads_the_function():
         assert isinstance(verdict, Approved), (sql, verdict)
         assert "CURRENT_USER()" in verdict.target_sql, verdict.target_sql
         assert "Z" not in str(con.execute(verdict.target_sql).fetchall())  # the function, not the column
+    # The exemption rests on that printing, on every engine the deciders run as (the ui lane's
+    # correction of its own replay): with the parentheses on these four, and bare on Postgres,
+    # where the word is reserved and the function alone.
+    for engine in ("mysql", "sqlite", "oracle"):
+        verdict = decide("SELECT current_user FROM kw", {"kw": {"id"}}, dialect=engine, target=engine, policy=None)
+        assert isinstance(verdict, Approved) and "CURRENT_USER()" in verdict.target_sql, (engine, verdict)
+    verdict = decide("SELECT current_user FROM kw", {"kw": {"id"}}, dialect="postgres", target="postgres", policy=None)
+    assert isinstance(verdict, Approved) and "CURRENT_USER" in verdict.target_sql, verdict
 
 
 def test_the_tables_read_are_found_as_the_engine_binds_them():
