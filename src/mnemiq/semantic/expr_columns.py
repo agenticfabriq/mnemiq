@@ -198,8 +198,13 @@ _SCAN = re.compile(r"(?P<line>--[^\n]*)|(?P<block>/\*)"
                    r'|"(?P<double>(?:[^"]|"")+)"|`(?P<back>(?:[^`]|``)+)`|\'(?P<single>(?:[^\']|\'\')+)\''
                    r"|(?P<token>(?![0-9]+(?!" + _IDENT_CHAR + r"))" + _IDENT_CHAR + r"+)", re.S)
 _QUOTE = {"double": '"', "back": "`", "single": "'"}
-_UESCAPE = re.compile(r"\s*UESCAPE\s*'(?P<esc>[^'])'", re.I | re.S)
-_HEX = re.compile(r"[0-9A-Fa-f]+")
+# Whitespace or a comment may stand between the closing quote and UESCAPE, and between it and
+# its character: Postgres reads the clause in the grammar, past comments (the review gate on
+# the twenty-second commit). An escape is exactly four or six hex digits.
+_GAP = r"(?:\s|/\*.*?\*/|--[^\n]*(?:\n|$))*"
+_UESCAPE = re.compile(_GAP + r"UESCAPE" + _GAP + r"'(?P<esc>[^'])'", re.I | re.S)
+_HEX4 = re.compile(r"[0-9A-Fa-f]{4}")
+_HEX6 = re.compile(r"[0-9A-Fa-f]{6}")
 # The one spelling every engine reads as the constant unquoted, never as a column so named: a
 # dimension `null` over a table with a phi column `null` is shown to the uncleared (the
 # dimension tests), where `true` on sqlite and `current_date` on DuckDB read the column.
@@ -266,10 +271,10 @@ def _unicode_escaped(expr: str, match: re.Match, span: str) -> str | None:
             elif span.startswith(esc, i + 1):
                 out.append(esc)
                 i += 2
-            elif span[i + 1:i + 2] == "+" and _HEX.fullmatch(span[i + 2:i + 8]):
+            elif span[i + 1:i + 2] == "+" and _HEX6.fullmatch(span[i + 2:i + 8]):
                 out.append(chr(int(span[i + 2:i + 8], 16)))
                 i += 8
-            elif _HEX.fullmatch(span[i + 1:i + 5]):
+            elif _HEX4.fullmatch(span[i + 1:i + 5]):
                 out.append(chr(int(span[i + 1:i + 5], 16)))
                 i += 5
             else:

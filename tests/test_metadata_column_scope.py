@@ -508,6 +508,12 @@ def test_a_quoted_name_the_parser_reads_as_a_unit_is_read_whole():
     assert "secret!code" in keyword_columns("U&\"secret!!code\" UESCAPE '!'")
     assert "secret_code" not in keyword_columns('U& "secret\\005fcode"')
     assert "secret_code" not in keyword_columns('U&"secret\\zzzzcode"')   # an escape Postgres refuses
+    # A comment may stand between the closing quote and UESCAPE, or between it and its
+    # character (the gate on the twenty-second commit); an escape short of its digits is none
+    assert "secret_code" in keyword_columns("U&\"secret!005fcode\" /* c */ UESCAPE '!'")
+    assert "secret_code" in keyword_columns("U&\"secret!005fcode\" -- c\n UESCAPE /* d */ '!'")
+    assert keyword_columns('U&"secret\\5f"') == {"u", "secret\\5f"}
+    assert keyword_columns('U&"secret\\+00005"') == {"u", "secret\\+00005"}
 
 
 def test_a_struct_column_named_like_the_source_keeps_its_root_reading():
