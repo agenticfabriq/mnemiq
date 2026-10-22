@@ -282,8 +282,11 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
         # `date_trunc(secret_code, id)` reads the column on DuckDB while sqlglot makes a string of
         # the unit, so the parse saw `id` alone and the example naming and using the withheld
         # column reached the uncleared's prompt. The selectors' rule (`keyword_columns`), held
-        # here to the tables the example reads.
-        if any(obj.lower().rsplit(".", 1)[-1] in read and col.lower() in tokens for obj, col in not_raw):
+        # here to the tables the example reads, by name or as a token of the text: a table named
+        # inside a string (`query_table('orders')`) is no Table node to sqlglot, and read by the
+        # nodes alone the check never fired (the review gate on the first commit).
+        if any((obj.lower().rsplit(".", 1)[-1] in read or obj.lower().rsplit(".", 1)[-1] in tokens)
+               and col.lower() in tokens for obj, col in not_raw):
             return False
         return check_cls(ast, AccessPolicy(denied=set(not_raw)), dialect) is None
     logger.info("an example was withheld from an identity with columns withheld: its SQL parses as "
