@@ -331,7 +331,11 @@ def test_an_example_reading_a_withheld_column_through_a_unit_argument_is_not_sho
                     "WITH q AS (TABLE orders) SELECT * FROM q",
                     # a name quoted inside the string keeps its quotes as a token (the gate)
                     "SELECT date_trunc(secret_code, id) FROM query_table('\"orders\"')",
-                    "SELECT * FROM query_table('main.\"orders\"')"):
+                    "SELECT * FROM query_table('main.\"orders\"')",
+                    # `query_table` drops quote characters anywhere in the name (the gate): no
+                    # token matches, and a source the parse cannot name may be any withheld table
+                    "SELECT date_trunc(secret_code, id) FROM query_table('\"ord\"\"ers\"')",
+                    "SELECT * FROM query_table('o\"r\"ders')"):
         assert con.execute(example).fetchall(), example
         assert _reads_only_raw(example, frozenset({("orders", "secret_code")})) is False, example
     store = init_store(str(tmp_path / "s.duckdb"))

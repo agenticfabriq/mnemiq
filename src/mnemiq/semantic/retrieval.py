@@ -283,6 +283,12 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
         # keeps its quotes as a token, stripped here (the gate on the third).
         read = {t.name.lower() for t in ast.find_all(exp.Table)} | {
             token.rsplit(".", 1)[-1].strip('"`') for token in tokens}
+        if "" in read:
+            # A source the parse cannot name at all, a table function: DuckDB's `query_table`
+            # reads the table named inside the string with quote characters dropped anywhere in
+            # it (`'"ord""ers"'` is orders), so no token matches, and any withheld table may be the
+            # one read (the review gate on the fourth commit).
+            read |= withheld_tables
         if _reads_unnamed_columns(ast) and read & withheld_tables:
             return False
         # Any token of the example's text the engine reads as a column where a table the example
