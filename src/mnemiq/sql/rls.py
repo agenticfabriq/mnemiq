@@ -92,6 +92,9 @@ def _validate_filter(
         if key != _SUBJECT and key not in schema:
             return None  # a table the policy author has not got
 
+    for node in wrapped.walk():
+        if _parameter_in_another_case(node):
+            return None  # a lambda's parameter spelled in another case than declared: no predicate
     for column in wrapped.find_all(exp.Column):
         owner = resolved.get(id(column))
         if owner is None:
@@ -1752,6 +1755,34 @@ def _stand_in(kind: str) -> str:
         return "{" + fields + "}"
 
     return build(parsed)
+
+
+def _declares(lam: exp.Lambda, name: str) -> bool:
+    """Whether the lambda declares a parameter so named, the name folded."""
+    return name.lower() in {p.name.lower() for p in lam.expressions}
+
+
+def _parameter_in_another_case(node: exp.Expression) -> bool:
+    """Whether `node` names a lambda's parameter in another case than the nearest lambda
+    declaring it, folded, spells it. DuckDB binds `X` under `x -> ...` to the parameter in a
+    WHERE (Codex's forty-first review of #160: an inner `X -> ...` shadowed an outer `x`, and
+    `list_transform(tags, x -> list_transform([attrs], X -> x = region))` was approved, Malformed
+    JSON on the row) and to a column of the folded name in a SELECT list where one is in scope
+    (the review gate on round 50, measured on DuckDB 1.5.4: `list_transform(tags, X -> x)`
+    read the column `x`, so a filter `(SELECT list_transform(['q'], X -> x) FROM o LIMIT 1) =
+    ['SECRET']` was an oracle on a hidden `o.x`). Two bindings for one spelling, neither the
+    parameter's own: such a filter is no predicate here, and the author spells the parameter
+    as declared. sqlglot reads the exact spelling as an Identifier and any other as a Column."""
+    if not isinstance(node, (exp.Identifier, exp.Column)) or node.args.get("table"):
+        return False
+    if isinstance(node, exp.Identifier) and isinstance(node.parent, exp.Column):
+        return False  # read through its Column
+    lam = node.find_ancestor(exp.Lambda)
+    while lam is not None:
+        if _declares(lam, node.name):
+            return node.name not in {p.name for p in lam.expressions}
+        lam = lam.find_ancestor(exp.Lambda)
+    return False
 
 
 def _is_lambda_parameter(node: exp.Expression) -> bool:

@@ -1214,6 +1214,14 @@ _TYPED_PART_RUNS = [
 ]
 _TYPED_PART_RAISES = [
     "list_transform([[lower(region)]], x -> region) = [[region]]",   # a typed text against a list
+    # a parameter spelled in another case than declared: DuckDB binds it to the parameter here
+    # (the inner X shadows the outer x, JSON against text, and the row raises) and to a column
+    # of the folded name in a SELECT list where one is in scope, so the filter is no predicate
+    # (Codex's forty-first review; the review gate on round 50)
+    "list_transform(tags, x -> list_transform([attrs], X -> x = region)) IS NOT NULL",
+    "list_transform([attrs], x -> list_transform(tags, y -> X = 'z')) IS NOT NULL",
+    "list_transform([[attrs]], x -> list_transform(tags, y -> X[1] = region)) IS NOT NULL",
+    "list_transform([{'k': attrs}], x -> list_transform(tags, y -> X.k = region)) IS NOT NULL",
     "list_transform([lower(region)], x -> TRY_CAST(x AS VARCHAR)) = [[region]]",
     "list_transform([lower(region)], x -> id) = [[id]]",            # a typed number too (the gate)
     "list_transform([lower(region)], x -> {'a': id}) = [[region]]",  # and a typed struct
@@ -1307,6 +1315,27 @@ def test_a_typed_part_meeting_a_container_or_holding_json_is_refused(row_filter)
         con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
     verdict = _decide(row_filter, snapshot=snapshot)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_a_parameter_spelled_in_another_case_is_no_predicate():
+    # The review gate on round 50, measured on DuckDB 1.5.4: in a SELECT list a parameter
+    # spelled in another case than declared binds to a column of the folded name where one is in
+    # scope (`list_transform(tags, X -> x)` reads the column `x`), so a filter reading one through
+    # a subquery's projection was an oracle on a hidden column; in a WHERE it binds the
+    # parameter. Refused whichever way DuckDB would bind it; spelled as declared, it runs.
+    from mnemiq.sql.rls import _validate_filter
+    schema = {"claim": {"id"}}
+    oracle = "(SELECT list_transform(['q'], X -> x) FROM claim LIMIT 1) = ['SECRET']"
+    assert _validate_filter(oracle, {"id"}, "duckdb", schema) is None
+    assert _validate_filter("(SELECT list_transform(['q'], x -> x) FROM claim LIMIT 1) = ['SECRET']", {"id"}, "duckdb", schema) is not None
+    con, snapshot = _typed_part_world()
+    for row_filter in ("list_transform(tags, X -> x = region) IS NOT NULL",
+                       "list_transform([attrs], x -> list_transform(tags, X -> x = region)) IS NOT NULL",
+                       "list_transform([attrs], x -> list_transform(tags, y -> X = attrs)) IS NOT NULL"):
+        con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()   # DuckDB binds the parameter in a WHERE
+        verdict = _decide(row_filter, snapshot=snapshot)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (row_filter, verdict)
+    assert isinstance(_decide("list_transform(tags, X -> X = region) IS NOT NULL", snapshot=snapshot), Approved)
 
 
 _PART_RULES_RUN = [
