@@ -921,8 +921,10 @@ def _projection_name(projection: exp.Expression, dialect: str | None) -> str | N
     the alias where Postgres binds `secret` outward, to the hidden claim.secret (measured on
     Postgres 16: the hidden values returned; Codex's fifth review of #178, M209), and refused
     `"SECRET"` referenced as written as unknown. A bare column projection exposes its own name
-    the same way; any other projection the name sqlglot gives it, unquoted. Every reader of a
-    derived output's names goes through here: read folded by the generated-name rule, `(SELECT
+    the same way; any other projection the name sqlglot gives it, unquoted. The readers of a
+    derived output's names here go through it, the exposure walk, the generated-name rule and
+    the member check (a RENAME's names stay folded, DuckDB's syntax, where quoting folds; the
+    value check matches projections its own way, #178): read folded by the generated-name rule, `(SELECT
     1 AS "SECRET", 2 AS secret, secret_1 FROM claim) d` carried `secret` twice on Postgres and
     the honest `d.secret_1` was refused; read folded by the member check, a source named
     `secret` beside that `d` was refused as readable two ways (the review gate on the first
