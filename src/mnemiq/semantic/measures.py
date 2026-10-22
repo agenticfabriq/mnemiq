@@ -24,7 +24,7 @@ from functools import lru_cache
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Column, Dimension, Metric
-from mnemiq.semantic.expr_columns import columns_read, expression_scope
+from mnemiq.semantic.expr_columns import columns_read, expression_scope, keyword_columns
 
 
 def select_metrics(
@@ -121,6 +121,12 @@ def _reads_raw(expr: str, source: str, by_key: dict, grants: GrantSet) -> bool:
         if scope == "unparsed" and not known:
             return False  # a spelling that names no column: malformed, so unchecked, so withheld
         if not all(read_raw(column, grants) for column in known):
+            return False
+    # Any token of the expression's text the engine reads as a column where one is so named
+    # (`true`, `current_date`, a unit the parser made a string of): held to the raw read where
+    # the table has the column, nothing otherwise.
+    for name in keyword_columns(expr):
+        if not all(read_raw(column, grants) for column in by_key.get((table, name), ())):
             return False
     return True
 
