@@ -317,9 +317,20 @@ def test_an_example_reading_a_withheld_column_through_a_unit_argument_is_not_sho
     assert _reads_only_raw(sql, frozenset({("orders", "secret_code")})) is False
     assert _reads_only_raw(sql, frozenset({("other", "secret_code")})) is True   # a table the example does not read
     assert _reads_only_raw("SELECT count(id) FROM orders", frozenset({("orders", "secret_code")})) is True
-    # a table named inside a string is no Table node to sqlglot, and DuckDB reads it (the gate)
+    # a table named inside a string is no Table node to sqlglot, and DuckDB reads it (the gate):
+    # a source the parse cannot name may be any withheld table, under the token rule and the
+    # unnamed-columns rule alike, however the string spells it
     assert con.execute("SELECT date_trunc(secret_code, id) FROM query_table('orders') ORDER BY secret_code").fetchall() == dates
-    assert _reads_only_raw("SELECT date_trunc(secret_code, id) FROM query_table('orders')", frozenset({("orders", "secret_code")})) is False
+    assert len(con.execute("SELECT * FROM query_table('main.orders')").fetchall()[0]) == 2
+    for example in ("SELECT date_trunc(secret_code, id) FROM query_table('orders')",
+                    "SELECT date_trunc(secret_code, id) FROM query_table('main.orders')",
+                    "SELECT * FROM query_table('orders')",
+                    # `TABLE orders` is a Table named `TABLE` to sqlglot, a CTE over it its own name
+                    "SELECT date_trunc(secret_code, id) FROM (TABLE orders)",
+                    "WITH q AS (TABLE orders) SELECT date_trunc(secret_code, id) FROM q",
+                    "WITH q AS (TABLE orders) SELECT * FROM q"):
+        assert con.execute(example).fetchall(), example
+        assert _reads_only_raw(example, frozenset({("orders", "secret_code")})) is False, example
     store = init_store(str(tmp_path / "s.duckdb"))
     embedder = FakeEmbedder()
     snapshot = Snapshot(version="v1", source_id="s", created_at="t", columns=_COLUMNS, examples=[

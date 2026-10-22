@@ -274,7 +274,13 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
         # A read of columns no node names cannot be seen by `check_cls`, which checks named ones
         # (Codex's review of #121): `SELECT COLUMNS('secret_code') FROM orders` returns the column.
         # Withheld when any table the example reads has a withheld column.
-        read = {t.name.lower() for t in ast.find_all(exp.Table)}
+        # The tables read: the parse's names, and every table the text names anywhere, by the
+        # last part of a dotted token, since the parse names some wrongly or not at all:
+        # `query_table('orders')` is a Table with no name to sqlglot and `query_table('main.orders')`
+        # names the table inside a dotted string, `TABLE orders` is a Table named `TABLE` and a
+        # CTE over it is its own name, and DuckDB reads orders through each (the review gate on
+        # the second and third commits).
+        read = {t.name.lower() for t in ast.find_all(exp.Table)} | {token.rsplit(".", 1)[-1] for token in tokens}
         if _reads_unnamed_columns(ast) and read & withheld_tables:
             return False
         # Any token of the example's text the engine reads as a column where a table the example
@@ -282,11 +288,8 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
         # `date_trunc(secret_code, id)` reads the column on DuckDB while sqlglot makes a string of
         # the unit, so the parse saw `id` alone and the example naming and using the withheld
         # column reached the uncleared's prompt. The selectors' rule (`keyword_columns`), held
-        # here to the tables the example reads, by name or as a token of the text: a table named
-        # inside a string (`query_table('orders')`) is no Table node to sqlglot, and read by the
-        # nodes alone the check never fired (the review gate on the first commit).
-        if any((obj.lower().rsplit(".", 1)[-1] in read or obj.lower().rsplit(".", 1)[-1] in tokens)
-               and col.lower() in tokens for obj, col in not_raw):
+        # here to the tables the example reads.
+        if any(obj.lower().rsplit(".", 1)[-1] in read and col.lower() in tokens for obj, col in not_raw):
             return False
         return check_cls(ast, AccessPolicy(denied=set(not_raw)), dialect) is None
     logger.info("an example was withheld from an identity with columns withheld: its SQL parses as "
