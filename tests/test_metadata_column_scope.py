@@ -302,6 +302,71 @@ def test_counting_rows_reads_no_column_and_is_shown():
     assert _reads_only_raw("SELECT count(*) FROM orders", frozenset({("orders", "secret_code")}))
 
 
+def test_an_example_reading_a_withheld_column_through_a_unit_argument_is_not_shown(tmp_path):
+    # M210 (Codex's twenty-third review of #172): sqlglot makes a string of `date_trunc`'s unit
+    # argument, so the parse-based check saw `id` alone where DuckDB reads `secret_code` (the
+    # values `year` and `day` give different dates), and the example naming and using the
+    # withheld column reached the uncleared's prompt. Held to the raw text as the selectors are.
+    from mnemiq.semantic.retrieval import _reads_only_raw
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE orders(id DATE, secret_code TEXT)")
+    con.execute("INSERT INTO orders VALUES ('2026-03-15', 'year'), ('2026-03-15', 'day')")
+    dates = con.execute("SELECT date_trunc(secret_code, id) FROM orders ORDER BY secret_code").fetchall()
+    assert dates[0] != dates[1]
+    sql = "SELECT date_trunc(secret_code, id) AS period, count(*) FROM orders GROUP BY 1"
+    assert _reads_only_raw(sql, frozenset({("orders", "secret_code")})) is False
+    assert _reads_only_raw(sql, frozenset({("other", "secret_code")})) is True   # a table the example does not read
+    assert _reads_only_raw("SELECT count(id) FROM orders", frozenset({("orders", "secret_code")})) is True
+    # a table named inside a string is no Table node to sqlglot, and DuckDB reads it (the gate):
+    # a source the parse cannot name may be any withheld table, under the token rule and the
+    # unnamed-columns rule alike, however the string spells it
+    assert con.execute("SELECT date_trunc(secret_code, id) FROM query_table('orders') ORDER BY secret_code").fetchall() == dates
+    assert len(con.execute("SELECT * FROM query_table('main.orders')").fetchall()[0]) == 2
+    for example in ("SELECT date_trunc(secret_code, id) FROM query_table('orders')",
+                    "SELECT date_trunc(secret_code, id) FROM query_table('main.orders')",
+                    "SELECT * FROM query_table('orders')",
+                    # `TABLE orders` is a Table named `TABLE` to sqlglot, a CTE over it its own name
+                    "SELECT date_trunc(secret_code, id) FROM (TABLE orders)",
+                    "WITH q AS (TABLE orders) SELECT date_trunc(secret_code, id) FROM q",
+                    "WITH q AS (TABLE orders) SELECT * FROM q",
+                    # a name quoted inside the string keeps its quotes as a token (the gate)
+                    "SELECT date_trunc(secret_code, id) FROM query_table('\"orders\"')",
+                    "SELECT * FROM query_table('main.\"orders\"')",
+                    # `query_table` drops quote characters anywhere in the name (the gate): no
+                    # token matches, and a source the parse cannot name may be any withheld table
+                    "SELECT date_trunc(secret_code, id) FROM query_table('\"ord\"\"ers\"')",
+                    "SELECT * FROM query_table('o\"r\"ders')"):
+        assert con.execute(example).fetchall(), example
+        assert _reads_only_raw(example, frozenset({("orders", "secret_code")})) is False, example
+    # a column list renames by position, and the withheld column reaches the text under a name
+    # no token matches (Codex's first review of #181): withheld wherever a list stands over a
+    # withheld table read, shown over a table with nothing withheld
+    for example in ("SELECT date_trunc(unit, id) FROM orders AS q(id, unit)",
+                    "SELECT date_trunc(unit, id) FROM (SELECT id, secret_code FROM orders) q(id, unit)",
+                    "WITH w(id, unit) AS (SELECT id, secret_code FROM orders) SELECT date_trunc(unit, id) FROM w",
+                    # DuckDB reads a column by its position, which no token names (the gate)
+                    "SELECT date_trunc(#2, #1) FROM orders",
+                    "SELECT date_trunc(# 2, # 1) FROM orders",
+                    "SELECT date_trunc(#/**/2, #--c\n1) FROM orders"):
+        assert sorted(con.execute(example).fetchall()) == sorted(dates), example
+        assert _reads_only_raw(example, frozenset({("orders", "secret_code")})) is False, example
+    assert _reads_only_raw("SELECT count(x) FROM other AS q(x)", frozenset({("orders", "secret_code")})) is True
+    # a table's name or alias as a value is the whole row as a struct on DuckDB (the gate)
+    for example in ("SELECT orders FROM orders", "SELECT o FROM orders o"):
+        assert len(con.execute(example).fetchall()[0][0]) == 2, example
+        assert _reads_only_raw(example, frozenset({("orders", "secret_code")})) is False, example
+    store = init_store(str(tmp_path / "s.duckdb"))
+    embedder = FakeEmbedder()
+    snapshot = Snapshot(version="v1", source_id="s", created_at="t", columns=_COLUMNS, examples=[
+        Example(question="how many orders by period", sql=sql, tables=["orders"], object_id="orders"),
+        Example(question="how many orders", sql="SELECT count(id) FROM orders", tables=["orders"], object_id="orders")])
+    build_example_index(store, snapshot, embedder)
+    (qvec,) = embedder.embed(["how many orders"])
+    shown = _retrieve_examples(store, qvec, {"orders"}, k=5, not_raw=frozenset({("orders", "secret_code")}))
+    assert [e.sql for e in shown] == ["SELECT count(id) FROM orders"]
+    assert len(_retrieve_examples(store, qvec, {"orders"}, k=5, not_raw=frozenset())) == 2
+
+
 def test_a_dimension_reading_another_table_is_withheld_from_everyone():
     """Dimensions share the expression check, so they share its stricter rule: one qualified by
     another table cannot be checked against this source's columns."""
