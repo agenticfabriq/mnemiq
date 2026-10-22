@@ -45,6 +45,22 @@ def test_a_quoted_alias_is_not_the_folded_name_where_quoting_keeps_case():
     _refused_unknown('SELECT (SELECT "SECRET" FROM (SELECT 1 AS secret) d) FROM claim', "postgres")
 
 
+def test_every_reader_of_a_derived_output_keeps_the_quoting():
+    # The review gate on the first commit: the generated-name rule and the member check read a
+    # derived output's names too, and folded they refused honest queries on Postgres. `(SELECT
+    # 1 AS "SECRET", 2 AS secret, secret_1 FROM claim) d` carries `secret` once there, so
+    # `d.secret_1` is the column (DuckDB folds, renames the duplicate `secret_1` and the column
+    # away, and is refused as before); a source named `secret` beside a `d` exposing `SECRET` is
+    # read one way on Postgres (measured: the query runs), two on DuckDB.
+    granted = {"claim": {"id", "secret", "secret_1"}}
+    honest = 'SELECT d.secret_1 FROM (SELECT 1 AS "SECRET", 2 AS secret, secret_1 FROM claim) d'
+    assert isinstance(decide(honest, granted, dialect="postgres", target="postgres"), Approved)
+    assert isinstance(decide(honest, granted, dialect="duckdb", target="duckdb"), Refusal)
+    one_way = 'SELECT (SELECT secret.x FROM (SELECT 1 AS "SECRET" FROM claim) d LIMIT 1) FROM (SELECT 1 AS x) secret'
+    assert isinstance(_decide(one_way, "postgres"), Approved)
+    assert isinstance(_decide(one_way, "duckdb"), Refusal)
+
+
 def test_duckdb_folds_a_quoted_alias_and_reads_it():
     duck = duckdb.connect()
     duck.execute("CREATE TABLE claim (id INT, secret INT); INSERT INTO claim VALUES (1, 41)")

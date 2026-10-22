@@ -641,8 +641,8 @@ def fields_as_members(ast: exp.Expression, dialect: str | None = None,
                     exposed[name] = ((columns - {old for old, _ in renames})
                                      | {new for _, new in renames})
                 found |= set().union(*exposed.values())
-            elif select.alias_or_name:
-                found.add(resolve(select.alias_or_name, quoted=False, dialect=dialect))
+            elif (named := _projection_name(select, dialect)):
+                found.add(named)
         return found
 
     binds_nearer = (dialect or "").lower() != "oracle"
@@ -921,7 +921,12 @@ def _projection_name(projection: exp.Expression, dialect: str | None) -> str | N
     the alias where Postgres binds `secret` outward, to the hidden claim.secret (measured on
     Postgres 16: the hidden values returned; Codex's fifth review of #178, M209), and refused
     `"SECRET"` referenced as written as unknown. A bare column projection exposes its own name
-    the same way; any other projection the name sqlglot gives it, unquoted."""
+    the same way; any other projection the name sqlglot gives it, unquoted. Every reader of a
+    derived output's names goes through here: read folded by the generated-name rule, `(SELECT
+    1 AS "SECRET", 2 AS secret, secret_1 FROM claim) d` carried `secret` twice on Postgres and
+    the honest `d.secret_1` was refused; read folded by the member check, a source named
+    `secret` beside that `d` was refused as readable two ways (the review gate on the first
+    commit)."""
     if isinstance(projection, exp.Alias):
         return resolve_identifier(projection.args.get("alias"), dialect)
     if isinstance(projection, exp.Column):
@@ -1169,10 +1174,10 @@ def _projected_names(scope, columns, dialect: str | None, seen: frozenset[int]) 
     for projection in scope.expression.selects:
         star = _star_of(projection)
         if star is None:
-            alias = projection.alias_or_name
+            alias = _projection_name(projection, dialect)
             if not alias:
                 return None
-            names.append(resolve(alias, quoted=False, dialect=dialect))
+            names.append(alias)
             continue
         pattern = _columns_pattern(projection)
         if pattern is None and (isinstance(projection, exp.Columns) or (
