@@ -208,6 +208,18 @@ def test_redundant_parentheses_around_a_bare_item_read_through():
         assert isinstance(_decide(sql, "postgres"), Approved), sql
     verdict = _decide("SELECT v AS x FROM claim ORDER BY (x, id)", "postgres")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    # a row constructor stays an expression under any parentheses: the inner list inherited the
+    # outer parentheses' bare reading (Codex's fifth review), where Postgres reads the system
+    # column inside the row
+    for sql in ("SELECT v AS x FROM claim ORDER BY ((x, id))", "SELECT id AS ctid FROM claim ORDER BY ((ctid, id))"):
+        verdict = _decide(sql, "postgres")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
+    # Postgres reads a bare DISTINCT ON alias as it reads a bare ORDER BY one, measured on 16
+    # (the same review): bare and in redundant parentheses admitted, inside an expression not
+    assert isinstance(_decide("SELECT DISTINCT ON (x) id AS x FROM claim ORDER BY x", "postgres"), Approved)
+    assert isinstance(_decide("SELECT DISTINCT ON (((x))) id AS x FROM claim ORDER BY x", "postgres"), Approved)
+    verdict = _decide("SELECT DISTINCT ON (x + 0) id AS x FROM claim ORDER BY x", "postgres")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
     # an engine not measured keeps the parentheses an expression, fail-closed (the gate's round)
     assert isinstance(_decide("SELECT v AS x FROM claim ORDER BY ((x))", "oracle"), Approved)   # measured on Oracle 23
     verdict = _decide("SELECT v AS x FROM claim ORDER BY ((x))", "snowflake")

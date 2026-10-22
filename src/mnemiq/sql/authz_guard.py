@@ -162,8 +162,8 @@ def _unknown_column(name: str) -> Refusal:
 _ALIAS_BARE: dict[str | None, frozenset[str]] = {
     "duckdb": frozenset({"select", "where", "group", "having", "order", "qualify", "window", "distinct"}),
     "sqlite": frozenset({"where", "group", "having", "order", "join"}),
-    "postgres": frozenset({"group", "order"}),
-    "postgresql": frozenset({"group", "order"}),
+    "postgres": frozenset({"group", "order", "distinct"}),  # DISTINCT ON reads a bare alias as ORDER BY does, measured on Postgres 16 (Codex's fifth review of #177)
+    "postgresql": frozenset({"group", "order", "distinct"}),
     "mysql": frozenset({"group", "having", "order"}),
     "oracle": frozenset({"order"}),
     None: frozenset({"order"}),
@@ -210,8 +210,14 @@ def _is_wrapper(node: exp.Expression, dialect: str | None) -> bool:
         return False
     if isinstance(parent, exp.Group):
         return True
+    if isinstance(node, exp.Tuple):
+        # A list is structure directly under its clause alone: wrapped in parentheses it is a row
+        # constructor, an expression, and the parentheses above it do not make it bare (Codex's
+        # fifth review of #177: `ORDER BY ((ctid, id))` inherited the outer parentheses' bare
+        # reading through the recursion, where Postgres reads the system column inside the row).
+        return False
     if isinstance(parent, exp.Ordered):
-        return isinstance(node, exp.Paren)
+        return True
     return _is_wrapper(parent, dialect)
 
 
