@@ -262,7 +262,10 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
 
     from sqlglot import exp
 
+    from mnemiq.semantic.expr_columns import keyword_columns
+
     withheld_tables = {obj.lower().rsplit(".", 1)[-1] for obj, _ in not_raw}
+    tokens = keyword_columns(sql)
     for dialect in ("duckdb", "oracle"):
         try:
             ast = sqlglot.parse_one(sql, read=dialect)
@@ -271,8 +274,16 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
         # A read of columns no node names cannot be seen by `check_cls`, which checks named ones
         # (Codex's review of #121): `SELECT COLUMNS('secret_code') FROM orders` returns the column.
         # Withheld when any table the example reads has a withheld column.
-        if _reads_unnamed_columns(ast) and any(
-                t.name.lower() in withheld_tables for t in ast.find_all(exp.Table)):
+        read = {t.name.lower() for t in ast.find_all(exp.Table)}
+        if _reads_unnamed_columns(ast) and read & withheld_tables:
+            return False
+        # Any token of the example's text the engine reads as a column where a table the example
+        # reads has a withheld column so named (M210, Codex's twenty-third review of #172):
+        # `date_trunc(secret_code, id)` reads the column on DuckDB while sqlglot makes a string of
+        # the unit, so the parse saw `id` alone and the example naming and using the withheld
+        # column reached the uncleared's prompt. The selectors' rule (`keyword_columns`), held
+        # here to the tables the example reads.
+        if any(obj.lower().rsplit(".", 1)[-1] in read and col.lower() in tokens for obj, col in not_raw):
             return False
         return check_cls(ast, AccessPolicy(denied=set(not_raw)), dialect) is None
     logger.info("an example was withheld from an identity with columns withheld: its SQL parses as "

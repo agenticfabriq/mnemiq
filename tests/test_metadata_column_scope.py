@@ -302,6 +302,33 @@ def test_counting_rows_reads_no_column_and_is_shown():
     assert _reads_only_raw("SELECT count(*) FROM orders", frozenset({("orders", "secret_code")}))
 
 
+def test_an_example_reading_a_withheld_column_through_a_unit_argument_is_not_shown(tmp_path):
+    # M210 (Codex's twenty-third review of #172): sqlglot makes a string of `date_trunc`'s unit
+    # argument, so the parse-based check saw `id` alone where DuckDB reads `secret_code` (the
+    # values `year` and `day` give different dates), and the example naming and using the
+    # withheld column reached the uncleared's prompt. Held to the raw text as the selectors are.
+    from mnemiq.semantic.retrieval import _reads_only_raw
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE TABLE orders(id DATE, secret_code TEXT)")
+    con.execute("INSERT INTO orders VALUES ('2026-03-15', 'year'), ('2026-03-15', 'day')")
+    dates = con.execute("SELECT date_trunc(secret_code, id) FROM orders ORDER BY secret_code").fetchall()
+    assert dates[0] != dates[1]
+    sql = "SELECT date_trunc(secret_code, id) AS period, count(*) FROM orders GROUP BY 1"
+    assert _reads_only_raw(sql, frozenset({("orders", "secret_code")})) is False
+    assert _reads_only_raw(sql, frozenset({("other", "secret_code")})) is True   # a table the example does not read
+    assert _reads_only_raw("SELECT count(id) FROM orders", frozenset({("orders", "secret_code")})) is True
+    store = init_store(str(tmp_path / "s.duckdb"))
+    embedder = FakeEmbedder()
+    snapshot = Snapshot(version="v1", source_id="s", created_at="t", columns=_COLUMNS, examples=[
+        Example(question="how many orders by period", sql=sql, tables=["orders"], object_id="orders"),
+        Example(question="how many orders", sql="SELECT count(id) FROM orders", tables=["orders"], object_id="orders")])
+    build_example_index(store, snapshot, embedder)
+    (qvec,) = embedder.embed(["how many orders"])
+    shown = _retrieve_examples(store, qvec, {"orders"}, k=5, not_raw=frozenset({("orders", "secret_code")}))
+    assert [e.sql for e in shown] == ["SELECT count(id) FROM orders"]
+    assert len(_retrieve_examples(store, qvec, {"orders"}, k=5, not_raw=frozenset())) == 2
+
+
 def test_a_dimension_reading_another_table_is_withheld_from_everyone():
     """Dimensions share the expression check, so they share its stricter rule: one qualified by
     another table cannot be checked against this source's columns."""
