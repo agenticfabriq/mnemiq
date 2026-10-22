@@ -167,6 +167,49 @@ def test_an_aggregates_filter_predicate_reads_no_alias():
     assert isinstance(_decide("SELECT 0 AS x, count(*) FILTER (WHERE v = 10) FROM claim", "duckdb"), Approved)
 
 
+def test_a_window_functions_filter_and_order_by_read_the_alias_on_duckdb():
+    # Codex's fourth review of #177: `count(*) FILTER (WHERE secret = 1) OVER ()` binds the
+    # alias on DuckDB (measured; the plain aggregate's FILTER binds none, the test above), and
+    # so does an aggregate's own ORDER BY under OVER; Postgres binds the alias in neither.
+    duck = duckdb.connect()
+    duck.execute("CREATE TABLE claim (id INT, v INT); INSERT INTO claim VALUES (1, 10), (2, 20), (1, 30)")
+    for sql in ("SELECT v AS x, count(*) FILTER (WHERE x = 10) OVER () AS n FROM claim",
+                "SELECT v AS x, string_agg(id, ',' ORDER BY x) OVER () AS s FROM claim"):
+        duck.execute(sql).fetchall()
+        assert isinstance(_decide(sql, "duckdb"), Approved), sql
+        verdict = _decide(sql, "postgres")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
+    plain = "SELECT v AS x, string_agg(id, ',' ORDER BY x) AS s FROM claim GROUP BY v"
+    with pytest.raises(duckdb.Error):
+        duck.execute(plain).fetchall()
+    verdict = _decide(plain, "duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+
+
+def test_redundant_parentheses_around_a_bare_item_read_through():
+    # The same review: `GROUP BY ((x))` reads the alias as `GROUP BY x` does, on DuckDB,
+    # Postgres, MySQL and SQLite (measured), where the parentheses made the item an expression
+    # and the table refused it; a list in GROUP BY is its items on DuckDB and Postgres, and in
+    # ORDER BY a row constructor, an expression Postgres reads as input columns (measured).
+    duck = duckdb.connect()
+    duck.execute("CREATE TABLE claim (id INT, v INT); INSERT INTO claim VALUES (1, 10), (2, 20), (1, 30)")
+    wrapped = ("SELECT v AS x FROM claim GROUP BY (x)", "SELECT v AS x FROM claim GROUP BY ((x))",
+               "SELECT v AS x FROM claim GROUP BY (x, id)", "SELECT v AS x FROM claim GROUP BY ROLLUP(((x)))",
+               "SELECT v AS x FROM claim GROUP BY CUBE((x), id)", "SELECT v AS x FROM claim GROUP BY GROUPING SETS (((x)))",
+               "SELECT v AS x FROM claim ORDER BY ((x))", "SELECT DISTINCT ON (((x))) v AS x FROM claim ORDER BY x")
+    for sql in wrapped:
+        duck.execute(sql).fetchall()
+        assert isinstance(_decide(sql, "duckdb"), Approved), sql
+    for sql in wrapped[:-1]:   # Postgres reads each too; its DISTINCT ON stays outside its table
+        assert isinstance(_decide(sql, "postgres"), Approved), sql
+    verdict = _decide("SELECT v AS x FROM claim ORDER BY (x, id)", "postgres")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    with pytest.raises(duckdb.Error):
+        duck.execute("SELECT v AS x FROM claim GROUP BY (x) + 0").fetchall()
+    verdict = _decide("SELECT v AS x FROM claim GROUP BY (x) + 0", "duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+
+
 def test_distinct_on_reads_a_bare_alias_and_a_source_column_inside_an_expression():
     # Codex's second review of #177: `SELECT DISTINCT ON (secret + 0) id AS secret FROM claim`
     # deduplicates on the hidden source column (measured: two rows of three), where the

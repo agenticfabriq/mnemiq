@@ -183,10 +183,44 @@ def _is_distinct_on(node: exp.Expression | None) -> bool:
     return isinstance(node, exp.Distinct) and isinstance(node.parent, exp.Select) and node.args.get("on") is not None
 
 
+def _is_wrapper(node: exp.Expression) -> bool:
+    """Parentheses around a bare item that the engine reads through: a grouping set's, a
+    DISTINCT ON list's, a one-item set among them (`GROUPING SETS ((x), ())` parses `(x)` as a
+    Paren), and redundant ones around a GROUP BY, ROLLUP, CUBE, GROUPING SETS, DISTINCT ON or
+    ORDER BY item to any depth: `GROUP BY ((secret))` reads the alias as `GROUP BY secret` does
+    on DuckDB, Postgres, MySQL and SQLite, measured, where the parentheses made the item an
+    expression and the table refused it (Codex's fourth review of #177). A list in GROUP BY
+    (`GROUP BY (secret, id)`) is its items on DuckDB and Postgres and an error on MySQL and
+    SQLite, measured; in ORDER BY it is a row constructor, an expression, which Postgres reads
+    as input columns (measured: no alias bound), so it stays one there. Parentheses beside
+    anything else (`(secret) + 0`) are an expression still."""
+    if not isinstance(node, (exp.Tuple, exp.Paren)):
+        return False
+    parent = node.parent
+    if isinstance(parent, (exp.Group, exp.Rollup, exp.Cube, exp.GroupingSets)) or _is_distinct_on(parent):
+        return True
+    if isinstance(parent, exp.Ordered):
+        return isinstance(node, exp.Paren)
+    return _is_wrapper(parent)
+
+
+def _windowed(node: exp.Expression) -> bool:
+    """Whether an aggregate (a Func or a WITHIN GROUP, or the FILTER over one) is a window
+    function's, whose FILTER predicate and ORDER BY DuckDB binds an output alias in, measured
+    (`count(*) FILTER (WHERE secret = 1) OVER ()`, `string_agg(id ORDER BY secret) OVER ()`),
+    where a plain aggregate's bind none (Codex's fourth review of #177); Postgres binds none in
+    either, and its table admits no `window`."""
+    if isinstance(node.parent, exp.Filter):
+        node = node.parent
+    return isinstance(node.parent, exp.Window)
+
+
 def _clause_of(column: exp.Column) -> tuple[str, bool]:
     """The clause of its own SELECT a column sits in, and whether it is the whole item there:
     `where`, `group`, `having`, `order`, `qualify`, `join` (an ON), `window` (an OVER's own
-    ORDER BY or PARTITION BY, whatever clause holds it), `aggregate` (an aggregate's own ORDER
+    ORDER BY or PARTITION BY, whatever clause holds it, and a window function's own FILTER
+    predicate and ORDER BY, which DuckDB binds an alias in, measured: Codex's fourth review of
+    #177), `aggregate` (a plain aggregate's own ORDER
     BY or FILTER predicate, which bind to source columns alone: DuckDB rejects an alias there,
     measured, and with a hidden column of the alias's name read it, Codex's first and third
     reviews of #177), `limit` (a
@@ -197,9 +231,10 @@ def _clause_of(column: exp.Column) -> tuple[str, bool]:
     as the projection list's expression, Codex's second review of #177; an aggregate's own
     DISTINCT is its clause's expression); a set operation's ORDER BY is `order`,
     sqlglot holding it under the operation. A ROLLUP, CUBE or GROUPING SETS wrapper, a
-    grouping set's parentheses and a DISTINCT ON list's are structure, not an expression:
-    `GROUP BY ROLLUP(x)` is a bare item (the same review, where the wrapper made it an
-    expression and DuckDB's table refused it). Where an alias and a source column
+    grouping set's parentheses, a DISTINCT ON list's and redundant parentheses around a bare
+    item (`_is_wrapper`) are structure, not an expression: `GROUP BY ROLLUP(x)` is a bare item
+    (the same review, where the wrapper made it an expression and DuckDB's table refused it),
+    and so is `GROUP BY ((x))` (the fourth). Where an alias and a source column
     share a name the engine reads the column first everywhere but a bare ORDER BY item (and
     HAVING on DuckDB), measured, which the resolver binds under the complete schema and the
     grant alone cannot see: the register's residual, recorded at #167."""
@@ -208,13 +243,15 @@ def _clause_of(column: exp.Column) -> tuple[str, bool]:
         if isinstance(node, (exp.Window, exp.WindowSpec)):
             return "window", bare
         if isinstance(node, exp.Order) and isinstance(node.parent, (exp.Func, exp.WithinGroup)):
-            return "aggregate", False  # WITHIN GROUP (ORDER BY ...) is no Func to sqlglot (the gate on the second commit)
+            # WITHIN GROUP (ORDER BY ...) is no Func to sqlglot (the gate on the second commit)
+            return ("window" if _windowed(node.parent) else "aggregate"), False
         if isinstance(node, exp.Where) and isinstance(node.parent, exp.Filter):
             # An aggregate's FILTER (WHERE ...) binds to source columns alone, as its ORDER BY
             # does: read as the SELECT's WHERE, where DuckDB admits an alias, `count(*) FILTER
             # (WHERE secret = 1)` beside an alias `secret` counted the hidden column's rows, and
             # DuckDB rejects the alias there with no such column (Codex's third review of #177).
-            return "aggregate", False
+            # A window function's FILTER is the window's, where DuckDB binds the alias (the fourth).
+            return ("window" if _windowed(node.parent) else "aggregate"), False
         if isinstance(node, (exp.Limit, exp.Offset)):
             return "limit", False
         kind = next((name for cls, name in ((exp.Where, "where"), (exp.Group, "group"), (exp.Having, "having"),
@@ -225,8 +262,8 @@ def _clause_of(column: exp.Column) -> tuple[str, bool]:
         if kind is not None:
             if clause is None:
                 clause = kind
-        elif isinstance(node, (exp.Tuple, exp.Paren)) and (isinstance(node.parent, (exp.Rollup, exp.Cube, exp.GroupingSets)) or _is_distinct_on(node.parent)):
-            pass  # a grouping set's or a DISTINCT ON list's parentheses, a one-item set among them (`GROUPING SETS ((x), ())` parses `(x)` as a Paren)
+        elif _is_wrapper(node):
+            pass  # parentheses the engine reads through: a grouping set's, a DISTINCT ON list's, redundant ones around a bare item
         elif not isinstance(node, (exp.Ordered, exp.Alias, exp.Rollup, exp.Cube, exp.GroupingSets)):
             bare = False  # the column sits inside an expression of the clause
         node = node.parent
