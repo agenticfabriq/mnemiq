@@ -1340,7 +1340,8 @@ def test_a_parameter_spelled_in_another_case_is_no_predicate():
     # a struct field or key spelled like a parameter in another case names no parameter
     # (Codex's forty-second review): DuckDB runs these, and the parameters are spelled as declared
     for row_filter in ("list_transform([{X: tags}], x -> list_transform(x.X, y -> y = region)) = [[true]]",
-                       "list_transform([{X: tags}], x -> list_transform(x.x, y -> y = region)) = [[true]]"):
+                       "list_transform([{X: tags}], x -> list_transform(x.x, y -> y = region)) = [[true]]",
+                       "list_transform(tags, x -> {X: x}.X = region) = [true]"):   # the key inside the body (the gate)
         assert con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall() == [(1,)], row_filter
         assert isinstance(_decide(row_filter, snapshot=snapshot), Approved), row_filter
 
