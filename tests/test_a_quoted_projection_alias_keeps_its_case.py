@@ -61,6 +61,40 @@ def test_every_reader_of_a_derived_output_keeps_the_quoting():
     assert isinstance(_decide(one_way, "duckdb"), Refusal)
 
 
+def test_a_projection_without_an_alias_exposes_no_name():
+    # Codex's first review of #180: `(SELECT 'secret') d` is `secret` to sqlglot's
+    # `alias_or_name`, and the walk stopped at d; Postgres names the column `?column?`, DuckDB
+    # and SQLite `'secret'`, and each binds a bare `secret` outward to claim.secret (measured
+    # on all three: the hidden value returned). MySQL alone names the literal `secret`; the
+    # refusal there is the fail-closed cost.
+    duck = duckdb.connect()
+    duck.execute("CREATE TABLE claim (id INT, secret INT); INSERT INTO claim VALUES (1, 41)")
+    assert duck.execute("SELECT (SELECT secret FROM (SELECT 'secret') d) FROM claim").fetchall() == [(41,)]
+    for sql in ("SELECT (SELECT secret FROM (SELECT 'secret') d) FROM claim",
+                "SELECT (SELECT secret FROM (SELECT upper('secret')) d) FROM claim",
+                "SELECT (SELECT secret FROM (SELECT id, 'secret' FROM claim) d LIMIT 1) FROM claim",
+                "WITH d AS (SELECT 'secret') SELECT (SELECT secret FROM d) FROM claim"):
+        for dialect in ("postgres", "duckdb", "sqlite", "mysql"):
+            _refused_unknown(sql, dialect)
+    # aliased, the literal is the alias, as before
+    assert isinstance(_decide("SELECT (SELECT secret FROM (SELECT 'secret' AS secret) d) FROM claim", "postgres"), Approved)
+    # an unaliased projection keeps its position among the output's names, so a column list
+    # names it and an honest `_N` column beside it is no generated name (the gate's round);
+    # unlisted, the engine's own name may twin a column's (DuckDB names `(secret)` `secret`), so
+    # a `_N` reference beside one is the engine's own and refused (the gate's second round)
+    granted = {"claim": {"id", "secret_1"}}
+    for dialect in ("postgres", "duckdb"):
+        assert isinstance(decide("WITH w(a, secret_1) AS (SELECT 1, secret_1 FROM claim) SELECT w.secret_1 FROM w",
+                                 granted, dialect=dialect, target=dialect), Approved), dialect
+        assert isinstance(decide("SELECT d.secret_1 FROM (SELECT 1, secret_1 FROM claim) d",
+                                 granted, dialect=dialect, target=dialect), Refusal), dialect
+    assert duck.execute("SELECT d.secret_1 FROM (SELECT 'SAFE' AS secret, (secret) FROM claim) d").fetchall() == [(41,)]
+    for sql in ("SELECT d.secret_1 FROM (SELECT 'SAFE' AS secret, (secret) FROM claim) d",
+                "SELECT d.secret_1 FROM (SELECT 'SAFE' AS secret, ((c.secret)) FROM claim c) d"):
+        for dialect in ("duckdb", "postgres"):
+            assert isinstance(_decide(sql, dialect), Refusal), (sql, dialect)
+
+
 def test_duckdb_folds_a_quoted_alias_and_reads_it():
     duck = duckdb.connect()
     duck.execute("CREATE TABLE claim (id INT, secret INT); INSERT INTO claim VALUES (1, 41)")

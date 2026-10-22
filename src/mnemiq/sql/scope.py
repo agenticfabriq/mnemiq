@@ -890,6 +890,9 @@ def _item_sources(item: exp.Expression, picked: list[str], dialect: str | None) 
 # of the generated name (Codex's fifth review of #167: `wide.secret_1`, granted, let `d.secret_1`
 # over `(SELECT 'SAFE' AS secret, c.* FROM wide w CROSS JOIN claim c) d` read claim's secret).
 GENERATED_NAME = "\0generated-name"
+# A projection with no alias, named by the engine itself (`?column?`, a literal's text): the
+# name no reference spells, holding the position among a derived output's names.
+_ENGINE_NAMED = "\0engine-named"
 
 
 def _exposed(source, column: exp.Column, columns, dialect: str | None):
@@ -908,7 +911,11 @@ def _exposed(source, column: exp.Column, columns, dialect: str | None):
     if suffixed is not None:
         names = _output_names(source, columns, dialect, frozenset())
         base = resolve(suffixed[1], quoted=bool(column.this.args.get("quoted")), dialect=dialect)
-        if names is None or names.count(base) > 1:
+        if names is None or names.count(base) > 1 or _ENGINE_NAMED in names:
+            # A projection the engine names itself may twin a column's name (DuckDB names
+            # `(secret)` `secret`: the review gate on the fourth commit of #180, where
+            # `(SELECT 'SAFE' AS secret, (secret) FROM claim) d` read the hidden column as
+            # `d.secret_1`), so a `_N` reference beside one is the engine's own, fail-closed.
             return ("table", GENERATED_NAME)
     name = resolve_identifier(column.this, dialect)
     return _exposure(source, name, column, columns, dialect, frozenset())
@@ -921,7 +928,18 @@ def _projection_name(projection: exp.Expression, dialect: str | None) -> str | N
     the alias where Postgres binds `secret` outward, to the hidden claim.secret (measured on
     Postgres 16: the hidden values returned; Codex's fifth review of #178, M209), and refused
     `"SECRET"` referenced as written as unknown. A bare column projection exposes its own name
-    the same way; any other projection the name sqlglot gives it, unquoted. The readers of a
+    the same way. Any other projection exposes no name here: the engine names it itself, and
+    not as sqlglot's `alias_or_name` does (`(SELECT 'secret') d` is `secret` to sqlglot,
+    `?column?` to Postgres and `'secret'` to DuckDB and SQLite, each of which binds a bare
+    `secret` outward past d to the hidden claim.secret, measured; MySQL alone names the
+    literal `secret`), so read by that name the walk stopped at d and the hidden column was
+    read on three engines (Codex's first review of #180). Unnamed here, the reference binds
+    past the source as the engine binds it, and a reference to the engine's own name for such
+    a projection (`d.max` on Postgres; `secret` for the literal on MySQL, which alone names it
+    so) is not read as the source's: fail-closed, a refusal there. DuckDB names a parenthesised
+    column `(secret)` `secret`, so among a derived output's names such a projection may twin a
+    column's name, and a `_N` reference beside one is read as the engine's own and refused (the
+    gate's second round on the fourth commit). The readers of a
     derived output's names here go through it, the exposure walk, the generated-name rule and
     the member check (a RENAME's names stay folded, DuckDB's syntax, where quoting folds; the
     value check matches projections its own way, #178): read folded by the generated-name rule, `(SELECT
@@ -933,8 +951,7 @@ def _projection_name(projection: exp.Expression, dialect: str | None) -> str | N
         return resolve_identifier(projection.args.get("alias"), dialect)
     if isinstance(projection, exp.Column):
         return resolve_identifier(projection.this, dialect)
-    name = projection.alias_or_name
-    return resolve(name, quoted=False, dialect=dialect) if name else None
+    return None
 
 
 def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None,
@@ -1176,10 +1193,12 @@ def _projected_names(scope, columns, dialect: str | None, seen: frozenset[int]) 
     for projection in scope.expression.selects:
         star = _star_of(projection)
         if star is None:
-            alias = _projection_name(projection, dialect)
-            if not alias:
-                return None
-            names.append(alias)
+            # A projection with no alias keeps its position under the engine's own name, which
+            # no reference spells, so a column list still names it and a `_N` reference beside
+            # it is honest (the review gate on the fourth commit: `WITH w(a, end_hour_24) AS
+            # (SELECT 1, end_hour_24 FROM t)` was refused as a generated name once the literal's
+            # sqlglot name was gone and the output's names were "not to be told").
+            names.append(_projection_name(projection, dialect) or _ENGINE_NAMED)
             continue
         pattern = _columns_pattern(projection)
         if pattern is None and (isinstance(projection, exp.Columns) or (
