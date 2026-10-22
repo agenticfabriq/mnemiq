@@ -242,10 +242,12 @@ def _clause_of(column: exp.Column, dialect: str | None) -> tuple[str, bool]:
     as the projection list's expression, Codex's second review of #177; an aggregate's own
     DISTINCT is its clause's expression); a set operation's ORDER BY is `order`,
     sqlglot holding it under the operation. A ROLLUP, CUBE or GROUPING SETS wrapper, a
-    grouping set's parentheses, a DISTINCT ON list's and redundant parentheses around a bare
-    item (`_is_wrapper`) are structure, not an expression: `GROUP BY ROLLUP(x)` is a bare item
-    (the same review, where the wrapper made it an expression and DuckDB's table refused it),
-    and so is `GROUP BY ((x))` (the fourth). Where an alias and a source column
+    grouping set's parentheses and a DISTINCT ON list's are structure, not an expression:
+    `GROUP BY ROLLUP(x)` is a bare item (the same review, where the wrapper made it an
+    expression and DuckDB's table refused it). Redundant parentheses around a bare item are
+    structure on the engines measured alone (`_is_wrapper`, `_READS_THROUGH_PARENTHESES`):
+    `GROUP BY ((x))` is a bare item there (the fourth) and an expression on any other engine,
+    fail-closed. Where an alias and a source column
     share a name the engine reads the column first everywhere but a bare ORDER BY item (and
     HAVING on DuckDB), measured, which the resolver binds under the complete schema and the
     grant alone cannot see: the register's residual, recorded at #167."""
