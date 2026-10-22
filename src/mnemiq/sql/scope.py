@@ -914,6 +914,22 @@ def _exposed(source, column: exp.Column, columns, dialect: str | None):
     return _exposure(source, name, column, columns, dialect, frozenset())
 
 
+def _projection_name(projection: exp.Expression, dialect: str | None) -> str | None:
+    """The name a projection exposes, resolved as the engine resolves it, its quoting kept: on
+    Postgres and Oracle `1 AS "SECRET"` exposes `SECRET`, not `secret`, and read folded as if
+    unquoted it let `SELECT (SELECT secret FROM (SELECT 1 AS "SECRET") d) FROM claim` pass as
+    the alias where Postgres binds `secret` outward, to the hidden claim.secret (measured on
+    Postgres 16: the hidden values returned; Codex's fifth review of #178, M209), and refused
+    `"SECRET"` referenced as written as unknown. A bare column projection exposes its own name
+    the same way; any other projection the name sqlglot gives it, unquoted."""
+    if isinstance(projection, exp.Alias):
+        return resolve_identifier(projection.args.get("alias"), dialect)
+    if isinstance(projection, exp.Column):
+        return resolve_identifier(projection.this, dialect)
+    name = projection.alias_or_name
+    return resolve(name, quoted=False, dialect=dialect) if name else None
+
+
 def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None,
               seen: frozenset[int], listed: tuple[str, ...] | None = None):
     """What `scope` (a derived table's or CTE's) exposes under `name`, in projection order (M181).
@@ -991,8 +1007,7 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
                 return None
             continue
         if star is None:
-            alias = projection.alias_or_name
-            if alias and resolve(alias, quoted=False, dialect=dialect) == name:
+            if _projection_name(projection, dialect) == name:
                 return _NAMED
             continue
         # `COLUMNS('id')` expands only the names its pattern picks, so a later projection of a
