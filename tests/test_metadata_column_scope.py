@@ -338,6 +338,15 @@ def test_an_example_reading_a_withheld_column_through_a_unit_argument_is_not_sho
                     "SELECT * FROM query_table('o\"r\"ders')"):
         assert con.execute(example).fetchall(), example
         assert _reads_only_raw(example, frozenset({("orders", "secret_code")})) is False, example
+    # a column list renames by position, and the withheld column reaches the text under a name
+    # no token matches (Codex's first review of #181): withheld wherever a list stands over a
+    # withheld table read, shown over a table with nothing withheld
+    for example in ("SELECT date_trunc(unit, id) FROM orders AS q(id, unit)",
+                    "SELECT date_trunc(unit, id) FROM (SELECT * FROM orders) q(id, unit)",
+                    "WITH w(id, unit) AS (SELECT * FROM orders) SELECT date_trunc(unit, id) FROM w"):
+        assert sorted(con.execute(example).fetchall()) == sorted(dates), example
+        assert _reads_only_raw(example, frozenset({("orders", "secret_code")})) is False, example
+    assert _reads_only_raw("SELECT count(x) FROM other AS q(x)", frozenset({("orders", "secret_code")})) is True
     store = init_store(str(tmp_path / "s.duckdb"))
     embedder = FakeEmbedder()
     snapshot = Snapshot(version="v1", source_id="s", created_at="t", columns=_COLUMNS, examples=[

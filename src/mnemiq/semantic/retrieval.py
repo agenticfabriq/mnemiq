@@ -291,6 +291,12 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
             read |= withheld_tables
         if _reads_unnamed_columns(ast) and read & withheld_tables:
             return False
+        # A column list renames by position (`FROM orders AS q(id, unit)`, a derived table's or
+        # a CTE's list the same), so a withheld column reaches the text under a name no token
+        # matches: `date_trunc(unit, id)` read orders.secret_code on DuckDB and passed (Codex's
+        # first review of #181). Withheld wherever a list stands over a withheld table read.
+        if read & withheld_tables and any(alias.columns for alias in ast.find_all(exp.TableAlias)):
+            return False
         # Any token of the example's text the engine reads as a column where a table the example
         # reads has a withheld column so named (M210, Codex's twenty-third review of #172):
         # `date_trunc(secret_code, id)` reads the column on DuckDB while sqlglot makes a string of
