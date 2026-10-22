@@ -1775,8 +1775,17 @@ def _parameter_in_another_case(node: exp.Expression) -> bool:
     as declared. sqlglot reads the exact spelling as an Identifier and any other as a Column."""
     if not isinstance(node, (exp.Identifier, exp.Column)) or node.args.get("table"):
         return False
-    if isinstance(node, exp.Identifier) and isinstance(node.parent, exp.Column):
-        return False  # read through its Column
+    if isinstance(node, exp.Identifier) and (
+            isinstance(node.parent, exp.Column)                                            # read through its Column
+            or (isinstance(node.parent, exp.Dot) and node is node.parent.expression)        # a struct field's name, `x.X`
+            or (isinstance(node.parent, exp.PropertyEQ) and node is node.parent.this)):    # a struct key, `{X: tags}`
+        # A name in another role than a reference: a field or a key spelled like a parameter in
+        # another case names no parameter, and read as one it refused `list_transform([{X:
+        # tags}], x -> list_transform(x.X, y -> y = region))`, which DuckDB runs (Codex's
+        # forty-second review of #160). A declaration needs no exemption: its own lambda is the
+        # nearest and spells it; a body that is a bare name (`X -> x`) has the lambda as its
+        # parent too and is a reference (the review gate on round 51).
+        return False
     lam = node.find_ancestor(exp.Lambda)
     while lam is not None:
         if _declares(lam, node.name):

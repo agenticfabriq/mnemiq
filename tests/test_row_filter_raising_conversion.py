@@ -1330,12 +1330,19 @@ def test_a_parameter_spelled_in_another_case_is_no_predicate():
     assert _validate_filter("(SELECT list_transform(['q'], x -> x) FROM claim LIMIT 1) = ['SECRET']", {"id"}, "duckdb", schema) is not None
     con, snapshot = _typed_part_world()
     for row_filter in ("list_transform(tags, X -> x = region) IS NOT NULL",
+                       "list_transform(tags, x -> list_transform([attrs], X -> x)) IS NOT NULL",   # a body that is the bare name (the gate)
                        "list_transform([attrs], x -> list_transform(tags, X -> x = region)) IS NOT NULL",
                        "list_transform([attrs], x -> list_transform(tags, y -> X = attrs)) IS NOT NULL"):
         con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()   # DuckDB binds the parameter in a WHERE
         verdict = _decide(row_filter, snapshot=snapshot)
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (row_filter, verdict)
     assert isinstance(_decide("list_transform(tags, X -> X = region) IS NOT NULL", snapshot=snapshot), Approved)
+    # a struct field or key spelled like a parameter in another case names no parameter
+    # (Codex's forty-second review): DuckDB runs these, and the parameters are spelled as declared
+    for row_filter in ("list_transform([{X: tags}], x -> list_transform(x.X, y -> y = region)) = [[true]]",
+                       "list_transform([{X: tags}], x -> list_transform(x.x, y -> y = region)) = [[true]]"):
+        assert con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall() == [(1,)], row_filter
+        assert isinstance(_decide(row_filter, snapshot=snapshot), Approved), row_filter
 
 
 _PART_RULES_RUN = [
