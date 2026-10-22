@@ -143,6 +143,157 @@ def _unknown_column(name: str) -> Refusal:
     )
 
 
+# The clauses of its own SELECT in which each engine reads a select alias, as a bare item
+# (`ORDER BY x`, `GROUP BY x`) and inside an expression (`ORDER BY x + 0`, `WHERE x = 1`),
+# measured on DuckDB and SQLite (M164's fix: DuckDB reads one in a later projection, in WHERE,
+# GROUP BY, HAVING, QUALIFY, ORDER BY and inside a window's ORDER BY or PARTITION BY, not in
+# a JOIN's ON, and inside an expression everywhere but GROUP BY, where it fails to bind; SQLite
+# in WHERE, GROUP BY, HAVING, ORDER BY and an ON, bare and inside an expression alike, not in
+# a projection or a window), on Oracle 23 for a bare ORDER BY item (the register's measurement;
+# GROUP BY and HAVING there not measured, so not admitted), and as documented for Postgres
+# (GROUP BY and ORDER BY, where an output name is read as a bare item alone and inside an
+# expression as an input column: `ORDER BY xmin + 0` reads the system column, the review gate)
+# and MySQL (GROUP BY, HAVING and ORDER BY; inside an expression not measured, so not
+# admitted). An engine not listed reads a bare alias in ORDER BY alone, which every engine
+# does: fail-closed, since an alias admitted where the engine reads a column, a pseudo-column
+# or a function instead is M164's leak, and an alias refused where the engine would read it
+# costs a retry. Where a column and an alias share the name the engine reads the column
+# (measured on both), which is checked by its name.
+_ALIAS_BARE: dict[str | None, frozenset[str]] = {
+    "duckdb": frozenset({"select", "where", "group", "having", "order", "qualify", "window", "distinct"}),
+    "sqlite": frozenset({"where", "group", "having", "order", "join"}),
+    "postgres": frozenset({"group", "order", "distinct"}),  # DISTINCT ON reads a bare alias as ORDER BY does, measured on Postgres 16 (Codex's fifth review of #177)
+    "postgresql": frozenset({"group", "order", "distinct"}),
+    "mysql": frozenset({"group", "having", "order"}),
+    "oracle": frozenset({"order"}),
+    None: frozenset({"order"}),
+}
+_ALIAS_IN_EXPRESSION: dict[str | None, frozenset[str]] = {
+    "duckdb": frozenset({"select", "where", "having", "order", "qualify", "window"}),
+    "sqlite": frozenset({"where", "group", "having", "order", "join"}),
+    None: frozenset(),
+}
+
+
+def _is_distinct_on(node: exp.Expression | None) -> bool:
+    """A SELECT's own `DISTINCT ON (...)`: sqlglot wraps an aggregate's DISTINCT in the same node
+    (`count(DISTINCT x)`), which is part of its clause's expression (the review gate on the
+    fourth commit of #177, where every alias inside one was read as a DISTINCT ON item and
+    `HAVING count(DISTINCT x) > 0` refused on SQLite, which runs it)."""
+    return isinstance(node, exp.Distinct) and isinstance(node.parent, exp.Select) and node.args.get("on") is not None
+
+
+# The engines measured reading redundant parentheses around a bare item through: an engine not
+# listed keeps them an expression, fail-closed, as the table above admits nothing unmeasured
+# (the review gate on the sixth commit: Oracle reads `ORDER BY ((alias))` as the bare item, measured on Oracle 23 (its one clause with an alias)).
+_READS_THROUGH_PARENTHESES = frozenset({"duckdb", "postgres", "postgresql", "mysql", "sqlite", "oracle"})
+
+
+def _is_wrapper(node: exp.Expression, dialect: str | None) -> bool:
+    """Parentheses around a bare item that the engine reads through: a grouping set's, a
+    DISTINCT ON list's, a one-item set among them (`GROUPING SETS ((x), ())` parses `(x)` as a
+    Paren), structure on every engine; and, on the engines measured (`_READS_THROUGH_PARENTHESES`),
+    redundant ones around a GROUP BY, ROLLUP, CUBE, GROUPING SETS, DISTINCT ON or ORDER BY item
+    to any depth: `GROUP BY ((secret))` reads the alias as `GROUP BY secret` does on DuckDB, Postgres, MySQL, SQLite and Oracle 23,
+    measured, where the parentheses made the item an expression and the table refused it
+    (Codex's fourth review of #177). A list in GROUP BY (`GROUP BY (secret, id)`) is its items on
+    DuckDB and Postgres and an error on MySQL and SQLite, measured; in ORDER BY it is a row
+    constructor, an expression, which Postgres reads as input columns (measured: no alias
+    bound), so it stays one there. Parentheses beside anything else (`(secret) + 0`) are an
+    expression still."""
+    if not isinstance(node, (exp.Tuple, exp.Paren)):
+        return False
+    parent = node.parent
+    if isinstance(parent, (exp.Rollup, exp.Cube, exp.GroupingSets)) or _is_distinct_on(parent):
+        return True
+    if (dialect or "").lower() not in _READS_THROUGH_PARENTHESES:
+        return False
+    if isinstance(parent, exp.Group):
+        return True
+    if isinstance(node, exp.Tuple):
+        # A list is structure directly under its clause alone: wrapped in parentheses it is a row
+        # constructor, an expression, and the parentheses above it do not make it bare (Codex's
+        # fifth review of #177: `ORDER BY ((ctid, id))` inherited the outer parentheses' bare
+        # reading through the recursion, where Postgres reads the system column inside the row).
+        return False
+    if isinstance(parent, exp.Ordered):
+        return True
+    return _is_wrapper(parent, dialect)
+
+
+def _windowed(node: exp.Expression) -> bool:
+    """Whether an aggregate (a Func or a WITHIN GROUP, or the FILTER over one) is a window
+    function's, whose FILTER predicate and ORDER BY DuckDB binds an output alias in, measured
+    (`count(*) FILTER (WHERE secret = 1) OVER ()`, `string_agg(id ORDER BY secret) OVER ()`),
+    where a plain aggregate's bind none (Codex's fourth review of #177); Postgres binds none in
+    either, and its table admits no `window`."""
+    if isinstance(node.parent, exp.Filter):
+        node = node.parent
+    return isinstance(node.parent, exp.Window)
+
+
+def _clause_of(column: exp.Column, dialect: str | None) -> tuple[str, bool]:
+    """The clause of its own SELECT a column sits in, and whether it is the whole item there:
+    `where`, `group`, `having`, `order`, `qualify`, `join` (an ON), `window` (an OVER's own
+    ORDER BY or PARTITION BY, whatever clause holds it, and a window function's own FILTER
+    predicate and ORDER BY, which DuckDB binds an alias in, measured: Codex's fourth review of
+    #177), `aggregate` (a plain aggregate's own ORDER
+    BY or FILTER predicate, which bind to source columns alone: DuckDB rejects an alias there,
+    measured, and with a hidden column of the alias's name read it, Codex's first and third
+    reviews of #177), `limit` (a
+    LIMIT or OFFSET, where no engine measured reads an alias), or `select`, the projection
+    list, or `distinct` (the SELECT's own DISTINCT ON item, `_is_distinct_on`: DuckDB reads a
+    bare alias there and the source column inside an expression, measured, where `DISTINCT ON
+    (secret + 0)` beside an alias `secret` deduplicated on the hidden column and was admitted
+    as the projection list's expression, Codex's second review of #177; an aggregate's own
+    DISTINCT is its clause's expression); a set operation's ORDER BY is `order`,
+    sqlglot holding it under the operation. A ROLLUP, CUBE or GROUPING SETS wrapper, a
+    grouping set's parentheses and a DISTINCT ON list's are structure, not an expression:
+    `GROUP BY ROLLUP(x)` is a bare item (the same review, where the wrapper made it an
+    expression and DuckDB's table refused it). Redundant parentheses around a bare item are
+    structure on the engines measured alone (`_is_wrapper`, `_READS_THROUGH_PARENTHESES`):
+    `GROUP BY ((x))` is a bare item there (the fourth) and an expression on any other engine,
+    fail-closed. Where an alias and a source column
+    share a name the engine reads the column first everywhere but a bare ORDER BY item (and
+    HAVING on DuckDB), measured, which the resolver binds under the complete schema and the
+    grant alone cannot see: the register's residual, recorded at #167."""
+    clause, node, bare = None, column.parent, True
+    while node is not None and not isinstance(node, (exp.Select, exp.SetOperation)):
+        if isinstance(node, (exp.Window, exp.WindowSpec)):
+            return "window", bare
+        if isinstance(node, exp.Order) and isinstance(node.parent, (exp.Func, exp.WithinGroup)):
+            # WITHIN GROUP (ORDER BY ...) is no Func to sqlglot (the gate on the second commit),
+            # and under OVER it is not measured on DuckDB, so it stays the aggregate's, fail-closed
+            # (the gate on the sixth commit); a Func's own ORDER BY under OVER is the window's.
+            windowed = isinstance(node.parent, exp.Func) and _windowed(node.parent)
+            return ("window" if windowed else "aggregate"), False
+        if isinstance(node, exp.Where) and isinstance(node.parent, exp.Filter):
+            # An aggregate's FILTER (WHERE ...) binds to source columns alone, as its ORDER BY
+            # does: read as the SELECT's WHERE, where DuckDB admits an alias, `count(*) FILTER
+            # (WHERE secret = 1)` beside an alias `secret` counted the hidden column's rows, and
+            # DuckDB rejects the alias there with no such column (Codex's third review of #177).
+            # A window function's FILTER is the window's, where DuckDB binds the alias (the fourth).
+            return ("window" if _windowed(node.parent) else "aggregate"), False
+        if isinstance(node, (exp.Limit, exp.Offset)):
+            return "limit", False
+        kind = next((name for cls, name in ((exp.Where, "where"), (exp.Group, "group"), (exp.Having, "having"),
+                                            (exp.Order, "order"), (exp.Qualify, "qualify"), (exp.Join, "join"))
+                     if isinstance(node, cls)), None)
+        if kind is None and _is_distinct_on(node):
+            kind = "distinct"  # the SELECT's own DISTINCT ON, not an aggregate's DISTINCT (`count(DISTINCT x)`), the same node to sqlglot (the gate)
+        if kind is not None:
+            if clause is None:
+                clause = kind
+        elif _is_wrapper(node, dialect):
+            pass  # parentheses the engine reads through: a grouping set's, a DISTINCT ON list's, redundant ones around a bare item
+        elif not isinstance(node, (exp.Ordered, exp.Alias, exp.Rollup, exp.Cube, exp.GroupingSets)):
+            bare = False  # the column sits inside an expression of the clause
+        node = node.parent
+    if clause in ("where", "having", "qualify", "join"):
+        bare = True  # a predicate: an output name there is always inside an expression
+    return clause or "select", bare
+
+
 def check_access(ast: exp.Expression, visible: dict[str, set[str]],
                  dialect: str | None = None,
                  columns: dict[str, set[str]] | None = None) -> Refusal | None:
@@ -335,8 +486,9 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
 
     # A SELECT alias is a name the query invents for an expression, and GROUP BY / ORDER BY /
     # HAVING may refer to it: `SELECT year(d) AS y, count(*) FROM t GROUP BY y` is ordinary,
-    # correct SQL -- and without this the engine could not answer "count X by year" at all.
-    # It is safe: an alias can only be defined from columns that were themselves checked. The
+    # correct SQL -- and without this the engine could not answer "count X by year" at all,
+    # on the engines that read an alias there (`_ALIAS_BARE`, `_ALIAS_IN_EXPRESSION`: on Oracle
+    # a bare name in WHERE is a column, a pseudo-column or a function, M164). The
     # aliases of the reference's OWN SELECT, since no engine resolves a name to another scope's
     # alias (the ui lane's replay of #167: statement-wide, `SELECT (SELECT max(secret) FROM
     # claim) AS secret FROM wide` let the inner hidden `secret` through on the outer alias). In
@@ -354,6 +506,15 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     def aliases_of(column: exp.Column) -> set[str]:
         if resolved is None:
             return statement_aliases
+        clause, bare = _clause_of(column, dialect)
+        reads = _ALIAS_BARE if bare else _ALIAS_IN_EXPRESSION
+        if clause not in reads.get((dialect or "").lower(), reads[None]):
+            # The engine reads no select alias in this clause, so the name is a column, a
+            # pseudo-column or a no-argument function to it: on Oracle, `SELECT id AS mq_leak
+            # FROM claim WHERE mq_leak = 1` ran a function of that name and returned every row
+            # (M164, measured on Oracle 23), and `AS ORA_ROWSCN ... WHERE ORA_ROWSCN IS NOT NULL`
+            # filtered on the pseudo-column, where the alias had let the bare name through.
+            return set()
         select = column.find_ancestor(exp.Select, exp.SetOperation)
         while isinstance(select, (exp.SetOperation, exp.Subquery, exp.Paren)):
             # A set operation's ORDER BY names its output, which is the first branch's (the

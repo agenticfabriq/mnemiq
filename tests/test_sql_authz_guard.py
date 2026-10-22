@@ -11,7 +11,9 @@ VISIBLE = {
 
 
 def _check(sql):
-    return check_access(sqlglot.parse_one(sql, read="duckdb"), VISIBLE)
+    # As DuckDB, which the statements are parsed as: a select alias binds in the clauses the
+    # executing engine reads it in (M164), and these are DuckDB's.
+    return check_access(sqlglot.parse_one(sql, read="duckdb"), VISIBLE, "duckdb")
 
 
 def test_an_authorized_query_passes():
