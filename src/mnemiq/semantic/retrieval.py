@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -298,11 +297,13 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
         # first review of #181). Withheld wherever a list stands over a withheld table read.
         if read & withheld_tables and any(alias.columns for alias in ast.find_all(exp.TableAlias)):
             return False
-        # DuckDB reads a column by its position too, `#2` or `# 2`, which no token names (the
-        # review gate on the sixth commit and on this one): withheld wherever the text holds one
-        # over a withheld table read. A table's name or alias as a value, the whole row as a
-        # struct (`SELECT orders FROM orders`), the unnamed-columns rule withholds already.
-        if read & withheld_tables and re.search(r"#\s*\d", sql):
+        # DuckDB reads a column by its position too, `#2`, `# 2` or `#/**/2`, which no token
+        # names (the review gate on the sixth, seventh and eighth commits): a `#` has no place in an
+        # example over a withheld table, a positional reference there or MySQL's comment opener
+        # elsewhere, so the character alone withholds, a string literal holding it included. A
+        # table's name or alias as a value, the whole row as a struct (`SELECT orders FROM
+        # orders`), the unnamed-columns rule withholds already.
+        if read & withheld_tables and "#" in sql:
             return False
         # Any token of the example's text the engine reads as a column where a table the example
         # reads has a withheld column so named (M210, Codex's twenty-third review of #172):

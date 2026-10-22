@@ -346,7 +346,8 @@ def test_an_example_reading_a_withheld_column_through_a_unit_argument_is_not_sho
                     "WITH w(id, unit) AS (SELECT id, secret_code FROM orders) SELECT date_trunc(unit, id) FROM w",
                     # DuckDB reads a column by its position, which no token names (the gate)
                     "SELECT date_trunc(#2, #1) FROM orders",
-                    "SELECT date_trunc(# 2, # 1) FROM orders"):
+                    "SELECT date_trunc(# 2, # 1) FROM orders",
+                    "SELECT date_trunc(#/**/2, #--c\n1) FROM orders"):
         assert sorted(con.execute(example).fetchall()) == sorted(dates), example
         assert _reads_only_raw(example, frozenset({("orders", "secret_code")})) is False, example
     assert _reads_only_raw("SELECT count(x) FROM other AS q(x)", frozenset({("orders", "secret_code")})) is True
