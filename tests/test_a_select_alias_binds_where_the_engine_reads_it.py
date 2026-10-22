@@ -204,7 +204,7 @@ def test_redundant_parentheses_around_a_bare_item_read_through():
     for sql in wrapped:
         duck.execute(sql).fetchall()
         assert isinstance(_decide(sql, "duckdb"), Approved), sql
-    for sql in wrapped[:-1]:   # Postgres reads each too; its DISTINCT ON stays outside its table
+    for sql in wrapped:   # Postgres reads each too, DISTINCT ON since the ninth commit
         assert isinstance(_decide(sql, "postgres"), Approved), sql
     verdict = _decide("SELECT v AS x FROM claim ORDER BY (x, id)", "postgres")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
