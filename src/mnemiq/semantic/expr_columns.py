@@ -215,13 +215,17 @@ _EXECUTABLE_COMMENT = re.compile(r"/\*M?!")
 # A token's characters: MySQL's identifier class (ASCII letters, digits, `_`, `$` and every
 # character from U+0080 up), and DuckDB's, which ends a name at eighteen characters of that
 # range, measured over the Basic Multilingual Plane (`SELECT secret_code<c> FROM t` for each
-# code point): U+00A0, U+2000 to U+200B, U+202F, U+205F, U+2060, U+3000 and U+FEFF. Python's
-# `\s` is not that set: it misses the zero-width space, the word joiner and U+FEFF (the review
-# gate on the twenty-ninth commit) and holds four characters DuckDB keeps in a name (U+0085,
-# U+1680, U+2028, U+2029), where a split only withholds more. A no-break space after
-# `secret_code` was part of the token under MySQL's class alone, and DuckDB read the column
-# (Codex's twentieth review of #172), so the tokens are read under both classes.
-_DUCKDB_BOUNDARY = r"\s\u00a0\u2000-\u200b\u202f\u205f\u2060\u3000\ufeff"
+# code point): U+00A0, U+2000 to U+200B, U+202F, U+205F, U+2060, U+3000 and U+FEFF, and no
+# other. Python's `\s` is not that set: it misses the zero-width space, the word joiner and
+# U+FEFF (the review gate on the twenty-ninth commit) and holds four characters DuckDB keeps in
+# a name (U+0085, U+1680, U+2028, U+2029), at which a split is no reading of DuckDB's and lost
+# the column: a phi column named `secret_code<U+0085>` read by `secret_code<U+0085><NBSP>` was
+# `secret_code` to the split and the whole spelling to MySQL's class, neither the column, and
+# it reached the uncleared (Codex's twenty-second review). Joined readings withhold more only
+# where one of them is the engine's own. A no-break space after `secret_code` was part of the
+# token under MySQL's class alone, and DuckDB read the column (Codex's twentieth review of
+# #172), so the tokens are read under both classes.
+_DUCKDB_BOUNDARY = r"\u00a0\u2000-\u200b\u202f\u205f\u2060\u3000\ufeff"
 _IDENT_CHARS = {
     "mysql": r"[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff]",
     "duckdb": r"(?:(?![" + _DUCKDB_BOUNDARY + r"])[A-Za-z0-9_$\u0080-\uffff\U00010000-\U0010ffff])",

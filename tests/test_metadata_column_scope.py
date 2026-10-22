@@ -413,6 +413,33 @@ def test_a_pivot_carries_the_rest_of_the_row_under_an_alias_that_is_no_source_al
             assert select_metrics(["orders"], [_metric(expr)], grants, columns=columns) == [], expr
 
 
+def test_a_character_duckdb_keeps_in_a_name_is_no_boundary():
+    # Codex's twenty-second review of #172: U+0085 is part of a name to DuckDB and a no-break
+    # space ends it, so `secret_code<U+0085><NBSP>` reads the column `secret_code<U+0085>`; split
+    # at U+0085 as Python's `\s` splits, the scan read `secret_code`, and MySQL's class the whole
+    # spelling, neither the column, and the phi column so named reached the uncleared through
+    # both selectors. The boundary set is the measured one and nothing else: a split DuckDB does
+    # not make withholds less, not more.
+    from mnemiq.contract import Dimension
+    from mnemiq.semantic.expr_columns import expression_scope, keyword_columns
+    from mnemiq.semantic.measures import select_dimensions
+    for kept in ("\u0085", "\u1680", "\u2028", "\u2029"):
+        name = f"secret_code{kept}"
+        con = duckdb.connect(":memory:")
+        con.execute(f'CREATE TABLE orders(id DATE, "{name}" TEXT)')
+        con.execute("INSERT INTO orders VALUES ('2026-03-15', 'year'), ('2026-03-15', 'day')")
+        expr = f"(SELECT max(date_trunc({name}\u00a0, id)) FROM orders)"
+        assert con.execute(f"SELECT {expr}").fetchall()[0][0] is not None, repr(kept)
+        columns = [_COLUMNS[0], Column(id=f"orders.{name}", object_id="orders", name=name, data_type="text", pii_level="phi")]
+        assert expression_scope(expr, "orders") == "own", repr(kept)
+        assert name in keyword_columns(expr), repr(kept)
+        dim = Dimension(id=f"d:{expr}", label=expr, source="orders", expr=expr)
+        assert select_metrics(["orders"], [_metric(expr)], _UNCLEARED, columns=columns) == [], repr(kept)
+        assert select_metrics(["orders"], [_metric(expr)], _CLEARED, columns=columns) == [_metric(expr)], repr(kept)
+        assert select_dimensions(["orders"], [dim], _UNCLEARED, columns=columns) == [], repr(kept)
+        assert select_dimensions(["orders"], [dim], _CLEARED, columns=columns) == [dim], repr(kept)
+
+
 def test_a_mysql_executable_comment_is_withheld_from_everyone():
     # Codex's twenty-first review of #172: MySQL runs `/*! ... */` (and `/*!50000 ... */` from
     # that version) as code, measured, where every other engine reads a comment, so the parse
