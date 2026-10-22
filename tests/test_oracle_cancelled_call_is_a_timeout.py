@@ -121,7 +121,7 @@ def test_execute_arrow_reads_the_cancel_against_its_own_deadline(monkeypatch, el
             adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=4.9995)
     else:
         # Before the deadline the cancel is anyone's: raised as the cancel it is, the driver's
-        # ORA-01013 its cause, so the runner neither reads it as an outage nor re-runs it (the
+        # ORA-01013 its cause, so the runner does not read it as an outage (the
         # review gate on M188).
         with pytest.raises(QueryCancelled, match="ORA-01013") as caught:
             adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=4.9995)

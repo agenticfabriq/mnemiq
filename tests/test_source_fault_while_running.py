@@ -5,8 +5,10 @@ dropped after the proof, or mid-fetch, reached the runner as "The source rejecte
 the loop handed it to the model as repair feedback: a correct query rewritten because the network
 failed. Measured on the runtime's Postgres path (DuckDB's attach of a live Postgres, reconnects
 refused): a duckdb IOException, which the adapter's own `source_unavailable` already called an
-outage, and nobody asked it there. With reconnects allowed the very next run succeeded, which is
-why the loop re-runs the same approved statement once, without the model, before it gives up.
+outage, and nobody asked it there. The turn now ends on it, reported as the outage it is, and the
+statement is never run again: a first draft re-ran it once, and Codex's review of #179 showed a cancel or
+a statement timeout worded in another language, and an administrator's kill, all read as outages, so the
+re-run repeated the very query someone had stopped.
 
 Real DuckDB sources whose connection closes at a chosen run; Oracle's and SQLite's timeouts through
 their own `execute_arrow`.
@@ -264,16 +266,18 @@ def test_a_source_down_at_the_run_fails_the_turn_without_asking_the_model_to_rep
     source = _DropsAtRun(_duckdb(tmp_path), at=1)
     answer, generator = _ask(source)
     assert len(generator.calls) == 1, generator.calls
-    assert source.runs == 2, "one re-run of the same statement, then the outage"
+    assert source.runs == 1, "the statement is not run again"
     _is_the_outage(answer)
 
 
-def test_a_connection_that_drops_once_is_answered_by_the_rerun(tmp_path):
+def test_a_connection_that_drops_once_is_not_run_again(tmp_path):
+    # The source would answer the next run, as the Postgres attach reconnects, and it still ends the
+    # turn: the drop cannot be told apart from an administrator's kill or a cancel in another language.
     source = _DropsOnceAtRun(_duckdb(tmp_path), at=1)
     answer, generator = _ask(source)
-    assert answer.failed is False and answer.deferred is False, answer
-    assert len(generator.calls) == 1, "the re-run is the same statement: no model call"
-    assert source.runs == 2
+    _is_the_outage(answer)
+    assert len(generator.calls) == 1
+    assert source.runs == 1
 
 
 def test_the_caller_reads_failed_and_not_deferred(tmp_path):
@@ -288,7 +292,7 @@ def test_deep_mode_stops_at_the_first_run_the_source_does_not_answer(tmp_path):
     source = _DropsAtRun(_duckdb(tmp_path), at=1)
     answer, generator = _ask(source, candidates=5)
     assert len(generator.calls) == 1, generator.calls
-    assert source.runs == 2
+    assert source.runs == 1
     _is_the_outage(answer)
     assert answer.candidates_executed == 0
 
@@ -301,21 +305,22 @@ def test_deep_mode_fails_the_turn_when_the_source_goes_down_after_a_candidate_ra
     assert answer.candidates_executed == 1
 
 
-def test_deep_mode_keeps_a_candidate_whose_rerun_answers(tmp_path):
+def test_deep_mode_stops_on_a_drop_the_source_would_answer_next_time(tmp_path):
     source = _DropsOnceAtRun(_duckdb(tmp_path), at=1)
     answer, generator = _ask(source, candidates=5)
-    assert answer.failed is False, answer
-    assert answer.candidates_executed == 5
-    assert len(generator.calls) == 5
+    _is_the_outage(answer)
+    assert answer.candidates_executed == 0
+    assert len(generator.calls) == 1
+    assert source.runs == 1
 
 
-# -- a cancel the bound did not send: neither an outage nor re-run (the review gate on M188) ------
+# -- a cancel the bound did not send is a cancel (the review gate on M188) ------------------------
 #
 # Measured on the Postgres attach: `pg_cancel_backend` from another session raises DuckDB's
 # IOException ("canceling statement due to user request"), which the classifier calls unavailable,
 # and Oracle's ORA-01013 before the deadline is an OperationalError, which its classifier calls
-# unavailable too. Read as outages they were re-run, undoing a cancel aimed at a runaway query. A
-# cancel keeps the reading it had before M188, a failure the repair loop handles, now named.
+# unavailable too. Read as outages they would be reported as the source not answering. A cancel keeps
+# the reading it had before M188, a failure the repair loop handles, now named.
 
 
 def test_a_postgres_cancel_through_the_attach_is_a_cancel():
@@ -387,3 +392,60 @@ def test_a_cancelled_statement_is_not_rerun_as_it_was(tmp_path):
     assert answer.reason_code is not DeferralReason.SOURCE_UNAVAILABLE, answer
     assert len(generator.calls) == 2, "the repair loop's next attempt, as before M188"
     assert source.sqls[0] != source.sqls[1], "the cancelled statement itself was run again"
+
+
+# -- worded in another language: read as an outage, and never run again (Codex's review of #179) ------
+#
+# The attach carries no SQLSTATE, only the server's message, so a cancel or a statement timeout from a
+# Postgres whose `lc_messages` is not English matches neither English guard and reads as an outage. That
+# is a misreport this accepts and states, and it costs the turn, never a second run of the statement.
+
+
+_GERMAN_CANCEL = ("IO Error: Failed to fetch header for COPY: FEHLER:  storniere Anfrage wegen "
+                  "Benutzeranforderung")
+_GERMAN_TIMEOUT = ("IO Error: Failed to fetch header for COPY: FEHLER:  storniere Anfrage wegen "
+                   "Zeitüberschreitung der Anweisung")
+
+
+class _GermanAtRun(_DropsAtRun):
+    """Run number `at` ends with the attach's own fault for a server message in German, raised
+    through `execute_bounded` as a Postgres source's would be."""
+
+    def __init__(self, inner, at, message):
+        super().__init__(inner, at)
+        self._message = message
+
+    def execute_arrow(self, sql, timeout_s=None):
+        from mnemiq.adapters.duckdb import execute_bounded
+
+        self.runs += 1
+        if self.runs == self._at:
+            message = self._message
+
+            class Con:
+                def interrupt(self):
+                    pass
+
+                def execute(self, q):
+                    raise duckdb.IOException(message)
+
+            return execute_bounded(Con(), sql, timeout_s)
+        return self._inner.execute_arrow(sql, timeout_s=timeout_s)
+
+
+@pytest.mark.parametrize("message", [_GERMAN_CANCEL, _GERMAN_TIMEOUT], ids=["cancel", "statement-timeout"])
+def test_a_cancel_or_timeout_in_another_language_ends_the_turn_and_is_not_run_again(tmp_path, message):
+    source = _GermanAtRun(_duckdb(tmp_path), at=1, message=message)
+    answer, generator = _ask(source)
+    _is_the_outage(answer)
+    assert source.runs == 1, "the stopped statement ran again"
+    assert len(generator.calls) == 1
+
+
+@pytest.mark.parametrize("message", [_GERMAN_CANCEL, _GERMAN_TIMEOUT], ids=["cancel", "statement-timeout"])
+def test_deep_mode_does_not_run_a_stopped_statement_again_either(tmp_path, message):
+    source = _GermanAtRun(_duckdb(tmp_path), at=1, message=message)
+    answer, generator = _ask(source, candidates=5)
+    _is_the_outage(answer)
+    assert source.runs == 1
+    assert answer.candidates_executed == 0

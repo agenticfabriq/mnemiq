@@ -1358,7 +1358,7 @@ class OracleAdapter:
             if _is_cancel(exc):
                 # ORA-01013 before the deadline: anyone's cancel, not the bound's, and not an
                 # outage either, though the classifier calls the driver's cancel unavailable (the
-                # review gate on M188): read as one, the runner would re-run what was stopped.
+                # review gate on M188): read as one, the turn would end as the source's fault.
                 raise QueryCancelled(f"the source cancelled the query: {exc}") from exc
             raise
 
@@ -1818,7 +1818,7 @@ _UNAVAILABLE_DPY = frozenset({
     # (`prove_outcome`), where a `cursor.parse` decodes no value, so each of these is the wire's or
     # the handshake's, never the statement's; and the runner while a statement runs (M188), where
     # a value decoder can raise 5001 to 5006 on one statement's rows, which then reads as the
-    # source unavailable: re-run once and reported as an outage, a reading both lanes accepted
+    # source unavailable: reported as an outage and not run again, a reading both lanes accepted
     # (a result the driver could not read is not the model's to repair either way, and the turn
     # reports the class alone).
     # Left out: ERR_UNEXPECTED_XML_TYPE 5007 (impl/thin/dbobject.pyx) and
