@@ -184,6 +184,10 @@ def test_a_window_functions_filter_and_order_by_read_the_alias_on_duckdb():
         duck.execute(plain).fetchall()
     verdict = _decide(plain, "duckdb")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    # WITHIN GROUP under OVER is not measured on DuckDB (no aggregate here takes that form under
+    # a window), so it stays the aggregate's and admits no alias (the gate's round)
+    verdict = _decide("SELECT v AS x, percentile_disc(0.5) WITHIN GROUP (ORDER BY x) OVER () AS p FROM claim", "duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
 
 
 def test_redundant_parentheses_around_a_bare_item_read_through():
@@ -204,6 +208,11 @@ def test_redundant_parentheses_around_a_bare_item_read_through():
         assert isinstance(_decide(sql, "postgres"), Approved), sql
     verdict = _decide("SELECT v AS x FROM claim ORDER BY (x, id)", "postgres")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    # an engine not measured keeps the parentheses an expression, fail-closed (the gate's round)
+    assert isinstance(_decide("SELECT v AS x FROM claim ORDER BY ((x))", "oracle"), Approved)   # measured on Oracle 23
+    verdict = _decide("SELECT v AS x FROM claim ORDER BY ((x))", "snowflake")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    assert isinstance(_decide("SELECT v AS x FROM claim ORDER BY x", "snowflake"), Approved)
     with pytest.raises(duckdb.Error):
         duck.execute("SELECT v AS x FROM claim GROUP BY (x) + 0").fetchall()
     verdict = _decide("SELECT v AS x FROM claim GROUP BY (x) + 0", "duckdb")

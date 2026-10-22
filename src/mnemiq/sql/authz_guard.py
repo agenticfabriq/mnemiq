@@ -183,25 +183,36 @@ def _is_distinct_on(node: exp.Expression | None) -> bool:
     return isinstance(node, exp.Distinct) and isinstance(node.parent, exp.Select) and node.args.get("on") is not None
 
 
-def _is_wrapper(node: exp.Expression) -> bool:
+# The engines measured reading redundant parentheses around a bare item through: an engine not
+# listed keeps them an expression, fail-closed, as the table above admits nothing unmeasured
+# (the review gate on the sixth commit: Oracle reads `ORDER BY ((alias))` as the bare item, measured on Oracle 23 (its one clause with an alias)).
+_READS_THROUGH_PARENTHESES = frozenset({"duckdb", "postgres", "postgresql", "mysql", "sqlite", "oracle"})
+
+
+def _is_wrapper(node: exp.Expression, dialect: str | None) -> bool:
     """Parentheses around a bare item that the engine reads through: a grouping set's, a
     DISTINCT ON list's, a one-item set among them (`GROUPING SETS ((x), ())` parses `(x)` as a
-    Paren), and redundant ones around a GROUP BY, ROLLUP, CUBE, GROUPING SETS, DISTINCT ON or
-    ORDER BY item to any depth: `GROUP BY ((secret))` reads the alias as `GROUP BY secret` does
-    on DuckDB, Postgres, MySQL and SQLite, measured, where the parentheses made the item an
-    expression and the table refused it (Codex's fourth review of #177). A list in GROUP BY
-    (`GROUP BY (secret, id)`) is its items on DuckDB and Postgres and an error on MySQL and
-    SQLite, measured; in ORDER BY it is a row constructor, an expression, which Postgres reads
-    as input columns (measured: no alias bound), so it stays one there. Parentheses beside
-    anything else (`(secret) + 0`) are an expression still."""
+    Paren), structure on every engine; and, on the engines measured (`_READS_THROUGH_PARENTHESES`),
+    redundant ones around a GROUP BY, ROLLUP, CUBE, GROUPING SETS, DISTINCT ON or ORDER BY item
+    to any depth: `GROUP BY ((secret))` reads the alias as `GROUP BY secret` does on DuckDB, Postgres, MySQL, SQLite and Oracle 23,
+    measured, where the parentheses made the item an expression and the table refused it
+    (Codex's fourth review of #177). A list in GROUP BY (`GROUP BY (secret, id)`) is its items on
+    DuckDB and Postgres and an error on MySQL and SQLite, measured; in ORDER BY it is a row
+    constructor, an expression, which Postgres reads as input columns (measured: no alias
+    bound), so it stays one there. Parentheses beside anything else (`(secret) + 0`) are an
+    expression still."""
     if not isinstance(node, (exp.Tuple, exp.Paren)):
         return False
     parent = node.parent
-    if isinstance(parent, (exp.Group, exp.Rollup, exp.Cube, exp.GroupingSets)) or _is_distinct_on(parent):
+    if isinstance(parent, (exp.Rollup, exp.Cube, exp.GroupingSets)) or _is_distinct_on(parent):
+        return True
+    if (dialect or "").lower() not in _READS_THROUGH_PARENTHESES:
+        return False
+    if isinstance(parent, exp.Group):
         return True
     if isinstance(parent, exp.Ordered):
         return isinstance(node, exp.Paren)
-    return _is_wrapper(parent)
+    return _is_wrapper(parent, dialect)
 
 
 def _windowed(node: exp.Expression) -> bool:
@@ -215,7 +226,7 @@ def _windowed(node: exp.Expression) -> bool:
     return isinstance(node.parent, exp.Window)
 
 
-def _clause_of(column: exp.Column) -> tuple[str, bool]:
+def _clause_of(column: exp.Column, dialect: str | None) -> tuple[str, bool]:
     """The clause of its own SELECT a column sits in, and whether it is the whole item there:
     `where`, `group`, `having`, `order`, `qualify`, `join` (an ON), `window` (an OVER's own
     ORDER BY or PARTITION BY, whatever clause holds it, and a window function's own FILTER
@@ -243,8 +254,11 @@ def _clause_of(column: exp.Column) -> tuple[str, bool]:
         if isinstance(node, (exp.Window, exp.WindowSpec)):
             return "window", bare
         if isinstance(node, exp.Order) and isinstance(node.parent, (exp.Func, exp.WithinGroup)):
-            # WITHIN GROUP (ORDER BY ...) is no Func to sqlglot (the gate on the second commit)
-            return ("window" if _windowed(node.parent) else "aggregate"), False
+            # WITHIN GROUP (ORDER BY ...) is no Func to sqlglot (the gate on the second commit),
+            # and under OVER it is not measured on DuckDB, so it stays the aggregate's, fail-closed
+            # (the gate on the sixth commit); a Func's own ORDER BY under OVER is the window's.
+            windowed = isinstance(node.parent, exp.Func) and _windowed(node.parent)
+            return ("window" if windowed else "aggregate"), False
         if isinstance(node, exp.Where) and isinstance(node.parent, exp.Filter):
             # An aggregate's FILTER (WHERE ...) binds to source columns alone, as its ORDER BY
             # does: read as the SELECT's WHERE, where DuckDB admits an alias, `count(*) FILTER
@@ -262,7 +276,7 @@ def _clause_of(column: exp.Column) -> tuple[str, bool]:
         if kind is not None:
             if clause is None:
                 clause = kind
-        elif _is_wrapper(node):
+        elif _is_wrapper(node, dialect):
             pass  # parentheses the engine reads through: a grouping set's, a DISTINCT ON list's, redundant ones around a bare item
         elif not isinstance(node, (exp.Ordered, exp.Alias, exp.Rollup, exp.Cube, exp.GroupingSets)):
             bare = False  # the column sits inside an expression of the clause
@@ -477,7 +491,7 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     def aliases_of(column: exp.Column) -> set[str]:
         if resolved is None:
             return statement_aliases
-        clause, bare = _clause_of(column)
+        clause, bare = _clause_of(column, dialect)
         reads = _ALIAS_BARE if bare else _ALIAS_IN_EXPRESSION
         if clause not in reads.get((dialect or "").lower(), reads[None]):
             # The engine reads no select alias in this clause, so the name is a column, a
