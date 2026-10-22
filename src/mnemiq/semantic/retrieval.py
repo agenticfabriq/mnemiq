@@ -279,8 +279,10 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
         # `query_table('orders')` is a Table with no name to sqlglot and `query_table('main.orders')`
         # names the table inside a dotted string, `TABLE orders` is a Table named `TABLE` and a
         # CTE over it is its own name, and DuckDB reads orders through each (the review gate on
-        # the second and third commits).
-        read = {t.name.lower() for t in ast.find_all(exp.Table)} | {token.rsplit(".", 1)[-1] for token in tokens}
+        # the second and third commits); a name quoted inside the string (`query_table('"orders"')`)
+        # keeps its quotes as a token, stripped here (the gate on the third).
+        read = {t.name.lower() for t in ast.find_all(exp.Table)} | {
+            token.rsplit(".", 1)[-1].strip('"`') for token in tokens}
         if _reads_unnamed_columns(ast) and read & withheld_tables:
             return False
         # Any token of the example's text the engine reads as a column where a table the example
