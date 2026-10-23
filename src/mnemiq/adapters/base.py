@@ -20,9 +20,10 @@ class QueryCancelled(RuntimeError):
     request", Oracle's ORA-01013 before the deadline). Neither an outage nor a timeout: the
     driver's classifier calls the cancel unavailable, the right reading at the proof, but at the
     run that reading would end the turn telling the caller the source did not answer (the review
-    gate on M188). The runner reports it as the cancel it is, and it reaches the repair loop as it
-    did before. A cancel worded in another language is not recognised and keeps the outage
-    reading: it ends the turn, and is never run again."""
+    gate on M188). The runner reports it as the cancel it is, and the turn ends on it rather than
+    reaching the repair loop, where a model writing the same SQL again would run the stopped
+    statement a second time (Codex's second review of #179). A cancel worded in another language is
+    not recognised and keeps the outage reading: it ends the turn too, and is never run again."""
 
 
 class SourceAdapter(Protocol):

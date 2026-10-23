@@ -17,6 +17,7 @@ their own `execute_arrow`.
 from __future__ import annotations
 
 import sqlite3
+import sys
 import time
 
 import duckdb
@@ -319,8 +320,9 @@ def test_deep_mode_stops_on_a_drop_the_source_would_answer_next_time(tmp_path):
 # Measured on the Postgres attach: `pg_cancel_backend` from another session raises DuckDB's
 # IOException ("canceling statement due to user request"), which the classifier calls unavailable,
 # and Oracle's ORA-01013 before the deadline is an OperationalError, which its classifier calls
-# unavailable too. Read as outages they would be reported as the source not answering. A cancel keeps
-# the reading it had before M188, a failure the repair loop handles, now named.
+# unavailable too. Read as outages they would be reported as the source not answering. A cancel ends
+# the turn, reported as the cancel it is: handed to the repair loop, as before M188, a model that wrote
+# the same SQL again ran the stopped statement a second time (Codex's second review of #179).
 
 
 def test_a_postgres_cancel_through_the_attach_is_a_cancel():
@@ -341,6 +343,7 @@ def test_a_postgres_cancel_through_the_attach_is_a_cancel():
 
 def test_the_runner_reads_a_cancel_as_neither_an_outage_nor_a_timeout():
     from mnemiq.adapters.base import QueryCancelled
+    from mnemiq.execute.runner import QueryCancelledError
 
     class Cancelled:
         def source_unavailable(self, exc):
@@ -349,19 +352,22 @@ def test_the_runner_reads_a_cancel_as_neither_an_outage_nor_a_timeout():
         def execute_arrow(self, sql, timeout_s=None):
             raise QueryCancelled("the source cancelled the query: canceling statement due to user request")
 
-    with pytest.raises(ExecutionError) as caught:
+    with pytest.raises(QueryCancelledError) as caught:
         run(Cancelled(), "SELECT 1")
+    assert isinstance(caught.value, ExecutionError), "every caller catching ExecutionError still catches it"
     assert not isinstance(caught.value, SourceUnavailableError)
     assert "cancelled" in caught.value.message and "timed out" not in caught.value.message
 
 
 def test_oracles_cancel_before_the_deadline_is_a_cancel_and_not_an_outage(oracle, monkeypatch):
+    from mnemiq.execute.runner import QueryCancelledError
+
     oracledb, driver_error, adapter = oracle
     cancel = driver_error("ORA-01013: user requested cancel of current operation", 1013,
                           oracledb.OperationalError)
     clock = iter([0.0, 100.0, 100.5])   # ended half a second into a 5 s bound
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
-    with pytest.raises(ExecutionError) as caught:
+    with pytest.raises(QueryCancelledError) as caught:
         run(adapter(_raise(cancel)), "SELECT 1 FROM dual", timeout_s=5)
     assert not isinstance(caught.value, SourceUnavailableError)
     assert "cancelled" in caught.value.message
@@ -386,12 +392,34 @@ class _CancelledAtRun(_DropsAtRun):
         return self._inner.execute_arrow(sql, timeout_s=timeout_s)
 
 
-def test_a_cancelled_statement_is_not_rerun_as_it_was(tmp_path):
+_SAME = ['{"sql": "SELECT id FROM claim WHERE id > 0", "reason": "ok"}'] * 12
+
+
+def _is_the_cancel(answer):
+    assert answer.failed is True and answer.deferred is False, answer
+    assert answer.reason_code is DeferralReason.EXECUTION_FAILED, answer.reason_code
+    assert "cancelled" in answer.answer, answer.answer
+
+
+@pytest.mark.parametrize("candidates", [1, 5], ids=["single", "deep"])
+def test_a_cancelled_statement_ends_the_turn_though_the_model_would_write_it_again(tmp_path, monkeypatch, candidates):
+    # The model writes the same SQL every time, as it often does once repaired: the cancelled
+    # statement runs once, and nothing after it.
+    monkeypatch.setattr(sys.modules[__name__], "_REPLIES", _SAME)
     source = _CancelledAtRun(_duckdb(tmp_path), at=1)
-    answer, generator = _ask(source)
-    assert answer.reason_code is not DeferralReason.SOURCE_UNAVAILABLE, answer
-    assert len(generator.calls) == 2, "the repair loop's next attempt, as before M188"
-    assert source.sqls[0] != source.sqls[1], "the cancelled statement itself was run again"
+    answer, generator = _ask(source, candidates=candidates)
+    _is_the_cancel(answer)
+    assert source.runs == 1, source.sqls
+    assert len(generator.calls) == 1, generator.calls
+    assert answer.candidates_executed in (None, 0)
+
+
+def test_deep_mode_ends_the_turn_on_a_cancel_after_a_candidate_ran(tmp_path):
+    source = _CancelledAtRun(_duckdb(tmp_path), at=2)
+    answer, generator = _ask(source, candidates=5)
+    _is_the_cancel(answer)
+    assert answer.candidates_executed == 1
+    assert source.runs == 2 and len(generator.calls) == 2
 
 
 # -- worded in another language: read as an outage, and never run again (Codex's review of #179) ------

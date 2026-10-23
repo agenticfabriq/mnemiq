@@ -53,6 +53,13 @@ class SourceUnavailableError(ExecutionError):
     keeps its reading, a statement that produced no table."""
 
 
+class QueryCancelledError(ExecutionError):
+    """The source ended the statement on a cancel the bound did not send: an operator's or another
+    session's. Neither the statement's failure nor an outage, and ended on, not repaired: handed to
+    the repair loop, a model that wrote the same SQL again ran the stopped statement a second time
+    (Codex's second review of #179). An `ExecutionError` still, as `SourceUnavailableError` is."""
+
+
 @dataclass
 class ExecutionResult:
     table: pa.Table
@@ -82,10 +89,10 @@ def run(adapter, sql: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> ExecutionRes
         if isinstance(exc, QueryCancelled):
             # Before the outage question, which the driver's classifier answers yes for its own
             # cancel: read as an outage, the statement someone stopped would be run again.
-            raise ExecutionError(
+            raise QueryCancelledError(
                 "The source cancelled this query before it finished: an operator or another "
-                "session stopped it. If it was too expensive, make it cheaper: fewer joins, "
-                "narrower filters, or an aggregate instead of raw rows.",
+                "session stopped it, so it was not run again. Ask again once whoever stopped it "
+                "is done; the server log has the source's words.",
                 source_detail=str(exc),
             ) from exc
         if source_did_not_answer(adapter, exc):
