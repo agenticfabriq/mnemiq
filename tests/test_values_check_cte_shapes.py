@@ -458,3 +458,26 @@ def test_a_source_whose_output_the_walk_cannot_name_keeps_the_statement_wide_rea
     sql = "WITH x(region, doc) AS (SELECT * FROM t) SELECT count(*) FROM x WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u) AS y WHERE doc = 'west')"
     assert con.execute(sql).fetchall() == [(1,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None
+
+
+def test_a_natural_join_beside_sources_lacking_the_name_leaves_it_to_the_enclosing_scope():
+    # Codex's seventh review of #178: `EXISTS (SELECT 1 FROM w NATURAL JOIN w AS b WHERE doc =
+    # 'west')` compares the outer `t.doc`, neither `w` holding `doc`, and the NATURAL skip let an
+    # absent value through where the statement-wide reading had refused it. Beside a source
+    # holding the name the merged column is the join's, unsettled, and the skip stands.
+    visible = {**VISIBLE, "v": {"doc", "k", "name"}, "w": {"k"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'); "
+                "CREATE TABLE v (doc VARCHAR, k INTEGER, name VARCHAR); INSERT INTO v VALUES ('west', 1, 'n'); "
+                "CREATE TABLE w (k VARCHAR); INSERT INTO w VALUES ('west')")
+    sql = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM w NATURAL JOIN w AS b WHERE doc = 'west')"
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index())
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
+    sql = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM v NATURAL JOIN v AS b WHERE doc = 'west')"
+    assert con.execute(sql).fetchall() == [(1,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None
+    # and a base table renamed by position may hold the name under any spelling (`z(doc)` is `w.k`)
+    sql = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM w AS z(doc) NATURAL JOIN w AS b(doc) WHERE doc = 'west')"
+    assert con.execute(sql).fetchall() == [(1,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None

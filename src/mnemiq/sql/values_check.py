@@ -147,6 +147,18 @@ def _names(source: Scope, wanted: str, dialect: str | None, visible: dict[str, s
     return False
 
 
+def _may_hold(source: exp.Expression | Scope, wanted: str, dialect: str | None,
+              visible: dict[str, set[str]]) -> bool:
+    """Whether a source can hold the column in its output: a base table by its granted columns,
+    one renamed by position by any, a local source by `_names`, holding unless it answers no."""
+    if isinstance(source, exp.Table):
+        renamed = source.args.get("alias")
+        if isinstance(renamed, exp.TableAlias) and renamed.columns:
+            return True
+        return any(wanted in _stored(c, dialect) for c in visible.get(source.name, ()))
+    return not isinstance(source, Scope) or _names(source, wanted, dialect, visible) is not False
+
+
 def _same_column(column: exp.Column, alias: str) -> exp.Column:
     """The column's name, quoting kept, under another qualifier: rebuilt by `exp.column(name,
     table=...)` it was unquoted, which the engine folds where the written one it does not."""
@@ -317,11 +329,17 @@ def check_values(
         # join inside a subquery is another scope's, and read here it switched the check
         # off for the outer column (the review gate on the fourth round). A NATURAL
         # join's keys are every name its sides share, which a set of granted names
-        # cannot settle, so the name answers nothing (Codex's third review of #178:
-        # `t NATURAL RIGHT JOIN (SELECT region AS doc FROM t) q` compares `t.region`).
+        # cannot settle, so the name answers nothing where a source holds or may hold it
+        # (Codex's third review of #178: `t NATURAL RIGHT JOIN (SELECT region AS doc FROM
+        # t) q` compares `t.region`); beside sources none of which can hold the name the
+        # join is no part of its binding, and the enclosing scope is asked (Codex's seventh
+        # review: `EXISTS (SELECT 1 FROM w NATURAL JOIN w b WHERE doc = 'west')` compares
+        # the outer `t.doc`, and the skip let an absent value through where the
+        # statement-wide reading had refused it).
         for join in scope.expression.args.get("joins") or []:
             if (join.method or "").upper() == "NATURAL":
-                return None
+                return None if any(_may_hold(source, wanted, dialect, visible)
+                                   for _, source in scope.selected_sources.values()) else _ABSENT
             if not any(_written(key, dialect) == wanted for key in (join.args.get("using") or ())):
                 continue
             side = (join.side or "").upper()
