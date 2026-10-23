@@ -342,14 +342,13 @@ def test_a_name_through_a_star_comes_from_the_scopes_one_selected_source():
 
 
 def test_the_shapes_only_the_statement_wide_reading_answers_still_refuse():
-    # The gate's second round: a star over a join, a set operation, a recursive CTE and a
-    # correlated name resolve to no owner in their scope alone, and the statement-wide
-    # reading, kept as the fallback, refuses each as before.
+    # The gate's second round: a star over a join, a set operation and a recursive CTE resolve
+    # to no owner in their scope alone, and the statement-wide reading, kept as the fallback,
+    # refuses each as before.
     for sql in ("WITH x AS (SELECT * FROM t JOIN u ON t.region = u.name) SELECT count(*) FROM x WHERE doc = 'west'",
                 "WITH x AS (SELECT t.* FROM t JOIN u ON t.region = u.name) SELECT count(*) FROM x WHERE doc = 'west'",
                 "WITH x AS (SELECT doc FROM t UNION ALL SELECT doc FROM t) SELECT count(*) FROM x WHERE doc = 'west'",
-                "WITH RECURSIVE r AS (SELECT doc FROM t UNION ALL SELECT doc FROM r WHERE false) SELECT count(*) FROM r WHERE doc = 'west'",
-                "SELECT count(*) FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.region = u.name AND doc = 'west')"):
+                "WITH RECURSIVE r AS (SELECT doc FROM t UNION ALL SELECT doc FROM r WHERE false) SELECT count(*) FROM r WHERE doc = 'west'"):
         verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), {**VISIBLE, "u": {"name"}}, _Index())
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
 
@@ -374,3 +373,88 @@ def test_the_one_cte_control_and_a_present_literal_still_behave():
     _refused_on_doc("WITH x AS (SELECT doc FROM t) SELECT count(*) FROM x WHERE x.doc = 'west'")
     assert _check("WITH x AS (SELECT doc FROM t) SELECT count(*) FROM x WHERE x.doc = 'a'") is None
     assert _check("WITH x(region, doc) AS (SELECT doc, region FROM t) SELECT count(*) FROM x WHERE x.region = 'a'") is None
+
+
+def test_a_correlated_name_is_read_in_the_enclosing_scopes_before_the_statement_wide_reading():
+    # Codex's sixth review of #178: `doc` inside the EXISTS names no column of `u`, so DuckDB
+    # binds it to the enclosing scope's `x.doc`, `t.region` through the column list over a star,
+    # whose base column the walk leaves unknown; read statement-wide it was `t.doc`, and the
+    # present value 'west' was refused. The same through two levels of subquery, a LATERAL
+    # derived table, a derived table DuckDB correlates without the keyword, and a scalar
+    # subquery in the select list; the qualified `x.doc` skips the same way.
+    visible = {**VISIBLE, "u": {"name"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east'); "
+                "CREATE TABLE u (name VARCHAR); INSERT INTO u VALUES ('n')")
+    for sql in ("WITH x(region, doc) AS (SELECT * FROM t) SELECT count(*) FROM x WHERE EXISTS (SELECT 1 FROM u WHERE doc = 'west')",
+                "WITH x(region, doc) AS (SELECT * FROM t) SELECT count(*) FROM x WHERE EXISTS (SELECT 1 FROM u WHERE x.doc = 'west')",
+                "WITH x(region, doc) AS (SELECT * FROM t) SELECT count(*) FROM x "
+                "WHERE EXISTS (SELECT 1 FROM u WHERE EXISTS (SELECT 1 FROM u AS u2 WHERE doc = 'west'))",
+                "WITH x(region, doc) AS (SELECT * FROM t) SELECT count(*) FROM x, LATERAL (SELECT 1 FROM u WHERE doc = 'west') AS d",
+                "WITH x(region, doc) AS (SELECT * FROM t) SELECT count(*) FROM x, (SELECT 1 FROM u WHERE doc = 'west') AS d"):
+        assert con.execute(sql).fetchall() == [(1,)], sql
+        assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None, sql
+    sql = "WITH x(region, doc) AS (SELECT * FROM t) SELECT (SELECT count(*) FROM u WHERE doc = 'west') FROM x"
+    assert con.execute(sql).fetchall() == [(1,), (0,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None
+
+
+def test_a_correlated_name_an_enclosing_base_table_holds_is_checked_against_it():
+    # The controls: the enclosing scope's base table owns the name, under its alias too, and
+    # the wrong literal counts nothing there, so the check refuses naming `t.doc`, by the walk
+    # through the scopes and not by the statement-wide reading; and a name the subquery's own
+    # source holds is that source's, `t.doc` under a correlated `u.name` (the gate's second
+    # round). The inner scope's own source wins where both hold the name
+    # (`test_a_subquerys_own_column_is_read_in_its_own_scope`).
+    visible = {**VISIBLE, "u": {"name"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east'); "
+                "CREATE TABLE u (name VARCHAR); INSERT INTO u VALUES ('n')")
+    for sql in ("SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE doc = 'west')",
+                "SELECT count(*) FROM t AS q WHERE EXISTS (SELECT 1 FROM u WHERE q.doc = 'west')",
+                "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE EXISTS (SELECT 1 FROM u AS u2 WHERE doc = 'west'))",
+                "SELECT count(*) FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.region = u.name AND doc = 'west')"):
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index())
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+
+
+def test_a_source_whose_output_the_walk_cannot_name_keeps_the_statement_wide_reading():
+    # The review gate on round 9: a derived table over a star over a join, or over a set
+    # operation, may yield the name, and the engine binds there (`y.doc` is `v.doc`, unindexed),
+    # so the scope is not passed for the enclosing one, where `t` would own the name and refuse
+    # a present value; the statement-wide reading, kept, sees `t` and `v` and skips as before.
+    # A source naming the column as an expression, through a star or not (`doc || '' AS doc`,
+    # the gate's second round on this change), holds the name, and nothing is checked.
+    visible = {**VISIBLE, "u": {"name"}, "v": {"doc", "k", "name"}, "w": {"k"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'); "
+                "CREATE TABLE u (name VARCHAR); INSERT INTO u VALUES ('n'); "
+                "CREATE TABLE v (doc VARCHAR, k INTEGER, name VARCHAR); INSERT INTO v VALUES ('west', 1, 'n'); "
+                "CREATE TABLE w (k VARCHAR); INSERT INTO w VALUES ('west')")
+    for sql in ("SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN v ON true) AS y WHERE doc = 'west')",
+                "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT doc FROM v UNION ALL SELECT doc FROM v) AS y WHERE doc = 'west')",
+                "WITH y AS (SELECT 1 AS k FROM (SELECT * FROM u JOIN v ON true) AS z WHERE doc = 'west') SELECT count(*) FROM t, y",
+                "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM (SELECT * FROM u JOIN v ON true) AS z) AS y WHERE doc = 'west')",
+                "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM (SELECT doc || '' AS doc FROM v) AS z) AS y WHERE doc = 'west')",
+                "WITH y AS (SELECT 1 AS k FROM (SELECT * FROM (SELECT doc || '' AS doc FROM v) AS z) AS q WHERE doc = 'west') SELECT count(*) FROM t, y",
+                "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT k || '' AS doc FROM w) AS y WHERE doc = 'west')"):
+        assert con.execute(sql).fetchall() == [(1,)], sql
+        assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None, sql
+    # Where no table of the statement but `t` holds the name, the statement-wide reading
+    # refuses as before, the engine binding the name to `t` through the correlation: a star
+    # over a join and a set operation, each over tables lacking it; and a plain star over a
+    # source the walk names as lacking it, two levels down, is absent for sure.
+    visible = {**VISIBLE, "u": {"name"}, "w": {"k"}}
+    for sql in ("SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN w ON true) AS y WHERE doc = 'west')",
+                "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT k FROM w UNION ALL SELECT k FROM w) AS y WHERE doc = 'west')",
+                "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM (SELECT k FROM w) AS z) AS y WHERE doc = 'west')"):
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index())
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    # A plain star over one base table the walk names, so its absence is sure and the
+    # enclosing scope's column list over a star skips (`y` has no `doc`; `x.doc` is `t.region`).
+    visible = {**VISIBLE, "u": {"name"}}
+    sql = "WITH x(region, doc) AS (SELECT * FROM t) SELECT count(*) FROM x WHERE EXISTS (SELECT 1 FROM (SELECT * FROM u) AS y WHERE doc = 'west')"
+    assert con.execute(sql).fetchall() == [(1,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None

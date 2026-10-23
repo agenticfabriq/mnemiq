@@ -92,34 +92,59 @@ def _projects_a_star(projection: exp.Expression) -> bool:
     return isinstance(projection.this if isinstance(projection, exp.Column) else projection, exp.Star)
 
 
-def _projects(source: Scope, wanted: str, dialect: str | None) -> bool:
-    """Whether a local source names the column in its own output, as `_through_scopes` reads
-    the output: a column list naming it by position (`WITH x(doc) AS (SELECT upper(region) FROM
-    t)`, where the projection's own name never met and the statement-wide reading placed `doc`
-    by `t`: the review gate on the fifth round), or a projection past the list so named, since
-    the list renames the first projections away (`WITH x(k) AS (SELECT doc FROM t)` has no
-    `doc`). A star among the listed positions leaves the positions unknown, and a listed name
-    is then the source's own with its base column unknown, as the qualified reference reads
-    it: `WITH x(region, doc) AS (SELECT * FROM t)` has `doc` for `t.region`, and read
-    statement-wide it was `t.doc`, a value the engine returns refused naming that column
-    (Codex's fourth review of #178). `x(doc) AS (SELECT * FROM t)` skips the same way, its
-    `doc` being `t.doc` by the position alone, which the gate's sixth round had read
-    statement-wide and refused. A projection the list renames away names nothing of the
-    output, so only those from the first star on are read, where the positions may run past
-    the list (the gate's seventh round). A star outside the list or a set operation leaves the
-    statement-wide reading as before (a star over a join inside a CTE, a union's output: the
-    gate's second round on M174)."""
-    if not isinstance(source.expression, exp.Select):
-        return False
+def _names(source: Scope, wanted: str, dialect: str | None, visible: dict[str, set[str]],
+           depth: int = 0) -> bool | None:
+    """Whether a local source names the column in its own output, as the engine names it: True,
+    False, or None where the walk cannot tell. A column list names the first projections by
+    position (`WITH x(doc) AS (SELECT upper(region) FROM t)` has `doc`, the projection's own
+    name never meeting the column: the review gate's fifth round) and renames those away
+    (`WITH x(k) AS (SELECT doc FROM t)` has no `doc`); a projection past the list keeps its own
+    name. A star among the listed positions yields a column per source column, so the positions
+    are unknown, and only a listed name or a named projection from the star on answers (the
+    gate's seventh round: `WITH x(k, m) AS (SELECT region AS doc, * FROM ...)`), otherwise the
+    walk cannot tell. A star past the list is followed into the source's one selected source,
+    in order: a base table's granted columns say, a local source this again, and a modified
+    star, a star over a join or a base table renamed by position leave the answer unknown.
+    Unknown, the source may yield the name and the engine binds there, so the caller keeps the
+    statement-wide reading for the scope rather than ask the enclosing one (the review gate on
+    the ninth round: `EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN v ON true) y WHERE doc =
+    'west')` with `v` holding `doc` binds to `y`, and `(SELECT * FROM (SELECT doc || '' AS doc
+    FROM v) z) y` names `doc` through the star as an expression; asked of the enclosing scope,
+    each refused a present value against `t.doc`)."""
+    if depth > 32 or not isinstance(source.expression, exp.Select):
+        return None
     selects = source.expression.selects
     listed = _column_list(source, dialect) or []
     first_star = next((i for i, p in enumerate(selects[:len(listed)]) if _projects_a_star(p)), None)
     if first_star is not None:
-        return wanted in listed or any(_projection_name(p, dialect) == wanted
-                                       for p in selects[first_star:] if not _projects_a_star(p))
+        if wanted in listed or any(_projection_name(p, dialect) == wanted
+                                   for p in selects[first_star:] if not _projects_a_star(p)):
+            return True
+        return None
     if wanted in listed[:len(selects)]:
         return True
-    return any(_projection_name(p, dialect) == wanted for p in selects[len(listed):] if not _projects_a_star(p))
+    for projection in selects[len(listed):]:
+        if not _projects_a_star(projection):
+            if _projection_name(projection, dialect) == wanted:
+                return True
+            continue
+        if not _is_star(projection) or len(source.selected_sources) != 1:
+            return None
+        (alias,) = source.selected_sources
+        _, inner = source.selected_sources[alias]
+        if isinstance(inner, exp.Table):
+            renamed = inner.args.get("alias")
+            if isinstance(renamed, exp.TableAlias) and renamed.columns:
+                return None
+            if any(wanted in _stored(c, dialect) for c in visible.get(inner.name, ())):
+                return True
+            continue
+        if not isinstance(inner, Scope):
+            return None
+        through = _names(inner, wanted, dialect, visible, depth + 1)
+        if through is not False:
+            return through
+    return False
 
 
 def _same_column(column: exp.Column, alias: str) -> exp.Column:
@@ -164,9 +189,10 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     before the name answers nothing. A base table under an alias column list (`FROM t
     q(region, doc)`) renames its columns by position, which a set of names cannot place, so
     the walk answers nothing there (the same review: `q.doc` is `t.region`, and the walk said
-    `t.doc`). Names meet as the engine resolves them (`_written`, `_stored`). Where this answers nothing, the caller keeps the
-    statement-wide reading it had: a star over a join, a set operation, a recursive CTE and a
-    correlated name each resolved there and nowhere here (the gate's second round)."""
+    `t.doc`). Names meet as the engine resolves them (`_written`, `_stored`). Where this answers nothing, the caller asks the
+    enclosing scopes, then keeps the statement-wide reading it had: a star over a join, a set
+    operation and a recursive CTE each resolved there and nowhere here (the gate's second
+    round)."""
     source = scope.sources.get(column.table) if column.table else None
     if isinstance(source, exp.Table):
         alias = source.args.get("alias")
@@ -261,84 +287,111 @@ def check_values(
             alias_to_table[table.alias_or_name] = table.name
     referenced = set(alias_to_table.values())
     scopes = _scopes(ast)
+    _ABSENT = object()  # no source of the scope can hold the name: the enclosing scope's turn
+    _WIDE = object()  # the scope cannot tell: the statement-wide reading's turn, as before
+
+    def in_scope(column: exp.Column, scope: Scope) -> tuple[str, str] | None | object:
+        """The scope's own answer (M141, M174): a base table, or a local source followed to the
+        column it projects, the column renamed included -- `x.doc` may be `t.region`, and read
+        by its name it would be checked against `t.doc`'s values. An unqualified name is read
+        among the scope's selected sources, a base table holding it or a local source
+        projecting it, one owner or no answer. None is a skip; `_ABSENT` says no source of this
+        scope can hold the name, and the enclosing scope is asked; `_WIDE` says the scope
+        cannot tell, a source's output being one the walk cannot name (`_names`) or two
+        sources owning the name, and the statement-wide reading answers as before."""
+        qualifier = column.table
+        if qualifier:
+            return _through_scopes(column, scope, visible, dialect) if qualifier in scope.sources else _ABSENT
+        wanted = _written(column.this, dialect)
+        # The merged column of a USING join is the join's: an inner or LEFT join's the
+        # left input's, a RIGHT join's the right input's, a FULL join's coalesced from
+        # both (measured by the ui lane on Postgres and DuckDB). `SELECT doc FROM t
+        # RIGHT JOIN t q(region, doc) USING (doc)` compares `q.doc`, `t.region`, where
+        # the walk discarded q and took `t.doc` as the sole owner (Codex's second
+        # review of #178); a FULL join's the same with the literal on q's side (the ui
+        # lane). The candidates are the join's side; a source renamed by position
+        # among them answers nothing, and so does a FULL join.
+        candidates = list(scope.selected_sources)
+        # This scope's own joins alone, in order, each USING the key narrowing the
+        # candidates in turn (a later RIGHT join decides over an earlier inner one): a
+        # join inside a subquery is another scope's, and read here it switched the check
+        # off for the outer column (the review gate on the fourth round). A NATURAL
+        # join's keys are every name its sides share, which a set of granted names
+        # cannot settle, so the name answers nothing (Codex's third review of #178:
+        # `t NATURAL RIGHT JOIN (SELECT region AS doc FROM t) q` compares `t.region`).
+        for join in scope.expression.args.get("joins") or []:
+            if (join.method or "").upper() == "NATURAL":
+                return None
+            if not any(_written(key, dialect) == wanted for key in (join.args.get("using") or ())):
+                continue
+            side = (join.side or "").upper()
+            if side == "FULL":
+                return None
+            right = join.this.alias_or_name
+            candidates = [right] if side == "RIGHT" else [a for a in candidates if a != right]
+        # A source renamed by position among the candidates, before any sole owner: the
+        # statement-wide reading would place the name by it (the gate's second round).
+        if any(isinstance(source, exp.Table) and isinstance(source.args.get("alias"), exp.TableAlias)
+               and source.args["alias"].columns for alias, (_, source) in scope.selected_sources.items()
+               if alias in candidates):
+            return None
+        owners: list[tuple[str, str]] = []
+        unknown = False
+        for alias, (_, source) in scope.selected_sources.items():
+            if alias not in candidates:
+                continue
+            if isinstance(source, exp.Table):
+                found = _through_scopes(_same_column(column, alias), scope, visible, dialect)
+                if found is not None and any(wanted in _stored(c, dialect) for c in visible.get(source.name, ())):
+                    owners.append(found)
+            else:
+                found = _through_scopes(_same_column(column, alias), scope, visible, dialect)
+                if found is not None:
+                    owners.append(found)
+                else:
+                    holds = _names(source, wanted, dialect, visible)
+                    if holds:
+                        # A local source naming the column that the walk could not follow
+                        # to a base column (a USING output of a join inside it, a function,
+                        # an expression through a star): the name is that source's, not a
+                        # base table's, and the statement-wide reading placed it by one
+                        # (Codex's third review of #178: `(SELECT doc FROM t RIGHT JOIN t
+                        # q(region, doc) USING (doc)) x WHERE doc = 'west'` compares
+                        # `t.region`, the walk said `t.doc`).
+                        return None
+                    if holds is None:
+                        unknown = True  # the source may yield the name, and the engine binds there
+        if len(owners) == 1:
+            return owners[0]
+        return _WIDE if owners or unknown else _ABSENT
 
     def resolve(column: exp.Column) -> tuple[str, str] | None:
-        qualifier = column.table
+        # The scope's own answer first, then each enclosing scope's, the nearest first, as the
+        # engine binds a correlated name: `WITH x(region, doc) AS (SELECT * FROM t) SELECT
+        # count(*) FROM x WHERE EXISTS (SELECT 1 FROM u WHERE doc = 'west')` compares `x.doc`,
+        # `t.region`, which the list over a star leaves unresolved, and the name, held by no
+        # source of the subquery's own scope, fell to the statement-wide reading, `t.doc`, a
+        # present value refused (Codex's sixth review of #178). Only a scope none of whose
+        # sources can hold the name is passed: a source whose output the walk cannot name may
+        # yield it, and the engine binds there, so that scope keeps the statement-wide reading
+        # it had (`_names`, the review gate on this round). A CTE's body the engine does not
+        # correlate, and `_ABSENT` says no source of it can hold the name, so the name fails
+        # there and whatever the walk answers past it is moot.
         scope = scopes.get(id(column))
-        if scope is not None:
-            # The scope's own answer first (M141, M174): a base table, or a local source
-            # followed to the column it projects, the column renamed included -- `x.doc` may be
-            # `t.region`, and read by its name it would be checked against `t.doc`'s values.
-            # An unqualified name is read among the scope's selected sources, a base table
-            # holding it or a local source projecting it, one owner or no answer.
-            if qualifier:
-                found = _through_scopes(column, scope, visible, dialect)
-                if found is not None:
-                    return found
-                if isinstance(scope.sources.get(qualifier), Scope):
-                    return None  # a local source projecting no such column: nothing to check
-            else:
-                wanted = _written(column.this, dialect)
-                # The merged column of a USING join is the join's: an inner or LEFT join's the
-                # left input's, a RIGHT join's the right input's, a FULL join's coalesced from
-                # both (measured by the ui lane on Postgres and DuckDB). `SELECT doc FROM t
-                # RIGHT JOIN t q(region, doc) USING (doc)` compares `q.doc`, `t.region`, where
-                # the walk discarded q and took `t.doc` as the sole owner (Codex's second
-                # review of #178); a FULL join's the same with the literal on q's side (the ui
-                # lane). The candidates are the join's side; a source renamed by position
-                # among them answers nothing, and so does a FULL join.
-                candidates = list(scope.selected_sources)
-                # This scope's own joins alone, in order, each USING the key narrowing the
-                # candidates in turn (a later RIGHT join decides over an earlier inner one): a
-                # join inside a subquery is another scope's, and read here it switched the check
-                # off for the outer column (the review gate on the fourth round). A NATURAL
-                # join's keys are every name its sides share, which a set of granted names
-                # cannot settle, so the name answers nothing (Codex's third review of #178:
-                # `t NATURAL RIGHT JOIN (SELECT region AS doc FROM t) q` compares `t.region`).
-                for join in scope.expression.args.get("joins") or []:
-                    if (join.method or "").upper() == "NATURAL":
-                        return None
-                    if not any(_written(key, dialect) == wanted for key in (join.args.get("using") or ())):
-                        continue
-                    side = (join.side or "").upper()
-                    if side == "FULL":
-                        return None
-                    right = join.this.alias_or_name
-                    candidates = [right] if side == "RIGHT" else [a for a in candidates if a != right]
-                # A source renamed by position among the candidates, before any sole owner: the
-                # statement-wide reading would place the name by it (the gate's second round).
-                if any(isinstance(source, exp.Table) and isinstance(source.args.get("alias"), exp.TableAlias)
-                       and source.args["alias"].columns for alias, (_, source) in scope.selected_sources.items()
-                       if alias in candidates):
-                    return None
-                owners: list[tuple[str, str]] = []
-                for alias, (_, source) in scope.selected_sources.items():
-                    if alias not in candidates:
-                        continue
-                    if isinstance(source, exp.Table):
-                        found = _through_scopes(_same_column(column, alias), scope, visible, dialect)
-                        if found is not None and any(wanted in _stored(c, dialect) for c in visible.get(source.name, ())):
-                            owners.append(found)
-                    else:
-                        found = _through_scopes(_same_column(column, alias), scope, visible, dialect)
-                        if found is not None:
-                            owners.append(found)
-                        elif _projects(source, wanted, dialect):
-                            # A local source projecting the name that the walk could not follow
-                            # to a base column (a USING output of a join inside it, a function):
-                            # the name is that source's, not a base table's, and the statement-
-                            # wide reading placed it by one (Codex's third review of #178:
-                            # `(SELECT doc FROM t RIGHT JOIN t q(region, doc) USING (doc)) x
-                            # WHERE doc = 'west'` compares `t.region`, the walk said `t.doc`).
-                            return None
-                if len(owners) == 1:
-                    return owners[0]
-        # The statement-wide reading, as before M174, where the scope answers nothing: a star
-        # over a join, a set operation, a recursive CTE, a correlated name, a column sqlglot
-        # lists in no scope (the review gate's second round, each refused here and skipped by
-        # the scope alone).
+        while scope is not None:
+            answer = in_scope(column, scope)
+            if answer is _WIDE:
+                break
+            if answer is not _ABSENT:
+                return answer
+            scope = scope.parent
+        # The statement-wide reading, as before M174, where a scope cannot tell or no scope
+        # answers: a star over a join, a set operation, a recursive CTE, a column sqlglot lists
+        # in no scope (the review gate's second round, each refused here and skipped by the
+        # scope alone).
         # The catalog's spelling is returned, as the scope's answer returns it: the index is
         # keyed by it, and the name as typed met nothing there (the gate on the fourth round).
+        qualifier = column.table
         if qualifier:
             table = alias_to_table.get(qualifier)
             return (table, _stored_match(column, visible.get(table, ()), dialect) or column.name) if table else None
