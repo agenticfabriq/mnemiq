@@ -1331,7 +1331,7 @@ class OracleAdapter:
         # thread to race -- which is the concurrency bug removed rather than guarded.
         self._refuse_unless_read(sql)
 
-        started = [float("inf")]  # the bounded call's start: before it, no deadline has passed
+        started = [float("inf")]  # the start of the round trip in flight: before the first, no deadline has passed
 
         armed = int(timeout_s * 1000) / 1000 if timeout_s is not None else None  # the driver's deadline, whole milliseconds
 
@@ -1341,7 +1341,18 @@ class OracleAdapter:
             started[0] = time.monotonic()  # the call alone, not the lease's lock wait, its setup round trip or a DDL-race backoff (the gate on the second commit)
             cur.execute(sql)
             names = [d[0] for d in cur.description] if cur.description else []
-            return names, cur.fetchall()
+            # `call_timeout` bounds each round trip, not the statement, and the fetch is several:
+            # the clock restarts as each row is handed over, since a round trip can only begin
+            # after the row before it, so a fault late in a long fetch is measured against its own
+            # trip (Codex's review of #179). Measured from the execute, it read as the bound's end
+            # and was repaired by running the statement again. The driver's `fetchall` is this
+            # same loop without the clock.
+            rows = []
+            started[0] = time.monotonic()
+            for row in cur:
+                rows.append(row)
+                started[0] = time.monotonic()
+            return names, rows
 
         try:
             names, rows = self._with_cursor(_fetch)
@@ -1350,7 +1361,8 @@ class OracleAdapter:
             # (`_TIMEOUT_CODES`, `_AT_THE_DEADLINE`); report it as a timeout rather than letting a driver code
             # reach the caller as an opaque source error. ORA-01013 is the cancel itself, the
             # driver's at the deadline or anyone's on a connection the caller owns (`over`), so
-            # it is a timeout only once the deadline has passed (Codex's first review of #176),
+            # it is a timeout only once its round trip has reached the deadline (Codex's first
+            # review of #176, and of #179 for the round trip),
             # and so is DPY-4011, a closed connection, which before the deadline is the source's
             # (M188). Raised as `QueryTimedOut`, which the runner reads as the timeout it is.
             if timeout_s is not None and _is_timeout(exc, deadline_met=time.monotonic() - started[0] >= armed):

@@ -68,6 +68,10 @@ class _FakeCursor:
     def fetchall(self):
         return [(7,)]
 
+    def __iter__(self):
+        """`execute_arrow` iterates the cursor, as python-oracledb's does, to clock each round trip."""
+        return iter(self.fetchall())
+
     def close(self):
         self.closed = True
 
