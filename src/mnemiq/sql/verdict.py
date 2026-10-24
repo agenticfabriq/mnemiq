@@ -60,7 +60,9 @@ class RefusalCode(StrEnum):
     # the tree, which for a multi-target DELETE is a SOURCE.
     AMBIGUOUS_WRITE_TARGET = "ambiguous_write_target"
     # A row or column policy, decided for an engine whose binding of a CTE name the scope rule does
-    # not model (M150). A deployment's configuration, not the statement: never repairable.
+    # not model (M150), or whose rewrite the target's generator cannot print where the statement as
+    # asked prints (`unprintable`, round 61 of #160). A deployment's configuration, not the
+    # statement: never repairable.
     POLICY_TARGET_UNSUPPORTED = "policy_target_unsupported"
     # The source accepts the statement as asked and refuses it once the access policy is applied:
     # a row filter, or the snapshot it was checked against, no longer matches the source (M158).

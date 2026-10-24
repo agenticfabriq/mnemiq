@@ -235,7 +235,11 @@ def unprintable(target: str, exc: Exception, *, policys: bool) -> Refusal:
     literal's key, the Column or the Var it is here, must name a struct's field for Postgres or
     Oracle (Codex's forty-seventh review of #160), and the error escaped both deciders. The
     statement's where the statement as asked does not print; the policy's (`policys`) where the
-    statement prints and its governed rewrite does not, which no rewrite of the question repairs."""
+    statement prints and its governed rewrite does not, which no rewrite of the question repairs.
+    The generator's ValueError is the MAP literal's case and the advice names it; a round trip
+    that fails otherwise (the row-cap fallback's re-read, M137, raising a parse error) gets the
+    engine's name alone, since advice about a construct the statement may not hold would spend the
+    repair pass (the review gate on round 61)."""
     logger.warning("the plan could not be printed for %s (%s)", target, exc)
     if policys:
         return Refusal(code=RefusalCode.POLICY_TARGET_UNSUPPORTED,
@@ -243,10 +247,10 @@ def unprintable(target: str, exc: Exception, *, policys: bool) -> Refusal:
                                 f"{target} engine, where the statement as asked can; the policy, not the "
                                 "statement, needs another spelling."),
                        subject=target)
+    advice = (" Spell the lookup without a MAP literal keyed by a column or a lambda's parameter, which that "
+              "engine's printer cannot name." if isinstance(exc, ValueError) else "")
     return Refusal(code=RefusalCode.UNPRINTABLE_FOR_TARGET,
-                   message=(f"The statement cannot be printed for the {target} engine. Spell the expression "
-                            "as that engine reads it, without a MAP literal keyed by a column or a lambda's "
-                            "parameter."),
+                   message=f"The statement cannot be printed for the {target} engine; spell it as that engine reads it.{advice}",
                    subject=target)
 
 
