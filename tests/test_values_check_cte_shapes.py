@@ -339,6 +339,22 @@ def test_a_natural_join_leaves_the_names_it_does_not_merge_alone():
     sql = "SELECT count(*) FROM t NATURAL FULL JOIN (SELECT region AS doc FROM t) AS q WHERE doc = 'west'"
     assert con.execute(sql).fetchall() == [(1,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None
+    # and none where a side cannot be named, or adds no owner under the grant (the review gate on
+    # round 14): the coalesced column carries that side's values too, on either side
+    for sql, granted in (("SELECT count(*) FROM t NATURAL FULL JOIN (SELECT * FROM (SELECT region AS doc FROM t) AS z CROSS JOIN u) AS q WHERE doc = 'west'", visible),
+                         ("SELECT count(*) FROM t FULL JOIN v USING (doc) WHERE doc = 'west'", {**visible, "v": {"k", "name"}}),
+                         ("SELECT count(*) FROM v FULL JOIN t AS b USING (doc) WHERE doc = 'west'", {**visible, "v": {"k", "name"}})):
+        assert con.execute(sql).fetchall() == [(1,)], sql
+        assert check_values(sqlglot.parse_one(sql, read="duckdb"), granted, _Index()) is None, sql
+    # A source beside the FULL join that cannot hold the name is no side of it (the review gate on
+    # round 15: counted as one, it blocked the answer and these skipped where main refused)
+    for sql in ("SELECT count(*) FROM t FULL JOIN t AS b USING (doc), u WHERE doc = 'west'",
+                "SELECT count(*) FROM t FULL JOIN t AS b USING (doc) CROSS JOIN w WHERE doc = 'west'",
+                "SELECT count(*) FROM w, t FULL JOIN t AS b USING (doc) WHERE doc = 'west'",
+                "SELECT count(*) FROM t NATURAL FULL JOIN t AS b, u WHERE doc = 'west'"):
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index())
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
     sql = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT name FROM u) AS a NATURAL JOIN v AS b WHERE doc = 'west')"
     assert con.execute(sql).fetchall() == [(2,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None

@@ -310,7 +310,9 @@ def check_values(
         projecting it, one owner or no answer. None is a skip; `_ABSENT` says no source of this
         scope can hold the name, and the enclosing scope is asked; `_WIDE` says the scope
         cannot tell, a source's output being one the walk cannot name (`_names`) or two
-        sources owning the name, and the statement-wide reading answers as before."""
+        sources owning the name, and the statement-wide reading answers as before; where a join
+        has made the name one side's (`narrowed`) that scope answers nothing instead, since the
+        statement-wide reading would resurrect the other side."""
         qualifier = column.table
         if qualifier:
             return _through_scopes(column, scope, visible, dialect) if qualifier in scope.sources else _ABSENT
@@ -352,7 +354,7 @@ def check_values(
         from_ = scope.expression.args.get("from_")
         left = [from_.this.alias_or_name] if from_ is not None else []
         narrowed = False  # a join made the name one side's
-        full = False  # a FULL join's merged column: both sides stay, one answer where they agree
+        full_sides = None  # a FULL join's two inputs, by alias: both stay, one answer where they agree
         for join in scope.expression.args.get("joins") or []:
             right = join.this.alias_or_name
             if (join.method or "").upper() == "NATURAL":
@@ -373,9 +375,17 @@ def check_values(
             side = (join.side or "").upper()
             narrowed = True
             if side == "FULL":
-                full = True
+                # The join's left input is the sources before it still among the candidates, its
+                # right input the joined source; counted as every source of the scope, a source
+                # beside the join that cannot hold the name blocked the answer and `w, t FULL JOIN
+                # t b USING (doc)` skipped where main refused (the review gate on round 15).
+                full_sides = ([a for a in candidates if a in left], [right])
+                candidates = full_sides[0] + full_sides[1]
+            elif side == "RIGHT":
+                candidates = [right]
+                full_sides = None  # a later RIGHT join's merged column is its right input's alone
             else:
-                candidates = [right] if side == "RIGHT" else [a for a in candidates if a != right]
+                candidates = [a for a in candidates if a != right]
             left.append(right)
         # A source renamed by position among the candidates, before any sole owner: the
         # statement-wide reading would place the name by it (the gate's second round).
@@ -383,7 +393,7 @@ def check_values(
                and source.args["alias"].columns for alias, (_, source) in scope.selected_sources.items()
                if alias in candidates):
             return None
-        owners: list[tuple[str, str]] = []
+        owner_of: dict[str, tuple[str, str]] = {}  # by the candidate's alias
         unknown = False
         for alias, (_, source) in scope.selected_sources.items():
             if alias not in candidates:
@@ -391,11 +401,11 @@ def check_values(
             if isinstance(source, exp.Table):
                 found = _through_scopes(_same_column(column, alias), scope, visible, dialect)
                 if found is not None and any(wanted in _stored(c, dialect) for c in visible.get(source.name, ())):
-                    owners.append(found)
+                    owner_of[alias] = found
             else:
                 found = _through_scopes(_same_column(column, alias), scope, visible, dialect)
                 if found is not None:
-                    owners.append(found)
+                    owner_of[alias] = found
                 else:
                     holds = _names(source, wanted, dialect, visible)
                     if holds:
@@ -409,8 +419,15 @@ def check_values(
                         return None
                     if holds is None:
                         unknown = True  # the source may yield the name, and the engine binds there
-        if full:
-            return owners[0] if owners and len(set(owners)) == 1 and not unknown else None
+        owners = list(owner_of.values())
+        if full_sides is not None:
+            # The merged column is coalesced from the join's two inputs: each must add an owner, and
+            # every owner must be the one base column. An input that adds none, a table lacking the
+            # name under the grant or a source the walk cannot name, is one whose values the
+            # coalesced column still carries (the review gate on round 14); a source beside the
+            # left input that cannot hold the name is no part of it.
+            sides = [[owner_of[a] for a in side if a in owner_of] for side in full_sides]
+            return owners[0] if all(sides) and len(set(owners)) == 1 else None
         if len(owners) == 1:
             return owners[0]
         if owners or unknown:
