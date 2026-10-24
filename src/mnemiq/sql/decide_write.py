@@ -22,7 +22,7 @@ from mnemiq.sql.guard import bound_by_position, misgrouped_set_chain, niladic_na
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.reading import as_duckdb_reads, rendered
+from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, rendered
 from mnemiq.sql.scope import base_tables, check_policy_target, fields_as_members, known_columns
 from mnemiq.sql.rls import apply_row_filters_to_write, check_filter_targets, unplaceable_policy
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
@@ -250,6 +250,16 @@ def check_write_shape(sql: str, dialect: str = "duckdb", executes_as: str | None
         return Refusal(
             code=RefusalCode.NOT_A_SINGLE_STATEMENT,
             message="Return exactly one statement. Multiple statements are never executed.",
+        )
+    dotted_key = dotted_map_keys(sql, dialect)
+    if dotted_key:
+        key = dotted_key[0]
+        return Refusal(
+            code=RefusalCode.UNMODELLED_CALL,
+            message=(f"A MAP literal keyed by a dotted name ({key}) is read by the parser as its last part "
+                     "alone, so the engine cannot say what the query reads. Spell the key in parentheses, "
+                     f"MAP {{({key}): ...}}, or as MAP([{key}], [...])."),
+            subject=key,
         )
     ast = statements[0]
     if isinstance(ast, _WRITE_ROOTS) and _has_unscoped_with(ast):

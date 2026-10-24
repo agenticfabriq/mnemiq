@@ -167,3 +167,35 @@ def test_an_arrow_in_a_lambda_takers_list_slot_is_the_json_extract_too():
     sql = "SELECT list_transform(tags, x -> x) FROM claim"
     assert con.execute(sql).fetchall() == [(["north"],)]
     assert isinstance(_decide(sql), Approved)
+
+
+def test_a_dotted_map_key_is_refused_before_the_parse_loses_it():
+    # Codex's forty-fourth review of #160: sqlglot reads `MAP {x.region: 1}` as `MAP {region: 1}`
+    # before any node exists, so the re-reading bound the key to the base column and the installed
+    # statement answered another question (DuckDB reads the element's field). The text's tokens say
+    # which keys the parse has lost, and the statement is refused with the spellings sqlglot keeps.
+    # (The parameter is `e`: beside the fixture's column `x`, DuckDB binds `x.region` to the column.)
+    con = _table()
+    dotted = "SELECT list_transform([{region: 'south'}], e -> MAP {e.region: 1}[region]) FROM claim"
+    kept = "SELECT list_transform([{region: 'south'}], e -> MAP {(e.region): 1}[region]) FROM claim"
+    assert con.execute(dotted).fetchall() == con.execute(kept).fetchall() == [([None],)]
+    verdict = _decide(dotted)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNMODELLED_CALL, verdict
+    assert "MAP {(e.region): ...}" in verdict.message and "MAP([e.region], [...])" in verdict.message, verdict.message
+    # Only a chain of names is lost; a key sqlglot keeps whole is read as before (the gate's round).
+    for sql, rows in (("SELECT MAP {claim.region::VARCHAR: 1}['north'] FROM claim", [(1,)]),
+                      ("SELECT list_transform([[{f: 'a'}]], e -> MAP {e[1].f: 1}['a']) FROM claim", [([1],)]),
+                      ("SELECT MAP {CASE WHEN claim.id > 0 THEN 'k' END: 1}['k'] FROM claim", [(1,)])):
+        assert con.execute(sql).fetchall() == rows, sql
+        verdict = _decide(sql)
+        assert isinstance(verdict, Approved), (sql, verdict)
+        assert con.execute(verdict.target_sql).fetchall() == rows, verdict.target_sql
+    verdict = _decide(kept)
+    assert isinstance(verdict, Approved) and "(e.region)" in verdict.target_sql, verdict
+    assert con.execute(verdict.target_sql).fetchall() == [([None],)]
+    grants = GrantSet(frozenset(VISIBLE), writable=frozenset({"sink"}))
+    verdict = decide_write("UPDATE sink SET s = 'b' WHERE list_transform([{i: 1}], e -> MAP {e.i: 1}[i])[1] = 1", VISIBLE, grants,
+                           adapter=_OkAdapter(), dialect="duckdb", target="duckdb", writes_enabled=True, policy=AccessPolicy())
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNMODELLED_CALL, verdict
+    assert body_of(ViewDefinition(object_id="v", dialect="duckdb",
+                                  definition="SELECT list_transform([{region: 'south'}], e -> MAP {e.region: 1}[region]) AS k FROM claim")) is None

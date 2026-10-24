@@ -11,7 +11,7 @@ from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import names_one_object, object_key
-from mnemiq.sql.reading import as_duckdb_reads, is_lambda_parameter, map_struct
+from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, is_lambda_parameter, map_struct
 from mnemiq.sql.scope import (base_tables, column_tables, cte_references, known_columns,
                               scope_resolved)
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -35,6 +35,8 @@ _FENCED = frozenset({"oracle"})
 def _parsed(filt: str, dialect: str, wrapped: bool = False) -> exp.Expression:
     """A row filter's parse, bare or as the WHERE of the query it becomes, read as DuckDB reads
     it (`as_duckdb_reads`): the one installed, the validator's and the typing rules' alike."""
+    if dotted_map_keys(filt, dialect):
+        raise ValueError("a MAP literal keyed by a dotted name, which the parser reads as its last part alone")
     text = f"SELECT 1 FROM {_SUBJECT} WHERE {filt}" if wrapped else filt
     return as_duckdb_reads(sqlglot.parse_one(text, read=dialect))
 

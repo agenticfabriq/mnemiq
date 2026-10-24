@@ -1596,3 +1596,24 @@ def test_a_map_keyed_by_a_lambdas_parameter_is_typed_by_the_parameter():
                  "list_transform([attrs], x -> MAP {x: 1}[x]) = [1]"):
         assert con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall() == [(1,)], safe
         assert isinstance(_decide(safe, snapshot=_snapshot(types)), Approved), safe
+
+
+def test_a_dotted_map_key_in_a_row_filter_is_no_predicate():
+    # Codex's forty-fourth review of #160: `list_transform([{region: 'south'}], x -> MAP {x.region:
+    # 1}[region] IS NULL) = [false]` removes every row (the key is the element's field, 'south', and
+    # the lookup finds nothing), and installed as `MAP {region: 1}` it kept every row, the parser
+    # having read the key as its last part alone. The text's tokens say so, and the filter is no
+    # predicate; the spelling sqlglot keeps, `(x.region)`, is installed to the text's rows.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, amount INT, big BIGINT, attrs JSON, d DATE, tags VARCHAR[]); "
+                "INSERT INTO claim VALUES (1, 'north', 1, 1, '{\"a\": 1}', DATE '2026-01-01', ['north'])")
+    types = {**TYPES, ("claim", "tags"): "VARCHAR[]"}
+    dotted = "list_transform([{region: 'south'}], x -> MAP {x.region: 1}[region] IS NULL) = [false]"
+    assert con.execute(f"SELECT id FROM claim WHERE {dotted}").fetchall() == []
+    verdict = _decide(dotted, snapshot=_snapshot(types))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    kept = "list_transform([{region: 'south'}], x -> MAP {(x.region): 1}[region] IS NULL) = [false]"
+    assert con.execute(f"SELECT id FROM claim WHERE {kept}").fetchall() == []
+    verdict = _decide(kept, snapshot=_snapshot(types))
+    assert isinstance(verdict, Approved), verdict
+    assert con.execute(verdict.target_sql).fetchall() == []

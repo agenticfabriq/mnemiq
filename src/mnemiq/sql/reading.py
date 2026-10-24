@@ -29,6 +29,14 @@ Lambda becomes the `exp.JSONExtract` it is, its left side the Column, or the row
 DuckDB reads, so the grant check sees the read and the typing rules read the extract as they
 read `json_extract(value, path)`.
 
+One divergence no tree can undo: sqlglot reads a dotted MAP key, `MAP {x.region: 1}`, as its
+last part alone, `region`, before any node exists, so the re-reading made it the base column
+and `list_transform([{region: 'south'}], x -> MAP {x.region: 1}[region] IS NULL) = [false]`,
+which removes every row (the key is the element's field), was installed as `MAP {region: 1}`
+and kept every row, the policy reversed (Codex's forty-fourth review of #160). Such a key is
+found in the text's tokens (`dotted_map_keys`) and the statement refused, with the spellings
+sqlglot keeps in the advice: `MAP {(x.region): 1}`, or `MAP([x.region], [1])`.
+
 sqlglot builds `exp.ToMap` over a Struct from DuckDB's `MAP {...}` syntax alone, so for a tree
 parsed in any other dialect this is a no-op; the name says whose reading it restores.
 """
@@ -36,10 +44,12 @@ parsed in any other dialect this is a no-op; the name says whose reading it rest
 from __future__ import annotations
 
 import logging
+import re
 import threading
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.tokens import TokenType
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +104,62 @@ def arrow_read_as_a_lambda(node: exp.Expression) -> bool:
     if isinstance(parent, exp.Anonymous) and parent.name.lower() in lambda_takers():
         return len(parent.expressions) < 2 or parent.expressions[1] is not node
     return True
+
+
+_OPENERS = (TokenType.L_PAREN, TokenType.L_BRACKET, TokenType.L_BRACE)
+_CLOSERS = (TokenType.R_PAREN, TokenType.R_BRACKET, TokenType.R_BRACE)
+
+
+def dotted_map_keys(sql: str, dialect: str | None) -> list[str]:
+    """The dotted keys of the MAP literals in `sql` that sqlglot's parse loses, read off the text's
+    tokens: after `MAP {` or a comma at the map's own depth, up to the colon, a key that is a
+    chain of identifiers joined by dots and nothing else (`x.region`, `a.b.c`, `"x".region`).
+    Any other key sqlglot keeps whole, `x[1].f`, `x.f(1)`, `claim.region::VARCHAR`, `(x.region)`,
+    a CASE over a dotted name (the review gate on round 57 of #160, where a dot anywhere at the
+    map's depth was flagged and each of these was refused)."""
+    try:
+        tokens = sqlglot.Dialect.get_or_raise(dialect or "duckdb").tokenize(sql)
+    except Exception:  # noqa: BLE001 -- text the tokenizer refuses: the parser will say so
+        return []
+    found: list[str] = []
+    stack: list[list] = []  # one frame per open bracket: [is a MAP brace, the key's tokens or None]
+    for position, token in enumerate(tokens):
+        kind = token.token_type
+        if kind in _OPENERS:
+            if stack and stack[-1][0] and stack[-1][1] is not None:
+                stack[-1][1].append(token)  # a bracket or a parenthesis in the key: no chain of names
+            is_map = kind == TokenType.L_BRACE and position > 0 and tokens[position - 1].token_type == TokenType.MAP
+            stack.append([is_map, [] if is_map else None])
+            continue
+        if kind in _CLOSERS:
+            if stack:
+                stack.pop()
+            continue
+        if not stack or not stack[-1][0]:
+            continue
+        frame = stack[-1]
+        if kind == TokenType.COLON and frame[1] is not None:
+            if _dotted_chain(frame[1]):
+                found.append(".".join(k.text for k in frame[1][::2]))
+            frame[1] = None
+        elif kind == TokenType.COMMA:
+            frame[1] = []
+        elif frame[1] is not None:
+            frame[1].append(token)
+    return found
+
+
+_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def _dotted_chain(key: list) -> bool:
+    """Whether a key's tokens are identifiers joined by dots and nothing else, the one shape sqlglot
+    reduces to its last identifier: `x.region`, `a.b.c`, a quoted name among them."""
+    if len(key) < 3 or len(key) % 2 == 0:
+        return False
+    names, dots = key[::2], key[1::2]
+    return all(d.token_type == TokenType.DOT for d in dots) and all(
+        n.token_type != TokenType.DOT and (n.token_type == TokenType.IDENTIFIER or _NAME.match(n.text)) for n in names)
 
 
 def map_struct(node: exp.ToMap) -> exp.Struct | None:
