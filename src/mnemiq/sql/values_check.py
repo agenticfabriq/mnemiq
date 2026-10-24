@@ -336,8 +336,14 @@ def check_values(
         # `EXISTS (SELECT 1 FROM w NATURAL JOIN w b WHERE doc = 'west')` compares the outer
         # `t.doc`; the eighth: `w NATURAL JOIN w b, t`, `t NATURAL JOIN t b` and five more
         # compare `t.doc`, where a skip on any NATURAL join in the scope let an absent
-        # value through). A FULL join's merged column is coalesced from both sides and
-        # answers nothing, as a USING FULL join's does. A join's left side is the FROM
+        # value through). A FULL join's merged column is coalesced from both sides, and
+        # answers only where both resolve to one base column (`t NATURAL FULL JOIN t b`
+        # compares `coalesce(t.doc, b.doc)`, both `t.doc`: Codex's ninth review), else
+        # nothing. A merged column is one side's, so where that side's output the walk
+        # cannot name the scope answers nothing rather than the statement-wide reading, which
+        # resurrected the discarded side: `t NATURAL RIGHT JOIN (SELECT * FROM (SELECT region AS
+        # doc FROM t) z CROSS JOIN u) q WHERE doc = 'west'` compares `q.doc`, `t.region`, and
+        # was refused against `t.doc` (the same review). A join's left side is the FROM
         # source and the joins before it, not every other source of the scope: read as the
         # latter, a source joined LATER that held the name made an earlier NATURAL join a
         # merge, and `w NATURAL JOIN (SELECT region AS doc, 'west' AS k FROM t) b NATURAL LEFT
@@ -345,6 +351,8 @@ def check_values(
         # review gate on round 13).
         from_ = scope.expression.args.get("from_")
         left = [from_.this.alias_or_name] if from_ is not None else []
+        narrowed = False  # a join made the name one side's
+        full = False  # a FULL join's merged column: both sides stay, one answer where they agree
         for join in scope.expression.args.get("joins") or []:
             right = join.this.alias_or_name
             if (join.method or "").upper() == "NATURAL":
@@ -356,15 +364,18 @@ def check_values(
                 if not any(_may_hold(scope.selected_sources[a][1], wanted, dialect, visible)
                            for a in candidates if a in left and a in scope.selected_sources):
                     candidates = [right]
+                    narrowed = True
                     left.append(right)
                     continue
             elif not any(_written(key, dialect) == wanted for key in (join.args.get("using") or ())):
                 left.append(right)
                 continue
             side = (join.side or "").upper()
+            narrowed = True
             if side == "FULL":
-                return None
-            candidates = [right] if side == "RIGHT" else [a for a in candidates if a != right]
+                full = True
+            else:
+                candidates = [right] if side == "RIGHT" else [a for a in candidates if a != right]
             left.append(right)
         # A source renamed by position among the candidates, before any sole owner: the
         # statement-wide reading would place the name by it (the gate's second round).
@@ -398,9 +409,13 @@ def check_values(
                         return None
                     if holds is None:
                         unknown = True  # the source may yield the name, and the engine binds there
+        if full:
+            return owners[0] if owners and len(set(owners)) == 1 and not unknown else None
         if len(owners) == 1:
             return owners[0]
-        return _WIDE if owners or unknown else _ABSENT
+        if owners or unknown:
+            return None if narrowed else _WIDE
+        return _ABSENT
 
     def resolve(column: exp.Column) -> tuple[str, str] | None:
         # The scope's own answer first, then each enclosing scope's, the nearest first, as the

@@ -328,8 +328,16 @@ def test_a_natural_join_leaves_the_names_it_does_not_merge_alone():
         assert con.execute(sql).fetchall() == [(0,)], sql
         verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index())
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
-    sql = "SELECT count(*) FROM t NATURAL FULL JOIN t AS b WHERE doc = 'west'"
-    assert con.execute(sql).fetchall() == [(0,)]
+    # A FULL join's merged column is coalesced from both sides: one answer where both resolve to
+    # one base column (Codex's ninth review: `coalesce(t.doc, b.doc)` is `t.doc` twice), none
+    # where they differ.
+    for sql in ("SELECT count(*) FROM t NATURAL FULL JOIN t AS b WHERE doc = 'west'",
+                "SELECT count(*) FROM t FULL JOIN t AS b USING (doc) WHERE doc = 'west'"):
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index())
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    sql = "SELECT count(*) FROM t NATURAL FULL JOIN (SELECT region AS doc FROM t) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(1,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None
     sql = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT name FROM u) AS a NATURAL JOIN v AS b WHERE doc = 'west')"
     assert con.execute(sql).fetchall() == [(2,)]
@@ -537,3 +545,27 @@ def test_a_natural_join_beside_sources_lacking_the_name_leaves_it_to_the_enclosi
            "NATURAL JOIN (SELECT k FROM v) AS b WHERE doc = 'west')")
     assert con.execute(sql).fetchall() == [(1,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None
+
+
+def test_a_joins_side_whose_output_the_walk_cannot_name_is_not_read_statement_wide():
+    # Codex's ninth review of #178: a RIGHT join made the name `q`'s, `q`'s output a star over a
+    # join (or a union) the walk cannot name, and the statement-wide reading, kept for a scope
+    # that cannot tell, resurrected the discarded left input and refused a present value against
+    # `t.doc` where DuckDB compares `q.doc`, `t.region`. A merged column is one side's: where
+    # that side cannot be named the scope answers nothing.
+    visible = {**VISIBLE, "u": {"name"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east'); "
+                "CREATE TABLE u (name VARCHAR); INSERT INTO u VALUES ('n')")
+    for sql, rows in (("SELECT count(*) FROM t NATURAL RIGHT JOIN (SELECT * FROM (SELECT region AS doc FROM t) AS z CROSS JOIN u) AS q WHERE doc = 'west'", 1),
+                      ("SELECT count(*) FROM t NATURAL RIGHT JOIN (SELECT * FROM (SELECT region AS doc FROM t UNION ALL SELECT region AS doc FROM t) AS z) AS q WHERE doc = 'west'", 2),
+                      ("SELECT count(*) FROM t RIGHT JOIN (SELECT * FROM (SELECT region AS doc FROM t) AS z CROSS JOIN u) AS q USING (doc) WHERE doc = 'west'", 1),
+                      # the left side cannot hold the name, the right side cannot be named: the name is the right's, and nothing is checked
+                      ("SELECT count(*) FROM (SELECT name FROM u) AS a NATURAL JOIN (SELECT * FROM (SELECT region AS doc, 'n' AS name FROM t) AS z CROSS JOIN u) AS b WHERE doc = 'west'", 1)):
+        assert con.execute(sql).fetchall() == [(rows,)], sql
+        assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None, sql
+    # and the left side's own holder still answers where the join leaves the name there
+    sql = "SELECT count(*) FROM t NATURAL JOIN (SELECT * FROM (SELECT region AS doc FROM t) AS z CROSS JOIN u) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index())
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
