@@ -207,7 +207,12 @@ def is_lambda_parameter(node: exp.Expression) -> bool:
 def as_duckdb_reads(ast: exp.Expression) -> exp.Expression:
     """The tree re-read as DuckDB reads it, in place: a Lambda outside a lambda taker the JSON
     extract over Columns, innermost first, and then every MAP literal's bare key the Column
-    it is, or the Var of an enclosing lambda's parameter spelled exactly."""
+    it is, or the Var of an enclosing lambda's parameter spelled exactly. The Var carries the
+    key's own Identifier, so its name compares bare and its render keeps the quotes: rendered
+    by name, `"x.secret"` became `x.secret`, which the next parse reduced to `secret`, and
+    `MAP {secret: 1}` ran against the column where the text read the parameter (Codex's
+    forty-sixth review of #160); a doubled quote tokenized nowhere and raised out of the
+    decider the same way."""
     for lam in reversed(list(ast.find_all(exp.Lambda))):
         if not arrow_read_as_a_lambda(lam):
             continue
@@ -219,7 +224,7 @@ def as_duckdb_reads(ast: exp.Expression) -> exp.Expression:
         for item in struct.expressions if struct is not None else ():
             if isinstance(item, exp.PropertyEQ) and isinstance(item.this, exp.Identifier):
                 key = item.this
-                item.set("this", exp.Var(this=key.name) if is_lambda_parameter(key) else exp.Column(this=key.copy()))
+                item.set("this", exp.Var(this=key.copy()) if is_lambda_parameter(key) else exp.Column(this=key.copy()))
     return ast
 
 

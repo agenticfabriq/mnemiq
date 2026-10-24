@@ -117,6 +117,22 @@ def test_a_map_key_naming_its_lambdas_parameter_is_the_parameter():
     assert isinstance(verdict, ApprovedWrite) and "MAP {x: 1}" in verdict.target_sql, verdict
 
 
+def test_a_quoted_parameter_key_keeps_its_quotes_in_the_render():
+    # Codex's forty-sixth review of #160: the parameter's Var rendered its bare name, so `"x.secret"`
+    # became `x.secret`, which the next parse reduced to `secret`, and `MAP {secret: 1}` ran against
+    # the column the grant withholds where the text read the parameter; a doubled quote tokenized
+    # nowhere and raised out of the decider. The Var carries the key's own Identifier: the name
+    # compares bare, the render keeps the quotes, and the target runs to the text's rows.
+    con = _table()
+    for name in ('"x.secret"', '"a""b"', '"x y"', '"end"', '"X"'):
+        sql = f"SELECT list_transform(tags, {name} -> map_keys(MAP {{{name}: 1}})[1]) FROM claim"
+        rows = con.execute(sql).fetchall()
+        assert rows == [(['north'],)], sql
+        verdict = _decide(sql)
+        assert isinstance(verdict, Approved) and f"MAP {{{name}: 1}}" in verdict.target_sql, (sql, verdict)
+        assert con.execute(verdict.target_sql).fetchall() == rows, verdict.target_sql
+
+
 def test_an_arrow_outside_a_lambda_taker_is_no_lambda():
     # The review gate on round 54: sqlglot reads `a -> b` as a lambda inside any call, DuckDB
     # only inside the calls it hands a lambda to and as the JSON arrow elsewhere, so a MAP key

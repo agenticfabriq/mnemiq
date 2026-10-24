@@ -1556,6 +1556,7 @@ def test_a_map_literals_bare_key_is_read_and_installed_as_the_engine_reads_it():
     verdict = _decide(reversed_, snapshot=_snapshot(types))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
     for row_filter in ("list_transform(tags, x -> MAP {x: 1}[x] = 1) = [true]",   # the key is the parameter
+                       "list_transform(['south'], \"x.region\" -> MAP {\"x.region\": 1}[region] IS NULL) = [true]",   # quoted, the parameter still (Codex's forty-sixth)
                        "list_transform([1], x -> list_transform(tags, y -> MAP {x: 1}[1] = 1)) = [[true]]",   # bound outside the body typed
                        "MAP {region: 1}[region] = 1",                                # the key is a column
                        "MAP {\"X\": 1}['qx'] = 1",                                   # quoted, a column still
