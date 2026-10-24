@@ -18,6 +18,7 @@ oracledb = pytest.importorskip("oracledb")
 
 from oracledb import errors as oracledb_errors  # noqa: E402
 
+from mnemiq.adapters.base import QueryCancelled  # noqa: E402
 from mnemiq.adapters.oracle import OracleAdapter, _is_timeout  # noqa: E402
 
 
@@ -56,6 +57,12 @@ def test_the_cancel_is_a_timeout_only_once_the_deadline_has_passed():
     assert _is_timeout(cancel, deadline_met=True)
     assert not _is_timeout(cancel, deadline_met=False)
     assert not _is_timeout(oracledb.DatabaseError("ORA-01013: user requested cancel of current operation"), deadline_met=False)
+    # A closed connection reads as the cancel does (M188): the bound's end at the deadline, and the
+    # source's before it, an outage the runner reports through the adapter's own classifier.
+    closed = _driver_error("DPY-4011: the database or network closed the connection", 4011)
+    assert _is_timeout(closed, deadline_met=True)
+    assert not _is_timeout(closed, deadline_met=False)
+    assert not _is_timeout(oracledb.DatabaseError("DPY-4011: the database or network closed the connection"), deadline_met=False)
     # the driver's own timeout codes do not depend on the clock
     assert _is_timeout(_driver_error("DPY-4024: call timeout of 300 ms exceeded", 4024), deadline_met=False)
     assert _is_timeout(_driver_error("ORA-03156: the statement timed out", 3156), deadline_met=False)
@@ -113,5 +120,92 @@ def test_execute_arrow_reads_the_cancel_against_its_own_deadline(monkeypatch, el
         with pytest.raises(RuntimeError, match="query timed out after 4.9995"):
             adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=4.9995)
     else:
-        with pytest.raises(oracledb.OperationalError, match="ORA-01013"):
+        # Before the deadline the cancel is anyone's: raised as the cancel it is, the driver's
+        # ORA-01013 its cause, so the runner does not read it as an outage (the
+        # review gate on M188).
+        with pytest.raises(QueryCancelled, match="ORA-01013") as caught:
             adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=4.9995)
+        assert isinstance(caught.value.__cause__, oracledb.OperationalError)
+
+
+class _FetchingCursor:
+    """A cursor whose execute answers in one second and whose fetch is several round trips, one
+    row each, taking the given seconds; the last trip raises `error` when one is given. `fetchall`
+    is the driver's own loop over the same trips."""
+
+    description = [("N", None, None, None, None, None, None)]
+
+    def __init__(self, clock, trips, error=None):
+        self.connection = type("Connection", (), {"call_timeout": 0})()
+        self._clock, self._trips, self._error = clock, list(trips), error
+
+    def execute(self, sql):
+        self._clock[0] += 1.0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self._trips:
+            raise StopIteration
+        seconds = self._trips.pop(0)
+        self._clock[0] += seconds
+        if not self._trips and self._error is not None:
+            raise self._error
+        return (seconds,)
+
+    def fetchall(self):
+        return list(self)
+
+
+def _fetching_adapter(monkeypatch, trips, error=None):
+    clock = [100.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    adapter = OracleAdapter.__new__(OracleAdapter)
+    adapter._oracledb = oracledb
+    adapter._refuse_unless_read = lambda sql: None
+    adapter._with_cursor = lambda work, timeout_ms=None: work(_FetchingCursor(clock, trips, error))
+    return adapter
+
+
+_CANCEL = ("ORA-01013: user requested cancel of current operation", 1013, oracledb.OperationalError)
+_CLOSED = ("DPY-4011: the database or network closed the connection", 4011, None)
+
+
+@pytest.mark.parametrize("trips", [[3.0, 3.0, 3.0, 0.5], [4.5]], ids=["late", "first-fetch"])
+def test_a_cancel_in_the_fetch_is_the_cancel_not_the_bounds_end(monkeypatch, trips):
+    # Codex's review of #179 at f97f7749: `call_timeout` bounds each round trip, not the
+    # statement, and the clock ran from the execute through the whole fetch. Three 3 s trips and
+    # a cancel 0.5 s into the fourth, 10.5 s after the execute under a 5 s bound: no trip reached
+    # the bound, so it is not the bound's end. Read as one it was repairable, and the model could
+    # run the statement again. And the first fetch trip is its own too: 4.5 s after a 1 s
+    # execute is 5.5 s from the execute, short of the bound from the trip's start.
+    adapter = _fetching_adapter(monkeypatch, trips, _driver_error(*_CANCEL))
+    with pytest.raises(QueryCancelled, match="ORA-01013"):
+        adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=5.0)
+
+
+def test_a_closed_connection_late_in_a_long_fetch_is_the_sources(monkeypatch):
+    # The same trips ending in DPY-4011: the source dropped the connection, so the driver's error
+    # reaches the runner as it is and the adapter's classifier reads it as the outage it is.
+    adapter = _fetching_adapter(monkeypatch, [3.0, 3.0, 3.0, 0.5], _driver_error(*_CLOSED))
+    with pytest.raises(oracledb.DatabaseError, match="DPY-4011") as caught:
+        adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=5.0)
+    assert adapter.source_unavailable(caught.value)
+
+
+@pytest.mark.parametrize("fault", [_CANCEL, _CLOSED], ids=["cancel", "closed"])
+def test_a_fetch_round_trip_that_reaches_the_bound_is_a_timeout(monkeypatch, fault):
+    # The other side: one trip that itself lasts the bound is the bound's end, however short the
+    # trips before it.
+    adapter = _fetching_adapter(monkeypatch, [0.5, 0.5, 5.0], _driver_error(*fault))
+    with pytest.raises(RuntimeError, match="query timed out after 5.0"):
+        adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=5.0)
+
+
+def test_a_long_fetch_with_no_fault_returns_every_row(monkeypatch):
+    # The per-trip clock changes how the fetch is driven, not what it returns.
+    adapter = _fetching_adapter(monkeypatch, [3.0, 3.0, 3.0, 0.5])
+    table = adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=5.0)
+    assert table.column_names == ["N"]
+    assert table.column(0).to_pylist() == [3.0, 3.0, 3.0, 0.5]

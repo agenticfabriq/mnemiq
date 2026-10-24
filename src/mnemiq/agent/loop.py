@@ -21,7 +21,13 @@ from mnemiq.progress import Emit, Stage, step
 from mnemiq.redact import policy_safe_detail
 from mnemiq.execute.render import render_result
 from mnemiq.execute.resultset import cluster
-from mnemiq.execute.runner import DEFAULT_TIMEOUT_S, ExecutionError, run
+from mnemiq.execute.runner import (
+    DEFAULT_TIMEOUT_S,
+    ExecutionError,
+    QueryCancelledError,
+    SourceUnavailableError,
+    run,
+)
 from mnemiq.execute.select import (
     ClusterView,
     SelectorRead,
@@ -363,6 +369,22 @@ class Agent:
             try:
                 with step(emit, Stage.EXECUTE):
                     result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
+            except SourceUnavailableError as exc:
+                # Not the statement's failure, so not fed back: the model would rewrite a correct
+                # query because the network failed (M188). A failure, not a deferral (M6), as the
+                # proof seam reports the same fault before the run. Not run again either: a cancel
+                # or a statement timeout worded in another language, and an administrator's kill,
+                # read as outages too, and a second run would repeat what someone stopped (Codex's
+                # review of #179).
+                logger.warning("the source did not answer while a query ran: %s", exc.full_text)
+                return AgentAnswer(answer=exc.message, failed=True,
+                                   reason_code=DeferralReason.SOURCE_UNAVAILABLE)
+            except QueryCancelledError as exc:
+                # Someone stopped the statement, so the turn ends here: repaired, a model writing
+                # the same SQL again would run it a second time (Codex's second review of #179).
+                logger.warning("the source cancelled a query while it ran: %s", exc.full_text)
+                return AgentAnswer(answer=exc.message, failed=True,
+                                   reason_code=DeferralReason.EXECUTION_FAILED)
             except ExecutionError as exc:
                 # The database is the one authority that cannot be wrong about itself: its
                 # complaint is the cheapest accuracy lever we have. Feed it back and retry.
@@ -426,13 +448,18 @@ class Agent:
         )
 
     def _execute(self, approved: Approved, grants: GrantSet, packet: ContextPacket):
-        """Cache-or-run one plan; None on execution error (this candidate just drops out)."""
+        """Cache-or-run one plan; None on execution error (this candidate just drops out). A
+        source that did not answer, or a statement someone cancelled, raises its own error
+        (`SourceUnavailableError`, `QueryCancelledError`), which ends the turn rather than this
+        candidate alone (M188)."""
         key = cache_key(approved.plan_sql, grants.fingerprint, packet.enrichment_version)
         hit = self.cache.get(key)
         if hit is not None:
             return from_ipc(hit)
         try:
             result = run(self.adapter, approved.target_sql, timeout_s=self.timeout_s)
+        except (SourceUnavailableError, QueryCancelledError):
+            raise
         except ExecutionError as exc:
             # This candidate drops out of the vote. Logged for the same reason the single-answer
             # path logs: when three of five candidates are rejected by the source and two
@@ -501,7 +528,25 @@ class Agent:
                     if getattr(outcome, "code", None) == DeferralReason.UNDEFINED_TERM:
                         undefined = outcome
                     continue
-                table = self._execute(outcome, grants, packet)
+                try:
+                    table = self._execute(outcome, grants, packet)
+                except SourceUnavailableError as exc:
+                    # The run-time half of the stop above (M188): the source did not answer this
+                    # candidate's run, so it would not answer the next candidate's, and dropping it
+                    # would ask every later candidate and then the single path.
+                    logger.warning("the source did not answer while a query ran: %s", exc.full_text)
+                    return AgentAnswer(answer=exc.message, failed=True,
+                                       reason_code=DeferralReason.SOURCE_UNAVAILABLE,
+                                       candidates_executed=len(executed),
+                                       narrowed=_narrowed_of(executed))
+                except QueryCancelledError as exc:
+                    # A later candidate, or the single path's fallback, could write the stopped
+                    # statement again: the turn ends on the cancel, as the single path does.
+                    logger.warning("the source cancelled a query while it ran: %s", exc.full_text)
+                    return AgentAnswer(answer=exc.message, failed=True,
+                                       reason_code=DeferralReason.EXECUTION_FAILED,
+                                       candidates_executed=len(executed),
+                                       narrowed=_narrowed_of(executed))
             if table is not None:
                 executed.append((outcome, table))
 

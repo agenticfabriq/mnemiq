@@ -8,6 +8,7 @@ import threading
 import duckdb
 import pyarrow as pa
 
+from mnemiq.adapters.base import QueryCancelled
 from mnemiq.duckdb_extensions import connect_duckdb, load_extension, lock_configuration
 
 logger = logging.getLogger(__name__)
@@ -179,6 +180,14 @@ def _ended_by_statement_timeout(exc: Exception) -> bool:
     return "canceling statement due to statement timeout" in str(exc)
 
 
+def _cancelled_by_request(exc: Exception) -> bool:
+    """A Postgres source's own cancel, which `pg_cancel_backend` from another session raises through
+    the attach as an IOException this classifier calls unavailable (measured, the review gate on
+    M188). The server's English message: a source whose `lc_messages` is another language says it
+    otherwise, and that cancel keeps the outage reading."""
+    return "canceling statement due to user request" in str(exc)
+
+
 def execute_bounded(con, sql: str, timeout_s: float | None) -> pa.Table:
     """Run `sql` on a DuckDB connection, interrupted if it overruns `timeout_s`, and with a source's
     own statement-timeout cancellation raised as the interrupt it is -- one body for the single-
@@ -195,6 +204,8 @@ def execute_bounded(con, sql: str, timeout_s: float | None) -> pa.Table:
             raise duckdb.InterruptException(
                 f"query timed out after {timeout_s}s: the source ended it at its statement "
                 "timeout") from exc
+        if _cancelled_by_request(exc):
+            raise QueryCancelled(f"the source cancelled the query: {exc}") from exc
         raise
     finally:
         if timer is not None:
