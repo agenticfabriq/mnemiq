@@ -325,7 +325,12 @@ class OracleAdapter:
                 try:
                     yield self._con
                 finally:
-                    _set_call_timeout(self._con, previous)
+                    # Never raising over the body's error: a connection the driver closed says
+                    # so on its next call.
+                    try:
+                        _set_call_timeout(self._con, previous)
+                    except Exception:
+                        pass
             return
         # Bounded by `wait_timeout`: DPY-4005 rather than an unbounded wait. Measured on a max=1
         # pool, which raised after the configured 1.5s instead of blocking.
@@ -355,21 +360,20 @@ class OracleAdapter:
             yield con
         finally:
             try:
-                reset = _set_call_timeout(con, 0)
+                _set_call_timeout(con, 0)
             except Exception:
                 # Two things this must not do: mask the body's exception, and skip the return.
                 # A bare `finally` did both -- a raise here replaced whatever the caller was
                 # already failing with, and jumped over `release`.
-                reset = False
-            if reset:
-                self._pool.release(con)
-            else:
+                #
                 # DROPPED rather than released, because a connection that will not accept a
                 # timeout reset would go back into the pool carrying an unknown one, and the
-                # next borrower would inherit a bound nobody set; and one the driver closed is
-                # dropped without the reset, which would have ended the process
+                # next borrower would inherit a bound nobody set; one the driver closed lands
+                # here too, without the write that would have ended the process
                 # (`_set_call_timeout`). `drop` retires it and the pool opens a replacement.
                 self._pool.drop(con)
+            else:
+                self._pool.release(con)
 
     def _recheck_read_only(self, con) -> None:
         """Re-probe the database's open mode on a bounded cadence, and say so when it lapses.
@@ -1724,24 +1728,27 @@ def _is_ddl_race(exc: Exception) -> bool:
     return "ora-01466" in str(exc).lower()
 
 
-def _set_call_timeout(con, ms: int) -> bool:
-    """Set `con.call_timeout` unless the driver has closed the connection, and say whether it did.
+def _set_call_timeout(con, ms: int) -> None:
+    """Set `con.call_timeout`, asking the driver first when it calls the connection unhealthy.
 
     python-oracledb 4.0.2 closes a connection itself when a call outlives `call_timeout` and the
     server does not answer the break that follows within the same bound (DPY-4011, "socket timed
     out while recovering from previous socket timeout"); measured on Oracle Free 23 in thin mode
     with a query that was only slow, standalone and pooled alike. Setting `call_timeout` on that
     connection dereferences the socket the driver dropped and segfaults: no `except` catches it,
-    and it ends the process for every caller. Every other call measured there is safe --
-    `rollback` and `execute` raise DPY-1001, `drop` and `release` return -- so a write skipped
-    here leaves the driver to report the dead connection on its next call. `is_healthy()` reads
-    the same socket without a round trip. Every write of `call_timeout` in this file goes through
-    here, and a test holds it to that.
+    and it ends the process for every caller.
+
+    `is_healthy()` is a local check that says False for that dropped socket, and also for a
+    session the server has said it is ending while the socket stays open, where the write is safe
+    and skipping it would run the next statement unbounded (the review gate on the first commit).
+    So an unhealthy connection is pinged first: on the dropped socket `ping` raises DPY-1001
+    (measured, as `rollback` and `execute` do there) before the write is reached, and a
+    connection that answers has its socket and takes the write. Every write of `call_timeout` in
+    this file goes through here, and a test holds it to that.
     """
     if not con.is_healthy():
-        return False
+        con.ping()
     con.call_timeout = ms
-    return True
 
 
 # The codes a bounded call's end takes, by the driver's own error list (python-oracledb
