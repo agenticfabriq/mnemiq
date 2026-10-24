@@ -9,6 +9,7 @@ from sqlglot import exp
 
 from mnemiq.sql.identifiers import resolve_name
 from mnemiq.sql.qualify import object_key
+from mnemiq.sql.reading import as_duckdb_reads
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ def check_shape(
             message="Return exactly one statement. Multiple statements are never executed.",
         )
 
-    ast = statements[0]
+    ast = as_duckdb_reads(statements[0])  # one tree for the guards and the render: `reading`
     if not isinstance(ast, _ALLOWED_ROOTS):
         return Refusal(
             code=RefusalCode.NOT_SELECT_ONLY,

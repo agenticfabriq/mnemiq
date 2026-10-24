@@ -11,6 +11,7 @@ from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import names_one_object, object_key
+from mnemiq.sql.reading import as_duckdb_reads, map_struct
 from mnemiq.sql.scope import (base_tables, column_tables, cte_references, known_columns,
                               scope_resolved)
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -29,6 +30,13 @@ _SUBJECT = "__mnemiq_filtered__"
 # reading ROWNUM is neither merged nor has predicates pushed into it, and `ROWNUM > 0` holds for
 # every row, so the fence changes which rows the outer query sees first and never which rows.
 _FENCED = frozenset({"oracle"})
+
+
+def _parsed(filt: str, dialect: str, wrapped: bool = False) -> exp.Expression:
+    """A row filter's parse, bare or as the WHERE of the query it becomes, read as DuckDB reads
+    it (`as_duckdb_reads`): the one installed, the validator's and the typing rules' alike."""
+    text = f"SELECT 1 FROM {_SUBJECT} WHERE {filt}" if wrapped else filt
+    return as_duckdb_reads(sqlglot.parse_one(text, read=dialect))
 
 
 def _validate_filter(
@@ -58,7 +66,7 @@ def _validate_filter(
     it is refused: an unvalidatable filter must not become a filter that silently does nothing.
     """
     try:
-        expr = sqlglot.parse_one(filt, read=dialect)
+        expr = _parsed(filt, dialect)
     except Exception:
         return None
     if not isinstance(expr, exp.Condition):
@@ -79,7 +87,7 @@ def _validate_filter(
     schema = dict(policy_schema or {})
     schema[_SUBJECT] = set(cols)
     try:
-        wrapped = sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {filt}", read=dialect)
+        wrapped = _parsed(filt, dialect, wrapped=True)
     except Exception:
         return None
     resolved = column_tables(wrapped, executes_as or dialect, schema)
@@ -97,6 +105,11 @@ def _validate_filter(
         if _parameter_in_another_case(node):
             return None  # a lambda's parameter spelled in another case than declared: no predicate
     for column in wrapped.find_all(exp.Column):
+        if _is_lambda_parameter(column):
+            # A MAP literal's key naming its lambda's parameter, a Column by `as_duckdb_reads`
+            # (sqlglot spells the exact name an Identifier everywhere else): the parameter,
+            # which DuckDB binds before any column, not a name to hold to the table.
+            continue
         owner = resolved.get(id(column))
         if owner is None:
             if column.table:
@@ -604,17 +617,6 @@ def _coerces_to_json(node: exp.Expression, type_of, engine: str) -> bool:
     Codex's fifth review). Text, and a value of unknown type, is parsed on the rows that take
     it."""
     return _values_coerce_to_json(_branches(node), type_of, engine)
-
-
-def _map_key(item: exp.PropertyEQ) -> exp.Expression:
-    """A MAP literal's key as the engine evaluates it: sqlglot parses `MAP {attrs: 1}`'s key as a
-    struct-field identifier, which stands for the column, read in the key's own SELECT."""
-    key = item.this
-    if isinstance(key, exp.Identifier):
-        as_column = exp.Column(this=key.copy())
-        as_column.parent = item
-        return as_column
-    return key
 
 
 def _untypable(value: exp.Expression, type_of, engine: str) -> bool:
@@ -1779,7 +1781,7 @@ def _parameter_in_another_case(node: exp.Expression) -> bool:
     if isinstance(node, exp.Identifier) and (
             isinstance(node.parent, exp.Column)                                            # read through its Column
             or (isinstance(node.parent, exp.Dot) and node is node.parent.expression)        # a struct field's name, `x.X`
-            or (isinstance(node.parent, exp.PropertyEQ) and node is node.parent.this)):    # a struct key, `{X: tags}`
+            or (isinstance(node.parent, exp.PropertyEQ) and node is node.parent.this)):    # a struct key, `{X: tags}`; a MAP's is a Column (`as_duckdb_reads`)
         # A name in another role than a reference: a field or a key spelled like a parameter in
         # another case names no parameter, and read as one it refused `list_transform([{X:
         # tags}], x -> list_transform(x.X, y -> y = region))`, which DuckDB runs (Codex's
@@ -2052,7 +2054,7 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
     check matches known spellings; it is not a proof.
     """
     engine = (executes_as or dialect).lower()
-    wrapped = sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {filt}", read=dialect)
+    wrapped = _parsed(filt, dialect, wrapped=True)
     owners = column_tables(wrapped, engine) or {}
 
     def types_of(key: str) -> dict[str, str]:
@@ -2216,11 +2218,9 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             # once (`MAP {...}['b']`, whose struct sqlglot wraps in the bracket) are the same
             # shapes (the review gate on 3d52790).
             if isinstance(node, exp.ToMap):
-                struct = node.this
-                while isinstance(struct, (exp.Bracket, exp.Paren)):
-                    struct = struct.this
-                items = struct.expressions if isinstance(struct, exp.Struct) else []
-                groups = [[_map_key(item) for item in items if isinstance(item, exp.PropertyEQ)],
+                struct = map_struct(node)
+                items = struct.expressions if struct is not None else []
+                groups = [[item.this for item in items if isinstance(item, exp.PropertyEQ)],
                           [item.expression for item in items if isinstance(item, exp.PropertyEQ)]]
             else:
                 groups = [node.expressions]

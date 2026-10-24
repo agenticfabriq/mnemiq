@@ -29,6 +29,7 @@ from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.lineage import lineage_for
 from mnemiq.sql.scope import (base_tables, check_policy_target, fields_as_members, known_columns,
                               scope_resolved)
+from mnemiq.sql.reading import as_duckdb_reads, rendered
 from mnemiq.sql.rls import apply_row_and_mask, check_filter_targets, unplaceable_policy
 from mnemiq.sql.values_check import check_values
 from mnemiq.sql.views import check_views
@@ -40,7 +41,7 @@ def _render_target(tree: exp.Expression, plan_sql: str, dialect: str, target: st
     One path for the executed statement and the one a caller is shown (M51), so the two agree
     whenever the policy changed nothing."""
     try:
-        return sqlglot.transpile(plan_sql, read=dialect, write=target)[0]
+        return rendered(plan_sql, dialect, target)
     except sqlglot.errors.ParseError:
         return _transpile_under_the_cap(tree, dialect, target)
 
@@ -57,7 +58,7 @@ def _transpile_under_the_cap(shaped: exp.Expression, dialect: str, target: str) 
     limit = shaped.args.get("limit")
     uncapped = shaped.copy()
     uncapped.set("limit", None)
-    reread = sqlglot.parse_one(uncapped.sql(dialect=dialect), read=dialect)
+    reread = as_duckdb_reads(sqlglot.parse_one(uncapped.sql(dialect=dialect), read=dialect))
     if limit is not None:
         reread.set("limit", limit.copy())
     return reread.sql(dialect=target)

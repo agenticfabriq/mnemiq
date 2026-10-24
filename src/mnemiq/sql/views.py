@@ -8,6 +8,7 @@ from sqlglot import exp
 from mnemiq.contract import ViewDefinition
 from mnemiq.sql.identifiers import rules_for
 from mnemiq.sql.qualify import object_key
+from mnemiq.sql.reading import as_duckdb_reads
 from mnemiq.sql.scope import cte_references
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
@@ -26,7 +27,7 @@ def body_of(view: ViewDefinition) -> exp.Expression | None:
     prefix keeps one SQL implementation -- `str.partition` would be a second, and a worse one.
     """
     try:
-        parsed = sqlglot.parse_one(view.definition, read=view.dialect)
+        parsed = as_duckdb_reads(sqlglot.parse_one(view.definition, read=view.dialect))
     except Exception:
         return None
     if isinstance(parsed, exp.Create):

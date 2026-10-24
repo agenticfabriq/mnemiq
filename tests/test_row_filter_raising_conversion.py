@@ -1534,3 +1534,37 @@ def test_a_slice_over_text_is_text_and_meets_a_list_as_the_cast(row_filter):
         con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
     verdict = _decide(row_filter)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_a_map_literals_bare_key_is_read_and_installed_as_the_engine_reads_it():
+    # Codex's forty-third review of #160: DuckDB reads a MAP literal's bare key as an expression,
+    # the lambda's parameter here, and sqlglot wrote it back as the text 'X', so the filter
+    # installed kept the row the filter written removed. Read as the column it is, the key is a
+    # parameter spelled in another case, no predicate (the case guard); a key spelled as the
+    # engine reads it is installed as written, the same rows as the text where the plain
+    # rendering gave others; and a key naming no column of the table is held to the table,
+    # where it reached the engine before.
+    types = {**TYPES, ("claim", "tags"): "VARCHAR[]", ("claim", "X"): "VARCHAR"}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, amount INT, big BIGINT, attrs JSON, d DATE, tags VARCHAR[], \"X\" VARCHAR); "
+                "INSERT INTO claim VALUES (1, 'north', 1, 1, '{\"a\": 1}', DATE '2026-01-01', ['north'], 'qx')")
+    reversed_ = "list_transform(tags, x -> MAP {X: x}[x] IS NULL) = [true]"
+    assert con.execute(f"SELECT id FROM claim WHERE {reversed_}").fetchall() == []
+    plain = sqlglot.parse_one(reversed_, read="duckdb").sql(dialect="duckdb")
+    assert "MAP {'X': x}" in plain and con.execute(f"SELECT id FROM claim WHERE {plain}").fetchall() == [(1,)]
+    verdict = _decide(reversed_, snapshot=_snapshot(types))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    for row_filter in ("list_transform(tags, x -> MAP {x: 1}[x] = 1) = [true]",   # the key is the parameter
+                       "MAP {region: 1}[region] = 1",                                # the key is a column
+                       "MAP {\"X\": 1}['qx'] = 1",                                   # quoted, a column still
+                       "MAP {'X': 1}['X'] = 1",                                      # a string, as written
+                       "{X: 1}.X = 1"):                                              # a struct's key is a name
+        rows = con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall()
+        assert rows == [(1,)], row_filter
+        verdict = _decide(row_filter, snapshot=_snapshot(types))
+        assert isinstance(verdict, Approved), (row_filter, verdict)
+        assert con.execute(verdict.target_sql).fetchall() == rows, verdict.target_sql
+    with pytest.raises(duckdb.Error):
+        con.execute("SELECT id FROM claim WHERE MAP {nowhere: 1} IS NOT NULL")
+    verdict = _decide("MAP {nowhere: 1} IS NOT NULL", snapshot=_snapshot(types))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
