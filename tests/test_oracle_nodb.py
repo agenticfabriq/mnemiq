@@ -92,6 +92,9 @@ class _FakeCon:
                 raise RuntimeError(f"write#{self.writes}")
         object.__setattr__(self, name, value)
 
+    def is_healthy(self):
+        return True  # read before every timeout write (`_set_call_timeout`), as a real one has it
+
 
 class _FakePool:
     def __init__(self, con):
@@ -169,6 +172,9 @@ class _ProbeFails:
         object.__setattr__(self, "timeouts", [])
         object.__setattr__(self, "closed", 0)
         object.__setattr__(self, "call_timeout", 0)
+
+    def is_healthy(self):
+        return True
 
     def cursor(self):
         outer = self
@@ -407,6 +413,9 @@ class _ProbeSaysReadOnly:
     is what a SUCCESSFUL check looks like for this probe."""
 
     call_timeout = 0
+
+    def is_healthy(self):
+        return True
 
     def cursor(self):
         import oracledb

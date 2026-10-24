@@ -321,11 +321,11 @@ class OracleAdapter:
             with self._lock:
                 previous = self._con.call_timeout
                 if timeout_ms:
-                    self._con.call_timeout = timeout_ms
+                    _set_call_timeout(self._con, timeout_ms)
                 try:
                     yield self._con
                 finally:
-                    self._con.call_timeout = previous
+                    _set_call_timeout(self._con, previous)
             return
         # Bounded by `wait_timeout`: DPY-4005 rather than an unbounded wait. Measured on a max=1
         # pool, which raised after the configured 1.5s instead of blocking.
@@ -350,24 +350,26 @@ class OracleAdapter:
             # pool hands back after a network fault -- was never released. Repeat that and the
             # pool runs out: one poisoned session becomes DPY-4005 for every healthy request,
             # which is M72's own failure mode reintroduced by M72's fix.
-            con.call_timeout = timeout_ms or 0
+            _set_call_timeout(con, timeout_ms or 0)
             self._recheck_read_only(con)
             yield con
         finally:
             try:
-                con.call_timeout = 0
+                reset = _set_call_timeout(con, 0)
             except Exception:
                 # Two things this must not do: mask the body's exception, and skip the return.
                 # A bare `finally` did both -- a raise here replaced whatever the caller was
                 # already failing with, and jumped over `release`.
-                #
+                reset = False
+            if reset:
+                self._pool.release(con)
+            else:
                 # DROPPED rather than released, because a connection that will not accept a
                 # timeout reset would go back into the pool carrying an unknown one, and the
-                # next borrower would inherit a bound nobody set. `drop` retires it and the pool
-                # opens a replacement.
+                # next borrower would inherit a bound nobody set; and one the driver closed is
+                # dropped without the reset, which would have ended the process
+                # (`_set_call_timeout`). `drop` retires it and the pool opens a replacement.
                 self._pool.drop(con)
-            else:
-                self._pool.release(con)
 
     def _recheck_read_only(self, con) -> None:
         """Re-probe the database's open mode on a bounded cadence, and say so when it lapses.
@@ -419,7 +421,7 @@ class OracleAdapter:
         cur = con.cursor()
         try:
             if self._probe_timeout_ms:
-                con.call_timeout = self._probe_timeout_ms
+                _set_call_timeout(con, self._probe_timeout_ms)
             cur.execute(self._READ_ONLY_DB_PROBE)
             cur.fetchall()
         except self._oracledb.DatabaseError as exc:
@@ -443,7 +445,7 @@ class OracleAdapter:
         finally:
             cur.close()
             try:
-                con.call_timeout = previous
+                _set_call_timeout(con, previous)
             except Exception:
                 pass  # the lease's own cleanup drops a connection it cannot reset
         self._ro_checked_at = now
@@ -1335,7 +1337,7 @@ class OracleAdapter:
 
         def _fetch(cur):
             if timeout_s is not None:
-                cur.connection.call_timeout = int(timeout_s * 1000)
+                _set_call_timeout(cur.connection, int(timeout_s * 1000))
             started[0] = time.monotonic()  # the call alone, not the lease's lock wait, its setup round trip or a DDL-race backoff (the gate on the second commit)
             cur.execute(sql)
             names = [d[0] for d in cur.description] if cur.description else []
@@ -1720,6 +1722,26 @@ def _is_ddl_race(exc: Exception) -> bool:
     if getattr(err, "code", None) == 1466 or getattr(err, "full_code", None) == "ORA-01466":
         return True
     return "ora-01466" in str(exc).lower()
+
+
+def _set_call_timeout(con, ms: int) -> bool:
+    """Set `con.call_timeout` unless the driver has closed the connection, and say whether it did.
+
+    python-oracledb 4.0.2 closes a connection itself when a call outlives `call_timeout` and the
+    server does not answer the break that follows within the same bound (DPY-4011, "socket timed
+    out while recovering from previous socket timeout"); measured on Oracle Free 23 in thin mode
+    with a query that was only slow, standalone and pooled alike. Setting `call_timeout` on that
+    connection dereferences the socket the driver dropped and segfaults: no `except` catches it,
+    and it ends the process for every caller. Every other call measured there is safe --
+    `rollback` and `execute` raise DPY-1001, `drop` and `release` return -- so a write skipped
+    here leaves the driver to report the dead connection on its next call. `is_healthy()` reads
+    the same socket without a round trip. Every write of `call_timeout` in this file goes through
+    here, and a test holds it to that.
+    """
+    if not con.is_healthy():
+        return False
+    con.call_timeout = ms
+    return True
 
 
 # The codes a bounded call's end takes, by the driver's own error list (python-oracledb
