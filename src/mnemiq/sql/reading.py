@@ -149,9 +149,12 @@ def dotted_map_keys(sql: str, dialect: str | None) -> list[str]:
     return found
 
 
-# An unquoted identifier as the tokenizer reads one: a letter or an underscore, then word characters,
-# in any script (`é`, `λ`: Codex's forty-fifth review of #160 found an ASCII-only class letting
-# `MAP {é.region: 1}` through), the dollar sign DuckDB allows included. A string literal is none.
+# A bare identifier is whatever the tokenizer read as one (`TokenType.VAR`): the tokenizer has decided,
+# in every script and spelling DuckDB takes (Codex's forty-fifth review of #160 found an ASCII-only
+# class letting `MAP {é.region: 1}` through; the review gate then found a decomposed `é` and a name
+# starting with a non-ASCII digit, which the tokenizer takes and a Unicode word class does not). A
+# keyword the tokenizer typed as itself (`END`, `KEY`) is a name where it is spelled as a word. A
+# string or a number literal is none.
 _NAME = re.compile(r"^[^\W\d][\w$]*$")
 _LITERALS = (TokenType.STRING, TokenType.NUMBER, TokenType.NATIONAL_STRING, TokenType.RAW_STRING,
              TokenType.HEREDOC_STRING, TokenType.BYTE_STRING, TokenType.BIT_STRING, TokenType.HEX_STRING,
@@ -159,7 +162,7 @@ _LITERALS = (TokenType.STRING, TokenType.NUMBER, TokenType.NATIONAL_STRING, Toke
 
 
 def _is_name(token) -> bool:
-    return token.token_type == TokenType.IDENTIFIER or (
+    return token.token_type in (TokenType.IDENTIFIER, TokenType.VAR) or (
         token.token_type not in (TokenType.DOT, *_LITERALS) and _NAME.match(token.text) is not None)
 
 

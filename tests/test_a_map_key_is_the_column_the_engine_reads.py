@@ -207,6 +207,9 @@ def test_a_dotted_map_key_is_refused_before_the_parse_loses_it():
     ("MAP {\"x\".region: 1}", ['"x".region']),
     ("MAP {\u00e9.region: 1}", ["\u00e9.region"]),            # Codex's forty-fifth review: an ASCII-only class let it through
     ("MAP {\u03bb.a.b: 1}", ["\u03bb.a.b"]),
+    ("MAP {e\u0301.region: 1}", ["e\u0301.region"]),            # the gate on round 58: a decomposed letter, a VAR to the tokenizer
+    ("MAP {\u0663a.region: 1}", ["\u0663a.region"]),              # a name starting with a non-ASCII digit, the same
+    ("MAP {x.key: 1}", ["x.key"]),                                # a keyword spelled as a word is a name
     ("MAP {a.b.c: MAP {d.e: 1}}", ["a.b.c", "d.e"]),
     ("MAP {'a.b': 1, x.y: 2}", ["x.y"]),
     ("MAP {(x.region): 1}", []),
@@ -229,5 +232,9 @@ def test_a_unicode_dotted_map_key_is_refused_too():
     assert con.execute(sql).fetchall() == [([None],)]
     verdict = _decide(sql)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNMODELLED_CALL and "\u00e9.region" in verdict.message, verdict
+    sql = "SELECT list_transform([{region: 'south'}], e\u0301 -> MAP {e\u0301.region: 1}[region]) FROM claim"
+    assert con.execute(sql).fetchall() == [([None],)]
+    verdict = _decide(sql)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNMODELLED_CALL, verdict
     verdict = _decide("SELECT MAP {\"my col\".region: 1}['k'] FROM claim")
     assert isinstance(verdict, Refusal) and 'MAP {("my col".region): ...}' in verdict.message, verdict
