@@ -188,7 +188,9 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     column per column of its source, so the positions are unknown and the walk gives up (the
     review gate's fifth round). A projection without a qualifier is followed
     into the scope's one SELECTED source, not its one visible definition: three chained CTEs
-    count every earlier CTE among `sources` and skipped the walk (the same finding). A name no
+    count every earlier CTE among `sources` and skipped the walk (the same finding); over
+    several selected sources it is placed by that scope's join rules (`_in_scope`), as the
+    engine binds a bare name there (Codex's tenth review of #178). A name no
     projection carries comes through a star, into the scope's one selected source the same
     way (the review gate: an unqualified `doc` through `SELECT * FROM t` lost its owner once
     the statement-wide lookup became the fallback), a star with an EXCLUDE, a REPLACE or a
@@ -202,9 +204,10 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     q(region, doc)`) renames its columns by position, which a set of names cannot place, so
     the walk answers nothing there (the same review: `q.doc` is `t.region`, and the walk said
     `t.doc`). Names meet as the engine resolves them (`_written`, `_stored`). Where this answers nothing, the caller asks the
-    enclosing scopes, then keeps the statement-wide reading it had: a star over a join, a set
-    operation and a recursive CTE each resolved there and nowhere here (the gate's second
-    round)."""
+    enclosing scopes, then keeps the statement-wide reading it had: a set operation and a
+    recursive CTE each resolved there and nowhere here (the gate's second round). A plain star
+    over several sources yields the name as the scope binds a bare one, by its join rules
+    (Codex's eleventh review); a modified star over several stays unknown."""
     source = scope.sources.get(column.table) if column.table else None
     if isinstance(source, exp.Table):
         alias = source.args.get("alias")
@@ -232,8 +235,26 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
         for candidate in selects[len(listed):]:
             star = candidate.this if isinstance(candidate, exp.Column) else candidate
             if isinstance(star, exp.Star):
-                if not _is_star(candidate) or len(source.selected_sources) != 1:
+                if not _is_star(candidate):
                     return None
+                if len(source.selected_sources) != 1:
+                    # A plain star over a join yields the name as the scope binds a bare one: the
+                    # one source holding it under the grant, or a USING or NATURAL join's merged
+                    # column (Codex's eleventh review of #178: `(SELECT * FROM t JOIN u ON true) q
+                    # FULL JOIN t b USING (doc)` compares `coalesce(q.doc, b.doc)`, `t.doc` twice,
+                    # and the walk gave up on the two sources, so the FULL join's left input had
+                    # no owner and the scope skipped where main refused the absent value). Two
+                    # sources holding it under the grant, which the star lists twice, answer
+                    # nothing, and so does a source the walk cannot name beside a holder, since
+                    # the star lists its columns too (`listed`); none holding it passes to the
+                    # later projections. Names are placed by the grant, as the single-source
+                    # star places them.
+                    bare = column.copy()
+                    bare.set("table", None)
+                    answer = _in_scope(bare, source, visible, dialect, depth + 1, listed=True)
+                    if answer is _ABSENT:
+                        continue
+                    return answer if isinstance(answer, tuple) else None
                 (alias,) = source.selected_sources
                 through = _through_scopes(_same_column(column, alias), source, visible, dialect, depth + 1)
                 if through is None:
@@ -274,7 +295,7 @@ _WIDE = object()  # the scope cannot tell: the statement-wide reading's turn, as
 
 
 def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], dialect: str | None,
-              depth: int = 0) -> tuple[str, str] | None | object:
+              depth: int = 0, listed: bool = False) -> tuple[str, str] | None | object:
     """The scope's own answer (M141, M174): a base table, or a local source followed to the
     column it projects, the column renamed included -- `x.doc` may be `t.region`, and read
     by its name it would be checked against `t.doc`'s values. An unqualified name is read
@@ -284,7 +305,9 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     cannot tell, a source's output being one the walk cannot name (`_names`) or two
     sources owning the name, and the statement-wide reading answers as before; where a join
     has made the name one side's (`narrowed`) that scope answers nothing instead, since the
-    statement-wide reading would resurrect the other side."""
+    statement-wide reading would resurrect the other side. Under a star (`listed`) a source the
+    walk cannot name beside a holder answers nothing: the star lists that source's columns too,
+    and the engine binds the name to the first without the ambiguity error a bare name meets."""
     qualifier = column.table
     if qualifier:
         return _through_scopes(column, scope, visible, dialect, depth + 1) if qualifier in scope.sources else _ABSENT
@@ -409,7 +432,11 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
         # left input that cannot hold the name is no part of it.
         sides = [[owner_of[a] for a in side if a in owner_of] for side in full_sides]
         return owners[0] if all(sides) and len(set(owners)) == 1 else None
-    if len(owners) == 1:
+    if len(owners) == 1 and not (listed and unknown):
+        # A bare name beside a source the walk cannot name is the one owner's, since the engine
+        # raises where that source holds it too; a star lists both and raises nothing, so the
+        # name may be the unnamed source's (`(VALUES ('west')) AS x(doc), t`: the review gate on
+        # round 18, where `t` alone was counted and a present value refused).
         return owners[0]
     if owners or unknown:
         return None if narrowed else _WIDE

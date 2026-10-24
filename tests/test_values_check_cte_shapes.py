@@ -118,8 +118,12 @@ def test_a_star_before_a_projection_of_the_same_name_yields_the_name_first():
     assert _check("WITH a AS (SELECT hidden AS k, doc AS d FROM t), b AS (SELECT *, d AS k FROM a) SELECT count(*) FROM b WHERE b.k = 'west'") is None
     # and where the star's source is the base table itself, its columns decide
     _refused_on_doc("WITH b AS (SELECT *, doc AS k FROM t) SELECT count(*) FROM b WHERE b.k = 'west'")
-    # a star over two sources before the name: not known either way, nothing checked
-    assert _check("WITH t AS (SELECT *, u.region AS doc FROM t JOIN t u USING (doc)) SELECT count(*) FROM t WHERE t.doc = 'zzz'") is None
+    # a star over two sources before the name yields the USING join's merged column, `t.doc`, and
+    # the later projection is renamed (round 18 of #178; this held to the conservative skip before)
+    cte = "WITH t AS (SELECT *, u.region AS doc FROM t JOIN t u USING (doc)) SELECT count(*) FROM t WHERE t.doc = '{}'"
+    assert [con.execute(cte.format(lit)).fetchall() for lit in ("west", "a")] == [[(0,)], [(1,)]]
+    _refused_on_doc(cte.format("west"))
+    assert _check(cte.format("a")) is None
 
 
 def test_a_base_table_alias_column_list_renames_by_position_and_is_not_placed():
@@ -644,4 +648,48 @@ def test_a_derived_tables_unqualified_projection_over_a_join_is_placed_by_the_jo
     for sql in ("SELECT count(*) FROM (SELECT doc FROM t FULL JOIN (SELECT region AS doc FROM t) AS b USING (doc)) AS q WHERE doc = 'west'",
                 "SELECT count(*) FROM (SELECT doc FROM t RIGHT JOIN (SELECT region AS doc FROM t) AS b USING (doc)) AS q WHERE doc = 'west'"):
         assert con.execute(sql).fetchall() == [(1,)], sql
+        assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql
+
+
+def test_a_plain_star_over_a_join_yields_the_name_as_the_scope_binds_it():
+    # Codex's eleventh review of #178: `(SELECT * FROM t JOIN u ON true) AS q FULL JOIN t AS b USING
+    # (doc)` compares `coalesce(q.doc, b.doc)`, `t.doc` twice, and the walk gave up on a star over
+    # two sources, so the FULL join's left input had no owner and the scope skipped where main
+    # refused the absent value. The star yields the name as the scope binds a bare one now: the
+    # one source holding it, or a USING or NATURAL join's merged column; two sources holding it
+    # answer nothing, and a modified star over a join stays unknown.
+    visible = {**VISIBLE, "u": {"name"}, "v": {"doc", "k", "name"}, "w": {"k"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east'); "
+                "CREATE TABLE u (name VARCHAR); INSERT INTO u VALUES ('n'); "
+                "CREATE TABLE v (doc VARCHAR, k INTEGER, name VARCHAR); INSERT INTO v VALUES ('west', 1, 'n'); "
+                "CREATE TABLE w (k VARCHAR); INSERT INTO w VALUES ('west')")
+    for sql in ("SELECT count(*) FROM (SELECT * FROM t JOIN u ON true) AS q FULL JOIN t AS b USING (doc) WHERE doc = 'west'",
+                "SELECT count(*) FROM (SELECT * FROM t NATURAL JOIN t AS b) AS q FULL JOIN t AS c USING (doc) WHERE doc = 'west'",
+                "SELECT count(*) FROM (SELECT * FROM u JOIN w ON true, t) AS q FULL JOIN t AS b USING (doc) WHERE doc = 'west'",
+                "SELECT count(*) FROM (SELECT * FROM t JOIN t AS b USING (doc)) AS q WHERE doc = 'west'"):
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    # the inner RIGHT join makes the star's `doc` the renamed source's, `t.region`: a present value,
+    # which main refused against `t.doc`
+    sql = "SELECT count(*) FROM (SELECT * FROM t RIGHT JOIN (SELECT region AS doc FROM t) AS z USING (doc)) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(1,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    # a source the walk cannot name beside a holder: the star lists both columns and the engine binds
+    # the name to the first, so the scope answers nothing (the review gate on round 18: `t` alone
+    # was counted and this present value refused against `t.doc`); a RIGHT join on the name beside
+    # the same source makes the merged column the right side's, `t.doc`, and the absent value refuses
+    sql = "SELECT count(*) FROM (SELECT * FROM (VALUES ('west')) AS x(doc), t) AS q WHERE q.doc = 'west'"
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    sql = "SELECT count(*) FROM (SELECT * FROM (VALUES ('west')) AS x(doc) RIGHT JOIN t USING (doc)) AS q WHERE q.doc = 'west'"
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
+    # two sources holding the name: DuckDB lists both and binds the bare name to the first; the
+    # check answers nothing, as before. A modified star over a join stays unknown (main refused it).
+    for sql in ("SELECT count(*) FROM (SELECT * FROM t JOIN v ON true) AS q WHERE doc = 'west'",
+                "SELECT count(*) FROM (SELECT * EXCLUDE (region) FROM t JOIN u ON true) AS q FULL JOIN t AS b USING (doc) WHERE doc = 'west'"):
+        assert con.execute(sql).fetchall() == [(0,)], sql
         assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql
