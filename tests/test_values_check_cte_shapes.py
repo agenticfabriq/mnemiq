@@ -702,7 +702,9 @@ def test_a_plain_star_over_a_join_yields_the_name_as_the_scope_binds_it():
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
     # a qualifier names its source as the engine folds names: `T.*` and `T.doc` are `t`'s on DuckDB,
     # where the written name missed the source and a qualified star's walk gave up (the review gate
-    # on round 19); the older qualified lookups fold the same way now
+    # on round 19); the scopes' two older qualified lookups fold the same way, while the
+    # statement-wide fallback's map stays keyed by the written name, which a case-variant qualifier
+    # reaches only where no scope holds its source
     for sql in ("SELECT count(*) FROM (SELECT T.* FROM t) AS q WHERE doc = 'west'",
                 "SELECT count(*) FROM (SELECT T.* FROM t JOIN u ON true) AS q WHERE doc = 'west'",
                 "SELECT count(*) FROM (SELECT T.doc FROM t JOIN u ON true) AS q WHERE doc = 'west'",
@@ -715,8 +717,56 @@ def test_a_plain_star_over_a_join_yields_the_name_as_the_scope_binds_it():
     assert con.execute(sql).fetchall() == [(0,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
     # two sources holding the name: DuckDB lists both and binds the bare name to the first; the
-    # check answers nothing, as before. A modified star over a join stays unknown (main refused it).
-    for sql in ("SELECT count(*) FROM (SELECT * FROM t JOIN v ON true) AS q WHERE doc = 'west'",
-                "SELECT count(*) FROM (SELECT * EXCLUDE (region) FROM t JOIN u ON true) AS q FULL JOIN t AS b USING (doc) WHERE doc = 'west'"):
+    # check answers nothing, as before
+    sql = "SELECT count(*) FROM (SELECT * FROM t JOIN v ON true) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(0,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    # a star whose EXCLUDE names another column yields this one as a plain star does (round 20; held to
+    # unknown before, and skipped where main refused)
+    sql = "SELECT count(*) FROM (SELECT * EXCLUDE (region) FROM t JOIN u ON true) AS q FULL JOIN t AS b USING (doc) WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
+
+
+def test_a_star_says_how_it_yields_the_name_and_a_derived_source_proves_its_absence():
+    # Codex's thirteenth review of #178: the walk conflated absence with unknown twice. A qualified
+    # star over a derived source that provably lacks the name stopped it, so `b.*, t.*` over `t JOIN
+    # (SELECT name FROM u) b` was unresolved and the FULL join over it skipped where main refused, and
+    # `b.*, t.region AS doc` refused a present value against `t.doc`; and a star with EXCLUDE on the
+    # name was unknown, so `t.* EXCLUDE (doc), region AS doc` fell to the statement-wide reading and
+    # refused `t.region`'s present value, on main too. A star says how it yields the name now, and a
+    # derived source's named projections say whether it has one.
+    visible = {**VISIBLE, "u": {"name"}, "v": {"doc", "k", "name"}, "w": {"k"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east'); "
+                "CREATE TABLE u (name VARCHAR); INSERT INTO u VALUES ('n')")
+    refused = ("SELECT count(*) FROM (SELECT b.*, t.* FROM t JOIN (SELECT name FROM u) AS b ON true) AS q FULL JOIN t AS c USING (doc) WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * EXCLUDE (region) FROM t) AS q WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * REPLACE (upper(region) AS region) FROM t) AS q WHERE doc = 'west'",
+               # RENAME both drops a name and gives it: unknown, and the statement-wide reading refuses as before
+               "SELECT count(*) FROM (SELECT * RENAME (region AS doc) FROM t) AS q WHERE doc = 'west'")
+    for sql in refused:
         assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    # a derived source whose own star is over a join is no proven absence: the walk below still places
+    # it by the scope's join rules (the review gate on round 20)
+    sql = "SELECT count(*) FROM (SELECT * FROM (SELECT * FROM t JOIN u ON true) AS x) AS q FULL JOIN t AS b USING (doc) WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
+    # a qualified EXCLUDE entry drops one source's column: under a bare star over a join the other
+    # source's still comes through, so nothing is said; under the star qualified by that source it is gone
+    con.execute("CREATE TABLE v (doc VARCHAR, k INTEGER, name VARCHAR); INSERT INTO v VALUES ('west', 1, 'n')")
+    sql = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * EXCLUDE (t.doc) FROM t JOIN v ON true) AS y WHERE doc = 'west')"
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    present = ("SELECT count(*) FROM (SELECT b.*, t.region AS doc FROM t JOIN (SELECT name FROM u) AS b ON true) AS q WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT t.* EXCLUDE (t.doc), region AS doc FROM t) AS q WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT t.* EXCLUDE (doc), region AS doc FROM t) AS q WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * EXCLUDE (doc), region AS doc FROM t) AS q WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * REPLACE (upper(doc) AS doc) FROM t) AS q WHERE doc = 'A'")
+    for sql in present:
+        assert con.execute(sql).fetchall() == [(1,)], sql
         assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql

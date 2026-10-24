@@ -37,13 +37,33 @@ def _scopes(ast: exp.Expression) -> dict[int, Scope]:
         return {}
 
 
-def _is_star(projection: exp.Expression) -> bool:
-    """A star that passes the source's columns through as they are: one with an EXCLUDE, a
-    REPLACE or a RENAME changes what a name reaches (`* REPLACE (upper(doc) AS doc)` is no
-    longer `t.doc`, `* RENAME (region AS doc)` is `t.region`), and the walk gives up on it
-    rather than guess (the review gate's fourth round on M174)."""
+def _star_yields(projection: exp.Expression, wanted: str, dialect: str | None) -> str | None:
+    """How a star projection yields the name, as the engine expands it: "column", its source's
+    column (a plain star, or one whose EXCLUDE and REPLACE name other columns); "expression",
+    the replacement's value under the name (`* REPLACE (upper(doc) AS doc)` is no longer
+    `t.doc`); "none", not at all (`* EXCLUDE (doc)`, so the name is a later projection's:
+    `t.* EXCLUDE (doc), region AS doc` is `t.region`, which the walk's giving up on every
+    modified star left to the statement-wide reading and `t.doc`, a present value refused on
+    main and the branch alike: Codex's thirteenth review of #178); or None where the walk
+    cannot tell (RENAME, which both drops a name and gives it: `* RENAME (region AS doc)`
+    beside the star's own `doc`; a qualified EXCLUDE entry on a star not qualified by that same
+    source, which drops one source's column while another's may come through)."""
     star = projection.this if isinstance(projection, exp.Column) else projection
-    return isinstance(star, exp.Star) and not any(star.args.get(k) for k in ("except_", "replace", "rename"))
+    if star.args.get("rename"):
+        return None
+    own = projection.args.get("table") if isinstance(projection, exp.Column) else None
+    for excluded in star.args.get("except_") or ():
+        if _written(excluded.this if isinstance(excluded, exp.Column) else excluded, dialect) != wanted:
+            continue
+        qualifier = excluded.args.get("table") if isinstance(excluded, exp.Column) else None
+        if qualifier is None or (own is not None and _written(qualifier, dialect) == _written(own, dialect)):
+            return "none"
+        # `* EXCLUDE (t.doc)` over `t JOIN v` drops one source's column and the other's still comes
+        # through: which, the walk cannot tell (the review gate on round 20).
+        return None
+    if any(_written(r.args.get("alias"), dialect) == wanted for r in star.args.get("replace") or ()):
+        return "expression"
+    return "column"
 
 
 def _column_list(source: Scope, dialect: str | None) -> list[str] | None:
@@ -103,8 +123,10 @@ def _names(source: Scope, wanted: str, dialect: str | None, visible: dict[str, s
     are unknown, and only a listed name or a named projection from the star on answers (the
     gate's seventh round: `WITH x(k, m) AS (SELECT region AS doc, * FROM ...)`), otherwise the
     walk cannot tell. A star past the list is followed into the source's one selected source,
-    in order: a base table's granted columns say, a local source this again, and a modified
-    star, a star over a join or a base table renamed by position leave the answer unknown.
+    in order, or the source a qualified star names: a base table's granted columns say, a local
+    source this again; a star says how it yields the name (`_star_yields`: EXCLUDE naming it
+    passes to the later projections, REPLACE naming it is the source's own, RENAME is unknown),
+    and a bare star over a join or a base table renamed by position leave the answer unknown.
     Unknown, the source may yield the name and the engine binds there, so the caller keeps the
     statement-wide reading for the scope rather than ask the enclosing one (the review gate on
     the ninth round: `EXISTS (SELECT 1 FROM (SELECT * FROM u JOIN v ON true) y WHERE doc =
@@ -128,9 +150,22 @@ def _names(source: Scope, wanted: str, dialect: str | None, visible: dict[str, s
             if _projection_name(projection, dialect) == wanted:
                 return True
             continue
-        if not _is_star(projection) or len(source.selected_sources) != 1:
+        yields = _star_yields(projection, wanted, dialect)
+        if yields is None:
             return None
-        (alias,) = source.selected_sources
+        if yields == "none":
+            continue  # EXCLUDE names it: a later projection's, if any
+        if yields == "expression":
+            return True  # REPLACE names it: the source's own, no base column behind it
+        qualifier = projection.args.get("table") if isinstance(projection, exp.Column) else None
+        if qualifier is not None:
+            alias = _source_named(qualifier, source.selected_sources, dialect)
+            if alias is None:
+                return None
+        elif len(source.selected_sources) != 1:
+            return None
+        else:
+            (alias,) = source.selected_sources
         _, inner = source.selected_sources[alias]
         if isinstance(inner, exp.Table):
             renamed = inner.args.get("alias")
@@ -210,8 +245,9 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     projection carries comes through a star, into the scope's one selected source or the one
     a qualified star names, the same way (the review gate: an unqualified `doc` through
     `SELECT * FROM t` lost its owner once
-    the statement-wide lookup became the fallback), a star with an EXCLUDE, a REPLACE or a
-    RENAME excepted, which the walk gives up on (`_is_star`). The projections are read in
+    the statement-wide lookup became the fallback); a star says how it yields the name
+    (`_star_yields`), and a local source's named projections prove it absent, so EXCLUDE on
+    the name and a source lacking it pass to the later projections. The projections are read in
     order, as the engine names the output: a plain star BEFORE a projection of the asked name
     yields that name first where its source has the column, and the later projection is
     renamed (`WITH t AS (SELECT *, region AS doc FROM t)` keeps the star's `doc`, DuckDB's
@@ -224,7 +260,7 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     enclosing scopes, then keeps the statement-wide reading it had: a set operation and a
     recursive CTE each resolved there and nowhere here (the gate's second round). A plain star
     over several sources yields the name as the scope binds a bare one, by its join rules
-    (Codex's eleventh review); a modified star over several stays unknown."""
+    (Codex's eleventh review); a RENAME star stays unknown."""
     source = scope.sources.get(_source_named(column.args.get("table"), scope.sources, dialect)) if column.table else None
     if isinstance(source, exp.Table):
         alias = source.args.get("alias")
@@ -253,8 +289,11 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
         for candidate in selects[len(listed):]:
             star = candidate.this if isinstance(candidate, exp.Column) else candidate
             if isinstance(star, exp.Star):
-                if not _is_star(candidate):
-                    return None
+                yields = _star_yields(candidate, wanted, dialect)
+                if yields is None or yields == "expression":
+                    return None  # RENAME: cannot tell; REPLACE naming it: no base column behind the name
+                if yields == "none":
+                    continue  # EXCLUDE names it: the name is a later projection's
                 qualifier = candidate.args.get("table") if isinstance(candidate, exp.Column) else None
                 if qualifier is not None:
                     # A qualified star yields its named source's own columns, a USING merge aside
@@ -285,6 +324,17 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
                     return answer if isinstance(answer, tuple) else None
                 else:
                     (alias,) = source.selected_sources
+                inner = source.sources.get(alias)
+                if isinstance(inner, Scope):
+                    # A local source's named projections prove the name absent, and the star
+                    # yields nothing of it: `b.*, t.*` over `t JOIN (SELECT name FROM u) b` is
+                    # `t.doc` through the second star, where the walk's None for `b.doc` stopped
+                    # it and the FULL join over it skipped (Codex's thirteenth review of #178).
+                    # `_names` answering None is no verdict: a bare star over a join inside the
+                    # source is one the walk below still places by the scope's join rules (the
+                    # review gate on round 20).
+                    if _names(inner, wanted, dialect, visible, depth + 1) is False:
+                        continue
                 through = _through_scopes(_same_column(column, alias), source, visible, dialect, depth + 1)
                 if through is None:
                     return None  # the star may yield the name: not known either way
