@@ -79,16 +79,24 @@ def test_a_star_among_the_listed_positions_leaves_the_positions_unknown():
     _refused_on_doc("WITH x(k) AS (SELECT region, * FROM t) SELECT count(*) FROM x WHERE x.doc = 'west'")
 
 
-def test_a_star_with_a_modifier_is_not_passed_through():
-    # The same round: a REPLACE, a RENAME or an EXCLUDE changes what a name reaches, so the
-    # walk gives up rather than read the raw column (`upper(doc)` is not among `t.doc`'s raw
-    # values, a false refusal; `region AS doc` is `t.region`).
-    assert _check("WITH x AS (SELECT * REPLACE (upper(doc) AS doc) FROM t) SELECT count(*) FROM x WHERE x.doc = 'A'") is None
-    assert _check("WITH x AS (SELECT * RENAME (region AS doc) FROM t) SELECT count(*) FROM x WHERE x.doc = 'west'") is None
-    assert _check("WITH x AS (SELECT * EXCLUDE (doc) FROM t) SELECT count(*) FROM x WHERE x.doc = 'west'") is None
+def test_a_star_with_a_modifier_is_read_as_the_engine_expands_it():
+    # The same round held every modified star to a skip. A REPLACE by an expression is the
+    # source's own, nothing checked (`upper(doc)` is not among `t.doc`'s raw values, a false
+    # refusal otherwise); an EXCLUDE of the name leaves no `doc` to read; and a RENAME giving the
+    # name beside the star's own `doc` lists the two in the table's column order, which the walk
+    # cannot see, so nothing is checked (round 21 of #178: `t(doc, region)` compares `t.doc` and
+    # `t(region, doc)` compares `t.region`, measured both ways below).
     con = duckdb.connect()
     con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west')")
     assert con.execute("WITH x AS (SELECT * REPLACE (upper(doc) AS doc) FROM t) SELECT count(*) FROM x WHERE x.doc = 'A'").fetchall() == [(1,)]
+    assert _check("WITH x AS (SELECT * REPLACE (upper(doc) AS doc) FROM t) SELECT count(*) FROM x WHERE x.doc = 'A'") is None
+    assert _check("WITH x AS (SELECT * EXCLUDE (doc) FROM t) SELECT count(*) FROM x WHERE x.doc = 'west'") is None
+    renamed = "WITH x AS (SELECT * RENAME (region AS doc) FROM t) SELECT count(*) FROM x WHERE x.doc = 'west'"
+    assert con.execute(renamed).fetchall() == [(0,)]
+    other = duckdb.connect()
+    other.execute("CREATE TABLE t (region VARCHAR, doc VARCHAR); INSERT INTO t VALUES ('west', 'a')")
+    assert other.execute(renamed).fetchall() == [(1,)]
+    assert _check(renamed) is None
 
 
 def test_three_chained_ctes_are_followed_to_the_base_column():
@@ -743,9 +751,9 @@ def test_a_star_says_how_it_yields_the_name_and_a_derived_source_proves_its_abse
                 "CREATE TABLE u (name VARCHAR); INSERT INTO u VALUES ('n')")
     refused = ("SELECT count(*) FROM (SELECT b.*, t.* FROM t JOIN (SELECT name FROM u) AS b ON true) AS q FULL JOIN t AS c USING (doc) WHERE doc = 'west'",
                "SELECT count(*) FROM (SELECT * EXCLUDE (region) FROM t) AS q WHERE doc = 'west'",
-               "SELECT count(*) FROM (SELECT * REPLACE (upper(region) AS region) FROM t) AS q WHERE doc = 'west'",
-               # RENAME both drops a name and gives it: unknown, and the statement-wide reading refuses as before
-               "SELECT count(*) FROM (SELECT * RENAME (region AS doc) FROM t) AS q WHERE doc = 'west'")
+               "SELECT count(*) FROM (SELECT * REPLACE (upper(region) AS region) FROM t) AS q WHERE doc = 'west'")
+    # (`* RENAME (region AS doc)` beside the star's own `doc` is unknown, the order being the table's: the
+    # round-4 test measures both orders)
     for sql in refused:
         assert con.execute(sql).fetchall() == [(0,)], sql
         verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
@@ -767,6 +775,44 @@ def test_a_star_says_how_it_yields_the_name_and_a_derived_source_proves_its_abse
                "SELECT count(*) FROM (SELECT t.* EXCLUDE (doc), region AS doc FROM t) AS q WHERE doc = 'west'",
                "SELECT count(*) FROM (SELECT * EXCLUDE (doc), region AS doc FROM t) AS q WHERE doc = 'west'",
                "SELECT count(*) FROM (SELECT * REPLACE (upper(doc) AS doc) FROM t) AS q WHERE doc = 'A'")
+    for sql in present:
+        assert con.execute(sql).fetchall() == [(1,)], sql
+        assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql
+
+
+def test_a_star_follows_the_column_a_replace_or_rename_gives_and_two_holders_of_one_lineage_are_it():
+    # Codex's fourteenth review of #178, three edges of the star rules (`* RENAME (region AS doc)`
+    # beside the star's own `doc` is the round-4 test's: unknown, the order being the table's).
+    # Two holders of one lineage
+    # (`t CROSS JOIN t tt` lists `doc` twice, each `t.doc`) answered nothing, so a FULL join over
+    # such a star skipped where main refused; a bare star over a join inside a source could not
+    # prove the name absent, so `b.*` over `u CROSS JOIN w` stopped the walk and the later
+    # `region AS doc` was never read, a present value refused on main and the branch alike; and a
+    # REPLACE by a bare column was an opaque expression, so `* REPLACE (doc AS doc)` skipped where
+    # main refused. RENAME is read the same way: the column it gives the name from, the original
+    # first where the source still lists it.
+    visible = {**VISIBLE, "u": {"name"}, "v": {"doc", "k", "name"}, "w": {"k"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east'); "
+                "CREATE TABLE u (name VARCHAR); INSERT INTO u VALUES ('n'); "
+                "CREATE TABLE w (k VARCHAR); INSERT INTO w VALUES ('west')")
+    refused = ("SELECT count(*) FROM (SELECT b.*, a.* FROM (SELECT name FROM u) AS b CROSS JOIN (SELECT * FROM t CROSS JOIN t AS tt) AS a) AS q FULL JOIN t AS c USING (doc) WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * FROM t CROSS JOIN t AS tt) AS q WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * REPLACE (doc AS doc) FROM t) AS q FULL JOIN t AS c USING (doc) WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * RENAME (region AS r) FROM t) AS q WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * RENAME (doc AS k) FROM t) AS q WHERE k = 'west'",
+               # a REPLACE by a bare column bound across the star's scope: `t.doc` under `name`, absent
+               "SELECT count(*) FROM (SELECT u.* REPLACE (doc AS name) FROM t JOIN u ON true) AS q WHERE name = 'west'")
+    for sql in refused:
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    present = ("SELECT count(*) FROM (SELECT b.*, t.region AS doc FROM t CROSS JOIN (SELECT * FROM u CROSS JOIN w) AS b) AS q WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * EXCLUDE (doc) RENAME (region AS doc) FROM t) AS q WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * REPLACE (region AS doc) FROM t) AS q WHERE doc = 'west'",
+               # a REPLACE by a bare column is bound across the star's scope: `u.* REPLACE (region AS name)` over
+               # `t JOIN u` is `t.region`, not a column of `u` (the review gate on round 21)
+               "SELECT count(*) FROM (SELECT u.* REPLACE (region AS name), t.doc AS name FROM t JOIN u ON true) AS q WHERE name = 'west'")
     for sql in present:
         assert con.execute(sql).fetchall() == [(1,)], sql
         assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql
