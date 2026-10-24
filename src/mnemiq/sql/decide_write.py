@@ -496,12 +496,12 @@ def decide_write(
     try:
         asked_sql = rendered(asked_plan, dialect, target)
     except (ValueError, sqlglot.errors.SqlglotError) as exc:
-        return unprintable(target, exc, policys=False)
+        return unprintable(target, exc, policys=False, tree=asked)
     plan_sql = shaped.sql(dialect=dialect)
     try:
         target_sql = asked_sql if asked_plan == plan_sql else rendered(plan_sql, dialect, target)
     except (ValueError, sqlglot.errors.SqlglotError) as exc:
-        return unprintable(target, exc, policys=True)
+        return unprintable(target, exc, policys=True, tree=shaped)
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof
         # the source understands -- `EXPLAIN` is not Oracle syntax (see mnemiq.sql.prove).

@@ -230,16 +230,17 @@ def as_duckdb_reads(ast: exp.Expression) -> exp.Expression:
     return ast
 
 
-def unprintable(target: str, exc: Exception, *, policys: bool) -> Refusal:
+def unprintable(target: str, exc: Exception, *, policys: bool, tree: exp.Expression) -> Refusal:
     """The refusal for a plan the target's generator cannot print. sqlglot raises where a DuckDB MAP
     literal's key, the Column or the Var it is here, must name a struct's field for Postgres or
     Oracle (Codex's forty-seventh review of #160), and the error escaped both deciders. The
     statement's where the statement as asked does not print; the policy's (`policys`) where the
     statement prints and its governed rewrite does not, which no rewrite of the question repairs.
-    The generator's ValueError is the MAP literal's case and the advice names it; a round trip
-    that fails otherwise (the row-cap fallback's re-read, M137, raising a parse error) gets the
-    engine's name alone, since advice about a construct the statement may not hold would spend the
-    repair pass (the review gate on round 61)."""
+    The advice names the MAP literal where `tree`, the statement rendered, holds one, whatever the
+    error (the generator's ValueError is the one measured, and sqlglot's own errors from the row-cap
+    fallback's re-read or the write decider's plain re-parse arrive here too); a statement without
+    one gets the engine's name alone, since advice about a construct it does not hold would spend
+    the repair pass (the review gate on rounds 61 and 62)."""
     logger.warning("the plan could not be printed for %s (%s)", target, exc)
     if policys:
         return Refusal(code=RefusalCode.POLICY_TARGET_UNSUPPORTED,
@@ -248,7 +249,7 @@ def unprintable(target: str, exc: Exception, *, policys: bool) -> Refusal:
                                 "statement, needs another spelling."),
                        subject=target)
     advice = (" Spell the lookup without a MAP literal keyed by a column or a lambda's parameter, which that "
-              "engine's printer cannot name." if isinstance(exc, ValueError) else "")
+              "engine's printer cannot name." if tree.find(exp.ToMap) is not None else "")
     return Refusal(code=RefusalCode.UNPRINTABLE_FOR_TARGET,
                    message=f"The statement cannot be printed for the {target} engine; spell it as that engine reads it.{advice}",
                    subject=target)

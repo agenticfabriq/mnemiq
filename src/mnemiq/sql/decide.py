@@ -48,7 +48,7 @@ def _render_target(tree: exp.Expression, plan_sql: str, dialect: str, target: st
         except sqlglot.errors.ParseError:
             return _transpile_under_the_cap(tree, dialect, target)
     except (ValueError, sqlglot.errors.SqlglotError) as exc:
-        return unprintable(target, exc, policys=policys)
+        return unprintable(target, exc, policys=policys, tree=tree)
 
 
 def _transpile_under_the_cap(shaped: exp.Expression, dialect: str, target: str) -> str:

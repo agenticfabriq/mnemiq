@@ -10,13 +10,14 @@ from __future__ import annotations
 
 import duckdb
 import pytest
+import sqlglot
 from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import ViewDefinition
 from mnemiq.sql.decide import decide
 from mnemiq.sql.decide_write import decide_write
-from mnemiq.sql.reading import dotted_map_keys
+from mnemiq.sql.reading import dotted_map_keys, unprintable
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import body_of
@@ -151,6 +152,22 @@ def test_a_map_key_the_target_cannot_print_is_refused_not_raised():
         verdict = decide_write("UPDATE sink SET s = 'b' WHERE MAP {i: 1}[i] = 1", VISIBLE, grants, adapter=_OkAdapter(),
                                dialect="duckdb", target=target, writes_enabled=True, policy=AccessPolicy())
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNPRINTABLE_FOR_TARGET, (target, verdict)
+
+
+def test_the_unprintable_advice_names_the_map_literal_only_where_the_statement_holds_one():
+    # The review gate on rounds 61 and 62: the row-cap fallback's re-read and the write decider's
+    # plain re-parse reach the same refusal with sqlglot's own errors, and advice about a MAP
+    # literal the statement does not hold would spend the repair pass. The statement decides.
+    with_map = sqlglot.parse_one("SELECT MAP {region: 1}[region] FROM claim", read="duckdb")
+    without = sqlglot.parse_one("SELECT region FROM claim", read="duckdb")
+    for exc in (ValueError("Name needs to be a string or an Identifier"), sqlglot.errors.ParseError("x"),
+                sqlglot.errors.TokenError("x")):
+        named = unprintable("postgres", exc, policys=False, tree=with_map)
+        assert named.code is RefusalCode.UNPRINTABLE_FOR_TARGET and "MAP literal" in named.message and "postgres" in named.message
+        bare = unprintable("postgres", exc, policys=False, tree=without)
+        assert bare.code is RefusalCode.UNPRINTABLE_FOR_TARGET and "MAP" not in bare.message and "postgres" in bare.message
+    policys = unprintable("oracle", ValueError("x"), policys=True, tree=with_map)
+    assert policys.code is RefusalCode.POLICY_TARGET_UNSUPPORTED and not policys.repairable and "oracle" in policys.message
 
 
 def test_an_arrow_outside_a_lambda_taker_is_no_lambda():

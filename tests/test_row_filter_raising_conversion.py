@@ -1615,14 +1615,14 @@ def test_a_row_filter_the_target_cannot_print_is_the_policys_refusal():
                     target="duckdb", policy=build_access_policy(_snapshot(types), grants))
     assert isinstance(verdict, Approved) and "MAP {region: 1}" in verdict.target_sql, verdict
     # the write path the same: the write as asked prints, its governed rewrite does not (the review
-    # gate on round 61)
+    # gate on round 61). Postgres alone: on Oracle `apply_row_filters_to_write` refuses every UPDATE or
+    # DELETE of a row-filtered table before the render step, with this same code (the gate on round 62)
     writable = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}), row_filters={"claim": "MAP {region: 1}[region] = 1"})
-    for engine in ("postgres", "oracle"):
-        verdict = decide_write("UPDATE claim SET region = 'x' WHERE id = 1", visible_schema(_snapshot(types), writable), writable,
-                               policy=build_access_policy(_snapshot(types), writable), dialect="duckdb", target=engine,
-                               writes_enabled=True)
-        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.POLICY_TARGET_UNSUPPORTED, (engine, verdict)
-        assert "MAP" not in verdict.message and not verdict.repairable, verdict
+    verdict = decide_write("UPDATE claim SET region = 'x' WHERE id = 1", visible_schema(_snapshot(types), writable), writable,
+                           policy=build_access_policy(_snapshot(types), writable), dialect="duckdb", target="postgres",
+                           writes_enabled=True)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.POLICY_TARGET_UNSUPPORTED, verdict
+    assert "policy" in verdict.message and not verdict.repairable, verdict
 
 
 def test_a_dotted_map_key_in_a_row_filter_is_no_predicate():
