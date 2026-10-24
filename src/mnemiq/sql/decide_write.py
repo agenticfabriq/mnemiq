@@ -18,10 +18,11 @@ from mnemiq.sql.functions import (
     opaque_columns,
 )
 from mnemiq.sql.cls import check_cls
+from mnemiq.sql.guard import bound_by_position, misgrouped_set_chain, niladic_names, unnamed_read
 from mnemiq.sql.policy import AccessPolicy
-from mnemiq.sql.prove import prove
+from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import base_tables, check_policy_target
+from mnemiq.sql.scope import base_tables, check_policy_target, fields_as_members, known_columns
 from mnemiq.sql.rls import apply_row_filters_to_write, check_filter_targets, unplaceable_policy
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import check_views
@@ -232,8 +233,14 @@ def _target_table(ast: exp.Expression) -> str | None:
     return object_key(node) if node is not None else None
 
 
-def check_write_shape(sql: str, dialect: str = "duckdb") -> exp.Expression | Refusal:
-    """One bounded DML statement, or a Refusal. UPDATE/DELETE must be bounded by a WHERE."""
+def check_write_shape(sql: str, dialect: str = "duckdb", executes_as: str | None = None,
+                      columns: dict[str, set[str]] | None = None) -> exp.Expression | Refusal:
+    """One bounded DML statement, or a Refusal. UPDATE/DELETE must be bounded by a WHERE. A
+    read no node names (a method call, a COLUMNS inside an expression) is refused here as on the
+    read side, before any check runs, for the engine that executes (M192, M193); in a write every
+    star and every COLUMNS are, since no check expands them (M195), and so is a column reached by
+    position, `#2`, as on the read side (M197; `columns` is the grant's map, as `check_shape`
+    takes it)."""
     try:
         statements = [s for s in sqlglot.parse(sql, read=dialect) if s is not None]
     except Exception:
@@ -276,6 +283,18 @@ def check_write_shape(sql: str, dialect: str = "duckdb") -> exp.Expression | Ref
             code=RefusalCode.UNBOUNDED_WRITE,
             message="An UPDATE or DELETE must have a WHERE clause; an unbounded mutation is refused.",
         )
+    misgrouped = misgrouped_set_chain(ast, executes_as or dialect)
+    if misgrouped is not None:
+        return misgrouped
+    unnamed = unnamed_read(ast, executes_as or dialect, write=True)
+    if unnamed is not None:
+        return unnamed
+    for part in ast.iter_expressions():
+        if part is ast.this:
+            continue  # the target: an INSERT's alias column list names the columns written
+        positional = bound_by_position(part, executes_as or dialect, columns)
+        if positional is not None:
+            return positional
     return ast
 
 
@@ -325,15 +344,24 @@ def decide_write(
             ),
             subject=None,
         )
-    shaped = check_write_shape(sql, dialect=dialect)
+    shaped = check_write_shape(sql, dialect=dialect, executes_as=target, columns=visible)
     if isinstance(shaped, Refusal):
         return shaped
+    ambiguous = fields_as_members(shaped, target, known_columns(visible, policy))  # M165, M167
+    if ambiguous is not None:
+        return ambiguous
+    named = niladic_names(shaped, known_columns(visible, policy), dialect, target)  # M194: the write path leaks the same names
+    if named is not None:
+        return named
+    if ambiguous is not None:
+        return ambiguous
     # M150, as on the read side: no policy is applied for an engine whose CTE binding it misreads.
     unsupported = check_policy_target(shaped, policy, target)
     if unsupported is not None:
         return unsupported
 
-    refusal = check_access(shaped, visible, target)  # every referenced table readable, cols exist
+    refusal = check_access(shaped, visible, target,  # every referenced table readable, cols exist
+                           columns=known_columns(visible, policy))
     if refusal is not None:
         return refusal
     # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
@@ -367,12 +395,14 @@ def decide_write(
     # And the column form, for the reason above stated once more: a write is the worse place to
     # lose it. `INSERT INTO notes SELECT id, leaked FROM vc_t` stores what the virtual column's
     # expression returned into a table the caller may read forever (M100, the M30 shape).
-    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target)
+    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target,
+                                    columns=known_columns(visible, policy))
     if computed is not None:
         return computed
 
     # A write needs RAW access: a masked column is treated as denied for writes.
-    write_cls = check_cls(shaped, AccessPolicy(denied=policy.denied | policy.masked), target)
+    write_cls = check_cls(shaped, AccessPolicy(denied=policy.denied | policy.masked), target,
+                          columns=known_columns(visible, policy))
     if write_cls is not None:
         return write_cls
 
@@ -457,7 +487,8 @@ def decide_write(
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof
         # the source understands -- `EXPLAIN` is not Oracle syntax (see mnemiq.sql.prove).
-        refused = prove(adapter, target_sql)
+        # A refusal of what the policy added is the operator's, not the caller's (M158).
+        refused = prove_governed(adapter, target_sql, asked_sql)
         if refused is not None:
             return refused
 

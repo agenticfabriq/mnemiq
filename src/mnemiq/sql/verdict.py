@@ -62,9 +62,22 @@ class RefusalCode(StrEnum):
     # A row or column policy, decided for an engine whose binding of a CTE name the scope rule does
     # not model (M150). A deployment's configuration, not the statement: never repairable.
     POLICY_TARGET_UNSUPPORTED = "policy_target_unsupported"
+    # The source accepts the statement as asked and refuses it once the access policy is applied:
+    # a row filter, or the snapshot it was checked against, no longer matches the source (M158).
+    # Never repairable: every rewrite of the question meets the same policy.
+    POLICY_REWRITE_REJECTED = "policy_rewrite_rejected"
+    # The source could not be asked whether a statement is valid: a connection fault, a timeout,
+    # an interrupt, as the adapter reads its driver's errors (Codex's review of #159). Not the
+    # statement's, so never repairable: every rewrite meets the same silence. Distinct from
+    # EXPLAIN_FAILED, which is the source's answer, no.
+    SOURCE_UNAVAILABLE = "source_unavailable"
     # A LIMIT or FETCH that states no plain row count -- a percentage, WITH TIES, an expression --
     # so the row cap can neither keep it nor replace it without changing the answer (M162).
     UNREADABLE_LIMIT = "unreadable_limit"
+    # A bare niladic name (`current_date`, `session_user`) where a table the decider knows has
+    # a column so named: this engine reads the column, and no check sees a column through the
+    # function's node (M194). Repairable: the column qualified, or a call the engine keeps.
+    AMBIGUOUS_NILADIC_NAME = "ambiguous_niladic_name"
 
 
 # A refusal the model can act on is a repair; a refusal it cannot act on is a dead end.
@@ -79,6 +92,7 @@ REPAIRABLE = frozenset(
         RefusalCode.UNKNOWN_TABLE,
         RefusalCode.UNKNOWN_COLUMN,
         RefusalCode.EXPLAIN_FAILED,
+        RefusalCode.AMBIGUOUS_NILADIC_NAME,
         # Repairable on purpose. The measured cost of this guard is a legitimate scalar
         # function sqlglot does not model -- Postgres `age()` was the one case in 459 --
         # and the repair loop can rewrite that into arithmetic the engine does model.
@@ -108,7 +122,10 @@ REPAIRABLE = frozenset(
         # UNRESOLVABLE_CALLS is deliberately absent. It condemns every statement against the
         # source, not one function, so there is nothing for a rewrite to avoid and a retry loop
         # would spend every attempt to reach the deferral it starts at. The fix belongs to the
-        # deployer, who sees this in the trace, not to the model.
+        # deployer, who sees this in the trace, not to the model. POLICY_REWRITE_REJECTED is
+        # absent for the same reason: no rewrite of the question escapes the policy (M158), and
+        # SOURCE_UNAVAILABLE because no source read the statement, so there is nothing to repair
+        # against.
         #
         # `plan_query` reads this now (M98). It used to retry every refusal but
         # UNAUTHORIZED_TABLE, so an unrepairable code was retried until the attempts ran out and

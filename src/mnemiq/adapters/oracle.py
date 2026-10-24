@@ -329,7 +329,17 @@ class OracleAdapter:
             return
         # Bounded by `wait_timeout`: DPY-4005 rather than an unbounded wait. Measured on a max=1
         # pool, which raised after the configured 1.5s instead of blocking.
-        con = self._pool.acquire()
+        try:
+            con = self._pool.acquire()
+        except (self._oracledb.Error, OSError) as exc:
+            # No session was had, so no statement was asked: the fault is the source's whatever
+            # its code, and `unavailable_fault` reads the mark before any code list (Codex's
+            # seventh review of #159, so that a pool that cannot authenticate does not depend on
+            # the list naming its error). The driver's errors and the socket's; a TypeError or
+            # an AttributeError is a bug, not an outage, and keeps its reading (the review
+            # gate).
+            _mark_acquire_fault(exc)
+            raise
         try:
             # Set rather than left alone, because a value can arrive on a pooled connection from
             # its last borrower: measured, `call_timeout` survives release and re-acquire. This
@@ -1294,6 +1304,10 @@ class OracleAdapter:
         # its own leased connection while it does.
         self._with_cursor(_parse, self._probe_timeout_ms)
 
+    def source_unavailable(self, exc: BaseException) -> bool:
+        """The proof seam's question: did the source not answer, rather than answer no."""
+        return unavailable_fault(exc)
+
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
         """Run a query and return Arrow, bounding it by the driver's own call timeout.
 
@@ -1315,9 +1329,14 @@ class OracleAdapter:
         # thread to race -- which is the concurrency bug removed rather than guarded.
         self._refuse_unless_read(sql)
 
+        started = [float("inf")]  # the bounded call's start: before it, no deadline has passed
+
+        armed = int(timeout_s * 1000) / 1000 if timeout_s is not None else None  # the driver's deadline, whole milliseconds
+
         def _fetch(cur):
             if timeout_s is not None:
                 cur.connection.call_timeout = int(timeout_s * 1000)
+            started[0] = time.monotonic()  # the call alone, not the lease's lock wait, its setup round trip or a DDL-race backoff (the gate on the second commit)
             cur.execute(sql)
             names = [d[0] for d in cur.description] if cur.description else []
             return names, cur.fetchall()
@@ -1325,9 +1344,12 @@ class OracleAdapter:
         try:
             names, rows = self._with_cursor(_fetch)
         except self._oracledb.DatabaseError as exc:
-            # DPY-4011/ORA-03156 surface a cancelled call; report it as a timeout rather than
-            # letting a driver code reach the caller as an opaque source error.
-            if timeout_s is not None and _is_timeout(exc):
+            # DPY-4024, ORA-01013, ORA-03156 and DPY-4011 surface a bounded call's end
+            # (`_TIMEOUT_SPELLINGS`); report it as a timeout rather than letting a driver code
+            # reach the caller as an opaque source error. ORA-01013 is the cancel itself, the
+            # driver's at the deadline or anyone's on a connection the caller owns (`over`), so
+            # it is a timeout only once the deadline has passed (Codex's first review of #176).
+            if timeout_s is not None and _is_timeout(exc, deadline_met=time.monotonic() - started[0] >= armed):
                 raise RuntimeError(f"query timed out after {timeout_s}s") from exc
             raise
 
@@ -1700,6 +1722,192 @@ def _is_ddl_race(exc: Exception) -> bool:
     return "ora-01466" in str(exc).lower()
 
 
-def _is_timeout(exc: Exception) -> bool:
+# The codes a bounded call's end takes, by the driver's own error list (python-oracledb
+# 4.0.2, the locked version), each by its code so a reworded message changes nothing: DPY-4024,
+# the thin-mode call timeout ("call timeout of 300 ms exceeded", measured on Oracle Free 23);
+# ORA-01013, the cancel a call timeout surfaces as in thick mode and under a server-side
+# cancel, which this raised as the driver's own error while it was unmatched (M187, the ui
+# lane); ORA-03156, the server's own statement timeout; and DPY-4011, a closed connection,
+# read as a timeout until the runner reads the adapter's own outage classification after its
+# timeout branch (M188). What the runner makes of the "query timed out" this raises is the
+# runner's (M188): it reads "interrupt" alone today. The code is read off the driver's error
+# object (`full_code`) where the error carries one, so an application error whose message
+# quotes a timeout code (`ORA-20001: ... ORA-01013`) is not one (Codex's first review of
+# #176); an error with no code, a wrapped or a synthetic one, is read by its text, where the
+# word "timeout" alone counts too, the fallback the matcher has always had. A driver error
+# of another code whose message says "timeout" (ORA-12170, a connect timeout; ORA-12609, a
+# receive timeout) is not the query's timeout: the driver fills `full_code` from the code
+# its message leads with, so an error so led is read by its code, those being the
+# connection's and not a bounded call's end, and one whose message leads with no code goes
+# down the text branch (the gate on the second commit). ORA-01013 is the
+# cancel, which the deadline raises and anyone holding the connection may: a timeout only
+# once the deadline has passed (`deadline_met`), the cancel's own detail kept otherwise.
+_TIMEOUT_CODES = frozenset({"DPY-4011", "DPY-4024", "ORA-03156"})
+_CANCEL_CODE = "ORA-01013"
+_TIMEOUT_SPELLINGS = tuple(code.lower() for code in sorted(_TIMEOUT_CODES)) + ("timeout",)
+
+
+def _is_timeout(exc: Exception, deadline_met: bool = True) -> bool:
+    code = getattr(exc.args[0], "full_code", None) if exc.args else None
+    if isinstance(code, str) and code:
+        return code.upper() in _TIMEOUT_CODES or (code.upper() == _CANCEL_CODE and deadline_met)
     text = str(exc).lower()
-    return "dpy-4011" in text or "ora-03156" in text or "timeout" in text
+    return any(spelling in text for spelling in _TIMEOUT_SPELLINGS) or (
+        _CANCEL_CODE.lower() in text and deadline_met)
+
+
+# The driver's own codes that say the connection, the pool, the connect handshake or the wire
+# protocol failed, so no session read the statement and answered. Read off the driver's error
+# table (`errors.ERR_MESSAGE_FORMATS`,
+# python-oracledb 4.0.2, the locked version) code by code rather than one code per incident,
+# after two incidents (Codex's second and third reviews of #159: DPY-4005, then DPY-4033); the
+# taxonomy test classifies every code in that table, this set, the OperationalErrors or a
+# reviewed list of refusals, so a driver whose table differs fails it and sends a maintainer back
+# here. Each code here is a plain `DatabaseError`, `InterfaceError`, `ProgrammingError`,
+# `NotSupportedError` or `InternalError` with `isrecoverable` False, so neither the type nor the
+# flag tells it from a parse refusal. Left out on purpose: the statement's own faults the same
+# classes hold (DPY-4004 invalid number, DPY-4007 cannot convert, the bind errors) and the cursor
+# and fetch states (DPY-1003, 1004, 1006). The ORA codes a growing pool meets on acquire are
+# beside the set, `_UNAVAILABLE_ORA`.
+_UNAVAILABLE_DPY = frozenset({
+    "DPY-1001", "DPY-1002",  # not connected; pool not open
+    "DPY-4005",  # timed out waiting for the pool: `_lease` under `wait_timeout`, pool exhausted
+    "DPY-4011",  # the database or network closed the connection (recoverable, named for the test)
+    "DPY-4024",  # call timeout exceeded
+    "DPY-4033",  # the database closed the connection: idle time exceeded
+    "DPY-4035",  # invalid server response to the connection request
+    # An unsupported in-band notification, a NotSupportedError: the read buffer's
+    # `_check_connected` (impl/thin/packet.pyx) disconnects the transport before raising it,
+    # beside the idle-time and connection-closed raises, so the session is gone (Codex's fifth
+    # review of #159).
+    "DPY-3008",
+    # The protocol faults (InternalError), by the driver source files that raise each constant,
+    # as a code search of the driver's repository lists them (the installed wheel is compiled,
+    # so the files are named here rather than re-read on review; Codex's fourth review of #159
+    # found 5000 and 5009). ERR_MESSAGE_TYPE_UNKNOWN 5000, ERR_UNKNOWN_SERVER_PIGGYBACK 5009 and
+    # ERR_UNKNOWN_TRANSACTION_SYNC_VERSION 5014: impl/thin/messages/base.pyx, the response parser.
+    # ERR_UNKNOWN_TRANSACTION_STATE 5010: impl/thin/connection.pyx, the state the server sends.
+    # ERR_BUFFER_LENGTH_INSUFFICIENT 5001, ERR_INTEGER_TOO_LARGE 5002 and
+    # ERR_UNEXPECTED_NEGATIVE_INTEGER 5003: impl/thin/packet.pyx (the read buffer) and
+    # impl/base/buffer.pyx (the base buffer the value decoders share). ERR_UNEXPECTED_REFUSE
+    # 5005: impl/thin/messages/connect.pyx. ERR_UNEXPECTED_END_OF_DATA 5006: impl/base/utils.pyx,
+    # called from the protocol message, the read buffer and the OSON decoder. ERR_UNEXPECTED_DATA
+    # 5004: impl/thin/messages/network_services.pyx (connect time) and the vector, OSON and Arrow
+    # value decoders. Today the proof seam (`prove_outcome`, through `source_unavailable`) is
+    # this classifier's only caller, and a proof (`cursor.parse`) decodes no value, so there each
+    # of these is the wire's or the handshake's, never the statement's. M188 proposes a second
+    # caller, the runner reading a fault while running: there a value decoder can raise 5001 to
+    # 5006 on one statement's rows, which would then read as the source unavailable, a reading
+    # both lanes accepted in advance (a result the driver could not read is not the model's to
+    # repair either way, and the model sees the class alone); whoever wires it decides it there.
+    # Left out: ERR_UNEXPECTED_XML_TYPE 5007 (impl/thin/dbobject.pyx) and
+    # ERR_NUMBER_TOO_LARGE 5015 (impl/base/decoders.pyx), a value's; ERR_UNEXPECTED_PIPELINE_FAILURE
+    # 5011 (impl/base/pipeline.pyx), 5012 not implemented and 5013 creation, the driver's or the
+    # caller's.
+    "DPY-5000", "DPY-5001", "DPY-5002", "DPY-5003", "DPY-5004", "DPY-5005", "DPY-5006",
+    "DPY-5009", "DPY-5010", "DPY-5014",
+    # Connect-time configuration a growing pool can surface on acquire: tnsnames lookup and its
+    # include cycle, credentials and an expired access token, connect descriptor and its address
+    # list, protocol and its handler, wallet, server_type, TLS, password type and its handler,
+    # a password verifier the driver cannot use.
+    "DPY-2018", "DPY-2033", "DPY-2049", "DPY-2056", "DPY-2057", "DPY-3015",
+    "DPY-4000", "DPY-4001", "DPY-4017", "DPY-4018", "DPY-4019", "DPY-4021", "DPY-4026",
+    "DPY-4027", "DPY-4028", "DPY-4030", "DPY-4032", "DPY-4034",
+})
+# The ORA codes a session cannot be had under, which a growing pool meets on acquire and no
+# statement causes: the call timeout (03156); the credentials and the account (01017 logon
+# denied, 01045 CREATE SESSION revoked, Codex's sixth review of #159; 28000 locked, 28001
+# expired); the instance not available, starting or shutting down (01033, 01034, 01089, 01090,
+# 01092) or open to restricted sessions alone (01035); the session and process limits (00018,
+# 00020, 02391); the profile's connect time, which logs a session off mid-use (02399), and an
+# authentication protocol the server no longer accepts (28040); Codex's seventh review of #159
+# for the last two; and a session killed by the administrator (00028), met as the error ORA-00604
+# wraps (its eighth). The TNS ranges are matched beside this set, and a fault on the pool's
+# acquire is unavailable whatever its code (`_acquire_fault`).
+_UNAVAILABLE_ORA = frozenset({18, 20, 28, 1017, 1033, 1034, 1035, 1045, 1089, 1090, 1092, 2391,
+                              2399, 3156, 28000, 28001, 28040})
+
+
+_ACQUIRE_FAULT = "mnemiq_raised_on_acquire"
+
+
+def _mark_acquire_fault(exc: BaseException) -> None:
+    """Mark an exception the pool's `acquire` raised, on the instance; a class the mark cannot be
+    set on (a slotted one) is left as it is, and read by its code."""
+    try:
+        setattr(exc, _ACQUIRE_FAULT, True)
+    except Exception:  # noqa: BLE001 -- the mark is an aid to the reading, never its failure
+        pass
+
+
+def _acquire_fault(exc: BaseException) -> bool:
+    return getattr(exc, _ACQUIRE_FAULT, False) is True
+
+
+def unavailable_fault(exc: BaseException) -> bool:
+    """Whether a python-oracledb error says the source could not be asked, rather than that it
+    answered no: the proof seam's `source_unavailable` (Codex's review of #159). A fault the
+    pool's `acquire` raised is one whatever its code: no session was had.
+
+    The driver types its network faults `OperationalError` (its DPY-6xxx, and the ORA codes it
+    lists as such: ORA-03113, ORA-03114 and ORA-01013, the cancel a call timeout surfaces as, among
+    them) and flags a dead session recoverable (DPY-4011, which it cross-references ORA-03113 to).
+    One of its OperationalError codes says nothing by itself: ORA-00604 wraps the error a
+    recursive SQL raised, and is read by the codes in its message (Codex's eighth review of
+    #159). Everything else it leaves a plain `DatabaseError`, `InterfaceError` or
+    `InternalError`, so the rest is named: `_UNAVAILABLE_DPY`, read off the driver's error table,
+    and among the ORA codes `_UNAVAILABLE_ORA` (the call timeout, and what a growing pool meets
+    on acquire: the credentials, the account, the instance's state, the session and process
+    limits, a session killed) with the TNS ranges (ORA-12150 to 12236, ORA-12500 to 12699) its
+    list leaves out. A parse refusal (ORA-00904, ORA-00942, ORA-00936) is none of these and keeps
+    its reading, as do the driver's data faults (DPY-4004) and `ReadOnlyViolation`, this
+    adapter's own refusal to parse DDL.
+    """
+    if isinstance(exc, (ConnectionError, TimeoutError)) or _acquire_fault(exc):
+        return True
+    error = exc.args[0] if getattr(exc, "args", None) else None
+    if error is None or not hasattr(error, "full_code"):
+        return False
+    try:
+        import oracledb
+    except ImportError:  # pragma: no cover -- an oracledb error exists only with the driver
+        return False
+    if getattr(error, "isrecoverable", False):
+        return True
+    code = getattr(error, "code", 0) or 0
+    if code == 604:
+        # ORA-00604, an error at a recursive SQL level, is typed OperationalError by the driver
+        # and wraps whatever the recursive SQL raised: a SERVERERROR trigger failing on a
+        # missing table wraps ORA-00942, a statement's refusal (Codex's eighth review of #159).
+        # Read by the errors it wraps, the other entries of the error stack, each a line of its
+        # own in the message: unavailable where one of them is, a refusal otherwise. A code
+        # quoted inside an entry's text (`ORA-20001: ... see ORA-03113`, an application error
+        # raised by a trigger) is prose, not an entry (Codex's ninth review of #159). A message
+        # naming no other entry keeps the driver's reading below (the review gate).
+        nested = [int(n) for n in re.findall(r"^\s*ORA-(\d{5}):", str(getattr(error, "message", "")),
+                                             re.MULTILINE)
+                  if int(n) != 604]
+        if nested:
+            return any(_ora_unavailable(n) for n in nested)
+    if isinstance(exc, oracledb.OperationalError):
+        return True
+    return error.full_code in _UNAVAILABLE_DPY or _ora_unavailable(code)
+
+
+def _operational_ora() -> frozenset[int]:
+    """The ORA codes the driver types OperationalError, read off the driver's own table, for a
+    code that ORA-00604 wraps, where the driver's typing of the outer code says nothing; the
+    installed driver's list, less 00604 itself, where the table cannot be read."""
+    try:
+        from oracledb import errors
+
+        return frozenset(int(code) for code in errors.ERR_OPERATIONAL_ERROR_CODES) - {604}
+    except Exception:  # noqa: BLE001 -- a driver without the table: python-oracledb 4.0.2's list
+        return frozenset({22, 378, 600, 602, 603, 609, 1012, 1013, 1033, 1034, 1041, 1043, 1089,
+                          1090, 1092, 3111, 3113, 3114, 3122, 3135, 12153, 12203, 12500, 12571,
+                          27146, 28511})
+
+
+def _ora_unavailable(code: int) -> bool:
+    return (code in _UNAVAILABLE_ORA or code in _operational_ora()
+            or 12150 <= code <= 12236 or 12500 <= code <= 12699)

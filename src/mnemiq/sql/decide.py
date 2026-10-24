@@ -21,13 +21,14 @@ from mnemiq.sql.authz_guard import (
 )
 from mnemiq.sql.cls import check_cls
 from mnemiq.sql.fanout_check import KeyFacts, check_fanout
-from mnemiq.sql.guard import MAX_ROWS, check_shape
+from mnemiq.sql.guard import MAX_ROWS, check_shape, niladic_names
 from mnemiq.sql.lint import lint
 from mnemiq.sql.policy import AccessPolicy
-from mnemiq.sql.prove import prove
+from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.lineage import lineage_for
-from mnemiq.sql.scope import base_tables, check_policy_target, scope_resolved
+from mnemiq.sql.scope import (base_tables, check_policy_target, fields_as_members, known_columns,
+                              scope_resolved)
 from mnemiq.sql.rls import apply_row_and_mask, check_filter_targets, unplaceable_policy
 from mnemiq.sql.values_check import check_values
 from mnemiq.sql.views import check_views
@@ -91,13 +92,23 @@ def decide(
                          columns=visible)
     if isinstance(shaped, Refusal):
         return shaped
+    # M165: `c.secret.status` reads a field of `secret`, and every check below reads columns, so
+    # the reference is made a field access over `secret` before any of them runs.
+    ambiguous = fields_as_members(shaped, target, known_columns(visible, policy))
+    if ambiguous is not None:
+        return ambiguous
+    # M194: a bare `current_date` where a known table has a column so named reads the column
+    # through the function's node, which no check below sees.
+    named = niladic_names(shaped, known_columns(visible, policy), dialect, target)  # the advice in the dialect the model writes
+    if named is not None:
+        return named
     # M150: before any policy is applied, refuse an engine whose CTE binding the rewrite misreads.
     unsupported = check_policy_target(shaped, policy, target)
     if unsupported is not None:
         return unsupported
     row_cap = shaped.meta.get("row_cap")  # read now: the rewrites below build new trees
 
-    refusal = check_access(shaped, visible, target)
+    refusal = check_access(shaped, visible, target, columns=known_columns(visible, policy))
     if refusal is not None:
         return refusal
     # M65: what `check_access` reads -- `base_tables` -- is empty for a source it cannot model,
@@ -133,11 +144,13 @@ def decide(
     # Oracle, returning an SSN from an ungranted table while every check above passed it (M100).
     # Third shape of the same thing, after `count(*)` reaching `count_star` and `id + 1`
     # reaching a macro named `+`, and answered the same way: ask the source, do not enumerate.
-    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target)
+    computed = check_opaque_columns(shaped, opaque_columns(adapter, functions), target,
+                                    columns=known_columns(visible, policy))
     if computed is not None:
         return computed
 
-    cls = check_cls(shaped, policy, target)  # column deny / mask-in-predicate
+    cls = check_cls(shaped, policy, target,  # column deny / mask-in-predicate
+                    columns=known_columns(visible, policy))
     if cls is not None:
         return cls
 
@@ -242,11 +255,14 @@ def decide(
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof
         # the source understands -- `EXPLAIN` is not Oracle syntax (see mnemiq.sql.prove).
-        refused = prove(adapter, target_sql)
+        # A refusal of what the policy added is the operator's, not the model's (M158).
+        refused = prove_governed(adapter, target_sql, asked_sql)
         if refused is not None:
-            # What the source refused is the policy's rewrite, so its words can quote the policy and
-            # the rows it removes, and the model repairs against them. `prove` has logged them
-            # whole; under a policy the refusal keeps the error's class only (`policy_safe_detail`).
+            # EXPLAIN_FAILED: what the source refused is the policy's rewrite, so its words can
+            # quote the policy and the rows it removes, and the model repairs against them. `prove`
+            # has logged them whole; under a policy the refusal keeps the error's class only
+            # (`policy_safe_detail`). POLICY_REWRITE_REJECTED carries no source words at all;
+            # SOURCE_UNAVAILABLE carries the driver's, which name no row, kept to their class too.
             return replace(refused, source_detail=policy_safe_detail(
                 refused.source_detail, asked=asked_sql, executed=target_sql, dialect=target))
 

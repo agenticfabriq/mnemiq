@@ -43,6 +43,12 @@ class DeferralReason(StrEnum):
     # them together is M6 exactly, and a flaky judge would raise the measured deferral rate while
     # the cause stayed readable only in `verify_layer`, case by case.
     VERIFIER_UNAVAILABLE = "verifier_unavailable"
+    # The source could not be asked whether it would run the statement: a connection fault or a
+    # timeout at the proof, read off the driver's errors by the adapter -- NOT a deferral. A
+    # sibling of MODEL_UNAVAILABLE: nothing about the question or the grants, and the caller's
+    # move is to try again and page an operator if it persists. Before it had a code of its own it
+    # arrived as UNGOVERNABLE, which is a deferral, so a source outage raised the deferral rate.
+    SOURCE_UNAVAILABLE = "source_unavailable"
     # The decider refused for a reason that is about the SOURCE or the POLICY rather than the
     # question, and no rewrite can change it: a source that redefines a builtin's name so no
     # call on it can be resolved, or a row filter that is not a valid predicate. NOT a source

@@ -10,6 +10,7 @@ from mnemiq.adapters.duckdb import (
     duckdb_reachable_user_functions,
     duckdb_user_functions,
     execute_bounded,
+    unavailable_fault,
 )
 from mnemiq.config import SourceSpec
 from mnemiq.duckdb_extensions import (
@@ -96,3 +97,7 @@ class FederatedAdapter:
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
         return execute_bounded(self._con, sql, timeout_s)
+
+    def source_unavailable(self, exc: BaseException) -> bool:
+        """The proof seam's question, answered as DuckDB's: one connection runs every source."""
+        return unavailable_fault(exc)

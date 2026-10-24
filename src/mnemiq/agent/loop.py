@@ -339,7 +339,10 @@ class Agent:
                     guard_fanout=self.guard_fanout,
                 )
             if isinstance(outcome, Deferred):
-                return AgentAnswer(answer=outcome.reason, deferred=True,
+                # A source that could not be asked happened TO us, so it is a stated failure and
+                # stays out of the deferral rate, like a model or a judge that did not answer (M6).
+                outage = outcome.code is DeferralReason.SOURCE_UNAVAILABLE
+                return AgentAnswer(answer=outcome.reason, deferred=not outage, failed=outage,
                                    reason_code=outcome.code)
 
             approved: Approved = outcome
@@ -473,6 +476,18 @@ class Agent:
                     guard_undefined_terms=self.guard_undefined_terms,
                     guard_fanout=self.guard_fanout,
                 )
+                if getattr(outcome, "code", None) is DeferralReason.SOURCE_UNAVAILABLE:
+                    # The source did not answer this candidate's proof, so it would not answer the
+                    # next one's either: stop here, before another model call and before the
+                    # single path's fallback, which would ask the same source again (Codex's
+                    # review of #159). A failure, not a deferral (M6), and the turn fails even
+                    # when earlier candidates ran: a reduced set is never an answer here -- under
+                    # `min_agreement` it is DISAGREEMENT by rule, which would count the outage as
+                    # a deferral after all.
+                    return AgentAnswer(answer=outcome.reason, failed=True,
+                                       reason_code=outcome.code,
+                                       candidates_executed=len(executed),
+                                       narrowed=_narrowed_of(executed))
                 if not isinstance(outcome, Approved):
                     # M35: an UNDEFINED_TERM deferral is a finding about the QUESTION, not a
                     # failed attempt by this candidate, so it must not be dropped and outvoted.

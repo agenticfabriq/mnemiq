@@ -22,7 +22,7 @@ export function disposition(turn: Turn): Disposition {
 export const DISPOSITION_LABEL: Record<Disposition, string> = {
   answered: "Answered",
   declined: "Declined",
-  // Three codes reach this disposition and only one of them is the source. It said
+  // Four codes reach this disposition and only two of them are the source. It said
   // "Source failed" over a model-provider outage before a verifier outage could reach
   // it too; the card below names which one broke.
   failed: "Could not answer",
@@ -71,11 +71,18 @@ export const REASONS: Record<DeferralReason, { title: string; next: string }> = 
     title: "The source rejected every attempt",
     next: "Page an operator. This is a source failure, not a refusal.",
   },
+  // Rides `failed: true`. The source could not be asked whether it would run the query -- a
+  // connection fault or a timeout -- so it is not `execution_failed`, where the source read every
+  // attempt and refused it. An outage, so trying again can work, which that card cannot say.
+  source_unavailable: {
+    title: "The source did not answer",
+    next: "An outage, not a judgement about your question. Try again, and page an operator if it persists.",
+  },
   model_unavailable: {
     title: "The model provider did not respond",
     next: "An outage, not a judgement about your data. Try again.",
   },
-  // Third code riding `failed: true`, and the third thing that can break. The engine ran the
+  // A code riding `failed: true`, and another thing that can break. The engine ran the
   // query and could not get the answer CHECKED, which is why it is not `verification` -- that
   // one means a judge read the result and declined to stand behind it.
   verifier_unavailable: {
@@ -87,7 +94,7 @@ export const REASONS: Record<DeferralReason, { title: string; next: string }> = 
     // cases share is that nothing was judged, which is the part the operator needs.
     next: "The query ran; the verifier gave no usable answer, so the result was withheld rather than returned unchecked. Nothing here is a judgement about your data — check the verifier endpoint and its model.",
   },
-  // A deferral, NOT one of the three above that ride `failed: true`. The engine could not
+  // A deferral, NOT one of the four that ride `failed: true`. The engine could not
   // establish that the query is governed -- a source that redefines a builtin's name, a row
   // filter that is not a valid predicate -- so rephrasing is the one thing that will not help.
   // It is not retried either (M98): trying could not have worked.

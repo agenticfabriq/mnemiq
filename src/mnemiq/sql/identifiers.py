@@ -126,17 +126,19 @@ def resolve_name(node: exp.Expression, dialect: str | None) -> str | None:
 def resolve_stored(name: str, dialect: str | None) -> str:
     """Resolve a name that came from a CATALOG rather than from a query.
 
-    Always as an UNQUOTED identifier: the database has already applied its own folding by the time
-    a name reaches its data dictionary, so `CREATE TABLE Claim` is `claim` in Postgres and `CLAIM`
-    in Oracle.
+    As an UNQUOTED identifier, which is right only where the engine never tells names apart by
+    case: DuckDB and SQLite keep `Secret` as created and read `secret` as it, and `check_access`
+    folds a stored column name this way there (M170). Where quoting keeps case (Postgres, Oracle)
+    a mixed-case stored name belongs to a column created with quotes and its fold is a DIFFERENT
+    name -- `"Amount"` beside `amount` -- so this must not be applied to such a catalog's names
+    without knowing which were quoted (the review gate's case on M170).
 
-    NOT yet wired, and named here so the next reader knows it was considered rather than missed.
-    The plan-versus-snapshot comparison still runs on as-typed text -- `check_access` tests
-    `object_key(table) not in visible` -- so on Postgres `SELECT id FROM CLAIM` is refused
-    `unauthorized_table` against a granted `claim`, though the engine folds them to one object.
-    That direction only ever REFUSES, which is why it is a usability defect rather than the leak
-    this module was written for, and why it is deferred rather than rushed: `visible`, the column
-    schema and the policy maps are all keyed by that text, so resolving one side means resolving
-    the boundary where all of them are built. This function is what that boundary will call.
+    The rest of the plan-versus-snapshot comparison still runs on as-typed text: `check_access`
+    tests `object_key(table) not in visible`, and on Postgres and Oracle its column names too, so
+    on Postgres `SELECT id FROM CLAIM` is refused `unauthorized_table` against a granted `claim`,
+    though the engine folds them to one object. That direction only ever REFUSES, which is why it
+    is a usability defect rather than the leak this module was written for: `visible` and the
+    policy maps are keyed by that text, so resolving it means resolving the boundary where they
+    are built, tables, columns and row filters together (the register's M170 remainder).
     """
     return resolve(name, quoted=False, dialect=dialect)

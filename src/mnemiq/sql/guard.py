@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import collections
+import logging
+import re
+
 import sqlglot
 from sqlglot import exp
 
 from mnemiq.sql.identifiers import resolve_name
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.verdict import Refusal, RefusalCode
+
+logger = logging.getLogger(__name__)
 
 MAX_ROWS = 1000
 
@@ -66,6 +72,12 @@ def check_shape(
     # statement, and identifier folding belongs to the second: `decide` defaults to parsing duckdb
     # and targeting postgres, so keying the fold on the parse dialect answers for the wrong engine.
     # Production passes them equal, which is exactly why the mismatch would not have surfaced.
+    unnamed = unnamed_read(ast, executes_as or dialect)
+    if unnamed is not None:
+        return unnamed
+    misgrouped = misgrouped_set_chain(ast, executes_as or dialect)
+    if misgrouped is not None:
+        return misgrouped
     if _has_projection_star(ast, executes_as or dialect, columns) \
             or _projects_a_row(ast, columns) \
             or _uses_a_row_outside_the_projection(ast, columns):
@@ -83,12 +95,131 @@ def check_shape(
             ),
         )
 
+    positional = bound_by_position(ast, executes_as or dialect, columns)
+    if positional is not None:
+        return positional
+
     # The schema said which of these are columns; qualifying them is what makes that answer
     # checkable by the engine rather than taken on trust (M90). Before `_with_limit` so the
     # returned tree is the one that runs, and before `check_cls` ever sees it -- a qualified
     # reference is one that grant checking can rule on.
+    # Read before qualifying, which rebuilds columns without their source positions.
+    null_order_written = _first_key_writes_null_order(ast, sql, dialect)
     _qualify_schema_resolved(ast, columns)
-    return _with_limit(ast, max_rows, executes_as or dialect)
+    shaped = _with_limit(ast, max_rows, executes_as or dialect)
+    if not isinstance(shaped, Refusal):
+        shaped.meta["null_order_written"] = null_order_written
+    return shaped
+
+
+def bound_by_position(ast: exp.Expression, dialect: str,
+                       columns: dict[str, set[str]] | None) -> Refusal | None:
+    """A column the statement reaches by POSITION rather than by name, which no name-based check
+    can read: refused as unnamed, before any grant is consulted (M183 to M186).
+
+    The resolver binds a qualified column through a derived table by what the derived table
+    EXPOSES under the name. Three shapes expose columns by position instead, measured on DuckDB:
+    a star in a branch of a set operation inside a derived table or CTE lines the branches up by
+    position, so `(SELECT * FROM claim UNION ALL SELECT * FROM wide) d` serves wide's second
+    column under claim's name `secret` (M183); a column list over a star renames by position, so
+    `(SELECT * FROM claim) d(x, y)` serves `secret` as `y` (M184); and DuckDB's `#2` is the second
+    column whatever its name (M185). A PIVOT or UNPIVOT source has no projection the resolver
+    models, and traversing it was an AssertionError rather than a verdict (M186). Each is refused
+    with the advice to name the columns; a set operation of named branches, a column list over
+    named projections, and VALUES under either (the ui lane's 42 recorded statements) are not
+    these shapes and pass.
+    """
+    for positional in ast.find_all(exp.PositionalColumn):
+        return Refusal(
+            code=RefusalCode.SELECT_STAR,
+            message=(f"`#{positional.this.name}` names a column by its position, which the engine "
+                     "cannot check by name. Name the column instead."),
+            subject=f"#{positional.this.name}",
+        )
+    for pivot in ast.find_all(exp.Pivot):
+        kind = "UNPIVOT" if pivot.args.get("unpivot") else "PIVOT"
+        return Refusal(
+            code=RefusalCode.UNMODELLED_SOURCE,
+            message=(f"A {kind} source reshapes a table in a way the engine cannot attribute "
+                     "column by column. Write the reshaping as a query over named columns "
+                     "(a UNION ALL of one SELECT per column, or CASE expressions) instead."),
+            subject=kind,
+        )
+    for alias in ast.find_all(exp.Alias):
+        if isinstance(alias.this, exp.Columns):
+            # `COLUMNS(*) AS "x_\0"` renames every column it expands by a pattern, so the names
+            # the outer query reads are derived and no node names the column read (Codex's
+            # review of #167: `d.x_secret` over it returned a withheld secret).
+            return Refusal(
+                code=RefusalCode.SELECT_STAR,
+                message=("`COLUMNS(...)` with an alias template renames the columns it expands "
+                         "by a pattern, so the engine cannot tell which column a derived name "
+                         "reads. Name the columns, and alias each one."),
+                subject=alias.alias,
+            )
+    ctes = _visible_ctes(ast, {}, dialect)
+    memo: dict[int, bool] = {}
+    for table in ast.find_all(exp.Table):
+        alias = table.args.get("alias")
+        if alias is None or not alias.args.get("columns"):
+            continue
+        # A column list on a table REFERENCE renames by position too (Codex's review of #167):
+        # over a base table, `FROM claim d(secret, id)` serves secret as `d.id`; over a CTE
+        # whose body expands a star, the same; over a table function, its columns. Refused
+        # whatever stands behind the name: telling a CTE of named projections apart would need
+        # the CTE visible at the reference's own scope, and a lookup at the root let an inner
+        # WITH shadowing an outer name through (the review gate); no recorded statement lists
+        # columns on a reference (the ui lane's count).
+        return Refusal(
+            code=RefusalCode.SELECT_STAR,
+            message=(f"The column list on {table.alias_or_name!r} renames what it reads by "
+                     "position, so the new names say nothing about which columns are read. "
+                     "Name the columns in a SELECT instead of listing them on the alias."),
+            subject=table.alias_or_name or None,
+        )
+    for node in ast.find_all(exp.Subquery, exp.CTE, exp.Lateral):
+        body = node.this
+        if isinstance(node, exp.Lateral):
+            # A LATERAL's column list sits on the LATERAL's alias, over its subquery (the ui
+            # lane's replay of #167: `LATERAL (SELECT * FROM claim) l(x, y)` served secret as
+            # `l.y` under hidden, denied and masked alike).
+            body = body.this if isinstance(body, exp.Subquery) else body
+        while isinstance(body, exp.Paren):
+            body = body.this
+        if not isinstance(body, exp.Query):
+            continue
+        if body.find(exp.Table) is None:
+            # No table or CTE is named under it, so no star in it reaches a base table: `WITH
+            # t(a, b) AS (SELECT * FROM (VALUES (1, 2)))`, the shape of every recorded statement
+            # a column list appears in (the ui lane's count), where the star walk's fail-closed
+            # reading of VALUES would refuse it.
+            continue
+        alias = node.args.get("alias")
+        if isinstance(body, exp.SetOperation):
+            # The branches' stars, each asked whether it reaches a base table in its own scope.
+            for select in _output_selects(body):
+                inner = _visible_ctes(select, ctes, dialect)
+                for projection in select.expressions:
+                    if _is_star(projection) and _expands_a_base_table(
+                            select, projection, inner, columns, memo, frozenset(), dialect):
+                        return Refusal(
+                            code=RefusalCode.SELECT_STAR,
+                            message=("A `*` in a branch of a UNION, INTERSECT or EXCEPT inside a "
+                                     "subquery or CTE lines the branches' columns up by position, "
+                                     "so a name outside it can read another table's column. Name "
+                                     "the columns in every branch."),
+                            subject=node.alias_or_name or None,
+                        )
+        if alias is not None and alias.args.get("columns") and _star_reaches_base(
+                body, ctes, memo, columns, frozenset(), dialect):
+            return Refusal(
+                code=RefusalCode.SELECT_STAR,
+                message=(f"The column list on {node.alias_or_name!r} renames a `*` by position, "
+                         "so the new names say nothing about which columns are read. Name the "
+                         "columns in the SELECT instead of listing them on the alias."),
+                subject=node.alias_or_name or None,
+            )
+    return None
 
 
 def _output_selects(ast: exp.Expression) -> list[exp.Select]:
@@ -107,6 +238,380 @@ def _output_selects(ast: exp.Expression) -> list[exp.Select]:
     if isinstance(ast, exp.Subquery):
         return _output_selects(ast.this)  # redundant parentheses nest Subquery in Subquery
     return []
+
+
+# The engines that bind INTERSECT tighter than UNION and EXCEPT, against the parser's left fold.
+_INTERSECT_BINDS_TIGHTER = frozenset({"duckdb", "postgres", "postgresql", "mysql"})
+
+
+# The niladic names sqlglot reads as a function with no Column node, which DuckDB binds to a
+# same-named column of the query's own FROM before the function (M194). Not `current_user`,
+# for one reason only: sqlglot prints `exp.CurrentUser` with its parentheses for DuckDB,
+# MySQL, SQLite and Oracle, and bare for Postgres, where the word is reserved, so the target
+# SQL reads the function on each (the ui lane's replay of #175, measured through the target
+# SQL on DuckDB; the bare spelling there reads the column, the review gate). The other
+# names print bare, which is the leak; one that came to print with parentheses would leave
+# this tuple on the same measurement, not on reasoning.
+# The bare niladic words an engine binds to a column of that name where the table has one,
+# read off the statement AS PRINTED FOR THE TARGET: what reaches the engine is the printed
+# text, not the class the parser chose. Oracle's `SYSDATE` parses to the CURRENT_TIMESTAMP
+# node with a time zone and prints a bare `CURRENT_TIMESTAMP` on DuckDB, which bound the
+# column while the node's printed name matched nothing (the review gate on the seventh
+# commit); MySQL's `UTC_TIMESTAMP()` parses to a node of its own and prints the same bare
+# word (the gate on the eighth); and `now()` written as MySQL prints `NOW()` for Postgres,
+# a call there, which the Postgres parser reads back as the CURRENT_TIMESTAMP node and a
+# re-parse of the printing refused (the gate on the same round). A word is bare where no
+# word character, dollar or dot precedes it and no word character or `(` follows, outside
+# every quoted span and comment (`_QUOTED_OR_COMMENT`, cut before the scan: `'a
+# current_timestamp'` was refused with the scan over the whole text, the gate): `kw.current_date`
+# and `"current_date"` are columns the grant check reads, and `current_date()` is the call.
+_NILADIC_WORDS = ("current_date", "current_timestamp", "current_time", "localtime",
+                  "localtimestamp", "session_user", "current_catalog")
+_BARE_NILADIC = re.compile(r"(?<![\w$.])(" + "|".join(_NILADIC_WORDS) + r")(?![\w(])", re.I)
+_QUOTED_OR_COMMENT = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"|`(?:[^`]|``)*`|/\*.*?\*/|--[^\n]*", re.S)
+
+
+def _bare_niladic_words(sql: str) -> collections.Counter:
+    """How many times `sql` holds each niladic word bare, lowercased, quoted spans and
+    comments cut."""
+    return collections.Counter(match.group(1).lower() for match in _BARE_NILADIC.finditer(_QUOTED_OR_COMMENT.sub(" ", sql)))
+
+
+# The call spellings the repair may name, per dialect the model writes in (the statement it
+# retries with is parsed as `dialect` and printed for the target, so a target's spelling
+# could be a column to the parser: the review gate), in order of preference; the first the
+# decider approves as the retry is named (`_call_advice`): parsed as a call the function
+# guard models, and printed for the target with no bare niladic word a table the statement
+# reads has as a column. Measured: `now()` on DuckDB and MySQL is a plain call the guard
+# models; Postgres's `now()` parses to the CURRENT_TIMESTAMP node and `localtimestamp` to
+# its own, where `clock_timestamp()` is unmodelled without an adapter's function inventory
+# and was advised beside a column named `current_timestamp`, then refused on the retry
+# (Codex's first review of #175); `today()` on DuckDB, `curdate()` on MySQL and `SYSDATE` on
+# Oracle parse to niladic nodes too (the gate), `get_current_timestamp()` is unmodelled, and
+# `current_date()` reads the column on DuckDB (the ui lane's replay). A table holding every
+# candidate's name leaves the repair with no example. An engine not listed the same. Only
+# Postgres ever falls through to a second spelling: the first elsewhere is a plain call the
+# guard models, and wins wherever it prints as one (the gate).
+_CALL_ADVICE: dict[str, tuple[str, ...]] = {
+    "duckdb": ("now()", "localtimestamp"),
+    "postgres": ("now()", "localtimestamp"),
+    "postgresql": ("now()", "localtimestamp"),
+    "mysql": ("now()", "sysdate()"),
+    "sqlite": ("datetime('now')", "date('now')"),
+    "oracle": ("SYSTIMESTAMP", "SYSDATE"),
+}
+
+
+def _call_advice(dialect: str | None, target: str | None, taken: frozenset[str]) -> str | None:
+    """The first of the dialect's call spellings the decider approves as the retry: a call the
+    function guard models (a typed node, or a name on its allow-list) whose printing for the
+    target holds no bare niladic word in `taken`, the words the tables read have as columns."""
+    from mnemiq.sql.authz_guard import _KNOWN_FUNCTIONS  # authz_guard imports this module
+
+    for call in _CALL_ADVICE.get((dialect or "").lower(), ()):
+        try:
+            node = sqlglot.parse_one(f"SELECT {call}", read=dialect).selects[0]
+            printed = node.sql(dialect=target)
+        except Exception:  # noqa: BLE001 -- a spelling the dialect cannot parse or the target cannot print is no advice
+            continue
+        if isinstance(node, exp.Anonymous) and str(node.this).upper() not in _KNOWN_FUNCTIONS:
+            continue
+        if set(_bare_niladic_words(printed)) & taken:
+            continue
+        return call
+    return None
+
+
+def niladic_names(ast: exp.Expression, columns, dialect: str | None = None,
+                  target: str | None = None) -> Refusal | None:
+    """A column named like a niladic SQL function is read through the function's node, which
+    no grant, deny or mask check sees: DuckDB binds a bare `current_date` to a same-named
+    column of the query's own FROM before the function, and sqlglot reads the name as
+    `CurrentDate` with no Column node, so bare `current_date`, `current_timestamp`,
+    `current_time`, `localtime`, `localtimestamp`, `session_user` and `current_catalog`, in a
+    projection, an aggregate, a WHERE, an ORDER BY, a derived table, a CTE and a write, each
+    returned a withheld column's value or an oracle on it (M194, the ui lane's replay of #169).
+    The call form is no safer: `current_date()` and `today()` parse to the same node and the
+    target SQL prints the bare name, which the engine binds to the column. Refused where a
+    table the statement reads has a column so named: DuckDB binds the column only from the
+    query's own FROM, and every path to it (a derived star, a CTE star, USING, LATERAL)
+    reaches a base table the statement reads, so a known table the statement never reads
+    fires nothing, nor does a query with no FROM (the ui lane's replay of #175: the broad
+    form over every known table was cost there; measured cost of that broader form, 0 of
+    2,803 corpus statements using CURRENT_DATE or CURRENT_TIMESTAMP, the register, no
+    corpus schema having such a column). Where no table read has one the name is the
+    function to every engine measured. With no schema beyond the grant a withheld column is
+    unknown here, a residual the register records. The repair names the column with its
+    table, and a call the dialect the query is written in parses as a call the function
+    guard models and that prints for the target with no bare niladic word a table read has
+    as a column (`_call_advice`), since the retry is parsed as that dialect. The tables read
+    are found as the engine that runs the query binds them (`target`), as the decider finds
+    them: whether a CTE stands in front of a base table folds names by the engine's rule
+    (the review gate on the fifth commit). The words are read off the statement as printed
+    for the target (`_bare_niladic_words`), what the engine binds; a statement the target
+    cannot print is read as printed for the dialect and the fall-back logged, and the
+    decider's own printing for the target fails the statement after this."""
+    from mnemiq.sql.scope import base_tables  # scope imports this module's checks
+
+    engine = target or dialect
+    referenced = {object_key(table) for table in base_tables(ast, engine)}
+
+    def columns_of(table: str) -> set[str]:
+        # Every inventory keyed by a spelling that folds onto the table's: a grant keyed `KW`
+        # and a policy keyed `kw` are one table to DuckDB, and read under the grant's key
+        # alone the policy's `current_date` was unseen and the bare name approved (Codex's
+        # first review of #175). Folded on every engine, which refuses more where quoting
+        # keeps `"KW"` and `kw` apart, never less.
+        return {n.lower() for key, names in (columns or {}).items() if key.lower() == table.lower() for n in names}
+
+    taken = frozenset(name for table in referenced for name in columns_of(table))
+    try:
+        printed = ast.sql(dialect=engine)
+    except Exception as exc:  # noqa: BLE001 -- the decider's own printing fails the statement after this
+        logger.warning("niladic rule: the statement could not be printed for %s (%s); read as printed for %s", engine, exc, dialect)
+        printed = ast.sql(dialect=dialect)
+    # A word the dialect's parser reads as a column (`localtimestamp` on SQLite, which has no
+    # such keyword) is the column, and the grant check reads it: each such column reference
+    # that prints bare accounts for one bare occurrence, and the occurrences beyond them are
+    # the function's spelling. By occurrence, not by word: taken off for the whole statement,
+    # a quoted `"current_timestamp"` read in a subquery switched the rule off for the bare
+    # word beside it and the column leaked (the gate's second round on this commit).
+    bare = _bare_niladic_words(printed)
+    as_columns = collections.Counter(
+        column.name.lower() for column in ast.find_all(exp.Column)
+        if not column.table and _bare_niladic_words(column.sql(dialect=engine)))
+    for name in sorted(name for name, count in bare.items() if count > as_columns[name]):
+        owners = sorted(table for table in referenced if name in columns_of(table))
+        if owners:
+            call = _call_advice(dialect, engine, taken)
+            advice = f"such as {call}" if call else "with its own name and parentheses"
+            return Refusal(
+                code=RefusalCode.AMBIGUOUS_NILADIC_NAME,
+                message=(f"{name!r} names a column of {owners[0]!r} and a SQL function, and the "
+                         f"engine reads the column where that table is in the FROM. Write "
+                         f"{owners[0]}.{name} for the column, or for the function a call written "
+                         f"as one in this query's dialect, {advice}."),
+                subject=name,
+            )
+    return None
+
+
+def misgrouped_set_chain(ast: exp.Expression, engine: str) -> Refusal | None:
+    """Refuse a set-operation chain the parser groups differently from the engine: sqlglot folds
+    an unparenthesised chain left to right, so `A UNION ALL B INTERSECT C` is an INTERSECT over a
+    UNION, where DuckDB binds INTERSECT tighter and reads `A UNION ALL (B INTERSECT C)` (M203,
+    measured; Postgres documents the same precedence and MySQL has it from 8.0.31, so both are
+    held to it unmeasured, the review gate on the ninth commit; Oracle and SQLite group left to
+    right as the parser does, and are not refused). Every rule
+    over the tree then reads a shape the engine does not run. Not a cost alone: in a RECURSIVE
+    body the resolver found no recursive part and read the CTE's own references as the base
+    table, so a row filter on it was injected into them, and the approved statement answered
+    `[1]` where the original answers `[1, 2, 3]` (Codex's sixth review of #170). The shape is
+    an INTERSECT whose bare left operand is a UNION or an EXCEPT; a parenthesised operand is a
+    subquery to the parser and grouped as written. The corpus holds no such chain (the ui lane's
+    count, 2026-10-19)."""
+    if (engine or "").lower() not in _INTERSECT_BINDS_TIGHTER:
+        return None
+    for node in ast.find_all(exp.Intersect):
+        if isinstance(node.this, (exp.Union, exp.Except)):
+            return Refusal(
+                code=RefusalCode.PARSE_ERROR,
+                message=("A UNION or EXCEPT followed by INTERSECT without parentheses is grouped "
+                         "one way by the parser and another by the engine, which binds INTERSECT "
+                         "tighter, so the statement cannot be checked as it would run. Write the "
+                         "parentheses: `A UNION ALL (B INTERSECT C)` or `(A UNION ALL B) INTERSECT C`."),
+                subject="INTERSECT",
+            )
+    return None
+
+
+def unnamed_read(ast: exp.Expression, engine: str, write: bool = False) -> Refusal | None:
+    """Two DuckDB spellings that read a column no node names, so no grant, deny or mask check
+    sees the read; refused before any check runs, by both deciders (M192, M193: measured on
+    DuckDB 1.5.4, each returned a withheld value under deny, under mask and hidden with the
+    schema listing it; Codex's first review of #169 copied the denied value into a writable
+    table through the write decider's own shape check, which had not run this).
+
+    Method-call syntax: `x.f()` is `f(x)` to DuckDB, and sqlglot reads `secret.lower()` as a Dot
+    over an identifier and a call, with no Column node; `secret.max()`, `claim.secret.lower()`,
+    `WHERE secret.starts_with('Z')`, `ORDER BY secret.lower()` and `HAVING secret.max() LIKE
+    'Z%'` the same. Whether the left side is a column is not for the decider to resolve: the
+    grant lists only the visible columns, so a hidden one is exactly the name a visible-schema
+    lookup misses. Executed as DuckDB, every Dot whose right side is a call is refused, the
+    schema-qualified `main.lower(note)` with it (the plain spelling exists, and the advice names
+    it). Executed as Oracle, which has no method syntax on a bare column (a method of an
+    object-typed column is reached only through a table alias, `c.secret.f()`), anything but a
+    bare identifier on the left is refused (an alias-led Dot, a Column, a parenthesised
+    column), and a bare identifier is a package or schema name (`DBMS_LOB.SUBSTR(note, 10,
+    1)`), whose column sits in the arguments and is checked, and whose function the inventory
+    judges. The walk visits every Dot, so a chain (`secret.lower().upper()`) is refused at
+    its outer call; the left side's spelling (quoted, upper-cased, parenthesised, a struct
+    column, a derived table's alias) never matters.
+
+    `COLUMNS(...)` inside an expression: as a projection on its own the resolver reads it, and
+    among the outermost projections the star check refuses it, but inside a call, a WHERE, an
+    ORDER BY, a struct or a derived table's expression (`upper(COLUMNS('e'))`, `WHERE
+    COLUMNS('ecr') LIKE 'Z%'`, `struct_pack(COLUMNS('e'))`, `concat(*COLUMNS('e'))`) the engine
+    expands it into reads of columns that appear in no node. Every COLUMNS that is not a bare
+    projection is refused, the qualified `x.COLUMNS(...)` spelling (a Dot over a call) with it.
+
+    A star, or a bare COLUMNS, is read by the outermost star check (`_has_projection_star`), by
+    the resolver for a derived table or a CTE the outer query reads by name and whose own Select
+    does not consume it (a DISTINCT, a GROUP BY, an ORDER BY ALL or by position reads every
+    column: `SELECT count(*) FROM (SELECT DISTINCT * FROM claim) d` answers by whether two
+    withheld values are equal, M198), and by nothing else; `COUNT(*)` and an EXISTS's projection
+    read no value, unless an INTERSECT or EXCEPT under the EXISTS compares it, and a PIVOT or
+    UNPIVOT source is refused as unmodelled with its own code (`_projection_is_read` is that
+    whole list). A star in a scalar subquery, an IN list or a RETURNING is read by none of them,
+    and its Select names no Column: `SELECT (SELECT * FROM one LIMIT 1) AS s FROM pub` over a one-column table
+    returned the withheld value hidden, denied and masked, and `WHERE (SELECT * FROM one LIMIT
+    1) LIKE 'Z%'` was an oracle (M196). Every star whose query is not the outermost one, a
+    derived table, a CTE, an EXISTS or `COUNT(*)` is refused. In a write (`write=True`, the
+    write decider's shape check) the outermost, derived and CTE readings do not exist either:
+    the INSERT's source has no outermost check, so `INSERT INTO sink SELECT * FROM claim` and
+    `INSERT INTO sink SELECT COLUMNS('secret') FROM claim` were approved and copied the
+    withheld value into a table the same grant reads (Codex's second review of #169; M195).
+    Every star and every COLUMNS but `COUNT(*)`'s and an EXISTS's is refused there: a write names
+    every column it reads. A column reached by position (`#2`) is the same read under another
+    spelling, refused on the read side by `bound_by_position` and, since M197, in the write
+    decider's shape check as well.
+    """
+    for dot in ast.find_all(exp.Dot):
+        if isinstance(dot.expression, exp.Anonymous) and str(dot.expression.this).upper() == "COLUMNS":
+            continue  # the qualified star spelling, refused below with the star's own code
+        if not isinstance(dot.expression, (exp.Anonymous, exp.Func)):
+            continue
+        left = dot.this
+        if engine == "duckdb" or not isinstance(left, exp.Identifier):
+            # The same shape as a schema-qualified call (`public.customer_rows()`), which the
+            # function inventory refuses as an unmodelled call: one code for both readings,
+            # since the decider cannot tell what either reads.
+            return Refusal(
+                code=RefusalCode.UNMODELLED_CALL,
+                message=(f"`{dot.sql()}` is a call the engine cannot see into: DuckDB's method "
+                         "syntax `x.f()` names the column where no check can read it, and a "
+                         "qualified call names a function the engine does not model. Write the "
+                         "call as `f(x)` over a plain column."),
+                subject=dot.this.sql(),
+            )
+    for expansion in ast.find_all(exp.Columns):
+        if expansion.find_ancestor(exp.Pivot) is not None or (
+                isinstance(expansion.parent, exp.Select) and _projection_is_read(expansion, write)):
+            continue  # a PIVOT's own refusal; a bare projection the resolver or star check reads
+        return Refusal(
+            code=RefusalCode.SELECT_STAR,
+            message=("`COLUMNS(...)` inside an expression expands to columns no check can "
+                     "see. Use it only as a projection on its own, or name the columns."),
+            subject=expansion.sql(),
+        )
+    for call in ast.find_all(exp.Anonymous):
+        if str(call.this).upper() == "COLUMNS":
+            return Refusal(
+                code=RefusalCode.SELECT_STAR,
+                message=("`COLUMNS(...)` inside an expression expands to columns no check can "
+                         "see. Use it only as a projection on its own, or name the columns."),
+                subject=call.sql(),
+            )
+    for star in ast.find_all(exp.Star):
+        if isinstance(star.parent, exp.Columns):
+            continue  # `COLUMNS(*)`: the COLUMNS loop above ruled on it (Codex's fifth review)
+        if _projection_is_read(star, write):
+            continue
+        return Refusal(
+            code=RefusalCode.SELECT_STAR,
+            message=("`*` here expands to columns no check can see: a star is read only as the "
+                     "outermost projection, in a derived table or a CTE the query reads by "
+                     "name, under EXISTS or as COUNT(*), and in a write only as the last two. "
+                     "Name the columns instead."),
+            subject=star.parent.sql() if isinstance(star.parent, exp.Column) else star.sql(),
+        )
+    return None
+
+
+def _projection_is_read(node: exp.Expression, write: bool) -> bool:
+    """Whether some check reads this star or bare COLUMNS: `COUNT(*)`; the projection of an
+    EXISTS, unless an INTERSECT or EXCEPT on the way compares the values (`EXISTS (SELECT *
+    FROM one INTERSECT SELECT 'Z')` is true only on the withheld value: Codex's third review of
+    #169) or a DISTINCT, a GROUP BY, an ORDER BY by position or ALL, or a UNION without ALL
+    consumes them (`... UNION SELECT 'Z' OFFSET 1`: the fourth); and, on the read side only, the outermost query's (the star check), a derived
+    table's or a CTE's (the resolver, where the outer query names what it reads). A star or
+    COLUMNS anywhere else, a scalar subquery (`WHERE (SELECT COLUMNS('secret') FROM one LIMIT
+    1) = 'Z'`, the same review), an IN list, a value in parentheses, an INSERT's source, is read
+    by nothing."""
+    holder = node.parent
+    if isinstance(holder, exp.Column):
+        holder = holder.parent  # `t.*`
+    if isinstance(holder, exp.Count):
+        return True
+    if node.find_ancestor(exp.Pivot) is not None:
+        return True  # a PIVOT or UNPIVOT source is refused as unmodelled, with its own code
+    if not isinstance(holder, exp.Select):
+        return False
+    query, compared, wrappers = holder, False, [holder]
+    while isinstance(query.parent, (exp.SetOperation, exp.Paren)):
+        query = query.parent
+        wrappers.append(query)
+        compared = compared or isinstance(query, (exp.Intersect, exp.Except))
+    outer = query.parent
+    if isinstance(outer, exp.Exists):
+        # Existence reads the values where an INTERSECT or EXCEPT compares them, or where a
+        # deduplication or a grouping decides how many rows there are and an OFFSET or a
+        # HAVING then asks: `EXISTS (SELECT * FROM one UNION SELECT 'Z' OFFSET 1)` is true only
+        # where the withheld value differs from the guess (Codex's fourth review of #169). The
+        # rule is broader than the oracle, fail-closed: any consumer on the climb (a DISTINCT, a
+        # GROUP BY, an ORDER BY by position or ALL, a UNION without ALL) refuses, with or
+        # without the OFFSET, since a LIMIT, a QUALIFY or a HAVING can ask the same question.
+        return not compared and not any(_consumes_its_projection(wrapper) or (
+            isinstance(wrapper, exp.SetOperation) and bool(wrapper.args.get("distinct")))
+            for wrapper in wrappers)
+    if write:
+        return False
+    if outer is None:
+        return True  # the outermost projection: `_has_projection_star` rules on it
+    if isinstance(outer, exp.CTE):
+        return not any(_consumes_its_projection(wrapper) for wrapper in wrappers)
+    while isinstance(outer, exp.Subquery) and isinstance(outer.parent, exp.Subquery):
+        wrappers.append(outer)
+        outer = outer.parent  # `((SELECT ...)) d` nests Subquery in Subquery
+    if not isinstance(outer, exp.Subquery) or not isinstance(outer.parent, (exp.From, exp.Join, exp.Lateral)):
+        return False
+    wrappers.append(outer)
+    return not any(_consumes_its_projection(wrapper) for wrapper in wrappers)  # M198
+
+
+_WRAPPERS = (exp.Select, exp.Subquery, exp.SetOperation, exp.Paren)
+
+
+def _consumes_its_projection(node: exp.Expression) -> bool:
+    """Whether the query, or a wrapper around it, reads every column of its projection, star
+    included: a DISTINCT (plain or ON) compares them, a GROUP BY (ALL, or by position: a star
+    under any other GROUP BY is DuckDB's own error) groups by them, an ORDER BY ALL or by
+    position orders by them, in the Select's own ORDER BY, a window's, or the ORDER BY sqlglot
+    hangs on a wrapping Subquery (`((SELECT * FROM pair) ORDER BY 2 LIMIT 1) d`: the review gate
+    on the fourth round) or on a set operation (`(SELECT * FROM pair UNION ALL SELECT * FROM
+    pair ORDER BY 2 LIMIT 1) d`, whose branches the positional check refuses as well). Measured on DuckDB 1.5.4: `SELECT count(*) FROM (SELECT DISTINCT *
+    FROM claim) d`, the GROUP BY ALL twin and the CTE spelling answer 1 or 2 by whether two
+    rows' withheld values are equal, and `(SELECT * FROM claim ORDER BY 2 LIMIT 1) d` serves the
+    id of the smallest (the ui lane's replay of #169; M198). A name in any of those clauses is a
+    Column the checks read; a position or ALL is not."""
+    if isinstance(node, exp.Select) and (node.args.get("distinct") is not None
+                                         or node.args.get("group") is not None):
+        return True  # a set operation's own DISTINCT is M183's: its branches bind by position
+    for ordered in node.find_all(exp.Ordered):
+        if ordered.find_ancestor(*_WRAPPERS) is not node:
+            continue  # a subquery's own ORDER BY, judged with that subquery's projection
+        key = ordered.this
+        while isinstance(key, exp.Paren):
+            key = key.this
+        if not isinstance(key, exp.Column):
+            # A key is left alone only as a bare column name, which the checks read. Every
+            # other spelling consumes the projection, fail-closed: a position (`2`, `(2)`,
+            # `-(-2)`, `2 COLLATE nocase`, each the position to DuckDB: the ui lane, Codex's
+            # sixth review and the gate found one after another), ALL, and a constant or an
+            # expression (`2::INT`, `id + 1`), which DuckDB reads otherwise and are refused
+            # all the same rather than told apart spelling by spelling.
+            return True
+    return False
 
 
 def _is_star(projection: exp.Expression) -> bool:
@@ -488,6 +993,12 @@ def _sources(select: exp.Select) -> dict[str, exp.Expression]:
 # depending on quoting, and getting that wrong in either direction has a cost: too wide and a CTE
 # vouches for a base table, too narrow and ordinary SQL is refused.
 Scope = dict[str, tuple[exp.Expression, "Scope"]]
+# A key no CTE can be named, an object and not a string (a quoted identifier can spell any
+# string, and a CTE so named would have overwritten a string key: the review gate): under it a
+# scope carries the recursive parts of its RECURSIVE CTEs, (id of the recursive part's node, the
+# CTE's name, its entry), which `_scope_within` binds for a SELECT sitting in that part as the
+# star resolver descends into the body.
+_RECURSIVE_PARTS: object = object()
 
 
 def _visible_ctes(node: exp.Expression, outer: Scope, dialect: str) -> Scope:
@@ -521,13 +1032,48 @@ def _visible_ctes(node: exp.Expression, outer: Scope, dialect: str) -> Scope:
     for cte in with_.expressions:
         key = resolve_name(cte, dialect)
         # snapshot BEFORE binding this name: the body sees the outer scope and its preceding
-        # siblings, plus itself only when the WITH is RECURSIVE
+        # siblings, plus itself only when the WITH is RECURSIVE, and then only in its RECURSIVE
+        # PART, the right side of the body's UNION: in the anchor the name is the base table
+        # (DuckDB, measured: `WITH RECURSIVE claim AS (SELECT * FROM claim UNION ALL ...)
+        # SELECT * FROM claim` returned the base table's hidden column, the anchor's star bound
+        # to the CTE and vouched for by nothing: M201). Only a UNION makes a CTE recursive: an
+        # INTERSECT or EXCEPT body is a plain CTE, its own name the base table everywhere in it
+        # (`... INTERSECT SELECT * FROM claim` expanded the CTE and returned the hidden column:
+        # the ui lane's replay of #170 at 3e98092), and a body with no UNION has no recursive
+        # part. The rule `_in_recursive_part` in `scope` states for the name resolver.
         body_scope: Scope = dict(scope)
         entry = (cte.this, body_scope)
-        if recursive:
-            body_scope[key] = entry
+        body = cte.this
+        while isinstance(body, (exp.Subquery, exp.Paren)):
+            body = body.this
+        if recursive and isinstance(body, exp.Union):
+            body_scope[_RECURSIVE_PARTS] = (*body_scope.get(_RECURSIVE_PARTS, ()), (id(body.right), key, entry))
         scope[key] = entry
     return scope
+
+
+def _scope_within(select: exp.Expression, scope: Scope) -> Scope:
+    """The scope a SELECT sees: `scope`, plus a RECURSIVE CTE's own name where the SELECT sits in
+    that CTE's recursive part."""
+    parts = scope.get(_RECURSIVE_PARTS, ())
+    if not parts:
+        return scope
+    above = {id(n) for n in [select, *_ancestors(select)]}
+    bound = [(key, entry) for part, key, entry in parts if part in above]
+    if not bound:
+        return scope
+    seen: Scope = dict(scope)
+    for key, entry in bound:
+        seen[key] = entry
+    return seen
+
+
+def _ancestors(node: exp.Expression) -> list[exp.Expression]:
+    out, node = [], node.parent
+    while node is not None:
+        out.append(node)
+        node = node.parent
+    return out
 
 
 def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
@@ -563,7 +1109,7 @@ def _star_reaches_base(node: exp.Expression, ctes: Scope, memo: dict[int, bool],
     if selects:
         inner, within = _visible_ctes(node, ctes, dialect), stack | {id(node)}
         answer = any(
-            _expands_a_base_table(select, projection, inner, columns, memo, within, dialect)
+            _expands_a_base_table(select, projection, _scope_within(select, inner), columns, memo, within, dialect)
             for select in selects
             for projection in select.expressions
             # A row reference joins the walk too: naming a DERIVED TABLE is bounded by that
@@ -744,9 +1290,14 @@ def _with_limit(ast: exp.Expression, max_rows: int, engine: str = "duckdb") -> e
     A limit the query set itself is the query's business: `LIMIT 10` for a top ten returns ten
     rows on purpose. One the guard imposed is a cut nobody asked for, and a result that fills it
     may have been cut -- so the tree carries `meta["row_cap"]` for the caller to say so.
+
+    It also carries `meta["wrote_limit"]`: whether the statement bounded itself, kept or clamped. A
+    reader asking whether the statement set a LIMIT cannot ask the tree, whose LIMIT may be the cap's,
+    nor `row_cap`, which also marks a clamped one (M161: the logic lint refused for the cap's LIMIT).
     """
     existing = ast.args.get("limit")
-    if existing is not None and not _states_no_bound(existing, engine):
+    wrote = existing is not None and not _states_no_bound(existing, engine)
+    if wrote:
         count = _written_count(existing)
         if count is None:
             # Replacing a bound we cannot read changes the answer: a top-5 WITH TIES became a
@@ -772,10 +1323,37 @@ def _with_limit(ast: exp.Expression, max_rows: int, engine: str = "duckdb") -> e
                          "keep ties as well."),
             )
         if count <= max_rows:
+            ast.meta["wrote_limit"] = True
             return ast
     capped = ast.limit(max_rows)
     capped.meta["row_cap"] = max_rows
+    capped.meta["wrote_limit"] = wrote
     return capped
+
+
+def _first_key_writes_null_order(ast: exp.Expression, sql: str, dialect: str) -> bool:
+    """Is the root's first sort key followed, in the text, by NULLS FIRST or NULLS LAST?
+
+    sqlglot records every key's null order, written or the dialect's default, and keeps no mark of
+    which; the logic lint leaves a written one alone (M161). So the text decides, at the key's own
+    position: a NULLS clause in a window or a subquery says nothing about the root's top-N. Only a
+    column key is read, because only a column key is linted."""
+    order = ast.args.get("order")
+    if order is None or not order.expressions:
+        return False
+    key = order.expressions[0].this
+    ident = key.this if isinstance(key, exp.Column) else None
+    end = ident.meta.get("end") if isinstance(ident, exp.Identifier) else None
+    if end is None:
+        return False
+    try:
+        tokens = sqlglot.tokenize(sql, read=dialect)
+    except Exception:
+        return False
+    words = [t.text.upper() for t in tokens if t.start > end][:3]
+    if words[:1] in (["ASC"], ["DESC"]):
+        words = words[1:]
+    return words[:2] in (["NULLS", "FIRST"], ["NULLS", "LAST"])
 
 
 def _states_no_bound(limit: exp.Expression, engine: str) -> bool:

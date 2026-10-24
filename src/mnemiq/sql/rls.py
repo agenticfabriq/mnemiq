@@ -11,7 +11,8 @@ from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import names_one_object, object_key
-from mnemiq.sql.scope import base_tables, column_tables, cte_references, scope_resolved
+from mnemiq.sql.scope import (base_tables, column_tables, cte_references, known_columns,
+                              scope_resolved)
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 logger = logging.getLogger(__name__)
@@ -81,7 +82,7 @@ def _validate_filter(
         wrapped = sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {filt}", read=dialect)
     except Exception:
         return None
-    resolved = column_tables(wrapped, executes_as or dialect)
+    resolved = column_tables(wrapped, executes_as or dialect, schema)
     if resolved is None:
         return None  # scopes unreadable -> the filter cannot be validated, so it is refused
 
@@ -2468,8 +2469,12 @@ def apply_row_and_mask(
     #   * an unqualified `ssn` across two tables that both mask it is genuinely ambiguous, and
     #     resolution declines to guess -> mask, as before.
     # Only a column resolved to a DIFFERENT base table is dropped, which is the reported defect
-    # and the one case where the old answer was certainly wrong.
-    owners = column_tables(ast, executes_as or dialect)
+    # and the one case where the old answer was certainly wrong. A column read through a derived
+    # table's star is resolved to the table the star reaches by the schema (M181): the grant's
+    # columns beside the policy's, since a table the schema does not list takes any name, and
+    # the policy's alone let `wide` take `secret` first and dropped claim's mask as another
+    # table's (the review gate).
+    owners = column_tables(ast, executes_as or dialect, known_columns(visible, policy))
     referenced_masked: set[str] = set()
     for column in ast.find_all(exp.Column):
         owner = None if owners is None else owners.get(id(column))

@@ -8,10 +8,12 @@ export const DEFAULT_MODE: Mode = "thinking";
  * Why there is no answer, categorised by what the caller should do next.
  * Mirrors `DeferralReason` in src/mnemiq/contract/seams.py.
  *
- * The last three are deliberately in this list and are NOT deferrals: they ride with
+ * Four are deliberately in this list and are NOT deferrals: `execution_failed`,
+ * `source_unavailable`, `model_unavailable` and `verifier_unavailable` ride with
  * `failed: true` and `deferred: false`, and the UI must keep them apart. Each names a
- * different thing that broke -- the source, the model provider, the verifier -- so the card
- * has to say which; "Source failed" over a verifier outage is a false statement.
+ * different thing that broke -- the source refusing every attempt, the source not answering,
+ * the model provider, the verifier -- so the card has to say which; "Source failed" over a
+ * verifier outage is a false statement.
  */
 export type DeferralReason =
   | "authorization"
@@ -23,6 +25,7 @@ export type DeferralReason =
   | "verification"
   | "disagreement"
   | "execution_failed"
+  | "source_unavailable"
   | "model_unavailable"
   | "verifier_unavailable"
   | "ungovernable"
