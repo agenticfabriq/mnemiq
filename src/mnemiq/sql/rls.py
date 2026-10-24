@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import logging
+import re
+import threading
 
 import sqlglot
 from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import names_one_object, object_key
+from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, is_lambda_parameter, map_struct
 from mnemiq.sql.scope import (base_tables, column_tables, cte_references, known_columns,
                               scope_resolved)
 from mnemiq.sql.verdict import Refusal, RefusalCode
+
+logger = logging.getLogger(__name__)
 
 
 # The stand-in for the table a filter is attached to, so the predicate can be validated as the
@@ -23,6 +30,15 @@ _SUBJECT = "__mnemiq_filtered__"
 # reading ROWNUM is neither merged nor has predicates pushed into it, and `ROWNUM > 0` holds for
 # every row, so the fence changes which rows the outer query sees first and never which rows.
 _FENCED = frozenset({"oracle"})
+
+
+def _parsed(filt: str, dialect: str, wrapped: bool = False) -> exp.Expression:
+    """A row filter's parse, bare or as the WHERE of the query it becomes, read as DuckDB reads
+    it (`as_duckdb_reads`): the one installed, the validator's and the typing rules' alike."""
+    if dotted_map_keys(filt, dialect):
+        raise ValueError("a MAP literal keyed by a dotted name, which the parser reads as its last part alone")
+    text = f"SELECT 1 FROM {_SUBJECT} WHERE {filt}" if wrapped else filt
+    return as_duckdb_reads(sqlglot.parse_one(text, read=dialect))
 
 
 def _validate_filter(
@@ -52,7 +68,7 @@ def _validate_filter(
     it is refused: an unvalidatable filter must not become a filter that silently does nothing.
     """
     try:
-        expr = sqlglot.parse_one(filt, read=dialect)
+        expr = _parsed(filt, dialect)
     except Exception:
         return None
     if not isinstance(expr, exp.Condition):
@@ -73,7 +89,7 @@ def _validate_filter(
     schema = dict(policy_schema or {})
     schema[_SUBJECT] = set(cols)
     try:
-        wrapped = sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {filt}", read=dialect)
+        wrapped = _parsed(filt, dialect, wrapped=True)
     except Exception:
         return None
     resolved = column_tables(wrapped, executes_as or dialect, schema)
@@ -87,6 +103,9 @@ def _validate_filter(
         if key != _SUBJECT and key not in schema:
             return None  # a table the policy author has not got
 
+    for node in wrapped.walk():
+        if _parameter_in_another_case(node):
+            return None  # a lambda's parameter spelled in another case than declared: no predicate
     for column in wrapped.find_all(exp.Column):
         owner = resolved.get(id(column))
         if owner is None:
@@ -101,6 +120,2101 @@ def _validate_filter(
         elif column.name not in schema.get(owner, set()):
             return None
     return expr
+
+
+# Conversions that raise on a value they cannot read (M159). A row filter runs over every row of
+# its table, the ones it removes included, so one bad value in a hidden row fails every question on
+# the table, and the error can quote that value. sqlglot's typed parses, and Oracle's conversions it
+# leaves untyped. TRY_CAST and a DEFAULT ... ON CONVERSION ERROR clause do not raise.
+_PARSES = (exp.ToNumber, exp.StrToDate, exp.StrToTime)
+_UNTYPED_CONVERSIONS = frozenset({"to_binary_double", "to_binary_float", "to_timestamp_tz",
+                                  "to_dsinterval", "to_yminterval"})
+# Text read as JSON, which DuckDB refuses on malformed text and quotes ("Input: ..."): every
+# scalar JSON reader in `duckdb_functions()` that does so in 1.5.4, measured, by how sqlglot parses
+# it (a test re-measures the list, at the arguments it knows for each reader). Oracle's JSON functions default to NULL ON ERROR, so this is
+# DuckDB's alone. Safe over a column the snapshot types JSON, or over `TRY_CAST(value AS JSON)`.
+_JSON_PARSES = (exp.JSONExtract, exp.JSONExtractScalar, exp.ParseJSON, exp.JSONKeys, exp.JSONType)
+_UNTYPED_JSON_PARSES = frozenset({
+    "from_json", "from_json_strict", "json_array_length", "json_contains", "json_deserialize_sql",
+    "json_exists", "json_merge_patch", "json_pretty", "json_structure", "json_transform",
+    "json_transform_strict", "json_value"})
+# The strict transforms raise where a WELL-FORMED value does not fit the structure asked for, and
+# quote it (measured: `json_transform_strict(attrs, '{"a":"INTEGER"}')` over a JSON column whose
+# `a` holds text; `json_transform` gives NULL there), so a typed column does not make them safe
+# (Codex's review of #160). Only a constant cannot fail on a row.
+_STRICT_JSON_TRANSFORMS = frozenset({"from_json_strict", "json_transform_strict"})
+# A comparison converts a text column to the other side's type, row by row, in both engines:
+# DuckDB on `=`, `<>` and IN (its ordering comparisons refuse at bind, on no row's value), Oracle
+# on every comparison (an implicit TO_NUMBER or TO_DATE). Seen only where the snapshot types both
+# sides; an untyped column compared to a number is not.
+_COMPARISONS = (exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.NullSafeEQ,
+                exp.NullSafeNEQ, exp.In, exp.Between)
+_ARITHMETIC = (exp.Add, exp.Sub, exp.Mul, exp.Div, exp.Mod, exp.IntDiv)
+_INTEGER_RANK = {exp.DataType.Type.TINYINT: 1, exp.DataType.Type.SMALLINT: 2,
+                 exp.DataType.Type.INT: 3, exp.DataType.Type.BIGINT: 4,
+                 exp.DataType.Type.INT128: 5}
+# Every value of these renders as text, so a cast of one to unbounded text cannot fail (DuckDB).
+_RENDERS_AS_TEXT = (set(_INTEGER_RANK) | exp.DataType.NUMERIC_TYPES | exp.DataType.TEMPORAL_TYPES
+                    | exp.DataType.TEXT_TYPES | {exp.DataType.Type.BOOLEAN})
+# Each engine's non-raising spelling, as the refusal names it. Oracle's DEFAULT clause is kept by
+# sqlglot on CAST and TO_NUMBER only: given a format argument, `CAST(d AS DATE DEFAULT NULL ON
+# CONVERSION ERROR, 'YYYY-MM-DD')` is read as TO_DATE and rendered without the clause, and
+# TO_DATE's own DEFAULT does not parse.
+_SAFE_FORM = {
+    "duckdb": ("TRY_CAST(value AS type), which gives NULL where the value does not convert "
+               "(for JSON, read from TRY_CAST(value AS JSON), and json_transform rather than "
+               "json_transform_strict)"),
+    "oracle": ("CAST(value AS type DEFAULT NULL ON CONVERSION ERROR) with no format argument, or "
+               "TO_NUMBER(value DEFAULT NULL ON CONVERSION ERROR)"),
+}
+
+
+def _cast_cannot_fail(source: str | None, to: exp.DataType, engine: str) -> bool:
+    """Whether every value of a column typed `source` converts to `to` without error."""
+    if source is None:
+        return False  # the snapshot did not say: unknown, and refused
+    try:
+        known = exp.DataType.build(source, dialect=engine)
+    except Exception:
+        return False
+    if known == to:
+        return True
+    if known.this in _INTEGER_RANK and to.this in _INTEGER_RANK:
+        return _INTEGER_RANK[known.this] <= _INTEGER_RANK[to.this]
+    return (engine == "duckdb" and to.this in (exp.DataType.Type.TEXT, exp.DataType.Type.VARCHAR)
+            and not to.expressions and known.this in _RENDERS_AS_TEXT)
+
+
+# A value that is one of several branches: CASE, COALESCE (IFNULL and NVL parse to it), IF.
+_BRANCHED = (exp.Case, exp.Coalesce, exp.If)
+
+
+def _branches(value: exp.Expression) -> list[exp.Expression]:
+    """The values a branched expression can be, its conditions left out."""
+    if isinstance(value, exp.Case):
+        default = value.args.get("default")
+        return ([branch.args["true"] for branch in value.args.get("ifs", [])]
+                + ([default] if default is not None else []))
+    if isinstance(value, exp.If):
+        return [branch for branch in (value.args.get("true"), value.args.get("false"))
+                if branch is not None]
+    return [value.this, *value.expressions]
+
+
+_READER_LOCK = threading.Lock()
+_READER = None
+
+
+def _duckdb(sql: str, params=()):
+    """One value from DuckDB's own reading of a constant expression, through mnemiq's local-only
+    door (M107): what a literal or a cast means is the engine's to say, not Python's."""
+    global _READER
+    from mnemiq.duckdb_extensions import connect_duckdb
+
+    with _READER_LOCK:
+        if _READER is None:
+            _READER = connect_duckdb(local_only=True)
+        return _READER.execute(sql, list(params)).fetchone()[0]
+
+
+def _duckdb_rows(sql: str, params=()):
+    """Every row of a catalogue question put to the same local-only reader."""
+    global _READER
+    from mnemiq.duckdb_extensions import connect_duckdb
+
+    with _READER_LOCK:
+        if _READER is None:
+            _READER = connect_duckdb(local_only=True)
+        return _READER.execute(sql, list(params)).fetchall()
+
+
+def _json_text(text: str) -> bool:
+    """Whether a literal is JSON as DuckDB reads it: asked of DuckDB's own `json_valid`, since
+    it is DuckDB's reader that fails on the row. Python's grammar differs both ways (it takes a
+    lone surrogate escape DuckDB refuses; it refuses `[1,]` and `-NaN`, which DuckDB reads: the
+    review gate and Codex's fourth review of #160), and `json_valid` agreed with
+    `json_extract_string` on every literal measured. Through mnemiq's own door, local-only (the
+    JSON functions are built in, so nothing is fetched; M107). Without the driver, Python's
+    reader with every object pair kept and the result encoded, the stricter side."""
+    try:
+        return bool(_duckdb("SELECT json_valid($1)", [text]))
+    except Exception:  # noqa: BLE001 -- no DuckDB here: Python's reader stands in
+        try:
+            json.dumps(json.loads(text, object_pairs_hook=lambda pairs: pairs),
+                       ensure_ascii=False).encode("utf-8")
+        except (ValueError, UnicodeEncodeError):
+            return False
+        return True
+
+
+def _json_cannot_fail(source, type_of, engine: str, *, chosen_by_the_row: bool = False) -> bool:
+    """Whether the text a JSON function reads is already JSON, or NULL where it is not.
+
+    `chosen_by_the_row`: the source is one branch of a CASE, COALESCE or IF, so the row's data
+    decides whether it is read. A constant at the top is read on every row and fails every read
+    at once, which the operator sees; on a branch it fails on the rows that take the branch,
+    which can be the hidden ones (the review gate on #160), so there a constant is safe only
+    where it is JSON.
+    """
+    while isinstance(source, exp.Paren):
+        source = source.this  # `(attrs)` is `attrs` (Codex's second review of #160)
+    if source is None or isinstance(source, exp.Null):
+        return True
+    if not _reads_a_column(source) and not chosen_by_the_row:
+        return True  # a constant cannot fail on a row
+    if isinstance(source, exp.Literal):
+        return source.is_string and _json_text(source.this)
+    if isinstance(source, exp.Cast):  # TryCast is a Cast
+        if source.to.this != exp.DataType.Type.JSON:
+            # To any other type it is text again, which the reader parses: `TRY_CAST(region AS
+            # VARCHAR)` raised as `region` does (Codex's review of #160).
+            return False
+        # TRY_CAST: NULL where the text is not JSON. CAST: JSON where what is cast is.
+        return isinstance(source, exp.TryCast) or _json_cannot_fail(
+            source.this, type_of, engine, chosen_by_the_row=True)
+    if isinstance(source, _BRANCHED):
+        # `COALESCE(attrs, '{}'::JSON)`: JSON on every branch, so JSON whichever is taken.
+        return all(_json_cannot_fail(branch, type_of, engine, chosen_by_the_row=True)
+                   for branch in _branches(source))
+    known = _known_type(source, type_of, engine)
+    if known is not None and known.this not in exp.DataType.TEXT_TYPES:
+        # A value of a known non-text type, JSON itself or a number, a boolean, a date, a list, a
+        # struct, a subquery of one of those: serialised to JSON, never parsed (measured,
+        # `json_contains(COALESCE(attrs, []), '1')` runs; Codex's fifth review of #160).
+        return True
+    if not isinstance(source, exp.Column):
+        return False
+    known = type_of(source)
+    try:
+        return known is not None and exp.DataType.build(known, dialect=engine).this == (
+            exp.DataType.Type.JSON)
+    except Exception:
+        return False
+
+
+def _branch_type(value, type_of, engine: str) -> exp.DataType | None:
+    """The type of a branched value, from its branches: measured on DuckDB, NULL and a text
+    literal take the other branches' type (`CASE WHEN c THEN 7 ELSE 'b' END` is INTEGER, and
+    converts a text column it is compared with), a text column beside a number is a bind fault
+    on no row's value, and the rest share a type. Unknown where any branch's type is. Measured
+    on Oracle too: a mixed CASE or COALESCE is ORA-00932 at parse. Oracle's NVL is not read
+    here as Oracle types it (its leading argument's type, the other converted row by row):
+    `_nvl_converts_a_text_column` refuses that conversion before this typing is consulted, so a
+    mixed NVL reads as text here only on a filter already refused, and a text-led NVL compared
+    with a number (`NVL(region, id) = 7`, ORA-01722 on the hidden row) is caught through
+    `_converts_a_text_column`. A value whose every branch is a text literal or NULL is text, not
+    a literal: DuckDB types it VARCHAR (measured: beside a number it is the bind fault, and an
+    outer CASE holding it beside a text column stays text, so the outer value is refused where
+    a comparison converts it; Codex's third review of #160)."""
+    known, literal = [], False
+    for branch in _branches(value):
+        while isinstance(branch, exp.Paren):
+            branch = branch.this  # `(NULL)` is NULL (Codex's fourth review of #160)
+        if isinstance(branch, exp.Null):
+            continue
+        if isinstance(branch, exp.Literal) and branch.is_string:
+            literal = True
+            continue
+        typed = _known_type(branch, type_of, engine)
+        if typed is None:
+            return None
+        known.append(typed)
+    # On DuckDB a JSON branch makes the whole value JSON, the other branches converted to it row
+    # by row (measured: `COALESCE(attrs, region)` is JSON, and malformed text on the row that
+    # takes region; Codex's fourth review of #160). The walk refuses that mix at the branched
+    # node itself, on DuckDB, through `_coerces_to_json`; the typing below reads a JSON branch
+    # beside text as text, which only a comparison visited earlier in the walk consults, and a
+    # refusal there or at the node is a refusal either way.
+    text = [typed for typed in known if typed.this in exp.DataType.TEXT_TYPES]
+    if text:
+        return text[0]
+    if known:
+        return known[0]
+    return exp.DataType.build("VARCHAR") if literal else None
+
+
+# DuckDB's calls that return JSON, typed by name so nothing runs (Codex's nineteenth review of
+# #160: `list_contains([region], to_json(id))`, `region = to_json(id)`, a CASE between them and
+# `[to_json(id)] = [region]` were of unknown type on the call's side and approved, where DuckDB
+# unifies the text to JSON and parses it). By sqlglot's node where it has one, by name where
+# it does not: the names the local reader's own catalogue lists with a JSON or JSON[] return
+# (`_json_returners`; twelve on 1.5.4, the typed list below where the catalogue cannot be
+# asked). `json_transform`, `from_json` and `json_value` are not among them: the first two
+# return the structure they are asked for, the third VARCHAR, and typed JSON they would pass
+# beside a JSON value where they return text (the review gate on the twenty-first round, twice).
+# A name the catalogue does not list, a source-defined function among them, is unknown here,
+# and unknown beside text is not refused, since that would refuse `lower(region) = 'x'` (the
+# residual; the review gate on the twentieth round).
+_JSON_CALL_NODES = (exp.JSONExtract, exp.JSONObject, exp.JSONArray, exp.JSONArrayAgg,
+                    exp.JSONObjectAgg, exp.ParseJSON)
+_JSON_RETURNERS_KNOWN = frozenset({"to_json", "row_to_json", "array_to_json", "json_quote",
+                                   "json_object", "json_array", "json_merge_patch",
+                                   "json_extract", "json_extract_path", "json_structure",
+                                   "json_serialize_sql", "json_serialize_plan"})
+_JSON_RETURNERS: frozenset[str] | None = None
+_JSON_EXTRACTS = frozenset({"json_extract", "json_extract_path"})
+# The json extension's aggregate macros, which the catalogue lists with no return type (Codex's
+# twenty-second review of #160: `region = (SELECT json_group_array(id) FROM claim)` approved,
+# region parsed as JSON on the row): typed JSON by name.
+_JSON_MACROS = frozenset({"json_group_array", "json_group_object", "json_group_structure"})
+# The extracts that return text, VARCHAR or VARCHAR[] by the path's shape (the same review:
+# `(attrs ->> '$.a') = 7` approved, the text converted to a number on the row).
+_TEXT_EXTRACT_NODES = (exp.JSONExtractScalar,)
+_TEXT_EXTRACT_NAMES = frozenset({"json_extract_string", "json_extract_path_text"})
+
+
+def _json_returners() -> frozenset[str]:
+    """The calls the local reader's catalogue answers with JSON or JSON[] (any overload), the
+    typed list where the catalogue cannot be asked (logged: a missing name is an approval)."""
+    global _JSON_RETURNERS
+    if _JSON_RETURNERS is None:
+        try:
+            rows = _duckdb_rows("SELECT DISTINCT lower(function_name) FROM duckdb_functions() "
+                                "WHERE return_type IN ('JSON', 'JSON[]')")
+            _JSON_RETURNERS = (frozenset(name for (name,) in rows) or _JSON_RETURNERS_KNOWN) | _JSON_MACROS
+        except Exception:  # noqa: BLE001 -- the catalogue could not be asked: the typed list
+            logger.warning("DuckDB's catalogue could not be asked which calls return JSON; "
+                           "the typed list stands in (M159)")
+            _JSON_RETURNERS = _JSON_RETURNERS_KNOWN | _JSON_MACROS
+    return _JSON_RETURNERS
+
+
+def _is_json_call(node: exp.Expression) -> bool:
+    return isinstance(node, _JSON_CALL_NODES) or (
+        isinstance(node, exp.Anonymous) and node.name.lower() in _json_returners())
+
+
+def _is_text_extract(node: exp.Expression) -> bool:
+    return isinstance(node, _TEXT_EXTRACT_NODES) or (
+        isinstance(node, exp.Anonymous) and node.name.lower() in _TEXT_EXTRACT_NAMES)
+
+
+def _scalar_projections(node: exp.Expression) -> list[exp.Expression] | None:
+    """A scalar subquery's one projection per branch, unaliased, else None: one for a SELECT,
+    one per branch of a set operation (Codex's twenty-third review of #160: `(SELECT attrs ...
+    UNION ALL SELECT attrs ... LIMIT 1)` was unknown, and JSON beside text approved). A bare
+    SELECT or set operation reads the same, never wrapped in a Subquery of its own, which would
+    re-parent the live node and cut it off from the filter's tree (the review gate on the
+    twenty-seventh round: a correlated column in a branch lost its SELECT's enclosing one)."""
+    columns = _set_columns(node)
+    return columns[0] if columns is not None and len(columns) == 1 else None
+
+
+def _set_columns(node: exp.Expression) -> list[list[exp.Expression]] | None:
+    """A query's projections by position, one list per output column holding each branch's
+    expression: a SELECT's own, a set operation's per branch, a VALUES list's per row (`region
+    = (VALUES (1))` was unknown, and the text converted on the row: Codex's twenty-fifth review
+    of #160); None where the branches' widths differ or a branch is no query."""
+    if isinstance(node, exp.Subquery):
+        node = node.this
+    if not isinstance(node, (exp.Select, exp.SetOperation, exp.Values)):
+        return None
+    rows, pending = [], [node]
+    while pending:
+        query = pending.pop()
+        while isinstance(query, (exp.Subquery, exp.Paren)):
+            query = query.this  # a parenthesised branch, `((SELECT ...) UNION ALL (SELECT ...))`
+        if isinstance(query, exp.SetOperation):
+            pending.extend((query.right, query.left))
+        elif isinstance(query, exp.Select) and query.selects:
+            rows.append([projection.unalias() for projection in query.selects])
+        elif isinstance(query, exp.Values) and query.expressions:
+            rows.extend([list(row.expressions) for row in query.expressions if isinstance(row, exp.Tuple)])
+        else:
+            return None
+    if not rows or any(len(row) != len(rows[0]) for row in rows):
+        return None
+    return [[row[position] for row in rows] for position in range(len(rows[0]))]
+
+
+def _scalar_projection(node: exp.Expression) -> exp.Expression | None:
+    """The first branch's projection (the walk's handle on the subquery), else None."""
+    branches = _scalar_projections(node)
+    return branches[0] if branches else None
+
+
+def _subquery_type(node: exp.Expression, type_of) -> str | None:
+    """A scalar subquery's type: its one projection's, each branch of a set operation typed and
+    the branches unified as DuckDB unifies them (`typeof((SELECT id ... UNION ALL SELECT region
+    ... LIMIT 1))` is VARCHAR, not the first branch's INTEGER: the review gate on the
+    twenty-sixth round), None where a branch cannot be typed."""
+    branches = _scalar_projections(node)
+    if not branches:
+        return None
+    kinds = [_pure_type(branch, type_of) for branch in branches]
+    if any(kind is None for kind in kinds):
+        return None
+    if len(set(kinds)) == 1:
+        return kinds[0]
+    try:
+        # Unified as a set operation unifies, not as COALESCE does: DuckDB refuses
+        # `COALESCE(NULL::INTEGER, NULL::VARCHAR)` and unions the two to VARCHAR.
+        branches_sql = " UNION ALL ".join(f"SELECT NULL::{k} AS x" for k in kinds)
+        return _duckdb(f"SELECT typeof(x) FROM ({branches_sql}) LIMIT 1")
+    except Exception:  # noqa: BLE001 -- the branches cannot be unified by the probe: unknown
+        return None
+
+
+def _is_typed_call(node: exp.Expression) -> bool:
+    """A call whose type is known here without running it: a JSON returner or a text extract."""
+    return _is_json_call(node) or _is_text_extract(node)
+
+
+def _extract_path(node: exp.Expression) -> exp.Expression | None:
+    """The path argument of a JSON extract, or None where the call has none."""
+    if isinstance(node, (exp.JSONExtract, exp.JSONExtractScalar)):
+        return node.expression
+    if isinstance(node, exp.Anonymous) and node.name.lower() in _JSON_EXTRACTS | _TEXT_EXTRACT_NAMES:
+        return node.expressions[1] if len(node.expressions) > 1 else None
+    return None
+
+
+_SCALAR_PATH_TYPES = frozenset({"VARCHAR", "TEXT", "STRING", "CHAR", "BPCHAR"})
+
+
+def _path_shape(path: exp.Expression | None, type_of) -> str | None:
+    """Whether an extract's path makes it a scalar or a list, by the path's own type, as DuckDB
+    decides it: one string literal (or a parsed JSON path) is a scalar, a list literal of string
+    literals a list, a column or a cast by its declared type (a text column is one path, so
+    `json_extract_string(attrs, region)` is one VARCHAR, where a list reading let `= 7` through
+    and the engine converted the hidden row's value: Codex's twenty-sixth review of #160), and
+    anything else is None: the reader cannot tell the shape without running the call."""
+    while isinstance(path, exp.Paren):
+        path = path.this
+    if path is None or (isinstance(path, exp.Literal) and path.is_string) or isinstance(path, exp.JSONPath):
+        return "scalar"
+    if isinstance(path, exp.Array):
+        return "list" if all(isinstance(e, exp.Literal) and e.is_string for e in path.expressions) else None
+    declared = None
+    if isinstance(path, exp.Column):
+        declared = type_of(path)
+    elif isinstance(path, exp.Cast):
+        declared = path.to.sql(dialect="duckdb")
+    if declared is None:
+        return None
+    declared = declared.strip().upper()
+    if declared.endswith("[]"):
+        return "list" if declared[:-2].split("(")[0] in _SCALAR_PATH_TYPES else None
+    return "scalar" if declared.split("(")[0] in _SCALAR_PATH_TYPES else None
+
+
+def _json_call_type(node: exp.Expression, type_of) -> str:
+    """JSON (VARCHAR for a text extract), or the list of it for an extract whose path is a list
+    (`json_extract(x, ['$.a'])` is JSON[] to DuckDB, and so is a column holding a list of paths;
+    typed as a scalar it unified with `[region]` as a list of text would not: the review gate
+    on the twentieth and twenty-first rounds). The path's shape is read by `_path_shape` off the
+    ORIGINAL node, whose columns the resolver knows (a copy's are known to none, and read there
+    a column path has no shape); a path the reader cannot read is refused by the walk, which
+    reads the original too, before this type is relied on."""
+    leaf = "VARCHAR" if _is_text_extract(node) else "JSON"
+    return leaf + "[]" if _path_shape(_extract_path(node), type_of) == "list" else leaf
+
+
+# The arrow sqlglot reads as a lambda outside the calls DuckDB hands one to (`attrs -> '$.a'`
+# inside a call's arguments: Codex's nineteenth review of #160) is re-read as the JSON extract
+# it is before any rule here runs (`reading.py`), so a Lambda reaching these rules is a lambda
+# to DuckDB too, and the extract meets the JSON readers' rules as `json_extract(attrs, '$.a')`.
+
+
+def _known_type(value, type_of, engine: str) -> exp.DataType | None:
+    """`value`'s type where it is plain to see: a typed column, a literal, a cast, arithmetic, an
+    interval, a list, a struct or a row, a scalar subquery's one projection, a branched value
+    whose branches are typed, NULLIF's first argument (Codex's second review of #160). A call
+    DuckDB answers with JSON is typed through `_pure_type`, as a `NULL::JSON`."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if isinstance(value, exp.Boolean):
+        return exp.DataType.build("BOOLEAN")
+    if isinstance(value, exp.DateStrToDate):  # Oracle's DATE '...' literal
+        return exp.DataType.build("DATE")
+    if isinstance(value, exp.Interval):
+        return exp.DataType.build("INTERVAL")
+    if isinstance(value, exp.Array):
+        return exp.DataType(this=exp.DataType.Type.ARRAY)
+    if isinstance(value, (exp.Struct, exp.Tuple)) or (
+            isinstance(value, exp.Anonymous) and value.name.lower() == "row"):
+        return exp.DataType(this=exp.DataType.Type.STRUCT)
+    parameter = _lambda_parameter_type(value, type_of)  # a lambda's parameter, the element walked
+    if parameter is not None and parameter is not _UNREADABLE:
+        try:
+            return exp.DataType.build(parameter, dialect=engine)
+        except Exception:
+            return None
+    if isinstance(value, exp.Column):
+        known = type_of(value)
+        try:
+            return None if known is None else exp.DataType.build(known, dialect=engine)
+        except Exception:
+            return None
+    if isinstance(value, exp.Cast):
+        return value.to
+    if isinstance(value, exp.Subquery):
+        inner = value.this
+        if isinstance(inner, exp.Select) and len(inner.selects) == 1:
+            return _known_type(inner.selects[0].unalias(), type_of, engine)
+        return None  # a set operation's is typed through `_type_of_value`, by `_subquery_type`
+    if isinstance(value, (exp.Nullif, exp.Max, exp.Min)):
+        return _known_type(value.this, type_of, engine)
+    if isinstance(value, exp.Nvl2):
+        return _known_type(value.args["true"], type_of, engine)  # Oracle: its second argument's
+    if isinstance(value, (exp.Count, exp.Sum, exp.Avg)):
+        # A number of some width, which is all this reader's callers ask (text or not); the
+        # width is `_duckdb_type`'s to tell, and it never reads this answer.
+        return exp.DataType.build("DOUBLE")
+    if isinstance(value, _BRANCHED):
+        return _branch_type(value, type_of, engine)
+    if isinstance(value, exp.Neg):
+        return _known_type(value.this, type_of, engine)  # `-id` is id's type
+    if isinstance(value, exp.Literal) and value.is_number or isinstance(value, _ARITHMETIC):
+        return exp.DataType.build("DOUBLE")
+    return None
+
+
+def _coerces_to_json(node: exp.Expression, type_of, engine: str) -> bool:
+    """DuckDB types a CASE, COALESCE or IF with a JSON branch as JSON and converts every other
+    branch to JSON on the rows that take it: `COALESCE(attrs, region)`, `COALESCE(attrs, 'x')`
+    and `IF(c, 'x', attrs)` are Malformed JSON on those rows (measured; Codex's fourth review
+    of #160), with no JSON reader around them. So beside a JSON branch every branch must be JSON
+    already, NULL, a literal that is JSON, or a value of a known type that is not text: a
+    number, a boolean, a date, a list, a struct or a JSON-typed subquery is serialised, not
+    parsed (measured, `COALESCE(attrs, 0)`, `COALESCE(attrs, [])`, `COALESCE(attrs, d)` run;
+    Codex's fifth review). Text, and a value of unknown type, is parsed on the rows that take
+    it."""
+    return _values_coerce_to_json(_branches(node), type_of, engine)
+
+
+def _untypable(value: exp.Expression, type_of, engine: str) -> bool:
+    """Whether the value's type cannot be told (a call, a subquery with an aggregate) or cannot
+    be read: asked of DuckDB's own grammar where DuckDB executes, of the reader here elsewhere."""
+    if engine == "duckdb":
+        kind = _duckdb_type(value, type_of)
+        return kind is None or kind is _UNREADABLE
+    return _type_of_value(value, type_of, engine) is None
+
+
+def _type_of_value(value: exp.Expression, type_of, engine: str) -> exp.DataType | None:
+    """A value's type as the reader here knows it, else as DuckDB types a pure expression (a
+    list element or a struct field read out of a container, `[attrs][1]`, `({'a': attrs}).a`,
+    which the reader does not follow; Codex's tenth review of #160)."""
+    known = _known_type(value, type_of, engine)
+    if known is not None or engine != "duckdb":
+        return known
+    if _scalar_projection(value) is not None:
+        # A scalar subquery is its projection's type, the projection alone handed to the probe,
+        # never the subquery, whose FROM would run (as `_duckdb_type` reads it): `region =
+        # (SELECT json_group_array(id) FROM claim)` (Codex's twenty-second review of #160).
+        kind = _subquery_type(value, type_of)
+    else:
+        kind = _pure_type(value, type_of)
+    if kind is None:
+        return None
+    try:
+        return exp.DataType.build(kind, dialect="duckdb")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _values_coerce_to_json(values, type_of, engine: str) -> bool:
+    """`_coerces_to_json`'s reading over any values DuckDB unifies to one type: a branched
+    value's branches, a list's elements, a map's keys or its values (Codex's ninth review of
+    #160: `[attrs, region]` is JSON[], region parsed on every row), a list search's element and
+    argument."""
+    typed = [_type_of_value(value, type_of, engine) for value in values]
+    if not any(known is not None and known.this == exp.DataType.Type.JSON for known in typed):
+        return False
+    return not all(
+        (known is not None and known.this not in exp.DataType.TEXT_TYPES)
+        or _json_cannot_fail(value, type_of, engine, chosen_by_the_row=True)
+        for value, known in zip(values, typed))
+
+
+# What may be handed to DuckDB to type: a value expression of columns, literals, casts,
+# arithmetic, lists, structs, maps, branched values and the comparisons and boolean operators their
+# conditions are made of, which binds without running anything once each column is a typed
+# NULL. No function call, no subquery: typing those would evaluate policy text on the
+# validator's connection (a table function reading a file, a subquery over a billion rows),
+# which a validator must not do (the review gate on #160); their type is unknown here.
+_PURE = (exp.Column, exp.Identifier, exp.Literal, exp.Boolean, exp.Null, exp.Paren, exp.Neg,
+         exp.Cast, exp.DataType, exp.DataTypeParam, exp.ColumnDef,  # a UNION's or STRUCT's member
+         exp.Interval, exp.Var, exp.DateStrToDate,
+         exp.Case, exp.If, exp.Coalesce, exp.Nullif, exp.Array, exp.Struct, exp.PropertyEQ,
+         exp.ToMap, exp.Map,  # `MAP {'a': attrs}`, `MAP(['a'], [attrs])` (the review gate)
+         exp.Bracket, exp.Dot,  # `[attrs][1]`, `({'a': attrs}).a` (Codex's tenth review)
+         exp.Tuple,  # `('a', 1)`, a row value, as `map_from_entries` takes them
+         exp.EQ, exp.NEQ, exp.GT, exp.GTE, exp.LT, exp.LTE, exp.And, exp.Or, exp.Not, exp.Is,
+         exp.In, exp.Between, exp.Like, exp.ILike, *_ARITHMETIC)
+
+
+def _pure_type(value: exp.Expression, type_of) -> str | None:
+    """DuckDB's type for a pure value expression (`_PURE`: columns, literals, casts, arithmetic),
+    each column replaced by a NULL of its snapshot type, so the expression binds and nothing
+    runs; None for anything else, or where a column's type is not known."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if isinstance(value, exp.Column):
+        # The value itself: its declared type, since replacing the root of the copy rebinds
+        # nothing and the probe would ask DuckDB for a column with no FROM (the review gate on
+        # the twenty-fourth round: `[region] = [(SELECT attrs FROM claim LIMIT 1)]` approved).
+        return type_of(value)
+    if _is_union_extract(value):
+        return _union_member_type(value, type_of)
+    # A call that returns JSON is a typed NULL to the probe, as a column is: nothing of it runs,
+    # and what it holds (`to_json(id)` beside `[region]`) is JSON to DuckDB's unification.
+    # A scalar subquery with one pure projection is that projection to the probe: `[region] =
+    # [(SELECT json_group_array(id) FROM claim)]` (the review gate on the twenty-third round),
+    # the projection alone handed over, never the subquery, whose FROM would run.
+    json_calls = [node for node in value.walk() if _is_typed_call(node) or _scalar_projection(node) is not None
+                  or _is_union_extract(node)]
+    inside_a_json_call = {id(inner) for call in json_calls for inner in call.walk() if inner is not call}
+    if not all(id(node) in inside_a_json_call or _is_typed_call(node) or _scalar_projection(node) is not None
+               or _is_union_extract(node)
+               or isinstance(node, (*_PURE, *_PURE_CALL_NODES, *_LAMBDA_CALL_NODES, exp.Lambda)) or (
+               isinstance(node, exp.Anonymous)
+               and node.name.lower() in _LIST_CONSTRUCTORS | _PURE_CALLS | _LAMBDA_CALLS)
+               for node in value.walk()):
+        return None
+    # A MAP literal's keys are the Columns or the Vars `as_duckdb_reads` made them (`MAP {id: 1}`
+    # is keyed by the column, MAP(INTEGER, INTEGER); the review gate on #160 found them typed as
+    # names, and this typer re-read them for itself until round 54), typed below with the other
+    # columns and parameters; a map whose struct sqlglot wraps otherwise, or an entry that is no
+    # key-value pair, is not pure.
+    for to_map in value.find_all(exp.ToMap):
+        if not isinstance(to_map.this, exp.Struct):
+            return None
+        if not all(isinstance(item, exp.PropertyEQ) for item in to_map.this.expressions):
+            return None
+    # The types are read off the original nodes, which the resolver knows by identity; the
+    # copy's are then replaced in the same traversal order.
+    declared = [type_of(column) for column in value.find_all(exp.Column)
+                if id(column) not in inside_a_json_call]
+    if None in declared:
+        return None
+    # A lambda's parameter referenced inside the value but bound by a lambda outside it (a
+    # part of the body probed on its own, `x[1]` or `x.k` as a comparison's side) is a typed
+    # NULL of the element walked, as a column is; one bound inside the value DuckDB binds
+    # itself. Read untyped, `list_filter([[attrs]], x -> x[1] = region)` was approved and
+    # raised Malformed JSON on the row (the review gate on the forty-seventh round).
+    free: dict[str, str] = {}
+    for node in value.walk():
+        if not isinstance(node, (exp.Identifier, exp.Column, exp.Var)) or node.args.get("table"):
+            continue
+        # The nearest lambda DECLARING the name, through every enclosing one: inside `y ->
+        # ...` a reference bound by the outer `x -> ...` read only the nearest lambda and was
+        # skipped, its parts and containers untyped (Codex's fortieth review of #160).
+        lam = node.find_ancestor(exp.Lambda)
+        while lam is not None and node.name not in {p.name for p in lam.expressions}:
+            lam = lam.find_ancestor(exp.Lambda)
+        if lam is None or any(n is lam for n in value.walk()):
+            continue
+        kind_of = _lambda_parameter_type(node, type_of)
+        if kind_of is None or kind_of is _UNREADABLE:
+            return None
+        free[node.name] = kind_of
+    typed_nulls = value.copy()
+    for node in list(typed_nulls.walk()):
+        if isinstance(node, (exp.Identifier, exp.Column, exp.Var)) and not node.args.get("table") and node.name in free:
+            lam = node.find_ancestor(exp.Lambda)
+            while lam is not None and node.name not in {p.name for p in lam.expressions}:
+                lam = lam.find_ancestor(exp.Lambda)  # declared inside the copy: DuckDB binds it
+            if lam is None:
+                try:
+                    node.replace(sqlglot.parse_one(_stand_in(free[node.name]), read="duckdb"))
+                except Exception:  # noqa: BLE001 -- a type the reader cannot stand in for: unknown
+                    return None
+    if _is_typed_call(value):
+        return _json_call_type(value, type_of)
+    if _scalar_projection(value) is not None:
+        return _subquery_type(value, type_of)
+    # Typed calls first, so a scalar subquery inside one goes with it (the review gate on the
+    # twenty-fourth round: typing it from the copy, whose nodes `type_of` does not know, made
+    # the whole value unknown and disarmed the typed-call reading); then each scalar subquery
+    # outside a typed call and outside another, typed from the ORIGINAL node's projection and
+    # replaced in the copy in the same traversal order.
+    # Each nested call is typed from the ORIGINAL node, as the subqueries below are: the copy's
+    # columns are known to no resolver, so a column path there read as no shape and the call
+    # fell to the scalar leaf (the review gate on the thirtieth round). Same traversal order.
+    nested = list(value.find_all(*_JSON_CALL_NODES, *_TEXT_EXTRACT_NODES, exp.Anonymous))
+    copies = list(typed_nulls.find_all(*_JSON_CALL_NODES, *_TEXT_EXTRACT_NODES, exp.Anonymous))
+    for original, call in zip(nested, copies):
+        if _is_typed_call(original):
+            call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(_json_call_type(original, type_of))))
+        elif _is_union_extract(original):
+            member = _union_member_type(original, type_of)
+            if member is None:
+                return None  # a member the reader cannot name: the value is unknown, as before
+            call.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(member, dialect="duckdb")))
+    originals = [sq for sq in value.find_all(exp.Subquery)
+                 if id(sq) not in inside_a_json_call and _scalar_projection(sq) is not None]
+    inside_another = {id(inner) for sq in originals for inner in sq.walk() if inner is not sq}
+    originals = [sq for sq in originals if id(sq) not in inside_another]
+    projected = [_subquery_type(sq, type_of) for sq in originals]
+    if None in projected:
+        return None
+    copies = [sq for sq in typed_nulls.find_all(exp.Subquery) if _scalar_projection(sq) is not None]
+    copies = [sq for sq in copies if not any(sq is not other and sq.find_ancestor(exp.Subquery) is other for other in copies)]
+    if len(copies) != len(originals):
+        return None  # the copy and the original disagree on the subqueries: not shown safe
+    for subquery, kind_of in zip(copies, projected):
+        subquery.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
+    for column, kind_of in zip(list(typed_nulls.find_all(exp.Column)), declared):
+        column.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
+    try:
+        return _duckdb(f"SELECT typeof({typed_nulls.sql(dialect='duckdb')})")
+    except Exception:  # noqa: BLE001 -- unreadable by DuckDB: the type cannot be told
+        return None
+
+
+# `_duckdb_type`'s answer for a text or JSON branch: a text literal beside it is taken as it is
+# (or the mix is a bind fault on no row's value), or parsed by `_coerces_to_json`'s rule.
+_TEXT = "text"
+_UNREADABLE = "unreadable"  # a declared or engine-reported type the reader here cannot parse
+_LIST_CONSTRUCTORS = frozenset({"array_value", "list_pack"})  # `list_value` parses as a list
+# Container accessors that build a value from their arguments and run nothing, typed by DuckDB
+# like the containers they read (Codex's twelfth review of #160: `map_values(MAP(['a'],
+# [attrs])) = map_values(MAP(['a'], [region]))`, `list_extract([attrs], 1) = region` and the
+# struct and key twins were of unknown type on both sides, and parsed region as JSON on the
+# hidden row); by sqlglot's node where it has one, by name where it does not.
+_PURE_CALL_NODES = (exp.MapKeys, exp.StructExtract, exp.ArrayDistinct, exp.MapFromEntries,
+                    exp.ArraySlice, exp.SortArray, exp.Flatten, exp.ArrayReverse)
+_PURE_CALLS = frozenset({"map_values", "map_entries", "list_extract", "array_extract", "list_element",
+                         "array_element", "list_slice", "list_reverse", "list_unique",
+                         "list_distinct", "array_distinct", "map_keys", "struct_extract",
+                         "flatten", "list_sort", "map_from_entries", "row",
+                         "union_value",  # typed by DuckDB from its argument's stand-in
+                         "list_any_value",  # an element of the list, the list's element type (round 55: the arrow
+                         # it read, `list_any_value(attrs -> ['$.a'])`, was refused as a lambda before, JSON beside text now)
+                         "element_at"})  # a map looked up: a LIST of the value type (`V[]`), from stand-ins
+# Calls that hand DuckDB a lambda, typed by DuckDB from the list walked and the lambda's body
+# with the parameters bound by the engine itself (`list_transform([attrs], x -> x)` is JSON[],
+# `list_filter(tags, x -> true)` VARCHAR[], the parameters identifiers to sqlglot, no column's):
+# read as an untyped part, the first was approved beside `[region]` and raised Malformed JSON
+# on the row, and the second refused beside `tags` where it runs (Codex's thirty-ninth review
+# of #160).
+_LAMBDA_CALL_NODES = (exp.Transform, exp.ArrayFilter)
+_LAMBDA_CALLS = frozenset({"list_transform", "array_transform", "list_apply", "array_apply", "apply",
+                           "list_filter", "array_filter", "filter", "list_reduce", "array_reduce", "reduce"})
+
+
+def _is_union_extract(node: exp.Expression) -> bool:
+    return (isinstance(node, exp.Anonymous) and node.name.lower() == "union_extract"
+            and len(node.expressions) == 2)
+
+
+def _union_member_type(call: exp.Expression, type_of) -> str | None:
+    """`union_extract(u, 'a')` is the type of u's member `a`, read off u's own type: DuckDB
+    types the extract of a NULL stand-in as NULL, so the probe cannot answer it, and left
+    unknown the call made its container unknown, `[union_extract(TRY_CAST(region AS UNION(a
+    VARCHAR)), 'a')] = [[id]]` casting the hidden text to a list unread (Codex's twenty-ninth
+    review of #160). None where the tag is no string literal or names no member."""
+    if not _is_union_extract(call):
+        return None
+    tag = call.expressions[1]
+    if not (isinstance(tag, exp.Literal) and tag.is_string):
+        return None
+    inner = _pure_type(call.expressions[0], type_of)
+    if inner is None:
+        return None
+    try:
+        kind = _parse_type(inner)
+    except ValueError:
+        return None
+    if kind[0] != "union":
+        return None
+    for name, member in kind[1]:
+        if name is not None and name.lower() == tag.name.lower():
+            return _castable(member)
+    return None
+# A list searched for a value (the element type unified with the value's), or two lists searched
+# against each other; by sqlglot's node where it has one, by name where it does not.
+_LIST_SEARCHES = (exp.ArrayContains, exp.ArrayPosition, exp.ArrayOverlaps, exp.ArrayContainsAll,
+                  exp.Contains, exp.ArrayContainedBy)
+_LIST_PAIRS = (exp.ArrayOverlaps, exp.ArrayContainsAll, exp.ArrayContainedBy)
+_LIST_SEARCH_NAMES = frozenset({"list_has", "array_has", "list_position", "list_indexof",
+                                "array_indexof", "list_has_all", "array_has_all", "list_has_any",
+                                "array_has_any", "array_contains", "list_contains"})
+_LIST_PAIR_NAMES = frozenset({"list_has_all", "array_has_all", "list_has_any", "array_has_any"})
+# A map looked up by a key, which DuckDB converts to the map's key type (Codex's eleventh
+# review of #160: `element_at(MAP([attrs], [1]), region)` parses region as JSON on every row).
+_MAP_LOOKUPS = frozenset({"element_at", "map_extract", "map_extract_value", "map_contains"})
+_MAP_ONLY_LOOKUPS = frozenset({"map_extract", "map_extract_value", "map_contains"})
+_TEXT_NAMES = frozenset({"VARCHAR", "TEXT", "STRING", "CHAR", "BPCHAR", "NVARCHAR", "NCHAR", "NAME"})
+
+
+def _split_top(text: str) -> list[str]:
+    """`text` split on the commas outside any parentheses, brackets or quotes."""
+    parts, depth, quote, current = [], 0, None, []
+    for ch in text:
+        if quote:
+            current.append(ch)
+            if ch == quote:
+                quote = None
+            continue
+        if ch in "\"'":
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+    return [part for part in parts if part]
+
+
+def _parse_type(text: str):
+    """A DuckDB type, in DuckDB's words, as a tree: `("leaf", NAME)`, `("array", element)`,
+    `("struct", [(name or None, field), ...])`, `("map", key, value)`, `("union", [(name,
+    member), ...])`. DuckDB's own grammar, read directly: sqlglot's DataType reads a nested
+    unnamed struct (`STRUCT(STRUCT(JSON))`, which `row(row(attrs))` gives) as a struct literal
+    (the review gate on #160). A leaf keeps its parameters beside its name (`DECIMAL(2,1)`,
+    `ENUM('x')`: without its labels an ENUM is no cast target, and the unification's failure
+    read as a bind fault let a struct holding one through; Codex's fourteenth review)."""
+    text = text.strip()
+    bracket = re.search(r"\[\d*\]$", text)
+    if bracket is not None:
+        return ("array", _parse_type(text[:bracket.start()]))
+    quoted = re.match(r'("(?:[^"]|"")*")\s*(?:\((.*)\))?$', text, re.S)
+    if quoted is not None:
+        # DuckDB quotes a type name that is a keyword (`typeof([])` is `"NULL"[]`): kept as
+        # spelled, so a cast target rebuilds, and read bare by `_bare` (Codex's sixteenth
+        # review of #160, whose fix refused every type the reader could not parse).
+        return ("leaf", quoted.group(1), f"({quoted.group(2)})" if quoted.group(2) is not None else "")
+    head = re.match(r"([A-Za-z_][A-Za-z_0-9 ]*?)\s*(?:\((.*)\))?$", text, re.S)
+    if head is None:
+        raise ValueError(text)
+    name, inner = head.group(1).strip().upper(), head.group(2)
+    if name not in ("STRUCT", "MAP", "UNION"):
+        return ("leaf", name, f"({inner})" if inner is not None else "")
+    if name == "STRUCT":
+        fields = []
+        for item in _split_top(inner or ""):
+            label, rest = _split_label(item)
+            fields.append((label, _parse_type(rest)))
+        return ("struct", fields)
+    if name == "MAP":
+        key, value = _split_top(inner or "")
+        return ("map", _parse_type(key), _parse_type(value))
+    if name == "UNION":
+        members = []
+        for item in _split_top(inner or ""):
+            label, rest = _split_label(item)
+            members.append((label, _parse_type(rest)))
+        return ("union", members)
+    raise ValueError(text)
+
+
+def _bare(name: str) -> str:
+    """A leaf's name without DuckDB's quoting: `"NULL"` is NULL."""
+    if name.startswith('"') and name.endswith('"'):
+        return name[1:-1].replace('""', '"').upper()
+    return name
+
+
+def _split_label(item: str) -> tuple[str | None, str]:
+    """A struct field or union member: `name TYPE` or, unnamed, `TYPE` (a space outside any
+    parentheses separates the name, a quoted name kept whole)."""
+    if item.startswith('"'):
+        # A doubled quote inside the name is one quote (`"a""b" JSON` names a""b: Codex's
+        # sixteenth review of #160); the first lone quote closes the name. Nothing after it
+        # means the quoted token is an unnamed field's TYPE, a keyword DuckDB quotes as a type
+        # name (`typeof(row(NULL, 1))` is `STRUCT("NULL", INTEGER)`: the review gate).
+        name, position = [], 1
+        while position < len(item):
+            if item[position] == '"':
+                if item[position + 1:position + 2] == '"':
+                    name.append('"')
+                    position += 2
+                    continue
+                rest = item[position + 1:].strip()
+                if not rest or rest.startswith(("[", "(")):
+                    return None, item  # the type itself, with its array suffix or parameters
+                return "".join(name), rest
+            name.append(item[position])
+            position += 1
+        raise ValueError(f"unterminated quoted name in {item!r}")
+    depth = 0
+    for position, ch in enumerate(item):
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == " " and depth == 0:
+            rest = item[position + 1:].strip()
+            if rest.upper().startswith(("WITH ", "WITHOUT ")):
+                return None, item  # an unnamed `TIMESTAMP WITH TIME ZONE` (the review gate)
+            return item[:position], rest
+    return None, item
+
+
+def _castable(node) -> str:
+    """The type back in DuckDB's words as a cast target, an unnamed struct's fields named by
+    position (`STRUCT(f1 JSON)`), which `row(attrs)` gives and no cast accepts (Codex's
+    thirteenth review of #160)."""
+    kind = node[0]
+    if kind == "leaf":
+        return node[1] + node[2]
+    if kind == "array":
+        return _castable(node[1]) + "[]"
+    if kind == "map":
+        return f"MAP({_castable(node[1])}, {_castable(node[2])})"
+    fields = [f'"{(name or f"f{position}").replace(chr(34), chr(34) * 2)}" {_castable(field)}'
+              for position, (name, field) in enumerate(node[1], 1)]
+    return f"{'STRUCT' if kind == 'struct' else 'UNION'}({', '.join(fields)})"
+
+
+def _holds_union(node) -> bool:
+    kind = node[0]
+    if kind == "leaf":
+        return False
+    if kind == "array":
+        return _holds_union(node[1])
+    if kind == "map":
+        return _holds_union(node[1]) or _holds_union(node[2])
+    return kind == "union" or any(_holds_union(field) for _, field in node[1])
+
+
+def _holds_json(node) -> bool:
+    kind = node[0]
+    if kind == "leaf":
+        return _bare(node[1]) == "JSON"
+    if kind == "array":
+        return _holds_json(node[1])
+    if kind == "map":
+        return _holds_json(node[1]) or _holds_json(node[2])
+    return any(_holds_json(field) for _, field in node[1])
+
+
+def _text_becomes_json(kind, unified) -> bool:
+    """Whether converting a value of type `kind` to `unified` parses text as JSON anywhere: the
+    two types walked side by side, a list's element with the element, a struct's fields paired
+    by name where both name them (DuckDB matches them so, and `{'a': attrs, 'b': region}`
+    beside `{'b': region, 'a': attrs}` runs) and by position otherwise, a map's key with the
+    key and value with the value. Shapes that do not line up cannot be told, and are read as
+    converting."""
+    if unified[0] == "leaf":
+        return _bare(unified[1]) == "JSON" and kind[0] == "leaf" and _bare(kind[1]) in _TEXT_NAMES
+    if kind[0] != unified[0]:
+        return True
+    if kind[0] == "array":
+        return _text_becomes_json(kind[1], unified[1])
+    if kind[0] == "map":
+        return _text_becomes_json(kind[1], unified[1]) or _text_becomes_json(kind[2], unified[2])
+    if len(kind[1]) != len(unified[1]):
+        return True
+    if all(name is not None for name, _ in kind[1]) and all(name is not None for name, _ in unified[1]):
+        by_name = {name.lower(): field for name, field in unified[1]}  # folded as DuckDB folds
+        if len(by_name) != len(unified[1]) or any(name.lower() not in by_name for name, _ in kind[1]):
+            return True
+        pairs = [(field, by_name[name.lower()]) for name, field in kind[1]]
+    else:
+        pairs = [(inner, outer) for (_, inner), (_, outer) in zip(kind[1], unified[1])]
+    return any(_text_becomes_json(inner, outer) for inner, outer in pairs)
+
+
+_CONTAINER_KINDS = frozenset({"array", "struct", "map"})
+
+
+_PULLS_TEXT: dict[str, bool] = {}  # the leaf types asked and found not to pull text
+
+
+def _pulls_text(castable: str) -> bool:
+    """Whether a text beside this leaf type inside a container can fail to convert on the
+    row: `[TRY_CAST(region AS BIT)] = [region]` cast 'north' to BIT and raised, UUID and
+    VARINT the same, where INTEGER, BOOLEAN, DATE and the rest are serialised and the
+    comparison runs (measured, DuckDB 1.5.4; Codex's thirty-eighth review of #160, through a
+    lambda). Asked of DuckDB with no data: a text no type accepts but one that accepts every
+    text (a text or a blob type, beside which no row can fail), beside a NULL of the type
+    inside a list, binds only where the text is kept as text or accepted whole (the gate on
+    the forty-fifth round: the probe tells "serialised" from "converted whole" by nothing,
+    and need not). Not shown safe where it cannot be asked; only the answer "no" is kept,
+    so a failure of the reader does not stick for the process (the same gate)."""
+    if castable not in _PULLS_TEXT:
+        try:
+            _duckdb(f"SELECT [chr(1)] = [NULL::{castable}]")
+        except Exception:  # noqa: BLE001 -- the text may be converted: not shown safe
+            return True
+        if len(_PULLS_TEXT) >= 256:
+            _PULLS_TEXT.clear()  # the keys are cast targets written in filters: bounded
+        _PULLS_TEXT[castable] = False
+    return _PULLS_TEXT[castable]
+
+
+def _text_pulled(x, y) -> bool:
+    """Whether one of two leaf types is text and the other one DuckDB converts the text to
+    where they meet (`_pulls_text`); JSON is left to its own rule."""
+    for text, other in ((x, y), (y, x)):
+        if (_bare(text[1]) in _TEXT_NAMES and _bare(other[1]) not in _TEXT_NAMES
+                and _bare(other[1]) != "JSON" and _pulls_text(_castable(other))):
+            return True
+    return False
+
+
+def _named_pairs(left, right):
+    """A struct's fields paired by folded name where both sides name every field, a field the
+    other side lacks left out: DuckDB fills it with NULL (`{'a': region} = {'b': [id]}` runs,
+    `{'a': region, 'c': 1} = {'b': 1, 'a': [id]}` raises on `a`; measured in a comparison, a
+    COALESCE, a CASE and a list literal; Codex's thirty-eighth review of #160), by position
+    otherwise."""
+    if all(n is not None for n, _ in left) and all(n is not None for n, _ in right):
+        by_name = {n.lower(): g for n, g in right}
+        return [(f, by_name[n.lower()]) for n, f in left if n.lower() in by_name]
+    return [(f, g) for (_, f), (_, g) in zip(left, right)]
+
+
+def _text_meets_a_typed_container(a, b) -> bool:
+    """Whether the two types, walked side by side, put a text leaf against a list, a struct or
+    a map at a NESTED position: inside a container DuckDB casts the text to that type on the
+    row, and `'north'` is no list (measured: `[json_extract_string(attrs, ['$.a'])] = [region]`
+    raised quoting the hidden row's value, Codex's twenty-seventh review of #160; `[region] =
+    [[id]]` and the struct twin the same). Beside a number or a date inside a container the
+    number is serialised instead and the comparison runs, so only a container counts."""
+    def walk(x, y, depth):
+        if x[0] == "leaf" and y[0] == "leaf":
+            # Inside a container a text leaf beside a leaf DuckDB converts text to (BIT, UUID,
+            # VARINT, measured) is the cast on the row; beside a number, a date or a boolean
+            # the typed side is serialised and the comparison runs (`_text_pulled`).
+            return bool(depth) and _text_pulled(x, y)
+        if depth and ((x[0] == "leaf" and _bare(x[1]) in _TEXT_NAMES and y[0] in _CONTAINER_KINDS)
+                      or (y[0] == "leaf" and _bare(y[1]) in _TEXT_NAMES and x[0] in _CONTAINER_KINDS)):
+            return True
+        if x[0] == "array" and y[0] == "array":
+            return walk(x[1], y[1], depth + 1)
+        if x[0] == "map" and y[0] == "map":
+            return walk(x[1], y[1], depth + 1) or walk(x[2], y[2], depth + 1)
+        if x[0] in ("struct", "union") and y[0] == x[0]:
+            # Fields paired by name where both sides name every field, as DuckDB pairs them
+            # (`{'a': region, 'b': 1} = {'b': 1, 'a': [id]}` raised on the row where pairing
+            # by position read `region` against `1`: the review gate on the thirty-second
+            # round), by position otherwise; a struct field the other side lacks reads NULL (`_named_pairs`). A UNION type's members the same: `[TRY_CAST([id] AS UNION(a
+            # INTEGER[]))] = [TRY_CAST(region AS UNION(a VARCHAR))]` cast the text member to a
+            # list on the row (Codex's twenty-eighth review), unread while the walk stopped at
+            # the union. Names folded as DuckDB folds them (`{'A': region} = {'a': region}`
+            # runs, the same review).
+            pairs = _paired_fields(x[1], y[1])
+            if pairs is None and x[0] == "struct":
+                pairs = _named_pairs(x[1], y[1])  # a struct field the other side lacks reads NULL
+            return pairs is None or any(walk(f, g, depth + 1) for f, g in pairs)
+        return False
+    return walk(a, b, 0)
+
+
+def _paired_fields(left, right):
+    """A struct's or a union's fields paired as DuckDB pairs them: by folded name where both
+    sides name every field (None where a left name is missing on the right, or a name repeats),
+    by position otherwise."""
+    if all(n is not None for n, _ in left) and all(n is not None for n, _ in right):
+        by_name = {n.lower(): g for n, g in right}
+        if len(by_name) != len(right) or any(n.lower() not in by_name for n, _ in left):
+            return None
+        return [(f, by_name[n.lower()]) for n, f in left]
+    return [(f, g) for (_, f), (_, g) in zip(left, right)]
+
+
+_LITERAL_NODES = (exp.Literal, exp.Null, exp.Boolean, exp.Neg, exp.Paren, exp.Tuple, exp.Array,
+                  exp.Struct, exp.PropertyEQ, exp.Identifier, exp.ToMap)
+
+
+class _JsonMeetsText(Exception):
+    """A JSON part and a text or untyped part unified by the value's own syntax."""
+
+
+def _shape_from_type(node):
+    """A parsed type in the shape form `_shape_of` builds: a leaf is `json`, `text` or `other`."""
+    kind = node[0]
+    if kind == "leaf":
+        name = _bare(node[1])
+        return ("leaf", "json" if name == "JSON" else "text" if name in _TEXT_NAMES else "other")
+    if kind == "array":
+        return ("array", _shape_from_type(node[1]))
+    if kind == "map":
+        return ("map", _shape_from_type(node[1]), _shape_from_type(node[2]))
+    return ("struct", [(name, _shape_from_type(field)) for name, field in node[1]])
+
+
+def _unify(a, b):
+    """The shape DuckDB gives two shapes it unifies: a list's items, a builder's list and
+    element, a map's keys with the keys and its values with the values, a struct's fields
+    paired by folded name where both sides name every field and by position otherwise (as
+    `_named_pairs` pairs them; a named field one side lacks kept as it is). JSON wins a
+    leaf and text is kept over the rest, so a JSON leaf meeting a text one, at any depth,
+    is a text parsed as JSON on the row (`_JsonMeetsText`); a part the reader cannot read
+    meets nothing safely; shapes of different kinds are left as the first, a bind fault on
+    no row's value."""
+    if a[0] == "leaf" and b[0] == "leaf":
+        if {a[1], b[1]} == {"json", "text"} or "unreadable" in (a[1], b[1]):
+            raise _JsonMeetsText
+        return ("leaf", "json" if "json" in (a[1], b[1]) else "text" if "text" in (a[1], b[1]) else "other")
+    if a[0] != b[0]:
+        return a
+    if a[0] == "array":
+        return ("array", _unify(a[1], b[1]))
+    if a[0] == "map":
+        return ("map", _unify(a[1], b[1]), _unify(a[2], b[2]))
+    if all(n is not None for n, _ in a[1]) and all(n is not None for n, _ in b[1]):
+        fields = list(a[1])
+        for name, g in b[1]:
+            i = next((k for k, (n, _) in enumerate(fields) if n.lower() == name.lower()), None)
+            if i is None:
+                fields.append((name, g))
+            else:
+                fields[i] = (fields[i][0], _unify(fields[i][1], g))
+        return ("struct", fields)
+    # By position where a side leaves a field unnamed (`row(...)`): the review gate on the
+    # forty-sixth round, where a row's JSON part met nothing and `list_append([row(
+    # lower(region))], row(attrs))` was approved, raising Malformed JSON on the row.
+    paired = [(n, _unify(f, g)) for (n, f), (_, g) in zip(a[1], b[1])]
+    longer = a[1] if len(a[1]) >= len(b[1]) else b[1]
+    return ("struct", paired + list(longer[len(paired):]))
+
+
+def _unify_all(shapes):
+    out = None
+    for shape in shapes:
+        out = shape if out is None else _unify(out, shape)
+    return out if out is not None else ("leaf", "other")
+
+
+def _element_of(shape):
+    return shape[1] if shape[0] == "array" else shape
+
+
+def _shape_of(value: exp.Expression, type_of):
+    """The shape of a value the reader cannot type, its own container syntax walked and
+    unified as DuckDB unifies it (`_unify`): a list literal's or constructor's items, a
+    builder's list and element (an appended value one element, a concatenated list's
+    elements, a transform's lambda body, a slice's list), a map's keys and its values, a
+    struct's or a row's fields each its own. A part that is no such syntax is its declared
+    type's shape where the reader has one, and a `text` leaf otherwise, a text it may be. A
+    struct's fields and a row's parts never unify with each other, nor a map's keys with its
+    values: `{'a': lower(region), 'b': attrs}` and `MAP {lower(region): attrs}` run (the
+    review gate on the forty-fifth round, which read every part of a value as one group),
+    where `[{'a': lower(region)}, {'a': attrs}]` and `MAP {lower(region): 1, attrs: 2}` raise
+    Malformed JSON on the row (measured)."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if _is_filter(value):
+        args = _builder_arguments(value)
+        return _shape_of(args[0], type_of) if args else ("leaf", "other")  # the list, filtered
+    if _is_list_builder(value):
+        args = _builder_arguments(value)
+        if _is_slice(value):
+            return _shape_of(args[0], type_of) if args else ("leaf", "other")
+        if _is_transform(value):
+            # The lambda's parameter inside the body is typed as the element walked, a list
+            # raising by itself unreadable (`_lambda_parameter_type`, through `_duckdb_type`).
+            return ("array", _unify_all(_shape_of(arg.this, type_of) for arg in args if isinstance(arg, exp.Lambda)))
+        if _is_append_or_prepend(value) and len(args) >= 2:
+            if isinstance(value, exp.Anonymous):
+                lst, element = (args[0], args[1]) if _is_append(value) else (args[1], args[0])
+            else:
+                lst, element = value.this, value.args.get("expression")
+            return ("array", _unify(_element_of(_shape_of(lst, type_of)), _shape_of(element, type_of)))
+        return ("array", _unify_all(_element_of(_shape_of(arg, type_of)) for arg in args))
+    if isinstance(value, exp.Array) or _is_list_call(value):
+        return ("array", _unify_all(_shape_of(item, type_of) for item in value.expressions))
+    if isinstance(value, exp.ToMap) and isinstance(value.this, exp.Struct):
+        entries = [item for item in value.this.expressions if isinstance(item, exp.PropertyEQ)]
+        return ("map", _unify_all(_shape_of(item.this, type_of) for item in entries),
+                _unify_all(_shape_of(item.expression, type_of) for item in entries))
+    if isinstance(value, exp.Map):
+        keys, values = value.args.get("keys"), value.args.get("values")
+        return ("map", _element_of(_shape_of(keys, type_of)) if keys is not None else ("leaf", "other"),
+                _element_of(_shape_of(values, type_of)) if values is not None else ("leaf", "other"))
+    if isinstance(value, exp.MapFromEntries) and isinstance(value.this, exp.Array):
+        parts = []
+        for entry in value.this.expressions:
+            if isinstance(entry, exp.Struct):
+                parts.append([item.expression if isinstance(item, exp.PropertyEQ) else item for item in entry.expressions])
+            else:
+                parts.append(list(entry.expressions) if _is_row(entry) else [])
+        return ("map", _unify_all(_shape_of(p[0], type_of) for p in parts if len(p) == 2),
+                _unify_all(_shape_of(p[1], type_of) for p in parts if len(p) == 2))
+    if _is_row(value):
+        return ("struct", [(None, _shape_of(part, type_of)) for part in value.expressions])
+    if isinstance(value, exp.Struct):
+        return ("struct", [(item.this.name if isinstance(item, exp.PropertyEQ) and isinstance(item.this, exp.Identifier) else None,
+                            _shape_of(item.expression if isinstance(item, exp.PropertyEQ) else item, type_of))
+                           for item in value.expressions])
+    kind = _duckdb_type(value, type_of, json_as_text=False)
+    if kind is None or kind is _TEXT:
+        return ("leaf", "text")
+    if kind is _UNREADABLE:
+        return ("leaf", "unreadable")  # not shown safe, wherever it sits
+    try:
+        return _shape_from_type(_parse_type(kind))
+    except ValueError:
+        return ("leaf", "unreadable")
+
+
+def _unknown_meets_json(unknown, values, type_of) -> bool:
+    """Whether a value of unknown type beside a typed one holding JSON puts text, or a part
+    the reader cannot type, where the JSON is, or JSON where the typed one holds text
+    (`_text_meets_json` over `_shape_of`), the text parsed as JSON on the row. The typed
+    sides are read with JSON kept apart from text, since `_duckdb_type` folds a bare JSON
+    column into text and `lower(region) = attrs` was approved and raised Malformed JSON on
+    the row (measured while taking the gate's advisories on the forty-fifth round). Refused
+    whole before, wherever a typed side held JSON (the same gate): `{'a': lower(region),
+    'b': attrs} = {'a': 'x', 'b': attrs}` runs, the fields never meeting, where `{'a':
+    lower(region)} = {'a': attrs}` raises. A typed side the reader cannot parse is not
+    shown safe."""
+    typed = []
+    for value in _unwrapped(values):
+        kind = _duckdb_type(value, type_of, json_as_text=False)
+        if kind is None or kind is _TEXT:
+            continue
+        if kind is _UNREADABLE:
+            return True
+        try:
+            node = _parse_type(kind)
+        except ValueError:
+            return True
+        if _holds_json(node):
+            typed.append(node)
+    return any(_text_meets_json(_shape_of(u, type_of), node) for u in unknown for node in typed)
+
+
+def _text_meets_json(shape, kind) -> bool:
+    """Whether an unknown value's shape (`_shape_of`) puts text, or a part the reader cannot
+    type, where the typed side holds JSON, or JSON where it holds text, walked side by side
+    as DuckDB unifies the two (a struct's fields by name, a field one side lacks reading
+    NULL): the text is parsed as JSON on the row, at the top (`lower(region) = attrs`) as
+    inside a container. Shapes that do not line up are not shown safe."""
+    if shape[0] == "leaf" and shape[1] == "unreadable":
+        return True  # a part the reader cannot read: not shown safe (the gate on the forty-sixth round)
+    if shape[0] == "leaf" and kind[0] == "leaf":
+        name = _bare(kind[1])
+        return (shape[1] == "text" and name == "JSON") or (shape[1] == "json" and name in _TEXT_NAMES)
+    if shape[0] != kind[0]:
+        return True
+    if shape[0] == "array":
+        return _text_meets_json(shape[1], kind[1])
+    if shape[0] == "map":
+        return _text_meets_json(shape[1], kind[1]) or _text_meets_json(shape[2], kind[2])
+    return any(_text_meets_json(f, g) for f, g in _named_pairs(shape[1], kind[1]))
+
+
+def _json_part_beside_text(value: exp.Expression, type_of) -> bool:
+    """Whether a value the reader cannot type unifies, in its own container syntax, a part
+    whose type holds JSON with a part that is text or that the reader cannot type: the
+    builder or constructor unifies them as a comparison's sides are unified, the text is
+    parsed as JSON on the row, and the value raises by itself, whatever it is compared to.
+    `list_append([lower(region)], attrs) = ['north', '{}']` raised Malformed JSON and was
+    approved, the literal side's exemption dropping the walk's finding (Codex's
+    thirty-eighth review of #160), and so was the same beside another unknown. Beside a
+    number the JSON value is serialised: `list_append([id], attrs) = [1, 2]` runs. Which
+    parts unify is DuckDB's (`_shape_of`)."""
+    try:
+        _shape_of(value, type_of)
+    except _JsonMeetsText:
+        return True
+    return False
+
+
+def _shape_differs(x, y) -> bool:
+    """Whether two parsed types differ in shape anywhere: a leaf against a list, a struct or a
+    map, or two containers of different kinds, at the top or inside. Inside a builder or a
+    lambda the engine casts the part to the slot's type on the row (`list_transform(
+    [lower(region)], x -> id) = [[id]]` raised Unimplemented type for cast (INTEGER ->
+    INTEGER[]) on the first row: the review gate on the forty-fourth round), where two typed
+    values at a comparison's top fail at bind time. Two leaves of different types are no
+    shape, the number serialised beside text and the comparison run, unless the typed leaf
+    is one DuckDB converts text to (`_text_pulled`: `x -> TRY_CAST(region AS BIT)` where
+    `[region]` is compared raised on the row, Codex's thirty-eighth review)."""
+    if x[0] == "leaf" or y[0] == "leaf":
+        return x[0] != y[0] or _text_pulled(x, y)
+    if x[0] != y[0]:
+        return True
+    if x[0] == "array":
+        return _shape_differs(x[1], y[1])
+    if x[0] == "map":
+        return _shape_differs(x[1], y[1]) or _shape_differs(x[2], y[2])
+    pairs = _paired_fields(x[1], y[1])  # a struct's or a union's fields, as DuckDB pairs them
+    if pairs is None and x[0] == "struct":
+        pairs = _named_pairs(x[1], y[1])  # a field the other side lacks reads NULL
+    return pairs is None or any(_shape_differs(f, g) for f, g in pairs)
+
+
+def _typed_part_meets(part: str, kind) -> bool:
+    """Whether a part of an unknown value that the reader CAN type (a column, a cast, a pure
+    value) meets `kind`, the type the other side holds at that part's slot: by shape, a leaf
+    against a container or two containers of different kinds refused at any depth, since the
+    part sits inside a builder or a lambda that casts it to the slot's type on the row
+    (`_shape_differs`). `TRY_CAST([region] AS VARCHAR[])` appended to `[[lower(region)]]`
+    beside `[[region], [region]]` is a list against a list and runs, and was refused as an
+    untyped part meeting a list (Codex's thirty-seventh review of #160). A part whose type
+    holds JSON where its slot holds text is refused, the slot's text parsed as JSON on the
+    row (`list_append([id], attrs) = [region, region]`); beside a JSON slot it is JSON
+    against JSON and runs (`MAP {lower(region): attrs} = MAP {'x': attrs}`: the gate on the
+    forty-fifth round, where any JSON part was refused). A JSON part beside the unknown's
+    own text is `_json_part_beside_text`'s. The part's type is asked with JSON kept apart
+    from text, which `_duckdb_type` folds together for the comparisons it answers for. A
+    type the reader cannot read is not shown safe."""
+    if part is _UNREADABLE:
+        return True
+    try:
+        parsed = _parse_type(part)
+    except ValueError:
+        return True
+    return (_holds_json(parsed) and _text_becomes_json(kind, parsed)) or _shape_differs(parsed, kind)
+
+
+def _unknown_meets_a_container(value: exp.Expression, kind, type_of) -> bool:
+    """Whether a value the reader cannot type puts an untyped part against a list, a struct or
+    a map of the other side's type: its own list and struct syntax is walked beside the type,
+    and where the syntax ends in a part the reader could not type, that part meets whatever
+    the type holds there. `[lower(region)] = [region]` ends in text and runs; `[struct_insert(
+    {'a': id}, b := region)] = [{'a': id, 'b': [id]}]` and `list_transform([region], x -> x) =
+    [[id]]` end against a struct and a list, which the engine casts the text to on the row
+    (Codex's thirty-first review of #160). A part the reader CAN type (a column, a cast, a
+    pure value) meets its slot by shape instead (`_typed_part_meets`): a typed list appended,
+    concatenated, sliced or returned by a lambda is a list, not text (Codex's thirty-seventh
+    review), and a typed number where a list is compared is the cast on the row."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if _is_filter(value) and kind[0] == "array":
+        args = _builder_arguments(value)
+        return bool(args) and _unknown_meets_a_container(args[0], kind, type_of)  # the list, filtered
+    if _is_list_builder(value) and kind[0] == "array":
+        # A call that builds a list from lists and elements: `list_append`, `list_prepend`,
+        # `list_concat`, a slice, `list_transform` with a lambda (Codex's thirty-fifth review
+        # of #160: each refused as a bare unknown where it runs). A list-shaped argument is
+        # walked against the list's type, a lambda's body and any other argument against the
+        # element's. A slice is a list only over list-shaped syntax: over text it slices the
+        # text and is text (`array_slice(lower(region), 1, 1)` is VARCHAR), so any other first
+        # argument is read as the cast; its indices are not read. A transform's input list
+        # says nothing of its output's type, so its lambda body alone is walked (the review
+        # gate on the first draft, both).
+        args = _builder_arguments(value)
+        if _is_slice(value):
+            if args and _is_list_shaped(args[0]):
+                return _unknown_meets_a_container(args[0], kind, type_of)
+            part = _duckdb_type(args[0], type_of, json_as_text=False) if args else None
+            return part is None or part is _TEXT or _typed_part_meets(part, kind)  # a typed list: its type
+        if _is_transform(value):
+            return any(_unknown_meets_a_container(arg.this, kind[1], type_of) for arg in args if isinstance(arg, exp.Lambda))
+        if _is_append_or_prepend(value) and len(args) >= 2:
+            # By position, not by shape: an appended or prepended list is ONE element of the
+            # result (`list_append([[region]], [lower(region)])`, Codex's thirty-sixth review of
+            # #160, refused where it runs). sqlglot's node holds the list in `this` and the
+            # element in `expression` for both, prepend's written order turned around; the
+            # anonymous spellings keep the written order, `list_prepend(element, list)`.
+            if isinstance(value, exp.Anonymous):
+                lst, element = (args[0], args[1]) if _is_append(value) else (args[1], args[0])
+            else:
+                lst, element = value.this, value.args.get("expression")
+            return _unknown_meets_a_container(lst, kind, type_of) or (element is not None and _unknown_meets_a_container(element, kind[1], type_of))
+        for arg in args:
+            if _is_list_shaped(arg):
+                if _unknown_meets_a_container(arg, kind, type_of):
+                    return True
+                continue
+            part = _duckdb_type(arg, type_of, json_as_text=False)
+            if part is not None and part is not _TEXT:
+                if _typed_part_meets(part, kind):  # a typed argument is a list of the result's type
+                    return True
+            elif _unknown_meets_a_container(arg, kind[1], type_of):
+                return True
+        return False
+    if (isinstance(value, exp.Array) or _is_list_call(value)) and kind[0] == "array":
+        # `[a, b]`, and the call forms `array_value(a, b)`, `list_value(...)`, `list_pack(...)`
+        # (Codex's thirty-fourth review of #160: `array_value(lower(region)) = [region]` runs
+        # and was refused as a bare unknown).
+        return any(_unknown_meets_a_container(item, kind[1], type_of) for item in value.expressions)
+    if isinstance(value, exp.ToMap) and isinstance(value.this, exp.Struct) and kind[0] == "map":
+        # `MAP {k: v}`: each key against the key type, each value against the value type
+        # (`MAP {1: lower(region)} = MAP {1: region}` runs and was refused as a bare unknown:
+        # Codex's thirty-second review of #160).
+        return any(_unknown_meets_a_container(item.this, kind[1], type_of) or _unknown_meets_a_container(item.expression, kind[2], type_of)
+                   for item in value.this.expressions if isinstance(item, exp.PropertyEQ))
+    if isinstance(value, exp.Map) and kind[0] == "map":
+        # `MAP([k...], [v...])`: the keys list's items against the key type, the values list's
+        # against the value type (Codex's thirty-third review of #160: refused as a bare
+        # unknown where it runs).
+        keys, values = value.args.get("keys"), value.args.get("values")
+        if not (isinstance(keys, exp.Array) and isinstance(values, exp.Array)):
+            return True  # a keys or values argument that is no list literal: unread, the cast (the gate)
+        return any(_unknown_meets_a_container(item, kind[1], type_of) for item in keys.expressions) \
+            or any(_unknown_meets_a_container(item, kind[2], type_of) for item in values.expressions)
+    if isinstance(value, exp.MapFromEntries) and isinstance(value.this, exp.Array) and kind[0] == "map":
+        # `map_from_entries([(k, v), ...])`: each entry's first part against the key type, its
+        # second against the value type (the same review).
+        for entry in value.this.expressions:
+            if isinstance(entry, exp.Struct):  # `{'key': k, 'value': v}` entries are accepted too
+                parts = [item.expression if isinstance(item, exp.PropertyEQ) else item for item in entry.expressions]
+            else:
+                parts = list(entry.expressions) if _is_row(entry) else []
+            if len(parts) != 2:
+                return True  # an entry the walk cannot read: the cast (the gate)
+            if _unknown_meets_a_container(parts[0], kind[1], type_of) or _unknown_meets_a_container(parts[1], kind[2], type_of):
+                return True
+        return False
+    if _is_row(value) and kind[0] == "struct":
+        # `row(a, b)` and `(a, b)`: positional fields against the struct's (the same review).
+        return any(_unknown_meets_a_container(part, field, type_of) for part, (_, field) in zip(value.expressions, kind[1]))
+    if isinstance(value, exp.Struct) and kind[0] == "struct":
+        items = [(item.this.name.lower() if isinstance(item, exp.PropertyEQ) and isinstance(item.this, exp.Identifier) else None,
+                  item.expression if isinstance(item, exp.PropertyEQ) else item) for item in value.expressions]
+        if all(name is not None for name, _ in items) and all(n is not None for n, _ in kind[1]):
+            by_name = {n.lower(): field for n, field in kind[1]}
+            # A field the other side lacks reads NULL, no cast (`_named_pairs`; the gate on the
+            # forty-fifth round: `[{'a': lower(region)}, {'b': attrs}]` runs).
+            return any(name in by_name and _unknown_meets_a_container(part, by_name[name], type_of) for name, part in items)
+        return any(_unknown_meets_a_container(part, field, type_of) for (_, part), (_, field) in zip(items, kind[1]))
+    part = _duckdb_type(value, type_of, json_as_text=False)
+    if part is None or part is _TEXT:
+        return kind[0] in _CONTAINER_KINDS  # a part the reader cannot type, or text, meets whatever is there
+    return _typed_part_meets(part, kind)
+
+
+def _is_list_call(value: exp.Expression) -> bool:
+    return isinstance(value, exp.Anonymous) and value.name.lower() in _LIST_CONSTRUCTORS
+
+
+_LIST_BUILDER_NODES = (exp.ArrayAppend, exp.ArrayPrepend, exp.ArrayConcat, exp.ArraySlice, exp.Transform)
+_LIST_BUILDER_NAMES = frozenset({"list_slice", "array_slice", "list_append", "array_append", "list_prepend",
+                                 "array_prepend", "list_concat", "array_concat", "list_cat", "array_cat",
+                                 "list_transform", "array_transform", "apply", "list_apply", "array_apply"})
+
+
+def _is_slice(value: exp.Expression) -> bool:
+    return isinstance(value, exp.ArraySlice) or (
+        isinstance(value, exp.Anonymous) and value.name.lower() in ("list_slice", "array_slice"))
+
+
+def _is_transform(value: exp.Expression) -> bool:
+    return isinstance(value, exp.Transform) or (
+        isinstance(value, exp.Anonymous) and value.name.lower() in ("list_transform", "array_transform", "apply", "list_apply", "array_apply"))
+
+
+def _is_filter(value: exp.Expression) -> bool:
+    return isinstance(value, exp.ArrayFilter) or (
+        isinstance(value, exp.Anonymous) and value.name.lower() in ("list_filter", "array_filter", "filter"))
+
+
+def _is_append(value: exp.Expression) -> bool:
+    return isinstance(value, exp.ArrayAppend) or (
+        isinstance(value, exp.Anonymous) and value.name.lower() in ("list_append", "array_append"))
+
+
+def _is_append_or_prepend(value: exp.Expression) -> bool:
+    return _is_append(value) or isinstance(value, exp.ArrayPrepend) or (
+        isinstance(value, exp.Anonymous) and value.name.lower() in ("list_prepend", "array_prepend"))
+
+
+def _is_list_builder(value: exp.Expression) -> bool:
+    return isinstance(value, _LIST_BUILDER_NODES) or (
+        isinstance(value, exp.Anonymous) and value.name.lower() in _LIST_BUILDER_NAMES)
+
+
+def _builder_arguments(value: exp.Expression) -> list:
+    if isinstance(value, exp.Anonymous):
+        return list(value.expressions)
+    out = [value.this] if value.this is not None else []
+    expression = value.args.get("expression")
+    if expression is not None:
+        out.append(expression)
+    out.extend(value.expressions or [])
+    return out
+
+
+def _is_list_shaped(value: exp.Expression) -> bool:
+    """List syntax: a literal, a constructor, a builder, or a slice over one of these (a slice
+    over anything else slices text, through any depth of slicing: the gate's third round on
+    the forty-second commit, `list_slice(list_slice(lower(region), 1, 3), 1, 2)`)."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if _is_slice(value):
+        args = _builder_arguments(value)
+        return bool(args) and _is_list_shaped(args[0])
+    return isinstance(value, exp.Array) or _is_list_call(value) or _is_list_builder(value)
+
+
+def _is_row(value: exp.Expression) -> bool:
+    return isinstance(value, exp.Tuple) or (isinstance(value, exp.Anonymous) and value.name.lower() == "row")
+
+
+def _bare_value(value: exp.Expression) -> bool:
+    """A value with no list, struct, map or row syntax at its top: what the engine casts whole."""
+    while isinstance(value, exp.Paren):
+        value = value.this
+    if _is_slice(value):
+        # A slice is list syntax only over list-shaped syntax, through any depth; over text it
+        # is text, and beside a literal list it is cast whole on the row (the gate on the
+        # forty-second round).
+        return not _is_list_shaped(value)
+    return not (isinstance(value, (exp.Array, exp.Struct, exp.ToMap, exp.Map, exp.MapFromEntries))
+                or _is_row(value) or _is_list_call(value) or _is_list_builder(value))
+
+
+def _pure_literal(value: exp.Expression) -> bool:
+    """A container written out of literals alone, which DuckDB coerces to the other side's
+    type (`[region] = [['x']]` runs); one holding a column, a call or a cast is typed as itself
+    and the other side is cast to it. By node class, since sqlglot's Array and Struct are
+    functions to `find`."""
+    return all(isinstance(node, _LITERAL_NODES) for node in value.walk())
+
+
+def _unwrapped(values) -> list:
+    out = []
+    for value in values:
+        while isinstance(value, exp.Paren):
+            value = value.this
+        if value is not None and not isinstance(value, exp.Null):
+            out.append(value)
+    return out
+
+
+def _json_inside_a_container(values, type_of) -> bool:
+    """Whether DuckDB's unification of `values` (a branched value's branches, a comparison's
+    sides) converts text to JSON inside a list or a struct, on the rows that take the branch
+    or on every row: `CASE WHEN id = 1 THEN [attrs] ELSE [region] END` is JSON[], and Malformed
+    JSON on the row that takes region, as are the struct twin and `[attrs] = [region]` (measured
+    on DuckDB 1.5.4; Codex's eighth review of #160), where `[id]` beside `[attrs]` is serialised
+    and runs. Each value's type is DuckDB's own (`_duckdb_type`, nothing runs), and so is the
+    unified type (`typeof(COALESCE(NULL::T1, ...))`): refused where it holds JSON and a value's
+    type differs from it with text where the unified type has JSON (`_text_becomes_json`), or
+    cannot be told. A mix DuckDB cannot unify is a bind fault on no row's value, not this
+    class."""
+    kinds = []
+    for value in values:
+        while isinstance(value, exp.Paren):
+            value = value.this
+        if value is None or isinstance(value, exp.Null):
+            continue
+        kinds.append(_duckdb_type(value, type_of))
+    if any(kind is _UNREADABLE for kind in kinds):
+        return True  # a declared type the reader cannot parse: not shown safe
+    try:
+        known = [_parse_type(kind) for kind in kinds if kind is not None and kind is not _TEXT]
+    except ValueError:
+        return True  # a type the reader here cannot read: not shown safe
+    # Text against a typed container at a nested position, JSON or not: the text is cast to
+    # the container's type on the row. Both sides must be typed by something other than their
+    # literals: a literal side is coerced to the other (`[region] = [['x']]` runs, measured),
+    # and a literal text cast to a container fails on no row's value.
+    typed = [(value, _parse_type(kind)) for value, kind in zip(_unwrapped(values), kinds)
+             if kind is not None and kind is not _TEXT and kind is not _UNREADABLE]
+    # A value the reader cannot type, beside a container typed by something other than its
+    # literals, is refused where its untyped part meets a list, a struct or a map of that type:
+    # the engine casts whatever text the part holds to that shape on the row, and dropping the
+    # unknown operand read the rest as safe (Codex's thirty-first review of #160). Where the
+    # untyped part meets text or a number, unknown stays approved by design (`[region] =
+    # [lower(region)]` runs).
+    # A container of literals alone is coerced to the other side INSIDE a container only; at
+    # the top level DuckDB casts the untyped text to the literal's type on the row instead
+    # (`lower(region) = ['x']` raised, `[lower(region)] = ['x']` runs: the review gate on the
+    # thirty-seventh round), so an unknown value with no container syntax of its own is
+    # refused beside a literal container too.
+    unknown = [value for value, kind in zip(_unwrapped(values), kinds) if kind is None]
+    if any(_json_part_beside_text(u, type_of) for u in unknown):
+        return True  # the value raises by itself, whatever it is compared to
+    if unknown and _unknown_meets_json(unknown, values, type_of):
+        return True
+    if unknown and any(any(_unknown_meets_a_container(u, parsed, type_of) and (not _pure_literal(value) or _bare_value(u))
+                           for u in unknown) for value, parsed in typed):
+        return True
+    for i, (left, kind_l) in enumerate(typed):
+        for right, kind_r in typed[i + 1:]:
+            if _text_meets_a_typed_container(kind_l, kind_r) and not (
+                    _pure_literal(left) or _pure_literal(right)):
+                return True
+    if not any(_holds_json(node) for node in known):
+        return False
+    if any(_holds_union(node) for node in known) and any(node != known[0] for node in known):
+        # Two UNION types unify by the operator and the operand order, not by their members
+        # (measured, DuckDB 1.5.4: COALESCE and a list keep the first operand's type, CASE and
+        # IF the last's, at the top level and inside a struct alike), so the COALESCE asked
+        # below answers for one operator only. Refused wherever the UNION sits: the operator
+        # that happens to keep the text member runs, a false refusal (Codex's fifteenth review
+        # of #160, and the review gate on the sixteenth round's draft, which exempted a branch
+        # and let the struct-nested pair and a list search through).
+        return True
+    try:
+        unified = _parse_type(_duckdb("SELECT typeof(COALESCE("
+                                      + ", ".join(f"NULL::{_castable(node)}" for node in known) + "))"))
+    except Exception:  # noqa: BLE001 -- not shown safe: the unification could not be asked
+        # A mix DuckDB cannot unify is a bind fault on no row's value, and was left alone; so was
+        # a cast target the reader here had rebuilt wrongly (an ENUM without its labels, Codex's
+        # fourteenth review), which is the fail-open side. Refused, fail-closed: the statement
+        # the engine cannot bind is refused either way.
+        return True
+    return any(node != unified and _text_becomes_json(node, unified) for node in known)
+
+
+def _duckdb_type(branch: exp.Expression, type_of, json_as_text: bool = True) -> str | None:
+    """The type DuckDB gives a branch, in DuckDB's words, or `_TEXT`. A column's is the
+    snapshot's; a cast's its target; a pure value expression's (`7`, `1.5`, `id + 1`, `INTERVAL
+    '1 day'`, `[1, 2]`, a nested CASE) is asked of DuckDB with each column replaced by a NULL of
+    its snapshot type, so nothing runs and the answer is the engine's (`typeof(7)` is INTEGER,
+    `typeof(1.5)` DECIMAL(2,1), `typeof(id + 1)` over an INTEGER id is INTEGER, where the type
+    reader here says DOUBLE for each: the review gate on #160). None where it cannot be told
+    without running something: a call, a subquery whose projection is not pure. The type
+    reader's guess is not taken instead (Codex's seventh review of #160: it typed a nested CASE
+    of integers and a counted subquery DOUBLE, and 'nan' passed the cast to DOUBLE where DuckDB
+    converts it to INTEGER and BIGINT on the row that takes it, and fails). A bare JSON is
+    `_TEXT` too, text to the comparisons this answers for, unless `json_as_text` is off: a
+    part of an unknown value's syntax that holds JSON decides the unknown's type."""
+    while isinstance(branch, exp.Paren):
+        branch = branch.this
+    kind = None
+    parameter = _lambda_parameter_type(branch, type_of)
+    if parameter is _UNREADABLE:
+        return _UNREADABLE
+    if parameter is not None:
+        kind = parameter
+    elif isinstance(branch, exp.Column):
+        kind = type_of(branch)
+    elif isinstance(branch, exp.Cast):
+        kind = branch.to.sql(dialect="duckdb")
+    elif _scalar_projection(branch) is not None:
+        # A scalar subquery is its one projection's type (the gate's `(SELECT id + 1 FROM
+        # entitlement LIMIT 1)` beside 'nan'); the projection alone is handed to DuckDB, never
+        # the subquery, whose FROM would run; a set operation's branches unified.
+        kind = _subquery_type(branch, type_of)
+    else:
+        kind = _pure_type(branch, type_of)
+    if kind is None:
+        return None
+    try:
+        parsed = _parse_type(kind)  # DuckDB's own grammar: a nested unnamed struct reads too
+    except ValueError:
+        # A declared type (a column's, from the snapshot; a cast's target) the reader cannot
+        # parse is not an unknown value: it may hold JSON, and reading it as unknown let a
+        # UNION("a""b" JSON) member pass (Codex's sixteenth review of #160). Refused by every
+        # reader of this answer.
+        return _UNREADABLE
+    if parsed[0] == "leaf" and (_bare(parsed[1]) in _TEXT_NAMES or (json_as_text and _bare(parsed[1]) == "JSON")):
+        return _TEXT
+    return kind
+
+
+def _stand_in(kind: str) -> str:
+    """A value of type `kind` DuckDB types a part of: a typed NULL for a leaf, where a NULL
+    container's element or field types as NULL (`typeof((NULL::JSON[])[1])` is `"NULL"`,
+    measured), a one-element list, a struct of stand-in fields and a one-entry map for the
+    containers."""
+    parsed = _parse_type(kind)
+
+    def build(node) -> str:
+        if node[0] == "leaf":
+            return f"NULL::{_castable(node)}"
+        if node[0] == "array":
+            return f"[{build(node[1])}]"
+        if node[0] == "map":
+            return f"MAP([{build(node[1])}], [{build(node[2])}])"
+        fields = ", ".join(f"'{(name or f'f{position}').replace(chr(39), chr(39) * 2)}': {build(field)}"
+                           for position, (name, field) in enumerate(node[1], 1))
+        return "{" + fields + "}"
+
+    return build(parsed)
+
+
+def _declares(lam: exp.Lambda, name: str) -> bool:
+    """Whether the lambda declares a parameter so named, the name folded."""
+    return name.lower() in {p.name.lower() for p in lam.expressions}
+
+
+def _parameter_in_another_case(node: exp.Expression) -> bool:
+    """Whether `node` names a lambda's parameter in another case than the nearest lambda
+    declaring it, folded, spells it. DuckDB binds `X` under `x -> ...` to the parameter in a
+    WHERE (Codex's forty-first review of #160: an inner `X -> ...` shadowed an outer `x`, and
+    `list_transform(tags, x -> list_transform([attrs], X -> x = region))` was approved, Malformed
+    JSON on the row) and to a column of the folded name in a SELECT list where one is in scope
+    (the review gate on round 50, measured on DuckDB 1.5.4: `list_transform(tags, X -> x)`
+    read the column `x`, so a filter `(SELECT list_transform(['q'], X -> x) FROM o LIMIT 1) =
+    ['SECRET']` was an oracle on a hidden `o.x`). Two bindings for one spelling, neither the
+    parameter's own: such a filter is no predicate here, and the author spells the parameter
+    as declared. sqlglot reads the exact spelling as an Identifier and any other as a Column."""
+    if not isinstance(node, (exp.Identifier, exp.Column)) or node.args.get("table"):
+        return False
+    if isinstance(node, exp.Identifier) and (
+            isinstance(node.parent, exp.Column)                                            # read through its Column
+            or (isinstance(node.parent, exp.Dot) and node is node.parent.expression)        # a struct field's name, `x.X`
+            or (isinstance(node.parent, exp.PropertyEQ) and node is node.parent.this)):    # a struct key, `{X: tags}`; a MAP's is a Column or a Var (`as_duckdb_reads`)
+        # A name in another role than a reference: a field or a key spelled like a parameter in
+        # another case names no parameter, and read as one it refused `list_transform([{X:
+        # tags}], x -> list_transform(x.X, y -> y = region))`, which DuckDB runs (Codex's
+        # forty-second review of #160). A declaration needs no exemption: its own lambda is the
+        # nearest and spells it; a body that is a bare name (`X -> x`) has the lambda as its
+        # parent too and is a reference (the review gate on round 51).
+        return False
+    lam = node.find_ancestor(exp.Lambda)
+    while lam is not None:
+        if _declares(lam, node.name):
+            return node.name not in {p.name for p in lam.expressions}
+        lam = lam.find_ancestor(exp.Lambda)
+    return False
+
+
+def _reads_a_column(node: exp.Expression) -> bool:
+    """Whether a value reads a row's data: a column, or a lambda's parameter, which stands for
+    an element of the list walked and is no constant. Every rule asking this through
+    `find(exp.Column)` read a parameter as a constant or a literal (the review gate's three
+    rounds on the forty-seventh commit, one assumption: `list_filter(tags, x -> x = id)` and
+    `x::INT = 1` were approved, text converted on the row), where the wholesale refusal of a
+    list the reader could not type had covered them."""
+    return any(isinstance(inner, exp.Column) or is_lambda_parameter(inner) for inner in node.walk())
+
+
+def _type_from_shape(shape) -> str | None:
+    """A DuckDB type for a shape (`_shape_of`): JSON and VARCHAR leaves, the containers over
+    them; None where a leaf's type the shape does not carry (`other`), `_UNREADABLE` for one
+    the reader could not read."""
+    if shape[0] == "leaf":
+        return {"json": "JSON", "text": "VARCHAR", "unreadable": _UNREADABLE}.get(shape[1])
+    parts = [_type_from_shape(part) for part in ([shape[1]] if shape[0] == "array" else [shape[1], shape[2]] if shape[0] == "map" else [field for _, field in shape[1]])]
+    if any(part is _UNREADABLE for part in parts):
+        return _UNREADABLE
+    if any(part is None for part in parts):
+        return None
+    if shape[0] == "array":
+        return parts[0] + "[]"
+    if shape[0] == "map":
+        return f"MAP({parts[0]}, {parts[1]})"
+    fields = ", ".join(f'"{(name or f"f{position}").replace(chr(34), chr(34) * 2)}" {part}'
+                       for position, ((name, _), part) in enumerate(zip(shape[1], parts), 1))
+    return f"STRUCT({fields})"
+
+
+def _lambda_parameter_type(node: exp.Expression, type_of) -> str | None:
+    """The type of a lambda's parameter, for a reference to it inside the body: the element
+    type of the list the call walks for the first parameter, BIGINT for an index parameter
+    (`(x, i) -> ...`), as DuckDB binds them. None for a name that is no parameter, or where
+    the list walked cannot be typed, which leaves the parameter to the shape rules
+    (`_shape_of`); `_UNREADABLE` where the list's type cannot be read. The body's own
+    comparisons are walked like any other, and reading the parameter as untyped text they
+    approved `list_filter([attrs], x -> x = region)`, Malformed JSON on the row (the review
+    gate on the forty-seventh round)."""
+    if not isinstance(node, (exp.Identifier, exp.Column, exp.Var)) or node.args.get("table"):
+        return None
+    name = node.name
+    lam = node.find_ancestor(exp.Lambda)
+    while lam is not None:
+        params = [p.name for p in lam.expressions]
+        if name in params:
+            call = lam.parent
+            args = _builder_arguments(call) if isinstance(call, exp.Func) else []
+            walked = next((arg for arg in args if arg is not lam), None)
+            if walked is None:
+                return _UNREADABLE
+            # `list_reduce(list, (acc, x[, i]) -> ...)` binds the accumulator and the element
+            # to the element's type and the third parameter to the index; a transform or a
+            # filter binds the first to the element and the second to the index (the gate).
+            reduce = isinstance(call, exp.Anonymous) and call.name.lower() in ("list_reduce", "array_reduce", "reduce")
+            if params.index(name) >= (2 if reduce else 1):
+                return "BIGINT"
+            if reduce and params.index(name) == 0 and len(args) >= 3:
+                # `list_reduce(list, lambda, initial)`: the accumulator is the initial value's
+                # type (the gate: read as the element's, `acc = 'z'` over a JSON initial was
+                # text against text and approved, Malformed JSON on the row).
+                kind = _duckdb_type(args[2], type_of, json_as_text=False)
+                if kind is _TEXT:
+                    return "VARCHAR"  # a text initial: `acc = id` converts the text on the row (the gate on the forty-seventh commit)
+                return kind
+            kind = _duckdb_type(walked, type_of, json_as_text=False)
+            if kind is None or kind is _TEXT:
+                # A list the reader cannot type is read by its shape, which carries the JSON
+                # its parts hold (`[TRY_CAST(lower(region) AS JSON)]`: the gate, where an
+                # untyped parameter read `x = 'zz'` as text against text).
+                try:
+                    return _type_from_shape(_element_of(_shape_of(walked, type_of)))
+                except _JsonMeetsText:
+                    return _UNREADABLE  # the list raises by itself
+            if kind is _UNREADABLE:
+                return _UNREADABLE
+            try:
+                parsed = _parse_type(kind)
+            except ValueError:
+                return _UNREADABLE
+            return _castable(parsed[1]) if parsed[0] == "array" else _UNREADABLE
+        lam = lam.find_ancestor(exp.Lambda)
+    return None
+
+
+def _literal_cannot_convert(node: exp.Expression, type_of, engine: str) -> bool:
+    """A text literal on a branch beside a branch of a known non-text type takes the branches'
+    type, and is converted on the rows that take it: `CASE WHEN id = 1 THEN 7 ELSE 'north' END =
+    7` runs on the first row and fails on the second (measured on DuckDB; Codex's fifth review of
+    #160), as do a DATE, a BOOLEAN and an INTERVAL beside `'x'`. Whether a literal converts is
+    DuckDB's to say, asked through TRY_CAST to the type DuckDB unifies the typed branches to
+    (Python's parsers take an out-of-range integer, Unicode digits, a basic ISO date and `nan`,
+    which DuckDB refuses: the review gate); refused where DuckDB cannot be asked. A text branch
+    (a column, a cast) beside the literal means the value is text, or the mix is a bind fault on
+    no row's value, so no literal is converted. A branch whose type cannot be told without
+    running it, a call or a subquery with an aggregate, leaves the literal's target unknown,
+    and the literal is refused (Codex's seventh review of #160); a cast in its place, `CAST('7'
+    AS DOUBLE)`, is a typed branch and not a literal."""
+    literals, kinds, unknown = [], [], False
+    for branch in _branches(node):
+        while isinstance(branch, exp.Paren):
+            branch = branch.this
+        if isinstance(branch, exp.Literal) and branch.is_string:
+            literals.append(branch.this)
+        elif not isinstance(branch, exp.Null):
+            # JSON kept apart from text: a literal beside a JSON branch is parsed as JSON on
+            # the row, `attrs = 'a'` Malformed JSON (the review gate on the forty-seventh
+            # round), where `'{"a": 1}'` converts; asked of DuckDB through TRY_CAST like any
+            # other type.
+            kind = _duckdb_type(branch, type_of, json_as_text=False)
+            if kind is None or kind is _UNREADABLE:
+                unknown = True
+            elif kind is _TEXT:
+                return False
+            else:
+                kinds.append(kind)
+    if not literals:
+        return False
+    if unknown:
+        return True
+    if not kinds:
+        return False
+    try:
+        unified = _duckdb("SELECT typeof(COALESCE(" + ", ".join(f"NULL::{k}" for k in kinds) + "))")
+        if _parse_type(unified)[0] != "leaf":
+            # To a list, a struct or a map, TRY_CAST gives a container of NULLs where an
+            # element does not convert (`TRY_CAST('[north]' AS INTEGER[])` is `[NULL]`), not
+            # NULL, so it cannot say whether the literal converts; the literal is refused, and
+            # `CAST('[1]' AS INTEGER[])` is a typed branch (the review gate on #160).
+            return True
+        return any(not _duckdb(f"SELECT TRY_CAST($1 AS {unified}) IS NOT NULL", [text])
+                   for text in literals)
+    except Exception:  # noqa: BLE001 -- unreadable: the literal may fail on a row, refused
+        return True
+
+
+def _nvl_converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
+    """Oracle's NVL and NVL2 take their leading argument's type and convert the other argument
+    to it row by row: `NVL(id, region)` is ORA-01722 on a row whose id is NULL and whose region
+    is not a number (measured; the review gate on #160), where COALESCE and CASE refuse the mix
+    at parse, on no row's value."""
+    if isinstance(node, exp.Coalesce) and node.args.get("is_nvl"):
+        lead, others = node.this, node.expressions
+    elif isinstance(node, exp.Nvl2):
+        lead, others = node.args["true"], [node.args["false"]]
+    else:
+        return False
+    typed = _known_type(lead, type_of, engine)
+    if typed is None or typed.this in exp.DataType.TEXT_TYPES:
+        return False
+    return any((known := _known_type(other, type_of, engine)) is not None
+               and known.this in exp.DataType.TEXT_TYPES and _reads_a_column(other)
+               for other in others)
+
+
+def _sides(node: exp.Expression) -> list:
+    """The values a comparison, NULLIF, IN or BETWEEN sets against each other."""
+    if isinstance(node, exp.In):
+        sides = [node.this, *node.expressions]
+        query = node.args.get("query")
+        if query is not None:
+            # The set query's one projection, a set operation's branches unified: typed as the
+            # scalar subquery it would be (`region IN (SELECT attrs ... UNION ALL SELECT attrs
+            # ...)` parsed region as JSON on the row, the query dropped as no plain SELECT:
+            # Codex's twenty-fourth review of #160). The node itself, never re-wrapped.
+            sides.append(query)
+        return sides
+    if isinstance(node, exp.Between):
+        return [node.this, node.args.get("low"), node.args.get("high")]
+    # `= ANY (SELECT ...)`, `= ALL (...)` and `= SOME (...)` compare with each value the subquery
+    # yields (the same review: `region = ANY(SELECT attrs FROM claim)` approved and parsed);
+    # sqlglot wraps ANY's query in a Subquery and ALL's and SOME's in none, read alike.
+    return [side.this if isinstance(side, (exp.Any, exp.All)) else side
+            for side in (node.this, node.expression)]
+
+
+def _json_beside_a_literal(sides, type_of) -> bool:
+    """Whether a comparison sets a JSON value against a text literal no JSON parses: DuckDB
+    converts the literal to JSON, `attrs = 'a'` Malformed JSON on every row where
+    `'{"a": 1}'` converts (the review gate on the forty-seventh round, where the text-column
+    rule counts no literal and the container rule coerces a literal side to the other). The
+    JSON side is read with JSON kept apart from text; whether the literal parses is asked of
+    DuckDB through TRY_CAST, with no data."""
+    literals = [side.this for side in sides if isinstance(side, exp.Literal) and side.is_string]
+    if not literals:
+        return False
+    for side in sides:
+        if isinstance(side, exp.Literal):
+            continue
+        kind = _duckdb_type(side, type_of, json_as_text=False)
+        if kind is None or kind is _TEXT or kind is _UNREADABLE:
+            continue
+        try:
+            parsed = _parse_type(kind)
+        except ValueError:
+            continue
+        if parsed[0] == "leaf" and _bare(parsed[1]) == "JSON":
+            try:
+                return any(not _duckdb("SELECT TRY_CAST($1 AS JSON) IS NOT NULL", [text]) for text in literals)
+            except Exception:  # noqa: BLE001 -- not shown safe
+                return True
+    return False
+
+
+def _converts_a_text_column(node: exp.Expression, type_of, engine: str) -> bool:
+    """Whether a comparison sets a text column against a value of another type."""
+    text = other = False
+    for side in _sides(node):
+        while isinstance(side, exp.Paren):
+            side = side.this  # `(region) = 7` converts the column as `region = 7` does (Codex, #160)
+        known = _type_of_value(side, type_of, engine)  # a container accessor's, as DuckDB's
+        if known is None:
+            continue
+        if known.this in exp.DataType.TEXT_TYPES:
+            # A text side holding a column is converted row by row: the column itself, or a
+            # text-typed value over one (`NVL(region, id) = 7` on Oracle, `COALESCE(region, 'x')
+            # = 7` on DuckDB, measured). A text literal holds no column and is never counted.
+            # The column may sit in a condition: a literal the row chooses by a column is read on
+            # the rows that choose it, and whether it converts is not evaluated here, so
+            # `CASE WHEN id > 0 THEN 'x' ELSE '1' END = 7` is refused (it fails on the rows with
+            # id > 0, the review gate on #160) and so is the same with '0', which would run; the
+            # operator writes such literals in the other side's type.
+            text = text or _reads_a_column(side)
+        else:
+            other = True
+    return text and other
+
+
+def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy, *,
+                       executes_as: str | None = None) -> exp.Expression | None:
+    """The first conversion in `table`'s row filter that can raise on a row's value, else None.
+
+    For a filter `_validate_filter` accepted. Two rules, by the shape. An explicit conversion
+    (a cast, a parse) is type-aware where the snapshot knows the operand's type, which takes a
+    bare column: `CAST(id AS BIGINT)` over an INTEGER cannot fail, and is kept; an operand
+    reading no column is a constant, which cannot fail on a row; anything else is refused, an
+    expression's type, or a column's the snapshot does not record, being unknown. An implicit
+    conversion (a comparison, NULLIF, Oracle's NVL and NVL2) is refused only where both sides'
+    types are known and one is a text column or a text-typed value over one: a side of unknown
+    type (`UPPER(region) > 0`, `NVL(id, TRIM(region))`) is not counted, since refusing every
+    comparison with an untyped expression would refuse most filters, and the guide says so. The
+    check matches known spellings; it is not a proof.
+    """
+    engine = (executes_as or dialect).lower()
+    wrapped = _parsed(filt, dialect, wrapped=True)
+    owners = column_tables(wrapped, engine) or {}
+
+    def types_of(key: str) -> dict[str, str]:
+        key = table if key == _SUBJECT else key
+        return next((cols for obj, cols in policy.policy_types.items()
+                     if names_one_object(key, [obj])), {})
+
+    def type_of(column: exp.Column) -> str | None:
+        owner = owners.get(id(column))
+        if owner is None and not column.table:
+            # Unqualified, which the resolver leaves unowned: the one table of the column's own
+            # SELECT that has a column of that name, as `_validate_filter` reads it. None where no
+            # table or more than one does -- a correlated reference among them -- so it is unknown.
+            select = column.find_ancestor(exp.Select)
+            # The SELECT's own sources, not a subquery's inside it: `COALESCE(attrs, (SELECT attrs
+            # FROM claim WHERE id = 1))` reads the outer `attrs` from the filtered table alone,
+            # and counting the subquery's `claim` beside it read the name as ambiguous and the
+            # JSON column as unknown (Codex's fifth review of #160).
+            own = [t for t in base_tables(select, engine)
+                   if t.find_ancestor(exp.Select) is select] if select is not None else []
+            while select is not None and select.args.get("from_") is None:
+                # A SELECT with no FROM at all reads the enclosing one's sources, as the engine
+                # resolves a correlated name (`(SELECT region) = 7`: Codex's twenty-third
+                # review of #160, the column unknown and the conversion unread). One with a
+                # FROM, a derived table among its sources, keeps its own, so a derived column
+                # is not read as the outer base column of the same name (the review gate).
+                select = select.find_ancestor(exp.Select)
+                own = [t for t in base_tables(select, engine)
+                       if t.find_ancestor(exp.Select) is select] if select is not None else []
+            having = [key for key in {object_key(t) for t in own}
+                      if column.name.lower() in types_of(key)]
+            owner = having[0] if len(having) == 1 else None
+        return None if owner is None else types_of(owner).get(column.name.lower())
+
+    for node in wrapped.args["where"].walk():
+        if engine == "duckdb" and _is_union_extract(node) and not (
+                isinstance(node.expressions[1], exp.Literal) and node.expressions[1].is_string):
+            return node.expressions[1]  # the TAG: a constant the engine resolves and the reader
+            # cannot (`'a' || ''`, `CAST('a' AS VARCHAR)`), which left the whole container
+            # unknown and a raising comparison approved (Codex's thirtieth review of #160)
+        if engine == "duckdb" and _is_typed_call(node) and _extract_path(node) is not None \
+                and _path_shape(_extract_path(node), type_of) is None:
+            return _extract_path(node)  # the PATH, whose shape the reader cannot tell: scalar
+            # or list is the engine's call, and either reading approves a conversion the other
+            # refuses; returned rather than the call so the refusal names the path
+        if engine == "duckdb" and isinstance(node, (exp.SetOperation, exp.Values)):
+            # A set operation unifies its branches' projections as a branched value's branches
+            # are unified, each branch converted to the unified type on the rows it yields:
+            # `(SELECT attrs ... UNION ALL SELECT region ... LIMIT 1) IS NOT NULL` parsed region
+            # as JSON (Codex's twenty-fourth review of #160).
+            columns = _set_columns(node)
+            if columns is not None and any(len(column) > 1 and (
+                    _values_coerce_to_json(column, type_of, engine)
+                    or _json_inside_a_container(column, type_of)) for column in columns):
+                return node  # per output position, whatever the width (the twenty-fifth
+                # review); a VALUES list's rows unify as a set operation's branches do (the gate)
+        if engine == "duckdb" and (isinstance(node, _JSON_PARSES) or (
+                isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_JSON_PARSES)):
+            # The typed readers parse their first argument; an untyped one may parse any (both of
+            # `json_contains` and `json_merge_patch` do), so each argument must be safe.
+            sources = [node.this] if isinstance(node, _JSON_PARSES) else node.expressions
+            if isinstance(node, exp.Anonymous) and node.name.lower() in _STRICT_JSON_TRANSFORMS:
+                if any(_reads_a_column(source) for source in sources):
+                    return node  # raises on a well-formed value too, see _STRICT_JSON_TRANSFORMS
+                continue
+            if all(_json_cannot_fail(source, type_of, engine) for source in sources):
+                continue
+            return node
+        if isinstance(node, (*_COMPARISONS, exp.Nullif)):
+            # NULLIF compares its two arguments as `=` does (measured: `NULLIF(region, 7)`
+            # converts the column, Codex's second review of #160).
+            if _converts_a_text_column(node, type_of, engine):
+                return node
+            if engine == "duckdb" and (_json_inside_a_container(_sides(node), type_of)
+                                       or _json_beside_a_literal(_sides(node), type_of)):
+                return node
+            continue
+        if engine == "oracle" and _nvl_converts_a_text_column(node, type_of, engine):
+            return node
+        if engine == "duckdb" and isinstance(node, _BRANCHED) and (
+                _coerces_to_json(node, type_of, engine)
+                or _json_inside_a_container(_branches(node), type_of)
+                or _literal_cannot_convert(node, type_of, engine)):
+            return node
+        if engine == "duckdb" and (isinstance(node, exp.Bracket)
+                                   or (isinstance(node, exp.ToMap) and isinstance(node.this, exp.Bracket))
+                                   or (isinstance(node, exp.Anonymous) and node.name.lower() in _MAP_LOOKUPS)):
+            # A map looked up by a key: the key is converted to the map's key type, so a text
+            # key beside a JSON-keyed map is parsed on every row (Codex's eleventh review of
+            # #160). The map is typed by DuckDB; its key type stands in for the map beside
+            # the key under both readings. A list subscripted by a number converts nothing.
+            # A subscripted map literal is parsed with the bracket inside the map (the review
+            # gate on cd17747: `MAP {...}[region]`), so the map is rebuilt over its struct.
+            map_only = isinstance(node, exp.Anonymous) and node.name.lower() in _MAP_ONLY_LOOKUPS
+            if isinstance(node, exp.ToMap):
+                bracket = node.this
+                container = exp.ToMap(this=bracket.this.copy())
+                container.parent = node
+                key = bracket.expressions[0] if bracket.expressions else None
+            elif isinstance(node, exp.Bracket):
+                container, key = node.this, (node.expressions[0] if node.expressions else None)
+            else:
+                operands = list(node.expressions)
+                container, key = (operands + [None, None])[:2]
+            kind = _type_of_value(container, type_of, engine) if container is not None else None
+            if (key is not None and kind is not None and kind.this == exp.DataType.Type.MAP
+                    and kind.expressions and isinstance(kind.expressions[0], exp.DataType)):
+                key_type = exp.Cast(this=exp.Null(), to=kind.expressions[0].copy())
+                key_type.parent = node
+                pair = [key_type, key]
+                if _values_coerce_to_json(pair, type_of, engine) or _json_inside_a_container(pair, type_of):
+                    return node
+            elif key is not None and kind is None and map_only:
+                return node  # a map the reader cannot type may be keyed by JSON (the gate)
+        if engine == "duckdb" and (isinstance(node, _LIST_SEARCHES) or (
+                isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_SEARCH_NAMES)):
+            # A list search unifies the list's element type with what is searched for, or with
+            # the other list's elements: `list_contains([attrs], region)` and `array_position`
+            # parse region as JSON on every row (Codex's tenth review of #160). Read as the
+            # element (the list subscripted) beside the argument, or the two lists together.
+            if isinstance(node, exp.Anonymous):
+                operands = list(node.expressions)
+                haystack, needle = (operands + [None, None])[:2]
+            else:
+                haystack, needle = node.this, node.args.get("expression")
+            if isinstance(node, exp.Contains):
+                # DuckDB's `contains` searches a string as well as a list: a list search only
+                # where the reader types the first argument as a list (the review gate: over a
+                # JSON column it is the string search, and over a list a call returns it is
+                # left to the other rules).
+                kind = _type_of_value(haystack, type_of, engine) if haystack is not None else None
+                if kind is None or kind.this not in (exp.DataType.Type.ARRAY, exp.DataType.Type.LIST):
+                    haystack = None
+            if haystack is not None and needle is not None:
+                pairs = isinstance(node, _LIST_PAIRS) or (
+                    isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_PAIR_NAMES)
+                element = exp.Bracket(this=haystack.copy(), expressions=[exp.Literal.number(1)])
+                element.parent = node
+                pair = [haystack, needle] if pairs else [element, needle]
+                if _values_coerce_to_json(pair, type_of, engine) or _json_inside_a_container(pair, type_of):
+                    return node
+                lists = pair if pairs else [element]
+                if any(_untypable(value, type_of, engine) for value in lists):
+                    # A list the reader cannot type (`list_distinct([attrs])`, a call) may hold
+                    # JSON, and the search would parse what it looks for (the review gate on
+                    # e12b82d): refused, fail-closed. The value searched for, where untyped
+                    # beside a JSON element, is refused above, and beside a text element it
+                    # parses nothing. Typed in DuckDB's own grammar: sqlglot's DataType does
+                    # not read `STRUCT(INTEGER, "NULL"[])`, which `row(id, [])` is, and the
+                    # valid search over it was refused (Codex's eighteenth review of #160).
+                    return node
+        if engine == "duckdb" and (isinstance(node, (exp.Array, exp.ToMap)) or (
+                isinstance(node, exp.Anonymous) and node.name.lower() in _LIST_CONSTRUCTORS)):
+            # A list's elements, and a map's keys and its values, are unified to one type as a
+            # branched value's branches are: `[attrs, region]` is JSON[], region parsed on every
+            # row (Codex's ninth review of #160: indexed, wrapped in a struct, or as a map's
+            # values, approved and Malformed JSON on the hidden row). The list spelled as a
+            # call (`array_value`, `list_value`, `list_pack`) and a map literal subscripted at
+            # once (`MAP {...}['b']`, whose struct sqlglot wraps in the bracket) are the same
+            # shapes (the review gate on 3d52790).
+            if isinstance(node, exp.ToMap):
+                struct = map_struct(node)
+                items = struct.expressions if struct is not None else []
+                groups = [[item.this for item in items if isinstance(item, exp.PropertyEQ)],
+                          [item.expression for item in items if isinstance(item, exp.PropertyEQ)]]
+            else:
+                groups = [node.expressions]
+            if any(_values_coerce_to_json(group, type_of, engine) or _json_inside_a_container(group, type_of)
+                   for group in groups if group):
+                return node
+        untyped = isinstance(node, exp.Anonymous) and node.name.lower() in _UNTYPED_CONVERSIONS
+        if not (untyped or isinstance(node, (exp.Cast, *_PARSES))):
+            continue
+        if (isinstance(node, exp.TryCast) or node.args.get("safe")
+                or node.args.get("default") is not None):
+            continue  # TRY_CAST, or Oracle's DEFAULT ... ON CONVERSION ERROR
+        operands = node.expressions if untyped else [node.this]
+        if not any(_reads_a_column(arg) for arg in operands):
+            continue  # a constant cannot fail on a row
+        if isinstance(node, exp.Cast) and isinstance(node.this, (exp.Column, exp.Identifier)):
+            # The operand's type: the snapshot's for a column, the element walked for a
+            # lambda's parameter (`CAST(x AS JSON)` over a JSON element, `i::VARCHAR` over the
+            # index: round 47).
+            if is_lambda_parameter(node.this):
+                source = _lambda_parameter_type(node.this, type_of)
+            else:
+                source = type_of(node.this) if isinstance(node.this, exp.Column) else None
+            if source is not None and source is not _UNREADABLE and _cast_cannot_fail(source, node.to, engine):
+                continue
+        return node
+    return None
+
+
+def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
+    safe = _SAFE_FORM.get(engine, "a form that cannot fail, or a column of the right type")
+    if engine == "duckdb" and node.parent is not None and _is_union_extract(node.parent) \
+            and node.parent.expressions[1] is node:
+        safe = ("the union member's tag as one string literal: a tag the engine resolves as a "
+                "constant and the reader cannot leaves the extract's type, and so the "
+                "conversion it meets, unread")
+    elif engine == "duckdb" and node.parent is not None and _is_typed_call(node.parent) \
+            and _extract_path(node.parent) is node:
+        safe = ("the extract's path as one string literal, a list of string literals, or a text "
+                "column: whether this path makes the extract one value or a list cannot be told "
+                "without running it, and the two are converted differently")
+    if engine == "duckdb" and isinstance(node, _BRANCHED):
+        safe += (", and a text literal on a branch as CAST('...' AS type): beside a branch of "
+                 "another type it is converted to that type on the rows that take it, and beside "
+                 "a call or an aggregate the type it would be converted to cannot be told")
+    # The conversion is the policy's text, so it goes to the operator's log only.
+    logger.warning("row filter for %r: %s can raise on a row's value, which fails every read of "
+                   "the table and can quote that value in the error; write %s (M159)",
+                   table, node.sql(dialect=engine), safe)
+    return Refusal(
+        code=RefusalCode.INVALID_ROW_FILTER,
+        message=(f"The row-access policy for {table!r} converts a value in a way that can fail on "
+                 "the table's data, so it cannot be applied. The operator must rewrite the "
+                 f"conversion as {safe}; the server log names it."),
+        subject=table,
+    )
 
 
 def _derived_table(
@@ -327,6 +2441,10 @@ def apply_row_and_mask(
                     message=f"The row-access policy for {name!r} is not a valid predicate.",
                     subject=name,
                 ), []
+            raising = raising_conversion(policy.row_filter_for(name), name, dialect, policy,
+                                         executes_as=executes_as)
+            if raising is not None:
+                return _raising_refusal(raising, name, (executes_as or dialect).lower()), []
         derived = _derived_table(
             name, table_node.alias_or_name, visible[name],
             # `.lower()`: this dict is keyed folded and `name` is the QUERY's spelling.
@@ -395,6 +2513,9 @@ def apply_row_filters_to_write(
             message=f"The row-access policy for {name!r} is not a valid predicate.",
             subject=name,
         ), []
+    raising = raising_conversion(filt, name, dialect, policy, executes_as=executes_as)
+    if raising is not None:
+        return _raising_refusal(raising, name, (executes_as or dialect).lower()), []
     if (executes_as or dialect).lower() in _FENCED:
         # The target is filtered by conjunction, and a conjunction is not a fence: the engine may
         # still evaluate the statement's own WHERE on rows the filter removes (M160, measured on

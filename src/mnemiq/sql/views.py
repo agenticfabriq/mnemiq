@@ -8,6 +8,7 @@ from sqlglot import exp
 from mnemiq.contract import ViewDefinition
 from mnemiq.sql.identifiers import rules_for
 from mnemiq.sql.qualify import object_key
+from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys
 from mnemiq.sql.scope import cte_references
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
@@ -25,8 +26,10 @@ def body_of(view: ViewDefinition) -> exp.Expression | None:
     `CREATE VIEW x AS SELECT ...`. Normalising through the parser rather than by stripping the
     prefix keeps one SQL implementation -- `str.partition` would be a second, and a worse one.
     """
+    if dotted_map_keys(view.definition, view.dialect):
+        return None  # the parser reads the key as its last part alone: not a body the checks can read
     try:
-        parsed = sqlglot.parse_one(view.definition, read=view.dialect)
+        parsed = as_duckdb_reads(sqlglot.parse_one(view.definition, read=view.dialect))
     except Exception:
         return None
     if isinstance(parsed, exp.Create):

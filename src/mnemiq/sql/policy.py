@@ -7,6 +7,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
 from mnemiq.sql.identifiers import ascii_lower
 from mnemiq.sql.qualify import names_one_object
+from mnemiq.sql.reading import as_duckdb_reads
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,10 @@ class AccessPolicy:
     # is refused UNRESOLVABLE_VIEW (M45): a policy built by hand with `row_filters` must carry the
     # schema its views read.
     policy_schema: dict[str, set[str]] = field(default_factory=dict)
+    # Each column's type as the snapshot recorded it, `{object: {column (lower case): type}}`,
+    # where it did. A row filter's conversion is refused when it can raise on a row's value
+    # (M159), and only the type says when it cannot. A column without one is read as unknown.
+    policy_types: dict[str, dict[str, str]] = field(default_factory=dict)
     # The CALLER's tables, the objects it is granted: what a card served to it may name. None means
     # no table scope, for a policy built by hand rather than from a grant set.
     visible: frozenset[str] | None = None
@@ -161,7 +166,7 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
         if view is None:
             continue
         try:
-            parsed = sqlglot.parse_one(view.definition, read=view.dialect)
+            parsed = as_duckdb_reads(sqlglot.parse_one(view.definition, read=view.dialect))  # tables alone are read here; one reading everywhere
         except Exception:
             # We cannot see what this view reads, so we cannot say the policy is irrelevant.
             # Returning what we have left the policy EMPTY, which skipped the rewrite entirely
@@ -270,8 +275,11 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
     row_filters = {t: f for t, f in grants.row_filters.items()
                    if t in reachable or t.lower() in folded}
     policy_schema: dict[str, set[str]] = {}
+    policy_types: dict[str, dict[str, str]] = {}
     for c in snapshot.columns:
         policy_schema.setdefault(c.object_id, set()).add(c.name)
+        if c.data_type:
+            policy_types.setdefault(c.object_id, {})[c.name.lower()] = c.data_type
     unknown = unknown_filter_targets(snapshot, grants.row_filters)
     if unknown and (snapshot.version, unknown) not in _reported:
         if len(_reported) >= _REPORTED_BOUND:
@@ -286,5 +294,5 @@ def build_access_policy(snapshot: Snapshot, grants: GrantSet) -> AccessPolicy:
         )
     return AccessPolicy(
         row_filters=row_filters, denied=denied, masked=masked, policy_schema=policy_schema,
-        visible=frozenset(grants.objects), unknown_filter_targets=unknown,
+        policy_types=policy_types, visible=frozenset(grants.objects), unknown_filter_targets=unknown,
     )
