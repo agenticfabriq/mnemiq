@@ -1670,7 +1670,8 @@ class ReadOnlyViolation(RuntimeError):
 
 
 class ConnectionUnusable(ConnectionError):
-    """The driver calls this connection unhealthy, so no call was made on it (`_usable`).
+    """The driver calls this connection unhealthy, so the adapter wrote no bound on it and did not
+    make the call the bound was for (`_usable`).
 
     A `ConnectionError`, which `unavailable_fault` reads as the source's: the session could not
     be asked."""
@@ -1743,7 +1744,7 @@ def _is_ddl_race(exc: Exception) -> bool:
 
 
 def _usable(con) -> None:
-    """Raise `ConnectionUnusable`, making no call, when the driver calls `con` unhealthy.
+    """Raise `ConnectionUnusable`, with no call made, when the driver calls `con` unhealthy.
 
     python-oracledb 4.0.2 closes a connection itself when a call outlives `call_timeout` and the
     server does not answer the break that follows within the same bound (DPY-4011, "socket timed
@@ -1756,12 +1757,18 @@ def _usable(con) -> None:
     server said it is ending while the socket stays open. Skipping only the write ran the next
     statement unbounded on the second (the review gate on the first commit), and a ping to tell
     the two apart runs under whatever bound the connection already carries, which can be none
-    (Codex's review of #182). So no call is made on either: the session is gone or going, and
-    the caller hears it as the source's.
+    (Codex's review of #182). So neither gets the write nor the call it was about to bound: the
+    session is gone or going, and the caller hears it as the source's. What this holds is that
+    no `call_timeout` write reaches an unhealthy connection and no bound is skipped. A session
+    the server starts ending between two checks still gets the calls that come before the next
+    one (`_cursor`'s rollback and SET TRANSACTION READ ONLY, the read-only probe, a query asked
+    for with no bound), each under whatever bound is already in force on the connection, as
+    before this guard (Codex's second review of #182).
     """
     if not con.is_healthy():
         raise ConnectionUnusable(
-            "the Oracle driver reports this connection unhealthy, so no call was made on it")
+            "the Oracle driver reports this connection unhealthy, so the adapter wrote no bound "
+            "and did not make the call it was for")
 
 
 def _set_call_timeout(con, ms: int) -> None:

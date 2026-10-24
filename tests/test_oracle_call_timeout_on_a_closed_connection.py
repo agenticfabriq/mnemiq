@@ -1,5 +1,5 @@
-"""No call reaches a connection the driver calls unhealthy, and no `call_timeout` write reaches one
-it has closed, because that write ends the process.
+"""No `call_timeout` write reaches a connection the driver calls unhealthy, because on one it has
+closed that write ends the process; and no bound is skipped, so the call it was for is refused.
 
 python-oracledb 4.0.2 closes a connection itself when a call outlives `call_timeout` and the server
 does not answer the break that follows within the same bound: DPY-4011, "socket timed out while
@@ -11,9 +11,11 @@ no `except` catches a segfault: the lease's reset ended the process for every ca
 `is_healthy()` is a local check, False for that dropped socket and also for a session the server
 said it is ending while the socket stays open. On the second, a write would be safe, and any call
 made to tell the two apart -- a ping -- runs under whatever bound the connection already carries,
-which can be none (Codex's review of #182). So the adapter makes no call on an unhealthy connection
-at all: it raises `ConnectionUnusable`, a `ConnectionError`, which `unavailable_fault` reads as the
-source's. The live reproduction is in `test_oracle_adapter.py`.
+which can be none (Codex's review of #182). So where the adapter would write a bound, or enter a
+borrowed lease, it makes no call on an unhealthy connection: it raises `ConnectionUnusable`, a
+`ConnectionError`, which `unavailable_fault` reads as the source's. Between those checks a session
+the server starts ending still gets the calls that come before the next one, listed under
+`_usable` (Codex's second review of #182). The live reproduction is in `test_oracle_adapter.py`.
 
 No database here: the fake records a write made with the socket gone, which is what crashed,
 rather than raising, which the lease's `except` would have caught and so passed on the code that
