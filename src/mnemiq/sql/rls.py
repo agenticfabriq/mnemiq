@@ -2188,6 +2188,20 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
     return None
 
 
+def _spelled_for(node: exp.Expression, engine: str) -> str:
+    """The node's text for the operator's log: the engine's dialect where its generator prints it,
+    DuckDB's otherwise, the tree's own repr last. The log line rendered `CAST(MAP {region: 1}[region]
+    AS INT)` for Postgres and Oracle, whose generators name a struct's field by a plain identifier,
+    and raised out of both deciders before the refusal it describes was built, so one such policy
+    failed every read and write of its table (Codex's forty-eighth review of #160)."""
+    for dialect in (engine, "duckdb"):
+        try:
+            return node.sql(dialect=dialect)
+        except Exception:  # noqa: BLE001 -- a log line must not fail the refusal it describes
+            continue
+    return repr(node)
+
+
 def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
     safe = _SAFE_FORM.get(engine, "a form that cannot fail, or a column of the right type")
     if engine == "duckdb" and node.parent is not None and _is_union_extract(node.parent) \
@@ -2207,7 +2221,7 @@ def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
     # The conversion is the policy's text, so it goes to the operator's log only.
     logger.warning("row filter for %r: %s can raise on a row's value, which fails every read of "
                    "the table and can quote that value in the error; write %s (M159)",
-                   table, node.sql(dialect=engine), safe)
+                   table, _spelled_for(node, engine), safe)
     return Refusal(
         code=RefusalCode.INVALID_ROW_FILTER,
         message=(f"The row-access policy for {table!r} converts a value in a way that can fail on "
