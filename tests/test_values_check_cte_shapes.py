@@ -622,3 +622,26 @@ def test_a_joins_side_whose_output_the_walk_cannot_name_is_not_read_statement_wi
     assert con.execute(sql).fetchall() == [(0,)]
     verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index())
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
+
+
+def test_a_derived_tables_unqualified_projection_over_a_join_is_placed_by_the_joins_rules():
+    # Codex's tenth review of #178: `(SELECT doc FROM t FULL JOIN t AS b USING (doc)) AS q` projects
+    # `coalesce(t.doc, b.doc)`, `t.doc` twice, and the walk gave up on a projection over two sources,
+    # so the FULL join over `q` skipped where main refused the absent value. The projection is placed
+    # by its own scope's join rules now; where those answer nothing the walk still does.
+    visible = {**VISIBLE, "u": {"name"}, "v": {"doc", "k", "name"}, "w": {"k"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east')")
+    for sql in ("SELECT count(*) FROM (SELECT doc FROM t FULL JOIN t AS b USING (doc)) AS q FULL JOIN t AS c USING (doc) WHERE doc = 'west'",
+                "SELECT count(*) FROM (SELECT doc FROM t FULL JOIN t AS b USING (doc)) AS q WHERE doc = 'west'",
+                "SELECT count(*) FROM (SELECT doc FROM t JOIN t AS b USING (doc)) AS q FULL JOIN t AS c USING (doc) WHERE doc = 'west'",
+                "SELECT count(*) FROM (SELECT doc FROM t NATURAL JOIN t AS b) AS q WHERE doc = 'west'"):
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    # and nothing where the inner join's inputs differ, the merged column carrying `t.region` too
+    # (main refused these present values against `t.doc`)
+    for sql in ("SELECT count(*) FROM (SELECT doc FROM t FULL JOIN (SELECT region AS doc FROM t) AS b USING (doc)) AS q WHERE doc = 'west'",
+                "SELECT count(*) FROM (SELECT doc FROM t RIGHT JOIN (SELECT region AS doc FROM t) AS b USING (doc)) AS q WHERE doc = 'west'"):
+        assert con.execute(sql).fetchall() == [(1,)], sql
+        assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql

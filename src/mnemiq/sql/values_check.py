@@ -257,7 +257,163 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     if isinstance(inner, exp.Column) and len(source.selected_sources) == 1:
         (alias,) = source.selected_sources
         return _through_scopes(_same_column(inner, alias), source, visible, dialect, depth + 1)
+    if isinstance(inner, exp.Column) and source.selected_sources:
+        # Over several sources the projection is placed as the engine binds it in its own
+        # scope, by the join rules: `(SELECT doc FROM t FULL JOIN t b USING (doc)) q` projects
+        # `coalesce(t.doc, b.doc)`, `t.doc` twice, and the walk gave up on the two sources, so
+        # `q FULL JOIN t c USING (doc) WHERE doc = 'west'` skipped where main refused the absent
+        # value (Codex's tenth review of #178); where the rules answer nothing, or that the
+        # scope cannot tell, the walk answers nothing.
+        answer = _in_scope(inner, source, visible, dialect, depth + 1)
+        return answer if isinstance(answer, tuple) else None
     return None
+
+
+_ABSENT = object()  # no source of the scope can hold the name: the enclosing scope's turn
+_WIDE = object()  # the scope cannot tell: the statement-wide reading's turn, as before
+
+
+def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], dialect: str | None,
+              depth: int = 0) -> tuple[str, str] | None | object:
+    """The scope's own answer (M141, M174): a base table, or a local source followed to the
+    column it projects, the column renamed included -- `x.doc` may be `t.region`, and read
+    by its name it would be checked against `t.doc`'s values. An unqualified name is read
+    among the scope's selected sources, a base table holding it or a local source
+    projecting it, one owner or no answer. None is a skip; `_ABSENT` says no source of this
+    scope can hold the name, and the enclosing scope is asked; `_WIDE` says the scope
+    cannot tell, a source's output being one the walk cannot name (`_names`) or two
+    sources owning the name, and the statement-wide reading answers as before; where a join
+    has made the name one side's (`narrowed`) that scope answers nothing instead, since the
+    statement-wide reading would resurrect the other side."""
+    qualifier = column.table
+    if qualifier:
+        return _through_scopes(column, scope, visible, dialect, depth + 1) if qualifier in scope.sources else _ABSENT
+    wanted = _written(column.this, dialect)
+    # The merged column of a USING join is the join's: an inner or LEFT join's the
+    # left input's, a RIGHT join's the right input's, a FULL join's coalesced from
+    # both (measured by the ui lane on Postgres and DuckDB). `SELECT doc FROM t
+    # RIGHT JOIN t q(region, doc) USING (doc)` compares `q.doc`, `t.region`, where
+    # the walk discarded q and took `t.doc` as the sole owner (Codex's second
+    # review of #178); a FULL join's the same with the literal on q's side (the ui
+    # lane). The candidates are the join's side; a source renamed by position
+    # among them answers nothing, and so does a FULL join.
+    candidates = list(scope.selected_sources)
+    # This scope's own joins alone, in order, each USING the key narrowing the
+    # candidates in turn (a later RIGHT join decides over an earlier inner one): a
+    # join inside a subquery is another scope's, and read here it switched the check
+    # off for the outer column (the review gate on the fourth round). A NATURAL join
+    # is a USING join on every name its sides share, so it unsettles a name only where
+    # both sides may hold it (`_may_hold`), and then by its side as a USING key is: a
+    # name the right side cannot hold the join merges nothing of, and one the left
+    # side cannot hold is the right side's (Codex's third review of #178: `t NATURAL
+    # RIGHT JOIN (SELECT region AS doc FROM t) q` compares `t.region`; the seventh:
+    # `EXISTS (SELECT 1 FROM w NATURAL JOIN w b WHERE doc = 'west')` compares the outer
+    # `t.doc`; the eighth: `w NATURAL JOIN w b, t`, `t NATURAL JOIN t b` and five more
+    # compare `t.doc`, where a skip on any NATURAL join in the scope let an absent
+    # value through). A FULL join's merged column is coalesced from both sides, and
+    # answers only where both resolve to one base column (`t NATURAL FULL JOIN t b`
+    # compares `coalesce(t.doc, b.doc)`, both `t.doc`: Codex's ninth review), else
+    # nothing. A merged column is one side's, so where that side's output the walk
+    # cannot name the scope answers nothing rather than the statement-wide reading, which
+    # resurrected the discarded side: `t NATURAL RIGHT JOIN (SELECT * FROM (SELECT region AS
+    # doc FROM t) z CROSS JOIN u) q WHERE doc = 'west'` compares `q.doc`, `t.region`, and
+    # was refused against `t.doc` (the same review). A join's left side is the FROM
+    # source and the joins before it, not every other source of the scope: read as the
+    # latter, a source joined LATER that held the name made an earlier NATURAL join a
+    # merge, and `w NATURAL JOIN (SELECT region AS doc, 'west' AS k FROM t) b NATURAL LEFT
+    # JOIN t c WHERE doc = 'west'` refused a present value, `b.doc`, against `t.doc` (the
+    # review gate on round 13).
+    from_ = scope.expression.args.get("from_")
+    left = [from_.this.alias_or_name] if from_ is not None else []
+    narrowed = False  # a join made the name one side's
+    full_sides = None  # a FULL join's two inputs, by alias: both stay, one answer where they agree
+    comma_starts_an_input = (dialect or "").lower() in _COMMA_BINDS_LOOSER
+    for join in scope.expression.args.get("joins") or []:
+        right = join.this.alias_or_name
+        if comma_starts_an_input and not any(join.args.get(k) for k in ("side", "kind", "method", "on", "using")):
+            # A comma binds more loosely than JOIN, so it begins a new left input: `v, t FULL
+            # JOIN t b USING (doc)` compares `coalesce(t.doc, b.doc)`, and with `v` among the
+            # join's left input the owners differed and the scope skipped where main refused
+            # (the review gate on round 15).
+            left = [right]
+            continue
+        if (join.method or "").upper() == "NATURAL":
+            right_may = right not in scope.selected_sources or _may_hold(
+                scope.selected_sources[right][1], wanted, dialect, visible)
+            if not right_may:
+                left.append(right)
+                continue
+            if not any(_may_hold(scope.selected_sources[a][1], wanted, dialect, visible)
+                       for a in candidates if a in left and a in scope.selected_sources):
+                candidates = [right]
+                narrowed = True
+                full_sides = None  # the name is the right side's alone; a FULL join before it is superseded
+                left.append(right)
+                continue
+        elif not any(_written(key, dialect) == wanted for key in (join.args.get("using") or ())):
+            left.append(right)
+            continue
+        side = (join.side or "").upper()
+        narrowed = True
+        if side == "FULL":
+            # The join's left input is the sources before it still among the candidates, its
+            # right input the joined source; counted as every source of the scope, a source
+            # beside the join that cannot hold the name blocked the answer and `w, t FULL JOIN
+            # t b USING (doc)` skipped where main refused (the review gate on round 15).
+            full_sides = ([a for a in candidates if a in left], [right])
+            candidates = full_sides[0] + full_sides[1]
+        elif side == "RIGHT":
+            candidates = [right]
+            full_sides = None  # a later RIGHT join's merged column is its right input's alone
+        else:
+            candidates = [a for a in candidates if a != right]
+        left.append(right)
+    # A source renamed by position among the candidates, before any sole owner: the
+    # statement-wide reading would place the name by it (the gate's second round).
+    if any(isinstance(source, exp.Table) and isinstance(source.args.get("alias"), exp.TableAlias)
+           and source.args["alias"].columns for alias, (_, source) in scope.selected_sources.items()
+           if alias in candidates):
+        return None
+    owner_of: dict[str, tuple[str, str]] = {}  # by the candidate's alias
+    unknown = False
+    for alias, (_, source) in scope.selected_sources.items():
+        if alias not in candidates:
+            continue
+        if isinstance(source, exp.Table):
+            found = _through_scopes(_same_column(column, alias), scope, visible, dialect, depth + 1)
+            if found is not None and any(wanted in _stored(c, dialect) for c in visible.get(source.name, ())):
+                owner_of[alias] = found
+        else:
+            found = _through_scopes(_same_column(column, alias), scope, visible, dialect, depth + 1)
+            if found is not None:
+                owner_of[alias] = found
+            else:
+                holds = _names(source, wanted, dialect, visible, depth + 1)
+                if holds:
+                    # A local source naming the column that the walk could not follow
+                    # to a base column (a USING output of a join inside it, a function,
+                    # an expression through a star): the name is that source's, not a
+                    # base table's, and the statement-wide reading placed it by one
+                    # (Codex's third review of #178: `(SELECT doc FROM t RIGHT JOIN t
+                    # q(region, doc) USING (doc)) x WHERE doc = 'west'` compares
+                    # `t.region`, the walk said `t.doc`).
+                    return None
+                if holds is None:
+                    unknown = True  # the source may yield the name, and the engine binds there
+    owners = list(owner_of.values())
+    if full_sides is not None:
+        # The merged column is coalesced from the join's two inputs: each must add an owner, and
+        # every owner must be the one base column. An input that adds none, a table lacking the
+        # name under the grant or a source the walk cannot name, is one whose values the
+        # coalesced column still carries (the review gate on round 14); a source beside the
+        # left input that cannot hold the name is no part of it.
+        sides = [[owner_of[a] for a in side if a in owner_of] for side in full_sides]
+        return owners[0] if all(sides) and len(set(owners)) == 1 else None
+    if len(owners) == 1:
+        return owners[0]
+    if owners or unknown:
+        return None if narrowed else _WIDE
+    return _ABSENT
 
 
 # The engines on which a join the parser gives no kind, side, method, ON or USING can only be a
@@ -310,149 +466,6 @@ def check_values(
             alias_to_table[table.alias_or_name] = table.name
     referenced = set(alias_to_table.values())
     scopes = _scopes(ast)
-    _ABSENT = object()  # no source of the scope can hold the name: the enclosing scope's turn
-    _WIDE = object()  # the scope cannot tell: the statement-wide reading's turn, as before
-
-    def in_scope(column: exp.Column, scope: Scope) -> tuple[str, str] | None | object:
-        """The scope's own answer (M141, M174): a base table, or a local source followed to the
-        column it projects, the column renamed included -- `x.doc` may be `t.region`, and read
-        by its name it would be checked against `t.doc`'s values. An unqualified name is read
-        among the scope's selected sources, a base table holding it or a local source
-        projecting it, one owner or no answer. None is a skip; `_ABSENT` says no source of this
-        scope can hold the name, and the enclosing scope is asked; `_WIDE` says the scope
-        cannot tell, a source's output being one the walk cannot name (`_names`) or two
-        sources owning the name, and the statement-wide reading answers as before; where a join
-        has made the name one side's (`narrowed`) that scope answers nothing instead, since the
-        statement-wide reading would resurrect the other side."""
-        qualifier = column.table
-        if qualifier:
-            return _through_scopes(column, scope, visible, dialect) if qualifier in scope.sources else _ABSENT
-        wanted = _written(column.this, dialect)
-        # The merged column of a USING join is the join's: an inner or LEFT join's the
-        # left input's, a RIGHT join's the right input's, a FULL join's coalesced from
-        # both (measured by the ui lane on Postgres and DuckDB). `SELECT doc FROM t
-        # RIGHT JOIN t q(region, doc) USING (doc)` compares `q.doc`, `t.region`, where
-        # the walk discarded q and took `t.doc` as the sole owner (Codex's second
-        # review of #178); a FULL join's the same with the literal on q's side (the ui
-        # lane). The candidates are the join's side; a source renamed by position
-        # among them answers nothing, and so does a FULL join.
-        candidates = list(scope.selected_sources)
-        # This scope's own joins alone, in order, each USING the key narrowing the
-        # candidates in turn (a later RIGHT join decides over an earlier inner one): a
-        # join inside a subquery is another scope's, and read here it switched the check
-        # off for the outer column (the review gate on the fourth round). A NATURAL join
-        # is a USING join on every name its sides share, so it unsettles a name only where
-        # both sides may hold it (`_may_hold`), and then by its side as a USING key is: a
-        # name the right side cannot hold the join merges nothing of, and one the left
-        # side cannot hold is the right side's (Codex's third review of #178: `t NATURAL
-        # RIGHT JOIN (SELECT region AS doc FROM t) q` compares `t.region`; the seventh:
-        # `EXISTS (SELECT 1 FROM w NATURAL JOIN w b WHERE doc = 'west')` compares the outer
-        # `t.doc`; the eighth: `w NATURAL JOIN w b, t`, `t NATURAL JOIN t b` and five more
-        # compare `t.doc`, where a skip on any NATURAL join in the scope let an absent
-        # value through). A FULL join's merged column is coalesced from both sides, and
-        # answers only where both resolve to one base column (`t NATURAL FULL JOIN t b`
-        # compares `coalesce(t.doc, b.doc)`, both `t.doc`: Codex's ninth review), else
-        # nothing. A merged column is one side's, so where that side's output the walk
-        # cannot name the scope answers nothing rather than the statement-wide reading, which
-        # resurrected the discarded side: `t NATURAL RIGHT JOIN (SELECT * FROM (SELECT region AS
-        # doc FROM t) z CROSS JOIN u) q WHERE doc = 'west'` compares `q.doc`, `t.region`, and
-        # was refused against `t.doc` (the same review). A join's left side is the FROM
-        # source and the joins before it, not every other source of the scope: read as the
-        # latter, a source joined LATER that held the name made an earlier NATURAL join a
-        # merge, and `w NATURAL JOIN (SELECT region AS doc, 'west' AS k FROM t) b NATURAL LEFT
-        # JOIN t c WHERE doc = 'west'` refused a present value, `b.doc`, against `t.doc` (the
-        # review gate on round 13).
-        from_ = scope.expression.args.get("from_")
-        left = [from_.this.alias_or_name] if from_ is not None else []
-        narrowed = False  # a join made the name one side's
-        full_sides = None  # a FULL join's two inputs, by alias: both stay, one answer where they agree
-        comma_starts_an_input = (dialect or "").lower() in _COMMA_BINDS_LOOSER
-        for join in scope.expression.args.get("joins") or []:
-            right = join.this.alias_or_name
-            if comma_starts_an_input and not any(join.args.get(k) for k in ("side", "kind", "method", "on", "using")):
-                # A comma binds more loosely than JOIN, so it begins a new left input: `v, t FULL
-                # JOIN t b USING (doc)` compares `coalesce(t.doc, b.doc)`, and with `v` among the
-                # join's left input the owners differed and the scope skipped where main refused
-                # (the review gate on round 15).
-                left = [right]
-                continue
-            if (join.method or "").upper() == "NATURAL":
-                right_may = right not in scope.selected_sources or _may_hold(
-                    scope.selected_sources[right][1], wanted, dialect, visible)
-                if not right_may:
-                    left.append(right)
-                    continue
-                if not any(_may_hold(scope.selected_sources[a][1], wanted, dialect, visible)
-                           for a in candidates if a in left and a in scope.selected_sources):
-                    candidates = [right]
-                    narrowed = True
-                    full_sides = None  # the name is the right side's alone; a FULL join before it is superseded
-                    left.append(right)
-                    continue
-            elif not any(_written(key, dialect) == wanted for key in (join.args.get("using") or ())):
-                left.append(right)
-                continue
-            side = (join.side or "").upper()
-            narrowed = True
-            if side == "FULL":
-                # The join's left input is the sources before it still among the candidates, its
-                # right input the joined source; counted as every source of the scope, a source
-                # beside the join that cannot hold the name blocked the answer and `w, t FULL JOIN
-                # t b USING (doc)` skipped where main refused (the review gate on round 15).
-                full_sides = ([a for a in candidates if a in left], [right])
-                candidates = full_sides[0] + full_sides[1]
-            elif side == "RIGHT":
-                candidates = [right]
-                full_sides = None  # a later RIGHT join's merged column is its right input's alone
-            else:
-                candidates = [a for a in candidates if a != right]
-            left.append(right)
-        # A source renamed by position among the candidates, before any sole owner: the
-        # statement-wide reading would place the name by it (the gate's second round).
-        if any(isinstance(source, exp.Table) and isinstance(source.args.get("alias"), exp.TableAlias)
-               and source.args["alias"].columns for alias, (_, source) in scope.selected_sources.items()
-               if alias in candidates):
-            return None
-        owner_of: dict[str, tuple[str, str]] = {}  # by the candidate's alias
-        unknown = False
-        for alias, (_, source) in scope.selected_sources.items():
-            if alias not in candidates:
-                continue
-            if isinstance(source, exp.Table):
-                found = _through_scopes(_same_column(column, alias), scope, visible, dialect)
-                if found is not None and any(wanted in _stored(c, dialect) for c in visible.get(source.name, ())):
-                    owner_of[alias] = found
-            else:
-                found = _through_scopes(_same_column(column, alias), scope, visible, dialect)
-                if found is not None:
-                    owner_of[alias] = found
-                else:
-                    holds = _names(source, wanted, dialect, visible)
-                    if holds:
-                        # A local source naming the column that the walk could not follow
-                        # to a base column (a USING output of a join inside it, a function,
-                        # an expression through a star): the name is that source's, not a
-                        # base table's, and the statement-wide reading placed it by one
-                        # (Codex's third review of #178: `(SELECT doc FROM t RIGHT JOIN t
-                        # q(region, doc) USING (doc)) x WHERE doc = 'west'` compares
-                        # `t.region`, the walk said `t.doc`).
-                        return None
-                    if holds is None:
-                        unknown = True  # the source may yield the name, and the engine binds there
-        owners = list(owner_of.values())
-        if full_sides is not None:
-            # The merged column is coalesced from the join's two inputs: each must add an owner, and
-            # every owner must be the one base column. An input that adds none, a table lacking the
-            # name under the grant or a source the walk cannot name, is one whose values the
-            # coalesced column still carries (the review gate on round 14); a source beside the
-            # left input that cannot hold the name is no part of it.
-            sides = [[owner_of[a] for a in side if a in owner_of] for side in full_sides]
-            return owners[0] if all(sides) and len(set(owners)) == 1 else None
-        if len(owners) == 1:
-            return owners[0]
-        if owners or unknown:
-            return None if narrowed else _WIDE
-        return _ABSENT
 
     def resolve(column: exp.Column) -> tuple[str, str] | None:
         # The scope's own answer first, then each enclosing scope's, the nearest first, as the
@@ -468,7 +481,7 @@ def check_values(
         # there and whatever the walk answers past it is moot.
         scope = scopes.get(id(column))
         while scope is not None:
-            answer = in_scope(column, scope)
+            answer = _in_scope(column, scope, visible, dialect)
             if answer is _WIDE:
                 break
             if answer is not _ABSENT:
