@@ -1,21 +1,23 @@
-"""No `call_timeout` write reaches a connection the driver has closed, because that write ends the
-process.
+"""No call reaches a connection the driver calls unhealthy, and no `call_timeout` write reaches one
+it has closed, because that write ends the process.
 
 python-oracledb 4.0.2 closes a connection itself when a call outlives `call_timeout` and the server
 does not answer the break that follows within the same bound: DPY-4011, "socket timed out while
 recovering from previous socket timeout". Measured on Oracle Free 23 in thin mode with a query that
 was only slow (0.4 s a row under a 1 s bound), on a standalone and a pooled connection alike. On
 that connection `call_timeout = ...` dereferences the socket the driver dropped and segfaults, and
-no `except` catches a segfault: the lease's reset ended the process for every caller. Every other
-call measured there is safe -- `rollback`, `execute` and `ping` raise DPY-1001, `drop`, `release`,
-`close` and `is_healthy` return -- so the adapter pings a connection `is_healthy()` calls unhealthy
-before the write, and the driver's DPY-1001 reaches the caller instead. A connection unhealthy with
-its socket open (a session the server said it is ending) answers the ping and is still bounded
-(the review gate on the first commit). The live reproduction is in `test_oracle_adapter.py`.
+no `except` catches a segfault: the lease's reset ended the process for every caller.
+
+`is_healthy()` is a local check, False for that dropped socket and also for a session the server
+said it is ending while the socket stays open. On the second, a write would be safe, and any call
+made to tell the two apart -- a ping -- runs under whatever bound the connection already carries,
+which can be none (Codex's review of #182). So the adapter makes no call on an unhealthy connection
+at all: it raises `ConnectionUnusable`, a `ConnectionError`, which `unavailable_fault` reads as the
+source's. The live reproduction is in `test_oracle_adapter.py`.
 
 No database here: the fake records a write made with the socket gone, which is what crashed,
 rather than raising, which the lease's `except` would have caught and so passed on the code that
-crashed.
+crashed; and it counts every call that would cross the network while it is unhealthy.
 """
 
 from __future__ import annotations
@@ -29,22 +31,27 @@ import pytest
 oracledb = pytest.importorskip("oracledb")
 
 import mnemiq.adapters.oracle as oracle_module  # noqa: E402
-from mnemiq.adapters.oracle import OracleAdapter  # noqa: E402
+from mnemiq.adapters.oracle import (  # noqa: E402
+    ConnectionUnusable,
+    OracleAdapter,
+    unavailable_fault,
+)
 
 _CLOSED_BY_THE_DRIVER = "DPY-4011: the database or network closed the connection"
 
 
 class _Connection:
-    """A connection the driver can close mid-call, recording every `call_timeout` write and the
-    ones made with the socket gone. `healthy` is what `is_healthy()` says; `socket` is whether the
-    driver still holds one, which is what the write needs."""
+    """A connection the driver can close mid-call. It records every `call_timeout` write, the ones
+    made with the socket gone, and every network call made while unhealthy. `healthy` is what
+    `is_healthy()` says; `socket` is whether the driver still holds one, which the write needs."""
 
-    def __init__(self, healthy: bool = True, socket: bool | None = None):
+    def __init__(self, healthy: bool = True, socket: bool | None = None, ending_after=None):
+        object.__setattr__(self, "ending_after", ending_after)   # the server ends it after this
         object.__setattr__(self, "healthy", healthy)
         object.__setattr__(self, "socket", healthy if socket is None else socket)
         object.__setattr__(self, "written_while_closed", [])
         object.__setattr__(self, "written", [])
-        object.__setattr__(self, "pings", 0)
+        object.__setattr__(self, "calls_while_unhealthy", [])
         object.__setattr__(self, "call_timeout", 0)
 
     def __setattr__(self, name, value):
@@ -59,16 +66,20 @@ class _Connection:
         object.__setattr__(self, "healthy", False)
         object.__setattr__(self, "socket", False)
 
-    def _require_socket(self):
+    def say_the_session_is_ending(self):
+        object.__setattr__(self, "healthy", False)   # the socket stays open
+
+    def network(self, call):
+        if not self.healthy:
+            self.calls_while_unhealthy.append(call)
         if not self.socket:
             raise oracledb.InterfaceError("DPY-1001: not connected to database")
 
     def ping(self):
-        object.__setattr__(self, "pings", self.pings + 1)
-        self._require_socket()
+        self.network("ping")
 
     def rollback(self):
-        self._require_socket()
+        self.network("rollback")
 
     def cursor(self):
         return _Cursor(self)
@@ -81,7 +92,9 @@ class _Cursor:
         self.connection = con
 
     def execute(self, sql, **_binds):
-        self.connection._require_socket()
+        self.connection.network("execute")
+        if sql == self.connection.ending_after:
+            self.connection.say_the_session_is_ending()
         if "slow" in sql:
             # The bound ran out and the break went unanswered: the driver closes the connection.
             self.connection.close_by_the_driver()
@@ -118,6 +131,10 @@ def _pooled(con, read_only=True):
     return adapter
 
 
+_UNHEALTHY = pytest.mark.parametrize("socket", [False, True],
+                                     ids=["socket-dropped", "session-ending"])
+
+
 def test_a_pooled_connection_closed_during_the_lease_is_dropped_without_a_write():
     con = _Connection()
     adapter = _pooled(con)
@@ -128,19 +145,31 @@ def test_a_pooled_connection_closed_during_the_lease_is_dropped_without_a_write(
     assert adapter._pool.dropped == [con] and adapter._pool.released == []
 
 
-def test_a_closed_connection_the_pool_hands_back_is_not_written_and_is_dropped():
-    con = _Connection(healthy=False)
+def test_a_pooled_session_ending_during_the_lease_is_dropped_with_no_call_at_its_reset():
+    # The pool drops it anyway, on return or at the next acquire, and a call to reset a bound
+    # nobody will use could stall on that session (the review gate on the second commit).
+    con = _Connection()
     adapter = _pooled(con)
-    with pytest.raises(oracledb.InterfaceError, match="DPY-1001"):
+    with adapter._lease(timeout_ms=1000) as leased:
+        leased.say_the_session_is_ending()
+    assert con.written == [1000] and con.calls_while_unhealthy == [], "the reset wrote or called"
+    assert adapter._pool.dropped == [con] and adapter._pool.released == []
+
+
+@_UNHEALTHY
+def test_an_unhealthy_connection_the_pool_hands_back_gets_no_call_and_is_dropped(socket):
+    con = _Connection(healthy=False, socket=socket)
+    adapter = _pooled(con)
+    with pytest.raises(ConnectionUnusable):
         with adapter._lease(timeout_ms=1000) as leased:
             leased.cursor().execute("SELECT 1 FROM dual")
-    assert con.written_while_closed == []
+    assert con.written == con.written_while_closed == con.calls_while_unhealthy == []
     assert adapter._pool.dropped == [con] and adapter._pool.released == []
 
 
 def test_a_healthy_lease_still_bounds_its_connection_and_releases_it():
     # The control: an adapter that never wrote the timeout, or dropped every connection, passes
-    # both tests above.
+    # the tests around it.
     con = _Connection()
     adapter = _pooled(con)
     with adapter._lease(timeout_ms=1000) as leased:
@@ -149,56 +178,42 @@ def test_a_healthy_lease_still_bounds_its_connection_and_releases_it():
     assert adapter._pool.released == [con] and adapter._pool.dropped == []
 
 
-def test_a_connection_unhealthy_with_its_socket_open_is_still_bounded():
-    # `is_healthy()` is also False for a session the server said it is ending while the socket
-    # stays open. The write is safe there, and skipping it ran the statement unbounded.
-    con = _Connection(healthy=False, socket=True)
-    borrowed = OracleAdapter.over(con, oracledb, schema="APP", read_only=False)
-    assert borrowed.execute_arrow("SELECT 1 FROM dual", timeout_s=2.0).num_rows == 1
-    assert con.written == [2000, 0]
-
-
-def test_an_unhealthy_pooled_connection_is_dropped_with_no_round_trip_at_its_reset():
-    # The pool drops it anyway, on return or at the next acquire, and a ping to reset a bound
-    # nobody will use could stall on a session the server is ending (the review gate on the
-    # second commit). The lease's own bound still reaches it.
-    con = _Connection(healthy=False, socket=True)
-    adapter = _pooled(con)
-    with adapter._lease(timeout_ms=1000) as leased:
-        assert leased.call_timeout == 1000
-    assert con.written == [1000] and con.pings == 1, "the reset pinged or wrote"
-    assert adapter._pool.dropped == [con] and adapter._pool.released == []
-
-
 def test_a_borrowed_connection_closed_during_the_lease_is_not_written_back():
     con = _Connection()
     adapter = OracleAdapter.over(con, oracledb, schema="APP")
-    with pytest.raises(oracledb.DatabaseError, match="DPY-4011"):
+    with pytest.raises(oracledb.DatabaseError, match="DPY-4011"):   # the body's, not the restore's
         with adapter._lease(timeout_ms=1000) as leased:
             leased.cursor().execute("SELECT slow(1) FROM dual")
     assert con.written == [1000]
     assert con.written_while_closed == [], "the restore wrote to a closed connection: a segfault"
 
 
-def test_a_borrowed_connection_already_closed_is_not_written_by_the_next_lease():
-    con = _Connection(healthy=False)
-    adapter = OracleAdapter.over(con, oracledb, schema="APP")
-    with pytest.raises(oracledb.InterfaceError, match="DPY-1001"):
+@_UNHEALTHY
+@pytest.mark.parametrize("read_only", [True, False], ids=["read-only", "writable"])
+def test_an_unhealthy_borrowed_connection_gets_no_call_and_reads_as_the_sources(socket, read_only):
+    # Read-only, the first call would be `_cursor`'s rollback; writable, `execute_arrow`'s bound.
+    # On a session the server is ending either is a round trip under whatever bound the
+    # connection carries, here none (Codex's review of #182).
+    con = _Connection(healthy=False, socket=socket)
+    adapter = OracleAdapter.over(con, oracledb, schema="APP", read_only=read_only)
+    with pytest.raises(ConnectionUnusable) as caught:
         adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=1.0)
-    with pytest.raises(oracledb.InterfaceError, match="DPY-1001"):
-        with adapter._lease(timeout_ms=1000) as leased:   # a lease that bounds on entry
-            leased.rollback()
-    assert con.written_while_closed == []
+    assert unavailable_fault(caught.value) and adapter.source_unavailable(caught.value)
+    with pytest.raises(ConnectionUnusable):
+        with adapter._lease(timeout_ms=1000):   # a lease that bounds on entry
+            pass
+    assert con.written == con.written_while_closed == con.calls_while_unhealthy == []
 
 
-def test_a_writable_borrowed_connection_already_closed_is_not_bounded_before_its_query():
-    # Writable, `_cursor` issues no rollback, so the first call to reach the closed connection is
-    # `execute_arrow`'s own bound for the query.
-    con = _Connection(healthy=False)
-    adapter = OracleAdapter.over(con, oracledb, schema="APP", read_only=False)
-    with pytest.raises(oracledb.InterfaceError, match="DPY-1001"):
+def test_a_session_ending_before_its_query_gets_no_bound_and_no_query():
+    # Unhealthy after the lease's setup, during `_cursor`'s SET TRANSACTION READ ONLY: the next
+    # call is `execute_arrow`'s bound, then the query, each on whatever bound the lease left.
+    con = _Connection(ending_after="SET TRANSACTION READ ONLY")
+    adapter = _pooled(con)
+    with pytest.raises(ConnectionUnusable):
         adapter.execute_arrow("SELECT 1 FROM dual", timeout_s=1.0)
-    assert con.written_while_closed == []
+    assert con.written == [0] and con.calls_while_unhealthy == []
+    assert adapter._pool.dropped == [con] and adapter._pool.released == []
 
 
 @pytest.mark.parametrize("healthy, bounded", [(True, [1234]), (False, [])],
@@ -213,6 +228,7 @@ def test_a_read_only_probe_on_a_closed_connection_writes_no_timeout(healthy, bou
     adapter._recheck_read_only(con)
     assert con.written == bounded
     assert con.written_while_closed == [], "the probe wrote a timeout to a closed connection"
+    assert con.calls_while_unhealthy == [], "a call after the close"
 
 
 _TIMEOUT_ATTRIBUTES = {"call_timeout", "callTimeout"}   # the driver keeps the old name as an alias

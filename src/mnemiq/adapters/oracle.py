@@ -320,15 +320,18 @@ class OracleAdapter:
             # put it back.
             with self._lock:
                 previous = self._con.call_timeout
+                # Bound or not: read-only, the lease's first call is `_cursor`'s rollback, a round
+                # trip on whatever bound the connection carries (Codex's review of #182).
+                _usable(self._con)
                 if timeout_ms:
                     _set_call_timeout(self._con, timeout_ms)
                 try:
                     yield self._con
                 finally:
                     # Never raising over the body's error, which is the caller's: a connection
-                    # the driver closed says so on its next call, and one that refuses the
-                    # restore keeps this lease's bound, the connection being the caller's to
-                    # reset and not this adapter's to drop.
+                    # the driver calls unhealthy is not restored, and the next lease refuses
+                    # it; one that refuses the restore keeps this lease's bound, the connection
+                    # being the caller's to reset and not this adapter's to drop.
                     try:
                         _set_call_timeout(self._con, previous)
                     except Exception:
@@ -362,28 +365,22 @@ class OracleAdapter:
             yield con
         finally:
             try:
-                # An unhealthy connection is dropped with no round trip. The pool would drop it
-                # anyway, a dropped socket on return and a session the server is ending at the
-                # next acquire (python-oracledb 4.0.2's `_check_connection`); `drop` hands the
-                # close to the pool's own thread (`_drop_conn_impl`); and pinging it to reset a
-                # bound nobody will use could stall on that session (the review gate on the
-                # second commit).
-                reusable = con.is_healthy()
-                if reusable:
-                    _set_call_timeout(con, 0)
+                _set_call_timeout(con, 0)
             except Exception:
                 # Two things this must not do: mask the body's exception, and skip the return.
                 # A bare `finally` did both -- a raise here replaced whatever the caller was
                 # already failing with, and jumped over `release`.
-                reusable = False
-            if reusable:
-                self._pool.release(con)
-            else:
-                # DROPPED rather than released: an unhealthy connection, for the reason above,
-                # and one that will not accept a timeout reset, which would go back into the
-                # pool carrying an unknown one for the next borrower to inherit a bound nobody
-                # set. `drop` retires it and the pool opens a replacement.
+                #
+                # DROPPED rather than released, because a connection that will not accept a
+                # timeout reset would go back into the pool carrying an unknown one, and the
+                # next borrower would inherit a bound nobody set. One the driver calls unhealthy
+                # lands here with no call made (`_usable`); the pool would drop it anyway, at
+                # return or the next acquire (python-oracledb 4.0.2's `_check_connection`), and
+                # `drop` hands the close to the pool's own thread. `drop` retires it and the
+                # pool opens a replacement.
                 self._pool.drop(con)
+            else:
+                self._pool.release(con)
 
     def _recheck_read_only(self, con) -> None:
         """Re-probe the database's open mode on a bounded cadence, and say so when it lapses.
@@ -1672,6 +1669,13 @@ class ReadOnlyViolation(RuntimeError):
     """A read-only adapter was asked to run something that is not a read."""
 
 
+class ConnectionUnusable(ConnectionError):
+    """The driver calls this connection unhealthy, so no call was made on it (`_usable`).
+
+    A `ConnectionError`, which `unavailable_fault` reads as the source's: the session could not
+    be asked."""
+
+
 _LEAD_COMMENT = re.compile(r"\A(?:\s+|--[^\n]*|/\*.*?\*/)+", re.S)
 _LEAD_WORD = re.compile(r"\A[A-Za-z_][A-Za-z_0-9]*")
 
@@ -1738,8 +1742,8 @@ def _is_ddl_race(exc: Exception) -> bool:
     return "ora-01466" in str(exc).lower()
 
 
-def _set_call_timeout(con, ms: int) -> None:
-    """Set `con.call_timeout`, asking the driver first when it calls the connection unhealthy.
+def _usable(con) -> None:
+    """Raise `ConnectionUnusable`, making no call, when the driver calls `con` unhealthy.
 
     python-oracledb 4.0.2 closes a connection itself when a call outlives `call_timeout` and the
     server does not answer the break that follows within the same bound (DPY-4011, "socket timed
@@ -1748,16 +1752,22 @@ def _set_call_timeout(con, ms: int) -> None:
     connection dereferences the socket the driver dropped and segfaults: no `except` catches it,
     and it ends the process for every caller.
 
-    `is_healthy()` is a local check that says False for that dropped socket, and also for a
-    session the server has said it is ending while the socket stays open, where the write is safe
-    and skipping it would run the next statement unbounded (the review gate on the first commit).
-    So an unhealthy connection is pinged first: on the dropped socket `ping` raises DPY-1001
-    (measured, as `rollback` and `execute` do there) before the write is reached, and a
-    connection that answers has its socket and takes the write. Every write of `call_timeout` in
-    this file goes through here, and a test holds it to that.
+    `is_healthy()` is a local check, False for that dropped socket and also for a session the
+    server said it is ending while the socket stays open. Skipping only the write ran the next
+    statement unbounded on the second (the review gate on the first commit), and a ping to tell
+    the two apart runs under whatever bound the connection already carries, which can be none
+    (Codex's review of #182). So no call is made on either: the session is gone or going, and
+    the caller hears it as the source's.
     """
     if not con.is_healthy():
-        con.ping()
+        raise ConnectionUnusable(
+            "the Oracle driver reports this connection unhealthy, so no call was made on it")
+
+
+def _set_call_timeout(con, ms: int) -> None:
+    """Set `con.call_timeout` on a connection `_usable` passes. Every write of `call_timeout` in
+    this file goes through here, and a test holds it to that."""
+    _usable(con)
     con.call_timeout = ms
 
 

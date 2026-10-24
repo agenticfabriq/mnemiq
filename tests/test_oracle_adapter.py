@@ -353,18 +353,19 @@ except Exception as exc:
     print("first:", driver.args[0].full_code)
 try:
     print("then:", adapter.execute_arrow("SELECT 1 FROM dual").num_rows, "row")
-except oracledb.Error as exc:
-    print("then:", exc.args[0].full_code)
+except Exception as exc:
+    print("then:", exc.args[0].full_code if isinstance(exc, oracledb.Error) else type(exc).__name__)
 """
 
 
-@pytest.mark.parametrize("shape, then", [("pooled", "then: 1 row"), ("borrowed", "then: DPY-1001")])
+@pytest.mark.parametrize("shape, then", [("pooled", "then: 1 row"),
+                                         ("borrowed", "then: ConnectionUnusable")])
 def test_a_timeout_that_closes_the_connection_does_not_end_the_process(shape, then):
     """python-oracledb 4.0.2 segfaults when `call_timeout` is set on a connection it closed after
     an unanswered break, and the lease set it in its cleanup: one slow query ended the process for
     every caller. In a subprocess, so the crash is this test's failure rather than the suite's
-    end. A pool replaces the closed connection; a borrowed one is the caller's, and the driver
-    reports it closed on the next call."""
+    end. A pool replaces the closed connection; a borrowed one is the caller's, and the next call
+    is refused without touching it, as the source's."""
     import subprocess
     import sys
 
