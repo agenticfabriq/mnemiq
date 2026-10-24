@@ -481,8 +481,8 @@ _GERMAN_TIMEOUT = ("IO Error: Failed to fetch header for COPY: FEHLER:  stornier
                    "Zeitüberschreitung der Anweisung")
 
 
-class _GermanAtRun(_DropsAtRun):
-    """Run number `at` ends with the attach's own fault for a server message in German, raised
+class _AttachFaultAtRun(_DropsAtRun):
+    """Run number `at` ends with the attach's own fault for the given server message, raised
     through `execute_bounded` as a Postgres source's would be."""
 
     def __init__(self, inner, at, message):
@@ -509,7 +509,7 @@ class _GermanAtRun(_DropsAtRun):
 
 @pytest.mark.parametrize("message", [_GERMAN_CANCEL, _GERMAN_TIMEOUT], ids=["cancel", "statement-timeout"])
 def test_a_cancel_or_timeout_in_another_language_ends_the_turn_and_is_not_run_again(tmp_path, message):
-    source = _GermanAtRun(_duckdb(tmp_path), at=1, message=message)
+    source = _AttachFaultAtRun(_duckdb(tmp_path), at=1, message=message)
     answer, generator = _ask(source)
     _is_the_outage(answer)
     assert source.runs == 1, "the stopped statement ran again"
@@ -518,8 +518,97 @@ def test_a_cancel_or_timeout_in_another_language_ends_the_turn_and_is_not_run_ag
 
 @pytest.mark.parametrize("message", [_GERMAN_CANCEL, _GERMAN_TIMEOUT], ids=["cancel", "statement-timeout"])
 def test_deep_mode_does_not_run_a_stopped_statement_again_either(tmp_path, message):
-    source = _GermanAtRun(_duckdb(tmp_path), at=1, message=message)
+    source = _AttachFaultAtRun(_duckdb(tmp_path), at=1, message=message)
     answer, generator = _ask(source, candidates=5)
     _is_the_outage(answer)
     assert source.runs == 1
     assert answer.candidates_executed == 0
+
+
+# -- the driver's words never outweigh its type (Codex's fifth review of #179) ------------------
+#
+# The runner read "interrupt" anywhere in a fault's text as the timeout, before the cancel and the
+# outage. The attach's message quotes the statement, so a cancel or a dropped connection on a query
+# naming `service_interruptions` read as a timeout, the model's to repair, and the stopped statement
+# could run again. The text is now asked only of a fault nothing typed has claimed.
+
+_QUOTED = 'IO Error: Failed to execute query "SELECT id FROM service_interruptions": '
+_CANCEL_QUOTING = _QUOTED + "ERROR:  canceling statement due to user request"
+_DROP_QUOTING = _QUOTED + "server closed the connection unexpectedly"
+
+
+class _Attach:
+    """The attach's `execute_bounded` over a connection raising `message`, with DuckDB's own
+    classifier."""
+
+    def __init__(self, message):
+        self._message = message
+
+    def execute_arrow(self, sql, timeout_s=None):
+        from mnemiq.adapters.duckdb import execute_bounded
+
+        message = self._message
+
+        class Con:
+            def interrupt(self):
+                pass
+
+            def execute(self, q):
+                raise duckdb.IOException(message)
+
+        return execute_bounded(Con(), sql, timeout_s)
+
+    def source_unavailable(self, exc):
+        from mnemiq.adapters.duckdb import unavailable_fault
+
+        return unavailable_fault(exc)
+
+
+def test_a_cancel_quoting_a_statement_that_says_interrupt_is_still_the_cancel():
+    from mnemiq.execute.runner import QueryCancelledError
+
+    with pytest.raises(QueryCancelledError) as caught:
+        run(_Attach(_CANCEL_QUOTING), "SELECT id FROM service_interruptions", timeout_s=20)
+    assert "timed out" not in caught.value.message
+
+
+def test_a_drop_quoting_a_statement_that_says_interrupt_is_still_the_outage():
+    with pytest.raises(SourceUnavailableError):
+        run(_Attach(_DROP_QUOTING), "SELECT id FROM service_interruptions", timeout_s=20)
+
+
+def test_an_interrupt_nothing_typed_claims_is_still_read_as_the_timeout():
+    # The control: the words still decide where no type does, a driver or a wrapper raising an
+    # untyped error, and there the other reading is a rejection, repairable either way. A fault
+    # an adapter's classifier calls an outage is the outage first, whatever its words: DuckDB's
+    # IOException through the attach, a MySQL server's "Query execution was interrupted" among
+    # them if it arrives so (unmeasured).
+    class Untyped:
+        def execute_arrow(self, sql, timeout_s=None):
+            raise RuntimeError("Query execution was interrupted")
+
+    with pytest.raises(ExecutionError) as caught:
+        run(Untyped(), "SELECT 1", timeout_s=20)
+    assert "timed out after 20s" in caught.value.message, caught.value.message
+
+
+@pytest.mark.parametrize("candidates", [1, 5], ids=["single", "deep"])
+def test_a_cancel_quoting_interrupt_ends_the_turn_though_the_model_would_write_it_again(
+        tmp_path, monkeypatch, candidates):
+    monkeypatch.setattr(sys.modules[__name__], "_REPLIES", _SAME)
+    source = _AttachFaultAtRun(_duckdb(tmp_path), at=1, message=_CANCEL_QUOTING)
+    answer, generator = _ask(source, candidates=candidates)
+    _is_the_cancel(answer)
+    assert source.runs == 1, "the cancelled statement ran again"
+    assert len(generator.calls) == 1, generator.calls
+
+
+@pytest.mark.parametrize("candidates", [1, 5], ids=["single", "deep"])
+def test_a_drop_quoting_interrupt_ends_the_turn_and_is_not_run_again(
+        tmp_path, monkeypatch, candidates):
+    monkeypatch.setattr(sys.modules[__name__], "_REPLIES", _SAME)
+    source = _AttachFaultAtRun(_duckdb(tmp_path), at=1, message=_DROP_QUOTING)
+    answer, generator = _ask(source, candidates=candidates)
+    _is_the_outage(answer)
+    assert source.runs == 1, "the statement ran again after the source dropped it"
+    assert len(generator.calls) == 1, generator.calls

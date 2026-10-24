@@ -67,6 +67,13 @@ class ExecutionResult:
     elapsed_ms: float
 
 
+def _timed_out(timeout_s: float) -> ExecutionError:
+    return ExecutionError(
+        f"The query timed out after {timeout_s}s. Make it cheaper: fewer joins, "
+        "narrower filters, or an aggregate instead of raw rows."
+    )
+
+
 def run(adapter, sql: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> ExecutionResult:
     started = time.perf_counter()
     try:
@@ -78,14 +85,11 @@ def run(adapter, sql: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> ExecutionRes
         # somewhere in the string.
         raise
     except Exception as exc:
-        # The timeout first: DuckDB's classifier calls its interrupt unavailable, the proof seam's
-        # reading of a proof that never came back, and here it is the statement's cost.
-        if (isinstance(exc, QueryTimedOut) or "interrupt" in type(exc).__name__.lower()
-                or "interrupt" in str(exc).lower()):
-            raise ExecutionError(
-                f"The query timed out after {timeout_s}s. Make it cheaper: fewer joins, "
-                "narrower filters, or an aggregate instead of raw rows."
-            ) from exc
+        # The typed readings first. The timeout before the outage: DuckDB's classifier calls its
+        # interrupt unavailable, the proof seam's reading of a proof that never came back, and
+        # here it is the statement's cost.
+        if isinstance(exc, QueryTimedOut) or "interrupt" in type(exc).__name__.lower():
+            raise _timed_out(timeout_s) from exc
         if isinstance(exc, QueryCancelled):
             # Before the outage question, which the driver's classifier answers yes for its own
             # cancel: read as an outage, the statement someone stopped would be run again.
@@ -102,6 +106,13 @@ def run(adapter, sql: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> ExecutionRes
                 "source's error.",
                 source_detail=str(exc),
             ) from exc
+        # The words last, asked only of a fault nothing typed has claimed, where the other reading
+        # is a rejection and both are the model's to repair. A fault's text can quote the
+        # statement, so asked first they read a cancel or a dropped connection on a query naming
+        # `service_interruptions` as a timeout, and the stopped statement could run again (Codex's
+        # fifth review of #179).
+        if "interrupt" in str(exc).lower():
+            raise _timed_out(timeout_s) from exc
         raise ExecutionError("The source rejected this query.", source_detail=str(exc)) from exc
 
     elapsed = (time.perf_counter() - started) * 1000
