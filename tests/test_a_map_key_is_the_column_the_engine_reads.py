@@ -151,3 +151,19 @@ def test_an_arrow_outside_a_lambda_taker_is_the_json_extract_it_is():
     verdict = decide(sql, {**VISIBLE, "claim": VISIBLE["claim"] | {"attrs"}}, dialect="duckdb", target="duckdb")
     assert isinstance(verdict, Approved) and "attrs -> '$.a'" in verdict.target_sql, verdict
     assert con.execute(verdict.target_sql).fetchall() == rows == [("1x",)]
+
+
+def test_an_arrow_in_a_lambda_takers_list_slot_is_the_json_extract_too():
+    # The review gate on round 55: the taker check read the parent call and not the slot, so an
+    # arrow in the list argument of a taker kept its parameter and the hidden column's read went
+    # unseen (DuckDB reads the arrow there, then refuses the statement at bind for the types it
+    # has). The lambda's own slot, the second argument, is a lambda still.
+    for sql in ("SELECT list_transform(secret -> ['$'], x -> x) FROM claim",
+                "SELECT len(list_filter(secret -> ['$'], x -> 1 = 1)) FROM claim",
+                "SELECT list_reduce(secret -> ['$'], (a, b) -> a, 0) FROM claim"):
+        verdict = _decide(sql)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
+    con = _table()
+    sql = "SELECT list_transform(tags, x -> x) FROM claim"
+    assert con.execute(sql).fetchall() == [(["north"],)]
+    assert isinstance(_decide(sql), Approved)

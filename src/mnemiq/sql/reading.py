@@ -83,12 +83,17 @@ def lambda_takers() -> frozenset[str]:
 
 def arrow_read_as_a_lambda(node: exp.Expression) -> bool:
     """Whether sqlglot's Lambda is DuckDB's JSON arrow: a Lambda under anything but a call DuckDB
-    hands a lambda to."""
+    hands a lambda to, or in any slot of such a call but the lambda's own, the second argument
+    (`list_transform(secret -> ['$'], x -> x)` reads `secret` through the arrow in the list's
+    slot, where the parent alone said lambda: the review gate on round 55 of #160)."""
     if not isinstance(node, exp.Lambda):
         return False
     parent = node.parent
-    return not (isinstance(parent, LAMBDA_TAKER_NODES) or (
-        isinstance(parent, exp.Anonymous) and parent.name.lower() in lambda_takers()))
+    if isinstance(parent, LAMBDA_TAKER_NODES):
+        return node is not parent.args.get("expression") and node is not parent.args.get("merge")
+    if isinstance(parent, exp.Anonymous) and parent.name.lower() in lambda_takers():
+        return len(parent.expressions) < 2 or parent.expressions[1] is not node
+    return True
 
 
 def map_struct(node: exp.ToMap) -> exp.Struct | None:
