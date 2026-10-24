@@ -2029,7 +2029,16 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             owner = having[0] if len(having) == 1 else None
         return None if owner is None else types_of(owner).get(column.name.lower())
 
+    if engine == "duckdb":
+        # The filter itself is a boolean position: `region` alone converts the column.
+        kind = _type_of_value(wrapped.args["where"].this, type_of, engine)
+        if kind is not None and kind.this in exp.DataType.TEXT_TYPES:
+            return wrapped.args["where"].this
     for node in wrapped.args["where"].walk():
+        if engine == "duckdb":
+            text = _text_in_a_boolean_position(node, type_of, engine)
+            if text is not None:
+                return text
         if engine == "duckdb" and _is_union_extract(node) and not (
                 isinstance(node.expressions[1], exp.Literal) and node.expressions[1].is_string):
             return node.expressions[1]  # the TAG: a constant the engine resolves and the reader
@@ -2200,6 +2209,31 @@ def _spelled_for(node: exp.Expression, engine: str) -> str:
         except Exception:  # noqa: BLE001 -- a log line must not fail the refusal it describes
             continue
     return repr(node)
+
+
+def _text_in_a_boolean_position(node: exp.Expression, type_of, engine: str) -> exp.Expression | None:
+    """The text-typed operand DuckDB converts to BOOLEAN where `node` consumes a boolean: the sides
+    of AND and OR, NOT's operand, the left of IS TRUE and IS FALSE, an IF's condition (which a
+    searched CASE's WHEN arms are to the parser, so the walk meets them as IF nodes), and the
+    filter itself. Text that is no boolean's spelling raises on the row
+    (`region IS TRUE` over 'north': Codex's fifty-first review of #160), where a number converts
+    and `TRY_CAST(value AS BOOLEAN)` gives NULL; the validator's enumerated comparisons never saw
+    these positions. None where no operand is typed as text."""
+    if isinstance(node, (exp.And, exp.Or)):
+        operands = [node.this, node.expression]
+    elif isinstance(node, exp.Not):
+        operands = [node.this]
+    elif isinstance(node, exp.Is) and isinstance(node.expression, exp.Boolean):
+        operands = [node.this]
+    elif isinstance(node, exp.If):
+        operands = [node.this]
+    else:
+        return None
+    for operand in operands:
+        kind = _type_of_value(operand, type_of, engine)
+        if kind is not None and kind.this in exp.DataType.TEXT_TYPES:
+            return operand
+    return None
 
 
 def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:

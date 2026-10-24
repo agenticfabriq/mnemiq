@@ -1626,6 +1626,32 @@ def test_a_row_filter_the_target_cannot_print_is_the_policys_refusal():
     assert "policy" in verdict.message and not verdict.repairable, verdict
 
 
+def test_a_text_value_in_a_boolean_position_is_a_raising_conversion():
+    # Codex's fifty-first review of #160: DuckDB converts a value to BOOLEAN where a boolean is
+    # consumed, and text that is no boolean's spelling raises on the row, so `region IS TRUE` over
+    # 'north' failed every read and write of the table while both deciders approved it; the
+    # validator's enumerated comparisons never saw the sides of AND and OR, NOT's operand, IS TRUE,
+    # a CASE or IF condition, or the filter itself. A number converts, and TRY_CAST gives NULL.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, amount INT, big BIGINT, attrs JSON, d DATE); "
+                "INSERT INTO claim VALUES (1, 'north', 1, 1, '{\"a\": 1}', DATE '2026-01-01')")
+    for raising in ("region IS TRUE", "region IS FALSE", "region AND true", "region OR id = 1", "NOT region", "region",
+                    "CASE WHEN region THEN true ELSE false END", "IF(region, true, false)", "amount > 0 AND region"):
+        with pytest.raises(duckdb.Error, match="Could not convert string"):
+            con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
+        verdict = _decide(raising)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (raising, verdict)
+    grants = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}), row_filters={"claim": "region IS TRUE"})
+    verdict = decide_write("DELETE FROM claim WHERE id = 1", visible_schema(_snapshot(), grants), grants,
+                           policy=build_access_policy(_snapshot(), grants), dialect="duckdb", target="duckdb", writes_enabled=True)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    for safe, rows in (("id IS TRUE", [(1,)]), ("id AND true", [(1,)]), ("TRY_CAST(region AS BOOLEAN) IS TRUE", []),
+                       ("(region = 'north') IS TRUE", [(1,)]), ("region IS NULL", []), ("NOT region IS NULL", [(1,)]),
+                       ("CASE WHEN id > 0 THEN region END = 'north'", [(1,)])):
+        assert con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall() == rows, safe
+        assert isinstance(_decide(safe), Approved), safe
+
+
 def test_a_rendering_that_loses_a_try_cast_is_refused():
     # M217 (Codex's forty-ninth review of #160): sqlglot writes `TRY_CAST(region AS INT)` as `CAST` for
     # Postgres, MySQL and SQLite with no warning, so a row filter validated as a non-raising
