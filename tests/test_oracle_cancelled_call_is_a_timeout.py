@@ -74,7 +74,7 @@ class _Cursor:
     """A cursor whose execute raises, on a connection that takes a call timeout."""
 
     def __init__(self, raising):
-        self.connection = type("Connection", (), {"call_timeout": 0})()
+        self.connection = type("Connection", (), {"call_timeout": 0, "is_healthy": lambda self: True})()
         self._raising = raising
 
     def execute(self, sql):

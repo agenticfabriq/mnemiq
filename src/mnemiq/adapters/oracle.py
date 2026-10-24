@@ -320,12 +320,22 @@ class OracleAdapter:
             # put it back.
             with self._lock:
                 previous = self._con.call_timeout
+                # Bound or not: read-only, the lease's first call is `_cursor`'s rollback, a round
+                # trip on whatever bound the connection carries (Codex's review of #182).
+                _usable(self._con)
                 if timeout_ms:
-                    self._con.call_timeout = timeout_ms
+                    _set_call_timeout(self._con, timeout_ms)
                 try:
                     yield self._con
                 finally:
-                    self._con.call_timeout = previous
+                    # Never raising over the body's error, which is the caller's: a connection
+                    # the driver calls unhealthy is not restored, and the next lease refuses
+                    # it; one that refuses the restore keeps this lease's bound, the connection
+                    # being the caller's to reset and not this adapter's to drop.
+                    try:
+                        _set_call_timeout(self._con, previous)
+                    except Exception:
+                        pass
             return
         # Bounded by `wait_timeout`: DPY-4005 rather than an unbounded wait. Measured on a max=1
         # pool, which raised after the configured 1.5s instead of blocking.
@@ -350,12 +360,12 @@ class OracleAdapter:
             # pool hands back after a network fault -- was never released. Repeat that and the
             # pool runs out: one poisoned session becomes DPY-4005 for every healthy request,
             # which is M72's own failure mode reintroduced by M72's fix.
-            con.call_timeout = timeout_ms or 0
+            _set_call_timeout(con, timeout_ms or 0)
             self._recheck_read_only(con)
             yield con
         finally:
             try:
-                con.call_timeout = 0
+                _set_call_timeout(con, 0)
             except Exception:
                 # Two things this must not do: mask the body's exception, and skip the return.
                 # A bare `finally` did both -- a raise here replaced whatever the caller was
@@ -363,8 +373,11 @@ class OracleAdapter:
                 #
                 # DROPPED rather than released, because a connection that will not accept a
                 # timeout reset would go back into the pool carrying an unknown one, and the
-                # next borrower would inherit a bound nobody set. `drop` retires it and the pool
-                # opens a replacement.
+                # next borrower would inherit a bound nobody set. One the driver calls unhealthy
+                # lands here with no call made (`_usable`); the pool would drop it anyway, at
+                # return or the next acquire (python-oracledb 4.0.2's `_check_connection`), and
+                # `drop` hands the close to the pool's own thread. `drop` retires it and the
+                # pool opens a replacement.
                 self._pool.drop(con)
             else:
                 self._pool.release(con)
@@ -419,7 +432,7 @@ class OracleAdapter:
         cur = con.cursor()
         try:
             if self._probe_timeout_ms:
-                con.call_timeout = self._probe_timeout_ms
+                _set_call_timeout(con, self._probe_timeout_ms)
             cur.execute(self._READ_ONLY_DB_PROBE)
             cur.fetchall()
         except self._oracledb.DatabaseError as exc:
@@ -443,7 +456,7 @@ class OracleAdapter:
         finally:
             cur.close()
             try:
-                con.call_timeout = previous
+                _set_call_timeout(con, previous)
             except Exception:
                 pass  # the lease's own cleanup drops a connection it cannot reset
         self._ro_checked_at = now
@@ -1335,7 +1348,7 @@ class OracleAdapter:
 
         def _fetch(cur):
             if timeout_s is not None:
-                cur.connection.call_timeout = int(timeout_s * 1000)
+                _set_call_timeout(cur.connection, int(timeout_s * 1000))
             started[0] = time.monotonic()  # the call alone, not the lease's lock wait, its setup round trip or a DDL-race backoff (the gate on the second commit)
             cur.execute(sql)
             names = [d[0] for d in cur.description] if cur.description else []
@@ -1656,6 +1669,14 @@ class ReadOnlyViolation(RuntimeError):
     """A read-only adapter was asked to run something that is not a read."""
 
 
+class ConnectionUnusable(ConnectionError):
+    """The driver calls this connection unhealthy, so the adapter wrote no bound on it and did not
+    make the call the bound was for (`_usable`).
+
+    A `ConnectionError`, which `unavailable_fault` reads as the source's: the session could not
+    be asked."""
+
+
 _LEAD_COMMENT = re.compile(r"\A(?:\s+|--[^\n]*|/\*.*?\*/)+", re.S)
 _LEAD_WORD = re.compile(r"\A[A-Za-z_][A-Za-z_0-9]*")
 
@@ -1720,6 +1741,41 @@ def _is_ddl_race(exc: Exception) -> bool:
     if getattr(err, "code", None) == 1466 or getattr(err, "full_code", None) == "ORA-01466":
         return True
     return "ora-01466" in str(exc).lower()
+
+
+def _usable(con) -> None:
+    """Raise `ConnectionUnusable`, with no call made, when the driver calls `con` unhealthy.
+
+    python-oracledb 4.0.2 closes a connection itself when a call outlives `call_timeout` and the
+    server does not answer the break that follows within the same bound (DPY-4011, "socket timed
+    out while recovering from previous socket timeout"); measured on Oracle Free 23 in thin mode
+    with a query that was only slow, standalone and pooled alike. Setting `call_timeout` on that
+    connection dereferences the socket the driver dropped and segfaults: no `except` catches it,
+    and it ends the process for every caller.
+
+    `is_healthy()` is a local check, False for that dropped socket and also for a session the
+    server said it is ending while the socket stays open. Skipping only the write ran the next
+    statement unbounded on the second (the review gate on the first commit), and a ping to tell
+    the two apart runs under whatever bound the connection already carries, which can be none
+    (Codex's review of #182). So neither gets the write nor the call it was about to bound: the
+    session is gone or going, and the caller hears it as the source's. What this holds is that
+    no `call_timeout` write reaches an unhealthy connection and no bound is skipped. A session
+    the server starts ending between two checks still gets the calls that come before the next
+    one (`_cursor`'s rollback and SET TRANSACTION READ ONLY, the read-only probe, a query asked
+    for with no bound), each under whatever bound is already in force on the connection, as
+    before this guard (Codex's second review of #182).
+    """
+    if not con.is_healthy():
+        raise ConnectionUnusable(
+            "the Oracle driver reports this connection unhealthy, so the adapter wrote no bound "
+            "and did not make the call it was for")
+
+
+def _set_call_timeout(con, ms: int) -> None:
+    """Set `con.call_timeout` on a connection `_usable` passes. Every write of `call_timeout` in
+    this file goes through here, and a test holds it to that."""
+    _usable(con)
+    con.call_timeout = ms
 
 
 # The codes a bounded call's end takes, by the driver's own error list (python-oracledb

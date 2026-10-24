@@ -37,6 +37,9 @@ class _FakeConnection:
     def rollback(self):
         pass
 
+    def is_healthy(self):
+        return True  # read before every timeout write (`_set_call_timeout`), as a real one has it
+
     def cursor(self):
         self.cursors += 1
         return _FakeCursor(self)
