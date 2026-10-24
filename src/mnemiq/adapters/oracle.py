@@ -325,8 +325,10 @@ class OracleAdapter:
                 try:
                     yield self._con
                 finally:
-                    # Never raising over the body's error: a connection the driver closed says
-                    # so on its next call.
+                    # Never raising over the body's error, which is the caller's: a connection
+                    # the driver closed says so on its next call, and one that refuses the
+                    # restore keeps this lease's bound, the connection being the caller's to
+                    # reset and not this adapter's to drop.
                     try:
                         _set_call_timeout(self._con, previous)
                     except Exception:
@@ -360,20 +362,27 @@ class OracleAdapter:
             yield con
         finally:
             try:
-                _set_call_timeout(con, 0)
+                # An unhealthy connection is dropped with no round trip. The pool would drop it
+                # anyway, a dropped socket on return and a session the server is ending at the
+                # next acquire (python-oracledb 4.0.2's `_check_connection`), and pinging it to
+                # reset a bound nobody will use could stall on that session (the review gate on
+                # the second commit).
+                reusable = con.is_healthy()
+                if reusable:
+                    _set_call_timeout(con, 0)
             except Exception:
                 # Two things this must not do: mask the body's exception, and skip the return.
                 # A bare `finally` did both -- a raise here replaced whatever the caller was
                 # already failing with, and jumped over `release`.
-                #
+                reusable = False
+            if reusable:
+                self._pool.release(con)
+            else:
                 # DROPPED rather than released, because a connection that will not accept a
                 # timeout reset would go back into the pool carrying an unknown one, and the
-                # next borrower would inherit a bound nobody set; one the driver closed lands
-                # here too, without the write that would have ended the process
-                # (`_set_call_timeout`). `drop` retires it and the pool opens a replacement.
+                # next borrower would inherit a bound nobody set. `drop` retires it and the pool
+                # opens a replacement.
                 self._pool.drop(con)
-            else:
-                self._pool.release(con)
 
     def _recheck_read_only(self, con) -> None:
         """Re-probe the database's open mode on a bounded cadence, and say so when it lapses.

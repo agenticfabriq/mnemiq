@@ -44,6 +44,7 @@ class _Connection:
         object.__setattr__(self, "socket", healthy if socket is None else socket)
         object.__setattr__(self, "written_while_closed", [])
         object.__setattr__(self, "written", [])
+        object.__setattr__(self, "pings", 0)
         object.__setattr__(self, "call_timeout", 0)
 
     def __setattr__(self, name, value):
@@ -63,6 +64,7 @@ class _Connection:
             raise oracledb.InterfaceError("DPY-1001: not connected to database")
 
     def ping(self):
+        object.__setattr__(self, "pings", self.pings + 1)
         self._require_socket()
 
     def rollback(self):
@@ -151,12 +153,21 @@ def test_a_connection_unhealthy_with_its_socket_open_is_still_bounded():
     # `is_healthy()` is also False for a session the server said it is ending while the socket
     # stays open. The write is safe there, and skipping it ran the statement unbounded.
     con = _Connection(healthy=False, socket=True)
+    borrowed = OracleAdapter.over(con, oracledb, schema="APP", read_only=False)
+    assert borrowed.execute_arrow("SELECT 1 FROM dual", timeout_s=2.0).num_rows == 1
+    assert con.written == [2000, 0]
+
+
+def test_an_unhealthy_pooled_connection_is_dropped_with_no_round_trip_at_its_reset():
+    # The pool drops it anyway, on return or at the next acquire, and a ping to reset a bound
+    # nobody will use could stall on a session the server is ending (the review gate on the
+    # second commit). The lease's own bound still reaches it.
+    con = _Connection(healthy=False, socket=True)
     adapter = _pooled(con)
     with adapter._lease(timeout_ms=1000) as leased:
         assert leased.call_timeout == 1000
-    borrowed = OracleAdapter.over(con, oracledb, schema="APP", read_only=False)
-    assert borrowed.execute_arrow("SELECT 1 FROM dual", timeout_s=2.0).num_rows == 1
-    assert con.written == [1000, 0, 2000, 0]
+    assert con.written == [1000] and con.pings == 1, "the reset pinged or wrote"
+    assert adapter._pool.dropped == [con] and adapter._pool.released == []
 
 
 def test_a_borrowed_connection_closed_during_the_lease_is_not_written_back():
@@ -220,7 +231,8 @@ def _could_name_the_timeout(name, constants) -> bool:
 def test_every_call_timeout_write_in_the_adapter_goes_through_the_guard():
     # The next write added beside these would bring the crash back, and no test above would see
     # a site it does not drive: every assignment to `.call_timeout`, under either of the driver's
-    # names or through `setattr`, sits inside the one function that checks the connection first.
+    # names or through `setattr` or `__setattr__`, sits inside the one function that checks the
+    # connection first. A `setattr` bound to another name is beyond it.
     tree = ast.parse(inspect.getsource(oracle_module))
     # The module's own constants, so `setattr(exc, _ACQUIRE_FAULT, True)` reads as what it is.
     constants = {
@@ -246,6 +258,13 @@ def test_every_call_timeout_write_in_the_adapter_goes_through_the_guard():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
         and node.func.id == "setattr" and len(node.args) >= 2
         and _could_name_the_timeout(node.args[1], constants)
+    ] + [
+        (node.lineno, owners.get(id(node)))   # `object.__setattr__`, `con.__setattr__`
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "__setattr__" and len(node.args) >= 2
+        # the name is the second of three arguments on `object`, the first of two on the instance
+        and _could_name_the_timeout(node.args[1 if len(node.args) >= 3 else 0], constants)
     ]
     assert writes, "no write found: the walk is not reading the adapter"
     assert {owner for _, owner in writes} == {"_set_call_timeout"}, writes
