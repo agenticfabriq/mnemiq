@@ -8,7 +8,10 @@ follows the scope's own answer.
 
 from __future__ import annotations
 
+import sqlite3
+
 import duckdb
+import pytest
 import sqlglot
 
 from mnemiq.sql.values_check import check_values
@@ -355,6 +358,40 @@ def test_a_natural_join_leaves_the_names_it_does_not_merge_alone():
         assert con.execute(sql).fetchall() == [(0,)], sql
         verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index())
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    # A comma binds more loosely than JOIN on DuckDB, so a source before it is no part of the FULL
+    # join's left input even where it holds the name (the review gate on round 15: `v` among the
+    # owners made them differ, and these skipped where main refused)
+    for sql in ("SELECT count(*) FROM v, t FULL JOIN t AS b USING (doc) WHERE doc = 'west'",
+                "SELECT count(*) FROM (SELECT region AS doc FROM t) AS q, t FULL JOIN t AS b USING (doc) WHERE doc = 'west'"):
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    # SQLite binds a comma like JOIN: the same statement is an ambiguous USING there, the parser
+    # reads that comma as the CROSS JOIN it is, and the check keeps the sources before the join in
+    # its left input, answering nothing
+    lite = sqlite3.connect(":memory:")
+    lite.executescript("CREATE TABLE t (doc TEXT, region TEXT); INSERT INTO t VALUES ('a', 'west'), ('b', 'east'); "
+                       "CREATE TABLE v (doc TEXT, k INTEGER, name TEXT); INSERT INTO v VALUES ('west', 1, 'n')")
+    sql = "SELECT count(*) FROM v, t FULL JOIN t AS b USING (doc) WHERE doc = 'west'"
+    with pytest.raises(sqlite3.OperationalError, match="ambiguous"):
+        lite.execute(sql)
+    assert check_values(sqlglot.parse_one(sql, read="sqlite"), visible, _Index(), dialect="sqlite") is None
+    # MySQL takes a bare JOIN, which binds like any JOIN and reads as the node of a comma, so there the
+    # sources before it stay in the next join's left input: the merged `doc` is the left input's,
+    # `t.doc` (the review gate on round 16; MySQL's grammar as documented, not measured here). Oracle's
+    # CROSS APPLY reads as the node of a comma before a LATERAL, the same.
+    for sql, engine in (("SELECT count(*) FROM t JOIN w NATURAL LEFT JOIN (SELECT region AS doc FROM t) AS q WHERE doc = 'west'", "mysql"),
+                        ("SELECT count(*) FROM t CROSS APPLY (SELECT 1 AS k FROM dual) q FULL JOIN t b USING (doc) WHERE doc = 'west'", "oracle")):
+        verdict = check_values(sqlglot.parse_one(sql, read=engine), visible, _Index(), dialect=engine)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    # A NATURAL join whose left input cannot hold the name under the grant makes the name its right
+    # side's, and a FULL join before it is superseded (the review gate on round 15: the FULL join's
+    # stale inputs answered nothing where the inner join's merged values are the right side's)
+    hidden = {**visible, "v": {"k", "name"}}
+    sql = "SELECT count(*) FROM v FULL JOIN v AS b USING (doc) NATURAL JOIN (SELECT doc FROM t) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
     sql = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT name FROM u) AS a NATURAL JOIN v AS b WHERE doc = 'west')"
     assert con.execute(sql).fetchall() == [(2,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None

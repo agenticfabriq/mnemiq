@@ -260,6 +260,17 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     return None
 
 
+# The engines on which a join the parser gives no kind, side, method, ON or USING can only be a
+# comma, which binds more loosely than JOIN: a bare JOIN and an APPLY are syntax errors on DuckDB
+# (measured on 1.5.4), and Postgres documents the same grammar. MySQL takes a bare JOIN, which
+# binds like any JOIN and reads as the same node (the review gate on round 16: `t JOIN w NATURAL
+# LEFT JOIN (SELECT region AS doc FROM t) q` compares `t.doc` there), and Oracle takes CROSS and
+# OUTER APPLY, which read as the node of a comma before a LATERAL; on both the sources before such
+# a join stay its left input. SQLite binds a comma like JOIN, and the parser types its joins (a
+# comma a CROSS JOIN, a bare JOIN `ON TRUE`), so the node never arises there.
+_COMMA_BINDS_LOOSER = frozenset({"duckdb", "postgres", "postgresql"})
+
+
 def check_values(
     ast: exp.Expression,
     visible: dict[str, set[str]],
@@ -355,8 +366,16 @@ def check_values(
         left = [from_.this.alias_or_name] if from_ is not None else []
         narrowed = False  # a join made the name one side's
         full_sides = None  # a FULL join's two inputs, by alias: both stay, one answer where they agree
+        comma_starts_an_input = (dialect or "").lower() in _COMMA_BINDS_LOOSER
         for join in scope.expression.args.get("joins") or []:
             right = join.this.alias_or_name
+            if comma_starts_an_input and not any(join.args.get(k) for k in ("side", "kind", "method", "on", "using")):
+                # A comma binds more loosely than JOIN, so it begins a new left input: `v, t FULL
+                # JOIN t b USING (doc)` compares `coalesce(t.doc, b.doc)`, and with `v` among the
+                # join's left input the owners differed and the scope skipped where main refused
+                # (the review gate on round 15).
+                left = [right]
+                continue
             if (join.method or "").upper() == "NATURAL":
                 right_may = right not in scope.selected_sources or _may_hold(
                     scope.selected_sources[right][1], wanted, dialect, visible)
@@ -367,6 +386,7 @@ def check_values(
                            for a in candidates if a in left and a in scope.selected_sources):
                     candidates = [right]
                     narrowed = True
+                    full_sides = None  # the name is the right side's alone; a FULL join before it is superseded
                     left.append(right)
                     continue
             elif not any(_written(key, dialect) == wanted for key in (join.args.get("using") or ())):
