@@ -49,6 +49,7 @@ import threading
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.errors import ErrorLevel
 from sqlglot.tokens import TokenType
 
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -256,7 +257,15 @@ def unprintable(target: str, exc: Exception, *, policys: bool, tree: exp.Express
                    subject=target)
 
 
+# A construct the target's generator cannot render raises rather than printing a blank: at the
+# default level sqlglot logs `MAP_FROM_ENTRIES unsupported` and writes `SELECT  AS m FROM claim`
+# for Postgres, a statement that is not the one decided (M216, Codex's forty-eighth review of
+# #160); raised, it is the unprintable refusal.
+UNSUPPORTED_RAISES = {"unsupported_level": ErrorLevel.RAISE}
+
+
 def rendered(sql: str, read: str, write: str) -> str:
     """`sql`'s round trip into the target dialect, sqlglot's `transpile` with the re-reading
-    between the parse and the render, so the statement run is the statement read."""
-    return as_duckdb_reads(sqlglot.parse_one(sql, read=read)).sql(dialect=write)
+    between the parse and the render, so the statement run is the statement read; a construct
+    the target cannot render raises (`UNSUPPORTED_RAISES`)."""
+    return as_duckdb_reads(sqlglot.parse_one(sql, read=read)).sql(dialect=write, **UNSUPPORTED_RAISES)

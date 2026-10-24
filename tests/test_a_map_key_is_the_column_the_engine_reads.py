@@ -154,6 +154,23 @@ def test_a_map_key_the_target_cannot_print_is_refused_not_raised():
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNPRINTABLE_FOR_TARGET, (target, verdict)
 
 
+def test_a_construct_the_target_cannot_render_is_refused_not_blanked():
+    # M216 (Codex's forty-eighth review of #160, a side note): sqlglot's Postgres generator has no
+    # `map_from_entries`, logged it as unsupported and wrote `SELECT  AS m FROM claim`, a statement
+    # that is not the one decided, which the decider approved. Told to raise, the generator's
+    # refusal is the unprintable one, without the MAP advice since the statement holds no literal;
+    # a lambda Postgres renders is approved as before, and DuckDB runs the call as written.
+    con = _table()
+    sql = "SELECT map_from_entries([{'k': 'a', 'v': 1}]) AS m FROM claim"
+    assert con.execute(sql).fetchall() == [({'a': 1},)]
+    verdict = decide(sql, VISIBLE, dialect="duckdb", target="postgres")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNPRINTABLE_FOR_TARGET, verdict
+    assert "MAP literal" not in verdict.message and "postgres" in verdict.message, verdict
+    assert isinstance(decide(sql, VISIBLE, dialect="duckdb", target="duckdb"), Approved)
+    verdict = decide("SELECT list_transform(tags, x -> x || 'a') FROM claim", VISIBLE, dialect="duckdb", target="postgres")
+    assert isinstance(verdict, Approved) and "TRANSFORM(" in verdict.target_sql, verdict
+
+
 def test_the_unprintable_advice_names_the_map_literal_only_where_the_statement_holds_one():
     # The review gate on rounds 61 and 62: the row-cap fallback's re-read and the write decider's
     # plain re-parse reach the same refusal with sqlglot's own errors, and advice about a MAP
