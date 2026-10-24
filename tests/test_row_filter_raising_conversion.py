@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 
 import duckdb
 import pytest
@@ -1623,6 +1624,42 @@ def test_a_row_filter_the_target_cannot_print_is_the_policys_refusal():
                            writes_enabled=True)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.POLICY_TARGET_UNSUPPORTED, verdict
     assert "policy" in verdict.message and not verdict.repairable, verdict
+
+
+def test_a_rendering_that_loses_a_try_cast_is_refused():
+    # M217 (Codex's forty-ninth review of #160): sqlglot writes `TRY_CAST(region AS INT)` as `CAST` for
+    # Postgres, MySQL and SQLite with no warning, so a row filter validated as a non-raising
+    # conversion ran as a raising one there, and on SQLite, whose CAST gives 0 for text it cannot
+    # read, admitted the row the filter excluded. The rendering is re-read in the target's dialect,
+    # and a lost TRY_CAST is the render step's refusal: the policy's where the filter brought it, the
+    # statement's where the statement did. DuckDB keeps it and runs it as written.
+    lite = sqlite3.connect(":memory:")
+    lite.executescript("CREATE TABLE claim (id INTEGER, region TEXT); INSERT INTO claim VALUES (1, 'north')")
+    assert lite.execute("SELECT id FROM claim WHERE CAST(region AS INTEGER) IS NOT NULL").fetchall() == [(1,)]  # the drift admits the row
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, region VARCHAR); INSERT INTO claim VALUES (1, 'north')")
+    assert con.execute("SELECT id FROM claim WHERE TRY_CAST(region AS INT) IS NOT NULL").fetchall() == []
+    types = {**TYPES, ("claim", "tags"): "VARCHAR[]"}
+    grants = GrantSet(frozenset({"claim"}), row_filters={"claim": "TRY_CAST(region AS INT) IS NOT NULL"})
+    for engine in ("postgres", "mysql", "sqlite"):
+        verdict = decide("SELECT id FROM claim", visible_schema(_snapshot(types), grants), dialect="duckdb",
+                        target=engine, policy=build_access_policy(_snapshot(types), grants))
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.POLICY_TARGET_UNSUPPORTED, (engine, verdict)
+        verdict = decide("SELECT TRY_CAST(region AS INT) AS r FROM claim", visible_schema(_snapshot(types), GrantSet(frozenset({"claim"}))),
+                        dialect="duckdb", target=engine)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNPRINTABLE_FOR_TARGET and "TRY_CAST" in verdict.message, (engine, verdict)
+        # the row-cap fallback renders the same way (sqlglot cannot parse the cap after ROLLUP)
+        verdict = decide("SELECT TRY_CAST(region AS INT) AS r, count(*) AS n FROM claim GROUP BY ROLLUP (region)",
+                        visible_schema(_snapshot(types), GrantSet(frozenset({"claim"}))), dialect="duckdb", target=engine)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNPRINTABLE_FOR_TARGET, (engine, verdict)
+    verdict = decide("SELECT id FROM claim", visible_schema(_snapshot(types), grants), dialect="duckdb",
+                    target="duckdb", policy=build_access_policy(_snapshot(types), grants))
+    assert isinstance(verdict, Approved) and "TRY_CAST(region AS INT)" in verdict.target_sql, verdict
+    # and the capped ROLLUP twin stays approved on DuckDB: the check re-reads the uncapped render, the
+    # capped one being the text sqlglot cannot parse (the review gate on round 68)
+    verdict = decide("SELECT TRY_CAST(region AS INT) AS r, count(*) AS n FROM claim GROUP BY ROLLUP (region)",
+                    visible_schema(_snapshot(types), GrantSet(frozenset({"claim"}))), dialect="duckdb", target="duckdb")
+    assert isinstance(verdict, Approved) and "TRY_CAST" in verdict.target_sql and "ROLLUP" in verdict.target_sql, verdict
 
 
 def test_a_raising_filter_the_target_cannot_print_is_still_refused_not_raised():

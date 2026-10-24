@@ -49,7 +49,7 @@ import threading
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import ErrorLevel
+from sqlglot.errors import ErrorLevel, UnsupportedError
 from sqlglot.tokens import TokenType
 
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -252,6 +252,9 @@ def unprintable(target: str, exc: Exception, *, policys: bool, tree: exp.Express
                        subject=target)
     advice = (" The likely cause is a MAP literal keyed by a column or a lambda's parameter, which that engine's "
               "printer cannot name; spell the lookup without one." if tree.find(exp.ToMap) is not None else "")
+    if isinstance(exc, LostTryCast):
+        advice += (f" TRY_CAST has no rendering on {target}; write the conversion in the form that engine cannot "
+                   "fail on.")
     return Refusal(code=RefusalCode.UNPRINTABLE_FOR_TARGET,
                    message=f"The statement cannot be printed for the {target} engine; spell it as that engine reads it.{advice}",
                    subject=target)
@@ -264,8 +267,30 @@ def unprintable(target: str, exc: Exception, *, policys: bool, tree: exp.Express
 UNSUPPORTED_RAISES = {"unsupported_level": ErrorLevel.RAISE}
 
 
+class LostTryCast(UnsupportedError):
+    """The rendering wrote a TRY_CAST as CAST: `kept`'s own error, so the refusal's advice can name it."""
+
+
+def kept(tree: exp.Expression, text: str, target: str) -> str:
+    """`text`, the tree rendered for the target, where the rendering kept every TRY_CAST: sqlglot
+    writes `CAST` for the engines that lack it (Postgres, MySQL and SQLite among ours; Snowflake and
+    ClickHouse the same) with no warning, so a row filter validated as a
+    non-raising conversion ran as a raising one there, and on SQLite, whose CAST gives 0 for text
+    it cannot read, as one admitting the row the filter excluded (M217, Codex's forty-ninth review
+    of #160). Measured by re-reading the text in the target's dialect and counting its TRY_CAST
+    nodes against the tree's; fewer raises sqlglot's own error, which the render step refuses on.
+    Oracle keeps the spelling, which that engine then refuses to run (it has CAST ... DEFAULT NULL
+    ON CONVERSION ERROR), and the proof step reports that refusal."""
+    wanted = sum(1 for _ in tree.find_all(exp.TryCast))
+    if wanted and sum(1 for _ in sqlglot.parse_one(text, read=target).find_all(exp.TryCast)) < wanted:
+        raise LostTryCast(f"TRY_CAST has no rendering for {target}: its non-raising conversion would run as CAST")
+    return text
+
+
 def rendered(sql: str, read: str, write: str) -> str:
     """`sql`'s round trip into the target dialect, sqlglot's `transpile` with the re-reading
     between the parse and the render, so the statement run is the statement read; a construct
-    the target cannot render raises (`UNSUPPORTED_RAISES`)."""
-    return as_duckdb_reads(sqlglot.parse_one(sql, read=read)).sql(dialect=write, **UNSUPPORTED_RAISES)
+    the target cannot render raises (`UNSUPPORTED_RAISES`), and so does a rendering that loses a
+    TRY_CAST (`kept`)."""
+    tree = as_duckdb_reads(sqlglot.parse_one(sql, read=read))
+    return kept(tree, tree.sql(dialect=write, **UNSUPPORTED_RAISES), write)

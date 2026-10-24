@@ -17,7 +17,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import ViewDefinition
 from mnemiq.sql.decide import decide
 from mnemiq.sql.decide_write import decide_write
-from mnemiq.sql.reading import dotted_map_keys, unprintable
+from mnemiq.sql.reading import LostTryCast, dotted_map_keys, unprintable
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import body_of
@@ -194,6 +194,10 @@ def test_the_unprintable_advice_names_the_map_literal_only_where_the_statement_h
         assert bare.code is RefusalCode.UNPRINTABLE_FOR_TARGET and "MAP" not in bare.message and "postgres" in bare.message
     policys = unprintable("oracle", ValueError("x"), policys=True, tree=with_map)
     assert policys.code is RefusalCode.POLICY_TARGET_UNSUPPORTED and not policys.repairable and "oracle" in policys.message
+    # the TRY_CAST advice follows the check's own error, not the tree (the review gate on round 68)
+    with_try = sqlglot.parse_one("SELECT TRY_CAST(region AS INT) FROM claim", read="duckdb")
+    assert "TRY_CAST" in unprintable("postgres", LostTryCast("x"), policys=False, tree=with_try).message
+    assert "TRY_CAST" not in unprintable("postgres", ValueError("x"), policys=False, tree=with_try).message
 
 
 def test_an_arrow_outside_a_lambda_taker_is_no_lambda():
