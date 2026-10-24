@@ -140,7 +140,7 @@ def dotted_map_keys(sql: str, dialect: str | None) -> list[str]:
         frame = stack[-1]
         if kind == TokenType.COLON and frame[1] is not None:
             if _dotted_chain(frame[1]):
-                found.append(".".join(k.text for k in frame[1][::2]))
+                found.append(".".join(_spelled(k) for k in frame[1][::2]))
             frame[1] = None
         elif kind == TokenType.COMMA:
             frame[1] = []
@@ -149,7 +149,23 @@ def dotted_map_keys(sql: str, dialect: str | None) -> list[str]:
     return found
 
 
-_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+# An unquoted identifier as the tokenizer reads one: a letter or an underscore, then word characters,
+# in any script (`é`, `λ`: Codex's forty-fifth review of #160 found an ASCII-only class letting
+# `MAP {é.region: 1}` through), the dollar sign DuckDB allows included. A string literal is none.
+_NAME = re.compile(r"^[^\W\d][\w$]*$")
+_LITERALS = (TokenType.STRING, TokenType.NUMBER, TokenType.NATIONAL_STRING, TokenType.RAW_STRING,
+             TokenType.HEREDOC_STRING, TokenType.BYTE_STRING, TokenType.BIT_STRING, TokenType.HEX_STRING,
+             TokenType.UNICODE_STRING)
+
+
+def _is_name(token) -> bool:
+    return token.token_type == TokenType.IDENTIFIER or (
+        token.token_type not in (TokenType.DOT, *_LITERALS) and _NAME.match(token.text) is not None)
+
+
+def _spelled(token) -> str:
+    """A name as written: a quoted identifier with its quotes, so the advice parses."""
+    return '"' + token.text.replace('"', '""') + '"' if token.token_type == TokenType.IDENTIFIER else token.text
 
 
 def _dotted_chain(key: list) -> bool:
@@ -158,8 +174,7 @@ def _dotted_chain(key: list) -> bool:
     if len(key) < 3 or len(key) % 2 == 0:
         return False
     names, dots = key[::2], key[1::2]
-    return all(d.token_type == TokenType.DOT for d in dots) and all(
-        n.token_type != TokenType.DOT and (n.token_type == TokenType.IDENTIFIER or _NAME.match(n.text)) for n in names)
+    return all(d.token_type == TokenType.DOT for d in dots) and all(_is_name(n) for n in names)
 
 
 def map_struct(node: exp.ToMap) -> exp.Struct | None:

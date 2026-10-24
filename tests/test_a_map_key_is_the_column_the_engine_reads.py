@@ -16,6 +16,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import ViewDefinition
 from mnemiq.sql.decide import decide
 from mnemiq.sql.decide_write import decide_write
+from mnemiq.sql.reading import dotted_map_keys
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import body_of
@@ -199,3 +200,34 @@ def test_a_dotted_map_key_is_refused_before_the_parse_loses_it():
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNMODELLED_CALL, verdict
     assert body_of(ViewDefinition(object_id="v", dialect="duckdb",
                                   definition="SELECT list_transform([{region: 'south'}], e -> MAP {e.region: 1}[region]) AS k FROM claim")) is None
+
+
+@pytest.mark.parametrize("sql, keys", [
+    ("MAP {x.region: 1}[region]", ["x.region"]),
+    ("MAP {\"x\".region: 1}", ['"x".region']),
+    ("MAP {\u00e9.region: 1}", ["\u00e9.region"]),            # Codex's forty-fifth review: an ASCII-only class let it through
+    ("MAP {\u03bb.a.b: 1}", ["\u03bb.a.b"]),
+    ("MAP {a.b.c: MAP {d.e: 1}}", ["a.b.c", "d.e"]),
+    ("MAP {'a.b': 1, x.y: 2}", ["x.y"]),
+    ("MAP {(x.region): 1}", []),
+    ("MAP {x[1].f: 1}", []),
+    ("MAP {x.f(1): 1}", []),
+    ("MAP {claim.region::VARCHAR: 1}", []),
+    ("MAP {CASE WHEN x.a THEN 1 END: 1}", []),
+    ("MAP {'a'.b: 1}", []),                                       # a string literal is no name (the gate on round 57)
+    ("{x.region: 1}", []),                                        # a struct's key DuckDB refuses itself
+])
+def test_the_dotted_keys_the_parse_loses_are_read_off_the_text(sql, keys):
+    assert dotted_map_keys(sql, "duckdb") == keys
+
+
+def test_a_unicode_dotted_map_key_is_refused_too():
+    # Codex's forty-fifth review of #160: `MAP {\u00e9.region: 1}` under `\u00e9 -> ...` passed the text check,
+    # whose name class was ASCII, and was installed as `MAP {region: 1}`, the policy reversed.
+    con = _table()
+    sql = "SELECT list_transform([{region: 'south'}], \u00e9 -> MAP {\u00e9.region: 1}[region]) FROM claim"
+    assert con.execute(sql).fetchall() == [([None],)]
+    verdict = _decide(sql)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNMODELLED_CALL and "\u00e9.region" in verdict.message, verdict
+    verdict = _decide("SELECT MAP {\"my col\".region: 1}['k'] FROM claim")
+    assert isinstance(verdict, Refusal) and 'MAP {("my col".region): ...}' in verdict.message, verdict

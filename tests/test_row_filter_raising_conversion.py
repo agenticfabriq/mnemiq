@@ -1608,10 +1608,11 @@ def test_a_dotted_map_key_in_a_row_filter_is_no_predicate():
     con.execute("CREATE TABLE claim(id INT, region VARCHAR, amount INT, big BIGINT, attrs JSON, d DATE, tags VARCHAR[]); "
                 "INSERT INTO claim VALUES (1, 'north', 1, 1, '{\"a\": 1}', DATE '2026-01-01', ['north'])")
     types = {**TYPES, ("claim", "tags"): "VARCHAR[]"}
-    dotted = "list_transform([{region: 'south'}], x -> MAP {x.region: 1}[region] IS NULL) = [false]"
-    assert con.execute(f"SELECT id FROM claim WHERE {dotted}").fetchall() == []
-    verdict = _decide(dotted, snapshot=_snapshot(types))
-    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    for dotted in ("list_transform([{region: 'south'}], x -> MAP {x.region: 1}[region] IS NULL) = [false]",
+                   "list_transform([{region: 'south'}], \u00e9 -> MAP {\u00e9.region: 1}[region] IS NULL) = [false]"):  # Codex's forty-fifth
+        assert con.execute(f"SELECT id FROM claim WHERE {dotted}").fetchall() == [], dotted
+        verdict = _decide(dotted, snapshot=_snapshot(types))
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (dotted, verdict)
     kept = "list_transform([{region: 'south'}], x -> MAP {(x.region): 1}[region] IS NULL) = [false]"
     assert con.execute(f"SELECT id FROM claim WHERE {kept}").fetchall() == []
     verdict = _decide(kept, snapshot=_snapshot(types))
