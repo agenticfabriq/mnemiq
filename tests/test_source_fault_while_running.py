@@ -193,7 +193,7 @@ def oracle():
         bare._oracledb = oracledb
 
         class Cursor:
-            connection = type("Connection", (), {"call_timeout": 0})()
+            connection = type("Connection", (), {"call_timeout": 0, "is_healthy": lambda self: True})()
 
             def execute(self, sql):
                 raising()

@@ -331,6 +331,59 @@ def test_the_timeout_is_not_left_behind_when_the_cursor_cannot_be_acquired():
         assert con.call_timeout == 0, "a failed acquisition left the pooled connection bounded"
 
 
+# Slow and nothing else: 0.4 s a row for eight rows, under a 1 s bound. The server does not answer
+# the driver's break within the bound either, so the driver closes the connection (DPY-4011).
+_SLOW = ("WITH FUNCTION slow(n NUMBER) RETURN NUMBER IS BEGIN DBMS_SESSION.SLEEP(0.4); RETURN n; "
+         "END; SELECT slow(level) AS n FROM dual CONNECT BY level <= 8")
+
+_TIME_OUT_THEN_ASK_AGAIN = """
+import os, sys
+import oracledb
+from mnemiq.adapters.oracle import OracleAdapter
+dsn, user, pw = (os.environ[f"MNEMIQ_ORACLE_TEST_{k}"] for k in ("DSN", "USER", "PASSWORD"))
+if sys.argv[1] == "pooled":
+    adapter = OracleAdapter(dsn=dsn, user=user, password=pw)
+else:
+    adapter = OracleAdapter.over(oracledb.connect(user=user, password=pw, dsn=dsn), oracledb, schema=user)
+try:
+    adapter.execute_arrow(sys.argv[2], timeout_s=1.0)
+    print("first: no fault")
+except Exception as exc:
+    driver = exc if isinstance(exc, oracledb.Error) else exc.__cause__
+    print("first:", driver.args[0].full_code)
+try:
+    print("then:", adapter.execute_arrow("SELECT 1 FROM dual").num_rows, "row")
+except Exception as exc:
+    print("then:", exc.args[0].full_code if isinstance(exc, oracledb.Error) else type(exc).__name__)
+"""
+
+
+@pytest.mark.parametrize("shape, then", [("pooled", "then: 1 row"),
+                                         ("borrowed", "then: ConnectionUnusable")])
+def test_a_timeout_that_closes_the_connection_does_not_end_the_process(shape, then):
+    """python-oracledb 4.0.2 segfaults when `call_timeout` is set on a connection it closed after
+    an unanswered break, and the lease set it in its cleanup: one slow query ended the process for
+    every caller. In a subprocess, so the crash is this test's failure rather than the suite's
+    end. A pool replaces the closed connection; a borrowed one is the caller's, and the next call
+    is refused without touching it, as the source's."""
+    import subprocess
+    import sys
+
+    import mnemiq
+
+    env = {**os.environ, "MNEMIQ_ORACLE_TEST_DSN": DSN, "MNEMIQ_ORACLE_TEST_USER": USER,
+           "MNEMIQ_ORACLE_TEST_PASSWORD": PASSWORD,
+           # the code under test, whatever the subprocess's own path would find
+           "PYTHONPATH": os.path.dirname(os.path.dirname(mnemiq.__file__))}
+    run = subprocess.run([sys.executable, "-c", _TIME_OUT_THEN_ASK_AGAIN, shape, _SLOW],
+                         capture_output=True, text=True, timeout=120, env=env)
+    assert run.returncode == 0, f"exit {run.returncode}\n{run.stdout}{run.stderr[-2000:]}"
+    # The precondition: a driver that cancelled in time raises DPY-4024, closes nothing, and
+    # would pass this test on the code that crashed.
+    assert "first: DPY-4011" in run.stdout, run.stdout
+    assert then in run.stdout, run.stdout
+
+
 # `test_a_read_only_adapter_cannot_read_a_table_created_this_instant` lived here and is REMOVED,
 # not moved. The behaviour is real and measured -- a read-only transaction pins a snapshot and
 # Oracle refuses to read an object whose definition changed just before it began, ORA-01466 (NOT

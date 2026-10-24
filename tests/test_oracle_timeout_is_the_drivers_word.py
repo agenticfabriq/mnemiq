@@ -106,7 +106,7 @@ class _Cursor:
     """A cursor whose execute raises, on a connection that takes a call timeout."""
 
     def __init__(self, raising):
-        self.connection = type("Connection", (), {"call_timeout": 0})()
+        self.connection = type("Connection", (), {"call_timeout": 0, "is_healthy": lambda self: True})()
         self._raising = raising
 
     def execute(self, sql):
@@ -171,7 +171,7 @@ class _FetchingCursor:
     description = [("N", None, None, None, None, None, None)]
 
     def __init__(self, clock, trips, error=None):
-        self.connection = type("Connection", (), {"call_timeout": 0})()
+        self.connection = type("Connection", (), {"call_timeout": 0, "is_healthy": lambda self: True})()
         self._clock, self._trips, self._error = clock, list(trips), error
 
     def execute(self, sql):

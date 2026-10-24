@@ -262,7 +262,10 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
 
     from sqlglot import exp
 
+    from mnemiq.semantic.expr_columns import keyword_columns
+
     withheld_tables = {obj.lower().rsplit(".", 1)[-1] for obj, _ in not_raw}
+    tokens = keyword_columns(sql)
     for dialect in ("duckdb", "oracle"):
         try:
             ast = sqlglot.parse_one(sql, read=dialect)
@@ -271,8 +274,44 @@ def _reads_only_raw(sql: str, not_raw: frozenset[tuple[str, str]]) -> bool:
         # A read of columns no node names cannot be seen by `check_cls`, which checks named ones
         # (Codex's review of #121): `SELECT COLUMNS('secret_code') FROM orders` returns the column.
         # Withheld when any table the example reads has a withheld column.
-        if _reads_unnamed_columns(ast) and any(
-                t.name.lower() in withheld_tables for t in ast.find_all(exp.Table)):
+        # The tables read: the parse's names, and every table the text names anywhere, by the
+        # last part of a dotted token, since the parse names some wrongly or not at all:
+        # `query_table('orders')` is a Table with no name to sqlglot and `query_table('main.orders')`
+        # names the table inside a dotted string, `TABLE orders` is a Table named `TABLE` and a
+        # CTE over it is its own name, and DuckDB reads orders through each (the review gate on
+        # the second and third commits); a name quoted inside the string (`query_table('"orders"')`)
+        # keeps its quotes as a token, stripped here (the gate on the third).
+        read = {t.name.lower() for t in ast.find_all(exp.Table)} | {
+            token.rsplit(".", 1)[-1].strip('"`') for token in tokens}
+        if "" in read:
+            # A source the parse cannot name at all, a table function: DuckDB's `query_table`
+            # reads the table named inside the string with quote characters dropped anywhere in
+            # it (`'"ord""ers"'` is orders), so no token matches, and any withheld table may be the
+            # one read (the review gate on the fourth commit).
+            read |= withheld_tables
+        if _reads_unnamed_columns(ast) and read & withheld_tables:
+            return False
+        # A column list renames by position (`FROM orders AS q(id, unit)`, a derived table's or
+        # a CTE's list the same), so a withheld column reaches the text under a name no token
+        # matches: `date_trunc(unit, id)` read orders.secret_code on DuckDB and passed (Codex's
+        # first review of #181). Withheld wherever a list stands over a withheld table read.
+        if read & withheld_tables and any(alias.columns for alias in ast.find_all(exp.TableAlias)):
+            return False
+        # DuckDB reads a column by its position too, `#2`, `# 2` or `#/**/2`, which no token
+        # names (the review gate on the sixth, seventh and eighth commits): a `#` has no place in an
+        # example over a withheld table, a positional reference there or MySQL's comment opener
+        # elsewhere, so the character alone withholds, a string literal holding it included. A
+        # table's name or alias as a value, the whole row as a struct (`SELECT orders FROM
+        # orders`), the unnamed-columns rule withholds already.
+        if read & withheld_tables and "#" in sql:
+            return False
+        # Any token of the example's text the engine reads as a column where a table the example
+        # reads has a withheld column so named (M210, Codex's twenty-third review of #172):
+        # `date_trunc(secret_code, id)` reads the column on DuckDB while sqlglot makes a string of
+        # the unit, so the parse saw `id` alone and the example naming and using the withheld
+        # column reached the uncleared's prompt. The selectors' rule (`keyword_columns`), held
+        # here to the tables the example reads.
+        if any(obj.lower().rsplit(".", 1)[-1] in read and col.lower() in tokens for obj, col in not_raw):
             return False
         return check_cls(ast, AccessPolicy(denied=set(not_raw)), dialect) is None
     logger.info("an example was withheld from an identity with columns withheld: its SQL parses as "
