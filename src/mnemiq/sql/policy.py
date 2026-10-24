@@ -7,6 +7,7 @@ from mnemiq.authz.grants import GrantSet
 from mnemiq.contract import Snapshot
 from mnemiq.sql.identifiers import ascii_lower
 from mnemiq.sql.qualify import names_one_object
+from mnemiq.sql.reading import as_duckdb_reads
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +166,7 @@ def _reachable(snapshot: Snapshot, grants: GrantSet) -> set[str]:
         if view is None:
             continue
         try:
-            parsed = sqlglot.parse_one(view.definition, read=view.dialect)
+            parsed = as_duckdb_reads(sqlglot.parse_one(view.definition, read=view.dialect))  # tables alone are read here; one reading everywhere
         except Exception:
             # We cannot see what this view reads, so we cannot say the policy is irrelevant.
             # Returning what we have left the policy EMPTY, which skipped the rewrite entirely

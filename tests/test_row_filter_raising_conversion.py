@@ -692,7 +692,8 @@ def test_a_call_returning_text_beside_text_is_not_refused_for_being_unknown():
         assert con.execute(f"SELECT id FROM claim WHERE {row_filter}").fetchall() is not None
         assert isinstance(_decide(row_filter), Approved), row_filter
     # The typed lists stand in where the catalogue cannot be asked; on this engine they are it.
-    from mnemiq.sql.rls import _JSON_MACROS, _JSON_RETURNERS_KNOWN, _LAMBDA_TAKERS_KNOWN, _json_returners, _lambda_takers
+    from mnemiq.sql.reading import LAMBDA_TAKERS_KNOWN, lambda_takers
+    from mnemiq.sql.rls import _JSON_MACROS, _JSON_RETURNERS_KNOWN, _json_returners
 
     assert _json_returners() == _JSON_RETURNERS_KNOWN | _JSON_MACROS  # the macros carry no catalogue type
     # Where the catalogue cannot be asked, the typed list stands in, the macros with it.
@@ -706,7 +707,7 @@ def test_a_call_returning_text_beside_text_is_not_refused_for_being_unknown():
         patched.setattr(rls_module, "_duckdb_rows", no_catalogue)
         assert _json_returners() == _JSON_RETURNERS_KNOWN | _JSON_MACROS
     assert rls_module._JSON_RETURNERS == _JSON_RETURNERS_KNOWN | _JSON_MACROS  # the live reader again
-    assert _lambda_takers() == _LAMBDA_TAKERS_KNOWN
+    assert lambda_takers() == LAMBDA_TAKERS_KNOWN
     # Residuals the gate named (pre-existing): a lambda DuckDB takes is not read for JSON
     # unification inside its body, `list_transform([region], x -> x = to_json(id))[1]`, where
     # `x` is the list's element and the reader does not type a lambda's parameter; and
@@ -1555,6 +1556,7 @@ def test_a_map_literals_bare_key_is_read_and_installed_as_the_engine_reads_it():
     verdict = _decide(reversed_, snapshot=_snapshot(types))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
     for row_filter in ("list_transform(tags, x -> MAP {x: 1}[x] = 1) = [true]",   # the key is the parameter
+                       "list_transform([1], x -> list_transform(tags, y -> MAP {x: 1}[1] = 1)) = [[true]]",   # bound outside the body typed
                        "MAP {region: 1}[region] = 1",                                # the key is a column
                        "MAP {\"X\": 1}['qx'] = 1",                                   # quoted, a column still
                        "MAP {'X': 1}['X'] = 1",                                      # a string, as written
@@ -1568,3 +1570,29 @@ def test_a_map_literals_bare_key_is_read_and_installed_as_the_engine_reads_it():
         con.execute("SELECT id FROM claim WHERE MAP {nowhere: 1} IS NOT NULL")
     verdict = _decide("MAP {nowhere: 1} IS NOT NULL", snapshot=_snapshot(types))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_a_map_keyed_by_a_lambdas_parameter_is_typed_by_the_parameter():
+    # Found by the mutation run on round 54: a MAP literal keyed by a JSON-typed parameter and
+    # looked up with text converts the text on the row (`MAP {x: 1}[region]` under `x -> ...`
+    # over `[attrs]`, Malformed JSON on the hidden row), and the key, a parameter the pure typer
+    # could not type, left the map untyped and the lookup approved, before round 53 as after it
+    # (the function form, `MAP([x], [1])[region]`, was refused). The parameter's type stands in
+    # for the key, as for any reference bound outside the value probed; the text-keyed twin and
+    # the key bound inside the value run and are approved.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, attrs JSON, tags VARCHAR[]); "
+                "INSERT INTO claim VALUES (1, 'north', '{\"a\": 1}', ['north'])")
+    types = {**TYPES, ("claim", "tags"): "VARCHAR[]"}
+    for raising in ("list_transform([attrs], x -> MAP {x: 1}[region]) = [1]",
+                    "list_transform([attrs], x -> list_transform(tags, y -> MAP {x: 1}[y] = 1)) = [[true]]",
+                    "list_transform([attrs], x -> element_at(MAP {x: 1}, region)) = [[1]]",
+                    "list_transform([region], x -> json_extract_string(MAP {x: 1}::VARCHAR, '$.a')) = ['y']"):   # the key reads the row
+        with pytest.raises(duckdb.Error, match="Malformed JSON"):
+            con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
+        verdict = _decide(raising, snapshot=_snapshot(types))
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (raising, verdict)
+    for safe in ("list_transform(tags, x -> MAP {x: 1}[region]) = [1]",
+                 "list_transform([attrs], x -> MAP {x: 1}[x]) = [1]"):
+        assert con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall() == [(1,)], safe
+        assert isinstance(_decide(safe, snapshot=_snapshot(types)), Approved), safe

@@ -12,13 +12,73 @@ installed as `MAP {'X': x}[x] IS NULL` kept every row, the policy reversed (Code
 review of #160, measured on DuckDB 1.5.4). Read as the Column it is, the key renders as
 written, quoted or not, the grant check sees the read, the row filter's case guard reads a
 lambda's parameter in another case as the reference it is, and the typing rules read the
-column. A struct literal's key (`{X: tags}`) is a name to DuckDB and stays one.
+column. A struct literal's key (`{X: tags}`) is a name to DuckDB and stays one. A key spelled
+exactly as an enclosing lambda's parameter is that parameter, which DuckDB binds before any
+column (measured: `list_transform([7], x -> MAP {x: 1}[7])` over a table with a column `x` reads
+the parameter), so it becomes a Var, bare in the render and no Column to any guard; a parameter
+spelled in another case stays a Column, and is refused as an unknown one, since DuckDB binds
+it to a column of the folded name in a SELECT list where one is in scope.
+
+sqlglot builds `exp.ToMap` over a Struct from DuckDB's `MAP {...}` syntax alone, so for a tree
+parsed in any other dialect this is a no-op; the name says whose reading it restores.
 """
 
 from __future__ import annotations
 
+import logging
+import threading
+
 import sqlglot
 from sqlglot import exp
+
+logger = logging.getLogger(__name__)
+
+# The calls DuckDB hands a lambda to. Anywhere else `a -> b` is DuckDB's JSON extract, which
+# sqlglot reads as a lambda inside a call's arguments or beside an operator (`list_contains(
+# [region], attrs -> '$.a')`, `region = attrs -> '$.a'`: Codex's nineteenth review of #160), so a
+# reader trusting the parse sees a statement the engine does not run, and the arrow's left side,
+# a column to DuckDB, is a lambda's parameter to sqlglot: `concat(secret -> map_keys(MAP {secret:
+# 1})[1])` read a hidden column through a key this module had made a Var (the review gate on
+# round 54 of #160; DuckDB raises quoting the value).
+LAMBDA_TAKERS_KNOWN = frozenset({"list_transform", "array_transform", "apply", "list_apply",
+                                 "array_apply", "list_filter", "array_filter", "filter",
+                                 "list_reduce", "array_reduce", "reduce"})
+LAMBDA_TAKER_NODES = (exp.Transform, exp.ArrayFilter, exp.Reduce)
+_TAKERS: frozenset[str] | None = None
+_TAKERS_LOCK = threading.Lock()
+
+
+def lambda_takers() -> frozenset[str]:
+    """The calls DuckDB hands a lambda to, asked of the local reader's own catalogue
+    (`duckdb_functions()`, a LAMBDA among the parameter types: eleven names on 1.5.4), the
+    list above where the catalogue cannot be asked. A typed list missed `array_apply` and
+    listed `list_sort`, `list_any_value` and `list_grade_up`, which take none (the review gate
+    on the twentieth and twenty-first rounds of #160)."""
+    global _TAKERS
+    with _TAKERS_LOCK:
+        if _TAKERS is None:
+            try:
+                from mnemiq.duckdb_extensions import connect_duckdb
+
+                rows = connect_duckdb(local_only=True).execute(
+                    "SELECT DISTINCT lower(function_name) FROM duckdb_functions() "
+                    "WHERE list_contains(parameter_types, 'LAMBDA')").fetchall()
+                _TAKERS = frozenset(name for (name,) in rows) or LAMBDA_TAKERS_KNOWN
+            except Exception:  # noqa: BLE001 -- the catalogue could not be asked: the typed list
+                logger.warning("DuckDB's catalogue could not be asked which calls take a lambda; "
+                               "the typed list stands in (M159)")
+                _TAKERS = LAMBDA_TAKERS_KNOWN
+        return _TAKERS
+
+
+def arrow_read_as_a_lambda(node: exp.Expression) -> bool:
+    """Whether sqlglot's Lambda is DuckDB's JSON arrow: a Lambda under anything but a call DuckDB
+    hands a lambda to."""
+    if not isinstance(node, exp.Lambda):
+        return False
+    parent = node.parent
+    return not (isinstance(parent, LAMBDA_TAKER_NODES) or (
+        isinstance(parent, exp.Anonymous) and parent.name.lower() in lambda_takers()))
 
 
 def map_struct(node: exp.ToMap) -> exp.Struct | None:
@@ -30,13 +90,30 @@ def map_struct(node: exp.ToMap) -> exp.Struct | None:
     return struct if isinstance(struct, exp.Struct) else None
 
 
+def is_lambda_parameter(node: exp.Expression) -> bool:
+    """Whether `node` references an enclosing lambda's parameter in its exact spelling: an
+    Identifier (sqlglot's reading of a bare parameter), an unqualified Column, or the Var a MAP
+    literal's key becomes here. A lambda sqlglot read out of DuckDB's JSON arrow declares
+    nothing (`arrow_read_as_a_lambda`): its left side is a column to the engine."""
+    if not isinstance(node, (exp.Identifier, exp.Column, exp.Var)) or node.args.get("table"):
+        return False
+    lam = node.find_ancestor(exp.Lambda)
+    while lam is not None:
+        if not arrow_read_as_a_lambda(lam) and node.name in {p.name for p in lam.expressions}:
+            return True
+        lam = lam.find_ancestor(exp.Lambda)
+    return False
+
+
 def as_duckdb_reads(ast: exp.Expression) -> exp.Expression:
-    """The tree with every MAP literal's bare key read as the Column it is, in place."""
+    """The tree with every MAP literal's bare key read as DuckDB reads it, in place: the Column
+    it is, or the Var of an enclosing lambda's parameter spelled exactly."""
     for node in list(ast.find_all(exp.ToMap)):
         struct = map_struct(node)
         for item in struct.expressions if struct is not None else ():
             if isinstance(item, exp.PropertyEQ) and isinstance(item.this, exp.Identifier):
-                item.set("this", exp.Column(this=item.this.copy()))
+                key = item.this
+                item.set("this", exp.Var(this=key.name) if is_lambda_parameter(key) else exp.Column(this=key.copy()))
     return ast
 
 

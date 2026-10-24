@@ -9,6 +9,7 @@ answered for the string where the author asked for the column."""
 from __future__ import annotations
 
 import duckdb
+import pytest
 from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
@@ -19,7 +20,7 @@ from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import body_of
 
-VISIBLE = {"claim": {"id", "region"}, "sink": {"i", "s"}}
+VISIBLE = {"claim": {"id", "region", "tags", "x"}, "sink": {"i", "s"}}
 
 
 class _OkAdapter:
@@ -29,7 +30,8 @@ class _OkAdapter:
 
 def _table():
     con = duckdb.connect()
-    con.execute("CREATE TABLE claim(id INT, region VARCHAR, secret VARCHAR); INSERT INTO claim VALUES (1, 'north', 's3cret'); "
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, secret VARCHAR, tags VARCHAR[], x VARCHAR); "
+                "INSERT INTO claim VALUES (1, 'north', 's3cret', ['north'], 'col'); "
                 "CREATE TABLE sink(i INT, s VARCHAR); INSERT INTO sink VALUES (1, 'a')")
     return con
 
@@ -86,3 +88,47 @@ def test_a_view_bodys_map_key_is_a_column():
     body = body_of(ViewDefinition(object_id="leak", dialect="duckdb",
                                   definition="SELECT map_keys(MAP {secret: 1})[1] AS k FROM claim"))
     assert body is not None and {c.name for c in body.find_all(exp.Column)} == {"secret"}
+
+
+def test_a_map_key_naming_its_lambdas_parameter_is_the_parameter():
+    # The review gate on round 53: read as a Column, the key named no column of the table and a
+    # valid query was refused. DuckDB binds the parameter before any column, a column `x` beside it
+    # included (measured), so the key is a Var: bare in the render, no Column to the guards. A
+    # parameter spelled in another case stays a Column and is refused, as it is elsewhere, since
+    # DuckDB binds it to a column of the folded name in a SELECT list where one is in scope.
+    con = _table()
+    for sql in ("SELECT list_transform(tags, x -> MAP {x: 1}[x]) FROM claim",
+                "SELECT list_transform([7], x -> MAP {x: 1}[7]) FROM claim"):
+        rows = con.execute(sql).fetchall()
+        verdict = _decide(sql)
+        assert isinstance(verdict, Approved) and "MAP {x: 1}" in verdict.target_sql, (sql, verdict)
+        assert con.execute(verdict.target_sql).fetchall() == rows, verdict.target_sql
+    assert rows == [([1],)]  # the parameter 7, not the column 'col'
+    sql = "SELECT list_transform(tags, x -> MAP {X: 1}[x]) FROM claim"
+    verdict = _decide(sql)  # the column `x` of the folded name, granted: read as DuckDB reads it, and run as written
+    assert isinstance(verdict, Approved) and "MAP {X: 1}" in verdict.target_sql, verdict
+    assert con.execute(verdict.target_sql).fetchall() == con.execute(sql).fetchall() == [([None],)]
+    verdict = decide(sql, {"claim": {"id", "region", "tags"}}, dialect="duckdb", target="duckdb")  # no such column granted
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    grants = GrantSet(frozenset(VISIBLE), writable=frozenset({"sink"}))
+    verdict = decide_write("UPDATE sink SET s = 'b' WHERE list_transform([i], x -> MAP {x: 1}[x])[1] = 1", VISIBLE, grants,
+                           adapter=_OkAdapter(), dialect="duckdb", target="duckdb", writes_enabled=True, policy=AccessPolicy())
+    assert isinstance(verdict, ApprovedWrite) and "MAP {x: 1}" in verdict.target_sql, verdict
+
+
+def test_an_arrow_outside_a_lambda_taker_is_no_lambda():
+    # The review gate on round 54: sqlglot reads `a -> b` as a lambda inside any call, DuckDB
+    # only inside the calls it hands a lambda to and as the JSON arrow elsewhere, so a MAP key
+    # spelled as the arrow's left side was a Var no guard saw, and `concat(secret ->
+    # map_keys(MAP {secret: 1})[1])` read the hidden column (DuckDB raises quoting its value).
+    # Inside a real lambda the same spelling is the parameter, which shadows the column.
+    con = _table()
+    sql = "SELECT concat(secret -> map_keys(MAP {secret: 1})[1]) FROM claim"
+    with pytest.raises(duckdb.Error, match="s3cret"):
+        con.execute(sql).fetchall()
+    verdict = _decide(sql)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+    sql = "SELECT list_transform(tags, secret -> MAP {secret: 1}[secret]) FROM claim"
+    assert con.execute(sql).fetchall() == [([1],)]
+    verdict = _decide(sql)
+    assert isinstance(verdict, Approved) and "MAP {secret: 1}" in verdict.target_sql, verdict

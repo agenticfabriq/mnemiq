@@ -11,7 +11,7 @@ from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import names_one_object, object_key
-from mnemiq.sql.reading import as_duckdb_reads, map_struct
+from mnemiq.sql.reading import arrow_read_as_a_lambda, as_duckdb_reads, is_lambda_parameter, map_struct
 from mnemiq.sql.scope import (base_tables, column_tables, cte_references, known_columns,
                               scope_resolved)
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -105,11 +105,6 @@ def _validate_filter(
         if _parameter_in_another_case(node):
             return None  # a lambda's parameter spelled in another case than declared: no predicate
     for column in wrapped.find_all(exp.Column):
-        if _is_lambda_parameter(column):
-            # A MAP literal's key naming its lambda's parameter, a Column by `as_duckdb_reads`
-            # (sqlglot spells the exact name an Identifier everywhere else): the parameter,
-            # which DuckDB binds before any column, not a name to hold to the table.
-            continue
         owner = resolved.get(id(column))
         if owner is None:
             if column.table:
@@ -513,43 +508,10 @@ def _json_call_type(node: exp.Expression, type_of) -> str:
     return leaf + "[]" if _path_shape(_extract_path(node), type_of) == "list" else leaf
 
 
-# The calls DuckDB hands a lambda to. Anywhere else `a -> b` is DuckDB's JSON extract, which
-# sqlglot reads as a lambda inside a call's arguments or beside an operator (`list_contains(
-# [region], attrs -> '$.a')`, `region = attrs -> '$.a'`: Codex's nineteenth review of #160), so the
-# reader here sees a statement the engine does not run; refused, with the plain spelling in the
-# advice (`json_extract(attrs, '$.a')`, which sqlglot reads as the extract everywhere).
-_LAMBDA_TAKERS_KNOWN = frozenset({"list_transform", "array_transform", "apply", "list_apply",
-                                  "array_apply", "list_filter", "array_filter", "filter",
-                                  "list_reduce", "array_reduce", "reduce"})
-_LAMBDA_TAKER_NODES = (exp.Transform, exp.ArrayFilter, exp.Reduce)
-_LAMBDA_TAKERS: frozenset[str] | None = None
-
-
-def _lambda_takers() -> frozenset[str]:
-    """The calls DuckDB hands a lambda to, asked of the local reader's own catalogue
-    (`duckdb_functions()`, a LAMBDA among the parameter types: eleven names on 1.5.4), the
-    list above where the catalogue cannot be asked. A typed list missed `array_apply` and
-    listed `list_sort`, `list_any_value` and `list_grade_up`, which take none (the review gate
-    on the twentieth and twenty-first rounds)."""
-    global _LAMBDA_TAKERS
-    if _LAMBDA_TAKERS is None:
-        try:
-            rows = _duckdb_rows("SELECT DISTINCT lower(function_name) FROM duckdb_functions() "
-                                "WHERE list_contains(parameter_types, 'LAMBDA')")
-            _LAMBDA_TAKERS = frozenset(name for (name,) in rows) or _LAMBDA_TAKERS_KNOWN
-        except Exception:  # noqa: BLE001 -- the catalogue could not be asked: the typed list
-            logger.warning("DuckDB's catalogue could not be asked which calls take a lambda; "
-                           "the typed list stands in (M159)")
-            _LAMBDA_TAKERS = _LAMBDA_TAKERS_KNOWN
-    return _LAMBDA_TAKERS
-
-
-def _arrow_read_as_a_lambda(node: exp.Expression) -> bool:
-    if not isinstance(node, exp.Lambda):
-        return False
-    parent = node.parent
-    return not (isinstance(parent, _LAMBDA_TAKER_NODES) or (
-        isinstance(parent, exp.Anonymous) and parent.name.lower() in _lambda_takers()))
+# The calls DuckDB hands a lambda to, and the arrow sqlglot reads as a lambda anywhere else, are
+# `reading.py`'s (`lambda_takers`, `arrow_read_as_a_lambda`), which the parameter reading there
+# needs as well: refused here, with the plain spelling in the advice (`json_extract(attrs,
+# '$.a')`, which sqlglot reads as the extract everywhere).
 
 
 def _known_type(value, type_of, engine: str) -> exp.DataType | None:
@@ -709,30 +671,21 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
                and node.name.lower() in _LIST_CONSTRUCTORS | _PURE_CALLS | _LAMBDA_CALLS)
                for node in value.walk()):
         return None
-    # A MAP literal's keys are expressions DuckDB evaluates (`MAP {id: 1}` is keyed by the
-    # column, MAP(INTEGER, INTEGER)), which sqlglot parses as struct-field identifiers, so they
-    # are typed here as columns of the value's own SELECT (the review gate on #160: left as
-    # names, the map was typed MAP(VARCHAR, INTEGER), and `MAP {attrs: 1}` beside `MAP {region:
-    # 1}` read as one type where DuckDB parses region to JSON). A key of any other shape is not
-    # pure.
-    keys = []
+    # A MAP literal's keys are the Columns or the Vars `as_duckdb_reads` made them (`MAP {id: 1}`
+    # is keyed by the column, MAP(INTEGER, INTEGER); the review gate on #160 found them typed as
+    # names, and this typer re-read them for itself until round 54), typed below with the other
+    # columns and parameters; a map whose struct sqlglot wraps otherwise, or an entry that is no
+    # key-value pair, is not pure.
     for to_map in value.find_all(exp.ToMap):
         if not isinstance(to_map.this, exp.Struct):
             return None
-        for item in to_map.this.expressions:
-            if not isinstance(item, exp.PropertyEQ):
-                return None
-            if isinstance(item.this, exp.Identifier):
-                as_column = exp.Column(this=item.this.copy())
-                as_column.parent = item  # read in the value's own SELECT, as the engine reads it
-                keys.append(as_column)
-            # any other key (a literal, a cast such as `'{}'::JSON`) is a pure value of its own
+        if not all(isinstance(item, exp.PropertyEQ) for item in to_map.this.expressions):
+            return None
     # The types are read off the original nodes, which the resolver knows by identity; the
     # copy's are then replaced in the same traversal order.
     declared = [type_of(column) for column in value.find_all(exp.Column)
                 if id(column) not in inside_a_json_call]
-    key_types = [type_of(column) for column in keys]
-    if None in declared or None in key_types:
+    if None in declared:
         return None
     # A lambda's parameter referenced inside the value but bound by a lambda outside it (a
     # part of the body probed on its own, `x[1]` or `x.k` as a comparison's side) is a typed
@@ -741,7 +694,7 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
     # raised Malformed JSON on the row (the review gate on the forty-seventh round).
     free: dict[str, str] = {}
     for node in value.walk():
-        if not isinstance(node, (exp.Identifier, exp.Column)) or node.args.get("table"):
+        if not isinstance(node, (exp.Identifier, exp.Column, exp.Var)) or node.args.get("table"):
             continue
         # The nearest lambda DECLARING the name, through every enclosing one: inside `y ->
         # ...` a reference bound by the outer `x -> ...` read only the nearest lambda and was
@@ -757,7 +710,7 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
         free[node.name] = kind_of
     typed_nulls = value.copy()
     for node in list(typed_nulls.walk()):
-        if isinstance(node, (exp.Identifier, exp.Column)) and not node.args.get("table") and node.name in free:
+        if isinstance(node, (exp.Identifier, exp.Column, exp.Var)) and not node.args.get("table") and node.name in free:
             lam = node.find_ancestor(exp.Lambda)
             while lam is not None and node.name not in {p.name for p in lam.expressions}:
                 lam = lam.find_ancestor(exp.Lambda)  # declared inside the copy: DuckDB binds it
@@ -803,10 +756,6 @@ def _pure_type(value: exp.Expression, type_of) -> str | None:
         subquery.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
     for column, kind_of in zip(list(typed_nulls.find_all(exp.Column)), declared):
         column.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
-    copied_keys = [item.this for to_map in typed_nulls.find_all(exp.ToMap)
-                   for item in to_map.this.expressions if isinstance(item.this, exp.Identifier)]
-    for key, kind_of in zip(copied_keys, key_types):
-        key.replace(exp.Cast(this=exp.Null(), to=exp.DataType.build(kind_of, dialect="duckdb")))
     try:
         return _duckdb(f"SELECT typeof({typed_nulls.sql(dialect='duckdb')})")
     except Exception:  # noqa: BLE001 -- unreadable by DuckDB: the type cannot be told
@@ -1781,7 +1730,7 @@ def _parameter_in_another_case(node: exp.Expression) -> bool:
     if isinstance(node, exp.Identifier) and (
             isinstance(node.parent, exp.Column)                                            # read through its Column
             or (isinstance(node.parent, exp.Dot) and node is node.parent.expression)        # a struct field's name, `x.X`
-            or (isinstance(node.parent, exp.PropertyEQ) and node is node.parent.this)):    # a struct key, `{X: tags}`; a MAP's is a Column (`as_duckdb_reads`)
+            or (isinstance(node.parent, exp.PropertyEQ) and node is node.parent.this)):    # a struct key, `{X: tags}`; a MAP's is a Column or a Var (`as_duckdb_reads`)
         # A name in another role than a reference: a field or a key spelled like a parameter in
         # another case names no parameter, and read as one it refused `list_transform([{X:
         # tags}], x -> list_transform(x.X, y -> y = region))`, which DuckDB runs (Codex's
@@ -1797,19 +1746,6 @@ def _parameter_in_another_case(node: exp.Expression) -> bool:
     return False
 
 
-def _is_lambda_parameter(node: exp.Expression) -> bool:
-    """Whether `node` references a lambda's parameter: an identifier (sqlglot's reading of a
-    bare parameter) or an unqualified column named by an enclosing lambda."""
-    if not isinstance(node, (exp.Identifier, exp.Column)) or node.args.get("table"):
-        return False
-    lam = node.find_ancestor(exp.Lambda)
-    while lam is not None:
-        if node.name in {p.name for p in lam.expressions}:
-            return True
-        lam = lam.find_ancestor(exp.Lambda)
-    return False
-
-
 def _reads_a_column(node: exp.Expression) -> bool:
     """Whether a value reads a row's data: a column, or a lambda's parameter, which stands for
     an element of the list walked and is no constant. Every rule asking this through
@@ -1817,7 +1753,7 @@ def _reads_a_column(node: exp.Expression) -> bool:
     rounds on the forty-seventh commit, one assumption: `list_filter(tags, x -> x = id)` and
     `x::INT = 1` were approved, text converted on the row), where the wholesale refusal of a
     list the reader could not type had covered them."""
-    return any(isinstance(inner, exp.Column) or _is_lambda_parameter(inner) for inner in node.walk())
+    return any(isinstance(inner, exp.Column) or is_lambda_parameter(inner) for inner in node.walk())
 
 
 def _type_from_shape(shape) -> str | None:
@@ -1849,7 +1785,7 @@ def _lambda_parameter_type(node: exp.Expression, type_of) -> str | None:
     comparisons are walked like any other, and reading the parameter as untyped text they
     approved `list_filter([attrs], x -> x = region)`, Malformed JSON on the row (the review
     gate on the forty-seventh round)."""
-    if not isinstance(node, (exp.Identifier, exp.Column)) or node.args.get("table"):
+    if not isinstance(node, (exp.Identifier, exp.Column, exp.Var)) or node.args.get("table"):
         return None
     name = node.name
     lam = node.find_ancestor(exp.Lambda)
@@ -2090,7 +2026,7 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
         return None if owner is None else types_of(owner).get(column.name.lower())
 
     for node in wrapped.args["where"].walk():
-        if engine == "duckdb" and _arrow_read_as_a_lambda(node):
+        if engine == "duckdb" and arrow_read_as_a_lambda(node):
             return node  # `attrs -> '$.a'` where DuckDB extracts JSON and sqlglot sees a lambda
         if engine == "duckdb" and _is_union_extract(node) and not (
                 isinstance(node.expressions[1], exp.Literal) and node.expressions[1].is_string):
@@ -2240,7 +2176,7 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
             # The operand's type: the snapshot's for a column, the element walked for a
             # lambda's parameter (`CAST(x AS JSON)` over a JSON element, `i::VARCHAR` over the
             # index: round 47).
-            if _is_lambda_parameter(node.this):
+            if is_lambda_parameter(node.this):
                 source = _lambda_parameter_type(node.this, type_of)
             else:
                 source = type_of(node.this) if isinstance(node.this, exp.Column) else None
