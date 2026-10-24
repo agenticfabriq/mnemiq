@@ -240,24 +240,20 @@ def test_oracles_call_timeout_reaches_the_model_as_a_timeout(oracle):
     assert "timed out after 0.3s" in caught.value.message, caught.value.message
 
 
-@pytest.mark.parametrize("elapsed, reading", [(0.5, "outage"), (5.0, "timeout")])
-def test_oracles_closed_connection_is_an_outage_before_the_deadline(oracle, monkeypatch, elapsed, reading):
+@pytest.mark.parametrize("elapsed", [0.5, 5.0, 7.5])
+def test_oracles_closed_connection_is_an_outage_whatever_the_clock(oracle, monkeypatch, elapsed):
     # DPY-4011, the database or network closed the connection, was read as a timeout whatever the
-    # clock until the runner read the adapter's outage classification (M187's note). Before the
-    # deadline nothing the bound did closed it, so it is the source's; at or after the deadline it
-    # stays the call's end, as ORA-01013 does.
+    # clock until the runner read the adapter's outage classification (M187's note), then as one
+    # at or past the deadline the adapter measured (Codex's reviews of #179: it could not measure
+    # it). The driver reports its own bound as DPY-4024 and closes the connection after it only
+    # when the server did not answer its cancel either, so a closed connection is the source's.
     oracledb, driver_error, adapter = oracle
     closed = driver_error("DPY-4011: the database or network closed the connection", 4011,
                           oracledb.DatabaseError)
-    clock = iter([0.0, 100.0, 100.0 + elapsed])   # the lease's wait, the call's start, its end
+    clock = iter([0.0, 100.0, 100.0 + elapsed])   # a clock that would have read the deadline
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
-    with pytest.raises(ExecutionError) as caught:
+    with pytest.raises(SourceUnavailableError):
         run(adapter(_raise(closed)), "SELECT 1 FROM dual", timeout_s=5)
-    if reading == "outage":
-        assert isinstance(caught.value, SourceUnavailableError), caught.value
-    else:
-        assert not isinstance(caught.value, SourceUnavailableError)
-        assert "timed out" in caught.value.message
 
 
 # -- the loop --------------------------------------------------------------------------------
@@ -319,7 +315,7 @@ def test_deep_mode_stops_on_a_drop_the_source_would_answer_next_time(tmp_path):
 #
 # Measured on the Postgres attach: `pg_cancel_backend` from another session raises DuckDB's
 # IOException ("canceling statement due to user request"), which the classifier calls unavailable,
-# and Oracle's ORA-01013 before the deadline is an OperationalError, which its classifier calls
+# and Oracle's ORA-01013 is an OperationalError, which its classifier calls
 # unavailable too. Read as outages they would be reported as the source not answering. A cancel ends
 # the turn, reported as the cancel it is: handed to the repair loop, as before M188, a model that wrote
 # the same SQL again ran the stopped statement a second time (Codex's second review of #179).
@@ -359,13 +355,14 @@ def test_the_runner_reads_a_cancel_as_neither_an_outage_nor_a_timeout():
     assert "cancelled" in caught.value.message and "timed out" not in caught.value.message
 
 
-def test_oracles_cancel_before_the_deadline_is_a_cancel_and_not_an_outage(oracle, monkeypatch):
+@pytest.mark.parametrize("elapsed", [0.5, 5.0, 7.5])
+def test_oracles_cancel_is_a_cancel_and_not_an_outage_whatever_the_clock(oracle, monkeypatch, elapsed):
     from mnemiq.execute.runner import QueryCancelledError
 
     oracledb, driver_error, adapter = oracle
     cancel = driver_error("ORA-01013: user requested cancel of current operation", 1013,
                           oracledb.OperationalError)
-    clock = iter([0.0, 100.0, 100.5])   # ended half a second into a 5 s bound
+    clock = iter([0.0, 100.0, 100.0 + elapsed])   # a clock that would have read the deadline
     monkeypatch.setattr(time, "monotonic", lambda: next(clock))
     with pytest.raises(QueryCancelledError) as caught:
         run(adapter(_raise(cancel)), "SELECT 1 FROM dual", timeout_s=5)

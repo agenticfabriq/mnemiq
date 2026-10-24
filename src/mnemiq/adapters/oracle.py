@@ -1331,46 +1331,30 @@ class OracleAdapter:
         # thread to race -- which is the concurrency bug removed rather than guarded.
         self._refuse_unless_read(sql)
 
-        started = [float("inf")]  # the start of the round trip in flight: before the first, no deadline has passed
-
-        armed = int(timeout_s * 1000) / 1000 if timeout_s is not None else None  # the driver's deadline, whole milliseconds
-
         def _fetch(cur):
             if timeout_s is not None:
                 cur.connection.call_timeout = int(timeout_s * 1000)
-            started[0] = time.monotonic()  # the call alone, not the lease's lock wait, its setup round trip or a DDL-race backoff (the gate on the second commit)
             cur.execute(sql)
             names = [d[0] for d in cur.description] if cur.description else []
-            # `call_timeout` bounds each round trip, not the statement, and the fetch is several:
-            # the clock restarts as each row is handed over, since a round trip can only begin
-            # after the row before it, so a fault late in a long fetch is measured against its own
-            # trip (Codex's review of #179). Measured from the execute, it read as the bound's end
-            # and was repaired by running the statement again. The driver's `fetchall` is this
-            # same loop without the clock.
-            rows = []
-            started[0] = time.monotonic()
-            for row in cur:
-                rows.append(row)
-                started[0] = time.monotonic()
-            return names, rows
+            return names, cur.fetchall()
 
         try:
             names, rows = self._with_cursor(_fetch)
         except self._oracledb.DatabaseError as exc:
-            # DPY-4024, ORA-01013, ORA-03156 and DPY-4011 surface a bounded call's end
-            # (`_TIMEOUT_CODES`, `_AT_THE_DEADLINE`); report it as a timeout rather than letting a driver code
-            # reach the caller as an opaque source error. ORA-01013 is the cancel itself, the
-            # driver's at the deadline or anyone's on a connection the caller owns (`over`), so
-            # it is a timeout only once its round trip has reached the deadline (Codex's first
-            # review of #176, and of #179 for the round trip),
-            # and so is DPY-4011, a closed connection, which before the deadline is the source's
-            # (M188). Raised as `QueryTimedOut`, which the runner reads as the timeout it is.
-            if timeout_s is not None and _is_timeout(exc, deadline_met=time.monotonic() - started[0] >= armed):
+            # The driver's own word for the bound's end (`_TIMEOUT_CODES`) is a timeout, raised as
+            # `QueryTimedOut` rather than letting a driver code reach the caller as an opaque
+            # source error. Nothing else is one, however long the call ran: the adapter cannot
+            # time the bound, which covers each round trip, some of them the driver's own between
+            # rows (Codex's reviews of #179), and it does not need to, since the driver reports
+            # the bound as DPY-4024 itself.
+            if timeout_s is not None and _is_timeout(exc):
                 raise QueryTimedOut(f"query timed out after {timeout_s}s") from exc
             if _is_cancel(exc):
-                # ORA-01013 before the deadline: anyone's cancel, not the bound's, and not an
-                # outage either, though the classifier calls the driver's cancel unavailable (the
-                # review gate on M188): read as one, the turn would end as the source's fault.
+                # ORA-01013: someone else's cancel, since the driver cancels its own bound and
+                # reports DPY-4024. Not an outage either, though the classifier calls the driver's
+                # cancel unavailable (the review gate on M188): read as one, the turn would end as
+                # the source's fault. A closed connection, DPY-4011, goes to the classifier as the
+                # driver raised it.
                 raise QueryCancelled(f"the source cancelled the query: {exc}") from exc
             raise
 
@@ -1745,28 +1729,25 @@ def _is_ddl_race(exc: Exception) -> bool:
 
 # The codes a bounded call's end takes, by the driver's own error list (python-oracledb
 # 4.0.2, the locked version), each by its code so a reworded message changes nothing: DPY-4024,
-# the thin-mode call timeout ("call timeout of 300 ms exceeded", measured on Oracle Free 23);
-# ORA-01013, the cancel a call timeout surfaces as in thick mode and under a server-side
-# cancel, which this raised as the driver's own error while it was unmatched (M187, the ui
-# lane); ORA-03156, the server's own statement timeout; and DPY-4011, a closed connection. The
-# runner reads the `QueryTimedOut` this raises as the timeout, and asks the adapter's outage
-# classification after it (M188), so a closed connection is no longer a timeout whatever the
-# clock: like the cancel, only once the deadline has passed, the bound's own teardown then, and
-# before it the source's, an outage the runner reports as one. The code is read off the driver's error
+# the call timeout ("call timeout of 300 ms exceeded", measured on Oracle Free 23), which thin
+# mode raises after cancelling the call itself and to which the driver maps thick mode's
+# DPI-1067; and ORA-03156, the server's own statement timeout. Nothing else is a timeout, and no
+# clock makes one (Codex's reviews of #179). ORA-01013, the cancel, matched as one by M187 and
+# then once a deadline the adapter measured had passed, is always someone else's: the adapter
+# never cancels and the driver reports its own bound as DPY-4024 (`_is_cancel`). DPY-4011, a
+# closed connection, follows the bound only when the server did not answer the driver's cancel
+# either, so it is the source's, an outage the runner reads through the adapter's classifier
+# (M188). The code is read off the driver's error
 # object (`full_code`) where the error carries one, so an application error whose message
-# quotes a timeout code (`ORA-20001: ... ORA-01013`) is not one (Codex's first review of
+# quotes a timeout code (`ORA-20001: ... DPY-4024`) is not one (Codex's first review of
 # #176); an error with no code, a wrapped or a synthetic one, is read by its text, where the
 # word "timeout" alone counts too, the fallback the matcher has always had. A driver error
 # of another code whose message says "timeout" (ORA-12170, a connect timeout; ORA-12609, a
 # receive timeout) is not the query's timeout: the driver fills `full_code` from the code
 # its message leads with, so an error so led is read by its code, those being the
 # connection's and not a bounded call's end, and one whose message leads with no code goes
-# down the text branch (the gate on the second commit). ORA-01013 is the
-# cancel, which the deadline raises and anyone holding the connection may: a timeout only
-# once the deadline has passed (`deadline_met`), the cancel's own detail kept otherwise. The
-# same for DPY-4011 (M188).
+# down the text branch (the gate on the second commit).
 _TIMEOUT_CODES = frozenset({"DPY-4024", "ORA-03156"})
-_AT_THE_DEADLINE = frozenset({"ORA-01013", "DPY-4011"})
 _TIMEOUT_SPELLINGS = tuple(code.lower() for code in sorted(_TIMEOUT_CODES)) + ("timeout",)
 
 
@@ -1780,13 +1761,12 @@ def _is_cancel(exc: Exception) -> bool:
     return "ora-01013" in str(exc).lower()
 
 
-def _is_timeout(exc: Exception, deadline_met: bool = True) -> bool:
+def _is_timeout(exc: Exception) -> bool:
     code = getattr(exc.args[0], "full_code", None) if exc.args else None
     if isinstance(code, str) and code:
-        return code.upper() in _TIMEOUT_CODES or (code.upper() in _AT_THE_DEADLINE and deadline_met)
+        return code.upper() in _TIMEOUT_CODES
     text = str(exc).lower()
-    return any(spelling in text for spelling in _TIMEOUT_SPELLINGS) or (
-        any(code.lower() in text for code in _AT_THE_DEADLINE) and deadline_met)
+    return any(spelling in text for spelling in _TIMEOUT_SPELLINGS)
 
 
 # The driver's own codes that say the connection, the pool, the connect handshake or the wire
