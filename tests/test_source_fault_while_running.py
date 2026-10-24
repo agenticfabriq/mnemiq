@@ -187,13 +187,15 @@ def oracle():
     def driver_error(message, code, kind=None):
         return (kind or oracledb.DatabaseError)(oracledb_errors._Error(message=message, code=code))
 
-    def adapter(raising):
-        """`execute_arrow` alone, over a lease and a cursor that raises: no database."""
+    def adapter(raising, healthy=True):
+        """`execute_arrow` alone, over a lease and a cursor that raises: no database. `healthy` is
+        what the driver's `is_healthy()` says of the connection."""
         bare = OracleAdapter.__new__(OracleAdapter)
         bare._oracledb = oracledb
 
         class Cursor:
-            connection = type("Connection", (), {"call_timeout": 0, "is_healthy": lambda self: True})()
+            connection = type("Connection", (), {"call_timeout": 0,
+                                                 "is_healthy": lambda self: healthy})()
 
             def execute(self, sql):
                 raising()
@@ -256,6 +258,21 @@ def test_oracles_closed_connection_is_an_outage_whatever_the_clock(oracle, monke
         run(adapter(_raise(closed)), "SELECT 1 FROM dual", timeout_s=5)
 
 
+def test_oracles_refusal_of_a_connection_its_driver_gave_up_is_an_outage(oracle):
+    # The adapter refuses a connection python-oracledb calls unhealthy before writing its bound,
+    # since that write segfaults on one the driver closed (#182, M214). The refusal is
+    # `ConnectionUnusable`, and the statement was never sent: the source's, not the query's.
+    from mnemiq.adapters.oracle import ConnectionUnusable
+
+    _, _, adapter = oracle
+    sent = []
+    with pytest.raises(SourceUnavailableError) as caught:
+        run(adapter(lambda: sent.append("execute"), healthy=False), "SELECT 1 FROM dual",
+            timeout_s=5)
+    assert sent == [], "nothing is sent on a connection the driver gave up"
+    assert isinstance(caught.value.__cause__, ConnectionUnusable), caught.value.__cause__
+
+
 # -- the loop --------------------------------------------------------------------------------
 
 
@@ -265,6 +282,38 @@ def test_a_source_down_at_the_run_fails_the_turn_without_asking_the_model_to_rep
     assert len(generator.calls) == 1, generator.calls
     assert source.runs == 1, "the statement is not run again"
     _is_the_outage(answer)
+
+
+def test_a_connection_oracles_driver_gave_up_after_the_proof_ends_the_turn(tmp_path, oracle):
+    # The proof answers, here DuckDB's EXPLAIN, and the run meets Oracle's own refusal of a
+    # connection its driver calls unhealthy (#182, M214): the turn ends as the source's, and the
+    # model is not asked to repair a query nothing was wrong with.
+    _, _, adapter = oracle
+    proved, sent = _duckdb(tmp_path), []
+    unusable = adapter(lambda: sent.append("execute"), healthy=False)
+
+    class _ProvedThenUnusable:
+        """DuckDB for everything the proof asks; Oracle's `execute_arrow` and its classifier for
+        the run."""
+
+        runs = 0
+
+        def __getattr__(self, name):
+            return getattr(proved, name)
+
+        def execute_arrow(self, sql, timeout_s=None):
+            self.runs += 1
+            return unusable.execute_arrow(sql, timeout_s=timeout_s)
+
+        def source_unavailable(self, exc):
+            return unusable.source_unavailable(exc)
+
+    source = _ProvedThenUnusable()
+    answer, generator = _ask(source)
+    _is_the_outage(answer)
+    assert source.runs == 1, "the proof answered and the run was reached, once"
+    assert sent == []
+    assert len(generator.calls) == 1, generator.calls
 
 
 def test_a_connection_that_drops_once_is_not_run_again(tmp_path):

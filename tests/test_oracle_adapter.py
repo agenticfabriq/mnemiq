@@ -350,7 +350,7 @@ try:
     print("first: no fault")
 except Exception as exc:
     driver = exc if isinstance(exc, oracledb.Error) else exc.__cause__
-    print("first:", driver.args[0].full_code)
+    print("first:", driver.args[0].full_code, "raised as", type(exc).__name__)
 try:
     print("then:", adapter.execute_arrow("SELECT 1 FROM dual").num_rows, "row")
 except Exception as exc:
@@ -358,14 +358,9 @@ except Exception as exc:
 """
 
 
-@pytest.mark.parametrize("shape, then", [("pooled", "then: 1 row"),
-                                         ("borrowed", "then: ConnectionUnusable")])
-def test_a_timeout_that_closes_the_connection_does_not_end_the_process(shape, then):
-    """python-oracledb 4.0.2 segfaults when `call_timeout` is set on a connection it closed after
-    an unanswered break, and the lease set it in its cleanup: one slow query ended the process for
-    every caller. In a subprocess, so the crash is this test's failure rather than the suite's
-    end. A pool replaces the closed connection; a borrowed one is the caller's, and the next call
-    is refused without touching it, as the source's."""
+def _time_out_then_ask_again(shape: str) -> str:
+    """`_TIME_OUT_THEN_ASK_AGAIN` over `_SLOW` in a subprocess, so a crash is the calling test's
+    failure rather than the suite's end; its output, once it exits cleanly."""
     import subprocess
     import sys
 
@@ -379,9 +374,29 @@ def test_a_timeout_that_closes_the_connection_does_not_end_the_process(shape, th
                          capture_output=True, text=True, timeout=120, env=env)
     assert run.returncode == 0, f"exit {run.returncode}\n{run.stdout}{run.stderr[-2000:]}"
     # The precondition: a driver that cancelled in time raises DPY-4024, closes nothing, and
-    # would pass this test on the code that crashed.
+    # would pass on the code that crashed.
     assert "first: DPY-4011" in run.stdout, run.stdout
-    assert then in run.stdout, run.stdout
+    return run.stdout
+
+
+@pytest.mark.parametrize("shape, then", [("pooled", "then: 1 row"),
+                                         ("borrowed", "then: ConnectionUnusable")])
+def test_a_timeout_that_closes_the_connection_does_not_end_the_process(shape, then):
+    """python-oracledb 4.0.2 segfaults when `call_timeout` is set on a connection it closed after
+    an unanswered break, and the lease set it in its cleanup: one slow query ended the process for
+    every caller. A pool replaces the closed connection; a borrowed one is the caller's, and the
+    next call is refused without touching it, as the source's."""
+    out = _time_out_then_ask_again(shape)
+    assert then in out, out
+
+
+@pytest.mark.parametrize("shape", ["pooled", "borrowed"])
+def test_a_slow_query_the_driver_closes_at_its_bound_is_a_timeout(shape):
+    """The driver closes the connection when its own bound ended the call and the break went
+    unanswered, and says so on DPY-4011's second line (`_BOUND_ENDED_CLOSING`). That is the
+    bound's end, so the caller hears `QueryTimedOut`, where any other DPY-4011 is the source's."""
+    out = _time_out_then_ask_again(shape)
+    assert "first: DPY-4011 raised as QueryTimedOut" in out, out
 
 
 # `test_a_read_only_adapter_cannot_read_a_table_created_this_instant` lived here and is REMOVED,
