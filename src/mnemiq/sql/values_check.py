@@ -174,6 +174,22 @@ def _projection_name(projection: exp.Expression, dialect: str | None) -> str:
     return resolve(projection.alias_or_name, quoted=False, dialect=dialect)
 
 
+def _source_named(qualifier: exp.Identifier | None, sources, dialect: str | None) -> str | None:
+    """The key of `sources` a qualifier names, as the engine resolves names: the key as written,
+    else the one key that, read unquoted, folds to the qualifier's spelling (`T.*` over `t` on
+    DuckDB, where the written key missed and a qualified star's walk gave up: the review gate on
+    round 19). The scope's map keeps its keys unquoted, so a quoted key in another case may meet
+    an unquoted qualifier on an engine that keeps them apart, where the engine then finds no such
+    source and runs nothing."""
+    if qualifier is None:
+        return None
+    if qualifier.name in sources:
+        return qualifier.name
+    wanted = _written(qualifier, dialect)
+    matches = [key for key in sources if _written(exp.to_identifier(key), dialect) == wanted]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str]],
                     dialect: str | None, depth: int = 0) -> tuple[str, str] | None:
     """The base table and column a qualified column reads, followed through each CTE or derived
@@ -191,8 +207,9 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     count every earlier CTE among `sources` and skipped the walk (the same finding); over
     several selected sources it is placed by that scope's join rules (`_in_scope`), as the
     engine binds a bare name there (Codex's tenth review of #178). A name no
-    projection carries comes through a star, into the scope's one selected source the same
-    way (the review gate: an unqualified `doc` through `SELECT * FROM t` lost its owner once
+    projection carries comes through a star, into the scope's one selected source or the one
+    a qualified star names, the same way (the review gate: an unqualified `doc` through
+    `SELECT * FROM t` lost its owner once
     the statement-wide lookup became the fallback), a star with an EXCLUDE, a REPLACE or a
     RENAME excepted, which the walk gives up on (`_is_star`). The projections are read in
     order, as the engine names the output: a plain star BEFORE a projection of the asked name
@@ -208,7 +225,7 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     recursive CTE each resolved there and nowhere here (the gate's second round). A plain star
     over several sources yields the name as the scope binds a bare one, by its join rules
     (Codex's eleventh review); a modified star over several stays unknown."""
-    source = scope.sources.get(column.table) if column.table else None
+    source = scope.sources.get(_source_named(column.args.get("table"), scope.sources, dialect)) if column.table else None
     if isinstance(source, exp.Table):
         alias = source.args.get("alias")
         if isinstance(alias, exp.TableAlias) and alias.columns:
@@ -230,14 +247,25 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
         # A list names the first projections alone and the engine keeps the rest by their own
         # names (`WITH x(k) AS (SELECT region, doc FROM t)` keeps `doc`: the review gate's
         # fourth round), so the projections past the list are matched by name, in order, a
-        # star met first followed into the scope's one selected source.
+        # star met first followed into its source: the scope's one, the one a qualified star
+        # names, or the join's rules over several.
         projection = None
         for candidate in selects[len(listed):]:
             star = candidate.this if isinstance(candidate, exp.Column) else candidate
             if isinstance(star, exp.Star):
                 if not _is_star(candidate):
                     return None
-                if len(source.selected_sources) != 1:
+                qualifier = candidate.args.get("table") if isinstance(candidate, exp.Column) else None
+                if qualifier is not None:
+                    # A qualified star yields its named source's own columns, a USING merge aside
+                    # (`t.*` over `t RIGHT JOIN b USING (doc)` is `t.doc`, not the merged column),
+                    # so the walk follows that source alone; read as a bare star, `u.*` placed
+                    # the name by the join and refused `t.region`'s present value (Codex's
+                    # twelfth review of #178).
+                    alias = _source_named(qualifier, source.selected_sources, dialect)
+                    if alias is None:
+                        return None
+                elif len(source.selected_sources) != 1:
                     # A plain star over a join yields the name as the scope binds a bare one: the
                     # one source holding it under the grant, or a USING or NATURAL join's merged
                     # column (Codex's eleventh review of #178: `(SELECT * FROM t JOIN u ON true) q
@@ -255,7 +283,8 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
                     if answer is _ABSENT:
                         continue
                     return answer if isinstance(answer, tuple) else None
-                (alias,) = source.selected_sources
+                else:
+                    (alias,) = source.selected_sources
                 through = _through_scopes(_same_column(column, alias), source, visible, dialect, depth + 1)
                 if through is None:
                     return None  # the star may yield the name: not known either way
@@ -308,9 +337,9 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     statement-wide reading would resurrect the other side. Under a star (`listed`) a source the
     walk cannot name beside a holder answers nothing: the star lists that source's columns too,
     and the engine binds the name to the first without the ambiguity error a bare name meets."""
-    qualifier = column.table
-    if qualifier:
-        return _through_scopes(column, scope, visible, dialect, depth + 1) if qualifier in scope.sources else _ABSENT
+    if column.table:
+        named = _source_named(column.args.get("table"), scope.sources, dialect)
+        return _through_scopes(column, scope, visible, dialect, depth + 1) if named is not None else _ABSENT
     wanted = _written(column.this, dialect)
     # The merged column of a USING join is the join's: an inner or LEFT join's the
     # left input's, a RIGHT join's the right input's, a FULL join's coalesced from
