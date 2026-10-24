@@ -245,8 +245,8 @@ def test_oracles_closed_connection_is_an_outage_whatever_the_clock(oracle, monke
     # DPY-4011, the database or network closed the connection, was read as a timeout whatever the
     # clock until the runner read the adapter's outage classification (M187's note), then as one
     # at or past the deadline the adapter measured (Codex's reviews of #179: it could not measure
-    # it). The driver reports its own bound as DPY-4024 and closes the connection after it only
-    # when the server did not answer its cancel either, so a closed connection is the source's.
+    # it). The driver reports its own bound as DPY-4024, or as DPY-4011 with a line saying so
+    # (`_BOUND_ENDED_CLOSING`); a closed connection with no such line is the source's.
     oracledb, driver_error, adapter = oracle
     closed = driver_error("DPY-4011: the database or network closed the connection", 4011,
                           oracledb.DatabaseError)

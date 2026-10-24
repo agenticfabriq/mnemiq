@@ -1354,7 +1354,7 @@ class OracleAdapter:
                 # reports DPY-4024. Not an outage either, though the classifier calls the driver's
                 # cancel unavailable (the review gate on M188): read as one, the turn would end as
                 # the source's fault. A closed connection, DPY-4011, goes to the classifier as the
-                # driver raised it.
+                # driver raised it, unless the driver said its bound ended it (`_is_timeout`).
                 raise QueryCancelled(f"the source cancelled the query: {exc}") from exc
             raise
 
@@ -1735,9 +1735,9 @@ def _is_ddl_race(exc: Exception) -> bool:
 # clock makes one (Codex's reviews of #179). ORA-01013, the cancel, matched as one by M187 and
 # then once a deadline the adapter measured had passed, is always someone else's: the adapter
 # never cancels and the driver reports its own bound as DPY-4024 (`_is_cancel`). DPY-4011, a
-# closed connection, follows the bound only when the server did not answer the driver's cancel
-# either, so it is the source's, an outage the runner reads through the adapter's classifier
-# (M188). The code is read off the driver's error
+# closed connection, is the source's, an outage the runner reads through the adapter's
+# classifier (M188), with the one exception the driver names (`_BOUND_ENDED_CLOSING`). The code
+# is read off the driver's error
 # object (`full_code`) where the error carries one, so an application error whose message
 # quotes a timeout code (`ORA-20001: ... DPY-4024`) is not one (Codex's first review of
 # #176); an error with no code, a wrapped or a synthetic one, is read by its text, where the
@@ -1749,6 +1749,21 @@ def _is_ddl_race(exc: Exception) -> bool:
 # down the text branch (the gate on the second commit).
 _TIMEOUT_CODES = frozenset({"DPY-4024", "ORA-03156"})
 _TIMEOUT_SPELLINGS = tuple(code.lower() for code in sorted(_TIMEOUT_CODES)) + ("timeout",)
+
+# The line thin mode puts under DPY-4011 when a call outlived `call_timeout` and the break it then
+# sent went unanswered within the same bound, so the driver closed the connection itself
+# (python-oracledb 4.0.2, `_process_message`). The bound's end in the driver's own words: measured
+# on Oracle Free 23 with a query that was only slow, 0.4 s a row under a 1 s bound, so a server that
+# answers ends this way, and is read as a timeout the model may answer with a cheaper query rather
+# than an outage that ends the turn. A source that drops off the network mid-query leaves the same
+# line, the residual this accepts: each repaired attempt reads as a timeout until one meets the
+# outage, at a pool acquire that opens a session, and the loop's attempt limit bounds how many (an
+# idle pooled session is pinged only past `ping_interval`). The driver's other line under DPY-4011,
+# "socket timed out while awaiting break response from server", is reached only with a break already
+# in progress, and the timeout path raises before that check, so it follows a break someone else's
+# `cancel()` began (`_break_external`), and stays the source's. Matched as a whole line of the
+# driver's own error, never inside another line.
+_BOUND_ENDED_CLOSING = "socket timed out while recovering from previous socket timeout"
 
 
 def _is_cancel(exc: Exception) -> bool:
@@ -1762,8 +1777,12 @@ def _is_cancel(exc: Exception) -> bool:
 
 
 def _is_timeout(exc: Exception) -> bool:
-    code = getattr(exc.args[0], "full_code", None) if exc.args else None
+    error = exc.args[0] if exc.args else None
+    code = getattr(error, "full_code", None)
     if isinstance(code, str) and code:
+        if code.upper() == "DPY-4011":
+            lines = str(getattr(error, "message", "")).splitlines()[1:]
+            return _BOUND_ENDED_CLOSING in (line.strip() for line in lines)
         return code.upper() in _TIMEOUT_CODES
     text = str(exc).lower()
     return any(spelling in text for spelling in _TIMEOUT_SPELLINGS)
@@ -1863,8 +1882,8 @@ def unavailable_fault(exc: BaseException) -> bool:
     pool's `acquire` raised is one whatever its code: no session was had.
 
     The driver types its network faults `OperationalError` (its DPY-6xxx, and the ORA codes it
-    lists as such: ORA-03113, ORA-03114 and ORA-01013, the cancel a call timeout surfaces as, among
-    them) and flags a dead session recoverable (DPY-4011, which it cross-references ORA-03113 to).
+    lists as such: ORA-03113, ORA-03114 and ORA-01013, the cancel, among them) and flags a dead
+    session recoverable (DPY-4011, which it cross-references ORA-03113 to).
     One of its OperationalError codes says nothing by itself: ORA-00604 wraps the error a
     recursive SQL raised, and is read by the codes in its message (Codex's eighth review of
     #159). Everything else it leaves a plain `DatabaseError`, `InterfaceError` or

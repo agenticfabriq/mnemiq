@@ -16,14 +16,15 @@ class QueryTimedOut(RuntimeError):
 
 class QueryCancelled(RuntimeError):
     """An adapter's own word that the source ended the statement on a cancel the bound did not
-    send: an operator's or another session's (Postgres's "canceling statement due to user
-    request", Oracle's ORA-01013 before the deadline). Neither an outage nor a timeout: the
-    driver's classifier calls the cancel unavailable, the right reading at the proof, but at the
-    run that reading would end the turn telling the caller the source did not answer (the review
-    gate on M188). The runner reports it as the cancel it is, and the turn ends on it rather than
-    reaching the repair loop, where a model writing the same SQL again would run the stopped
-    statement a second time (Codex's second review of #179). A cancel worded in another language is
-    not recognised and keeps the outage reading: it ends the turn too, and is never run again."""
+    send: an operator's or another session's (Postgres's "canceling statement due to user request",
+    Oracle's ORA-01013, which its driver never raises for its own bound). Neither an outage nor a
+    timeout: the driver's classifier calls the cancel unavailable, the right reading at the proof,
+    but at the run that reading would end the turn telling the caller the source did not answer
+    (the review gate on M188). The runner reports it as the cancel it is, and the turn ends on it
+    rather than reaching the repair loop, where a model writing the same SQL again would run the
+    stopped statement a second time (Codex's second review of #179). A cancel worded in another
+    language is not recognised and keeps the outage reading: it ends the turn too, and is never run
+    again."""
 
 
 class SourceAdapter(Protocol):
