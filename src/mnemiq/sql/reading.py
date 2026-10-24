@@ -240,7 +240,8 @@ def unprintable(target: str, exc: Exception, *, policys: bool, tree: exp.Express
     error (the generator's ValueError is the one measured, and sqlglot's own errors from the row-cap
     fallback's re-read or the write decider's plain re-parse arrive here too); a statement without
     one gets the engine's name alone, since advice about a construct it does not hold would spend
-    the repair pass (the review gate on rounds 61 and 62)."""
+    the repair pass (the review gate on rounds 61 and 62); the advice calls the literal the likely
+    cause, not the cause, since the error may be another's (the gate on round 63)."""
     logger.warning("the plan could not be printed for %s (%s)", target, exc)
     if policys:
         return Refusal(code=RefusalCode.POLICY_TARGET_UNSUPPORTED,
@@ -248,8 +249,8 @@ def unprintable(target: str, exc: Exception, *, policys: bool, tree: exp.Express
                                 f"{target} engine, where the statement as asked can; the policy, not the "
                                 "statement, needs another spelling."),
                        subject=target)
-    advice = (" Spell the lookup without a MAP literal keyed by a column or a lambda's parameter, which that "
-              "engine's printer cannot name." if tree.find(exp.ToMap) is not None else "")
+    advice = (" The likely cause is a MAP literal keyed by a column or a lambda's parameter, which that engine's "
+              "printer cannot name; spell the lookup without one." if tree.find(exp.ToMap) is not None else "")
     return Refusal(code=RefusalCode.UNPRINTABLE_FOR_TARGET,
                    message=f"The statement cannot be printed for the {target} engine; spell it as that engine reads it.{advice}",
                    subject=target)

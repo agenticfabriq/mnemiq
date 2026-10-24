@@ -145,7 +145,7 @@ def test_a_map_key_the_target_cannot_print_is_refused_not_raised():
                     "SELECT MAP {region: 1}[region] FROM claim"):
             verdict = decide(sql, VISIBLE, dialect="duckdb", target=target)
             assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNPRINTABLE_FOR_TARGET, (target, sql, verdict)
-            assert verdict.repairable and target in verdict.message, verdict
+            assert verdict.repairable and target in verdict.message and "MAP literal" in verdict.message, verdict
         verdict = decide("SELECT MAP {'a': 1}['a'] FROM claim", VISIBLE, dialect="duckdb", target=target)
         assert isinstance(verdict, Approved), verdict
         grants = GrantSet(frozenset(VISIBLE), writable=frozenset({"sink"}))
