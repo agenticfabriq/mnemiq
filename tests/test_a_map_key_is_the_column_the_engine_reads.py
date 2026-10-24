@@ -169,6 +169,15 @@ def test_a_construct_the_target_cannot_render_is_refused_not_blanked():
     assert isinstance(decide(sql, VISIBLE, dialect="duckdb", target="duckdb"), Approved)
     verdict = decide("SELECT list_transform(tags, x -> x || 'a') FROM claim", VISIBLE, dialect="duckdb", target="postgres")
     assert isinstance(verdict, Approved) and "TRANSFORM(" in verdict.target_sql, verdict
+    # the row-cap fallback renders the same way: sqlglot cannot parse the cap after ROLLUP, so the
+    # capped plan is re-read without it (M137), and that render raises on the construct too (the
+    # review gate on round 66)
+    capped = "SELECT map_from_entries([{'k': 'a', 'v': 1}]) AS m, count(*) AS n FROM claim GROUP BY ROLLUP (region)"
+    assert con.execute(capped).fetchall() == [({'a': 1}, 1), ({'a': 1}, 1)]
+    verdict = decide(capped, VISIBLE, dialect="duckdb", target="postgres")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNPRINTABLE_FOR_TARGET, verdict
+    verdict = decide(capped, VISIBLE, dialect="duckdb", target="duckdb")
+    assert isinstance(verdict, Approved) and "ROLLUP" in verdict.target_sql and "MAP_FROM_ENTRIES" in verdict.target_sql, verdict
 
 
 def test_the_unprintable_advice_names_the_map_literal_only_where_the_statement_holds_one():
