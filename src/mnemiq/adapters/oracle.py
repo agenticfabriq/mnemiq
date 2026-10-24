@@ -364,9 +364,10 @@ class OracleAdapter:
             try:
                 # An unhealthy connection is dropped with no round trip. The pool would drop it
                 # anyway, a dropped socket on return and a session the server is ending at the
-                # next acquire (python-oracledb 4.0.2's `_check_connection`), and pinging it to
-                # reset a bound nobody will use could stall on that session (the review gate on
-                # the second commit).
+                # next acquire (python-oracledb 4.0.2's `_check_connection`); `drop` hands the
+                # close to the pool's own thread (`_drop_conn_impl`); and pinging it to reset a
+                # bound nobody will use could stall on that session (the review gate on the
+                # second commit).
                 reusable = con.is_healthy()
                 if reusable:
                     _set_call_timeout(con, 0)
@@ -378,10 +379,10 @@ class OracleAdapter:
             if reusable:
                 self._pool.release(con)
             else:
-                # DROPPED rather than released, because a connection that will not accept a
-                # timeout reset would go back into the pool carrying an unknown one, and the
-                # next borrower would inherit a bound nobody set. `drop` retires it and the pool
-                # opens a replacement.
+                # DROPPED rather than released: an unhealthy connection, for the reason above,
+                # and one that will not accept a timeout reset, which would go back into the
+                # pool carrying an unknown one for the next borrower to inherit a bound nobody
+                # set. `drop` retires it and the pool opens a replacement.
                 self._pool.drop(con)
 
     def _recheck_read_only(self, con) -> None:
