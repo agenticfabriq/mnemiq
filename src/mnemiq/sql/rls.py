@@ -11,7 +11,7 @@ from sqlglot import exp
 
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import names_one_object, object_key
-from mnemiq.sql.reading import arrow_read_as_a_lambda, as_duckdb_reads, is_lambda_parameter, map_struct
+from mnemiq.sql.reading import as_duckdb_reads, is_lambda_parameter, map_struct
 from mnemiq.sql.scope import (base_tables, column_tables, cte_references, known_columns,
                               scope_resolved)
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -508,10 +508,10 @@ def _json_call_type(node: exp.Expression, type_of) -> str:
     return leaf + "[]" if _path_shape(_extract_path(node), type_of) == "list" else leaf
 
 
-# The calls DuckDB hands a lambda to, and the arrow sqlglot reads as a lambda anywhere else, are
-# `reading.py`'s (`lambda_takers`, `arrow_read_as_a_lambda`), which the parameter reading there
-# needs as well: refused here, with the plain spelling in the advice (`json_extract(attrs,
-# '$.a')`, which sqlglot reads as the extract everywhere).
+# The arrow sqlglot reads as a lambda outside the calls DuckDB hands one to (`attrs -> '$.a'`
+# inside a call's arguments: Codex's nineteenth review of #160) is re-read as the JSON extract
+# it is before any rule here runs (`reading.py`), so a Lambda reaching these rules is a lambda
+# to DuckDB too, and the extract meets the JSON readers' rules as `json_extract(attrs, '$.a')`.
 
 
 def _known_type(value, type_of, engine: str) -> exp.DataType | None:
@@ -779,6 +779,8 @@ _PURE_CALLS = frozenset({"map_values", "map_entries", "list_extract", "array_ext
                          "list_distinct", "array_distinct", "map_keys", "struct_extract",
                          "flatten", "list_sort", "map_from_entries", "row",
                          "union_value",  # typed by DuckDB from its argument's stand-in
+                         "list_any_value",  # an element of the list, the list's element type (round 55: the arrow
+                         # it read, `list_any_value(attrs -> ['$.a'])`, was refused as a lambda before, JSON beside text now)
                          "element_at"})  # a map looked up: a LIST of the value type (`V[]`), from stand-ins
 # Calls that hand DuckDB a lambda, typed by DuckDB from the list walked and the lambda's body
 # with the parameters bound by the engine itself (`list_transform([attrs], x -> x)` is JSON[],
@@ -2026,8 +2028,6 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
         return None if owner is None else types_of(owner).get(column.name.lower())
 
     for node in wrapped.args["where"].walk():
-        if engine == "duckdb" and arrow_read_as_a_lambda(node):
-            return node  # `attrs -> '$.a'` where DuckDB extracts JSON and sqlglot sees a lambda
         if engine == "duckdb" and _is_union_extract(node) and not (
                 isinstance(node.expressions[1], exp.Literal) and node.expressions[1].is_string):
             return node.expressions[1]  # the TAG: a constant the engine resolves and the reader
@@ -2188,11 +2188,7 @@ def raising_conversion(filt: str, table: str, dialect: str, policy: AccessPolicy
 
 def _raising_refusal(node: exp.Expression, table: str, engine: str) -> Refusal:
     safe = _SAFE_FORM.get(engine, "a form that cannot fail, or a column of the right type")
-    if engine == "duckdb" and isinstance(node, exp.Lambda):
-        safe = ("json_extract(value, path) in place of `value -> path` here: inside a call's "
-                "arguments or beside an operator the parser reads the arrow as a lambda where "
-                "DuckDB reads a JSON extract, so the filter cannot be checked as DuckDB runs it")
-    elif engine == "duckdb" and node.parent is not None and _is_union_extract(node.parent) \
+    if engine == "duckdb" and node.parent is not None and _is_union_extract(node.parent) \
             and node.parent.expressions[1] is node:
         safe = ("the union member's tag as one string literal: a tag the engine resolves as a "
                 "constant and the reader cannot leaves the extract's type, and so the "

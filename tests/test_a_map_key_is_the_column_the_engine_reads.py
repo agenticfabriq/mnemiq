@@ -30,8 +30,8 @@ class _OkAdapter:
 
 def _table():
     con = duckdb.connect()
-    con.execute("CREATE TABLE claim(id INT, region VARCHAR, secret VARCHAR, tags VARCHAR[], x VARCHAR); "
-                "INSERT INTO claim VALUES (1, 'north', 's3cret', ['north'], 'col'); "
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, secret VARCHAR, tags VARCHAR[], x VARCHAR, attrs JSON); "
+                "INSERT INTO claim VALUES (1, 'north', 's3cret', ['north'], 'col', '{\"a\": 1}'); "
                 "CREATE TABLE sink(i INT, s VARCHAR); INSERT INTO sink VALUES (1, 'a')")
     return con
 
@@ -132,3 +132,22 @@ def test_an_arrow_outside_a_lambda_taker_is_no_lambda():
     assert con.execute(sql).fetchall() == [([1],)]
     verdict = _decide(sql)
     assert isinstance(verdict, Approved) and "MAP {secret: 1}" in verdict.target_sql, verdict
+
+
+def test_an_arrow_outside_a_lambda_taker_is_the_json_extract_it_is():
+    # M213 (the review gate on round 54): the arrow's left side is a column to DuckDB and a
+    # lambda's parameter to sqlglot, so `concat(secret -> 1)` read the hidden column past the
+    # grant check and DuckDB raised quoting its value; a row of columns the same. Re-read as the
+    # JSON extract over Columns, the read is refused; over a granted JSON column the extract is
+    # approved, rendered as written, and runs to the engine's rows.
+    con = _table()
+    with pytest.raises(duckdb.Error, match="s3cret"):
+        con.execute("SELECT concat(secret -> 1) FROM claim").fetchall()
+    for sql in ("SELECT concat(secret -> 1) FROM claim", "SELECT concat((id, secret) -> 1) FROM claim"):
+        verdict = _decide(sql)
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
+    sql = "SELECT concat(attrs -> '$.a', 'x') FROM claim"
+    rows = con.execute(sql).fetchall()
+    verdict = decide(sql, {**VISIBLE, "claim": VISIBLE["claim"] | {"attrs"}}, dialect="duckdb", target="duckdb")
+    assert isinstance(verdict, Approved) and "attrs -> '$.a'" in verdict.target_sql, verdict
+    assert con.execute(verdict.target_sql).fetchall() == rows == [("1x",)]

@@ -19,6 +19,16 @@ the parameter), so it becomes a Var, bare in the render and no Column to any gua
 spelled in another case stays a Column, and is refused as an unknown one, since DuckDB binds
 it to a column of the folded name in a SELECT list where one is in scope.
 
+The arrow parts the two readings the same way: sqlglot reads `a -> b` as a lambda inside any
+call, DuckDB only inside the calls it hands a lambda to (`lambda_takers`) and as the JSON
+extract anywhere else, so the arrow's left side is a column to the engine and a lambda's
+parameter to every reader of the tree: with `secret` hidden, `SELECT concat(secret -> 1) FROM
+claim` passed the grant check, which walks Columns, and DuckDB ran `json_extract(secret, 1)`,
+raising with the hidden value quoted (M213, the review gate on round 54 of #160). Such a
+Lambda becomes the `exp.JSONExtract` it is, its left side the Column, or the row of Columns,
+DuckDB reads, so the grant check sees the read and the typing rules read the extract as they
+read `json_extract(value, path)`.
+
 sqlglot builds `exp.ToMap` over a Struct from DuckDB's `MAP {...}` syntax alone, so for a tree
 parsed in any other dialect this is a no-op; the name says whose reading it restores.
 """
@@ -106,8 +116,15 @@ def is_lambda_parameter(node: exp.Expression) -> bool:
 
 
 def as_duckdb_reads(ast: exp.Expression) -> exp.Expression:
-    """The tree with every MAP literal's bare key read as DuckDB reads it, in place: the Column
+    """The tree re-read as DuckDB reads it, in place: a Lambda outside a lambda taker the JSON
+    extract over Columns, innermost first, and then every MAP literal's bare key the Column
     it is, or the Var of an enclosing lambda's parameter spelled exactly."""
+    for lam in reversed(list(ast.find_all(exp.Lambda))):
+        if not arrow_read_as_a_lambda(lam):
+            continue
+        columns = [exp.Column(this=p.copy()) if isinstance(p, exp.Identifier) else p.copy() for p in lam.expressions]
+        left = columns[0] if len(columns) == 1 else exp.Tuple(expressions=columns)
+        lam.replace(exp.JSONExtract(this=left, expression=lam.this.copy()))
     for node in list(ast.find_all(exp.ToMap)):
         struct = map_struct(node)
         for item in struct.expressions if struct is not None else ():
