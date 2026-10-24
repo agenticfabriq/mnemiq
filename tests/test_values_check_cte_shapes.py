@@ -285,18 +285,62 @@ def test_a_local_sources_name_the_walk_cannot_follow_stays_unresolved():
     _refused_on_doc("WITH x(k) AS (SELECT doc FROM t) SELECT count(*) FROM x, t WHERE doc = 'west'")
 
 
-def test_a_natural_join_answers_nothing():
-    # The same review: a NATURAL join's keys are every name its sides share, and a RIGHT or
-    # FULL one takes the right side's; `t NATURAL RIGHT JOIN (SELECT region AS doc FROM t) q`
-    # compares `t.region` where the walk said `t.doc`.
+def test_a_natural_join_unsettles_only_the_name_both_sides_may_hold():
+    # Codex's third review: a NATURAL join's keys are every name its sides share, and a RIGHT
+    # one takes the right side's, `t NATURAL RIGHT JOIN (SELECT region AS doc FROM t) q`
+    # compares `t.region` where the walk said `t.doc`. An inner or LEFT one takes the left
+    # side's, `t.doc`, as a USING key does, and the absent value is refused (Codex's eighth
+    # review: a skip on any NATURAL join let seven absent values through); a FULL one
+    # coalesces both sides and answers nothing.
     con = duckdb.connect()
     con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east')")
     assert con.execute("SELECT doc FROM t NATURAL RIGHT JOIN (SELECT region AS doc FROM t) q WHERE doc = 'west'").fetchall() == [("west",)]
-    for side in ("", "LEFT ", "RIGHT ", "FULL "):
+    for side in ("", "LEFT "):
+        assert con.execute(f"SELECT count(*) FROM t NATURAL {side}JOIN (SELECT region AS doc FROM t) q WHERE doc = 'west'").fetchall() == [(0,)]
+        _refused_on_doc(f"SELECT count(*) FROM t NATURAL {side}JOIN (SELECT region AS doc FROM t) q WHERE doc = 'west'")
+        assert _check(f"SELECT count(*) FROM t NATURAL {side}JOIN (SELECT region AS doc FROM t) q WHERE doc = 'a'") is None, side
+    for side in ("RIGHT ", "FULL "):
         for literal in ("west", "a"):
             assert _check(f"SELECT count(*) FROM t NATURAL {side}JOIN (SELECT region AS doc FROM t) q WHERE doc = '{literal}'") is None, (side, literal)
     # a NATURAL join inside a subquery is another scope's, and leaves the outer column's check on
     _refused_on_doc("SELECT count(*) FROM t WHERE doc = 'west' AND region IN (SELECT region FROM t NATURAL JOIN t u)")
+
+
+def test_a_natural_join_leaves_the_names_it_does_not_merge_alone():
+    # Codex's eighth review of #178: a skip on any NATURAL join in the scope let seven absent
+    # values through where main refused them; each compares `t.doc` on DuckDB and counts
+    # nothing. A name the right side cannot hold the join merges nothing of, a correlated
+    # scope included; one the left side cannot hold is the right side's; a FULL join's is
+    # coalesced from both and answers nothing.
+    visible = {**VISIBLE, "u": {"name"}, "v": {"doc", "k", "name"}, "w": {"k"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east'); "
+                "CREATE TABLE u (name VARCHAR); INSERT INTO u VALUES ('n'); "
+                "CREATE TABLE v (doc VARCHAR, k INTEGER, name VARCHAR); INSERT INTO v VALUES ('west', 1, 'n'); "
+                "CREATE TABLE w (k VARCHAR); INSERT INTO w VALUES ('west')")
+    for sql in ("SELECT count(*) FROM (SELECT * FROM (SELECT * FROM t JOIN u ON true) AS z) AS a NATURAL JOIN u AS b WHERE doc = 'west'",
+                "SELECT count(*) FROM w NATURAL JOIN w AS b, t WHERE doc = 'west'",
+                "SELECT count(*) FROM t JOIN t AS q USING (doc), w NATURAL JOIN w AS b WHERE doc = 'west'",
+                "WITH x AS (SELECT doc FROM t NATURAL JOIN t AS b WHERE doc = 'west') SELECT count(*) FROM x",
+                "SELECT count(*) FROM t NATURAL JOIN t AS b(region, doc) WHERE doc = 'west'",
+                "SELECT count(*) FROM t NATURAL LEFT JOIN t AS b WHERE doc = 'west'",
+                "SELECT count(*) FROM v WHERE EXISTS (SELECT 1 FROM t NATURAL RIGHT JOIN (SELECT region FROM t) AS b WHERE doc = 'west')"):
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index())
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    sql = "SELECT count(*) FROM t NATURAL FULL JOIN t AS b WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(0,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None
+    sql = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT name FROM u) AS a NATURAL JOIN v AS b WHERE doc = 'west')"
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None
+    # A join's left side is the sources joined before it: a later source holding the name does
+    # not make an earlier NATURAL join a merge (the review gate on round 13: `doc` is `b.doc`,
+    # `t.region`, and read with `c` on the left the first join dropped `b`, its only holder).
+    sql = ("SELECT count(*) FROM w NATURAL JOIN (SELECT region AS doc, 'west' AS k FROM t) AS b "
+           "NATURAL LEFT JOIN t AS c WHERE doc = 'west'")
+    assert con.execute(sql).fetchall() == [(1,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None
 
 
 def test_the_statement_wide_reading_returns_the_catalogs_spelling():

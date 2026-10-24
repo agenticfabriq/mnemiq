@@ -327,26 +327,45 @@ def check_values(
         # This scope's own joins alone, in order, each USING the key narrowing the
         # candidates in turn (a later RIGHT join decides over an earlier inner one): a
         # join inside a subquery is another scope's, and read here it switched the check
-        # off for the outer column (the review gate on the fourth round). A NATURAL
-        # join's keys are every name its sides share, which a set of granted names
-        # cannot settle, so the name answers nothing where a source holds or may hold it
-        # (Codex's third review of #178: `t NATURAL RIGHT JOIN (SELECT region AS doc FROM
-        # t) q` compares `t.region`); beside sources none of which can hold the name the
-        # join is no part of its binding, and the enclosing scope is asked (Codex's seventh
-        # review: `EXISTS (SELECT 1 FROM w NATURAL JOIN w b WHERE doc = 'west')` compares
-        # the outer `t.doc`, and the skip let an absent value through where the
-        # statement-wide reading had refused it).
+        # off for the outer column (the review gate on the fourth round). A NATURAL join
+        # is a USING join on every name its sides share, so it unsettles a name only where
+        # both sides may hold it (`_may_hold`), and then by its side as a USING key is: a
+        # name the right side cannot hold the join merges nothing of, and one the left
+        # side cannot hold is the right side's (Codex's third review of #178: `t NATURAL
+        # RIGHT JOIN (SELECT region AS doc FROM t) q` compares `t.region`; the seventh:
+        # `EXISTS (SELECT 1 FROM w NATURAL JOIN w b WHERE doc = 'west')` compares the outer
+        # `t.doc`; the eighth: `w NATURAL JOIN w b, t`, `t NATURAL JOIN t b` and five more
+        # compare `t.doc`, where a skip on any NATURAL join in the scope let an absent
+        # value through). A FULL join's merged column is coalesced from both sides and
+        # answers nothing, as a USING FULL join's does. A join's left side is the FROM
+        # source and the joins before it, not every other source of the scope: read as the
+        # latter, a source joined LATER that held the name made an earlier NATURAL join a
+        # merge, and `w NATURAL JOIN (SELECT region AS doc, 'west' AS k FROM t) b NATURAL LEFT
+        # JOIN t c WHERE doc = 'west'` refused a present value, `b.doc`, against `t.doc` (the
+        # review gate on round 13).
+        from_ = scope.expression.args.get("from_")
+        left = [from_.this.alias_or_name] if from_ is not None else []
         for join in scope.expression.args.get("joins") or []:
+            right = join.this.alias_or_name
             if (join.method or "").upper() == "NATURAL":
-                return None if any(_may_hold(source, wanted, dialect, visible)
-                                   for _, source in scope.selected_sources.values()) else _ABSENT
-            if not any(_written(key, dialect) == wanted for key in (join.args.get("using") or ())):
+                right_may = right not in scope.selected_sources or _may_hold(
+                    scope.selected_sources[right][1], wanted, dialect, visible)
+                if not right_may:
+                    left.append(right)
+                    continue
+                if not any(_may_hold(scope.selected_sources[a][1], wanted, dialect, visible)
+                           for a in candidates if a in left and a in scope.selected_sources):
+                    candidates = [right]
+                    left.append(right)
+                    continue
+            elif not any(_written(key, dialect) == wanted for key in (join.args.get("using") or ())):
+                left.append(right)
                 continue
             side = (join.side or "").upper()
             if side == "FULL":
                 return None
-            right = join.this.alias_or_name
             candidates = [right] if side == "RIGHT" else [a for a in candidates if a != right]
+            left.append(right)
         # A source renamed by position among the candidates, before any sole owner: the
         # statement-wide reading would place the name by it (the gate's second round).
         if any(isinstance(source, exp.Table) and isinstance(source.args.get("alias"), exp.TableAlias)
