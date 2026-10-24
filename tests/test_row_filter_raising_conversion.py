@@ -1599,6 +1599,23 @@ def test_a_map_keyed_by_a_lambdas_parameter_is_typed_by_the_parameter():
         assert isinstance(_decide(safe, snapshot=_snapshot(types)), Approved), safe
 
 
+def test_a_row_filter_the_target_cannot_print_is_the_policys_refusal():
+    # Codex's forty-seventh review of #160: a MAP literal keyed by a column in a row filter printed
+    # for Postgres or Oracle raised out of `decide` for every statement on the table. The statement
+    # as asked prints, so the refusal is the policy's, never the model's to repair; on DuckDB the
+    # filter installs.
+    types = {**TYPES, ("claim", "tags"): "VARCHAR[]"}
+    grants = GrantSet(frozenset({"claim"}), row_filters={"claim": "MAP {region: 1}[region] = 1"})
+    for engine in ("postgres", "oracle"):
+        verdict = decide("SELECT id FROM claim", visible_schema(_snapshot(types), grants), dialect="duckdb",
+                        target=engine, policy=build_access_policy(_snapshot(types), grants))
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.POLICY_TARGET_UNSUPPORTED, (engine, verdict)
+        assert not verdict.repairable
+    verdict = decide("SELECT id FROM claim", visible_schema(_snapshot(types), grants), dialect="duckdb",
+                    target="duckdb", policy=build_access_policy(_snapshot(types), grants))
+    assert isinstance(verdict, Approved) and "MAP {region: 1}" in verdict.target_sql, verdict
+
+
 def test_a_dotted_map_key_in_a_row_filter_is_no_predicate():
     # Codex's forty-fourth review of #160: `list_transform([{region: 'south'}], x -> MAP {x.region:
     # 1}[region] IS NULL) = [false]` removes every row (the key is the element's field, 'south', and

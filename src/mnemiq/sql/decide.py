@@ -29,21 +29,26 @@ from mnemiq.sql.qualify import expand_tables, object_key
 from mnemiq.sql.lineage import lineage_for
 from mnemiq.sql.scope import (base_tables, check_policy_target, fields_as_members, known_columns,
                               scope_resolved)
-from mnemiq.sql.reading import as_duckdb_reads, rendered
+from mnemiq.sql.reading import as_duckdb_reads, rendered, unprintable
 from mnemiq.sql.rls import apply_row_and_mask, check_filter_targets, unplaceable_policy
 from mnemiq.sql.values_check import check_values
 from mnemiq.sql.views import check_views
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
 
 
-def _render_target(tree: exp.Expression, plan_sql: str, dialect: str, target: str) -> str:
+def _render_target(tree: exp.Expression, plan_sql: str, dialect: str, target: str,
+                   *, policys: bool = False) -> str | Refusal:
     """`plan_sql` in the target's dialect, through the row-cap fallback where sqlglot needs it.
     One path for the executed statement and the one a caller is shown (M51), so the two agree
-    whenever the policy changed nothing."""
+    whenever the policy changed nothing. A plan the target's generator cannot print is a refusal
+    (`unprintable`), the policy's where `policys`, since the statement as asked printed."""
     try:
-        return rendered(plan_sql, dialect, target)
-    except sqlglot.errors.ParseError:
-        return _transpile_under_the_cap(tree, dialect, target)
+        try:
+            return rendered(plan_sql, dialect, target)
+        except sqlglot.errors.ParseError:
+            return _transpile_under_the_cap(tree, dialect, target)
+    except (ValueError, sqlglot.errors.SqlglotError) as exc:
+        return unprintable(target, exc, policys=policys)
 
 
 def _transpile_under_the_cap(shaped: exp.Expression, dialect: str, target: str) -> str:
@@ -247,11 +252,17 @@ def decide(
     expand_tables(shaped, registry or {})
     expand_tables(asked, registry or {})
 
-    plan_sql = shaped.sql(dialect=dialect)
-    target_sql = _render_target(shaped, plan_sql, dialect, target)
+    # The statement as asked first, then the governed plan: a rewrite the target cannot print where
+    # the statement prints is the policy's refusal, not the model's.
     asked_plan = asked.sql(dialect=dialect)
-    asked_sql = (target_sql if asked_plan == plan_sql
-                 else _render_target(asked, asked_plan, dialect, target))
+    asked_sql = _render_target(asked, asked_plan, dialect, target)
+    if isinstance(asked_sql, Refusal):
+        return asked_sql
+    plan_sql = shaped.sql(dialect=dialect)
+    target_sql = (asked_sql if asked_plan == plan_sql
+                  else _render_target(shaped, plan_sql, dialect, target, policys=True))
+    if isinstance(target_sql, Refusal):
+        return target_sql
 
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof

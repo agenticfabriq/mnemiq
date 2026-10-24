@@ -133,6 +133,26 @@ def test_a_quoted_parameter_key_keeps_its_quotes_in_the_render():
         assert con.execute(verdict.target_sql).fetchall() == rows, verdict.target_sql
 
 
+def test_a_map_key_the_target_cannot_print_is_refused_not_raised():
+    # Codex's forty-seventh review of #160: sqlglot's Postgres and Oracle generators name a struct's
+    # field by a plain identifier, so the Column or the Var a MAP literal's key becomes raised a
+    # ValueError out of both deciders for those targets. The plan is refused, repairably, and a
+    # string key prints as before; the write path the same.
+    for target in ("postgres", "oracle"):
+        for sql in ('SELECT list_transform(tags, "x.secret" -> map_keys(MAP {"x.secret": 1})[1]) FROM claim',
+                    "SELECT list_transform(tags, x -> MAP {x: 1}[x]) FROM claim",
+                    "SELECT MAP {region: 1}[region] FROM claim"):
+            verdict = decide(sql, VISIBLE, dialect="duckdb", target=target)
+            assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNPRINTABLE_FOR_TARGET, (target, sql, verdict)
+            assert verdict.repairable and target in verdict.message, verdict
+        verdict = decide("SELECT MAP {'a': 1}['a'] FROM claim", VISIBLE, dialect="duckdb", target=target)
+        assert isinstance(verdict, Approved), verdict
+        grants = GrantSet(frozenset(VISIBLE), writable=frozenset({"sink"}))
+        verdict = decide_write("UPDATE sink SET s = 'b' WHERE MAP {i: 1}[i] = 1", VISIBLE, grants, adapter=_OkAdapter(),
+                               dialect="duckdb", target=target, writes_enabled=True, policy=AccessPolicy())
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNPRINTABLE_FOR_TARGET, (target, verdict)
+
+
 def test_an_arrow_outside_a_lambda_taker_is_no_lambda():
     # The review gate on round 54: sqlglot reads `a -> b` as a lambda inside any call, DuckDB
     # only inside the calls it hands a lambda to and as the JSON arrow elsewhere, so a MAP key

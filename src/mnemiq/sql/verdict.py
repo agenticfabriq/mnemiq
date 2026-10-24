@@ -78,6 +78,13 @@ class RefusalCode(StrEnum):
     # a column so named: this engine reads the column, and no check sees a column through the
     # function's node (M194). Repairable: the column qualified, or a call the engine keeps.
     AMBIGUOUS_NILADIC_NAME = "ambiguous_niladic_name"
+    # The statement has no rendering in the target's dialect: sqlglot's generator refused to print
+    # it (a DuckDB MAP literal keyed by a column or a lambda's parameter, for Postgres or Oracle,
+    # which name a struct's field by a plain identifier: Codex's forty-seventh review of #160),
+    # where the error escaped both deciders. Repairable: another spelling of the question may
+    # print. A policy's rewrite that does not print where the statement does is
+    # POLICY_TARGET_UNSUPPORTED, the deployment's.
+    UNPRINTABLE_FOR_TARGET = "unprintable_for_target"
 
 
 # A refusal the model can act on is a repair; a refusal it cannot act on is a dead end.
@@ -137,6 +144,8 @@ REPAIRABLE = frozenset(
         RefusalCode.FAN_OUT,
         # The message says to state the bound as a plain count, which the same query can always do.
         RefusalCode.UNREADABLE_LIMIT,
+        # The message names the engine the statement cannot be printed for; another spelling can be.
+        RefusalCode.UNPRINTABLE_FOR_TARGET,
     }
 )
 

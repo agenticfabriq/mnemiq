@@ -51,6 +51,8 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.tokens import TokenType
 
+from mnemiq.sql.verdict import Refusal, RefusalCode
+
 logger = logging.getLogger(__name__)
 
 # The calls DuckDB hands a lambda to. Anywhere else `a -> b` is DuckDB's JSON extract, which
@@ -226,6 +228,26 @@ def as_duckdb_reads(ast: exp.Expression) -> exp.Expression:
                 key = item.this
                 item.set("this", exp.Var(this=key.copy()) if is_lambda_parameter(key) else exp.Column(this=key.copy()))
     return ast
+
+
+def unprintable(target: str, exc: Exception, *, policys: bool) -> Refusal:
+    """The refusal for a plan the target's generator cannot print. sqlglot raises where a DuckDB MAP
+    literal's key, the Column or the Var it is here, must name a struct's field for Postgres or
+    Oracle (Codex's forty-seventh review of #160), and the error escaped both deciders. The
+    statement's where the statement as asked does not print; the policy's (`policys`) where the
+    statement prints and its governed rewrite does not, which no rewrite of the question repairs."""
+    logger.warning("the plan could not be printed for %s (%s)", target, exc)
+    if policys:
+        return Refusal(code=RefusalCode.POLICY_TARGET_UNSUPPORTED,
+                       message=(f"The access policy's rewrite of this statement cannot be printed for the "
+                                f"{target} engine, where the statement as asked can; the policy, not the "
+                                "statement, needs another spelling."),
+                       subject=target)
+    return Refusal(code=RefusalCode.UNPRINTABLE_FOR_TARGET,
+                   message=(f"The statement cannot be printed for the {target} engine. Spell the expression "
+                            "as that engine reads it, without a MAP literal keyed by a column or a lambda's "
+                            "parameter."),
+                   subject=target)
 
 
 def rendered(sql: str, read: str, write: str) -> str:

@@ -512,6 +512,7 @@ _RETRIED = {
     # M162: "State the row limit as a plain number of rows" -- the same question can always.
     RefusalCode.UNREADABLE_LIMIT: True,
     RefusalCode.AMBIGUOUS_NILADIC_NAME: True,  # M194: the column qualified, or a call the engine keeps
+    RefusalCode.UNPRINTABLE_FOR_TARGET: True,  # another spelling of the question may print for the target
     # "may only be selected, not used in a filter" / "Query the table directly." Both name a
     # different query, which is the test for belonging here.
     RefusalCode.MASKED_COLUMN_IN_PREDICATE: True,

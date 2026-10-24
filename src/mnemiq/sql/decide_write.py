@@ -22,7 +22,7 @@ from mnemiq.sql.guard import bound_by_position, misgrouped_set_chain, niladic_na
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, rendered
+from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, rendered, unprintable
 from mnemiq.sql.scope import base_tables, check_policy_target, fields_as_members, known_columns
 from mnemiq.sql.rls import apply_row_filters_to_write, check_filter_targets, unplaceable_policy
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
@@ -490,11 +490,18 @@ def decide_write(
         return governed
     shaped = governed
 
-    plan_sql = shaped.sql(dialect=dialect)
-    target_sql = rendered(plan_sql, dialect, target)
+    # The write as asked first, then the governed one: a rewrite the target cannot print where the
+    # write prints is the policy's refusal, not the model's (Codex's forty-seventh review of #160).
     asked_plan = asked.sql(dialect=dialect)
-    asked_sql = (target_sql if asked_plan == plan_sql
-                 else rendered(asked_plan, dialect, target))
+    try:
+        asked_sql = rendered(asked_plan, dialect, target)
+    except (ValueError, sqlglot.errors.SqlglotError) as exc:
+        return unprintable(target, exc, policys=False)
+    plan_sql = shaped.sql(dialect=dialect)
+    try:
+        target_sql = asked_sql if asked_plan == plan_sql else rendered(plan_sql, dialect, target)
+    except (ValueError, sqlglot.errors.SqlglotError) as exc:
+        return unprintable(target, exc, policys=True)
     if adapter is not None:
         # the snapshot can be stale, and only the source knows the truth. `prove` picks the proof
         # the source understands -- `EXPLAIN` is not Oracle syntax (see mnemiq.sql.prove).
