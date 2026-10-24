@@ -487,8 +487,9 @@ def test_a_natural_join_beside_sources_lacking_the_name_leaves_it_to_the_enclosi
     sql = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT k FROM w) AS a NATURAL JOIN w AS b WHERE doc = 'west')"
     assert con.execute(sql).fetchall() == [(0,)]
     verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index())
-    assert isinstance(verdict, Refusal) and "t.doc" in verdict.message, verdict
-    sql = ("SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM (SELECT doc || '' AS doc FROM v) AS z) AS a "
-           "NATURAL JOIN (SELECT doc FROM v) AS b WHERE doc = 'west')")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
+    # the join's key is `k`, and only `a`, through its star, can hold `doc` (the gate on round 11)
+    sql = ("SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM (SELECT doc || '' AS doc, k FROM v) AS z) AS a "
+           "NATURAL JOIN (SELECT k FROM v) AS b WHERE doc = 'west')")
     assert con.execute(sql).fetchall() == [(1,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index()) is None
