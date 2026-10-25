@@ -6,6 +6,27 @@ if TYPE_CHECKING:
     import pyarrow as pa
 
 
+class QueryTimedOut(RuntimeError):
+    """An adapter's own word that the statement ran past its time limit, raised by an adapter
+    whose driver ends a bounded call with an error of its own (Oracle's call timeout, SQLite's
+    interrupt). The runner reads it as the timeout, the statement's cost and the model's to
+    make cheaper (M188): the bare `RuntimeError` it replaces reached the model as "The source
+    rejected this query." A `RuntimeError` still, so a caller catching that keeps catching it."""
+
+
+class QueryCancelled(RuntimeError):
+    """An adapter's own word that the source ended the statement on a cancel the bound did not
+    send: an operator's or another session's (Postgres's "canceling statement due to user request",
+    Oracle's ORA-01013, which its driver never raises for its own bound). Neither an outage nor a
+    timeout: the driver's classifier calls the cancel unavailable, the right reading at the proof,
+    but at the run that reading would end the turn telling the caller the source did not answer
+    (the review gate on M188). The runner reports it as the cancel it is, and the turn ends on it
+    rather than reaching the repair loop, where a model writing the same SQL again would run the
+    stopped statement a second time (Codex's second review of #179). A cancel worded in another
+    language is not recognised and keeps the outage reading: it ends the turn too, and is never run
+    again."""
+
+
 class SourceAdapter(Protocol):
     # The SQL dialect this adapter actually executes. The engine transpiles its plan
     # (written in duckdb) to this before running -- so a SQLite source receives SQLite,

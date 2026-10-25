@@ -5,6 +5,9 @@ from dataclasses import dataclass
 
 import pyarrow as pa
 
+from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
+from mnemiq.sql.prove import source_did_not_answer
+
 DEFAULT_TIMEOUT_S = 30.0
 
 
@@ -41,11 +44,34 @@ class ExecutionError(Exception):
         return f"{self.message} {self.source_detail}" if self.source_detail else self.message
 
 
+class SourceUnavailableError(ExecutionError):
+    """The source did not answer while the statement ran: a connection that dropped after the
+    proof, or mid-fetch (M188). The proof seam reads the same fault before the run as
+    SOURCE_UNAVAILABLE; here it reached the model as "The source rejected this query." and was
+    repaired, a correct query rewritten because the network failed. Not the statement's failure,
+    so never the model's to repair. An `ExecutionError` still, so every caller catching that
+    keeps its reading, a statement that produced no table."""
+
+
+class QueryCancelledError(ExecutionError):
+    """The source ended the statement on a cancel the bound did not send: an operator's or another
+    session's. Neither the statement's failure nor an outage, and ended on, not repaired: handed to
+    the repair loop, a model that wrote the same SQL again ran the stopped statement a second time
+    (Codex's second review of #179). An `ExecutionError` still, as `SourceUnavailableError` is."""
+
+
 @dataclass
 class ExecutionResult:
     table: pa.Table
     row_count: int
     elapsed_ms: float
+
+
+def _timed_out(timeout_s: float) -> ExecutionError:
+    return ExecutionError(
+        f"The query timed out after {timeout_s}s. Make it cheaper: fewer joins, "
+        "narrower filters, or an aggregate instead of raw rows."
+    )
 
 
 def run(adapter, sql: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> ExecutionResult:
@@ -59,11 +85,34 @@ def run(adapter, sql: str, timeout_s: float = DEFAULT_TIMEOUT_S) -> ExecutionRes
         # somewhere in the string.
         raise
     except Exception as exc:
-        if "interrupt" in type(exc).__name__.lower() or "interrupt" in str(exc).lower():
-            raise ExecutionError(
-                f"The query timed out after {timeout_s}s. Make it cheaper: fewer joins, "
-                "narrower filters, or an aggregate instead of raw rows."
+        # The typed readings first. The timeout before the outage: DuckDB's classifier calls its
+        # interrupt unavailable, the proof seam's reading of a proof that never came back, and
+        # here it is the statement's cost.
+        if isinstance(exc, QueryTimedOut) or "interrupt" in type(exc).__name__.lower():
+            raise _timed_out(timeout_s) from exc
+        if isinstance(exc, QueryCancelled):
+            # Before the outage question, which the driver's classifier answers yes for its own
+            # cancel: read as an outage, the statement someone stopped would be run again.
+            raise QueryCancelledError(
+                "The source cancelled this query before it finished: an operator or another "
+                "session stopped it, so it was not run again. Ask again once whoever stopped it "
+                "is done; the server log has the source's words.",
+                source_detail=str(exc),
             ) from exc
+        if source_did_not_answer(adapter, exc):
+            raise SourceUnavailableError(
+                "The source did not answer while this query ran. That is not about the query. "
+                "Try again, and tell the operator if it persists; the server log has the "
+                "source's error.",
+                source_detail=str(exc),
+            ) from exc
+        # The words last, asked only of a fault nothing typed has claimed, where the other reading
+        # is a rejection and both are the model's to repair. A fault's text can quote the
+        # statement, so asked first they read a cancel or a dropped connection on a query naming
+        # `service_interruptions` as a timeout, and the stopped statement could run again (Codex's
+        # fifth review of #179).
+        if "interrupt" in str(exc).lower():
+            raise _timed_out(timeout_s) from exc
         raise ExecutionError("The source rejected this query.", source_detail=str(exc)) from exc
 
     elapsed = (time.perf_counter() - started) * 1000

@@ -5,6 +5,8 @@ import threading
 
 import pyarrow as pa
 
+from mnemiq.adapters.base import QueryTimedOut
+
 
 class SQLiteAdapter:
     """Read a SQLite database through the stdlib driver.
@@ -76,7 +78,7 @@ class SQLiteAdapter:
             rows = cursor.fetchall()
         except sqlite3.OperationalError as exc:
             if "interrupt" in str(exc).lower():
-                raise RuntimeError(f"query timed out after {timeout_s}s") from exc
+                raise QueryTimedOut(f"query timed out after {timeout_s}s") from exc
             raise
         finally:
             if timer is not None:

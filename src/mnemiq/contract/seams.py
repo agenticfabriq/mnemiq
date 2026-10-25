@@ -35,7 +35,9 @@ class DeferralReason(StrEnum):
     INVALID_QUERY = "invalid_query"  # could not produce valid SQL within the budget
     VERIFICATION = "verification"  # we answered, then the verifier declined to stand behind it
     DISAGREEMENT = "disagreement"  # candidates diverged too much to pick one
-    EXECUTION_FAILED = "execution_failed"  # the source rejected every attempt -- NOT a deferral
+    # The source rejected every attempt, or cancelled one, which ends the turn at once so a model
+    # cannot write the stopped statement again (M188) -- NOT a deferral.
+    EXECUTION_FAILED = "execution_failed"
     MODEL_UNAVAILABLE = "model_unavailable"  # the model provider did not answer -- NOT a deferral
     # The answer was produced and executed and then could not be CHECKED -- NOT a deferral, and
     # kept apart from VERIFICATION for the reason that one exists: "the verifier declined to

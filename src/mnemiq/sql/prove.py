@@ -55,12 +55,14 @@ class ProofOutcome:
     detail: str | None = None  # the source's words: the operator's log and the repair loop read them
 
 
-def _unavailable(adapter: Any, exc: Exception) -> bool:
+def source_did_not_answer(adapter: Any, exc: Exception) -> bool:
     """Whether `exc` says the source could not be asked, rather than that it answered no.
 
     The adapter's word where it has one, whole: its driver's faults are its to know. Without one,
     Python's own connection, timeout and interrupt errors, so an exception nobody classified keeps
-    its old reading, a refusal, and the repair loop handles it as before.
+    its old reading, a refusal, and the repair loop handles it as before. One question for both
+    seams that meet a source fault: the proof here, and the runner while the statement runs
+    (M188), which asks its timeout first.
     """
     told = getattr(adapter, "source_unavailable", None)
     if told is None:
@@ -68,7 +70,7 @@ def _unavailable(adapter: Any, exc: Exception) -> bool:
     try:
         return bool(told(exc))
     except Exception:  # noqa: BLE001 -- a classifier that fails says nothing, and the old reading stands
-        logger.warning("The adapter could not classify a proof fault; it is read as a refusal.",
+        logger.warning("The adapter could not classify a source fault; it is read as a refusal.",
                        exc_info=True)
         return False
 
@@ -87,7 +89,7 @@ def prove_outcome(adapter: Any, target_sql: str) -> ProofOutcome:
         # a later one repairs is exactly the one an operator wants to read, and by then it has
         # been overwritten. This is the only record of it: `source_detail` is withheld from the
         # caller, so without this line an EXPLAIN failure would be visible nowhere at all.
-        if _unavailable(adapter, exc):
+        if source_did_not_answer(adapter, exc):
             logger.warning("The source could not be asked to prove a plan: %s", exc)
             return ProofOutcome(Proof.UNAVAILABLE, str(exc))
         logger.warning("EXPLAIN refused a plan; the source said: %s", exc)
