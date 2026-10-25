@@ -15,11 +15,13 @@ blocked.
 - **CodeQL (GitHub's default setup) runs on every pull request without being required.** Let it finish green too. An alert
   needs a decision, a fix or a dismissal with a reason, which no setting can make.
 - These are GitHub settings, not files in this repository, so they can drift without a commit. Confirm
-  them before relying on them: `gh api repos/agenticfabriq/mnemiq/branches/main/protection` for the
-  pull-request rule, the required checks and the force-push block (it answers admins only; anyone else
-  gets a 404 that reads like "not protected"), `gh api repos/agenticfabriq/mnemiq --jq
-  '{allow_rebase_merge, allow_squash_merge, allow_merge_commit}'` for the merge methods, and
-  `gh api repos/agenticfabriq/mnemiq/code-scanning/default-setup` for CodeQL.
+  them before relying on them, each command on one line as written here:
+  - `gh api repos/agenticfabriq/mnemiq/branches/main/protection` for the pull-request rule, the required
+    checks and the force-push block. It answers admins only: a non-admin gets a plain `Not Found`, where
+    an unprotected branch answers `Branch not protected`.
+  - `gh api repos/agenticfabriq/mnemiq --jq '{allow_rebase_merge, allow_squash_merge, allow_merge_commit}'`
+    for the merge methods, which the protection call does not report.
+  - `gh api repos/agenticfabriq/mnemiq/code-scanning/default-setup` for CodeQL.
 
 ## Run the repo guard on every commit and before a branch's first push
 
