@@ -2216,11 +2216,12 @@ def _text_in_a_boolean_position(node: exp.Expression, type_of, engine: str) -> e
     them (the review gate on round 69). Text that is no boolean's spelling raises on the row
     (`region IS TRUE` over 'north': Codex's fifty-first review of #160), where a number converts
     and `TRY_CAST(value AS BOOLEAN)` gives NULL; the validator's enumerated comparisons never saw
-    these positions. A text literal reads no row and is never counted, as a constant is counted
-    nowhere here (`'true' AND id = 1` runs; `'north' AND id = 1` raises on the operator's own text,
-    on no row's value, as `'north' = id` would); a value the reader cannot type is not counted
-    either, as nowhere else (`upper(region) IS TRUE` raises and passes). None where no operand is a
-    text column."""
+    these positions. A text literal reads no row and is not counted in a boolean position, as the
+    comparisons count none (`'true' AND id = 1` runs; `'north' AND id = 1` raises on the operator's
+    own text and on no row's value, as `'north' = id` would, and over an empty table runs); a
+    literal on a branched value is another matter, counted where the branch's type converts it
+    (`_coerces_to_json`). A value the reader cannot type is not counted either, as nowhere else
+    (`upper(region) IS TRUE` raises and passes). None where no operand is a text column."""
     if isinstance(node, (exp.And, exp.Or)):
         operands = [node.this, node.expression]
     elif isinstance(node, exp.Not):

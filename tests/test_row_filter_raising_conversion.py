@@ -1661,8 +1661,10 @@ def test_a_text_value_in_a_boolean_position_is_a_raising_conversion():
         assert con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall() == rows, safe
         assert isinstance(_decide(safe), Approved), safe
     # a text constant that is no boolean's spelling raises too, on the operator's own text and no row's
-    # value: a constant is counted nowhere in this validator (`'north' = id` is approved the same), so
-    # the install fails loudly where a row-dependent conversion would fail by the data
+    # value: a boolean position counts no literal, as the comparisons count none (`'north' = id` is
+    # approved the same); the failure is the text's, not the data's, and over an empty table the
+    # statement runs, so nothing here promises it is caught at install (a literal on a branched value
+    # is counted, where the branch's type converts it: M159's `COALESCE(attrs, 'x')`)
     for constant in ("'north' AND id = 1", "CAST('north' AS VARCHAR) AND id = 1"):
         with pytest.raises(duckdb.Error, match="Could not convert string"):
             con.execute(f"SELECT id FROM claim WHERE {constant}").fetchall()
