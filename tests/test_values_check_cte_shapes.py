@@ -871,3 +871,40 @@ def test_a_stars_two_lineages_are_listed_in_from_order_and_a_replace_by_any_colu
         assert [con.execute(renamed.format(lit)).fetchall() for lit in ("a", "west")] == [[(1,)], [(0,)]], renamed
         for lit in ("a", "west"):
             assert check_values(sqlglot.parse_one(renamed.format(lit), read="duckdb"), visible, _Index(), dialect="duckdb") is None, (renamed, lit)
+
+
+def test_a_join_groups_merge_and_a_comma_inputs_columns_are_listed_as_the_engine_lists_them():
+    # Codex's sixteenth review of #178: the FROM order read the scope's top-level joins alone, so a
+    # parenthesised group's USING or NATURAL merge was lost (`(t RIGHT JOIN (SELECT region AS doc FROM
+    # t) b USING (doc))` is `b`'s `doc`, `t.region`, and the reversed group `t.doc`), a comma input's
+    # RIGHT join narrowed the star to its right input where the engine lists the earlier input's column
+    # first, and a merged column followed by another holder skipped behind a guard on any narrowing.
+    # Measured on DuckDB 1.5.4: `t` holds 'west' in `region` alone, so a count of 0 is `t.doc`'s.
+    visible = {**VISIBLE, "u": {"name"}, "v": {"doc", "k", "name"}, "w": {"k"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east'); "
+                "CREATE TABLE v (doc VARCHAR, k INT, name VARCHAR); INSERT INTO v VALUES ('west', 1, 'x')")
+    b = "(SELECT region AS doc FROM t) AS b"
+    refused = (f"SELECT count(*) FROM (SELECT * FROM ({b} RIGHT JOIN t USING (doc))) AS q WHERE doc = 'west'",
+               f"SELECT count(*) FROM (SELECT * FROM (t LEFT JOIN {b} USING (doc))) AS q WHERE doc = 'west'",
+               f"SELECT count(*) FROM (SELECT * FROM t, {b} RIGHT JOIN v USING (doc)) AS q WHERE doc = 'west'",
+               f"SELECT count(*) FROM (SELECT * FROM t JOIN t AS c USING (doc) CROSS JOIN {b}) AS q WHERE doc = 'west'",
+               f"SELECT count(*) FROM (SELECT * FROM t NATURAL JOIN t AS c CROSS JOIN {b}) AS q WHERE doc = 'west'")
+    for sql in refused:
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    present = ((f"SELECT count(*) FROM (SELECT * FROM (t RIGHT JOIN {b} USING (doc))) AS q WHERE doc = 'west'", 1),
+               (f"SELECT count(*) FROM (SELECT * FROM (t NATURAL RIGHT JOIN {b})) AS q WHERE doc = 'west'", 1),
+               (f"SELECT count(*) FROM (SELECT * FROM (t FULL JOIN {b} USING (doc))) AS q WHERE doc = 'west'", 1),
+               (f"SELECT count(*) FROM (SELECT * FROM {b}, t RIGHT JOIN t AS c USING (doc)) AS q WHERE doc = 'west'", 2),
+               (f"SELECT count(*) FROM (SELECT * FROM {b}, t RIGHT JOIN v USING (doc)) AS q WHERE doc = 'west'", 1),
+               (f"SELECT count(*) FROM (SELECT * FROM t RIGHT JOIN {b} USING (doc) CROSS JOIN t AS c) AS q WHERE doc = 'west'", 2))
+    for sql, rows in present:
+        assert con.execute(sql).fetchall() == [(rows,)], sql
+        assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql
+    # a USING key two columns of the left input hold is the engine's ambiguity error, so nothing is read
+    sql = f"SELECT count(*) FROM (SELECT * FROM {b} CROSS JOIN t JOIN t AS c USING (doc)) AS q WHERE doc = 'west'"
+    with pytest.raises(duckdb.BinderException, match="Ambiguous"):
+        con.execute(sql)
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
