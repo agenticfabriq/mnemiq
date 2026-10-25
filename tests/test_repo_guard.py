@@ -20,13 +20,18 @@ BLOCKED_NAME = "zebrablock"
 KEY_SHAPE = "AKIA" + "Q" * 16  # a secret shape the script blocks, never spelled whole in this file
 
 
+# git runs under an empty global config and no system one, so a contributor's settings (a signing
+# key, `core.quotePath=false`) cannot colour what the script sees (the review gate on the fix).
+ENV = {**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+       "REPO_GUARD_NAME_PATTERNS": BLOCKED_NAME}
+
+
 def _git(repo: Path, *args: str) -> str:
-    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True).stdout
+    return subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True, env=ENV).stdout
 
 
 def _guard(repo: Path, *args: str) -> int:
-    env = {**os.environ, "REPO_GUARD_NAME_PATTERNS": BLOCKED_NAME}
-    return subprocess.run(["bash", "scripts/repo-guard.sh", *args], cwd=repo, env=env,
+    return subprocess.run(["bash", "scripts/repo-guard.sh", *args], cwd=repo, env=ENV,
                           capture_output=True, text=True).returncode
 
 

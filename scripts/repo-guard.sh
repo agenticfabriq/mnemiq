@@ -160,7 +160,6 @@ HOME_PATH_PATTERNS='/(Users|home)/[A-Za-z0-9._-]+'
 # The scanner itself: free of name tokens now, but its secret-shape patterns
 # can match their own spelling. Never scan it.
 EXCLUDE_PATH='scripts/repo-guard.sh'
-EXCLUDE_REGEX="^$(printf '%s' "$EXCLUDE_PATH" | sed 's/\./\\./g')\$"
 
 fail=0
 
