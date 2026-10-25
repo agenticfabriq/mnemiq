@@ -28,10 +28,13 @@ machine for names on a private blocklist.
   root. It scans the lines each non-merge commit on the branch adds, so it catches a secret one
   commit adds and a later one removes; a merge commit's own conflict resolution is not scanned. With
   no arguments it checks only what is staged, which before a push is usually nothing.
-- The blocklist is `REPO_GUARD_NAME_PATTERNS`, read from the environment, else from this checkout's
-  own `./.env` (never the main checkout's), so a worktree needs its own `.env` unless the variable
-  is exported. A contributor sets it to `off`, as `.env.example` does. An empty value blocks every
-  commit, on purpose.
+- The blocklist is `REPO_GUARD_NAME_PATTERNS`, read from the environment when set and non-empty,
+  else from this checkout's own `./.env` (never the main checkout's), so a worktree needs its own
+  `.env` unless the variable is exported. A contributor sets it to `off`, as `.env.example` does,
+  which turns the name check off. Only when neither gives a value is every commit blocked.
+- On a maintainer's machine, check the guard reports `clean (names, secrets, home paths)`. If it
+  prints `proprietary-name check off` instead, this checkout has no list (a worktree whose `.env`
+  was copied from `.env.example`, say), and its commits are not checked for names.
 - CI skips the name check, because a public log would reveal the list.
 
 ## What never goes in this repository
