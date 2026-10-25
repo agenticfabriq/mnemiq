@@ -21,13 +21,13 @@ blocked.
 machine for names on a private blocklist.
 
 - `git config core.hooksPath .githooks` runs it before each commit, with whitespace and lint checks.
-  Staged mode is the only one that checks names. It takes the staged paths, skipping renamed ones,
-  and reads their working-tree copies. So commit each file as it stands (no partial staging, no
-  edits between `git add` and the commit), and commit a rename apart from edits to that file.
+  Staged mode is the only one that checks names. It reads the staged content of each path git lists
+  as added, copied, modified, renamed or type-changed, the guard script itself and submodule pointers
+  excepted, so what it scans is what the commit will hold.
 - Before a branch's first push, run `scripts/repo-guard.sh --range origin/main..HEAD` from the repo
-  root. It scans the lines each non-merge commit on the branch adds, so it catches a secret one
-  commit adds and a later one removes; a merge commit's own conflict resolution is not scanned. With
-  no arguments it checks only what is staged, which before a push is usually nothing.
+  root. It scans the lines each commit on the branch adds, a merge commit's own conflict resolution
+  included, so it catches a secret one commit adds and a later one removes. With no arguments it
+  checks only what is staged, which before a push is usually nothing.
 - The blocklist is `REPO_GUARD_NAME_PATTERNS`, read from the environment when set and non-empty,
   else from this checkout's own `./.env` (never the main checkout's), so a worktree needs its own
   `.env` unless the variable is exported. A contributor sets it to `off`, as `.env.example` does,
