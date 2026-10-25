@@ -2236,8 +2236,14 @@ def _text_in_a_boolean_position(node: exp.Expression, type_of, engine: str) -> e
         operands = [node.this]
     elif isinstance(node, exp.Is) and isinstance(node.expression, exp.Boolean):
         operands = [node.this]
-    elif isinstance(node, exp.If) and isinstance(node.parent, exp.Case) and node.parent.this is not None:
-        return None  # a simple CASE's arm: its WHEN value is compared with the operand, read below
+    elif isinstance(node, exp.If) and isinstance(node.parent, exp.Case) and node.parent.this is not None \
+            and any(node is arm for arm in node.parent.args.get("ifs") or ()):
+        # A simple CASE's arm: its WHEN value is compared with the operand, read below. The arms
+        # alone: an IF as the operand or as the ELSE result is a condition under the same parent
+        # (`CASE IF(region, true, false) WHEN true THEN true ELSE false END` and `CASE id WHEN 2 THEN
+        # true ELSE IF(region, true, false) END` each raised on 'north' and both deciders approved
+        # them: Codex's fifty-third review of #160).
+        return None
     elif isinstance(node, (exp.If, exp.Where, exp.Having)):
         operands = [node.this]
     elif isinstance(node, exp.ArrayFilter) and isinstance(node.expression, exp.Lambda):

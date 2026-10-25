@@ -1686,7 +1686,10 @@ def test_a_list_filters_lambda_result_is_a_boolean_position_and_a_simple_cases_a
     types = {**TYPES, ("claim", "tags"): "VARCHAR[]"}
     for raising in ("list_filter(tags, x -> x) = tags", "filter(tags, x -> x) = tags", "array_filter(tags, x -> x) = tags",
                     # a boolean operand converts each text WHEN value (the review gate on round 73)
-                    "CASE true WHEN region THEN true ELSE false END", "CASE id = 1 WHEN region THEN true ELSE false END"):
+                    "CASE true WHEN region THEN true ELSE false END", "CASE id = 1 WHEN region THEN true ELSE false END",
+                    # an IF as the operand or the ELSE result is a condition under the CASE (Codex's fifty-third review)
+                    "CASE IF(region, true, false) WHEN true THEN true ELSE false END",
+                    "CASE id WHEN 2 THEN true ELSE IF(region, true, false) END"):
         with pytest.raises(duckdb.Error, match="Could not convert string"):
             con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
         verdict = _decide(raising, snapshot=_snapshot(types))
