@@ -2210,14 +2210,17 @@ def _text_in_a_boolean_position(node: exp.Expression, type_of, engine: str) -> e
     """The text column DuckDB converts to BOOLEAN where `node` consumes a boolean: the sides of AND
     and OR, NOT's operand, the left of IS TRUE and IS FALSE, an IF's condition (which a searched
     CASE's WHEN arms are to the parser, so the walk meets them as IF nodes), a simple CASE's operand
-    beside a boolean WHEN value, and every WHERE, HAVING and ON the filter holds, the filter's own
+    beside a WHEN value the reader types as BOOLEAN (a literal or a comparison: the review gate on
+    round 70), and every WHERE, HAVING and ON the filter holds, the filter's own
     WHERE, a subquery's, an aggregate's FILTER clause (a WHERE to the parser) and a join's ON among
     them (the review gate on round 69). Text that is no boolean's spelling raises on the row
     (`region IS TRUE` over 'north': Codex's fifty-first review of #160), where a number converts
     and `TRY_CAST(value AS BOOLEAN)` gives NULL; the validator's enumerated comparisons never saw
-    these positions. A text literal reads no row and is never counted (`'true' AND id = 1` runs);
-    a value the reader cannot type is not counted either, as nowhere else (`upper(region) IS TRUE`
-    raises and passes). None where no operand is a text column."""
+    these positions. A text literal reads no row and is never counted, as a constant is counted
+    nowhere here (`'true' AND id = 1` runs; `'north' AND id = 1` raises on the operator's own text,
+    on no row's value, as `'north' = id` would); a value the reader cannot type is not counted
+    either, as nowhere else (`upper(region) IS TRUE` raises and passes). None where no operand is a
+    text column."""
     if isinstance(node, (exp.And, exp.Or)):
         operands = [node.this, node.expression]
     elif isinstance(node, exp.Not):
@@ -2229,7 +2232,8 @@ def _text_in_a_boolean_position(node: exp.Expression, type_of, engine: str) -> e
     elif isinstance(node, exp.Join):
         operands = [node.args["on"]] if node.args.get("on") is not None else []
     elif isinstance(node, exp.Case) and node.this is not None and any(
-            isinstance(branch.this, exp.Boolean) for branch in node.args.get("ifs") or ()):
+            (kind := _type_of_value(branch.this, type_of, engine)) is not None
+            and kind.this == exp.DataType.Type.BOOLEAN for branch in node.args.get("ifs") or ()):
         operands = [node.this]  # compared with each WHEN value, a boolean here
     else:
         return None

@@ -1641,6 +1641,7 @@ def test_a_text_value_in_a_boolean_position_is_a_raising_conversion():
     for raising in ("region IS TRUE", "region IS FALSE", "region AND true", "region OR id = 1", "NOT region", "region",
                     "CASE WHEN region THEN true ELSE false END", "IF(region, true, false)", "amount > 0 AND region",
                     "(region) IS TRUE", "NOT (region)", "CASE region WHEN true THEN true ELSE false END",
+                    "CASE region WHEN (1 = 1) THEN true ELSE false END", "CASE region WHEN id > 0 THEN true ELSE false END",
                     "id IN (SELECT id FROM claim WHERE region)", "EXISTS (SELECT 1 FROM claim AS c WHERE c.region)",
                     "(SELECT count(*) FILTER (WHERE region) FROM claim) > 0",
                     "id IN (SELECT id FROM claim GROUP BY id, region HAVING region)",
@@ -1659,6 +1660,13 @@ def test_a_text_value_in_a_boolean_position_is_a_raising_conversion():
                        ("'yes' AND id = 1", [(1,)]), ("id IN (SELECT id FROM claim WHERE id IS TRUE)", [(1,)])):
         assert con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall() == rows, safe
         assert isinstance(_decide(safe), Approved), safe
+    # a text constant that is no boolean's spelling raises too, on the operator's own text and no row's
+    # value: a constant is counted nowhere in this validator (`'north' = id` is approved the same), so
+    # the install fails loudly where a row-dependent conversion would fail by the data
+    for constant in ("'north' AND id = 1", "CAST('north' AS VARCHAR) AND id = 1"):
+        with pytest.raises(duckdb.Error, match="Could not convert string"):
+            con.execute(f"SELECT id FROM claim WHERE {constant}").fetchall()
+        assert isinstance(_decide(constant), Approved), constant
     # a value the reader cannot type is not counted, as nowhere else: `upper(region)` raises and passes
     with pytest.raises(duckdb.Error, match="Could not convert string"):
         con.execute("SELECT id FROM claim WHERE upper(region) IS TRUE").fetchall()
