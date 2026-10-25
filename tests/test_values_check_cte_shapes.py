@@ -965,6 +965,37 @@ def test_a_join_groups_merge_and_a_comma_inputs_columns_are_listed_as_the_engine
                       (f"SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM {excluded} WHERE doc = 'west')", 2)):
         assert con.execute(sql).fetchall() == [(rows,)], sql
         assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql
+    # a merged column whose every holder is excluded goes with them, and the name is the next column's
+    # (Codex's twentieth review: the kept merge refused `c`'s present value against `t.doc`, and the
+    # reversed order skipped the absent value main refused)
+    sql = ("SELECT count(*) FROM (SELECT * EXCLUDE (t.doc, b.doc) FROM t JOIN t AS b USING (doc) CROSS JOIN "
+           "(SELECT region AS doc FROM t) AS c) AS q WHERE doc = 'west'")
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    sql = ("SELECT count(*) FROM (SELECT * EXCLUDE (t.doc, b.doc) FROM t RIGHT JOIN (SELECT region AS doc FROM t) AS b "
+           "USING (doc) CROSS JOIN t AS c) AS q WHERE doc = 'west'")
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
+    # an input the grant shows no holder of still holds the key (the review gate on round 30): the merge
+    # stays with the visible input alone excluded and goes with both named
+    hidden = {**visible, "v": {"k", "name"}}
+    sql = ("SELECT count(*) FROM (SELECT * EXCLUDE (t.doc) FROM t LEFT JOIN v USING (doc) CROSS JOIN "
+           "(SELECT region AS doc FROM t) AS c) AS q WHERE doc = 'west'")
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
+    sql = ("SELECT count(*) FROM (SELECT * EXCLUDE (t.doc, v.doc) FROM t LEFT JOIN v USING (doc) CROSS JOIN "
+           "(SELECT region AS doc FROM t) AS c) AS q WHERE doc = 'west'")
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Index(), dialect="duckdb") is None
+    # a RIGHT merge with one holder excluded, either one, keeps its merged column, `b`'s `doc`, `t.region`
+    # (measured: one row), where a merge dropped on any excluded holder would fall to `t.doc` and refuse
+    for shape in ("EXCLUDE (b.doc) FROM t RIGHT JOIN (SELECT region AS doc FROM t) AS b USING (doc)",
+                  "EXCLUDE (t.doc) FROM t RIGHT JOIN (SELECT region AS doc FROM t) AS b USING (doc)"):
+        sql = f"SELECT count(*) FROM (SELECT * {shape}) AS q WHERE doc = 'west'"
+        assert con.execute(sql).fetchall() == [(1,)], sql
+        assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql
     # the other source excluded, and a merged column the excluded source feeds, which is the join's and
     # stays (the review gate on round 29: dropping `t` inside the merge disarmed main's refusal)
     for shape in ("EXCLUDE (b.doc) FROM t CROSS JOIN (SELECT region AS doc FROM t) AS b",

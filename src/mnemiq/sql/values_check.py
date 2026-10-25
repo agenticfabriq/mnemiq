@@ -681,10 +681,33 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     cols = joined(columns(from_.this) if from_ is not None else [], scope.expression.args.get("joins") or [])
     cols += [alias for alias in scope.selected_sources if alias not in seen]
     # A star's qualified EXCLUDE drops the named sources' OWN columns of the name; a merged column
-    # those sources feed is the join's, not theirs, and stays (`* EXCLUDE (t.doc)` over `t LEFT JOIN
-    # (SELECT region AS doc FROM t) b USING (doc)` lists the merged `doc`, `t.doc`'s values, measured:
-    # the review gate on round 29, where dropping `t` inside the merge disarmed the refusal).
-    cols = [col for col in cols if isinstance(col, _Merge) or col not in without]
+    # those sources feed is the join's, not theirs, and stays while a holder of it is left (`*
+    # EXCLUDE (t.doc)` over `t LEFT JOIN (SELECT region AS doc FROM t) b USING (doc)` lists the
+    # merged `doc`, `t.doc`'s values, measured: the review gate on round 29, where dropping `t`
+    # inside the merge disarmed the refusal), and goes with its last holder (`* EXCLUDE (t.doc,
+    # b.doc)` over `t JOIN t b USING (doc) CROSS JOIN (SELECT region AS doc FROM t) c` lists `c`'s
+    # `doc` alone, `t.region`, measured: Codex's twentieth review, where the kept merge refused the
+    # present value and the reversed order skipped the absent one main refused).
+
+    def excluded(col: str | _Merge) -> bool:
+        if isinstance(col, _Merge):
+            return excluded_side(col.left) and excluded_side(col.right)
+        return col in without
+
+    def excluded_side(side: list[str | _Merge]) -> bool:
+        # USING demands the key on each input, so an input the grant shows no holder of holds it
+        # in a column the grant hides, and only an EXCLUDE naming that source drops it; read as
+        # holding nothing, the merge went with the visible input's exclusion alone and `EXCLUDE
+        # (t.doc)` over `t LEFT JOIN v USING (doc)` with `v.doc` hidden skipped the absent value the
+        # kept merge refuses (the review gate on round 30). Where the input has a holder the grant
+        # shows, or a merge, those decide: a second, hidden holder beside them would be the
+        # engine's ambiguity error on the key.
+        deciding = [c for c in side if isinstance(c, _Merge) or present(c) is not None]
+        if deciding:
+            return all(excluded(c) for c in deciding)
+        return bool(side) and all(c in without for c in side)
+
+    cols = [col for col in cols if not excluded(col)]
     if not listed:
         # The engine's binding of the bare name among the columns, as a USING key's on an input.
         answer = bare(cols)
