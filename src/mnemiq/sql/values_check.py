@@ -441,6 +441,14 @@ class _Merge(NamedTuple):
 # without placing it (`_HELD`).
 _LISTS_DUPLICATE_STAR_COLUMNS = frozenset({"duckdb"})
 
+# The engines that bind a bare name to a USING or NATURAL join's merged column before every other
+# source's column of the name: DuckDB, measured on 1.5.4 (`v, t FULL JOIN t b USING (doc)`, `t JOIN t
+# c USING (doc) CROSS JOIN (SELECT region AS doc FROM t) b` and `(t FULL JOIN t b USING (doc)), v`
+# each compare the merged column). Postgres 16 and MySQL 8.4 refuse the bare name as ambiguous in
+# each of those shapes, the plain `t JOIN t c USING (doc)` alone resolving (measured on throwaway
+# containers, round 25), so there the merged column is one lineage among the others.
+_BINDS_A_MERGE_FIRST = frozenset({"duckdb"})
+
 
 _ABSENT = object()  # no source of the scope can hold the name: the enclosing scope's turn
 _WIDE = object()  # the scope cannot tell: the statement-wide reading's turn, as before
@@ -456,7 +464,8 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     among the name's output columns of the FROM clause, as the engine lists a star's: each
     source holding the name is one, and a USING or NATURAL join on the name merges its two
     inputs' into one, the join's, listed in the join's place. The reading is the engine's
-    binding of a bare name among those columns: a merged column before every other; one owner;
+    binding of a bare name among those columns: a merged column before every other on DuckDB
+    (`_BINDS_A_MERGE_FIRST`); one owner;
     the owner beside a source the walk
     cannot name, since the engine raises where that source holds it too; and nothing where two
     lineages are listed, the engine's ambiguity error. None is a skip; `_ABSENT` says no source
@@ -628,13 +637,13 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     from_ = scope.expression.args.get("from_")
     cols = joined(columns(from_.this) if from_ is not None else [], scope.expression.args.get("joins") or [])
     cols += [alias for alias in scope.selected_sources if alias not in seen]
-    if not listed:
+    if not listed and (dialect or "").lower() in _BINDS_A_MERGE_FIRST:
         merges = [col for col in cols if isinstance(col, _Merge)]
         if merges:
-            # A merged column takes a bare name before every other source's column (measured on
-            # DuckDB 1.5.4, round 24: `v, t FULL JOIN t b USING (doc)`, `t JOIN t c USING (doc) CROSS
-            # JOIN (SELECT region AS doc FROM t) b` and `(t FULL JOIN t b USING (doc)), v` each
-            # compare the merged column), and two merged columns are the engine's ambiguity error.
+            # A merged column takes a bare name before every other source's column on DuckDB
+            # (`_BINDS_A_MERGE_FIRST`), and two merged columns are the engine's ambiguity error;
+            # on the other engines the merged column is one lineage among the others below, two
+            # being the ambiguity error there (the review gate on round 24).
             return resolve(merges[0]) if len(merges) == 1 else None
     found = [f for f in (resolve(col) for col in cols) if f is not None]
     if not found:

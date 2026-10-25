@@ -903,6 +903,22 @@ def test_a_join_groups_merge_and_a_comma_inputs_columns_are_listed_as_the_engine
     for sql, rows in present:
         assert con.execute(sql).fetchall() == [(rows,)], sql
         assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql
+    # a merged column takes a bare name before another holder's column on DuckDB, measured, where Postgres
+    # 16 and MySQL 8.4 refuse the name as ambiguous and the statement would only error (the review gate
+    # on round 24: the rule ran on every engine, untested beside an inner merge)
+    for sql in ("SELECT count(*) FROM v, t JOIN t AS c USING (doc) WHERE doc = 'west'",
+                "SELECT count(*) FROM t JOIN t AS c USING (doc), v WHERE doc = 'west'"):
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+        assert check_values(sqlglot.parse_one(sql, read="postgres"), visible, _Index(), dialect="postgres") is None, sql
+    # a merge whose inputs the grant hides is the name's column still (USING demands it on both), so the
+    # inner name binds there and the outer `t.doc` is no reading of it: main asked the enclosing scope and
+    # refused the present value (the review gate on round 24)
+    hidden = {**visible, "v": {"k", "name"}}
+    sql = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM v JOIN v AS b USING (doc) WHERE doc = 'west')"
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Index(), dialect="duckdb") is None
     # a USING key two columns of the left input hold is the engine's ambiguity error, so nothing is read
     sql = f"SELECT count(*) FROM (SELECT * FROM {b} CROSS JOIN t JOIN t AS c USING (doc)) AS q WHERE doc = 'west'"
     with pytest.raises(duckdb.BinderException, match="Ambiguous"):
