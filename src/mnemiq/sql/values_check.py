@@ -696,6 +696,17 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     # now at `c`'s place, and `EXCLUDE (t.doc)` over `t LEFT JOIN b USING (doc) CROSS JOIN d` the
     # merge at `b`'s place, before `d`.
 
+    def lacks(alias: str) -> bool:
+        """Whether a source's own output provably lacks the name: a local source whose projections,
+        none of them a star, name it nowhere (`_names` False). A base table may hold it in a column
+        the grant hides, and so may a star over one, which `_names` reads by the grant alone (`(SELECT
+        * FROM v) z` with `v.doc` withheld: the review gate on round 32, where the wrapped holder was
+        dropped as a stand-in and the merge it held went with the visible input's exclusion)."""
+        source = scope.selected_sources.get(alias, (None, None))[1]
+        return (isinstance(source, Scope) and isinstance(source.expression, exp.Select)
+                and not any(_projects_a_star(p) for p in source.expression.selects)
+                and _names(source, wanted, dialect, visible, depth + 1) is False)
+
     def holders(col: _Merge) -> list[str]:
         out: list[str] = []
         for side in (col.left, col.right):
@@ -705,7 +716,12 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
                     out += holders(m)
                 continue
             visible_holders = [c for c in side if present(c) is not None]
-            out += visible_holders or [c for c in side if not isinstance(c, _Merge)]
+            # The input's sources stand in for the holder the grant hides, save one whose own output
+            # provably lacks the name (a derived table projecting other columns): counted, `z` in `t
+            # LEFT JOIN (v CROSS JOIN (SELECT name FROM u) z) USING (doc)` with `v.doc` withheld kept
+            # the merge alive at `z`'s place once `t.doc` and `v.doc` were excluded, and `d`'s present
+            # value was refused against `t.doc` (Codex's twenty-second review of #178).
+            out += visible_holders or [c for c in side if not isinstance(c, _Merge) and not lacks(c)]
         return out
 
     merge_of: dict[str, _Merge] = {}

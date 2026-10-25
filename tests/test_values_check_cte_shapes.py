@@ -883,7 +883,8 @@ def test_a_join_groups_merge_and_a_comma_inputs_columns_are_listed_as_the_engine
     visible = {**VISIBLE, "u": {"name"}, "v": {"doc", "k", "name"}, "w": {"k"}}
     con = duckdb.connect()
     con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east'); "
-                "CREATE TABLE v (doc VARCHAR, k INT, name VARCHAR); INSERT INTO v VALUES ('west', 1, 'x')")
+                "CREATE TABLE v (doc VARCHAR, k INT, name VARCHAR); INSERT INTO v VALUES ('west', 1, 'x'); "
+                "CREATE TABLE u (name VARCHAR); INSERT INTO u VALUES ('n')")
     b = "(SELECT region AS doc FROM t) AS b"
     refused = (f"SELECT count(*) FROM (SELECT * FROM ({b} RIGHT JOIN t USING (doc))) AS q WHERE doc = 'west'",
                f"SELECT count(*) FROM (SELECT * FROM (t LEFT JOIN {b} USING (doc))) AS q WHERE doc = 'west'",
@@ -1019,6 +1020,23 @@ def test_a_join_groups_merge_and_a_comma_inputs_columns_are_listed_as_the_engine
            "(SELECT region AS doc FROM t) AS c) AS q WHERE doc = 'west'")
     assert con.execute(sql).fetchall() == [(2,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Index(), dialect="duckdb") is None
+    # a source whose own output provably lacks the name is no stand-in for the hidden holder (Codex's
+    # twenty-second review: `z` kept the merge alive once both real holders were excluded)
+    stand_in = "t LEFT JOIN (v CROSS JOIN (SELECT name FROM u) AS z) USING (doc) CROSS JOIN (SELECT region AS doc FROM t) AS d"
+    sql = f"SELECT count(*) FROM (SELECT * EXCLUDE (t.doc, v.doc) FROM {stand_in}) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Index(), dialect="duckdb") is None
+    sql = f"SELECT count(*) FROM (SELECT * EXCLUDE (t.doc) FROM {stand_in}) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
+    # a star over the withheld holder may hold the name, so it stands in and the merge stays (the review gate
+    # on round 32: read by the grant alone it counted as lacking the name, and the absent value passed)
+    sql = ("SELECT count(*) FROM (SELECT * EXCLUDE (t.doc) FROM t LEFT JOIN (SELECT * FROM v) AS z USING (doc) CROSS JOIN "
+           "(SELECT region AS doc FROM t) AS d) AS q WHERE doc = 'west'")
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
     # a RIGHT merge with one holder excluded, either one, keeps its merged column, `b`'s `doc`, `t.region`
     # (measured: one row), where a merge dropped on any excluded holder would fall to `t.doc` and refuse
     for shape in ("EXCLUDE (b.doc) FROM t RIGHT JOIN (SELECT region AS doc FROM t) AS b USING (doc)",
