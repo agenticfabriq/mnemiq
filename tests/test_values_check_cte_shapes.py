@@ -919,6 +919,22 @@ def test_a_join_groups_merge_and_a_comma_inputs_columns_are_listed_as_the_engine
     sql = "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM v JOIN v AS b USING (doc) WHERE doc = 'west')"
     assert con.execute(sql).fetchall() == [(2,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Index(), dialect="duckdb") is None
+    # DuckDB's precedence binds a USING key inside a join's input too: the right input holds a merge and
+    # another holder, and the key is the merged `doc`, `t.doc` (Codex's seventeenth review: the two counted
+    # as lineages, and the absent value main refused was skipped); Postgres refuses the key as ambiguous
+    group = "(t AS b JOIN t AS c USING (doc) CROSS JOIN (SELECT region AS doc FROM t) AS d)"
+    for sql in (f"SELECT count(*) FROM t RIGHT JOIN {group} USING (doc) WHERE doc = 'west'",
+                f"SELECT count(*) FROM t FULL JOIN {group} USING (doc) WHERE doc = 'west'",
+                f"SELECT count(*) FROM {group} LEFT JOIN t USING (doc) WHERE doc = 'west'"):
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+        assert check_values(sqlglot.parse_one(sql, read="postgres"), visible, _Index(), dialect="postgres") is None, sql
+    # two merged columns are the ambiguity error on DuckDB too, so nothing is read
+    sql = "SELECT count(*) FROM t JOIN t AS c USING (doc), v JOIN v AS w USING (doc) WHERE doc = 'west'"
+    with pytest.raises(duckdb.BinderException, match="mbiguous"):
+        con.execute(sql)
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
     # a USING key two columns of the left input hold is the engine's ambiguity error, so nothing is read
     sql = f"SELECT count(*) FROM (SELECT * FROM {b} CROSS JOIN t JOIN t AS c USING (doc)) AS q WHERE doc = 'west'"
     with pytest.raises(duckdb.BinderException, match="Ambiguous"):

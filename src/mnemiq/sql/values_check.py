@@ -593,7 +593,16 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
         owner, also beside a source the walk cannot name (the engine raises where that source
         holds it too: `(VALUES ('west')) AS x(doc), t` is `t.doc` or the error); `_HELD`;
         `_UNKNOWN`; None where no column is the name's; `_WIDE` where two lineages are listed,
-        the engine's ambiguity error."""
+        the engine's ambiguity error. On DuckDB a merged column among them takes the name before
+        every other source's column (`_BINDS_A_MERGE_FIRST`), inside a join's input as at the top:
+        `t RIGHT JOIN (t b JOIN t c USING (doc) CROSS JOIN (SELECT region AS doc FROM t) d) USING
+        (doc)` binds the right input's key to the merged `doc`, `t.doc`, where the merged column
+        and `d`'s counted as two lineages and the absent value main refused was skipped (Codex's
+        seventeenth review of #178); two merged columns are the ambiguity error there too."""
+        if (dialect or "").lower() in _BINDS_A_MERGE_FIRST:
+            merges = [col for col in cols if isinstance(col, _Merge)]
+            if merges:
+                return resolve(merges[0]) if len(merges) == 1 else _WIDE
         found = [f for f in (resolve(col) for col in cols) if f is not None]
         if not found:
             return None
@@ -637,42 +646,38 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     from_ = scope.expression.args.get("from_")
     cols = joined(columns(from_.this) if from_ is not None else [], scope.expression.args.get("joins") or [])
     cols += [alias for alias in scope.selected_sources if alias not in seen]
-    if not listed and (dialect or "").lower() in _BINDS_A_MERGE_FIRST:
-        merges = [col for col in cols if isinstance(col, _Merge)]
-        if merges:
-            # A merged column takes a bare name before every other source's column on DuckDB
-            # (`_BINDS_A_MERGE_FIRST`), and two merged columns are the engine's ambiguity error;
-            # on the other engines the merged column is one lineage among the others below, two
-            # being the ambiguity error there (the review gate on round 24).
-            return resolve(merges[0]) if len(merges) == 1 else None
+    if not listed:
+        # The engine's binding of the bare name among the columns, as a USING key's on an input.
+        answer = bare(cols)
+        if answer is None:
+            return _ABSENT
+        if isinstance(answer, tuple) or answer is _HELD:
+            return answer
+        # Two lineages, the engine's ambiguity error, or sources the walk cannot name alone:
+        # nothing where a join made the name one side's, the statement-wide reading's turn else.
+        return None if narrowed else _WIDE
     found = [f for f in (resolve(col) for col in cols) if f is not None]
     if not found:
         return _ABSENT
     if any(f is _HELD for f in found):
         return _HELD
     owners = [f for f in found if isinstance(f, tuple)]
-    if listed:
-        if not owners:
-            return None  # sources the walk cannot name alone: the scope may hold the name
-        if len(owners) < len(found):
-            # A star lists the unnamed source's columns too, and the engine binds the name to the
-            # first without the ambiguity error a bare name meets, so the name may be that source's
-            # (`(VALUES ('west')) AS x(doc), t`: the review gate on round 18, where `t` alone was
-            # counted and a present value refused); the owner says the scope holds the name.
-            return _HELD
-        if len(set(owners)) == 1 or (dialect or "").lower() in _LISTS_DUPLICATE_STAR_COLUMNS:
-            # Two holders of one lineage are the one column (`t CROSS JOIN t tt` lists `doc` twice,
-            # each `t.doc`: Codex's fourteenth review); two lineages are listed in FROM order and
-            # DuckDB binds the bare name to the first (`t CROSS JOIN (SELECT region AS doc FROM t)
-            # b` lists `doc` then `doc_1`: the fifteenth review, where the reversed order refused
-            # `t.region`'s present value against `t.doc` on main and here).
-            return owners[0]
+    if not owners:
+        return None  # sources the walk cannot name alone: the scope may hold the name
+    if len(owners) < len(found):
+        # A star lists the unnamed source's columns too, and the engine binds the name to the
+        # first without the ambiguity error a bare name meets, so the name may be that source's
+        # (`(VALUES ('west')) AS x(doc), t`: the review gate on round 18, where `t` alone was
+        # counted and a present value refused); the owner says the scope holds the name.
         return _HELD
-    if len(set(owners)) == 1:
-        # One lineage, also beside a source the walk cannot name: the engine raises where that
-        # source holds the name too (`(VALUES ('west')) AS x(doc), t` is `t.doc` or the error).
+    if len(set(owners)) == 1 or (dialect or "").lower() in _LISTS_DUPLICATE_STAR_COLUMNS:
+        # Two holders of one lineage are the one column (`t CROSS JOIN t tt` lists `doc` twice,
+        # each `t.doc`: Codex's fourteenth review); two lineages are listed in FROM order and
+        # DuckDB binds the bare name to the first (`t CROSS JOIN (SELECT region AS doc FROM t)
+        # b` lists `doc` then `doc_1`: the fifteenth review, where the reversed order refused
+        # `t.region`'s present value against `t.doc` on main and here).
         return owners[0]
-    return None if narrowed else _WIDE
+    return _HELD
 
 
 # The engines on which a join the parser gives no kind, side, method, ON or USING can only be a
