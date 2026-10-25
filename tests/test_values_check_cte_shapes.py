@@ -724,11 +724,12 @@ def test_a_plain_star_over_a_join_yields_the_name_as_the_scope_binds_it():
     sql = "SELECT count(*) FROM (SELECT b.* FROM t JOIN (SELECT region AS doc FROM t) AS b USING (doc)) AS q WHERE doc = 'west'"
     assert con.execute(sql).fetchall() == [(0,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
-    # two sources holding the name: DuckDB lists both and binds the bare name to the first; the
-    # check answers nothing, as before
+    # two sources holding the name: DuckDB lists both in FROM order and binds the bare name to the
+    # first, `t.doc` (round 22 of #178; held to a skip before)
     sql = "SELECT count(*) FROM (SELECT * FROM t JOIN v ON true) AS q WHERE doc = 'west'"
     assert con.execute(sql).fetchall() == [(0,)]
-    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
     # a star whose EXCLUDE names another column yields this one as a plain star does (round 20; held to
     # unknown before, and skipped where main refused)
     sql = "SELECT count(*) FROM (SELECT * EXCLUDE (region) FROM t JOIN u ON true) AS q FULL JOIN t AS b USING (doc) WHERE doc = 'west'"
@@ -816,3 +817,36 @@ def test_a_star_follows_the_column_a_replace_or_rename_gives_and_two_holders_of_
     for sql in present:
         assert con.execute(sql).fetchall() == [(1,)], sql
         assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql
+
+
+def test_a_stars_two_lineages_are_listed_in_from_order_and_a_replace_by_any_column_follows_it():
+    # Codex's fifteenth review of #178. A REPLACE by a qualified column was an opaque expression, so
+    # `* REPLACE (t.doc AS doc)` skipped where main refused; two sources holding the name under a star
+    # as two columns answered nothing, so a FULL join over `(SELECT * FROM t CROSS JOIN (SELECT region
+    # AS doc FROM t) b) q` skipped where main refused, while the engine lists them in FROM order and
+    # binds the bare name to the first (`doc`, then `doc_1`), which the walk can see where it cannot
+    # see a table's column order; and two RENAMEs giving one name took the last, where they are two
+    # columns in the table's order, unknown.
+    visible = {**VISIBLE, "u": {"name"}, "v": {"doc", "k", "name"}, "w": {"k"}}
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (doc VARCHAR, region VARCHAR); INSERT INTO t VALUES ('a', 'west'), ('b', 'east'); "
+                "CREATE TABLE u (name VARCHAR); INSERT INTO u VALUES ('n')")
+    refused = ("SELECT count(*) FROM (SELECT * REPLACE (t.doc AS doc) FROM t) AS q WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * FROM t CROSS JOIN (SELECT region AS doc FROM t) AS b) AS q FULL JOIN t AS c USING (doc) WHERE doc = 'west'",
+               "SELECT count(*) FROM (SELECT * FROM t JOIN u ON true CROSS JOIN (SELECT region AS doc FROM t) AS b) AS q WHERE doc = 'west'")
+    for sql in refused:
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    # the reversed FROM order lists the derived table's `doc` first, `t.region`: a present value, which
+    # main refused against `t.doc`
+    sql = "SELECT count(*) FROM (SELECT * FROM (SELECT region AS doc FROM t) AS b CROSS JOIN t) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    # two RENAMEs giving one name: the table's column order decides which the engine lists first, and
+    # the walk cannot see it, so nothing is checked either way
+    for renamed in ("SELECT count(*) FROM (SELECT * RENAME (doc AS name, region AS name) FROM t) AS q WHERE name = '{}'",
+                    "SELECT count(*) FROM (SELECT * RENAME (region AS name, doc AS name) FROM t) AS q WHERE name = '{}'"):
+        assert [con.execute(renamed.format(lit)).fetchall() for lit in ("a", "west")] == [[(1,)], [(0,)]], renamed
+        for lit in ("a", "west"):
+            assert check_values(sqlglot.parse_one(renamed.format(lit), read="duckdb"), visible, _Index(), dialect="duckdb") is None, (renamed, lit)
