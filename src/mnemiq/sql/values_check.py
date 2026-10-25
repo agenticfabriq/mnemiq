@@ -518,6 +518,7 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     comma_starts_an_input = (dialect or "").lower() in _COMMA_BINDS_LOOSER
     presence: dict[str, object] = {}
     seen: set[str] = set()
+    order: list[str] = []  # the sources in FROM order, as the engine lists a star's columns
     narrowed = False  # a join made the name one side's
 
     def present(alias: str) -> object:
@@ -571,6 +572,7 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
         else:
             first = [node.alias_or_name]
             seen.add(node.alias_or_name)
+            order.append(node.alias_or_name)
         return joined(first, node.args.get("joins") or [])
 
     def joined(current: list[str | _Merge], joins: list[exp.Join]) -> list[str | _Merge]:
@@ -679,35 +681,50 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
 
     from_ = scope.expression.args.get("from_")
     cols = joined(columns(from_.this) if from_ is not None else [], scope.expression.args.get("joins") or [])
-    cols += [alias for alias in scope.selected_sources if alias not in seen]
-    # A star's qualified EXCLUDE drops the named sources' OWN columns of the name; a merged column
-    # those sources feed is the join's, not theirs, and stays while a holder of it is left (`*
-    # EXCLUDE (t.doc)` over `t LEFT JOIN (SELECT region AS doc FROM t) b USING (doc)` lists the
-    # merged `doc`, `t.doc`'s values, measured: the review gate on round 29, where dropping `t`
-    # inside the merge disarmed the refusal), and goes with its last holder (`* EXCLUDE (t.doc,
-    # b.doc)` over `t JOIN t b USING (doc) CROSS JOIN (SELECT region AS doc FROM t) c` lists `c`'s
-    # `doc` alone, `t.region`, measured: Codex's twentieth review, where the kept merge refused the
-    # present value and the reversed order skipped the absent one main refused).
+    # The star's columns of the name in the engine's order (measured on DuckDB 1.5.4, Codex's twenty-first
+    # review of #178 and the review gates on rounds 29 and 30): a merged column sits where its first
+    # surviving holder sits, keeps its lineage however many holders a qualified EXCLUDE names, and
+    # goes with its last; an input's other columns of the name keep their own places. The holders
+    # of a merge are the sources its USING key binds on each input: a nested merge's own holders
+    # where the input holds one (the key binds to the merged column before any other: `(t JOIN t b
+    # USING (doc) CROSS JOIN (SELECT region AS doc FROM t) d) JOIN t c USING (doc)` under `EXCLUDE
+    # (t.doc, b.doc, c.doc)` lists `d`'s `doc` alone, where `d` counted as a holder kept the outer
+    # merge alive and refused `t.region`'s present value), else the input's holders the grant
+    # shows, else, the grant hiding the key USING demands, every source of the input (`EXCLUDE
+    # (t.doc)` over `t LEFT JOIN v USING (doc)` with `v.doc` hidden keeps the merge: round 30's
+    # gate). `EXCLUDE (t.doc, b.doc)` over the nested shape lists `d`'s `doc` before the merge,
+    # now at `c`'s place, and `EXCLUDE (t.doc)` over `t LEFT JOIN b USING (doc) CROSS JOIN d` the
+    # merge at `b`'s place, before `d`.
 
-    def excluded(col: str | _Merge) -> bool:
+    def holders(col: _Merge) -> list[str]:
+        out: list[str] = []
+        for side in (col.left, col.right):
+            merges = [c for c in side if isinstance(c, _Merge)]
+            if merges:
+                for m in merges:
+                    out += holders(m)
+                continue
+            visible_holders = [c for c in side if present(c) is not None]
+            out += visible_holders or [c for c in side if not isinstance(c, _Merge)]
+        return out
+
+    merge_of: dict[str, _Merge] = {}
+    for col in cols:
         if isinstance(col, _Merge):
-            return excluded_side(col.left) and excluded_side(col.right)
-        return col in without
-
-    def excluded_side(side: list[str | _Merge]) -> bool:
-        # USING demands the key on each input, so an input the grant shows no holder of holds it
-        # in a column the grant hides, and only an EXCLUDE naming that source drops it; read as
-        # holding nothing, the merge went with the visible input's exclusion alone and `EXCLUDE
-        # (t.doc)` over `t LEFT JOIN v USING (doc)` with `v.doc` hidden skipped the absent value the
-        # kept merge refuses (the review gate on round 30). Where the input has a holder the grant
-        # shows, or a merge, those decide: a second, hidden holder beside them would be the
-        # engine's ambiguity error on the key.
-        deciding = [c for c in side if isinstance(c, _Merge) or present(c) is not None]
-        if deciding:
-            return all(excluded(c) for c in deciding)
-        return bool(side) and all(c in without for c in side)
-
-    cols = [col for col in cols if not excluded(col)]
+            for alias in holders(col):
+                merge_of[alias] = col
+    emitted: set[int] = set()
+    star: list[str | _Merge] = []
+    for alias in order + [alias for alias in scope.selected_sources if alias not in seen]:
+        if alias in without:
+            continue
+        merge = merge_of.get(alias)
+        if merge is None:
+            star.append(alias)
+        elif id(merge) not in emitted:
+            emitted.add(id(merge))
+            star.append(merge)
+    cols = star
     if not listed:
         # The engine's binding of the bare name among the columns, as a USING key's on an input.
         answer = bare(cols)

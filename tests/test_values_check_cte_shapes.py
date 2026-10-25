@@ -965,6 +965,36 @@ def test_a_join_groups_merge_and_a_comma_inputs_columns_are_listed_as_the_engine
                       (f"SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM {excluded} WHERE doc = 'west')", 2)):
         assert con.execute(sql).fetchall() == [(rows,)], sql
         assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql
+    # a merged column sits where its first surviving holder sits, and a nested merge's holders are its own,
+    # the key binding to it before the input's other holders (Codex's twenty-first review: `d` counted as a
+    # holder kept the outer merge alive and refused `t.region`'s present value); measured column orders
+    nested = "(t JOIN t AS b USING (doc) CROSS JOIN (SELECT region AS doc FROM t) AS d)"
+    for shape, rows in ((f"EXCLUDE (t.doc, b.doc, c.doc) FROM {nested} JOIN t AS c USING (doc)", 2),
+                        (f"EXCLUDE (t.doc, b.doc, c.doc) FROM t AS c RIGHT JOIN {nested} USING (doc)", 2),
+                        (f"EXCLUDE (t.doc, b.doc) FROM {nested} JOIN t AS c USING (doc)", 2),
+                        (f"EXCLUDE (t.doc) FROM {nested} JOIN t AS c USING (doc)", 0),
+                        (f"EXCLUDE (d.doc) FROM {nested} JOIN t AS c USING (doc)", 0),
+                        ("EXCLUDE (t.doc) FROM t LEFT JOIN (SELECT region AS doc FROM t) AS b USING (doc) CROSS JOIN "
+                         "(SELECT region AS doc FROM t) AS d", 0)):
+        sql = f"SELECT count(*) FROM (SELECT * {shape}) AS q WHERE doc = 'west'"
+        assert con.execute(sql).fetchall() == [(rows,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        if rows:
+            assert verdict is None, (sql, verdict)
+        else:
+            assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+    # a holder that is no participant of the merge and precedes its holders keeps its own place, before the
+    # merged column (measured: `d.doc` is the first column, `west`, and the merged `doc` the second, `a`; the
+    # review gate on round 31 read the merged column as first off a join that returned no rows); excluding
+    # `d`'s column leaves the merged column first
+    ahead = "(SELECT region AS doc FROM t) AS d CROSS JOIN (t JOIN t AS e USING (doc)) JOIN t AS f USING (doc)"
+    sql = f"SELECT count(*) FROM (SELECT * FROM {ahead}) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    sql = f"SELECT count(*) FROM (SELECT * EXCLUDE (d.doc) FROM {ahead}) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
     # a merged column whose every holder is excluded goes with them, and the name is the next column's
     # (Codex's twentieth review: the kept merge refused `c`'s present value against `t.doc`, and the
     # reversed order skipped the absent value main refused)
