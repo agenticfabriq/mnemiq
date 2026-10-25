@@ -9,6 +9,7 @@ from sqlglot import exp
 
 from mnemiq.sql.identifiers import resolve_name
 from mnemiq.sql.qualify import object_key
+from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,18 @@ def check_shape(
             message="Return exactly one statement. Multiple statements are never executed.",
         )
 
-    ast = statements[0]
+    dotted = dotted_map_keys(sql, dialect)
+    if dotted:
+        # The parse has already lost the key's qualifier (`reading`), so the text decides.
+        key = dotted[0]
+        return Refusal(
+            code=RefusalCode.UNMODELLED_CALL,
+            message=(f"A MAP literal keyed by a dotted name ({key}) is read by the parser as its last part "
+                     "alone, so the engine cannot say what the query reads. Spell the key in parentheses, "
+                     f"MAP {{({key}): ...}}, or as MAP([{key}], [...])."),
+            subject=key,
+        )
+    ast = as_duckdb_reads(statements[0])  # one tree for the guards and the render: `reading`
     if not isinstance(ast, _ALLOWED_ROOTS):
         return Refusal(
             code=RefusalCode.NOT_SELECT_ONLY,
