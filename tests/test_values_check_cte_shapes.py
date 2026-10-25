@@ -930,6 +930,24 @@ def test_a_join_groups_merge_and_a_comma_inputs_columns_are_listed_as_the_engine
         verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
         assert check_values(sqlglot.parse_one(sql, read="postgres"), visible, _Index(), dialect="postgres") is None, sql
+    # under a star DuckDB binds the bare name to the first column listed whatever follows, so a later
+    # merged column the walk cannot place leaves a known first column the reading (Codex's eighteenth
+    # review: a guard on any unplaced column skipped the absent value main refused); the reversed order
+    # lists the coalesced column first, a present value, and nothing is checked; Postgres refuses the
+    # bare name two listed columns hold, so nothing is read there
+    merge = "(t AS b FULL JOIN (SELECT region AS doc FROM t) AS c USING (doc))"
+    for sql, rows in ((f"SELECT count(*) FROM (SELECT * FROM t CROSS JOIN {merge}) AS q WHERE doc = 'west'", 0),
+                      ("SELECT count(*) FROM (SELECT * FROM t, (VALUES ('west')) AS x(doc)) AS q WHERE doc = 'west'", 0),
+                      ("SELECT count(*) FROM (SELECT * FROM t CROSS JOIN t AS q2(region, doc)) AS q WHERE doc = 'west'", 0),
+                      (f"SELECT count(*) FROM (SELECT * FROM {merge} CROSS JOIN t) AS q WHERE doc = 'west'", 2),
+                      ("SELECT count(*) FROM (SELECT * FROM (VALUES ('west')) AS x(doc), t) AS q WHERE doc = 'west'", 2)):
+        assert con.execute(sql).fetchall() == [(rows,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        if rows == 0:
+            assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
+        else:
+            assert verdict is None, (sql, verdict)
+        assert check_values(sqlglot.parse_one(sql, read="postgres"), visible, _Index(), dialect="postgres") is None, sql
     # two merged columns are the ambiguity error on DuckDB too, so nothing is read
     sql = "SELECT count(*) FROM t JOIN t AS c USING (doc), v JOIN v AS w USING (doc) WHERE doc = 'west'"
     with pytest.raises(duckdb.BinderException, match="mbiguous"):

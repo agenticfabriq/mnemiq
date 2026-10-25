@@ -473,10 +473,10 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     cannot tell and no join concerned the name, so the statement-wide reading answers as before,
     where a join that made the name one side's (`narrowed`) answers nothing instead, since that
     reading would resurrect the other side. Under a star (`listed`) the engine binds the name to
-    the first column listed without the ambiguity error a bare name meets: a source the walk
-    cannot name among them answers nothing, two lineages are the first in order on DuckDB
-    (`_LISTS_DUPLICATE_STAR_COLUMNS`) and `_HELD` elsewhere, where Postgres refuses the bare
-    name and MySQL the derived table."""
+    the first column listed without the ambiguity error a bare name meets: on DuckDB
+    (`_LISTS_DUPLICATE_STAR_COLUMNS`) the first column is the reading whatever follows, nothing
+    where the walk cannot name it; elsewhere two columns of one lineage are that column and any
+    other pair `_HELD`, Postgres refusing the bare name and MySQL the derived table."""
     if column.table:
         named = _source_named(column.args.get("table"), scope.sources, dialect)
         return _through_scopes(column, scope, visible, dialect, depth + 1) if named is not None else _ABSENT
@@ -656,28 +656,32 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
         # Two lineages, the engine's ambiguity error, or sources the walk cannot name alone:
         # nothing where a join made the name one side's, the statement-wide reading's turn else.
         return None if narrowed else _WIDE
+    # Under a star, the name's columns in the order the engine lists them.
     found = [f for f in (resolve(col) for col in cols) if f is not None]
     if not found:
         return _ABSENT
-    if any(f is _HELD for f in found):
+    if (dialect or "").lower() in _LISTS_DUPLICATE_STAR_COLUMNS:
+        # DuckDB lists every column and binds the bare name to the first, whatever follows (`t CROSS
+        # JOIN (SELECT region AS doc FROM t) b` lists `doc` then `doc_1`: Codex's fifteenth review,
+        # where the reversed order refused `t.region`'s present value against `t.doc`), so a known
+        # first column is the reading even where a later one cannot be placed: `t CROSS JOIN (t b
+        # FULL JOIN (SELECT region AS doc FROM t) c USING (doc))` is `t.doc`, and a guard on any
+        # unplaced column skipped the absent value main refused (the eighteenth review). A first
+        # column the walk cannot name may be the engine's binding (`(VALUES ('west')) AS x(doc),
+        # t`: the review gate on round 18, where `t` alone was counted and a present value
+        # refused), so nothing is placed; a later owner says the scope holds the name.
+        first = found[0]
+        if isinstance(first, tuple) or first is _HELD:
+            return first
+        return _HELD if any(isinstance(f, tuple) for f in found) else None
+    # The other engines refuse a bare name two listed columns hold, or the derived table itself
+    # (Postgres 16 and MySQL 8.4, measured), so two holders of one lineage are that column (`t
+    # CROSS JOIN t tt`: Codex's fourteenth review) and any other pair holds the name unplaced.
+    if len(set(found)) == 1 and isinstance(found[0], tuple):
+        return found[0]
+    if any(isinstance(f, tuple) or f is _HELD for f in found):
         return _HELD
-    owners = [f for f in found if isinstance(f, tuple)]
-    if not owners:
-        return None  # sources the walk cannot name alone: the scope may hold the name
-    if len(owners) < len(found):
-        # A star lists the unnamed source's columns too, and the engine binds the name to the
-        # first without the ambiguity error a bare name meets, so the name may be that source's
-        # (`(VALUES ('west')) AS x(doc), t`: the review gate on round 18, where `t` alone was
-        # counted and a present value refused); the owner says the scope holds the name.
-        return _HELD
-    if len(set(owners)) == 1 or (dialect or "").lower() in _LISTS_DUPLICATE_STAR_COLUMNS:
-        # Two holders of one lineage are the one column (`t CROSS JOIN t tt` lists `doc` twice,
-        # each `t.doc`: Codex's fourteenth review); two lineages are listed in FROM order and
-        # DuckDB binds the bare name to the first (`t CROSS JOIN (SELECT region AS doc FROM t)
-        # b` lists `doc` then `doc_1`: the fifteenth review, where the reversed order refused
-        # `t.region`'s present value against `t.doc` on main and here).
-        return owners[0]
-    return _HELD
+    return None  # sources the walk cannot name alone: the scope may hold the name
 
 
 # The engines on which a join the parser gives no kind, side, method, ON or USING can only be a
