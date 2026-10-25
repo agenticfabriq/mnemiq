@@ -948,6 +948,12 @@ def test_a_join_groups_merge_and_a_comma_inputs_columns_are_listed_as_the_engine
         else:
             assert verdict is None, (sql, verdict)
         assert check_values(sqlglot.parse_one(sql, read="postgres"), visible, _Index(), dialect="postgres") is None, sql
+    # a first column the walk cannot name followed by one it cannot place: the scope holds the name (the
+    # review gate on round 27: read as unknown, the enclosing scope fell to the statement-wide reading)
+    sql = ("SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM (SELECT * FROM (VALUES ('west')) AS x(doc), t AS q2(region, doc)) "
+           "AS q WHERE doc = 'west')")
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
     # two merged columns are the ambiguity error on DuckDB too, so nothing is read
     sql = "SELECT count(*) FROM t JOIN t AS c USING (doc), v JOIN v AS w USING (doc) WHERE doc = 'west'"
     with pytest.raises(duckdb.BinderException, match="mbiguous"):

@@ -669,11 +669,13 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
         # unplaced column skipped the absent value main refused (the eighteenth review). A first
         # column the walk cannot name may be the engine's binding (`(VALUES ('west')) AS x(doc),
         # t`: the review gate on round 18, where `t` alone was counted and a present value
-        # refused), so nothing is placed; a later owner says the scope holds the name.
+        # refused), so nothing is placed; a later owner, or a later column held without a place,
+        # says the scope holds the name (the review gate on round 27: read as unknown, the
+        # enclosing scope fell to the statement-wide reading and refused a present value).
         first = found[0]
         if isinstance(first, tuple) or first is _HELD:
             return first
-        return _HELD if any(isinstance(f, tuple) for f in found) else None
+        return _HELD if any(isinstance(f, tuple) or f is _HELD for f in found) else None
     # The other engines refuse a bare name two listed columns hold, or the derived table itself
     # (Postgres 16 and MySQL 8.4, measured), so two holders of one lineage are that column (`t
     # CROSS JOIN t tt`: Codex's fourteenth review) and any other pair holds the name unplaced.
