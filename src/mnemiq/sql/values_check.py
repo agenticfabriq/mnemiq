@@ -716,12 +716,22 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
                     out += holders(m)
                 continue
             visible_holders = [c for c in side if present(c) is not None]
+            if visible_holders:
+                out += visible_holders
+                continue
             # The input's sources stand in for the holder the grant hides, save one whose own output
             # provably lacks the name (a derived table projecting other columns): counted, `z` in `t
             # LEFT JOIN (v CROSS JOIN (SELECT name FROM u) z) USING (doc)` with `v.doc` withheld kept
             # the merge alive at `z`'s place once `t.doc` and `v.doc` were excluded, and `d`'s present
-            # value was refused against `t.doc` (Codex's twenty-second review of #178).
-            out += visible_holders or [c for c in side if not isinstance(c, _Merge) and not lacks(c)]
+            # value was refused against `t.doc` (Codex's twenty-second review of #178). A stand-in a
+            # qualified EXCLUDE names holds the column, the engine refusing an EXCLUDE of a column a
+            # source lacks, and is the input's only holder, two being the ambiguity error on the key,
+            # so it alone stands in and the merge goes with it (Codex's twenty-third review: `u` beside
+            # the excluded `v` kept the merge alive and `d`'s present value was refused; the review gate
+            # on round 33: the exclusion settles which stand-in held the key, no unsure case is left).
+            candidates = [c for c in side if not isinstance(c, _Merge) and not lacks(c)]
+            named = [c for c in candidates if c in without]
+            out += named or candidates
         return out
 
     merge_of: dict[str, _Merge] = {}

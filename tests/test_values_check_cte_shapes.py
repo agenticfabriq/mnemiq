@@ -1030,6 +1030,26 @@ def test_a_join_groups_merge_and_a_comma_inputs_columns_are_listed_as_the_engine
     assert con.execute(sql).fetchall() == [(0,)]
     verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Index(), dialect="duckdb")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
+    # a stand-in a qualified EXCLUDE names held the key (the engine refuses an EXCLUDE of a column a source
+    # lacks, and two holders on an input are the ambiguity error), so the merge goes with it and the name is
+    # `d`'s, `t.region`, read against an index holding `t.region` too so a skip cannot pass for the reading
+    # (Codex's twenty-third review: `u` kept the merge alive and `d`'s present value was refused; the review
+    # gate on round 33: an unsure merge would have let a value absent from both columns pass)
+    class _Both(_Index):
+        data = {("t", "doc"): {"a", "b"}, ("t", "region"): {"west", "east"}}
+    maybe = "t LEFT JOIN (v CROSS JOIN u CROSS JOIN (SELECT name FROM u) AS z) USING (doc) CROSS JOIN (SELECT region AS doc FROM t) AS d"
+    sql = f"SELECT count(*) FROM (SELECT * EXCLUDE (t.doc, v.doc) FROM {maybe}) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Both(), dialect="duckdb") is None
+    sql = f"SELECT count(*) FROM (SELECT * EXCLUDE (t.doc, v.doc) FROM {maybe}) AS q WHERE doc = 'nowhere'"
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Both(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.region" in verdict.message, verdict
+    for ex in ("EXCLUDE (t.doc)", "EXCLUDE (v.doc)"):  # a holder left on either input keeps the merge, `t.doc`
+        sql = f"SELECT count(*) FROM (SELECT * {ex} FROM {maybe}) AS q WHERE doc = 'west'"
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), hidden, _Both(), dialect="duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
     # a star over the withheld holder may hold the name, so it stands in and the merge stays (the review gate
     # on round 32: read by the grant alone it counted as lacking the name, and the absent value passed)
     sql = ("SELECT count(*) FROM (SELECT * EXCLUDE (t.doc) FROM t LEFT JOIN (SELECT * FROM v) AS z USING (doc) CROSS JOIN "
