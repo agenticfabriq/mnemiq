@@ -14,6 +14,14 @@ blocked.
 - **Required checks:** `unit`, `workbench`, `guard` and `mcp-2x`.
 - **CodeQL (GitHub's default setup) runs on every pull request without being required.** Let it finish green too. An alert
   needs a decision, a fix or a dismissal with a reason, which no setting can make.
+- These are GitHub settings, not files in this repository, so they can drift without a commit. Confirm
+  them before relying on them, each command on one line as written here:
+  - `gh api repos/agenticfabriq/mnemiq/branches/main/protection` for the pull-request rule, the required
+    checks and the force-push block. It answers admins only: a non-admin gets a plain `Not Found`, where
+    an unprotected branch answers `Branch not protected`.
+  - `gh api repos/agenticfabriq/mnemiq --jq '{allow_rebase_merge, allow_squash_merge, allow_merge_commit}'`
+    for the merge methods, which the protection call does not report.
+  - `gh api repos/agenticfabriq/mnemiq/code-scanning/default-setup` for CodeQL.
 
 ## Run the repo guard on every commit and before a branch's first push
 
@@ -21,13 +29,13 @@ blocked.
 machine for names on a private blocklist.
 
 - `git config core.hooksPath .githooks` runs it before each commit, with whitespace and lint checks.
-  Staged mode is the only one that checks names. It takes the staged paths, skipping renamed ones,
-  and reads their working-tree copies. So commit each file as it stands (no partial staging, no
-  edits between `git add` and the commit), and commit a rename apart from edits to that file.
+  Staged mode is the only one that checks names. It reads the staged content of each path git lists
+  as added, copied, modified, renamed or type-changed, the guard script itself and submodule pointers
+  excepted, so what it scans is what the commit will hold.
 - Before a branch's first push, run `scripts/repo-guard.sh --range origin/main..HEAD` from the repo
-  root. It scans the lines each non-merge commit on the branch adds, so it catches a secret one
-  commit adds and a later one removes; a merge commit's own conflict resolution is not scanned. With
-  no arguments it checks only what is staged, which before a push is usually nothing.
+  root. It scans the lines each commit on the branch adds, a merge commit's own conflict resolution
+  included, so it catches a secret one commit adds and a later one removes. With no arguments it
+  checks only what is staged, which before a push is usually nothing.
 - The blocklist is `REPO_GUARD_NAME_PATTERNS`, read from the environment when set and non-empty,
   else from this checkout's own `./.env` (never the main checkout's), so a worktree needs its own
   `.env` unless the variable is exported. A contributor sets it to `off`, as `.env.example` does,

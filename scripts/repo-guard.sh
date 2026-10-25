@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # repo-guard: block commits that leak proprietary names, personal identity, or
-# secrets into this repo. Pre-commit hook (--staged), CI over the tree (--all), and CI over
-# the commits a push adds (--range <rev-range>), which is the only one that sees a secret
-# added and removed within a branch (M97).
+# secrets into this repo. Pre-commit hook (--staged, reading the index), CI over the tree
+# (--all), and CI over the commits a push adds (--range <rev-range>, merge commits' own
+# resolutions included), which is the only one that sees a secret added and removed within a
+# branch (M97).
 #
 # THREE CHECKS, TWO AUDIENCES, and the split is deliberate.
 #
@@ -36,12 +37,21 @@ if [ "$MODE" = "--range" ] && [ -z "$RANGE" ]; then
 fi
 
 list_files() {
+  # NUL-delimited in both modes: git C-quotes a path holding a quote, a backslash, a tab, a newline
+  # or, by default, a byte above 0x7f, and the quoted spelling names no file and no blob, so the
+  # tree scan skipped such a path silently and the index scan would refuse it as an instrument
+  # fault (the review gate on the fix, twice: `core.quotePath=false` covers the last case alone).
   if [ "$MODE" = "--all" ]; then
-    git ls-files
+    git ls-files -z
   elif [ "$MODE" = "--range" ]; then
     :   # --range does not scan paths; see scan_range
   else
-    git diff --cached --name-only --diff-filter=ACM
+    # R and T too: a renamed file's staged content is scanned like any other's (without R, `git mv
+    # b c` plus a blocked line appended to c showed as R096 and passed, where the same edit
+    # without the rename was blocked: M221; the hook's whitespace check has always listed ACMR),
+    # and so is a symlink replaced by a regular file, which git stages as a type change (the
+    # review gate on the fix).
+    git diff --cached --name-only -z --diff-filter=ACMRT
   fi
 }
 
@@ -62,8 +72,34 @@ list_files() {
 # ever matched a secret shape was this one, 1,089 times, matching the literal `AF_SECRET_KEY` in
 # its own pattern list.
 scan_range() {
-  git log -p -U0 --no-color --diff-filter=AMR --format='__COMMIT__ %H' "$RANGE" \
+  # `--diff-merges=combined`: `git log -p` prints no patch for a merge commit by default, so a
+  # line added only in a merge's conflict resolution was never scanned (M219), and CI runs this
+  # mode on every push, the merge a pull request's merge button makes included. A combined diff
+  # shows the lines present in NO parent, prefixed `++`, which the added-line rule below reads
+  # through its first `+`; a line the second parent already has is prefixed `+ ` and is read
+  # too, which rescans that parent's lines where its commits lie outside the range (a merge of
+  # `origin/main` into a branch scanned as `origin/main..HEAD`) and flags one at the merge, a
+  # verdict `--all` on main keeps true; a line the first parent already has is prefixed ` +`, is
+  # not an added line, and is not read.
+  # `--text`: a binary blob's patch is otherwise the one line `Binary files ... differ`, with no added
+  # line to read, so a key shape behind a NUL byte reached the public history unscanned (Codex's
+  # review of the fix); the patterns are ASCII and match in a binary blob as in a text one.
+  # T too: a symlink replaced by a regular file is a type change, which `AMR` left out, so a key
+  # shape such a file carried reached the history unread, and a later commit restoring the
+  # symlink left `--all` a clean tree to look at (the second Codex review of the fix).
+  git log -p -U0 --text --no-color --diff-filter=AMRT --diff-merges=combined --format='__COMMIT__ %H' "$RANGE" \
       -- . ":(exclude)$EXCLUDE_PATH"
+}
+
+# What the commit will hold: under --staged the INDEX blob, under --all the working tree. The
+# staged scan read the working-tree copy of each staged path, so a blocked line staged and then
+# removed from the file without staging the removal was committed unscanned, and a staged file
+# deleted from the working copy was skipped (M220); the hook materialises the index only for
+# ruff, after this script has run.
+content_of() {
+  # Stage 0 spelled out: `:<path>` is parsed as `:<n>:<rest>` where the path begins with a digit
+  # and a colon, so `0:s.txt` read as stage 0 of `s.txt` (the review gate on the fix).
+  if [ "$MODE" = "--staged" ]; then git show ":0:$1"; else cat "$1"; fi
 }
 
 # Resolve the blocklist: environment first (CI), then the gitignored .env.
@@ -130,7 +166,6 @@ HOME_PATH_PATTERNS='/(Users|home)/[A-Za-z0-9._-]+'
 # The scanner itself: free of name tokens now, but its secret-shape patterns
 # can match their own spelling. Never scan it.
 EXCLUDE_PATH='scripts/repo-guard.sh'
-EXCLUDE_REGEX="^$(printf '%s' "$EXCLUDE_PATH" | sed 's/\./\\./g')\$"
 
 fail=0
 
@@ -171,8 +206,15 @@ if [ "$MODE" = "--range" ]; then
   range_out="$(printf '%s\n' "$range_raw" | awk -v secret="$SECRET_PATTERNS" -v home="$HOME_PATH_PATTERNS" '
     # 12, not 13. `__COMMIT__` is ten characters and the space is the eleventh, so 13 dropped
     # the first hex digit and every SHA this printed was one an operator could not look up.
-    /^__COMMIT__ / { commit = substr($0, 12, 12); next }
-    /^\+\+\+ b\// { file = substr($0, 7); next }
+    /^__COMMIT__ / { commit = substr($0, 12, 12); header = 0; next }
+    # A file header runs from its `diff --` line to its first hunk line (`@@`, or `@@@` combined),
+    # and only there is `+++ b/` the file name: read by spelling alone, a content line that began
+    # `++ b/` (or `+ b/` in a combined diff) was taken for a header, so the key it carried named a
+    # file and was never matched (the Codex review of the fix).
+    /^diff --/ { header = 1; next }
+    header && /^\+\+\+ b\// { file = substr($0, 7); next }
+    header && /^@@/ { header = 0; next }
+    header { next }
     /^\+/ {
       body = substr($0, 2)
       if (body ~ secret) print "BLOCKED [secret]: " file " introduced at " commit " (matched a secret pattern)"
@@ -185,25 +227,48 @@ if [ "$MODE" = "--range" ]; then
   fi
 fi
 
-while IFS= read -r f; do
+while IFS= read -r -d '' f; do
   [ -z "$f" ] && continue
-  if printf '%s\n' "$f" | grep -qE "$EXCLUDE_REGEX"; then continue; fi
-  [ -f "$f" ] || continue
+  # The whole path, not a line of it: a path holding a newline whose second line spelled the
+  # excluded one was skipped by a line-wise match (the review gate on the fix).
+  [ "$f" = "$EXCLUDE_PATH" ] && continue
+  if [ "$MODE" = "--staged" ]; then
+    # A gitlink (a submodule added or moved) is a commit in another repository, not a blob here:
+    # nothing to scan, and read as a blob it was refused as an instrument fault (the review gate
+    # on the fix).
+    # `:(literal)`: a bare path here is a pathspec, so a file named `*` took the mode of the first
+    # entry the glob matched (the review gate on the fix).
+    # `head -c 6`, not `cut -c1-6`: `cut` works line by line, and a gitlink whose path holds a newline
+    # gave `160000` followed by the path's second line, which the case did not match, so a healthy
+    # submodule was refused as an instrument fault (Codex's review of the fix).
+    case "$(git ls-files -s -z -- ":(literal)$f" | head -c 6)" in 160000) continue ;; esac
+    # A path the index lists is a blob the index holds; a read that fails is the instrument
+    # failing, never a clean file (a path git quoted would fail here, which is why the list
+    # above is NUL-delimited).
+    if ! git cat-file -e ":0:$f" 2>/dev/null; then
+      echo "repo-guard: BLOCKED [instrument]: the index lists '$f' but no blob is read at that path." >&2
+      exit 2
+    fi
+  else
+    [ -f "$f" ] || continue
+  fi
 
-  if [ "$CHECK_NAMES" -eq 1 ] && grep -InEi "$NAME_PATTERNS" "$f" >/dev/null 2>&1; then
+  # `-a`, not `-I`: a blob with a NUL byte is read as text, so a key shape behind one is matched where
+  # `-I` took the whole blob for binary and reported nothing (Codex's review of the fix).
+  if [ "$CHECK_NAMES" -eq 1 ] && content_of "$f" | grep -anEi "$NAME_PATTERNS" >/dev/null 2>&1; then
     echo "BLOCKED [proprietary-name]: $f"
     # Safe to echo the match: this branch is unreachable under --all, so the text
     # reaches a terminal on the maintainer's machine and never a public log.
-    grep -InEi "$NAME_PATTERNS" "$f" | head -3 || true
+    content_of "$f" | grep -anEi "$NAME_PATTERNS" | head -3 || true
     fail=1
   fi
-  if grep -InE "$SECRET_PATTERNS" "$f" >/dev/null 2>&1; then
+  if content_of "$f" | grep -anE "$SECRET_PATTERNS" >/dev/null 2>&1; then
     echo "BLOCKED [secret]: $f (matched a secret pattern)"
     fail=1
   fi
-  if grep -InE "$HOME_PATH_PATTERNS" "$f" >/dev/null 2>&1; then
+  if content_of "$f" | grep -anE "$HOME_PATH_PATTERNS" >/dev/null 2>&1; then
     echo "BLOCKED [home-path]: $f (hardcodes a machine home directory)"
-    grep -InE "$HOME_PATH_PATTERNS" "$f" | head -3 || true
+    content_of "$f" | grep -anE "$HOME_PATH_PATTERNS" | head -3 || true
     fail=1
   fi
 done < <(list_files)
