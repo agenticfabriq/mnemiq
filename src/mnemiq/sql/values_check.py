@@ -56,12 +56,19 @@ def _star_yields(projection: exp.Expression, wanted: str, dialect: str | None):
     "none": not at all (EXCLUDE names it, or RENAME takes it: `* EXCLUDE (doc)` leaves the name
     to a later projection, which the walk's giving up on every modified star left to the
     statement-wide reading, a present value refused on main and the branch alike: Codex's
-    thirteenth review of #178; the RENAME forms its fourteenth). None where the walk cannot tell:
-    a qualified EXCLUDE entry on a star not qualified by that same source, which drops one
-    source's column while another's may come through."""
+    thirteenth review of #178; the RENAME forms its fourteenth). ("without", qualifiers): a plain
+    star whose qualified EXCLUDE entries drop the named sources' own columns of the name, the other
+    sources' and any merged column still coming through, so the star yields the name as the scope
+    binds a bare one among the columns left (`* EXCLUDE (t.doc)` over `t CROSS JOIN (SELECT region
+    AS doc FROM t) b` is `b`'s `doc`, `t.region`, and over `t LEFT JOIN b USING (doc)` the merged
+    `doc`, `t.doc`: Codex's nineteenth review, where read as unknown the first fell to
+    the statement-wide reading and refused the present value against the excluded `t.doc`, on
+    main and the branch alike). None where the walk cannot tell: a qualified star's EXCLUDE
+    naming another source, or such an EXCLUDE beside a RENAME giving the name."""
     star = projection.this if isinstance(projection, exp.Column) else projection
     own = projection.args.get("table") if isinstance(projection, exp.Column) else None
     gone = False
+    without: list[exp.Identifier] = []
     for excluded in star.args.get("except_") or ():
         if _written(excluded.this if isinstance(excluded, exp.Column) else excluded, dialect) != wanted:
             continue
@@ -69,9 +76,11 @@ def _star_yields(projection: exp.Expression, wanted: str, dialect: str | None):
         if qualifier is None or (own is not None and _written(qualifier, dialect) == _written(own, dialect)):
             gone = True
             continue
+        if own is not None:
+            return None  # a qualified star's EXCLUDE naming another source: unread
         # `* EXCLUDE (t.doc)` over `t JOIN v` drops one source's column and the other's still comes
-        # through: which, the walk cannot tell (the review gate on round 20).
-        return None
+        # through (the review gate on round 20): the walk reads the sources left.
+        without.append(qualifier)
     givers = []
     for renamed in star.args.get("rename") or ():
         before = renamed.this.this if isinstance(renamed.this, exp.Column) else renamed.this
@@ -85,11 +94,13 @@ def _star_yields(projection: exp.Expression, wanted: str, dialect: str | None):
             if isinstance(value, exp.Column):
                 return ("replaced", value)
             return "expression"
-    if len(givers) > 1:
-        return None  # two renamed columns under one name, in the table's order: unseen
+    if len(givers) > 1 or (givers and without):
+        return None  # two renamed columns under one name, or one beside a source's column left: an order unseen
     if givers:
         return ("column", givers[0]) if gone else ("renamed", givers[0])
-    return "none" if gone else "column"
+    if gone:
+        return "none"
+    return ("without", without) if without else "column"
 
 
 def _column_list(source: Scope, dialect: str | None) -> list[str] | None:
@@ -182,7 +193,13 @@ def _names(source: Scope, wanted: str, dialect: str | None, visible: dict[str, s
             return None
         if yields == "none":
             continue  # EXCLUDE names it, or RENAME takes it: a later projection's, if any
-        if yields == "expression" or isinstance(yields, tuple):
+        without: frozenset[str] = frozenset()
+        if isinstance(yields, tuple) and yields[0] == "without":
+            aliases = [_source_named(q, source.selected_sources, dialect) for q in yields[1]]
+            if any(a is None for a in aliases):
+                return None
+            without = frozenset(aliases)
+        elif yields == "expression" or isinstance(yields, tuple):
             return True  # REPLACE or RENAME gives the name: the source's own output has it
         qualifier = projection.args.get("table") if isinstance(projection, exp.Column) else None
         if qualifier is not None:
@@ -198,12 +215,14 @@ def _names(source: Scope, wanted: str, dialect: str | None, visible: dict[str, s
             # is the grant's answer: a table function or a VALUES list is invisible to it and may
             # hold the name, the same false refusal main makes (the review gate on round 21).
             answer = _in_scope(exp.Column(this=exp.Identifier(this=wanted, quoted=True)), source, visible,
-                               dialect, depth + 1, listed=True)
+                               dialect, depth + 1, listed=True, without=without)
             if answer is _ABSENT:
                 continue
             return True if isinstance(answer, tuple) or answer is _HELD else None
         else:
             (alias,) = source.selected_sources
+            if alias in without:
+                continue  # the one source's column is the excluded one: a later projection's, if any
         _, inner = source.selected_sources[alias]
         if isinstance(inner, exp.Table):
             renamed = inner.args.get("alias")
@@ -336,6 +355,19 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
                 # the two together are listed in the table's column order the walk cannot see, so the
                 # scope answers nothing there (the review gate on round 21: `t(region, doc)` lists the
                 # renamed `region` first, `t(doc, region)` the original).
+                without: frozenset[str] = frozenset()
+                if isinstance(yields, tuple) and yields[0] == "without":
+                    # A qualified EXCLUDE drops the named source's column and the others' still come
+                    # through, so the star yields the name as the scope binds a bare one among the
+                    # sources left (Codex's nineteenth review of #178: `* EXCLUDE (t.doc)` over `t
+                    # CROSS JOIN (SELECT region AS doc FROM t) b` is `b`'s `doc`, `t.region`, and read
+                    # as unknown it fell to the statement-wide reading, which refused the present
+                    # value against the excluded `t.doc`, on main and here alike).
+                    aliases = [_source_named(q, source.selected_sources, dialect) for q in yields[1]]
+                    if any(a is None for a in aliases):
+                        return None
+                    without = frozenset(aliases)
+                    yields = "column"
                 renamed_beside_own = isinstance(yields, tuple) and yields[0] == "renamed"
                 if yields == "column":
                     names = [column.this]
@@ -370,7 +402,7 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
                     # source may hold the name, the statement-wide reading then placing it by a
                     # base table, the same false refusal main makes (the review gate on round 21).
                     for ident in names:
-                        answer = _in_scope(exp.Column(this=ident.copy()), source, visible, dialect, depth + 1, listed=True)
+                        answer = _in_scope(exp.Column(this=ident.copy()), source, visible, dialect, depth + 1, listed=True, without=without)
                         if answer is _ABSENT:
                             continue
                         if renamed_beside_own and ident is names[0]:
@@ -379,6 +411,8 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
                     continue
                 else:
                     (alias,) = source.selected_sources
+                    if alias in without:
+                        continue  # the one source's column is the excluded one: the name is a later projection's
                 inner = source.sources.get(alias)
                 for ident in names:
                     # A local source's named projections prove a name absent, and the star yields
@@ -457,7 +491,7 @@ _UNKNOWN = object()  # a source the walk cannot name may hold the name, and the 
 
 
 def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], dialect: str | None,
-              depth: int = 0, listed: bool = False) -> tuple[str, str] | None | object:
+              depth: int = 0, listed: bool = False, without: frozenset[str] = frozenset()) -> tuple[str, str] | None | object:
     """The scope's own answer (M141, M174): a base table, or a local source followed to the
     column it projects, the column renamed included -- `x.doc` may be `t.region`, and read
     by its name it would be checked against `t.doc`'s values. An unqualified name is read
@@ -646,6 +680,11 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     from_ = scope.expression.args.get("from_")
     cols = joined(columns(from_.this) if from_ is not None else [], scope.expression.args.get("joins") or [])
     cols += [alias for alias in scope.selected_sources if alias not in seen]
+    # A star's qualified EXCLUDE drops the named sources' OWN columns of the name; a merged column
+    # those sources feed is the join's, not theirs, and stays (`* EXCLUDE (t.doc)` over `t LEFT JOIN
+    # (SELECT region AS doc FROM t) b USING (doc)` lists the merged `doc`, `t.doc`'s values, measured:
+    # the review gate on round 29, where dropping `t` inside the merge disarmed the refusal).
+    cols = [col for col in cols if isinstance(col, _Merge) or col not in without]
     if not listed:
         # The engine's binding of the bare name among the columns, as a USING key's on an input.
         answer = bare(cols)

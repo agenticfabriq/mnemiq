@@ -954,6 +954,28 @@ def test_a_join_groups_merge_and_a_comma_inputs_columns_are_listed_as_the_engine
            "AS q WHERE doc = 'west')")
     assert con.execute(sql).fetchall() == [(2,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    # a qualified EXCLUDE drops the named source's column and the star yields the name from the sources
+    # left (Codex's nineteenth review: read as unknown, the statement-wide reading refused the present
+    # value against the excluded `t.doc`, on main too); the one source's excluded column passes the name
+    # to a later projection; and through a derived table's own naming (`_names`) the same
+    excluded = "(SELECT * EXCLUDE (t.doc) FROM t CROSS JOIN (SELECT region AS doc FROM t) AS b) AS q"
+    for sql, rows in ((f"SELECT count(*) FROM {excluded} WHERE doc = 'west'", 2),
+                      ("SELECT count(*) FROM (SELECT * EXCLUDE (t.doc) FROM t CROSS JOIN v) AS q WHERE doc = 'west'", 2),
+                      ("SELECT count(*) FROM (SELECT * EXCLUDE (t.doc), 'west' AS doc FROM t) AS q WHERE doc = 'west'", 2),
+                      (f"SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM {excluded} WHERE doc = 'west')", 2)):
+        assert con.execute(sql).fetchall() == [(rows,)], sql
+        assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None, sql
+    # the other source excluded, and a merged column the excluded source feeds, which is the join's and
+    # stays (the review gate on round 29: dropping `t` inside the merge disarmed main's refusal)
+    for shape in ("EXCLUDE (b.doc) FROM t CROSS JOIN (SELECT region AS doc FROM t) AS b",
+                  "EXCLUDE (t.doc) FROM t NATURAL LEFT JOIN (SELECT region AS doc FROM t) AS b",
+                  "EXCLUDE (t.doc) FROM t LEFT JOIN (SELECT region AS doc FROM t) AS b USING (doc)",
+                  "EXCLUDE (t.doc) FROM t LEFT JOIN t AS c USING (doc)",
+                  "EXCLUDE (t.doc) FROM t JOIN (SELECT region AS doc FROM t) AS b USING (doc)"):
+        sql = f"SELECT count(*) FROM (SELECT * {shape}) AS q WHERE doc = 'west'"
+        assert con.execute(sql).fetchall() == [(0,)], sql
+        verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, (sql, verdict)
     # two merged columns are the ambiguity error on DuckDB too, so nothing is read
     sql = "SELECT count(*) FROM t JOIN t AS c USING (doc), v JOIN v AS w USING (doc) WHERE doc = 'west'"
     with pytest.raises(duckdb.BinderException, match="mbiguous"):
