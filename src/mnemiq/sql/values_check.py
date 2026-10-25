@@ -200,7 +200,7 @@ def _names(source: Scope, wanted: str, dialect: str | None, visible: dict[str, s
                                dialect, depth + 1, listed=True)
             if answer is _ABSENT:
                 continue
-            return True if isinstance(answer, tuple) else None
+            return True if isinstance(answer, tuple) or answer is _HELD else None
         else:
             (alias,) = source.selected_sources
         _, inner = source.selected_sources[alias]
@@ -437,8 +437,31 @@ def _through_scopes(column: exp.Column, scope: Scope, visible: dict[str, set[str
     return None
 
 
+def _from_order(node: exp.Expression) -> list[str]:
+    """The aliases of a FROM item and the joins hanging off it, in the order the engine lists a
+    star's columns. A parenthesised join group is an alias-less Subquery wrapping the group's
+    first item, which carries the group's joins, and `((SELECT region AS doc FROM t) b CROSS JOIN
+    t)` lists `b` first where the scope's own order, base tables first, listed `t` (the review gate
+    on round 22). The join rules read the scope's top-level joins alone; a USING join inside a
+    group is a merge they do not see, as before."""
+    joins = [alias for join in node.args.get("joins") or [] for alias in _from_order(join.this)]
+    if isinstance(node, exp.Subquery) and not node.alias and isinstance(node.this, (exp.Table, exp.Subquery)):
+        # A group wraps a FROM item; an alias-less derived table wraps a SELECT, whose own joins are
+        # another scope's (the review gate on round 23).
+        return _from_order(node.this) + joins
+    return [node.alias_or_name] + joins
+
+
+# The engines that list a star's duplicate names in FROM order and bind a bare name to the first,
+# the second renamed (`doc_1`): DuckDB, measured on 1.5.4. Postgres and MySQL refuse such a bare
+# name as ambiguous, so no reading of it is the engine's and the scope answers nothing there (the
+# review gate on round 22).
+_LISTS_DUPLICATE_STAR_COLUMNS = frozenset({"duckdb"})
+
+
 _ABSENT = object()  # no source of the scope can hold the name: the enclosing scope's turn
 _WIDE = object()  # the scope cannot tell: the statement-wide reading's turn, as before
+_HELD = object()  # under a star: a source holds the name and the scope cannot place it (`_names` reads it as held)
 
 
 def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], dialect: str | None,
@@ -454,7 +477,12 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     has made the name one side's (`narrowed`) that scope answers nothing instead, since the
     statement-wide reading would resurrect the other side. Under a star (`listed`) a source the
     walk cannot name beside a holder answers nothing: the star lists that source's columns too,
-    and the engine binds the name to the first without the ambiguity error a bare name meets."""
+    and the engine binds the name to the first without the ambiguity error a bare name meets;
+    two sources holding the name as two columns are, on DuckDB, the first in FROM order
+    (`_LISTS_DUPLICATE_STAR_COLUMNS`), where a bare name would be the ambiguity error, and on
+    the other engines `_HELD`: the star holds the name, which `_names` reports to the enclosing
+    scope, and the scope cannot place it, where None read as unknown fell to the statement-wide
+    reading. `_HELD` arrives only under a star; the top-level resolve never sees it."""
     if column.table:
         named = _source_named(column.args.get("table"), scope.sources, dialect)
         return _through_scopes(column, scope, visible, dialect, depth + 1) if named is not None else _ABSENT
@@ -470,8 +498,8 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
     # In FROM order, as the engine lists a star's columns: sqlglot's scope lists base tables
     # before derived tables, which put `t` first under `(SELECT ...) b CROSS JOIN t` and placed
     # the star's `doc` by `t` where the engine lists `b`'s (round 22 of #178).
-    in_from_order = ([scope.expression.args["from_"].this.alias_or_name] if scope.expression.args.get("from_") is not None else []) + [
-        join.this.alias_or_name for join in scope.expression.args.get("joins") or []]
+    in_from_order = (_from_order(scope.expression.args["from_"].this) if scope.expression.args.get("from_") is not None else []) + [
+        alias for join in scope.expression.args.get("joins") or [] for alias in _from_order(join.this)]
     candidates = [a for a in in_from_order if a in scope.selected_sources] + [
         a for a in scope.selected_sources if a not in in_from_order]
     # This scope's own joins alone, in order, each USING the key narrowing the
@@ -595,7 +623,7 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
         # name may be the unnamed source's (`(VALUES ('west')) AS x(doc), t`: the review gate on
         # round 18, where `t` alone was counted and a present value refused).
         return owners[0]
-    if listed and owners and not unknown and not narrowed:
+    if listed and owners and not unknown and not narrowed and (dialect or "").lower() in _LISTS_DUPLICATE_STAR_COLUMNS:
         # Under a star, two sources holding the name as two columns are listed in FROM order and
         # the engine binds the bare name to the first (`t CROSS JOIN (SELECT region AS doc FROM t)
         # b` lists `doc` then `doc_1`): the first holder's lineage, which the walk sees in the
@@ -603,6 +631,12 @@ def _in_scope(column: exp.Column, scope: Scope, visible: dict[str, set[str]], di
         # #178: a FULL join over such a star had no owner and skipped where main refused, and the
         # reversed order refused `t.region`'s present value against `t.doc` on main and here).
         return next(owner_of[alias] for alias in candidates if alias in owner_of)
+    if listed and len(owners) > 1:
+        # The star lists both columns: DuckDB binds the first, read above where the order is known,
+        # and the other engines refuse the bare name as ambiguous, so the statement-wide reading has
+        # no say here and would place the name by a base table (the review gate on round 23). The
+        # scope holds the name, which the enclosing one must hear, and cannot place it.
+        return _HELD
     if owners or unknown:
         return None if narrowed else _WIDE
     return _ABSENT

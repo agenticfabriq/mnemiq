@@ -843,6 +843,27 @@ def test_a_stars_two_lineages_are_listed_in_from_order_and_a_replace_by_any_colu
     sql = "SELECT count(*) FROM (SELECT * FROM (SELECT region AS doc FROM t) AS b CROSS JOIN t) AS q WHERE doc = 'west'"
     assert con.execute(sql).fetchall() == [(2,)]
     assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    # a parenthesised join group's sources take their place in the FROM order (the review gate on round
+    # 22: the scope lists base tables first, and `((SELECT region AS doc FROM t) b CROSS JOIN t)` read
+    # `t` first, refusing a present value against `t.doc`)
+    sql = "SELECT count(*) FROM (SELECT * FROM ((SELECT region AS doc FROM t) AS b CROSS JOIN t)) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(2,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    sql = "SELECT count(*) FROM (SELECT * FROM (t CROSS JOIN (SELECT region AS doc FROM t) AS b)) AS q WHERE doc = 'west'"
+    assert con.execute(sql).fetchall() == [(0,)]
+    verdict = check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.VALUE_GROUNDING and "t.doc" in verdict.message, verdict
+    # an alias-less derived table is an alias-less Subquery too, wrapping a SELECT whose joins are its own
+    # scope's: no group, and its inner `t` takes no place in the outer order (the review gate on round 23)
+    sql = ("SELECT count(*) FROM (SELECT * FROM (SELECT u.name AS one FROM u CROSS JOIN t) CROSS JOIN "
+           "(SELECT region AS doc FROM t) AS b CROSS JOIN t) AS q WHERE doc = 'west'")
+    assert con.execute(sql).fetchall() == [(4,)]
+    assert check_values(sqlglot.parse_one(sql, read="duckdb"), visible, _Index(), dialect="duckdb") is None
+    # the first-holder rule is DuckDB's: Postgres refuses such a bare name as ambiguous (documented, not
+    # measured here), so the scope answers nothing for that engine, and the statement-wide reading, which
+    # would place the name by the base table, has no say under a star listing two lineages
+    sql = "SELECT count(*) FROM (SELECT * FROM t CROSS JOIN (SELECT region AS doc FROM t) AS b) AS q WHERE doc = 'west'"
+    assert check_values(sqlglot.parse_one(sql, read="postgres"), visible, _Index(), dialect="postgres") is None
     # two RENAMEs giving one name: the table's column order decides which the engine lists first, and
     # the walk cannot see it, so nothing is checked either way
     for renamed in ("SELECT count(*) FROM (SELECT * RENAME (doc AS name, region AS name) FROM t) AS q WHERE name = '{}'",
