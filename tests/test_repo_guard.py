@@ -176,6 +176,25 @@ def test_range_mode_tells_a_header_from_a_content_line_spelled_like_one(repo: Pa
     assert _guard(repo, "--range", "HEAD~1..HEAD") == 1
 
 
+def test_range_mode_scans_a_type_change_the_tree_no_longer_shows(repo: Path) -> None:
+    # Codex's second review of the fix: a symlink replaced by a regular file holding a key, then restored,
+    # left `--range` (filtered to AMR) nothing to read and `--all` a clean tree
+    (repo / "link.txt").symlink_to("a.txt")
+    _git(repo, "add", "link.txt")
+    _git(repo, "commit", "-qm", "link")
+    (repo / "link.txt").unlink()
+    (repo / "link.txt").write_text(KEY_SHAPE + "\n")
+    _git(repo, "add", "link.txt")
+    _git(repo, "commit", "-qm", "a file where the link was")
+    assert _git(repo, "diff", "--name-status", "HEAD~1", "HEAD").startswith("T")
+    (repo / "link.txt").unlink()
+    (repo / "link.txt").symlink_to("a.txt")
+    _git(repo, "add", "link.txt")
+    _git(repo, "commit", "-qm", "the link back")
+    assert _guard(repo, "--all") == 0  # the tree is clean again
+    assert _guard(repo, "--range", "HEAD~2..HEAD") == 1  # the history is not
+
+
 def _merge_resolving_with(repo: Path, resolution: str) -> None:
     """A conflict on a.txt between main and a side branch, resolved on main with `resolution`."""
     _git(repo, "switch", "-q", "-c", "side")

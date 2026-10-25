@@ -84,7 +84,10 @@ scan_range() {
   # `--text`: a binary blob's patch is otherwise the one line `Binary files ... differ`, with no added
   # line to read, so a key shape behind a NUL byte reached the public history unscanned (Codex's
   # review of the fix); the patterns are ASCII and match in a binary blob as in a text one.
-  git log -p -U0 --text --no-color --diff-filter=AMR --diff-merges=combined --format='__COMMIT__ %H' "$RANGE" \
+  # T too: a symlink replaced by a regular file is a type change, which `AMR` left out, so a key
+  # shape such a file carried reached the history unread, and a later commit restoring the
+  # symlink left `--all` a clean tree to look at (the second Codex review of the fix).
+  git log -p -U0 --text --no-color --diff-filter=AMRT --diff-merges=combined --format='__COMMIT__ %H' "$RANGE" \
       -- . ":(exclude)$EXCLUDE_PATH"
 }
 
