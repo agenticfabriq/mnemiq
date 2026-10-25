@@ -2206,12 +2206,20 @@ def _spelled_for(node: exp.Expression, engine: str) -> str:
     return repr(node)
 
 
+def _typed_boolean(value: exp.Expression, type_of, engine: str) -> bool:
+    kind = _type_of_value(value, type_of, engine)
+    return kind is not None and kind.this == exp.DataType.Type.BOOLEAN
+
+
 def _text_in_a_boolean_position(node: exp.Expression, type_of, engine: str) -> exp.Expression | None:
     """The text column DuckDB converts to BOOLEAN where `node` consumes a boolean: the sides of AND
     and OR, NOT's operand, the left of IS TRUE and IS FALSE, an IF's condition (which a searched
-    CASE's WHEN arms are to the parser, so the walk meets them as IF nodes), a simple CASE's operand
+    CASE's WHEN arms are to the parser, so the walk meets them as IF nodes; a simple CASE's arms are
+    IF nodes too, and their WHEN value is compared with the operand, no condition: Codex's
+    fifty-second review of #160), a list filter's lambda result (`list_filter(tags, x -> x)` over
+    text elements, the same review; `filter` and `array_filter` are the one node), a simple CASE's operand
     beside a WHEN value the reader types as BOOLEAN (a literal or a comparison: the review gate on
-    round 70), and every WHERE, HAVING and ON the filter holds, the filter's own
+    round 70) and each WHEN value beside an operand it types so (round 73's gate), and every WHERE, HAVING and ON the filter holds, the filter's own
     WHERE, a subquery's, an aggregate's FILTER clause (a WHERE to the parser) and a join's ON among
     them (the review gate on round 69). Text that is no boolean's spelling raises on the row
     (`region IS TRUE` over 'north': Codex's fifty-first review of #160), where a number converts
@@ -2228,14 +2236,24 @@ def _text_in_a_boolean_position(node: exp.Expression, type_of, engine: str) -> e
         operands = [node.this]
     elif isinstance(node, exp.Is) and isinstance(node.expression, exp.Boolean):
         operands = [node.this]
+    elif isinstance(node, exp.If) and isinstance(node.parent, exp.Case) and node.parent.this is not None:
+        return None  # a simple CASE's arm: its WHEN value is compared with the operand, read below
     elif isinstance(node, (exp.If, exp.Where, exp.Having)):
         operands = [node.this]
+    elif isinstance(node, exp.ArrayFilter) and isinstance(node.expression, exp.Lambda):
+        operands = [node.expression.this]  # the predicate's result, per element
     elif isinstance(node, exp.Join):
         operands = [node.args["on"]] if node.args.get("on") is not None else []
-    elif isinstance(node, exp.Case) and node.this is not None and any(
-            (kind := _type_of_value(branch.this, type_of, engine)) is not None
-            and kind.this == exp.DataType.Type.BOOLEAN for branch in node.args.get("ifs") or ()):
-        operands = [node.this]  # compared with each WHEN value, a boolean here
+    elif isinstance(node, exp.Case) and node.this is not None:
+        # The operand is compared with each WHEN value, and a text one beside a boolean converts
+        # on the row whichever side holds the boolean: the operand beside a boolean WHEN value
+        # (the review gate on round 70), and each WHEN value beside a boolean operand (`CASE true
+        # WHEN region THEN true ELSE false END` raised on 'north' and both deciders approved it
+        # once the arm rule above kept the IF rule from reading it: the review gate on round 73).
+        whens = [branch.this for branch in node.args.get("ifs") or ()]
+        operands = list(whens) if _typed_boolean(node.this, type_of, engine) else []
+        if any(_typed_boolean(when, type_of, engine) for when in whens):
+            operands.append(node.this)
     else:
         return None
     for operand in operands:

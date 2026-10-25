@@ -1675,6 +1675,29 @@ def test_a_text_value_in_a_boolean_position_is_a_raising_conversion():
     assert isinstance(_decide("upper(region) IS TRUE"), Approved)
 
 
+def test_a_list_filters_lambda_result_is_a_boolean_position_and_a_simple_cases_arm_is_not():
+    # Codex's fifty-second review of #160: `list_filter(tags, x -> x)` converts each text element to
+    # BOOLEAN and raises on 'north', and the boolean positions of round 69 never saw a lambda's result;
+    # and a simple CASE's arms are IF nodes to the parser, so round 70's IF rule read a text WHEN value
+    # as a condition and refused `CASE region WHEN region THEN ...`, which compares and runs.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim(id INT, region VARCHAR, amount INT, big BIGINT, attrs JSON, d DATE, tags VARCHAR[]); "
+                "INSERT INTO claim VALUES (1, 'north', 1, 1, '{\"a\": 1}', DATE '2026-01-01', ['north'])")
+    types = {**TYPES, ("claim", "tags"): "VARCHAR[]"}
+    for raising in ("list_filter(tags, x -> x) = tags", "filter(tags, x -> x) = tags", "array_filter(tags, x -> x) = tags",
+                    # a boolean operand converts each text WHEN value (the review gate on round 73)
+                    "CASE true WHEN region THEN true ELSE false END", "CASE id = 1 WHEN region THEN true ELSE false END"):
+        with pytest.raises(duckdb.Error, match="Could not convert string"):
+            con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
+        verdict = _decide(raising, snapshot=_snapshot(types))
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (raising, verdict)
+    for safe, rows in (("list_filter(tags, x -> TRY_CAST(x AS BOOLEAN)) = tags", []), ("list_filter(tags, x -> x = 'north') = tags", [(1,)]),
+                       ("list_filter([id], x -> x) = [id]", [(1,)]), ("CASE region WHEN region THEN true ELSE false END", [(1,)]),
+                       ("CASE 'north' WHEN region THEN true ELSE false END", [(1,)])):
+        assert con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall() == rows, safe
+        assert isinstance(_decide(safe, snapshot=_snapshot(types)), Approved), safe
+
+
 def test_a_rendering_that_loses_a_try_cast_is_refused():
     # M217 (Codex's forty-ninth review of #160): sqlglot writes `TRY_CAST(region AS INT)` as `CAST` for
     # Postgres, MySQL and SQLite with no warning, so a row filter validated as a non-raising
