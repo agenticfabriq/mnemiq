@@ -1631,12 +1631,20 @@ def test_a_text_value_in_a_boolean_position_is_a_raising_conversion():
     # consumed, and text that is no boolean's spelling raises on the row, so `region IS TRUE` over
     # 'north' failed every read and write of the table while both deciders approved it; the
     # validator's enumerated comparisons never saw the sides of AND and OR, NOT's operand, IS TRUE,
-    # a CASE or IF condition, or the filter itself. A number converts, and TRY_CAST gives NULL.
+    # a CASE or IF condition, a simple CASE's operand beside a boolean WHEN value, or any WHERE,
+    # HAVING or ON the filter holds (the review gate on round 69: a subquery's WHERE, an aggregate's
+    # FILTER, a HAVING, a join's ON). A number converts, TRY_CAST gives NULL, a text literal reads no
+    # row, and a value the reader cannot type is not counted, as nowhere else.
     con = duckdb.connect()
     con.execute("CREATE TABLE claim(id INT, region VARCHAR, amount INT, big BIGINT, attrs JSON, d DATE); "
                 "INSERT INTO claim VALUES (1, 'north', 1, 1, '{\"a\": 1}', DATE '2026-01-01')")
     for raising in ("region IS TRUE", "region IS FALSE", "region AND true", "region OR id = 1", "NOT region", "region",
-                    "CASE WHEN region THEN true ELSE false END", "IF(region, true, false)", "amount > 0 AND region"):
+                    "CASE WHEN region THEN true ELSE false END", "IF(region, true, false)", "amount > 0 AND region",
+                    "(region) IS TRUE", "NOT (region)", "CASE region WHEN true THEN true ELSE false END",
+                    "id IN (SELECT id FROM claim WHERE region)", "EXISTS (SELECT 1 FROM claim AS c WHERE c.region)",
+                    "(SELECT count(*) FILTER (WHERE region) FROM claim) > 0",
+                    "id IN (SELECT id FROM claim GROUP BY id, region HAVING region)",
+                    "id IN (SELECT c.id FROM claim AS c JOIN claim AS d ON c.region)"):
         with pytest.raises(duckdb.Error, match="Could not convert string"):
             con.execute(f"SELECT id FROM claim WHERE {raising}").fetchall()
         verdict = _decide(raising)
@@ -1647,9 +1655,14 @@ def test_a_text_value_in_a_boolean_position_is_a_raising_conversion():
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
     for safe, rows in (("id IS TRUE", [(1,)]), ("id AND true", [(1,)]), ("TRY_CAST(region AS BOOLEAN) IS TRUE", []),
                        ("(region = 'north') IS TRUE", [(1,)]), ("region IS NULL", []), ("NOT region IS NULL", [(1,)]),
-                       ("CASE WHEN id > 0 THEN region END = 'north'", [(1,)])):
+                       ("CASE WHEN id > 0 THEN region END = 'north'", [(1,)]), ("'true' AND id = 1", [(1,)]),
+                       ("'yes' AND id = 1", [(1,)]), ("id IN (SELECT id FROM claim WHERE id IS TRUE)", [(1,)])):
         assert con.execute(f"SELECT id FROM claim WHERE {safe}").fetchall() == rows, safe
         assert isinstance(_decide(safe), Approved), safe
+    # a value the reader cannot type is not counted, as nowhere else: `upper(region)` raises and passes
+    with pytest.raises(duckdb.Error, match="Could not convert string"):
+        con.execute("SELECT id FROM claim WHERE upper(region) IS TRUE").fetchall()
+    assert isinstance(_decide("upper(region) IS TRUE"), Approved)
 
 
 def test_a_rendering_that_loses_a_try_cast_is_refused():
