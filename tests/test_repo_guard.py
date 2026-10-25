@@ -134,9 +134,46 @@ def test_staged_mode_skips_a_submodule_pointer_and_scans_the_file_beside_it(repo
     assert "160000" in _git(repo, "ls-files", "-s", "--", ":(literal)!")
     assert str(tmp_path) not in (repo / ".gitmodules").read_text()
     assert _guard(repo, "--staged") == 0
+    # a gitlink whose path holds a newline (`submodule add` refuses such a path, so the index entry is
+    # written directly): its mode is the record's first six bytes, not a line's (Codex's review of the
+    # fix: `cut` worked line by line and the healthy gitlink was refused as an instrument fault)
+    _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{_git(other, 'rev-parse', 'HEAD').strip()},s\nub")
+    assert _git(repo, "diff", "--cached", "--name-only", "-z").count("\x00") >= 3
+    assert _guard(repo, "--staged") == 0
     (repo / "*").write_text(f"clean\n{BLOCKED_NAME}\n")
     _git(repo, "add", "--", "*")
     assert _guard(repo, "--staged") == 1
+
+
+def test_every_mode_scans_a_binary_blob(repo: Path) -> None:
+    # Codex's review of the fix: `grep -I` took a blob with a NUL byte for binary and matched nothing,
+    # and `git log -p` printed `Binary files differ` with no added line to read
+    (repo / "bin.dat").write_bytes(b"bin\x00ary " + KEY_SHAPE.encode() + b"\n")
+    _git(repo, "add", "bin.dat")
+    assert _guard(repo, "--staged") == 1
+    assert _guard(repo, "--all") == 1
+    _git(repo, "commit", "-qm", "bin")
+    assert _guard(repo, "--range", "HEAD~1..HEAD") == 1
+    # control: a binary blob without a shape passes every mode
+    (repo / "bin.dat").write_bytes(b"bin\x00ary clean\n")
+    _git(repo, "add", "bin.dat")
+    assert _guard(repo, "--staged") == 0
+    assert _guard(repo, "--all") == 0
+    _git(repo, "commit", "-qm", "bin2")
+    assert _guard(repo, "--range", "HEAD~1..HEAD") == 0
+
+
+def test_range_mode_tells_a_header_from_a_content_line_spelled_like_one(repo: Path) -> None:
+    # Codex's review of the fix: a content line beginning `++ b/` printed as `+++ b/...` and was read as
+    # the file header, so the key it carried named a file and was never matched; in a combined diff a
+    # resolution line beginning `+ b/` did the same
+    (repo / "a.txt").write_text("clean\n++ b/" + KEY_SHAPE + "\n")
+    _git(repo, "commit", "-qam", "spelled like a header")
+    assert "+++ b/AKIA" in _git(repo, "log", "-p", "-U0", "HEAD~1..HEAD")
+    assert _guard(repo, "--range", "HEAD~1..HEAD") == 1
+    _git(repo, "reset", "-q", "--hard", "HEAD~1")
+    _merge_resolving_with(repo, "resolved\n+ b/" + KEY_SHAPE + "\n")
+    assert _guard(repo, "--range", "HEAD~1..HEAD") == 1
 
 
 def _merge_resolving_with(repo: Path, resolution: str) -> None:

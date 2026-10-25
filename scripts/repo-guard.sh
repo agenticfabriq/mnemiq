@@ -81,7 +81,10 @@ scan_range() {
   # `origin/main` into a branch scanned as `origin/main..HEAD`) and flags one at the merge, a
   # verdict `--all` on main keeps true; a line the first parent already has is prefixed ` +`, is
   # not an added line, and is not read.
-  git log -p -U0 --no-color --diff-filter=AMR --diff-merges=combined --format='__COMMIT__ %H' "$RANGE" \
+  # `--text`: a binary blob's patch is otherwise the one line `Binary files ... differ`, with no added
+  # line to read, so a key shape behind a NUL byte reached the public history unscanned (Codex's
+  # review of the fix); the patterns are ASCII and match in a binary blob as in a text one.
+  git log -p -U0 --text --no-color --diff-filter=AMR --diff-merges=combined --format='__COMMIT__ %H' "$RANGE" \
       -- . ":(exclude)$EXCLUDE_PATH"
 }
 
@@ -200,8 +203,15 @@ if [ "$MODE" = "--range" ]; then
   range_out="$(printf '%s\n' "$range_raw" | awk -v secret="$SECRET_PATTERNS" -v home="$HOME_PATH_PATTERNS" '
     # 12, not 13. `__COMMIT__` is ten characters and the space is the eleventh, so 13 dropped
     # the first hex digit and every SHA this printed was one an operator could not look up.
-    /^__COMMIT__ / { commit = substr($0, 12, 12); next }
-    /^\+\+\+ b\// { file = substr($0, 7); next }
+    /^__COMMIT__ / { commit = substr($0, 12, 12); header = 0; next }
+    # A file header runs from its `diff --` line to its first hunk line (`@@`, or `@@@` combined),
+    # and only there is `+++ b/` the file name: read by spelling alone, a content line that began
+    # `++ b/` (or `+ b/` in a combined diff) was taken for a header, so the key it carried named a
+    # file and was never matched (the Codex review of the fix).
+    /^diff --/ { header = 1; next }
+    header && /^\+\+\+ b\// { file = substr($0, 7); next }
+    header && /^@@/ { header = 0; next }
+    header { next }
     /^\+/ {
       body = substr($0, 2)
       if (body ~ secret) print "BLOCKED [secret]: " file " introduced at " commit " (matched a secret pattern)"
@@ -225,7 +235,10 @@ while IFS= read -r -d '' f; do
     # on the fix).
     # `:(literal)`: a bare path here is a pathspec, so a file named `*` took the mode of the first
     # entry the glob matched (the review gate on the fix).
-    case "$(git ls-files -s -z -- ":(literal)$f" | cut -c1-6)" in 160000) continue ;; esac
+    # `head -c 6`, not `cut -c1-6`: `cut` works line by line, and a gitlink whose path holds a newline
+    # gave `160000` followed by the path's second line, which the case did not match, so a healthy
+    # submodule was refused as an instrument fault (Codex's review of the fix).
+    case "$(git ls-files -s -z -- ":(literal)$f" | head -c 6)" in 160000) continue ;; esac
     # A path the index lists is a blob the index holds; a read that fails is the instrument
     # failing, never a clean file (a path git quoted would fail here, which is why the list
     # above is NUL-delimited).
@@ -237,20 +250,22 @@ while IFS= read -r -d '' f; do
     [ -f "$f" ] || continue
   fi
 
-  if [ "$CHECK_NAMES" -eq 1 ] && content_of "$f" | grep -InEi "$NAME_PATTERNS" >/dev/null 2>&1; then
+  # `-a`, not `-I`: a blob with a NUL byte is read as text, so a key shape behind one is matched where
+  # `-I` took the whole blob for binary and reported nothing (Codex's review of the fix).
+  if [ "$CHECK_NAMES" -eq 1 ] && content_of "$f" | grep -anEi "$NAME_PATTERNS" >/dev/null 2>&1; then
     echo "BLOCKED [proprietary-name]: $f"
     # Safe to echo the match: this branch is unreachable under --all, so the text
     # reaches a terminal on the maintainer's machine and never a public log.
-    content_of "$f" | grep -InEi "$NAME_PATTERNS" | head -3 || true
+    content_of "$f" | grep -anEi "$NAME_PATTERNS" | head -3 || true
     fail=1
   fi
-  if content_of "$f" | grep -InE "$SECRET_PATTERNS" >/dev/null 2>&1; then
+  if content_of "$f" | grep -anE "$SECRET_PATTERNS" >/dev/null 2>&1; then
     echo "BLOCKED [secret]: $f (matched a secret pattern)"
     fail=1
   fi
-  if content_of "$f" | grep -InE "$HOME_PATH_PATTERNS" >/dev/null 2>&1; then
+  if content_of "$f" | grep -anE "$HOME_PATH_PATTERNS" >/dev/null 2>&1; then
     echo "BLOCKED [home-path]: $f (hardcodes a machine home directory)"
-    content_of "$f" | grep -InE "$HOME_PATH_PATTERNS" | head -3 || true
+    content_of "$f" | grep -anE "$HOME_PATH_PATTERNS" | head -3 || true
     fail=1
   fi
 done < <(list_files)
