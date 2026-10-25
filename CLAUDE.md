@@ -20,8 +20,10 @@ blocked.
 `scripts/repo-guard.sh` checks for secret shapes and machine home paths, and on a maintainer's
 machine for names on a private blocklist.
 
-- `git config core.hooksPath .githooks` runs it on each commit's staged files, with whitespace and
-  lint checks. Staged mode is the only one that checks names.
+- `git config core.hooksPath .githooks` runs it before each commit, with whitespace and lint checks.
+  Staged mode is the only one that checks names. It takes the staged paths but reads their
+  working-tree copies, so commit each file as it stands: no partial staging, and no edits between
+  `git add` and the commit.
 - Before a branch's first push, run `scripts/repo-guard.sh --range origin/main..HEAD` from the repo
   root. It scans the lines each non-merge commit on the branch adds, so it catches a secret one
   commit adds and a later one removes; a merge commit's own conflict resolution is not scanned. With
