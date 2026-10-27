@@ -87,7 +87,9 @@ def test_the_DEFAULT_mode_is_judged_out_of_the_box():
 
 def test_sanity_stays_in_front_of_the_judge():
     """Not decoration: `Verifier.verify` returns on the first layer that produces a verdict,
-    so the cases sanity defers never reach the judge -- 17% of answers skip the LLM call.
+    so the cases sanity defers never reach the judge -- on the replay behind the published
+    trade, 33 of 437 executed answers (7.6%) skip the LLM call. (Quoted here as 17% until M146:
+    that counted 50 records that never executed, and end before the verifier in the product.)
     Dropping sanity when the judge arrived would have cost that with no accuracy gain, since
     the two together catch 95 against the judge's own 94."""
     from mnemiq.runtime import _build_mode_verifiers
@@ -117,6 +119,23 @@ def test_mode_verifiers_judge_endpoint_override():
 
     vs, jc = _build_mode_verifiers(_base_settings(verify_model="judge-model"), client=object())
     assert vs["deep"].judge is not None and jc == 1
+
+
+def test_the_sanity_switch_reaches_the_verifiers_both_doors_build():
+    """`MNEMIQ_VERIFY_SANITY` was read by the eval door alone: the product hard-coded `sanity=True`,
+    so setting it changed nothing for `serve`, `/v1/ask`, MCP or `mnemiq ask`, while an eval run
+    with it set measured a configuration no deployment could run -- issue #3's trap from the other
+    side. Both positions, because pinning only the default is satisfied by hardcoding it."""
+    from mnemiq.eval.engine import verifier_from
+    from mnemiq.runtime import _build_mode_verifiers
+
+    for configured in (True, False):
+        settings = _base_settings(verify_sanity=configured)
+        verifiers, _ = _build_mode_verifiers(settings, client=object())
+        built = [v for v in verifiers.values() if v is not None]
+        assert built, "no verifier was built, so this asserts nothing"
+        assert all(v.sanity is configured for v in built), configured
+        assert verifier_from(settings, None).sanity is configured
 
 
 def test_the_deployment_switch_reaches_the_verifier_the_product_uses():

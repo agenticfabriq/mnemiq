@@ -767,16 +767,25 @@ def _resolve_verify_level(mode_verify: str, override: str | None) -> str:
     return mode_verify
 
 
-def _build_verifier(level: str, *, threshold: float, grounding: bool, judge, fail_closed: bool):
-    """None when off; else a Verifier with sanity always on and the judge only at 'full'.
+def _build_verifier(level: str, *, threshold: float, grounding: bool, judge, fail_closed: bool,
+                    sanity: bool = True):
+    """None when off; else a Verifier with sanity on unless the deployment turned it off
+    (`MNEMIQ_VERIFY_SANITY=0`), and the judge only at 'full'.
 
     `fail_closed` is passed to every level even though only 'full' can reach an unavailable
     judge. Passing it conditionally would make the mode table decide a deployment's policy, and
     a mode promoted to 'full' later would silently arrive at the wrong one.
+
+    `sanity` was hard-coded True here while the eval door read the setting, so the setting did
+    nothing for a deployment and an eval run with it off measured a product nobody could run.
+    Wired rather than relabelled "eval path": every other verifier switch but the judge's reaches
+    both doors, and with an empty result answered when its values are grounded (M146), turning
+    the layer off is what a deployment does to answer every empty and null result, the judge
+    kept -- a decision worth making on purpose, and one the default does not make.
     """
     if level == "off":
         return None
-    return Verifier(threshold=threshold, sanity=True, grounding=grounding,
+    return Verifier(threshold=threshold, sanity=sanity, grounding=grounding,
                     judge=judge if level == "full" else None, fail_closed=fail_closed)
 
 
@@ -801,7 +810,8 @@ def _build_mode_verifiers(settings: Settings, *, client):
     verifiers = {
         name: _build_verifier(levels[name], threshold=settings.verify_threshold,
                               grounding=settings.verify_grounding, judge=judge,
-                              fail_closed=settings.verify_fail_closed)
+                              fail_closed=settings.verify_fail_closed,
+                              sanity=settings.verify_sanity)
         for name in MODES
     }
     return verifiers, judge_calls
@@ -915,8 +925,8 @@ def build_runtime(settings: Settings) -> Runtime:
     # Built at enrich time and persisted, exactly like the value index -- so ask-time needs the
     # store, not the records file. An unindexed store simply resolves nothing.
     ontology = OntologyIndex(con)
-    # Per-mode result verifier: sanity (free) in every mode, judge in `deep`; the judge is
-    # built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
+    # Per-mode result verifier: sanity (free) in every mode, judge in `thinking` and `deep`; the
+    # judge is built once and shared. MNEMIQ_VERIFY=0 forces off (byte-for-byte), =1 forces full.
     verifiers, _ = _build_mode_verifiers(settings, client=kit.client)
     agents = {
         name: build_agent(
