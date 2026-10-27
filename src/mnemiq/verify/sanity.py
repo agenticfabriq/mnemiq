@@ -37,6 +37,22 @@ def _named(values: list[FilterValue]) -> str:
     if first.why == "date_on_time":
         return (f"the date{'s' if many else ''} {texts} against {column}, which holds times as well "
                 "as dates, could not be checked as a bound")
+    if first.why == "not_on_a_date_column":
+        return (f"the date{'s' if many else ''} {texts}, not compared with a column known to hold "
+                "dates alone, could not be checked as a bound")
+    if first.why == "not_on_a_timestamp_column":
+        return (f"the timestamp{'s' if many else ''} {texts}, not compared with a column known to "
+                "hold timestamps, could not be checked as a bound")
+    if first.why == "not_a_date":
+        return f"{texts}, not a well-formed date, could not be checked"
+    if first.why == "not_a_timestamp":
+        return f"{texts}, not a well-formed timestamp with a time of day, could not be checked"
+    if first.why == "typed_other":
+        return (f"{texts}, typed as something other than a date or a timestamp, could not be "
+                "checked as a bound")
+    if first.why == "interval":
+        return (f"the interval{'s' if many else ''} {texts}, not compared with a date or time "
+                "column, could not be checked as a bound")
     if first.why == "range":
         return (f"the text bound{'s' if many else ''} {texts} on {column} could not be checked "
                 "against known values")
@@ -51,11 +67,11 @@ def _named(values: list[FilterValue]) -> str:
     return f"{texts} could not be checked against {column}'s known values"
 
 
-def _grounded_or_why(opening: str, grounding: ValueGrounding, *, output: bool) -> str | None:
+def _grounded_or_why(opening: str, grounding: ValueGrounding) -> str | None:
     """None when the answer may rest on what it filters on, else the sentence saying why not."""
     if grounding.never_true is not None:
         return f"{opening}, because the query's filter can never be true ({grounding.never_true})."
-    blocking = grounding.blocking(output=output)
+    blocking = grounding.blocking()
     if not blocking:
         return None
     groups: dict[tuple, list[FilterValue]] = {}
@@ -77,10 +93,11 @@ def sanity_check(question: str, table: pa.Table,
 
     Except where the result is the answer to a question whose true answer is "none" (M146). An
     empty result, or one NULL row from aggregates over nothing, passes when `grounding` -- the
-    decider's record of every string value the statement filters on -- says each was found in its
-    column's indexed values or is a date-only bound on a DATE column, and no filter can never
-    hold. A value on a table this identity reads through a row filter is never grounded: the
-    index cannot say which rows the caller may read (`ground_values`). Anything
+    decider's record of every string value in the statement, the projection's included -- says
+    each was found in its column's indexed values or is a bound of a bare column's own type (a
+    date on a DATE column, a full timestamp on a TIMESTAMP one), and no predicate can never hold.
+    A value on a table this identity reads through a row filter is never grounded: the index
+    cannot say which rows the caller may read (`ground_values`). Anything
     nothing could check keeps it declined, and the decline names the value, so the caller can
     confirm or correct it. `grounding` None means it was not evaluated (an `Approved` built
     outside the decider) and the rules are as before, every such result declined.
@@ -94,7 +111,7 @@ def sanity_check(question: str, table: pa.Table,
     if table.num_rows == 0:
         if grounding is None:
             return VerifyVerdict(0.0, True, "The query returned no rows, so I can't answer this confidently.", "sanity")
-        why = _grounded_or_why("No rows matched", grounding, output=False)
+        why = _grounded_or_why("No rows matched", grounding)
         return None if why is None else VerifyVerdict(0.0, True, why, "sanity")
     rows = table.to_pylist()
     if grounding is not None and _aggregate_over_nothing(table, rows):
@@ -102,8 +119,7 @@ def sanity_check(question: str, table: pa.Table,
             return VerifyVerdict(0.0, True, "The query produced an empty value, because it selects "
                                  f"NULL as written ({grounding.null_as_written}), not a value from "
                                  "the data.", "sanity")
-        # The output counts here: a CASE or FILTER there decides the value that came back NULL.
-        why = _grounded_or_why("The query produced an empty value", grounding, output=True)
+        why = _grounded_or_why("The query produced an empty value", grounding)
         return None if why is None else VerifyVerdict(0.0, True, why, "sanity")
     if table.num_rows == 1 and table.num_columns == 1:
         if _degenerate(next(iter(rows[0].values()))):

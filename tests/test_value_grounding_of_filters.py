@@ -167,11 +167,58 @@ def test_an_interval_needs_no_grounding():
         "SELECT id FROM claim WHERE filed > current_date - INTERVAL '30 days'")] == [TYPED]
 
 
-# --- a date-only string is exempt against a DATE column alone (fix round 1) -----------------------
+# --- a date-only string is exempt against a DATE column alone (fix rounds 1 and 2) ----------------
 #
 # Measured on DuckDB 1.5.4: `ts = '2024-03-03'` on a TIMESTAMP column returns no rows while 15 rows
 # fall on that day (the string is midnight), and on a TIME column `t < '2024-03-03'` reads the string
-# as 00:00, so it is never true. Neither is a date-range predicate.
+# as 00:00, so it is never true. The cost, accepted: a true "none" filtered by a date range on a
+# TIMESTAMP column (`ts >= '2031-01-01'`) is declined too, naming the date, since a date-only bound
+# on a timestamp cannot be told from the midnight mistake. Fix round 2 found the same bypass one
+# level deeper -- a DATE literal compared with an expression of timestamp type -- so a date is a
+# bound only where its partner is a bare column proven DATE, and nowhere else.
+
+def test_a_date_against_anything_but_a_bare_date_column_is_unchecked():
+    for sql in ("SELECT id FROM claim WHERE CAST(ts AS TIMESTAMP) = DATE '2024-03-03'",
+                "SELECT id FROM claim WHERE greatest(ts, ts) = DATE '2024-03-03'",
+                "SELECT id FROM claim WHERE CAST(filed AS DATE) > DATE '2031-01-01'",
+                "SELECT id FROM claim WHERE DATE '2031-01-01' < current_date",
+                "SELECT id FROM claim WHERE CAST(filed AS DATE) > current_date - INTERVAL '30 days'"):
+        assert [o for _, o, _, _ in _read(sql)] == [UNCHECKED], sql
+    # A column whose declared type is unknown is not proven DATE.
+    assert [o for _, o, _, _ in _read("SELECT id FROM claim WHERE filed > DATE '2031-01-01'",
+                                      types=None)] == [UNCHECKED]
+
+
+def test_a_full_timestamp_against_a_bare_timestamp_column_needs_no_grounding():
+    """A bound of the column's own precision is as safe as a number (the controller's addition to
+    fix round 2): a week written to the second on a TIMESTAMP column is a common genuine "none"."""
+    for sql in ("SELECT id FROM claim WHERE ts >= '2031-01-01 00:00:00' AND ts < '2031-01-08 00:00:00'",
+                "SELECT id FROM claim WHERE ts > TIMESTAMP '2031-01-01 00:00:00'",
+                "SELECT id FROM claim WHERE ts > CAST('2031-01-01 00:00:00' AS TIMESTAMP)",
+                "SELECT id FROM claim WHERE tz = '2031-01-01T10:30:00+02:00'",
+                "SELECT id FROM claim WHERE TIMESTAMP '2031-01-01 00:00:00' BETWEEN ts AND ts"):
+        assert {o for _, o, _, _ in _read(sql)} == {TYPED}, sql
+
+
+def test_a_full_timestamp_against_anything_but_a_bare_timestamp_column_is_unchecked():
+    for sql in ("SELECT id FROM claim WHERE CAST(ts AS TIMESTAMP) > TIMESTAMP '2031-01-01 00:00:00'",
+                "SELECT id FROM claim WHERE CAST(ts AS TIMESTAMP) > '2031-01-01 00:00:00'",
+                "SELECT id FROM claim WHERE filed > TIMESTAMP '2031-01-01 00:00:00'",
+                "SELECT id FROM claim WHERE filed > '2031-01-01 00:00:00'",
+                "SELECT id FROM claim WHERE at > '2031-01-01 00:00:00'",
+                "SELECT id FROM claim WHERE ts > TIMESTAMP '2031-01-01'"):  # no time of day
+        assert [o for _, o, _, _ in _read(sql)] == [UNCHECKED], sql
+    assert [o for _, o, _, _ in _read("SELECT id FROM claim WHERE ts > '2031-01-01 00:00:00'",
+                                      types=None)] == [UNCHECKED]
+
+
+def test_a_date_literal_that_is_the_subject_of_between_reads_its_bounds():
+    assert _read("SELECT id FROM claim WHERE DATE '2024-03-03' BETWEEN ts AND ts") == [
+        ("2024-03-03", UNCHECKED, "date_on_time", "claim.ts")]
+    assert _read("SELECT id FROM claim WHERE DATE '2024-03-03' BETWEEN filed AND filed") == [
+        ("2024-03-03", TYPED, "", "claim.filed")]
+    assert [o for _, o, _, _ in _read(
+        "SELECT id FROM claim WHERE DATE '2024-03-03' BETWEEN filed AND ts")] == [UNCHECKED]
 
 def test_a_date_only_string_against_a_timestamp_column_is_unchecked():
     for sql in ("SELECT id FROM claim WHERE ts = '2024-03-03'",
@@ -192,13 +239,10 @@ def test_a_string_with_a_time_part_against_a_date_column_is_unchecked():
 
 
 def test_a_typed_date_literal_against_a_timestamp_column_is_unchecked():
-    """An explicit DATE literal is exempt as written, except where the column it meets is known to
-    hold more than a date: `ts = DATE '2024-03-03'` is midnight too. A TIMESTAMP literal is no DATE
-    literal, so it is not exempt either."""
+    """`ts = DATE '2024-03-03'` is midnight too. (A TIMESTAMP literal with its time of day against a
+    bare TIMESTAMP column is a bound since the controller's addition to fix round 2.)"""
     assert [o for _, o, _, _ in _read("SELECT id FROM claim WHERE ts = DATE '2024-03-03'")] == [
         UNCHECKED]
-    assert [o for _, o, _, _ in _read(
-        "SELECT id FROM claim WHERE ts > TIMESTAMP '2031-01-01 00:00:00'")] == [UNCHECKED]
 
 
 def test_a_date_column_and_a_typed_date_literal_stay_exempt():
@@ -258,41 +302,32 @@ def test_another_table_beside_a_row_filtered_one_is_still_grounded():
     assert [(v.text, v.outcome) for v in g.values] == [("north", GROUNDED)]
 
 
-# --- a projection that can remove or reshape rows is no output (fix round 1) ----------------------
+# --- no output exemption: a value anywhere counts (fix round 2) ----------------------------------
+#
+# Fix round 1 exempted a projected value that provably removed no rows, and each review found it
+# bypassed one level deeper: a set-returning call, an alias read in WHERE, then an alias read by a
+# sibling item that WHERE, QUALIFY or a set-returning call reads. An exemption that has to model
+# every way a projection can reach the rows does not converge, so there is none: every string value
+# anywhere in the statement is grounded or typed, or the empty result is declined naming it.
 
-def test_a_literal_inside_a_set_returning_projection_counts_as_a_filter():
-    """Measured on DuckDB 1.5.4: `unnest(list_filter(tags, x -> x = 'opne'))` returns 0 rows where
-    'open' returns 800, and the empty result was answered on main's successor."""
-    g = _ground("SELECT unnest(list_filter(tags, x -> x = 'opne')) AS t FROM claim")
-    assert [(v.text, v.output) for v in g.values] == [("opne", False)]
-    v = sanity_check("q", _EMPTY, g)
-    assert v is not None and v.defer and "'opne'" in v.reason
-
-
-def test_an_unknown_function_in_the_projection_may_return_a_set():
-    g = _ground("SELECT string_to_table(note, 'x') AS piece FROM claim")
-    assert [(v.text, v.output) for v in g.values] == [("x", False)]
-
-
-def test_a_projection_read_by_alias_elsewhere_counts_as_a_filter():
-    for sql in ("SELECT upper(status) = 'OPNE' AS flag FROM claim WHERE flag",
-                "SELECT CASE WHEN adjuster = 'agnet_0042' THEN 1 END AS k, count(*) AS n "
-                "FROM claim GROUP BY k HAVING k = 1",
-                "SELECT CASE WHEN adjuster = 'agnet_0042' THEN 1 END AS k FROM claim "
-                "QUALIFY k = 1",
-                "SELECT CASE WHEN adjuster = 'agnet_0042' THEN 'x' END AS k, count(*) AS n "
-                "FROM claim GROUP BY 1",
-                "SELECT CASE WHEN adjuster = 'agnet_0042' THEN 'x' END AS k, count(*) AS n "
-                "FROM claim GROUP BY ALL"):
-        g = _ground(sql)
-        assert g.values and all(v.output is False for v in g.values), sql
-        assert sanity_check("q", _EMPTY, g).defer, sql
+def test_every_projected_value_counts_however_it_reaches_the_rows():
+    for sql in ("SELECT unnest(list_filter(tags, x -> x = 'opne')) AS t FROM claim",
+                "SELECT string_to_table(note, 'opne') AS piece FROM claim",
+                "SELECT upper(status) = 'OPNE' AS flag FROM claim WHERE flag",
+                "SELECT status = 'opne' AS x, x AS y FROM claim WHERE y",
+                "SELECT id, adjuster = 'agnet_0042' AS f, f AS g FROM claim WHERE g",
+                "SELECT list_filter(tags, x -> x = 'opne') AS l, unnest(l) AS t FROM claim",
+                "SELECT adjuster = 'agnet_0042' AS x, unnest(CASE WHEN x THEN [1] ELSE [] END) AS u "
+                "FROM claim",
+                "SELECT CASE WHEN adjuster = 'agnet_0042' THEN 'x' END AS k FROM claim "
+                "WHERE amount > 9e9 ORDER BY k"):
+        v = sanity_check("q", _EMPTY, _ground(sql))
+        assert v is not None and v.defer, sql
 
 
-def test_a_plain_projection_stays_output():
-    g = _ground("SELECT CASE WHEN adjuster = 'agnet_0042' THEN 'x' END AS k FROM claim "
-                "WHERE amount > 9e9 ORDER BY k")
-    assert all(v.output for v in g.values) and sanity_check("q", _EMPTY, g) is None
+def test_a_grounded_projected_value_is_fine():
+    assert sanity_check("q", _EMPTY, _ground(
+        "SELECT CASE WHEN status = 'open' THEN 1 END AS o FROM claim WHERE amount > 9e9")) is None
 
 
 # --- a predicate that can never hold -------------------------------------------------------------
@@ -303,25 +338,24 @@ def test_a_predicate_that_can_never_hold_is_recorded():
     assert _ground("SELECT id FROM claim WHERE status = NULL").never_true == "status = NULL"
     assert _ground("SELECT id FROM claim LIMIT 0").never_true == "LIMIT 0"
     assert _ground("SELECT id FROM claim WHERE 1 = 1 AND amount > 5").never_true is None
-    assert _ground("SELECT 1 = 0 AS flag FROM claim").never_true is None  # output, not a filter
+    # No output exemption (fix round 2): a projection read by alias can be the filter.
+    assert _ground("SELECT 1 = 0 AS flag FROM claim").never_true == "1 = 0"
 
 
-# --- the output removes no rows; the scope's resolver places the column ---------------------------
+# --- the projection is read like the rest; the scope's resolver places the column -----------------
 
-def test_values_in_the_output_are_marked_since_they_remove_no_rows():
+def test_a_value_in_the_projection_is_checked_like_any_other():
     g = _ground("SELECT CASE WHEN status = 'open' THEN 'Open' END AS s FROM claim "
                 "WHERE amount > 1000000000")
-    assert [(v.text, v.outcome, v.output) for v in g.values] == [
-        ("open", GROUNDED, True), ("Open", UNCHECKED, True)]
-    assert g.blocking(output=False) == []
-    assert [v.text for v in g.blocking(output=True)] == ["Open"]
+    assert [(v.text, v.outcome) for v in g.values] == [("open", GROUNDED), ("Open", UNCHECKED)]
+    assert [v.text for v in g.blocking()] == ["Open"]
 
 
-def test_a_subquerys_filter_inside_the_output_is_output_too():
+def test_a_subquerys_filter_inside_the_projection_counts_and_is_written_out():
     g = _ground("SELECT id, (SELECT max(amount) FROM claim c2 WHERE c2.status = 'opne') AS m "
                 "FROM claim WHERE amount > 1000000000")
-    assert [(v.text, v.output) for v in g.values] == [("opne", True)]
-    assert g.filters == ("amount > 1000000000",)
+    assert [(v.text, v.outcome) for v in g.values] == [("opne", ABSENT)]
+    assert g.filters == ("amount > 1000000000", "c2.status = 'opne'")
 
 
 def test_a_cte_column_list_is_read_by_position_as_check_values_reads_it():
@@ -421,11 +455,38 @@ def test_an_empty_result_from_a_predicate_that_can_never_hold_defers():
     assert v.reason == "No rows matched, because the query's filter can never be true (1 = 0)."
 
 
-def test_an_empty_result_ignores_values_in_the_output_and_a_null_does_not():
+def test_an_empty_result_and_a_null_both_read_the_projections_values():
     sql = "SELECT CASE WHEN status = 'open' THEN 'Open' END AS s FROM claim WHERE amount > 9e9"
-    assert sanity_check("q", _EMPTY, _ground(sql)) is None
-    v = sanity_check("q", pa.table({"s": [None]}), _ground(sql))
-    assert v is not None and v.defer and "'Open'" in v.reason
+    for table in (_EMPTY, pa.table({"s": [None]})):
+        v = sanity_check("q", table, _ground(sql))
+        assert v is not None and v.defer and "'Open'" in v.reason
+
+
+def test_a_typed_value_is_named_for_what_it_is():
+    """The task review's re-review of fix round 1: every cast was worded as a date, so a TIME
+    literal read "the date '10:00:00'", and a TIMESTAMP literal against a DATE column read
+    "compared with no column"."""
+    reasons = {
+        "SELECT id FROM claim WHERE at < TIME '10:00:00'":
+            "'10:00:00', typed as something other than a date or a timestamp, could not be checked "
+            "as a bound",
+        "SELECT id FROM claim WHERE filed > TIMESTAMP '2031-01-01 00:00:00'":
+            "the timestamp '2031-01-01 00:00:00', not compared with a column known to hold "
+            "timestamps, could not be checked as a bound",
+        "SELECT id FROM claim WHERE ts > TIMESTAMP '2031-01-01'":
+            "'2031-01-01', not a well-formed timestamp with a time of day, could not be checked",
+        "SELECT id FROM claim WHERE greatest(ts, ts) = DATE '2024-03-03'":
+            "the date '2024-03-03', not compared with a column known to hold dates alone, could "
+            "not be checked as a bound",
+        "SELECT id FROM claim WHERE filed > DATE '2031-02-30'":
+            "'2031-02-30', not a well-formed date, could not be checked",
+        "SELECT id FROM claim WHERE ts = DATE '2024-03-03'":
+            "the date '2024-03-03' against claim.ts, which holds times as well as dates, could not "
+            "be checked as a bound",
+    }
+    for sql, phrase in reasons.items():
+        v = sanity_check("q", _EMPTY, _ground(sql))
+        assert v is not None and phrase in v.reason, (sql, v and v.reason)
 
 
 def test_a_null_total_whose_values_are_grounded_passes_and_a_nan_does_not():

@@ -262,6 +262,66 @@ def test_a_date_only_string_against_a_timestamp_is_declined(source):
     assert ans.deferred is True and "'2024-03-03'" in ans.answer, ans.answer
 
 
+# Fix round 2: the reviews of fix round 1 found each exemption bypassed one level deeper -- a
+# projected value carried into WHERE, QUALIFY or a set-returning call through another item's alias,
+# and a DATE literal compared with an expression or a column pair of timestamp type. Each returns
+# no rows while its intended spelling returns some, and each was answered; on main each declined.
+_ROUND_2 = [
+    ("SELECT id, upper(status) = 'OPNE' AS f, f AS g FROM claim WHERE g", "'OPNE'",
+     "SELECT count(*) FROM claim WHERE upper(status) = 'OPEN'"),
+    ("SELECT id, adjuster = 'agnet_0042' AS f, f AS g FROM claim WHERE g", "'agnet_0042'",
+     "SELECT count(*) FROM claim WHERE adjuster = 'agent_0042'"),
+    ("SELECT list_filter(tags, x -> x = 'opne') AS l, unnest(l) AS t FROM claim", "'opne'",
+     "SELECT count(*) FROM (SELECT unnest(list_filter(tags, x -> x = 'open')) FROM claim) q"),
+    ("SELECT id, adjuster = 'agnet_0042' AS f, f AS g, row_number() OVER () AS rn FROM claim "
+     "QUALIFY g", "'agnet_0042'", "SELECT count(*) FROM claim WHERE adjuster = 'agent_0042'"),
+    ("SELECT adjuster = 'agnet_0042' AS x, unnest(CASE WHEN x THEN [1] ELSE [] END) AS u "
+     "FROM claim", "'agnet_0042'", "SELECT count(*) FROM claim WHERE adjuster = 'agent_0042'"),
+    ("SELECT id FROM claim WHERE CAST(ts AS TIMESTAMP) = DATE '2024-03-03'", "'2024-03-03'",
+     "SELECT count(*) FROM claim WHERE CAST(ts AS DATE) = DATE '2024-03-03'"),
+    ("SELECT id FROM claim WHERE greatest(ts, ts) = DATE '2024-03-03'", "'2024-03-03'",
+     "SELECT count(*) FROM claim WHERE CAST(ts AS DATE) = DATE '2024-03-03'"),
+    ("SELECT id FROM claim WHERE DATE '2024-03-03' BETWEEN ts AND ts", "'2024-03-03'",
+     "SELECT count(*) FROM claim WHERE CAST(ts AS DATE) = DATE '2024-03-03'"),
+]
+
+
+@pytest.mark.parametrize("sql,named,intended", _ROUND_2, ids=[f"r2-{i}" for i in range(len(_ROUND_2))])
+def test_a_value_reaching_the_rows_one_level_deeper_keeps_the_empty_result_declined(
+        source, sql, named, intended):
+    adapter, snap, values = source
+    assert adapter.execute(intended)[0][0] > 0  # the intended spelling has rows
+    ans = _ask_instant(adapter, snap, values, sql, "q")
+    assert ans.deferred is True and ans.verify_layer == "sanity", (sql, ans.answer)
+    assert named in ans.answer, ans.answer
+
+
+def test_a_week_written_to_the_second_on_a_timestamp_column_is_answered(source):
+    """A full timestamp against a bare TIMESTAMP column is a bound of the column's own precision,
+    as safe as a number (the controller's addition to fix round 2)."""
+    adapter, snap, values = source
+    ans = _ask_instant(adapter, snap, values,
+                       "SELECT id FROM claim WHERE ts >= '2031-01-01 00:00:00' "
+                       "AND ts < '2031-01-08 00:00:00'", "Which claims were stamped in 2031's first week?")
+    assert ans.deferred is False, ans.answer
+    assert ("No rows matched: ts >= '2031-01-01 00:00:00' AND ts < '2031-01-08 00:00:00'."
+            in ans.answer)
+
+
+def test_a_true_none_with_a_string_constant_in_its_projection_is_declined(source):
+    """The cost of the allow-list without an output exemption, accepted (fix round 2): a string the
+    projection writes is checked like any other, and a constant matches no column."""
+    adapter, snap, values = source
+    ans = _ask_instant(adapter, snap, values,
+                       "SELECT id, 'big claim' AS kind FROM claim WHERE status = 'open' "
+                       "AND amount > 1000000", "Which open claims are over 1,000,000?")
+    assert ans.deferred is True and "'big claim'" in ans.answer, ans.answer
+    grounded = _ask_instant(adapter, snap, values,
+                            "SELECT id, CASE WHEN status = 'open' THEN 1 END AS o FROM claim "
+                            "WHERE amount > 1000000", "Which claims are over 1,000,000?")
+    assert grounded.deferred is False, grounded.answer  # a grounded projected value is fine
+
+
 def test_with_the_layer_off_instant_runs_no_verifier_and_says_none_ran(source):
     """`MNEMIQ_VERIFY_SANITY=0` leaves `instant` with no layer at all, and a verifier with nothing
     to run stamped `verified: "basic"`, which the serializer defines as the deterministic net."""

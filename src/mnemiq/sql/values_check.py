@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 from typing import NamedTuple
 
 from sqlglot import exp
@@ -961,7 +961,6 @@ TYPED = "typed"  # a date-only ISO string read as a date, or an interval: a boun
 _EQUALITIES = (exp.EQ, exp.NEQ, exp.NullSafeEQ, exp.NullSafeNEQ)
 _RANGES = (exp.GT, exp.GTE, exp.LT, exp.LTE)
 _PATTERNS = (exp.Like, exp.ILike, exp.SimilarTo, exp.Glob, exp.RegexpLike, exp.RegexpILike)
-_PREDICATES = _EQUALITIES + _RANGES + _PATTERNS + (exp.In, exp.Between)
 
 # The engines that read a well-formed ISO date string as the date it spells wherever a date is
 # compared or cast: DuckDB, measured on 1.5.4 (`d >= '2031-01-01'` against a DATE column compares
@@ -973,23 +972,28 @@ _PREDICATES = _EQUALITIES + _RANGES + _PATTERNS + (exp.In, exp.Between)
 # and `DATE 'garbage' < d` when an earlier filter has removed every row, and returns the empty
 # result without an error (measured on 1.5.4) -- the empty case exactly.
 #
-# A DATE alone, never a timestamp or a time (Codex's review and the task review of ui-36, measured
-# on 1.5.4): `ts = '2024-03-03'` on a TIMESTAMP column is midnight and returned no rows while 15
-# fell on that day, a same-day BETWEEN the same, and on a TIME column `t < '2024-03-03'` reads the
-# string as 00:00. So a date-only string is a bound against a DATE column, and an explicit DATE
-# literal is one except where the column it meets is known to hold times as well.
+# A proven DATE alone (Codex's reviews and the task reviews of ui-36, measured on 1.5.4): `ts =
+# '2024-03-03'` on a TIMESTAMP column is midnight and returned no rows while 15 fell on that day,
+# a same-day BETWEEN the same, and on a TIME column `t < '2024-03-03'` reads the string as 00:00;
+# `CAST(ts AS TIMESTAMP) = DATE '2024-03-03'` and `greatest(ts, ts) = ...` are the same mistake
+# behind an expression. So a date-only string, or a DATE literal, is a bound only where every
+# operand it is directly compared with is a bare column the resolver places on a column the
+# snapshot declares DATE; against an expression, a cast, a function, or a column of any other or
+# unknown type it is unchecked. The cost, accepted: a true "none" filtered by a date range on a
+# TIMESTAMP column (`ts >= '2031-01-01'`), or through an expression, is declined, naming the date.
+#
+# A timestamp with its time of day is the TIMESTAMP column's own precision, as safe a bound as a
+# number (the controller's addition to fix round 2): a week written to the second on a timestamp
+# column is a common genuine "none", declined without this. So a full ISO timestamp, bare or as a
+# TIMESTAMP literal, is a bound against bare columns all declared TIMESTAMP or TIMESTAMPTZ, and on
+# the same terms as a date otherwise: unchecked against a DATE or TIME column, an expression, a
+# cast, or a column of unknown type, and a TIMESTAMP literal without a time of day is no bound.
 _ISO_DATES_READ_AS_DATES = frozenset({"duckdb", "postgres", "postgresql"})
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_ISO_DATETIME = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?"
+                           r"(Z|[+-]\d{2}(:?\d{2})?)?")
 _INTERVAL_TEXT = re.compile(r"\s*\d+(\.\d+)?(\s+(microsecond|millisecond|second|minute|hour|day|week"
                             r"|month|quarter|year|decade|century|millennium)s?)?\s*", re.IGNORECASE)
-
-# Functions that may return a set of rows from the projection: DuckDB's and Postgres's `unnest`
-# (sqlglot's Explode), `generate_series` on Postgres, and any call sqlglot does not model (`json_each`,
-# `regexp_split_to_table`, a UDF), which may be one. Measured on DuckDB 1.5.4:
-# `unnest(list_filter(tags, x -> x = 'opne'))` returns 0 rows where 'open' returns every row.
-_MAY_RETURN_A_SET = (exp.Explode, exp.ExplodeOuter, exp.Posexplode, exp.PosexplodeOuter, exp.Inline,
-                     exp.Unnest, exp.GenerateSeries, exp.ExplodingGenerateSeries, exp.Anonymous,
-                     exp.AnonymousAggFunc)
 
 
 @dataclass(frozen=True)
@@ -1002,15 +1006,14 @@ class FilterValue:
     # not_indexed (its column has no indexed values: high-cardinality, not a string, or no index),
     # masked, row_filtered (a table this identity reads through a row filter, whose unfiltered
     # index is never consulted), pattern, range (a text bound), date_on_time (a date-only value
-    # against a column holding times), not_a_column (compared with an expression), not_compared,
-    # unresolved (the resolver could not place its column).
+    # against a column holding times), not_on_a_date_column (a date compared with anything but a
+    # bare column proven DATE), not_on_a_timestamp_column (a full timestamp compared with anything
+    # but a bare column proven TIMESTAMP), not_a_date and not_a_timestamp (a DATE literal naming no
+    # real day; a TIMESTAMP literal without a well-formed time of day), typed_other (a typed literal
+    # of another type), interval (one not compared with a date or time column), not_a_column
+    # (compared with an expression), not_compared, unresolved (the resolver could not place it).
     why: str
     column: str | None  # `table.column`, where the resolver placed it
-    # It sits in the statement's output -- the projection or ORDER BY of the query whose rows are
-    # the result, a subquery there included -- in a projection that provably removes no rows
-    # (`_row_preserving`). It still decides a value there, so a single NULL counts it
-    # (`sum(CASE WHEN status = 'opne' THEN amount END)`).
-    output: bool
 
 
 @dataclass(frozen=True)
@@ -1024,25 +1027,28 @@ class ValueGrounding:
 
     values: tuple[FilterValue, ...]
     never_true: str | None  # a predicate that can never hold (`1 = 0`, `x = NULL`, LIMIT 0), as written
-    # Each WHERE, HAVING and QUALIFY condition outside the output and outside another such
-    # condition, as asked: the CTEs' and derived tables' too, in the order met from the top.
+    # Each WHERE, HAVING and QUALIFY condition outside another such condition, as asked: the CTEs',
+    # the derived tables' and a projected subquery's too, in the order met from the top.
     filters: tuple[str, ...]
     # An output column that is NULL as written (`SELECT NULL, NULL`, `CAST(NULL AS INT) AS x`), so a
     # NULL row is the query's own and no aggregate over nothing. Measured on the saved BIRD runs: a
     # model saying "no answer" in SQL, which with no value to ground passed as a "none".
     null_as_written: str | None = None
 
-    def blocking(self, *, output: bool) -> list[FilterValue]:
-        """The values an answered result cannot rest on: every one neither grounded nor typed. An
-        empty result reads the filters alone (`output=False`); a single NULL reads the output too."""
-        return [v for v in self.values
-                if v.outcome not in (GROUNDED, TYPED) and (output or not v.output)]
+    def blocking(self) -> list[FilterValue]:
+        """The values an answered result cannot rest on: every one neither grounded nor typed,
+        wherever it sits. No projected value is exempt (fix round 2): fix round 1 exempted one that
+        provably removed no rows, and each review found that exemption bypassed one level deeper --
+        a set-returning call, an alias WHERE reads, an alias a sibling item reads that WHERE,
+        QUALIFY or a set-returning call reads. An exemption that must model every way a projection
+        reaches the rows does not converge. The cost, accepted: a true "none" whose projection holds
+        a string constant (`'big claim' AS kind`) is declined, naming it."""
+        return [v for v in self.values if v.outcome not in (GROUNDED, TYPED)]
 
 
 def _result_queries(node: exp.Expression) -> list[exp.Expression]:
-    """The queries whose rows are the statement's result: the statement, and each arm of a UNION,
-    whose projections each give rows. INTERSECT and EXCEPT compare their arms' rows, so a value an
-    arm projects can remove rows there, and only the set operation's own ORDER BY is output."""
+    """The queries whose rows are the statement's result, for `_null_as_written`: the statement,
+    and each arm of a UNION, whose projections each give the result's columns."""
     while isinstance(node, exp.Subquery):
         node = node.this
     if isinstance(node, exp.Union):
@@ -1050,47 +1056,6 @@ def _result_queries(node: exp.Expression) -> list[exp.Expression]:
     if isinstance(node, (exp.Select, exp.SetOperation)):
         return [node]
     return []
-
-
-def _in_output(node: exp.Expression, results: set[int], dialect: str | None) -> bool:
-    """Whether the node sits in the result's output where it removes no rows: the projection of a
-    result query, in an item that provably keeps every row (`_row_preserving`), or its ORDER BY."""
-    child, parent = node, node.parent
-    while parent is not None:
-        if id(parent) in results:
-            if child.arg_key == "expressions":
-                return _row_preserving(child, parent, dialect)
-            if child.arg_key == "order":
-                return not any(isinstance(n, _MAY_RETURN_A_SET) for n in child.walk())
-        child, parent = parent, parent.parent
-    return False
-
-
-def _row_preserving(item: exp.Expression, query: exp.Expression, dialect: str | None) -> bool:
-    """Whether a projection item provably keeps every row the query's filters leave, so a value in
-    it removes none. Conservative, as the allow-list is: not where it may return a set
-    (`_MAY_RETURN_A_SET`), anywhere inside it; not where WHERE, HAVING, QUALIFY or GROUP BY reads
-    it, by its alias (DuckDB reads a select alias in WHERE: `SELECT upper(status) = 'OPNE' AS flag
-    FROM t WHERE flag` filters on the projection), by its position (`GROUP BY 1`) or by GROUP BY
-    ALL (the task review and Codex's review of ui-36)."""
-    if any(isinstance(n, _MAY_RETURN_A_SET) for n in item.walk()):
-        return False
-    group = query.args.get("group")
-    if group is not None:
-        if group.args.get("all"):
-            return False
-        position = next((i for i, e in enumerate(query.expressions) if e is item), None)
-        if position is not None and any(_numeric(e) == position + 1 for e in group.expressions):
-            return False
-    alias = item.args.get("alias") if isinstance(item, exp.Alias) else None
-    if alias is not None:
-        name = _written(alias, dialect)
-        for key in ("where", "having", "qualify", "group"):
-            clause = query.args.get(key)
-            if clause is not None and any(not c.table and _written(c.this, dialect) == name
-                                          for c in clause.find_all(exp.Column)):
-                return False
-    return True
 
 
 def _iso_date(text: str) -> bool:
@@ -1104,15 +1069,35 @@ def _iso_date(text: str) -> bool:
     return True
 
 
+def _iso_datetime(text: str) -> bool:
+    """An ISO timestamp with its time of day, naming a moment that exists."""
+    if not _ISO_DATETIME.fullmatch(text):
+        return False
+    try:
+        datetime.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
+_T = exp.DataType.Type
+_TIMESTAMPS = tuple(getattr(_T, n) for n in (
+    "TIMESTAMP", "TIMESTAMPTZ", "TIMESTAMPLTZ", "TIMESTAMPNTZ", "TIMESTAMP_S", "TIMESTAMP_MS",
+    "TIMESTAMP_NS", "DATETIME", "DATETIME2", "DATETIME64", "SMALLDATETIME") if hasattr(_T, n))
+
+
 def _temporal_kind(data_type, dialect: str | None) -> str | None:
-    """"date" for a DATE, "time" for any other temporal type (a timestamp, a time), else None."""
+    """"date" for a DATE, "timestamp" for a timestamp of any zone or precision, "time" for any
+    other temporal type (a time of day), else None."""
     try:
         built = data_type if isinstance(data_type, exp.DataType) else exp.DataType.build(
             str(data_type), dialect=dialect, udt=True)
     except (SqlglotError, ValueError):
         return None
-    if built.is_type(exp.DataType.Type.DATE, exp.DataType.Type.DATE32):
+    if built.is_type(_T.DATE, _T.DATE32):
         return "date"
+    if built.is_type(*_TIMESTAMPS):
+        return "timestamp"
     return "time" if built.is_type(*exp.DataType.TEMPORAL_TYPES) else None
 
 
@@ -1139,15 +1124,13 @@ _HOLDS = {exp.EQ: lambda a, b: a == b, exp.NEQ: lambda a, b: a != b, exp.GT: lam
           exp.GTE: lambda a, b: a >= b, exp.LT: lambda a, b: a < b, exp.LTE: lambda a, b: a <= b}
 
 
-def _never_true(ast: exp.Expression, results: set[int], render_as: str | None,
-                dialect: str | None) -> str | None:
-    """The first filter that can never hold, as written: the model's way of saying "no answer" in
+def _never_true(ast: exp.Expression, render_as: str | None) -> str | None:
+    """The first predicate that can never hold, as written: the model's way of saying "no answer" in
     SQL (`WHERE 1 = 0`), a comparison with NULL, or a LIMIT of nothing. An empty result there says
-    nothing about the data. Read conservatively: such a predicate under an OR counts too."""
+    nothing about the data. Read conservatively: such a predicate under an OR counts too, and so
+    does one in the projection, which an alias can carry into a filter (fix round 2)."""
     for node in ast.find_all(exp.Boolean, exp.Null, exp.Literal, exp.Limit, exp.Fetch,
                              *_EQUALITIES, *_RANGES):
-        if _in_output(node, results, dialect):
-            continue
         if isinstance(node, (exp.Limit, exp.Fetch)):
             count = node.args.get("count") if isinstance(node, exp.Fetch) else node.expression
             if _numeric(count) == 0:
@@ -1179,7 +1162,7 @@ def ground_values(
     render_as: str | None = None,
     row_filtered: set[str] | None = None,
 ) -> ValueGrounding:
-    """Every string literal of the statement, each with what checked it (M146).
+    """Every string literal of the statement, wherever it sits, each with what checked it (M146).
 
     GROUNDED and ABSENT only where an equality or IN list compares it with a column the resolver
     places on an indexed base column -- `check_values`'s own resolver (M141, M174), so a CTE that
@@ -1188,19 +1171,18 @@ def ground_values(
     it exist" is what a mask withholds, and the index is built without the row filter (M5), so on
     such a table it would answer for rows the caller cannot read -- a value present only in hidden
     rows read GROUNDED and its empty result was answered, an absent guess read ABSENT, a membership
-    test through `<>` or NOT IN (Codex's review of ui-36). `row_filtered` is folded as
-    `check_values` folds it (`names_one_object`). TYPED where a date-only ISO string is compared
-    with a DATE column, or written as a DATE literal no column known to hold times meets, or an
-    interval, on an engine that reads it so (`_ISO_DATES_READ_AS_DATES`). UNCHECKED everywhere
-    else: a pattern, a text range, a date against a timestamp or a time, a value compared with an
-    expression or with nothing, a column the resolver cannot place, one with no indexed values, or
-    no index at all (`values` None).
+    test through `<>` (Codex's review of ui-36). `row_filtered` is folded as `check_values` folds
+    it (`names_one_object`). TYPED only where a date-only ISO string or a DATE literal is directly
+    compared with bare columns all proven DATE (`_ISO_DATES_READ_AS_DATES`, `types`), or a
+    well-formed interval with a bare date or time column. UNCHECKED everywhere else: a pattern, a
+    text range, a date against anything but a proven DATE, another typed literal, a value compared
+    with an expression or with nothing, a column the resolver cannot place, one with no indexed
+    values, or no index at all (`values` None).
 
     `dialect` resolves names, as `check_values` is given the target; `render_as` writes the
     filters and the never-true predicate in the dialect the caller is shown (the plan's).
     """
     resolve = _resolver(ast, visible, dialect)
-    results = {id(q) for q in _result_queries(ast)}
     dates = (dialect or "").lower() in _ISO_DATES_READ_AS_DATES
     render_as = dialect if render_as is None else render_as
     hidden_rows = row_filtered or set()
@@ -1235,52 +1217,91 @@ def ground_values(
         why = withheld(table, name)
         if why is not None:
             return UNCHECKED, why, column
+        held = kind(table, name)
         if dates and _iso_date(text):
-            held = kind(table, name)
             if held == "date":
                 return TYPED, "", column
-            if held == "time":
+            if held in ("timestamp", "time"):
                 return UNCHECKED, "date_on_time", column
+        if dates and _iso_datetime(text):
+            if held == "timestamp":
+                return TYPED, "", column
+            if held in ("date", "time"):
+                return UNCHECKED, "not_on_a_timestamp_column", column
         if ranged:
             return UNCHECKED, "range", column
         if values is None or not values.has(table, name):
             return UNCHECKED, "not_indexed", column
         return (GROUNDED if values.contains(table, name, text) else ABSENT), "", column
 
-    def partner(node: exp.Expression) -> tuple[str, str] | None:
-        """The column a typed literal or an interval is compared with, through the arithmetic and
-        casts around it (`filed > current_date - INTERVAL '30 days'`), where it is one."""
-        child, parent = node, node.parent
-        while parent is not None and not isinstance(parent, _PREDICATES):
-            if isinstance(parent, (exp.Select, exp.Where, exp.Having, exp.Qualify, exp.Join)):
-                return None
-            child, parent = parent, parent.parent
-        if parent is None:
-            return None
-        sides = [parent.this] if isinstance(parent, (exp.In, exp.Between)) else [parent.left,
-                                                                                  parent.right]
-        other = next((s for s in sides if s is not child), None)
-        return place(other) if isinstance(other, exp.Column) else None
+    def compared_with(node: exp.Expression) -> list | None:
+        """The operands a node is directly compared with: the other side, the bounds of a BETWEEN
+        it is the subject of (`DATE '2024-03-03' BETWEEN s AND e`), or the list of an IN."""
+        parent = node.parent
+        if isinstance(parent, _EQUALITIES + _RANGES):
+            return [parent.right if parent.left is node else parent.left]
+        if isinstance(parent, exp.Between):
+            return ([parent.args.get("low"), parent.args.get("high")] if parent.this is node
+                    else [parent.this])
+        if isinstance(parent, exp.In):
+            return list(parent.expressions) if parent.this is node else [parent.this]
+        return None
 
-    def bound(literal: exp.Literal, well_formed: bool, date_only: bool) -> tuple[str, str, str | None]:
-        """A typed literal or an interval: a bound where it is well formed, the column it meets
-        may be consulted, and, for a date, that column is not known to hold times."""
-        placed = partner(literal)
-        column = f"{placed[0]}.{placed[1]}" if placed else None
-        why = withheld(*placed) if placed else None
+    def as_bound(node: exp.Expression, want: str) -> tuple[str, str, str | None]:
+        """A date-only value (`want` "date") or a full timestamp ("timestamp") is a bound only
+        where every operand it is directly compared with is a bare column placed on a column
+        declared that kind. Anything else is unchecked."""
+        unproven = f"not_on_a_{want}_column"
+        partners = compared_with(node) or []
+        placed = [place(p) if isinstance(p, exp.Column) else None for p in partners]
+        if not partners or None in placed:
+            return UNCHECKED, unproven, None
+        for spot in placed:
+            why = withheld(*spot)
+            if why is not None:
+                return UNCHECKED, why, f"{spot[0]}.{spot[1]}"
+        if want == "date":
+            timed = next((s for s in placed if kind(*s) in ("timestamp", "time")), None)
+            if timed is not None:
+                return UNCHECKED, "date_on_time", f"{timed[0]}.{timed[1]}"
+        column = f"{placed[0][0]}.{placed[0][1]}"
+        if dates and all(kind(*s) == want for s in placed):
+            return TYPED, "", column
+        return UNCHECKED, unproven, column
+
+    def interval(literal: exp.Literal, text: str) -> tuple[str, str, str | None]:
+        """A well-formed interval is a bound where the arithmetic holding it is compared with a
+        bare date or time column (`filed > current_date - INTERVAL '30 days'`)."""
+        child, parent = literal.parent, literal.parent.parent
+        while parent is not None and not isinstance(parent, _EQUALITIES + _RANGES + (exp.Between,)):
+            if not isinstance(parent, (exp.Add, exp.Sub, exp.Paren, exp.Cast)):
+                return UNCHECKED, "interval", None
+            child, parent = parent, parent.parent
+        partners = compared_with(child) if parent is not None else None
+        spot = (place(partners[0]) if partners and len(partners) == 1
+                and isinstance(partners[0], exp.Column) else None)
+        if spot is None:
+            return UNCHECKED, "interval", None
+        column = f"{spot[0]}.{spot[1]}"
+        why = withheld(*spot)
         if why is not None:
             return UNCHECKED, why, column
-        if date_only and placed and kind(*placed) == "time":
-            return UNCHECKED, "date_on_time", column
-        return (TYPED, "", column) if dates and well_formed else (UNCHECKED, "not_compared", column)
+        if dates and _INTERVAL_TEXT.fullmatch(text) and kind(*spot) in ("date", "timestamp", "time"):
+            return TYPED, "", column
+        return UNCHECKED, "interval", column
 
     def classify(literal: exp.Literal) -> tuple[str, str, str | None]:
         parent, text = literal.parent, literal.this
         if isinstance(parent, exp.Cast) and parent.this is literal:
-            is_date = _temporal_kind(parent.to, dialect) == "date"
-            return bound(literal, is_date and _iso_date(text), True)
+            to = _temporal_kind(parent.to, dialect)
+            if to == "date":
+                return as_bound(parent, "date") if _iso_date(text) else (UNCHECKED, "not_a_date", None)
+            if to == "timestamp":
+                return (as_bound(parent, "timestamp") if _iso_datetime(text)
+                        else (UNCHECKED, "not_a_timestamp", None))
+            return UNCHECKED, "typed_other", None
         if isinstance(parent, exp.Interval) and parent.this is literal:
-            return bound(literal, _INTERVAL_TEXT.fullmatch(text) is not None, False)
+            return interval(literal, text)
         if isinstance(parent, _EQUALITIES + _RANGES):
             other = parent.right if parent.left is literal else parent.left
             return against(other, text, isinstance(parent, _RANGES))
@@ -1288,6 +1309,10 @@ def ground_values(
             return against(parent.this, text, False)
         if isinstance(parent, exp.Between) and parent.this is not literal:
             return against(parent.this, text, True)
+        if isinstance(parent, (exp.In, exp.Between)) and _iso_date(text):
+            return as_bound(literal, "date")  # a date as the subject: read its bounds or its list
+        if isinstance(parent, (exp.In, exp.Between)) and _iso_datetime(text):
+            return as_bound(literal, "timestamp")
         if isinstance(parent, _PATTERNS):
             other = parent.expression if parent.this is literal else parent.this
             placed = place(other) if isinstance(other, exp.Column) else None
@@ -1300,18 +1325,17 @@ def ground_values(
     for literal in ast.find_all(exp.Literal, bfs=False):  # as written, so a decline names them in order
         if literal.is_string:
             outcome, why, column = classify(literal)
-            found.append(FilterValue(literal.this, outcome, why, column,
-                                     _in_output(literal, results, dialect)))
+            found.append(FilterValue(literal.this, outcome, why, column))
     filters: list[str] = []
     clauses = (exp.Where, exp.Having, exp.Qualify)
     for clause in ast.find_all(*clauses):
         # One inside another's condition (a subquery's WHERE in an IN) is written out by it.
-        if not _in_output(clause, results, dialect) and clause.find_ancestor(*clauses) is None:
+        if clause.find_ancestor(*clauses) is None:
             text = clause.this.sql(dialect=render_as)
             if text not in filters:
                 filters.append(text)
-    return ValueGrounding(tuple(found), _never_true(ast, results, render_as, dialect),
-                          tuple(filters), _null_as_written(ast, render_as))
+    return ValueGrounding(tuple(found), _never_true(ast, render_as), tuple(filters),
+                          _null_as_written(ast, render_as))
 
 
 def _null_as_written(ast: exp.Expression, render_as: str | None) -> str | None:
