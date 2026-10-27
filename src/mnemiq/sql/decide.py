@@ -215,13 +215,16 @@ def decide(
 
     # M146: what an empty result rests on, read where `check_values` reads -- the statement as
     # asked, before the row policy's rewrite adds a predicate of its own, the same resolver, the
-    # same masks -- so the value checked before the run and the one an empty answer rests on after
-    # it are placed on one column. On every approval: the result is not known yet. A walk that
+    # same masks and row-filtered tables -- so the value checked before the run and the one an
+    # empty answer rests on after it are placed on one column; the grounding never consults the
+    # index on a masked column or a row-filtered table. On every approval: the result is not known
+    # yet. A walk that
     # raises costs the empty answer and never the decision: None is "not evaluated", and an empty
     # result then declines as before. Without a value index this is the resolver's first reader.
     try:
         value_grounding = ground_values(shaped, visible, values, masks=policy.masks,
-                                        dialect=target, types=types, render_as=dialect)
+                                        dialect=target, types=types, render_as=dialect,
+                                        row_filtered=set(policy.row_filters))
     except Exception:  # an advisory fact whose absence fails closed; logged, never swallowed quietly
         logger.warning("value grounding could not be read; an empty result will be declined",
                        exc_info=True)

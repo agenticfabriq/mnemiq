@@ -34,10 +34,13 @@ class _Values:
         return literal in self.columns.get((table, column), set())
 
 
-_VISIBLE = {"claim": {"id", "region", "status", "amount", "adjuster", "filed", "note"},
+_VISIBLE = {"claim": {"id", "region", "status", "amount", "adjuster", "filed", "note", "ts", "tz",
+                      "at", "tags"},
             "office": {"id", "region", "city"}}
 _TYPES = {"claim": {"id": "INTEGER", "region": "VARCHAR", "status": "VARCHAR",
-                    "amount": "DOUBLE", "adjuster": "VARCHAR", "filed": "DATE", "note": "VARCHAR"},
+                    "amount": "DOUBLE", "adjuster": "VARCHAR", "filed": "DATE", "note": "VARCHAR",
+                    "ts": "TIMESTAMP", "tz": "TIMESTAMP WITH TIME ZONE", "at": "TIME",
+                    "tags": "VARCHAR[]"},
           "office": {"id": "INTEGER", "region": "VARCHAR", "city": "VARCHAR"}}
 
 
@@ -47,10 +50,12 @@ def _values() -> _Values:
                     ("office", "region"): {"north", "south"}})
 
 
-def _ground(sql: str, dialect: str = "duckdb", values=None, masks=None, types=_TYPES):
+def _ground(sql: str, dialect: str = "duckdb", values=None, masks=None, types=_TYPES,
+            row_filtered=None):
+    filtered = {} if row_filtered is None else {"row_filtered": row_filtered}
     return ground_values(sqlglot.parse_one(sql, read=dialect), _VISIBLE,
                          _values() if values is None else values, masks=masks, dialect=dialect,
-                         types=types)
+                         types=types, **filtered)
 
 
 def _read(sql: str, **kw) -> list[tuple]:
@@ -130,7 +135,7 @@ def test_numbers_need_no_grounding():
 
 def test_a_typed_date_literal_needs_no_grounding():
     assert _read("SELECT id FROM claim WHERE filed > DATE '2030-01-01'") == [
-        ("2030-01-01", TYPED, "", None)]
+        ("2030-01-01", TYPED, "", "claim.filed")]
 
 
 def test_an_iso_date_against_a_date_column_needs_no_grounding():
@@ -160,6 +165,134 @@ def test_on_sqlite_a_date_column_holds_text_so_a_date_string_is_a_text_range():
 def test_an_interval_needs_no_grounding():
     assert [o for _, o, _, _ in _read(
         "SELECT id FROM claim WHERE filed > current_date - INTERVAL '30 days'")] == [TYPED]
+
+
+# --- a date-only string is exempt against a DATE column alone (fix round 1) -----------------------
+#
+# Measured on DuckDB 1.5.4: `ts = '2024-03-03'` on a TIMESTAMP column returns no rows while 15 rows
+# fall on that day (the string is midnight), and on a TIME column `t < '2024-03-03'` reads the string
+# as 00:00, so it is never true. Neither is a date-range predicate.
+
+def test_a_date_only_string_against_a_timestamp_column_is_unchecked():
+    for sql in ("SELECT id FROM claim WHERE ts = '2024-03-03'",
+                "SELECT id FROM claim WHERE ts IN ('2024-03-03', '2024-03-04')",
+                "SELECT id FROM claim WHERE ts BETWEEN '2024-03-03' AND '2024-03-03'",
+                "SELECT id FROM claim WHERE ts >= '2031-01-01'",
+                "SELECT id FROM claim WHERE tz = '2024-03-03'"):
+        assert {o for _, o, _, _ in _read(sql)} == {UNCHECKED}, sql
+
+
+def test_a_date_only_string_against_a_time_column_is_unchecked():
+    assert [o for _, o, _, _ in _read("SELECT id FROM claim WHERE at < '2024-03-03'")] == [UNCHECKED]
+
+
+def test_a_string_with_a_time_part_against_a_date_column_is_unchecked():
+    assert [o for _, o, _, _ in _read("SELECT id FROM claim WHERE filed = '2024-03-03 10:00'")] == [
+        UNCHECKED]
+
+
+def test_a_typed_date_literal_against_a_timestamp_column_is_unchecked():
+    """An explicit DATE literal is exempt as written, except where the column it meets is known to
+    hold more than a date: `ts = DATE '2024-03-03'` is midnight too. A TIMESTAMP literal is no DATE
+    literal, so it is not exempt either."""
+    assert [o for _, o, _, _ in _read("SELECT id FROM claim WHERE ts = DATE '2024-03-03'")] == [
+        UNCHECKED]
+    assert [o for _, o, _, _ in _read(
+        "SELECT id FROM claim WHERE ts > TIMESTAMP '2031-01-01 00:00:00'")] == [UNCHECKED]
+
+
+def test_a_date_column_and_a_typed_date_literal_stay_exempt():
+    assert [o for _, o, _, _ in _read("SELECT id FROM claim WHERE filed = '2024-03-03'")] == [TYPED]
+    assert [o for _, o, _, _ in _read("SELECT id FROM claim WHERE filed > DATE '2030-01-01'")] == [
+        TYPED]
+
+
+# --- a row-filtered table: never the unfiltered index (fix round 1) ------------------------------
+#
+# The index is built without the row filter (M5). Answering an empty result on its say-so turns a
+# `<>` or NOT IN into a membership test on rows the caller cannot read: a value present only in
+# hidden rows read GROUNDED and the empty result was answered, an absent guess read ABSENT and was
+# declined with "does not appear". So nothing on such a table is grounded, and both read alike.
+
+_HIDDEN, _ABSENT_GUESS = "south", "sooth"  # present only in rows the filter hides; nowhere
+
+
+def _filtered(template: str, value: str, keyed: str = "claim"):
+    values = _values()
+    g = _ground(template.format(v=value), values=values, row_filtered={keyed})
+    return g, values.asked
+
+
+def test_on_a_row_filtered_table_a_hidden_value_and_an_absent_guess_read_alike():
+    for template in ("SELECT id FROM claim WHERE region = '{v}'",
+                     "SELECT id FROM claim WHERE region IN ('north', '{v}')",
+                     "SELECT id FROM claim WHERE region <> 'north' AND region <> '{v}'",
+                     "SELECT id FROM claim WHERE region NOT IN ('north', '{v}')"):
+        hidden, asked_hidden = _filtered(template, _HIDDEN)
+        guess, asked_guess = _filtered(template, _ABSENT_GUESS)
+        read = [(v.outcome, v.why, v.column) for v in hidden.values]
+        assert read == [(v.outcome, v.why, v.column) for v in guess.values], template
+        assert {o for o, _, _ in read} == {UNCHECKED} and {w for _, w, _ in read} == {"row_filtered"}
+        assert asked_hidden == asked_guess == [], "the unfiltered index was consulted"
+        declined_hidden = sanity_check("q", _EMPTY, hidden)
+        declined_guess = sanity_check("q", _EMPTY, guess)
+        assert declined_hidden.defer and declined_guess.defer, template
+        assert (declined_hidden.reason.replace(_HIDDEN, "?")
+                == declined_guess.reason.replace(_ABSENT_GUESS, "?")), template
+        assert "does not appear" not in declined_guess.reason
+
+
+def test_the_row_filtered_set_is_folded_as_check_values_folds_it():
+    g, asked = _filtered("SELECT id FROM claim WHERE region <> '{v}'", _HIDDEN, keyed="CLAIM")
+    assert [(v.outcome, v.why) for v in g.values] == [(UNCHECKED, "row_filtered")] and asked == []
+
+
+def test_a_date_on_a_row_filtered_table_is_unchecked_too():
+    g, _ = _filtered("SELECT id FROM claim WHERE filed > DATE '{v}'", "2031-01-01")
+    assert [(v.outcome, v.why) for v in g.values] == [(UNCHECKED, "row_filtered")]
+
+
+def test_another_table_beside_a_row_filtered_one_is_still_grounded():
+    g, _ = _filtered("SELECT o.id FROM office o JOIN claim c ON c.id = o.id "
+                     "WHERE o.region = '{v}' AND c.amount > 9e9", "north")
+    assert [(v.text, v.outcome) for v in g.values] == [("north", GROUNDED)]
+
+
+# --- a projection that can remove or reshape rows is no output (fix round 1) ----------------------
+
+def test_a_literal_inside_a_set_returning_projection_counts_as_a_filter():
+    """Measured on DuckDB 1.5.4: `unnest(list_filter(tags, x -> x = 'opne'))` returns 0 rows where
+    'open' returns 800, and the empty result was answered on main's successor."""
+    g = _ground("SELECT unnest(list_filter(tags, x -> x = 'opne')) AS t FROM claim")
+    assert [(v.text, v.output) for v in g.values] == [("opne", False)]
+    v = sanity_check("q", _EMPTY, g)
+    assert v is not None and v.defer and "'opne'" in v.reason
+
+
+def test_an_unknown_function_in_the_projection_may_return_a_set():
+    g = _ground("SELECT string_to_table(note, 'x') AS piece FROM claim")
+    assert [(v.text, v.output) for v in g.values] == [("x", False)]
+
+
+def test_a_projection_read_by_alias_elsewhere_counts_as_a_filter():
+    for sql in ("SELECT upper(status) = 'OPNE' AS flag FROM claim WHERE flag",
+                "SELECT CASE WHEN adjuster = 'agnet_0042' THEN 1 END AS k, count(*) AS n "
+                "FROM claim GROUP BY k HAVING k = 1",
+                "SELECT CASE WHEN adjuster = 'agnet_0042' THEN 1 END AS k FROM claim "
+                "QUALIFY k = 1",
+                "SELECT CASE WHEN adjuster = 'agnet_0042' THEN 'x' END AS k, count(*) AS n "
+                "FROM claim GROUP BY 1",
+                "SELECT CASE WHEN adjuster = 'agnet_0042' THEN 'x' END AS k, count(*) AS n "
+                "FROM claim GROUP BY ALL"):
+        g = _ground(sql)
+        assert g.values and all(v.output is False for v in g.values), sql
+        assert sanity_check("q", _EMPTY, g).defer, sql
+
+
+def test_a_plain_projection_stays_output():
+    g = _ground("SELECT CASE WHEN adjuster = 'agnet_0042' THEN 'x' END AS k FROM claim "
+                "WHERE amount > 9e9 ORDER BY k")
+    assert all(v.output for v in g.values) and sanity_check("q", _EMPTY, g) is None
 
 
 # --- a predicate that can never hold -------------------------------------------------------------
@@ -226,7 +359,8 @@ def test_the_decider_reads_the_statement_as_asked_never_the_policys_rewrite():
                      policy=build_access_policy(snap, grants), target="duckdb")
     assert "north" in verdict.target_sql  # the control: the policy really applied
     g = verdict.value_grounding
-    assert [(v.text, v.outcome) for v in g.values] == [("open", GROUNDED)]
+    # The policy's own 'north' is not read, and the table it filters is never looked up.
+    assert [(v.text, v.outcome, v.why) for v in g.values] == [("open", UNCHECKED, "row_filtered")]
     assert g.filters == ("status = 'open'",)
 
 
@@ -333,3 +467,12 @@ def test_the_answered_note_names_the_filters():
     assert answered_note(pa.table({"n": [3]}), g) == ""
     # The query's own NULL, answered only with the layer off, describes no "none".
     assert answered_note(pa.table({"s": [None]}), _ground("SELECT NULL AS s")) == ""
+
+
+def test_the_answered_note_cuts_a_long_filter_and_says_so():
+    conditions = " AND ".join(f"amount <> {i}" for i in range(200))
+    note = answered_note(_EMPTY, _ground(f"SELECT id FROM claim WHERE {conditions}"))
+    assert note.startswith("No rows matched: amount <> 0 AND amount <> 1 AND")
+    assert note.endswith("... (cut at 300 characters; the SQL shown with this answer has them "
+                         "whole).")
+    assert len(note) < 420

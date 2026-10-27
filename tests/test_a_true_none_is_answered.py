@@ -67,12 +67,14 @@ def source(tmp_path, monkeypatch):
     path = str(tmp_path / "syn.duckdb")
     con = duckdb.connect(path)
     con.execute("CREATE TABLE claim (id INTEGER, region VARCHAR, status VARCHAR, amount DOUBLE, "
-                "adjuster VARCHAR, filed DATE)")
+                "adjuster VARCHAR, filed DATE, ts TIMESTAMP, tags VARCHAR[])")
     regions = ["north", "south", "east", "west"]
     rows = [(i, regions[i % 4], "open" if i % 3 else "closed", float(100 + (i * 37) % 4900),
-             f"agent_{i % 300:04d}", f"2024-{1 + i % 12:02d}-{1 + i % 28:02d}")
+             f"agent_{i % 300:04d}", f"2024-{1 + i % 12:02d}-{1 + i % 28:02d}",
+             f"2024-{1 + i % 12:02d}-{1 + i % 28:02d} {8 + i % 9:02d}:{i % 60:02d}:00",
+             ["open", "urgent"] if i % 2 else ["open"])
             for i in range(1200)]
-    con.executemany("INSERT INTO claim VALUES (?, ?, ?, ?, ?, ?)", rows)
+    con.executemany("INSERT INTO claim VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
     con.close()
     adapter = DuckDBAdapter.duckdb(path)
     snap = enrich_structural(adapter, "syn")
@@ -172,21 +174,125 @@ def test_a_date_range_needs_no_grounding(source):
     assert "No rows matched: region = 'west' AND filed >= '2031-01-01'." in ans.answer
 
 
-def test_a_row_filtered_callers_true_none_is_answered_with_the_narrowing_note(source):
-    """Under a row filter an empty result is often the true answer for that caller (M117). The
-    value index is built without the filter (M5), so a grounded value is one the table holds."""
+_NORTH_ONLY = GrantSet(frozenset({"claim"}), row_filters={"claim": "region = 'north'"})
+
+
+def _ask_instant(adapter, snap, values, sql, question, grants=_GRANTS):
+    agents = _agents(adapter, values, sql, _CountingJudgeClient())
+    return agents["instant"].answer(_packet(question, grants), snap, grants, _IDENTITY)
+
+
+def test_a_row_filtered_callers_empty_result_is_declined_naming_the_value(source):
+    """The value index is built without the row filter (M5), so on a row-filtered table it cannot
+    say whether a value is in the rows this caller may read; answering on it would answer for rows
+    the caller cannot see. The cost, accepted: a true "none" there is declined, naming the value."""
     adapter, snap, values = source
-    grants = GrantSet(frozenset({"claim"}), row_filters={"claim": "region = 'north'"})
-    agents = _agents(adapter, values, "SELECT id, amount FROM claim WHERE region = 'south'",
-                     _CountingJudgeClient())
-    ans = agents["instant"].answer(_packet("List the south-region claims.", grants), snap, grants,
-                                   _IDENTITY)
-    assert ans.deferred is False, ans.answer
+    ans = _ask_instant(adapter, snap, values, "SELECT id, amount FROM claim WHERE region = 'south'",
+                       "List the south-region claims.", _NORTH_ONLY)
+    assert ans.deferred is True and ans.verify_layer == "sanity", ans.answer
+    assert ans.answer.startswith("No rows matched, and 'south' could not be checked"), ans.answer
     assert ans.narrowed and ans.narrowed[0].rows is True
-    assert "No rows matched: region = 'south'." in ans.answer
-    assert "Row filter applied to: claim." in ans.answer
-    # The note names the statement as asked, never the policy's own predicate.
-    assert "north" not in ans.answer
+    assert "north" not in ans.answer  # never the policy's own predicate
+
+
+@pytest.mark.parametrize("template", [
+    "SELECT id FROM claim WHERE region <> 'north' AND region <> '{v}'",
+    "SELECT id FROM claim WHERE region <> 'north' AND region IS DISTINCT FROM '{v}'",
+])
+def test_on_a_row_filtered_table_a_hidden_value_and_an_absent_guess_get_one_answer(source,
+                                                                                   template):
+    """Codex's review of ui-36: with the unfiltered index, a value present only in rows the filter
+    hides read GROUNDED and the empty result was answered, while an absent guess was declined with
+    "does not appear" -- a membership test on hidden rows that main never had, since the value
+    check before the run reads no `<>`."""
+    adapter, snap, values = source
+    hidden = _ask_instant(adapter, snap, values, template.format(v="south"), "q", _NORTH_ONLY)
+    guess = _ask_instant(adapter, snap, values, template.format(v="sooth"), "q", _NORTH_ONLY)
+    assert hidden.deferred is True and guess.deferred is True, (hidden.answer, guess.answer)
+    assert hidden.reason_code == guess.reason_code
+    assert hidden.answer.replace("south", "?") == guess.answer.replace("sooth", "?")
+    assert "does not appear" not in guess.answer
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT id FROM claim WHERE region = 'south'",
+    "SELECT id FROM claim WHERE region IN ('east', 'south')",
+    "SELECT id FROM claim WHERE region NOT IN ('north', 'south')",
+])
+def test_on_a_row_filtered_table_a_hidden_value_is_never_answered(source, sql):
+    """For `=`, IN and NOT IN the absent guess never reaches the run: the value check refuses it
+    before, as main does (M5 keeps that refusal and withholds the real values). The hidden value
+    runs, comes back empty, and is declined like any value nothing could check."""
+    adapter, snap, values = source
+    ans = _ask_instant(adapter, snap, values, sql, "q", _NORTH_ONLY)
+    assert ans.deferred is True and ans.verify_layer == "sanity", ans.answer
+    assert "'south' could not be checked against claim.region's known values" in ans.answer
+
+
+def test_a_misspelled_value_inside_a_set_returning_projection_is_declined(source):
+    """Measured: `unnest(list_filter(tags, x -> x = 'opne'))` returns no rows where 'open' returns
+    every claim. The projection removes rows, so its value is a filter's."""
+    adapter, snap, values = source
+    assert adapter.execute("SELECT count(*) FROM (SELECT unnest(list_filter(tags, x -> x = 'open')) "
+                           "FROM claim) q")[0][0] == 1200
+    ans = _ask_instant(adapter, snap, values,
+                       "SELECT unnest(list_filter(tags, x -> x = 'opne')) AS t FROM claim",
+                       "Which claims are tagged open?")
+    assert ans.deferred is True and "'opne'" in ans.answer, ans.answer
+
+
+def test_a_misspelled_value_in_a_projection_the_where_clause_reads_is_declined(source):
+    """DuckDB reads a select alias in WHERE: the projection is the filter."""
+    adapter, snap, values = source
+    sql = "SELECT id, upper(status) = 'OPNE' AS flag FROM claim WHERE flag"
+    assert adapter.execute(sql.replace("OPNE", "OPEN").replace("SELECT id,", "SELECT count(*),")
+                           .replace("WHERE flag", "WHERE flag GROUP BY flag"))[0][0] > 0
+    ans = _ask_instant(adapter, snap, values, sql, "Which claims are open?")
+    assert ans.deferred is True and "'OPNE'" in ans.answer, ans.answer
+
+
+def test_a_date_only_string_against_a_timestamp_is_declined(source):
+    """Measured: `ts = '2024-03-03'` is midnight, so it returns no rows while claims fall on that
+    day. A date-only string is a bound against a DATE column alone."""
+    adapter, snap, values = source
+    assert adapter.execute("SELECT count(*) FROM claim WHERE CAST(ts AS DATE) = DATE '2024-03-03'"
+                           )[0][0] > 0
+    ans = _ask_instant(adapter, snap, values, "SELECT id FROM claim WHERE ts = '2024-03-03'",
+                       "Which claims were stamped on 3 March 2024?")
+    assert ans.deferred is True and "'2024-03-03'" in ans.answer, ans.answer
+
+
+def test_with_the_layer_off_instant_runs_no_verifier_and_says_none_ran(source):
+    """`MNEMIQ_VERIFY_SANITY=0` leaves `instant` with no layer at all, and a verifier with nothing
+    to run stamped `verified: "basic"`, which the serializer defines as the deterministic net."""
+    adapter, snap, values = source
+    agents = _agents(adapter, values, NONE_SQL, _CountingJudgeClient(),
+                     Settings(verify_sanity=False))
+    assert agents["instant"].verifier is None
+    payload = answer_payload(agents["instant"].answer(
+        _packet("Which open claims are over 1,000,000?"), snap, _GRANTS, _IDENTITY))
+    assert payload["deferred"] is False and payload["verified"] is None
+
+
+def test_the_deep_vote_rests_an_empty_cluster_on_a_grounded_member(source):
+    """Empty results with the same columns cluster together, so a cluster can hold a candidate
+    resting on a misspelled value beside ones resting on grounded values; which one represented it
+    decided the answer by candidate order."""
+    adapter, snap, values = source
+    verifiers, _ = _build_mode_verifiers(Settings(), client=_CountingJudgeClient())
+    unchecked = json.dumps({"sql": MISSPELLED_SQL})
+    grounded = json.dumps({"sql": NONE_SQL})
+
+    def deep(replies):
+        return build_agent(MODES["deep"], generator=FakeGenerator(replies),
+                           synthesizer=FakeSynthesizer("SYNTHESIZED"), adapter=adapter,
+                           cache=TwoTierCache(L1Cache()), corrector=None, values=values,
+                           selector=None, verifier=verifiers["deep"])
+
+    ans = deep([unchecked] + [grounded] * 4).answer(_packet("q"), snap, _GRANTS, _IDENTITY)
+    assert ans.deferred is False and NONE_NOTE in ans.answer, ans.answer
+    ans = deep([unchecked] * 5).answer(_packet("q"), snap, _GRANTS, _IDENTITY)
+    assert ans.deferred is True and ans.answer.startswith(MISSPELLED_DECLINE), ans.answer
 
 
 # --- through Runtime.ask, to the payload /v1/ask serves -------------------------------------------
@@ -230,13 +336,11 @@ def test_runtime_ask_declines_a_misspelled_none_and_names_the_value(source, monk
     assert payload["answer"].startswith(MISSPELLED_DECLINE)
 
 
-def test_runtime_ask_answers_a_row_filtered_none_with_the_narrowing(source, monkeypatch):
+def test_runtime_ask_declines_a_row_filtered_empty_result_naming_the_value(source, monkeypatch):
     adapter, snap, values = source
-    grants = GrantSet(frozenset({"claim"}), row_filters={"claim": "region = 'north'"})
     rt = _runtime(monkeypatch, adapter, snap, values,
-                  "SELECT id, amount FROM claim WHERE region = 'south'", grants)
+                  "SELECT id, amount FROM claim WHERE region = 'south'", _NORTH_ONLY)
     payload = answer_payload(rt.ask("List the south-region claims.", _IDENTITY, mode="instant"))
-    assert payload["deferred"] is False, payload["answer"]
-    assert payload["narrowed"] == [{"object": "claim", "rows": True, "columns": False}]
-    assert "No rows matched: region = 'south'." in payload["answer"]
-    assert "Row filter applied to: claim." in payload["answer"]
+    assert payload["deferred"] is True and payload["reason_code"] == "verification"
+    assert payload["answer"].startswith("No rows matched, and 'south' could not be checked")
+    assert "north" not in payload["answer"]

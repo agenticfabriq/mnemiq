@@ -9,6 +9,8 @@ from mnemiq.verify.verdict import VerifyVerdict
 
 # Named in a decline, at most this many: the sentence is for a caller to act on, not an inventory.
 _NAMED = 3
+# The answered note's filters, at most this many characters of them.
+_NOTE_FILTERS = 300
 
 _UNSURE = "so I can't tell a true \"none\" from a misspelled value."
 
@@ -32,6 +34,9 @@ def _named(values: list[FilterValue]) -> str:
     if first.why == "pattern":
         on = f" on {column}" if column else ""
         return f"the pattern{'s' if many else ''} {texts}{on} could not be checked against known values"
+    if first.why == "date_on_time":
+        return (f"the date{'s' if many else ''} {texts} against {column}, which holds times as well "
+                "as dates, could not be checked as a bound")
     if first.why == "range":
         return (f"the text bound{'s' if many else ''} {texts} on {column} could not be checked "
                 "against known values")
@@ -73,7 +78,9 @@ def sanity_check(question: str, table: pa.Table,
     Except where the result is the answer to a question whose true answer is "none" (M146). An
     empty result, or one NULL row from aggregates over nothing, passes when `grounding` -- the
     decider's record of every string value the statement filters on -- says each was found in its
-    column's indexed values or is a well-formed date, and no filter can never hold. Anything
+    column's indexed values or is a date-only bound on a DATE column, and no filter can never
+    hold. A value on a table this identity reads through a row filter is never grounded: the
+    index cannot say which rows the caller may read (`ground_values`). Anything
     nothing could check keeps it declined, and the decline names the value, so the caller can
     confirm or correct it. `grounding` None means it was not evaluated (an `Approved` built
     outside the decider) and the rules are as before, every such result declined.
@@ -109,8 +116,13 @@ def sanity_check(question: str, table: pa.Table,
 def answered_note(table: pa.Table, grounding: ValueGrounding | None) -> str:
     """The engine's sentence on an answered empty result, appended after the synthesizer and never
     through it, like the other disclosures: a "none" must say what it is a "none" of. The filters
-    are the statement as asked, never a row policy's predicate. Empty for any other result."""
+    are the statement as asked, never a row policy's predicate, cut at `_NOTE_FILTERS` characters
+    where a long statement would bury the answer (the caller is shown the SQL whole). Empty for
+    any other result."""
     filters = "; ".join(grounding.filters) if grounding is not None else ""
+    if len(filters) > _NOTE_FILTERS:
+        filters = (f"{filters[:_NOTE_FILTERS]}... (cut at {_NOTE_FILTERS} characters; the SQL "
+                   "shown with this answer has them whole)")
     if table.num_rows == 0:
         return f"No rows matched: {filters}." if filters else "No rows matched."
     if _aggregate_over_nothing(table, table.to_pylist()):

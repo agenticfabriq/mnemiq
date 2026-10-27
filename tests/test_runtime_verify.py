@@ -138,6 +138,18 @@ def test_the_sanity_switch_reaches_the_verifiers_both_doors_build():
         assert verifier_from(settings, None).sanity is configured
 
 
+def test_a_verifier_with_no_layer_to_run_is_not_built():
+    """With sanity off, `instant` has no layer left; a verifier running none stamped every answer
+    `pass`, which the wire reports as `verified: "basic"`, the deterministic net."""
+    from mnemiq.runtime import _build_verifier
+    from mnemiq.verify.judge import FakeJudge
+
+    common = dict(threshold=0.5, judge=FakeJudge(0.9), fail_closed=True, sanity=False)
+    assert _build_verifier("sanity", grounding=False, **common) is None
+    assert _build_verifier("sanity", grounding=True, **common) is not None
+    assert _build_verifier("full", grounding=False, **common).judge is not None
+
+
 def test_the_deployment_switch_reaches_the_verifier_the_product_uses():
     """`_build_verifier` taking the argument proves nothing about the runtime passing it. Dropping
     `fail_closed=settings.verify_fail_closed` at the call site leaves every unit test above green

@@ -785,8 +785,14 @@ def _build_verifier(level: str, *, threshold: float, grounding: bool, judge, fai
     """
     if level == "off":
         return None
-    return Verifier(threshold=threshold, sanity=sanity, grounding=grounding,
-                    judge=judge if level == "full" else None, fail_closed=fail_closed)
+    judge = judge if level == "full" else None
+    if not sanity and not grounding and judge is None:
+        # No layer would run, and a verifier that runs none stamps every answer `pass`, which the
+        # wire calls `verified: "basic"`, the deterministic net: no verifier, so no stamp (the task
+        # review of ui-36).
+        return None
+    return Verifier(threshold=threshold, sanity=sanity, grounding=grounding, judge=judge,
+                    fail_closed=fail_closed)
 
 
 def _build_mode_verifiers(settings: Settings, *, client):
