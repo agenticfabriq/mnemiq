@@ -1115,6 +1115,17 @@ def _temporal_kind(data_type, dialect: str | None) -> str | None:
     return "time" if built.is_type(*exp.DataType.TEMPORAL_TYPES) else None
 
 
+def _written_as(node: exp.Expression, dialect: str | None) -> str:
+    """A constant as the caller wrote it, for the sentence naming it; sqlglot prints no JSON union
+    path for DuckDB, and a sentence is no reason to fail the decision."""
+    for rendering in (dialect, None):
+        try:
+            return node.sql(dialect=rendering)
+        except (ValueError, SqlglotError):
+            continue
+    return "a constant that could not be printed"
+
+
 def _opaque_constant(node: exp.Expression) -> bool:
     """A constant whose value the scan cannot read as a plain string (fix round 3): any leaf that
     carries text and is not a plain literal, a name or a keyword -- sqlglot's E'..' (ByteString),
@@ -1165,21 +1176,21 @@ def _never_true(ast: exp.Expression, render_as: str | None) -> str | None:
         if isinstance(node, (exp.Limit, exp.Fetch)):
             count = node.args.get("count") if isinstance(node, exp.Fetch) else node.expression
             if _numeric(count) == 0:
-                return node.sql(dialect=render_as).strip()
+                return _written_as(node, render_as).strip()
             continue
         if isinstance(node, (exp.Boolean, exp.Null, exp.Literal)):
             false = ((isinstance(node, exp.Boolean) and not node.this)
                      or isinstance(node, exp.Null) or _numeric(node) == 0)
             if false and _is_condition(node):
-                return node.sql(dialect=render_as)
+                return _written_as(node, render_as)
             continue
         left, right = node.left, node.right
         if not isinstance(node, (exp.NullSafeEQ, exp.NullSafeNEQ)) and (
                 isinstance(left, exp.Null) or isinstance(right, exp.Null)):
-            return node.sql(dialect=render_as)
+            return _written_as(node, render_as)
         a, b = _numeric(left), _numeric(right)
         if a is not None and b is not None and type(node) in _HOLDS and not _HOLDS[type(node)](a, b):
-            return node.sql(dialect=render_as)
+            return _written_as(node, render_as)
     return None
 
 
@@ -1369,18 +1380,25 @@ def ground_values(
 
     found = []
     for node in ast.walk(bfs=False):  # as written, so a decline names them in order
-        if isinstance(node, exp.Literal) and node.is_string:
+        if node.find_ancestor(exp.JSONPath) is not None:
+            continue  # a part of a path, which is classified whole
+        if isinstance(node, (exp.JSONPath, exp.JSONPathPart)):
+            # A JSON path is a constant whatever its leaves (fix round 4): a root, an integer
+            # subscript, a wildcard, a slice or a union carry no text, and `(j->'$[9]') IS NOT NULL`
+            # over `[42]` passed with no value to name. The whole path is one unchecked value.
+            found.append(FilterValue(_written_as(node, render_as), UNCHECKED, "json_path", None))
+        elif isinstance(node, exp.Literal) and node.is_string:
             outcome, why, column = classify(node)
             found.append(FilterValue(node.this, outcome, why, column))
         elif _opaque_constant(node):
-            found.append(FilterValue(node.sql(dialect=render_as), UNCHECKED, "not_a_plain_string",
+            found.append(FilterValue(_written_as(node, render_as), UNCHECKED, "not_a_plain_string",
                                      None))
     filters: list[str] = []
     clauses = (exp.Where, exp.Having, exp.Qualify)
     for clause in ast.find_all(*clauses):
         # One inside another's condition (a subquery's WHERE in an IN) is written out by it.
         if clause.find_ancestor(*clauses) is None:
-            text = clause.this.sql(dialect=render_as)
+            text = _written_as(clause.this, render_as)
             if text not in filters:
                 filters.append(text)
     return ValueGrounding(tuple(found), _never_true(ast, render_as), tuple(filters),
@@ -1395,5 +1413,5 @@ def _null_as_written(ast: exp.Expression, render_as: str | None) -> str | None:
             while isinstance(inner, (exp.Cast, exp.Paren)):
                 inner = inner.this
             if isinstance(inner, exp.Null):
-                return projection.sql(dialect=render_as)
+                return _written_as(projection, render_as)
     return None

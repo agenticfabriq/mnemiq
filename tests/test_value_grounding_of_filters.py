@@ -394,6 +394,17 @@ def test_a_constant_written_other_than_as_a_plain_string_is_never_grounded():
     assert [(v.outcome, v.why) for v in pg.values] == [(UNCHECKED, "not_a_plain_string")]
 
 
+def test_a_json_path_is_one_unchecked_constant_whatever_its_leaves():
+    """Fix round 4: a root, an integer subscript, a wildcard, a slice or a union carry no text, and
+    the constant scan passed them as no value at all. The whole path is classified, never its
+    parts: one unchecked value per path, named as written."""
+    for path in ("$[9]", "$", "$[*]", "$[1:3]", "$[1,2]", "$.a.b"):
+        g = _ground(f"SELECT id FROM claim WHERE (note->'{path}') IS NOT NULL")
+        assert [(v.outcome, v.why) for v in g.values] == [(UNCHECKED, "json_path")], path
+        v = sanity_check("q", _EMPTY, g)
+        assert v is not None and v.defer and "a JSON path" in v.reason, (path, v and v.reason)
+
+
 def test_a_grounded_projected_value_is_fine():
     assert sanity_check("q", _EMPTY, _ground(
         "SELECT CASE WHEN status = 'open' THEN 1 END AS o FROM claim WHERE amount > 9e9")) is None

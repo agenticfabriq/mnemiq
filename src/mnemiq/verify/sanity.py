@@ -31,6 +31,9 @@ def _named(values: list[FilterValue]) -> str:
     if first.why == "not_a_plain_string":  # its text is the constant as written, quotes and all
         written = ", ".join(v.text for v in values)
         return f"{written}, a constant written other than as a plain string, could not be checked"
+    if first.why == "json_path":  # the whole path as written
+        written = ", ".join(v.text for v in values)
+        return f"{written}, {'JSON paths' if many else 'a JSON path'}, could not be checked"
     texts, column = _listed([v.text for v in values]), first.column
     if first.outcome == ABSENT:
         return f"{texts} {'do' if many else 'does'} not appear among {column}'s known values"

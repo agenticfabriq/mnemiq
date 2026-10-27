@@ -67,15 +67,17 @@ def source(tmp_path, monkeypatch):
     path = str(tmp_path / "syn.duckdb")
     con = duckdb.connect(path)
     con.execute("CREATE TABLE claim (id INTEGER, region VARCHAR, status VARCHAR, amount DOUBLE, "
-                "adjuster VARCHAR, filed DATE, ts TIMESTAMP, tags VARCHAR[], tz TIMESTAMPTZ)")
+                "adjuster VARCHAR, filed DATE, ts TIMESTAMP, tags VARCHAR[], tz TIMESTAMPTZ, "
+                "j JSON)")
     regions = ["north", "south", "east", "west"]
     rows = [(i, regions[i % 4], "open" if i % 3 else "closed", float(100 + (i * 37) % 4900),
              f"agent_{i % 300:04d}", f"2024-{1 + i % 12:02d}-{1 + i % 28:02d}",
              f"2024-{1 + i % 12:02d}-{1 + i % 28:02d} {8 + i % 9:02d}:{i % 60:02d}:00",
              ["open", "urgent"] if i % 2 else ["open"],
-             f"2024-{1 + i % 12:02d}-{1 + i % 28:02d} {8 + i % 9:02d}:{i % 60:02d}:00+00")
+             f"2024-{1 + i % 12:02d}-{1 + i % 28:02d} {8 + i % 9:02d}:{i % 60:02d}:00+00",
+             "[42]")
             for i in range(1200)]
-    con.executemany("INSERT INTO claim VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    con.executemany("INSERT INTO claim VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
     con.close()
     adapter = DuckDBAdapter.duckdb(path)
     snap = enrich_structural(adapter, "syn")
@@ -338,6 +340,32 @@ def test_a_value_the_scan_cannot_read_as_a_bound_keeps_the_empty_result_declined
     ans = _ask_instant(adapter, snap, values, sql, "q")
     assert ans.deferred is True and ans.verify_layer == "sanity", (sql, ans.answer)
     assert named in ans.answer, ans.answer
+
+
+# Fix round 4: a JSON path is a constant too, whatever its leaves. Codex's pass on fix round 3:
+# `(j->'$[9]') IS NOT NULL` over `[42]` was approved with no value to check, ran empty and passed,
+# since a root, an integer subscript and a wildcard carry no text the constant scan read.
+#
+# A union path (`'$[1,2]'`) never reaches the run on main or here: the decider's niladic-name guard
+# raises printing it (sqlglot 30.12.0 has no DuckDB rendering for JSONPathUnion), a pre-existing
+# fault outside M146, so its classification is pinned in the unit file.
+@pytest.mark.parametrize("sql", [
+    "SELECT id FROM claim WHERE (j->'$[9]') IS NOT NULL",
+    "SELECT id FROM claim WHERE (j->'$') IS NULL",
+    "SELECT id FROM claim WHERE (j->'$[*]') IS NULL",
+    "SELECT id FROM claim WHERE (j->'$[1:3]') IS NULL",
+], ids=["index", "root", "wildcard", "slice"])
+def test_an_empty_result_resting_on_a_json_path_is_declined(source, sql):
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.schema import visible_schema
+
+    adapter, snap, values = source
+    # The statement the engine runs (sqlglot reprints the path) is approved, runs, and is empty.
+    executed = decide(sql, visible_schema(snap, _GRANTS), target="duckdb").target_sql
+    assert adapter.execute(f"SELECT count(*) FROM ({executed}) q")[0][0] == 0
+    ans = _ask_instant(adapter, snap, values, sql, "q")
+    assert ans.deferred is True and ans.verify_layer == "sanity", ans.answer
+    assert "a JSON path" in ans.answer, ans.answer
 
 
 def test_an_offset_timestamp_range_on_a_timestamptz_column_is_answered(source):
