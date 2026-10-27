@@ -12,10 +12,11 @@ from mnemiq.agent.loop import AgentAnswer
 # check ran, if any.
 #
 # Graded, not boolean, because "checked" would collapse two very different guarantees. `instant`
-# and `thinking` -- and `thinking` is the default mode -- run the deterministic net only, which
-# rejects empty and null results and never reads whether the answer is RIGHT. Serialising that
-# identically to a judge-approved `deep` answer would make exactly the accuracy claim the withheld
-# confidence exists to refuse, on the modes that get the most traffic.
+# runs the deterministic net only, which declines an empty or null result it cannot ground and
+# never reads whether the answer is RIGHT; `thinking` -- the default mode -- and `deep` add the
+# judge (`agent/modes.py`). Serialising a net-only answer identically to a judge-approved one would
+# make exactly the accuracy claim the withheld confidence exists to refuse, and so would a judged
+# answer whose judge could not be reached, hence `unavailable`.
 _VERIFIED_STATE = {
     "judge": "judged",                  # a judge scored this answer
     "judge_unavailable": "unavailable",  # a judge was configured and could not be reached

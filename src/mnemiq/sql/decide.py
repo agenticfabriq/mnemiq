@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 
 import sqlglot
@@ -31,9 +32,11 @@ from mnemiq.sql.scope import (base_tables, check_policy_target, fields_as_member
                               scope_resolved)
 from mnemiq.sql.reading import UNSUPPORTED_RAISES, as_duckdb_reads, kept, rendered, unprintable
 from mnemiq.sql.rls import apply_row_and_mask, check_filter_targets, unplaceable_policy
-from mnemiq.sql.values_check import check_values
+from mnemiq.sql.values_check import check_values, ground_values
 from mnemiq.sql.views import check_views
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode, Verdict
+
+logger = logging.getLogger(__name__)
 
 
 def _render_target(tree: exp.Expression, plan_sql: str, dialect: str, target: str,
@@ -84,6 +87,7 @@ def decide(
     registry: dict[str, str] | None = None,
     views: dict[str, ViewDefinition] | None = None,
     keys: KeyFacts | None = None,
+    types: dict[str, dict[str, str]] | None = None,
 ) -> Verdict:
     """The deterministic decider: shape, then access, then proof against the real source.
 
@@ -91,6 +95,10 @@ def decide(
     second, because an unauthorized query must never reach the database -- the DB's own
     permission error is not the control: by the time it fires, we have already confirmed to
     the model that the table exists.
+
+    `types` is each column's declared type by table (`schema.column_types`), read only to tell a
+    date compared with a date column from a text range (`ground_values`, M146); None reads every
+    such value as text, which declines more and never less.
     """
     policy = policy or AccessPolicy()
     # M88: `visible` is the schema, and the shape check was guessing about the same names at
@@ -205,6 +213,23 @@ def decide(
         if inflated is not None:
             return inflated
 
+    # M146: what an empty result rests on, read where `check_values` reads -- the statement as
+    # asked, before the row policy's rewrite adds a predicate of its own, the same resolver, the
+    # same masks and row-filtered tables -- so the value checked before the run and the one an
+    # empty answer rests on after it are placed on one column; the grounding never consults the
+    # index on a masked column or a row-filtered table. On every approval: the result is not known
+    # yet. A walk that
+    # raises costs the empty answer and never the decision: None is "not evaluated", and an empty
+    # result then declines as before. Without a value index this is the resolver's first reader.
+    try:
+        value_grounding = ground_values(shaped, visible, values, masks=policy.masks,
+                                        dialect=target, types=types, render_as=dialect,
+                                        row_filtered=set(policy.row_filters))
+    except Exception:  # an advisory fact whose absence fails closed; logged, never swallowed quietly
+        logger.warning("value grounding could not be read; an empty result will be declined",
+                       exc_info=True)
+        value_grounding = None
+
     # Provenance is read from the query as ASKED, before either rewrite touches it.
     #
     # It must precede `expand_tables`, which rewrites the identifiers. It must also precede the
@@ -283,4 +308,4 @@ def decide(
 
     return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables,
                     lineage=lineage, columns=columns, narrowed=narrowed, row_cap=row_cap,
-                    asked_sql=asked_sql, asked_plan=asked_plan)
+                    asked_sql=asked_sql, asked_plan=asked_plan, value_grounding=value_grounding)

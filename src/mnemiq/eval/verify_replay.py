@@ -10,6 +10,13 @@ from mnemiq.verify.verifier import Verifier
 
 _ANSWERABLE = {"correct", "correct_facts", "wrong", "deferred_wrongly", "error"}
 
+# Printed beside every row the sanity layer is in. This replay holds no value index, so it builds
+# each `Approved` without a value grounding, and its sanity layer declines every empty or null
+# result -- the rule before M146. The product answers one whose filter values are all grounded,
+# so a sanity row here counts as catches some results the product would answer.
+SANITY_ROW_LABEL = ("(sanity here is the rule before M146: no value index, so every empty or null "
+                    "result defers; the product answers one whose filter values are grounded)")
+
 
 def _table(rows: list[dict]) -> pa.Table:
     return pa.Table.from_pylist(rows) if rows else pa.table({})
@@ -129,6 +136,10 @@ def layer_defers(records: list[dict], verifier: Verifier) -> list[bool]:
     out: list[bool] = []
     for r in _answerable(records):
         packet = ContextPacket(question=r["question"], cards=[], grant_fingerprint="", enrichment_version=None)
+        # No decider ran, so no value grounding is recorded (`value_grounding` None), and an empty
+        # or null result defers as the no-rows rule did. Since M146 the product answers one whose
+        # filter values are all grounded, which this replay -- holding no value index -- cannot
+        # see: its sanity row counts those catches as the rule's.
         approved = Approved(plan_sql=r.get("sql") or "", target_sql=r.get("sql") or "")
         out.append(verifier.verify(packet, approved, _table(r.get("engine_rows") or [])).defer)
     return out

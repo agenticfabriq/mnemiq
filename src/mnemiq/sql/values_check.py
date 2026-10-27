@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import NamedTuple
 
 from sqlglot import exp
@@ -829,51 +832,7 @@ def check_values(
     answers whether a raw value exists, which the mask exists to withhold.
     """
     row_filtered = row_filtered or set()
-    # The statement-wide reading, the fallback where the scope answers nothing: every table
-    # node, a CTE's name excluded by a statement-wide set, as before M141.
-    cte = {c.alias_or_name for c in ast.find_all(exp.CTE)}
-    alias_to_table: dict[str, str] = {}
-    for table in ast.find_all(exp.Table):
-        alias = table.args.get("alias")
-        if isinstance(alias, exp.TableAlias) and alias.columns:
-            continue  # renamed by position (`t q(region, doc)`): a set of names cannot place them
-        if table.name not in cte:
-            alias_to_table[table.alias_or_name] = table.name
-    referenced = set(alias_to_table.values())
-    scopes = _scopes(ast)
-
-    def resolve(column: exp.Column) -> tuple[str, str] | None:
-        # The scope's own answer first, then each enclosing scope's, the nearest first, as the
-        # engine binds a correlated name: `WITH x(region, doc) AS (SELECT * FROM t) SELECT
-        # count(*) FROM x WHERE EXISTS (SELECT 1 FROM u WHERE doc = 'west')` compares `x.doc`,
-        # `t.region`, which the list over a star leaves unresolved, and the name, held by no
-        # source of the subquery's own scope, fell to the statement-wide reading, `t.doc`, a
-        # present value refused (Codex's sixth review of #178). Only a scope none of whose
-        # sources can hold the name is passed: a source whose output the walk cannot name may
-        # yield it, and the engine binds there, so that scope keeps the statement-wide reading
-        # it had (`_names`, the review gate on this round). A CTE's body the engine does not
-        # correlate, and `_ABSENT` says no source of it can hold the name, so the name fails
-        # there and whatever the walk answers past it is moot.
-        scope = scopes.get(id(column))
-        while scope is not None:
-            answer = _in_scope(column, scope, visible, dialect)
-            if answer is _WIDE:
-                break
-            if answer is not _ABSENT:
-                return None if answer is _HELD else answer  # held and unplaced: the scope's own skip
-            scope = scope.parent
-        # The statement-wide reading, as before M174, where a scope cannot tell or no scope
-        # answers: a star over a join, a set operation, a recursive CTE, a column sqlglot lists
-        # in no scope (the review gate's second round, each refused here and skipped by the
-        # scope alone).
-        # The catalog's spelling is returned, as the scope's answer returns it: the index is
-        # keyed by it, and the name as typed met nothing there (the gate on the fourth round).
-        qualifier = column.table
-        if qualifier:
-            table = alias_to_table.get(qualifier)
-            return (table, _stored_match(column, visible.get(table, ()), dialect) or column.name) if table else None
-        owners_wide = [t for t in referenced if _stored_match(column, visible.get(t, ()), dialect) is not None]
-        return (owners_wide[0], _stored_match(column, visible.get(owners_wide[0], ()), dialect)) if len(owners_wide) == 1 else None  # ambiguous -> skip
+    resolve = _resolver(ast, visible, dialect)
 
     def violation(column: exp.Column, literal: str) -> Refusal | None:
         resolved = resolve(column)
@@ -926,4 +885,533 @@ def check_values(
                 if found is not None:
                     return found
 
+    return None
+
+
+def _resolver(ast: exp.Expression, visible: dict[str, set[str]],
+              dialect: str | None) -> Callable[[exp.Column], tuple[str, str] | None]:
+    """The base table and column a column node reads, as `check_values` places it: the scope's own
+    answer, then each enclosing scope's, then the statement-wide reading. One resolver, so the
+    check refusing a value before the run and the grounding an empty result rests on after it
+    (`ground_values`, M146) cannot place the same column on two different base columns."""
+    # The statement-wide reading, the fallback where the scope answers nothing: every table
+    # node, a CTE's name excluded by a statement-wide set, as before M141.
+    cte = {c.alias_or_name for c in ast.find_all(exp.CTE)}
+    alias_to_table: dict[str, str] = {}
+    for table in ast.find_all(exp.Table):
+        alias = table.args.get("alias")
+        if isinstance(alias, exp.TableAlias) and alias.columns:
+            continue  # renamed by position (`t q(region, doc)`): a set of names cannot place them
+        if table.name not in cte:
+            alias_to_table[table.alias_or_name] = table.name
+    referenced = set(alias_to_table.values())
+    scopes = _scopes(ast)
+
+    def resolve(column: exp.Column) -> tuple[str, str] | None:
+        # The scope's own answer first, then each enclosing scope's, the nearest first, as the
+        # engine binds a correlated name: `WITH x(region, doc) AS (SELECT * FROM t) SELECT
+        # count(*) FROM x WHERE EXISTS (SELECT 1 FROM u WHERE doc = 'west')` compares `x.doc`,
+        # `t.region`, which the list over a star leaves unresolved, and the name, held by no
+        # source of the subquery's own scope, fell to the statement-wide reading, `t.doc`, a
+        # present value refused (Codex's sixth review of #178). Only a scope none of whose
+        # sources can hold the name is passed: a source whose output the walk cannot name may
+        # yield it, and the engine binds there, so that scope keeps the statement-wide reading
+        # it had (`_names`, the review gate on this round). A CTE's body the engine does not
+        # correlate, and `_ABSENT` says no source of it can hold the name, so the name fails
+        # there and whatever the walk answers past it is moot.
+        scope = scopes.get(id(column))
+        while scope is not None:
+            answer = _in_scope(column, scope, visible, dialect)
+            if answer is _WIDE:
+                break
+            if answer is not _ABSENT:
+                return None if answer is _HELD else answer  # held and unplaced: the scope's own skip
+            scope = scope.parent
+        # The statement-wide reading, as before M174, where a scope cannot tell or no scope
+        # answers: a star over a join, a set operation, a recursive CTE, a column sqlglot lists
+        # in no scope (the review gate's second round, each refused here and skipped by the
+        # scope alone).
+        # The catalog's spelling is returned, as the scope's answer returns it: the index is
+        # keyed by it, and the name as typed met nothing there (the gate on the fourth round).
+        qualifier = column.table
+        if qualifier:
+            table = alias_to_table.get(qualifier)
+            return (table, _stored_match(column, visible.get(table, ()), dialect) or column.name) if table else None
+        owners_wide = [t for t in referenced if _stored_match(column, visible.get(t, ()), dialect) is not None]
+        return (owners_wide[0], _stored_match(column, visible.get(owners_wide[0], ()), dialect)) if len(owners_wide) == 1 else None  # ambiguous -> skip
+
+    return resolve
+
+
+# --- M146: what an empty result rests on ----------------------------------------------------------
+#
+# An empty result is the answer when the question's true answer is "none", and it is also what a
+# misspelled filter value produces. The no-rows rule declined both. The value index holds the
+# evidence that tells them apart, so an empty result is answered only when every string value it
+# filters on was checked against its column's indexed values and found: an allow-list. A value
+# nothing could check is UNCHECKED, which is unknown and not absent, and declines exactly as an
+# ABSENT one does -- "decline when a value is absent" would pass a misspelling on a column the
+# index does not cover, and absent values on indexed columns are already refused before the run.
+
+GROUNDED = "grounded"  # its column is indexed, and holds the value
+ABSENT = "absent"  # its column is indexed, and does not hold it
+UNCHECKED = "unchecked"  # nothing could check it: unknown, which is not absent
+TYPED = "typed"  # a date-only ISO string read as a date, or an interval: a bound with no spelling
+
+_EQUALITIES = (exp.EQ, exp.NEQ, exp.NullSafeEQ, exp.NullSafeNEQ)
+_RANGES = (exp.GT, exp.GTE, exp.LT, exp.LTE)
+_PATTERNS = (exp.Like, exp.ILike, exp.SimilarTo, exp.Glob, exp.RegexpLike, exp.RegexpILike)
+
+# The engines that read a well-formed ISO date string as the date it spells wherever a date is
+# compared or cast: DuckDB, measured on 1.5.4 (`d >= '2031-01-01'` against a DATE column compares
+# dates); Postgres documents ISO 8601 input as accepted under every DateStyle. Not SQLite, whose
+# DATE is an affinity over text, so a date string there is a text comparison and a format mismatch
+# returns nothing (a BIRD world comparing '2013/09' with '2013-09'), nor an engine whose string to
+# date conversion follows a session format (Oracle's NLS_DATE_FORMAT). Elsewhere such a value stays
+# unchecked. Validated here, not left to the engine: DuckDB compares no row against `d = 'garbage'`
+# and `DATE 'garbage' < d` when an earlier filter has removed every row, and returns the empty
+# result without an error (measured on 1.5.4) -- the empty case exactly.
+#
+# A proven DATE alone (Codex's reviews and the task reviews of ui-36, measured on 1.5.4): `ts =
+# '2024-03-03'` on a TIMESTAMP column is midnight and returned no rows while 15 fell on that day,
+# a same-day BETWEEN the same, and on a TIME column `t < '2024-03-03'` reads the string as 00:00;
+# `CAST(ts AS TIMESTAMP) = DATE '2024-03-03'` and `greatest(ts, ts) = ...` are the same mistake
+# behind an expression. So a date-only string, or a DATE literal, is a bound only where every
+# operand it is directly compared with is a bare column the resolver places on a column the
+# snapshot declares DATE; against an expression, a cast, a function, or a column of any other or
+# unknown type it is unchecked. The cost, accepted: a true "none" filtered by a date range on a
+# TIMESTAMP column (`ts >= '2031-01-01'`), or through an expression, is declined, naming the date.
+#
+# A timestamp with its time of day is the TIMESTAMP column's own precision, as safe a bound as a
+# number (the controller's addition to fix round 2): a week written to the second on a timestamp
+# column is a common genuine "none", declined without this. So a full ISO timestamp, bare or as a
+# TIMESTAMP literal, is a bound against bare columns of its own zone-awareness, and on the same
+# terms as a date otherwise: unchecked against a DATE or TIME column, an expression, a cast, or a
+# column of unknown type, and a TIMESTAMP literal without a time of day is no bound. Two limits
+# from Codex's pass on fix round 2 (fix round 3): a naive value is a bound against a naive
+# TIMESTAMP column and an offset one against TIMESTAMPTZ, never across -- a naive range on a
+# TIMESTAMPTZ column gave 0 rows under UTC and 1 under New York for the same row, measured on
+# 1.5.4 -- and only as a range bound (`>`, `>=`, `<`, `<=`, BETWEEN), never `=`, `<>` or IN:
+# `ts = '2024-03-03 00:00:00'` is a disguised day filter that a midday row does not meet.
+_ISO_DATES_READ_AS_DATES = frozenset({"duckdb", "postgres", "postgresql"})
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+_ISO_DATETIME = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?"
+                           r"(Z|[+-]\d{2}(:?\d{2})?)?")
+_INTERVAL_TEXT = re.compile(r"\s*\d+(\.\d+)?(\s+(microsecond|millisecond|second|minute|hour|day|week"
+                            r"|month|quarter|year|decade|century|millennium)s?)?\s*", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class FilterValue:
+    """One string literal of a statement and what checked it."""
+
+    text: str
+    outcome: str  # GROUNDED | ABSENT | UNCHECKED | TYPED
+    # Why nothing could check it, for the sentence that names it; "" unless UNCHECKED. One of
+    # not_indexed (its column has no indexed values: high-cardinality, not a string, or no index),
+    # masked, row_filtered (a table this identity reads through a row filter, whose unfiltered
+    # index is never consulted), pattern, range (a text bound), date_on_time (a date-only value
+    # against a column holding times), not_on_a_date_column (a date compared with anything but a
+    # bare column proven DATE), not_on_a_timestamp_column (a full timestamp compared with anything
+    # but a bare column proven TIMESTAMP), not_a_date and not_a_timestamp (a DATE literal naming no
+    # real day; a TIMESTAMP literal without a well-formed time of day), typed_other (a typed literal
+    # of another type), interval (one not compared with a date or time column), timestamp_equality
+    # (a full timestamp in `=`, `<>` or IN), zone_mismatch (a naive timestamp and a zone-aware one),
+    # not_a_plain_string (a constant written other than as a plain literal, or a parameter: its
+    # `text` is the constant as written), not_a_column (compared with an expression),
+    # not_compared, unresolved (the resolver could not place it).
+    why: str
+    column: str | None  # `table.column`, where the resolver placed it
+
+
+@dataclass(frozen=True)
+class ValueGrounding:
+    """What an empty result rests on, recorded by the decider on the statement as asked (M146).
+
+    Recorded before the row policy's rewrite, so neither the policy's own literals nor its
+    predicate are counted, named or rendered. The value index is built without the filter (M5),
+    so a grounded value is one the table holds, not one this caller's rows hold: exactly the case
+    where an empty result is honest."""
+
+    values: tuple[FilterValue, ...]
+    never_true: str | None  # a predicate that can never hold (`1 = 0`, `x = NULL`, LIMIT 0), as written
+    # Each WHERE, HAVING and QUALIFY condition outside another such condition, as asked: the CTEs',
+    # the derived tables' and a projected subquery's too, in the order met from the top.
+    filters: tuple[str, ...]
+    # An output column that is NULL as written (`SELECT NULL, NULL`, `CAST(NULL AS INT) AS x`), so a
+    # NULL row is the query's own and no aggregate over nothing. Measured on the saved BIRD runs: a
+    # model saying "no answer" in SQL, which with no value to ground passed as a "none".
+    null_as_written: str | None = None
+
+    def blocking(self) -> list[FilterValue]:
+        """The values an answered result cannot rest on: every one neither grounded nor typed,
+        wherever it sits. No projected value is exempt (fix round 2): fix round 1 exempted one that
+        provably removed no rows, and each review found that exemption bypassed one level deeper --
+        a set-returning call, an alias WHERE reads, an alias a sibling item reads that WHERE,
+        QUALIFY or a set-returning call reads. An exemption that must model every way a projection
+        reaches the rows does not converge. The cost, accepted: a true "none" whose projection holds
+        a string constant (`'big claim' AS kind`) is declined, naming it."""
+        return [v for v in self.values if v.outcome not in (GROUNDED, TYPED)]
+
+
+def _result_queries(node: exp.Expression) -> list[exp.Expression]:
+    """The queries whose rows are the statement's result, for `_null_as_written`: the statement,
+    and each arm of a UNION, whose projections each give the result's columns."""
+    while isinstance(node, exp.Subquery):
+        node = node.this
+    if isinstance(node, exp.Union):
+        return [node, *_result_queries(node.left), *_result_queries(node.right)]
+    if isinstance(node, (exp.Select, exp.SetOperation)):
+        return [node]
+    return []
+
+
+def _iso_date(text: str) -> bool:
+    """A date-only ISO string naming a day that exists (`2024-02-30` does not)."""
+    if not _ISO_DATE.fullmatch(text):
+        return False
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _moment(text: str) -> str | None:
+    """An ISO timestamp with its time of day, naming a moment that exists: "timestamptz" where it
+    carries an explicit offset or zone, "timestamp" where it is naive, else None."""
+    if not _ISO_DATETIME.fullmatch(text):
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return "timestamp" if parsed.tzinfo is None else "timestamptz"
+
+
+_T = exp.DataType.Type
+_NAIVE_TIMESTAMPS = tuple(getattr(_T, n) for n in (
+    "TIMESTAMP", "TIMESTAMPNTZ", "TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP_NS", "DATETIME",
+    "DATETIME2", "DATETIME64", "SMALLDATETIME") if hasattr(_T, n))
+_ZONED_TIMESTAMPS = tuple(getattr(_T, n) for n in ("TIMESTAMPTZ", "TIMESTAMPLTZ") if hasattr(_T, n))
+_TIMESTAMP_KINDS = ("timestamp", "timestamptz")
+
+
+def _temporal_kind(data_type, dialect: str | None) -> str | None:
+    """"date" for a DATE; "timestamp" for a naive timestamp of any precision and "timestamptz" for
+    one that is zone-aware, kept apart because a naive value against a zone-aware column reads in
+    the session's zone (`_ISO_DATES_READ_AS_DATES`); "time" for a time of day; else None."""
+    try:
+        built = data_type if isinstance(data_type, exp.DataType) else exp.DataType.build(
+            str(data_type), dialect=dialect, udt=True)
+    except (SqlglotError, ValueError):
+        return None
+    if built.is_type(_T.DATE, _T.DATE32):
+        return "date"
+    if built.is_type(*_NAIVE_TIMESTAMPS):
+        return "timestamp"
+    if built.is_type(*_ZONED_TIMESTAMPS):
+        return "timestamptz"
+    return "time" if built.is_type(*exp.DataType.TEMPORAL_TYPES) else None
+
+
+def _written_as(node: exp.Expression, dialect: str | None) -> str:
+    """A constant as the caller wrote it, for the sentence naming it; sqlglot prints no JSON union
+    path for DuckDB, and a sentence is no reason to fail the decision."""
+    for rendering in (dialect, None):
+        try:
+            return node.sql(dialect=rendering)
+        except (ValueError, SqlglotError):
+            continue
+    return "a constant that could not be printed"
+
+
+def _opaque_constant(node: exp.Expression) -> bool:
+    """A constant whose value the scan cannot read as a plain string (fix round 3): any leaf that
+    carries text and is not a plain literal, a name or a keyword -- sqlglot's E'..' (ByteString),
+    N'..' (National), $$..$$ (RawString), a JSON path key, and any type a later sqlglot adds -- and
+    every parameter or placeholder, whose value is not in the statement at all. Found by what it
+    is not, so a new kind of constant fails closed rather than slipping past as no value."""
+    if isinstance(node, (exp.Parameter, exp.Placeholder, exp.SessionParameter)):
+        return True
+    if isinstance(node, (exp.Literal, exp.Identifier, exp.Var)):
+        return False
+    values = node.args.values()
+    if any(isinstance(v, exp.Expression)
+           or (isinstance(v, list) and any(isinstance(x, exp.Expression) for x in v)) for v in values):
+        return False
+    return any(isinstance(v, str) for v in values)
+
+
+def _is_condition(node: exp.Expression) -> bool:
+    """Whether the node is a whole condition, or one of its conjuncts: a filter's own truth value."""
+    child, parent = node, node.parent
+    while isinstance(parent, (exp.And, exp.Paren)):
+        child, parent = parent, parent.parent
+    if isinstance(parent, (exp.Where, exp.Having, exp.Qualify)):
+        return True
+    return isinstance(parent, exp.Join) and child.arg_key == "on"
+
+
+def _numeric(node: exp.Expression | None) -> float | None:
+    if isinstance(node, exp.Literal) and not node.is_string:
+        try:
+            return float(node.this)
+        except ValueError:
+            return None
+    return None
+
+
+_HOLDS = {exp.EQ: lambda a, b: a == b, exp.NEQ: lambda a, b: a != b, exp.GT: lambda a, b: a > b,
+          exp.GTE: lambda a, b: a >= b, exp.LT: lambda a, b: a < b, exp.LTE: lambda a, b: a <= b}
+
+
+def _never_true(ast: exp.Expression, render_as: str | None) -> str | None:
+    """The first predicate that can never hold, as written: the model's way of saying "no answer" in
+    SQL (`WHERE 1 = 0`), a comparison with NULL, or a LIMIT of nothing. An empty result there says
+    nothing about the data. Read conservatively: such a predicate under an OR counts too, and so
+    does one in the projection, which an alias can carry into a filter (fix round 2)."""
+    for node in ast.find_all(exp.Boolean, exp.Null, exp.Literal, exp.Limit, exp.Fetch,
+                             *_EQUALITIES, *_RANGES):
+        if isinstance(node, (exp.Limit, exp.Fetch)):
+            count = node.args.get("count") if isinstance(node, exp.Fetch) else node.expression
+            if _numeric(count) == 0:
+                return _written_as(node, render_as).strip()
+            continue
+        if isinstance(node, (exp.Boolean, exp.Null, exp.Literal)):
+            false = ((isinstance(node, exp.Boolean) and not node.this)
+                     or isinstance(node, exp.Null) or _numeric(node) == 0)
+            if false and _is_condition(node):
+                return _written_as(node, render_as)
+            continue
+        left, right = node.left, node.right
+        if not isinstance(node, (exp.NullSafeEQ, exp.NullSafeNEQ)) and (
+                isinstance(left, exp.Null) or isinstance(right, exp.Null)):
+            return _written_as(node, render_as)
+        a, b = _numeric(left), _numeric(right)
+        if a is not None and b is not None and type(node) in _HOLDS and not _HOLDS[type(node)](a, b):
+            return _written_as(node, render_as)
+    return None
+
+
+def ground_values(
+    ast: exp.Expression,
+    visible: dict[str, set[str]],
+    values,
+    masks: Callable[[str, str], bool] | None = None,
+    dialect: str | None = None,
+    types: dict[str, dict[str, str]] | None = None,
+    render_as: str | None = None,
+    row_filtered: set[str] | None = None,
+) -> ValueGrounding:
+    """Every string literal of the statement, wherever it sits, each with what checked it (M146).
+
+    GROUNDED and ABSENT only where an equality or IN list compares it with a column the resolver
+    places on an indexed base column -- `check_values`'s own resolver (M141, M174), so a CTE that
+    renames by position is read as the engine reads it -- and that column is neither masked for
+    this identity nor on a table it reads through a row filter. Neither is ever looked up: "does
+    it exist" is what a mask withholds, and the index is built without the row filter (M5), so on
+    such a table it would answer for rows the caller cannot read -- a value present only in hidden
+    rows read GROUNDED and its empty result was answered, an absent guess read ABSENT, a membership
+    test through `<>` (Codex's review of ui-36). `row_filtered` is folded as `check_values` folds
+    it (`names_one_object`). TYPED only where a date-only ISO string or a DATE literal is directly
+    compared with bare columns all proven DATE (`_ISO_DATES_READ_AS_DATES`, `types`), or a
+    well-formed interval with a bare date or time column. UNCHECKED everywhere else: a pattern, a
+    text range, a date against anything but a proven DATE, another typed literal, a value compared
+    with an expression or with nothing, a column the resolver cannot place, one with no indexed
+    values, or no index at all (`values` None).
+
+    `dialect` resolves names, as `check_values` is given the target; `render_as` writes the
+    filters and the never-true predicate in the dialect the caller is shown (the plan's).
+    """
+    resolve = _resolver(ast, visible, dialect)
+    dates = (dialect or "").lower() in _ISO_DATES_READ_AS_DATES
+    render_as = dialect if render_as is None else render_as
+    hidden_rows = row_filtered or set()
+
+    def kind(table: str, name: str) -> str | None:
+        declared = (types or {}).get(table, {}).get(name)
+        return None if declared is None else _temporal_kind(declared, dialect)
+
+    placements: dict[int, tuple[str, str] | None] = {}  # an IN list's column is placed once
+
+    def place(column: exp.Column) -> tuple[str, str] | None:
+        if id(column) not in placements:
+            placements[id(column)] = resolve(column)
+        return placements[id(column)]
+
+    def withheld(table: str, name: str) -> str | None:
+        """Why this column's values may not be consulted for this identity, or None."""
+        if names_one_object(table, hidden_rows):
+            return "row_filtered"
+        if masks is not None and masks(table, name):
+            return "masked"
+        return None
+
+    def against(other: exp.Expression, text: str, ranged: bool) -> tuple[str, str, str | None]:
+        if not isinstance(other, exp.Column):
+            return UNCHECKED, "not_a_column", None
+        placed = place(other)
+        if placed is None:
+            return UNCHECKED, "unresolved", None
+        table, name = placed
+        column = f"{table}.{name}"
+        why = withheld(table, name)
+        if why is not None:
+            return UNCHECKED, why, column
+        held = kind(table, name)
+        if dates and _iso_date(text):
+            if held == "date":
+                return TYPED, "", column
+            if held in (*_TIMESTAMP_KINDS, "time"):
+                return UNCHECKED, "date_on_time", column
+        moment = _moment(text) if dates else None
+        if moment is not None and held in (*_TIMESTAMP_KINDS, "date", "time"):
+            if held not in _TIMESTAMP_KINDS:
+                return UNCHECKED, "not_on_a_timestamp_column", column
+            if not ranged:
+                return UNCHECKED, "timestamp_equality", column
+            return (TYPED, "", column) if held == moment else (UNCHECKED, "zone_mismatch", column)
+        if ranged:
+            return UNCHECKED, "range", column
+        if values is None or not values.has(table, name):
+            return UNCHECKED, "not_indexed", column
+        return (GROUNDED if values.contains(table, name, text) else ABSENT), "", column
+
+    def compared_with(node: exp.Expression) -> list | None:
+        """The operands a node is directly compared with: the other side, the bounds of a BETWEEN
+        it is the subject of (`DATE '2024-03-03' BETWEEN s AND e`), or the list of an IN."""
+        parent = node.parent
+        if isinstance(parent, _EQUALITIES + _RANGES):
+            return [parent.right if parent.left is node else parent.left]
+        if isinstance(parent, exp.Between):
+            return ([parent.args.get("low"), parent.args.get("high")] if parent.this is node
+                    else [parent.this])
+        if isinstance(parent, exp.In):
+            return list(parent.expressions) if parent.this is node else [parent.this]
+        return None
+
+    def as_bound(node: exp.Expression, want: str) -> tuple[str, str, str | None]:
+        """A date-only value (`want` "date") or a full timestamp ("timestamp" naive, "timestamptz"
+        with an offset) is a bound only where every operand it is directly compared with is a bare
+        column placed on a column declared that kind -- and a timestamp only as a range bound:
+        `ts = '2024-03-03 00:00:00'` is a disguised day filter (fix round 3). Anything else is
+        unchecked."""
+        unproven = "not_on_a_date_column" if want == "date" else "not_on_a_timestamp_column"
+        partners = compared_with(node) or []
+        placed = [place(p) if isinstance(p, exp.Column) else None for p in partners]
+        if not partners or None in placed:
+            return UNCHECKED, unproven, None
+        for spot in placed:
+            why = withheld(*spot)
+            if why is not None:
+                return UNCHECKED, why, f"{spot[0]}.{spot[1]}"
+        column = f"{placed[0][0]}.{placed[0][1]}"
+        if want == "date":
+            timed = next((s for s in placed if kind(*s) in (*_TIMESTAMP_KINDS, "time")), None)
+            if timed is not None:
+                return UNCHECKED, "date_on_time", f"{timed[0]}.{timed[1]}"
+        else:
+            if not isinstance(node.parent, _RANGES + (exp.Between,)):
+                return UNCHECKED, "timestamp_equality", column
+            if all(kind(*s) in _TIMESTAMP_KINDS for s in placed) and any(kind(*s) != want
+                                                                        for s in placed):
+                return UNCHECKED, "zone_mismatch", column
+        if dates and all(kind(*s) == want for s in placed):
+            return TYPED, "", column
+        return UNCHECKED, unproven, column
+
+    def interval(literal: exp.Literal, text: str) -> tuple[str, str, str | None]:
+        """A well-formed interval is a bound where the arithmetic holding it is compared with a
+        bare date or time column (`filed > current_date - INTERVAL '30 days'`)."""
+        child, parent = literal.parent, literal.parent.parent
+        while parent is not None and not isinstance(parent, _EQUALITIES + _RANGES + (exp.Between,)):
+            if not isinstance(parent, (exp.Add, exp.Sub, exp.Paren, exp.Cast)):
+                return UNCHECKED, "interval", None
+            child, parent = parent, parent.parent
+        partners = compared_with(child) if parent is not None else None
+        spot = (place(partners[0]) if partners and len(partners) == 1
+                and isinstance(partners[0], exp.Column) else None)
+        if spot is None:
+            return UNCHECKED, "interval", None
+        column = f"{spot[0]}.{spot[1]}"
+        why = withheld(*spot)
+        if why is not None:
+            return UNCHECKED, why, column
+        if dates and _INTERVAL_TEXT.fullmatch(text) and kind(*spot) in ("date", *_TIMESTAMP_KINDS,
+                                                                         "time"):
+            return TYPED, "", column
+        return UNCHECKED, "interval", column
+
+    def classify(literal: exp.Literal) -> tuple[str, str, str | None]:
+        parent, text = literal.parent, literal.this
+        if isinstance(parent, exp.Cast) and parent.this is literal:
+            to = _temporal_kind(parent.to, dialect)
+            if to == "date":
+                return as_bound(parent, "date") if _iso_date(text) else (UNCHECKED, "not_a_date", None)
+            if to in _TIMESTAMP_KINDS:
+                moment = _moment(text)
+                if moment is None:
+                    return UNCHECKED, "not_a_timestamp", None
+                # TIMESTAMPTZ '..' of naive text takes the session's zone, and TIMESTAMP '..+02'
+                # drops or shifts an offset: the text's zone-awareness must be the type's.
+                return as_bound(parent, to) if moment == to else (UNCHECKED, "zone_mismatch", None)
+            return UNCHECKED, "typed_other", None
+        if isinstance(parent, exp.Interval) and parent.this is literal:
+            return interval(literal, text)
+        if isinstance(parent, _EQUALITIES + _RANGES):
+            other = parent.right if parent.left is literal else parent.left
+            return against(other, text, isinstance(parent, _RANGES))
+        if isinstance(parent, exp.In) and any(e is literal for e in parent.expressions):
+            return against(parent.this, text, False)
+        if isinstance(parent, exp.Between) and parent.this is not literal:
+            return against(parent.this, text, True)
+        if isinstance(parent, (exp.In, exp.Between)) and _iso_date(text):
+            return as_bound(literal, "date")  # a date as the subject: read its bounds or its list
+        if isinstance(parent, (exp.In, exp.Between)) and _moment(text) is not None:
+            return as_bound(literal, _moment(text))
+        if isinstance(parent, _PATTERNS):
+            other = parent.expression if parent.this is literal else parent.this
+            placed = place(other) if isinstance(other, exp.Column) else None
+            column = f"{placed[0]}.{placed[1]}" if placed else None
+            why = withheld(*placed) if placed else None
+            return UNCHECKED, why or "pattern", column
+        return UNCHECKED, "not_compared", None
+
+    found = []
+    for node in ast.walk(bfs=False):  # as written, so a decline names them in order
+        if node.find_ancestor(exp.JSONPath) is not None:
+            continue  # a part of a path, which is classified whole
+        if isinstance(node, (exp.JSONPath, exp.JSONPathPart)):
+            # A JSON path is a constant whatever its leaves (fix round 4): a root, an integer
+            # subscript, a wildcard, a slice or a union carry no text, and `(j->'$[9]') IS NOT NULL`
+            # over `[42]` passed with no value to name. The whole path is one unchecked value.
+            found.append(FilterValue(_written_as(node, render_as), UNCHECKED, "json_path", None))
+        elif isinstance(node, exp.Literal) and node.is_string:
+            outcome, why, column = classify(node)
+            found.append(FilterValue(node.this, outcome, why, column))
+        elif _opaque_constant(node):
+            found.append(FilterValue(_written_as(node, render_as), UNCHECKED, "not_a_plain_string",
+                                     None))
+    filters: list[str] = []
+    clauses = (exp.Where, exp.Having, exp.Qualify)
+    for clause in ast.find_all(*clauses):
+        # One inside another's condition (a subquery's WHERE in an IN) is written out by it.
+        if clause.find_ancestor(*clauses) is None:
+            text = _written_as(clause.this, render_as)
+            if text not in filters:
+                filters.append(text)
+    return ValueGrounding(tuple(found), _never_true(ast, render_as), tuple(filters),
+                          _null_as_written(ast, render_as))
+
+
+def _null_as_written(ast: exp.Expression, render_as: str | None) -> str | None:
+    """The first output column of the result's queries that is NULL as written, rendered."""
+    for query in _result_queries(ast):
+        for projection in query.expressions if isinstance(query, exp.Select) else ():
+            inner = projection.unalias()
+            while isinstance(inner, (exp.Cast, exp.Paren)):
+                inner = inner.this
+            if isinstance(inner, exp.Null):
+                return _written_as(projection, render_as)
     return None

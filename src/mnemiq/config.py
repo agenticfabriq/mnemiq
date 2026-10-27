@@ -178,7 +178,7 @@ class Settings(BaseSettings):
     verify_override: str | None = Field(default=None, validation_alias="MNEMIQ_VERIFY",
                                         description="verify override: unset=mode defaults, 0=force off, 1=force full")
     verify_threshold: float = Field(default=0.5, ge=0.0, le=1.0, description="judge-confidence defer cutoff")
-    verify_sanity: bool = Field(default=True, description="deterministic empty/null defer layer")
+    verify_sanity: bool = Field(default=True, description="deterministic empty/null layer, in every mode a verifier runs in, on the product and eval paths alike: declines an empty or null result unless every string value it filters on is grounded in the value index (M146); 0 answers every such result, the judge kept where a mode runs one")
     verify_grounding: bool = Field(default=False, description="question-literal grounding layer (opt-in)")
     verify_judge: bool = Field(default=False, description="LLM judge layer (eval path)")
     verify_fail_closed: bool = Field(default=True, description="an unreachable judge stops the answer (recorded as a failure, not a deferral) instead of returning it unchecked; 0 restores the fail-open behaviour")

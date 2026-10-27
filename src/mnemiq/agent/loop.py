@@ -40,6 +40,7 @@ from mnemiq.generate.generator import Generator, StrategyGenerator
 from mnemiq.generate.plan_query import Deferred, Feedback, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
+from mnemiq.verify.sanity import answered_note, sanity_check
 
 logger = logging.getLogger(__name__)
 
@@ -624,7 +625,7 @@ class Agent:
             chosen = majority  # no selector wired: Plan 12's vote, byte-for-byte
 
         winner = groups[chosen]
-        approved, table = executed[winner[0]]
+        approved, table = self._representative(packet, [executed[i] for i in winner])
         agreement = len(winner) / len(executed)
 
         with step(emit, Stage.VERIFY):
@@ -655,6 +656,20 @@ class Agent:
             verify_confidence=base.verify_confidence,
             verify_layer=base.verify_layer,
         )
+
+    def _representative(self, packet: ContextPacket, members: list):
+        """The cluster member whose plan stands for it. The results agree, so for most clusters any
+        member does and the first is kept, as before. An empty cluster is the exception (M146):
+        empty results with the same columns cluster together, so one candidate may rest on a
+        misspelled value and another on grounded ones, and which came first decided the answer.
+        The first member the sanity layer would pass stands for it; where none would, the first,
+        which the verifier then declines. Without a sanity layer, the first."""
+        if self.verifier is None or not getattr(self.verifier, "sanity", False):
+            return members[0]
+        for approved, table in members:
+            if sanity_check(packet.question, table, getattr(approved, "value_grounding", None)) is None:
+                return approved, table
+        return members[0]
 
     def _verified(self, packet: ContextPacket, approved: Approved, table):
         """The verifier's read, or None when none is wired. Returns (deferral, verdict).
@@ -726,6 +741,9 @@ class Agent:
         # the database, said once at boot, not on every answer it will ever give.
         answer = append_notes(
             answer,
+            # First: what the answer is a "none" of (M146). Whatever the verifier did with it, an
+            # empty result that is answered says so in the engine's words, not only the model's.
+            answered_note(table, getattr(approved, "value_grounding", None)),
             disclosure_sentence(trace.narrowed),
             lineage_disclosure_sentence(trace.lineage_completeness,
                                         list(trace.lineage_unresolved),

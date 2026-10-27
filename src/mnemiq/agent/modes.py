@@ -25,8 +25,8 @@ class Mode:
     verify: str = "sanity"  # result-verifier level: "off" | "sanity" | "full" (sanity+judge)
 
 
-# Verify levels: sanity (deterministic empty/null net) in every mode; the LLM judge only
-# in `deep`. MNEMIQ_VERIFY=0 forces off (byte-for-byte); =1 forces full everywhere.
+# Verify levels: sanity (deterministic empty/null net) in every mode; the LLM judge in
+# `thinking` and `deep`. MNEMIQ_VERIFY=0 forces off (byte-for-byte); =1 forces full everywhere.
 MODES: dict[str, Mode] = {
     "instant": Mode("instant", candidates=1, corrector=False, judge=False,
                     min_agreement=None, budget_s=30.0, max_attempts=1, verify="sanity"),
@@ -38,9 +38,12 @@ MODES: dict[str, Mode] = {
     # points of EX buys halving the wrong-rate, and being wrong is the expensive
     # failure for this product. Sanity stays in front of the judge rather than being
     # replaced by it: `Verifier.verify` returns on the first layer that produces a
-    # verdict, so the cases sanity defers never reach the judge and 17% of answers
-    # skip the LLM call. `instant` keeps `sanity` -- a mode whose contract is
-    # "cheapest, no retries" cannot also buy an LLM call per answer.
+    # verdict, so the cases sanity defers never reach the judge -- on that replay 33 of
+    # 437 executed answers (7.6%) skip the LLM call. (Quoted here as 17% until M146: that
+    # counted 83 deferrals, 50 of them records that never executed and end before the
+    # verifier in the product.) Since M146 an empty result whose filter values are all
+    # grounded goes on to the judge, so fewer skip it. `instant` keeps `sanity` -- a mode
+    # whose contract is "cheapest, no retries" cannot also buy an LLM call per answer.
     # `MNEMIQ_VERIFY=0` forces every mode off, byte for byte, for a deployment that
     # wants the old behaviour.
     "thinking": Mode("thinking", candidates=1, corrector=True, judge=False,
