@@ -10,6 +10,13 @@ from mnemiq.verify.verifier import Verifier
 
 _ANSWERABLE = {"correct", "correct_facts", "wrong", "deferred_wrongly", "error"}
 
+# Printed beside every row the sanity layer is in. This replay holds no value index, so it builds
+# each `Approved` without a value grounding, and its sanity layer declines every empty or null
+# result -- the rule before M146. The product answers one whose filter values are all grounded,
+# so a sanity row here counts as catches some results the product would answer.
+SANITY_ROW_LABEL = ("(sanity here is the rule before M146: no value index, so every empty or null "
+                    "result defers; the product answers one whose filter values are grounded)")
+
 
 def _table(rows: list[dict]) -> pa.Table:
     return pa.Table.from_pylist(rows) if rows else pa.table({})

@@ -106,6 +106,31 @@ def test_a_case_written_twice_is_replayed_once(tmp_path):
     assert by_id["c1"]["sql"] == "s2"
 
 
+def test_the_replay_labels_its_sanity_rows_as_the_rule_before_m146(tmp_path, monkeypatch, capsys):
+    """The replay holds no value index, so its sanity layer declines every empty or null result
+    -- the rule before M146 -- where the product answers one whose filter values are grounded. A
+    comment saying so stops no one quoting the printed row as the product's trade; the row says so
+    itself, in the deterministic run and beside the judge sweep."""
+    import json
+    import pathlib
+    import sys
+
+    scripts = str(pathlib.Path(__file__).resolve().parents[1] / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import run_verify_replay as rvr
+    from mnemiq.eval.verify_replay import SANITY_ROW_LABEL
+
+    p = tmp_path / "run.jsonl"
+    p.write_text(json.dumps({"case_id": "c1", "outcome": "wrong", "question": "q",
+                             "sql": "SELECT n FROM t", "engine_rows": []}) + "\n")
+    monkeypatch.setattr(sys, "argv", ["run_verify_replay.py", str(p)])
+    assert rvr.main() == 0
+    out = capsys.readouterr().out
+    assert "M146" in SANITY_ROW_LABEL and "value index" in SANITY_ROW_LABEL
+    assert out.count(SANITY_ROW_LABEL) == 2  # the two rows the sanity layer is in
+
+
 def test_a_row_without_a_case_id_is_still_replayed(tmp_path):
     # Older checkpoints and hand-made fixtures may carry no case_id. Dropping those rows would
     # silently shrink a run rather than dedupe it, so they are kept as distinct records.

@@ -24,8 +24,8 @@ import time
 
 from mnemiq.config import Settings
 from mnemiq.eval.bird_runner import enrich_bird_db
-from mnemiq.eval.verify_replay import (_ANSWERABLE, judge_scores, layer_defers, load_records,
-                                       replay, sweep)
+from mnemiq.eval.verify_replay import (_ANSWERABLE, SANITY_ROW_LABEL, judge_scores, layer_defers,
+                                       load_records, replay, sweep)
 from mnemiq.llm.client import LLMClient
 from mnemiq.semantic.cards import build_cards
 from mnemiq.verify.judge import JudgeRead, SemanticJudge
@@ -206,7 +206,8 @@ def main() -> int:
         for name, vf in (("sanity+grounding", Verifier(grounding=True)),
                          ("sanity-only (default)", Verifier()),
                          ("grounding-only", Verifier(sanity=False, grounding=True))):
-            print(f"\n== {name} ==\n{_line(replay(records, vf))}")
+            label = f"\n  {SANITY_ROW_LABEL}" if vf.sanity else ""
+            print(f"\n== {name} ==\n{_line(replay(records, vf))}{label}")
         return 0
 
     settings = Settings.from_env()
@@ -275,8 +276,8 @@ def main() -> int:
         # "sanity-only", which is a SEPARATE run of this script -- those rows are not printed
         # above, because `--judge` takes the other branch.
         sanity = layer_defers(records, Verifier())
-        print(f"\nsanity layer alone defers {sum(sanity)} of {len(sanity)} answerable cases; "
-              "sweeping the judge BESIDE it (either layer defers):")
+        print(f"\nsanity layer alone defers {sum(sanity)} of {len(sanity)} answerable cases "
+              f"{SANITY_ROW_LABEL}; sweeping the judge BESIDE it (either layer defers):")
         for row in sweep(records, scores, _THRESHOLDS, also_defer=sanity):
             print(f"thr {row['threshold']:.1f}:{_line(row)}")
     return 0
