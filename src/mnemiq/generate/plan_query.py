@@ -13,7 +13,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.fanout_check import guard_on, key_facts
 from mnemiq.sql.views import inventory_for
 from mnemiq.sql.policy import build_access_policy
-from mnemiq.sql.schema import visible_schema
+from mnemiq.sql.schema import column_types, visible_schema
 from mnemiq.sql.verdict import REPAIRABLE, Approved, Refusal, RefusalCode
 
 logger = logging.getLogger(__name__)
@@ -119,6 +119,8 @@ def plan_query(
     # M109: key uniqueness from the profile, read once per question. None leaves the check off;
     # a `guard_fanout` of None is auto, resolved against this snapshot (`guard_on`).
     keys = key_facts(snapshot) if guard_on(guard_fanout, snapshot) else None
+    # M146: the declared types, so a date compared with a date column is read as a bound.
+    types = column_types(snapshot)
     if not views.available and policy.row_filters:
         # Knowable before the first `generator.propose`, and unfixable by rephrasing: the refusal
         # fires ahead of the AST walk, so all `max_attempts` iterations would propose, be refused
@@ -243,7 +245,7 @@ def plan_query(
 
         verdict = decide(
             proposal.sql, visible, adapter=adapter, dialect=dialect, target=target,
-            values=values, policy=policy, registry=registry, views=views, keys=keys
+            values=values, policy=policy, registry=registry, views=views, keys=keys, types=types
         )
 
         corrected = False
@@ -265,6 +267,7 @@ def plan_query(
                 registry=registry,
                 views=views,
                 keys=keys,
+                types=types,
             )
             # Only when the repair is what carried it: a correction that still refuses is not
             # a corrected plan, it is a failed one, and reporting it would overstate the work.

@@ -129,6 +129,10 @@ def layer_defers(records: list[dict], verifier: Verifier) -> list[bool]:
     out: list[bool] = []
     for r in _answerable(records):
         packet = ContextPacket(question=r["question"], cards=[], grant_fingerprint="", enrichment_version=None)
+        # No decider ran, so no value grounding is recorded (`value_grounding` None), and an empty
+        # or null result defers as the no-rows rule did. Since M146 the product answers one whose
+        # filter values are all grounded, which this replay -- holding no value index -- cannot
+        # see: its sanity row counts those catches as the rule's.
         approved = Approved(plan_sql=r.get("sql") or "", target_sql=r.get("sql") or "")
         out.append(verifier.verify(packet, approved, _table(r.get("engine_rows") or [])).defer)
     return out

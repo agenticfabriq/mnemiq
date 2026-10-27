@@ -1,0 +1,335 @@
+"""M146: what an empty result rests on, one string value at a time.
+
+An empty result is answered only when every string value it filters on is grounded in the value
+index. That is an allow-list: a value nothing could check declines it exactly as one the index
+says is absent, because a misspelled value on a column the index does not cover is the wrong
+"none" the no-rows rule existed to stop, and it is unknown rather than absent. So the outcomes
+are kept apart -- grounded, absent, unchecked, and typed (a well-formed date or number, which has
+no spelling to check) -- and only the reason a value is unchecked is told apart further, for the
+sentence that names it. The column a value meets is placed by `check_values`'s own resolver, so a
+CTE's column list renaming by position is read as the engine reads it.
+"""
+
+from __future__ import annotations
+
+import pyarrow as pa
+import sqlglot
+
+from mnemiq.sql.values_check import ABSENT, GROUNDED, TYPED, UNCHECKED, ground_values
+from mnemiq.verify.sanity import answered_note, sanity_check
+
+
+class _Values:
+    """The value index's read side, recording what it was asked."""
+
+    def __init__(self, columns: dict[tuple[str, str], set[str]]):
+        self.columns = columns
+        self.asked: list[tuple[str, str, str]] = []
+
+    def has(self, table, column):
+        return (table, column) in self.columns
+
+    def contains(self, table, column, literal):
+        self.asked.append((table, column, literal))
+        return literal in self.columns.get((table, column), set())
+
+
+_VISIBLE = {"claim": {"id", "region", "status", "amount", "adjuster", "filed", "note"},
+            "office": {"id", "region", "city"}}
+_TYPES = {"claim": {"id": "INTEGER", "region": "VARCHAR", "status": "VARCHAR",
+                    "amount": "DOUBLE", "adjuster": "VARCHAR", "filed": "DATE", "note": "VARCHAR"},
+          "office": {"id": "INTEGER", "region": "VARCHAR", "city": "VARCHAR"}}
+
+
+def _values() -> _Values:
+    return _Values({("claim", "region"): {"north", "south", "east", "west"},
+                    ("claim", "status"): {"open", "closed"},
+                    ("office", "region"): {"north", "south"}})
+
+
+def _ground(sql: str, dialect: str = "duckdb", values=None, masks=None, types=_TYPES):
+    return ground_values(sqlglot.parse_one(sql, read=dialect), _VISIBLE,
+                         _values() if values is None else values, masks=masks, dialect=dialect,
+                         types=types)
+
+
+def _read(sql: str, **kw) -> list[tuple]:
+    return [(v.text, v.outcome, v.why, v.column) for v in _ground(sql, **kw).values]
+
+
+# --- one literal class at a time ------------------------------------------------------------------
+
+def test_a_value_its_indexed_column_holds_is_grounded():
+    assert _read("SELECT id FROM claim WHERE status = 'open'") == [
+        ("open", GROUNDED, "", "claim.status")]
+
+
+def test_each_member_of_an_in_list_is_grounded_on_its_own():
+    assert _read("SELECT id FROM claim WHERE region IN ('north', 'nrth')") == [
+        ("north", GROUNDED, "", "claim.region"), ("nrth", ABSENT, "", "claim.region")]
+
+
+def test_a_value_its_indexed_column_lacks_is_absent_not_unchecked():
+    # `<>` is not refused before the run, so an absent value can reach an empty result there.
+    assert _read("SELECT id FROM claim WHERE status <> 'opne'") == [
+        ("opne", ABSENT, "", "claim.status")]
+
+
+def test_a_value_on_an_unindexed_column_is_unchecked_not_absent():
+    assert _read("SELECT id FROM claim WHERE adjuster = 'agnet_0042'") == [
+        ("agnet_0042", UNCHECKED, "not_indexed", "claim.adjuster")]
+
+
+def test_a_masked_column_is_unchecked_and_its_values_are_never_consulted():
+    values = _values()
+    read = _read("SELECT id FROM claim WHERE status = 'open'", values=values,
+                 masks=lambda table, column: column == "status")
+    assert read == [("open", UNCHECKED, "masked", "claim.status")]
+    assert values.asked == []  # "does it exist" is what the mask withholds
+
+
+def test_a_pattern_is_unchecked():
+    assert _read("SELECT id FROM claim WHERE adjuster LIKE 'agn%'") == [
+        ("agn%", UNCHECKED, "pattern", "claim.adjuster")]
+
+
+def test_a_text_range_is_unchecked():
+    assert _read("SELECT id FROM claim WHERE status BETWEEN 'a' AND 'm'") == [
+        ("a", UNCHECKED, "range", "claim.status"), ("m", UNCHECKED, "range", "claim.status")]
+
+
+def test_a_value_compared_with_an_expression_is_unchecked():
+    assert _read("SELECT id FROM claim WHERE lower(status) = 'open'") == [
+        ("open", UNCHECKED, "not_a_column", None)]
+
+
+def test_a_value_compared_with_nothing_is_unchecked():
+    assert _read("SELECT id FROM claim WHERE concat(note, 'x') IS NOT NULL") == [
+        ("x", UNCHECKED, "not_compared", None)]
+
+
+def test_a_column_the_resolver_cannot_place_leaves_its_value_unchecked():
+    # `region` is on both sources: ambiguous, so no column is checked.
+    assert _read("SELECT 1 FROM claim, office WHERE region = 'north'") == [
+        ("north", UNCHECKED, "unresolved", None)]
+
+
+def test_with_no_value_index_every_string_value_is_unchecked():
+    read = [(v.text, v.outcome) for v in ground_values(
+        sqlglot.parse_one("SELECT id FROM claim WHERE status = 'open'", read="duckdb"), _VISIBLE,
+        None, dialect="duckdb", types=_TYPES).values]
+    assert read == [("open", UNCHECKED)]
+
+
+def test_numbers_need_no_grounding():
+    g = _ground("SELECT id FROM claim WHERE amount > 1000000 AND id = 5")
+    assert g.values == () and g.never_true is None
+
+
+# --- dates: a well-formed date read as one is a bound, like a number ------------------------------
+
+def test_a_typed_date_literal_needs_no_grounding():
+    assert _read("SELECT id FROM claim WHERE filed > DATE '2030-01-01'") == [
+        ("2030-01-01", TYPED, "", None)]
+
+
+def test_an_iso_date_against_a_date_column_needs_no_grounding():
+    assert _read("SELECT id FROM claim WHERE filed BETWEEN '2031-01-01' AND '2031-12-31'") == [
+        ("2031-01-01", TYPED, "", "claim.filed"), ("2031-12-31", TYPED, "", "claim.filed")]
+    assert _read("SELECT id FROM claim WHERE filed = '2031-01-01'") == [
+        ("2031-01-01", TYPED, "", "claim.filed")]
+
+
+def test_a_malformed_date_is_unchecked_since_an_engine_comparing_no_row_never_reads_it():
+    # Measured on DuckDB 1.5.4: `d = 'garbage'` and even `DATE 'garbage' < d` return no rows,
+    # without an error, when no row reaches the comparison -- the empty case exactly.
+    assert _read("SELECT id FROM claim WHERE filed > '2031/13/45'")[0][1] == UNCHECKED
+    assert _read("SELECT id FROM claim WHERE filed > CAST('garbage' AS DATE)")[0][1] == UNCHECKED
+
+
+def test_without_column_types_a_bare_date_string_is_a_text_range():
+    assert _read("SELECT id FROM claim WHERE filed >= '2031-01-01'", types=None) == [
+        ("2031-01-01", UNCHECKED, "range", "claim.filed")]
+
+
+def test_on_sqlite_a_date_column_holds_text_so_a_date_string_is_a_text_range():
+    assert _read("SELECT id FROM claim WHERE filed >= '2031-01-01'", dialect="sqlite") == [
+        ("2031-01-01", UNCHECKED, "range", "claim.filed")]
+
+
+def test_an_interval_needs_no_grounding():
+    assert [o for _, o, _, _ in _read(
+        "SELECT id FROM claim WHERE filed > current_date - INTERVAL '30 days'")] == [TYPED]
+
+
+# --- a predicate that can never hold -------------------------------------------------------------
+
+def test_a_predicate_that_can_never_hold_is_recorded():
+    assert _ground("SELECT id FROM claim WHERE 1 = 0").never_true == "1 = 0"
+    assert _ground("SELECT id FROM claim WHERE FALSE").never_true == "FALSE"
+    assert _ground("SELECT id FROM claim WHERE status = NULL").never_true == "status = NULL"
+    assert _ground("SELECT id FROM claim LIMIT 0").never_true == "LIMIT 0"
+    assert _ground("SELECT id FROM claim WHERE 1 = 1 AND amount > 5").never_true is None
+    assert _ground("SELECT 1 = 0 AS flag FROM claim").never_true is None  # output, not a filter
+
+
+# --- the output removes no rows; the scope's resolver places the column ---------------------------
+
+def test_values_in_the_output_are_marked_since_they_remove_no_rows():
+    g = _ground("SELECT CASE WHEN status = 'open' THEN 'Open' END AS s FROM claim "
+                "WHERE amount > 1000000000")
+    assert [(v.text, v.outcome, v.output) for v in g.values] == [
+        ("open", GROUNDED, True), ("Open", UNCHECKED, True)]
+    assert g.blocking(output=False) == []
+    assert [v.text for v in g.blocking(output=True)] == ["Open"]
+
+
+def test_a_subquerys_filter_inside_the_output_is_output_too():
+    g = _ground("SELECT id, (SELECT max(amount) FROM claim c2 WHERE c2.status = 'opne') AS m "
+                "FROM claim WHERE amount > 1000000000")
+    assert [(v.text, v.output) for v in g.values] == [("opne", True)]
+    assert g.filters == ("amount > 1000000000",)
+
+
+def test_a_cte_column_list_is_read_by_position_as_check_values_reads_it():
+    """`x.region` is the CTE's FIRST projection, `claim.status`: a resolver matching by name would
+    check 'open' against claim.region and call it absent."""
+    assert _read("WITH x(region, status) AS (SELECT status, region FROM claim) "
+                 "SELECT * FROM x WHERE x.region = 'open'") == [
+        ("open", GROUNDED, "", "claim.status")]
+
+
+def test_the_filters_are_rendered_as_asked():
+    g = _ground("SELECT id FROM claim WHERE status = 'open' AND amount > 1000000")
+    assert g.filters == ("status = 'open' AND amount > 1000000",)
+
+
+def test_a_filter_inside_another_is_written_out_by_it_and_a_ctes_is_its_own():
+    g = _ground("WITH big AS (SELECT id FROM claim WHERE amount > 9e9) SELECT id FROM big "
+                "WHERE id IN (SELECT id FROM claim WHERE status = 'open')")
+    assert g.filters == ("id IN (SELECT id FROM claim WHERE status = 'open')", "amount > 9e9")
+
+
+# --- the decider records it, on the statement as asked -------------------------------------------
+
+def test_the_decider_reads_the_statement_as_asked_never_the_policys_rewrite():
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.contract import Column, Snapshot
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.policy import build_access_policy
+
+    snap = Snapshot(version="v1", source_id="s", created_at="t", columns=[
+        Column(id=f"claim.{n}", object_id="claim", name=n) for n in ("id", "region", "status")])
+    grants = GrantSet(frozenset({"claim"}), row_filters={"claim": "region = 'north'"})
+    verdict = decide("SELECT id FROM claim WHERE status = 'open'",
+                     {"claim": {"id", "region", "status"}}, values=_values(),
+                     policy=build_access_policy(snap, grants), target="duckdb")
+    assert "north" in verdict.target_sql  # the control: the policy really applied
+    g = verdict.value_grounding
+    assert [(v.text, v.outcome) for v in g.values] == [("open", GROUNDED)]
+    assert g.filters == ("status = 'open'",)
+
+
+def test_a_walk_that_raises_costs_the_empty_answer_never_the_decision(monkeypatch):
+    import mnemiq.sql.decide as decide_mod
+
+    def _raises(*_a, **_k):
+        raise RuntimeError("a shape the walk did not expect")
+
+    monkeypatch.setattr(decide_mod, "ground_values", _raises)
+    verdict = decide_mod.decide("SELECT id FROM claim WHERE status = 'open'",
+                                {"claim": {"id", "status"}}, values=_values(), target="duckdb")
+    assert verdict.plan_sql and verdict.value_grounding is None
+    assert sanity_check("q", pa.table({"id": pa.array([], type=pa.int64())}),
+                        verdict.value_grounding).defer
+
+
+# --- the sanity rule on top of it ----------------------------------------------------------------
+
+_EMPTY = pa.table({"id": pa.array([], type=pa.int64())})
+
+
+def test_an_empty_result_whose_values_are_all_grounded_passes():
+    assert sanity_check("q", _EMPTY, _ground("SELECT id FROM claim WHERE status = 'open'")) is None
+
+
+def test_an_empty_result_on_numbers_alone_passes():
+    assert sanity_check("q", _EMPTY, _ground("SELECT id FROM claim WHERE amount > 9e9")) is None
+
+
+def test_an_empty_result_with_an_unchecked_value_defers_and_names_it():
+    v = sanity_check("q", _EMPTY, _ground("SELECT id FROM claim WHERE adjuster = 'agnet_0042' "
+                                          "AND status = 'open'"))
+    assert v is not None and v.defer and v.layer == "sanity" and v.confidence == 0.0
+    assert v.reason == ("No rows matched, and 'agnet_0042' could not be checked against "
+                        "claim.adjuster's known values, so I can't tell a true \"none\" from a "
+                        "misspelled value.")
+
+
+def test_values_sharing_a_reason_and_a_column_are_named_together():
+    v = sanity_check("q", _EMPTY, _ground("SELECT id FROM claim WHERE adjuster IN ('a1', 'a2') "
+                                          "AND lower(status) = 'x'"))
+    assert v.reason == ("No rows matched, and 'a1' and 'a2' could not be checked against "
+                        "claim.adjuster's known values; 'x', compared with an expression rather "
+                        "than a column, could not be checked, so I can't tell a true \"none\" from "
+                        "a misspelled value.")
+
+
+def test_an_empty_result_with_an_absent_value_defers_and_says_so():
+    v = sanity_check("q", _EMPTY, _ground("SELECT id FROM claim WHERE status <> 'opne'"))
+    assert v is not None and v.defer
+    assert "'opne' does not appear among claim.status's known values" in v.reason
+
+
+def test_an_empty_result_from_a_predicate_that_can_never_hold_defers():
+    v = sanity_check("q", _EMPTY, _ground("SELECT id FROM claim WHERE 1 = 0"))
+    assert v is not None and v.defer
+    assert v.reason == "No rows matched, because the query's filter can never be true (1 = 0)."
+
+
+def test_an_empty_result_ignores_values_in_the_output_and_a_null_does_not():
+    sql = "SELECT CASE WHEN status = 'open' THEN 'Open' END AS s FROM claim WHERE amount > 9e9"
+    assert sanity_check("q", _EMPTY, _ground(sql)) is None
+    v = sanity_check("q", pa.table({"s": [None]}), _ground(sql))
+    assert v is not None and v.defer and "'Open'" in v.reason
+
+
+def test_a_null_total_whose_values_are_grounded_passes_and_a_nan_does_not():
+    g = _ground("SELECT sum(amount) FROM claim WHERE status = 'open' AND amount > 9e9")
+    assert sanity_check("q", pa.table({"s": [None]}), g) is None
+    assert sanity_check("q", pa.table({"s": [None], "t": [None]}), g) is None  # several aggregates
+    assert sanity_check("q", pa.table({"s": [float("nan")]}), g).defer
+    # Several rows holding nothing is no aggregate over nothing: still declined.
+    assert sanity_check("q", pa.table({"s": [None, None]}), g).defer
+
+
+def test_a_null_the_query_selects_as_written_is_no_aggregate_over_nothing():
+    """Measured on the saved BIRD runs: `SELECT NULL, NULL` is a model saying "no answer" in SQL,
+    and with no value to ground it passed as one NULL row."""
+    row = pa.table({"a": [None], "b": [None]})
+    v = sanity_check("q", row, _ground("SELECT NULL, NULL LIMIT 1000"))
+    assert v is not None and v.defer
+    assert v.reason == ("The query produced an empty value, because it selects NULL as written "
+                        "(NULL), not a value from the data.")
+    v = sanity_check("q", row, _ground("SELECT max(amount), CAST(NULL AS INT) AS x FROM claim"))
+    assert v is not None and v.defer and "CAST(NULL AS INT) AS x" in v.reason
+
+
+def test_with_no_grounding_recorded_the_rules_are_as_before():
+    """`None` is "not evaluated" -- an `Approved` built outside the decider -- and declines."""
+    assert sanity_check("q", _EMPTY).reason == (
+        "The query returned no rows, so I can't answer this confidently.")
+    assert sanity_check("q", pa.table({"s": [None]})).reason == (
+        "The query produced an empty value, so I can't answer this confidently.")
+
+
+def test_the_answered_note_names_the_filters():
+    g = _ground("SELECT id FROM claim WHERE status = 'open' AND amount > 1000000")
+    assert answered_note(_EMPTY, g) == "No rows matched: status = 'open' AND amount > 1000000."
+    assert answered_note(_EMPTY, None) == "No rows matched."
+    assert answered_note(pa.table({"s": [None]}), g) == (
+        "The result holds no value: no rows matched (status = 'open' AND amount > 1000000), or "
+        "every row that matched holds none.")
+    assert answered_note(pa.table({"n": [3]}), g) == ""
+    # The query's own NULL, answered only with the layer off, describes no "none".
+    assert answered_note(pa.table({"s": [None]}), _ground("SELECT NULL AS s")) == ""

@@ -11,6 +11,16 @@ def schema_map(snapshot: Snapshot) -> dict[str, set[str]]:
     return tables
 
 
+def column_types(snapshot: Snapshot) -> dict[str, dict[str, str]]:
+    """Each column's declared type, by table, where the snapshot recorded one. Read by the decider
+    to tell a date compared with a date column from a text range (M146); never rendered."""
+    types: dict[str, dict[str, str]] = {}
+    for column in snapshot.columns:
+        if column.data_type:
+            types.setdefault(column.object_id, {})[column.name] = column.data_type
+    return types
+
+
 def visible_schema(snapshot: Snapshot, grants: GrantSet) -> dict[str, set[str]]:
     """The schema as this identity is allowed to know it.
 

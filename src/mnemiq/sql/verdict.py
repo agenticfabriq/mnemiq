@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # values_check imports this module for `Refusal`
+    from mnemiq.sql.values_check import ValueGrounding
 
 
 class RefusalCode(StrEnum):
@@ -245,6 +249,12 @@ class Approved:
     # target's dialect, which would change every prompt on a source whose target differs. Never
     # what runs. None where no decider set it.
     asked_plan: str | None = None
+    # M146: what an empty result rests on -- each string value the statement as asked filters on,
+    # with what checked it, and any filter that can never hold. Set by the decider, on every
+    # approval, since the result is not known yet. None is "not evaluated", and an empty result
+    # then declines as the no-rows rule did: an `Approved` built outside a decider
+    # (`eval/verify_replay.py`) keeps that rule rather than answering on facts nobody gathered.
+    value_grounding: ValueGrounding | None = None
 
     def model_sql(self) -> str:
         """What a model call may be shown of this statement (M156): the statement as asked, or

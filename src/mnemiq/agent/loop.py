@@ -40,6 +40,7 @@ from mnemiq.generate.generator import Generator, StrategyGenerator
 from mnemiq.generate.plan_query import Deferred, Feedback, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
+from mnemiq.verify.sanity import answered_note
 
 logger = logging.getLogger(__name__)
 
@@ -726,6 +727,9 @@ class Agent:
         # the database, said once at boot, not on every answer it will ever give.
         answer = append_notes(
             answer,
+            # First: what the answer is a "none" of (M146). Whatever the verifier did with it, an
+            # empty result that is answered says so in the engine's words, not only the model's.
+            answered_note(table, getattr(approved, "value_grounding", None)),
             disclosure_sentence(trace.narrowed),
             lineage_disclosure_sentence(trace.lineage_completeness,
                                         list(trace.lineage_unresolved),

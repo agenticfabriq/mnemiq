@@ -70,6 +70,11 @@ class Verifier:
     layer that fires is a hard defer and short-circuits. The judge produces a graded confidence;
     defer when it falls below `threshold`. `judge=None` -> deterministic-only.
 
+    An empty result is not one sanity always fires on (M146): one whose every filter value is
+    grounded in the value index passes it, so with no judge (`instant`) that is the whole decision,
+    and with one (`thinking`, `deep`) the judge reads the zero rows and decides. Its prompt is
+    unchanged; a line for empty previews is unmeasured on genuine "none" questions.
+
     Grounding is OFF by default: measured on saved runs it caught 28 wrong but lost 16 correct
     (a real EX cost), where sanity caught 31 wrong for only 2 lost. Grounding is a dial position
     (safety-first) and a soft signal the judge subsumes -- not a free default.
@@ -98,7 +103,10 @@ class Verifier:
 
     def verify(self, packet: ContextPacket, approved: Approved, table) -> VerifyVerdict:
         if self.sanity:
-            v = sanity_check(packet.question, table)
+            # The decider's record of what the statement filters on (M146): an empty result whose
+            # every value is grounded passes on, to the judge where one is wired, and the rest is
+            # declined here, naming the value. Absent on an `Approved` no decider built.
+            v = sanity_check(packet.question, table, getattr(approved, "value_grounding", None))
             if v is not None:
                 return v
         if self.grounding:
