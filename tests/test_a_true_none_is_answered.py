@@ -67,14 +67,15 @@ def source(tmp_path, monkeypatch):
     path = str(tmp_path / "syn.duckdb")
     con = duckdb.connect(path)
     con.execute("CREATE TABLE claim (id INTEGER, region VARCHAR, status VARCHAR, amount DOUBLE, "
-                "adjuster VARCHAR, filed DATE, ts TIMESTAMP, tags VARCHAR[])")
+                "adjuster VARCHAR, filed DATE, ts TIMESTAMP, tags VARCHAR[], tz TIMESTAMPTZ)")
     regions = ["north", "south", "east", "west"]
     rows = [(i, regions[i % 4], "open" if i % 3 else "closed", float(100 + (i * 37) % 4900),
              f"agent_{i % 300:04d}", f"2024-{1 + i % 12:02d}-{1 + i % 28:02d}",
              f"2024-{1 + i % 12:02d}-{1 + i % 28:02d} {8 + i % 9:02d}:{i % 60:02d}:00",
-             ["open", "urgent"] if i % 2 else ["open"])
+             ["open", "urgent"] if i % 2 else ["open"],
+             f"2024-{1 + i % 12:02d}-{1 + i % 28:02d} {8 + i % 9:02d}:{i % 60:02d}:00+00")
             for i in range(1200)]
-    con.executemany("INSERT INTO claim VALUES (?, ?, ?, ?, ?, ?, ?, ?)", rows)
+    con.executemany("INSERT INTO claim VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
     con.close()
     adapter = DuckDBAdapter.duckdb(path)
     snap = enrich_structural(adapter, "syn")
@@ -306,6 +307,45 @@ def test_a_week_written_to_the_second_on_a_timestamp_column_is_answered(source):
     assert ans.deferred is False, ans.answer
     assert ("No rows matched: ts >= '2031-01-01 00:00:00' AND ts < '2031-01-08 00:00:00'."
             in ans.answer)
+
+
+# Fix round 3: Codex's pass on fix round 2, each reproduced through decide, DuckDB and sanity.
+# A string written other than as a plain literal (E'', N'', $$...$$) was invisible to a scan that
+# read only plain literals, so a misspelled value slipped past both checks with nothing to name;
+# a naive timestamp against a TIMESTAMPTZ column reads in the session's zone; and a full timestamp
+# compared for equality is a disguised day filter. Each was answered.
+_ROUND_3 = [
+    ("SELECT id FROM claim WHERE status = E'opne'", "opne"),
+    ("SELECT id FROM claim WHERE status = N'opne'", "opne"),
+    ("SELECT id FROM claim WHERE status = $$opne$$", "opne"),
+    ("SELECT id FROM claim WHERE tz >= '2031-01-01 00:00:00' AND tz < '2031-01-08 00:00:00'",
+     "'2031-01-01 00:00:00'"),
+    ("SELECT id FROM claim WHERE ts = '2024-03-03 08:02:00'", "'2024-03-03 08:02:00'"),
+    ("SELECT id FROM claim WHERE ts IN ('2024-03-03 08:02:00', '2024-03-04 08:02:00')",
+     "'2024-03-03 08:02:00'"),
+]
+
+
+@pytest.mark.parametrize("sql,named", _ROUND_3, ids=[f"r3-{i}" for i in range(len(_ROUND_3))])
+def test_a_value_the_scan_cannot_read_as_a_bound_keeps_the_empty_result_declined(source, sql,
+                                                                                 named):
+    adapter, snap, values = source
+    assert adapter.execute("SELECT count(*) FROM claim WHERE status = 'open'")[0][0] > 0
+    # The day the equality cases name has rows, at other times of day.
+    assert adapter.execute("SELECT count(*) FROM claim WHERE CAST(ts AS DATE) = DATE '2024-03-03'"
+                           )[0][0] > 0
+    assert adapter.execute(f"SELECT count(*) FROM ({sql}) q")[0][0] == 0  # and the result is empty
+    ans = _ask_instant(adapter, snap, values, sql, "q")
+    assert ans.deferred is True and ans.verify_layer == "sanity", (sql, ans.answer)
+    assert named in ans.answer, ans.answer
+
+
+def test_an_offset_timestamp_range_on_a_timestamptz_column_is_answered(source):
+    adapter, snap, values = source
+    ans = _ask_instant(adapter, snap, values,
+                       "SELECT id FROM claim WHERE tz >= '2031-01-01 00:00:00+00' "
+                       "AND tz < '2031-01-08 00:00:00+00'", "q")
+    assert ans.deferred is False, ans.answer
 
 
 def test_a_true_none_with_a_string_constant_in_its_projection_is_declined(source):

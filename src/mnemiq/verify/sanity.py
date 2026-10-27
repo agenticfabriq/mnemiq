@@ -28,6 +28,9 @@ def _named(values: list[FilterValue]) -> str:
     """Values an answer could not rest on, one reason and one column between them, in the
     caller's words."""
     first, many = values[0], len(values) > 1
+    if first.why == "not_a_plain_string":  # its text is the constant as written, quotes and all
+        written = ", ".join(v.text for v in values)
+        return f"{written}, a constant written other than as a plain string, could not be checked"
     texts, column = _listed([v.text for v in values]), first.column
     if first.outcome == ABSENT:
         return f"{texts} {'do' if many else 'does'} not appear among {column}'s known values"
@@ -43,6 +46,13 @@ def _named(values: list[FilterValue]) -> str:
     if first.why == "not_on_a_timestamp_column":
         return (f"the timestamp{'s' if many else ''} {texts}, not compared with a column known to "
                 "hold timestamps, could not be checked as a bound")
+    if first.why == "timestamp_equality":
+        return (f"the timestamp{'s' if many else ''} {texts} compared for equality with {column} "
+                "could not be checked as a bound")
+    if first.why == "zone_mismatch":
+        return (f"the timestamp{'s' if many else ''} {texts}"
+                + (f" against {column}" if column else "")
+                + ", one zone-aware and the other not, could not be checked as a bound")
     if first.why == "not_a_date":
         return f"{texts}, not a well-formed date, could not be checked"
     if first.why == "not_a_timestamp":

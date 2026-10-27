@@ -985,9 +985,14 @@ _PATTERNS = (exp.Like, exp.ILike, exp.SimilarTo, exp.Glob, exp.RegexpLike, exp.R
 # A timestamp with its time of day is the TIMESTAMP column's own precision, as safe a bound as a
 # number (the controller's addition to fix round 2): a week written to the second on a timestamp
 # column is a common genuine "none", declined without this. So a full ISO timestamp, bare or as a
-# TIMESTAMP literal, is a bound against bare columns all declared TIMESTAMP or TIMESTAMPTZ, and on
-# the same terms as a date otherwise: unchecked against a DATE or TIME column, an expression, a
-# cast, or a column of unknown type, and a TIMESTAMP literal without a time of day is no bound.
+# TIMESTAMP literal, is a bound against bare columns of its own zone-awareness, and on the same
+# terms as a date otherwise: unchecked against a DATE or TIME column, an expression, a cast, or a
+# column of unknown type, and a TIMESTAMP literal without a time of day is no bound. Two limits
+# from Codex's pass on fix round 2 (fix round 3): a naive value is a bound against a naive
+# TIMESTAMP column and an offset one against TIMESTAMPTZ, never across -- a naive range on a
+# TIMESTAMPTZ column gave 0 rows under UTC and 1 under New York for the same row, measured on
+# 1.5.4 -- and only as a range bound (`>`, `>=`, `<`, `<=`, BETWEEN), never `=`, `<>` or IN:
+# `ts = '2024-03-03 00:00:00'` is a disguised day filter that a midday row does not meet.
 _ISO_DATES_READ_AS_DATES = frozenset({"duckdb", "postgres", "postgresql"})
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _ISO_DATETIME = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?"
@@ -1010,8 +1015,11 @@ class FilterValue:
     # bare column proven DATE), not_on_a_timestamp_column (a full timestamp compared with anything
     # but a bare column proven TIMESTAMP), not_a_date and not_a_timestamp (a DATE literal naming no
     # real day; a TIMESTAMP literal without a well-formed time of day), typed_other (a typed literal
-    # of another type), interval (one not compared with a date or time column), not_a_column
-    # (compared with an expression), not_compared, unresolved (the resolver could not place it).
+    # of another type), interval (one not compared with a date or time column), timestamp_equality
+    # (a full timestamp in `=`, `<>` or IN), zone_mismatch (a naive timestamp and a zone-aware one),
+    # not_a_plain_string (a constant written other than as a plain literal, or a parameter: its
+    # `text` is the constant as written), not_a_column (compared with an expression),
+    # not_compared, unresolved (the resolver could not place it).
     why: str
     column: str | None  # `table.column`, where the resolver placed it
 
@@ -1069,26 +1077,30 @@ def _iso_date(text: str) -> bool:
     return True
 
 
-def _iso_datetime(text: str) -> bool:
-    """An ISO timestamp with its time of day, naming a moment that exists."""
+def _moment(text: str) -> str | None:
+    """An ISO timestamp with its time of day, naming a moment that exists: "timestamptz" where it
+    carries an explicit offset or zone, "timestamp" where it is naive, else None."""
     if not _ISO_DATETIME.fullmatch(text):
-        return False
+        return None
     try:
-        datetime.fromisoformat(text)
+        parsed = datetime.fromisoformat(text)
     except ValueError:
-        return False
-    return True
+        return None
+    return "timestamp" if parsed.tzinfo is None else "timestamptz"
 
 
 _T = exp.DataType.Type
-_TIMESTAMPS = tuple(getattr(_T, n) for n in (
-    "TIMESTAMP", "TIMESTAMPTZ", "TIMESTAMPLTZ", "TIMESTAMPNTZ", "TIMESTAMP_S", "TIMESTAMP_MS",
-    "TIMESTAMP_NS", "DATETIME", "DATETIME2", "DATETIME64", "SMALLDATETIME") if hasattr(_T, n))
+_NAIVE_TIMESTAMPS = tuple(getattr(_T, n) for n in (
+    "TIMESTAMP", "TIMESTAMPNTZ", "TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP_NS", "DATETIME",
+    "DATETIME2", "DATETIME64", "SMALLDATETIME") if hasattr(_T, n))
+_ZONED_TIMESTAMPS = tuple(getattr(_T, n) for n in ("TIMESTAMPTZ", "TIMESTAMPLTZ") if hasattr(_T, n))
+_TIMESTAMP_KINDS = ("timestamp", "timestamptz")
 
 
 def _temporal_kind(data_type, dialect: str | None) -> str | None:
-    """"date" for a DATE, "timestamp" for a timestamp of any zone or precision, "time" for any
-    other temporal type (a time of day), else None."""
+    """"date" for a DATE; "timestamp" for a naive timestamp of any precision and "timestamptz" for
+    one that is zone-aware, kept apart because a naive value against a zone-aware column reads in
+    the session's zone (`_ISO_DATES_READ_AS_DATES`); "time" for a time of day; else None."""
     try:
         built = data_type if isinstance(data_type, exp.DataType) else exp.DataType.build(
             str(data_type), dialect=dialect, udt=True)
@@ -1096,9 +1108,28 @@ def _temporal_kind(data_type, dialect: str | None) -> str | None:
         return None
     if built.is_type(_T.DATE, _T.DATE32):
         return "date"
-    if built.is_type(*_TIMESTAMPS):
+    if built.is_type(*_NAIVE_TIMESTAMPS):
         return "timestamp"
+    if built.is_type(*_ZONED_TIMESTAMPS):
+        return "timestamptz"
     return "time" if built.is_type(*exp.DataType.TEMPORAL_TYPES) else None
+
+
+def _opaque_constant(node: exp.Expression) -> bool:
+    """A constant whose value the scan cannot read as a plain string (fix round 3): any leaf that
+    carries text and is not a plain literal, a name or a keyword -- sqlglot's E'..' (ByteString),
+    N'..' (National), $$..$$ (RawString), a JSON path key, and any type a later sqlglot adds -- and
+    every parameter or placeholder, whose value is not in the statement at all. Found by what it
+    is not, so a new kind of constant fails closed rather than slipping past as no value."""
+    if isinstance(node, (exp.Parameter, exp.Placeholder, exp.SessionParameter)):
+        return True
+    if isinstance(node, (exp.Literal, exp.Identifier, exp.Var)):
+        return False
+    values = node.args.values()
+    if any(isinstance(v, exp.Expression)
+           or (isinstance(v, list) and any(isinstance(x, exp.Expression) for x in v)) for v in values):
+        return False
+    return any(isinstance(v, str) for v in values)
 
 
 def _is_condition(node: exp.Expression) -> bool:
@@ -1221,13 +1252,15 @@ def ground_values(
         if dates and _iso_date(text):
             if held == "date":
                 return TYPED, "", column
-            if held in ("timestamp", "time"):
+            if held in (*_TIMESTAMP_KINDS, "time"):
                 return UNCHECKED, "date_on_time", column
-        if dates and _iso_datetime(text):
-            if held == "timestamp":
-                return TYPED, "", column
-            if held in ("date", "time"):
+        moment = _moment(text) if dates else None
+        if moment is not None and held in (*_TIMESTAMP_KINDS, "date", "time"):
+            if held not in _TIMESTAMP_KINDS:
                 return UNCHECKED, "not_on_a_timestamp_column", column
+            if not ranged:
+                return UNCHECKED, "timestamp_equality", column
+            return (TYPED, "", column) if held == moment else (UNCHECKED, "zone_mismatch", column)
         if ranged:
             return UNCHECKED, "range", column
         if values is None or not values.has(table, name):
@@ -1248,10 +1281,12 @@ def ground_values(
         return None
 
     def as_bound(node: exp.Expression, want: str) -> tuple[str, str, str | None]:
-        """A date-only value (`want` "date") or a full timestamp ("timestamp") is a bound only
-        where every operand it is directly compared with is a bare column placed on a column
-        declared that kind. Anything else is unchecked."""
-        unproven = f"not_on_a_{want}_column"
+        """A date-only value (`want` "date") or a full timestamp ("timestamp" naive, "timestamptz"
+        with an offset) is a bound only where every operand it is directly compared with is a bare
+        column placed on a column declared that kind -- and a timestamp only as a range bound:
+        `ts = '2024-03-03 00:00:00'` is a disguised day filter (fix round 3). Anything else is
+        unchecked."""
+        unproven = "not_on_a_date_column" if want == "date" else "not_on_a_timestamp_column"
         partners = compared_with(node) or []
         placed = [place(p) if isinstance(p, exp.Column) else None for p in partners]
         if not partners or None in placed:
@@ -1260,11 +1295,17 @@ def ground_values(
             why = withheld(*spot)
             if why is not None:
                 return UNCHECKED, why, f"{spot[0]}.{spot[1]}"
+        column = f"{placed[0][0]}.{placed[0][1]}"
         if want == "date":
-            timed = next((s for s in placed if kind(*s) in ("timestamp", "time")), None)
+            timed = next((s for s in placed if kind(*s) in (*_TIMESTAMP_KINDS, "time")), None)
             if timed is not None:
                 return UNCHECKED, "date_on_time", f"{timed[0]}.{timed[1]}"
-        column = f"{placed[0][0]}.{placed[0][1]}"
+        else:
+            if not isinstance(node.parent, _RANGES + (exp.Between,)):
+                return UNCHECKED, "timestamp_equality", column
+            if all(kind(*s) in _TIMESTAMP_KINDS for s in placed) and any(kind(*s) != want
+                                                                        for s in placed):
+                return UNCHECKED, "zone_mismatch", column
         if dates and all(kind(*s) == want for s in placed):
             return TYPED, "", column
         return UNCHECKED, unproven, column
@@ -1286,7 +1327,8 @@ def ground_values(
         why = withheld(*spot)
         if why is not None:
             return UNCHECKED, why, column
-        if dates and _INTERVAL_TEXT.fullmatch(text) and kind(*spot) in ("date", "timestamp", "time"):
+        if dates and _INTERVAL_TEXT.fullmatch(text) and kind(*spot) in ("date", *_TIMESTAMP_KINDS,
+                                                                         "time"):
             return TYPED, "", column
         return UNCHECKED, "interval", column
 
@@ -1296,9 +1338,13 @@ def ground_values(
             to = _temporal_kind(parent.to, dialect)
             if to == "date":
                 return as_bound(parent, "date") if _iso_date(text) else (UNCHECKED, "not_a_date", None)
-            if to == "timestamp":
-                return (as_bound(parent, "timestamp") if _iso_datetime(text)
-                        else (UNCHECKED, "not_a_timestamp", None))
+            if to in _TIMESTAMP_KINDS:
+                moment = _moment(text)
+                if moment is None:
+                    return UNCHECKED, "not_a_timestamp", None
+                # TIMESTAMPTZ '..' of naive text takes the session's zone, and TIMESTAMP '..+02'
+                # drops or shifts an offset: the text's zone-awareness must be the type's.
+                return as_bound(parent, to) if moment == to else (UNCHECKED, "zone_mismatch", None)
             return UNCHECKED, "typed_other", None
         if isinstance(parent, exp.Interval) and parent.this is literal:
             return interval(literal, text)
@@ -1311,8 +1357,8 @@ def ground_values(
             return against(parent.this, text, True)
         if isinstance(parent, (exp.In, exp.Between)) and _iso_date(text):
             return as_bound(literal, "date")  # a date as the subject: read its bounds or its list
-        if isinstance(parent, (exp.In, exp.Between)) and _iso_datetime(text):
-            return as_bound(literal, "timestamp")
+        if isinstance(parent, (exp.In, exp.Between)) and _moment(text) is not None:
+            return as_bound(literal, _moment(text))
         if isinstance(parent, _PATTERNS):
             other = parent.expression if parent.this is literal else parent.this
             placed = place(other) if isinstance(other, exp.Column) else None
@@ -1322,10 +1368,13 @@ def ground_values(
         return UNCHECKED, "not_compared", None
 
     found = []
-    for literal in ast.find_all(exp.Literal, bfs=False):  # as written, so a decline names them in order
-        if literal.is_string:
-            outcome, why, column = classify(literal)
-            found.append(FilterValue(literal.this, outcome, why, column))
+    for node in ast.walk(bfs=False):  # as written, so a decline names them in order
+        if isinstance(node, exp.Literal) and node.is_string:
+            outcome, why, column = classify(node)
+            found.append(FilterValue(node.this, outcome, why, column))
+        elif _opaque_constant(node):
+            found.append(FilterValue(node.sql(dialect=render_as), UNCHECKED, "not_a_plain_string",
+                                     None))
     filters: list[str] = []
     clauses = (exp.Where, exp.Having, exp.Qualify)
     for clause in ast.find_all(*clauses):

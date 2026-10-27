@@ -195,7 +195,8 @@ def test_a_full_timestamp_against_a_bare_timestamp_column_needs_no_grounding():
     for sql in ("SELECT id FROM claim WHERE ts >= '2031-01-01 00:00:00' AND ts < '2031-01-08 00:00:00'",
                 "SELECT id FROM claim WHERE ts > TIMESTAMP '2031-01-01 00:00:00'",
                 "SELECT id FROM claim WHERE ts > CAST('2031-01-01 00:00:00' AS TIMESTAMP)",
-                "SELECT id FROM claim WHERE tz = '2031-01-01T10:30:00+02:00'",
+                "SELECT id FROM claim WHERE tz > '2031-01-01T10:30:00+02:00'",
+                "SELECT id FROM claim WHERE tz > TIMESTAMPTZ '2031-01-01 00:00:00+00'",
                 "SELECT id FROM claim WHERE TIMESTAMP '2031-01-01 00:00:00' BETWEEN ts AND ts"):
         assert {o for _, o, _, _ in _read(sql)} == {TYPED}, sql
 
@@ -210,6 +211,54 @@ def test_a_full_timestamp_against_anything_but_a_bare_timestamp_column_is_unchec
         assert [o for _, o, _, _ in _read(sql)] == [UNCHECKED], sql
     assert [o for _, o, _, _ in _read("SELECT id FROM claim WHERE ts > '2031-01-01 00:00:00'",
                                       types=None)] == [UNCHECKED]
+    # Named for what it is: a DATE column, not a zone mismatch.
+    assert _read("SELECT id FROM claim WHERE filed > '2031-01-01 00:00:00'") == [
+        ("2031-01-01 00:00:00", UNCHECKED, "not_on_a_timestamp_column", "claim.filed")]
+
+
+def test_a_full_timestamp_is_a_bound_only_as_a_range_bound():
+    """Fix round 3: `ts = '2024-03-03 00:00:00'` is a disguised day filter -- a midday row exists,
+    the result is empty, and it passed. Equality, `<>` and IN are never bounds; a half-open range
+    (a week written to the second) stays one."""
+    for sql in ("SELECT id FROM claim WHERE ts = '2024-03-03 00:00:00'",
+                "SELECT id FROM claim WHERE ts <> '2024-03-03 00:00:00'",
+                "SELECT id FROM claim WHERE ts IN ('2024-03-03 00:00:00')",
+                "SELECT id FROM claim WHERE ts = TIMESTAMP '2024-03-03 00:00:00'",
+                "SELECT id FROM claim WHERE TIMESTAMP '2024-03-03 00:00:00' IN (ts)"):
+        assert [o for _, o, _, _ in _read(sql)] == [UNCHECKED], sql
+    assert {o for _, o, _, _ in _read(
+        "SELECT id FROM claim WHERE ts >= '2031-01-01 00:00:00' AND ts < '2031-01-08 00:00:00'"
+    )} == {TYPED}
+    v = sanity_check("q", _EMPTY, _ground("SELECT id FROM claim WHERE ts = '2024-03-03 00:00:00'"))
+    assert ("the timestamp '2024-03-03 00:00:00' compared for equality with claim.ts could not be "
+            "checked as a bound") in v.reason
+
+
+def test_a_timestamptz_column_takes_only_a_literal_with_an_explicit_offset():
+    """A naive literal against TIMESTAMPTZ reads in the session's zone, measured on DuckDB 1.5.4:
+    the same row and the same naive range give 0 rows under UTC and 1 under New York, where an
+    offset range gives 0 under both. So the column's zone-awareness must match the literal's."""
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE z (tz TIMESTAMPTZ)")
+    con.execute("INSERT INTO z VALUES ('2024-03-04 02:00:00+00')")
+    naive = "SELECT count(*) FROM z WHERE tz >= '2024-03-03 00:00:00' AND tz < '2024-03-04 00:00:00'"
+    aware = naive.replace(":00'", ":00+00'")
+    counts = {}
+    for zone in ("UTC", "America/New_York"):
+        con.execute(f"SET TimeZone = '{zone}'")
+        counts[zone] = (con.execute(naive).fetchone()[0], con.execute(aware).fetchone()[0])
+    assert counts == {"UTC": (0, 0), "America/New_York": (1, 0)}, counts  # the premise
+    assert {o for _, o, _, _ in _read(naive.replace("count(*) FROM z", "id FROM claim"))} == {
+        UNCHECKED}
+    assert {o for _, o, _, _ in _read(aware.replace("count(*) FROM z", "id FROM claim"))} == {TYPED}
+    # The other way round: an offset literal against a naive TIMESTAMP column, and a cast whose
+    # target's zone-awareness differs from its text's, are no bounds either.
+    for sql in ("SELECT id FROM claim WHERE ts > '2031-01-01 00:00:00+00'",
+                "SELECT id FROM claim WHERE tz > TIMESTAMP '2031-01-01 00:00:00'",
+                "SELECT id FROM claim WHERE tz > TIMESTAMPTZ '2031-01-01 00:00:00'"):
+        assert [o for _, o, _, _ in _read(sql)] == [UNCHECKED], sql
 
 
 def test_a_date_literal_that_is_the_subject_of_between_reads_its_bounds():
@@ -323,6 +372,26 @@ def test_every_projected_value_counts_however_it_reaches_the_rows():
                 "WHERE amount > 9e9 ORDER BY k"):
         v = sanity_check("q", _EMPTY, _ground(sql))
         assert v is not None and v.defer, sql
+
+
+def test_a_constant_written_other_than_as_a_plain_string_is_never_grounded():
+    """Fix round 3: sqlglot reads E'..' as ByteString, N'..' as National and $$..$$ as RawString,
+    and a scan of plain literals saw none of them: `status = E'opne'` ran, came back empty, and
+    passed with nothing to name. Any constant other than a numeric or plain string literal, a
+    boolean or NULL -- a parameter or placeholder included -- is unchecked wherever it sits."""
+    for sql, named in (("SELECT id FROM claim WHERE status = E'open'", "open"),
+                       ("SELECT id FROM claim WHERE status = N'open'", "open"),
+                       ("SELECT id FROM claim WHERE status = $$open$$", "open"),
+                       ("SELECT N'open' AS s FROM claim WHERE amount > 9e9", "open"),
+                       ("SELECT id FROM claim WHERE id IN (SELECT id FROM claim WHERE "
+                        "status = E'open')", "open"),
+                       ("SELECT id FROM claim WHERE status = ?", "?")):
+        g = _ground(sql)
+        assert [(v.outcome, v.why) for v in g.values] == [(UNCHECKED, "not_a_plain_string")], sql
+        v = sanity_check("q", _EMPTY, g)
+        assert v is not None and v.defer and named in v.reason, (sql, v and v.reason)
+    pg = _ground("SELECT id FROM claim WHERE status = $1", dialect="postgres")
+    assert [(v.outcome, v.why) for v in pg.values] == [(UNCHECKED, "not_a_plain_string")]
 
 
 def test_a_grounded_projected_value_is_fine():
