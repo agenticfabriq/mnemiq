@@ -8,7 +8,7 @@ from sqlglot.dialects.dialect import Dialect
 from mnemiq.sql.functions import FunctionInventory, UnreadableCalls, called_names
 from mnemiq.sql.identifiers import resolve, resolve_identifier, resolve_stored, rules_for
 from mnemiq.sql.qualify import object_key
-from mnemiq.sql.scope import GENERATED_NAME, base_tables, candidate_tables, column_tables
+from mnemiq.sql.scope import GENERATED_NAME, KnownColumns, base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 
@@ -807,7 +807,10 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
     # policy's columns, from `known_columns`) with the catalogue's pairs beside it, so a virtual
     # column reached through `(SELECT * FROM plain JOIN vc_t) d` binds to the table that
     # computes it rather than to a table the schema does not list, which would take any name.
-    schema: dict[str, set[str]] = {table: set(names) for table, names in (columns or {}).items()}
+    # What the caller's schema lists in full stays so (M215): read as listed from the grant alone,
+    # `plain` before `vc_t` would settle `leaked` on plain, which computes nothing.
+    schema = KnownColumns({table: set(names) for table, names in (columns or {}).items()})
+    schema.complete = getattr(columns, "complete", frozenset())
     for table, name in opaque:
         schema.setdefault(table, set()).add(name)
     resolved = column_tables(ast, dialect, schema)

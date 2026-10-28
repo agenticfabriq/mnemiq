@@ -51,6 +51,9 @@ def _policy(table, column, kind):
     return AccessPolicy(**{kind: {(table, column)}}, policy_schema=FULL)
 
 
+COMPLETE = AccessPolicy(policy_schema=FULL)  # production's: every column of the snapshot's
+
+
 def _decide(sql, visible, engine="duckdb", policy=None):
     return decide(sql, visible, dialect=engine, target=engine, policy=policy)
 
@@ -99,9 +102,20 @@ def test_on_every_engine_a_hidden_column_through_a_derived_star_is_unknown(sql, 
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (engine, verdict)
 
 
+WIDE_FIRST = "SELECT d.secret FROM (SELECT * FROM wide w JOIN claim c ON c.id = w.id) d"
+
+
+@pytest.mark.parametrize("policy", [None, COMPLETE], ids=["grant alone", "complete schema"])
 @pytest.mark.parametrize("sql", THROUGH_A_STAR)
-def test_a_granted_column_through_a_derived_star_is_approved_and_runs(con, sql):
-    verdict = _decide(sql, FULL)
+def test_a_granted_column_through_a_derived_star_is_approved_and_runs(con, sql, policy):
+    verdict = _decide(sql, FULL, policy=policy)
+    if sql == WIDE_FIRST and policy is None:
+        # From the grant alone wide, first under the star, may hold `secret` too, and DuckDB
+        # would read wide's (M215): refused as wide's unknown column; the complete schema shows
+        # wide without it and the read binds to claim.
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, verdict
+        assert "'wide'" in verdict.message, verdict.message
+        return
     assert isinstance(verdict, Approved), (sql, verdict)
     assert con.execute(verdict.target_sql).fetchall() == con.execute(sql).fetchall()
 
@@ -121,17 +135,18 @@ def test_the_policy_s_schema_binds_a_hidden_column_to_the_table_that_has_it():
 
 @pytest.mark.parametrize("schema", [None, {"claim": {"id", "secret"}}],
                          ids=["no policy schema", "claim alone"])
-def test_a_policy_schema_that_omits_a_table_under_the_star_still_denies_and_masks(con, schema):
-    # The review gate's case: the deny and mask passes read the grant's columns beside the
-    # policy's, so `wide`, which the policy does not list, does not take the name first; read
-    # through the policy's schema alone it did, and claim's mask was dropped as another table's.
-    sql = "SELECT d.secret FROM (SELECT * FROM wide w JOIN claim c ON c.id = w.id) d"
+def test_a_table_the_policy_schema_omits_before_the_star_s_holder_is_refused_not_unmasked(schema):
+    # The review gate's case on #167: read through the policy's schema alone, `wide`, which it
+    # does not list, took the name and claim's mask was dropped as another table's. The grant's
+    # columns beside the policy's list wide without `secret`, from the grant alone, so wide may
+    # still hold it and comes first under the star (M215): refused as wide's unknown column
+    # under a deny and a mask alike, nothing read. With wide listed in full the deny and the
+    # mask apply to claim (`test_a_withheld_column_read_through_a_derived_star_is_not_read`).
     listed = {"policy_schema": schema} if schema else {}
-    denied = _decide(sql, FULL, policy=AccessPolicy(denied={("claim", "secret")}, **listed))
-    assert isinstance(denied, Refusal) and denied.code is RefusalCode.UNAUTHORIZED_COLUMN, denied
-    masked = _decide(sql, FULL, policy=AccessPolicy(masked={("claim", "secret")}, **listed))
-    assert isinstance(masked, Approved), masked
-    assert con.execute(masked.target_sql).fetchall() == [(None,)], masked.target_sql
+    for kind in ("denied", "masked"):
+        verdict = _decide(WIDE_FIRST, FULL, policy=AccessPolicy(**{kind: {("claim", "secret")}}, **listed))
+        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (kind, verdict)
+        assert "'wide'" in verdict.message, verdict.message
 
 
 @pytest.mark.parametrize("schema", [None, FULL], ids=["plan as written", "visible map"])
@@ -143,14 +158,13 @@ def test_the_eval_criterion_attributes_a_masked_column_read_through_a_derived_st
 
     from mnemiq.eval.criterion import touched
 
-    ast = sqlglot.parse_one("SELECT d.secret FROM (SELECT * FROM wide w JOIN claim c ON c.id = w.id) d",
-                            read="duckdb")
-    result = touched(ast, AccessPolicy(masked={("claim", "secret")}), schema, "duckdb")
+    # The policy as production builds it, with every column of the snapshot's (M215: a policy
+    # listing no table in full leaves wide, first under the star, holding `secret` for all the
+    # resolver can tell, and the decider refuses that plan as wide's unknown column).
+    ast = sqlglot.parse_one(WIDE_FIRST, read="duckdb")
+    result = touched(ast, AccessPolicy(masked={("claim", "secret")}, policy_schema=FULL), schema, "duckdb")
     assert result.entries == {("mask", "claim")}, result
     assert result.unattributable == (), result
-
-
-COMPLETE = AccessPolicy(policy_schema=FULL)  # production's: every column of the snapshot's
 
 
 @pytest.mark.parametrize("sql", [
@@ -879,3 +893,124 @@ def test_a_column_by_number_is_refused(sql):
 def test_a_pivot_source_is_refused_as_unmodelled(sql):
     verdict = _decide(sql, FULL)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNMODELLED_SOURCE, verdict
+
+
+# --- M215: the first source under the star that may hold the name binds it ---------------------
+#
+# DuckDB lists a star's columns in FROM order and binds the outer name to the first of them. The
+# walk settled the name on the first source the schema lists WITH it, so a source before it that
+# may hold the name, listed from the grant alone without it, was passed over: `q.doc` over `h
+# JOIN t` was t's for every check and h's hidden doc for the engine. And it walked sqlglot's
+# source order, base tables before derived ones, so a derived source before a granted table was
+# passed over under the complete schema too: a denied or masked value was returned raw. Both
+# measured on main `04e2b13c` through `decide` as duckdb, DuckDB 1.5.4.
+
+EARLIER_HOLDER = [
+    "SELECT d.secret FROM (SELECT * FROM claim c JOIN other o ON o.id = c.id) d",
+    "SELECT secret FROM (SELECT * FROM claim c JOIN other o ON o.id = c.id) d",
+    "SELECT d.secret FROM (SELECT * FROM claim c, other o) d WHERE d.secret LIKE 'CLAIM%'",
+    "WITH d AS (SELECT * FROM claim c JOIN other o ON o.id = c.id) SELECT d.secret FROM d",
+    "SELECT d.secret FROM (SELECT * FROM claim c JOIN (SELECT * FROM other) o ON true) d",
+    # A later source's RENAME to the name does not come before an earlier holder (measured).
+    "SELECT d.secret FROM (SELECT * RENAME (w.note AS secret) FROM claim c JOIN wide w ON w.id = c.id) d",
+]
+
+FROM_ORDER = [
+    "SELECT d.secret FROM (SELECT * FROM (SELECT * FROM claim) a JOIN other o ON true) d",
+    "SELECT d.secret FROM (SELECT * FROM (SELECT * FROM claim) a, other o) d",
+    "WITH a AS (SELECT * FROM claim) SELECT d.secret FROM (SELECT * FROM a JOIN other o ON true) d",
+    # A parenthesised group, its own joins in their place.
+    "SELECT d.secret FROM (SELECT * FROM wide w JOIN ((SELECT * FROM claim) a JOIN other o ON true) ON true) d",
+    "SELECT d.secret FROM (SELECT * FROM ((SELECT * FROM claim) a JOIN wide w ON true) JOIN other o ON true) d",
+]
+
+
+@pytest.mark.parametrize("sql", EARLIER_HOLDER + FROM_ORDER)
+def test_the_first_source_that_may_hold_the_name_binds_it(con, sql):
+    # The engine reads claim's secret through each: the shape is the read, not a guess at one.
+    assert "CLAIM-SECRET" in str(con.execute(sql).fetchall()), sql
+    _withheld_three_ways(con, sql, "claim", "secret", "CLAIM-SECRET")
+
+
+@pytest.mark.parametrize("sql", FROM_ORDER)
+def test_a_derived_source_first_under_the_star_binds_the_name_under_the_complete_schema(sql):
+    verdict = _decide(sql, _hidden("claim", "secret"), policy=COMPLETE)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_COLUMN, (sql, verdict)
+    assert "'claim'" in verdict.message, verdict.message
+
+
+@pytest.mark.parametrize("policy", [None, COMPLETE], ids=["grant alone", "complete schema"])
+@pytest.mark.parametrize("sql", [
+    "SELECT d.secret FROM (SELECT * FROM other o JOIN claim c ON c.id = o.id) d",
+    "SELECT d.secret FROM (SELECT * FROM (SELECT * FROM other) a JOIN claim c ON true) d",
+    "SELECT d.secret FROM (SELECT o.* FROM claim c JOIN other o ON o.id = c.id) d",
+])
+def test_a_granted_holder_first_under_the_star_is_read(con, sql, policy):
+    # The controls: the granted holder comes first, or the star is the granted holder's alone,
+    # so the engine reads other's secret and nothing hidden is in the way.
+    verdict = _decide(sql, _hidden("claim", "secret"), policy=policy)
+    assert isinstance(verdict, Approved), (sql, verdict)
+    assert con.execute(verdict.target_sql).fetchall() == [("OTHER-SECRET",)]
+
+
+def test_the_opaque_column_check_reads_the_complete_schema_as_complete():
+    # `check_opaque_columns` copies the schema to add the source's opaque columns; read as a
+    # plain mapping, every table in it was listed from the grant alone, so `plain`, first under
+    # the star, settled `leaked` on itself and vc_t's opaque column went unread (M215).
+    import sqlglot
+
+    from mnemiq.sql.authz_guard import check_opaque_columns
+    from mnemiq.sql.scope import known_columns
+
+    schema = {"plain": {"id", "note"}, "vc_t": {"id", "leaked"}}
+    columns = known_columns(schema, AccessPolicy(policy_schema=schema))
+    sql = "SELECT d.leaked FROM (SELECT * FROM plain p JOIN vc_t v ON v.id = p.id) d"
+    refusal = check_opaque_columns(sqlglot.parse_one(sql, read="duckdb"),
+                                   frozenset({("vc_t", "leaked")}), "duckdb", columns=columns)
+    assert refusal is not None and refusal.code is RefusalCode.UNRESOLVABLE_CALLS, refusal
+
+
+def test_a_row_filter_through_a_derived_star_reads_the_policy_schema_as_complete():
+    # The row-filter validator binds a filter's columns through the policy's schema, every column
+    # of the snapshot's; read as listed from the grant alone, `entitlement`, first under the
+    # star, would hold `store_id` for all it could tell and the filter, valid, was refused (M215).
+    import sqlglot
+
+    from mnemiq.sql.rls import apply_row_and_mask
+
+    visible = {"payment": {"payment_id", "customer_id"}}
+    schema = {**visible, "customer": {"customer_id", "store_id"},
+              "entitlement": {"principal", "customer_id"}}
+    filt = ("customer_id IN (SELECT d.customer_id FROM (SELECT * FROM entitlement e JOIN customer c "
+            "ON c.customer_id = e.customer_id) d WHERE d.store_id = 1)")
+    policy = AccessPolicy(row_filters={"payment": filt}, policy_schema=schema)
+    out = apply_row_and_mask(sqlglot.parse_one("SELECT payment_id FROM payment", read="duckdb"),
+                             policy, visible, dialect="duckdb")[0]
+    assert not isinstance(out, Refusal), out
+    assert "d.store_id = 1" in out.sql(dialect="duckdb")
+
+
+@pytest.mark.parametrize("from_", [
+    "(SELECT * FROM t1) a JOIN t2 b ON true",
+    "(SELECT * FROM t1) a, t2 b",
+    "t1 a JOIN (t2 b JOIN t3 c ON true) ON true",
+    "((SELECT * FROM t1) a JOIN t2 b ON true) JOIN t3 c ON true",
+    "(t1 a JOIN (SELECT * FROM t2) b ON true) JOIN t3 c ON true",
+    "t1 a, (t2 b JOIN (SELECT * FROM t3) c ON true)",
+    "t1 a, LATERAL (SELECT * FROM t2) b",
+])
+def test_a_star_s_sources_are_walked_in_the_order_the_engine_lists_their_columns(from_):
+    # Read from the engine: each of t1, t2, t3 holds one column of its own, and a, b, c name them
+    # in that order, so the star's column order is the order of its sources.
+    import sqlglot
+    from sqlglot.optimizer.scope import build_scope
+
+    from mnemiq.sql.scope import _in_from_order
+
+    engine = duckdb.connect()
+    for n in (1, 2, 3):
+        engine.execute(f"CREATE TABLE t{n} (c{n} INT)")
+    listed = [d[0] for d in engine.execute(f"SELECT * FROM {from_}").description]
+    sql = f"SELECT * FROM {from_}"
+    walked = _in_from_order(build_scope(sqlglot.parse_one(sql, read="duckdb")))
+    assert walked == [{"c1": "a", "c2": "b", "c3": "c"}[name] for name in listed], (sql, listed)

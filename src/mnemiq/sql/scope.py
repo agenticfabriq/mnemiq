@@ -954,6 +954,35 @@ def _projection_name(projection: exp.Expression, dialect: str | None) -> str | N
     return None
 
 
+def _in_from_order(scope) -> list[str]:
+    """The scope's selected sources in FROM order, as the engine lists a star's columns (M215).
+    sqlglot's `selected_sources` lists base tables before derived ones, so a star over `(SELECT *
+    FROM h) a JOIN t` was walked t first and `q.doc` bound to t's doc, where DuckDB lists a's
+    columns first and reads h's hidden doc, under the complete schema too. A parenthesised join
+    group is an alias-less Subquery wrapping the group's first item, which carries the group's
+    joins, as the value check reads it. The walk reads the FROM and JOIN nodes sqlglot builds the
+    sources from, so it names the same set (measured over groups, LATERAL, VALUES, UNNEST, table
+    functions and an alias-less derived table); a source it did not place follows the rest."""
+    order: list[str] = []
+
+    def visit(node: exp.Expression) -> None:
+        if isinstance(node, exp.Subquery) and not node.alias and isinstance(node.this, (exp.Table, exp.Subquery)):
+            visit(node.this)
+        else:
+            order.append(node.alias_or_name)
+        for join in node.args.get("joins") or ():
+            visit(join.this)
+
+    select = scope.expression
+    if isinstance(select.args.get("from_"), exp.From):
+        visit(select.args["from_"].this)
+    for join in select.args.get("joins") or ():
+        visit(join.this)
+    sources = scope.selected_sources
+    placed = [source for source in dict.fromkeys(order) if source in sources]
+    return placed + [source for source in sources if source not in placed]
+
+
 def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None,
               seen: frozenset[int], listed: tuple[str, ...] | None = None):
     """What `scope` (a derived table's or CTE's) exposes under `name`, in projection order (M181).
@@ -965,7 +994,9 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
     FROM order, that the schema lists with the name (DuckDB binds the first source that has it,
     measured on a join of two tables both holding it), unless an EXCLUDE drops it or a RENAME
     moves it away from that source; a RENAME to the name or a REPLACE of it is a named column,
-    its own nodes checked. A star whose sources are listed with the name nowhere still settles
+    its own nodes checked. A source before it that may hold the name, one the schema does not
+    list or lists from the grant alone without it, settles it first, where that table's check
+    refuses it as unknown (M215). A star whose sources are listed with the name nowhere still settles
     it, on a base table under it: the first the schema does not list, which may well have it (a
     partial schema, the eval criterion's or a policy's alone), else the first listed without it,
     where the name is hidden or absent and that table's check refuses it as unknown. Read as
@@ -1042,20 +1073,30 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
         pattern = _columns_pattern(projection)
         qualifier = (resolve_identifier(projection.args.get("table"), dialect)
                      if isinstance(projection, exp.Column) else None)
-        picked = [source for source in scope.selected_sources
+        picked = [source for source in _in_from_order(scope)
                   if not qualifier or resolve(source, quoted=False, dialect=dialect) == qualifier]
         if any(item.alias and resolve(item.alias, quoted=False, dialect=dialect) == name
                for item in star.args.get("replace") or ()):
-            return _NAMED  # `* REPLACE (id AS secret)`: the name holds the expression's nodes
+            # `* REPLACE (id AS secret)`: the name holds the expression's nodes, every source's
+            # column of the name replaced by the one (measured over `h JOIN t`, both holding it)
+            return _NAMED
         unlisted = listed_without = None
         for source in picked:
+            # An earlier source that may hold the name is the engine's first column of it
+            # whatever a later one lists (M215): `(SELECT * FROM h JOIN t ON true) q` with h
+            # listed from the grant alone without `doc` read `q.doc` as t's, where DuckDB reads
+            # h's hidden doc. So a later source settles the name only where no earlier one may.
+            earlier = unlisted or listed_without
             excluded = any(_names_item(item, name, dialect)
                            for item in star.args.get("except_") or ()
                            if source in _item_sources(item, picked, dialect))
             renames = [item for item in star.args.get("rename") or ()
                        if source in _item_sources(item.this, picked, dialect)]
             if any(resolve(item.alias, quoted=False, dialect=dialect) == name for item in renames):
-                return _NAMED  # `RENAME (secret AS s2)`: `s2` is the column node `secret`, checked
+                # `RENAME (secret AS s2)`: `s2` is the column node `secret`, checked; after an
+                # earlier holder of the name, that holder's (measured: `* RENAME (t.region AS doc)
+                # FROM h JOIN t` reads h's doc)
+                return ("first", earlier) if earlier else _NAMED
             if excluded or any(_names_item(item.this, name, dialect) for item in renames):
                 continue  # dropped, or moved away from this source
             node, inner = scope.selected_sources[source]
@@ -1067,7 +1108,7 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
                     if stored and not _pattern_picks(pattern, stored):
                         continue  # listed, and the pattern picks none of its spellings
                 if _schema_lists(columns, key, column, dialect):
-                    return ("table", key)
+                    return ("first", earlier) if earlier else ("table", key)
                 if columns is not None and key in columns:
                     # Listed in full (the policy schema's, every column of the snapshot's) and
                     # lacking the name: the table does not have it, and the engine reads on to a
@@ -1085,7 +1126,7 @@ def _exposure(scope, name: str, column: exp.Column, columns, dialect: str | None
             if found[0] == "first":
                 listed_without = listed_without or found[1]
                 continue
-            return found
+            return ("first", earlier) if earlier else found
         if unlisted or listed_without:
             return ("first", unlisted or listed_without)  # the star may expose it: settled here
     return None
@@ -1302,7 +1343,9 @@ def column_tables(ast: exp.Expression, dialect: str | None = None,
 
     `columns` is the schema the exposure walk reads, table key to column names: a caller passes
     what it knows (the grant's and the policy's columns together, in `decide`); a table the
-    schema does not list owns a name only where no listed table under the same star has it. A
+    schema does not list, or lists from the grant alone without the name, owns the name where it
+    comes before every table under the same star listed with it, since it may hold the name and
+    the engine binds the first (M215), and where no table under the star is listed with it. A
     qualifier naming a derived table or CTE is bound
     through what that source EXPOSES under the column's name (M181): the first star reaching a
     base table that has the column binds it to that table, as `SELECT d.secret FROM (SELECT *
