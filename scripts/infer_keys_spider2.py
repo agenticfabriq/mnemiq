@@ -31,8 +31,8 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# BOTH deferred into `main()`. `snowflake.connector` obviously, and `drop_existing` because
-# importing it pulls the driver in transitively. Between them they made this module
+# BOTH deferred into `main()`: the connection, whose driver is an optional extra, and
+# `drop_existing`, whose module imported the driver too. Between them they made this module
 # unloadable without the warehouse extra, so `align_column` -- which decides whether a
 # CREATE OR REPLACE runs over a live table -- could not be tested. The commit that changed
 # its SQL applied this same convention to `add_relationships_spider2` and not to the file it
@@ -358,10 +358,10 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
-    import snowflake.connector
+    from mnemiq.eval.warehouse import snowflake_connection
     from fix_keys_snowflake import drop_existing
 
-    con = snowflake.connector.connect(connection_name=args.connection)
+    con = snowflake_connection(args.connection)
     cur = con.cursor()
     cur.execute(f"USE WAREHOUSE {args.warehouse}")
 

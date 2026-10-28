@@ -45,9 +45,9 @@ _DEFAULT_MINIDEV = os.environ.get(
 def connect(engine: str, args):
     """(connection, cursor) for the engine the run was produced on."""
     if engine == "snowflake":
-        import snowflake.connector
+        from mnemiq.eval.warehouse import snowflake_connection
 
-        con = snowflake.connector.connect(connection_name=args.connection)
+        con = snowflake_connection(args.connection)
         cur = con.cursor()
         cur.execute(f"USE WAREHOUSE {args.warehouse}")
         return con, cur

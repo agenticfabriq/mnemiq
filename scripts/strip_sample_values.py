@@ -55,21 +55,11 @@ def main() -> int:
     p.add_argument("--dry-run", action="store_true")
     args = p.parse_args()
 
-    # Imported here, not at module scope: the driver is an optional extra, and the regex above
-    # is the part worth testing. Several scripts here defer it the same way. Named as a rule
-    # rather than listed, because the list went stale one commit after it was written -- and
-    # then the rule replacing it was a grep I had not run, which matched nothing because the
-    # deferring scripts are not the ones with "snowflake" in the filename. This one is run:
-    #
-    #   grep -lE '(import snowflake|from snowflake)' scripts/*.py \
-    #     | xargs grep -LE '^(import snowflake|from snowflake)'
-    #
-    # Both spellings, because keying on `import snowflake` alone would omit a deferred
-    # `from snowflake.connector import connect`. The two forms return the same six files
-    # today; the broader one keeps doing so after someone writes the other spelling.
-    import snowflake.connector
+    # The driver is an optional extra, imported by `snowflake_connection` on call, so this module
+    # imports in CI and the regex above stays testable.
+    from mnemiq.eval.warehouse import snowflake_connection
 
-    con = snowflake.connector.connect(connection_name=args.connection)
+    con = snowflake_connection(args.connection)
     cur = con.cursor()
     cur.execute(f"USE WAREHOUSE {args.warehouse}")
     try:

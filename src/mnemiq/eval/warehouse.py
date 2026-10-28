@@ -108,6 +108,20 @@ def schema_for(db_id: str) -> str:
     return "".join(c if c.isalnum() or c == "_" else "_" for c in db_id.lower())
 
 
+def snowflake_connection(connection_name: str):
+    """A Snowflake connection from a named profile, with certificate revocation checks on.
+
+    snowflake-connector-python 4.8 made OCSP checks opt-in: with no `ocsp_fail_open` given, a
+    connection checks no certificate's revocation status, where 4.7 checked it fail-open by
+    default. Every script here connects through this, so the check stays on as before, fail-open
+    as before (a revocation responder that cannot be reached does not stop a run). The driver is
+    an optional extra, imported on call, so a script that names this still imports in CI.
+    """
+    import snowflake.connector
+
+    return snowflake.connector.connect(connection_name=connection_name, ocsp_fail_open=True)
+
+
 def databricks_sql_connection(workspace, warehouse_id: str | None = None):
     """(connection, warehouse_id) for a SQL warehouse, authenticated the way `workspace` is.
 

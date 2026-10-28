@@ -141,9 +141,9 @@ def main() -> int:
     # cycle-breaking whose output is replayed verbatim as CREATE OR REPLACE against a live
     # semantic view, and it had no test because the import stopped the file being loaded.
     # `strip_sample_values` and `grade_warehouse` defer it the same way.
-    import snowflake.connector
+    from mnemiq.eval.warehouse import snowflake_connection
 
-    con = snowflake.connector.connect(connection_name=args.connection)
+    con = snowflake_connection(args.connection)
     cur = con.cursor()
     cur.execute(f"USE WAREHOUSE {args.warehouse}")
     primary, foreign = declared_keys(cur, args.database)

@@ -16,7 +16,7 @@ import re
 import sys
 import time
 
-import snowflake.connector
+from mnemiq.eval.warehouse import snowflake_connection
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
 
@@ -112,7 +112,7 @@ def main() -> int:
     if not remaining:
         return 0
 
-    con = snowflake.connector.connect(connection_name=args.connection)
+    con = snowflake_connection(args.connection)
     cur = con.cursor()
     cur.execute(f"USE WAREHOUSE {args.warehouse}")
 

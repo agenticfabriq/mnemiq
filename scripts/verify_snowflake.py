@@ -15,7 +15,7 @@ import sys
 
 from mnemiq.config import Settings
 from mnemiq.duckdb_extensions import connect_duckdb, load_extension
-import snowflake.connector
+from mnemiq.eval.warehouse import snowflake_connection
 
 from bird_to_parquet import _INTERNAL_PREFIXES, sqlite_dbs
 
@@ -63,7 +63,7 @@ def main() -> int:
         print(f"no SQLite databases under {root}", file=sys.stderr)
         return 1
 
-    con = snowflake.connector.connect(connection_name=args.connection)
+    con = snowflake_connection(args.connection)
     cur = con.cursor()
     cur.execute(f"USE WAREHOUSE {args.warehouse}")
 
