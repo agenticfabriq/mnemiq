@@ -1014,3 +1014,30 @@ def test_a_star_s_sources_are_walked_in_the_order_the_engine_lists_their_columns
     sql = f"SELECT * FROM {from_}"
     walked = _in_from_order(build_scope(sqlglot.parse_one(sql, read="duckdb")))
     assert walked == [{"c1": "a", "c2": "b", "c3": "c"}[name] for name in listed], (sql, listed)
+
+
+# The ui lane's replay of #187: with the granted holder first under the star, claim's masked
+# column is no longer referenced, so the rewrite drops claim's mask wrap where main kept it. Every
+# way past the join to claim's own `secret` is still refused or reads other's, so nothing the wrap
+# held is read (probed on main `2b28f1eb`).
+HOLDER_FIRST = "(SELECT * FROM (SELECT * FROM other) a JOIN claim c ON true) d"
+
+
+@pytest.mark.parametrize("kind", ["masked", "denied"])
+@pytest.mark.parametrize(("sql", "expected"), [
+    (f"SELECT * FROM {HOLDER_FIRST}", RefusalCode.SELECT_STAR),
+    (f"SELECT d.* FROM {HOLDER_FIRST}", RefusalCode.SELECT_STAR),
+    (f"SELECT COLUMNS('secret.*') FROM {HOLDER_FIRST}", RefusalCode.SELECT_STAR),
+    # DuckDB's name for claim's duplicate `secret`, in a projection and a predicate.
+    (f"SELECT d.secret_1 FROM {HOLDER_FIRST}", RefusalCode.UNKNOWN_COLUMN),
+    (f"SELECT count(*) FROM {HOLDER_FIRST} WHERE d.secret_1 IS NOT NULL", RefusalCode.UNKNOWN_COLUMN),
+    (f"SELECT d.secret FROM {HOLDER_FIRST}", [("OTHER-SECRET",)]),
+    (f"SELECT x.s FROM (SELECT d.secret AS s FROM {HOLDER_FIRST}) x", [("OTHER-SECRET",)]),
+])
+def test_with_the_granted_holder_first_nothing_past_the_join_reads_the_withheld_column(con, sql, expected, kind):
+    verdict = _decide(sql, FULL, policy=_policy("claim", "secret", kind))
+    if isinstance(expected, RefusalCode):
+        assert isinstance(verdict, Refusal) and verdict.code is expected, (sql, verdict)
+    else:
+        assert isinstance(verdict, Approved), (sql, verdict)
+        assert con.execute(verdict.target_sql).fetchall() == expected
