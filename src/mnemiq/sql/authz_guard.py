@@ -5,7 +5,7 @@ import re
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
-from mnemiq.sql.functions import FunctionInventory, UnreadableCalls, called_names
+from mnemiq.sql.functions import FunctionInventory, Unanswered, UnreadableCalls, called_names
 from mnemiq.sql.identifiers import resolve, resolve_identifier, resolve_stored, rules_for
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.scope import GENERATED_NAME, KnownColumns, base_tables, candidate_tables, column_tables
@@ -709,7 +709,7 @@ def check_unmodelled_calls(
         # guard written to use it: measured, a raising `user_functions()` on a source holding a
         # `median` macro left `SELECT median(id) FROM claim` approved.
         if inventory.unanswered:
-            return _source_did_not_answer(inventory)
+            return _source_did_not_answer("which functions it defines", inventory.reason)
         return _cannot_resolve(inventory)
     # A whole-source answer naming nothing clears every statement. A narrow one (M101) says only
     # that none of the names it was ASKED about is defined, so it clears nothing until the
@@ -787,6 +787,8 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
     REPAIRABLE, unlike the other arrivals at this code. Selecting a different column is a real
     rewrite, and the message names the one to avoid.
     """
+    if isinstance(opaque, Unanswered):
+        return _source_did_not_answer("which of its columns are computed", opaque.reason)
     if opaque is None:
         # ASKED and could not answer. Every column could be computed by an expression nobody can
         # read, and `check_access` passes a listed column, so there is nothing else looking.
@@ -865,16 +867,17 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
     return None
 
 
-def _source_did_not_answer(inventory: FunctionInventory) -> Refusal:
-    """The source did not answer when asked what it defines (M180): an outage, refused as the
-    proof seam refuses one, SOURCE_UNAVAILABLE, which no rewrite mends and the agent reports as
-    the source being down after one model call. The reason kept is the fault's type (M94)."""
+def _source_did_not_answer(asked: str, reason: str) -> Refusal:
+    """The source did not answer a catalogue question the decider put (M180): an outage, refused
+    as the proof seam refuses one, SOURCE_UNAVAILABLE, which no rewrite mends and the agent
+    reports as the source being down after one model call. The reason kept is the fault's type
+    (M94)."""
     return Refusal(
         code=RefusalCode.SOURCE_UNAVAILABLE,
-        message=("The source did not answer when asked which functions it defines, so this query "
-                 "could not be checked against it. That is not about the query. Try again, and "
-                 "tell the operator if it persists; the server log has the source's error."),
-        source_detail=inventory.reason or None,
+        message=(f"The source did not answer when asked {asked}, so this query could not be "
+                 "checked against it. That is not about the query. Try again, and tell the "
+                 "operator if it persists; the server log has the source's error."),
+        source_detail=reason or None,
     )
 
 

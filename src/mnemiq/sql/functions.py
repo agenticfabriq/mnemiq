@@ -438,7 +438,16 @@ def _builtins_from(adapter) -> tuple[frozenset[str] | None, bool]:
         return None, True
 
 
-def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str, str]] | None:
+@dataclass(frozen=True)
+class Unanswered:
+    """What `opaque_columns` gives where the source did not answer (M180): an outage, apart from
+    None, a fault a retry may clear, as `FunctionInventory.unanswered` is apart from `unavailable`.
+    `reason` is the fault's type, never its text (M94)."""
+
+    reason: str = ""
+
+
+def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str, str]] | None | Unanswered:
     """(table, column) pairs whose stored expression this engine cannot attribute.
 
     A virtual column is a route to user code with no call in the statement, which is the third
@@ -468,7 +477,15 @@ def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str
         return frozenset()
     try:
         columns = adapter.virtual_columns()
-    except Exception:
+    except Exception as exc:
+        # The second seam a source already down can meet first: on Oracle a statement calling no
+        # function asks the per-name inventory about no names, which never reaches the source
+        # (Codex's review of M180: `SELECT id FROM claim` kept the retry).
+        from mnemiq.sql.prove import source_did_not_answer
+
+        if source_did_not_answer(adapter, exc):
+            logger.warning("The source could not be asked which of its columns are computed: %s", exc)
+            return Unanswered(type(exc).__name__)
         return None
     if not inventory.certain:
         return frozenset((t, c) for t, c, _ in columns)
