@@ -2442,6 +2442,30 @@ def unplaceable_policy(ast: exp.Expression, policy: AccessPolicy, dialect: str |
     return None
 
 
+def _decided_as_its_engine(name: str, dialect: str | None, executes_as: str | None) -> Refusal | None:
+    """A row filter is SQL in the source's own dialect, and is applied only to a statement decided
+    as the engine that runs it (M218). Decided in another dialect, the filter is translated with no
+    equivalence behind it: DuckDB's `greatest(id, NULL)` and `concat(region, NULL)` skip the NULL
+    where SQLite's rendering, `MAX(id, NULL)` and `region || NULL`, gives NULL, so a filter that
+    excludes a row on one admits it on the other (Codex, executed on SQLite), and a function can
+    keep its spelling and change its meaning, which no comparison of renderings sees (MySQL's
+    GREATEST and CONCAT give NULL where DuckDB's skip it). Every shipped door decides as the
+    adapter's own dialect, so this refuses what only a direct call reaches: `decide`'s defaults,
+    duckdb for postgres, among them."""
+    if not executes_as or executes_as.lower() == (dialect or "").lower():
+        return None
+    return Refusal(
+        code=RefusalCode.POLICY_TARGET_UNSUPPORTED,
+        message=(
+            f"The row-access policy for {name!r} is written in the SQL of the engine that runs it "
+            f"and is applied only to a statement decided as that engine; this one is decided as "
+            f"{dialect!r} and runs as {executes_as!r}. This is a deployment setting, not a limit "
+            f"on your grants."
+        ),
+        subject=name,
+    )
+
+
 def apply_row_and_mask(
     ast: exp.Expression,
     policy: AccessPolicy,
@@ -2517,6 +2541,9 @@ def apply_row_and_mask(
             continue
         filt: exp.Expression | None = None
         if needs_filter:
+            elsewhere = _decided_as_its_engine(name, dialect, executes_as)
+            if elsewhere is not None:
+                return elsewhere, []
             filt = _validate_filter(
                 policy.row_filter_for(name), visible[name], dialect, policy.policy_schema,
                 executes_as=executes_as,
@@ -2591,6 +2618,9 @@ def apply_row_filters_to_write(
     filt = policy.row_filter_for(name)
     if filt is None:
         return ast, narrowed
+    elsewhere = _decided_as_its_engine(name, dialect, executes_as)
+    if elsewhere is not None:
+        return elsewhere, []
     predicate = _validate_filter(filt, visible.get(name, set()), dialect, policy.policy_schema,
                                  executes_as=executes_as)
     if predicate is None:

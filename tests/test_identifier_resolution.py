@@ -123,15 +123,17 @@ def test_the_WRITE_path_resolves_reads_the_same_way_the_read_path_does():
     sql = ('INSERT INTO scratch SELECT id, amount FROM '
            '(WITH "claim" AS (SELECT id, amount FROM src) SELECT id, amount FROM claim) t')
     visible = {"claim": {"id", "amount"}, "src": {"id", "amount"}, "scratch": {"id", "amount"}}
-    policy = AccessPolicy(row_filters={"claim": "amount > 0"})
+    # A mask, not a row filter: a filter decided in one dialect for another engine is refused
+    # before any resolving (M218), and a mask is the policy that still crosses dialects.
+    policy = AccessPolicy(masked={("claim", "amount")})
 
     def narrow(executes_as):
         ast = sqlglot.parse_one(sql, read="duckdb")
         out, narrowed = apply_row_filters_to_write(ast, policy, visible, _target_node(ast),
                                                    "duckdb", executes_as=executes_as)
-        return {n.object for n in narrowed}, "amount > 0" in str(out)
+        return {n.object for n in narrowed}, "NULL AS amount" in out.sql(dialect="duckdb").replace('"', "")
 
-    assert narrow("oracle") == ({"claim"}, True), "unfiltered rows would be copied into scratch"
+    assert narrow("oracle") == ({"claim"}, True), "unmasked values would be copied into scratch"
     assert narrow("duckdb") == (set(), False), "the CTE really does shadow here"
 
     # asserted BEHAVIOURALLY rather than by reading the source: an earlier version of this test

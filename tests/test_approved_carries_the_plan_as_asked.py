@@ -42,8 +42,9 @@ def test_under_a_row_filter_it_carries_no_policy_predicate():
 
 def test_it_is_in_the_plan_dialect_not_the_targets():
     """`asked_sql` is the target's rendering -- Oracle's FETCH FIRST here -- and would change
-    every prompt on a source whose target differs from the plan."""
-    approved = _approved(AccessPolicy(row_filters={"policy": "region = 'west'"},
+    every prompt on a source whose target differs from the plan. Under a mask: a row filter is
+    applied only to a statement decided as the engine that runs it (M218)."""
+    approved = _approved(AccessPolicy(masked={("policy", "premium")},
                                       policy_schema=VISIBLE), target="oracle")
     assert "FETCH FIRST" in approved.asked_sql
     assert "LIMIT" in approved.asked_plan and "FETCH" not in approved.asked_plan
