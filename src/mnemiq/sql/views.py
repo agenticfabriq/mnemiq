@@ -116,7 +116,16 @@ def spellings(names: set[str], fold=str.lower) -> set[str]:
     return out
 
 
-def _mentions(body: exp.Expression) -> set[str]:
+def _restricting(names: set[str], dialect: str | None) -> set[str]:
+    """Every spelling of `names` a RESTRICTING comparison matches on: folded every letter, as
+    `spellings` does by default, and folded as the view's engine folds (M176). A match refuses, so
+    the union is never narrower than either. Lower-casing alone kept `orderſ` apart from `orders`
+    where Oracle folds the long s to S, so a view reading `orderſ` read the filtered ORDERS and
+    was approved; the dotless i and the final sigma are the same shape."""
+    return spellings(names) | spellings(names, rules_for(dialect).fold)
+
+
+def _mentions(body: exp.Expression, dialect: str | None = None) -> set[str]:
     """Every table name the body mentions, in both spellings, from the RAW tree.
 
     Deliberately not `base_tables`. That resolves scopes to tell a CTE reference from a base
@@ -131,7 +140,7 @@ def _mentions(body: exp.Expression) -> set[str]:
     # Folded and bare-segmented, because unquoted identifiers are case-insensitive in all three
     # engines and a body may qualify what the snapshot keys bare. Widening here can only ADD
     # matches, and every added match is a refusal.
-    return spellings(names)
+    return _restricting(names, dialect)
 
 
 class ViewInventory(dict):
@@ -383,9 +392,7 @@ def _walk(
         # The filtered set is widened the same way and by its bare last segment, so a body
         # saying `customer` still matches a filter keyed `public.customer`. Both directions,
         # because a miss here means not refusing.
-        wanted = {f for f in filtered} | {f.lower() for f in filtered} \
-            | {f.rsplit(".", 1)[-1] for f in filtered} \
-            | {f.rsplit(".", 1)[-1].lower() for f in filtered}
+        wanted = _restricting(set(filtered), view.dialect)
         # A body may only read objects the snapshot knows. A caller writing
         # `SELECT a FROM 'customer.csv'` is already refused UNAUTHORIZED_TABLE because the name
         # is not in `visible`; a view body was never held to that, so a view could reach a file
@@ -422,7 +429,8 @@ def _walk(
                                f"{it} reads an object that is not in this source, so this engine "
                                "cannot tell what policy applies to it.",
                                f"{name!r} reads unknown {unknown[0]!r}")
-        reached = sorted(_mentions(body) & wanted)
+        mentioned = _mentions(body, view.dialect)
+        reached = sorted(mentioned & wanted)
         if reached:
             # The table is offered as the repair only when the view reaches exactly ONE filtered
             # policy key, the body wrote that key exactly, and the caller holds it. Not by any
@@ -432,7 +440,7 @@ def _walk(
             # table's rows. Not by the view's name prefix either: a prefix may be a schema, not a
             # catalog, and nothing here can tell which. A federated body writes `customer` where
             # the key is `pg.customer`, so it gets no hint -- fail closed, the refusal still holds.
-            keys = sorted(f for f in filtered if spellings({f}) & _mentions(body))
+            keys = sorted(f for f in filtered if _restricting({f}, view.dialect) & mentioned)
             written = {object_key(t).lower() for t in body.find_all(exp.Table)}
             held = (keys[0] if len(keys) == 1 and keys[0].lower() in written
                     and keys[0].lower() in granted else None)
