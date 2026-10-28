@@ -30,8 +30,8 @@ def main() -> None:
     args = p.parse_args()
 
     if args.engine == "snowflake":
-        import snowflake.connector
-        con = snowflake.connector.connect(connection_name=args.connection)
+        from mnemiq.eval.warehouse import snowflake_connection
+        con = snowflake_connection(args.connection)
         cur = con.cursor()
         cur.execute(f"USE WAREHOUSE {args.sf_warehouse}")
     else:

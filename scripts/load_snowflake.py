@@ -19,7 +19,7 @@ import argparse
 import os
 import sys
 
-import snowflake.connector
+from mnemiq.eval.warehouse import snowflake_connection
 
 
 def parquet_tree(root: str, allowed: set[str] | None) -> list[tuple[str, list[str]]]:
@@ -106,7 +106,7 @@ def main() -> int:
 
     con = cur = None
     if not args.dry_run:
-        con = snowflake.connector.connect(connection_name=args.connection)
+        con = snowflake_connection(args.connection)
         cur = con.cursor()
         cur.execute(f"USE WAREHOUSE {args.warehouse}")
         cur.execute(f"CREATE DATABASE IF NOT EXISTS {args.database}")

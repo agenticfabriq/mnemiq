@@ -282,9 +282,9 @@ def main() -> int:
 
     # Deferred so `plan_recasts` above can be imported and tested without the warehouse
     # extra, the convention `tests/test_ddl_translate.py` sets.
-    import snowflake.connector
+    from mnemiq.eval.warehouse import snowflake_connection
 
-    con = snowflake.connector.connect(connection_name=args.connection)
+    con = snowflake_connection(args.connection)
     cur = con.cursor()
     cur.execute(f"USE WAREHOUSE {args.warehouse}")
 

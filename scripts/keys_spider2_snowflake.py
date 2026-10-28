@@ -15,7 +15,7 @@ import os
 import sqlite3
 import sys
 
-import snowflake.connector
+from mnemiq.eval.warehouse import snowflake_connection
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fix_keys_snowflake import drop_existing  # noqa: E402
@@ -74,7 +74,7 @@ def main() -> int:
         print(f"no .sqlite under {os.path.join(root, 'databases')} -- nothing to replay",
               file=sys.stderr)
         return 2
-    con = snowflake.connector.connect(connection_name=args.connection)
+    con = snowflake_connection(args.connection)
     cur = con.cursor()
     cur.execute(f"USE WAREHOUSE {args.warehouse}")
 

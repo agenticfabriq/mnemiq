@@ -16,7 +16,7 @@ import argparse
 import os
 import sys
 
-import snowflake.connector
+from mnemiq.eval.warehouse import snowflake_connection
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from exc_reason import reason  # noqa: E402
@@ -43,7 +43,7 @@ def main() -> int:
     keys = load_keys(root)
     wanted = sorted({c.db_id for c in load_spider(root, split=args.split)})
 
-    con = snowflake.connector.connect(connection_name=args.connection)
+    con = snowflake_connection(args.connection)
     cur = con.cursor()
     cur.execute(f"USE WAREHOUSE {args.warehouse}")
 
