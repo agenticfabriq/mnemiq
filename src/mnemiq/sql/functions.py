@@ -18,10 +18,13 @@ splits the question instead, into the names a statement is written to ask for
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 
 from sqlglot import exp
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,11 @@ class FunctionInventory:
     available: bool = True
     asked: bool = True
     reason: str = ""   # declared for every constructor, not only the failing one
+    # Asked and not answered because the SOURCE did not answer, by the adapter's own reading of
+    # its driver's fault (`source_did_not_answer`, the proof seam's question): an outage, which
+    # no rewrite of the statement mends. False for a fault the adapter does not know, which keeps
+    # the retry M98 gives a catalogue call that raised (M180).
+    unanswered: bool = False
     # Whether this answer also covers what a VIEW BODY on this source may invoke. It does not,
     # for a Postgres attachment: measured, `SELECT median(1)` binds to DuckDB's aggregate and a
     # Postgres UDF is unreachable from a generated query, but reading a Postgres view whose body
@@ -197,9 +205,9 @@ class FunctionInventory:
         return cls(names or (), **kw)
 
     @classmethod
-    def unavailable(cls, reason: str = "") -> "FunctionInventory":
+    def unavailable(cls, reason: str = "", *, unanswered: bool = False) -> "FunctionInventory":
         """Asked and could not answer. Denies certification, never an answer."""
-        return cls(available=False, asked=True, reason=reason)
+        return cls(available=False, asked=True, reason=reason, unanswered=unanswered)
 
     @classmethod
     def never_asked(cls) -> "FunctionInventory":
@@ -301,7 +309,7 @@ def inventory_from(adapter, called=None) -> FunctionInventory:
     except Exception as exc:
         # The TYPE, not the message. A source's exception text is made of the caller's schema
         # and can carry a DSN, and this reason reaches an audit record (M94).
-        return FunctionInventory.unavailable(type(exc).__name__)
+        return _unanswered(adapter, exc)
     builtins, builtins_asked = _builtins_from(adapter)
     return FunctionInventory.of(
         names,
@@ -312,6 +320,21 @@ def inventory_from(adapter, called=None) -> FunctionInventory:
         binder_prefers_builtins=getattr(adapter, "binder_prefers_builtins", False),
         unresolvable=unresolvable,
     )
+
+
+def _unanswered(adapter, exc: Exception) -> FunctionInventory:
+    """The inventory a catalogue call that raised gives: unavailable, and unanswered where the
+    adapter reads the fault as the source not answering (M180). A source down before the decider
+    starts fails here first, and read as a fault worth retrying it cost three model calls (eight
+    on the deep path) and reached the caller as an ungovernable source, where the proof seam
+    reports the same outage after one."""
+    from mnemiq.sql.prove import source_did_not_answer
+
+    down = source_did_not_answer(adapter, exc)
+    if down:
+        # The operator's record, as at the proof: the reason kept on the inventory is the type.
+        logger.warning("The source could not be asked which functions it defines: %s", exc)
+    return FunctionInventory.unavailable(type(exc).__name__, unanswered=down)
 
 
 def _answers_by_name(adapter) -> bool:
@@ -332,7 +355,7 @@ def _inventory_for_names(adapter, called) -> FunctionInventory:
         defined, unresolvable = adapter.resolve_called_functions(asked)
     except Exception as exc:
         # The TYPE, never the message, as for `user_functions` (M94).
-        return FunctionInventory.unavailable(type(exc).__name__)
+        return _unanswered(adapter, exc)
     builtins, builtins_asked = _builtins_from(adapter)
     return FunctionInventory.of(
         defined,
@@ -415,7 +438,16 @@ def _builtins_from(adapter) -> tuple[frozenset[str] | None, bool]:
         return None, True
 
 
-def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str, str]] | None:
+@dataclass(frozen=True)
+class Unanswered:
+    """What `opaque_columns` gives where the source did not answer (M180): an outage, apart from
+    None, a fault a retry may clear, as `FunctionInventory.unanswered` is apart from `unavailable`.
+    `reason` is the fault's type, never its text (M94)."""
+
+    reason: str = ""
+
+
+def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str, str]] | None | Unanswered:
     """(table, column) pairs whose stored expression this engine cannot attribute.
 
     A virtual column is a route to user code with no call in the statement, which is the third
@@ -445,7 +477,15 @@ def opaque_columns(adapter, inventory: FunctionInventory) -> frozenset[tuple[str
         return frozenset()
     try:
         columns = adapter.virtual_columns()
-    except Exception:
+    except Exception as exc:
+        # The second seam a source already down can meet first: on Oracle a statement calling no
+        # function asks the per-name inventory about no names, which never reaches the source
+        # (Codex's review of M180: `SELECT id FROM claim` kept the retry).
+        from mnemiq.sql.prove import source_did_not_answer
+
+        if source_did_not_answer(adapter, exc):
+            logger.warning("The source could not be asked which of its columns are computed: %s", exc)
+            return Unanswered(type(exc).__name__)
         return None
     if not inventory.certain:
         return frozenset((t, c) for t, c, _ in columns)
