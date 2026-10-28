@@ -708,6 +708,8 @@ def check_unmodelled_calls(
         # test below and clear the statement. The collapse this type exists to prevent, in the
         # guard written to use it: measured, a raising `user_functions()` on a source holding a
         # `median` macro left `SELECT median(id) FROM claim` approved.
+        if inventory.unanswered:
+            return _source_did_not_answer(inventory)
         return _cannot_resolve(inventory)
     # A whole-source answer naming nothing clears every statement. A narrow one (M101) says only
     # that none of the names it was ASKED about is defined, so it clears nothing until the
@@ -861,6 +863,19 @@ def check_opaque_columns(ast: exp.Expression, opaque, dialect: str | None = None
             if (table.lower(), name) in opaque:
                 return refuse(name, "reading it", "Answer without that column.")
     return None
+
+
+def _source_did_not_answer(inventory: FunctionInventory) -> Refusal:
+    """The source did not answer when asked what it defines (M180): an outage, refused as the
+    proof seam refuses one, SOURCE_UNAVAILABLE, which no rewrite mends and the agent reports as
+    the source being down after one model call. The reason kept is the fault's type (M94)."""
+    return Refusal(
+        code=RefusalCode.SOURCE_UNAVAILABLE,
+        message=("The source did not answer when asked which functions it defines, so this query "
+                 "could not be checked against it. That is not about the query. Try again, and "
+                 "tell the operator if it persists; the server log has the source's error."),
+        source_detail=inventory.reason or None,
+    )
 
 
 def _cannot_resolve(inventory: FunctionInventory, *, unreadable: bool = False) -> Refusal:
