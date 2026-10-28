@@ -1741,18 +1741,21 @@ def test_a_raising_filter_the_target_cannot_print_is_still_refused_not_raised():
     # Codex's forty-eighth review of #160: `CAST(MAP {region: 1}[region] AS INT) = 1` is a raising
     # conversion, and the refusal's log line printed the filter for the engine, which raised for
     # Postgres and Oracle before the refusal was built, so the one policy failed every read and
-    # write of its table. The log prints what it can; the refusal is the validator's, on every target.
+    # write of its table. The log prints what it can; the refusal is the validator's on DuckDB, and
+    # decided as DuckDB for another engine the filter is not applied at all (M218): refused either
+    # way, never raised.
     types = {**TYPES, ("claim", "tags"): "VARCHAR[]"}
     grants = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}),
                       row_filters={"claim": "CAST(MAP {region: 1}[region] AS INT) = 1"})
     for engine in ("duckdb", "postgres", "oracle", "mysql", "sqlite"):
+        code = RefusalCode.INVALID_ROW_FILTER if engine == "duckdb" else RefusalCode.POLICY_TARGET_UNSUPPORTED
         verdict = decide("SELECT id FROM claim", visible_schema(_snapshot(types), grants), dialect="duckdb",
                         target=engine, policy=build_access_policy(_snapshot(types), grants))
-        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (engine, verdict)
+        assert isinstance(verdict, Refusal) and verdict.code is code, (engine, verdict)
         verdict = decide_write("INSERT INTO claim (id) SELECT id FROM claim", visible_schema(_snapshot(types), grants), grants,
                                policy=build_access_policy(_snapshot(types), grants), dialect="duckdb", target=engine,
                                writes_enabled=True)
-        assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, (engine, verdict)
+        assert isinstance(verdict, Refusal) and verdict.code is code, (engine, verdict)
 
 
 def test_a_dotted_map_key_in_a_row_filter_is_no_predicate():

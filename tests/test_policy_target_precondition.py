@@ -28,7 +28,9 @@ FORWARD = ("WITH RECURSIVE foo AS (SELECT amount FROM claim), claim(amount) AS "
 
 
 def _read(sql, target, policy=FILTERED):
-    return decide(sql, SCHEMA, dialect="duckdb", target=target, policy=policy)
+    # Decided as the engine that runs it, as production decides: a row filter decided in another
+    # dialect is refused on its own account (M218).
+    return decide(sql, SCHEMA, dialect=target, target=target, policy=policy)
 
 
 @pytest.mark.parametrize("target", ["postgres", "sqlite"])

@@ -64,7 +64,8 @@ def test_a_row_filter_binds_however_the_table_is_spelled(snapshot_key, query_ref
         snapshot, GrantSet(objects=frozenset({snapshot_key}),
                            row_filters={snapshot_key: "region = 'west'"}))
     v = decide(f"SELECT id FROM {query_ref}",
-               {snapshot_key: {"id", "region"}, query_ref: {"id", "region"}}, policy=policy)
+               {snapshot_key: {"id", "region"}, query_ref: {"id", "region"}}, policy=policy,
+               target="duckdb")  # decided as the engine that runs it, as every shipped door does (M218)
     assert not isinstance(v, Refusal), v
     assert "region = 'west'" in v.plan_sql, v.plan_sql
 
@@ -183,7 +184,7 @@ def test_the_applied_row_policy_does_not_depend_on_how_the_caller_spells_the_tab
     policy = AccessPolicy(row_filters={"claim": "region = 'west'", "CLAIM": "region = 'east'"})
     plans = {}
     for q in CASES:
-        v = decide(f"SELECT id FROM {q}", {q: {"id", "region"}}, policy=policy)
+        v = decide(f"SELECT id FROM {q}", {q: {"id", "region"}}, policy=policy, target="duckdb")
         assert "west" in v.plan_sql and "east" in v.plan_sql, (q, v.plan_sql)
         plans[q] = v.plan_sql.replace(q, "T")
     assert len(set(plans.values())) == 1, plans
