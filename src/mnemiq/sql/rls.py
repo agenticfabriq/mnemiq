@@ -12,8 +12,8 @@ from sqlglot import exp
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import names_one_object, object_key
 from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, is_lambda_parameter, map_struct
-from mnemiq.sql.scope import (base_tables, column_tables, cte_references, known_columns,
-                              scope_resolved)
+from mnemiq.sql.scope import (KnownColumns, base_tables, column_tables, cte_references,
+                              known_columns, scope_resolved)
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 logger = logging.getLogger(__name__)
@@ -86,7 +86,10 @@ def _validate_filter(
         # check below, so a filter naming it would read whatever table happens to carry that
         # name. Unspellable by convention is not unspellable.
         return None
-    schema = dict(policy_schema or {})
+    # The policy's schema is every column of the snapshot's, so its tables are listed in full: one
+    # lacking a name under a derived star does not have it, as the deciders read it (M215).
+    schema = KnownColumns(policy_schema or {})
+    schema.complete = frozenset(schema)
     schema[_SUBJECT] = set(cols)
     try:
         wrapped = _parsed(filt, dialect, wrapped=True)
