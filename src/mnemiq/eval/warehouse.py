@@ -114,12 +114,19 @@ def snowflake_connection(connection_name: str):
     snowflake-connector-python 4.8 made OCSP checks opt-in: with no `ocsp_fail_open` given, a
     connection checks no certificate's revocation status, where 4.7 checked it fail-open by
     default. Every script here connects through this, so the check stays on as before, fail-open
-    as before (a revocation responder that cannot be reached does not stop a run). The driver is
-    an optional extra, imported on call, so a script that names this still imports in CI.
+    as before (a revocation responder that cannot be reached does not stop a run), unless the
+    profile says otherwise: the driver lays the call's arguments over the profile's, so passing
+    the opt-in unconditionally turned a profile's `ocsp_fail_open = false`, fail-closed, into
+    fail-open (Codex's second review of the bump). The profile is read where the driver reads
+    it. The driver is an optional extra, imported on call, so a script naming this imports in CI.
     """
     import snowflake.connector
+    from snowflake.connector.config_manager import CONFIG_MANAGER
 
-    return snowflake.connector.connect(connection_name=connection_name, ocsp_fail_open=True)
+    connections = CONFIG_MANAGER["connections"]
+    profile = connections[connection_name] if connection_name in connections else {}
+    opt_in = {} if "ocsp_fail_open" in profile else {"ocsp_fail_open": True}
+    return snowflake.connector.connect(connection_name=connection_name, **opt_in)
 
 
 def databricks_sql_connection(workspace, warehouse_id: str | None = None):
