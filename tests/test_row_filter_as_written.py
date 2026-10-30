@@ -258,6 +258,8 @@ def test_a_name_the_parse_does_not_read_as_a_column_or_a_table_refuses_the_filte
     ("oracle", "id IN (SELECT ALL id FROM entitlement)"),
     # The same where the parse drops the word: NULL is the literal to DuckDB, never a column.
     ("duckdb", "list_reverse_sort([id], NULL) IS NOT NULL"),
+    # A quoted call's name, which a parse holds as the function and no name: DuckDB runs it.
+    ("duckdb", "\"upper\"(region) = 'WEST'"),
 ])
 def test_names_the_parse_accounts_for_pass(dialect, filt):
     schema = {"claim": {"id", "region", "d"}, "entitlement": {"id", "who"}}
@@ -416,3 +418,29 @@ def test_postgres_reads_no_word_taken_as_reserved_as_a_column():
         assert _reads_the_column(run, _beside("id_probe", "id_probe")), "the control"
         read = [w for w in sorted(RESERVED["postgres"]) if _reads_the_column(run, _beside(w, w))]
     assert not read, read
+
+
+
+@pytest.mark.parametrize("filt", [
+    'list_reverse_sort([id], "all") IS NOT NULL AND id IN (SELECT id FROM entitlement UNION ALL SELECT id FROM entitlement)',
+    'list_reverse_sort([id], "all") IS NOT NULL AND id IN (SELECT ALL id FROM entitlement)',
+    "list_reverse_sort([id], \"both\") IS NOT NULL AND TRIM(BOTH FROM region) = 'x'",
+])
+def test_a_quoted_name_the_parse_drops_is_never_excused_as_a_keyword(filt):
+    # The same word unquoted elsewhere stands where a keyword does, and counted together its place
+    # excused the dropped name (Codex's eighth review of #193). A quoted name is a name wherever
+    # it stands. Every table and column here is in the schema, so nothing else refuses it.
+    schema = {"claim": {"id", "region", "d"}, "entitlement": {"id", "who"}}
+    verdict = decide("SELECT id FROM claim", {"claim": schema["claim"]}, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    control = decide("SELECT id FROM claim", {"claim": schema["claim"]}, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(row_filters={"claim": filt.split(" AND ", 1)[1]}, policy_schema=schema))
+    assert isinstance(control, Approved), control  # the keyword's half alone passes
+
+
+def test_a_quoted_name_is_held_only_by_a_quoted_name_in_the_parse():
+    # An unquoted `d` the parse keeps does not stand in for the quoted `"d"` it dropped.
+    from mnemiq.sql import rls
+    filt = 'list_reverse_sort([id], "d") IS NOT NULL AND d > 0'
+    assert rls._quoted_dropped(filt, "duckdb", rls._parsed(filt, "duckdb")) == {"d"}

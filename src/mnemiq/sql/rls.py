@@ -190,7 +190,21 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
              and not (isinstance(v.parent, exp.Extract) and v.arg_key == "this")
              and not isinstance(v.parent, (exp.Interval, exp.IntervalSpan))}
     dropped = _keywords_dropped(filt, dialect, counted)
-    return sorted(set(lost) | (parts & set(names(filt, named))) | set(dropped))
+    return sorted(set(lost) | (parts & set(names(filt, named))) | set(dropped) | _quoted_dropped(filt, dialect, tree))
+
+
+def _quoted_dropped(filt: str, dialect: str, tree: exp.Expression) -> set[str]:
+    """Every quoted name in the text that the parse holds fewer times than written. A quoted name
+    is a name wherever it stands, so none is excused as a keyword's place, which the count above
+    could not tell apart: `list_reverse_sort([id], "all")` beside a `UNION ALL` passed, the
+    keyword's place cancelling the column the parse dropped (Codex's eighth review of #193). Read
+    from the parse, not its reprint, which quotes and unquotes as it likes; a call's name is left
+    out, as in the count."""
+    tokens = sqlglot.tokenize(filt, read=dialect)
+    written = Counter(t.text for i, t in enumerate(tokens) if t.token_type is TokenType.IDENTIFIER
+                      and not (i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN))
+    held = Counter(node.name for node in tree.find_all(exp.Identifier) if node.args.get("quoted"))
+    return {name.casefold() for name in written - held}
 
 
 def _fresh_name(filt: str) -> str:
