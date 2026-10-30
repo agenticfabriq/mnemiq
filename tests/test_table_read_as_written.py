@@ -85,6 +85,25 @@ def test_on_oracle_a_name_whose_unquoted_fold_is_unmeasured_is_decided_only_quot
     assert isinstance(unquoted, Refusal) and isinstance(quoted, Approved), (unquoted, quoted)
 
 
+
+@pytest.mark.parametrize("sql", ['WITH "ᾀ" AS (SELECT 1 AS ID FROM DUAL) SELECT ID FROM ᾀ',
+                                 'WITH ᾀ AS (SELECT 1 AS ID FROM DUAL) SELECT ID FROM "ᾀ"',
+                                 "WITH ᾀ AS (SELECT 1 AS ID FROM DUAL) SELECT ID FROM ᾀ"])
+def test_on_oracle_a_cte_or_reference_named_with_an_unmeasured_fold_is_refused(sql):
+    # Which one a reference binds to cannot be told: the shared rules keep `ᾀ` either way, and
+    # Oracle folds the unquoted `ᾀ` to a letter of its own, so the reference can read a table of
+    # that name past the grant (Codex's review of the M223 branch). The third, unquoted on both
+    # sides, binds whatever the fold is; refused all the same, quoting is the repair.
+    verdict = decide(sql, {"DUAL": {"DUMMY"}}, dialect="oracle", target="oracle")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_TABLE, verdict
+    assert "quoted" in verdict.message, verdict.message
+
+
+def test_on_oracle_the_quoted_cte_and_reference_are_approved():
+    verdict = decide('WITH "ᾀ" AS (SELECT 1 AS ID FROM DUAL) SELECT ID FROM "ᾀ"', {"DUAL": {"DUMMY"}},
+                     dialect="oracle", target="oracle")
+    assert isinstance(verdict, Approved), verdict
+
 def test_on_oracle_a_kept_letter_the_sweep_measured_reads_as_written():
     # Oracle stores an unquoted `straße` as STRAßE: `ß` is kept, measured.
     verdict = decide("SELECT ID FROM STRAßE", {"STRAßE": set(COLUMNS)}, dialect="oracle",

@@ -6,7 +6,7 @@ from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
 from mnemiq.sql.functions import FunctionInventory, Unanswered, UnreadableCalls, called_names
-from mnemiq.sql.identifiers import resolve, resolve_identifier, resolve_stored, rules_for
+from mnemiq.sql.identifiers import resolve, resolve_exactly, resolve_identifier, resolve_stored, rules_for
 from mnemiq.sql.qualify import engine_key, object_key, stored_key
 from mnemiq.sql.scope import GENERATED_NAME, KnownColumns, base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -330,6 +330,33 @@ def not_read_as_written(table: exp.Table, held, dialect: str | None) -> Refusal 
     return None
 
 
+def _unmeasured_name(ast: exp.Expression, dialect: str | None) -> Refusal | None:
+    """A table or a CTE named unquoted with a character whose fold on the engine was never
+    measured (`identifiers.resolve_exactly`), refused saying to quote it (M223).
+
+    Which CTE a reference binds to is read by the shared rules, which keep such a character: with
+    `WITH "ᾀ" AS (...) SELECT ... FROM ᾀ` both read as `ᾀ`, the reference was taken for the CTE and
+    left unchecked, where Oracle folds the unquoted `ᾀ` to one letter of its own and reads a table
+    of that name (Codex's review of the M223 branch); unquoted in the CTE and quoted in the
+    reference, the same the other way. Quoted, a name reads as written on every engine."""
+    for node in ast.find_all(exp.Table, exp.CTE):
+        if isinstance(node, exp.Table):
+            parts = [node.args.get(arg) for arg in ("catalog", "db", "this")]
+        else:
+            alias = node.args.get("alias")
+            parts = [alias.this if isinstance(alias, exp.TableAlias) else None]
+        for part in parts:
+            if isinstance(part, exp.Identifier) and resolve_exactly(
+                    part.name, quoted=bool(part.quoted), dialect=dialect) is None:
+                return Refusal(
+                    code=RefusalCode.UNKNOWN_TABLE,
+                    message=(f"How {part.sql(dialect=dialect)} reads unquoted here is not known. "
+                             "Write the name quoted, as it is stored."),
+                    subject=part.name,
+                )
+    return None
+
+
 def _as_listed(key: str, dialect: str | None) -> str:
     """`key` written so the engine reads it as that name: bare where the engine folds it to
     itself, quoted otherwise."""
@@ -357,6 +384,9 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     # tables, and the aliases that stand for them. `base_tables` -- not `find_all` minus a flat
     # set of CTE names -- because a reference inside a CTE body naming that same CTE reads the
     # base table, and skipping it let an ungranted table through (M31).
+    unmeasured = _unmeasured_name(ast, dialect)
+    if unmeasured is not None:
+        return unmeasured
     alias_to_table: dict[str, str] = {}
     named: set[int] = set()
     resolved = column_tables(ast, dialect, columns if columns is not None else visible, named=named)
