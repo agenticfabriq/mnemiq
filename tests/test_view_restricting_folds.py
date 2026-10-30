@@ -92,7 +92,8 @@ def test_every_view_a_fold_matches_is_walked_not_the_first(body):
 
 def _over_twins(body: str, dialect: str, views: dict[str, str], visible=("v",)):
     defs = {k: ViewDefinition(object_id=k, dialect=dialect, definition=d) for k, d in views.items()}
-    defs.setdefault("v", ViewDefinition(object_id="v", dialect=dialect, definition=body))
+    if body:
+        defs.setdefault("v", ViewDefinition(object_id="v", dialect=dialect, definition=body))
     schema = {"orders": {"id"}, "safe_table": {"id"}, **{k: {"id"} for k in defs}}
     policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
     return decide("SELECT id FROM v", {k: {"id"} for k in visible}, dialect=dialect, target=dialect,
@@ -123,6 +124,58 @@ def test_a_refusal_through_a_twin_names_only_the_view_the_query_read():
     verdict = _over_twins("SELECT id FROM safe_table", "oracle", {"V": "SELECT id FROM orders"})
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
     assert verdict.subject == "v" and "'V'" not in verdict.message, verdict
+
+
+def test_a_granted_table_s_view_twin_is_refused_under_the_table_s_name():
+    # Postgres keeps a quoted "V" apart from `v`; the caller holds the table `v` and not the view.
+    # The lowercase fallback walks "V", the conservative reading, and the refusal names what the
+    # query wrote, never "V" (Codex's fourth review of #192).
+    verdict = _over_twins("", "postgres", {"V": "SELECT id FROM orders"})
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
+    assert verdict.subject == "v" and "'V'" not in verdict.message, verdict
+
+
+def test_layered_twins_are_walked_once_each(monkeypatch):
+    # Eight case twins a level, each reading the next level's name, which all eight twins there
+    # match: walked twin by twin, 8 ** 5 bodies (Codex's fourth review of #192 measured 37,448
+    # parses at 40 views). A view already walked clean is not walked again.
+    import collections
+    import itertools
+
+    from mnemiq.sql import views as module
+
+    levels = 5
+    defs = {}
+    for level in range(levels):
+        read = f"SELECT id FROM abc{level + 1}" if level + 1 < levels else "SELECT id FROM safe_table"
+        for letters in itertools.product(*("aA", "bB", "cC")):
+            name = "".join(letters) + str(level)
+            defs[name] = read
+    layered = dict(defs)
+    parsed = []
+    body_of = module.body_of
+    monkeypatch.setattr(module, "body_of", lambda view: parsed.append(view.object_id) or body_of(view))
+    verdict = _over_twins("SELECT id FROM abc0", "postgres", defs)
+    assert isinstance(verdict, Approved), verdict
+    walked = collections.Counter(name for name in parsed if name in layered)
+    assert set(walked) == set(layered) and max(walked.values()) == 1, walked.most_common(3)  # every twin, once
+
+
+def test_a_view_walked_clean_near_the_top_still_meets_the_nesting_limit_deeper_down():
+    # `v` reads `x`, which reads `y`, directly and again through a chain that brings `x` to the
+    # limit's last level, where `y` falls past it. Walked clean near the top, `x` must still be
+    # walked again down there and refused: a clean walk is remembered only for that depth or above.
+    from mnemiq.sql.views import MAX_DEPTH
+
+    def chain(first: int) -> dict[str, str]:
+        links = {f"c{i}": f"SELECT id FROM c{i + 1}" for i in range(first, MAX_DEPTH - 2)}
+        links[f"c{MAX_DEPTH - 2}"] = "SELECT id FROM x"
+        return {**links, "x": "SELECT id FROM y", "y": "SELECT id FROM safe_table"}
+
+    deep = _over_twins("SELECT id FROM x UNION ALL SELECT id FROM c1", "duckdb", chain(1))
+    assert isinstance(deep, Refusal) and deep.code is RefusalCode.UNRESOLVABLE_VIEW, deep
+    shallow = _over_twins("SELECT id FROM x UNION ALL SELECT id FROM c2", "duckdb", chain(2))
+    assert isinstance(shallow, Approved), shallow  # the control: one level shorter fits
 
 
 def test_on_duckdb_a_long_s_view_name_is_still_unknown():

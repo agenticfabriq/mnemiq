@@ -301,7 +301,7 @@ def check_views(
     # Exact names, case-folded -- never `spellings`, whose bare last segment would let a grant on
     # `sales.customer` name a filtered `public.customer` the caller does not hold.
     return _walk(ast, views, filtered, known, (), 0, "", "",
-                 {g.lower() for g in granted} if granted else set())
+                 {g.lower() for g in granted} if granted else set(), None, {})
 
 
 def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
@@ -378,17 +378,25 @@ def _walk(
     catalog: str,
     top: str,
     granted: set[str],
-    dialect: str | None = None,
+    dialect: str | None,
+    clean: dict[tuple[str, str], int],
 ) -> Refusal | None:
     # `dialect` is the engine that reads `ast`'s names: a nested body's own view's. None at the
     # top, where the grant check has already refused any name the caller does not hold exactly.
+    #
+    # `clean` is every view this request has walked without a refusal, by the catalog its body's
+    # names resolve in, at the deepest depth it did so. Walking every fold twin re-walked each
+    # shared view once per path to it: eight twins a level over five levels was 37,448 parses and
+    # 5.4 s (Codex's fourth review of #192). A view walked clean at a depth is clean at any depth
+    # no deeper, since the nesting limit leaves it more room; a cycle refuses, so nothing on the
+    # stack is ever in it.
     for node in ast.find_all(exp.Table):
-        found = _views_read(node, views, catalog, dialect)
-        for name, view in found:
-            # The view the query read, named in every refusal below: at the top, the one its
-            # spelling found first, so a twin walked beside it is refused under the name the
-            # caller holds and its own stays in the log.
-            here = top or found[0][0]
+        for name, view in _views_read(node, views, catalog, dialect):
+            # The view the query read, named in every refusal below: at the top, as the query
+            # spells it, which the grant check has passed. Never an inventory key: a twin the
+            # fallback walks may be one the caller does not hold, a quoted "V" beside a granted
+            # table `v` (Codex's fourth review of #192), and its name stays in the log.
+            here = top or object_key(node)
             # Only the view the query read, which the caller holds. `it` names the view the
             # problem is in where that is the same view, and says "a view it reads" where not.
             it = repr(here) if name == here else f"a view {here!r} reads"
@@ -400,6 +408,9 @@ def _walk(
                 return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
                                f"{here!r} nests views deeper than this engine will resolve.",
                                f"depth {depth} at {name!r}")
+            inherited = name.rsplit(".", 1)[0] if "." in name else catalog
+            if clean.get((name, inherited), -1) >= depth:
+                continue
             body = body_of(view)
             if body is None:
                 return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
@@ -474,9 +485,9 @@ def _walk(
                                f"{name!r} reads row-filtered {keys or reached}, offered {held!r}")
             # The body's own catalog carries into it: a view two levels down is still written in
             # the source's naming, not the federation's.
-            nested = _walk(body, views, filtered, known, (*stack, name), depth + 1,
-                           name.rsplit(".", 1)[0] if "." in name else catalog, here, granted,
-                           view.dialect)
+            nested = _walk(body, views, filtered, known, (*stack, name), depth + 1, inherited, here,
+                           granted, view.dialect, clean)
             if nested is not None:
                 return nested
+            clean[(name, inherited)] = depth
     return None
