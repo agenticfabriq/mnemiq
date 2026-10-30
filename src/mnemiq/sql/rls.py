@@ -177,6 +177,12 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     fields = [e.this.name.casefold() for struct in tree.find_all(exp.Struct) for e in struct.expressions
               if isinstance(e, exp.PropertyEQ) and isinstance(e.this, exp.Identifier)]
     lost = Counter(written) - Counter(names(tree.sql(dialect=dialect), counted)) - Counter(fields)
+    if lost:
+        # A word the reprint respells or leaves out where no name can stand is a keyword there:
+        # sqlglot prints `FETCH FIRST 1 ROW ONLY` with ROWS and drops a default null order, which
+        # refused filters main approves (Codex's sixth review of #193). Only those places are
+        # excused; a loss beyond them is still a name lost.
+        lost -= _keyword_places(filt, dialect, counted, set(lost))
     # A date part holds its text; a MAP key read as a lambda's parameter holds the parameter's
     # Identifier (`as_duckdb_reads`), a name the lambda declares.
     parts = {v.name.casefold() for v in tree.find_all(exp.Var) if isinstance(v.this, str)
@@ -184,6 +190,39 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
              and not isinstance(v.parent, (exp.Interval, exp.IntervalSpan))}
     dropped = _keywords_dropped(filt, dialect, counted)
     return sorted(set(lost) | (parts & set(names(filt, named))) | set(dropped))
+
+
+def _fresh_name(filt: str) -> str:
+    fresh = "mnemiq_name_probe"
+    while fresh in filt.casefold():
+        fresh += "_"
+    return fresh
+
+
+def _probe(filt: str, token, fresh: str, dialect: str) -> exp.Expression | None:
+    """The filter parsed again with `fresh` in the token's place, or None where it does not parse:
+    a place only a keyword fits."""
+    try:
+        return sqlglot.parse_one(filt[:token.start] + fresh + filt[token.end + 1:], read=dialect)
+    except sqlglot.errors.ParseError:
+        return None
+
+
+def _keyword_places(filt: str, dialect: str, counted, words: set[str]) -> Counter:
+    """How often each of `words` stands in the text where no name can: where a fresh name in its
+    place does not parse (`_keywords_dropped`'s reading of a place). Never a quoted identifier,
+    which is a name wherever it stands."""
+    fresh = _fresh_name(filt)
+    tokens = sqlglot.tokenize(filt, read=dialect)
+    places: Counter = Counter()
+    for i, t in enumerate(tokens):
+        if t.token_type not in counted or t.token_type is TokenType.IDENTIFIER or t.text.casefold() not in words:
+            continue
+        if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN:
+            continue  # a call's name, never counted
+        if _probe(filt, t, fresh, dialect) is None:
+            places[t.text.casefold()] += 1
+    return places
 
 
 def _keywords_dropped(filt: str, dialect: str, counted) -> list[str]:
@@ -202,18 +241,15 @@ def _keywords_dropped(filt: str, dialect: str, counted) -> list[str]:
     directly before a parenthesis, a brace or a string is a call, a type's parameters, a
     constructor or a typed literal, never a column, and is left alone: a fresh name before the
     brace of `MAP {1: x}` is dropped, which refused every map literal."""
-    fresh = "mnemiq_name_probe"
-    while fresh in filt.casefold():
-        fresh += "_"
+    fresh = _fresh_name(filt)
     tokens = sqlglot.tokenize(filt, read=dialect)
     dropped = []
     for i, t in enumerate(tokens):
         if t.token_type in counted or not _WORD.fullmatch(filt[t.start:t.end + 1]) or (
                 i + 1 < len(tokens) and tokens[i + 1].token_type in _NOT_A_COLUMN_AFTER):
             continue
-        try:
-            probe = sqlglot.parse_one(filt[:t.start] + fresh + filt[t.end + 1:], read=dialect)
-        except sqlglot.errors.ParseError:
+        probe = _probe(filt, t, fresh, dialect)
+        if probe is None:
             continue
         if fresh not in probe.sql(dialect=dialect).casefold():
             dropped.append(t.text.casefold())

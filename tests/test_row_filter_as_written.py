@@ -235,6 +235,16 @@ def test_a_name_the_parse_does_not_read_as_a_column_or_a_table_refuses_the_filte
     ("duckdb", "TRY_CAST(id AS DECIMAL(10, 2)) > 0 AND d > DATE '2020-01-01' AND TRY_CAST(id AS VARCHAR) <> ''"),
     ("duckdb", "TRY_CAST(region AS CHARACTER VARYING) = 'a' AND TRY_CAST(id AS DOUBLE PRECISION) > 0"),
     ("oracle", "d > DATE '2020-01-01' AND d < TIMESTAMP '2030-01-01 00:00:00'"),
+    # A keyword the reprint respells or leaves out where no name can stand: sqlglot prints ROW as
+    # ROWS (Codex's sixth review of #193), and drops a default null order and a TRIM side.
+    ("postgres", "id IN (SELECT e.id FROM entitlement AS e FETCH FIRST 1 ROW ONLY)"),
+    ("oracle", "id IN (SELECT e.id FROM entitlement e FETCH FIRST 1 ROW ONLY)"),
+    # Each place is excused, not each word once.
+    ("oracle", "id IN (SELECT e.id FROM entitlement e FETCH FIRST 1 ROW ONLY) "
+               "OR id IN (SELECT e.id FROM entitlement e WHERE e.who = 'r' FETCH FIRST 1 ROW ONLY)"),
+    ("duckdb", "id IN (SELECT e.id FROM entitlement AS e ORDER BY e.id DESC NULLS LAST LIMIT 10)"),
+    ("duckdb", "TRIM(BOTH ' ' FROM region) = 'west' AND TRIM(LEADING 'x' FROM region) = 'west'"),
+    ("duckdb", "TRY_CAST(d AS TIMESTAMP WITH TIME ZONE) IS NOT NULL"),
 ])
 def test_names_the_parse_accounts_for_pass(dialect, filt):
     schema = {"claim": {"id", "region", "d"}, "entitlement": {"id", "who"}}
