@@ -15,13 +15,25 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
-from mnemiq.sql.decide import decide
+from mnemiq.sql.decide import decide as _decide_as_given
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
+from tests.stored_names import as_stored, keyed, policy_keyed, stored
 
 NAMES = ("current_date", "current_timestamp", "current_time", "localtime", "localtimestamp",
          "session_user", "current_catalog")
+TABLES = ("kw", "claim", "sink")
+
+
+def decide(sql, visible, *, dialect="duckdb", target="postgres", policy=None, **kwargs):
+    """`decide`, each table spelled as the target stores it unquoted (M223): on Oracle a grant
+    keys KW, and a statement reads it as KW."""
+    policy = policy_keyed(policy, target, *TABLES) if policy is not None else None
+    return _decide_as_given(as_stored(sql, target, *TABLES), keyed(visible, target, *TABLES),
+                             dialect=dialect, target=target, policy=policy, **kwargs)
+
+
 SCHEMA = {"kw": {"id", *NAMES}, "claim": {"id", "secret"}, "sink": {"i", "s"}}
 HIDDEN = {"kw": {"id"}, "claim": {"id", "secret"}, "sink": {"i", "s"}}
 WITH_SCHEMA = AccessPolicy(policy_schema=SCHEMA)
@@ -144,7 +156,7 @@ def test_the_repair_names_a_call_the_decider_approves_in_that_dialect(dialect, c
     policy = AccessPolicy(policy_schema=schema)
     verdict = decide("SELECT current_date FROM kw", {"kw": {"id"}, "sink": {"i", "s"}}, dialect=dialect, target=dialect, policy=policy)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.AMBIGUOUS_NILADIC_NAME, verdict
-    assert "kw.current_date" in verdict.message and call in verdict.message, verdict.message
+    assert f"{stored('kw', dialect)}.current_date" in verdict.message and call in verdict.message, verdict.message
     assert "current_date()" not in verdict.message and "get_current_timestamp" not in verdict.message
     assert "clock_timestamp" not in verdict.message
     retry = decide(f"SELECT {call} FROM kw", {"kw": {"id"}, "sink": {"i", "s"}}, dialect=dialect, target=dialect, policy=policy)

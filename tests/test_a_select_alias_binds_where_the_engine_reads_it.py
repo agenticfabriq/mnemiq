@@ -17,6 +17,7 @@ import pytest
 from mnemiq.sql.decide import decide
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
+from tests.stored_names import as_stored, keyed
 
 VISIBLE = {"claim": {"id", "v"}}
 SHAPES = {
@@ -50,7 +51,8 @@ READS = {
 
 
 def _decide(sql, dialect, policy=None):
-    return decide(sql, VISIBLE, dialect=dialect, target=dialect, policy=policy)
+    return decide(as_stored(sql, dialect, "claim"), keyed(VISIBLE, dialect, "claim"),
+                  dialect=dialect, target=dialect, policy=policy)
 
 
 @pytest.mark.parametrize("engine", sorted(READS))

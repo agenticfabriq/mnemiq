@@ -1800,16 +1800,16 @@ def test_a_udf_that_reads_an_ungranted_table_is_refused_and_the_builtins_are_not
             assert inventory.may_shadow_a_builtin is False
 
             def verdict(sql):
-                return decide(sql, {"m99_claim": {"id"}}, adapter=adapter,
+                return decide(sql, {"M99_CLAIM": {"id"}}, adapter=adapter,
                               dialect="oracle", target="oracle")
 
-            refused = verdict("SELECT m99_leak(1) AS x FROM m99_claim")
+            refused = verdict("SELECT m99_leak(1) AS x FROM M99_CLAIM")
             assert refused.code.value == "unmodelled_call", refused
             assert refused.subject == "m99_leak"
 
-            for clean in ("SELECT length('abc') AS n FROM m99_claim",
-                          "SELECT count(*) AS n FROM m99_claim",
-                          "SELECT id FROM m99_claim"):
+            for clean in ("SELECT length('abc') AS n FROM M99_CLAIM",
+                          "SELECT count(*) AS n FROM M99_CLAIM",
+                          "SELECT id FROM M99_CLAIM"):
                 assert not hasattr(verdict(clean), "code"), clean
     finally:
         adapter.close()
@@ -1834,15 +1834,15 @@ def test_a_synonym_is_a_route_to_a_udf_and_the_alias_is_what_the_query_spells():
     con = adapter._pool.acquire()
     cur = con.cursor()
     drops = ("DROP SYNONYM add_days", "DROP FUNCTION syn_udf",
-             "DROP TABLE syn_secret", "DROP TABLE syn_claim")
+             "DROP TABLE syn_secret", "DROP TABLE SYN_CLAIM")
     try:
         for ddl in drops:
             with contextlib.suppress(Exception):
                 cur.execute(ddl)
         cur.execute("CREATE TABLE syn_secret(ssn VARCHAR2(20))")
         cur.execute("INSERT INTO syn_secret VALUES ('123-45-6789')")
-        cur.execute("CREATE TABLE syn_claim(id NUMBER)")
-        cur.execute("INSERT INTO syn_claim VALUES (1)")
+        cur.execute("CREATE TABLE SYN_CLAIM(id NUMBER)")
+        cur.execute("INSERT INTO SYN_CLAIM VALUES (1)")
         cur.execute("CREATE OR REPLACE FUNCTION syn_udf(x NUMBER) RETURN VARCHAR2 IS "
                     "v VARCHAR2(20); BEGIN SELECT ssn INTO v FROM syn_secret WHERE ROWNUM = 1; "
                     "RETURN v; END;")
@@ -1857,16 +1857,16 @@ def test_a_synonym_is_a_route_to_a_udf_and_the_alias_is_what_the_query_spells():
         assert "add_days" in names and "syn_udf" in names
 
         def verdict(sql):
-            return decide(sql, {"syn_claim": {"id"}}, adapter=adapter,
+            return decide(sql, {"SYN_CLAIM": {"id"}}, adapter=adapter,
                           dialect="oracle", target="oracle")
 
-        refused = verdict("SELECT add_days(1) AS x FROM syn_claim")
+        refused = verdict("SELECT add_days(1) AS x FROM SYN_CLAIM")
         assert refused.code.value == "unmodelled_call", refused
         # ...from the INVENTORY branch, not the allowlist. They share a code and differ in what
         # they say, and asserting only the code is how the first version passed while reverted.
         assert "defined by this source itself" in refused.message, refused.message
 
-        for clean in ("SELECT count(*) AS n FROM syn_claim", "SELECT id FROM syn_claim"):
+        for clean in ("SELECT count(*) AS n FROM SYN_CLAIM", "SELECT id FROM SYN_CLAIM"):
             assert not hasattr(verdict(clean), "code"), clean
     finally:
         for ddl in drops:
@@ -1920,15 +1920,15 @@ def test_a_synonym_chain_is_followed_and_a_cycle_does_not_stop_it():
     cur = con.cursor()
     drops = ("DROP SYNONYM add_days", "DROP SYNONYM hop_mid", "DROP SYNONYM loop_a",
              "DROP SYNONYM loop_b", "DROP FUNCTION ch_udf", "DROP TABLE ch_secret",
-             "DROP TABLE ch_claim")
+             "DROP TABLE CH_CLAIM")
     try:
         for ddl in drops:
             with contextlib.suppress(Exception):
                 cur.execute(ddl)
         cur.execute("CREATE TABLE ch_secret(ssn VARCHAR2(20))")
         cur.execute("INSERT INTO ch_secret VALUES ('123-45-6789')")
-        cur.execute("CREATE TABLE ch_claim(id NUMBER)")
-        cur.execute("INSERT INTO ch_claim VALUES (1)")
+        cur.execute("CREATE TABLE CH_CLAIM(id NUMBER)")
+        cur.execute("INSERT INTO CH_CLAIM VALUES (1)")
         cur.execute("CREATE OR REPLACE FUNCTION ch_udf(x NUMBER) RETURN VARCHAR2 IS "
                     "v VARCHAR2(20); BEGIN SELECT ssn INTO v FROM ch_secret WHERE ROWNUM = 1; "
                     "RETURN v; END;")
@@ -1945,7 +1945,7 @@ def test_a_synonym_chain_is_followed_and_a_cycle_does_not_stop_it():
         assert "add_days" in names, "the chained alias is what the query spells"
         assert "hop_mid" in names
 
-        refused = decide("SELECT add_days(1) AS x FROM ch_claim", {"ch_claim": {"id"}},
+        refused = decide("SELECT add_days(1) AS x FROM CH_CLAIM", {"CH_CLAIM": {"id"}},
                          adapter=adapter, dialect="oracle", target="oracle")
         assert refused.code.value == "unmodelled_call"
         assert "defined by this source itself" in refused.message
@@ -1972,7 +1972,7 @@ def test_a_virtual_column_runs_a_udf_the_statement_never_names():
     adapter = OracleAdapter(dsn=DSN, user=USER, password=PASSWORD, schema=USER.upper())
     con = adapter._pool.acquire()
     cur = con.cursor()
-    drops = ("DROP TABLE vc_t", "DROP FUNCTION vc_udf", "DROP TABLE vc_sec")
+    drops = ("DROP TABLE VC_T", "DROP FUNCTION vc_udf", "DROP TABLE vc_sec")
     try:
         for ddl in drops:
             with contextlib.suppress(Exception):
@@ -1982,12 +1982,12 @@ def test_a_virtual_column_runs_a_udf_the_statement_never_names():
         cur.execute("CREATE OR REPLACE FUNCTION vc_udf(x NUMBER) RETURN VARCHAR2 DETERMINISTIC "
                     "IS v VARCHAR2(20); BEGIN SELECT ssn INTO v FROM vc_sec WHERE ROWNUM = 1; "
                     "RETURN v; END;")
-        cur.execute("CREATE TABLE vc_t(id NUMBER, qty NUMBER, price NUMBER, "
+        cur.execute("CREATE TABLE VC_T(id NUMBER, qty NUMBER, price NUMBER, "
                     "total AS (qty * price), leaked AS (vc_udf(id)))")
-        cur.execute("INSERT INTO vc_t(id, qty, price) VALUES (1, 2, 3)")
+        cur.execute("INSERT INTO VC_T(id, qty, price) VALUES (1, 2, 3)")
         con.commit()
 
-        cur.execute("SELECT id, leaked FROM vc_t")
+        cur.execute("SELECT id, leaked FROM VC_T")
         assert cur.fetchone()[1] == "123-45-6789", "no leak, so nothing below proves anything"
 
         # The dictionary draws the distinction; this engine does not have to parse Oracle SQL.
@@ -1995,17 +1995,17 @@ def test_a_virtual_column_runs_a_udf_the_statement_never_names():
         assert stored["total"] == '"QTY"*"PRICE"'
         assert "VC_UDF" in stored["leaked"]
 
-        visible = {"vc_t": {"id", "qty", "price", "total", "leaked"}}
+        visible = {"VC_T": {"id", "qty", "price", "total", "leaked"}}
 
         def verdict(sql):
             return decide(sql, visible, adapter=adapter, dialect="oracle", target="oracle")
 
-        for spelling in ("SELECT id, leaked FROM vc_t", "SELECT vc_t.leaked FROM vc_t"):
+        for spelling in ("SELECT id, leaked FROM VC_T", "SELECT VC_T.leaked FROM VC_T"):
             refused = verdict(spelling)
             assert refused.code.value == "unresolvable_calls", spelling
             assert refused.subject == "leaked"
 
-        for clean in ("SELECT id, total FROM vc_t", "SELECT id, qty FROM vc_t"):
+        for clean in ("SELECT id, total FROM VC_T", "SELECT id, qty FROM VC_T"):
             assert not hasattr(verdict(clean), "code"), clean
     finally:
         for ddl in drops:
@@ -2033,7 +2033,7 @@ def test_a_write_cannot_store_what_a_virtual_column_computed():
                             schema=USER.upper(), read_only=False)
     con = adapter._pool.acquire()
     cur = con.cursor()
-    drops = ("DROP TABLE vc_notes", "DROP TABLE vc_t", "DROP FUNCTION vc_udf",
+    drops = ("DROP TABLE VC_NOTES", "DROP TABLE VC_T", "DROP FUNCTION vc_udf",
              "DROP TABLE vc_sec")
     try:
         for ddl in drops:
@@ -2044,23 +2044,23 @@ def test_a_write_cannot_store_what_a_virtual_column_computed():
         cur.execute("CREATE OR REPLACE FUNCTION vc_udf(x NUMBER) RETURN VARCHAR2 DETERMINISTIC "
                     "IS v VARCHAR2(20); BEGIN SELECT ssn INTO v FROM vc_sec WHERE ROWNUM = 1; "
                     "RETURN v; END;")
-        cur.execute("CREATE TABLE vc_t(id NUMBER, leaked AS (vc_udf(id)))")
-        cur.execute("INSERT INTO vc_t(id) VALUES (1)")
-        cur.execute("CREATE TABLE vc_notes(id NUMBER, note VARCHAR2(40))")
+        cur.execute("CREATE TABLE VC_T(id NUMBER, leaked AS (vc_udf(id)))")
+        cur.execute("INSERT INTO VC_T(id) VALUES (1)")
+        cur.execute("CREATE TABLE VC_NOTES(id NUMBER, note VARCHAR2(40))")
         con.commit()
 
-        visible = {"vc_t": {"id", "leaked"}, "vc_notes": {"id", "note"}}
-        grants = GrantSet(frozenset({"vc_t", "vc_notes"}), writable=frozenset({"vc_notes"}))
+        visible = {"VC_T": {"id", "leaked"}, "VC_NOTES": {"id", "note"}}
+        grants = GrantSet(frozenset({"VC_T", "VC_NOTES"}), writable=frozenset({"VC_NOTES"}))
 
         def write(sql):
             return decide_write(sql, visible, grants, policy=AccessPolicy(), adapter=adapter,
                                 dialect="oracle", target="oracle", writes_enabled=True)
 
-        refused = write("INSERT INTO vc_notes (id, note) SELECT id, leaked FROM vc_t")
+        refused = write("INSERT INTO VC_NOTES (id, note) SELECT id, leaked FROM VC_T")
         assert refused.code.value == "unresolvable_calls", refused
         assert refused.subject == "leaked"
 
-        ordinary = write("INSERT INTO vc_notes (id, note) SELECT id, 'ok' FROM vc_t")
+        ordinary = write("INSERT INTO VC_NOTES (id, note) SELECT id, 'ok' FROM VC_T")
         assert not hasattr(ordinary, "code"), ordinary
     finally:
         for ddl in drops:
@@ -2102,15 +2102,15 @@ def test_a_synonym_over_a_db_link_is_a_route_to_a_udf_this_engine_cannot_resolve
         pytest.skip("needs CREATE DATABASE LINK; see this module's docstring for the grant")
 
     drops = ("DROP SYNONYM add_days", "DROP DATABASE LINK dbl_loop",
-             "DROP FUNCTION dbl_udf", "DROP TABLE dbl_secret", "DROP TABLE dbl_claim")
+             "DROP FUNCTION dbl_udf", "DROP TABLE dbl_secret", "DROP TABLE DBL_CLAIM")
     try:
         for ddl in drops:
             with contextlib.suppress(Exception):
                 cur.execute(ddl)
         cur.execute("CREATE TABLE dbl_secret(ssn VARCHAR2(20))")
         cur.execute("INSERT INTO dbl_secret VALUES ('123-45-6789')")
-        cur.execute("CREATE TABLE dbl_claim(id NUMBER)")
-        cur.execute("INSERT INTO dbl_claim VALUES (1)")
+        cur.execute("CREATE TABLE DBL_CLAIM(id NUMBER)")
+        cur.execute("INSERT INTO DBL_CLAIM VALUES (1)")
         cur.execute("CREATE OR REPLACE FUNCTION dbl_udf(x NUMBER) RETURN VARCHAR2 IS "
                     "v VARCHAR2(20); BEGIN SELECT ssn INTO v FROM dbl_secret WHERE ROWNUM = 1; "
                     "RETURN v; END;")
@@ -2137,7 +2137,7 @@ def test_a_synonym_over_a_db_link_is_a_route_to_a_udf_this_engine_cannot_resolve
         assert "add_days" in set(adapter.unresolvable_aliases()), "the alias a query spells"
         assert "add_days" not in set(adapter.user_functions()), "back in the wrong bucket"
 
-        refused = decide("SELECT add_days(1) AS x FROM dbl_claim", {"dbl_claim": {"id"}},
+        refused = decide("SELECT add_days(1) AS x FROM DBL_CLAIM", {"DBL_CLAIM": {"id"}},
                          adapter=adapter, dialect="oracle", target="oracle")
         assert refused.code.value == "unmodelled_call", refused
         # From the INVENTORY branch, not the allowlist. They share a code and differ in what
@@ -2146,8 +2146,8 @@ def test_a_synonym_over_a_db_link_is_a_route_to_a_udf_this_engine_cannot_resolve
         assert "cannot resolve" in refused.message, refused.message
         assert "defined by this source itself" not in refused.message
 
-        for clean in ("SELECT count(*) AS n FROM dbl_claim", "SELECT id FROM dbl_claim"):
-            v = decide(clean, {"dbl_claim": {"id"}}, adapter=adapter,
+        for clean in ("SELECT count(*) AS n FROM DBL_CLAIM", "SELECT id FROM DBL_CLAIM"):
+            v = decide(clean, {"DBL_CLAIM": {"id"}}, adapter=adapter,
                        dialect="oracle", target="oracle")
             assert not hasattr(v, "code"), clean
     finally:
@@ -2157,3 +2157,44 @@ def test_a_synonym_over_a_db_link_is_a_route_to_a_udf_this_engine_cannot_resolve
         con.commit()
         adapter._pool.release(con)
         adapter.close()
+
+
+def test_a_grant_on_a_quoted_lowercase_table_does_not_read_its_unquoted_namesake():
+    """M223, on the shipped path: the structural snapshot keys a quoted `m223_sales` and an
+    unquoted M223_SALES apart, and with only the quoted one granted, `SELECT ID, NOTE FROM
+    m223_sales`, which Oracle reads as M223_SALES, was approved and returned that table's row.
+    Refused now, saying to quote it; the quoted spelling reads the granted table."""
+    import oracledb
+
+    from mnemiq.authz.grants import GrantSet
+    from mnemiq.enrichment.pipeline import enrich_structural
+    from mnemiq.sql.decide import decide
+    from mnemiq.sql.schema import visible_schema
+
+    w = _adapter(read_only=False)
+    drops = ("DROP TABLE M223_SALES", 'DROP TABLE "m223_sales"')
+    for ddl in drops:
+        with contextlib.suppress(oracledb.DatabaseError):
+            w.execute(ddl)
+    try:
+        w.execute("CREATE TABLE M223_SALES (id NUMBER(5), note VARCHAR2(20))")
+        w.execute("INSERT INTO M223_SALES VALUES (1, 'ungranted')")
+        w.execute('CREATE TABLE "m223_sales" (id NUMBER(5), note VARCHAR2(20))')
+        w.execute("""INSERT INTO "m223_sales" VALUES (2, 'granted')""")
+        adapter = _adapter()
+        snapshot = enrich_structural(adapter, "ora")
+        assert {"M223_SALES", "m223_sales"} <= {c.object_id for c in snapshot.columns}
+        visible = visible_schema(snapshot, GrantSet(frozenset({"m223_sales"})))
+
+        refused = decide("SELECT ID, NOTE FROM m223_sales", visible, adapter=adapter,
+                         dialect="oracle", target="oracle")
+        assert refused.code.value == "unknown_table", refused
+        assert '"m223_sales"' in refused.message, refused.message
+
+        approved = decide('SELECT ID, NOTE FROM "m223_sales"', visible, adapter=adapter,
+                          dialect="oracle", target="oracle")
+        assert [tuple(r) for r in adapter.execute(approved.target_sql)] == [(2, "granted")]
+    finally:
+        for ddl in drops:
+            with contextlib.suppress(oracledb.DatabaseError):
+                w.execute(ddl)

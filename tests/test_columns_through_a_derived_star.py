@@ -17,12 +17,15 @@ replay of 11,337 recorded statements found no verdict change beyond the two expe
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import duckdb
 import pytest
 
 from mnemiq.sql.decide import decide
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
+from tests.stored_names import as_stored, keyed
 
 FULL = {"claim": {"id", "secret"}, "other": {"id", "secret"}, "wide": {"id", "note"},
         "twin": {"id", "secret_1"}}
@@ -55,7 +58,10 @@ COMPLETE = AccessPolicy(policy_schema=FULL)  # production's: every column of the
 
 
 def _decide(sql, visible, engine="duckdb", policy=None):
-    return decide(sql, visible, dialect=engine, target=engine, policy=policy)
+    if policy is not None:
+        policy = replace(policy, policy_schema=keyed(policy.policy_schema, engine, *FULL))
+    return decide(as_stored(sql, engine, *FULL), keyed(visible, engine, *FULL), dialect=engine,
+                  target=engine, policy=policy)
 
 
 def _withheld_three_ways(con, sql, table, column, value):

@@ -17,6 +17,7 @@ from sqlglot import exp
 from mnemiq.sql.decide import decide
 from mnemiq.sql.identifiers import resolve, resolve_name, resolve_stored, rules_for
 from mnemiq.sql.scope import base_tables
+from tests.stored_names import as_stored, keyed
 
 _VISIBLE = {"policy": {"id"}}
 
@@ -28,7 +29,10 @@ _ORACLE_ONLY = 'WITH "claim" AS (SELECT id FROM policy) SELECT id FROM claim'
 
 
 def _verdict(sql, engine):
-    return type(decide(sql, _VISIBLE, target=engine, dialect=engine)).__name__
+    # The granted base table spelled as the engine stores it unquoted (M223): Oracle's is POLICY.
+    # The CTE names stay as written: how each engine reads them is what these tests measure.
+    return type(decide(as_stored(sql, engine, "policy"), keyed(_VISIBLE, engine, "policy"),
+                       target=engine, dialect=engine)).__name__
 
 
 def test_a_quoted_CTE_no_longer_hides_a_base_table_from_the_grant_check():

@@ -33,24 +33,24 @@ if not DSN:
 oracledb = pytest.importorskip("oracledb")
 
 FENCE = " AND ROWNUM > 0"
-SCHEMA = {"m160_claim": {"id", "region", "amount"},
-          "m160_payment": {"id", "claim_id", "paid"},
-          "m160_entitlement": {"id", "who"}}
-VISIBLE = {"m160_claim": SCHEMA["m160_claim"], "m160_payment": SCHEMA["m160_payment"]}
-ENTITLED = "id IN (SELECT id FROM m160_entitlement WHERE who = 'r')"
+SCHEMA = {"M160_CLAIM": {"id", "region", "amount"},
+          "M160_PAYMENT": {"id", "claim_id", "paid"},
+          "M160_ENTITLEMENT": {"id", "who"}}
+VISIBLE = {"M160_CLAIM": SCHEMA["M160_CLAIM"], "M160_PAYMENT": SCHEMA["M160_PAYMENT"]}
+ENTITLED = "id IN (SELECT id FROM M160_ENTITLEMENT WHERE who = 'r')"
 POLICIES = {
-    "subquery": {"m160_claim": ENTITLED},
-    "two tables": {"m160_claim": ENTITLED,
-                   "m160_payment": "claim_id IN (SELECT id FROM m160_entitlement WHERE who = 'r')"},
+    "subquery": {"M160_CLAIM": ENTITLED},
+    "two tables": {"M160_CLAIM": ENTITLED,
+                   "M160_PAYMENT": "claim_id IN (SELECT id FROM M160_ENTITLEMENT WHERE who = 'r')"},
 }
 FAILS_ON_REMOVED = "CASE WHEN amount = 20 THEN TO_NUMBER(region) ELSE 1 END > 0"
 CALLERS = {
-    "where": ("SELECT id FROM m160_claim WHERE {p}", [(i,) for i in range(1, 6)]),
-    "join on": ("SELECT c.id FROM m160_claim c JOIN m160_payment p ON p.claim_id = c.id AND {p}",
+    "where": ("SELECT id FROM M160_CLAIM WHERE {p}", [(i,) for i in range(1, 6)]),
+    "join on": ("SELECT c.id FROM M160_CLAIM c JOIN M160_PAYMENT p ON p.claim_id = c.id AND {p}",
                 [(i,) for i in range(1, 6)]),
-    "in subquery": ("SELECT id FROM m160_payment WHERE claim_id IN "
-                    "(SELECT id FROM m160_claim WHERE {p})", [(i,) for i in range(1, 6)]),
-    "cte": ("WITH x AS (SELECT id, amount, region FROM m160_claim WHERE {p}) SELECT id FROM x",
+    "in subquery": ("SELECT id FROM M160_PAYMENT WHERE claim_id IN "
+                    "(SELECT id FROM M160_CLAIM WHERE {p})", [(i,) for i in range(1, 6)]),
+    "cte": ("WITH x AS (SELECT id, amount, region FROM M160_CLAIM WHERE {p}) SELECT id FROM x",
             [(i,) for i in range(1, 6)]),
 }
 
@@ -59,7 +59,7 @@ CALLERS = {
 def cursor():
     con = oracledb.connect(user=USER, password=PASSWORD, dsn=DSN)
     c = con.cursor()
-    names = ("m160_claim", "m160_payment", "m160_entitlement")
+    names = ("M160_CLAIM", "M160_PAYMENT", "M160_ENTITLEMENT")
 
     def drop():
         for name in names:
@@ -69,15 +69,15 @@ def cursor():
                 pass  # not there
 
     drop()
-    c.execute("CREATE TABLE m160_claim (id NUMBER, region VARCHAR2(20), amount NUMBER)")
-    c.execute("CREATE TABLE m160_payment (id NUMBER, claim_id NUMBER, paid NUMBER)")
-    c.execute("CREATE TABLE m160_entitlement (id NUMBER, who VARCHAR2(20))")
+    c.execute("CREATE TABLE M160_CLAIM (id NUMBER, region VARCHAR2(20), amount NUMBER)")
+    c.execute("CREATE TABLE M160_PAYMENT (id NUMBER, claim_id NUMBER, paid NUMBER)")
+    c.execute("CREATE TABLE M160_ENTITLEMENT (id NUMBER, who VARCHAR2(20))")
     # Ids 1..5 are the caller's; every other row is removed by the filter and has a region that
     # is not a number.
-    c.executemany("INSERT INTO m160_claim VALUES (:1, :2, :3)",
+    c.executemany("INSERT INTO M160_CLAIM VALUES (:1, :2, :3)",
                   [(i, "west" if i <= 5 else f"r{i}", 10 if i <= 5 else 20) for i in range(1, 3001)])
-    c.executemany("INSERT INTO m160_payment VALUES (:1, :2, 1)", [(i, i) for i in range(1, 3001)])
-    c.executemany("INSERT INTO m160_entitlement VALUES (:1, 'r')", [(i,) for i in range(1, 6)])
+    c.executemany("INSERT INTO M160_PAYMENT VALUES (:1, :2, 1)", [(i, i) for i in range(1, 3001)])
+    c.executemany("INSERT INTO M160_ENTITLEMENT VALUES (:1, 'r')", [(i,) for i in range(1, 6)])
     con.commit()
     yield c
     drop()

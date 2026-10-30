@@ -10,6 +10,7 @@ from mnemiq.sql.authz_guard import (
     check_opaque_columns,
     check_unmodelled_calls,
     check_unmodelled_source,
+    not_read_as_written,
 )
 from mnemiq.sql.functions import (
     UnreadableCalls,
@@ -424,6 +425,12 @@ def decide_write(
             code=RefusalCode.AMBIGUOUS_WRITE_TARGET,
             message="This engine cannot tell which single table this statement writes to.",
         )
+    # An INSERT's target is not a base table, so the grant check's test that the engine reads
+    # a name as written (M223) has not seen it: on Oracle a write grant on a quoted `sales`
+    # approved `INSERT INTO sales`, which writes SALES.
+    misread = not_read_as_written(_target_node(shaped), grants.writable, target)
+    if misread is not None:
+        return misread
     if not grants.allows_write(tgt):
         return Refusal(
             code=RefusalCode.UNAUTHORIZED_WRITE,

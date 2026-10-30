@@ -20,12 +20,21 @@ import pytest
 import sqlglot
 
 from mnemiq.authz.grants import GrantSet
-from mnemiq.sql.decide import decide
+from mnemiq.sql.decide import decide as _decide
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
+from tests.stored_names import as_stored, keyed, policy_keyed, stored
 
 SCHEMA = {"claim": {"id", "region"}, "scratch": {"id", "region"}}
+
+
+def decide(sql, visible, *, dialect="duckdb", target="postgres", policy=None, **kwargs):
+    """`decide`, each table spelled as the target stores it unquoted (M223): on Oracle a grant
+    keys CLAIM, and a statement reads it as CLAIM."""
+    policy = policy_keyed(policy, target, *SCHEMA) if policy is not None else None
+    return _decide(as_stored(sql, target, *SCHEMA), keyed(visible, target, *SCHEMA),
+                   dialect=dialect, target=target, policy=policy, **kwargs)
 DRIFTING = ["greatest(id, NULL) IS NULL", "concat(region, NULL) IS NULL"]
 ROWS = "CREATE TABLE claim (id INT, region VARCHAR); INSERT INTO claim VALUES (1, 'west')"
 
@@ -52,7 +61,7 @@ def test_a_filter_decided_in_another_dialect_is_refused_as_the_deployment_s(filt
     verdict = decide("SELECT id FROM claim", SCHEMA, dialect="duckdb", target=target, policy=_filtered(filt))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.POLICY_TARGET_UNSUPPORTED, verdict
     assert not verdict.repairable  # the model cannot write its way past a deployment setting
-    assert "'claim'" in verdict.message and repr(target) in verdict.message, verdict.message
+    assert repr(stored("claim", target)) in verdict.message and repr(target) in verdict.message, verdict.message
 
 
 @pytest.mark.parametrize("filt", DRIFTING)
