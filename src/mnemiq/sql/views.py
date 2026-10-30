@@ -322,7 +322,10 @@ def _walk(
     catalog: str,
     top: str,
     granted: set[str],
+    dialect: str | None = None,
 ) -> Refusal | None:
+    # `dialect` is the engine that reads `ast`'s names: a nested body's own view's. None at the
+    # top, where the grant check has already refused any name the caller does not hold exactly.
     for node in ast.find_all(exp.Table):
         name = object_key(node)
         view = views.get(name) or views.get(node.name)
@@ -356,11 +359,18 @@ def _walk(
             # dead code. `SourceSpec.catalog` is a free-form DuckDB attach alias and nothing in
             # `merge_snapshots` or `qualify_object_id` normalises it. Measured: catalog `pg`
             # refused and catalog `PG` approved, on the identical statement.
-            wanted = {object_key(node).lower(), node.name.lower()}
+            spelled = {object_key(node), node.name}
             if catalog:
-                wanted |= {f"{catalog}.{w}".lower() for w in tuple(wanted)}
+                spelled |= {f"{catalog}.{s}" for s in tuple(spelled)}
+            wanted = {s.lower() for s in spelled}
+            # And as the body's engine folds (Codex's review of #192). Oracle reads `ſales` as
+            # SALES, which `str.lower` keeps apart from `sales`, so the known-object check vouched
+            # for a view this lookup never found, and the filtered table behind it went unwalked.
+            # A match here walks a view, which can only refuse, so the union is safe.
+            fold = rules_for(dialect).fold
+            folded = {fold(s) for s in spelled}
             for key in sorted(views):
-                if key.lower() in wanted:
+                if key.lower() in wanted or fold(key) in folded:
                     view, name = views[key], key
                     break
         if view is None:
@@ -452,7 +462,8 @@ def _walk(
         # The body's own catalog carries into it: a view two levels down is still written in
         # the source's naming, not the federation's.
         nested = _walk(body, views, filtered, known, (*stack, name), depth + 1,
-                       name.rsplit(".", 1)[0] if "." in name else catalog, here, granted)
+                       name.rsplit(".", 1)[0] if "." in name else catalog, here, granted,
+                       view.dialect)
         if nested is not None:
             return nested
     return None

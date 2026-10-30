@@ -56,6 +56,30 @@ def test_a_long_s_spelling_of_an_unfiltered_table_is_still_read():
     assert isinstance(verdict, Approved), verdict
 
 
+def _read_through_a_nested_view(spelled: str, dialect: str = "oracle"):
+    schema = {"orders": {"id"}, "sales": {"id"}, "v": {"id"}}
+    policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
+    views = {"sales": ViewDefinition(object_id="sales", dialect=dialect, definition="SELECT id FROM orders"),
+             "v": ViewDefinition(object_id="v", dialect=dialect, definition=f"SELECT id FROM {spelled}")}
+    return decide("SELECT id FROM v", {"v": {"id"}}, dialect=dialect, target=dialect, policy=policy, views=views)
+
+
+@pytest.mark.parametrize("spelled", ["ſales", "app.ſales", "SALEſ", "(SELECT id FROM ſales) x"])
+def test_a_view_read_under_a_spelling_oracle_folds_onto_it_is_walked(spelled):
+    # The known-object check vouched for `ſales` as SALES, and the nested lookup folded with
+    # `str.lower` alone, so it found no view, walked nothing, and `v` was approved over the
+    # filtered ORDERS that SALES reads (Codex's review of #192).
+    verdict = _read_through_a_nested_view(spelled)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, (spelled, verdict)
+    plain = _read_through_a_nested_view(spelled.replace("ſ", "s").replace("SALEs", "SALES"))
+    assert isinstance(plain, Refusal) and plain.code is RefusalCode.UNGOVERNED_VIEW, plain  # the control
+
+
+def test_on_duckdb_a_long_s_view_name_is_still_unknown():
+    verdict = _read_through_a_nested_view("ſales", dialect="duckdb")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW, verdict
+
+
 def test_on_duckdb_the_long_s_names_another_object_and_is_refused_as_unknown():
     # DuckDB folds ASCII alone (M154), so `orderſ` is not ORDERS there: unknown, not ungoverned.
     verdict = _read_view("SELECT id FROM orderſ", "orders", dialect="duckdb")
