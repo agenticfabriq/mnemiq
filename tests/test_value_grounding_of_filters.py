@@ -743,6 +743,11 @@ def test_the_probe_quotes_the_stored_names_and_escapes_the_value():
         "SELECT 1 FROM \"CLAIM\" WHERE \"ADJUSTER\" = 'x' FETCH FIRST 1 ROWS ONLY")
     assert probe_sql("claim", "adjuster", "x", "mysql") == (
         "SELECT 1 FROM `claim` WHERE `adjuster` = 'x' LIMIT 1")
+    # A federated source binds a table to catalog.schema.table: each part quoted on its own.
+    assert probe_sql("pg.public.customer", "name", "x", "duckdb") == (
+        "SELECT 1 FROM \"pg\".\"public\".\"customer\" WHERE \"name\" = 'x' LIMIT 1")
+    assert probe_sql("main.claim", "adjuster", "x", "duckdb") == (
+        "SELECT 1 FROM \"main\".\"claim\" WHERE \"adjuster\" = 'x' LIMIT 1")
 
 
 def test_the_source_answers_found_missing_or_nothing(tmp_path):

@@ -1483,9 +1483,17 @@ def confirm_by_source(grounding: ValueGrounding, holds: Callable[[str, str, str]
 
 def probe_sql(table: str, column: str, text: str, dialect: str | None) -> str:
     """Whether `table.column` holds `text`, in the source's dialect: the names quoted in their stored
-    spelling, as the value index reads them, and the value a string literal sqlglot escapes."""
+    spelling, as the value index reads them, and the value a string literal sqlglot escapes. A
+    dotted name (`catalog.schema.table`, as a federated source binds it) is quoted part by part;
+    one with more parts stays one name, and a probe that cannot resolve it only says nothing."""
+    parts = table.split(".")
+    if not 1 <= len(parts) <= 3 or not all(parts):
+        parts = [table]
+    quoted = [exp.to_identifier(part, quoted=True) for part in parts]
+    named = exp.Table(this=quoted[-1], db=quoted[-2] if len(quoted) > 1 else None,
+                      catalog=quoted[-3] if len(quoted) > 2 else None)
     return (exp.select(exp.Literal.number(1))
-            .from_(exp.Table(this=exp.to_identifier(table, quoted=True)))
+            .from_(named)
             .where(exp.EQ(this=exp.Column(this=exp.to_identifier(column, quoted=True)),
                           expression=exp.Literal.string(text)))
             .limit(1)
