@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import json
 import logging
@@ -136,6 +137,57 @@ def _validate_filter(
             return None
     expr.meta[_AS_WRITTEN] = _without_a_closing_semicolon(filt, dialect)
     return expr
+
+
+_NAME_TOKENS = frozenset({TokenType.VAR, TokenType.IDENTIFIER})
+
+
+def _unaccounted_names(filt: str, dialect: str) -> list[str]:
+    """Every name in the filter's text that its parse lost or read as a date part, which the checks
+    above therefore never saw. The filter runs as written (M222), so its engine reads every name in
+    it, and the checks read only the parse: sqlglot drops `secret` from `list_reverse_sort(xs,
+    secret)` and `decode(blob, secret)`, and reads it as a date part in `date_diff(secret, a, b)`,
+    where DuckDB reads a column the policy may not hold (Codex's review of #193).
+
+    Two comparisons. A name in the text must come back, as often, among the names of the parse's
+    own reprint, where a dropped one is missing and a date part prints as a string. And a date part
+    the parse holds outside EXTRACT and an INTERVAL, which are keywords in every engine, must not
+    have been written as a bare name. A function's name is left out of both: a reprint may rename it
+    (`now()` prints as CURRENT_TIMESTAMP), and it reads no data."""
+    def names(text: str) -> list[str]:
+        tokens = sqlglot.tokenize(text, read=dialect)
+        return [t.text.casefold() for i, t in enumerate(tokens) if t.token_type in _NAME_TOKENS
+                and not (i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN)]
+
+    tree = _parsed(filt, dialect)
+    written = names(filt)
+    # A struct literal's field names reprint as strings (`{X: 1}` as `{'X': 1}`): names the filter
+    # gives, not reads.
+    fields = [e.this.name.casefold() for struct in tree.find_all(exp.Struct) for e in struct.expressions
+              if isinstance(e, exp.PropertyEQ) and isinstance(e.this, exp.Identifier)]
+    lost = Counter(written) - Counter(names(tree.sql(dialect=dialect))) - Counter(fields)
+    # A date part holds its text; a MAP key read as a lambda's parameter holds the parameter's
+    # Identifier (`as_duckdb_reads`), a name the lambda declares.
+    parts = {v.name.casefold() for v in tree.find_all(exp.Var) if isinstance(v.this, str)
+             and not (isinstance(v.parent, exp.Extract) and v.arg_key == "this")
+             and not isinstance(v.parent, (exp.Interval, exp.IntervalSpan))}
+    return sorted(set(lost) | (parts & set(written)))
+
+
+def _lost_names(filt: str, table: str, dialect: str) -> Refusal | None:
+    """The refusal for a filter whose text names what its parse does not read (`_unaccounted_names`),
+    after the conversion check, whose advice is the more useful where both apply. The caller is
+    told only that the policy is not valid; the names go to the operator's log."""
+    lost = _unaccounted_names(filt, dialect)
+    if not lost:
+        return None
+    logger.warning("the row filter for %r names %s, which the parse does not read as a column or a "
+                   "table; write a date part or a constant quoted", table, lost)
+    return Refusal(
+        code=RefusalCode.INVALID_ROW_FILTER,
+        message=f"The row-access policy for {table!r} is not a valid predicate.",
+        subject=table,
+    )
 
 
 def _without_a_closing_semicolon(filt: str, dialect: str) -> str:
@@ -2651,6 +2703,9 @@ def apply_row_and_mask(
                                          executes_as=executes_as)
             if raising is not None:
                 return _raising_refusal(raising, name, (executes_as or dialect).lower()), []
+            lost = _lost_names(policy.row_filter_for(name), name, dialect)
+            if lost is not None:
+                return lost, []
         derived = _derived_table(
             name, table_node.alias_or_name, visible[name],
             # `.lower()`: this dict is keyed folded and `name` is the QUERY's spelling.
@@ -2725,6 +2780,9 @@ def apply_row_filters_to_write(
     raising = raising_conversion(filt, name, dialect, policy, executes_as=executes_as)
     if raising is not None:
         return _raising_refusal(raising, name, (executes_as or dialect).lower()), []
+    lost = _lost_names(filt, name, dialect)
+    if lost is not None:
+        return lost, []
     if (executes_as or dialect).lower() in _FENCED:
         # The target is filtered by conjunction, and a conjunction is not a fence: the engine may
         # still evaluate the statement's own WHERE on rows the filter removes (M160, measured on

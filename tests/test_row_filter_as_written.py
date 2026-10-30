@@ -23,7 +23,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.rls import as_written
-from mnemiq.sql.verdict import Approved, ApprovedWrite
+from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
 
 SCHEMA = {"claim": {"id", "region"}, "scratch": {"id", "region"}}
 ROWS = ("CREATE TABLE claim (id INT, region VARCHAR); CREATE TABLE scratch (id INT, region VARCHAR);"
@@ -187,3 +187,49 @@ def test_a_text_that_does_not_read_back_as_the_expanded_tree_is_refused(monkeypa
     monkeypatch.setattr(rls, "expand_tables", lambda tree, registry: real(tree, {"pg": "elsewhere"}))
     verdict = _federated("id IN (SELECT person_id FROM pg.entitlement)")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.POLICY_TARGET_UNSUPPORTED, verdict
+
+
+@pytest.mark.parametrize(("dialect", "filt"), [
+    # sqlglot reads `secret` as a date part, a Var no column check sees; DuckDB reads the column.
+    # Printed from the parse it was the literal 'SECRET'; run as written it read claim.secret,
+    # a column the policy does not hold (Codex's review of #193).
+    ("duckdb", "date_diff(secret, DATE '2020-01-01', DATE '2021-01-01') = 1"),
+    ("duckdb", "date_diff(year, DATE '2020-01-01', DATE '2021-01-01') = 1"),
+    ("duckdb", "date_trunc(secret, DATE '2020-01-01') IS NOT NULL"),
+    # The parse drops the name outright; only the reprint's names miss it.
+    ("duckdb", "list_reverse_sort([id], secret) IS NOT NULL"),
+    # The parse holds a date part that reprints bare; only the date-part check sees it.
+    ("duckdb", "time_bucket(INTERVAL 1 DAY, d, secret) IS NOT NULL"),
+])
+def test_a_name_the_parse_does_not_read_as_a_column_or_a_table_refuses_the_filter(dialect, filt):
+    schema = {"claim": {"id", "d"}}
+    verdict = decide("SELECT id FROM claim", schema, dialect=dialect, target=dialect,
+                     policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+@pytest.mark.parametrize(("dialect", "filt"), [
+    ("duckdb", "EXTRACT(year FROM d) = 2020 AND d > DATE '2020-01-01' - INTERVAL 1 DAY"),
+    ("duckdb", "date_diff('year', d, DATE '2021-01-01') = 1"),
+    ("duckdb", "id IN (SELECT e.id FROM entitlement AS e WHERE e.who = 'r')"),
+    ("duckdb", "TRY_CAST(id AS INTEGER) > 0 AND upper(region) = 'WEST'"),
+    ("oracle", "d > SYSDATE - INTERVAL '1' DAY AND EXTRACT(YEAR FROM d) = 2020"),
+    ("oracle", "TRUNC(d, 'DD') = d"),
+    ("postgres", "date_part('day', d) = 1 AND d > CURRENT_DATE - INTERVAL '1 day'"),
+])
+def test_names_the_parse_accounts_for_pass(dialect, filt):
+    schema = {"claim": {"id", "region", "d"}, "entitlement": {"id", "who"}}
+    verdict = decide("SELECT id FROM claim", {"claim": schema["claim"]}, dialect=dialect, target=dialect,
+                     policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
+    assert isinstance(verdict, Approved), (dialect, filt, verdict)
+
+
+@pytest.mark.parametrize("sql", ["DELETE FROM claim WHERE id > 0", "UPDATE claim SET d = NULL WHERE id > 0"])
+def test_a_write_target_s_filter_is_held_to_the_same_names(sql):
+    # The target's filter is conjoined, not wrapped, and checked on its own path.
+    schema = {"claim": {"id", "d"}}
+    filt = "date_diff(secret, DATE '2020-01-01', DATE '2021-01-01') = 1"
+    grants = GrantSet(frozenset(schema), writable=frozenset(schema), row_filters={"claim": filt})
+    verdict = decide_write(sql, schema, grants, dialect="duckdb", target="duckdb", writes_enabled=True,
+                           policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
