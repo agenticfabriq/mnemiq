@@ -95,6 +95,12 @@ asked from), the run's `annotations`, and, when graded, `outcome` with the row c
 with the same `--out` skips the questions already in it, asks again one whose line a killed run
 cut short, and refuses a file written under a different configuration, settings or copy of a set.
 
+One known limit: the runner ends a statement at its time limit with `KILL QUERY` over a second
+connection. A MySQL server that freezes while keeping its connections open (a paused VM, for
+example) answers neither, so the run waits until the server is back. Nothing wrong is recorded.
+If a run stops making progress, stop it and start it again with the same `--out` once MySQL
+answers: it resumes, and asks the question it was on again.
+
 ## The setup behind our BEAVER figures
 
 - **Model:** GPT-5.5, through an OpenAI-compatible endpoint.

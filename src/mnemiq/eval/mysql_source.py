@@ -334,7 +334,12 @@ class MySQLSource:
         during a slow reopen reaches nothing; it kills the session `run` started on, and a KILL
         that stalls past that check is `_run`'s to contain (it retires the session). A connection
         it reopens or drops is its own: it installs one only while `run` is current, and a failure
-        closes the one it used, never one a reattach opened since."""
+        closes the one it used, never one a reattach opened since.
+
+        A known limit (Codex's fourth review): a server that freezes with its connections open
+        answers neither the statement nor the KILL, and nothing in this process frees the caller
+        then, an interrupt included, so the call waits for the server. Bounding it would take a
+        worker process; docs/beaver.md tells the operator to stop the run and resume it."""
         run.timed_out = True
         killer = self._killer
         try:
