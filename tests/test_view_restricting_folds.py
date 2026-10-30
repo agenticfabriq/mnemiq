@@ -348,6 +348,56 @@ def test_distinct_spellings_of_one_twin_group_share_one_walk(monkeypatch):
     assert len(lookups) < 4 * len(twins), len(lookups)
 
 
+def test_qualified_twins_are_walked_once_from_every_enclosing_catalog(monkeypatch):
+    # N views, each in its own schema, all reading one qualified name with N case twins. A qualified
+    # view resolves the names inside it in its own prefix, so its walk is the same from any catalog,
+    # yet each enclosing catalog enumerated the twins again, N squared (Codex's eleventh review of
+    # #192: 262,656 lookups at N=512).
+    import itertools
+
+    from mnemiq.sql import views as module
+
+    lookups = []
+
+    class Counting(dict):
+        def get(self, key, default=None):
+            lookups.append(key)
+            return super().get(key, default)
+
+    class Request(module._Request):
+        def __post_init__(self):
+            super().__post_init__()
+            self.clean = Counting(self.clean)
+
+    monkeypatch.setattr(module, "_Request", Request)
+    twins = ["p." + "".join(c) for c in itertools.product(*("tT",) * 7)]
+    defs = {k: ViewDefinition(object_id=k, dialect="postgres", definition="SELECT id FROM safe_table") for k in twins}
+    wrappers = [f"s{i}.v" for i in range(len(twins))]
+    defs |= {w: ViewDefinition(object_id=w, dialect="postgres", definition="SELECT id FROM p.ttttttt")
+             for w in wrappers}
+    query = " UNION ALL ".join(f"SELECT id FROM {w}" for w in wrappers)
+    verdict = module.check_views(sqlglot.parse_one(query, read="postgres"), defs, {"orders"},
+                                 known={"safe_table", "orders", *defs}, granted=set(wrappers))
+    assert verdict is None, verdict
+    assert len(lookups) < 4 * len(defs), len(lookups)
+
+
+@pytest.mark.parametrize("first, second", [("b.v1", "a.v1"), ("a.v1", "b.v1")])
+def test_a_bare_view_walked_clean_in_one_catalog_is_walked_again_in_another(first, second):
+    # A bare view resolves the names inside it in the catalog it is read from, so `w` reading `x`
+    # reaches the clean `b.x` from `b.v1` and the filtered one through `a.x` from `a.v1`: a record
+    # of its bucket shared across catalogs, as a qualified bucket's is, approved the second read.
+    from mnemiq.sql.views import check_views
+
+    defs = {k: ViewDefinition(object_id=k, dialect="postgres", definition=body) for k, body in (
+        ("a.v1", "SELECT id FROM w"), ("b.v1", "SELECT id FROM w"), ("w", "SELECT id FROM x"),
+        ("a.x", "SELECT id FROM orders"), ("b.x", "SELECT id FROM safe_table"))}
+    query = f"SELECT id FROM {first} UNION ALL SELECT id FROM {second}"
+    verdict = check_views(sqlglot.parse_one(query, read="postgres"), defs, {"orders"},
+                          known={"safe_table", "orders", *defs}, granted={"a.v1", "b.v1"})
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
+
+
 def test_on_duckdb_a_long_s_view_name_is_still_unknown():
     verdict = _read_through_a_nested_view("ſales", dialect="duckdb")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW, verdict

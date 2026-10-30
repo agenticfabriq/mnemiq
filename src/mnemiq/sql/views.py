@@ -365,11 +365,15 @@ def _unwalked(node: exp.Table, request: _Request, catalog: str, depth: int):
     the rest unasked. So references sharing twins, under any spelling or qualifier, visit them
     once."""
     for bucket in sorted(_buckets(node, catalog)):
-        if request.clean_buckets.get((bucket, catalog), -1) >= depth:
+        # A bucket of qualified views is walked the same from every catalog, since each resolves
+        # the names inside it in its own prefix: recorded once for all of them, a view in each of N
+        # schemas reading N qualified twins no longer lists them N times (Codex's eleventh review).
+        scope = "" if bucket in request.qualified else catalog
+        if request.clean_buckets.get((bucket, scope), -1) >= depth:
             continue
         for name in request.by_coarse.get(bucket, ()):
             yield name, request.views[name]
-        request.clean_buckets[(bucket, catalog)] = depth
+        request.clean_buckets[(bucket, scope)] = depth
 
 
 @dataclass
@@ -392,12 +396,14 @@ class _Request:
     clean: dict[tuple[str, str], int] = field(default_factory=dict)
     clean_buckets: dict[tuple[str, str], int] = field(default_factory=dict)
     by_coarse: dict[str, list[str]] = field(default_factory=dict)
+    qualified: set[str] = field(default_factory=set)
     wanted: set[str] = field(default_factory=set)
     _recognised: dict[str | None, set[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for key in sorted(self.views):
             self.by_coarse.setdefault(_coarse(key), []).append(key)
+        self.qualified = {b for b, keys in self.by_coarse.items() if all("." in k for k in keys)}
         # The filtered set is widened the same way as a body's mentions and by its bare last
         # segment, so a body saying `customer` still matches a filter keyed `public.customer`.
         # Both directions, because a miss here means not refusing.
