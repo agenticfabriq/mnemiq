@@ -979,8 +979,11 @@ _PATTERNS = (exp.Like, exp.ILike, exp.SimilarTo, exp.Glob, exp.RegexpLike, exp.R
 # behind an expression. So a date-only string, or a DATE literal, is a bound only where every
 # operand it is directly compared with is a bare column the resolver places on a column the
 # snapshot declares DATE; against an expression, a cast, a function, or a column of any other or
-# unknown type it is unchecked. The cost, accepted: a true "none" filtered by a date range on a
-# TIMESTAMP column (`ts >= '2031-01-01'`), or through an expression, is declined, naming the date.
+# unknown type it is unchecked. One exception, since: a plain date-only string that is the
+# inclusive start (`ts >= '2031-01-01'`) or the exclusive end (`ts < '2031-01-02'`) of a range on a
+# bare naive TIMESTAMP column is a bound, because midnight is what a half-open day range means
+# (`_half_open`). The cost, accepted: a true "none" filtered by any other date form on a TIMESTAMP
+# column, or through an expression, is declined, naming the date.
 #
 # A timestamp with its time of day is the TIMESTAMP column's own precision, as safe a bound as a
 # number (the controller's addition to fix round 2): a week written to the second on a timestamp
@@ -1162,6 +1165,14 @@ def _numeric(node: exp.Expression | None) -> float | None:
     return None
 
 
+def _half_open(comparison: exp.Expression, literal: exp.Expression) -> bool:
+    """Whether `literal` is the inclusive start or the exclusive end of a range on the other
+    operand, on whichever side it is written: `col >= x`, `x <= col`, `col < x`, `x > col`."""
+    if comparison.right is literal:
+        return isinstance(comparison, (exp.GTE, exp.LT))
+    return isinstance(comparison, (exp.LTE, exp.GT))
+
+
 _HOLDS = {exp.EQ: lambda a, b: a == b, exp.NEQ: lambda a, b: a != b, exp.GT: lambda a, b: a > b,
           exp.GTE: lambda a, b: a >= b, exp.LT: lambda a, b: a < b, exp.LTE: lambda a, b: a <= b}
 
@@ -1215,8 +1226,9 @@ def ground_values(
     rows read GROUNDED and its empty result was answered, an absent guess read ABSENT, a membership
     test through `<>` (Codex's review of ui-36). `row_filtered` is folded as `check_values` folds
     it (`names_one_object`). TYPED only where a date-only ISO string or a DATE literal is directly
-    compared with bare columns all proven DATE (`_ISO_DATES_READ_AS_DATES`, `types`), or a
-    well-formed interval with a bare date or time column. UNCHECKED everywhere else: a pattern, a
+    compared with bare columns all proven DATE (`_ISO_DATES_READ_AS_DATES`, `types`), a plain
+    date-only string is the half-open start or end of a range on a bare naive TIMESTAMP column
+    (`_half_open`), or a well-formed interval with a bare date or time column. UNCHECKED everywhere else: a pattern, a
     text range, a date against anything but a proven DATE, another typed literal, a value compared
     with an expression or with nothing, a column the resolver cannot place, one with no indexed
     values, or no index at all (`values` None).
@@ -1248,7 +1260,8 @@ def ground_values(
             return "masked"
         return None
 
-    def against(other: exp.Expression, text: str, ranged: bool) -> tuple[str, str, str | None]:
+    def against(other: exp.Expression, text: str, ranged: bool,
+                half_open: bool = False) -> tuple[str, str, str | None]:
         if not isinstance(other, exp.Column):
             return UNCHECKED, "not_a_column", None
         placed = place(other)
@@ -1262,6 +1275,13 @@ def ground_values(
         held = kind(table, name)
         if dates and _iso_date(text):
             if held == "date":
+                return TYPED, "", column
+            # Midnight is what a half-open day range means on a naive TIMESTAMP column, so the
+            # range's start (`>=`) or end (`<`) counts the day whole and an empty result there is
+            # honest. Measured on saved local-model runs: every right answer this rule declined
+            # bounded its day this way. Not on TIMESTAMPTZ, whose midnight is the session's
+            # zone's.
+            if held == "timestamp" and half_open:
                 return TYPED, "", column
             if held in (*_TIMESTAMP_KINDS, "time"):
                 return UNCHECKED, "date_on_time", column
@@ -1361,7 +1381,7 @@ def ground_values(
             return interval(literal, text)
         if isinstance(parent, _EQUALITIES + _RANGES):
             other = parent.right if parent.left is literal else parent.left
-            return against(other, text, isinstance(parent, _RANGES))
+            return against(other, text, isinstance(parent, _RANGES), _half_open(parent, literal))
         if isinstance(parent, exp.In) and any(e is literal for e in parent.expressions):
             return against(parent.this, text, False)
         if isinstance(parent, exp.Between) and parent.this is not literal:

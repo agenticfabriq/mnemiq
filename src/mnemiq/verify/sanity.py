@@ -108,7 +108,8 @@ def sanity_check(question: str, table: pa.Table,
     empty result, or one NULL row from aggregates over nothing, passes when `grounding` -- the
     decider's record of every string value in the statement, the projection's included -- says
     each was found in its column's indexed values or is a bound of a bare column's own type (a
-    date on a DATE column, a full timestamp on a TIMESTAMP one), and no predicate can never hold.
+    date on a DATE column or as the half-open end of a range on a TIMESTAMP one, a full timestamp on a
+    TIMESTAMP one), and no predicate can never hold.
     A value on a table this identity reads through a row filter is never grounded: the index
     cannot say which rows the caller may read (`ground_values`). Anything
     nothing could check keeps it declined, and the decline names the value, so the caller can

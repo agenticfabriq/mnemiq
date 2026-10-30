@@ -265,6 +265,20 @@ def test_a_date_only_string_against_a_timestamp_is_declined(source):
     assert ans.deferred is True and "'2024-03-03'" in ans.answer, ans.answer
 
 
+def test_a_half_open_day_on_a_timestamp_is_answered(source):
+    """`ts >= day AND ts < next day` counts the day whole, so its "none" is answered; the same day
+    ended with `<=` is declined."""
+    adapter, snap, values = source
+    half_open = "SELECT id FROM claim WHERE region = 'west' AND ts >= '2031-01-01' AND ts < '2031-01-02'"
+    assert adapter.execute(half_open.replace("SELECT id", "SELECT count(*)"))[0][0] == 0
+    ans = _ask_instant(adapter, snap, values, half_open, "Which west claims were stamped on 1 January 2031?")
+    assert ans.deferred is False, ans.answer
+    assert "No rows matched: region = 'west' AND ts >= '2031-01-01' AND ts < '2031-01-02'." in ans.answer
+    inclusive = half_open.replace("ts < '2031-01-02'", "ts <= '2031-01-01'")
+    ans = _ask_instant(adapter, snap, values, inclusive, "Which west claims were stamped on 1 January 2031?")
+    assert ans.deferred is True and "'2031-01-01'" in ans.answer, ans.answer
+
+
 # Fix round 2: the reviews of fix round 1 found each exemption bypassed one level deeper -- a
 # projected value carried into WHERE, QUALIFY or a set-returning call through another item's alias,
 # and a DATE literal compared with an expression or a column pair of timestamp type. Each returns

@@ -273,9 +273,67 @@ def test_a_date_only_string_against_a_timestamp_column_is_unchecked():
     for sql in ("SELECT id FROM claim WHERE ts = '2024-03-03'",
                 "SELECT id FROM claim WHERE ts IN ('2024-03-03', '2024-03-04')",
                 "SELECT id FROM claim WHERE ts BETWEEN '2024-03-03' AND '2024-03-03'",
-                "SELECT id FROM claim WHERE ts >= '2031-01-01'",
                 "SELECT id FROM claim WHERE tz = '2024-03-03'"):
         assert {o for _, o, _, _ in _read(sql)} == {UNCHECKED}, sql
+
+
+def test_the_half_open_premise_measured_on_duckdb():
+    """A date-only string against a TIMESTAMP column is midnight. As the inclusive start or the
+    exclusive end of a range that is what the range means, and the day is counted whole; as an
+    inclusive end it drops the day's hours."""
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (ts TIMESTAMP)")
+    con.execute("INSERT INTO t VALUES ('2024-03-03 10:00:00')")
+    count = lambda where: con.execute(f"SELECT count(*) FROM t WHERE {where}").fetchone()[0]  # noqa: E731
+    assert count("ts >= '2024-03-03' AND ts < '2024-03-04'") == 1
+    assert count("'2024-03-03' <= ts AND '2024-03-04' > ts") == 1
+    assert count("ts >= '2024-03-03' AND ts <= '2024-03-03'") == 0
+    assert count("ts BETWEEN '2024-03-03' AND '2024-03-03'") == 0
+    assert count("ts > '2024-03-03'") == 1  # "after the 3rd" that keeps the 3rd's hours
+
+
+def test_a_date_only_string_bounding_a_timestamp_half_open_is_a_bound():
+    """The inclusive start (`>=`) or the exclusive end (`<`) of a range on a naive TIMESTAMP column,
+    written on either side: an empty result there is honest, so the date is a bound."""
+    for sql in ("SELECT id FROM claim WHERE ts >= '2024-03-03' AND ts < '2024-03-04'",
+                "SELECT id FROM claim WHERE '2024-03-03' <= ts AND '2024-03-04' > ts",
+                "SELECT id FROM claim WHERE ts >= '2031-01-01'",
+                "SELECT id FROM claim WHERE ts < '1990-01-01'"):
+        assert {(o, w) for _, o, w, _ in _read(sql)} == {(TYPED, "")}, sql
+
+
+def test_a_date_only_string_that_misreads_a_day_on_a_timestamp_stays_unchecked():
+    """An inclusive end (`<=`, BETWEEN) drops the day's hours, an exclusive start (`>`) keeps them,
+    and `=`, `<>` and IN compare with midnight alone."""
+    for sql in ("SELECT id FROM claim WHERE ts <= '2024-03-03'",
+                "SELECT id FROM claim WHERE ts > '2024-03-03'",
+                "SELECT id FROM claim WHERE '2024-03-03' >= ts",
+                "SELECT id FROM claim WHERE '2024-03-03' < ts",
+                "SELECT id FROM claim WHERE ts BETWEEN '2024-03-03' AND '2024-03-04'",
+                "SELECT id FROM claim WHERE ts = '2024-03-03'",
+                "SELECT id FROM claim WHERE ts <> '2024-03-03'",
+                "SELECT id FROM claim WHERE ts IN ('2024-03-03')"):
+        assert {(o, w) for _, o, w, _ in _read(sql)} == {(UNCHECKED, "date_on_time")}, sql
+
+
+def test_a_half_open_date_on_a_zone_aware_or_a_time_column_stays_unchecked():
+    """On TIMESTAMPTZ a date-only string is midnight in the session's zone, so where its day starts
+    is the session's, not the question's; a TIME column holds no day at all."""
+    for sql in ("SELECT id FROM claim WHERE tz >= '2024-03-03'",
+                "SELECT id FROM claim WHERE tz < '2024-03-04'",
+                "SELECT id FROM claim WHERE at < '2024-03-04'"):
+        assert {o for _, o, _, _ in _read(sql)} == {UNCHECKED}, sql
+
+
+def test_a_half_open_bound_is_a_plain_date_string_against_a_bare_column_only():
+    """A DATE literal, a cast column or an engine that compares a date string as text keeps the
+    rule as it was."""
+    for sql, dialect in (("SELECT id FROM claim WHERE ts >= DATE '2024-03-03'", "duckdb"),
+                         ("SELECT id FROM claim WHERE CAST(ts AS TIMESTAMP) >= '2024-03-03'", "duckdb"),
+                         ("SELECT id FROM claim WHERE ts >= '2024-03-03'", "sqlite")):
+        assert {o for _, o, _, _ in _read(sql, dialect=dialect)} == {UNCHECKED}, (sql, dialect)
 
 
 def test_a_date_only_string_against_a_time_column_is_unchecked():
