@@ -350,8 +350,7 @@ def _buckets(node: exp.Table, catalog: str) -> set[str]:
     as the federated one, so this is not federation's bug. And as wide as any engine's fold: Oracle
     reads `ſales` as SALES, which `str.lower` keeps apart from `sales`, so the known-object check
     vouched for a view this lookup never found, and the filtered table behind it went unwalked; the
-    query's own names are read the same way, since a grant on a quoted `ſALES` passes the grant
-    check and Oracle runs the unquoted spelling as SALES."""
+    query's own names are read the same way, as the engine that runs it reads them."""
     spelled = {object_key(node), node.name}
     if catalog:
         # A FEDERATED view body is written in the SOURCE's own naming, so a NESTED view
