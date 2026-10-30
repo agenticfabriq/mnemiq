@@ -204,9 +204,11 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
             continue  # held as a node of its own here (`SYSDATE` as the call it is), printed in its place
         lost.add(word)
     # A date part holds its text; a MAP key read as a lambda's parameter holds the parameter's
-    # Identifier (`as_duckdb_reads`), a name the lambda declares.
+    # Identifier (`as_duckdb_reads`), a name the lambda declares. A collation's name is a Var
+    # too, in COLLATE's place, and names no column (Codex's thirteenth review of #193).
     parts = {v.name.casefold() for v in tree.find_all(exp.Var) if isinstance(v.this, str)
-             and not _in_extract_or_interval(v)}
+             and not _in_extract_or_interval(v)
+             and not (isinstance(v.parent, exp.Collate) and v.arg_key == "expression")}
     dropped = _keywords_dropped(filt, dialect, counted)
     return sorted(lost | (parts & written) | set(dropped))
 

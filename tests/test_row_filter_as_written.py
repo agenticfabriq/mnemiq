@@ -532,3 +532,27 @@ def test_a_word_held_as_a_call_where_a_name_would_not_print_is_refused():
                      policy=AccessPolicy(row_filters={"claim": "date_diff(current_date, d, d) = 1"},
                                          policy_schema=schema))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+@pytest.mark.parametrize("engine", ["duckdb", "sqlite"])
+@pytest.mark.parametrize("statement", ["SELECT id FROM claim", "DELETE FROM claim WHERE id > 0"])
+def test_a_collation_name_is_no_date_part(engine, statement):
+    # `nocase` stands where a collation is named, which the parse holds as a Var; read as a date
+    # part, a valid filter refused every read and write of its table (Codex's thirteenth review).
+    schema = {"claim": {"id", "region"}}
+    policy = AccessPolicy(row_filters={"claim": "region COLLATE nocase = 'west'"}, policy_schema=schema)
+    if statement.startswith("SELECT"):
+        verdict = decide(statement, schema, dialect=engine, target=engine, policy=policy)
+        assert isinstance(verdict, Approved), verdict
+    else:
+        verdict = decide_write(statement, schema, GrantSet(frozenset(schema), writable=frozenset(schema)),
+                               policy=policy, dialect=engine, writes_enabled=True)
+        assert isinstance(verdict, ApprovedWrite), verdict
+
+
+def test_a_collation_name_does_not_excuse_the_same_word_dropped_elsewhere():
+    schema = {"claim": {"id", "region", "d"}}
+    filt = "region COLLATE nocase = 'west' AND decode(d, nocase) IS NOT NULL"
+    verdict = decide("SELECT id FROM claim", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
