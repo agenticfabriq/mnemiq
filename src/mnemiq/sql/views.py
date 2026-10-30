@@ -389,8 +389,8 @@ class _Request:
     clean: dict[tuple[str, str], int] = field(default_factory=dict)
     by_lower: dict[str, list[str]] = field(default_factory=dict)
     by_coarse: dict[str, list[str]] = field(default_factory=dict)
-    groups: dict[tuple[str, str, str], list[tuple[str, ViewDefinition]]] = field(default_factory=dict)
-    clean_groups: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    groups: dict[tuple[frozenset[str], str], list[tuple[str, ViewDefinition]]] = field(default_factory=dict)
+    clean_groups: dict[tuple[frozenset[str], str], int] = field(default_factory=dict)
     wanted: set[str] = field(default_factory=set)
     _recognised: dict[str | None, set[str]] = field(default_factory=dict)
 
@@ -424,10 +424,13 @@ def _walk(
     request: _Request,
 ) -> Refusal | None:
     for node in ast.find_all(exp.Table):
-        # Every reference spelled alike in one catalog reads the same views: walked clean once at a
-        # depth, the group is clean at any depth no deeper, as a view is. N references to N twins
-        # enumerated and visited the group each time, N squared (Codex's seventh review of #192).
-        group = (object_key(node), node.name, catalog)
+        # Every reference a fold joins, in one catalog, reads the same views: the exact key is among
+        # its twins. Walked clean once at a depth, the group is clean at any depth no deeper, as a
+        # view is. Keyed by spelling, N references to N twins enumerated and visited the group each
+        # time, N squared, alike or each spelled its own way (Codex's seventh and eighth reviews of
+        # #192).
+        spellings_ = {object_key(node), node.name}
+        group = (frozenset(f(s) for s in spellings_ for f in (str.lower, _coarse)), catalog)
         if request.clean_groups.get(group, -1) >= depth:
             continue
         if group not in request.groups:

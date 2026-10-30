@@ -303,6 +303,36 @@ def test_repeated_references_to_a_twin_group_are_walked_once(monkeypatch):
     assert len(lookups) < 4 * len(twins), len(lookups)
 
 
+def test_distinct_spellings_of_one_twin_group_share_one_walk(monkeypatch):
+    # Each of N quoted twins referenced once under its own spelling: a group per spelling
+    # enumerated and visited all N, N squared (Codex's eighth review of #192). Every spelling a
+    # fold joins has the same candidates, so the group is the fold's.
+    import itertools
+
+    from mnemiq.sql import views as module
+
+    lookups = []
+
+    class Counting(dict):
+        def get(self, key, default=None):
+            lookups.append(key)
+            return super().get(key, default)
+
+    class Request(module._Request):
+        def __post_init__(self):
+            super().__post_init__()
+            self.clean = Counting(self.clean)
+
+    monkeypatch.setattr(module, "_Request", Request)
+    twins = ["".join(c) for c in itertools.product(*("tT",) * 7)]
+    defs = {k: ViewDefinition(object_id=k, dialect="postgres", definition="SELECT id FROM safe_table") for k in twins}
+    query = " UNION ALL ".join(f'SELECT id FROM "{k}"' for k in twins)
+    verdict = module.check_views(sqlglot.parse_one(query, read="postgres"), defs, {"orders"},
+                                 known={"safe_table", "orders", *defs}, granted=set(twins))
+    assert verdict is None, verdict
+    assert len(lookups) < 4 * len(twins), len(lookups)
+
+
 def test_on_duckdb_a_long_s_view_name_is_still_unknown():
     verdict = _read_through_a_nested_view("ſales", dialect="duckdb")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW, verdict
