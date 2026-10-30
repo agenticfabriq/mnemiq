@@ -140,7 +140,8 @@ def test_the_narrow_question_agrees_with_the_whole_read_or_oracle_refuses_the_ca
 
 OTHER = "m177_other"
 M177_DROPS = ["DROP PUBLIC SYNONYM m177_app_priv", "DROP PUBLIC SYNONYM m177_app_pub",
-              "DROP PUBLIC SYNONYM m177_shadow", "DROP PUBLIC DATABASE LINK m177_dead",
+              "DROP PUBLIC SYNONYM m177_shadow", "DROP PUBLIC SYNONYM m177_idx",
+              "DROP PUBLIC DATABASE LINK m177_dead",
               f"DROP USER {OTHER} CASCADE"]
 
 
@@ -257,6 +258,60 @@ def test_a_hidden_link_synonym_in_current_schema_shadowing_a_safe_public_one_is_
         _drop_m177(ac, oracledb)
         try:
             app.cursor().execute("DROP FUNCTION m177_safe_fn")
+        except oracledb.DatabaseError:
+            pass
+        app.close()
+        admin.close()
+
+
+
+def test_an_index_named_like_a_public_alias_over_a_hidden_link_ends_nothing():
+    """M177: the caller's own index shares its name with a PUBLIC alias whose chain runs through
+    another account's hidden synonym over a dead link. An index is in a namespace of its own, so
+    Oracle resolves the name to the PUBLIC alias; taken for the end of the chain, it let the name
+    reach NAME_RESOLVE (Codex's second review of #194)."""
+    import secrets
+
+    oracledb = pytest.importorskip("oracledb")
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    admin = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
+                             mode=oracledb.AUTH_MODE_SYSDBA)
+    ac = admin.cursor()
+    app = oracledb.connect(user=USER, password=PASSWORD, dsn=DSN)
+    _drop_m177(ac, oracledb)
+    for drop in ("DROP TABLE m177_t",):
+        try:
+            app.cursor().execute(drop)
+        except oracledb.DatabaseError:
+            pass
+    other_pw = "P" + secrets.token_hex(8)
+    adapter = OracleAdapter(DSN, USER, PASSWORD)
+    try:
+        for statement in (f"CREATE USER {OTHER} IDENTIFIED BY {other_pw}",
+                          f"GRANT CREATE SESSION, CREATE SYNONYM TO {OTHER}",
+                          "CREATE PUBLIC DATABASE LINK m177_dead CONNECT TO nobody IDENTIFIED BY x "
+                          "USING '10.255.255.1:1521/NOPE'",
+                          f"CREATE PUBLIC SYNONYM m177_idx FOR {OTHER}.m177_hop_pub"):
+            ac.execute(statement)
+        for statement in ("CREATE TABLE m177_t (id NUMBER)", "CREATE INDEX m177_idx ON m177_t (id)"):
+            app.cursor().execute(statement)
+        other = oracledb.connect(user=OTHER, password=other_pw, dsn=DSN)
+        try:
+            other.cursor().execute("CREATE SYNONYM m177_hop_pub FOR m177_fn@m177_dead")
+        finally:
+            other.close()
+
+        def spy(stored):  # over the dead link it would wait 40 s
+            raise AssertionError(f"{stored} was handed to NAME_RESOLVE")
+
+        adapter._name_resolve = spy
+        assert adapter.resolve_called_functions(["m177_idx"]) == ([], ["m177_idx"])
+    finally:
+        adapter.close()
+        _drop_m177(ac, oracledb)
+        try:
+            app.cursor().execute("DROP TABLE m177_t")
         except oracledb.DatabaseError:
             pass
         app.close()

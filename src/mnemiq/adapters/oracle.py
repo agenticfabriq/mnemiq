@@ -915,8 +915,12 @@ class OracleAdapter:
                     return True
                 owner, stored = target_owner or owner, target
                 continue
+            # Only an object in the namespace a name resolves in ends the chain: an index, a
+            # trigger or a constraint of the same name shadows nothing, and Oracle goes on to the
+            # PUBLIC synonym (Codex's second review of #194).
             if self._rows("SELECT 1 FROM all_objects WHERE owner = :owner AND object_name = :name "
-                          "AND ROWNUM = 1", owner=owner, name=stored):
+                          f"AND object_type IN ({_SHARED_NAMESPACE}) AND ROWNUM = 1",
+                          owner=owner, name=stored):
                 return False
             if owner != self._user:
                 return True
@@ -1739,6 +1743,13 @@ _UNRESOLVED = object()
 # chain of synonyms): a synonym that does not resolve, which is never read as "not a function".
 _SYNONYM_DOES_NOT_RESOLVE = frozenset({6564, 980, 1775})
 
+
+# The object types sharing the namespace a schema-level name resolves in, the one NAME_RESOLVE
+# searches: Oracle's "Database Object Names and Qualifiers". Private synonyms share it too, and
+# are followed instead of ending the chain. A materialized view's name is its table's.
+_SHARED_NAMESPACE = ", ".join(f"'{t}'" for t in (
+    "TABLE", "VIEW", "SEQUENCE", "PROCEDURE", "FUNCTION", "PACKAGE", "TYPE", "OPERATOR",
+    "MATERIALIZED VIEW"))
 
 def _chunks(items, size: int):
     """`items` in slices of `size`: an Oracle IN list is capped at 1,000 (ORA-01795)."""

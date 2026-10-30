@@ -24,7 +24,7 @@ from mnemiq.adapters.oracle import OracleAdapter
 class _Dictionary:
     """`_rows` answered from Python sets, routed by the shape of the SQL it is handed."""
 
-    def __init__(self, own=(), synonyms=(), oracle_owned=("SYS",), hidden=()):
+    def __init__(self, own=(), synonyms=(), oracle_owned=("SYS",), hidden=(), objects=None):
         self.own = set(own)
         # (owner, name, target_owner, target_name, db_link), all as Oracle stores them
         self.synonyms = list(synonyms)
@@ -33,6 +33,9 @@ class _Dictionary:
         # synonym, an object it holds no grant on, a name nothing holds. Every other synonym, and
         # every synonym's target, is shown.
         self.hidden = set(hidden)
+        # Shown objects other than synonyms, by (owner, name), with their type: every synonym's
+        # target is a FUNCTION unless named here.
+        self.objects = dict(objects or {})
 
     def _shown(self):
         return [s for s in self.synonyms if (s[0], s[1]) not in self.hidden]
@@ -44,8 +47,11 @@ class _Dictionary:
             return [(to, tn, link) for o, n, to, tn, link in self._shown() if (o, n) == key]
         if "object_name = :name" in sql:
             key = (binds["owner"], binds["name"])
-            objects = {(o, n) for o, n, *_ in self.synonyms} | {(to, tn) for _, _, to, tn, _ in self.synonyms}
-            return [(1,)] if key in objects - self.hidden else []
+            kinds = {(to, tn): "FUNCTION" for _, _, to, tn, _ in self.synonyms}
+            kinds.update({(o, n): "SYNONYM" for o, n, *_ in self.synonyms})
+            kinds.update(self.objects)
+            kind = kinds.get(key) if key not in self.hidden else None
+            return [(1,)] if kind is not None and f"'{kind}'" in sql else []
         if "all_procedures" in sql:
             return [(n,) for n in self.own if n in values]
         if "object_type = 'SYNONYM'" in sql:
@@ -245,3 +251,20 @@ def test_a_hidden_synonym_in_current_schema_shadowing_a_safe_public_one_is_never
 def test_a_synonym_current_schema_shows_is_resolved_from_there():
     d = _Dictionary(synonyms=[("OTHER", "X", "APP2", "F", None)])
     assert _adapter(d, {"X": ("APP2", None)}, schema="OTHER").resolve_called_functions(["x"]) == (["x"], [])
+
+
+def test_an_object_in_another_namespace_does_not_end_the_chain():
+    # Oracle resolves a name among tables, views, sequences, procedures, functions, packages,
+    # types, operators and synonyms; an index of the same name is in a namespace of its own and
+    # shadows nothing. Taken for the end of the chain, an index X let NAME_RESOLVE follow PUBLIC's X
+    # through a hidden link (Codex's second review of #194).
+    d = _Dictionary(synonyms=[("PUBLIC", "X", "OTHER", "HOP", None), ("OTHER", "HOP", None, "FN", "DEAD")],
+                    hidden={("OTHER", "HOP")}, objects={("APP", "X"): "INDEX"})
+    assert _adapter(d, {}).resolve_called_functions(["x"]) == ([], ["x"])
+
+
+def test_an_object_in_the_shared_namespace_ends_the_chain():
+    d = _Dictionary(synonyms=[("PUBLIC", "X", "OTHER", "HOP", None), ("OTHER", "HOP", None, "FN", "DEAD")],
+                    hidden={("OTHER", "HOP")}, objects={("APP", "X"): "TABLE"})
+    # This schema's table X is what Oracle reads X as: NOT_PLSQL, no function behind the name.
+    assert _adapter(d, {"X": module._NOT_PLSQL}).resolve_called_functions(["x"]) == ([], [])
