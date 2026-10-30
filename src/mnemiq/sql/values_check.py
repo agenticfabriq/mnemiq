@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import NamedTuple
 
@@ -14,6 +15,8 @@ from mnemiq.semantic.values import shown
 from mnemiq.sql.qualify import names_one_object
 from mnemiq.sql.identifiers import resolve, resolve_identifier, resolve_stored
 from mnemiq.sql.verdict import Refusal, RefusalCode
+
+logger = logging.getLogger(__name__)
 
 
 def _column_and_string(a: exp.Expression, b: exp.Expression) -> tuple[exp.Column, str] | None:
@@ -979,8 +982,11 @@ _PATTERNS = (exp.Like, exp.ILike, exp.SimilarTo, exp.Glob, exp.RegexpLike, exp.R
 # behind an expression. So a date-only string, or a DATE literal, is a bound only where every
 # operand it is directly compared with is a bare column the resolver places on a column the
 # snapshot declares DATE; against an expression, a cast, a function, or a column of any other or
-# unknown type it is unchecked. The cost, accepted: a true "none" filtered by a date range on a
-# TIMESTAMP column (`ts >= '2031-01-01'`), or through an expression, is declined, naming the date.
+# unknown type it is unchecked. One exception, since: a plain date-only string that is the
+# inclusive start (`ts >= '2031-01-01'`) or the exclusive end (`ts < '2031-01-02'`) of a range on a
+# bare naive TIMESTAMP column is a bound, because midnight is what a half-open day range means
+# (`_half_open`). The cost, accepted: a true "none" filtered by any other date form on a TIMESTAMP
+# column, or through an expression, is declined, naming the date.
 #
 # A timestamp with its time of day is the TIMESTAMP column's own precision, as safe a bound as a
 # number (the controller's addition to fix round 2): a week written to the second on a timestamp
@@ -1019,9 +1025,13 @@ class FilterValue:
     # (a full timestamp in `=`, `<>` or IN), zone_mismatch (a naive timestamp and a zone-aware one),
     # not_a_plain_string (a constant written other than as a plain literal, or a parameter: its
     # `text` is the constant as written), not_a_column (compared with an expression),
-    # not_compared, unresolved (the resolver could not place it).
+    # not_compared, unresolved (the resolver could not place it). "probed" on a value the source
+    # itself grounded or ruled out (`confirm_by_source`).
     why: str
     column: str | None  # `table.column`, where the resolver placed it
+    # (table, column) for a not_indexed value compared by equality or IN with a bare column, so the
+    # source can be asked whether the column holds it; None for every other value.
+    placed: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1162,6 +1172,14 @@ def _numeric(node: exp.Expression | None) -> float | None:
     return None
 
 
+def _half_open(comparison: exp.Expression, literal: exp.Expression) -> bool:
+    """Whether `literal` is the inclusive start or the exclusive end of a range on the other
+    operand, on whichever side it is written: `col >= x`, `x <= col`, `col < x`, `x > col`."""
+    if comparison.right is literal:
+        return isinstance(comparison, (exp.GTE, exp.LT))
+    return isinstance(comparison, (exp.LTE, exp.GT))
+
+
 _HOLDS = {exp.EQ: lambda a, b: a == b, exp.NEQ: lambda a, b: a != b, exp.GT: lambda a, b: a > b,
           exp.GTE: lambda a, b: a >= b, exp.LT: lambda a, b: a < b, exp.LTE: lambda a, b: a <= b}
 
@@ -1215,8 +1233,9 @@ def ground_values(
     rows read GROUNDED and its empty result was answered, an absent guess read ABSENT, a membership
     test through `<>` (Codex's review of ui-36). `row_filtered` is folded as `check_values` folds
     it (`names_one_object`). TYPED only where a date-only ISO string or a DATE literal is directly
-    compared with bare columns all proven DATE (`_ISO_DATES_READ_AS_DATES`, `types`), or a
-    well-formed interval with a bare date or time column. UNCHECKED everywhere else: a pattern, a
+    compared with bare columns all proven DATE (`_ISO_DATES_READ_AS_DATES`, `types`), a plain
+    date-only string is the half-open start or end of a range on a bare naive TIMESTAMP column
+    (`_half_open`), or a well-formed interval with a bare date or time column. UNCHECKED everywhere else: a pattern, a
     text range, a date against anything but a proven DATE, another typed literal, a value compared
     with an expression or with nothing, a column the resolver cannot place, one with no indexed
     values, or no index at all (`values` None).
@@ -1248,7 +1267,8 @@ def ground_values(
             return "masked"
         return None
 
-    def against(other: exp.Expression, text: str, ranged: bool) -> tuple[str, str, str | None]:
+    def against(other: exp.Expression, text: str, ranged: bool,
+                half_open: bool = False) -> tuple[str, str, str | None]:
         if not isinstance(other, exp.Column):
             return UNCHECKED, "not_a_column", None
         placed = place(other)
@@ -1262,6 +1282,13 @@ def ground_values(
         held = kind(table, name)
         if dates and _iso_date(text):
             if held == "date":
+                return TYPED, "", column
+            # Midnight is what a half-open day range means on a naive TIMESTAMP column, so the
+            # range's start (`>=`) or end (`<`) counts the day whole and an empty result there is
+            # honest. Measured on saved local-model runs: every right answer this rule declined
+            # bounded its day this way. Not on TIMESTAMPTZ, whose midnight is the session's
+            # zone's.
+            if held == "timestamp" and half_open:
                 return TYPED, "", column
             if held in (*_TIMESTAMP_KINDS, "time"):
                 return UNCHECKED, "date_on_time", column
@@ -1361,7 +1388,7 @@ def ground_values(
             return interval(literal, text)
         if isinstance(parent, _EQUALITIES + _RANGES):
             other = parent.right if parent.left is literal else parent.left
-            return against(other, text, isinstance(parent, _RANGES))
+            return against(other, text, isinstance(parent, _RANGES), _half_open(parent, literal))
         if isinstance(parent, exp.In) and any(e is literal for e in parent.expressions):
             return against(parent.this, text, False)
         if isinstance(parent, exp.Between) and parent.this is not literal:
@@ -1378,6 +1405,17 @@ def ground_values(
             return UNCHECKED, why or "pattern", column
         return UNCHECKED, "not_compared", None
 
+    def equality_spot(literal: exp.Literal) -> tuple[str, str] | None:
+        """The column a not_indexed value is compared with, as `against` placed it."""
+        parent = literal.parent
+        if isinstance(parent, _EQUALITIES):
+            other = parent.right if parent.left is literal else parent.left
+        elif isinstance(parent, exp.In) and any(e is literal for e in parent.expressions):
+            other = parent.this
+        else:
+            return None
+        return place(other) if isinstance(other, exp.Column) else None
+
     found = []
     for node in ast.walk(bfs=False):  # as written, so a decline names them in order
         if node.find_ancestor(exp.JSONPath) is not None:
@@ -1389,7 +1427,8 @@ def ground_values(
             found.append(FilterValue(_written_as(node, render_as), UNCHECKED, "json_path", None))
         elif isinstance(node, exp.Literal) and node.is_string:
             outcome, why, column = classify(node)
-            found.append(FilterValue(node.this, outcome, why, column))
+            found.append(FilterValue(node.this, outcome, why, column,
+                                     equality_spot(node) if why == "not_indexed" else None))
         elif _opaque_constant(node):
             found.append(FilterValue(_written_as(node, render_as), UNCHECKED, "not_a_plain_string",
                                      None))
@@ -1403,6 +1442,75 @@ def ground_values(
                 filters.append(text)
     return ValueGrounding(tuple(found), _never_true(ast, render_as), tuple(filters),
                           _null_as_written(ast, render_as))
+
+
+
+# --- a value the index could not check, asked of the source -------------------------------------
+#
+# The value index holds a column's values only where it can hold them all (`build_value_index`), so
+# a high-cardinality column -- an id, a lot number -- has none, and every value on it was UNCHECKED:
+# a true "none" filtered on one was declined. Measured on saved local-model runs: a third of the
+# right answers the sanity layer declined. The source can answer for such a value itself, so once a
+# result is empty each not_indexed value is asked of it: found is grounded, missing is absent, and
+# a probe that fails or times out leaves the value unchecked, the empty result declined as before.
+# Only a not_indexed value carries a column to ask (`FilterValue.placed`): a masked column or a
+# row-filtered table never does, because whether a value exists is what those withhold.
+
+PROBE_LIMIT = 8  # distinct values asked per grounding; any beyond stay unchecked
+
+
+def confirm_by_source(grounding: ValueGrounding, holds: Callable[[str, str, str], bool | None],
+                      limit: int = PROBE_LIMIT) -> ValueGrounding:
+    """`grounding` with each not_indexed value the source was asked about grounded or ruled out.
+    `holds(table, column, text)` answers True, False, or None for a source that said nothing."""
+    asked: dict[tuple[str, str, str], bool | None] = {}
+    values = []
+    for value in grounding.values:
+        if value.outcome != UNCHECKED or value.why != "not_indexed" or value.placed is None:
+            values.append(value)
+            continue
+        key = (*value.placed, value.text)
+        if key not in asked:
+            if len(asked) >= limit:
+                values.append(value)
+                continue
+            asked[key] = holds(*key)
+        found = asked[key]
+        values.append(value if found is None
+                      else replace(value, outcome=GROUNDED if found else ABSENT, why="probed"))
+    return replace(grounding, values=tuple(values))
+
+
+def probe_sql(table: str, column: str, text: str, dialect: str | None) -> str:
+    """Whether `table.column` holds `text`, in the source's dialect: the names quoted in their stored
+    spelling, as the value index reads them, and the value a string literal sqlglot escapes. The
+    table is one quoted name even when it holds a dot: split, a table stored as `a.b` would be read
+    as table `b` in schema `a`, an object nobody checked for this caller. So a federated source's
+    `catalog.schema.table` does not resolve, and its probe only says nothing, as its value index
+    holds nothing (the e2e lane's read of 9a0ed29c)."""
+    return (exp.select(exp.Literal.number(1))
+            .from_(exp.Table(this=exp.to_identifier(table, quoted=True)))
+            .where(exp.EQ(this=exp.Column(this=exp.to_identifier(column, quoted=True)),
+                          expression=exp.Literal.string(text)))
+            .limit(1)
+            .sql(dialect=dialect))
+
+
+def source_holds(adapter, dialect: str | None, physical: dict[str, str],
+                 timeout_s: float) -> Callable[[str, str, str], bool | None]:
+    """`holds` for `confirm_by_source`, asking `adapter`. `physical` maps a snapshot table to the
+    source's own name for it (`Snapshot.source_bindings`), as the value index does."""
+    def holds(table: str, column: str, text: str) -> bool | None:
+        sql = probe_sql(physical.get(table, table), column, text, dialect)
+        try:
+            return adapter.execute_arrow(sql, timeout_s=timeout_s).num_rows > 0
+        except Exception as exc:  # noqa: BLE001 -- unanswered, the value stays unchecked and declines
+            # The kind of failure only: a source's error text quotes the statement, value and all,
+            # and the value may sit on a column the index skipped as personal data (Codex's review).
+            logger.info("the source did not answer whether %s.%s holds a filter value (%s); it stays "
+                        "unchecked", table, column, type(exc).__name__)
+            return None
+    return holds
 
 
 def _null_as_written(ast: exp.Expression, render_as: str | None) -> str | None:
