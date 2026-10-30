@@ -340,17 +340,95 @@ def cte_references(ast: exp.Expression, dialect: str | None = None, *,
     as reads when the walk missed one. `engine` is whose binding to model when it is not the
     executor's: a view body is bound by its own source engine (Codex's review of #138). None is
     DuckDB's rule, the one every decider needs."""
-    bound = cte_binder(dialect, engine=engine)
-    return [table for table in ast.find_all(exp.Table) if bound(table)]
+    bound = cte_bindings(ast, dialect, engine=engine)
+    return [table for table in ast.find_all(exp.Table) if id(table) in bound]
 
 
-def cte_binder(dialect: str | None = None, *, engine: str | None = None):
-    """Whether a table node names a CTE in scope where it stands, as `cte_references` reports it,
-    for a caller asking of many nodes of one tree: each WITH's names are resolved once, where
-    asking node by node resolved every CTE in scope again, 4,002,000 resolutions for 2,000 CTEs
-    each read once (Codex's fourteenth review of #192). For one tree, while it is not changed."""
-    index: dict = {}
-    return lambda table: _cte_binding(table, dialect, engine, index) is not None
+def cte_binder(ast: exp.Expression, dialect: str | None = None, *, engine: str | None = None):
+    """Whether a table node of `ast` names a CTE in scope where it stands, as `cte_references`
+    reports it, for a caller that may ask of a few nodes or of none: the bindings are worked out
+    on the first asking (`cte_bindings`). For `ast` while it is not changed."""
+    bound: dict[int, exp.CTE] | None = None
+
+    def binds(table: exp.Table) -> bool:
+        nonlocal bound
+        if bound is None:
+            bound = cte_bindings(ast, dialect, engine=engine)
+        return id(table) in bound
+
+    return binds
+
+
+def cte_bindings(ast: exp.Expression, dialect: str | None = None, *,
+                 engine: str | None = None) -> dict[int, exp.CTE]:
+    """Every table node of `ast` that names a CTE in scope where it stands, by id, with the CTE the
+    engine binds it to: `_cte_binding`'s answer for each, worked out in one pass down the tree.
+    Asked node by node, each climbing to every WITH above it, 2,000 CTEs were 4,002,000 name
+    resolutions, and a UNION of 2,000 branches, which sqlglot nests 2,000 deep whichever side it
+    leans to, about 2,000,000 steps up (Codex's fourteenth to sixteenth reviews of #192).
+
+    Each name's CTEs in scope are a stack, the innermost on top. Inside a WITH's own CTE bodies
+    the earlier siblings are in scope, each pushed as its body is left, or every sibling at once
+    for an engine in `_EVERY_SIBLING`; under RECURSIVE a CTE is in scope in its own recursive part
+    (`_in_recursive_part`) unless an earlier sibling has its name; the query holding the WITH has
+    all of them. A name a WITH defines twice binds the first, as Oracle runs it. Iterative, since
+    such a tree is deeper than Python's recursion limit. The ids are those of `ast`'s nodes, valid
+    while the caller holds it."""
+    every = (engine or "").lower() in _EVERY_SIBLING
+    in_scope: dict[str, list[exp.CTE]] = {}
+    bound: dict[int, exp.CTE] = {}
+    recursive_parts: dict[int, tuple[exp.Expression, exp.CTE, set[str]]] = {}
+
+    def define(cte: exp.CTE, defined: set[str], pushed: list[str]) -> None:
+        name = resolve_name(cte, dialect)
+        if name is not None and name not in defined:
+            defined.add(name)
+            in_scope.setdefault(name, []).append(cte)
+            pushed.append(name)
+
+    todo: list = [ast]
+    while todo:
+        item = todo.pop()
+        if isinstance(item, tuple):
+            if item[0] == "define":
+                define(*item[1:])
+            else:
+                for name in item[1]:
+                    in_scope[name].pop()
+            continue
+        node = item
+        part = recursive_parts.get(id(node))
+        if part is not None and part[0] is node:
+            _, cte, defined = part
+            name = resolve_name(cte, dialect)
+            if name is not None and name not in defined:
+                in_scope.setdefault(name, []).append(cte)
+                todo.append(("pop", [name]))
+        if isinstance(node, exp.Table) and not (node.db or node.catalog):
+            name = resolve_name(node, dialect)
+            if name is not None and in_scope.get(name):
+                bound[id(node)] = in_scope[name][-1]
+        with_ = next((v for v in node.args.values() if isinstance(v, exp.With)), None)
+        if with_ is None:
+            todo.extend(node.iter_expressions())
+            continue
+        defined: set[str] = set()
+        pushed: list[str] = []
+        order: list = [("define", cte, defined, pushed) for cte in with_.expressions] if every else []
+        order += [child for child in with_.iter_expressions() if not isinstance(child, exp.CTE)]
+        for cte in with_.expressions:
+            body = cte.this
+            while isinstance(body, (exp.Subquery, exp.Paren)):
+                body = body.this
+            if with_.args.get("recursive") and not every and isinstance(body, exp.Union):
+                recursive_parts[id(body.right)] = (body.right, cte, defined)
+            order.append(cte)
+            if not every:
+                order.append(("define", cte, defined, pushed))
+        order += [child for child in node.iter_expressions() if child is not with_]
+        order.append(("pop", pushed))
+        todo.extend(reversed(order))
+    return bound
 
 
 def _missed_reads(ast: exp.Expression, walked: list[exp.Table], dialect: str | None) -> list[exp.Table]:
@@ -407,22 +485,25 @@ def check_policy_target(ast: exp.Expression, policy, target: str | None):
 _EVERY_SIBLING = frozenset({"sqlite"})
 
 
-def _recursive_part(cte: exp.CTE) -> exp.Expression | None:
-    """The recursive part of the CTE's body: the right side of the body's top-level UNION, ALL
-    or not. Only a UNION makes a CTE recursive; an INTERSECT or
+def _in_recursive_part(table: exp.Table, cte: exp.CTE | None) -> bool:
+    """Whether the reference sits in the recursive part of the CTE's body: the right side of
+    the body's top-level UNION, ALL or not. Only a UNION makes a CTE recursive; an INTERSECT or
     EXCEPT body is a plain CTE to the engine, its own name the base table everywhere in it, and
     of three UNION ALL branches only the LAST is the recursive part (DuckDB, measured on the ui
     lane's replay of #170 at 3e98092: `WITH RECURSIVE claim AS (... INTERSECT SELECT id, secret
     FROM claim)` and the middle branch of three each returned the hidden column). A body with
     no UNION has no recursive part."""
-    body = cte.this
+    body = cte.this if cte is not None else None
     while isinstance(body, (exp.Subquery, exp.Paren)):
         body = body.this
-    return body.right if isinstance(body, exp.Union) else None
-
-
-def _right_side(node: exp.Expression) -> bool:
-    return isinstance(node.parent, exp.SetOperation) and node.arg_key == "expression"
+    if not isinstance(body, exp.Union):
+        return False
+    node = table.parent
+    while node is not None and node is not body:
+        if node is body.right:
+            return True
+        node = node.parent
+    return False
 
 
 def _cte_in_scope(table: exp.Table, dialect: str | None = None,
@@ -460,54 +541,8 @@ def _cte_scope(scope, cte: exp.CTE):
     return None
 
 
-def _marks_a_binding(node: exp.Expression) -> bool:
-    """Whether `_cte_binding` reads anything at `node`: a CTE, a WITH, a node holding one, or a set
-    operation's right side, which may be a CTE's recursive part."""
-    return (isinstance(node, (exp.CTE, exp.With)) or _right_side(node)
-            or any(isinstance(v, exp.With) for v in node.args.values()))
-
-
-def _climb(node: exp.Expression, memo: dict) -> exp.Expression | None:
-    """The nearest strict ancestor of `node` that `_marks_a_binding`, or None. Shared through `memo`,
-    where every node passed on the way records the answer, so references sharing ancestors pass them
-    once: sqlglot nests a flat UNION of N branches N deep, and each reference climbing all of it
-    was 2,004,999 steps at 2,000 branches (Codex's fifteenth review of #192). Each entry holds its
-    node, so the id cannot be reused by another while the memo lives."""
-    entry = memo.get(id(node))
-    if entry is not None and entry[0] is node:
-        return entry[1]
-    path, up = [node], node.parent
-    while up is not None and not _marks_a_binding(up):
-        entry = memo.get(id(up))
-        if entry is not None and entry[0] is up:
-            up = entry[1]
-            break
-        path.append(up)
-        up = up.parent
-    for passed in path:
-        memo[id(passed)] = (passed, up)
-    return up
-
-
-def _with_names(with_: exp.With, dialect: str | None, index: dict):
-    """A WITH's CTEs, the position of the first CTE each resolved name defines, and the position
-    of each CTE: worked out once per WITH and dialect in `index`. The entry holds the WITH itself,
-    so its id cannot be reused by another node while the index lives."""
-    withs = index.setdefault("withs", {})
-    entry = withs.get((id(with_), dialect))
-    if entry is None or entry[0] is not with_:
-        ctes = tuple(with_.expressions)
-        first: dict[str, int] = {}
-        for i, cte in enumerate(ctes):
-            name = resolve_name(cte, dialect)
-            if name is not None:
-                first.setdefault(name, i)
-        entry = withs[(id(with_), dialect)] = (with_, ctes, first, {id(cte): i for i, cte in enumerate(ctes)})
-    return entry[1:]
-
-
 def _cte_binding(table: exp.Table, dialect: str | None = None,
-                 engine: str | None = None, index: dict | None = None) -> exp.CTE | None:
+                 engine: str | None = None) -> exp.CTE | None:
     """The CTE in scope where the table is read that the engine binds this name to, or None.
 
     Only a WITH on one of the table's ENCLOSING queries can stand in front of it. A name matched
@@ -523,52 +558,37 @@ def _cte_binding(table: exp.Table, dialect: str | None = None,
     `cls`'s own CTE name sets do not use yet, so they may still disagree with this one: matching lowercased bare names excused `FROM
     main.claim` behind a CTE `claim`, and Postgres's `claim` behind `"Claim"`.
     Structural, never by arg name. In doubt the answer is None, which over-reports: a refusal.
-
-    A WITH's names are looked up in `index` (`_with_names`), and the climb to it goes by `_climb`,
-    both shared by a caller asking of many nodes of one unchanged tree (`cte_binder`); the first
-    CTE of a name is the one bound, as the first match among the visible ones was.
     """
     if table.db or table.catalog:
         return None
     name = resolve_name(table, dialect)
     if name is None:
         return None
-    if index is None:
-        index = {}
-    climb = index.setdefault("climb", {})
-    # Only the ancestors `_marks_a_binding` are visited, so `child` is the last of those passed: the
-    # WITH itself when the table sits in one of its CTE bodies, since a WITH is one of them.
-    child, node, last_cte, last_right, recursive_part = table, _climb(table, climb), None, None, False
+    child, node, last_cte = table, table.parent, None
     while node is not None:
-        if _right_side(node):
-            last_right = node
         if isinstance(node, exp.CTE):
             last_cte = node
-            # In the recursive part when the last right side passed on the way up is the body's.
-            recursive_part = last_right is not None and last_right is _recursive_part(node)
         for with_ in (v for v in node.args.values() if isinstance(v, exp.With)):
-            ctes, first, position = _with_names(with_, dialect, index)
-            found = first.get(name)
-            if found is None:
-                continue
-            if child is with_ and (engine or "").lower() not in _EVERY_SIBLING:
-                # The table sits inside one of this WITH's own CTE bodies, where only earlier
-                # siblings are visible.
-                at = position.get(id(last_cte), 0)
-                if found < at:
-                    return ctes[found]
+            names = [(resolve_name(cte, dialect), cte) for cte in with_.expressions]
+            if child is with_ and (engine or "").lower() in _EVERY_SIBLING:
+                visible = names
+            elif child is with_:  # the table sits inside one of this WITH's own CTE bodies
+                at = next((i for i, cte in enumerate(with_.expressions) if cte is last_cte), 0)
                 # Under RECURSIVE the CTE's own name binds in its RECURSIVE part alone, the
-                # right side of its body's UNION (`_recursive_part`); in the anchor, in an
+                # right side of its body's UNION (`_in_recursive_part`); in the anchor, in an
                 # earlier UNION ALL branch and anywhere in an INTERSECT or EXCEPT body it is the
                 # base table (DuckDB, measured: `WITH RECURSIVE claim AS (SELECT ... FROM claim
                 # UNION ALL ...)` read the base `claim` in the anchor, and a hidden join key
                 # went unread when the whole body was taken as the CTE: Codex's fourth review
                 # of #170; the other two shapes, the ui lane's replay at 3e98092).
-                if found == at and with_.args.get("recursive") and recursive_part:
-                    return ctes[found]
-                continue
-            return ctes[found]
-        child, node = node, _climb(node, climb)
+                itself = names[at:at + 1] if with_.args.get("recursive") and _in_recursive_part(table, last_cte) else []
+                visible = names[:at] + itself
+            else:
+                visible = names
+            for visible_name, cte in visible:
+                if visible_name == name:
+                    return cte
+        child, node = node, node.parent
     return None
 
 

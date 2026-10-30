@@ -537,47 +537,46 @@ def test_a_view_body_s_cte_chain_resolves_each_cte_name_once(monkeypatch):
     assert len(calls) < 4 * n, len(calls)
 
 
-def _ancestor_reads(monkeypatch) -> list:
-    from mnemiq.sql import scope
+def _parent_reads(monkeypatch) -> list:
+    # Every step up the tree reads a node's `parent`, a slot sqlglot declares on Expression.
+    from sqlglot import exp
 
-    calls = []
-    real = scope._marks_a_binding
-    monkeypatch.setattr(scope, "_marks_a_binding", lambda node: calls.append(1) or real(node))
-    return calls
+    slot = exp.Expression.__dict__["parent"]
+    reads = []
+    monkeypatch.setattr(exp.Expression, "parent", property(
+        lambda self: reads.append(1) or slot.__get__(self, type(self)), lambda self, value: slot.__set__(self, value)))
+    return reads
 
 
-@pytest.mark.parametrize("prefix", ["", "WITH c AS (SELECT 1 AS id) "])
-def test_references_sharing_ancestors_climb_them_once(monkeypatch, prefix):
-    # sqlglot nests a flat UNION of N branches N deep, and each reference asked whether a CTE binds
-    # it climbed every ancestor: 2,004,999 ancestors at 2,000 branches, with no CTE at all (Codex's
-    # fifteenth review of #192). Under a WITH every reference climbs to it.
+def _right_nested_union(n: int):
+    # Built, not parsed: parsing N nested parentheses runs past Python's recursion limit.
+    from sqlglot import exp
+
+    tree = sqlglot.parse_one("SELECT id FROM v", read="duckdb")
+    for _ in range(n - 1):
+        tree = exp.Union(this=sqlglot.parse_one("SELECT id FROM v", read="duckdb"), expression=exp.Subquery(this=tree),
+                         distinct=False)
+    return tree
+
+
+@pytest.mark.parametrize("shape", ["flat", "flat under a WITH", "right-nested", "recursive"])
+def test_references_sharing_ancestors_do_not_each_climb_them(monkeypatch, shape):
+    # sqlglot nests a UNION of N branches N deep, whichever side it leans to, and each reference
+    # asked whether a CTE binds it climbed every ancestor: 2,004,999 steps at 2,000 flat branches
+    # with no CTE at all, as many right-nested, and a recursive CTE naming itself in each branch
+    # climbed again for its recursive part (Codex's fifteenth and sixteenth reviews of #192).
     from mnemiq.sql.views import check_views
 
     n = 400
     defs = {"v": ViewDefinition(object_id="v", dialect="duckdb", definition="SELECT id FROM safe_table")}
-    query = prefix + " UNION ALL ".join(["SELECT id FROM v"] * n)
-    calls = _ancestor_reads(monkeypatch)
-    verdict = check_views(sqlglot.parse_one(query, read="duckdb"), defs, {"orders"},
-                          known={"orders", "safe_table", "v"}, granted={"v"}, dialect="duckdb")
+    branches = " UNION ALL ".join(["SELECT id FROM v"] * n)
+    tree = {"flat": lambda: sqlglot.parse_one(branches, read="duckdb"),
+            "flat under a WITH": lambda: sqlglot.parse_one("WITH c AS (SELECT 1 AS id) " + branches, read="duckdb"),
+            "right-nested": lambda: _right_nested_union(n),
+            "recursive": lambda: sqlglot.parse_one(f"WITH RECURSIVE v AS (SELECT 1 AS id UNION ALL {branches}) "
+                                                   "SELECT id FROM v", read="duckdb")}[shape]()
+    reads = _parent_reads(monkeypatch)
+    verdict = check_views(tree, defs, {"orders"}, known={"orders", "safe_table", "v"}, granted={"v"},
+                          dialect="duckdb")
     assert verdict is None, verdict
-    assert len(calls) < 8 * n, len(calls)
-
-
-def test_references_to_a_recursive_cte_in_its_own_body_find_its_recursive_part_once(monkeypatch):
-    # Each branch naming the CTE asks whether it sits in the recursive part, the last branch, and
-    # each asking climbed the branches above it.
-    from sqlglot import exp
-
-    from mnemiq.sql.views import check_views
-
-    n = 400
-    reads = []
-    real = exp.SetOperation.right
-    monkeypatch.setattr(exp.SetOperation, "right", property(lambda self: reads.append(1) or real.fget(self)))
-    query = "WITH RECURSIVE r AS (SELECT 1 AS id UNION ALL " + " UNION ALL ".join(["SELECT id FROM r"] * n) + \
-        ") SELECT id FROM r"
-    defs = {"r": ViewDefinition(object_id="r", dialect="duckdb", definition="SELECT id FROM safe_table")}
-    verdict = check_views(sqlglot.parse_one(query, read="duckdb"), defs, {"orders"},
-                          known={"orders", "safe_table", "r"}, granted={"r"}, dialect="duckdb")
-    assert verdict is None, verdict
-    assert len(reads) < 8 * n, len(reads)
+    assert len(reads) < 4 * n, len(reads)

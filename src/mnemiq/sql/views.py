@@ -318,7 +318,7 @@ def check_views(
     # which let a grant on `ä` name a filtered `Ä`.
     return _walk(ast, views, filtered, known, (), 0, "", "",
                  set(granted) if granted else set(), _Request(views, known, filtered),
-                 cte_binder(dialect))
+                 cte_binder(ast, dialect))
 
 
 def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
