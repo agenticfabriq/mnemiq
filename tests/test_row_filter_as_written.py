@@ -218,10 +218,6 @@ def test_a_text_that_does_not_read_back_as_the_expanded_tree_is_refused(monkeypa
     # A keyword that is neither a name nor a type to the parser, dropped where DuckDB reads the
     # column: `values` (Codex's fourth review of #193). Every keyword's place is probed, not a list.
     ("duckdb", "decode(d, values) IS NOT NULL"),
-    # Oracle does not reserve BOTH (V$RESERVED_WORDS, Oracle Free 23), so the word sqlglot drops
-    # from `TRIM(BOTH FROM region)` may be a column there: still refused, where DuckDB and Postgres,
-    # which reserve it, pass.
-    ("oracle", "TRIM(BOTH FROM region) = 'west'"),
 ])
 def test_a_name_the_parse_does_not_read_as_a_column_or_a_table_refuses_the_filter(dialect, filt):
     claim = stored("claim", dialect)  # as the engine stores it unquoted (M223)
@@ -498,4 +494,41 @@ def test_a_struct_field_held_where_written_does_not_stand_in_for_a_dropped_name(
     else:
         verdict = decide_write(statement, schema, GrantSet(frozenset(schema), writable=frozenset(schema)),
                                policy=policy, dialect="duckdb", writes_enabled=True)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_a_word_the_reprint_adds_does_not_stand_in_for_a_dropped_name():
+    # sqlglot prints `INTERVAL '1 month'` as `INTERVAL '1' MONTH`, a `month` the text never wrote,
+    # and counted, it stood in for the `month` decode drops (Codex's twelfth review of #193).
+    schema = {"claim": {"id", "d", "blob"}}
+    interval = "d > CURRENT_DATE - INTERVAL '1 month'"
+    for filt, refused in ((f"{interval} AND decode(blob, month) IS NOT NULL", True), (interval, False)):
+        verdict = decide("SELECT id FROM claim", schema, dialect="duckdb", target="duckdb",
+                         policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
+        assert isinstance(verdict, Refusal) is refused, (filt, verdict)
+
+
+
+def test_on_oracle_a_dropped_word_it_does_not_reserve_is_refused():
+    # Oracle does not reserve BOTH (V$RESERVED_WORDS, Oracle Free 23), so the word sqlglot drops
+    # from `TRIM(BOTH FROM region)` may be a column there: refused, where DuckDB and Postgres,
+    # which reserve it, pass. Every name here is in the schema, so only the name check refuses.
+    schema = {"CLAIM": {"id", "region"}}
+    verdict = decide("SELECT id FROM CLAIM", schema, dialect="oracle", target="oracle",
+                     policy=AccessPolicy(row_filters={"CLAIM": "TRIM(BOTH FROM region) = 'west'"},
+                                         policy_schema=schema))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+    control = decide("SELECT id FROM CLAIM", schema, dialect="oracle", target="oracle",
+                     policy=AccessPolicy(row_filters={"CLAIM": "TRIM(region) = 'west'"}, policy_schema=schema))
+    assert isinstance(control, Approved), control
+
+
+def test_a_word_held_as_a_call_where_a_name_would_not_print_is_refused():
+    # `date_diff(current_date, d, d)`: sqlglot holds CURRENT_DATE as the call, and a name in its
+    # place prints as a date part, never as a name, so the place proves nothing about the word;
+    # DuckDB binds a bare `current_date` to a column of that name first (measured for M225).
+    schema = {"claim": {"id", "d"}}
+    verdict = decide("SELECT id FROM claim", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(row_filters={"claim": "date_diff(current_date, d, d) = 1"},
+                                         policy_schema=schema))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict

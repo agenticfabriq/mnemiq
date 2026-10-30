@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 import json
 import logging
@@ -152,12 +151,18 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     secret)` and `decode(blob, secret)`, and reads it as a date part in `date_diff(secret, a, b)`,
     where DuckDB reads a column the policy may not hold (Codex's review of #193).
 
-    Each name is accounted for where it stands: a word in the text the parse holds no name for at
-    that offset is lost, unless that place is a keyword's (`_a_keyword_here`). Counted across the
-    filter, a keyword kept in one place stood in for a name dropped in another: `first.all` dropped
-    beside a `UNION ALL` and a `NULLS FIRST` passed (Codex's tenth review of #193). A date part the
-    parse holds outside EXTRACT and an INTERVAL, which are keywords in every engine, must not have
-    been written as a bare name. A function's name is left out: it reads no data."""
+    Each name is accounted for where it stands, never across the filter: counted by word, a
+    keyword kept in one place stood in for a name dropped in another, `first.all` beside a `UNION
+    ALL` and a `NULLS FIRST` (Codex's tenth review of #193), and a word the reprint adds or repeats
+    could do the same (its twelfth). A word is accounted for by a name the parse holds at its own
+    offset (sqlglot records one on every Identifier it builds from the text). One without is
+    excused only by its own place: a word the engine reserves, not after a dot (`_reserved_apart`);
+    a place where a fresh name in its stead does not parse, which only a keyword fits; a struct
+    literal's field, a name the filter gives; or a place where the fresh name prints and one print
+    of the word goes, so the parse held the word there as a node of its own (`SYSDATE` as the
+    call). A quoted name is excused by none but the field. A date part the parse holds outside
+    EXTRACT and an INTERVAL, which are keywords in every engine, must not have been written as a
+    bare name. A function's name is left out: it reads no data."""
     # A keyword the parser takes as an identifier is a name too: `comment` tokenizes as COMMENT,
     # and DuckDB reads `date_diff(comment, a, b)` as the column (Codex's second review of #193).
     # A type's name among them is left to `_keywords_dropped`, which probes it where it stands with
@@ -174,34 +179,30 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
                 and not (i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN)]
 
     tokens = sqlglot.tokenize(filt, read=dialect)
-    identifiers = [node for node in tree.find_all(exp.Identifier) if "start" in node.meta]
-    held = {node.meta["start"] for node in identifiers}
+    held = {node.meta["start"] for node in tree.find_all(exp.Identifier) if "start" in node.meta}
     fresh = _fresh_name(filt)
-    quoted, unquoted, excused, written = Counter(), Counter(), Counter(), set()
+
+    def printed(expression: exp.Expression, word: str) -> int:
+        return sum(1 for _, t in names(expression.sql(dialect=dialect)) if t.text.casefold() == word)
+
+    lost, written = set(), set()
     for i, t in names(filt):
         word = t.text.casefold()
         written.add(word)
         if t.token_type not in counted or t.start in held:
             continue
-        if t.token_type is TokenType.IDENTIFIER:
-            quoted[word] += 1  # a name wherever it stands
-        elif _a_keyword_here(filt, tokens, i, fresh, dialect):
-            excused[word] += 1
-        else:
-            unquoted[word] += 1
-    # A word the parse holds as a node with no offset (`SYSDATE` as the call it is) still prints:
-    # each one the reprint prints beyond the parse's own names and the places excused above
-    # accounts for one occurrence, so a keyword kept elsewhere never does.
-    printed = Counter(t.text.casefold() for _, t in names(tree.sql(dialect=dialect)) if t.token_type in counted)
-    unpositioned = printed - Counter(node.name.casefold() for node in identifiers) - excused
-    # A struct literal's field names, which the parse rebuilds with no offset and the reprint
-    # prints as strings (`{X: 1}` as `{'X': 1}`): names the filter gives, not reads, one a field,
-    # quoted or not. A field held at its offset (`struct_pack(x := 1)`) is accounted for already,
-    # and credited again it stood in for a name dropped elsewhere (Codex's eleventh review of #193).
-    fields = Counter(e.this.name.casefold() for struct in tree.find_all(exp.Struct) for e in struct.expressions
-                     if isinstance(e, exp.PropertyEQ) and isinstance(e.this, exp.Identifier)
-                     and "start" not in e.this.meta)
-    lost = set(quoted - fields) | set(unquoted - unpositioned - (fields - quoted))
+        quoted = t.token_type is TokenType.IDENTIFIER  # a name wherever it stands
+        if not quoted and _reserved_apart(tokens, i, dialect):
+            continue
+        probe = _probe(filt, t, fresh, dialect)
+        if probe is None:
+            if not quoted:
+                continue  # a place only a keyword fits
+        elif _a_field_of(probe, fresh):
+            continue  # a struct literal's field, a name the filter gives, not reads
+        elif not quoted and printed(probe, fresh) and printed(_raw(filt, dialect), word) > printed(probe, word):
+            continue  # held as a node of its own here (`SYSDATE` as the call it is), printed in its place
+        lost.add(word)
     # A date part holds its text; a MAP key read as a lambda's parameter holds the parameter's
     # Identifier (`as_duckdb_reads`), a name the lambda declares.
     parts = {v.name.casefold() for v in tree.find_all(exp.Var) if isinstance(v.this, str)
@@ -210,17 +211,21 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     return sorted(lost | (parts & written) | set(dropped))
 
 
+def _raw(filt: str, dialect: str) -> exp.Expression:
+    """The filter's own parse, compared with a probe's, which is parsed the same way."""
+    return sqlglot.parse_one(filt, read=dialect)
+
+
+def _a_field_of(probe: exp.Expression, fresh: str) -> bool:
+    """Whether `fresh` stands in the probe as a struct literal's field: `{X: 1}`, whose field the
+    parse rebuilds without an offset and the reprint prints as a string."""
+    return any(isinstance(e, exp.PropertyEQ) and isinstance(e.this, exp.Identifier) and e.this.name == fresh
+               for struct in probe.find_all(exp.Struct) for e in struct.expressions)
+
+
 def _in_extract_or_interval(var: exp.Var) -> bool:
     return (isinstance(var.parent, exp.Extract) and var.arg_key == "this") or isinstance(
         var.parent, (exp.Interval, exp.IntervalSpan))
-
-
-def _a_keyword_here(filt: str, tokens, i: int, fresh: str, dialect: str) -> bool:
-    """Whether token `i`, which the parse holds no name for, stands where its engine reads a
-    keyword: a word the engine reserves (`_reserved_apart`), or a place where a fresh name does not
-    parse, which only a keyword fits (sqlglot prints `FETCH FIRST 1 ROW ONLY` with ROWS and drops a
-    default null order: Codex's sixth review of #193)."""
-    return _reserved_apart(tokens, i, dialect) or _probe(filt, tokens[i], fresh, dialect) is None
 
 
 def _fresh_name(filt: str) -> str:
