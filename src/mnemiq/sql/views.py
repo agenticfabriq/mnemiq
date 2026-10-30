@@ -312,6 +312,56 @@ def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
     return Refusal(code=code, message=message, subject=view)
 
 
+def _views_read(
+    node: exp.Table, views: dict[str, ViewDefinition], catalog: str, dialect: str | None,
+) -> list[tuple[str, ViewDefinition]]:
+    """Every view `node` may read, keyed as the inventory keys it: one where a key matches
+    exactly, else every key the case-insensitive fallback matches."""
+    name = object_key(node)
+    view = views.get(name) or views.get(node.name)
+    if view is not None:
+        # A body may qualify a view the snapshot keys bare.
+        return [(name if name in views else node.name, view)]
+    if catalog:
+        # A FEDERATED view body is written in the SOURCE's own naming, so a NESTED view
+        # reads `claim_v` where the merged inventory keys it `pg.claim_v`, and the lookup
+        # above misses. Measured: `pg.claim_v2` over `pg.claim_v` over a filtered
+        # `pg.claim` was APPROVED while the byte-identical single-source shape refused.
+        # Resolved in the ENCLOSING view's catalog only, never globally, so two catalogs
+        # holding a view of the same name cannot resolve to each other's.
+        for candidate in (f"{catalog}.{name}", f"{catalog}.{node.name}"):
+            if candidate in views:
+                return [(candidate, views[candidate])]
+    # Case-insensitive fallback, tried LAST so an exact match always wins. Unquoted
+    # identifiers are case-insensitive in all three engines -- `_spellings` two screens
+    # down folds for exactly this reason -- but this lookup did not. Measured: a body
+    # writing `FROM CLAIM_V` against an inventory keyed `claim_v` missed, the nested view
+    # was never walked, and its row-filtered base was never reached. APPROVED on the
+    # single-source path as well as the federated one, so this is not federation's bug.
+    #
+    # `.lower()` on the WHOLE candidate, catalog included. Lowercasing only the table
+    # half left the prefix in its original case while the comparison below folds the real
+    # key in full, so any catalog alias carrying an uppercase letter made this fallback
+    # dead code. `SourceSpec.catalog` is a free-form DuckDB attach alias and nothing in
+    # `merge_snapshots` or `qualify_object_id` normalises it. Measured: catalog `pg`
+    # refused and catalog `PG` approved, on the identical statement.
+    spelled = {name, node.name}
+    if catalog:
+        spelled |= {f"{catalog}.{s}" for s in tuple(spelled)}
+    wanted = {s.lower() for s in spelled}
+    # And as the body's engine folds (Codex's review of #192). Oracle reads `ſales` as SALES,
+    # which `str.lower` keeps apart from `sales`, so the known-object check vouched for a view
+    # this lookup never found, and the filtered table behind it went unwalked.
+    fold = rules_for(dialect).fold
+    folded = {fold(s) for s in spelled}
+    # EVERY key either fold matches, not the first. Neither fold reads quoting, so two keys they
+    # cannot tell apart are two views the body may read, and the first in sort order can be a
+    # harmless one hiding the one the engine reads (Codex's second review of #192: `app."ſALES"`
+    # walked APP.SALES and approved). Walking a view can only refuse. Sorted, so a refusal names
+    # the same view every run.
+    return [(key, views[key]) for key in sorted(views) if key.lower() in wanted or fold(key) in folded]
+
+
 def _walk(
     ast: exp.Expression,
     views: dict[str, ViewDefinition],
@@ -327,143 +377,96 @@ def _walk(
     # `dialect` is the engine that reads `ast`'s names: a nested body's own view's. None at the
     # top, where the grant check has already refused any name the caller does not hold exactly.
     for node in ast.find_all(exp.Table):
-        name = object_key(node)
-        view = views.get(name) or views.get(node.name)
-        if view is not None and name not in views:
-            name = node.name  # a body may qualify a view the snapshot keys bare
-        if view is None and catalog:
-            # A FEDERATED view body is written in the SOURCE's own naming, so a NESTED view
-            # reads `claim_v` where the merged inventory keys it `pg.claim_v`, and the lookup
-            # above misses. Measured: `pg.claim_v2` over `pg.claim_v` over a filtered
-            # `pg.claim` was APPROVED while the byte-identical single-source shape refused.
-            # Resolved in the ENCLOSING view's catalog only, never globally, so two catalogs
-            # holding a view of the same name cannot resolve to each other's.
-            for candidate in (f"{catalog}.{object_key(node)}", f"{catalog}.{node.name}"):
-                if candidate in views:
-                    view, name = views[candidate], candidate
-                    break
-        if view is None:
-            # Case-insensitive fallback, tried LAST so an exact match always wins. Unquoted
-            # identifiers are case-insensitive in all three engines -- `_spellings` two screens
-            # down folds for exactly this reason -- but this lookup did not. Measured: a body
-            # writing `FROM CLAIM_V` against an inventory keyed `claim_v` missed, the nested view
-            # was never walked, and its row-filtered base was never reached. APPROVED on the
-            # single-source path as well as the federated one, so this is not federation's bug.
-            #
-            # `sorted` so a source holding two keys differing only in case resolves the same way
-            # every run. Such a source cannot exist unambiguously under those same engine rules,
-            # but a deterministic wrong answer is debuggable and a arbitrary one is not.
-            # `.lower()` on the WHOLE candidate, catalog included. Lowercasing only the table
-            # half left the prefix in its original case while the comparison below folds the real
-            # key in full, so any catalog alias carrying an uppercase letter made this fallback
-            # dead code. `SourceSpec.catalog` is a free-form DuckDB attach alias and nothing in
-            # `merge_snapshots` or `qualify_object_id` normalises it. Measured: catalog `pg`
-            # refused and catalog `PG` approved, on the identical statement.
-            spelled = {object_key(node), node.name}
-            if catalog:
-                spelled |= {f"{catalog}.{s}" for s in tuple(spelled)}
-            wanted = {s.lower() for s in spelled}
-            # And as the body's engine folds (Codex's review of #192). Oracle reads `ſales` as
-            # SALES, which `str.lower` keeps apart from `sales`, so the known-object check vouched
-            # for a view this lookup never found, and the filtered table behind it went unwalked.
-            # A match here walks a view, which can only refuse, so the union is safe.
-            fold = rules_for(dialect).fold
-            folded = {fold(s) for s in spelled}
-            for key in sorted(views):
-                if key.lower() in wanted or fold(key) in folded:
-                    view, name = views[key], key
-                    break
-        if view is None:
-            continue
-        here = top or name  # the view the query read: named in every refusal below
-        # Only the view the query read, which the caller holds. `it` names the view the
-        # problem is in where that is the same view, and says "a view it reads" where not.
-        it = repr(here) if name == here else f"a view {here!r} reads"
-        if name in stack:
-            return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
-                           f"{it} is defined in terms of itself, so it cannot be resolved.",
-                           f"cycle {' -> '.join((*stack, name))}")
-        if depth >= MAX_DEPTH:
-            return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
-                           f"{here!r} nests views deeper than this engine will resolve.",
-                           f"depth {depth} at {name!r}")
-        body = body_of(view)
-        if body is None:
-            return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
-                           f"{it} has a definition this engine cannot read, so it cannot confirm "
-                           "the row policy on the tables behind it.",
-                           f"no readable body for {name!r}")
-        unrecognised = unrecognised_source(body)
-        if unrecognised is not None:
-            return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
-                           f"{it} reads through a {unrecognised.lower()} rather than a named "
-                           "table, so this engine cannot tell which tables it touches.",
-                           f"{name!r} reads through a {unrecognised.lower()}")
-        # The filtered set is widened the same way and by its bare last segment, so a body
-        # saying `customer` still matches a filter keyed `public.customer`. Both directions,
-        # because a miss here means not refusing.
-        wanted = _restricting(set(filtered), view.dialect)
-        # A body may only read objects the snapshot knows. A caller writing
-        # `SELECT a FROM 'customer.csv'` is already refused UNAUTHORIZED_TABLE because the name
-        # is not in `visible`; a view body was never held to that, so a view could reach a file
-        # the caller could not. That is M27's shape -- the view reaching past the caller's own
-        # boundary -- and it closes every unknown-object spelling at once rather than the file
-        # literal specifically.
-        if known is not None:
-            # A reference a CTE BINDS is a name the body defines; the source is not expected to
-            # know it. Counting one as an unknown object refused every ordinary CTE view -- five
-            # of eight new refusals in the review's matrix were legitimate SQL. Exempt by SCOPE,
-            # not by name: pooling every alias in the body and matching it by bare name let
-            # `WITH secret AS (...) SELECT ... FROM main.secret` read a real table the snapshot
-            # does not know, and a `secret` read outside the CTE's scope too, with any inventory
-            # (Codex's review of #132). Bound as the view's OWN engine binds it, since its source
-            # runs the body: SQLite binds a later sibling, and DuckDB's rule refused such a view
-            # (Codex's review of #138). Never a qualified name. `_mentions` still collects every
-            # alias, so a CTE named after a filtered table still trips the filtered check.
-            bound = {id(t) for t in cte_references(body, view.dialect, engine=view.dialect)}
-            # Folded as the VIEW's engine folds, never wider: a match here vouches that a read is
-            # of a known object, and folding every letter let a known `Ä` vouch for an unknown `ä`
-            # that DuckDB, SQLite and Postgres keep apart (Codex's review of #147, M154).
-            fold = rules_for(view.dialect).fold
-            recognised = spellings(known, fold) | spellings(set(views), fold)
-            # BOTH sides normalised. Widening only the known set still rejected `public.film`
-            # against a snapshot that keys it `film`: a name is known when ANY of its spellings
-            # matches any recognised one, not when its exact text appears.
-            unknown = sorted(
-                object_key(x)
-                for x in body.find_all(exp.Table)
-                if id(x) not in bound and not (spellings({object_key(x)}, fold) & recognised)
-            )
-            if unknown:
+        for name, view in _views_read(node, views, catalog, dialect):
+            here = top or name  # the view the query read: named in every refusal below
+            # Only the view the query read, which the caller holds. `it` names the view the
+            # problem is in where that is the same view, and says "a view it reads" where not.
+            it = repr(here) if name == here else f"a view {here!r} reads"
+            if name in stack:
                 return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
-                               f"{it} reads an object that is not in this source, so this engine "
-                               "cannot tell what policy applies to it.",
-                               f"{name!r} reads unknown {unknown[0]!r}")
-        mentioned = _mentions(body, view.dialect)
-        reached = sorted(mentioned & wanted)
-        if reached:
-            # The table is offered as the repair only when the view reaches exactly ONE filtered
-            # policy key, the body wrote that key exactly, and the caller holds it. Not by any
-            # widened spelling: `spellings` folds to the bare segment, which is right for refusing
-            # and wrong for naming -- a body reading `sales.customer` reaches a filtered
-            # `public.customer` that way, and the repair would send the model to a different
-            # table's rows. Not by the view's name prefix either: a prefix may be a schema, not a
-            # catalog, and nothing here can tell which. A federated body writes `customer` where
-            # the key is `pg.customer`, so it gets no hint -- fail closed, the refusal still holds.
-            keys = sorted(f for f in filtered if _restricting({f}, view.dialect) & mentioned)
-            written = {object_key(t).lower() for t in body.find_all(exp.Table)}
-            held = (keys[0] if len(keys) == 1 and keys[0].lower() in written
-                    and keys[0].lower() in granted else None)
-            repair = f" Query {held!r} directly." if held else ""
-            return _refuse(RefusalCode.UNGOVERNED_VIEW, here,
-                           f"{it} reads a table that is row-filtered for you, and this engine "
-                           f"cannot apply that filter through a view.{repair}",
-                           f"{name!r} reads row-filtered {keys or reached}, offered {held!r}")
-        # The body's own catalog carries into it: a view two levels down is still written in
-        # the source's naming, not the federation's.
-        nested = _walk(body, views, filtered, known, (*stack, name), depth + 1,
-                       name.rsplit(".", 1)[0] if "." in name else catalog, here, granted,
-                       view.dialect)
-        if nested is not None:
-            return nested
+                               f"{it} is defined in terms of itself, so it cannot be resolved.",
+                               f"cycle {' -> '.join((*stack, name))}")
+            if depth >= MAX_DEPTH:
+                return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
+                               f"{here!r} nests views deeper than this engine will resolve.",
+                               f"depth {depth} at {name!r}")
+            body = body_of(view)
+            if body is None:
+                return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
+                               f"{it} has a definition this engine cannot read, so it cannot confirm "
+                               "the row policy on the tables behind it.",
+                               f"no readable body for {name!r}")
+            unrecognised = unrecognised_source(body)
+            if unrecognised is not None:
+                return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
+                               f"{it} reads through a {unrecognised.lower()} rather than a named "
+                               "table, so this engine cannot tell which tables it touches.",
+                               f"{name!r} reads through a {unrecognised.lower()}")
+            # The filtered set is widened the same way and by its bare last segment, so a body
+            # saying `customer` still matches a filter keyed `public.customer`. Both directions,
+            # because a miss here means not refusing.
+            wanted = _restricting(set(filtered), view.dialect)
+            # A body may only read objects the snapshot knows. A caller writing
+            # `SELECT a FROM 'customer.csv'` is already refused UNAUTHORIZED_TABLE because the name
+            # is not in `visible`; a view body was never held to that, so a view could reach a file
+            # the caller could not. That is M27's shape -- the view reaching past the caller's own
+            # boundary -- and it closes every unknown-object spelling at once rather than the file
+            # literal specifically.
+            if known is not None:
+                # A reference a CTE BINDS is a name the body defines; the source is not expected to
+                # know it. Counting one as an unknown object refused every ordinary CTE view -- five
+                # of eight new refusals in the review's matrix were legitimate SQL. Exempt by SCOPE,
+                # not by name: pooling every alias in the body and matching it by bare name let
+                # `WITH secret AS (...) SELECT ... FROM main.secret` read a real table the snapshot
+                # does not know, and a `secret` read outside the CTE's scope too, with any inventory
+                # (Codex's review of #132). Bound as the view's OWN engine binds it, since its source
+                # runs the body: SQLite binds a later sibling, and DuckDB's rule refused such a view
+                # (Codex's review of #138). Never a qualified name. `_mentions` still collects every
+                # alias, so a CTE named after a filtered table still trips the filtered check.
+                bound = {id(t) for t in cte_references(body, view.dialect, engine=view.dialect)}
+                # Folded as the VIEW's engine folds, never wider: a match here vouches that a read is
+                # of a known object, and folding every letter let a known `Ä` vouch for an unknown `ä`
+                # that DuckDB, SQLite and Postgres keep apart (Codex's review of #147, M154).
+                fold = rules_for(view.dialect).fold
+                recognised = spellings(known, fold) | spellings(set(views), fold)
+                # BOTH sides normalised. Widening only the known set still rejected `public.film`
+                # against a snapshot that keys it `film`: a name is known when ANY of its spellings
+                # matches any recognised one, not when its exact text appears.
+                unknown = sorted(
+                    object_key(x)
+                    for x in body.find_all(exp.Table)
+                    if id(x) not in bound and not (spellings({object_key(x)}, fold) & recognised)
+                )
+                if unknown:
+                    return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
+                                   f"{it} reads an object that is not in this source, so this engine "
+                                   "cannot tell what policy applies to it.",
+                                   f"{name!r} reads unknown {unknown[0]!r}")
+            mentioned = _mentions(body, view.dialect)
+            reached = sorted(mentioned & wanted)
+            if reached:
+                # The table is offered as the repair only when the view reaches exactly ONE filtered
+                # policy key, the body wrote that key exactly, and the caller holds it. Not by any
+                # widened spelling: `spellings` folds to the bare segment, which is right for refusing
+                # and wrong for naming -- a body reading `sales.customer` reaches a filtered
+                # `public.customer` that way, and the repair would send the model to a different
+                # table's rows. Not by the view's name prefix either: a prefix may be a schema, not a
+                # catalog, and nothing here can tell which. A federated body writes `customer` where
+                # the key is `pg.customer`, so it gets no hint -- fail closed, the refusal still holds.
+                keys = sorted(f for f in filtered if _restricting({f}, view.dialect) & mentioned)
+                written = {object_key(t).lower() for t in body.find_all(exp.Table)}
+                held = (keys[0] if len(keys) == 1 and keys[0].lower() in written
+                        and keys[0].lower() in granted else None)
+                repair = f" Query {held!r} directly." if held else ""
+                return _refuse(RefusalCode.UNGOVERNED_VIEW, here,
+                               f"{it} reads a table that is row-filtered for you, and this engine "
+                               f"cannot apply that filter through a view.{repair}",
+                               f"{name!r} reads row-filtered {keys or reached}, offered {held!r}")
+            # The body's own catalog carries into it: a view two levels down is still written in
+            # the source's naming, not the federation's.
+            nested = _walk(body, views, filtered, known, (*stack, name), depth + 1,
+                           name.rsplit(".", 1)[0] if "." in name else catalog, here, granted,
+                           view.dialect)
+            if nested is not None:
+                return nested
     return None

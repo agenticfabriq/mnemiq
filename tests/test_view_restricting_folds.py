@@ -75,6 +75,21 @@ def test_a_view_read_under_a_spelling_oracle_folds_onto_it_is_walked(spelled):
     assert isinstance(plain, Refusal) and plain.code is RefusalCode.UNGOVERNED_VIEW, plain  # the control
 
 
+@pytest.mark.parametrize("body", ['SELECT id FROM app."ſALES"', "SELECT id FROM app.ſALES"])
+def test_every_view_a_fold_matches_is_walked_not_the_first(body):
+    # Two views a wider fold cannot tell apart: APP.SALES reads nothing filtered and sorts first.
+    # Walking only the first match approved `app."ſALES"`, which Oracle reads as the filtered
+    # APP.ſALES (Codex's second review of #192). The unquoted spelling is Oracle's APP.SALES, and
+    # is refused too: the lookup does not resolve quoting, so it walks every candidate.
+    schema = {"orders": {"id"}, "safe_table": {"id"}, "APP.ſALES": {"id"}, "APP.SALES": {"id"}, "v": {"id"}}
+    views = {"APP.ſALES": ViewDefinition(object_id="APP.ſALES", dialect="oracle", definition="SELECT id FROM orders"),
+             "APP.SALES": ViewDefinition(object_id="APP.SALES", dialect="oracle", definition="SELECT id FROM safe_table"),
+             "v": ViewDefinition(object_id="v", dialect="oracle", definition=body)}
+    policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
+    verdict = decide("SELECT id FROM v", {"v": {"id"}}, dialect="oracle", target="oracle", policy=policy, views=views)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, (body, verdict)
+
+
 def test_on_duckdb_a_long_s_view_name_is_still_unknown():
     verdict = _read_through_a_nested_view("ſales", dialect="duckdb")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW, verdict
