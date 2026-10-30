@@ -175,7 +175,7 @@ def decide(
     # declined rather than answered past. The floor, deliberately -- see `check_views` (M27).
     ungoverned = check_views(shaped, {} if views is None else views, set(policy.row_filters),
                              known=set(policy.policy_schema),
-                             granted=set(visible), dialect=target)
+                             granted=set(visible))
     if ungoverned is not None:
         return ungoverned
 

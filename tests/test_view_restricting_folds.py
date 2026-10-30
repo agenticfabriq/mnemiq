@@ -213,9 +213,48 @@ def test_the_inventory_is_folded_once_a_request_not_once_a_reference(monkeypatch
     schema = {"orders": {"id"}, "safe_table": {"id"}, **{k: {"id"} for k in defs}}
     views = {k: ViewDefinition(object_id=k, dialect="oracle", definition=d) for k, d in defs.items()}
     verdict = module.check_views(sqlglot.parse_one(query, read="oracle"), views, {"orders"},
-                                 known=set(schema), granted=set(defs), dialect="oracle")
+                                 known=set(schema), granted=set(defs))
     assert verdict is None, verdict
     assert len(folds) < 40 * n, len(folds)  # one pass of the inventory, not one a reference
+
+
+@pytest.mark.parametrize("filtered_is", ["a view", "the table"])
+def test_letters_no_single_narrow_fold_joins_are_joined(filtered_is):
+    # Oracle reads the unquoted `ᾀſ` as ᾈS. Lowercase keeps ſ apart from s, and the vouching fold
+    # keeps ᾀ (its Python uppercase is two letters), so neither joined `ᾀſ` to ᾈS, and `v` was
+    # approved over the filtered ORDERS behind the view ᾈS (Codex's sixth review of #192). A known
+    # quoted table `ᾀſ` passes the known-object check. The restricting key is uppercase then
+    # casefold, which joins every letter Oracle folds to its fold: all 6,679 letters Oracle Free 23
+    # answers, swept live.
+    schema = {"orders": {"id"}, "ᾀſ": {"id"}, "ᾈS": {"id"}, "v": {"id"}}
+    if filtered_is == "a view":
+        filters, body_views = {"orders": "1 = 1"}, {"ᾈS": "SELECT id FROM orders"}
+    else:
+        filters, body_views = {"ᾈS": "1 = 1"}, {}
+    defs = {k: ViewDefinition(object_id=k, dialect="oracle", definition=d) for k, d in body_views.items()}
+    defs["v"] = ViewDefinition(object_id="v", dialect="oracle", definition="SELECT id FROM ᾀſ")
+    policy = AccessPolicy(row_filters=filters, policy_schema=schema)
+    verdict = decide("SELECT id FROM v", {"v": {"id"}}, dialect="oracle", target="oracle", policy=policy, views=defs)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
+
+
+def test_the_filtered_set_is_spelled_once_a_request(monkeypatch):
+    # Each view walked rebuilt every filtered table's spellings: 4.3 s at 2,000 views and 2,000
+    # filters (Codex's sixth review of #192). Grown together here, counted in coarse folds.
+    from mnemiq.sql import views as module
+
+    folds = []
+    coarse = module._coarse
+    monkeypatch.setattr(module, "_coarse", lambda text: folds.append(text) or coarse(text))
+    n = 300
+    defs = {f"v{i}": ViewDefinition(object_id=f"v{i}", dialect="oracle", definition="SELECT id FROM safe_table")
+            for i in range(n)}
+    filtered = {f"f{i}" for i in range(n)}
+    query = " UNION ALL ".join(f"SELECT id FROM v{i}" for i in range(n))
+    known = {"safe_table", *filtered, *defs}
+    verdict = module.check_views(sqlglot.parse_one(query, read="oracle"), defs, filtered, known=known, granted=set(defs))
+    assert verdict is None, verdict
+    assert len(folds) < 40 * n, len(folds)
 
 
 def test_on_duckdb_a_long_s_view_name_is_still_unknown():

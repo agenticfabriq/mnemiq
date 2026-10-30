@@ -117,16 +117,24 @@ def spellings(names: set[str], fold=str.lower) -> set[str]:
     return out
 
 
-def _restricting(names: set[str], dialect: str | None) -> set[str]:
-    """Every spelling of `names` a RESTRICTING comparison matches on: folded every letter, as
-    `spellings` does by default, and folded as the view's engine folds (M176). A match refuses, so
-    the union is never narrower than either. Lower-casing alone kept `orderſ` apart from `orders`
-    where Oracle folds the long s to S, so a view reading `orderſ` read the filtered ORDERS and
-    was approved; the dotless i and the final sigma are the same shape."""
-    return spellings(names) | spellings(names, rules_for(dialect).fold)
+def _coarse(name: str) -> str:
+    """A key that joins every spelling an engine may fold onto one name: uppercase, then casefold.
+    Lowercase alone kept `orderſ` apart from `orders` where Oracle folds the long s to S, so a view
+    reading `orderſ` read the filtered ORDERS and was approved (M176); the dotless i and the final
+    sigma are the same shape, and one fold or the other was not enough for `ᾀſ`, which Oracle
+    reads as ᾈS (Codex's sixth review of #192). Swept live on Oracle Free 23, this joins each of
+    the 6,679 letters Oracle answers to Oracle's fold of it; DuckDB, Postgres and SQLite fold
+    ASCII alone, which it joins too. Wider than every engine, so for comparisons that refuse."""
+    return name.upper().casefold()
 
 
-def _mentions(body: exp.Expression, dialect: str | None = None) -> set[str]:
+def _restricting(names: set[str]) -> set[str]:
+    """Every spelling of `names` a RESTRICTING comparison matches on, lowercased and `_coarse`. A
+    match refuses, so a key wider than the engine's only adds refusals."""
+    return spellings(names) | spellings(names, _coarse)
+
+
+def _mentions(body: exp.Expression) -> set[str]:
     """Every table name the body mentions, in both spellings, from the RAW tree.
 
     Deliberately not `base_tables`. That resolves scopes to tell a CTE reference from a base
@@ -141,7 +149,7 @@ def _mentions(body: exp.Expression, dialect: str | None = None) -> set[str]:
     # Folded and bare-segmented, because unquoted identifiers are case-insensitive in all three
     # engines and a body may qualify what the snapshot keys bare. Widening here can only ADD
     # matches, and every added match is a refusal.
-    return _restricting(names, dialect)
+    return _restricting(names)
 
 
 class ViewInventory(dict):
@@ -246,7 +254,6 @@ def check_views(
     filtered: set[str],
     known: set[str] | None = None,
     granted: set[str] | None = None,
-    dialect: str | None = None,
 ) -> Refusal | None:
     """Refuse a granted view that reads a row-filtered table, and one this engine cannot read.
 
@@ -301,11 +308,8 @@ def check_views(
         )
     # Exact names, case-folded -- never `spellings`, whose bare last segment would let a grant on
     # `sales.customer` name a filtered `public.customer` the caller does not hold.
-    # `dialect` is the engine that runs the statement, which folds the query's own names: a grant
-    # on a quoted `ſALES` passes the grant check, and Oracle reads the unquoted spelling as SALES
-    # (Codex's fifth review of #192).
     return _walk(ast, views, filtered, known, (), 0, "", "",
-                 {g.lower() for g in granted} if granted else set(), dialect, _Request(views, known))
+                 {g.lower() for g in granted} if granted else set(), _Request(views, known, filtered))
 
 
 def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
@@ -317,9 +321,7 @@ def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
     return Refusal(code=code, message=message, subject=view)
 
 
-def _views_read(
-    node: exp.Table, request: _Request, catalog: str, dialect: str | None,
-) -> list[tuple[str, ViewDefinition]]:
+def _views_read(node: exp.Table, request: _Request, catalog: str) -> list[tuple[str, ViewDefinition]]:
     """Every view `node` may read, keyed as the inventory keys it: the key the body spells, where
     there is one, first, and then every other key the lowercase or the body's engine folds onto it.
 
@@ -356,12 +358,13 @@ def _views_read(
     # `qualify_object_id` normalises it. Measured: catalog `pg` refused and catalog `PG` approved,
     # on the identical statement.
     #
-    # And as the body's engine folds (Codex's review of #192). Oracle reads `ſales` as SALES,
-    # which `str.lower` keeps apart from `sales`, so the known-object check vouched for a view this
-    # lookup never found, and the filtered table behind it went unwalked.
-    fold = rules_for(dialect).fold
-    folded = request.folded(dialect)
-    twins = {k for s in spelled for k in (*request.by_lower.get(s.lower(), ()), *folded.get(fold(s), ()))}
+    # And `_coarse`, as wide as any engine's fold (Codex's reviews of #192). Oracle reads `ſales`
+    # as SALES, which `str.lower` keeps apart from `sales`, so the known-object check vouched for a
+    # view this lookup never found, and the filtered table behind it went unwalked; the query's own
+    # names are read the same way, since a grant on a quoted `ſALES` passes the grant check and
+    # Oracle runs the unquoted spelling as SALES.
+    twins = {k for s in spelled
+             for k in (*request.by_lower.get(s.lower(), ()), *request.by_coarse.get(_coarse(s), ()))}
     twins.discard(exact)
     return [(k, views[k]) for k in ([exact] if exact is not None else []) + sorted(twins)]
 
@@ -381,23 +384,21 @@ class _Request:
 
     views: dict[str, ViewDefinition]
     known: set[str] | None
+    filtered: set[str]
     clean: dict[tuple[str, str], int] = field(default_factory=dict)
     by_lower: dict[str, list[str]] = field(default_factory=dict)
-    _by_fold: dict[str | None, dict[str, list[str]]] = field(default_factory=dict)
+    by_coarse: dict[str, list[str]] = field(default_factory=dict)
+    wanted: set[str] = field(default_factory=set)
     _recognised: dict[str | None, set[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         for key in self.views:
             self.by_lower.setdefault(key.lower(), []).append(key)
-
-    def folded(self, dialect: str | None) -> dict[str, list[str]]:
-        """The inventory's keys by their fold in `dialect`."""
-        if dialect not in self._by_fold:
-            fold, index = rules_for(dialect).fold, {}
-            for key in self.views:
-                index.setdefault(fold(key), []).append(key)
-            self._by_fold[dialect] = index
-        return self._by_fold[dialect]
+            self.by_coarse.setdefault(_coarse(key), []).append(key)
+        # The filtered set is widened the same way as a body's mentions and by its bare last
+        # segment, so a body saying `customer` still matches a filter keyed `public.customer`.
+        # Both directions, because a miss here means not refusing.
+        self.wanted = _restricting(set(self.filtered))
 
     def recognised(self, dialect: str | None) -> set[str]:
         """Every spelling of a known object or a view, folded as `dialect` folds."""
@@ -417,13 +418,10 @@ def _walk(
     catalog: str,
     top: str,
     granted: set[str],
-    dialect: str | None,
     request: _Request,
 ) -> Refusal | None:
-    # `dialect` is the engine that reads `ast`'s names: a nested body's own view's, and at the
-    # top the engine that runs the statement (`check_views`).
     for node in ast.find_all(exp.Table):
-        for name, view in _views_read(node, request, catalog, dialect):
+        for name, view in _views_read(node, request, catalog):
             # The view the query read, named in every refusal below: at the top, as the query
             # spells it, which the grant check has passed. Never an inventory key: a twin the
             # fallback walks may be one the caller does not hold, a quoted "V" beside a granted
@@ -455,10 +453,6 @@ def _walk(
                                f"{it} reads through a {unrecognised.lower()} rather than a named "
                                "table, so this engine cannot tell which tables it touches.",
                                f"{name!r} reads through a {unrecognised.lower()}")
-            # The filtered set is widened the same way and by its bare last segment, so a body
-            # saying `customer` still matches a filter keyed `public.customer`. Both directions,
-            # because a miss here means not refusing.
-            wanted = _restricting(set(filtered), view.dialect)
             # A body may only read objects the snapshot knows. A caller writing
             # `SELECT a FROM 'customer.csv'` is already refused UNAUTHORIZED_TABLE because the name
             # is not in `visible`; a view body was never held to that, so a view could reach a file
@@ -495,8 +489,8 @@ def _walk(
                                    f"{it} reads an object that is not in this source, so this engine "
                                    "cannot tell what policy applies to it.",
                                    f"{name!r} reads unknown {unknown[0]!r}")
-            mentioned = _mentions(body, view.dialect)
-            reached = sorted(mentioned & wanted)
+            mentioned = _mentions(body)
+            reached = sorted(mentioned & request.wanted)
             if reached:
                 # The table is offered as the repair only when the view reaches exactly ONE filtered
                 # policy key, the body wrote that key exactly, and the caller holds it. Not by any
@@ -506,7 +500,7 @@ def _walk(
                 # table's rows. Not by the view's name prefix either: a prefix may be a schema, not a
                 # catalog, and nothing here can tell which. A federated body writes `customer` where
                 # the key is `pg.customer`, so it gets no hint -- fail closed, the refusal still holds.
-                keys = sorted(f for f in filtered if _restricting({f}, view.dialect) & mentioned)
+                keys = sorted(f for f in filtered if _restricting({f}) & mentioned)
                 written = {object_key(t).lower() for t in body.find_all(exp.Table)}
                 held = (keys[0] if len(keys) == 1 and keys[0].lower() in written
                         and keys[0].lower() in granted else None)
@@ -518,7 +512,7 @@ def _walk(
             # The body's own catalog carries into it: a view two levels down is still written in
             # the source's naming, not the federation's.
             nested = _walk(body, views, filtered, known, (*stack, name), depth + 1, inherited, here,
-                           granted, view.dialect, request)
+                           granted, request)
             if nested is not None:
                 return nested
             request.clean[(name, inherited)] = depth
