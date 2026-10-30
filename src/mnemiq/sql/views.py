@@ -254,6 +254,7 @@ def check_views(
     filtered: set[str],
     known: set[str] | None = None,
     granted: set[str] | None = None,
+    dialect: str | None = None,
 ) -> Refusal | None:
     """Refuse a granted view that reads a row-filtered table, and one this engine cannot read.
 
@@ -270,6 +271,12 @@ def check_views(
     nothing, so every object a body reads is unknown and the view is refused. A caller must never
     turn an empty set into None (`... or None`), which would skip the rule exactly where it is
     widest. Both deciders pass `set(policy.policy_schema)`.
+
+    A name a CTE in scope binds is the CTE, never a view, and is not looked up: `dialect` is the
+    engine that runs the query, whose binding `check_access` reads too, and a view body is bound
+    by its own engine. Looked up, a CTE named `ſales` matched an ungranted SALES through the wide
+    fold and refused the query, saying a view of that name reads a filtered table, and main did the
+    same for `sales` (Codex's twelfth review of #192). The CTE's body is still walked.
 
     M27: a view's rows are defined by SQL held in the source, so a filter on its base table
     reaches nothing -- the decider refused the base table correctly, and the repair loop used
@@ -310,7 +317,8 @@ def check_views(
     # `sales.customer` name a filtered `public.customer` the caller does not hold, nor folded,
     # which let a grant on `ä` name a filtered `Ä`.
     return _walk(ast, views, filtered, known, (), 0, "", "",
-                 set(granted) if granted else set(), _Request(views, known, filtered))
+                 set(granted) if granted else set(), _Request(views, known, filtered),
+                 {id(t) for t in cte_references(ast, dialect)})
 
 
 def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
@@ -428,8 +436,11 @@ def _walk(
     top: str,
     granted: set[str],
     request: _Request,
+    bound: set[int],
 ) -> Refusal | None:
     for node in ast.find_all(exp.Table):
+        if id(node) in bound:
+            continue
         for name, view in _unwalked(node, request, catalog, depth):
             # The view the query read, named in every refusal below: at the top, as the query
             # spells it, which the grant check has passed. Never an inventory key: a twin the
@@ -462,6 +473,9 @@ def _walk(
                                f"{it} reads through a {unrecognised.lower()} rather than a named "
                                "table, so this engine cannot tell which tables it touches.",
                                f"{name!r} reads through a {unrecognised.lower()}")
+            # The body's references its own CTEs bind, as the view's engine binds them: neither an
+            # unknown object below nor a view in the walk into the body.
+            inner = {id(t) for t in cte_references(body, view.dialect, engine=view.dialect)}
             # A body may only read objects the snapshot knows. A caller writing
             # `SELECT a FROM 'customer.csv'` is already refused UNAUTHORIZED_TABLE because the name
             # is not in `visible`; a view body was never held to that, so a view could reach a file
@@ -479,7 +493,6 @@ def _walk(
                 # runs the body: SQLite binds a later sibling, and DuckDB's rule refused such a view
                 # (Codex's review of #138). Never a qualified name. `_mentions` still collects every
                 # alias, so a CTE named after a filtered table still trips the filtered check.
-                bound = {id(t) for t in cte_references(body, view.dialect, engine=view.dialect)}
                 # Folded as the VIEW's engine folds, never wider: a match here vouches that a read is
                 # of a known object, and folding every letter let a known `Ä` vouch for an unknown `ä`
                 # that DuckDB, SQLite and Postgres keep apart (Codex's review of #147, M154).
@@ -491,7 +504,7 @@ def _walk(
                 unknown = sorted(
                     object_key(x)
                     for x in body.find_all(exp.Table)
-                    if id(x) not in bound and not (spellings({object_key(x)}, fold) & recognised)
+                    if id(x) not in inner and not (spellings({object_key(x)}, fold) & recognised)
                 )
                 if unknown:
                     return _refuse(RefusalCode.UNRESOLVABLE_VIEW, here,
@@ -522,7 +535,7 @@ def _walk(
             # The body's own catalog carries into it: a view two levels down is still written in
             # the source's naming, not the federation's.
             nested = _walk(body, views, filtered, known, (*stack, name), depth + 1, inherited, here,
-                           granted, request)
+                           granted, request, inner)
             if nested is not None:
                 return nested
             request.clean[(name, inherited)] = depth

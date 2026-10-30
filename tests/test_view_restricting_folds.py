@@ -13,9 +13,11 @@ from __future__ import annotations
 import pytest
 import sqlglot
 
+from mnemiq.authz.grants import GrantSet
 from mnemiq.sql.decide import decide
+from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
-from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
+from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import ViewDefinition
 
 SCHEMA = {"orders": {"id", "store_id"}, "client": {"id"}, "ΚΟΣΜΟΣ": {"id"}, "stores": {"id"}, "v": {"id"}}
@@ -407,3 +409,63 @@ def test_on_duckdb_the_long_s_names_another_object_and_is_refused_as_unknown():
     # DuckDB folds ASCII alone (M154), so `orderſ` is not ORDERS there: unknown, not ungoverned.
     verdict = _read_view("SELECT id FROM orderſ", "orders", dialect="duckdb")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW, verdict
+
+
+def _read_with_sales_view(query: str, dialect: str, view: str = "SALES", body: str = "SELECT id FROM orders",
+                          visible=None):
+    schema = {"safe_table": {"id"}, "orders": {"id"}, view: {"id"}, "v": {"id"}}
+    policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
+    views = {view: ViewDefinition(object_id=view, dialect=dialect, definition=body)}
+    return decide(query, visible or {"safe_table": {"id"}}, dialect=dialect, target=dialect, policy=policy,
+                  views=views)
+
+
+@pytest.mark.parametrize(("dialect", "view", "cte"), [
+    ("oracle", "SALES", "ſales"), ("oracle", "SALES", "sales"), ("duckdb", "SALES", "ſales"),
+    ("duckdb", "sales", "sales"), ("duckdb", "SALES", "Sales")])
+def test_a_name_the_query_s_own_cte_binds_is_not_looked_up_as_a_view(dialect, view, cte):
+    # The engine binds the name to the CTE, so the view of that name is never read: looked up, the
+    # wide fold matched `ſales` to an ungranted SALES and refused the query, telling the caller a view
+    # of that name reads a filtered table (Codex's twelfth review of #192). Main refused the plain
+    # spelling the same way and named SALES itself.
+    verdict = _read_with_sales_view(f"WITH {cte} AS (SELECT id FROM safe_table) SELECT id FROM {cte}", dialect, view)
+    assert isinstance(verdict, Approved), verdict
+
+
+@pytest.mark.parametrize("dialect", ["oracle", "duckdb"])
+def test_a_cte_s_own_body_reading_a_filtered_view_is_still_refused(dialect):
+    verdict = _read_with_sales_view("WITH x AS (SELECT id FROM SALES) SELECT id FROM x", dialect,
+                                    visible={"safe_table": {"id"}, "SALES": {"id"}})
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
+
+
+@pytest.mark.parametrize("dialect", ["oracle", "duckdb"])
+def test_a_name_a_view_body_s_own_cte_binds_is_not_looked_up_as_a_view(dialect):
+    # The same inside a view: its engine binds `sales` in its body to the body's own CTE.
+    schema = {"safe_table": {"id"}, "orders": {"id"}, "SALES": {"id"}, "v": {"id"}}
+    policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
+    views = {"SALES": ViewDefinition(object_id="SALES", dialect=dialect, definition="SELECT id FROM orders"),
+             "v": ViewDefinition(object_id="v", dialect=dialect,
+                                 definition="WITH sales AS (SELECT id FROM safe_table) SELECT id FROM sales")}
+    verdict = decide("SELECT id FROM v", {"v": {"id"}}, dialect=dialect, target=dialect, policy=policy, views=views)
+    assert isinstance(verdict, Approved), verdict
+
+
+@pytest.mark.parametrize("door", ["read", "write"])
+def test_a_cte_oracle_folds_onto_the_name_read_binds_it_through_either_door(door):
+    # Oracle folds the unquoted `ſales` to SALES, so `FROM SALES` reads the CTE. Bound by any other
+    # engine's fold the name is not the CTE's, and the SALES view behind it was looked up.
+    schema = {"safe_table": {"id"}, "orders": {"id"}, "SALES": {"id"}, "scratch": {"id"}}
+    policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
+    views = {"SALES": ViewDefinition(object_id="SALES", dialect="oracle", definition="SELECT id FROM orders")}
+    query = "WITH ſales AS (SELECT id FROM safe_table) SELECT id FROM SALES"
+    if door == "read":
+        verdict = decide(query, {"safe_table": {"id"}}, dialect="oracle", target="oracle", policy=policy,
+                         views=views)
+        assert isinstance(verdict, Approved), verdict
+    else:
+        visible = {"safe_table": {"id"}, "scratch": {"id"}}
+        verdict = decide_write(f"INSERT INTO scratch (id) {query}", visible,
+                               GrantSet(frozenset(visible), writable=frozenset({"scratch"})),
+                               dialect="oracle", target="oracle", writes_enabled=True, policy=policy, views=views)
+        assert isinstance(verdict, ApprovedWrite), verdict

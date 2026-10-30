@@ -446,7 +446,7 @@ def decide_write(
     # decider had no `views` parameter at all, so it could not have run it even in principle.
     ungoverned = check_views(shaped, {} if views is None else views, set(policy.row_filters),
                              known=set(policy.policy_schema),
-                             granted=set(visible))
+                             granted=set(visible), dialect=target)
     if ungoverned is not None:
         return ungoverned
 
