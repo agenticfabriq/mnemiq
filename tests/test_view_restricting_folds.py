@@ -469,3 +469,21 @@ def test_a_cte_oracle_folds_onto_the_name_read_binds_it_through_either_door(door
                                GrantSet(frozenset(visible), writable=frozenset({"scratch"})),
                                dialect="oracle", target="oracle", writes_enabled=True, policy=policy, views=views)
         assert isinstance(verdict, ApprovedWrite), verdict
+
+
+def test_a_cte_s_binding_is_asked_only_of_a_reference_some_view_could_answer_to(monkeypatch):
+    # Asking costs a walk of every CTE in scope, so asked of every reference 2,000 CTEs were
+    # 4,004,001 name resolutions with no view at all (Codex's thirteenth review of #192).
+    from mnemiq.sql import views as module
+
+    asked = []
+    real = module.names_a_cte
+    monkeypatch.setattr(module, "names_a_cte", lambda t, *a, **k: asked.append(t.name) or real(t, *a, **k))
+    query = "WITH " + ", ".join(f"c{i} AS (SELECT id FROM safe_table)" for i in range(200)) + " SELECT id FROM " + \
+        ", ".join(f"c{i}" for i in range(200)) + ", sales"
+    defs = {"SALES": ViewDefinition(object_id="SALES", dialect="duckdb", definition="SELECT id FROM safe_table")}
+    verdict = module.check_views(sqlglot.parse_one(query, read="duckdb"), defs, {"orders"},
+                                 known={"safe_table", "orders", "SALES"}, granted={"safe_table", "SALES"},
+                                 dialect="duckdb")
+    assert verdict is None, verdict
+    assert asked == ["sales"], asked

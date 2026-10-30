@@ -343,6 +343,13 @@ def cte_references(ast: exp.Expression, dialect: str | None = None, *,
     return [table for table in ast.find_all(exp.Table) if _cte_in_scope(table, dialect, engine)]
 
 
+def names_a_cte(table: exp.Table, dialect: str | None = None, *, engine: str | None = None) -> bool:
+    """Whether `table` names a CTE in scope where it stands, as `cte_references` reports it: one
+    node, for a caller that asks only of the few it needs, since each costs a walk of every CTE in
+    scope."""
+    return _cte_in_scope(table, dialect, engine)
+
+
 def _missed_reads(ast: exp.Expression, walked: list[exp.Table], dialect: str | None) -> list[exp.Table]:
     """The table nodes `_scope_missed_a_read` counts: left out by the walk, not written, and not
     a CTE in scope -- reads the scope model missed."""

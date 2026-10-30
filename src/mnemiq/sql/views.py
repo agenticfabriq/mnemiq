@@ -10,7 +10,7 @@ from mnemiq.contract import ViewDefinition
 from mnemiq.sql.identifiers import rules_for
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys
-from mnemiq.sql.scope import cte_references
+from mnemiq.sql.scope import cte_references, names_a_cte
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 # A view nested deeper than this is either a cycle the stack missed or a schema nobody should
@@ -318,7 +318,7 @@ def check_views(
     # which let a grant on `ä` name a filtered `Ä`.
     return _walk(ast, views, filtered, known, (), 0, "", "",
                  set(granted) if granted else set(), _Request(views, known, filtered),
-                 {id(t) for t in cte_references(ast, dialect)})
+                 lambda t: names_a_cte(t, dialect))
 
 
 def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
@@ -436,10 +436,13 @@ def _walk(
     top: str,
     granted: set[str],
     request: _Request,
-    bound: set[int],
+    bound,
 ) -> Refusal | None:
     for node in ast.find_all(exp.Table):
-        if id(node) in bound:
+        # Asked only of a reference some view could answer to: asking costs a walk of every CTE in
+        # scope, and asked of every reference 2,000 CTEs were 4,004,001 name resolutions with no
+        # view at all (Codex's thirteenth review of #192).
+        if any(b in request.by_coarse for b in _buckets(node, catalog)) and bound(node):
             continue
         for name, view in _unwalked(node, request, catalog, depth):
             # The view the query read, named in every refusal below: at the top, as the query
@@ -535,7 +538,7 @@ def _walk(
             # The body's own catalog carries into it: a view two levels down is still written in
             # the source's naming, not the federation's.
             nested = _walk(body, views, filtered, known, (*stack, name), depth + 1, inherited, here,
-                           granted, request, inner)
+                           granted, request, lambda t: id(t) in inner)
             if nested is not None:
                 return nested
             request.clean[(name, inherited)] = depth
