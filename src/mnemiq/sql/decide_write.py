@@ -498,10 +498,12 @@ def decide_write(
         asked_sql = rendered(asked_plan, dialect, target)
     except (ValueError, sqlglot.errors.SqlglotError) as exc:
         return unprintable(target, exc, policys=False, tree=asked)
-    # Each row filter printed as its operator wrote it, never from its parse (M222), as `decide` does.
-    held, written = with_filters_held(shaped)
-    plan_sql = held.sql(dialect=dialect)
     try:
+        # Each row filter printed as its operator wrote it, never from its parse (M222), as `decide`
+        # does, and held in the dialect it is written in: held as DuckDB, Oracle's MINUS raised out
+        # of the decider (Codex's ninth review of #193).
+        held, written = with_filters_held(shaped, dialect=dialect)
+        plan_sql = held.sql(dialect=dialect)
         target_sql = asked_sql if asked_plan == plan_sql else rendered(plan_sql, dialect, target)
         plan_sql, target_sql = as_written(plan_sql, written, dialect), as_written(target_sql, written, target)
     except (ValueError, sqlglot.errors.SqlglotError) as exc:

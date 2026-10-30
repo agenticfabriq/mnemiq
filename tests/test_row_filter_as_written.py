@@ -444,3 +444,17 @@ def test_a_quoted_name_is_held_only_by_a_quoted_name_in_the_parse():
     from mnemiq.sql import rls
     filt = 'list_reverse_sort([id], "d") IS NOT NULL AND d > 0'
     assert rls._quoted_dropped(filt, "duckdb", rls._parsed(filt, "duckdb")) == {"d"}
+
+
+def test_an_oracle_write_reading_a_filtered_table_holds_its_filter_as_oracle():
+    # The write path held its filters as DuckDB, which cannot read Oracle's MINUS: the decider
+    # raised on a filter the read path approves (Codex's ninth review of #193).
+    schema = {"claim": {"id"}, "scratch": {"id"}, "entitlement": {"id"}}
+    filt = "id IN (SELECT id FROM entitlement MINUS SELECT id FROM entitlement)"
+    policy = AccessPolicy(row_filters={"claim": filt}, policy_schema=schema)
+    visible = {"claim": {"id"}, "scratch": {"id"}}
+    verdict = decide_write("INSERT INTO scratch (id) SELECT id FROM claim", visible,
+                           GrantSet(frozenset(visible), writable=frozenset({"scratch"})),
+                           policy=policy, dialect="oracle", writes_enabled=True)
+    assert isinstance(verdict, ApprovedWrite), verdict
+    assert filt in verdict.target_sql, verdict.target_sql  # as written
