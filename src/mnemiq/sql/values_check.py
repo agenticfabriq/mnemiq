@@ -1504,9 +1504,11 @@ def source_holds(adapter, dialect: str | None, physical: dict[str, str],
         sql = probe_sql(physical.get(table, table), column, text, dialect)
         try:
             return adapter.execute_arrow(sql, timeout_s=timeout_s).num_rows > 0
-        except Exception:  # noqa: BLE001 -- unanswered, the value stays unchecked and declines
-            logger.info("the source did not answer whether %s.%s holds a value; it stays unchecked",
-                        table, column, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 -- unanswered, the value stays unchecked and declines
+            # The kind of failure only: a source's error text quotes the statement, value and all,
+            # and the value may sit on a column the index skipped as personal data (Codex's review).
+            logger.info("the source did not answer whether %s.%s holds a filter value (%s); it stays "
+                        "unchecked", table, column, type(exc).__name__)
             return None
     return holds
 

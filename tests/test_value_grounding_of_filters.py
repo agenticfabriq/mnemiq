@@ -784,3 +784,22 @@ def test_a_table_stored_with_a_dot_is_probed_as_itself_not_as_a_schema_and_a_tab
     holds = source_holds(DuckDBAdapter.duckdb(path), "duckdb", {}, timeout_s=10)
     assert holds("a.b", "c", "mine") is True
     assert holds("a.b", "c", "twin_only") is False
+
+
+def test_a_failed_probe_logs_neither_the_value_nor_its_sql(tmp_path, caplog):
+    """The value may sit on a column the index skipped as personal data, and the source's error text
+    quotes the statement: a log line keeps the table, the column and the kind of failure only."""
+    import logging
+
+    import duckdb
+
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+    from mnemiq.sql.values_check import source_holds
+
+    path = str(tmp_path / "s.duckdb")
+    duckdb.connect(path).close()
+    caplog.set_level(logging.DEBUG)
+    holds = source_holds(DuckDBAdapter.duckdb(path), "duckdb", {}, timeout_s=10)
+    assert holds("patient", "national_id", "secret-4711") is None  # no such table: no answer
+    assert "patient.national_id" in caplog.text
+    assert "secret-4711" not in caplog.text and "SELECT 1" not in caplog.text
