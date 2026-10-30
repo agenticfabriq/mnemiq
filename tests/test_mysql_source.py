@@ -601,12 +601,28 @@ def test_validate_runs_the_plan_as_a_zero_row_derived_table_under_a_bound():
     assert seen == [("SELECT * FROM (SELECT a FROM t) AS mnemiq_probe LIMIT 0", 30)]
 
 
-def test_only_outages_and_timeouts_are_unanswered():
+def test_only_outages_timeouts_and_cancels_are_unanswered():
     a = adapter(Blocking())
     assert a.source_unavailable(MySQLUnavailable("gone"))
     assert a.source_unavailable(QueryTimedOut("slow"))
-    assert not a.source_unavailable(QueryCancelled("stopped"))
+    assert a.source_unavailable(QueryCancelled("stopped"))
     assert not a.source_unavailable(duckdb.IOException("Unknown column 'x' in 'field list'"))
+
+
+def test_an_operators_kill_at_the_proof_ends_the_turn_and_is_not_repaired():
+    # The contract `QueryCancelled` states: at the proof a cancel is unanswered, as the product
+    # adapters' classifiers read their drivers' cancels; repaired, a model writing the same SQL
+    # again would run what an operator stopped. At the run the runner asks the cancel first.
+    class OperatorKills(Session):
+        def execute(self, query):
+            if "mysql_query" in query and "CONNECTION_ID()" not in query:
+                raise duckdb.IOException(
+                    "Failed to fetch result row for MySQL query: Query execution was interrupted")
+            return super().execute(query)
+    a = adapter(OperatorKills())
+    assert prove_outcome(a, "SELECT 1").proof is Proof.UNAVAILABLE
+    with pytest.raises(QueryCancelledError):
+        run_statement(a, "SELECT 1", timeout_s=5)
 
 
 # -- configuration ---------------------------------------------------------------------------

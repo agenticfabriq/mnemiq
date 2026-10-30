@@ -462,9 +462,11 @@ class MySQLSource:
         """The proof seam's question: did the source not answer, rather than answer no. Outages
         reach here as `MySQLUnavailable`, typed by `_table` only once the session stops answering
         too, so a statement whose error merely quotes `lost connection` is never read as one. A
-        timeout at the proof is unanswered too; the runner asks its timeout first, so there it
-        stays the query's cost."""
-        return isinstance(exc, (ConnectionError, TimeoutError, QueryTimedOut,
+        timeout and an operator's cancel at the proof are unanswered too, as `QueryCancelled`'s
+        contract has it: repaired, a cancelled proof would send what an operator stopped back to
+        the model to run again. The runner asks its timeout and its cancel first, so there they
+        stay the query's cost and the cancel."""
+        return isinstance(exc, (ConnectionError, TimeoutError, QueryTimedOut, QueryCancelled,
                                 duckdb.InterruptException))
 
     def execute(self, sql: str) -> list[tuple]:
