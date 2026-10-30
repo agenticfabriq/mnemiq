@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import re
 
+import sqlglot
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
 from mnemiq.sql.functions import FunctionInventory, Unanswered, UnreadableCalls, called_names
-from mnemiq.sql.identifiers import resolve, resolve_identifier, resolve_stored, rules_for
-from mnemiq.sql.qualify import object_key
+from mnemiq.sql.identifiers import resolve, resolve_exactly, resolve_identifier, resolve_stored, rules_for
+from mnemiq.sql.qualify import engine_key, object_key, stored_key
 from mnemiq.sql.scope import GENERATED_NAME, KnownColumns, base_tables, candidate_tables, column_tables
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
@@ -294,6 +295,92 @@ def _clause_of(column: exp.Column, dialect: str | None) -> tuple[str, bool]:
     return clause or "select", bare
 
 
+def not_read_as_written(table: exp.Table, held, dialect: str | None) -> Refusal | None:
+    """The repair for a reference whose written name is not the held name the engine reads it as
+    (M223), where `held`, the names the caller may use here, has either; None where it is read as
+    written and held, or where neither is held, which the caller's own check refuses.
+
+    Every check after the grant looks a table up by the name as written, so a reference is decided
+    only where that is the name the engine reads. Measured before this, on Oracle: with a quoted
+    `sales` granted beside an ungranted SALES, `SELECT ID FROM sales` was approved and Oracle
+    returned SALES's rows. A held name the engine reads under another spelling (`CLAIM` for a
+    listed `claim`) is the same repair, not an unauthorized table. The words name only what was
+    written and names the caller holds, so they say nothing about whether an ungranted table
+    exists.
+    """
+    name, read = object_key(table), engine_key(table, dialect)
+    if name in held and read == stored_key(name, dialect):
+        return None
+    written = ".".join(table.args[arg].sql(dialect=dialect)
+                       for arg in ("catalog", "db", "this") if table.args.get(arg) is not None)
+    listed = [key for key in held if read is not None and stored_key(key, dialect) == read]
+    if len(listed) == 1:
+        return Refusal(
+            code=RefusalCode.UNKNOWN_TABLE,
+            message=f"{written} names the table listed as {listed[0]!r}. {_write_as_listed(listed[0], dialect)}",
+            subject=listed[0],
+        )
+    if name in held:
+        return Refusal(
+            code=RefusalCode.UNKNOWN_TABLE,
+            message=(f"{written} is read here as another name than the table listed as {name!r}. "
+                     f"{_write_as_listed(name, dialect)}"),
+            subject=name,
+        )
+    return None
+
+
+def _unmeasured_name(ast: exp.Expression, dialect: str | None) -> Refusal | None:
+    """A table or a CTE named unquoted with a character whose fold on the engine was never
+    measured (`identifiers.resolve_exactly`), refused saying to quote it (M223).
+
+    Which CTE a reference binds to is read by the shared rules, which keep such a character: with
+    `WITH "ᾀ" AS (...) SELECT ... FROM ᾀ` both read as `ᾀ`, the reference was taken for the CTE and
+    left unchecked, where Oracle folds the unquoted `ᾀ` to one letter of its own and reads a table
+    of that name (Codex's review of the M223 branch); unquoted in the CTE and quoted in the
+    reference, the same the other way. Quoted, a name reads as written on every engine."""
+    for node in ast.find_all(exp.Table, exp.CTE):
+        if isinstance(node, exp.Table):
+            parts = [node.args.get(arg) for arg in ("catalog", "db", "this")]
+        else:
+            alias = node.args.get("alias")
+            parts = [alias.this if isinstance(alias, exp.TableAlias) else None]
+        for part in parts:
+            if isinstance(part, exp.Identifier) and resolve_exactly(
+                    part.name, quoted=bool(part.quoted), dialect=dialect) is None:
+                return Refusal(
+                    code=RefusalCode.UNKNOWN_TABLE,
+                    message=(f"How {part.sql(dialect=dialect)} reads unquoted here is not known. "
+                             "Write the name quoted, as it is stored."),
+                    subject=part.name,
+                )
+    return None
+
+
+def _as_listed(key: str, dialect: str | None) -> str | None:
+    """`key` written so the engine reads it as that name, bare where that reads back, else quoted;
+    None where neither does, or where the key holds a dot, whose parts the key does not mark
+    (Codex's second review of the M223 branch). Each spelling is parsed back and kept only where it
+    names the key as written and as read, so `Sales Data` is quoted."""
+    if "." in key:
+        return None
+    for quoted in (False, True):
+        spelled = exp.to_identifier(key, quoted=quoted).sql(dialect=dialect)
+        try:
+            table = sqlglot.parse_one(f"SELECT 1 FROM {spelled}", read=dialect).find(exp.Table)
+        except sqlglot.errors.ParseError:
+            continue
+        if (table is not None and object_key(table) == key
+                and engine_key(table, dialect) == stored_key(key, dialect)):
+            return spelled
+    return None
+
+
+def _write_as_listed(key: str, dialect: str | None) -> str:
+    spelled = _as_listed(key, dialect)
+    return f"Write it as listed: {spelled}." if spelled is not None else "Write it as it is listed."
+
+
 def check_access(ast: exp.Expression, visible: dict[str, set[str]],
                  dialect: str | None = None,
                  columns: dict[str, set[str]] | None = None) -> Refusal | None:
@@ -313,11 +400,17 @@ def check_access(ast: exp.Expression, visible: dict[str, set[str]],
     # tables, and the aliases that stand for them. `base_tables` -- not `find_all` minus a flat
     # set of CTE names -- because a reference inside a CTE body naming that same CTE reads the
     # base table, and skipping it let an ungranted table through (M31).
+    unmeasured = _unmeasured_name(ast, dialect)
+    if unmeasured is not None:
+        return unmeasured
     alias_to_table: dict[str, str] = {}
     named: set[int] = set()
     resolved = column_tables(ast, dialect, columns if columns is not None else visible, named=named)
     for table in base_tables(ast, dialect):
         name = object_key(table)
+        misread = not_read_as_written(table, visible, dialect)
+        if misread is not None:
+            return misread
         if name not in visible:
             return Refusal(
                 code=RefusalCode.UNAUTHORIZED_TABLE,

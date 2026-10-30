@@ -35,6 +35,8 @@ def _named(values: list[FilterValue]) -> str:
         written = ", ".join(v.text for v in values)
         return f"{written}, {'JSON paths' if many else 'a JSON path'}, could not be checked"
     texts, column = _listed([v.text for v in values]), first.column
+    if first.outcome == ABSENT and first.why == "probed":  # the source itself was asked
+        return f"{texts} {'do' if many else 'does'} not appear in {column}"
     if first.outcome == ABSENT:
         return f"{texts} {'do' if many else 'does'} not appear among {column}'s known values"
     if first.why == "pattern":
@@ -100,6 +102,13 @@ def _aggregate_over_nothing(table: pa.Table, rows: list[dict]) -> bool:
     return table.num_rows == 1 and all(v is None for v in rows[0].values())
 
 
+def grounding_decides(table: pa.Table) -> bool:
+    """Whether `sanity_check` decides this result on the grounding: no rows, or one NULL row from
+    aggregates over nothing."""
+    return table.num_rows == 0 or (table.num_rows == 1
+                                   and _aggregate_over_nothing(table, table.to_pylist()))
+
+
 def sanity_check(question: str, table: pa.Table,
                  grounding: ValueGrounding | None = None) -> VerifyVerdict | None:
     """Defer results that cannot be a real answer: no rows, a null/NaN scalar, or all-null cells.
@@ -108,7 +117,8 @@ def sanity_check(question: str, table: pa.Table,
     empty result, or one NULL row from aggregates over nothing, passes when `grounding` -- the
     decider's record of every string value in the statement, the projection's included -- says
     each was found in its column's indexed values or is a bound of a bare column's own type (a
-    date on a DATE column, a full timestamp on a TIMESTAMP one), and no predicate can never hold.
+    date on a DATE column or as the half-open end of a range on a TIMESTAMP one, a full timestamp on a
+    TIMESTAMP one), and no predicate can never hold.
     A value on a table this identity reads through a row filter is never grounded: the index
     cannot say which rows the caller may read (`ground_values`). Anything
     nothing could check keeps it declined, and the decline names the value, so the caller can

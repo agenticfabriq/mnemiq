@@ -447,8 +447,10 @@ def test_the_federated_nested_view_folds_case_too(inner_ref, catalog):
     fed = merge_snapshots([(spec, _nested_case_snapshot(inner_ref))])
     grants = GrantSet(objects=frozenset({f"{catalog}.claim_v2"}),
                       row_filters={f"{catalog}.claim": "region = 'west'"})
+    # Decided as DuckDB, which runs a federated statement and reads `PG` as `pg`; on Postgres the
+    # unquoted `PG` is `pg`, and a grant keyed `PG.claim_v2` a quoted catalog (M223).
     v = decide(f"SELECT id FROM {catalog}.claim_v2", {f"{catalog}.claim_v2": {"id"}},
-               policy=build_access_policy(fed, grants), views=inventory_for(fed))
+               policy=build_access_policy(fed, grants), views=inventory_for(fed), target="duckdb")
     assert getattr(v, "code", None) is RefusalCode.UNGOVERNED_VIEW, v
 
 

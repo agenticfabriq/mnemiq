@@ -136,9 +136,9 @@ def test_decide_flags_a_logic_lint_and_refuses():
     from mnemiq.sql.decide import decide
     from mnemiq.sql.verdict import Refusal, RefusalCode
 
-    visible = {"t": {"name", "score"}}
+    visible = {"T": {"name", "score"}}  # as Oracle stores the unquoted `t` (M223)
     # Oracle puts NULLs first descending, so a top-1 there can return a NULL (M161).
-    verdict = decide("SELECT name FROM t ORDER BY score DESC FETCH FIRST 1 ROWS ONLY", visible,
+    verdict = decide("SELECT name FROM T ORDER BY score DESC FETCH FIRST 1 ROWS ONLY", visible,
                      adapter=None, dialect="oracle", target="oracle")
     assert isinstance(verdict, Refusal)
     assert verdict.code == RefusalCode.LOGIC_LINT
@@ -149,9 +149,9 @@ def test_decide_approves_the_guarded_form():
     from mnemiq.sql.decide import decide
     from mnemiq.sql.verdict import Approved
 
-    visible = {"t": {"name", "score"}}
+    visible = {"T": {"name", "score"}}  # as Oracle stores the unquoted `t` (M223)
     verdict = decide(
-        "SELECT name FROM t ORDER BY score DESC NULLS LAST FETCH FIRST 1 ROWS ONLY", visible,
+        "SELECT name FROM T ORDER BY score DESC NULLS LAST FETCH FIRST 1 ROWS ONLY", visible,
         adapter=None, dialect="oracle", target="oracle",
     )
     assert isinstance(verdict, Approved)

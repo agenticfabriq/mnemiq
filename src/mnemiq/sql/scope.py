@@ -340,7 +340,95 @@ def cte_references(ast: exp.Expression, dialect: str | None = None, *,
     as reads when the walk missed one. `engine` is whose binding to model when it is not the
     executor's: a view body is bound by its own source engine (Codex's review of #138). None is
     DuckDB's rule, the one every decider needs."""
-    return [table for table in ast.find_all(exp.Table) if _cte_in_scope(table, dialect, engine)]
+    bound = cte_bindings(ast, dialect, engine=engine)
+    return [table for table in ast.find_all(exp.Table) if id(table) in bound]
+
+
+def cte_binder(ast: exp.Expression, dialect: str | None = None, *, engine: str | None = None):
+    """Whether a table node of `ast` names a CTE in scope where it stands, as `cte_references`
+    reports it, for a caller that may ask of a few nodes or of none: the bindings are worked out
+    on the first asking (`cte_bindings`). For `ast` while it is not changed."""
+    bound: dict[int, exp.CTE] | None = None
+
+    def binds(table: exp.Table) -> bool:
+        nonlocal bound
+        if bound is None:
+            bound = cte_bindings(ast, dialect, engine=engine)
+        return id(table) in bound
+
+    return binds
+
+
+def cte_bindings(ast: exp.Expression, dialect: str | None = None, *,
+                 engine: str | None = None) -> dict[int, exp.CTE]:
+    """Every table node of `ast` that names a CTE in scope where it stands, by id, with the CTE the
+    engine binds it to: `_cte_binding`'s answer for each, worked out in one pass down the tree.
+    Asked node by node, each climbing to every WITH above it, 2,000 CTEs were 4,002,000 name
+    resolutions, and a UNION of 2,000 branches, which sqlglot nests 2,000 deep whichever side it
+    leans to, about 2,000,000 steps up (Codex's fourteenth to sixteenth reviews of #192).
+
+    Each name's CTEs in scope are a stack, the innermost on top. Inside a WITH's own CTE bodies
+    the earlier siblings are in scope, each pushed as its body is left, or every sibling at once
+    for an engine in `_EVERY_SIBLING`; under RECURSIVE a CTE is in scope in its own recursive part
+    (`_in_recursive_part`) unless an earlier sibling has its name; the query holding the WITH has
+    all of them. A name a WITH defines twice binds the first, as Oracle runs it. Iterative, since
+    such a tree is deeper than Python's recursion limit. The ids are those of `ast`'s nodes, valid
+    while the caller holds it."""
+    every = (engine or "").lower() in _EVERY_SIBLING
+    in_scope: dict[str, list[exp.CTE]] = {}
+    bound: dict[int, exp.CTE] = {}
+    recursive_parts: dict[int, tuple[exp.Expression, exp.CTE, set[str]]] = {}
+
+    def define(cte: exp.CTE, defined: set[str], pushed: list[str]) -> None:
+        name = resolve_name(cte, dialect)
+        if name is not None and name not in defined:
+            defined.add(name)
+            in_scope.setdefault(name, []).append(cte)
+            pushed.append(name)
+
+    todo: list = [ast]
+    while todo:
+        item = todo.pop()
+        if isinstance(item, tuple):
+            if item[0] == "define":
+                define(*item[1:])
+            else:
+                for name in item[1]:
+                    in_scope[name].pop()
+            continue
+        node = item
+        part = recursive_parts.get(id(node))
+        if part is not None and part[0] is node:
+            _, cte, defined = part
+            name = resolve_name(cte, dialect)
+            if name is not None and name not in defined:
+                in_scope.setdefault(name, []).append(cte)
+                todo.append(("pop", [name]))
+        if isinstance(node, exp.Table) and not (node.db or node.catalog):
+            name = resolve_name(node, dialect)
+            if name is not None and in_scope.get(name):
+                bound[id(node)] = in_scope[name][-1]
+        with_ = next((v for v in node.args.values() if isinstance(v, exp.With)), None)
+        if with_ is None:
+            todo.extend(node.iter_expressions())
+            continue
+        defined: set[str] = set()
+        pushed: list[str] = []
+        order: list = [("define", cte, defined, pushed) for cte in with_.expressions] if every else []
+        order += [child for child in with_.iter_expressions() if not isinstance(child, exp.CTE)]
+        for cte in with_.expressions:
+            body = cte.this
+            while isinstance(body, (exp.Subquery, exp.Paren)):
+                body = body.this
+            if with_.args.get("recursive") and not every and isinstance(body, exp.Union):
+                recursive_parts[id(body.right)] = (body.right, cte, defined)
+            order.append(cte)
+            if not every:
+                order.append(("define", cte, defined, pushed))
+        order += [child for child in node.iter_expressions() if child is not with_]
+        order.append(("pop", pushed))
+        todo.extend(reversed(order))
+    return bound
 
 
 def _missed_reads(ast: exp.Expression, walked: list[exp.Table], dialect: str | None) -> list[exp.Table]:

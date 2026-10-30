@@ -48,6 +48,8 @@ from sqlglot import exp
 class IdentifierRules:
     fold: Callable[[str], str]
     quoting_preserves_case: bool
+    # A character whose unquoted fold on the engine is not measured to be `fold`'s.
+    unmeasured: Callable[[str], bool] = lambda c: False
 
 
 _ASCII_LOWER = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
@@ -76,9 +78,19 @@ def _oracle_upper(text: str) -> str:
     return "".join(u if c.isalpha() and len(u := c.upper()) == 1 else c for c in text)
 
 
+def _oracle_unmeasured(c: str) -> bool:
+    """A character `_oracle_upper` keeps although it has an uppercase, and whose fold on Oracle
+    the sweep did not show to be kept: a Greek letter from U+1F80 on, where the 27 with a
+    subscript iota that Oracle folds to one letter are, and a non-letter (a circled letter, a
+    small Roman numeral, U+0345), which the sweep did not cover. The other letters it keeps, `ß`
+    among them, Oracle was measured to keep."""
+    return (c.upper() != c and _oracle_upper(c) == c
+            and (not c.isalpha() or 0x1F80 <= ord(c) <= 0x1FFF))
+
+
 _RULES: dict[str, IdentifierRules] = {
     "postgres": IdentifierRules(ascii_lower, True),
-    "oracle": IdentifierRules(_oracle_upper, True),
+    "oracle": IdentifierRules(_oracle_upper, True, _oracle_unmeasured),
     "duckdb": IdentifierRules(ascii_lower, False),
     "sqlite": IdentifierRules(ascii_lower, False),
 }
@@ -98,6 +110,17 @@ def resolve(text: str, *, quoted: bool, dialect: str | None) -> str:
     """What this identifier resolves to in `dialect`. Compare these, never the text as typed."""
     rules = rules_for(dialect)
     return text if (quoted and rules.quoting_preserves_case) else rules.fold(text)
+
+
+def resolve_exactly(text: str, *, quoted: bool, dialect: str | None) -> str | None:
+    """`resolve`, or None where an unquoted `text` holds a character the engine may fold another
+    way. `resolve` keeps such a character, which only makes two spellings look like two; a check
+    that APPROVES a name because it reads as written needs the engine's own reading, and has none
+    for these (M223)."""
+    rules = rules_for(dialect)
+    if not (quoted and rules.quoting_preserves_case) and any(map(rules.unmeasured, text)):
+        return None
+    return resolve(text, quoted=quoted, dialect=dialect)
 
 
 def resolve_identifier(node: exp.Expression | None, dialect: str | None) -> str | None:
@@ -133,12 +156,13 @@ def resolve_stored(name: str, dialect: str | None) -> str:
     name -- `"Amount"` beside `amount` -- so this must not be applied to such a catalog's names
     without knowing which were quoted (the review gate's case on M170).
 
-    The rest of the plan-versus-snapshot comparison still runs on as-typed text: `check_access`
-    tests `object_key(table) not in visible`, and on Postgres and Oracle its column names too, so
-    on Postgres `SELECT id FROM CLAIM` is refused `unauthorized_table` against a granted `claim`,
-    though the engine folds them to one object. That direction only ever REFUSES, which is why it
-    is a usability defect rather than the leak this module was written for: `visible` and the
-    policy maps are keyed by that text, so resolving it means resolving the boundary where they
-    are built, tables, columns and row filters together (the register's M170 remainder).
+    The rest of the plan-versus-snapshot comparison runs on as-typed text: `visible` and the
+    policy maps are keyed by stored names, and each check looks a table up by the name as
+    written. That is sound only where the engine reads a name as written, so `check_access`
+    decides a table reference only there and otherwise says how to write it
+    (`authz_guard.not_read_as_written`, M223). This paragraph once said the as-typed comparison
+    could only refuse; on Oracle, with a quoted `sales` granted beside SALES, it approved the
+    unquoted spelling, which reads SALES. Column names on Postgres and Oracle are still compared
+    as typed, which refuses `id` for a stored `ID` (the register's M170 remainder).
     """
     return resolve(name, quoted=False, dialect=dialect)

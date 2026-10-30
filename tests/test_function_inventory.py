@@ -1459,7 +1459,7 @@ class _LinkAliasSource:
         return list(self._aliases)
 
     def list_columns(self):
-        return [("dbl_claim", "id", "NUMBER")]
+        return [("DBL_CLAIM", "id", "NUMBER")]
 
 
 def test_an_unresolvable_alias_reaches_the_DECISION_not_just_the_inventory():
@@ -1472,7 +1472,7 @@ def test_an_unresolvable_alias_reaches_the_DECISION_not_just_the_inventory():
     inv = inventory_from(source)
     assert inv.names == frozenset() and inv.unresolvable == frozenset({"add_days"})
 
-    verdict = decide("SELECT add_days(1) AS x FROM dbl_claim", {"dbl_claim": {"id"}},
+    verdict = decide("SELECT add_days(1) AS x FROM DBL_CLAIM", {"DBL_CLAIM": {"id"}},
                      adapter=source, dialect="oracle", target="oracle")
     assert getattr(verdict, "code", None) is not None, f"APPROVED the call: {verdict}"
     assert verdict.code.value == "unmodelled_call", verdict
@@ -1494,7 +1494,7 @@ def test_a_source_that_CANNOT_SAY_refuses_rather_than_clearing():
     assert inv.asked and not inv.available, inv
     assert inv.reason == "RuntimeError", inv.reason  # the TYPE, never the message (M94)
 
-    verdict = decide("SELECT add_days(1) AS x FROM dbl_claim", {"dbl_claim": {"id"}},
+    verdict = decide("SELECT add_days(1) AS x FROM DBL_CLAIM", {"DBL_CLAIM": {"id"}},
                      adapter=source, dialect="oracle", target="oracle")
     # THE SPECIFIC CODE. `_LinkAliasSource` has no `execute`, so a statement the inventory
     # CLEARS still ends in `explain_failed` -- measured. Asserting only "some refusal" was
@@ -1504,7 +1504,7 @@ def test_a_source_that_CANNOT_SAY_refuses_rather_than_clearing():
 
     # The control that proves the assertion above discriminates: with nothing unresolvable the
     # inventory clears the call and the stub's missing `execute` is what refuses instead.
-    cleared = decide("SELECT add_days(1) AS x FROM dbl_claim", {"dbl_claim": {"id"}},
+    cleared = decide("SELECT add_days(1) AS x FROM DBL_CLAIM", {"DBL_CLAIM": {"id"}},
                      adapter=_LinkAliasSource(aliases=()), dialect="oracle", target="oracle")
     assert cleared.code.value == "explain_failed", cleared
 

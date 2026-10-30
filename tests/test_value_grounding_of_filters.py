@@ -273,9 +273,67 @@ def test_a_date_only_string_against_a_timestamp_column_is_unchecked():
     for sql in ("SELECT id FROM claim WHERE ts = '2024-03-03'",
                 "SELECT id FROM claim WHERE ts IN ('2024-03-03', '2024-03-04')",
                 "SELECT id FROM claim WHERE ts BETWEEN '2024-03-03' AND '2024-03-03'",
-                "SELECT id FROM claim WHERE ts >= '2031-01-01'",
                 "SELECT id FROM claim WHERE tz = '2024-03-03'"):
         assert {o for _, o, _, _ in _read(sql)} == {UNCHECKED}, sql
+
+
+def test_the_half_open_premise_measured_on_duckdb():
+    """A date-only string against a TIMESTAMP column is midnight. As the inclusive start or the
+    exclusive end of a range that is what the range means, and the day is counted whole; as an
+    inclusive end it drops the day's hours."""
+    import duckdb
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE t (ts TIMESTAMP)")
+    con.execute("INSERT INTO t VALUES ('2024-03-03 10:00:00')")
+    count = lambda where: con.execute(f"SELECT count(*) FROM t WHERE {where}").fetchone()[0]  # noqa: E731
+    assert count("ts >= '2024-03-03' AND ts < '2024-03-04'") == 1
+    assert count("'2024-03-03' <= ts AND '2024-03-04' > ts") == 1
+    assert count("ts >= '2024-03-03' AND ts <= '2024-03-03'") == 0
+    assert count("ts BETWEEN '2024-03-03' AND '2024-03-03'") == 0
+    assert count("ts > '2024-03-03'") == 1  # "after the 3rd" that keeps the 3rd's hours
+
+
+def test_a_date_only_string_bounding_a_timestamp_half_open_is_a_bound():
+    """The inclusive start (`>=`) or the exclusive end (`<`) of a range on a naive TIMESTAMP column,
+    written on either side: an empty result there is honest, so the date is a bound."""
+    for sql in ("SELECT id FROM claim WHERE ts >= '2024-03-03' AND ts < '2024-03-04'",
+                "SELECT id FROM claim WHERE '2024-03-03' <= ts AND '2024-03-04' > ts",
+                "SELECT id FROM claim WHERE ts >= '2031-01-01'",
+                "SELECT id FROM claim WHERE ts < '1990-01-01'"):
+        assert {(o, w) for _, o, w, _ in _read(sql)} == {(TYPED, "")}, sql
+
+
+def test_a_date_only_string_that_misreads_a_day_on_a_timestamp_stays_unchecked():
+    """An inclusive end (`<=`, BETWEEN) drops the day's hours, an exclusive start (`>`) keeps them,
+    and `=`, `<>` and IN compare with midnight alone."""
+    for sql in ("SELECT id FROM claim WHERE ts <= '2024-03-03'",
+                "SELECT id FROM claim WHERE ts > '2024-03-03'",
+                "SELECT id FROM claim WHERE '2024-03-03' >= ts",
+                "SELECT id FROM claim WHERE '2024-03-03' < ts",
+                "SELECT id FROM claim WHERE ts BETWEEN '2024-03-03' AND '2024-03-04'",
+                "SELECT id FROM claim WHERE ts = '2024-03-03'",
+                "SELECT id FROM claim WHERE ts <> '2024-03-03'",
+                "SELECT id FROM claim WHERE ts IN ('2024-03-03')"):
+        assert {(o, w) for _, o, w, _ in _read(sql)} == {(UNCHECKED, "date_on_time")}, sql
+
+
+def test_a_half_open_date_on_a_zone_aware_or_a_time_column_stays_unchecked():
+    """On TIMESTAMPTZ a date-only string is midnight in the session's zone, so where its day starts
+    is the session's, not the question's; a TIME column holds no day at all."""
+    for sql in ("SELECT id FROM claim WHERE tz >= '2024-03-03'",
+                "SELECT id FROM claim WHERE tz < '2024-03-04'",
+                "SELECT id FROM claim WHERE at < '2024-03-04'"):
+        assert {o for _, o, _, _ in _read(sql)} == {UNCHECKED}, sql
+
+
+def test_a_half_open_bound_is_a_plain_date_string_against_a_bare_column_only():
+    """A DATE literal, a cast column or an engine that compares a date string as text keeps the
+    rule as it was."""
+    for sql, dialect in (("SELECT id FROM claim WHERE ts >= DATE '2024-03-03'", "duckdb"),
+                         ("SELECT id FROM claim WHERE CAST(ts AS TIMESTAMP) >= '2024-03-03'", "duckdb"),
+                         ("SELECT id FROM claim WHERE ts >= '2024-03-03'", "sqlite")):
+        assert {o for _, o, _, _ in _read(sql, dialect=dialect)} == {UNCHECKED}, (sql, dialect)
 
 
 def test_a_date_only_string_against_a_time_column_is_unchecked():
@@ -617,3 +675,131 @@ def test_the_answered_note_cuts_a_long_filter_and_says_so():
     assert note.endswith("... (cut at 300 characters; the SQL shown with this answer has them "
                          "whole).")
     assert len(note) < 420
+
+
+# --- a value the index could not check, asked of the source -------------------------------------
+
+def test_a_not_indexed_value_records_the_column_it_is_compared_with():
+    g = _ground("SELECT id FROM claim WHERE adjuster IN ('agent_0042', 'agnet_0042')")
+    assert [(v.text, v.why, v.placed) for v in g.values] == [
+        ("agent_0042", "not_indexed", ("claim", "adjuster")),
+        ("agnet_0042", "not_indexed", ("claim", "adjuster"))]
+
+
+def test_only_a_not_indexed_value_carries_a_column_to_ask():
+    """Masked, row-filtered, pattern, range, expression and date values are never asked: what a
+    mask or a row filter withholds is whether a value exists, and the others are no equality."""
+    for sql, kw in (("SELECT id FROM claim WHERE status = 'open'",
+                     {"masks": lambda t, c: c == "status"}),
+                    ("SELECT id FROM claim WHERE adjuster = 'agent_0042'", {"row_filtered": {"claim"}}),
+                    ("SELECT id FROM claim WHERE adjuster LIKE 'agn%'", {}),
+                    ("SELECT id FROM claim WHERE adjuster > 'a'", {}),
+                    ("SELECT id FROM claim WHERE lower(adjuster) = 'x'", {}),
+                    ("SELECT id FROM claim WHERE ts = '2024-03-03'", {})):
+        assert [v.placed for v in _ground(sql, **kw).values] == [None], sql
+
+
+def test_the_source_grounds_or_rules_out_a_value_and_a_silent_source_changes_nothing():
+    from mnemiq.sql.values_check import confirm_by_source
+
+    asked = []
+
+    def holds(table, column, text):
+        asked.append((table, column, text))
+        return {"agent_0042": True, "agnet_0042": False}.get(text)
+
+    g = _ground("SELECT id FROM claim WHERE adjuster IN ('agent_0042', 'agnet_0042', 'quiet') "
+                "AND status = 'open' AND note LIKE 'x%'")
+    read = [(v.text, v.outcome, v.why) for v in confirm_by_source(g, holds).values]
+    assert read == [("agent_0042", GROUNDED, "probed"), ("agnet_0042", ABSENT, "probed"),
+                    ("quiet", UNCHECKED, "not_indexed"), ("open", GROUNDED, ""),
+                    ("x%", UNCHECKED, "pattern")]
+    assert asked == [("claim", "adjuster", "agent_0042"), ("claim", "adjuster", "agnet_0042"),
+                     ("claim", "adjuster", "quiet")]
+
+
+def test_a_value_is_asked_once_and_at_most_the_limit_are_asked():
+    from mnemiq.sql.values_check import confirm_by_source
+
+    asked = []
+
+    def holds(table, column, text):
+        asked.append(text)
+        return True
+
+    many = ", ".join(f"'a{i}'" for i in range(12))
+    g = _ground(f"SELECT id FROM claim WHERE adjuster IN ('a0', {many})")
+    out = confirm_by_source(g, holds, limit=8)
+    assert asked == [f"a{i}" for i in range(8)]
+    assert [v.outcome for v in out.values] == [GROUNDED] * 9 + [UNCHECKED] * 4
+
+
+def test_the_probe_quotes_the_stored_names_and_escapes_the_value():
+    from mnemiq.sql.values_check import probe_sql
+
+    assert probe_sql("claim", "adjuster", "O'Brien", "duckdb") == (
+        "SELECT 1 FROM \"claim\" WHERE \"adjuster\" = 'O''Brien' LIMIT 1")
+    assert probe_sql("CLAIM", "ADJUSTER", "x", "oracle") == (
+        "SELECT 1 FROM \"CLAIM\" WHERE \"ADJUSTER\" = 'x' FETCH FIRST 1 ROWS ONLY")
+    assert probe_sql("claim", "adjuster", "x", "mysql") == (
+        "SELECT 1 FROM `claim` WHERE `adjuster` = 'x' LIMIT 1")
+    # A dotted name stays one name: split, "a.b" would read table b in schema a, unchecked.
+    assert probe_sql("a.b", "c", "x", "duckdb") == "SELECT 1 FROM \"a.b\" WHERE \"c\" = 'x' LIMIT 1"
+
+
+def test_the_source_answers_found_missing_or_nothing(tmp_path):
+    import duckdb
+
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+    from mnemiq.sql.values_check import source_holds
+
+    path = str(tmp_path / "s.duckdb")
+    con = duckdb.connect(path)
+    con.execute("CREATE TABLE claim_raw (adjuster VARCHAR)")
+    con.execute("INSERT INTO claim_raw VALUES ('agent_0042'), ('O''Brien')")
+    con.close()
+    holds = source_holds(DuckDBAdapter.duckdb(path), "duckdb", {"claim": "claim_raw"}, timeout_s=10)
+    assert holds("claim", "adjuster", "agent_0042") is True
+    assert holds("claim", "adjuster", "O'Brien") is True  # through its physical name, escaped
+    assert holds("claim", "adjuster", "agnet_0042") is False
+    assert holds("claim", "no_such_column", "x") is None  # a failed probe says nothing
+
+
+def test_a_table_stored_with_a_dot_is_probed_as_itself_not_as_a_schema_and_a_table(tmp_path):
+    """The probed object must be the checked one: a table stored as "a.b", with a table b in a schema
+    a behind it holding the value, is asked as "a.b" and answers for itself."""
+    import duckdb
+
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+    from mnemiq.sql.values_check import source_holds
+
+    path = str(tmp_path / "s.duckdb")
+    con = duckdb.connect(path)
+    con.execute('CREATE TABLE "a.b" (c VARCHAR)')
+    con.execute("INSERT INTO \"a.b\" VALUES ('mine')")
+    con.execute("CREATE SCHEMA a")
+    con.execute("CREATE TABLE a.b (c VARCHAR)")
+    con.execute("INSERT INTO a.b VALUES ('twin_only')")
+    con.close()
+    holds = source_holds(DuckDBAdapter.duckdb(path), "duckdb", {}, timeout_s=10)
+    assert holds("a.b", "c", "mine") is True
+    assert holds("a.b", "c", "twin_only") is False
+
+
+def test_a_failed_probe_logs_neither_the_value_nor_its_sql(tmp_path, caplog):
+    """The value may sit on a column the index skipped as personal data, and the source's error text
+    quotes the statement: a log line keeps the table, the column and the kind of failure only."""
+    import logging
+
+    import duckdb
+
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+    from mnemiq.sql.values_check import source_holds
+
+    path = str(tmp_path / "s.duckdb")
+    duckdb.connect(path).close()
+    caplog.set_level(logging.DEBUG)
+    holds = source_holds(DuckDBAdapter.duckdb(path), "duckdb", {}, timeout_s=10)
+    assert holds("patient", "national_id", "secret-4711") is None  # no such table: no answer
+    assert "patient.national_id" in caplog.text
+    assert "secret-4711" not in caplog.text and "SELECT 1" not in caplog.text

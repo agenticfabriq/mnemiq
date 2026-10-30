@@ -20,6 +20,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
+from tests.stored_names import as_stored, keyed, policy_keyed
 
 GRANTED = {"claim": {"id", "amount", "secret"}}
 HIDDEN = {"claim": {"id", "amount"}}
@@ -35,7 +36,10 @@ def con():
 
 
 def _decide(sql, visible, engine, policy=None):
-    return decide(sql, visible, dialect=engine, target=engine, policy=policy)
+    # Each table spelled as the engine stores it unquoted (M223): Oracle's catalog lists CLAIM.
+    policy = policy_keyed(policy, engine, "claim", "other") if policy is not None else None
+    return decide(as_stored(sql, engine, "claim", "other"), keyed(visible, engine, "claim", "other"),
+                  dialect=engine, target=engine, policy=policy)
 
 
 # M170 on DuckDB: a granted column spelled in another case, a quoted alias met by its bare

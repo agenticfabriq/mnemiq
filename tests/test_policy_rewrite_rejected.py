@@ -199,26 +199,26 @@ def test_on_oracle_the_parse_proof_tells_the_policy_s_part_apart():
     adapter = OracleAdapter(dsn=DSN, user=user, password=password)
     try:
         def decided(sql, row_filter, *stale_columns):
-            names = [("m158_claim", "id"), ("m158_claim", "amount"), ("m158_entitlement", "id"),
-                     ("m158_entitlement", "who"), *stale_columns]
+            names = [("M158_CLAIM", "id"), ("M158_CLAIM", "amount"), ("M158_ENTITLEMENT", "id"),
+                     ("M158_ENTITLEMENT", "who"), *stale_columns]
             snapshot = Snapshot(version="v1", source_id="s", created_at="2026-10-15T00:00:00Z",
                                 columns=[Column(id=f"{t}.{c}", object_id=t, name=c)
                                          for t, c in names])
-            grants = GrantSet(frozenset({"m158_claim"}), row_filters={"m158_claim": row_filter})
+            grants = GrantSet(frozenset({"M158_CLAIM"}), row_filters={"M158_CLAIM": row_filter})
             return decide(sql, visible_schema(snapshot, grants), adapter=adapter,
                           dialect="oracle", target="oracle",
                           policy=build_access_policy(snapshot, grants))
 
-        whom = ("m158_entitlement", "whom")
-        status = ("m158_claim", "status")
-        stale = "id IN (SELECT id FROM m158_entitlement WHERE whom = 'r')"
-        current = "id IN (SELECT id FROM m158_entitlement WHERE who = 'r')"
-        assert isinstance(decided("SELECT id FROM m158_claim", current), Approved), "control"
+        whom = ("M158_ENTITLEMENT", "whom")
+        status = ("M158_CLAIM", "status")
+        stale = "id IN (SELECT id FROM M158_ENTITLEMENT WHERE whom = 'r')"
+        current = "id IN (SELECT id FROM M158_ENTITLEMENT WHERE who = 'r')"
+        assert isinstance(decided("SELECT id FROM M158_CLAIM", current), Approved), "control"
         for policy, columns in ((stale, (whom,)), (current, (status,))):
-            refused = decided("SELECT id FROM m158_claim", policy, *columns)
+            refused = decided("SELECT id FROM M158_CLAIM", policy, *columns)
             assert isinstance(refused, Refusal), (policy, columns, refused)
             assert refused.code is RefusalCode.POLICY_REWRITE_REJECTED, (policy, columns)
-        on_its_own = decided("SELECT status FROM m158_claim", stale, whom, status)
+        on_its_own = decided("SELECT status FROM M158_CLAIM", stale, whom, status)
         assert isinstance(on_its_own, Refusal) and on_its_own.code is RefusalCode.EXPLAIN_FAILED
     finally:
         adapter.close()

@@ -21,6 +21,7 @@ from mnemiq.sql.reading import LostTryCast, dotted_map_keys, unprintable
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import body_of
+from tests.stored_names import as_stored, keyed, stored
 
 VISIBLE = {"claim": {"id", "region", "tags", "x"}, "sink": {"i", "s"}}
 
@@ -140,16 +141,18 @@ def test_a_map_key_the_target_cannot_print_is_refused_not_raised():
     # ValueError out of both deciders for those targets. The plan is refused, repairably, and a
     # string key prints as before; the write path the same.
     for target in ("postgres", "oracle"):
+        visible, sink = keyed(VISIBLE, target, "claim", "sink"), stored("sink", target)
         for sql in ('SELECT list_transform(tags, "x.secret" -> map_keys(MAP {"x.secret": 1})[1]) FROM claim',
                     "SELECT list_transform(tags, x -> MAP {x: 1}[x]) FROM claim",
                     "SELECT MAP {region: 1}[region] FROM claim"):
-            verdict = decide(sql, VISIBLE, dialect="duckdb", target=target)
+            verdict = decide(as_stored(sql, target, "claim"), visible, dialect="duckdb", target=target)
             assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNPRINTABLE_FOR_TARGET, (target, sql, verdict)
             assert verdict.repairable and target in verdict.message and "MAP literal" in verdict.message, verdict
-        verdict = decide("SELECT MAP {'a': 1}['a'] FROM claim", VISIBLE, dialect="duckdb", target=target)
+        verdict = decide(as_stored("SELECT MAP {'a': 1}['a'] FROM claim", target, "claim"), visible,
+                         dialect="duckdb", target=target)
         assert isinstance(verdict, Approved), verdict
-        grants = GrantSet(frozenset(VISIBLE), writable=frozenset({"sink"}))
-        verdict = decide_write("UPDATE sink SET s = 'b' WHERE MAP {i: 1}[i] = 1", VISIBLE, grants, adapter=_OkAdapter(),
+        grants = GrantSet(frozenset(visible), writable=frozenset({sink}))
+        verdict = decide_write(f"UPDATE {sink} SET s = 'b' WHERE MAP {{i: 1}}[i] = 1", visible, grants, adapter=_OkAdapter(),
                                dialect="duckdb", target=target, writes_enabled=True, policy=AccessPolicy())
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNPRINTABLE_FOR_TARGET, (target, verdict)
 

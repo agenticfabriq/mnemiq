@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 
 from mnemiq.agent.budget import Budget
 from mnemiq.agent.synthesize import Synthesizer
@@ -40,9 +41,15 @@ from mnemiq.generate.generator import Generator, StrategyGenerator
 from mnemiq.generate.plan_query import Deferred, Feedback, plan_query
 from mnemiq.semantic.retrieval import ContextPacket
 from mnemiq.sql.verdict import Approved
-from mnemiq.verify.sanity import answered_note, sanity_check
+from mnemiq.sql.values_check import confirm_by_source, source_holds
+from mnemiq.verify.sanity import answered_note, grounding_decides, sanity_check
 
 logger = logging.getLogger(__name__)
+
+# The most the probes of filter values may take in one turn, together (`Agent._confirmed`): an
+# equality on a column the source has no index for can scan its table, and a probe not asked or
+# not answered only keeps its value unchecked, the empty result declined.
+PROBE_BUDGET_S = 10.0
 
 # Cycled across candidates in multi-candidate mode: engineered disagreement, so the
 # selector has something real to select over (uniform resampling measured 56% unanimous).
@@ -323,6 +330,7 @@ class Agent:
         # needs that because the model is shown the feedback and its own words reach the caller,
         # so the two together form a path back out for whatever the source said.
         feedback: Feedback | None = None
+        held: dict = {"spent_s": 0.0}  # what the source said about a filter value, asked once a turn
         failure: ExecutionError | None = None
 
         for _attempt in range(self.budget.max_attempts):
@@ -359,6 +367,7 @@ class Agent:
             if hit is not None:
                 table = from_ipc(hit)
                 with step(emit, Stage.VERIFY, cached=True):
+                    approved = self._confirmed(approved, table, snapshot, held)
                     blocked, verdict = self._verified(packet, approved, table)
                 if blocked is not None:
                     return blocked
@@ -405,6 +414,7 @@ class Agent:
 
             self.cache.put(key, to_ipc(result.table))
             with step(emit, Stage.VERIFY):
+                approved = self._confirmed(approved, result.table, snapshot, held)
                 blocked, verdict = self._verified(packet, approved, result.table)
             if blocked is not None:
                 return blocked
@@ -485,6 +495,7 @@ class Agent:
         # undefined-term deferral, which is a finding about the question rather than about the
         # candidate, and is carried out below rather than outvoted.
         executed: list[tuple[Approved, object]] = []
+        held: dict = {"spent_s": 0.0}  # what the source said about a filter value, asked once a turn
         undefined: Deferred | None = None
         for i in range(self.candidates):
             # seed_offset: a candidate that repeats an earlier one's strategy -- the fourth and
@@ -549,7 +560,7 @@ class Agent:
                                        candidates_executed=len(executed),
                                        narrowed=_narrowed_of(executed))
             if table is not None:
-                executed.append((outcome, table))
+                executed.append((self._confirmed(outcome, table, snapshot, held), table))
 
         if undefined is not None:
             # Before the vote and before the fallback: one candidate that could not ground a term
@@ -670,6 +681,35 @@ class Agent:
             if sanity_check(packet.question, table, getattr(approved, "value_grounding", None)) is None:
                 return approved, table
         return members[0]
+
+    def _confirmed(self, approved: Approved, table, snapshot: Snapshot, held: dict) -> Approved:
+        """`approved` with each filter value the value index could not check asked of the source,
+        where the sanity layer decides on the grounding: an empty result, or one NULL row from
+        aggregates over nothing. Found is grounded and missing is absent; unanswered stays unchecked
+        (`confirm_by_source`). Only a not_indexed value is ever asked, never one on a masked column
+        or a row-filtered table, whose existence those withhold. `held` keeps the answers for the
+        turn, so the candidates of a vote ask the source once between them, and the time spent,
+        so the turn's probes stop at `PROBE_BUDGET_S`."""
+        grounding = getattr(approved, "value_grounding", None)
+        if (grounding is None or not getattr(self.verifier, "sanity", False)
+                or not any(v.placed for v in grounding.values) or not grounding_decides(table)):
+            return approved
+        physical = {b.object_id: b.source_object for b in snapshot.source_bindings}
+        def holds(table_name: str, column: str, text: str) -> bool | None:
+            key = (table_name, column, text)
+            if key not in held:
+                left = PROBE_BUDGET_S - held["spent_s"]
+                if left <= 0:
+                    return None  # not kept: a later turn may ask it
+                started = time.monotonic()
+                held[key] = source_holds(self.adapter, self.dialect, physical,
+                                         min(self.timeout_s, left))(*key)
+                held["spent_s"] += time.monotonic() - started
+                # The column and the verdict, never the value: a log is no place for the data.
+                logger.info("asked the source whether %s.%s holds a filter value: %s", table_name,
+                            column, {True: "found", False: "missing", None: "no answer"}[held[key]])
+            return held[key]
+        return replace(approved, value_grounding=confirm_by_source(grounding, holds))
 
     def _verified(self, packet: ContextPacket, approved: Approved, table):
         """The verifier's read, or None when none is wired. Returns (deferral, verdict).

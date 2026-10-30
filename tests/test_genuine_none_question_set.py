@@ -9,8 +9,9 @@ before the rule it measures was run against it.
 - **20 genuine "none" questions.** The SQL is the right SQL and the true answer is empty (or, for
   a total or a maximum, one NULL; one is a count, which was answered before). Asserted against the
   data, not assumed. The expected outcome is pre-registered per case and per engine, including the
-  honest residual: a "none" filtered on a value the index does not cover stays declined, as does a
-  text date range where the column holds text.
+  honest residual: a text date range where the column holds text stays declined. A "none" filtered
+  on a value the index does not cover was declined too, until the source was asked about such a
+  value (2026-10-29): N19 and N20 were pre-registered declined, and are answered since.
 - **20 misspelled-value controls.** A wrong value -- a typo, a case slip, a missing accent, a date
   in the wrong format -- whose intended spelling has rows (asserted), so "none" would be a wrong
   answer. Every one must stay declined: before the run where the index covers the column (`check_
@@ -126,13 +127,14 @@ CASES = [
     Case("N18", "none", "How many customers in Germany are in segment B?",
          "SELECT count(*) AS n FROM customer WHERE country = 'Germany' AND segment_cd = 'B'",
          _both(A)),
-    # --- genuine "none" on a value the index does not cover: the honest residual -----------------
+    # --- genuine "none" on a value the index does not cover: the residual until the source was asked
+    # about such a value (2026-10-29), when both turned from declined to answered ---------------
     Case("N19", "none", "Which Dry goods did Harrow Provisions order?",
          f"SELECT p.name {_J} WHERE c.name = 'Harrow Provisions' AND p.category = 'Dry goods'",
-         _both(D)),
+         _both(A)),
     Case("N20", "none", "Which Enterprise-segment customers are in Germany?",
          "SELECT c.name FROM customer c JOIN segment_lookup s ON s.segment_cd = c.segment_cd "
-         "WHERE s.segment_name = 'Enterprise' AND c.country = 'Germany'", _both(D)),
+         "WHERE s.segment_name = 'Enterprise' AND c.country = 'Germany'", _both(A)),
     # --- controls: a misspelled value whose intended spelling has rows ---------------------------
     Case("C01", "control", "Which orders did Aurora Bakehouse place?",
          "SELECT ol.order_id FROM order_line ol JOIN customer c ON c.customer_id = ol.customer_id "

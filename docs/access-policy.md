@@ -38,6 +38,8 @@ A role given as a list grants read access to those tables. A role given as an ob
 
 An identity holding several roles may read every table any of them grants. Two roles filtering the same table combine with `OR`. A filter one role sets still applies when another role grants the same table without one.
 
+**Name a table as the source stores it.** Oracle stores an unquoted `customer` as `CUSTOMER` and Postgres stores an unquoted `Customer` as `customer`, so that is the spelling a grant and the snapshot use. The deciders approve a table only where the engine reads it as a name the identity holds, written as it is stored. On Oracle, `FROM customer` against a grant on `CUSTOMER` is refused with the spelling to write instead. A grant on a quoted lowercase `customer` is read only by `FROM "customer"`, since Oracle reads the unquoted name as `CUSTOMER`, which may be another table.
+
 ## Row filters
 
 **A filter is a predicate on its own table.** It may read another table only inside a subquery, as `rental` and `payment` do above. That subquery is resolved against the whole source, not against the caller's grants: an entitlements table is the usual case, and the caller is never granted one.

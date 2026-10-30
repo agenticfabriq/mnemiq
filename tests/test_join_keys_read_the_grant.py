@@ -11,10 +11,22 @@ import duckdb
 import pytest
 
 from mnemiq.authz.grants import GrantSet
-from mnemiq.sql.decide import decide
+from mnemiq.sql.decide import decide as _decide_as_given
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
+from tests.stored_names import as_stored, keyed, policy_keyed
+
+TABLES = ("claim", "pair", "one", "sink", "w")
+
+
+def decide(sql, visible, *, dialect="duckdb", target="postgres", policy=None, **kwargs):
+    """`decide`, each table spelled as the target stores it unquoted (M223): on Oracle a grant
+    keys CLAIM, and a statement reads it as CLAIM. A quoted name is left as written."""
+    policy = policy_keyed(policy, target, *TABLES) if policy is not None else None
+    return _decide_as_given(as_stored(sql, target, *TABLES), keyed(visible, target, *TABLES),
+                            dialect=dialect, target=target, policy=policy, **kwargs)
+
 
 SCHEMA = {"claim": {"id", "secret"}, "pair": {"id", "secret"}, "one": {"secret"}, "sink": {"i", "s"}, "w": {"id"}}
 HIDDEN = {"claim": {"id"}, "pair": {"id"}, "one": set(), "sink": {"i", "s"}, "w": {"id"}}

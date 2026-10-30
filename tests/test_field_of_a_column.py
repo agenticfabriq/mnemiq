@@ -10,6 +10,7 @@ or an Oracle JSON one, the field reads below were approved and returned the valu
 from __future__ import annotations
 
 import os
+import re
 
 import duckdb
 import pytest
@@ -17,11 +18,23 @@ import sqlglot
 from sqlglot import exp
 
 from mnemiq.authz.grants import GrantSet
-from mnemiq.sql.decide import decide
+from mnemiq.sql.decide import decide as _decide
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.scope import fields_as_members
 from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
+from tests.stored_names import as_stored, keyed, policy_keyed
+
+TABLES = ("claim", "other", "plain")
+
+
+def decide(sql, visible, *, dialect="duckdb", target="postgres", policy=None, **kwargs):
+    """`decide`, each table spelled as the target stores it unquoted (M223): on Oracle a grant
+    keys CLAIM, and a statement reads it as CLAIM."""
+    policy = policy_keyed(policy, target, *TABLES) if policy is not None else None
+    return _decide(as_stored(sql, target, *TABLES), keyed(visible, target, *TABLES),
+                   dialect=dialect, target=target, policy=policy, **kwargs)
+
 
 GRANTED = {"claim": {"id", "amount", "secret"}}
 HIDDEN = {"claim": {"id", "amount"}}
@@ -430,7 +443,7 @@ def test_on_oracle_a_json_column_s_field_is_read_and_now_checked_as_the_column()
     table = "m165_field_probe"
 
     def run(sql):
-        return cur.execute(sql.replace("FROM claim", f"FROM {table}")).fetchall()
+        return cur.execute(re.sub("FROM claim", f"FROM {table}", sql, flags=re.I)).fetchall()  # as written, or as decided (M223)
 
     try:
         try:
@@ -474,7 +487,7 @@ def test_on_oracle_a_colliding_reference_reads_the_field_and_is_refused():
     table, other = "m165_collide_claim", "m165_collide_other"
 
     def run(sql):
-        sql = sql.replace("FROM claim", f"FROM {table}").replace("JOIN other", f"JOIN {other}")
+        sql = re.sub("JOIN other", f"JOIN {other}", re.sub("FROM claim", f"FROM {table}", sql, flags=re.I), flags=re.I)
         return sorted(cur.execute(sql).fetchall())
 
     try:
@@ -509,7 +522,7 @@ def test_on_oracle_a_qualifier_reads_the_outer_source_before_a_nearer_column():
     table, other = "m167_bind_claim", "m167_bind_other"
 
     def run(sql):
-        sql = sql.replace("FROM claim", f"FROM {table}").replace("FROM other", f"FROM {other}")
+        sql = re.sub("FROM other", f"FROM {other}", re.sub("FROM claim", f"FROM {table}", sql, flags=re.I), flags=re.I)
         return cur.execute(sql).fetchall()
 
     try:

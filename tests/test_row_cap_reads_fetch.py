@@ -20,7 +20,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.guard import MAX_ROWS, check_shape
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 
-VISIBLE = {"claim": {"id", "amount"}}
+VISIBLE = {"CLAIM": {"id", "amount"}}
 
 
 def _decide(sql, engine):
@@ -36,7 +36,7 @@ def _decide(sql, engine):
 ])
 def test_a_bound_the_statement_wrote_within_the_cap_is_kept(engine, tail, runs):
     # NULLS LAST: an unguarded descending top-N on Oracle is the logic lint's to refuse (M161).
-    verdict = _decide(f"SELECT id FROM claim ORDER BY amount DESC NULLS LAST {tail}", engine)
+    verdict = _decide(f"SELECT id FROM CLAIM ORDER BY amount DESC NULLS LAST {tail}", engine)
     assert isinstance(verdict, Approved), verdict
     assert verdict.target_sql.endswith(runs), verdict.target_sql
     assert verdict.row_cap is None  # the statement's own bound: no cut to disclose
@@ -44,7 +44,7 @@ def test_a_bound_the_statement_wrote_within_the_cap_is_kept(engine, tail, runs):
 
 def test_fetch_first_row_only_is_one_row_not_the_cap():
     """No count is written, and the clause means one row."""
-    shaped = check_shape("SELECT id FROM claim ORDER BY amount DESC FETCH FIRST ROW ONLY",
+    shaped = check_shape("SELECT id FROM CLAIM ORDER BY amount DESC FETCH FIRST ROW ONLY",
                          dialect="oracle", executes_as="oracle")
     assert not isinstance(shaped, Refusal), shaped
     assert shaped.meta.get("row_cap") is None
@@ -54,7 +54,7 @@ def test_fetch_first_row_only_is_one_row_not_the_cap():
 @pytest.mark.parametrize("engine,tail", [("oracle", "FETCH FIRST 5000 ROWS ONLY"),
                                          ("duckdb", "LIMIT 5000")])
 def test_a_bound_over_the_cap_is_clamped_and_marked(engine, tail):
-    verdict = _decide(f"SELECT id FROM claim ORDER BY amount DESC NULLS LAST {tail}", engine)
+    verdict = _decide(f"SELECT id FROM CLAIM ORDER BY amount DESC NULLS LAST {tail}", engine)
     assert isinstance(verdict, Approved), verdict
     assert verdict.row_cap == MAX_ROWS and str(MAX_ROWS) in verdict.target_sql
 
@@ -66,7 +66,7 @@ def test_a_bound_over_the_cap_is_clamped_and_marked(engine, tail):
     ("duckdb", "LIMIT 1 + 1"),
 ])
 def test_a_bound_with_no_plain_count_is_refused_not_replaced(engine, tail):
-    verdict = _decide(f"SELECT id FROM claim ORDER BY amount DESC {tail}", engine)
+    verdict = _decide(f"SELECT id FROM CLAIM ORDER BY amount DESC {tail}", engine)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNREADABLE_LIMIT, verdict
     assert verdict.repairable  # the same question can always state its bound as a count
     assert f"at most {MAX_ROWS:,}" in verdict.message
@@ -80,7 +80,7 @@ def test_a_bound_with_no_plain_count_is_refused_not_replaced(engine, tail):
 ])
 def test_a_spelling_of_no_bound_takes_the_cap_as_if_none_were_written(dialect, tail, runs):
     """On main SQLite's `LIMIT -1` was kept and ran uncapped (the ui lane's review of #156)."""
-    shaped = check_shape(f"SELECT id FROM claim ORDER BY amount DESC {tail}", dialect=dialect,
+    shaped = check_shape(f"SELECT id FROM CLAIM ORDER BY amount DESC {tail}", dialect=dialect,
                          executes_as=dialect)
     assert not isinstance(shaped, Refusal), shaped
     assert shaped.meta.get("row_cap") == MAX_ROWS
@@ -90,7 +90,7 @@ def test_a_spelling_of_no_bound_takes_the_cap_as_if_none_were_written(dialect, t
 @pytest.mark.parametrize("tail", ["LIMIT -(-5)", "LIMIT -0", "LIMIT -(5 + 1)"])
 def test_a_minus_over_anything_but_a_positive_number_is_refused_in_sqlite(tail):
     """`-(-5)` is five rows and `-0` none: only a negative plain number is SQLite's no bound."""
-    shaped = check_shape(f"SELECT id FROM claim ORDER BY amount DESC {tail}", dialect="sqlite",
+    shaped = check_shape(f"SELECT id FROM CLAIM ORDER BY amount DESC {tail}", dialect="sqlite",
                          executes_as="sqlite")
     assert isinstance(shaped, Refusal) and shaped.code is RefusalCode.UNREADABLE_LIMIT, shaped
 
@@ -99,7 +99,7 @@ def test_a_minus_over_anything_but_a_positive_number_is_refused_in_sqlite(tail):
 def test_a_negative_limit_outside_sqlite_is_refused_not_capped(dialect):
     """Only SQLite reads a negative LIMIT as no bound; elsewhere it is an error the cap must not
     turn into a thousand rows."""
-    shaped = check_shape("SELECT id FROM claim ORDER BY amount DESC LIMIT -1", dialect=dialect,
+    shaped = check_shape("SELECT id FROM CLAIM ORDER BY amount DESC LIMIT -1", dialect=dialect,
                          executes_as=dialect)
     assert isinstance(shaped, Refusal) and shaped.code is RefusalCode.UNREADABLE_LIMIT, shaped
 
@@ -124,11 +124,11 @@ def _share_rewrite(share, p, *, rank=False):
     number = "RANK()" if rank else "ROW_NUMBER()"
     keep = re.sub(r"\bp\b", str(p), share)
     return (f"SELECT id FROM (SELECT id, {number} OVER (ORDER BY amount DESC) AS rn, "
-            f"COUNT(*) OVER () AS total FROM claim) t WHERE {keep}")
+            f"COUNT(*) OVER () AS total FROM CLAIM) t WHERE {keep}")
 
 
 def _ties_rewrite(ties, n):
-    return (f"SELECT id FROM (SELECT id, {ties.replace('...', 'amount DESC')} AS rn FROM claim) t "
+    return (f"SELECT id FROM (SELECT id, {ties.replace('...', 'amount DESC')} AS rn FROM CLAIM) t "
             f"WHERE rn <= {n}")
 
 
@@ -146,11 +146,11 @@ DUCK_ROWS = {"tied": "SELECT i AS id, 1 AS amount FROM range(10) r(i)",
 def test_the_suggested_share_keeps_its_count_of_rows_on_duckdb(rows, p, kept):
     import duckdb
 
-    _, share = _advice(f"SELECT id FROM claim ORDER BY amount DESC LIMIT {p}%", "duckdb")
+    _, share = _advice(f"SELECT id FROM CLAIM ORDER BY amount DESC LIMIT {p}%", "duckdb")
     verdict = _decide(_share_rewrite(share, p), "duckdb")
     assert isinstance(verdict, Approved), verdict
     con = duckdb.connect()
-    con.execute(f"CREATE TABLE claim AS {DUCK_ROWS[rows]}")
+    con.execute(f"CREATE TABLE CLAIM AS {DUCK_ROWS[rows]}")
     assert len(con.execute(verdict.target_sql).fetchall()) == kept, verdict.target_sql
 
 
@@ -170,11 +170,11 @@ def test_on_oracle_the_kept_bound_returns_its_own_count(tail, rows):
         cur = con.cursor()
         # 50 rows from dual, so a bound replaced by the cap returns all 50, not the count.
         # NULLS LAST: an unguarded top-N is the logic lint's to refuse (M161), not this test's.
-        verdict = decide(f"SELECT id FROM claim ORDER BY id DESC NULLS LAST {tail}", {"claim": {"id"}},
+        verdict = decide(f"SELECT id FROM CLAIM ORDER BY id DESC NULLS LAST {tail}", {"CLAIM": {"id"}},
                          dialect="oracle", target="oracle")
         assert isinstance(verdict, Approved), verdict
         sql = verdict.target_sql.replace(
-            "FROM claim", "FROM (SELECT level AS id FROM dual CONNECT BY level <= 50) claim")
+            "FROM CLAIM", "FROM (SELECT level AS id FROM dual CONNECT BY level <= 50) CLAIM")
         assert len(cur.execute(sql).fetchall()) == rows, sql
     finally:
         con.close()
@@ -203,20 +203,20 @@ ORA_ROWS = {"tied": "SELECT level AS id, 1 AS amount FROM dual CONNECT BY level 
 def test_on_oracle_the_suggested_rewrite_returns_what_the_refused_bound_would(rows, tail):
     oracledb = pytest.importorskip("oracledb")
     count = int(re.search(r"FIRST (\d+)", tail).group(1))
-    ties, share = _advice(f"SELECT id FROM claim ORDER BY amount DESC {tail}", "oracle")
+    ties, share = _advice(f"SELECT id FROM CLAIM ORDER BY amount DESC {tail}", "oracle")
     if "PERCENT" in tail:
         rewrite = _share_rewrite(share, count, rank="WITH TIES" in tail)
     else:
         rewrite = _ties_rewrite(ties, count)
     verdict = _decide(rewrite, "oracle")
     assert isinstance(verdict, Approved), verdict
-    data = f"FROM ({ORA_ROWS[rows]}) claim"
+    data = f"FROM ({ORA_ROWS[rows]}) CLAIM"
     con = oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
                            password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"), dsn=DSN)
     try:
         cur = con.cursor()
         written = len(cur.execute(f"SELECT id {data} ORDER BY amount DESC {tail}").fetchall())
-        suggested = len(cur.execute(verdict.target_sql.replace("FROM claim", data)).fetchall())
+        suggested = len(cur.execute(verdict.target_sql.replace("FROM CLAIM", data)).fetchall())
         assert suggested == written, (tail, verdict.target_sql)
     finally:
         con.close()

@@ -37,13 +37,13 @@ def _col(obj: str, name: str) -> Column:
 def _snapshot(prefix: str = "", views=()) -> Snapshot:
     return Snapshot(
         version="v1", source_id="s", created_at="t",
-        columns=[_col(f"{prefix}claim", "id"), _col(f"{prefix}claim", "region"),
+        columns=[_col(f"{prefix}CLAIM", "id"), _col(f"{prefix}CLAIM", "region"),
                  _col(f"{prefix}scratch", "id"), _col(f"{prefix}entitlement", "who")],
         views=list(views),
     )
 
 
-_VISIBLE = {"claim": {"id", "region"}}
+_VISIBLE = {"CLAIM": {"id", "region"}}
 
 
 @pytest.fixture(autouse=True)
@@ -53,8 +53,8 @@ def _fresh_log_memory(monkeypatch):
 
 
 def _read(key: str, snapshot: Snapshot | None = None):
-    grants = GrantSet(frozenset({"claim"}), row_filters={key: _FILTER})
-    return decide("SELECT id FROM claim", _VISIBLE,
+    grants = GrantSet(frozenset({"CLAIM"}), row_filters={key: _FILTER})
+    return decide("SELECT id FROM CLAIM", _VISIBLE,
                   policy=build_access_policy(snapshot or _snapshot(), grants), target="duckdb")
 
 
@@ -66,7 +66,7 @@ def test_a_filter_key_naming_no_table_refuses_the_read_without_naming_the_key(ke
     assert key not in verdict.message
 
 
-@pytest.mark.parametrize("key", ["claim", "Claim", "CLAIM"])
+@pytest.mark.parametrize("key", ["CLAIM", "Claim", "CLAIM"])
 def test_a_key_the_snapshot_holds_still_binds_in_any_case(key):
     """The control, and the fold: unquoted identifiers are case-insensitive in every engine
     mnemiq runs on, so these name the table and the filter applies."""
@@ -79,21 +79,21 @@ def test_a_filter_on_a_real_table_the_role_cannot_read_changes_nothing():
     """The other half of the decision: a key naming an object that exists is not suspicious.
     `entitlement` is in the snapshot and not granted, so its filter is irrelevant and the read of
     `claim` goes ahead as the policy wrote it."""
-    grants = GrantSet(frozenset({"claim"}), row_filters={"entitlement": "who = 'u'"})
+    grants = GrantSet(frozenset({"CLAIM"}), row_filters={"entitlement": "who = 'u'"})
     policy = build_access_policy(_snapshot(), grants)
     assert policy.unknown_filter_targets == frozenset()
-    assert isinstance(decide("SELECT id FROM claim", _VISIBLE, policy=policy, target="duckdb"),
+    assert isinstance(decide("SELECT id FROM CLAIM", _VISIBLE, policy=policy, target="duckdb"),
                       Approved)
 
 
 def test_a_key_naming_a_view_the_snapshot_holds_is_not_unknown():
     """A view is an object the snapshot holds even where none of its columns were recorded."""
-    view = ViewDefinition(object_id="claim_v", definition="SELECT id FROM claim", dialect="duckdb")
+    view = ViewDefinition(object_id="claim_v", definition="SELECT id FROM CLAIM", dialect="duckdb")
     grants = GrantSet(frozenset({"claim_v"}), row_filters={"claim_v": "id > 0"})
     assert build_access_policy(_snapshot(views=[view]), grants).unknown_filter_targets == frozenset()
 
 
-@pytest.mark.parametrize("key,refused", [("claim", True), ("pg.claim", False)])
+@pytest.mark.parametrize("key,refused", [("CLAIM", True), ("pg.claim", False)])
 def test_on_a_federated_snapshot_the_catalog_is_part_of_the_name(key, refused):
     """Federation qualifies every object id with its catalog, so there a bare key is the one
     that names nothing."""
@@ -107,7 +107,7 @@ class _Values:
     """A value index holding `claim.region` = west and east, unfiltered as the real one is."""
 
     def has(self, object_id, column):
-        return (object_id, column) == ("claim", "region")
+        return (object_id, column) == ("CLAIM", "region")
 
     def contains(self, object_id, column, literal):
         return literal in {"west", "east"}
@@ -123,12 +123,12 @@ def test_no_refusal_lists_a_value_while_a_key_is_unknown(target):
     tells it of none. It ran before the M50 check, so `claims` listed `east`, from rows a correct
     `claim` key withholds. The control is the same query under the correct key."""
     def read(key):
-        grants = GrantSet(frozenset({"claim"}), row_filters={key: _FILTER})
-        return decide("SELECT id FROM claim WHERE region = 'nope'", _VISIBLE,
+        grants = GrantSet(frozenset({"CLAIM"}), row_filters={key: _FILTER})
+        return decide("SELECT id FROM CLAIM WHERE region = 'nope'", _VISIBLE,
                       policy=build_access_policy(_snapshot(), grants), target=target,
                       values=_Values())
 
-    control = read("claim")
+    control = read("CLAIM")
     assert control.code is RefusalCode.VALUE_GROUNDING and "east" not in control.message
     verdict = read("claims")
     assert verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
@@ -136,10 +136,10 @@ def test_no_refusal_lists_a_value_while_a_key_is_unknown(target):
 
 
 def test_a_write_is_refused_too():
-    grants = GrantSet(frozenset({"claim", "scratch"}), writable=frozenset({"scratch"}),
+    grants = GrantSet(frozenset({"CLAIM", "scratch"}), writable=frozenset({"scratch"}),
                       row_filters={"public.claim": _FILTER})
-    verdict = decide_write("INSERT INTO scratch (id) SELECT id FROM claim",
-                           {"claim": {"id", "region"}, "scratch": {"id"}}, grants,
+    verdict = decide_write("INSERT INTO scratch (id) SELECT id FROM CLAIM",
+                           {"CLAIM": {"id", "region"}, "scratch": {"id"}}, grants,
                            policy=build_access_policy(_snapshot(), grants), dialect="duckdb",
                            writes_enabled=True)
     assert isinstance(verdict, Refusal), verdict
@@ -148,11 +148,11 @@ def test_a_write_is_refused_too():
 
 def test_the_question_is_deferred_before_any_model_call():
     """Every proposal would be refused identically, so none is asked for."""
-    generator = FakeGenerator(['{"sql": "SELECT id FROM claim"}'])
+    generator = FakeGenerator(['{"sql": "SELECT id FROM CLAIM"}'])
     packet = ContextPacket(question="how many claims?",
-                           cards=[RetrievedCard(object_id="claim", card="TABLE claim", score=1.0)],
+                           cards=[RetrievedCard(object_id="CLAIM", card="TABLE CLAIM", score=1.0)],
                            grant_fingerprint="fp", enrichment_version="v1")
-    grants = GrantSet(frozenset({"claim"}), row_filters={"claims": _FILTER})
+    grants = GrantSet(frozenset({"CLAIM"}), row_filters={"claims": _FILTER})
     outcome = plan_query(packet, _snapshot(), grants, generator, target="duckdb")
     assert isinstance(outcome, Deferred), outcome
     assert outcome.code is DeferralReason.UNGOVERNABLE
@@ -161,7 +161,7 @@ def test_the_question_is_deferred_before_any_model_call():
 
 
 def test_the_key_reaches_the_server_log_once(caplog):
-    grants = GrantSet(frozenset({"claim"}), row_filters={"public.claim": _FILTER})
+    grants = GrantSet(frozenset({"CLAIM"}), row_filters={"public.claim": _FILTER})
     with caplog.at_level(logging.WARNING, logger="mnemiq.sql.policy"):
         build_access_policy(_snapshot(), grants)
         build_access_policy(_snapshot(), grants)
@@ -170,7 +170,7 @@ def test_the_key_reaches_the_server_log_once(caplog):
 
 
 def test_a_snapshot_swap_logs_the_key_again_under_the_new_version(caplog):
-    grants = GrantSet(frozenset({"claim"}), row_filters={"public.claim": _FILTER})
+    grants = GrantSet(frozenset({"CLAIM"}), row_filters={"public.claim": _FILTER})
     swapped = _snapshot().model_copy(update={"version": "v2"})
     with caplog.at_level(logging.WARNING, logger="mnemiq.sql.policy"):
         build_access_policy(_snapshot(), grants)
@@ -183,7 +183,7 @@ def test_two_snapshots_in_use_at_once_log_once_each_and_the_memory_stays_bounded
     """A request in flight across a swap builds against the old version while new ones build
     against the new: alternating must not log on every call, and many swaps must not grow the
     memory without limit."""
-    grants = GrantSet(frozenset({"claim"}), row_filters={"public.claim": _FILTER})
+    grants = GrantSet(frozenset({"CLAIM"}), row_filters={"public.claim": _FILTER})
     v1, v2 = _snapshot(), _snapshot().model_copy(update={"version": "v2"})
     with caplog.at_level(logging.WARNING, logger="mnemiq.sql.policy"):
         for snapshot in (v1, v2, v1, v2, v1):
@@ -195,7 +195,7 @@ def test_two_snapshots_in_use_at_once_log_once_each_and_the_memory_stays_bounded
 
 
 def test_the_boot_advisory_names_the_key(caplog):
-    grants = GrantSet(frozenset({"claim"}), row_filters={"claims": _FILTER})
+    grants = GrantSet(frozenset({"CLAIM"}), row_filters={"claims": _FILTER})
     with caplog.at_level(logging.WARNING, logger="mnemiq.authz.coverage"):
         warn_unknown_filter_targets(grants, _snapshot(), role="manager")
     assert any("'claims'" in r.getMessage() and "manager" in r.getMessage()
@@ -211,7 +211,7 @@ def test_the_boot_advisory_is_wired_into_the_runtime(caplog):
             return ["manager"]
 
         def grants_for(self, identity: IdentityContext) -> GrantSet:
-            return GrantSet(frozenset({"claim"}), row_filters={"claims": _FILTER})
+            return GrantSet(frozenset({"CLAIM"}), row_filters={"claims": _FILTER})
 
     with caplog.at_level(logging.WARNING, logger="mnemiq.authz.coverage"):
         _warn_policy_advisories(_Provider(), _snapshot())
