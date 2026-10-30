@@ -11,6 +11,7 @@ the wide one: a match refuses, so the union is never narrower than either. Measu
 from __future__ import annotations
 
 import pytest
+import sqlglot
 
 from mnemiq.sql.decide import decide
 from mnemiq.sql.policy import AccessPolicy
@@ -176,6 +177,45 @@ def test_a_view_walked_clean_near_the_top_still_meets_the_nesting_limit_deeper_d
     assert isinstance(deep, Refusal) and deep.code is RefusalCode.UNRESOLVABLE_VIEW, deep
     shallow = _over_twins("SELECT id FROM x UNION ALL SELECT id FROM c2", "duckdb", chain(2))
     assert isinstance(shallow, Approved), shallow  # the control: one level shorter fits
+
+
+def test_the_query_s_own_spelling_is_folded_as_its_engine_reads_it():
+    # The caller holds an object keyed `ſALES`; Oracle reads the unquoted `ſALES` the query writes
+    # as SALES, a view over the filtered ORDERS. The top of the walk folded ASCII alone, found no
+    # view, and approved (Codex's fifth review of #192). Refused under the query's own spelling.
+    schema = {"orders": {"id"}, "SALES": {"id"}, "ſALES": {"id"}}
+    policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
+    views = {"SALES": ViewDefinition(object_id="SALES", dialect="oracle", definition="SELECT id FROM orders")}
+    verdict = decide("SELECT id FROM ſALES", {"ſALES": {"id"}}, dialect="oracle", target="oracle",
+                     policy=policy, views=views)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
+    assert verdict.subject == "ſALES" and "'SALES'" not in verdict.message, verdict
+
+
+def test_the_inventory_is_folded_once_a_request_not_once_a_reference(monkeypatch):
+    # Every table reference scanned and folded the whole inventory, and every view walked refolded
+    # it to recognise its body's names: 5.5 s at 2,000 views and references (Codex's fifth review
+    # of #192). Counted in folds, which grow with the inventory and the references, not with both.
+    from mnemiq.sql import views as module
+    from mnemiq.sql.identifiers import IdentifierRules
+
+    folds = []
+
+    def rules_for(dialect):
+        real = module_rules_for(dialect)
+        return IdentifierRules(lambda text: folds.append(text) or real.fold(text), real.quoting_preserves_case)
+
+    module_rules_for = module.rules_for
+    monkeypatch.setattr(module, "rules_for", rules_for)
+    n = 300
+    defs = {f"v{i}": "SELECT id FROM safe_table" for i in range(n)}
+    query = " UNION ALL ".join(f"SELECT id FROM v{i}" for i in range(n))
+    schema = {"orders": {"id"}, "safe_table": {"id"}, **{k: {"id"} for k in defs}}
+    views = {k: ViewDefinition(object_id=k, dialect="oracle", definition=d) for k, d in defs.items()}
+    verdict = module.check_views(sqlglot.parse_one(query, read="oracle"), views, {"orders"},
+                                 known=set(schema), granted=set(defs), dialect="oracle")
+    assert verdict is None, verdict
+    assert len(folds) < 40 * n, len(folds)  # one pass of the inventory, not one a reference
 
 
 def test_on_duckdb_a_long_s_view_name_is_still_unknown():

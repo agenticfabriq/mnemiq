@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import functools
 import logging
+from dataclasses import dataclass, field
 
 import sqlglot
 from sqlglot import exp
@@ -246,6 +246,7 @@ def check_views(
     filtered: set[str],
     known: set[str] | None = None,
     granted: set[str] | None = None,
+    dialect: str | None = None,
 ) -> Refusal | None:
     """Refuse a granted view that reads a row-filtered table, and one this engine cannot read.
 
@@ -300,8 +301,11 @@ def check_views(
         )
     # Exact names, case-folded -- never `spellings`, whose bare last segment would let a grant on
     # `sales.customer` name a filtered `public.customer` the caller does not hold.
+    # `dialect` is the engine that runs the statement, which folds the query's own names: a grant
+    # on a quoted `ſALES` passes the grant check, and Oracle reads the unquoted spelling as SALES
+    # (Codex's fifth review of #192).
     return _walk(ast, views, filtered, known, (), 0, "", "",
-                 {g.lower() for g in granted} if granted else set(), None, {})
+                 {g.lower() for g in granted} if granted else set(), dialect, _Request(views, known))
 
 
 def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
@@ -314,7 +318,7 @@ def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
 
 
 def _views_read(
-    node: exp.Table, views: dict[str, ViewDefinition], catalog: str, dialect: str | None,
+    node: exp.Table, request: _Request, catalog: str, dialect: str | None,
 ) -> list[tuple[str, ViewDefinition]]:
     """Every view `node` may read, keyed as the inventory keys it: the key the body spells, where
     there is one, first, and then every other key the lowercase or the body's engine folds onto it.
@@ -326,6 +330,7 @@ def _views_read(
     (its second). Walking a view can only refuse, so an inventory that holds two such keys refuses
     a body either would read: the conservative reading, at the cost of a view whose twin reads a
     filtered table."""
+    views = request.views
     name = object_key(node)
     exact = name if name in views else node.name if node.name in views else None
     spelled = {name, node.name}
@@ -354,18 +359,52 @@ def _views_read(
     # And as the body's engine folds (Codex's review of #192). Oracle reads `ſales` as SALES,
     # which `str.lower` keeps apart from `sales`, so the known-object check vouched for a view this
     # lookup never found, and the filtered table behind it went unwalked.
-    wanted = {s.lower() for s in spelled}
-    folded = {_folded(dialect, s) for s in spelled}
-    twins = [k for k in sorted(views)
-             if k != exact and (k.lower() in wanted or _folded(dialect, k) in folded)]
-    return [(k, views[k]) for k in ([exact] if exact is not None else []) + twins]
+    fold = rules_for(dialect).fold
+    folded = request.folded(dialect)
+    twins = {k for s in spelled for k in (*request.by_lower.get(s.lower(), ()), *folded.get(fold(s), ()))}
+    twins.discard(exact)
+    return [(k, views[k]) for k in ([exact] if exact is not None else []) + sorted(twins)]
 
 
-@functools.lru_cache(maxsize=1 << 16)
-def _folded(dialect: str | None, name: str) -> str:
-    """`name` folded as `dialect` folds, remembered: the lookup folds every view key for every
-    table a body reads, and Oracle's fold is a letter-by-letter walk (8 ms for 5,000 keys)."""
-    return rules_for(dialect).fold(name)
+@dataclass
+class _Request:
+    """What one `check_views` call works out once and reads at every table and view it meets: the
+    views walked clean, and the inventory and the known objects indexed by each fold. Walking every
+    fold twin re-walked each shared view once per path to it, 37,448 parses at 40 views (Codex's
+    fourth review of #192), and every table reference scanned and folded the whole inventory, and
+    every view walked refolded it, 5.5 s at 2,000 views (its fifth).
+
+    `clean` is every view walked without a refusal, by the catalog its body's names resolve in, at
+    the deepest depth it did so. A view walked clean at a depth is clean at any depth no deeper,
+    since the nesting limit leaves it more room; a cycle refuses, so nothing on the stack is ever
+    in it."""
+
+    views: dict[str, ViewDefinition]
+    known: set[str] | None
+    clean: dict[tuple[str, str], int] = field(default_factory=dict)
+    by_lower: dict[str, list[str]] = field(default_factory=dict)
+    _by_fold: dict[str | None, dict[str, list[str]]] = field(default_factory=dict)
+    _recognised: dict[str | None, set[str]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for key in self.views:
+            self.by_lower.setdefault(key.lower(), []).append(key)
+
+    def folded(self, dialect: str | None) -> dict[str, list[str]]:
+        """The inventory's keys by their fold in `dialect`."""
+        if dialect not in self._by_fold:
+            fold, index = rules_for(dialect).fold, {}
+            for key in self.views:
+                index.setdefault(fold(key), []).append(key)
+            self._by_fold[dialect] = index
+        return self._by_fold[dialect]
+
+    def recognised(self, dialect: str | None) -> set[str]:
+        """Every spelling of a known object or a view, folded as `dialect` folds."""
+        if dialect not in self._recognised:
+            fold = rules_for(dialect).fold
+            self._recognised[dialect] = spellings(self.known or set(), fold) | spellings(set(self.views), fold)
+        return self._recognised[dialect]
 
 
 def _walk(
@@ -379,19 +418,12 @@ def _walk(
     top: str,
     granted: set[str],
     dialect: str | None,
-    clean: dict[tuple[str, str], int],
+    request: _Request,
 ) -> Refusal | None:
-    # `dialect` is the engine that reads `ast`'s names: a nested body's own view's. None at the
-    # top, where the grant check has already refused any name the caller does not hold exactly.
-    #
-    # `clean` is every view this request has walked without a refusal, by the catalog its body's
-    # names resolve in, at the deepest depth it did so. Walking every fold twin re-walked each
-    # shared view once per path to it: eight twins a level over five levels was 37,448 parses and
-    # 5.4 s (Codex's fourth review of #192). A view walked clean at a depth is clean at any depth
-    # no deeper, since the nesting limit leaves it more room; a cycle refuses, so nothing on the
-    # stack is ever in it.
+    # `dialect` is the engine that reads `ast`'s names: a nested body's own view's, and at the
+    # top the engine that runs the statement (`check_views`).
     for node in ast.find_all(exp.Table):
-        for name, view in _views_read(node, views, catalog, dialect):
+        for name, view in _views_read(node, request, catalog, dialect):
             # The view the query read, named in every refusal below: at the top, as the query
             # spells it, which the grant check has passed. Never an inventory key: a twin the
             # fallback walks may be one the caller does not hold, a quoted "V" beside a granted
@@ -409,7 +441,7 @@ def _walk(
                                f"{here!r} nests views deeper than this engine will resolve.",
                                f"depth {depth} at {name!r}")
             inherited = name.rsplit(".", 1)[0] if "." in name else catalog
-            if clean.get((name, inherited), -1) >= depth:
+            if request.clean.get((name, inherited), -1) >= depth:
                 continue
             body = body_of(view)
             if body is None:
@@ -449,7 +481,7 @@ def _walk(
                 # of a known object, and folding every letter let a known `Ä` vouch for an unknown `ä`
                 # that DuckDB, SQLite and Postgres keep apart (Codex's review of #147, M154).
                 fold = rules_for(view.dialect).fold
-                recognised = spellings(known, fold) | spellings(set(views), fold)
+                recognised = request.recognised(view.dialect)
                 # BOTH sides normalised. Widening only the known set still rejected `public.film`
                 # against a snapshot that keys it `film`: a name is known when ANY of its spellings
                 # matches any recognised one, not when its exact text appears.
@@ -486,8 +518,8 @@ def _walk(
             # The body's own catalog carries into it: a view two levels down is still written in
             # the source's naming, not the federation's.
             nested = _walk(body, views, filtered, known, (*stack, name), depth + 1, inherited, here,
-                           granted, view.dialect, clean)
+                           granted, view.dialect, request)
             if nested is not None:
                 return nested
-            clean[(name, inherited)] = depth
+            request.clean[(name, inherited)] = depth
     return None
