@@ -477,8 +477,13 @@ def test_a_cte_s_binding_is_asked_only_of_a_reference_some_view_could_answer_to(
     from mnemiq.sql import views as module
 
     asked = []
-    real = module.names_a_cte
-    monkeypatch.setattr(module, "names_a_cte", lambda t, *a, **k: asked.append(t.name) or real(t, *a, **k))
+    real = module.cte_binder
+
+    def recording(*args, **kwargs):
+        bound = real(*args, **kwargs)
+        return lambda t: asked.append(t.name) or bound(t)
+
+    monkeypatch.setattr(module, "cte_binder", recording)
     query = "WITH " + ", ".join(f"c{i} AS (SELECT id FROM safe_table)" for i in range(200)) + " SELECT id FROM " + \
         ", ".join(f"c{i}" for i in range(200)) + ", sales"
     defs = {"SALES": ViewDefinition(object_id="SALES", dialect="duckdb", definition="SELECT id FROM safe_table")}
@@ -487,3 +492,46 @@ def test_a_cte_s_binding_is_asked_only_of_a_reference_some_view_could_answer_to(
                                  dialect="duckdb")
     assert verdict is None, verdict
     assert asked == ["sales"], asked
+
+
+def _name_resolutions(monkeypatch) -> list:
+    from mnemiq.sql import scope
+
+    calls = []
+    real = scope.resolve_name
+    monkeypatch.setattr(scope, "resolve_name", lambda *a, **k: calls.append(1) or real(*a, **k))
+    return calls
+
+
+def test_references_to_ctes_named_like_views_resolve_each_cte_name_once(monkeypatch):
+    # Each reference some view could answer to is asked whether a CTE binds it, and each asking
+    # resolved every CTE name in scope again: 2,000 CTEs named like 2,000 views, each read once,
+    # were 4,002,000 resolutions (Codex's fourteenth review of #192).
+    from mnemiq.sql.views import check_views
+
+    n = 400
+    query = "WITH " + ", ".join(f"c{i} AS (SELECT 1 AS id)" for i in range(n)) + " SELECT 1 FROM " + \
+        ", ".join(f"c{i}" for i in range(n))
+    defs = {f"c{i}": ViewDefinition(object_id=f"c{i}", dialect="duckdb", definition="SELECT id FROM orders")
+            for i in range(n)}
+    calls = _name_resolutions(monkeypatch)
+    verdict = check_views(sqlglot.parse_one(query, read="duckdb"), defs, {"orders"}, known={"orders", *defs},
+                          granted=set(defs), dialect="duckdb")
+    assert verdict is None, verdict
+    assert len(calls) < 4 * n, len(calls)
+
+
+def test_a_view_body_s_cte_chain_resolves_each_cte_name_once(monkeypatch):
+    # The same inside a view body, where every reference is asked: one view over a chain of 2,000
+    # CTEs, each reading the one before, was 4,002,001 resolutions (Codex's fourteenth review).
+    from mnemiq.sql.views import check_views
+
+    n = 400
+    body = "WITH c0 AS (SELECT id FROM safe_table), " + \
+        ", ".join(f"c{i} AS (SELECT id FROM c{i - 1})" for i in range(1, n)) + f" SELECT id FROM c{n - 1}"
+    defs = {"v": ViewDefinition(object_id="v", dialect="duckdb", definition=body)}
+    calls = _name_resolutions(monkeypatch)
+    verdict = check_views(sqlglot.parse_one("SELECT id FROM v", read="duckdb"), defs, {"orders"},
+                          known={"orders", "safe_table", "v"}, granted={"v"}, dialect="duckdb")
+    assert verdict is None, verdict
+    assert len(calls) < 4 * n, len(calls)

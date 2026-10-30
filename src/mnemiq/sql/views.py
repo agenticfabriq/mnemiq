@@ -10,7 +10,7 @@ from mnemiq.contract import ViewDefinition
 from mnemiq.sql.identifiers import rules_for
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys
-from mnemiq.sql.scope import cte_references, names_a_cte
+from mnemiq.sql.scope import cte_binder, cte_references
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
 # A view nested deeper than this is either a cycle the stack missed or a schema nobody should
@@ -318,7 +318,7 @@ def check_views(
     # which let a grant on `ä` name a filtered `Ä`.
     return _walk(ast, views, filtered, known, (), 0, "", "",
                  set(granted) if granted else set(), _Request(views, known, filtered),
-                 lambda t: names_a_cte(t, dialect))
+                 cte_binder(dialect))
 
 
 def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
@@ -439,9 +439,10 @@ def _walk(
     bound,
 ) -> Refusal | None:
     for node in ast.find_all(exp.Table):
-        # Asked only of a reference some view could answer to: asking costs a walk of every CTE in
-        # scope, and asked of every reference 2,000 CTEs were 4,004,001 name resolutions with no
-        # view at all (Codex's thirteenth review of #192).
+        # Asked only of a reference some view could answer to, and through one binder for the
+        # whole tree: asked of every reference, each asking resolving every CTE in scope again,
+        # 2,000 CTEs were 4,004,001 name resolutions with no view at all (Codex's thirteenth
+        # review of #192), and 4,002,000 with a view named like each (its fourteenth).
         if any(b in request.by_coarse for b in _buckets(node, catalog)) and bound(node):
             continue
         for name, view in _unwalked(node, request, catalog, depth):
