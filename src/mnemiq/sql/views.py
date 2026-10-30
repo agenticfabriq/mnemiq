@@ -306,10 +306,11 @@ def check_views(
                 "reachable; this is not a limit on your grants."
             ),
         )
-    # Exact names, case-folded -- never `spellings`, whose bare last segment would let a grant on
-    # `sales.customer` name a filtered `public.customer` the caller does not hold.
+    # Exact names -- never `spellings`, whose bare last segment would let a grant on
+    # `sales.customer` name a filtered `public.customer` the caller does not hold, nor folded,
+    # which let a grant on `ä` name a filtered `Ä`.
     return _walk(ast, views, filtered, known, (), 0, "", "",
-                 {g.lower() for g in granted} if granted else set(), _Request(views, known, filtered))
+                 set(granted) if granted else set(), _Request(views, known, filtered))
 
 
 def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
@@ -388,6 +389,8 @@ class _Request:
     clean: dict[tuple[str, str], int] = field(default_factory=dict)
     by_lower: dict[str, list[str]] = field(default_factory=dict)
     by_coarse: dict[str, list[str]] = field(default_factory=dict)
+    groups: dict[tuple[str, str, str], list[tuple[str, ViewDefinition]]] = field(default_factory=dict)
+    clean_groups: dict[tuple[str, str, str], int] = field(default_factory=dict)
     wanted: set[str] = field(default_factory=set)
     _recognised: dict[str | None, set[str]] = field(default_factory=dict)
 
@@ -421,7 +424,15 @@ def _walk(
     request: _Request,
 ) -> Refusal | None:
     for node in ast.find_all(exp.Table):
-        for name, view in _views_read(node, request, catalog):
+        # Every reference spelled alike in one catalog reads the same views: walked clean once at a
+        # depth, the group is clean at any depth no deeper, as a view is. N references to N twins
+        # enumerated and visited the group each time, N squared (Codex's seventh review of #192).
+        group = (object_key(node), node.name, catalog)
+        if request.clean_groups.get(group, -1) >= depth:
+            continue
+        if group not in request.groups:
+            request.groups[group] = _views_read(node, request, catalog)
+        for name, view in request.groups[group]:
             # The view the query read, named in every refusal below: at the top, as the query
             # spells it, which the grant check has passed. Never an inventory key: a twin the
             # fallback walks may be one the caller does not hold, a quoted "V" beside a granted
@@ -501,9 +512,10 @@ def _walk(
                 # catalog, and nothing here can tell which. A federated body writes `customer` where
                 # the key is `pg.customer`, so it gets no hint -- fail closed, the refusal still holds.
                 keys = sorted(f for f in filtered if _restricting({f}) & mentioned)
-                written = {object_key(t).lower() for t in body.find_all(exp.Table)}
-                held = (keys[0] if len(keys) == 1 and keys[0].lower() in written
-                        and keys[0].lower() in granted else None)
+                # Exact names, never folded: a caller holding `ä` was told to query 'Ä', the
+                # filtered table it does not hold (Codex's seventh review of #192).
+                written = {object_key(t) for t in body.find_all(exp.Table)}
+                held = keys[0] if len(keys) == 1 and keys[0] in written and keys[0] in granted else None
                 repair = f" Query {held!r} directly." if held else ""
                 return _refuse(RefusalCode.UNGOVERNED_VIEW, here,
                                f"{it} reads a table that is row-filtered for you, and this engine "
@@ -516,4 +528,5 @@ def _walk(
             if nested is not None:
                 return nested
             request.clean[(name, inherited)] = depth
+        request.clean_groups[group] = depth
     return None

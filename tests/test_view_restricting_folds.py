@@ -257,6 +257,52 @@ def test_the_filtered_set_is_spelled_once_a_request(monkeypatch):
     assert len(folds) < 40 * n, len(folds)
 
 
+@pytest.mark.parametrize("dialect", ["postgres", "duckdb", "oracle"])
+def test_the_repair_names_a_filtered_table_only_where_the_caller_holds_that_one(dialect):
+    # The caller holds `v` and `ä`; the filter is on `Ä`. The repair compared lowercased names and
+    # told the caller to query 'Ä' directly, a table it does not hold (Codex's seventh review of
+    # #192). Exact names now: no repair here, the refusal stands.
+    schema = {"v": {"id"}, "ä": {"id"}, "Ä": {"id"}}
+    policy = AccessPolicy(row_filters={"Ä": "1 = 1"}, policy_schema=schema)
+    views = {"v": ViewDefinition(object_id="v", dialect=dialect, definition='SELECT id FROM "Ä"')}
+    verdict = decide("SELECT id FROM v", {"v": {"id"}, "ä": {"id"}}, dialect=dialect, target=dialect,
+                     policy=policy, views=views)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
+    assert "Ä" not in verdict.message, verdict.message
+    held = decide("SELECT id FROM v", {"v": {"id"}, "Ä": {"id"}}, dialect=dialect, target=dialect,
+                  policy=policy, views=views)
+    assert "Query 'Ä' directly." in held.message, held.message  # the control: held, it is offered
+
+
+def test_repeated_references_to_a_twin_group_are_walked_once(monkeypatch):
+    # N case twins (Postgres keeps quoted case apart) read under one spelling N times: each
+    # reference enumerated and visited the whole group, N squared (Codex's seventh review of #192).
+    import itertools
+
+    from mnemiq.sql import views as module
+
+    lookups = []
+
+    class Counting(dict):
+        def get(self, key, default=None):
+            lookups.append(key)
+            return super().get(key, default)
+
+    class Request(module._Request):
+        def __post_init__(self):
+            super().__post_init__()
+            self.clean = Counting(self.clean)
+
+    monkeypatch.setattr(module, "_Request", Request)
+    twins = ["".join(c) for c in itertools.product(*("tT",) * 7)]  # 128 spellings of `ttttttt`
+    defs = {k: ViewDefinition(object_id=k, dialect="postgres", definition="SELECT id FROM safe_table") for k in twins}
+    query = " UNION ALL ".join("SELECT id FROM ttttttt" for _ in twins)
+    verdict = module.check_views(sqlglot.parse_one(query, read="postgres"), defs, {"orders"},
+                                 known={"safe_table", "orders", *defs}, granted={"ttttttt"})
+    assert verdict is None, verdict
+    assert len(lookups) < 4 * len(twins), len(lookups)
+
+
 def test_on_duckdb_a_long_s_view_name_is_still_unknown():
     verdict = _read_through_a_nested_view("ſales", dialect="duckdb")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW, verdict
