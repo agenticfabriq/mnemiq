@@ -90,6 +90,41 @@ def test_every_view_a_fold_matches_is_walked_not_the_first(body):
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, (body, verdict)
 
 
+def _over_twins(body: str, dialect: str, views: dict[str, str], visible=("v",)):
+    defs = {k: ViewDefinition(object_id=k, dialect=dialect, definition=d) for k, d in views.items()}
+    defs.setdefault("v", ViewDefinition(object_id="v", dialect=dialect, definition=body))
+    schema = {"orders": {"id"}, "safe_table": {"id"}, **{k: {"id"} for k in defs}}
+    policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
+    return decide("SELECT id FROM v", {k: {"id"} for k in visible}, dialect=dialect, target=dialect,
+                  policy=policy, views=defs)
+
+
+@pytest.mark.parametrize(("dialect", "body", "harmless", "filtered"), [
+    ("oracle", "SELECT id FROM ſALES", "ſALES", "SALES"),  # unquoted: Oracle reads SALES
+    ("postgres", "SELECT id FROM SALES", "SALES", "sales"),  # unquoted: Postgres reads sales
+])
+def test_an_exact_key_does_not_hide_the_view_the_engine_reads(dialect, body, harmless, filtered):
+    # The body's raw spelling is a key, of a view over nothing filtered; the engine folds the same
+    # spelling onto another key, a view over the filtered ORDERS. Trusting the exact key walked
+    # only the harmless view and approved (Codex's third review of #192).
+    verdict = _over_twins(body, dialect, {harmless: "SELECT id FROM safe_table", filtered: "SELECT id FROM orders"})
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
+
+
+def test_a_view_with_no_twin_is_still_read():
+    verdict = _over_twins("SELECT id FROM safe_v", "duckdb",
+                          {"safe_v": "SELECT id FROM safe_table", "sales": "SELECT id FROM orders"})
+    assert isinstance(verdict, Approved), verdict
+
+
+def test_a_refusal_through_a_twin_names_only_the_view_the_query_read():
+    # The query reads `v`, which the caller holds; `V` folds onto it and reads the filtered table.
+    # The refusal is about `v`, and the twin's name stays in the log.
+    verdict = _over_twins("SELECT id FROM safe_table", "oracle", {"V": "SELECT id FROM orders"})
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
+    assert verdict.subject == "v" and "'V'" not in verdict.message, verdict
+
+
 def test_on_duckdb_a_long_s_view_name_is_still_unknown():
     verdict = _read_through_a_nested_view("ſales", dialect="duckdb")
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_VIEW, verdict

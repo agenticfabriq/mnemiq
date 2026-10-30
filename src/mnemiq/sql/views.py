@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 
 import sqlglot
@@ -315,13 +316,19 @@ def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
 def _views_read(
     node: exp.Table, views: dict[str, ViewDefinition], catalog: str, dialect: str | None,
 ) -> list[tuple[str, ViewDefinition]]:
-    """Every view `node` may read, keyed as the inventory keys it: one where a key matches
-    exactly, else every key the case-insensitive fallback matches."""
+    """Every view `node` may read, keyed as the inventory keys it: the key the body spells, where
+    there is one, first, and then every other key the lowercase or the body's engine folds onto it.
+
+    Every one, the exact key included. Neither fold reads quoting, and the exact key is the raw
+    text, so a raw spelling can name a harmless view while the engine folds it onto another: Oracle
+    reads an unquoted `ſALES` as SALES, Postgres an unquoted `SALES` as sales (Codex's third review
+    of #192), and walking only the first match, exact or not, approved around the filtered one
+    (its second). Walking a view can only refuse, so an inventory that holds two such keys refuses
+    a body either would read: the conservative reading, at the cost of a view whose twin reads a
+    filtered table."""
     name = object_key(node)
-    view = views.get(name) or views.get(node.name)
-    if view is not None:
-        # A body may qualify a view the snapshot keys bare.
-        return [(name if name in views else node.name, view)]
+    exact = name if name in views else node.name if node.name in views else None
+    spelled = {name, node.name}
     if catalog:
         # A FEDERATED view body is written in the SOURCE's own naming, so a NESTED view
         # reads `claim_v` where the merged inventory keys it `pg.claim_v`, and the lookup
@@ -329,37 +336,36 @@ def _views_read(
         # `pg.claim` was APPROVED while the byte-identical single-source shape refused.
         # Resolved in the ENCLOSING view's catalog only, never globally, so two catalogs
         # holding a view of the same name cannot resolve to each other's.
-        for candidate in (f"{catalog}.{name}", f"{catalog}.{node.name}"):
-            if candidate in views:
-                return [(candidate, views[candidate])]
-    # Case-insensitive fallback, tried LAST so an exact match always wins. Unquoted
-    # identifiers are case-insensitive in all three engines -- `_spellings` two screens
-    # down folds for exactly this reason -- but this lookup did not. Measured: a body
-    # writing `FROM CLAIM_V` against an inventory keyed `claim_v` missed, the nested view
-    # was never walked, and its row-filtered base was never reached. APPROVED on the
-    # single-source path as well as the federated one, so this is not federation's bug.
-    #
-    # `.lower()` on the WHOLE candidate, catalog included. Lowercasing only the table
-    # half left the prefix in its original case while the comparison below folds the real
-    # key in full, so any catalog alias carrying an uppercase letter made this fallback
-    # dead code. `SourceSpec.catalog` is a free-form DuckDB attach alias and nothing in
-    # `merge_snapshots` or `qualify_object_id` normalises it. Measured: catalog `pg`
-    # refused and catalog `PG` approved, on the identical statement.
-    spelled = {name, node.name}
-    if catalog:
         spelled |= {f"{catalog}.{s}" for s in tuple(spelled)}
-    wanted = {s.lower() for s in spelled}
+        if exact is None:
+            exact = next((c for c in (f"{catalog}.{name}", f"{catalog}.{node.name}") if c in views), None)
+    # Case-insensitive, since unquoted identifiers are in all three engines. Measured: a body
+    # writing `FROM CLAIM_V` against an inventory keyed `claim_v` missed, the nested view was
+    # never walked, and its row-filtered base was never reached. APPROVED on the single-source
+    # path as well as the federated one, so this is not federation's bug.
+    #
+    # `.lower()` on the WHOLE candidate, catalog included. Lowercasing only the table half left
+    # the prefix in its original case while the comparison below folds the real key in full, so
+    # any catalog alias carrying an uppercase letter made this fallback dead code.
+    # `SourceSpec.catalog` is a free-form DuckDB attach alias and nothing in `merge_snapshots` or
+    # `qualify_object_id` normalises it. Measured: catalog `pg` refused and catalog `PG` approved,
+    # on the identical statement.
+    #
     # And as the body's engine folds (Codex's review of #192). Oracle reads `ſales` as SALES,
-    # which `str.lower` keeps apart from `sales`, so the known-object check vouched for a view
-    # this lookup never found, and the filtered table behind it went unwalked.
-    fold = rules_for(dialect).fold
-    folded = {fold(s) for s in spelled}
-    # EVERY key either fold matches, not the first. Neither fold reads quoting, so two keys they
-    # cannot tell apart are two views the body may read, and the first in sort order can be a
-    # harmless one hiding the one the engine reads (Codex's second review of #192: `app."ſALES"`
-    # walked APP.SALES and approved). Walking a view can only refuse. Sorted, so a refusal names
-    # the same view every run.
-    return [(key, views[key]) for key in sorted(views) if key.lower() in wanted or fold(key) in folded]
+    # which `str.lower` keeps apart from `sales`, so the known-object check vouched for a view this
+    # lookup never found, and the filtered table behind it went unwalked.
+    wanted = {s.lower() for s in spelled}
+    folded = {_folded(dialect, s) for s in spelled}
+    twins = [k for k in sorted(views)
+             if k != exact and (k.lower() in wanted or _folded(dialect, k) in folded)]
+    return [(k, views[k]) for k in ([exact] if exact is not None else []) + twins]
+
+
+@functools.lru_cache(maxsize=1 << 16)
+def _folded(dialect: str | None, name: str) -> str:
+    """`name` folded as `dialect` folds, remembered: the lookup folds every view key for every
+    table a body reads, and Oracle's fold is a letter-by-letter walk (8 ms for 5,000 keys)."""
+    return rules_for(dialect).fold(name)
 
 
 def _walk(
@@ -377,8 +383,12 @@ def _walk(
     # `dialect` is the engine that reads `ast`'s names: a nested body's own view's. None at the
     # top, where the grant check has already refused any name the caller does not hold exactly.
     for node in ast.find_all(exp.Table):
-        for name, view in _views_read(node, views, catalog, dialect):
-            here = top or name  # the view the query read: named in every refusal below
+        found = _views_read(node, views, catalog, dialect)
+        for name, view in found:
+            # The view the query read, named in every refusal below: at the top, the one its
+            # spelling found first, so a twin walked beside it is refused under the name the
+            # caller holds and its own stays in the log.
+            here = top or found[0][0]
             # Only the view the query read, which the caller holds. `it` names the view the
             # problem is in where that is the same view, and says "a view it reads" where not.
             it = repr(here) if name == here else f"a view {here!r} reads"
