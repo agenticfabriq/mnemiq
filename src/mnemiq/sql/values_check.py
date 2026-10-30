@@ -1483,17 +1483,13 @@ def confirm_by_source(grounding: ValueGrounding, holds: Callable[[str, str, str]
 
 def probe_sql(table: str, column: str, text: str, dialect: str | None) -> str:
     """Whether `table.column` holds `text`, in the source's dialect: the names quoted in their stored
-    spelling, as the value index reads them, and the value a string literal sqlglot escapes. A
-    dotted name (`catalog.schema.table`, as a federated source binds it) is quoted part by part;
-    one with more parts stays one name, and a probe that cannot resolve it only says nothing."""
-    parts = table.split(".")
-    if not 1 <= len(parts) <= 3 or not all(parts):
-        parts = [table]
-    quoted = [exp.to_identifier(part, quoted=True) for part in parts]
-    named = exp.Table(this=quoted[-1], db=quoted[-2] if len(quoted) > 1 else None,
-                      catalog=quoted[-3] if len(quoted) > 2 else None)
+    spelling, as the value index reads them, and the value a string literal sqlglot escapes. The
+    table is one quoted name even when it holds a dot: split, a table stored as `a.b` would be read
+    as table `b` in schema `a`, an object nobody checked for this caller. So a federated source's
+    `catalog.schema.table` does not resolve, and its probe only says nothing, as its value index
+    holds nothing (the e2e lane's read of 9a0ed29c)."""
     return (exp.select(exp.Literal.number(1))
-            .from_(named)
+            .from_(exp.Table(this=exp.to_identifier(table, quoted=True)))
             .where(exp.EQ(this=exp.Column(this=exp.to_identifier(column, quoted=True)),
                           expression=exp.Literal.string(text)))
             .limit(1)

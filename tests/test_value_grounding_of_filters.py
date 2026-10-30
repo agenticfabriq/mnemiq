@@ -743,11 +743,8 @@ def test_the_probe_quotes_the_stored_names_and_escapes_the_value():
         "SELECT 1 FROM \"CLAIM\" WHERE \"ADJUSTER\" = 'x' FETCH FIRST 1 ROWS ONLY")
     assert probe_sql("claim", "adjuster", "x", "mysql") == (
         "SELECT 1 FROM `claim` WHERE `adjuster` = 'x' LIMIT 1")
-    # A federated source binds a table to catalog.schema.table: each part quoted on its own.
-    assert probe_sql("pg.public.customer", "name", "x", "duckdb") == (
-        "SELECT 1 FROM \"pg\".\"public\".\"customer\" WHERE \"name\" = 'x' LIMIT 1")
-    assert probe_sql("main.claim", "adjuster", "x", "duckdb") == (
-        "SELECT 1 FROM \"main\".\"claim\" WHERE \"adjuster\" = 'x' LIMIT 1")
+    # A dotted name stays one name: split, "a.b" would read table b in schema a, unchecked.
+    assert probe_sql("a.b", "c", "x", "duckdb") == "SELECT 1 FROM \"a.b\" WHERE \"c\" = 'x' LIMIT 1"
 
 
 def test_the_source_answers_found_missing_or_nothing(tmp_path):
@@ -766,3 +763,24 @@ def test_the_source_answers_found_missing_or_nothing(tmp_path):
     assert holds("claim", "adjuster", "O'Brien") is True  # through its physical name, escaped
     assert holds("claim", "adjuster", "agnet_0042") is False
     assert holds("claim", "no_such_column", "x") is None  # a failed probe says nothing
+
+
+def test_a_table_stored_with_a_dot_is_probed_as_itself_not_as_a_schema_and_a_table(tmp_path):
+    """The probed object must be the checked one: a table stored as "a.b", with a table b in a schema
+    a behind it holding the value, is asked as "a.b" and answers for itself."""
+    import duckdb
+
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+    from mnemiq.sql.values_check import source_holds
+
+    path = str(tmp_path / "s.duckdb")
+    con = duckdb.connect(path)
+    con.execute('CREATE TABLE "a.b" (c VARCHAR)')
+    con.execute("INSERT INTO \"a.b\" VALUES ('mine')")
+    con.execute("CREATE SCHEMA a")
+    con.execute("CREATE TABLE a.b (c VARCHAR)")
+    con.execute("INSERT INTO a.b VALUES ('twin_only')")
+    con.close()
+    holds = source_holds(DuckDBAdapter.duckdb(path), "duckdb", {}, timeout_s=10)
+    assert holds("a.b", "c", "mine") is True
+    assert holds("a.b", "c", "twin_only") is False
