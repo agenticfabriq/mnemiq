@@ -203,14 +203,18 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
         elif not quoted and printed(probe, fresh) and printed(_raw(filt, dialect), word) > printed(probe, word):
             continue  # held as a node of its own here (`SYSDATE` as the call it is), printed in its place
         lost.add(word)
-    # A date part holds its text; a MAP key read as a lambda's parameter holds the parameter's
-    # Identifier (`as_duckdb_reads`), a name the lambda declares. A collation's name is a Var
-    # too, in COLLATE's place, and names no column (Codex's thirteenth review of #193).
-    parts = {v.name.casefold() for v in tree.find_all(exp.Var) if isinstance(v.this, str)
-             and not _in_extract_or_interval(v)
-             and not (isinstance(v.parent, exp.Collate) and v.arg_key == "expression")}
     dropped = _keywords_dropped(filt, dialect, counted)
-    return sorted(lost | (parts & written) | set(dropped))
+    return sorted(lost | (_date_parts(tree) & written) | set(dropped))
+
+
+def _date_parts(tree: exp.Expression) -> set[str]:
+    """The words the parse holds as date parts, outside EXTRACT and an INTERVAL. A date part holds
+    its text; a MAP key read as a lambda's parameter holds the parameter's Identifier
+    (`as_duckdb_reads`), a name the lambda declares. A collation's name is a Var too, in COLLATE's
+    place, and names no column (Codex's thirteenth review of #193)."""
+    return {v.name.casefold() for v in tree.find_all(exp.Var) if isinstance(v.this, str)
+            and not _in_extract_or_interval(v)
+            and not (isinstance(v.parent, exp.Collate) and v.arg_key == "expression")}
 
 
 def _raw(filt: str, dialect: str) -> exp.Expression:
@@ -265,7 +269,10 @@ def _keywords_dropped(filt: str, dialect: str, counted) -> list[str]:
     `DECIMAL(18, 3)`, Oracle's `DATE '2020-01-01'` as TO_DATE): counted, 37 of the 286 casts
     DuckDB accepts were refused. So the filter is parsed again with a fresh name in each one's
     place. A place that drops a name drops that one too; a column's or a type's place keeps it;
-    and a place only the keyword fits, an operator's or a multi-word type's, does not parse. A word
+    and a place only the keyword fits, an operator's or a multi-word type's, does not parse. A
+    place that holds the fresh name as a date part reads no column either, though the name
+    prints: sqlglot holds `values` in `date_diff(values, a, b)` as one, and DuckDB reads the
+    column (Codex's fourteenth review of #193). A word
     is read from the text where the token stands, so a string's contents are never one. A name
     directly before a parenthesis, a brace or a string is a call, a type's parameters, a
     constructor or a typed literal, never a column, and is left alone: a fresh name before the
@@ -281,7 +288,7 @@ def _keywords_dropped(filt: str, dialect: str, counted) -> list[str]:
         probe = _probe(filt, t, fresh, dialect)
         if probe is None:
             continue
-        if fresh not in probe.sql(dialect=dialect).casefold():
+        if fresh not in probe.sql(dialect=dialect).casefold() or fresh in _date_parts(probe):
             dropped.append(t.text.casefold())
     return dropped
 

@@ -218,6 +218,11 @@ def test_a_text_that_does_not_read_back_as_the_expanded_tree_is_refused(monkeypa
     # A keyword that is neither a name nor a type to the parser, dropped where DuckDB reads the
     # column: `values` (Codex's fourth review of #193). Every keyword's place is probed, not a list.
     ("duckdb", "decode(d, values) IS NOT NULL"),
+    # The same keyword where the parse reads a date part, which prints: the reprint keeps the
+    # word, so only the place says it is no column (Codex's fourteenth review of #193).
+    ("duckdb", "date_diff(values, DATE '2020-01-01', DATE '2021-01-01') = 1"),
+    ("duckdb", "date_trunc(values, d) IS NOT NULL"),
+    ("duckdb", "time_bucket(INTERVAL 1 DAY, d, values) IS NOT NULL"),
 ])
 def test_a_name_the_parse_does_not_read_as_a_column_or_a_table_refuses_the_filter(dialect, filt):
     claim = stored("claim", dialect)  # as the engine stores it unquoted (M223)
@@ -271,7 +276,7 @@ def test_names_the_parse_accounts_for_pass(dialect, filt):
     assert isinstance(verdict, Approved), (dialect, filt, verdict)
 
 
-@pytest.mark.parametrize("name", ["secret", "comment"])
+@pytest.mark.parametrize("name", ["secret", "comment", "values"])
 @pytest.mark.parametrize("sql", ["DELETE FROM claim WHERE id > 0", "UPDATE claim SET d = NULL WHERE id > 0"])
 def test_a_write_target_s_filter_is_held_to_the_same_names(sql, name):
     # The target's filter is conjoined, not wrapped, and checked on its own path.
@@ -291,6 +296,16 @@ def test_a_write_target_s_filter_dropping_a_keyword_s_place_is_refused(sql):
     verdict = decide_write(sql, schema, grants, dialect="duckdb", target="duckdb", writes_enabled=True,
                            policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_duckdb_reads_a_keyword_where_the_parse_reads_a_date_part_as_the_column():
+    # The refusal's control: the filter keeps the row whose `values` names the unit that counts
+    # these dates apart as 0, so it filters by a column the policy does not hold.
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INT, a DATE, b DATE, \"values\" VARCHAR);"
+                "INSERT INTO claim VALUES (1, DATE '2020-01-01', DATE '2020-01-02', 'month'),"
+                "(2, DATE '2020-01-01', DATE '2020-01-02', 'day')")
+    assert con.execute("SELECT id FROM claim WHERE date_diff(values, a, b) = 0").fetchall() == [(1,)]
 
 
 def test_a_type_s_name_read_as_a_date_part_is_refused_too():
