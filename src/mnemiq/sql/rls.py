@@ -152,59 +152,73 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     secret)` and `decode(blob, secret)`, and reads it as a date part in `date_diff(secret, a, b)`,
     where DuckDB reads a column the policy may not hold (Codex's review of #193).
 
-    Two comparisons. A name in the text must come back, as often, among the names of the parse's
-    own reprint, where a dropped one is missing and a date part prints as a string. And a date part
-    the parse holds outside EXTRACT and an INTERVAL, which are keywords in every engine, must not
-    have been written as a bare name. A function's name is left out of both: a reprint may rename it
-    (`now()` prints as CURRENT_TIMESTAMP), and it reads no data."""
+    Each name is accounted for where it stands: a word in the text the parse holds no name for at
+    that offset is lost, unless that place is a keyword's (`_a_keyword_here`). Counted across the
+    filter, a keyword kept in one place stood in for a name dropped in another: `first.all` dropped
+    beside a `UNION ALL` and a `NULLS FIRST` passed (Codex's tenth review of #193). A date part the
+    parse holds outside EXTRACT and an INTERVAL, which are keywords in every engine, must not have
+    been written as a bare name. A function's name is left out: it reads no data."""
     # A keyword the parser takes as an identifier is a name too: `comment` tokenizes as COMMENT,
     # and DuckDB reads `date_diff(comment, a, b)` as the column (Codex's second review of #193).
-    # A type's name among them the reprint may respell (INTEGER as INT), so it is left out of the
-    # count, kept for the date-part check, which `date_diff(date, a, b)` would otherwise pass, and
-    # looked for where it stands with every other keyword (`_keywords_dropped`).
+    # A type's name among them is left to `_keywords_dropped`, which probes it where it stands with
+    # every other keyword, and kept for the date-part check, which `date_diff(date, a, b)` would
+    # otherwise pass.
     parser = sqlglot.Dialect.get_or_raise(dialect).parser_class
     named = _NAME_TOKENS | parser.ID_VAR_TOKENS
+    counted = named - parser.TYPE_TOKENS
+    tree = _parsed(filt, dialect)
 
-    def names(text: str, kinds) -> list[str]:
+    def names(text: str) -> list:
         tokens = sqlglot.tokenize(text, read=dialect)
-        return [t.text.casefold() for i, t in enumerate(tokens) if t.token_type in kinds
+        return [(i, t) for i, t in enumerate(tokens) if t.token_type in named
                 and not (i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN)]
 
-    tree = _parsed(filt, dialect)
-    counted = named - parser.TYPE_TOKENS
-    written = names(filt, counted)
-    # A struct literal's field names reprint as strings (`{X: 1}` as `{'X': 1}`): names the filter
-    # gives, not reads.
-    fields = [e.this.name.casefold() for struct in tree.find_all(exp.Struct) for e in struct.expressions
-              if isinstance(e, exp.PropertyEQ) and isinstance(e.this, exp.Identifier)]
-    lost = Counter(written) - Counter(names(tree.sql(dialect=dialect), counted)) - Counter(fields)
-    if lost:
-        # A word the reprint respells or leaves out where no name can stand is a keyword there:
-        # sqlglot prints `FETCH FIRST 1 ROW ONLY` with ROWS and drops a default null order, which
-        # refused filters main approves (Codex's sixth review of #193). Only those places are
-        # excused; a loss beyond them is still a name lost.
-        lost -= _keyword_places(filt, dialect, counted, set(lost))
+    tokens = sqlglot.tokenize(filt, read=dialect)
+    identifiers = [node for node in tree.find_all(exp.Identifier) if "start" in node.meta]
+    held = {node.meta["start"] for node in identifiers}
+    fresh = _fresh_name(filt)
+    quoted, unquoted, excused, written = Counter(), Counter(), Counter(), set()
+    for i, t in names(filt):
+        word = t.text.casefold()
+        written.add(word)
+        if t.token_type not in counted or t.start in held:
+            continue
+        if t.token_type is TokenType.IDENTIFIER:
+            quoted[word] += 1  # a name wherever it stands
+        elif _a_keyword_here(filt, tokens, i, fresh, dialect):
+            excused[word] += 1
+        else:
+            unquoted[word] += 1
+    # A word the parse holds as a node with no offset (`SYSDATE` as the call it is) still prints:
+    # each one the reprint prints beyond the parse's own names and the places excused above
+    # accounts for one occurrence, so a keyword kept elsewhere never does.
+    printed = Counter(t.text.casefold() for _, t in names(tree.sql(dialect=dialect)) if t.token_type in counted)
+    unpositioned = printed - Counter(node.name.casefold() for node in identifiers) - excused
+    # A struct literal's field names, which the parse rebuilds with no offset and the reprint
+    # prints as strings (`{X: 1}` as `{'X': 1}`): names the filter gives, not reads, one a field,
+    # quoted or not.
+    fields = Counter(e.this.name.casefold() for struct in tree.find_all(exp.Struct) for e in struct.expressions
+                     if isinstance(e, exp.PropertyEQ) and isinstance(e.this, exp.Identifier))
+    lost = set(quoted - fields) | set(unquoted - unpositioned - (fields - quoted))
     # A date part holds its text; a MAP key read as a lambda's parameter holds the parameter's
     # Identifier (`as_duckdb_reads`), a name the lambda declares.
     parts = {v.name.casefold() for v in tree.find_all(exp.Var) if isinstance(v.this, str)
-             and not (isinstance(v.parent, exp.Extract) and v.arg_key == "this")
-             and not isinstance(v.parent, (exp.Interval, exp.IntervalSpan))}
+             and not _in_extract_or_interval(v)}
     dropped = _keywords_dropped(filt, dialect, counted)
-    return sorted(set(lost) | (parts & set(names(filt, named))) | set(dropped) | _quoted_dropped(filt, dialect, tree))
+    return sorted(lost | (parts & written) | set(dropped))
 
 
-def _quoted_dropped(filt: str, dialect: str, tree: exp.Expression) -> set[str]:
-    """Every quoted name in the text that the parse holds fewer times than written. A quoted name
-    is a name wherever it stands, so none is excused as a keyword's place, which the count above
-    could not tell apart: `list_reverse_sort([id], "all")` beside a `UNION ALL` passed, the
-    keyword's place cancelling the column the parse dropped (Codex's eighth review of #193). Read
-    from the parse, not its reprint, which quotes and unquotes as it likes; a call's name is left
-    out, as in the count."""
-    tokens = sqlglot.tokenize(filt, read=dialect)
-    written = Counter(t.text for i, t in enumerate(tokens) if t.token_type is TokenType.IDENTIFIER
-                      and not (i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN))
-    held = Counter(node.name for node in tree.find_all(exp.Identifier) if node.args.get("quoted"))
-    return {name.casefold() for name in written - held}
+def _in_extract_or_interval(var: exp.Var) -> bool:
+    return (isinstance(var.parent, exp.Extract) and var.arg_key == "this") or isinstance(
+        var.parent, (exp.Interval, exp.IntervalSpan))
+
+
+def _a_keyword_here(filt: str, tokens, i: int, fresh: str, dialect: str) -> bool:
+    """Whether token `i`, which the parse holds no name for, stands where its engine reads a
+    keyword: a word the engine reserves (`_reserved_apart`), or a place where a fresh name does not
+    parse, which only a keyword fits (sqlglot prints `FETCH FIRST 1 ROW ONLY` with ROWS and drops a
+    default null order: Codex's sixth review of #193)."""
+    return _reserved_apart(tokens, i, dialect) or _probe(filt, tokens[i], fresh, dialect) is None
 
 
 def _fresh_name(filt: str) -> str:
@@ -221,24 +235,6 @@ def _probe(filt: str, token, fresh: str, dialect: str) -> exp.Expression | None:
         return sqlglot.parse_one(filt[:token.start] + fresh + filt[token.end + 1:], read=dialect)
     except sqlglot.errors.ParseError:
         return None
-
-
-def _keyword_places(filt: str, dialect: str, counted, words: set[str]) -> Counter:
-    """How often each of `words` stands in the text where no name can: where a fresh name in its
-    place does not parse (`_keywords_dropped`'s reading of a place), or where it is a word the
-    engine reserves (`_reserved_apart`). Never a quoted identifier, which is a name wherever it
-    stands."""
-    fresh = _fresh_name(filt)
-    tokens = sqlglot.tokenize(filt, read=dialect)
-    places: Counter = Counter()
-    for i, t in enumerate(tokens):
-        if t.token_type not in counted or t.token_type is TokenType.IDENTIFIER or t.text.casefold() not in words:
-            continue
-        if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN:
-            continue  # a call's name, never counted
-        if _reserved_apart(tokens, i, dialect) or _probe(filt, t, fresh, dialect) is None:
-            places[t.text.casefold()] += 1
-    return places
 
 
 def _reserved_apart(tokens, i: int, dialect: str) -> bool:

@@ -348,14 +348,11 @@ def test_every_cast_duckdb_accepts_passes_the_name_check():
 def test_a_reserved_word_after_a_dot_is_a_name():
     # Postgres and DuckDB read a reserved word after a dot as a column (`e.all`): only a word
     # standing apart is excused.
-    from sqlglot.tokens import TokenType
-
     from mnemiq.sql import rls
-    counted = frozenset(TokenType)  # every word counts, so only the excuse decides
     for dialect in ("duckdb", "postgres"):
-        apart = rls._keyword_places("id IN (SELECT ALL id FROM entitlement)", dialect, counted, {"all"})
-        dotted = rls._keyword_places("id IN (SELECT e.all FROM entitlement e)", dialect, counted, {"all"})
-        assert apart["all"] == 1 and dotted["all"] == 0, (dialect, apart, dotted)
+        apart = sqlglot.tokenize("SELECT ALL id", read=dialect)
+        dotted = sqlglot.tokenize("SELECT e.all", read=dialect)
+        assert rls._reserved_apart(apart, 1, dialect) and not rls._reserved_apart(dotted, 3, dialect), dialect
 
 
 def test_every_word_taken_as_reserved_is_reserved_by_the_installed_duckdb():
@@ -432,6 +429,9 @@ def test_postgres_reads_no_word_taken_as_reserved_as_a_column():
     'list_reverse_sort([id], "all") IS NOT NULL AND id IN (SELECT id FROM entitlement UNION ALL SELECT id FROM entitlement)',
     'list_reverse_sort([id], "all") IS NOT NULL AND id IN (SELECT ALL id FROM entitlement)',
     "list_reverse_sort([id], \"both\") IS NOT NULL AND TRIM(BOTH FROM region) = 'x'",
+    # Nor stood in for by the same word the parse holds as a call: CURRENT_DATE prints, a column
+    # dropped is still dropped.
+    'list_reverse_sort([id], "current_date") IS NOT NULL AND d < current_date',
 ])
 def test_a_quoted_name_the_parse_drops_is_never_excused_as_a_keyword(filt):
     # The same word unquoted elsewhere stands where a keyword does, and counted together its place
@@ -450,7 +450,7 @@ def test_a_quoted_name_is_held_only_by_a_quoted_name_in_the_parse():
     # An unquoted `d` the parse keeps does not stand in for the quoted `"d"` it dropped.
     from mnemiq.sql import rls
     filt = 'list_reverse_sort([id], "d") IS NOT NULL AND d > 0'
-    assert rls._quoted_dropped(filt, "duckdb", rls._parsed(filt, "duckdb")) == {"d"}
+    assert rls._unaccounted_names(filt, "duckdb") == ["d"]
 
 
 def test_an_oracle_write_reading_a_filtered_table_holds_its_filter_as_oracle():
@@ -466,3 +466,18 @@ def test_an_oracle_write_reading_a_filtered_table_holds_its_filter_as_oracle():
                            policy=policy, dialect="oracle", writes_enabled=True)
     assert isinstance(verdict, ApprovedWrite), verdict
     assert filt in verdict.target_sql, verdict.target_sql  # as written
+
+
+@pytest.mark.parametrize("filt", [
+    # `first.all` is dropped by the parse; `UNION ALL` and `NULLS FIRST` are kept keywords of the
+    # same words, and counted across the filter they excused it (Codex's tenth review of #193).
+    "EXISTS (SELECT id FROM entitlement first WHERE decode(d, first.all) IS NOT NULL "
+    "UNION ALL SELECT id FROM entitlement WHERE FALSE ORDER BY id NULLS FIRST)",
+    "EXISTS (SELECT id FROM entitlement e WHERE decode(d, e.who) IS NOT NULL "
+    "UNION ALL SELECT id FROM entitlement WHERE who = 'r')",
+])
+def test_each_word_is_accounted_where_it_stands_not_across_the_filter(filt):
+    schema = {"claim": {"id"}, "entitlement": {"id", "d", "who"}}
+    verdict = decide("SELECT id FROM claim", {"claim": schema["claim"]}, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
