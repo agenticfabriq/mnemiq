@@ -336,6 +336,16 @@ def test_distinct_spellings_of_one_twin_group_share_one_walk(monkeypatch):
                                      known={"safe_table", "orders", *defs}, granted=set(twins))
         assert verdict is None, (dialect, verdict)
         assert len(lookups) < 4 * len(twins), (dialect, len(lookups))
+    # Each reference under its own qualifier, all sharing the bare name's twins: a group per
+    # qualified spelling enumerated and visited the shared twins each time (its tenth review).
+    lookups.clear()
+    twins = ["".join(c) for c in itertools.product(*("tT",) * 7)]
+    defs = {k: ViewDefinition(object_id=k, dialect="postgres", definition="SELECT id FROM safe_table") for k in twins}
+    query = " UNION ALL ".join(f"SELECT id FROM s{i}.ttttttt" for i in range(len(twins)))
+    verdict = module.check_views(sqlglot.parse_one(query, read="postgres"), defs, {"orders"},
+                                 known={"safe_table", "orders", *defs}, granted=set(twins))
+    assert verdict is None, verdict
+    assert len(lookups) < 4 * len(twins), len(lookups)
 
 
 def test_on_duckdb_a_long_s_view_name_is_still_unknown():

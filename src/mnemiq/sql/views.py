@@ -322,81 +322,81 @@ def _refuse(code: RefusalCode, view: str, message: str, detail: str) -> Refusal:
     return Refusal(code=code, message=message, subject=view)
 
 
-def _views_read(node: exp.Table, request: _Request, catalog: str) -> list[tuple[str, ViewDefinition]]:
-    """Every view `node` may read, keyed as the inventory keys it: the key the body spells, where
-    there is one, first, and then every other key the lowercase or the body's engine folds onto it.
+def _buckets(node: exp.Table, catalog: str) -> set[str]:
+    """The `_coarse` keys of every spelling `node` may name a view by. Every view it may read is in
+    one of those buckets: the key spelled exactly, every key equal lowercased, since names equal
+    lowercased are equal coarse (checked for every code point), and every key an engine's fold
+    joins to it.
 
-    Every one, the exact key included. Neither fold reads quoting, and the exact key is the raw
-    text, so a raw spelling can name a harmless view while the engine folds it onto another: Oracle
-    reads an unquoted `ſALES` as SALES, Postgres an unquoted `SALES` as sales (Codex's third review
-    of #192), and walking only the first match, exact or not, approved around the filtered one
-    (its second). Walking a view can only refuse, so an inventory that holds two such keys refuses
-    a body either would read: the conservative reading, at the cost of a view whose twin reads a
-    filtered table."""
-    views = request.views
-    name = object_key(node)
-    exact = name if name in views else node.name if node.name in views else None
-    spelled = {name, node.name}
+    Every one, the exact key's twins included. Neither fold reads quoting, and the exact key is the
+    raw text, so a raw spelling can name a harmless view while the engine folds it onto another:
+    Oracle reads an unquoted `ſALES` as SALES, Postgres an unquoted `SALES` as sales (Codex's third
+    review of #192), and walking only the first match, exact or not, approved around the filtered
+    one (its second). Walking a view can only refuse, so an inventory that holds two such keys
+    refuses a body either would read: the conservative reading, at the cost of a view whose twin
+    reads a filtered table.
+
+    Case-insensitive at least, since unquoted identifiers are in all three engines. Measured: a body
+    writing `FROM CLAIM_V` against an inventory keyed `claim_v` missed, the nested view was never
+    walked, and its row-filtered base was never reached. APPROVED on the single-source path as well
+    as the federated one, so this is not federation's bug. And as wide as any engine's fold: Oracle
+    reads `ſales` as SALES, which `str.lower` keeps apart from `sales`, so the known-object check
+    vouched for a view this lookup never found, and the filtered table behind it went unwalked; the
+    query's own names are read the same way, since a grant on a quoted `ſALES` passes the grant
+    check and Oracle runs the unquoted spelling as SALES."""
+    spelled = {object_key(node), node.name}
     if catalog:
         # A FEDERATED view body is written in the SOURCE's own naming, so a NESTED view
         # reads `claim_v` where the merged inventory keys it `pg.claim_v`, and the lookup
         # above misses. Measured: `pg.claim_v2` over `pg.claim_v` over a filtered
         # `pg.claim` was APPROVED while the byte-identical single-source shape refused.
         # Resolved in the ENCLOSING view's catalog only, never globally, so two catalogs
-        # holding a view of the same name cannot resolve to each other's.
+        # holding a view of the same name cannot resolve to each other's. The whole candidate
+        # folded, catalog included: folding only the table half made any catalog alias carrying
+        # an uppercase letter miss (measured: catalog `pg` refused and `PG` approved).
         spelled |= {f"{catalog}.{s}" for s in tuple(spelled)}
-        if exact is None:
-            exact = next((c for c in (f"{catalog}.{name}", f"{catalog}.{node.name}") if c in views), None)
-    # Case-insensitive, since unquoted identifiers are in all three engines. Measured: a body
-    # writing `FROM CLAIM_V` against an inventory keyed `claim_v` missed, the nested view was
-    # never walked, and its row-filtered base was never reached. APPROVED on the single-source
-    # path as well as the federated one, so this is not federation's bug.
-    #
-    # `.lower()` on the WHOLE candidate, catalog included. Lowercasing only the table half left
-    # the prefix in its original case while the comparison below folds the real key in full, so
-    # any catalog alias carrying an uppercase letter made this fallback dead code.
-    # `SourceSpec.catalog` is a free-form DuckDB attach alias and nothing in `merge_snapshots` or
-    # `qualify_object_id` normalises it. Measured: catalog `pg` refused and catalog `PG` approved,
-    # on the identical statement.
-    #
-    # And `_coarse`, as wide as any engine's fold (Codex's reviews of #192). Oracle reads `ſales`
-    # as SALES, which `str.lower` keeps apart from `sales`, so the known-object check vouched for a
-    # view this lookup never found, and the filtered table behind it went unwalked; the query's own
-    # names are read the same way, since a grant on a quoted `ſALES` passes the grant check and
-    # Oracle runs the unquoted spelling as SALES.
-    twins = {k for s in spelled
-             for k in (*request.by_lower.get(s.lower(), ()), *request.by_coarse.get(_coarse(s), ()))}
-    twins.discard(exact)
-    return [(k, views[k]) for k in ([exact] if exact is not None else []) + sorted(twins)]
+    return {_coarse(s) for s in spelled}
+
+
+def _unwalked(node: exp.Table, request: _Request, catalog: str, depth: int):
+    """Every view `node` may read, bucket by bucket, from the buckets this request has not walked
+    clean in `catalog` at `depth` or above. A bucket is recorded clean when the walk asks past its
+    last view, which it does only having refused none: a refusal returns from the walk and leaves
+    the rest unasked. So references sharing twins, under any spelling or qualifier, visit them
+    once."""
+    for bucket in sorted(_buckets(node, catalog)):
+        if request.clean_buckets.get((bucket, catalog), -1) >= depth:
+            continue
+        for name in request.by_coarse.get(bucket, ()):
+            yield name, request.views[name]
+        request.clean_buckets[(bucket, catalog)] = depth
 
 
 @dataclass
 class _Request:
     """What one `check_views` call works out once and reads at every table and view it meets: the
-    views walked clean, and the inventory and the known objects indexed by each fold. Walking every
-    fold twin re-walked each shared view once per path to it, 37,448 parses at 40 views (Codex's
-    fourth review of #192), and every table reference scanned and folded the whole inventory, and
-    every view walked refolded it, 5.5 s at 2,000 views (its fifth).
+    views and the buckets walked clean, and the inventory and the known objects indexed by each
+    fold. Walking every fold twin re-walked each shared view once per path to it, 37,448 parses at
+    40 views (Codex's fourth review of #192); every table reference scanned and folded the whole
+    inventory, 5.5 s at 2,000 views (its fifth); and references grouped by spelling, by fold, or by
+    qualifier each enumerated and visited the twins they shared, N squared (its seventh to tenth).
 
-    `clean` is every view walked without a refusal, by the catalog its body's names resolve in, at
-    the deepest depth it did so. A view walked clean at a depth is clean at any depth no deeper,
-    since the nesting limit leaves it more room; a cycle refuses, so nothing on the stack is ever
-    in it."""
+    `clean` is every view, and `clean_buckets` every bucket, walked without a refusal, by the
+    catalog the names inside resolve in, at the deepest depth it was. Clean at a depth is clean at
+    any depth no deeper, since the nesting limit leaves more room; a cycle refuses, so nothing on
+    the stack is ever in either."""
 
     views: dict[str, ViewDefinition]
     known: set[str] | None
     filtered: set[str]
     clean: dict[tuple[str, str], int] = field(default_factory=dict)
-    by_lower: dict[str, list[str]] = field(default_factory=dict)
+    clean_buckets: dict[tuple[str, str], int] = field(default_factory=dict)
     by_coarse: dict[str, list[str]] = field(default_factory=dict)
-    groups: dict[tuple[frozenset[str], str], list[tuple[str, ViewDefinition]]] = field(default_factory=dict)
-    clean_groups: dict[tuple[frozenset[str], str], int] = field(default_factory=dict)
     wanted: set[str] = field(default_factory=set)
     _recognised: dict[str | None, set[str]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        for key in self.views:
-            self.by_lower.setdefault(key.lower(), []).append(key)
+        for key in sorted(self.views):
             self.by_coarse.setdefault(_coarse(key), []).append(key)
         # The filtered set is widened the same way as a body's mentions and by its bare last
         # segment, so a body saying `customer` still matches a filter keyed `public.customer`.
@@ -424,18 +424,7 @@ def _walk(
     request: _Request,
 ) -> Refusal | None:
     for node in ast.find_all(exp.Table):
-        # Every reference the coarse key joins, in one catalog, reads the same views: the exact key
-        # is among its twins, and so is every lowercase twin, since names equal lowercased are
-        # equal coarse (checked for every code point). Walked clean once at a depth, the group is
-        # clean at any depth no deeper, as a view is. Keyed by spelling, or by lowercase, which
-        # keeps ſ apart from s, N references to N twins enumerated and visited the group each time,
-        # N squared (Codex's seventh to ninth reviews of #192).
-        group = (frozenset(_coarse(s) for s in (object_key(node), node.name)), catalog)
-        if request.clean_groups.get(group, -1) >= depth:
-            continue
-        if group not in request.groups:
-            request.groups[group] = _views_read(node, request, catalog)
-        for name, view in request.groups[group]:
+        for name, view in _unwalked(node, request, catalog, depth):
             # The view the query read, named in every refusal below: at the top, as the query
             # spells it, which the grant check has passed. Never an inventory key: a twin the
             # fallback walks may be one the caller does not hold, a quoted "V" beside a granted
@@ -531,5 +520,4 @@ def _walk(
             if nested is not None:
                 return nested
             request.clean[(name, inherited)] = depth
-        request.clean_groups[group] = depth
     return None
