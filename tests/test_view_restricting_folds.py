@@ -324,13 +324,18 @@ def test_distinct_spellings_of_one_twin_group_share_one_walk(monkeypatch):
             self.clean = Counting(self.clean)
 
     monkeypatch.setattr(module, "_Request", Request)
-    twins = ["".join(c) for c in itertools.product(*("tT",) * 7)]
-    defs = {k: ViewDefinition(object_id=k, dialect="postgres", definition="SELECT id FROM safe_table") for k in twins}
-    query = " UNION ALL ".join(f'SELECT id FROM "{k}"' for k in twins)
-    verdict = module.check_views(sqlglot.parse_one(query, read="postgres"), defs, {"orders"},
-                                 known={"safe_table", "orders", *defs}, granted=set(twins))
-    assert verdict is None, verdict
-    assert len(lookups) < 4 * len(twins), len(lookups)
+    # Case twins on Postgres, and the long s on Oracle, which lowercase keeps apart from s and the
+    # coarse key joins: a group keyed by lowercase as well split those (its ninth review).
+    for dialect, letters in (("postgres", "tT"), ("oracle", "sſ")):
+        lookups.clear()
+        twins = ["".join(c) for c in itertools.product(*(letters,) * 7)]
+        defs = {k: ViewDefinition(object_id=k, dialect=dialect, definition="SELECT id FROM safe_table")
+                for k in twins}
+        query = " UNION ALL ".join(f'SELECT id FROM "{k}"' for k in twins)
+        verdict = module.check_views(sqlglot.parse_one(query, read=dialect), defs, {"orders"},
+                                     known={"safe_table", "orders", *defs}, granted=set(twins))
+        assert verdict is None, (dialect, verdict)
+        assert len(lookups) < 4 * len(twins), (dialect, len(lookups))
 
 
 def test_on_duckdb_a_long_s_view_name_is_still_unknown():

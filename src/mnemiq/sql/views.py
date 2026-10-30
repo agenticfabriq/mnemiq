@@ -424,13 +424,13 @@ def _walk(
     request: _Request,
 ) -> Refusal | None:
     for node in ast.find_all(exp.Table):
-        # Every reference a fold joins, in one catalog, reads the same views: the exact key is among
-        # its twins. Walked clean once at a depth, the group is clean at any depth no deeper, as a
-        # view is. Keyed by spelling, N references to N twins enumerated and visited the group each
-        # time, N squared, alike or each spelled its own way (Codex's seventh and eighth reviews of
-        # #192).
-        spellings_ = {object_key(node), node.name}
-        group = (frozenset(f(s) for s in spellings_ for f in (str.lower, _coarse)), catalog)
+        # Every reference the coarse key joins, in one catalog, reads the same views: the exact key
+        # is among its twins, and so is every lowercase twin, since names equal lowercased are
+        # equal coarse (checked for every code point). Walked clean once at a depth, the group is
+        # clean at any depth no deeper, as a view is. Keyed by spelling, or by lowercase, which
+        # keeps ſ apart from s, N references to N twins enumerated and visited the group each time,
+        # N squared (Codex's seventh to ninth reviews of #192).
+        group = (frozenset(_coarse(s) for s in (object_key(node), node.name)), catalog)
         if request.clean_groups.get(group, -1) >= depth:
             continue
         if group not in request.groups:
