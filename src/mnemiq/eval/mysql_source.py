@@ -17,7 +17,8 @@ The server must run with two settings, and the adapter refuses to start without 
   creates them. MySQL accepts this setting only when the data directory is first created.
 
 Connection: `MNEMIQ_MYSQL_DSN`, in the extension's `key=value` form without a database (for
-example `host=127.0.0.1 port=3307 user=beaver password=...`). The adapter adds the database.
+example `host=127.0.0.1 port=3307 user=beaver`). The adapter adds the database. The password
+goes in `MYSQL_PWD`, which the extension reads, rather than in the DSN, which its errors quote.
 """
 
 from __future__ import annotations
@@ -68,6 +69,21 @@ class _Run:
         self.mysql_id, self.timed_out, self.interrupted = mysql_id, False, False
 
 
+# The connection-string tokens an error may show as they are; every other token, the password
+# among them, shows as `***`. An allow-list, because the extension's reading of a value is not
+# the generic scrubber's: it keeps reading past a brace or a quote, where the scrubber ends the
+# value, so all of such a password but its first part showed (Codex's third review).
+_SHOWN = re.compile(r"(?:host|port|user|socket|database|db)=[^\s'\"{}\\]*")
+
+# A secret shorter than this is not replaced on its own wherever it appears, which would mangle
+# the rest of the message; the connection string that quotes it is still replaced whole.
+_SHORTEST_REPLACED = 4
+
+
+def _shown(dsn: str) -> str:
+    return " ".join(t if _SHOWN.fullmatch(t) else "***" for t in dsn.split())
+
+
 def _without(text: str, *statements: str) -> str:
     """`text` with each statement's own text taken out. A source error can quote the statement,
     so a statement holding the words `lost connection` must not read as an outage, nor one
@@ -99,7 +115,7 @@ class MySQLSource:
         if not dsn.strip():
             raise MySQLMisconfigured(
                 f"set {DSN_ENV} to the MySQL connection, e.g. "
-                "'host=127.0.0.1 port=3307 user=beaver password=...'")
+                "'host=127.0.0.1 port=3307 user=beaver', and MYSQL_PWD to its password")
         if re.search(r"(?:^|\s)(?:database|db)\s*=", dsn):
             raise MySQLMisconfigured(
                 f"{DSN_ENV} names a database; leave it out, each BEAVER set picks its own")
@@ -126,7 +142,16 @@ class MySQLSource:
             raise failure
 
     def _scrub(self, text: str) -> str:
-        # The extension's connect error quotes the whole connection string, password included.
+        """`text` without the password. The extension's connect and invalid-DSN errors quote the
+        whole connection string (measured), so that is replaced first, by `_shown`. Then each
+        value `_shown` hid, and the password from `MYSQL_PWD`, wherever else it appears, and
+        last the generic scrub, for a credential in a shape neither of those knows."""
+        text = text.replace(self._dsn, _shown(self._dsn))
+        secrets = [t.split("=", 1)[-1] for t in self._dsn.split() if not _SHOWN.fullmatch(t)]
+        secrets.append(os.environ.get("MYSQL_PWD", ""))
+        for secret in sorted(secrets, key=len, reverse=True):
+            if len(secret) >= _SHORTEST_REPLACED:
+                text = text.replace(secret, "***")
         return scrub_credentials(text)
 
     def _clean(self, exc: BaseException) -> BaseException:

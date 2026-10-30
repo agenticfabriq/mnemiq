@@ -48,10 +48,15 @@ there is no MySQL driver to add.
 
 ```bash
 export MNEMIQ_BEAVER_DIR=/path/to/beaver        # holds query/data/<set>-00000-of-00001.parquet
-export MNEMIQ_MYSQL_DSN="host=127.0.0.1 port=3307 user=beaver password=..."   # no database
+export MNEMIQ_MYSQL_DSN="host=127.0.0.1 port=3307 user=beaver"   # no database, no password
+export MYSQL_PWD=...                            # the beaver user's password
 export MNEMIQ_LLM_BASE_URL=... MNEMIQ_LLM_API_KEY=... MNEMIQ_LLM_MODEL=...
 export MNEMIQ_EMBED_BASE_URL=... MNEMIQ_EMBED_MODEL=...
 ```
+
+The `mysql` extension reads the password from `MYSQL_PWD`. Keep it there, not in the DSN: the
+extension's connection errors quote the DSN whole. The runner scrubs a password it finds in one,
+but one that is never there cannot show.
 
 ## 3. Prove the grading path, then run
 

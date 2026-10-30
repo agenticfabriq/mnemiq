@@ -593,6 +593,42 @@ def test_a_source_that_cannot_attach_never_shows_the_password(monkeypatch):
     assert "hunter2" not in everything_shown(raised.value)
 
 
+# Passwords the generic scrubber reads differently from the extension: it ends a value at a brace
+# or a quote, where the extension keeps reading (measured), so all but the first part showed.
+ODD_PASSWORDS = ["{prefix}TOPSECRET", "'prefix'TOPSECRET", '"prefix"TOPSECRET',
+                 "pre fix TOPSECRET"]
+
+
+@pytest.mark.parametrize("password", ODD_PASSWORDS)
+@pytest.mark.parametrize("says", [
+    # The extension's two errors that quote the connection string, as measured.
+    'IO Error: Failed to connect to MySQL database with parameters "{dsn}": Access denied',
+    'Invalid Input Error: Invalid dsn "{dsn}" - expected key=value pairs separated by spaces',
+])
+def test_no_password_shows_whatever_it_holds(monkeypatch, password, says):
+    class Refuses(Session):
+        def execute(self, query):
+            if query.startswith("ATTACH"):
+                raise duckdb.IOException(says.format(dsn=a_dsn + " database=d"))
+            return super().execute(query)
+    a_dsn = "host=h port=3307 user=u password=" + password
+    monkeypatch.setattr(mysql_source, "connect_duckdb", lambda local_only=False: Refuses())
+    monkeypatch.setattr(mysql_source, "load_extension", lambda *a, **k: None)
+    with pytest.raises(MySQLUnavailable) as raised:
+        MySQLSource("d", dsn=a_dsn)
+    shown = everything_shown(raised.value)
+    assert "TOPSECRET" not in shown and "prefix" not in shown
+    assert "host=h port=3307 user=u" in shown  # the operator still sees which connection
+
+
+def test_the_password_from_mysql_pwd_never_shows(monkeypatch):
+    monkeypatch.setenv("MYSQL_PWD", "env-TOPSECRET")
+    a = adapter(Leaks(": Access denied (tried env-TOPSECRET)"))
+    with pytest.raises(ExecutionError) as raised:
+        run_statement(a, "SELECT x FROM t", timeout_s=5)
+    assert "TOPSECRET" not in everything_shown(raised.value)
+
+
 def test_validate_runs_the_plan_as_a_zero_row_derived_table_under_a_bound():
     a = adapter(Blocking())
     seen = []
@@ -743,13 +779,29 @@ def test_live_the_proof_accepts_a_valid_plan_and_rejects_an_unknown_column(live_
 
 @pytest.mark.integration
 @needs_mysql
-def test_live_a_wrong_password_is_unavailable_and_never_shown():
-    if "password=" not in LIVE_DSN:
-        pytest.skip("the DSN carries no password to replace")
-    dsn = re.sub(r"password=\S+", "password=not-the-password-7f3a", LIVE_DSN)
+@pytest.mark.parametrize("password", ["not-the-password-7f3a", *ODD_PASSWORDS])
+def test_live_a_wrong_password_is_unavailable_and_never_shown(monkeypatch, password):
+    monkeypatch.delenv("MYSQL_PWD", raising=False)
+    dsn = re.sub(r"\s*password=\S+", "", LIVE_DSN) + " password=" + password
     with pytest.raises(MySQLUnavailable) as raised:
         MySQLSource(LIVE_DB, dsn=dsn)
-    assert "not-the-password-7f3a" not in everything_shown(raised.value)
+    shown = everything_shown(raised.value)
+    assert all(part not in shown for part in password.replace("'", " ").replace('"', " ")
+               .replace("{", " ").replace("}", " ").split())
+
+
+@pytest.mark.integration
+@needs_mysql
+def test_live_the_password_can_come_from_mysql_pwd_instead(monkeypatch):
+    # The setup docs/beaver.md recommends: the extension reads MYSQL_PWD (measured), so the
+    # connection string, which its errors quote, need not hold the password at all.
+    if not os.getenv("MYSQL_PWD"):
+        pytest.skip("MYSQL_PWD is not set")
+    source = MySQLSource(LIVE_DB, dsn=re.sub(r"\s*password=\S+", "", LIVE_DSN))
+    try:
+        assert source.introspect()
+    finally:
+        source.close()
 
 
 @pytest.mark.integration
