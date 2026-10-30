@@ -154,24 +154,32 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     the parse holds outside EXTRACT and an INTERVAL, which are keywords in every engine, must not
     have been written as a bare name. A function's name is left out of both: a reprint may rename it
     (`now()` prints as CURRENT_TIMESTAMP), and it reads no data."""
-    def names(text: str) -> list[str]:
+    # A keyword the parser takes as an identifier is a name too: `comment` tokenizes as COMMENT,
+    # and DuckDB reads `date_diff(comment, a, b)` as the column (Codex's second review of #193).
+    # A type's name among them the reprint may respell (INTEGER as INT), so it is left out of the
+    # count and kept for the date-part check, which `date_diff(date, a, b)` would otherwise pass.
+    parser = sqlglot.Dialect.get_or_raise(dialect).parser_class
+    named = _NAME_TOKENS | parser.ID_VAR_TOKENS
+
+    def names(text: str, kinds) -> list[str]:
         tokens = sqlglot.tokenize(text, read=dialect)
-        return [t.text.casefold() for i, t in enumerate(tokens) if t.token_type in _NAME_TOKENS
+        return [t.text.casefold() for i, t in enumerate(tokens) if t.token_type in kinds
                 and not (i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN)]
 
     tree = _parsed(filt, dialect)
-    written = names(filt)
+    counted = named - parser.TYPE_TOKENS
+    written = names(filt, counted)
     # A struct literal's field names reprint as strings (`{X: 1}` as `{'X': 1}`): names the filter
     # gives, not reads.
     fields = [e.this.name.casefold() for struct in tree.find_all(exp.Struct) for e in struct.expressions
               if isinstance(e, exp.PropertyEQ) and isinstance(e.this, exp.Identifier)]
-    lost = Counter(written) - Counter(names(tree.sql(dialect=dialect))) - Counter(fields)
+    lost = Counter(written) - Counter(names(tree.sql(dialect=dialect), counted)) - Counter(fields)
     # A date part holds its text; a MAP key read as a lambda's parameter holds the parameter's
     # Identifier (`as_duckdb_reads`), a name the lambda declares.
     parts = {v.name.casefold() for v in tree.find_all(exp.Var) if isinstance(v.this, str)
              and not (isinstance(v.parent, exp.Extract) and v.arg_key == "this")
              and not isinstance(v.parent, (exp.Interval, exp.IntervalSpan))}
-    return sorted(set(lost) | (parts & set(written)))
+    return sorted(set(lost) | (parts & set(names(filt, named))))
 
 
 def _lost_names(filt: str, table: str, dialect: str) -> Refusal | None:

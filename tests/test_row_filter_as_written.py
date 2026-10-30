@@ -198,6 +198,10 @@ def test_a_text_that_does_not_read_back_as_the_expanded_tree_is_refused(monkeypa
     ("duckdb", "date_trunc(secret, DATE '2020-01-01') IS NOT NULL"),
     # The parse drops the name outright; only the reprint's names miss it.
     ("duckdb", "list_reverse_sort([id], secret) IS NOT NULL"),
+    # A keyword the engine reads as a column: `comment` tokenizes as COMMENT, no name token at all
+    # (Codex's second review of #193).
+    ("duckdb", "date_diff(comment, DATE '2020-01-01', DATE '2021-01-01') = 1"),
+    ("duckdb", "list_reverse_sort([id], comment) IS NOT NULL"),
     # The parse holds a date part that reprints bare; only the date-part check sees it.
     ("duckdb", "time_bucket(INTERVAL 1 DAY, d, secret) IS NOT NULL"),
 ])
@@ -224,12 +228,23 @@ def test_names_the_parse_accounts_for_pass(dialect, filt):
     assert isinstance(verdict, Approved), (dialect, filt, verdict)
 
 
+@pytest.mark.parametrize("name", ["secret", "comment"])
 @pytest.mark.parametrize("sql", ["DELETE FROM claim WHERE id > 0", "UPDATE claim SET d = NULL WHERE id > 0"])
-def test_a_write_target_s_filter_is_held_to_the_same_names(sql):
+def test_a_write_target_s_filter_is_held_to_the_same_names(sql, name):
     # The target's filter is conjoined, not wrapped, and checked on its own path.
     schema = {"claim": {"id", "d"}}
-    filt = "date_diff(secret, DATE '2020-01-01', DATE '2021-01-01') = 1"
+    filt = f"date_diff({name}, DATE '2020-01-01', DATE '2021-01-01') = 1"
     grants = GrantSet(frozenset(schema), writable=frozenset(schema), row_filters={"claim": filt})
     verdict = decide_write(sql, schema, grants, dialect="duckdb", target="duckdb", writes_enabled=True,
                            policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_a_type_s_name_read_as_a_date_part_is_refused_too():
+    # `date` is a type's keyword, left out of the count since a reprint respells types; a date
+    # part read from it is still refused.
+    schema = {"claim": {"id", "d"}}
+    filt = "date_diff(date, DATE '2020-01-01', DATE '2021-01-01') = 1"
+    verdict = decide("SELECT id FROM claim", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
