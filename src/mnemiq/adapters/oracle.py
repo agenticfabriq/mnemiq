@@ -820,11 +820,15 @@ class OracleAdapter:
         # a PUBLIC one -- so a PUBLIC candidate sharing its name with a private link synonym would
         # be resolved across that link (the review gate). Such a name is never resolved at all.
         private_links = {stored for owner, stored in over_links if owner == self._schema}
+        # The same for a chain out of sight (M177): any candidate of a name, since the name is all
+        # NAME_RESOLVE takes.
+        out_of_sight = {stored for owner, stored in sorted(candidates)
+                        if (owner, stored) not in over_links and self._out_of_sight(owner, stored)}
         unresolvable: set[str] = set()
         oracle_owned: set[str] | None = None
         for owner, stored in sorted(candidates):
             name = stored.lower()
-            if (owner, stored) in over_links or stored in private_links:
+            if (owner, stored) in over_links or stored in private_links | out_of_sight:
                 unresolvable.add(name)
                 continue
             resolved = self._name_resolve(stored)
@@ -877,6 +881,42 @@ class OracleAdapter:
             frontier = reached - found
             found |= frontier
         return found
+
+    def _out_of_sight(self, owner: str, stored: str) -> bool:
+        """Whether the synonym's chain passes through a hop this session's dictionary does not show,
+        where NAME_RESOLVE could follow it somewhere this engine cannot see (M177).
+
+        `_synonyms_reaching_a_link` reads ALL_SYNONYMS, which shows no other schema's private
+        synonym, so a PUBLIC alias to one over a DB link looked like any other alias: NAME_RESOLVE
+        followed it across the link, 40 s on a dead one, then DPY-4024 at the adapter's 30 s probe
+        timeout and every call in the statement unconfirmable, and a crash at 8 s, measured on
+        Oracle Free 23 with two accounts. So the chain is followed hop by hop first, by stored owner
+        and name, which ALL_SYNONYMS and ALL_OBJECTS answer from their indexes (0.4 ms each with
+        107,886 synonyms, where a folded name costs 1.5 s). A hop over a link, or onto a name the
+        dictionary does not show in another schema, is out of sight: hidden and missing look alike
+        there, and Oracle resolves a hidden object before any PUBLIC synonym. In the session's own
+        schema every object is shown, so a missing name is missing, and Oracle answers it with the
+        PUBLIC synonym of that name, which is followed. A cycle is left to NAME_RESOLVE, which
+        answers it at once (ORA-01775).
+        """
+        seen: set[tuple[str, str]] = set()
+        while (owner, stored) not in seen:
+            seen.add((owner, stored))
+            hop = self._rows("SELECT table_owner, table_name, db_link FROM all_synonyms "
+                             "WHERE owner = :owner AND synonym_name = :name", owner=owner, name=stored)
+            if hop:
+                target_owner, target, link = hop[0]
+                if link is not None:
+                    return True
+                owner, stored = target_owner or owner, target
+                continue
+            if self._rows("SELECT 1 FROM all_objects WHERE owner = :owner AND object_name = :name "
+                          "AND ROWNUM = 1", owner=owner, name=stored):
+                return False
+            if owner != self._user:
+                return True
+            owner = "PUBLIC"
+        return False
 
     def _name_resolve(self, stored: str):
         """Oracle's own resolution of the stored name, as a PL/SQL callable (context 1).

@@ -136,3 +136,75 @@ def test_the_narrow_question_agrees_with_the_whole_read_or_oracle_refuses_the_ca
         _drop_everything(app_cur, admin_cur, oracledb)
         app.close()
         admin.close()
+
+
+OTHER = "m177_other"
+M177_DROPS = ["DROP PUBLIC SYNONYM m177_app_priv", "DROP PUBLIC SYNONYM m177_app_pub",
+              "DROP PUBLIC DATABASE LINK m177_dead", f"DROP USER {OTHER} CASCADE"]
+
+
+def _drop_m177(admin_cur, oracledb):
+    for drop in M177_DROPS:
+        try:
+            admin_cur.execute(drop)
+        except oracledb.DatabaseError:
+            pass
+
+
+def test_a_public_alias_over_another_schema_s_link_synonym_is_never_handed_to_the_resolver():
+    """M177: the link walk reads ALL_SYNONYMS, which shows the caller no other schema's private
+    synonym, so a PUBLIC alias to one that reaches a DB link looked like any other alias and went to
+    NAME_RESOLVE: 40 s on a dead link, DPY-4024 at the adapter's 30 s probe timeout, a crash at 8 s.
+    The alias's chain is followed first, and a hop the caller's dictionary does not show, in
+    another schema, is unresolvable unasked.
+
+    Two accounts: `m177_other` owns a private synonym over a PUBLIC dead link and another over its
+    own private dead link, and a PUBLIC synonym names each. The app user is the caller."""
+    import secrets
+    import time
+
+    oracledb = pytest.importorskip("oracledb")
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    admin = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
+                             mode=oracledb.AUTH_MODE_SYSDBA)
+    ac = admin.cursor()
+    _drop_m177(ac, oracledb)  # a run killed before its cleanup
+    other_pw = "P" + secrets.token_hex(8)
+    adapter = OracleAdapter(DSN, USER, PASSWORD)
+    try:
+        for statement in (f"CREATE USER {OTHER} IDENTIFIED BY {other_pw}",
+                          f"GRANT CREATE SESSION, CREATE SYNONYM, CREATE DATABASE LINK TO {OTHER}",
+                          "CREATE PUBLIC DATABASE LINK m177_dead CONNECT TO nobody IDENTIFIED BY x "
+                          "USING '10.255.255.1:1521/NOPE'"):
+            ac.execute(statement)
+        other = oracledb.connect(user=OTHER, password=other_pw, dsn=DSN)
+        try:
+            for statement in ("CREATE DATABASE LINK m177_priv CONNECT TO nobody IDENTIFIED BY x "
+                              "USING '10.255.255.1:1521/NOPE'",
+                              "CREATE SYNONYM m177_hop_priv FOR m177_fn@m177_priv",
+                              "CREATE SYNONYM m177_hop_pub FOR m177_fn@m177_dead"):
+                other.cursor().execute(statement)
+        finally:
+            other.close()
+        ac.execute(f"CREATE PUBLIC SYNONYM m177_app_priv FOR {OTHER}.m177_hop_priv")
+        ac.execute(f"CREATE PUBLIC SYNONYM m177_app_pub FOR {OTHER}.m177_hop_pub")
+
+        asked = []
+        resolve = adapter._name_resolve
+
+        def spy(stored):
+            asked.append(stored)
+            if stored.upper().startswith("M177_"):  # over the dead link it would wait 40 s
+                raise AssertionError(f"{stored} was handed to NAME_RESOLVE")
+            return resolve(stored)
+
+        adapter._name_resolve = spy
+        started = time.monotonic()
+        result = adapter.resolve_called_functions(["m177_app_priv", "m177_app_pub"])
+        assert result == ([], ["m177_app_priv", "m177_app_pub"]), result
+        assert asked == [] and time.monotonic() - started < 10, (asked, time.monotonic() - started)
+    finally:
+        adapter.close()
+        _drop_m177(ac, oracledb)
+        admin.close()

@@ -24,26 +24,40 @@ from mnemiq.adapters.oracle import OracleAdapter
 class _Dictionary:
     """`_rows` answered from Python sets, routed by the shape of the SQL it is handed."""
 
-    def __init__(self, own=(), synonyms=(), oracle_owned=("SYS",)):
+    def __init__(self, own=(), synonyms=(), oracle_owned=("SYS",), hidden=()):
         self.own = set(own)
         # (owner, name, target_owner, target_name, db_link), all as Oracle stores them
         self.synonyms = list(synonyms)
         self.oracle_owned = set(oracle_owned)
+        # What the caller's dictionary does not show, by (owner, name): another schema's private
+        # synonym, an object it holds no grant on, a name nothing holds. Every other synonym, and
+        # every synonym's target, is shown.
+        self.hidden = set(hidden)
+
+    def _shown(self):
+        return [s for s in self.synonyms if (s[0], s[1]) not in self.hidden]
 
     def rows(self, sql, **binds):
         values = set(binds.values())
+        if "synonym_name = :name" in sql:
+            key = (binds["owner"], binds["name"])
+            return [(to, tn, link) for o, n, to, tn, link in self._shown() if (o, n) == key]
+        if "object_name = :name" in sql:
+            key = (binds["owner"], binds["name"])
+            objects = {(o, n) for o, n, *_ in self.synonyms} | {(to, tn) for _, _, to, tn, _ in self.synonyms}
+            return [(1,)] if key in objects - self.hidden else []
         if "all_procedures" in sql:
             return [(n,) for n in self.own if n in values]
         if "object_type = 'SYNONYM'" in sql:
             return [(o, n) for o, n, *_ in self.synonyms
                     if o in (binds["owner"], "PUBLIC") and n.lower() in values]
         if "db_link IS NOT NULL" in sql:
-            return [(o, n) for o, n, _, _, link in self.synonyms if link]
+            return [(o, n) for o, n, _, _, link in self._shown() if link]
         if "(table_owner, table_name) IN" in sql:
             pairs = {(binds[f"o{i}"], binds[f"n{i}"]) for i in range(len(binds) // 2)}
-            return [(o, n) for o, n, to, tn, _ in self.synonyms if (to, tn) in pairs]
+            return [(o, n) for o, n, to, tn, _ in self._shown() if (to, tn) in pairs]
         if "table_name IN" in sql:
-            return [(o, n) for o, n, _, tn, _ in self.synonyms if tn in values]
+            return [(o, n) for o, n, _, tn, _ in self._shown() if tn in values]
         if "oracle_maintained" in sql:
             return [(u,) for u in self.oracle_owned]
         raise AssertionError(f"unrouted dictionary query: {sql}")
@@ -53,7 +67,7 @@ def _adapter(dictionary, resolutions):
     """`resolutions` maps a stored synonym name to what `_name_resolve` returns; a name absent
     from it must never be resolved, and resolving it fails the test."""
     a = OracleAdapter.__new__(OracleAdapter)
-    a._schema = "APP"
+    a._schema = a._user = "APP"
     a._rows = dictionary.rows
 
     def resolve(stored):
@@ -171,4 +185,48 @@ def test_a_public_synonym_sharing_a_name_with_a_private_link_synonym_is_never_re
     """Oracle resolves the name to this schema's synonym first, so resolving the PUBLIC one would
     follow the private one across its link (the review gate)."""
     d = _Dictionary(synonyms=[("APP", "X", "APP", "F", "ERP"), ("PUBLIC", "X", "APP2", "F", None)])
+    assert _adapter(d, {}).resolve_called_functions(["x"]) == ([], ["x"])
+
+
+def test_a_hop_the_dictionary_does_not_show_is_unresolvable_and_never_resolved():
+    """M177: ALL_SYNONYMS shows the caller no other schema's private synonym, so a PUBLIC alias to
+    one over a DB link looked like any alias, and NAME_RESOLVE followed it across the link: 40 s
+    on a dead one, measured. The chain is followed first, through what the dictionary shows, and a
+    hop it does not show in another schema is unresolvable unasked, a function without a grant too."""
+    d = _Dictionary(synonyms=[("PUBLIC", "APP_PUB", "OTHER", "HOP", None),
+                              ("OTHER", "HOP", None, "FN", "DEAD"),
+                              ("PUBLIC", "TO_FN", "OTHER", "FN", None)],
+                    hidden={("OTHER", "HOP"), ("OTHER", "FN")})
+    assert _adapter(d, {}).resolve_called_functions(["app_pub", "to_fn"]) == ([], ["app_pub", "to_fn"])
+
+
+def test_a_name_this_schema_does_not_hold_is_followed_to_the_public_synonym():
+    # Oracle answers a name the schema does not hold by the PUBLIC synonym of that name. The
+    # session's own schema is all in its dictionary, so a name missing there is missing.
+    d = _Dictionary(synonyms=[("APP", "FB", "APP", "FB_TARGET", None),
+                              ("PUBLIC", "FB_TARGET", "APP2", "F", None)],
+                    hidden={("APP", "FB_TARGET")})
+    assert _adapter(d, {"FB": ("APP2", None)}).resolve_called_functions(["fb"]) == (["fb"], [])
+
+
+def test_a_name_another_schema_does_not_show_is_not_taken_for_missing():
+    # One schema over, a name the dictionary does not show may be one it hides, which Oracle
+    # resolves before any PUBLIC synonym, so the fallback is not assumed.
+    d = _Dictionary(synonyms=[("APP", "FB", "APP2", "FB_TARGET", None),
+                              ("PUBLIC", "FB_TARGET", "APP2", "F", None)],
+                    hidden={("APP2", "FB_TARGET")})
+    assert _adapter(d, {}).resolve_called_functions(["fb"]) == ([], ["fb"])
+
+
+def test_a_chain_the_dictionary_shows_is_resolved_as_before():
+    d = _Dictionary(synonyms=[("PUBLIC", "P", "APP2", "S", None), ("APP2", "S", "APP2", "F", None)])
+    assert _adapter(d, {"P": ("APP2", None)}).resolve_called_functions(["p"]) == (["p"], [])
+
+
+def test_a_public_alias_sharing_a_name_with_a_private_one_out_of_sight_is_never_resolved():
+    # NAME_RESOLVE takes the name, and Oracle reads this schema's synonym of it before PUBLIC's, so
+    # resolving the PUBLIC candidate would follow the private chain out of sight.
+    d = _Dictionary(synonyms=[("APP", "X", "OTHER", "HOP", None), ("OTHER", "HOP", None, "FN", "DEAD"),
+                              ("PUBLIC", "X", "APP2", "F", None)],
+                    hidden={("OTHER", "HOP")})
     assert _adapter(d, {}).resolve_called_functions(["x"]) == ([], ["x"])
