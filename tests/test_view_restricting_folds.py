@@ -18,15 +18,18 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, ApprovedWrite, Refusal, RefusalCode
-from mnemiq.sql.views import ViewDefinition
+from mnemiq.sql.views import ViewDefinition, check_views
+from tests.stored_names import as_stored, keyed, stored
 
 SCHEMA = {"orders": {"id", "store_id"}, "client": {"id"}, "ΚΟΣΜΟΣ": {"id"}, "stores": {"id"}, "v": {"id"}}
 
 
 def _read_view(body: str, filtered: str, dialect: str = "oracle"):
-    policy = AccessPolicy(row_filters={filtered: "1 = 1"}, policy_schema=SCHEMA)
-    views = {"v": ViewDefinition(object_id="v", dialect=dialect, definition=body)}
-    return decide("SELECT id FROM v", {"v": {"id"}}, dialect=dialect, target=dialect, policy=policy, views=views)
+    # The view the query reads is spelled as its engine stores it unquoted (M223): V on Oracle.
+    v = stored("v", dialect)
+    policy = AccessPolicy(row_filters={filtered: "1 = 1"}, policy_schema=keyed(SCHEMA, dialect, "v"))
+    views = {v: ViewDefinition(object_id=v, dialect=dialect, definition=body)}
+    return decide(f"SELECT id FROM {v}", {v: {"id"}}, dialect=dialect, target=dialect, policy=policy, views=views)
 
 
 @pytest.mark.parametrize("filtered", ["orders", "ORDERS"])
@@ -60,11 +63,12 @@ def test_a_long_s_spelling_of_an_unfiltered_table_is_still_read():
 
 
 def _read_through_a_nested_view(spelled: str, dialect: str = "oracle"):
-    schema = {"orders": {"id"}, "sales": {"id"}, "v": {"id"}}
+    v = stored("v", dialect)
+    schema = {"orders": {"id"}, "sales": {"id"}, v: {"id"}}
     policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
     views = {"sales": ViewDefinition(object_id="sales", dialect=dialect, definition="SELECT id FROM orders"),
-             "v": ViewDefinition(object_id="v", dialect=dialect, definition=f"SELECT id FROM {spelled}")}
-    return decide("SELECT id FROM v", {"v": {"id"}}, dialect=dialect, target=dialect, policy=policy, views=views)
+             v: ViewDefinition(object_id=v, dialect=dialect, definition=f"SELECT id FROM {spelled}")}
+    return decide(f"SELECT id FROM {v}", {v: {"id"}}, dialect=dialect, target=dialect, policy=policy, views=views)
 
 
 @pytest.mark.parametrize("spelled", ["ſales", "app.ſales", "SALEſ", "(SELECT id FROM ſales) x"])
@@ -84,22 +88,25 @@ def test_every_view_a_fold_matches_is_walked_not_the_first(body):
     # Walking only the first match approved `app."ſALES"`, which Oracle reads as the filtered
     # APP.ſALES (Codex's second review of #192). The unquoted spelling is Oracle's APP.SALES, and
     # is refused too: the lookup does not resolve quoting, so it walks every candidate.
-    schema = {"orders": {"id"}, "safe_table": {"id"}, "APP.ſALES": {"id"}, "APP.SALES": {"id"}, "v": {"id"}}
+    schema = {"orders": {"id"}, "safe_table": {"id"}, "APP.ſALES": {"id"}, "APP.SALES": {"id"}, "V": {"id"}}
     views = {"APP.ſALES": ViewDefinition(object_id="APP.ſALES", dialect="oracle", definition="SELECT id FROM orders"),
              "APP.SALES": ViewDefinition(object_id="APP.SALES", dialect="oracle", definition="SELECT id FROM safe_table"),
-             "v": ViewDefinition(object_id="v", dialect="oracle", definition=body)}
+             "V": ViewDefinition(object_id="V", dialect="oracle", definition=body)}
     policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
-    verdict = decide("SELECT id FROM v", {"v": {"id"}}, dialect="oracle", target="oracle", policy=policy, views=views)
+    verdict = decide("SELECT id FROM V", {"V": {"id"}}, dialect="oracle", target="oracle", policy=policy, views=views)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, (body, verdict)
 
 
-def _over_twins(body: str, dialect: str, views: dict[str, str], visible=("v",)):
+def _over_twins(body: str, dialect: str, views: dict[str, str], visible=None, query="SELECT id FROM {v}"):
+    # The view the query reads is spelled as its engine stores it unquoted (M223), unless a test
+    # names it: V on Oracle.
+    v = stored("v", dialect)
     defs = {k: ViewDefinition(object_id=k, dialect=dialect, definition=d) for k, d in views.items()}
     if body:
-        defs.setdefault("v", ViewDefinition(object_id="v", dialect=dialect, definition=body))
+        defs.setdefault(v, ViewDefinition(object_id=v, dialect=dialect, definition=body))
     schema = {"orders": {"id"}, "safe_table": {"id"}, **{k: {"id"} for k in defs}}
     policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
-    return decide("SELECT id FROM v", {k: {"id"} for k in visible}, dialect=dialect, target=dialect,
+    return decide(query.format(v=v), {k: {"id"} for k in (visible or (v,))}, dialect=dialect, target=dialect,
                   policy=policy, views=defs)
 
 
@@ -122,11 +129,19 @@ def test_a_view_with_no_twin_is_still_read():
 
 
 def test_a_refusal_through_a_twin_names_only_the_view_the_query_read():
-    # The query reads `v`, which the caller holds; `V` folds onto it and reads the filtered table.
-    # The refusal is about `v`, and the twin's name stays in the log.
-    verdict = _over_twins("SELECT id FROM safe_table", "oracle", {"V": "SELECT id FROM orders"})
-    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
+    # The query writes `v`, which the caller holds as a quoted lowercase name; Oracle reads the
+    # unquoted `v` as V, a twin over the filtered table. The grant check refuses it now, saying to
+    # quote it (M223), and the view check, asked alone, refuses it too. Each names `v`, and the
+    # twin's name stays in the log.
+    twins = {"v": "SELECT id FROM safe_table", "V": "SELECT id FROM orders"}
+    verdict = _over_twins("", "oracle", twins, visible=("v",), query="SELECT id FROM v")
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_TABLE, verdict
     assert verdict.subject == "v" and "'V'" not in verdict.message, verdict
+    defs = {k: ViewDefinition(object_id=k, dialect="oracle", definition=d) for k, d in twins.items()}
+    viewed = check_views(sqlglot.parse_one("SELECT id FROM v", read="oracle"), defs, {"orders"},
+                         known={"orders", "safe_table", *twins}, granted={"v"}, dialect="oracle")
+    assert isinstance(viewed, Refusal) and viewed.code is RefusalCode.UNGOVERNED_VIEW, viewed
+    assert viewed.subject == "v" and "'V'" not in viewed.message, viewed
 
 
 def test_a_granted_table_s_view_twin_is_refused_under_the_table_s_name():
@@ -190,8 +205,14 @@ def test_the_query_s_own_spelling_is_folded_as_its_engine_reads_it():
     views = {"SALES": ViewDefinition(object_id="SALES", dialect="oracle", definition="SELECT id FROM orders")}
     verdict = decide("SELECT id FROM ſALES", {"ſALES": {"id"}}, dialect="oracle", target="oracle",
                      policy=policy, views=views)
-    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
+    # Refused at the grant check now, since the query reads another name than the one held (M223),
+    # and by the view check asked alone, each naming only what the query wrote.
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNKNOWN_TABLE, verdict
     assert verdict.subject == "ſALES" and "'SALES'" not in verdict.message, verdict
+    viewed = check_views(sqlglot.parse_one("SELECT id FROM ſALES", read="oracle"), views, {"orders"},
+                         known=set(schema), granted={"ſALES"}, dialect="oracle")
+    assert isinstance(viewed, Refusal) and viewed.code is RefusalCode.UNGOVERNED_VIEW, viewed
+    assert viewed.subject == "ſALES" and "'SALES'" not in viewed.message, viewed
 
 
 def test_the_inventory_is_folded_once_a_request_not_once_a_reference(monkeypatch):
@@ -228,15 +249,15 @@ def test_letters_no_single_narrow_fold_joins_are_joined(filtered_is):
     # quoted table `ᾀſ` passes the known-object check. The restricting key is uppercase then
     # casefold, which joins every letter Oracle folds to its fold: all 6,679 letters Oracle Free 23
     # answers, swept live.
-    schema = {"orders": {"id"}, "ᾀſ": {"id"}, "ᾈS": {"id"}, "v": {"id"}}
+    schema = {"orders": {"id"}, "ᾀſ": {"id"}, "ᾈS": {"id"}, "V": {"id"}}
     if filtered_is == "a view":
         filters, body_views = {"orders": "1 = 1"}, {"ᾈS": "SELECT id FROM orders"}
     else:
         filters, body_views = {"ᾈS": "1 = 1"}, {}
     defs = {k: ViewDefinition(object_id=k, dialect="oracle", definition=d) for k, d in body_views.items()}
-    defs["v"] = ViewDefinition(object_id="v", dialect="oracle", definition="SELECT id FROM ᾀſ")
+    defs["V"] = ViewDefinition(object_id="V", dialect="oracle", definition="SELECT id FROM ᾀſ")
     policy = AccessPolicy(row_filters=filters, policy_schema=schema)
-    verdict = decide("SELECT id FROM v", {"v": {"id"}}, dialect="oracle", target="oracle", policy=policy, views=defs)
+    verdict = decide("SELECT id FROM V", {"V": {"id"}}, dialect="oracle", target="oracle", policy=policy, views=defs)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
 
 
@@ -264,14 +285,15 @@ def test_the_repair_names_a_filtered_table_only_where_the_caller_holds_that_one(
     # The caller holds `v` and `ä`; the filter is on `Ä`. The repair compared lowercased names and
     # told the caller to query 'Ä' directly, a table it does not hold (Codex's seventh review of
     # #192). Exact names now: no repair here, the refusal stands.
-    schema = {"v": {"id"}, "ä": {"id"}, "Ä": {"id"}}
+    v = stored("v", dialect)  # as the engine stores the view the query reads (M223)
+    schema = {v: {"id"}, "ä": {"id"}, "Ä": {"id"}}
     policy = AccessPolicy(row_filters={"Ä": "1 = 1"}, policy_schema=schema)
-    views = {"v": ViewDefinition(object_id="v", dialect=dialect, definition='SELECT id FROM "Ä"')}
-    verdict = decide("SELECT id FROM v", {"v": {"id"}, "ä": {"id"}}, dialect=dialect, target=dialect,
+    views = {v: ViewDefinition(object_id=v, dialect=dialect, definition='SELECT id FROM "Ä"')}
+    verdict = decide(f"SELECT id FROM {v}", {v: {"id"}, "ä": {"id"}}, dialect=dialect, target=dialect,
                      policy=policy, views=views)
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNGOVERNED_VIEW, verdict
     assert "Ä" not in verdict.message, verdict.message
-    held = decide("SELECT id FROM v", {"v": {"id"}, "Ä": {"id"}}, dialect=dialect, target=dialect,
+    held = decide(f"SELECT id FROM {v}", {v: {"id"}, "Ä": {"id"}}, dialect=dialect, target=dialect,
                   policy=policy, views=views)
     assert "Query 'Ä' directly." in held.message, held.message  # the control: held, it is offered
 
@@ -413,11 +435,12 @@ def test_on_duckdb_the_long_s_names_another_object_and_is_refused_as_unknown():
 
 def _read_with_sales_view(query: str, dialect: str, view: str = "SALES", body: str = "SELECT id FROM orders",
                           visible=None):
-    schema = {"safe_table": {"id"}, "orders": {"id"}, view: {"id"}, "v": {"id"}}
+    # The table the query reads spelled as its engine stores it unquoted (M223): SAFE_TABLE on Oracle.
+    schema = keyed({"safe_table": {"id"}, "orders": {"id"}, view: {"id"}, "v": {"id"}}, dialect, "safe_table")
     policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
     views = {view: ViewDefinition(object_id=view, dialect=dialect, definition=body)}
-    return decide(query, visible or {"safe_table": {"id"}}, dialect=dialect, target=dialect, policy=policy,
-                  views=views)
+    return decide(as_stored(query, dialect, "safe_table"), keyed(visible or {"safe_table": {"id"}}, dialect, "safe_table"),
+                  dialect=dialect, target=dialect, policy=policy, views=views)
 
 
 @pytest.mark.parametrize(("dialect", "view", "cte"), [
@@ -442,12 +465,13 @@ def test_a_cte_s_own_body_reading_a_filtered_view_is_still_refused(dialect):
 @pytest.mark.parametrize("dialect", ["oracle", "duckdb"])
 def test_a_name_a_view_body_s_own_cte_binds_is_not_looked_up_as_a_view(dialect):
     # The same inside a view: its engine binds `sales` in its body to the body's own CTE.
-    schema = {"safe_table": {"id"}, "orders": {"id"}, "SALES": {"id"}, "v": {"id"}}
+    v = stored("v", dialect)  # as the engine stores the view the query reads (M223)
+    schema = {"safe_table": {"id"}, "orders": {"id"}, "SALES": {"id"}, v: {"id"}}
     policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
     views = {"SALES": ViewDefinition(object_id="SALES", dialect=dialect, definition="SELECT id FROM orders"),
-             "v": ViewDefinition(object_id="v", dialect=dialect,
-                                 definition="WITH sales AS (SELECT id FROM safe_table) SELECT id FROM sales")}
-    verdict = decide("SELECT id FROM v", {"v": {"id"}}, dialect=dialect, target=dialect, policy=policy, views=views)
+             v: ViewDefinition(object_id=v, dialect=dialect,
+                               definition="WITH sales AS (SELECT id FROM safe_table) SELECT id FROM sales")}
+    verdict = decide(f"SELECT id FROM {v}", {v: {"id"}}, dialect=dialect, target=dialect, policy=policy, views=views)
     assert isinstance(verdict, Approved), verdict
 
 
@@ -455,18 +479,19 @@ def test_a_name_a_view_body_s_own_cte_binds_is_not_looked_up_as_a_view(dialect):
 def test_a_cte_oracle_folds_onto_the_name_read_binds_it_through_either_door(door):
     # Oracle folds the unquoted `ſales` to SALES, so `FROM SALES` reads the CTE. Bound by any other
     # engine's fold the name is not the CTE's, and the SALES view behind it was looked up.
-    schema = {"safe_table": {"id"}, "orders": {"id"}, "SALES": {"id"}, "scratch": {"id"}}
+    # Base tables as Oracle stores their unquoted names (M223).
+    schema = {"SAFE_TABLE": {"id"}, "orders": {"id"}, "SALES": {"id"}, "SCRATCH": {"id"}}
     policy = AccessPolicy(row_filters={"orders": "1 = 1"}, policy_schema=schema)
     views = {"SALES": ViewDefinition(object_id="SALES", dialect="oracle", definition="SELECT id FROM orders")}
-    query = "WITH ſales AS (SELECT id FROM safe_table) SELECT id FROM SALES"
+    query = "WITH ſales AS (SELECT id FROM SAFE_TABLE) SELECT id FROM SALES"
     if door == "read":
-        verdict = decide(query, {"safe_table": {"id"}}, dialect="oracle", target="oracle", policy=policy,
+        verdict = decide(query, {"SAFE_TABLE": {"id"}}, dialect="oracle", target="oracle", policy=policy,
                          views=views)
         assert isinstance(verdict, Approved), verdict
     else:
-        visible = {"safe_table": {"id"}, "scratch": {"id"}}
-        verdict = decide_write(f"INSERT INTO scratch (id) {query}", visible,
-                               GrantSet(frozenset(visible), writable=frozenset({"scratch"})),
+        visible = {"SAFE_TABLE": {"id"}, "SCRATCH": {"id"}}
+        verdict = decide_write(f"INSERT INTO SCRATCH (id) {query}", visible,
+                               GrantSet(frozenset(visible), writable=frozenset({"SCRATCH"})),
                                dialect="oracle", target="oracle", writes_enabled=True, policy=policy, views=views)
         assert isinstance(verdict, ApprovedWrite), verdict
 

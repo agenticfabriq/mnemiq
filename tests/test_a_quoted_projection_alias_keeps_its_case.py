@@ -13,12 +13,14 @@ import duckdb
 
 from mnemiq.sql.decide import decide
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
+from tests.stored_names import as_stored, keyed
 
 VISIBLE = {"claim": {"id"}}
 
 
 def _decide(sql, dialect):
-    return decide(sql, VISIBLE, dialect=dialect, target=dialect)
+    return decide(as_stored(sql, dialect, "claim"), keyed(VISIBLE, dialect, "claim"),
+                  dialect=dialect, target=dialect)
 
 
 def _refused_unknown(sql, dialect):

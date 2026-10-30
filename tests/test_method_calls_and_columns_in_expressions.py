@@ -16,6 +16,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
+from tests.stored_names import as_stored, keyed, policy_keyed
 
 FULL = {"claim": {"id", "secret", "info"}}
 COMPLETE = AccessPolicy(policy_schema=FULL)
@@ -31,7 +32,10 @@ def con():
 
 
 def _decide(sql, visible, policy=None, engine="duckdb"):
-    return decide(sql, visible, dialect=engine, target=engine, policy=policy)
+    # The table spelled as the engine stores it unquoted (M223): Oracle's catalog lists CLAIM.
+    policy = policy_keyed(policy, engine, "claim") if policy is not None else None
+    return decide(as_stored(sql, engine, "claim"), keyed(visible, engine, "claim"), dialect=engine,
+                  target=engine, policy=policy)
 
 
 def _withheld(con, sql, value=None):

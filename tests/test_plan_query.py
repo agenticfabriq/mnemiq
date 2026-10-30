@@ -16,8 +16,8 @@ def _snapshot() -> Snapshot:
         source_id="acme",
         created_at="2026-07-13T00:00:00Z",
         columns=[
-            Column(id="claim.claim_identifier", object_id="claim", name="claim_identifier"),
-            Column(id="claim.status", object_id="claim", name="status"),
+            Column(id="CLAIM.claim_identifier", object_id="CLAIM", name="claim_identifier"),
+            Column(id="CLAIM.status", object_id="CLAIM", name="status"),
             Column(id="person.last_name", object_id="person", name="last_name"),
         ],
     )
@@ -26,13 +26,13 @@ def _snapshot() -> Snapshot:
 def _packet() -> ContextPacket:
     return ContextPacket(
         question="how many claims?",
-        cards=[RetrievedCard(object_id="claim", card="TABLE claim", score=1.0)],
+        cards=[RetrievedCard(object_id="CLAIM", card="TABLE CLAIM", score=1.0)],
         grant_fingerprint="fp",
         enrichment_version="v1",
     )
 
 
-_GRANTS = GrantSet(frozenset({"claim"}))
+_GRANTS = GrantSet(frozenset({"CLAIM"}))
 
 
 def _plan(replies, target="duckdb", **kw):
@@ -42,17 +42,17 @@ def _plan(replies, target="duckdb", **kw):
 
 
 def test_a_good_query_is_approved_on_the_first_try():
-    outcome, generator = _plan(['{"sql": "SELECT claim_identifier FROM claim"}'])
+    outcome, generator = _plan(['{"sql": "SELECT claim_identifier FROM CLAIM"}'])
     assert isinstance(outcome, Approved)
-    assert outcome.tables == ["claim"]
+    assert outcome.tables == ["CLAIM"]
     assert generator.calls == [None]  # no feedback needed
 
 
 def test_a_repairable_refusal_is_fed_back_and_repaired():
     outcome, generator = _plan(
         [
-            '{"sql": "SELECT * FROM claim"}',  # rejected: star over a base table
-            '{"sql": "SELECT claim_identifier FROM claim"}',  # repaired
+            '{"sql": "SELECT * FROM CLAIM"}',  # rejected: star over a base table
+            '{"sql": "SELECT claim_identifier FROM CLAIM"}',  # repaired
         ]
     )
     assert isinstance(outcome, Approved)
@@ -64,7 +64,7 @@ def test_an_unauthorized_table_is_never_retried():
     outcome, generator = _plan(
         [
             '{"sql": "SELECT last_name FROM person"}',
-            '{"sql": "SELECT claim_identifier FROM claim"}',  # must never be reached
+            '{"sql": "SELECT claim_identifier FROM CLAIM"}',  # must never be reached
         ]
     )
     assert isinstance(outcome, Deferred)
@@ -73,7 +73,7 @@ def test_an_unauthorized_table_is_never_retried():
 
 
 def test_the_loop_is_bounded():
-    outcome, generator = _plan(['{"sql": "SELECT * FROM claim"}'] * 5, max_attempts=3)
+    outcome, generator = _plan(['{"sql": "SELECT * FROM CLAIM"}'] * 5, max_attempts=3)
     assert isinstance(outcome, Deferred)
     assert len(generator.calls) == 3
     # ...and a model that never writes valid SQL is exactly what INVALID_QUERY is for. The
@@ -113,20 +113,20 @@ def test_logic_lint_is_corrected_once_and_approved():
     snapshot = Snapshot(
         version="v1", source_id="s", created_at="2026-07-15T00:00:00Z",
         columns=[
-            Column(id="claim.name", object_id="claim", name="name"),
-            Column(id="claim.score", object_id="claim", name="score"),
+            Column(id="CLAIM.name", object_id="CLAIM", name="name"),
+            Column(id="CLAIM.score", object_id="CLAIM", name="score"),
         ],
     )
     packet = ContextPacket(
-        question="q", cards=[RetrievedCard(object_id="claim", card="TABLE claim", score=1.0)],
+        question="q", cards=[RetrievedCard(object_id="CLAIM", card="TABLE CLAIM", score=1.0)],
         grant_fingerprint="fp", enrichment_version="v1",
     )
-    grants = GrantSet(frozenset({"claim"}))
+    grants = GrantSet(frozenset({"CLAIM"}))
     # Oracle puts NULLs first descending, so this top-1 can return a NULL (M161).
     gen = FakeGenerator(
-        ['{"sql": "SELECT name FROM claim ORDER BY score DESC FETCH FIRST 1 ROWS ONLY"}'])
+        ['{"sql": "SELECT name FROM CLAIM ORDER BY score DESC FETCH FIRST 1 ROWS ONLY"}'])
     corrector = FakeCorrector(
-        ["SELECT name FROM claim ORDER BY score DESC NULLS LAST FETCH FIRST 1 ROWS ONLY"]
+        ["SELECT name FROM CLAIM ORDER BY score DESC NULLS LAST FETCH FIRST 1 ROWS ONLY"]
     )
 
     verdict = plan_query(
@@ -190,16 +190,16 @@ def test_without_a_corrector_a_lint_falls_back_to_regenerate_then_defers():
 
     snapshot = Snapshot(
         version="v1", source_id="s", created_at="2026-07-15T00:00:00Z",
-        columns=[Column(id="claim.score", object_id="claim", name="score"),
-                 Column(id="claim.name", object_id="claim", name="name")],
+        columns=[Column(id="CLAIM.score", object_id="CLAIM", name="score"),
+                 Column(id="CLAIM.name", object_id="CLAIM", name="name")],
     )
-    packet = ContextPacket(question="q", cards=[RetrievedCard(object_id="claim", card="c", score=1.0)],
+    packet = ContextPacket(question="q", cards=[RetrievedCard(object_id="CLAIM", card="c", score=1.0)],
                            grant_fingerprint="fp", enrichment_version="v1")
-    grants = GrantSet(frozenset({"claim"}))
+    grants = GrantSet(frozenset({"CLAIM"}))
     # Oracle puts NULLs first descending, so this top-1 can return a NULL (M161).
     gen = FakeGenerator([
-        '{"sql": "SELECT name FROM claim ORDER BY score DESC FETCH FIRST 1 ROWS ONLY"}',
-        '{"sql": "SELECT name FROM claim ORDER BY score DESC FETCH FIRST 1 ROWS ONLY"}',
+        '{"sql": "SELECT name FROM CLAIM ORDER BY score DESC FETCH FIRST 1 ROWS ONLY"}',
+        '{"sql": "SELECT name FROM CLAIM ORDER BY score DESC FETCH FIRST 1 ROWS ONLY"}',
     ])
     out = plan_query(packet, snapshot, grants, gen, adapter=None, dialect="oracle",
                      target="oracle", max_attempts=2)
@@ -213,7 +213,7 @@ def test_without_a_corrector_a_lint_falls_back_to_regenerate_then_defers():
 def test_a_plan_that_needed_no_repair_says_so():
     """`thinking` differs from `instant` by the corrector and almost nothing else, so an
     answer that cannot say whether it fired cannot show the mode doing its work."""
-    outcome, _ = _plan(['{"sql": "SELECT claim_identifier FROM claim"}'])
+    outcome, _ = _plan(['{"sql": "SELECT claim_identifier FROM CLAIM"}'])
     assert isinstance(outcome, Approved) and outcome.corrected is False
 
 
@@ -224,10 +224,10 @@ def test_a_plan_the_corrector_carried_records_it():
 
     class _Corrector:
         def correct(self, sql, message):
-            return "SELECT status FROM claim ORDER BY status DESC NULLS LAST FETCH FIRST 5 ROWS ONLY"
+            return "SELECT status FROM CLAIM ORDER BY status DESC NULLS LAST FETCH FIRST 5 ROWS ONLY"
 
     outcome, _ = _plan(
-        ['{"sql": "SELECT status FROM claim ORDER BY status DESC FETCH FIRST 5 ROWS ONLY"}'], corrector=_Corrector(), dialect="oracle", target="oracle"
+        ['{"sql": "SELECT status FROM CLAIM ORDER BY status DESC FETCH FIRST 5 ROWS ONLY"}'], corrector=_Corrector(), dialect="oracle", target="oracle"
     )
     assert isinstance(outcome, Approved)
     assert outcome.corrected is True
@@ -238,10 +238,10 @@ def test_a_correction_that_still_refuses_is_not_reported_as_corrected():
 
     class _Useless:
         def correct(self, sql, message):
-            return "SELECT status FROM claim ORDER BY status DESC FETCH FIRST 5 ROWS ONLY"  # the same lint violation
+            return "SELECT status FROM CLAIM ORDER BY status DESC FETCH FIRST 5 ROWS ONLY"  # the same lint violation
 
     outcome, _ = _plan(
-        ['{"sql": "SELECT status FROM claim ORDER BY status DESC FETCH FIRST 5 ROWS ONLY"}'] * 3, corrector=_Useless(), dialect="oracle", target="oracle"
+        ['{"sql": "SELECT status FROM CLAIM ORDER BY status DESC FETCH FIRST 5 ROWS ONLY"}'] * 3, corrector=_Useless(), dialect="oracle", target="oracle"
     )
     assert isinstance(outcome, Deferred)
 
@@ -249,7 +249,7 @@ def test_a_correction_that_still_refuses_is_not_reported_as_corrected():
 def test_decide_never_sets_corrected_because_the_decider_does_not_repair():
     from mnemiq.sql.decide import decide
 
-    verdict = decide("SELECT claim_identifier FROM claim", {"claim": {"claim_identifier"}},
+    verdict = decide("SELECT claim_identifier FROM CLAIM", {"CLAIM": {"claim_identifier"}},
                      dialect="duckdb", target="duckdb")
     assert isinstance(verdict, Approved) and verdict.corrected is False
 
@@ -277,7 +277,7 @@ def test_an_explain_refusal_also_marks_the_feedback_as_the_sources(caplog):
             from mnemiq.generate.generator import SqlProposal
             self.calls.append(feedback)
             if feedback is None:
-                return SqlProposal(sql="SELECT claim_identifier FROM claim")
+                return SqlProposal(sql="SELECT claim_identifier FROM CLAIM")
             return SqlProposal(sql=None, reason=f"the database said: {feedback}")
 
     generator = _Quoting()
@@ -392,8 +392,8 @@ def _pii_snapshot() -> Snapshot:
     return Snapshot(
         version="v1", source_id="acme", created_at="2026-07-13T00:00:00Z",
         columns=[
-            Column(id="claim.claim_identifier", object_id="claim", name="claim_identifier"),
-            Column(id="claim.ssn", object_id="claim", name="ssn", pii_level="direct"),
+            Column(id="CLAIM.claim_identifier", object_id="CLAIM", name="claim_identifier"),
+            Column(id="CLAIM.ssn", object_id="CLAIM", name="ssn", pii_level="direct"),
         ],
     )
 
@@ -405,8 +405,8 @@ def test_a_denied_column_is_not_a_puzzle_to_solve_with_another_attempt():
     from mnemiq.contract import DeferralReason
 
     generator = FakeGenerator([
-        '{"sql": "SELECT ssn FROM claim"}',
-        '{"sql": "SELECT claim_identifier FROM claim"}',   # must never be reached
+        '{"sql": "SELECT ssn FROM CLAIM"}',
+        '{"sql": "SELECT claim_identifier FROM CLAIM"}',   # must never be reached
     ])
     outcome = plan_query(_packet(), _pii_snapshot(), _GRANTS, generator, target="duckdb")
 
@@ -431,13 +431,13 @@ def test_a_source_the_engine_cannot_govern_is_not_retried_either():
 
     path = os.path.join(tempfile.mkdtemp(), "shadow.duckdb")
     con = duckdb.connect(path)
-    con.execute("CREATE TABLE claim(claim_identifier INTEGER, status VARCHAR)")
+    con.execute("CREATE TABLE CLAIM(claim_identifier INTEGER, status VARCHAR)")
     con.execute("CREATE MACRO count_star() AS (SELECT 1)")
     con.close()
 
     generator = FakeGenerator([
-        '{"sql": "SELECT count(*) AS n FROM claim"}',
-        '{"sql": "SELECT claim_identifier FROM claim"}',   # must never be reached
+        '{"sql": "SELECT count(*) AS n FROM CLAIM"}',
+        '{"sql": "SELECT claim_identifier FROM CLAIM"}',   # must never be reached
     ])
     outcome = plan_query(_packet(), _snapshot(), _GRANTS, generator,
                          adapter=DuckDBAdapter.duckdb(path), dialect="duckdb", target="duckdb")
@@ -453,8 +453,8 @@ def test_a_repairable_refusal_is_still_retried():
     read it before turns every membership decision into behaviour, and a code wrongly left out
     of the set now costs an answer rather than a retry."""
     outcome, generator = _plan([
-        '{"sql": "SELECT * FROM claim"}',
-        '{"sql": "SELECT claim_identifier FROM claim"}',
+        '{"sql": "SELECT * FROM CLAIM"}',
+        '{"sql": "SELECT claim_identifier FROM CLAIM"}',
     ])
     assert isinstance(outcome, Approved) and len(generator.calls) == 2
 
@@ -471,7 +471,7 @@ def test_a_denied_columns_name_is_withheld_once_source_words_are_in_play():
     from mnemiq.contract import DeferralReason
     from mnemiq.generate.plan_query import Feedback
 
-    generator = FakeGenerator(['{"sql": "SELECT ssn FROM claim"}'])
+    generator = FakeGenerator(['{"sql": "SELECT ssn FROM CLAIM"}'])
     outcome = plan_query(_packet(), _pii_snapshot(), _GRANTS, generator, target="duckdb",
                          feedback=Feedback("the source said: no column 'ssn'", from_source=True))
 
@@ -480,7 +480,7 @@ def test_a_denied_columns_name_is_withheld_once_source_words_are_in_play():
 
     # ...and it IS named when nothing source-derived reached the model, because a caller told
     # which column they lack can ask for it. Withholding it always would cost that for nothing.
-    plain = FakeGenerator(['{"sql": "SELECT ssn FROM claim"}'])
+    plain = FakeGenerator(['{"sql": "SELECT ssn FROM CLAIM"}'])
     named = plan_query(_packet(), _pii_snapshot(), _GRANTS, plain, target="duckdb")
     assert "ssn" in named.reason
 
@@ -566,7 +566,7 @@ def _attempts_for(code, monkeypatch):
         return Approved(plan_sql=sql, target_sql=sql)
 
     monkeypatch.setattr("mnemiq.generate.plan_query.decide", fake_decide)
-    generator = FakeGenerator(['{"sql": "SELECT claim_identifier FROM claim"}'] * 3)
+    generator = FakeGenerator(['{"sql": "SELECT claim_identifier FROM CLAIM"}'] * 3)
     outcome = plan_query(_packet(), _snapshot(), _GRANTS, generator, target="duckdb")
     return outcome, generator.calls
 
@@ -601,7 +601,7 @@ def test_the_denied_column_is_written_where_the_caller_cannot_see_it(caplog):
     """
     from mnemiq.generate.plan_query import Feedback
 
-    generator = FakeGenerator(['{"sql": "SELECT ssn FROM claim"}'])
+    generator = FakeGenerator(['{"sql": "SELECT ssn FROM CLAIM"}'])
     with caplog.at_level(logging.WARNING):
         outcome = plan_query(
             _packet(), _pii_snapshot(), _GRANTS, generator, target="duckdb",
@@ -641,7 +641,7 @@ def test_a_source_fault_that_survives_every_attempt_is_still_a_source_fault():
     for failures, check in ((1, "recovers"), (9, "exhausts")):
         mp = _pytest.MonkeyPatch()
         mp.setattr("mnemiq.generate.plan_query.decide", blips(failures))
-        generator = FakeGenerator(['{"sql": "SELECT claim_identifier FROM claim"}'] * 5)
+        generator = FakeGenerator(['{"sql": "SELECT claim_identifier FROM CLAIM"}'] * 5)
         outcome = plan_query(_packet(), _snapshot(), _GRANTS, generator, target="duckdb")
         mp.undo()
 

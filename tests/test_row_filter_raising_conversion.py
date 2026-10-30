@@ -32,6 +32,7 @@ from mnemiq.sql.decide_write import decide_write
 from mnemiq.sql.policy import build_access_policy
 from mnemiq.sql.schema import visible_schema
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
+from tests.stored_names import stored
 
 TYPES = {("claim", "id"): "INTEGER", ("claim", "region"): "VARCHAR", ("claim", "amount"): "INTEGER",
          ("claim", "big"): "BIGINT", ("claim", "attrs"): "JSON", ("claim", "d"): "DATE",
@@ -42,6 +43,7 @@ def _snapshot(types=TYPES, oracle=False):
     if oracle:
         types = {k: {"VARCHAR": "VARCHAR2(30)", "INTEGER": "NUMBER", "BIGINT": "NUMBER",
                      "JSON": "VARCHAR2(4000)", "DATE": "DATE"}[v] for k, v in types.items()}
+        types = {(stored(t, "oracle"), c): ty for (t, c), ty in types.items()}  # as Oracle stores them (M223)
     return Snapshot(version="v1", source_id="s", created_at="2026-10-15T00:00:00Z",
                     columns=[Column(id=f"{t}.{c}", object_id=t, name=c, data_type=ty)
                              for (t, c), ty in types.items()])
@@ -49,8 +51,9 @@ def _snapshot(types=TYPES, oracle=False):
 
 def _decide(row_filter, engine="duckdb", snapshot=None):
     snapshot = snapshot or _snapshot(oracle=engine == "oracle")
-    grants = GrantSet(frozenset({"claim"}), row_filters={"claim": row_filter})
-    return decide("SELECT id FROM claim", visible_schema(snapshot, grants), dialect=engine,
+    claim = stored("claim", engine)
+    grants = GrantSet(frozenset({claim}), row_filters={claim: row_filter})
+    return decide(f"SELECT id FROM {claim}", visible_schema(snapshot, grants), dialect=engine,
                   target=engine, policy=build_access_policy(snapshot, grants))
 
 
@@ -890,7 +893,7 @@ def test_every_duckdb_json_reader_that_quotes_malformed_text_is_refused():
     # (ORA-01722 on the hidden row, measured; the gate's advisory on #160).
     ("oracle", "NVL(region, id) = 7"),
     ("oracle", "region = NVL(id, 7)"),
-    ("oracle", "region = (SELECT 7 FROM entitlement)"),
+    ("oracle", "region = (SELECT 7 FROM ENTITLEMENT)"),  # as Oracle stores the unquoted name
     # NVL and NVL2 convert their other argument to the leading one's type, row by row: ORA-01722
     # on a row whose id is NULL (measured); COALESCE and CASE refuse the mix at parse instead.
     ("oracle", "NVL(id, region) IS NOT NULL"),
@@ -1010,7 +1013,7 @@ def test_on_oracle_the_advised_forms_run_where_the_raising_one_fails():
                                  ("NVL(id, region) IS NOT NULL", None), ("region = NVL(id, region)", None),
                                  ("NVL2(id, id, region) IS NOT NULL", None),
                                  ("region = NVL2(id, id, 7)", None),
-                                 ("region = (SELECT 7 FROM dual)", "region = (SELECT 7 FROM entitlement)")):
+                                 ("region = (SELECT 7 FROM dual)", "region = (SELECT 7 FROM ENTITLEMENT)")):
             with pytest.raises(oracledb.DatabaseError, match="ORA-01722"):
                 cur.execute(f"SELECT id FROM {data} WHERE {raising}").fetchall()
             verdict = _decide(decided or raising, "oracle")
@@ -1020,7 +1023,7 @@ def test_on_oracle_the_advised_forms_run_where_the_raising_one_fails():
                      "TO_NUMBER(region DEFAULT NULL ON CONVERSION ERROR) > 0"):
             verdict = _decide(safe, "oracle")
             assert isinstance(verdict, Approved), (safe, verdict)
-            sql = verdict.target_sql.replace("FROM claim", f"FROM {data}")
+            sql = verdict.target_sql.replace("FROM CLAIM", f"FROM {data}")  # as Oracle stores it (M223)
             assert cur.execute(sql).fetchall() == [(1,)], sql
     finally:
         con.close()
@@ -1608,8 +1611,11 @@ def test_a_row_filter_the_target_cannot_print_is_the_policys_refusal():
     types = {**TYPES, ("claim", "tags"): "VARCHAR[]"}
     grants = GrantSet(frozenset({"claim"}), row_filters={"claim": "MAP {region: 1}[region] = 1"})
     for engine in ("postgres", "oracle"):
-        verdict = decide("SELECT id FROM claim", visible_schema(_snapshot(types), grants), dialect="duckdb",
-                        target=engine, policy=build_access_policy(_snapshot(types), grants))
+        claim = stored("claim", engine)
+        snapshot = _snapshot({(stored(t, engine), c): ty for (t, c), ty in types.items()})
+        held = GrantSet(frozenset({claim}), row_filters={claim: grants.row_filters["claim"]})
+        verdict = decide(f"SELECT id FROM {claim}", visible_schema(snapshot, held), dialect="duckdb",
+                        target=engine, policy=build_access_policy(snapshot, held))
         assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.POLICY_TARGET_UNSUPPORTED, (engine, verdict)
         assert not verdict.repairable
     verdict = decide("SELECT id FROM claim", visible_schema(_snapshot(types), grants), dialect="duckdb",
@@ -1749,11 +1755,15 @@ def test_a_raising_filter_the_target_cannot_print_is_still_refused_not_raised():
                       row_filters={"claim": "CAST(MAP {region: 1}[region] AS INT) = 1"})
     for engine in ("duckdb", "postgres", "oracle", "mysql", "sqlite"):
         code = RefusalCode.INVALID_ROW_FILTER if engine == "duckdb" else RefusalCode.POLICY_TARGET_UNSUPPORTED
-        verdict = decide("SELECT id FROM claim", visible_schema(_snapshot(types), grants), dialect="duckdb",
-                        target=engine, policy=build_access_policy(_snapshot(types), grants))
+        claim = stored("claim", engine)
+        snapshot = _snapshot({(stored(t, engine), c): ty for (t, c), ty in types.items()})
+        held = GrantSet(frozenset({claim}), writable=frozenset({claim}),
+                        row_filters={claim: grants.row_filters["claim"]})
+        verdict = decide(f"SELECT id FROM {claim}", visible_schema(snapshot, held), dialect="duckdb",
+                        target=engine, policy=build_access_policy(snapshot, held))
         assert isinstance(verdict, Refusal) and verdict.code is code, (engine, verdict)
-        verdict = decide_write("INSERT INTO claim (id) SELECT id FROM claim", visible_schema(_snapshot(types), grants), grants,
-                               policy=build_access_policy(_snapshot(types), grants), dialect="duckdb", target=engine,
+        verdict = decide_write(f"INSERT INTO {claim} (id) SELECT id FROM {claim}", visible_schema(snapshot, held), held,
+                               policy=build_access_policy(snapshot, held), dialect="duckdb", target=engine,
                                writes_enabled=True)
         assert isinstance(verdict, Refusal) and verdict.code is code, (engine, verdict)
 

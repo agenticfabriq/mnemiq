@@ -19,7 +19,7 @@ from mnemiq.sql.decide import decide
 from mnemiq.sql.functions import FunctionInventory, calls_are_confirmable, inventory_from
 from mnemiq.sql.verdict import Refusal, RefusalCode
 
-VISIBLE = {"claim": {"id", "name"}}
+VISIBLE = {"CLAIM": {"id", "name"}}
 
 
 class _ByName:
@@ -62,26 +62,26 @@ def _decide(sql, adapter):
 
 def test_a_builtin_call_is_decided_without_reading_the_whole_dictionary():
     adapter = _ByName(defined={"helper"})
-    verdict = _decide("SELECT upper(name) FROM claim", adapter)
+    verdict = _decide("SELECT upper(name) FROM CLAIM", adapter)
     assert not isinstance(verdict, Refusal), verdict
     assert adapter.asked and "upper" in adapter.asked[0] and "helper" not in adapter.asked[0]
     assert not adapter.read_whole
 
 
 def test_a_call_the_source_defines_is_refused():
-    verdict = _decide("SELECT add_days(1) AS x FROM claim", _ByName(defined={"add_days"}))
+    verdict = _decide("SELECT add_days(1) AS x FROM CLAIM", _ByName(defined={"add_days"}))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNMODELLED_CALL
     assert "defined by this source itself" in verdict.message
 
 
 def test_a_call_through_a_link_alias_is_refused_with_its_own_sentence():
-    verdict = _decide("SELECT add_days(1) AS x FROM claim", _ByName(unresolvable={"add_days"}))
+    verdict = _decide("SELECT add_days(1) AS x FROM CLAIM", _ByName(unresolvable={"add_days"}))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNMODELLED_CALL
     assert "synonym it cannot resolve" in verdict.message
 
 
 def test_a_source_that_cannot_answer_refuses_the_statement():
-    verdict = _decide("SELECT upper(name) FROM claim", _ByName(fail=True))
+    verdict = _decide("SELECT upper(name) FROM CLAIM", _ByName(fail=True))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.UNRESOLVABLE_CALLS
 
 
@@ -100,7 +100,7 @@ def test_an_adapter_whose_binder_may_rename_is_still_asked_for_the_whole_source(
 def test_the_virtual_columns_calls_are_asked_about_too():
     """`opaque_columns` reads the same answer for them; unasked, a virtual column calling
     `upper` would be refused for want of a question."""
-    adapter = _ByName(virtual=[("claim", "loud", "UPPER(\"NAME\")")])
+    adapter = _ByName(virtual=[("CLAIM", "loud", "UPPER(\"NAME\")")])
     inventory = inventory_from(adapter, called={"id"})
     assert {"id", "upper"} <= inventory.asked_names
 
@@ -130,14 +130,14 @@ def test_the_guard_refuses_a_call_the_answer_was_not_asked_about():
     from sqlglot import parse_one
 
     asked_upper_only = FunctionInventory.of((), asked_names={"upper"}, binder_prefers_builtins=True)
-    ast = parse_one("SELECT add_days(1) FROM claim", read="oracle")
+    ast = parse_one("SELECT add_days(1) FROM CLAIM", read="oracle")
     assert check_unmodelled_calls(ast, asked_upper_only, "oracle", "oracle") is not None
 
 
 def test_an_unrelated_function_no_longer_downgrades_the_answers_lineage():
     """The precision the owner chose with this: a source defining one helper used to mark every
     answer carrying a call `unconfirmed-function-identity` (issue #5's coarse rule)."""
-    verdict = _decide("SELECT upper(name) FROM claim", _ByName(defined={"helper"}))
+    verdict = _decide("SELECT upper(name) FROM CLAIM", _ByName(defined={"helper"}))
     assert "unconfirmed-function-identity" not in verdict.lineage.reasons, verdict.lineage
     whole = FunctionInventory.of({"helper"}, binder_prefers_builtins=True)
     assert not calls_are_confirmable(whole, in_view_body=False)
@@ -146,7 +146,7 @@ def test_an_unrelated_function_no_longer_downgrades_the_answers_lineage():
 def test_a_virtual_column_calling_a_name_never_asked_about_is_opaque():
     from mnemiq.sql.functions import opaque_columns
 
-    adapter = _ByName(virtual=[("claim", "loud", "UPPER(\"NAME\")"),
-                               ("claim", "leaked", "\"APP\".\"SECRET_FN\"(\"ID\")")])
+    adapter = _ByName(virtual=[("CLAIM", "loud", "UPPER(\"NAME\")"),
+                               ("CLAIM", "leaked", "\"APP\".\"SECRET_FN\"(\"ID\")")])
     asked_upper_only = FunctionInventory.of((), asked_names={"upper"}, binder_prefers_builtins=True)
-    assert opaque_columns(adapter, asked_upper_only) == frozenset({("claim", "leaked")})
+    assert opaque_columns(adapter, asked_upper_only) == frozenset({("CLAIM", "leaked")})

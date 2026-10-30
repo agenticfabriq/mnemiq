@@ -16,13 +16,17 @@ import pytest
 from mnemiq.sql.decide import decide
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.verdict import Approved
+from tests.stored_names import as_stored, keyed, policy_keyed
 
 VISIBLE = {"policy": {"id", "region", "premium"}}
 SQL = "SELECT region, count(*) AS n FROM policy GROUP BY region"
 
 
 def _approved(policy=None, target="duckdb"):
-    verdict = decide(SQL, VISIBLE, dialect="duckdb", target=target, policy=policy)
+    # The table spelled as the target stores it unquoted (M223): Oracle's catalog lists POLICY.
+    policy = policy_keyed(policy, target, "policy") if policy is not None else None
+    verdict = decide(as_stored(SQL, target, "policy"), keyed(VISIBLE, target, "policy"),
+                     dialect="duckdb", target=target, policy=policy)
     assert isinstance(verdict, Approved), verdict
     return verdict
 

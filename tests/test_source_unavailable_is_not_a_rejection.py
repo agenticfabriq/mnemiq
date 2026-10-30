@@ -48,8 +48,8 @@ class _Scripted:
         return []
 
 
-REWRITE = "SELECT id FROM (SELECT * FROM claim WHERE who = 1) AS claim"
-ASKED = "SELECT id FROM claim"
+REWRITE = "SELECT id FROM (SELECT * FROM CLAIM WHERE who = 1) AS CLAIM"
+ASKED = "SELECT id FROM CLAIM"
 
 
 def _stale():
@@ -114,9 +114,9 @@ def test_the_adapter_s_reading_of_its_driver_is_the_whole_answer():
 
 def test_duckdb_tells_a_closed_connection_and_an_interrupt_from_a_statement_s_faults():
     con = duckdb.connect()
-    con.execute("CREATE TABLE claim(id INT)")
+    con.execute("CREATE TABLE CLAIM(id INT)")
     faults = {}
-    for name, sql in (("binder", "EXPLAIN SELECT whom FROM claim"),
+    for name, sql in (("binder", "EXPLAIN SELECT whom FROM CLAIM"),
                       ("catalog", "EXPLAIN SELECT id FROM nope"),
                       ("parser", "EXPLAIN SELECT FROM")):
         with pytest.raises(duckdb.Error) as caught:
@@ -312,17 +312,17 @@ def test_a_pool_session_or_protocol_fault_is_unavailable_at_every_proof_position
 def test_through_both_deciders_an_exhausted_oracle_pool_is_unavailable_not_the_model_s(code):
     pytest.importorskip("oracledb")
     snapshot = _snapshot()
-    grants = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}),
-                      row_filters={"claim": ENTITLED})
-    read = decide("SELECT id FROM claim", visible_schema(snapshot, grants),
+    grants = GrantSet(frozenset({"CLAIM"}), writable=frozenset({"CLAIM"}),
+                      row_filters={"CLAIM": ENTITLED})
+    read = decide("SELECT id FROM CLAIM", visible_schema(snapshot, grants),
                   adapter=_OracleScripted(_fault(code)), dialect="oracle", target="oracle",
                   policy=build_access_policy(snapshot, grants))
     assert isinstance(read, Refusal) and read.code is RefusalCode.SOURCE_UNAVAILABLE, read
     assert not read.repairable
     # No row filter on the write: on Oracle an UPDATE of a filtered table is refused before any
     # proof, as a limit of the deployment, so the proof is reached only on a plain grant.
-    plain = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}))
-    write = decide_write("UPDATE claim SET amount = 0 WHERE id = 1",
+    plain = GrantSet(frozenset({"CLAIM"}), writable=frozenset({"CLAIM"}))
+    write = decide_write("UPDATE CLAIM SET amount = 0 WHERE id = 1",
                          visible_schema(snapshot, plain), plain,
                          policy=build_access_policy(snapshot, plain),
                          adapter=_OracleScripted(_fault(code)), dialect="oracle", target="oracle",
@@ -396,7 +396,7 @@ def test_postgres_tells_a_lost_connection_and_a_cancelled_statement_from_a_state
     refused = [psycopg.errors.UndefinedColumn('column "whom" does not exist'),
                psycopg.errors.UndefinedTable('relation "nope" does not exist'),
                psycopg.errors.SyntaxError('syntax error at end of input'),
-               psycopg.errors.InsufficientPrivilege("permission denied for table claim")]
+               psycopg.errors.InsufficientPrivilege("permission denied for table CLAIM")]
     unanswered = [psycopg.OperationalError("server closed the connection unexpectedly"),
                   psycopg.errors.QueryCanceled("canceling statement due to statement timeout"),
                   psycopg.errors.AdminShutdown("terminating connection due to administrator command"),
@@ -406,7 +406,7 @@ def test_postgres_tells_a_lost_connection_and_a_cancelled_statement_from_a_state
 
 
 def _snapshot():
-    names = [("claim", "id"), ("claim", "amount"), ("entitlement", "id"), ("entitlement", "who")]
+    names = [("CLAIM", "id"), ("CLAIM", "amount"), ("entitlement", "id"), ("entitlement", "who")]
     return Snapshot(version="v1", source_id="s", created_at="2026-10-17T00:00:00Z",
                     columns=[Column(id=f"{t}.{c}", object_id=t, name=c) for t, c in names])
 
@@ -432,7 +432,7 @@ class _DropsAtTheProof:
 def _closed_source(tmp_path, name="s"):
     path = str(tmp_path / f"{name}.duckdb")
     con = duckdb.connect(path)
-    con.execute("CREATE TABLE claim(id INT, amount INT); CREATE TABLE entitlement(id INT, who VARCHAR)")
+    con.execute("CREATE TABLE CLAIM(id INT, amount INT); CREATE TABLE entitlement(id INT, who VARCHAR)")
     con.close()
     return _DropsAtTheProof(DuckDBAdapter.duckdb(path, read_only=False))
 
@@ -443,14 +443,14 @@ ENTITLED = "id IN (SELECT id FROM entitlement WHERE who = 'r')"
 def test_through_both_deciders_a_closed_source_is_unavailable_not_the_model_s(tmp_path):
     adapter = _closed_source(tmp_path)
     snapshot = _snapshot()
-    grants = GrantSet(frozenset({"claim"}), writable=frozenset({"claim"}),
-                      row_filters={"claim": ENTITLED})
-    read = decide("SELECT id FROM claim", visible_schema(snapshot, grants), adapter=adapter,
+    grants = GrantSet(frozenset({"CLAIM"}), writable=frozenset({"CLAIM"}),
+                      row_filters={"CLAIM": ENTITLED})
+    read = decide("SELECT id FROM CLAIM", visible_schema(snapshot, grants), adapter=adapter,
                   dialect="duckdb", target="duckdb", policy=build_access_policy(snapshot, grants))
     assert isinstance(read, Refusal) and read.code is RefusalCode.SOURCE_UNAVAILABLE, read
     assert not read.repairable
     adapter = _closed_source(tmp_path, "w")  # its own source: the first one's connection is gone
-    write = decide_write("UPDATE claim SET amount = 0 WHERE id = 1",
+    write = decide_write("UPDATE CLAIM SET amount = 0 WHERE id = 1",
                          visible_schema(snapshot, grants), grants,
                          policy=build_access_policy(snapshot, grants), adapter=adapter,
                          dialect="duckdb", target="duckdb", writes_enabled=True)
@@ -461,13 +461,13 @@ def test_through_the_agent_one_model_call_and_a_failure_that_says_the_source_did
     """Before, the closed connection read as EXPLAIN_FAILED: three model calls repairing a sound
     statement, and the caller told the model had failed. A failure, not a deferral: M6."""
     adapter = _closed_source(tmp_path)
-    grants = GrantSet(frozenset({"claim"}), row_filters={"claim": ENTITLED})
-    generator = FakeGenerator(['{"sql": "SELECT id FROM claim", "reason": "ok"}'] * 3)
+    grants = GrantSet(frozenset({"CLAIM"}), row_filters={"CLAIM": ENTITLED})
+    generator = FakeGenerator(['{"sql": "SELECT id FROM CLAIM", "reason": "ok"}'] * 3)
     agent = Agent(generator=generator, synthesizer=FakeSynthesizer("x"), adapter=adapter,
                   cache=TwoTierCache(L1Cache()))
     packet = ContextPacket(question="which claims?", grant_fingerprint=grants.fingerprint,
                            enrichment_version="v1",
-                           cards=[RetrievedCard(object_id="claim", card="TABLE claim", score=1.0)])
+                           cards=[RetrievedCard(object_id="CLAIM", card="TABLE CLAIM", score=1.0)])
     answer = agent.answer(packet, _snapshot(), grants,
                           IdentityContext(tenant_id="t", principal_id="u", roles=["r"]))
     assert len(generator.calls) == 1, generator.calls

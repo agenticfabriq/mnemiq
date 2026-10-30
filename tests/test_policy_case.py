@@ -51,8 +51,10 @@ def test_a_denied_column_is_refused_however_the_table_is_spelled(snapshot_key, q
     snapshot = Snapshot(version="v", source_id="s", created_at="t", views=[], jobs=JOBS,
                         columns=[_col(snapshot_key, "id"), _col(snapshot_key, "ssn", "direct")])
     policy = build_access_policy(snapshot, GrantSet(objects=frozenset({snapshot_key})))
+    # Decided as DuckDB, where every spelling here is one table: on Postgres an unquoted `Claim` is
+    # `claim`, and a grant keyed `Claim` a quoted table the statement does not read (M223).
     v = decide(f"SELECT ssn FROM {query_ref}",
-               {snapshot_key: {"id", "ssn"}, query_ref: {"id", "ssn"}}, policy=policy)
+               {snapshot_key: {"id", "ssn"}, query_ref: {"id", "ssn"}}, policy=policy, target="duckdb")
     assert isinstance(v, Refusal) and v.code is RefusalCode.UNAUTHORIZED_COLUMN, v
 
 
@@ -116,7 +118,7 @@ def test_a_masked_column_is_nulled_however_either_name_is_spelled(
     query_case, policy_table, policy_column
 ):
     v = decide(f"SELECT id, ssn FROM {query_case}", {query_case: {"id", "amount", "ssn"}},
-               policy=AccessPolicy(masked={(policy_table, policy_column)}))
+               policy=AccessPolicy(masked={(policy_table, policy_column)}), target="duckdb")  # one table (M223)
     assert not isinstance(v, Refusal), v
     assert "NULL AS ssn" in v.target_sql, v.target_sql
 
@@ -222,14 +224,15 @@ def test_a_masked_column_in_a_predicate_is_refused_however_spelled(query_case):
     -- every other masking test goes through `_derived_table`'s nulling path, which never calls
     it. Masking a filtered column would silently change the answer, so it refuses instead."""
     v = decide(f"SELECT id FROM {query_case} WHERE ssn = 'x'",
-               {query_case: {"id", "ssn"}}, policy=AccessPolicy(masked={("claim", "ssn")}))
+               {query_case: {"id", "ssn"}}, policy=AccessPolicy(masked={("claim", "ssn")}),
+               target="duckdb")  # where every spelling is one table (M223)
     assert isinstance(v, Refusal) and v.code is RefusalCode.MASKED_COLUMN_IN_PREDICATE, v
 
 
 def test_a_masked_column_in_a_bare_projection_is_still_allowed():
     """The control: only predicate use refuses. Selecting it is what the NULL projection is for."""
     v = decide("SELECT ssn FROM CLAIM", {"CLAIM": {"id", "ssn"}},
-               policy=AccessPolicy(masked={("claim", "ssn")}))
+               policy=AccessPolicy(masked={("claim", "ssn")}), target="duckdb")  # one table (M223)
     assert not isinstance(v, Refusal), v
 
 

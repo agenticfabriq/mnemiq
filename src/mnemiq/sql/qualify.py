@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from sqlglot import exp
 
+from mnemiq.sql.identifiers import resolve, resolve_exactly
+
 
 def object_key(table: exp.Table) -> str:
     """The object-id form a table node maps to, and the ONE place that question is answered.
@@ -25,6 +27,38 @@ A quoted identifier containing a literal dot is ambiguous against a dotted key -
     and every disagreement between them was a bypass.
     """
     return ".".join(p for p in (table.text("catalog"), table.text("db"), table.name) if p)
+
+
+def engine_key(table: exp.Table, dialect: str | None) -> str | None:
+    """The object id the ENGINE reads this reference as: each part resolved by the dialect's
+    rules, quoting included, and joined as `object_key` joins them. None where a part is not a
+    plain identifier, or holds a character the engine may fold another way (`resolve_exactly`),
+    so nothing can be said about how it is read.
+
+    `object_key` is the name as written, and every check looks a table up by it. The two agree
+    only where the engine reads the name as written, which is `engine_key(t) == stored_key(
+    object_key(t))`: on Oracle an unquoted `sales` is read as SALES, so a grant keyed by a quoted
+    `sales` matched the written name while Oracle read another table (M223). The grant check
+    decides a reference only where they agree (`authz_guard.not_read_as_written`).
+    """
+    parts = []
+    for arg in ("catalog", "db", "this"):
+        part = table.args.get(arg)
+        if part is None:
+            continue
+        read = (resolve_exactly(part.name, quoted=bool(part.quoted), dialect=dialect)
+                if isinstance(part, exp.Identifier) else None)
+        if read is None:
+            return None
+        parts.append(read)
+    return ".".join(p for p in parts if p)
+
+
+def stored_key(key: str, dialect: str | None) -> str:
+    """The name a stored object id is read as: itself where quoting keeps case (Postgres,
+    Oracle: a catalog keeps `SALES` and `sales` apart), its fold where the engine folds every
+    spelling (DuckDB, SQLite). What `engine_key` is compared with."""
+    return resolve(key, quoted=True, dialect=dialect)
 
 
 def expand_tables(ast: exp.Expression, registry: dict[str, str]) -> None:

@@ -20,12 +20,12 @@ import sqlglot
 from mnemiq.sql.decide import decide
 from mnemiq.sql.verdict import Approved, Refusal, RefusalCode
 
-VISIBLE = {"claim": {"id", "name"}}
+VISIBLE = {"CLAIM": {"id", "name"}}
 THREE = "SELECT 1 AS x UNION ALL SELECT NULL UNION ALL SELECT 2"
 
 
 def _verdict(tail, engine):
-    return decide(f"SELECT id FROM claim {tail}", VISIBLE, dialect=engine, target=engine)
+    return decide(f"SELECT id FROM CLAIM {tail}", VISIBLE, dialect=engine, target=engine)
 
 
 def _linted(verdict):
@@ -114,11 +114,11 @@ def test_a_not_null_guard_still_clears_it():
 
 
 @pytest.mark.parametrize("sql", [
-    "SELECT id, ROW_NUMBER() OVER (ORDER BY id NULLS LAST) AS r FROM claim "
+    "SELECT id, ROW_NUMBER() OVER (ORDER BY id NULLS LAST) AS r FROM CLAIM "
     "ORDER BY name DESC FETCH FIRST 5 ROWS ONLY",
-    "SELECT id FROM claim WHERE id IN (SELECT id FROM claim ORDER BY id NULLS LAST "
+    "SELECT id FROM CLAIM WHERE id IN (SELECT id FROM CLAIM ORDER BY id NULLS LAST "
     "FETCH FIRST 3 ROWS ONLY) ORDER BY name DESC FETCH FIRST 5 ROWS ONLY",
-    "SELECT id FROM claim ORDER BY name DESC, id NULLS LAST FETCH FIRST 5 ROWS ONLY",
+    "SELECT id FROM CLAIM ORDER BY name DESC, id NULLS LAST FETCH FIRST 5 ROWS ONLY",
 ])
 def test_a_null_order_written_anywhere_but_the_first_key_exempts_nothing(sql):
     """A window's, a subquery's or a later key's NULLS clause says nothing about the top-N."""
