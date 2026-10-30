@@ -416,3 +416,18 @@ def test_an_ordinary_update_with_a_from_clause_is_still_approved():
                      adapter=None, dialect="postgres", target="postgres",
                      policy=AccessPolicy(), views={}, writes_enabled=True)
     assert not isinstance(v, Refusal), v
+
+
+
+def test_of_two_ctes_of_one_name_the_first_is_bound():
+    # Oracle runs a WITH defining a name twice and reads the first (measured on Oracle Free 23:
+    # `WITH a AS (SELECT 1 ...), a AS (SELECT 2 ...) SELECT x FROM a` returned 1); DuckDB and SQLite
+    # refuse it. Each WITH's names are indexed once (Codex's fourteenth review of #192), and the
+    # index keeps the first.
+    from mnemiq.sql.scope import _cte_binding
+
+    ast = sqlglot.parse_one("WITH a AS (SELECT 1 AS x FROM dual), a AS (SELECT 2 AS x FROM dual) SELECT x FROM a",
+                            read="oracle")
+    first, second = ast.find(sqlglot.exp.With).expressions
+    outer = next(t for t in ast.find_all(sqlglot.exp.Table) if t.name == "a")
+    assert _cte_binding(outer, "oracle") is first, "bound the second"
