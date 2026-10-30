@@ -161,3 +161,31 @@ def test_on_oracle_a_write_grant_on_a_quoted_name_does_not_approve_the_unquoted_
                                  'DELETE FROM "sales" WHERE ID = 1'])
 def test_on_oracle_the_quoted_target_is_approved(sql):
     assert isinstance(_write(sql, "sales"), ApprovedWrite), _write(sql, "sales")
+
+
+@pytest.mark.parametrize(("engine", "held", "written"), [
+    ("oracle", "sales", "SELECT ID FROM sales"),
+    ("oracle", "SALES", "SELECT ID FROM sales"),
+    ("postgres", "Claim", "SELECT ID FROM Claim"),
+    ("postgres", "claim", "SELECT ID FROM CLAIM"),
+    ("duckdb", "Sales Data", 'SELECT ID FROM "sales data"'),  # needs quoting for its space
+    ("duckdb", "order", 'SELECT ID FROM "ORDER"'),  # needs quoting as a reserved word
+    ("sqlite", "Claim", "SELECT ID FROM CLAIM"),
+])
+def test_the_advised_spelling_is_approved_as_the_retry(engine, held, written):
+    import re
+
+    verdict = decide(written, {held: {"ID"}}, dialect=engine, target=engine)
+    assert verdict.code is RefusalCode.UNKNOWN_TABLE, verdict
+    advised = re.search(r"Write it as listed: (.+)\.$", verdict.message)
+    assert advised, verdict.message
+    retry = decide(f"SELECT ID FROM {advised.group(1)}", {held: {"ID"}}, dialect=engine, target=engine)
+    assert isinstance(retry, Approved), (advised.group(1), retry)
+
+
+def test_a_held_name_with_a_dot_is_given_no_spelling():
+    # Which parts a key with a dot has, the key does not mark (Codex's second review of the M223
+    # branch): the refusal names the listed key and no SQL.
+    verdict = decide("SELECT ID FROM APP.sales", {"APP.sales": {"ID"}}, dialect="oracle", target="oracle")
+    assert verdict.code is RefusalCode.UNKNOWN_TABLE, verdict
+    assert '"APP.sales"' not in verdict.message and "Write it as it is listed." in verdict.message, verdict.message

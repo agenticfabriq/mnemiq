@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+import sqlglot
 from sqlglot import exp
 from sqlglot.dialects.dialect import Dialect
 
@@ -316,15 +317,14 @@ def not_read_as_written(table: exp.Table, held, dialect: str | None) -> Refusal 
     if len(listed) == 1:
         return Refusal(
             code=RefusalCode.UNKNOWN_TABLE,
-            message=(f"{written} names the table listed as {listed[0]!r}. Write it as listed: "
-                     f"{_as_listed(listed[0], dialect)}."),
+            message=f"{written} names the table listed as {listed[0]!r}. {_write_as_listed(listed[0], dialect)}",
             subject=listed[0],
         )
     if name in held:
         return Refusal(
             code=RefusalCode.UNKNOWN_TABLE,
             message=(f"{written} is read here as another name than the table listed as {name!r}. "
-                     f"Write that table's name as listed: {_as_listed(name, dialect)}."),
+                     f"{_write_as_listed(name, dialect)}"),
             subject=name,
         )
     return None
@@ -357,12 +357,28 @@ def _unmeasured_name(ast: exp.Expression, dialect: str | None) -> Refusal | None
     return None
 
 
-def _as_listed(key: str, dialect: str | None) -> str:
-    """`key` written so the engine reads it as that name: bare where the engine folds it to
-    itself, quoted otherwise."""
-    if resolve(key, quoted=False, dialect=dialect) == stored_key(key, dialect):
-        return key
-    return exp.to_identifier(key, quoted=True).sql(dialect=dialect)
+def _as_listed(key: str, dialect: str | None) -> str | None:
+    """`key` written so the engine reads it as that name, bare where that reads back, else quoted;
+    None where neither does, or where the key holds a dot, whose parts the key does not mark
+    (Codex's second review of the M223 branch). Each spelling is parsed back and kept only where it
+    names the key as written and as read, so `Sales Data` is quoted."""
+    if "." in key:
+        return None
+    for quoted in (False, True):
+        spelled = exp.to_identifier(key, quoted=quoted).sql(dialect=dialect)
+        try:
+            table = sqlglot.parse_one(f"SELECT 1 FROM {spelled}", read=dialect).find(exp.Table)
+        except sqlglot.errors.ParseError:
+            continue
+        if (table is not None and object_key(table) == key
+                and engine_key(table, dialect) == stored_key(key, dialect)):
+            return spelled
+    return None
+
+
+def _write_as_listed(key: str, dialect: str | None) -> str:
+    spelled = _as_listed(key, dialect)
+    return f"Write it as listed: {spelled}." if spelled is not None else "Write it as it is listed."
 
 
 def check_access(ast: exp.Expression, visible: dict[str, set[str]],
