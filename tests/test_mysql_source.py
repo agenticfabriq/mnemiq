@@ -11,6 +11,7 @@ import os
 import re
 import threading
 import time
+import traceback
 
 import duckdb
 import pytest
@@ -140,6 +141,26 @@ def adapter(con, mysql_id=455):
     a._dsn, a._db, a._retired, a._state = "host=fake", "d", False, threading.Lock()
     a._local_only = False
     return a
+
+
+# The extension's connect error, as measured: the whole connection string, password included.
+LEAKS = ('Failed to connect to MySQL database with parameters "host=h user=u password=hunter2 '
+         'database=d"')
+
+
+def everything_shown(exc: BaseException) -> str:
+    """All the text `exc` carries anywhere along its chain: its message, every attribute a caller
+    reads (`source_detail`), and its cause and context, which a traceback, a logger or a debugger
+    can each reach, plus the formatted traceback itself."""
+    texts, seen, todo = [], set(), [exc]
+    while todo:
+        e = todo.pop()
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        texts += [str(e), repr(e)] + [str(v) for v in vars(e).values() if isinstance(v, str)]
+        todo += [e.__cause__, e.__context__]
+    return "\n".join(texts + traceback.format_exception(exc))
 
 
 # -- the timeout reaches MySQL ---------------------------------------------------------------
@@ -452,8 +473,7 @@ def test_an_outage_reaches_the_runner_as_unavailable_with_the_password_scrubbed(
     with pytest.raises(SourceUnavailableError) as raised:
         run_statement(_gone_adapter(), "SELECT 1", timeout_s=5)
     assert isinstance(raised.value.__cause__, MySQLUnavailable)
-    assert "hunter2" not in raised.value.full_text
-    assert raised.value.__cause__.__cause__ is None  # the driver's text, password and all, is dropped
+    assert "hunter2" not in everything_shown(raised.value)
 
 
 def test_an_outage_at_the_proof_is_unavailable_not_a_refusal(monkeypatch):
@@ -502,18 +522,75 @@ class SyntaxRejects(Session):
 def test_a_statement_holding_outage_or_cancel_words_is_the_models_to_repair(statement):
     # Only the source's own state decides an outage (the session still answers a probe), and
     # only MySQL's trailing words a cancel, so neither ends the turn and nothing is reattached.
-    # The runner itself reads leftover text naming an interrupt as a timeout, which, like a
-    # rejection, goes back to the model; that reading is the runner's, not this adapter's.
+    # Nor a timeout: the runner reads leftover text naming an interrupt as one, which would send
+    # the model to make a query cheaper that MySQL could not parse.
     a = adapter(SyntaxRejects())
     a._reattach = lambda: pytest.fail("a refusal is never reattached")
     with pytest.raises(ExecutionError) as raised:
         run_statement(a, statement, timeout_s=5)
-    assert type(raised.value) is ExecutionError  # not an outage, not a cancel
+    assert not isinstance(raised.value, (SourceUnavailableError, QueryCancelledError))
     words = statement.split("'")[1]
-    assert isinstance(raised.value.__cause__, duckdb.IOException)
-    assert words in str(raised.value.__cause__)  # the words did reach the message
+    assert raised.value.message == "The source rejected this query."
+    assert "syntax" in raised.value.repair_text and words in raised.value.repair_text
+    assert words in str(raised.value)  # what the harness records when a re-run fails
     proof = prove_outcome(a, statement)
     assert proof.proof is Proof.REJECTED and words in proof.detail
+
+
+class Leaks(Session):
+    """A source whose every statement fails with the extension's connect error, password and
+    all, after `hold_s` and ending in `ending`, so each of the adapter's readings meets it."""
+
+    def __init__(self, ending="", hold_s=0.0):
+        super().__init__()
+        self.ending, self.hold_s = ending, hold_s
+
+    def execute(self, query):
+        if "mysql_query" in query and "CONNECTION_ID()" not in query and "'SELECT 1'" not in query:
+            time.sleep(self.hold_s)
+            raise duckdb.IOException(LEAKS + self.ending)
+        return super().execute(query)
+
+
+@pytest.mark.parametrize("con, timeout_s, raises", [
+    # Past its deadline: the timeout is read before the error's words.
+    (Leaks(hold_s=0.3), 0.1, ExecutionError),
+    (Leaks(": Query execution was interrupted"), 5, QueryCancelledError),
+    (Leaks(": Query execution was interrupted, maximum statement execution time exceeded"), 5,
+     ExecutionError),
+    (Leaks(": Unknown column 'x' in 'field list'"), 5, ExecutionError),
+])
+def test_no_reading_of_a_fault_shows_the_password(con, timeout_s, raises):
+    a = adapter(con)
+    a._killer = type("NoOp", (), {"execute": lambda self, sql: None, "close": lambda self: None})()
+    with pytest.raises(raises) as raised:
+        run_statement(a, "SELECT x FROM t", timeout_s=timeout_s)
+    shown = everything_shown(raised.value)
+    assert "hunter2" not in shown
+    assert "host=h" in shown  # scrubbed, not dropped: the operator still sees which connection
+
+
+def test_the_proof_and_the_catalogue_never_show_the_password():
+    a = adapter(Leaks(": Unknown column 'x' in 'field list'"))
+    proof = prove_outcome(a, "SELECT x FROM t")
+    assert proof.proof is Proof.REJECTED and "hunter2" not in proof.detail
+    with pytest.raises(duckdb.IOException) as raised:
+        a.introspect()
+    assert "hunter2" not in everything_shown(raised.value)
+
+
+def test_a_source_that_cannot_attach_never_shows_the_password(monkeypatch):
+    class Refuses(Session):
+        def execute(self, query):
+            if query.startswith("ATTACH"):
+                raise duckdb.IOException(LEAKS + ": Access denied")
+            return super().execute(query)
+    monkeypatch.setattr(mysql_source, "connect_duckdb", lambda local_only=False: Refuses())
+    monkeypatch.setattr(mysql_source, "load_extension", lambda *a, **k: None)
+    dsn = "host=h user=u password=hunter2"  # named, so the traceback's own source line holds none
+    with pytest.raises(MySQLUnavailable) as raised:
+        MySQLSource("d", dsn=dsn)
+    assert "hunter2" not in everything_shown(raised.value)
 
 
 def test_validate_runs_the_plan_as_a_zero_row_derived_table_under_a_bound():
@@ -578,7 +655,7 @@ def test_a_kill_connection_that_cannot_open_says_so_without_the_password(monkeyp
     a._dsn = "host=h password=hunter2 database=d"
     with pytest.raises(duckdb.IOException) as raised:
         a._new_killer()
-    assert "hunter2" not in str(raised.value) and raised.value.__cause__ is None
+    assert "hunter2" not in everything_shown(raised.value)
 
 
 # -- live, against a MySQL server --------------------------------------------------------------
@@ -656,4 +733,14 @@ def test_live_a_wrong_password_is_unavailable_and_never_shown():
     dsn = re.sub(r"password=\S+", "password=not-the-password-7f3a", LIVE_DSN)
     with pytest.raises(MySQLUnavailable) as raised:
         MySQLSource(LIVE_DB, dsn=dsn)
-    assert "not-the-password-7f3a" not in str(raised.value)
+    assert "not-the-password-7f3a" not in everything_shown(raised.value)
+
+
+@pytest.mark.integration
+@needs_mysql
+def test_live_a_refusal_reaches_the_model_with_mysqls_words(live_source):
+    table = live_source.introspect()[0]
+    with pytest.raises(ExecutionError) as raised:
+        run_statement(live_source, f'SELECT "no_such_col" FROM "{table}"', timeout_s=30)
+    assert raised.value.message == "The source rejected this query."
+    assert "no_such_col" in raised.value.source_detail

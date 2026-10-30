@@ -223,15 +223,50 @@ def test_a_file_from_another_configuration_is_refused(dataset, source, tmp_path)
             engine_for=lambda adapter, db: (_answering("SELECT 1"), None))
 
 
-def test_a_last_line_cut_short_is_asked_again(dataset, source, tmp_path):
+def test_a_last_line_cut_short_is_removed_and_asked_again(dataset, source, tmp_path):
     cfg = _control_cfg(dataset, tmp_path, limit=2)
     run(cfg, source_for=lambda db: DuckDBAdapter.duckdb(source))
     text = cfg.out.read_text()
     cfg.out.write_text(text[: len(text) - 20])  # the second row, cut by a killed run
     again = run(cfg, source_for=lambda db: DuckDBAdapter.duckdb(source))
     assert [r["id"] for r in again] == ["shop_1"]
-    lines = cfg.out.read_text().splitlines()
-    assert json.loads(lines[-1])["id"] == "shop_1" and len(lines) == 3  # the cut line stays put
+    # Every line parses, the cut one gone, so the CLI's summary and the next resume both read it.
+    assert [r["id"] for r in _lines(cfg.out)] == ["shop_0", "shop_1"]
+    more = run(_control_cfg(dataset, tmp_path, limit=3),
+               source_for=lambda db: DuckDBAdapter.duckdb(source))
+    assert [r["id"] for r in more] == ["shop_2"]
+
+
+def _ungraded(root, out, settings, limit):
+    return run(RunConfig(beaver_dir=root, sets=["dw"], out=out, grade=False, limit=limit),
+               settings=settings, source_for=lambda db: object(),
+               engine_for=lambda adapter, db: (_answering("SELECT 1"), None))
+
+
+def test_a_file_from_other_engine_settings_is_refused_naming_them(tmp_path):
+    from mnemiq.config import Settings
+
+    _write_set(tmp_path, "dw", [{"id": "x_0", "question": "q0"}, {"id": "x_1", "question": "q1"}])
+    out = tmp_path / "r.jsonl"
+    measured = {"llm_model": "m", "verify_judge": True, "embed_model": "e"}
+    _ungraded(tmp_path, out, Settings(**measured), 1)
+    with pytest.raises(ValueError, match="verify_judge: True, this run the default"):
+        _ungraded(tmp_path, out, Settings(**{**measured, "verify_judge": False}), 2)
+    with pytest.raises(ValueError, match="embed_model"):
+        _ungraded(tmp_path, out, Settings(**{**measured, "embed_model": "other"}), 2)
+    # Where the model is served and the key that reaches it are not how it answers: they can
+    # change between sessions of one run (a tunnel's port), and neither is written to the file.
+    moved = Settings(**measured, llm_base_url="http://elsewhere:9/v1", llm_api_key="sk-not-kept")
+    assert [r["id"] for r in _ungraded(tmp_path, out, moved, 2)] == ["x_1"]
+    assert "sk-not-kept" not in out.read_text() and "elsewhere" not in out.read_text()
+
+
+def test_a_file_from_another_copy_of_a_set_is_refused(dataset, source, tmp_path):
+    run(_control_cfg(dataset, tmp_path, limit=1), source_for=lambda db: DuckDBAdapter.duckdb(source))
+    _write_set(dataset, "shop", SHOP[:2] + [_row("shop_2", "a changed question", "SELECT 1 AS m")])
+    with pytest.raises(ValueError, match="another copy of set 'shop'"):
+        run(_control_cfg(dataset, tmp_path, limit=3),
+            source_for=lambda db: DuckDBAdapter.duckdb(source))
 
 
 def test_ids_select_questions_and_dw_real_shares_its_database_source(tmp_path, source):

@@ -16,7 +16,9 @@ only the tables its annotation names, as in the runs behind our published BEAVER
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable
@@ -61,6 +63,18 @@ def parquet_path(beaver_dir: str | Path, set_name: str) -> Path:
     return Path(beaver_dir) / "query" / "data" / f"{set_name}-00000-of-00001.parquet"
 
 
+def _set_file(beaver_dir: str | Path, set_name: str) -> Path:
+    path = parquet_path(beaver_dir, set_name)
+    if not path.exists():
+        raise FileNotFoundError(f"no BEAVER set {set_name!r}: {path} does not exist")
+    return path
+
+
+def set_digest(beaver_dir: str | Path, set_name: str) -> str:
+    """Which copy of a set a row was asked from, so a run never resumes onto a changed one."""
+    return hashlib.sha256(_set_file(beaver_dir, set_name).read_bytes()).hexdigest()[:16]
+
+
 def _decoded(value, empty):
     """An annotation field: BEAVER stores each one as JSON text, and an empty one as ''."""
     return json.loads(value) if value else empty
@@ -70,9 +84,7 @@ def load_questions(beaver_dir: str | Path, set_name: str) -> list[Question]:
     """Every question in one set, in the file's order. `id` and `question` are required; gold SQL
     and the annotations are read when the file has them, so a set whose gold is held back loads
     with `gold_sql` None."""
-    path = parquet_path(beaver_dir, set_name)
-    if not path.exists():
-        raise FileNotFoundError(f"no BEAVER set {set_name!r}: {path} does not exist")
+    path = _set_file(beaver_dir, set_name)
     rows = pq.read_table(path).to_pylist()
     if rows and not {"id", "question"} <= rows[0].keys():
         raise ValueError(f"{path} has no `id` and `question` columns")
@@ -183,17 +195,46 @@ class RunConfig:
 
 
 # The fields a resumed file must agree on: a file mixing two of any is two measurements.
-_RUN_KEYS = ("annotations", "control", "graded", "model", "engine")
+_RUN_KEYS = ("annotations", "control", "graded", "model", "engine", "settings")
+
+# Settings that say where a model is served and with which credential, not how the engine
+# answers: a long run can move between sessions (a tunnel's new port), and none of it belongs in
+# a results file. Matched loosely, so a credential added later is left out by its name too.
+_NOT_BEHAVIOUR = re.compile(r"key|passw|pwd|secret|token|dsn|credential|_url$")
 
 
-def _resume(out: Path, header: dict) -> set[tuple[str, str]]:
+def engine_settings(settings) -> dict | None:
+    """The settings the engine answers under, recorded on every row and checked on resume: each
+    one that differs from its default (the defaults are the engine commit's, which the row also
+    records), credentials and endpoints left out. Every other setting is in, so one added later
+    is checked without anyone listing it here."""
+    fields = getattr(type(settings), "model_fields", None)
+    if fields is None:
+        return None  # the control, or a caller's own engine
+    chosen = {name: getattr(settings, name) for name, f in fields.items()
+              if not _NOT_BEHAVIOUR.search(name)
+              and getattr(settings, name) != f.get_default(call_default_factory=True)}
+    return json.loads(json.dumps(chosen, default=str))  # as the file holds it, so it compares
+
+
+def _difference(key: str, was, now) -> str:
+    if isinstance(was, dict) and isinstance(now, dict):
+        def shown(d, k):  # a setting left out of the record is at its default
+            return repr(d[k]) if k in d else "the default"
+        return "; ".join(f"{key}.{k}: {shown(was, k)}, this run {shown(now, k)}"
+                         for k in sorted(was.keys() | now.keys()) if was.get(k) != now.get(k))
+    return f"{key}: {was!r}, this run {now!r}"
+
+
+def _resume(out: Path, header: dict, digests: dict[str, str]) -> set[tuple[str, str]]:
     """The (set, id) pairs `out` already holds, after checking its rows were written by this
-    configuration. A last line cut short by a killed run is dropped and that question asked again;
-    a malformed line anywhere else stops the run, since appending would bury it."""
+    configuration from these copies of the sets (`digests`). A last line cut short by a killed run
+    is cut from the file and its question asked again; a malformed line anywhere else stops the
+    run, since appending would bury it."""
     if not out.exists():
         return set()
-    lines = out.read_text().splitlines()
-    done = set()
+    lines = out.read_bytes().splitlines(keepends=True)
+    done, kept, last = set(), 0, b"\n"
     for n, line in enumerate(lines, 1):
         try:
             row = json.loads(line)
@@ -203,13 +244,20 @@ def _resume(out: Path, header: dict) -> set[tuple[str, str]]:
             raise ValueError(f"{out}: line {n} is not JSON; fix or move the file") from None
         for key in _RUN_KEYS:
             if row.get(key) != header[key]:
-                raise ValueError(
-                    f"{out} holds rows from another run ({key}: {row.get(key)!r}, this run "
-                    f"{header[key]!r}); write to a new --out")
+                raise ValueError(f"{out} holds rows from another run "
+                                 f"({_difference(key, row.get(key), header[key])}); "
+                                 "write to a new --out")
+        digest = digests.get(row["set"])
+        if digest is not None and row.get("data") != digest:
+            raise ValueError(f"{out} holds rows asked from another copy of set {row['set']!r}; "
+                             "write to a new --out")
         done.add((row["set"], row["id"]))
-    if lines and not out.read_text().endswith("\n"):
-        with out.open("a") as fh:
-            fh.write("\n")
+        kept, last = kept + len(line), line
+    with out.open("r+b") as fh:
+        fh.truncate(kept)  # the cut line, if any: every line left is one whole row
+        if not last.endswith(b"\n"):  # a whole row whose newline the kill took
+            fh.seek(kept)
+            fh.write(b"\n")
     return done
 
 
@@ -252,8 +300,9 @@ def run(cfg: RunConfig, *, settings=None, source_for: Callable[[str], object] | 
     engine = source_rev()
     header = {"annotations": cfg.annotations, "control": cfg.control, "graded": cfg.grade,
               "model": None if cfg.control else getattr(settings, "llm_model", None),
-              "engine": engine}
-    done = _resume(cfg.out, header)
+              "engine": engine, "settings": None if cfg.control else engine_settings(settings)}
+    digests = {s: set_digest(cfg.beaver_dir, s) for s in cfg.sets}
+    done = _resume(cfg.out, header, digests)
     control = GoldControl() if cfg.control else None
     if engine_for is None:
         def engine_for(adapter, db):
@@ -279,7 +328,8 @@ def run(cfg: RunConfig, *, settings=None, source_for: Callable[[str], object] | 
                         adapter = source_for(q.db)
                         opened[q.db] = (adapter, *engine_for(adapter, q.db))
                     adapter, ask, snapshot = opened[q.db]
-                    row = _ask_one(q, cfg, header, adapter, ask, snapshot, control)
+                    row = _ask_one(q, cfg, {**header, "data": digests[q.set]}, adapter, ask,
+                                   snapshot, control)
                     fh.write(json.dumps(row, default=str) + "\n")
                     fh.flush()
                     written.append(row)

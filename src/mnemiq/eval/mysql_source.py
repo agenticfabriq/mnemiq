@@ -32,6 +32,7 @@ import pyarrow as pa
 
 from mnemiq.adapters.base import QueryCancelled, QueryTimedOut
 from mnemiq.duckdb_extensions import connect_duckdb, load_extension
+from mnemiq.execute.runner import ExecutionError
 from mnemiq.redact import scrub_credentials
 
 DSN_ENV = "MNEMIQ_MYSQL_DSN"
@@ -45,6 +46,19 @@ class MySQLUnavailable(ConnectionError):
 
 class MySQLMisconfigured(RuntimeError):
     """The server runs without a setting this adapter depends on. See the module docstring."""
+
+
+class MySQLRejected(ExecutionError):
+    """A statement MySQL refused, in the runner's own form for a refusal, which the runner passes
+    on as it stands. Left as the driver's error, it would meet the runner's last reading, which
+    takes any text naming an interrupt for a timeout: MySQL quotes the statement it refuses, so a
+    query it could not parse would go back to the model as one to make cheaper. This source types
+    its own timeouts, cancels and outages, so what reaches here is a refusal."""
+
+    def __str__(self) -> str:
+        # The harness records `str()` of an answer that fails when the grader re-runs it; with
+        # MySQL's words (scrubbed already) the results file says why.
+        return self.repair_text
 
 
 class _Run:
@@ -103,17 +117,37 @@ class MySQLSource:
         # `_run` releases the statement (and retires its session) under the same lock, so neither
         # can land after the release.
         self._state = threading.Lock()
+        failure = None
         try:
             self._attach()
         except duckdb.Error as exc:
-            raise self._unavailable(exc) from None
+            failure = self._unavailable(exc)
+        if failure is not None:  # raised outside the handler: see _clean
+            raise failure
 
     def _scrub(self, text: str) -> str:
         # The extension's connect error quotes the whole connection string, password included.
         return scrub_credentials(text)
 
+    def _clean(self, exc: BaseException) -> BaseException:
+        """`exc` rebuilt with the credential scrubbed from its text and from its cause's, and no
+        context. Every error leaving this source goes through here, not only an outage's: a
+        connect error can surface inside any statement, and the readings that put the driver's
+        words in their own message (a cancel, the server's time limit) carry it on.
+
+        The caller raises the copy outside its `except` block. Raised inside, the original rides
+        along as `__context__`, which `from None` hides from a printed traceback but does not
+        remove."""
+        text = self._scrub(str(exc))
+        try:
+            clean = type(exc)(text)
+        except Exception:  # noqa: BLE001 -- a type built otherwise; its words matter, not its type
+            clean = RuntimeError(f"{type(exc).__name__}: {text}")
+        if exc.__cause__ is not None:
+            clean.__cause__ = self._clean(exc.__cause__)
+        return clean
+
     def _unavailable(self, exc: BaseException) -> MySQLUnavailable:
-        # `from None` at the raise: the original error's text holds the password.
         return MySQLUnavailable(self._scrub(str(exc)))
 
     def _attach_sql(self, alias: str, read_only: bool) -> str:
@@ -175,13 +209,16 @@ class MySQLSource:
 
     def _new_killer(self):
         killer = connect_duckdb(local_only=self._local_only)
+        failure = None
         try:
             killer.execute("LOAD mysql")
             # Not read-only: the extension refuses `mysql_execute` on a read-only attach.
             killer.execute(self._attach_sql("kill", read_only=False))
         except duckdb.Error as exc:
             killer.close()
-            raise type(exc)(self._scrub(str(exc))) from None
+            failure = self._clean(exc)
+        if failure is not None:  # raised outside the handler: see _clean
+            raise failure
         return killer
 
     # Messages that can mean the server went away, not that the statement was wrong; `_lost`
@@ -227,6 +264,14 @@ class MySQLSource:
     # -- the passthrough ---------------------------------------------------------------------
 
     def _table(self, sql: str, timeout_s: float | None = None) -> pa.Table:
+        """`sql` run on MySQL as it stands. Whatever it raises is rebuilt by `_clean` first."""
+        try:
+            return self._passthrough(sql, timeout_s)
+        except Exception as exc:  # noqa: BLE001 -- rebuilt and raised, not handled
+            failure = self._clean(exc)
+        raise failure  # outside the handler: see _clean
+
+    def _passthrough(self, sql: str, timeout_s: float | None) -> pa.Table:
         statement = sql.strip().rstrip(";")
         literal = "'" + statement.replace("'", "''") + "'"
         query = f"SELECT * FROM mysql_query('src', {literal})"
@@ -426,7 +471,13 @@ class MySQLSource:
         return self._rows(sql)
 
     def execute_arrow(self, sql: str, timeout_s: float | None = None) -> pa.Table:
-        return self._table(sql, timeout_s)
+        try:
+            return self._table(sql, timeout_s)
+        except duckdb.InterruptException:
+            raise  # the runner reads DuckDB's interrupt by its type, as a timeout
+        except duckdb.Error as exc:  # already scrubbed, with no context, by `_table`
+            raise MySQLRejected("The source rejected this query.", source_detail=str(exc)) \
+                from exc
 
     def close(self) -> None:
         self._drop_killer()

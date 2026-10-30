@@ -84,9 +84,11 @@ the runner then records each question's SQL and grades nothing.
 
 A results file holds one JSON line per question: `id`, `set`, `db`, `sql` (null when mnemiq
 declined), `reason_code` (why it declined), `answer`, `model`, `engine` (the mnemiq commit,
-marked `-dirty` for uncommitted changes), the run's `annotations`, and, when graded, `outcome`
-with the row counts. A re-run with the same `--out` skips the questions already in it, and refuses
-a file written by a different configuration.
+marked `-dirty` for uncommitted changes), `settings` (every `MNEMIQ_*` setting that differs from
+its default, endpoints and credentials left out), `data` (which copy of the set's file it was
+asked from), the run's `annotations`, and, when graded, `outcome` with the row counts. A re-run
+with the same `--out` skips the questions already in it, asks again one whose line a killed run
+cut short, and refuses a file written under a different configuration, settings or copy of a set.
 
 ## The setup behind our BEAVER figures
 
