@@ -118,7 +118,8 @@ A useful first pass, on your data:
 
 The same harness runs the public benchmarks (BIRD mini-dev, Spider 1.0, Spider 2.0-lite) and the
 warehouse comparison scripts under `scripts/`, so the setup you use on your data is the setup the
-published numbers came from.
+published numbers came from. MIT's BEAVER runs on its own MySQL; [docs/beaver.md](docs/beaver.md)
+sets that up.
 
 Grading itself lives in **[beacon](https://github.com/agenticfabriq/beacon)**, a separate
 Apache-2.0 repository: the grader that decides what counts as correct, and the tracker that holds
