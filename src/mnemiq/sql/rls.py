@@ -140,6 +140,7 @@ def _validate_filter(
 
 
 _NAME_TOKENS = frozenset({TokenType.VAR, TokenType.IDENTIFIER})
+_NOT_A_COLUMN_AFTER = frozenset({TokenType.L_PAREN, TokenType.L_BRACE, TokenType.STRING})
 
 
 def _unaccounted_names(filt: str, dialect: str) -> list[str]:
@@ -157,7 +158,8 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     # A keyword the parser takes as an identifier is a name too: `comment` tokenizes as COMMENT,
     # and DuckDB reads `date_diff(comment, a, b)` as the column (Codex's second review of #193).
     # A type's name among them the reprint may respell (INTEGER as INT), so it is left out of the
-    # count and kept for the date-part check, which `date_diff(date, a, b)` would otherwise pass.
+    # count, kept for the date-part check, which `date_diff(date, a, b)` would otherwise pass, and
+    # looked for where it stands (`_types_dropped`).
     parser = sqlglot.Dialect.get_or_raise(dialect).parser_class
     named = _NAME_TOKENS | parser.ID_VAR_TOKENS
 
@@ -179,7 +181,37 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     parts = {v.name.casefold() for v in tree.find_all(exp.Var) if isinstance(v.this, str)
              and not (isinstance(v.parent, exp.Extract) and v.arg_key == "this")
              and not isinstance(v.parent, (exp.Interval, exp.IntervalSpan))}
-    return sorted(set(lost) | (parts & set(names(filt, named))))
+    dropped = _types_dropped(filt, dialect, named & parser.TYPE_TOKENS)
+    return sorted(set(lost) | (parts & set(names(filt, named))) | set(dropped))
+
+
+def _types_dropped(filt: str, dialect: str, types) -> list[str]:
+    """Each type's name in the filter's text that its parse holds nowhere: sqlglot drops `date`
+    from `decode(blob, date)`, where DuckDB reads the column (Codex's third review of #193).
+
+    Not counted against the reprint, which respells types in ways no count absorbs (`DECIMAL` as
+    `DECIMAL(18, 3)`, Oracle's `DATE '2020-01-01'` as TO_DATE): counted, 37 of the 286 casts
+    DuckDB accepts were refused. So the filter is parsed again with a fresh name in each one's
+    place. A place that drops a name drops that one too; a column's or a type's place keeps it; and
+    a place only the keyword fits, a multi-word type's, does not parse. A name directly before a
+    parenthesis, a brace or a string is a call, a type's parameters, a constructor or a typed
+    literal, never a column, and is left alone: a fresh name before the brace of `MAP {1: x}` is
+    dropped, which refused every map literal."""
+    fresh = "mnemiq_type_probe"
+    while fresh in filt.casefold():
+        fresh += "_"
+    tokens = sqlglot.tokenize(filt, read=dialect)
+    dropped = []
+    for i, t in enumerate(tokens):
+        if t.token_type not in types or (i + 1 < len(tokens) and tokens[i + 1].token_type in _NOT_A_COLUMN_AFTER):
+            continue
+        try:
+            probe = sqlglot.parse_one(filt[:t.start] + fresh + filt[t.end + 1:], read=dialect)
+        except sqlglot.errors.ParseError:
+            continue
+        if fresh not in probe.sql(dialect=dialect).casefold():
+            dropped.append(t.text.casefold())
+    return dropped
 
 
 def _lost_names(filt: str, table: str, dialect: str) -> Refusal | None:

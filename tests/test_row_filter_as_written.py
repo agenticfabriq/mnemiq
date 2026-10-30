@@ -204,6 +204,14 @@ def test_a_text_that_does_not_read_back_as_the_expanded_tree_is_refused(monkeypa
     ("duckdb", "list_reverse_sort([id], comment) IS NOT NULL"),
     # The parse holds a date part that reprints bare; only the date-part check sees it.
     ("duckdb", "time_bucket(INTERVAL 1 DAY, d, secret) IS NOT NULL"),
+    # A type's name, which a reprint respells and so cannot be counted, dropped by the parse while
+    # DuckDB reads the column: `decode(blob, date)` (Codex's third review of #193). Executed, the
+    # call reads the column; renamed to one the table lacks, DuckDB refuses it as not found.
+    ("duckdb", "decode(d, date) IS NOT NULL"),
+    ("duckdb", "decode(d, text) IS NOT NULL"),
+    ("duckdb", "list_reverse_sort([id], date) IS NOT NULL"),
+    # A cast to the same type elsewhere does not stand in for it.
+    ("duckdb", "decode(d, timestamp) IS NOT NULL AND TRY_CAST(id AS TIMESTAMP) IS NOT NULL"),
 ])
 def test_a_name_the_parse_does_not_read_as_a_column_or_a_table_refuses_the_filter(dialect, filt):
     schema = {"claim": {"id", "d"}}
@@ -220,6 +228,10 @@ def test_a_name_the_parse_does_not_read_as_a_column_or_a_table_refuses_the_filte
     ("oracle", "d > SYSDATE - INTERVAL '1' DAY AND EXTRACT(YEAR FROM d) = 2020"),
     ("oracle", "TRUNC(d, 'DD') = d"),
     ("postgres", "date_part('day', d) = 1 AND d > CURRENT_DATE - INTERVAL '1 day'"),
+    # Types, however the reprint respells them, and typed literals.
+    ("duckdb", "TRY_CAST(id AS DECIMAL(10, 2)) > 0 AND d > DATE '2020-01-01' AND TRY_CAST(id AS VARCHAR) <> ''"),
+    ("duckdb", "TRY_CAST(region AS CHARACTER VARYING) = 'a' AND TRY_CAST(id AS DOUBLE PRECISION) > 0"),
+    ("oracle", "d > DATE '2020-01-01' AND d < TIMESTAMP '2030-01-01 00:00:00'"),
 ])
 def test_names_the_parse_accounts_for_pass(dialect, filt):
     schema = {"claim": {"id", "region", "d"}, "entitlement": {"id", "who"}}
@@ -248,3 +260,32 @@ def test_a_type_s_name_read_as_a_date_part_is_refused_too():
     verdict = decide("SELECT id FROM claim", schema, dialect="duckdb", target="duckdb",
                      policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+def test_a_column_named_like_a_type_that_the_parse_reads_passes():
+    schema = {"claim": {"id", "date"}}
+    verdict = decide("SELECT id FROM claim", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(row_filters={"claim": "date > DATE '2020-01-01'"}, policy_schema=schema))
+    assert isinstance(verdict, Approved), verdict
+
+
+def test_every_cast_duckdb_accepts_passes_the_name_check():
+    # Each of DuckDB's single-word type names, cast to wherever DuckDB accepts it: a type's name is
+    # checked where the parse leaves it, and none of these leaves one out.
+    from mnemiq.sql.rls import _unaccounted_names
+
+    parser = sqlglot.Dialect.get_or_raise("duckdb").parser_class
+    tokenizer = sqlglot.Dialect.get_or_raise("duckdb").tokenizer_class
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, region VARCHAR, d DATE)")
+    accepted = []
+    for name in sorted(k for k, v in tokenizer.KEYWORDS.items() if v in parser.TYPE_TOKENS):
+        for filt in (f"CAST(id AS {name}) IS NOT NULL", f"TRY_CAST(region AS {name}) IS NOT NULL",
+                     f"id::{name} IS NOT NULL"):
+            try:
+                con.execute(f"SELECT id FROM claim WHERE {filt}").fetchall()
+            except duckdb.Error:
+                continue
+            accepted.append(filt)
+    assert len(accepted) > 150, len(accepted)
+    assert [(f, lost) for f in accepted if (lost := _unaccounted_names(f, "duckdb"))] == []
