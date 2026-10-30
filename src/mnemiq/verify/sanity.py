@@ -35,6 +35,8 @@ def _named(values: list[FilterValue]) -> str:
         written = ", ".join(v.text for v in values)
         return f"{written}, {'JSON paths' if many else 'a JSON path'}, could not be checked"
     texts, column = _listed([v.text for v in values]), first.column
+    if first.outcome == ABSENT and first.why == "probed":  # the source itself was asked
+        return f"{texts} {'do' if many else 'does'} not appear in {column}"
     if first.outcome == ABSENT:
         return f"{texts} {'do' if many else 'does'} not appear among {column}'s known values"
     if first.why == "pattern":
@@ -98,6 +100,13 @@ def _grounded_or_why(opening: str, grounding: ValueGrounding) -> str | None:
 def _aggregate_over_nothing(table: pa.Table, rows: list[dict]) -> bool:
     """One row, every cell NULL: what SUM, AVG, MIN and MAX return over no rows."""
     return table.num_rows == 1 and all(v is None for v in rows[0].values())
+
+
+def grounding_decides(table: pa.Table) -> bool:
+    """Whether `sanity_check` decides this result on the grounding: no rows, or one NULL row from
+    aggregates over nothing."""
+    return table.num_rows == 0 or (table.num_rows == 1
+                                   and _aggregate_over_nothing(table, table.to_pylist()))
 
 
 def sanity_check(question: str, table: pa.Table,

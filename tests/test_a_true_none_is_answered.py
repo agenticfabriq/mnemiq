@@ -40,10 +40,13 @@ _CARD = ("TABLE claim: id INTEGER, region VARCHAR (north|south|east|west), statu
 NONE_SQL = "SELECT id, amount FROM claim WHERE status = 'open' AND amount > 1000000"
 NONE_NOTE = "No rows matched: status = 'open' AND amount > 1000000."
 # A misspelled value on a column with 300 distinct values, past the index's 200: nothing checks it
-# before the run, so it returns nothing, and "none" would be a wrong answer.
+# before the run, so it returns nothing, and "none" would be a wrong answer. Asked once the result
+# is empty, the source says the column does not hold it.
 MISSPELLED_SQL = "SELECT id, amount FROM claim WHERE adjuster = 'agnet_0042'"
-MISSPELLED_DECLINE = ("No rows matched, and 'agnet_0042' could not be checked against "
-                      "claim.adjuster's known values")
+MISSPELLED_DECLINE = "No rows matched, and 'agnet_0042' does not appear in claim.adjuster"
+# The same column, a value it holds, and a total no claim reaches: a true "none" the index cannot
+# ground and the source can.
+UNINDEXED_NONE_SQL = "SELECT id, amount FROM claim WHERE adjuster = 'agent_0042' AND amount > 1000000"
 
 
 class _CountingJudgeClient:
@@ -130,7 +133,7 @@ def test_a_true_none_is_answered_in_every_mode_and_the_judge_reads_it_where_one_
             assert "(0 rows)" in judge.calls[-1]
 
 
-def test_a_value_nothing_could_check_keeps_the_empty_result_declined_and_is_named(source):
+def test_a_value_the_source_does_not_hold_keeps_the_empty_result_declined_and_is_named(source):
     adapter, snap, values = source
     judge = _CountingJudgeClient()
     agents = _agents(adapter, values, MISSPELLED_SQL, judge)
@@ -141,6 +144,86 @@ def test_a_value_nothing_could_check_keeps_the_empty_result_declined_and_is_name
         assert ans.verify_layer == "sanity" and str(ans.reason_code) == "verification", name
         assert ans.answer.startswith(MISSPELLED_DECLINE), (name, ans.answer)
     assert judge.calls == []  # declined before the judge: no model call spent on it
+
+
+
+class _Recording:
+    """The adapter, recording each statement it runs, and failing the probes when told to."""
+
+    def __init__(self, inner, fail_probes: bool = False):
+        self.inner, self.fail_probes, self.statements = inner, fail_probes, []
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+    def execute_arrow(self, sql, timeout_s=None):
+        self.statements.append(sql)
+        if self.fail_probes and _is_probe(sql):
+            raise TimeoutError("the probe ran past its bound")
+        return self.inner.execute_arrow(sql, timeout_s=timeout_s)
+
+    def probes(self):
+        return [s for s in self.statements if _is_probe(s)]
+
+
+def _is_probe(sql: str) -> bool:
+    return sql.startswith('SELECT 1 FROM "claim" WHERE "adjuster" = ')
+
+
+def test_a_true_none_on_a_column_the_index_cannot_hold_is_answered_in_every_mode(source):
+    """The index holds no value of a 300-value column, so the source is asked: it holds the value,
+    the empty result rests on it, and the "none" is answered, the source asked once a turn."""
+    adapter, snap, values = source
+    assert adapter.execute(UNINDEXED_NONE_SQL.replace("SELECT id, amount", "SELECT count(*)"))[0][0] == 0
+    recording = _Recording(adapter)
+    agents = _agents(recording, values, UNINDEXED_NONE_SQL, _CountingJudgeClient())
+    for name in ("instant", "thinking", "deep"):
+        before = len(recording.probes())
+        ans = agents[name].answer(_packet("Which claims of adjuster agent_0042 are over 1,000,000?"),
+                                  snap, _GRANTS, _IDENTITY)
+        assert ans.deferred is False and ans.failed is False, (name, ans.answer)
+        assert "No rows matched: adjuster = 'agent_0042' AND amount > 1000000." in ans.answer, name
+        assert recording.probes()[before:] == [
+            'SELECT 1 FROM "claim" WHERE "adjuster" = \'agent_0042\' LIMIT 1'], name
+
+
+def test_a_probe_the_source_does_not_answer_keeps_the_empty_result_declined(source):
+    adapter, snap, values = source
+    recording = _Recording(adapter, fail_probes=True)
+    ans = _ask_instant(recording, snap, values, UNINDEXED_NONE_SQL, "q")
+    assert ans.deferred is True and ans.verify_layer == "sanity", ans.answer
+    assert ans.answer.startswith("No rows matched, and 'agent_0042' could not be checked against "
+                                 "claim.adjuster's known values"), ans.answer
+    assert len(recording.probes()) == 1
+
+
+
+def test_the_turns_probes_stop_at_their_budget(source, monkeypatch):
+    import mnemiq.agent.loop as loop_mod
+
+    adapter, snap, values = source
+    monkeypatch.setattr(loop_mod, "PROBE_BUDGET_S", 0.0)
+    recording = _Recording(adapter)
+    ans = _ask_instant(recording, snap, values, UNINDEXED_NONE_SQL, "q")
+    assert ans.deferred is True and "could not be checked against claim.adjuster" in ans.answer
+    assert recording.probes() == []
+
+def test_a_result_with_rows_asks_the_source_nothing(source):
+    adapter, snap, values = source
+    recording = _Recording(adapter)
+    ans = _ask_instant(recording, snap, values,
+                       "SELECT id, amount FROM claim WHERE adjuster = 'agent_0042'", "q")
+    assert ans.deferred is False and ans.preview.row_count > 0, ans.answer
+    assert recording.probes() == []
+
+
+def test_a_row_filtered_callers_value_is_never_asked_of_the_source(source):
+    """Whether a value exists in rows the caller cannot read is what the row filter withholds."""
+    adapter, snap, values = source
+    recording = _Recording(adapter)
+    ans = _ask_instant(recording, snap, values, UNINDEXED_NONE_SQL, "q", grants=_NORTH_ONLY)
+    assert ans.deferred is True and "'agent_0042'" in ans.answer, ans.answer
+    assert recording.probes() == []
 
 
 def test_a_none_asked_as_a_total_is_answered_as_one(source):
@@ -162,8 +245,8 @@ def test_a_misspelled_total_stays_declined(source):
     ans = agents["instant"].answer(_packet("What is the total for adjuster agent_0042?"),
                                    snap, _GRANTS, _IDENTITY)
     assert ans.deferred is True and ans.verify_layer == "sanity"
-    assert ans.answer.startswith("The query produced an empty value, and 'agnet_0042' could not "
-                                 "be checked against claim.adjuster's known values"), ans.answer
+    assert ans.answer.startswith("The query produced an empty value, and 'agnet_0042' does not "
+                                 "appear in claim.adjuster"), ans.answer
 
 
 def test_a_date_range_needs_no_grounding(source):

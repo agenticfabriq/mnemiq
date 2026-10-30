@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import NamedTuple
 
@@ -14,6 +15,8 @@ from mnemiq.semantic.values import shown
 from mnemiq.sql.qualify import names_one_object
 from mnemiq.sql.identifiers import resolve, resolve_identifier, resolve_stored
 from mnemiq.sql.verdict import Refusal, RefusalCode
+
+logger = logging.getLogger(__name__)
 
 
 def _column_and_string(a: exp.Expression, b: exp.Expression) -> tuple[exp.Column, str] | None:
@@ -1022,9 +1025,13 @@ class FilterValue:
     # (a full timestamp in `=`, `<>` or IN), zone_mismatch (a naive timestamp and a zone-aware one),
     # not_a_plain_string (a constant written other than as a plain literal, or a parameter: its
     # `text` is the constant as written), not_a_column (compared with an expression),
-    # not_compared, unresolved (the resolver could not place it).
+    # not_compared, unresolved (the resolver could not place it). "probed" on a value the source
+    # itself grounded or ruled out (`confirm_by_source`).
     why: str
     column: str | None  # `table.column`, where the resolver placed it
+    # (table, column) for a not_indexed value compared by equality or IN with a bare column, so the
+    # source can be asked whether the column holds it; None for every other value.
+    placed: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -1398,6 +1405,17 @@ def ground_values(
             return UNCHECKED, why or "pattern", column
         return UNCHECKED, "not_compared", None
 
+    def equality_spot(literal: exp.Literal) -> tuple[str, str] | None:
+        """The column a not_indexed value is compared with, as `against` placed it."""
+        parent = literal.parent
+        if isinstance(parent, _EQUALITIES):
+            other = parent.right if parent.left is literal else parent.left
+        elif isinstance(parent, exp.In) and any(e is literal for e in parent.expressions):
+            other = parent.this
+        else:
+            return None
+        return place(other) if isinstance(other, exp.Column) else None
+
     found = []
     for node in ast.walk(bfs=False):  # as written, so a decline names them in order
         if node.find_ancestor(exp.JSONPath) is not None:
@@ -1409,7 +1427,8 @@ def ground_values(
             found.append(FilterValue(_written_as(node, render_as), UNCHECKED, "json_path", None))
         elif isinstance(node, exp.Literal) and node.is_string:
             outcome, why, column = classify(node)
-            found.append(FilterValue(node.this, outcome, why, column))
+            found.append(FilterValue(node.this, outcome, why, column,
+                                     equality_spot(node) if why == "not_indexed" else None))
         elif _opaque_constant(node):
             found.append(FilterValue(_written_as(node, render_as), UNCHECKED, "not_a_plain_string",
                                      None))
@@ -1423,6 +1442,69 @@ def ground_values(
                 filters.append(text)
     return ValueGrounding(tuple(found), _never_true(ast, render_as), tuple(filters),
                           _null_as_written(ast, render_as))
+
+
+
+# --- a value the index could not check, asked of the source -------------------------------------
+#
+# The value index holds a column's values only where it can hold them all (`build_value_index`), so
+# a high-cardinality column -- an id, a lot number -- has none, and every value on it was UNCHECKED:
+# a true "none" filtered on one was declined. Measured on saved local-model runs: a third of the
+# right answers the sanity layer declined. The source can answer for such a value itself, so once a
+# result is empty each not_indexed value is asked of it: found is grounded, missing is absent, and
+# a probe that fails or times out leaves the value unchecked, the empty result declined as before.
+# Only a not_indexed value carries a column to ask (`FilterValue.placed`): a masked column or a
+# row-filtered table never does, because whether a value exists is what those withhold.
+
+PROBE_LIMIT = 8  # distinct values asked per grounding; any beyond stay unchecked
+
+
+def confirm_by_source(grounding: ValueGrounding, holds: Callable[[str, str, str], bool | None],
+                      limit: int = PROBE_LIMIT) -> ValueGrounding:
+    """`grounding` with each not_indexed value the source was asked about grounded or ruled out.
+    `holds(table, column, text)` answers True, False, or None for a source that said nothing."""
+    asked: dict[tuple[str, str, str], bool | None] = {}
+    values = []
+    for value in grounding.values:
+        if value.outcome != UNCHECKED or value.why != "not_indexed" or value.placed is None:
+            values.append(value)
+            continue
+        key = (*value.placed, value.text)
+        if key not in asked:
+            if len(asked) >= limit:
+                values.append(value)
+                continue
+            asked[key] = holds(*key)
+        found = asked[key]
+        values.append(value if found is None
+                      else replace(value, outcome=GROUNDED if found else ABSENT, why="probed"))
+    return replace(grounding, values=tuple(values))
+
+
+def probe_sql(table: str, column: str, text: str, dialect: str | None) -> str:
+    """Whether `table.column` holds `text`, in the source's dialect: the names quoted in their stored
+    spelling, as the value index reads them, and the value a string literal sqlglot escapes."""
+    return (exp.select(exp.Literal.number(1))
+            .from_(exp.Table(this=exp.to_identifier(table, quoted=True)))
+            .where(exp.EQ(this=exp.Column(this=exp.to_identifier(column, quoted=True)),
+                          expression=exp.Literal.string(text)))
+            .limit(1)
+            .sql(dialect=dialect))
+
+
+def source_holds(adapter, dialect: str | None, physical: dict[str, str],
+                 timeout_s: float) -> Callable[[str, str, str], bool | None]:
+    """`holds` for `confirm_by_source`, asking `adapter`. `physical` maps a snapshot table to the
+    source's own name for it (`Snapshot.source_bindings`), as the value index does."""
+    def holds(table: str, column: str, text: str) -> bool | None:
+        sql = probe_sql(physical.get(table, table), column, text, dialect)
+        try:
+            return adapter.execute_arrow(sql, timeout_s=timeout_s).num_rows > 0
+        except Exception:  # noqa: BLE001 -- unanswered, the value stays unchecked and declines
+            logger.info("the source did not answer whether %s.%s holds a value; it stays unchecked",
+                        table, column, exc_info=True)
+            return None
+    return holds
 
 
 def _null_as_written(ast: exp.Expression, render_as: str | None) -> str | None:

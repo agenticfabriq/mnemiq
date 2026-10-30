@@ -675,3 +675,89 @@ def test_the_answered_note_cuts_a_long_filter_and_says_so():
     assert note.endswith("... (cut at 300 characters; the SQL shown with this answer has them "
                          "whole).")
     assert len(note) < 420
+
+
+# --- a value the index could not check, asked of the source -------------------------------------
+
+def test_a_not_indexed_value_records_the_column_it_is_compared_with():
+    g = _ground("SELECT id FROM claim WHERE adjuster IN ('agent_0042', 'agnet_0042')")
+    assert [(v.text, v.why, v.placed) for v in g.values] == [
+        ("agent_0042", "not_indexed", ("claim", "adjuster")),
+        ("agnet_0042", "not_indexed", ("claim", "adjuster"))]
+
+
+def test_only_a_not_indexed_value_carries_a_column_to_ask():
+    """Masked, row-filtered, pattern, range, expression and date values are never asked: what a
+    mask or a row filter withholds is whether a value exists, and the others are no equality."""
+    for sql, kw in (("SELECT id FROM claim WHERE status = 'open'",
+                     {"masks": lambda t, c: c == "status"}),
+                    ("SELECT id FROM claim WHERE adjuster = 'agent_0042'", {"row_filtered": {"claim"}}),
+                    ("SELECT id FROM claim WHERE adjuster LIKE 'agn%'", {}),
+                    ("SELECT id FROM claim WHERE adjuster > 'a'", {}),
+                    ("SELECT id FROM claim WHERE lower(adjuster) = 'x'", {}),
+                    ("SELECT id FROM claim WHERE ts = '2024-03-03'", {})):
+        assert [v.placed for v in _ground(sql, **kw).values] == [None], sql
+
+
+def test_the_source_grounds_or_rules_out_a_value_and_a_silent_source_changes_nothing():
+    from mnemiq.sql.values_check import confirm_by_source
+
+    asked = []
+
+    def holds(table, column, text):
+        asked.append((table, column, text))
+        return {"agent_0042": True, "agnet_0042": False}.get(text)
+
+    g = _ground("SELECT id FROM claim WHERE adjuster IN ('agent_0042', 'agnet_0042', 'quiet') "
+                "AND status = 'open' AND note LIKE 'x%'")
+    read = [(v.text, v.outcome, v.why) for v in confirm_by_source(g, holds).values]
+    assert read == [("agent_0042", GROUNDED, "probed"), ("agnet_0042", ABSENT, "probed"),
+                    ("quiet", UNCHECKED, "not_indexed"), ("open", GROUNDED, ""),
+                    ("x%", UNCHECKED, "pattern")]
+    assert asked == [("claim", "adjuster", "agent_0042"), ("claim", "adjuster", "agnet_0042"),
+                     ("claim", "adjuster", "quiet")]
+
+
+def test_a_value_is_asked_once_and_at_most_the_limit_are_asked():
+    from mnemiq.sql.values_check import confirm_by_source
+
+    asked = []
+
+    def holds(table, column, text):
+        asked.append(text)
+        return True
+
+    many = ", ".join(f"'a{i}'" for i in range(12))
+    g = _ground(f"SELECT id FROM claim WHERE adjuster IN ('a0', {many})")
+    out = confirm_by_source(g, holds, limit=8)
+    assert asked == [f"a{i}" for i in range(8)]
+    assert [v.outcome for v in out.values] == [GROUNDED] * 9 + [UNCHECKED] * 4
+
+
+def test_the_probe_quotes_the_stored_names_and_escapes_the_value():
+    from mnemiq.sql.values_check import probe_sql
+
+    assert probe_sql("claim", "adjuster", "O'Brien", "duckdb") == (
+        "SELECT 1 FROM \"claim\" WHERE \"adjuster\" = 'O''Brien' LIMIT 1")
+    assert probe_sql("CLAIM", "ADJUSTER", "x", "oracle") == (
+        "SELECT 1 FROM \"CLAIM\" WHERE \"ADJUSTER\" = 'x' FETCH FIRST 1 ROWS ONLY")
+    assert probe_sql("claim", "adjuster", "x", "mysql") == (
+        "SELECT 1 FROM `claim` WHERE `adjuster` = 'x' LIMIT 1")
+
+
+def test_the_source_answers_found_missing_or_nothing(tmp_path):
+    import duckdb
+
+    from mnemiq.adapters.duckdb import DuckDBAdapter
+    from mnemiq.sql.values_check import source_holds
+
+    path = str(tmp_path / "s.duckdb")
+    con = duckdb.connect(path)
+    con.execute("CREATE TABLE claim_raw (adjuster VARCHAR)")
+    con.execute("INSERT INTO claim_raw VALUES ('agent_0042'), ('O''Brien')")
+    con.close()
+    holds = source_holds(DuckDBAdapter.duckdb(path), "duckdb", {"claim": "claim_raw"}, timeout_s=10)
+    assert holds("claim", "adjuster", "agent_0042") is True
+    assert holds("claim", "adjuster", "O'Brien") is True  # through its physical name, escaped
+    assert holds("claim", "adjuster", "agnet_0042") is False
+    assert holds("claim", "no_such_column", "x") is None  # a failed probe says nothing
