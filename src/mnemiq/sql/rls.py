@@ -4,13 +4,15 @@ from dataclasses import dataclass
 import json
 import logging
 import re
+import secrets
 import threading
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.tokens import TokenType
 
 from mnemiq.sql.policy import AccessPolicy
-from mnemiq.sql.qualify import names_one_object, object_key
+from mnemiq.sql.qualify import expand_tables, names_one_object, object_key
 from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, is_lambda_parameter, map_struct
 from mnemiq.sql.scope import (KnownColumns, base_tables, column_tables, cte_references,
                               known_columns, scope_resolved)
@@ -30,6 +32,16 @@ _SUBJECT = "__mnemiq_filtered__"
 # reading ROWNUM is neither merged nor has predicates pushed into it, and `ROWNUM > 0` holds for
 # every row, so the fence changes which rows the outer query sees first and never which rows.
 _FENCED = frozenset({"oracle"})
+
+# A row filter runs as its operator wrote it (M222). Its parse is what the validators read; the
+# text rides on the parse's root under this key, through the rewrite, to the deciders, which print
+# it in the parse's place (`with_filters_held`, `as_written`). Printed from the parse, a filter
+# loses what sqlglot's tree has no slot for: `list_reverse_sort([id, NULL], 'NULLS FIRST')` reads
+# as ARRAY_REVERSE_SORT, which has no null order, so a filter keeping no row on DuckDB kept the row
+# once governed. M218 is what makes the text safe to print: a filter is applied only to a statement
+# decided as the engine that runs it, so the text is that engine's SQL.
+_AS_WRITTEN = "mnemiq_row_filter_as_written"
+_PLACEHOLDER = re.compile(r"\bmnemiq_row_filter_[0-9a-f]{16}\b")
 
 
 def _parsed(filt: str, dialect: str, wrapped: bool = False) -> exp.Expression:
@@ -122,7 +134,88 @@ def _validate_filter(
                 return None
         elif column.name not in schema.get(owner, set()):
             return None
+    expr.meta[_AS_WRITTEN] = _without_a_closing_semicolon(filt, dialect)
     return expr
+
+
+def _without_a_closing_semicolon(filt: str, dialect: str) -> str:
+    """The filter's text less a closing `;`, which its parse ignores and a parenthesised
+    predicate cannot hold. Any other `;` is a second statement, and the parse refused it."""
+    tokens = sqlglot.tokenize(filt, read=dialect)
+    if tokens and tokens[-1].token_type is TokenType.SEMICOLON:
+        return filt[: tokens[-1].start]
+    return filt
+
+
+def with_filters_held(tree: exp.Expression, registry: dict[str, str] | None = None,
+                      dialect: str = "duckdb") -> tuple[exp.Expression, dict[str, str]]:
+    """A copy of `tree` with each row filter the rewrite placed held out of it: the filter's parse
+    swapped for a placeholder column, and the text each placeholder stands for, which `as_written`
+    puts back once the copy is printed (M222). The placeholder survives the deciders' print and
+    re-read in every engine an adapter executes as, where a filter's parse does not. Fresh names
+    each call, so no statement can spell one in advance. A federation's `registry` expands the
+    text's tables as `expand_tables` expands the tree's (`_expanded`), in the filter's `dialect`."""
+    tree = tree.copy()
+    held = [node for node in tree.walk() if _AS_WRITTEN in node.meta]
+    texts: dict[str, str] = {}
+    for node in held:
+        name = f"mnemiq_row_filter_{secrets.token_hex(8)}"
+        texts[name] = _expanded(node.meta[_AS_WRITTEN], registry or {}, dialect)
+        node.replace(exp.column(name))
+    return tree, texts
+
+
+def _expanded(text: str, registry: dict[str, str], dialect: str) -> str:
+    """`text` with each `catalog.table` it reads written `catalog.schema.table`, as `expand_tables`
+    writes a federated statement's tree, so a filter's own subquery names what DuckDB can find. The
+    catalog is replaced where the parse found it, by what `expand_tables` would print there, and
+    the result is read back: it must parse to the expanded tree, or ValueError."""
+    tree = _parsed(text, dialect)
+    spans = []
+    for table in tree.find_all(exp.Table):
+        db = table.args.get("db")
+        if table.text("db") not in registry or table.args.get("catalog"):
+            continue
+        if "start" not in db.meta:
+            raise ValueError("a federated filter's catalog has no place in its text")
+        segment = exp.to_identifier(db.name).sql(dialect=dialect) + "." + exp.to_identifier(
+            registry[db.name]).sql(dialect=dialect)
+        spans.append((db.meta["start"], db.meta["end"] + 1, segment))
+    if not spans:
+        return text
+    out = text
+    for start, end, segment in sorted(spans, reverse=True):
+        out = out[:start] + segment + out[end:]
+    expected = tree.copy()
+    expand_tables(expected, registry)
+    if _parsed(out, dialect) != expected:
+        raise ValueError("a federated filter's tables did not expand as its statement's did")
+    return out
+
+
+def as_written(sql: str, texts: dict[str, str], dialect: str) -> str:
+    """`sql`, printed from a tree `with_filters_held`, with each placeholder replaced by its
+    filter's text as written: in parentheses, and closed on a new line so that a line comment in
+    the text ends there. Raises ValueError unless every placeholder printed exactly once, as a
+    condition of a WHERE joined to the rest by AND alone, which is where the rewrite puts a filter
+    and where parentheses give it the meaning the parse had. Anywhere else (under a NOT, an OR, a
+    comparison a printer added) the text would not mean what was validated."""
+    if not texts:
+        return sql
+    if sorted(_PLACEHOLDER.findall(sql)) != sorted(texts):
+        raise ValueError("a row filter did not print exactly once")
+    standing = [c.name for c in sqlglot.parse_one(sql, read=dialect).find_all(exp.Column)
+                if c.name in texts and not c.table and _a_where_conjunct(c)]
+    if sorted(standing) != sorted(texts):
+        raise ValueError("a row filter printed where it is not a condition of a WHERE")
+    return _PLACEHOLDER.sub(lambda m: f"({texts[m.group(0)]}\n)", sql)
+
+
+def _a_where_conjunct(node: exp.Expression) -> bool:
+    parent = node.parent
+    while isinstance(parent, (exp.Paren, exp.And)):
+        parent = parent.parent
+    return isinstance(parent, exp.Where)
 
 
 # Conversions that raise on a value they cannot read (M159). A row filter runs over every row of

@@ -37,7 +37,7 @@ def test_an_oracle_read_fences_the_filtered_table_inside_its_derived_table():
     verdict = _read("SELECT id FROM claim WHERE amount > 5", "oracle")
     assert isinstance(verdict, Approved), verdict
     # Inside the derived table, beside the policy: outside it, the fence would fence nothing.
-    assert "WHERE id IN (SELECT id FROM entitlement WHERE who = 'r') AND ROWNUM > 0) claim" in (
+    assert "WHERE (id IN (SELECT id FROM entitlement WHERE who = 'r')\n) AND ROWNUM > 0) claim" in (
         verdict.target_sql), verdict.target_sql
     assert "ROWNUM" not in verdict.asked_sql  # what the caller is shown is what they asked
 

@@ -94,14 +94,18 @@ def _ask(adapter, *, sql=None, row_filter=None, replies=None, stale=False):
     return answer, generator.calls
 
 
-def test_the_control_the_source_s_own_error_quotes_the_policy(adapter, caplog):
-    # Without this, the tests below could pass on an error that never quoted the policy at all. The
+def test_the_control_the_source_s_own_error_says_more_than_its_class(adapter, caplog):
+    # Without this, the test below could pass on an error that carried nothing past its class. The
     # operator's log keeps the whole text: it is the one place the full error is meant to be.
     with caplog.at_level(logging.WARNING):
         _ask(adapter, sql=BAD_CAST, row_filter=ENTITLED)
     logged = "\n".join(r.getMessage() for r in caplog.records if "the source said" in r.getMessage())
-    # DuckDB's echo is a window around the error, here opening at `WHERE who =`.
-    assert "who = 'secret_role_42'" in logged
+    # A row's value, and DuckDB's echo of the statement: a window on the line the error is on. The
+    # policy's text closes on its own line since M222, so an error in the caller's WHERE echoes
+    # the line after it and no longer the policy; an error in the policy's own text still does
+    # (the EXPLAIN refusal below).
+    assert "'west'" in logged and "AS claim WHERE amount > 0" in logged, logged
+    assert "secret_role_42" not in logged, logged
 
 
 def test_an_execution_error_reaches_the_model_as_its_class_only(adapter):

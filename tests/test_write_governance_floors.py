@@ -402,6 +402,8 @@ def test_the_with_floor_is_not_keyed_on_a_sqlglot_arg_name():
 
 
 _ENTITLED = "id IN (SELECT id FROM entitlement WHERE who = 'u')"
+# Each filter prints as its text, in parentheses closed on a new line (M222), which the
+# renderings below spell.
 
 # The last case is the only one that enters the conjoined-WHERE branch of
 # `apply_row_filters_to_write`, and reaching it needs TWO things at once: an UPDATE/DELETE root
@@ -424,14 +426,14 @@ _ENTITLED = "id IN (SELECT id FROM entitlement WHERE who = 'u')"
 # still satisfy both. Pinning the predicate's position is what distinguishes them.
 _PROVENANCE_SHAPES = [
     ("insert", "INSERT INTO scratch (id, amount) SELECT id, amount FROM claim",
-     {"claim": _ENTITLED}, ["claim", "scratch"], f"WHERE {_ENTITLED}) AS claim",
-     f"AND {_ENTITLED}"),
+     {"claim": _ENTITLED}, ["claim", "scratch"], f"WHERE ({_ENTITLED}\n)) AS claim",
+     f"AND ({_ENTITLED}"),
     ("update", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
-     {"claim": _ENTITLED}, ["claim", "scratch"], f"WHERE {_ENTITLED}) AS claim",
-     f"AND {_ENTITLED}"),
+     {"claim": _ENTITLED}, ["claim", "scratch"], f"WHERE ({_ENTITLED}\n)) AS claim",
+     f"AND ({_ENTITLED}"),
     ("delete", "DELETE FROM scratch WHERE id IN (SELECT id FROM claim)",
-     {"claim": _ENTITLED}, ["claim", "scratch"], f"WHERE {_ENTITLED}) AS claim",
-     f"AND {_ENTITLED}"),
+     {"claim": _ENTITLED}, ["claim", "scratch"], f"WHERE ({_ENTITLED}\n)) AS claim",
+     f"AND ({_ENTITLED}"),
     ("update_target_filtered", "UPDATE scratch SET amount = 0 WHERE id IN (SELECT id FROM claim)",
      # Anchored past the subquery's closing paren, so it pins the predicate onto the TARGET's
      # WHERE rather than merely somewhere in the statement -- a strictly stronger substring, and
@@ -441,7 +443,7 @@ _PROVENANCE_SHAPES = [
      # if existing is not None else predicate`), so a predicate injected there renders as a bare
      # `WHERE ...`. The bare form did not admit the inner conjunction an earlier version of this
      # comment said it did.
-     {"scratch": _ENTITLED}, ["claim", "scratch"], f"FROM claim) AND {_ENTITLED}", ") AS claim"),
+     {"scratch": _ENTITLED}, ["claim", "scratch"], f"FROM claim) AND ({_ENTITLED}\n)", ") AS claim"),
 ]
 
 

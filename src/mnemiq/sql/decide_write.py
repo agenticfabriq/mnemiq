@@ -24,7 +24,8 @@ from mnemiq.sql.prove import prove_governed
 from mnemiq.sql.qualify import object_key
 from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, rendered, unprintable
 from mnemiq.sql.scope import base_tables, check_policy_target, fields_as_members, known_columns
-from mnemiq.sql.rls import apply_row_filters_to_write, check_filter_targets, unplaceable_policy
+from mnemiq.sql.rls import (apply_row_filters_to_write, as_written, check_filter_targets,
+                            unplaceable_policy, with_filters_held)
 from mnemiq.sql.verdict import ApprovedWrite, Refusal, RefusalCode
 from mnemiq.sql.views import check_views
 
@@ -497,9 +498,12 @@ def decide_write(
         asked_sql = rendered(asked_plan, dialect, target)
     except (ValueError, sqlglot.errors.SqlglotError) as exc:
         return unprintable(target, exc, policys=False, tree=asked)
-    plan_sql = shaped.sql(dialect=dialect)
+    # Each row filter printed as its operator wrote it, never from its parse (M222), as `decide` does.
+    held, written = with_filters_held(shaped)
+    plan_sql = held.sql(dialect=dialect)
     try:
         target_sql = asked_sql if asked_plan == plan_sql else rendered(plan_sql, dialect, target)
+        plan_sql, target_sql = as_written(plan_sql, written, dialect), as_written(target_sql, written, target)
     except (ValueError, sqlglot.errors.SqlglotError) as exc:
         return unprintable(target, exc, policys=True, tree=shaped)
     if adapter is not None:
