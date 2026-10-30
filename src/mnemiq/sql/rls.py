@@ -15,6 +15,7 @@ from sqlglot.tokens import TokenType
 from mnemiq.sql.policy import AccessPolicy
 from mnemiq.sql.qualify import expand_tables, names_one_object, object_key
 from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, is_lambda_parameter, map_struct
+from mnemiq.sql.reserved_words import reserved
 from mnemiq.sql.scope import (KnownColumns, base_tables, column_tables, cte_references,
                               known_columns, scope_resolved)
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -210,8 +211,9 @@ def _probe(filt: str, token, fresh: str, dialect: str) -> exp.Expression | None:
 
 def _keyword_places(filt: str, dialect: str, counted, words: set[str]) -> Counter:
     """How often each of `words` stands in the text where no name can: where a fresh name in its
-    place does not parse (`_keywords_dropped`'s reading of a place). Never a quoted identifier,
-    which is a name wherever it stands."""
+    place does not parse (`_keywords_dropped`'s reading of a place), or where it is a word the
+    engine reserves (`_reserved_apart`). Never a quoted identifier, which is a name wherever it
+    stands."""
     fresh = _fresh_name(filt)
     tokens = sqlglot.tokenize(filt, read=dialect)
     places: Counter = Counter()
@@ -220,9 +222,17 @@ def _keyword_places(filt: str, dialect: str, counted, words: set[str]) -> Counte
             continue
         if i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN:
             continue  # a call's name, never counted
-        if _probe(filt, t, fresh, dialect) is None:
+        if _reserved_apart(tokens, i, dialect) or _probe(filt, t, fresh, dialect) is None:
             places[t.text.casefold()] += 1
     return places
+
+
+def _reserved_apart(tokens, i: int, dialect: str) -> bool:
+    """Whether token `i` is a word its engine reserves, not after a dot: one the engine reads as a
+    keyword wherever it stands, so no name (`reserved_words`). After a dot Postgres and DuckDB read
+    it as a column label (`e.all`); before one it is no qualifier either grammar takes."""
+    after_a_dot = i > 0 and tokens[i - 1].token_type is TokenType.DOT
+    return not after_a_dot and reserved(tokens[i].text, dialect)
 
 
 def _keywords_dropped(filt: str, dialect: str, counted) -> list[str]:
@@ -246,7 +256,8 @@ def _keywords_dropped(filt: str, dialect: str, counted) -> list[str]:
     dropped = []
     for i, t in enumerate(tokens):
         if t.token_type in counted or not _WORD.fullmatch(filt[t.start:t.end + 1]) or (
-                i + 1 < len(tokens) and tokens[i + 1].token_type in _NOT_A_COLUMN_AFTER):
+                i + 1 < len(tokens) and tokens[i + 1].token_type in _NOT_A_COLUMN_AFTER) or (
+                _reserved_apart(tokens, i, dialect)):
             continue
         probe = _probe(filt, t, fresh, dialect)
         if probe is None:

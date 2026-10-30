@@ -215,6 +215,10 @@ def test_a_text_that_does_not_read_back_as_the_expanded_tree_is_refused(monkeypa
     # A keyword that is neither a name nor a type to the parser, dropped where DuckDB reads the
     # column: `values` (Codex's fourth review of #193). Every keyword's place is probed, not a list.
     ("duckdb", "decode(d, values) IS NOT NULL"),
+    # Oracle does not reserve BOTH (V$RESERVED_WORDS, Oracle Free 23), so the word sqlglot drops
+    # from `TRIM(BOTH FROM region)` may be a column there: still refused, where DuckDB and Postgres,
+    # which reserve it, pass.
+    ("oracle", "TRIM(BOTH FROM region) = 'west'"),
 ])
 def test_a_name_the_parse_does_not_read_as_a_column_or_a_table_refuses_the_filter(dialect, filt):
     schema = {"claim": {"id", "d"}}
@@ -245,6 +249,15 @@ def test_a_name_the_parse_does_not_read_as_a_column_or_a_table_refuses_the_filte
     ("duckdb", "id IN (SELECT e.id FROM entitlement AS e ORDER BY e.id DESC NULLS LAST LIMIT 10)"),
     ("duckdb", "TRIM(BOTH ' ' FROM region) = 'west' AND TRIM(LEADING 'x' FROM region) = 'west'"),
     ("duckdb", "TRY_CAST(d AS TIMESTAMP WITH TIME ZONE) IS NOT NULL"),
+    # A word the engine reserves, which it never reads as a name where it stands unquoted, though
+    # a name could stand there to sqlglot: `TRIM(x FROM region)` trims x (Codex's seventh review).
+    ("duckdb", "TRIM(BOTH FROM region) = 'west'"),
+    ("postgres", "TRIM(BOTH FROM region) = 'west'"),
+    ("duckdb", "id IN (SELECT ALL id FROM entitlement)"),
+    ("postgres", "id IN (SELECT ALL id FROM entitlement)"),
+    ("oracle", "id IN (SELECT ALL id FROM entitlement)"),
+    # The same where the parse drops the word: NULL is the literal to DuckDB, never a column.
+    ("duckdb", "list_reverse_sort([id], NULL) IS NOT NULL"),
 ])
 def test_names_the_parse_accounts_for_pass(dialect, filt):
     schema = {"claim": {"id", "region", "d"}, "entitlement": {"id", "who"}}
@@ -321,3 +334,85 @@ def test_every_cast_duckdb_accepts_passes_the_name_check():
             accepted.append(filt)
     assert len(accepted) > 150, len(accepted)
     assert [(f, lost) for f in accepted if (lost := _unaccounted_names(f, "duckdb"))] == []
+
+
+def test_a_reserved_word_after_a_dot_is_a_name():
+    # Postgres and DuckDB read a reserved word after a dot as a column (`e.all`): only a word
+    # standing apart is excused.
+    from sqlglot.tokens import TokenType
+
+    from mnemiq.sql import rls
+    counted = frozenset(TokenType)  # every word counts, so only the excuse decides
+    for dialect in ("duckdb", "postgres"):
+        apart = rls._keyword_places("id IN (SELECT ALL id FROM entitlement)", dialect, counted, {"all"})
+        dotted = rls._keyword_places("id IN (SELECT e.all FROM entitlement e)", dialect, counted, {"all"})
+        assert apart["all"] == 1 and dotted["all"] == 0, (dialect, apart, dotted)
+
+
+def test_every_word_taken_as_reserved_is_reserved_by_the_installed_duckdb():
+    import duckdb
+
+    from mnemiq.sql.reserved_words import RESERVED
+    installed = {row[0] for row in duckdb.connect().execute(
+        "SELECT keyword_name FROM duckdb_keywords() WHERE keyword_category = 'reserved'").fetchall()}
+    assert RESERVED["duckdb"] <= installed, sorted(RESERVED["duckdb"] - installed)
+
+
+
+def _reads_the_column(run, query: str) -> bool:
+    """Whether `query`, an unquoted word selected beside a column of that name holding 7, reads it."""
+    try:
+        return run(query) == [(7,)]
+    except Exception:  # a parse or bind error: the word is not read as a name there
+        return False
+
+
+def _beside(word: str, stored: str, tail: str = "") -> str:
+    return f'SELECT {word} FROM (SELECT 7 AS "{stored}"{tail}) t'
+
+
+def test_duckdb_reads_no_word_taken_as_reserved_as_a_column():
+    import duckdb
+
+    from mnemiq.sql.reserved_words import RESERVED
+    con = duckdb.connect()
+    run = lambda q: con.execute(q).fetchall()  # noqa: E731
+    assert _reads_the_column(run, _beside("id_probe", "id_probe")), "the control"
+    read = [w for w in sorted(RESERVED["duckdb"]) if _reads_the_column(run, _beside(w, w))]
+    assert not read, read
+
+
+@pytest.mark.integration
+def test_oracle_reads_no_word_taken_as_reserved_as_a_column():
+    import os
+
+    oracledb = pytest.importorskip("oracledb")
+    dsn = os.environ.get("MNEMIQ_ORACLE_TEST_DSN")
+    if not dsn:
+        pytest.skip("set MNEMIQ_ORACLE_TEST_DSN to run the Oracle check")
+    from mnemiq.sql.reserved_words import RESERVED
+    with oracledb.connect(user=os.environ.get("MNEMIQ_ORACLE_TEST_USER", "appuser"),
+                          password=os.environ.get("MNEMIQ_ORACLE_TEST_PASSWORD", "apppw"), dsn=dsn) as con:
+        cur = con.cursor()
+        run = lambda q: cur.execute(q).fetchall()  # noqa: E731
+        # The column spelled as Oracle stores the unquoted word, so a name would be read as it.
+        assert _reads_the_column(run, _beside("id_probe", "ID_PROBE", " FROM dual")), "the control"
+        read = [w for w in sorted(RESERVED["oracle"])
+                if _reads_the_column(run, _beside(w, w.upper(), " FROM dual"))]
+    assert not read, read
+
+
+@pytest.mark.integration
+def test_postgres_reads_no_word_taken_as_reserved_as_a_column():
+    import os
+
+    psycopg = pytest.importorskip("psycopg")
+    dsn = os.environ.get("MNEMIQ_PG_DSN")
+    if not dsn:
+        pytest.skip("set MNEMIQ_PG_DSN to run the Postgres check")
+    from mnemiq.sql.reserved_words import RESERVED
+    with psycopg.connect(dsn, autocommit=True) as con:
+        run = lambda q: con.execute(q).fetchall()  # noqa: E731
+        assert _reads_the_column(run, _beside("id_probe", "id_probe")), "the control"
+        read = [w for w in sorted(RESERVED["postgres"]) if _reads_the_column(run, _beside(w, w))]
+    assert not read, read
