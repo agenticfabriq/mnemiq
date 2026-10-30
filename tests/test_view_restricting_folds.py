@@ -535,3 +535,49 @@ def test_a_view_body_s_cte_chain_resolves_each_cte_name_once(monkeypatch):
                           known={"orders", "safe_table", "v"}, granted={"v"}, dialect="duckdb")
     assert verdict is None, verdict
     assert len(calls) < 4 * n, len(calls)
+
+
+def _ancestor_reads(monkeypatch) -> list:
+    from mnemiq.sql import scope
+
+    calls = []
+    real = scope._marks_a_binding
+    monkeypatch.setattr(scope, "_marks_a_binding", lambda node: calls.append(1) or real(node))
+    return calls
+
+
+@pytest.mark.parametrize("prefix", ["", "WITH c AS (SELECT 1 AS id) "])
+def test_references_sharing_ancestors_climb_them_once(monkeypatch, prefix):
+    # sqlglot nests a flat UNION of N branches N deep, and each reference asked whether a CTE binds
+    # it climbed every ancestor: 2,004,999 ancestors at 2,000 branches, with no CTE at all (Codex's
+    # fifteenth review of #192). Under a WITH every reference climbs to it.
+    from mnemiq.sql.views import check_views
+
+    n = 400
+    defs = {"v": ViewDefinition(object_id="v", dialect="duckdb", definition="SELECT id FROM safe_table")}
+    query = prefix + " UNION ALL ".join(["SELECT id FROM v"] * n)
+    calls = _ancestor_reads(monkeypatch)
+    verdict = check_views(sqlglot.parse_one(query, read="duckdb"), defs, {"orders"},
+                          known={"orders", "safe_table", "v"}, granted={"v"}, dialect="duckdb")
+    assert verdict is None, verdict
+    assert len(calls) < 8 * n, len(calls)
+
+
+def test_references_to_a_recursive_cte_in_its_own_body_find_its_recursive_part_once(monkeypatch):
+    # Each branch naming the CTE asks whether it sits in the recursive part, the last branch, and
+    # each asking climbed the branches above it.
+    from sqlglot import exp
+
+    from mnemiq.sql.views import check_views
+
+    n = 400
+    reads = []
+    real = exp.SetOperation.right
+    monkeypatch.setattr(exp.SetOperation, "right", property(lambda self: reads.append(1) or real.fget(self)))
+    query = "WITH RECURSIVE r AS (SELECT 1 AS id UNION ALL " + " UNION ALL ".join(["SELECT id FROM r"] * n) + \
+        ") SELECT id FROM r"
+    defs = {"r": ViewDefinition(object_id="r", dialect="duckdb", definition="SELECT id FROM safe_table")}
+    verdict = check_views(sqlglot.parse_one(query, read="duckdb"), defs, {"orders"},
+                          known={"orders", "safe_table", "r"}, granted={"r"}, dialect="duckdb")
+    assert verdict is None, verdict
+    assert len(reads) < 8 * n, len(reads)

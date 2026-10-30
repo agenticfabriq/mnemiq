@@ -407,25 +407,22 @@ def check_policy_target(ast: exp.Expression, policy, target: str | None):
 _EVERY_SIBLING = frozenset({"sqlite"})
 
 
-def _in_recursive_part(table: exp.Table, cte: exp.CTE | None) -> bool:
-    """Whether the reference sits in the recursive part of the CTE's body: the right side of
-    the body's top-level UNION, ALL or not. Only a UNION makes a CTE recursive; an INTERSECT or
+def _recursive_part(cte: exp.CTE) -> exp.Expression | None:
+    """The recursive part of the CTE's body: the right side of the body's top-level UNION, ALL
+    or not. Only a UNION makes a CTE recursive; an INTERSECT or
     EXCEPT body is a plain CTE to the engine, its own name the base table everywhere in it, and
     of three UNION ALL branches only the LAST is the recursive part (DuckDB, measured on the ui
     lane's replay of #170 at 3e98092: `WITH RECURSIVE claim AS (... INTERSECT SELECT id, secret
     FROM claim)` and the middle branch of three each returned the hidden column). A body with
     no UNION has no recursive part."""
-    body = cte.this if cte is not None else None
+    body = cte.this
     while isinstance(body, (exp.Subquery, exp.Paren)):
         body = body.this
-    if not isinstance(body, exp.Union):
-        return False
-    node = table.parent
-    while node is not None and node is not body:
-        if node is body.right:
-            return True
-        node = node.parent
-    return False
+    return body.right if isinstance(body, exp.Union) else None
+
+
+def _right_side(node: exp.Expression) -> bool:
+    return isinstance(node.parent, exp.SetOperation) and node.arg_key == "expression"
 
 
 def _cte_in_scope(table: exp.Table, dialect: str | None = None,
@@ -463,11 +460,41 @@ def _cte_scope(scope, cte: exp.CTE):
     return None
 
 
+def _marks_a_binding(node: exp.Expression) -> bool:
+    """Whether `_cte_binding` reads anything at `node`: a CTE, a WITH, a node holding one, or a set
+    operation's right side, which may be a CTE's recursive part."""
+    return (isinstance(node, (exp.CTE, exp.With)) or _right_side(node)
+            or any(isinstance(v, exp.With) for v in node.args.values()))
+
+
+def _climb(node: exp.Expression, memo: dict) -> exp.Expression | None:
+    """The nearest strict ancestor of `node` that `_marks_a_binding`, or None. Shared through `memo`,
+    where every node passed on the way records the answer, so references sharing ancestors pass them
+    once: sqlglot nests a flat UNION of N branches N deep, and each reference climbing all of it
+    was 2,004,999 steps at 2,000 branches (Codex's fifteenth review of #192). Each entry holds its
+    node, so the id cannot be reused by another while the memo lives."""
+    entry = memo.get(id(node))
+    if entry is not None and entry[0] is node:
+        return entry[1]
+    path, up = [node], node.parent
+    while up is not None and not _marks_a_binding(up):
+        entry = memo.get(id(up))
+        if entry is not None and entry[0] is up:
+            up = entry[1]
+            break
+        path.append(up)
+        up = up.parent
+    for passed in path:
+        memo[id(passed)] = (passed, up)
+    return up
+
+
 def _with_names(with_: exp.With, dialect: str | None, index: dict):
     """A WITH's CTEs, the position of the first CTE each resolved name defines, and the position
     of each CTE: worked out once per WITH and dialect in `index`. The entry holds the WITH itself,
     so its id cannot be reused by another node while the index lives."""
-    entry = index.get((id(with_), dialect))
+    withs = index.setdefault("withs", {})
+    entry = withs.get((id(with_), dialect))
     if entry is None or entry[0] is not with_:
         ctes = tuple(with_.expressions)
         first: dict[str, int] = {}
@@ -475,7 +502,7 @@ def _with_names(with_: exp.With, dialect: str | None, index: dict):
             name = resolve_name(cte, dialect)
             if name is not None:
                 first.setdefault(name, i)
-        entry = index[(id(with_), dialect)] = (with_, ctes, first, {id(cte): i for i, cte in enumerate(ctes)})
+        entry = withs[(id(with_), dialect)] = (with_, ctes, first, {id(cte): i for i, cte in enumerate(ctes)})
     return entry[1:]
 
 
@@ -497,9 +524,9 @@ def _cte_binding(table: exp.Table, dialect: str | None = None,
     main.claim` behind a CTE `claim`, and Postgres's `claim` behind `"Claim"`.
     Structural, never by arg name. In doubt the answer is None, which over-reports: a refusal.
 
-    A WITH's names are looked up in `index` (`_with_names`), shared by a caller asking of many
-    nodes of one unchanged tree (`cte_binder`); the first CTE of a name is the one bound, as the
-    first match among the visible ones was.
+    A WITH's names are looked up in `index` (`_with_names`), and the climb to it goes by `_climb`,
+    both shared by a caller asking of many nodes of one unchanged tree (`cte_binder`); the first
+    CTE of a name is the one bound, as the first match among the visible ones was.
     """
     if table.db or table.catalog:
         return None
@@ -508,10 +535,17 @@ def _cte_binding(table: exp.Table, dialect: str | None = None,
         return None
     if index is None:
         index = {}
-    child, node, last_cte = table, table.parent, None
+    climb = index.setdefault("climb", {})
+    # Only the ancestors `_marks_a_binding` are visited, so `child` is the last of those passed: the
+    # WITH itself when the table sits in one of its CTE bodies, since a WITH is one of them.
+    child, node, last_cte, last_right, recursive_part = table, _climb(table, climb), None, None, False
     while node is not None:
+        if _right_side(node):
+            last_right = node
         if isinstance(node, exp.CTE):
             last_cte = node
+            # In the recursive part when the last right side passed on the way up is the body's.
+            recursive_part = last_right is not None and last_right is _recursive_part(node)
         for with_ in (v for v in node.args.values() if isinstance(v, exp.With)):
             ctes, first, position = _with_names(with_, dialect, index)
             found = first.get(name)
@@ -524,17 +558,17 @@ def _cte_binding(table: exp.Table, dialect: str | None = None,
                 if found < at:
                     return ctes[found]
                 # Under RECURSIVE the CTE's own name binds in its RECURSIVE part alone, the
-                # right side of its body's UNION (`_in_recursive_part`); in the anchor, in an
+                # right side of its body's UNION (`_recursive_part`); in the anchor, in an
                 # earlier UNION ALL branch and anywhere in an INTERSECT or EXCEPT body it is the
                 # base table (DuckDB, measured: `WITH RECURSIVE claim AS (SELECT ... FROM claim
                 # UNION ALL ...)` read the base `claim` in the anchor, and a hidden join key
                 # went unread when the whole body was taken as the CTE: Codex's fourth review
                 # of #170; the other two shapes, the ui lane's replay at 3e98092).
-                if found == at and with_.args.get("recursive") and _in_recursive_part(table, last_cte):
+                if found == at and with_.args.get("recursive") and recursive_part:
                     return ctes[found]
                 continue
             return ctes[found]
-        child, node = node, node.parent
+        child, node = node, _climb(node, climb)
     return None
 
 
