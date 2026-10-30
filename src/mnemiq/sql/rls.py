@@ -196,9 +196,11 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     unpositioned = printed - Counter(node.name.casefold() for node in identifiers) - excused
     # A struct literal's field names, which the parse rebuilds with no offset and the reprint
     # prints as strings (`{X: 1}` as `{'X': 1}`): names the filter gives, not reads, one a field,
-    # quoted or not.
+    # quoted or not. A field held at its offset (`struct_pack(x := 1)`) is accounted for already,
+    # and credited again it stood in for a name dropped elsewhere (Codex's eleventh review of #193).
     fields = Counter(e.this.name.casefold() for struct in tree.find_all(exp.Struct) for e in struct.expressions
-                     if isinstance(e, exp.PropertyEQ) and isinstance(e.this, exp.Identifier))
+                     if isinstance(e, exp.PropertyEQ) and isinstance(e.this, exp.Identifier)
+                     and "start" not in e.this.meta)
     lost = set(quoted - fields) | set(unquoted - unpositioned - (fields - quoted))
     # A date part holds its text; a MAP key read as a lambda's parameter holds the parameter's
     # Identifier (`as_duckdb_reads`), a name the lambda declares.

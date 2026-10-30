@@ -481,3 +481,21 @@ def test_each_word_is_accounted_where_it_stands_not_across_the_filter(filt):
     verdict = decide("SELECT id FROM claim", {"claim": schema["claim"]}, dialect="duckdb", target="duckdb",
                      policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
+
+@pytest.mark.parametrize("filt", ["decode(d, secret) = chr(65) AND struct_pack(secret := 1) IS NOT NULL",
+                                  'decode(d, "secret") = chr(65) AND struct_pack(secret := 1) IS NOT NULL'])
+@pytest.mark.parametrize("statement", ["SELECT id FROM claim", "DELETE FROM claim WHERE id > 0"])
+def test_a_struct_field_held_where_written_does_not_stand_in_for_a_dropped_name(filt, statement):
+    # The field `secret` of `struct_pack` is a name the parse holds at its offset, so it accounts
+    # for itself alone; crediting it again let the `secret` decode drops pass, a column outside the
+    # policy's schema (Codex's eleventh review of #193).
+    schema = {"claim": {"id", "d"}}
+    policy = AccessPolicy(row_filters={"claim": filt}, policy_schema=schema)
+    if statement.startswith("SELECT"):
+        verdict = decide(statement, schema, dialect="duckdb", target="duckdb", policy=policy)
+    else:
+        verdict = decide_write(statement, schema, GrantSet(frozenset(schema), writable=frozenset(schema)),
+                               policy=policy, dialect="duckdb", writes_enabled=True)
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
