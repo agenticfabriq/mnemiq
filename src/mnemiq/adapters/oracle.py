@@ -820,10 +820,12 @@ class OracleAdapter:
         # a PUBLIC one -- so a PUBLIC candidate sharing its name with a private link synonym would
         # be resolved across that link (the review gate). Such a name is never resolved at all.
         private_links = {stored for owner, stored in over_links if owner == self._schema}
-        # The same for a chain out of sight (M177): any candidate of a name, since the name is all
-        # NAME_RESOLVE takes.
-        out_of_sight = {stored for owner, stored in sorted(candidates)
-                        if (owner, stored) not in over_links and self._out_of_sight(owner, stored)}
+        # The same for a chain out of sight (M177), walked from where NAME_RESOLVE starts: the name
+        # in this schema, then PUBLIC's. Not from each candidate: with CURRENT_SCHEMA another than
+        # the session user, a private link synonym there that the caller cannot see shadows a
+        # PUBLIC one that is safe, and NAME_RESOLVE takes the private one (Codex's review of #194).
+        out_of_sight = {stored for stored in sorted({stored for _, stored in candidates})
+                        if stored not in private_links and self._out_of_sight(self._schema, stored)}
         unresolvable: set[str] = set()
         oracle_owned: set[str] | None = None
         for owner, stored in sorted(candidates):
@@ -883,8 +885,9 @@ class OracleAdapter:
         return found
 
     def _out_of_sight(self, owner: str, stored: str) -> bool:
-        """Whether the synonym's chain passes through a hop this session's dictionary does not show,
-        where NAME_RESOLVE could follow it somewhere this engine cannot see (M177).
+        """Whether resolving `stored` from `owner` passes through a hop this session's dictionary
+        does not show, where NAME_RESOLVE could follow it somewhere this engine cannot see (M177).
+        Asked from CURRENT_SCHEMA, as NAME_RESOLVE resolves a name.
 
         `_synonyms_reaching_a_link` reads ALL_SYNONYMS, which shows no other schema's private
         synonym, so a PUBLIC alias to one over a DB link looked like any other alias: NAME_RESOLVE
@@ -893,10 +896,12 @@ class OracleAdapter:
         Oracle Free 23 with two accounts. So the chain is followed hop by hop first, by stored owner
         and name, which ALL_SYNONYMS and ALL_OBJECTS answer from their indexes (0.4 ms each with
         107,886 synonyms, where a folded name costs 1.5 s). A hop over a link, or onto a name the
-        dictionary does not show in another schema, is out of sight: hidden and missing look alike
-        there, and Oracle resolves a hidden object before any PUBLIC synonym. In the session's own
-        schema every object is shown, so a missing name is missing, and Oracle answers it with the
-        PUBLIC synonym of that name, which is followed. A cycle is left to NAME_RESOLVE, which
+        dictionary does not show in a schema other than the session user's, is out of sight:
+        hidden and missing look alike there, and Oracle resolves a hidden object before any PUBLIC
+        synonym. So with CURRENT_SCHEMA another schema, a name not shown there is out of sight
+        even where a PUBLIC synonym of it is safe. In the session user's own schema every object
+        is shown, so a missing name is missing, and Oracle answers it with the PUBLIC synonym of
+        that name, which is followed. A cycle is left to NAME_RESOLVE, which
         answers it at once (ORA-01775).
         """
         seen: set[tuple[str, str]] = set()

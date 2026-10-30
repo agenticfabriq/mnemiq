@@ -140,7 +140,8 @@ def test_the_narrow_question_agrees_with_the_whole_read_or_oracle_refuses_the_ca
 
 OTHER = "m177_other"
 M177_DROPS = ["DROP PUBLIC SYNONYM m177_app_priv", "DROP PUBLIC SYNONYM m177_app_pub",
-              "DROP PUBLIC DATABASE LINK m177_dead", f"DROP USER {OTHER} CASCADE"]
+              "DROP PUBLIC SYNONYM m177_shadow", "DROP PUBLIC DATABASE LINK m177_dead",
+              f"DROP USER {OTHER} CASCADE"]
 
 
 def _drop_m177(admin_cur, oracledb):
@@ -207,4 +208,56 @@ def test_a_public_alias_over_another_schema_s_link_synonym_is_never_handed_to_th
     finally:
         adapter.close()
         _drop_m177(ac, oracledb)
+        admin.close()
+
+
+
+def test_a_hidden_link_synonym_in_current_schema_shadowing_a_safe_public_one_is_never_resolved():
+    """M177, with CURRENT_SCHEMA another account's: NAME_RESOLVE starts there, where `m177_other`
+    holds a private synonym over a dead link that the caller cannot see, shadowing a PUBLIC synonym
+    of the same name over the caller's own function (Codex's review of #194). From the caller's own
+    schema, the control, the same name resolves to that function."""
+    import secrets
+
+    oracledb = pytest.importorskip("oracledb")
+    from mnemiq.adapters.oracle import OracleAdapter
+
+    admin = oracledb.connect(user=ADMIN_USER, password=ADMIN_PASSWORD, dsn=DSN,
+                             mode=oracledb.AUTH_MODE_SYSDBA)
+    ac = admin.cursor()
+    app = oracledb.connect(user=USER, password=PASSWORD, dsn=DSN)
+    _drop_m177(ac, oracledb)
+    other_pw = "P" + secrets.token_hex(8)
+    shadowed = OracleAdapter(DSN, USER, PASSWORD, schema=OTHER)
+    own = OracleAdapter(DSN, USER, PASSWORD)
+    try:
+        for statement in (f"CREATE USER {OTHER} IDENTIFIED BY {other_pw}",
+                          f"GRANT CREATE SESSION, CREATE SYNONYM TO {OTHER}",
+                          "CREATE PUBLIC DATABASE LINK m177_dead CONNECT TO nobody IDENTIFIED BY x "
+                          "USING '10.255.255.1:1521/NOPE'",
+                          f"CREATE PUBLIC SYNONYM m177_shadow FOR {USER.upper()}.m177_safe_fn"):
+            ac.execute(statement)
+        app.cursor().execute("CREATE OR REPLACE FUNCTION m177_safe_fn(x NUMBER) RETURN NUMBER IS "
+                             "BEGIN RETURN x; END;")
+        other = oracledb.connect(user=OTHER, password=other_pw, dsn=DSN)
+        try:
+            other.cursor().execute("CREATE SYNONYM m177_shadow FOR m177_fn@m177_dead")
+        finally:
+            other.close()
+
+        def spy(stored):  # over the dead link it would wait 40 s
+            raise AssertionError(f"{stored} was handed to NAME_RESOLVE")
+
+        shadowed._name_resolve = spy
+        assert shadowed.resolve_called_functions(["m177_shadow"]) == ([], ["m177_shadow"])
+        assert own.resolve_called_functions(["m177_shadow"]) == (["m177_shadow"], [])  # the control
+    finally:
+        shadowed.close()
+        own.close()
+        _drop_m177(ac, oracledb)
+        try:
+            app.cursor().execute("DROP FUNCTION m177_safe_fn")
+        except oracledb.DatabaseError:
+            pass
+        app.close()
         admin.close()

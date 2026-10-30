@@ -49,7 +49,7 @@ class _Dictionary:
         if "all_procedures" in sql:
             return [(n,) for n in self.own if n in values]
         if "object_type = 'SYNONYM'" in sql:
-            return [(o, n) for o, n, *_ in self.synonyms
+            return [(o, n) for o, n, *_ in self._shown()
                     if o in (binds["owner"], "PUBLIC") and n.lower() in values]
         if "db_link IS NOT NULL" in sql:
             return [(o, n) for o, n, _, _, link in self._shown() if link]
@@ -63,11 +63,12 @@ class _Dictionary:
         raise AssertionError(f"unrouted dictionary query: {sql}")
 
 
-def _adapter(dictionary, resolutions):
+def _adapter(dictionary, resolutions, schema="APP"):
     """`resolutions` maps a stored synonym name to what `_name_resolve` returns; a name absent
-    from it must never be resolved, and resolving it fails the test."""
+    from it must never be resolved, and resolving it fails the test. The session user is APP;
+    `schema` is CURRENT_SCHEMA."""
     a = OracleAdapter.__new__(OracleAdapter)
-    a._schema = a._user = "APP"
+    a._schema, a._user = schema, "APP"
     a._rows = dictionary.rows
 
     def resolve(stored):
@@ -230,3 +231,17 @@ def test_a_public_alias_sharing_a_name_with_a_private_one_out_of_sight_is_never_
                               ("PUBLIC", "X", "APP2", "F", None)],
                     hidden={("OTHER", "HOP")})
     assert _adapter(d, {}).resolve_called_functions(["x"]) == ([], ["x"])
+
+
+def test_a_hidden_synonym_in_current_schema_shadowing_a_safe_public_one_is_never_resolved():
+    # CURRENT_SCHEMA is OTHER, not the session user. OTHER's private X over a dead link is hidden
+    # from the caller, PUBLIC's X is safe, and NAME_RESOLVE('X') starts in OTHER and takes the
+    # private one (Codex's review of #194). A name not shown there is out of sight.
+    d = _Dictionary(synonyms=[("OTHER", "X", None, "FN", "DEAD"), ("PUBLIC", "X", "APP2", "F", None)],
+                    hidden={("OTHER", "X")})
+    assert _adapter(d, {}, schema="OTHER").resolve_called_functions(["x"]) == ([], ["x"])
+
+
+def test_a_synonym_current_schema_shows_is_resolved_from_there():
+    d = _Dictionary(synonyms=[("OTHER", "X", "APP2", "F", None)])
+    assert _adapter(d, {"X": ("APP2", None)}, schema="OTHER").resolve_called_functions(["x"]) == (["x"], [])
