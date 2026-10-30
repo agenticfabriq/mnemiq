@@ -212,6 +212,9 @@ def test_a_text_that_does_not_read_back_as_the_expanded_tree_is_refused(monkeypa
     ("duckdb", "list_reverse_sort([id], date) IS NOT NULL"),
     # A cast to the same type elsewhere does not stand in for it.
     ("duckdb", "decode(d, timestamp) IS NOT NULL AND TRY_CAST(id AS TIMESTAMP) IS NOT NULL"),
+    # A keyword that is neither a name nor a type to the parser, dropped where DuckDB reads the
+    # column: `values` (Codex's fourth review of #193). Every keyword's place is probed, not a list.
+    ("duckdb", "decode(d, values) IS NOT NULL"),
 ])
 def test_a_name_the_parse_does_not_read_as_a_column_or_a_table_refuses_the_filter(dialect, filt):
     schema = {"claim": {"id", "d"}}
@@ -252,6 +255,16 @@ def test_a_write_target_s_filter_is_held_to_the_same_names(sql, name):
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
 
 
+@pytest.mark.parametrize("sql", ["DELETE FROM claim WHERE id > 0", "UPDATE claim SET d = NULL WHERE id > 0"])
+def test_a_write_target_s_filter_dropping_a_keyword_s_place_is_refused(sql):
+    schema = {"claim": {"id", "d"}}
+    filt = "decode(d, values) IS NOT NULL"
+    grants = GrantSet(frozenset(schema), writable=frozenset(schema), row_filters={"claim": filt})
+    verdict = decide_write(sql, schema, grants, dialect="duckdb", target="duckdb", writes_enabled=True,
+                           policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
 def test_a_type_s_name_read_as_a_date_part_is_refused_too():
     # `date` is a type's keyword, left out of the count since a reprint respells types; a date
     # part read from it is still refused.
@@ -267,6 +280,15 @@ def test_a_column_named_like_a_type_that_the_parse_reads_passes():
     verdict = decide("SELECT id FROM claim", schema, dialect="duckdb", target="duckdb",
                      policy=AccessPolicy(row_filters={"claim": "date > DATE '2020-01-01'"}, policy_schema=schema))
     assert isinstance(verdict, Approved), verdict
+
+
+def test_a_string_is_never_taken_for_a_name():
+    # A word is read from the text where its token stands, quotes and all: a string's token holds
+    # its contents, and `'last'` read as the word `last` is probed where sqlglot drops whatever
+    # stands, so a constant would refuse the filter as a dropped name.
+    from mnemiq.sql.rls import _unaccounted_names
+
+    assert _unaccounted_names("list_reverse_sort(xs, 'last')[1] IS NOT NULL", "duckdb") == []
 
 
 def test_every_cast_duckdb_accepts_passes_the_name_check():

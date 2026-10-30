@@ -141,6 +141,7 @@ def _validate_filter(
 
 _NAME_TOKENS = frozenset({TokenType.VAR, TokenType.IDENTIFIER})
 _NOT_A_COLUMN_AFTER = frozenset({TokenType.L_PAREN, TokenType.L_BRACE, TokenType.STRING})
+_WORD = re.compile(r"[^\W\d]\w*")
 
 
 def _unaccounted_names(filt: str, dialect: str) -> list[str]:
@@ -159,7 +160,7 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     # and DuckDB reads `date_diff(comment, a, b)` as the column (Codex's second review of #193).
     # A type's name among them the reprint may respell (INTEGER as INT), so it is left out of the
     # count, kept for the date-part check, which `date_diff(date, a, b)` would otherwise pass, and
-    # looked for where it stands (`_types_dropped`).
+    # looked for where it stands with every other keyword (`_keywords_dropped`).
     parser = sqlglot.Dialect.get_or_raise(dialect).parser_class
     named = _NAME_TOKENS | parser.ID_VAR_TOKENS
 
@@ -181,29 +182,34 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     parts = {v.name.casefold() for v in tree.find_all(exp.Var) if isinstance(v.this, str)
              and not (isinstance(v.parent, exp.Extract) and v.arg_key == "this")
              and not isinstance(v.parent, (exp.Interval, exp.IntervalSpan))}
-    dropped = _types_dropped(filt, dialect, named & parser.TYPE_TOKENS)
+    dropped = _keywords_dropped(filt, dialect, counted)
     return sorted(set(lost) | (parts & set(names(filt, named))) | set(dropped))
 
 
-def _types_dropped(filt: str, dialect: str, types) -> list[str]:
-    """Each type's name in the filter's text that its parse holds nowhere: sqlglot drops `date`
-    from `decode(blob, date)`, where DuckDB reads the column (Codex's third review of #193).
+def _keywords_dropped(filt: str, dialect: str, counted) -> list[str]:
+    """Each word in the filter's text the count leaves out, a type's name or any other keyword,
+    standing where its parse holds no name: sqlglot drops `date` from `decode(blob, date)` (Codex's
+    third review of #193) and `values` from `decode(blob, values)` (its fourth), where DuckDB reads
+    the column. Every keyword, not a list of them: `values` is neither a name nor a type to the
+    parser, and a list of the ones found is the next one missed.
 
     Not counted against the reprint, which respells types in ways no count absorbs (`DECIMAL` as
     `DECIMAL(18, 3)`, Oracle's `DATE '2020-01-01'` as TO_DATE): counted, 37 of the 286 casts
     DuckDB accepts were refused. So the filter is parsed again with a fresh name in each one's
-    place. A place that drops a name drops that one too; a column's or a type's place keeps it; and
-    a place only the keyword fits, a multi-word type's, does not parse. A name directly before a
-    parenthesis, a brace or a string is a call, a type's parameters, a constructor or a typed
-    literal, never a column, and is left alone: a fresh name before the brace of `MAP {1: x}` is
-    dropped, which refused every map literal."""
-    fresh = "mnemiq_type_probe"
+    place. A place that drops a name drops that one too; a column's or a type's place keeps it;
+    and a place only the keyword fits, an operator's or a multi-word type's, does not parse. A word
+    is read from the text where the token stands, so a string's contents are never one. A name
+    directly before a parenthesis, a brace or a string is a call, a type's parameters, a
+    constructor or a typed literal, never a column, and is left alone: a fresh name before the
+    brace of `MAP {1: x}` is dropped, which refused every map literal."""
+    fresh = "mnemiq_name_probe"
     while fresh in filt.casefold():
         fresh += "_"
     tokens = sqlglot.tokenize(filt, read=dialect)
     dropped = []
     for i, t in enumerate(tokens):
-        if t.token_type not in types or (i + 1 < len(tokens) and tokens[i + 1].token_type in _NOT_A_COLUMN_AFTER):
+        if t.token_type in counted or not _WORD.fullmatch(filt[t.start:t.end + 1]) or (
+                i + 1 < len(tokens) and tokens[i + 1].token_type in _NOT_A_COLUMN_AFTER):
             continue
         try:
             probe = sqlglot.parse_one(filt[:t.start] + fresh + filt[t.end + 1:], read=dialect)
