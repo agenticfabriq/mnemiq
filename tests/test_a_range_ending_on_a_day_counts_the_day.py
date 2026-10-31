@@ -1,14 +1,17 @@
-"""A range written to end on a bare date against a timestamp column ends at the next day's start.
+"""A bare date compared with a timestamp column is read as the whole day it names.
 
 `ts <= '2024-03-09'` compares with midnight at the START of the 9th, so every row later that day
 falls out, where the range a person means by "as of", "through" or "up to" the 9th ends before the
 10th. A local 32B model wrote this bound on most runs of the questions that turn on it, and every
 such answer was wrong; ending the range at the next day turned them right and turned no right
-answer wrong. The decider moves the bound (`close_day_bounds`): `<=` becomes `<` the next day,
-in the literal's own spelling, so the statement stays valid in every dialect, and the caller, the
-judge and the source all read the moved bound. Only a bare column placed on a column declared a
-naive timestamp (or an Oracle DATE, which holds a time of day) is read this way: on a DATE the two
-bounds are the same rows, and on text, a zone-aware timestamp or an expression nothing is moved.
+answer wrong. The decider reads every such comparison by day (`close_day_bounds`): `<=` becomes
+`<` the next day and `>` becomes `>=` it, `=` and `<>` the day's range and its negation, so
+complementary predicates stay complementary. The next day is written in the literal's own
+spelling, so the statement stays valid in every dialect, and the caller, the judge and the source
+all read the moved bound. Only a bare column bound directly to a base table of its own scope and
+declared a naive timestamp (or an Oracle DATE, which holds a time of day) is read this way: on a
+DATE the two readings are the same rows, and on text, a zone-aware timestamp or an expression
+nothing moves.
 """
 from __future__ import annotations
 
@@ -54,9 +57,19 @@ def _closed(sql: str, dialect: str = "duckdb", types=TYPES) -> tuple[str, int]:
      "SELECT id FROM claim WHERE ts < CAST('2024-03-10' AS DATE)"),
     ("SELECT id FROM claim WHERE ts <= TRY_CAST('2024-03-09' AS TIMESTAMP)",
      "SELECT id FROM claim WHERE ts < TRY_CAST('2024-03-10' AS TIMESTAMP)"),
-    # The literal on the left is the same bound.
+    # The literal on the left is the same bound, written with the column first.
     ("SELECT id FROM claim WHERE '2024-03-09' >= ts",
-     "SELECT id FROM claim WHERE '2024-03-10' > ts"),
+     "SELECT id FROM claim WHERE ts < '2024-03-10'"),
+    # After the day: from the next day's start, either way round.
+    ("SELECT id FROM claim WHERE ts > '2024-03-09'",
+     "SELECT id FROM claim WHERE ts >= '2024-03-10'"),
+    ("SELECT id FROM claim WHERE '2024-03-09' < ts",
+     "SELECT id FROM claim WHERE ts >= '2024-03-10'"),
+    # On the day, and off it.
+    ("SELECT id FROM claim WHERE ts = '2024-03-09'",
+     "SELECT id FROM claim WHERE (ts >= '2024-03-09' AND ts < '2024-03-10')"),
+    ("SELECT id FROM claim WHERE ts <> '2024-03-09'",
+     "SELECT id FROM claim WHERE NOT (ts >= '2024-03-09' AND ts < '2024-03-10')"),
     # A qualified column, through its alias.
     ("SELECT c.id FROM claim AS c WHERE c.ts <= '2024-03-09'",
      "SELECT c.id FROM claim AS c WHERE c.ts < '2024-03-10'"),
@@ -78,12 +91,73 @@ def test_a_between_ending_on_a_bare_date_keeps_its_start_and_ends_before_the_nex
         "SELECT id FROM claim WHERE NOT (ts >= '2024-03-01' AND ts < '2024-03-10')", 1)
 
 
-def test_every_such_bound_in_the_statement_moves_wherever_it_sits():
+def test_every_such_bound_on_a_base_tables_column_moves_wherever_it_sits():
     sql, moved = _closed(
-        "WITH recent AS (SELECT id, ts FROM claim WHERE ts <= '2024-03-09') "
-        "SELECT id, CASE WHEN ts <= '2024-03-05' THEN 'early' ELSE 'late' END AS half FROM recent")
-    assert moved == 2
-    assert "ts < '2024-03-10'" in sql and "ts < '2024-03-06'" in sql and "<=" not in sql
+        "SELECT id, CASE WHEN ts <= '2024-03-05' THEN 'early' ELSE 'late' END AS half FROM claim "
+        "WHERE ts <= '2024-03-09' AND EXISTS (SELECT 1 FROM claim AS c2 WHERE c2.ts <= '2024-03-01')")
+    assert moved == 3
+    assert ("ts < '2024-03-06'" in sql and "ts < '2024-03-10'" in sql and "c2.ts < '2024-03-02'" in sql
+            and "<=" not in sql)
+    # Inside a CTE's body the column is the base table's, and moves.
+    assert _closed("WITH r AS (SELECT id FROM claim WHERE ts <= '2024-03-09') SELECT id FROM r") == (
+        "WITH r AS (SELECT id FROM claim WHERE ts < '2024-03-10') SELECT id FROM r", 1)
+
+
+@pytest.mark.parametrize("asked", [
+    # A set operation's output is not the base column it shares a name with (Codex's review):
+    # here it is text, which compares as text.
+    "WITH x AS (SELECT note AS ts FROM claim UNION ALL SELECT note AS ts FROM claim) "
+    "SELECT ts FROM x WHERE ts <= '2024-03-09'",
+    # A derived table's output, the same.
+    "SELECT ts FROM (SELECT note AS ts FROM claim) AS d WHERE ts <= '2024-03-09'",
+    # A name the subquery's own table does not hold is the enclosing scope's (a CTE's output here).
+    "WITH x AS (SELECT note AS stamp FROM claim) SELECT stamp FROM x "
+    "WHERE EXISTS (SELECT 1 FROM claim AS u WHERE stamp <= '2024-03-09')",
+    # The cost, accepted: a CTE's output read outside it is not followed, nor is an enclosing
+    # scope's, even where it is the base table's timestamp column unchanged.
+    "WITH r AS (SELECT ts FROM claim) SELECT ts FROM r WHERE ts <= '2024-03-09'",
+    "WITH x AS (SELECT ts AS stamp FROM claim) SELECT stamp FROM x "
+    "WHERE EXISTS (SELECT 1 FROM claim AS u WHERE stamp <= '2024-03-09')",
+])
+def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
+    assert _closed(asked)[1] == 0, asked
+
+
+def test_the_unions_text_compares_as_written_on_the_engine():
+    """Codex's counterexample: rewritten, `'2024-03-09a' < '2024-03-10'` returned two rows where
+    the statement as written returns none."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP, note VARCHAR)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00', '2024-03-09a')")
+    asked = ("WITH x AS (SELECT note AS ts FROM claim UNION ALL SELECT note AS ts FROM claim) "
+             "SELECT ts FROM x WHERE ts <= '2024-03-09'")
+    verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+    assert isinstance(verdict, Approved) and verdict.day_bounds == 0
+    assert con.execute(verdict.target_sql).fetchall() == con.execute(asked).fetchall() == []
+
+
+def test_complementary_predicates_stay_complementary_on_the_engine():
+    """Moving `<=` alone made a `<= D` bucket and a `> D` bucket both count a noon row on D
+    (Codex's review). Read by day, each pair partitions the rows: every row in exactly one."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-08 23:00'), (2, '2024-03-09 00:00'), "
+                "(3, '2024-03-09 12:00'), (4, '2024-03-10 00:00')")
+    for low, high in (("ts <= '2024-03-09'", "ts > '2024-03-09'"),
+                      ("ts = '2024-03-09'", "ts <> '2024-03-09'"),
+                      ("ts <= '2024-03-09'", "NOT ts <= '2024-03-09'"),
+                      ("ts BETWEEN '2024-03-09' AND '2024-03-09'",
+                       "NOT ts BETWEEN '2024-03-09' AND '2024-03-09'")):
+        asked = (f"SELECT SUM(CASE WHEN {low} THEN 1 ELSE 0 END) AS a, "
+                 f"SUM(CASE WHEN {high} THEN 1 ELSE 0 END) AS b FROM claim")
+        verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+        assert isinstance(verdict, Approved), verdict
+        a, b = con.execute(verdict.target_sql).fetchone()
+        assert a + b == 4, (low, high, a, b, verdict.target_sql)
+    # And by day: the 9th is rows 2 and 3.
+    day = decide("SELECT count(*) FROM claim WHERE ts = '2024-03-09'", VISIBLE, dialect="duckdb",
+                 target="duckdb", types=TYPES)
+    assert con.execute(day.target_sql).fetchone()[0] == 2
 
 
 @pytest.mark.parametrize("asked", [
@@ -105,9 +179,10 @@ def test_every_such_bound_in_the_statement_moves_wherever_it_sits():
     # The exclusive end and the inclusive start already mean the day boundary they name.
     "SELECT id FROM claim WHERE ts < '2024-03-10'",
     "SELECT id FROM claim WHERE ts >= '2024-03-01'",
-    # Not measured, so not moved: a strict start and a single day by equality.
-    "SELECT id FROM claim WHERE ts > '2024-03-09'",
-    "SELECT id FROM claim WHERE ts = '2024-03-09'",
+    "SELECT id FROM claim WHERE '2024-03-10' > ts",
+    # IN and NOT IN, left together as written.
+    "SELECT id FROM claim WHERE ts IN ('2024-03-09', '2024-03-10')",
+    "SELECT id FROM claim WHERE ts NOT IN ('2024-03-09')",
     # A BETWEEN whose end has a time of day.
     "SELECT id FROM claim WHERE ts BETWEEN '2024-03-01' AND '2024-03-09 12:00:00'",
     # Text, in the mirrored and the BETWEEN spellings too.
