@@ -160,9 +160,12 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     a place where a fresh name in its stead does not parse, which only a keyword fits; a struct
     literal's field, a name the filter gives; or a place where the fresh name prints and one print
     of the word goes, so the parse held the word there as a node of its own (`SYSDATE` as the
-    call). A quoted name is excused by none but the field. A date part the parse holds outside
-    EXTRACT and an INTERVAL, which are keywords in every engine, must not have been written as a
-    bare name. A function's name is left out: it reads no data."""
+    call). A quoted name is excused by none but the field. A place that holds the fresh name as a
+    date part, outside EXTRACT and an INTERVAL, which are keywords in every engine, excuses no
+    word: the engine reads a bare one there as a column. That too is decided where the word
+    stands: a quoted 'day' as the unit beside a column `day` the policy holds refused the filter
+    while the date parts were counted by word (Codex's fifteenth review of #193). A function's
+    name is left out: it reads no data."""
     # A keyword the parser takes as an identifier is a name too: `comment` tokenizes as COMMENT,
     # and DuckDB reads `date_diff(comment, a, b)` as the column (Codex's second review of #193).
     # A type's name among them is left to `_keywords_dropped`, which probes it where it stands with
@@ -185,10 +188,9 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
     def printed(expression: exp.Expression, word: str) -> int:
         return sum(1 for _, t in names(expression.sql(dialect=dialect)) if t.text.casefold() == word)
 
-    lost, written = set(), set()
+    lost = set()
     for i, t in names(filt):
         word = t.text.casefold()
-        written.add(word)
         if t.token_type not in counted or t.start in held:
             continue
         quoted = t.token_type is TokenType.IDENTIFIER  # a name wherever it stands
@@ -200,11 +202,11 @@ def _unaccounted_names(filt: str, dialect: str) -> list[str]:
                 continue  # a place only a keyword fits
         elif _a_field_of(probe, fresh):
             continue  # a struct literal's field, a name the filter gives, not reads
-        elif not quoted and printed(probe, fresh) and printed(_raw(filt, dialect), word) > printed(probe, word):
+        elif not quoted and fresh not in _date_parts(probe) and printed(probe, fresh) and (
+                printed(_raw(filt, dialect), word) > printed(probe, word)):
             continue  # held as a node of its own here (`SYSDATE` as the call it is), printed in its place
         lost.add(word)
-    dropped = _keywords_dropped(filt, dialect, counted)
-    return sorted(lost | (_date_parts(tree) & written) | set(dropped))
+    return sorted(lost | set(_keywords_dropped(filt, dialect, counted)))
 
 
 def _date_parts(tree: exp.Expression) -> set[str]:

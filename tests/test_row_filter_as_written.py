@@ -308,6 +308,35 @@ def test_duckdb_reads_a_keyword_where_the_parse_reads_a_date_part_as_the_column(
     assert con.execute("SELECT id FROM claim WHERE date_diff(values, a, b) = 0").fetchall() == [(1,)]
 
 
+@pytest.mark.parametrize("sql", ["SELECT id FROM claim", "DELETE FROM claim WHERE id > 0"])
+def test_a_column_spelled_like_a_quoted_date_part_passes(sql):
+    # A date part is decided where it stands: the quoted 'day' is the unit, the bare `day` a column
+    # the policy holds, and neither stands in for the other (Codex's fifteenth review of #193).
+    schema = {"claim": {"id", "a", "b", "day"}}
+    filt = "date_diff('day', a, b) > day"
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INT, a DATE, b DATE, day INT);"
+                "INSERT INTO claim VALUES (1, DATE '2020-01-01', DATE '2020-01-05', 1),"
+                "(2, DATE '2020-01-01', DATE '2020-01-02', 5)")
+    assert con.execute(f"SELECT id FROM claim WHERE {filt}").fetchall() == [(1,)]
+    policy = AccessPolicy(row_filters={"claim": filt}, policy_schema=schema)
+    if sql.startswith("SELECT"):
+        verdict = decide(sql, schema, dialect="duckdb", target="duckdb", policy=policy)
+    else:
+        grants = GrantSet(frozenset(schema), writable=frozenset(schema), row_filters={"claim": filt})
+        verdict = decide_write(sql, schema, grants, dialect="duckdb", target="duckdb", writes_enabled=True, policy=policy)
+    assert isinstance(verdict, (Approved, ApprovedWrite)), verdict
+
+
+def test_a_held_column_written_where_the_parse_reads_a_date_part_is_still_refused():
+    # The same word as a column elsewhere does not excuse the place that reads a date part.
+    schema = {"claim": {"id", "a", "b", "day"}}
+    filt = "date_diff('day', a, b) > day AND date_diff(day, a, b) = 0"
+    verdict = decide("SELECT id FROM claim", schema, dialect="duckdb", target="duckdb",
+                     policy=AccessPolicy(row_filters={"claim": filt}, policy_schema=schema))
+    assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
+
+
 def test_a_type_s_name_read_as_a_date_part_is_refused_too():
     # `date` is a type's keyword, left out of the count since a reprint respells types; a date
     # part read from it is still refused.
