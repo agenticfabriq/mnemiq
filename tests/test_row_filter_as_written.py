@@ -337,6 +337,23 @@ def test_a_held_column_written_where_the_parse_reads_a_date_part_is_still_refuse
     assert isinstance(verdict, Refusal) and verdict.code is RefusalCode.INVALID_ROW_FILTER, verdict
 
 
+@pytest.mark.parametrize("dialect", ["duckdb", "sqlite", "postgres"])
+@pytest.mark.parametrize("sql", ["SELECT id FROM claim", "DELETE FROM claim WHERE id > 0"])
+def test_isnull_passes(dialect, sql):
+    # A fresh name in ISNULL's place is an alias standing alone and nothing in a WHERE, which is
+    # where the filter stands: probed alone, ISNULL read as a lost name and refused the table's
+    # reads and writes (Codex's sixteenth review of #193).
+    schema = {"claim": {"id"}}
+    filt = "id ISNULL"
+    policy = AccessPolicy(row_filters={"claim": filt}, policy_schema=schema)
+    if sql.startswith("SELECT"):
+        verdict = decide(sql, schema, dialect=dialect, target=dialect, policy=policy)
+    else:
+        grants = GrantSet(frozenset(schema), writable=frozenset(schema), row_filters={"claim": filt})
+        verdict = decide_write(sql, schema, grants, dialect=dialect, target=dialect, writes_enabled=True, policy=policy)
+    assert isinstance(verdict, (Approved, ApprovedWrite)), verdict
+
+
 def test_a_type_s_name_read_as_a_date_part_is_refused_too():
     # `date` is a type's keyword, left out of the count since a reprint respells types; a date
     # part read from it is still refused.

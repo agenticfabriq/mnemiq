@@ -221,7 +221,14 @@ def _date_parts(tree: exp.Expression) -> set[str]:
 
 def _raw(filt: str, dialect: str) -> exp.Expression:
     """The filter's own parse, compared with a probe's, which is parsed the same way."""
-    return sqlglot.parse_one(filt, read=dialect)
+    return _where(filt, dialect)
+
+
+def _where(text: str, dialect: str) -> exp.Expression:
+    """`text` parsed as the WHERE it stands in, where a name cannot follow a predicate as its
+    alias: alone, `id mnemiq_name_probe` is `id` aliased, so ISNULL's place took a name and
+    `id ISNULL` refused its table's reads and writes (Codex's sixteenth review of #193)."""
+    return sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {text}", read=dialect)
 
 
 def _a_field_of(probe: exp.Expression, fresh: str) -> bool:
@@ -247,7 +254,7 @@ def _probe(filt: str, token, fresh: str, dialect: str) -> exp.Expression | None:
     """The filter parsed again with `fresh` in the token's place, or None where it does not parse:
     a place only a keyword fits."""
     try:
-        return sqlglot.parse_one(filt[:token.start] + fresh + filt[token.end + 1:], read=dialect)
+        return _where(filt[:token.start] + fresh + filt[token.end + 1:], dialect)
     except sqlglot.errors.ParseError:
         return None
 
