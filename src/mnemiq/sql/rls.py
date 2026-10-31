@@ -4,14 +4,17 @@ from dataclasses import dataclass
 import json
 import logging
 import re
+import secrets
 import threading
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.tokens import TokenType
 
 from mnemiq.sql.policy import AccessPolicy
-from mnemiq.sql.qualify import names_one_object, object_key
+from mnemiq.sql.qualify import expand_tables, names_one_object, object_key
 from mnemiq.sql.reading import as_duckdb_reads, dotted_map_keys, is_lambda_parameter, map_struct
+from mnemiq.sql.reserved_words import reserved
 from mnemiq.sql.scope import (KnownColumns, base_tables, column_tables, cte_references,
                               known_columns, scope_resolved)
 from mnemiq.sql.verdict import Refusal, RefusalCode
@@ -30,6 +33,16 @@ _SUBJECT = "__mnemiq_filtered__"
 # reading ROWNUM is neither merged nor has predicates pushed into it, and `ROWNUM > 0` holds for
 # every row, so the fence changes which rows the outer query sees first and never which rows.
 _FENCED = frozenset({"oracle"})
+
+# A row filter runs as its operator wrote it (M222). Its parse is what the validators read; the
+# text rides on the parse's root under this key, through the rewrite, to the deciders, which print
+# it in the parse's place (`with_filters_held`, `as_written`). Printed from the parse, a filter
+# loses what sqlglot's tree has no slot for: `list_reverse_sort([id, NULL], 'NULLS FIRST')` reads
+# as ARRAY_REVERSE_SORT, which has no null order, so a filter keeping no row on DuckDB kept the row
+# once governed. M218 is what makes the text safe to print: a filter is applied only to a statement
+# decided as the engine that runs it, so the text is that engine's SQL.
+_AS_WRITTEN = "mnemiq_row_filter_as_written"
+_PLACEHOLDER = re.compile(r"\bmnemiq_row_filter_[0-9a-f]{16}\b")
 
 
 def _parsed(filt: str, dialect: str, wrapped: bool = False) -> exp.Expression:
@@ -122,7 +135,267 @@ def _validate_filter(
                 return None
         elif column.name not in schema.get(owner, set()):
             return None
+    expr.meta[_AS_WRITTEN] = _without_a_closing_semicolon(filt, dialect)
     return expr
+
+
+_NAME_TOKENS = frozenset({TokenType.VAR, TokenType.IDENTIFIER})
+_NOT_A_COLUMN_AFTER = frozenset({TokenType.L_PAREN, TokenType.L_BRACE, TokenType.STRING})
+_WORD = re.compile(r"[^\W\d]\w*")
+
+
+def _unaccounted_names(filt: str, dialect: str) -> list[str]:
+    """Every name in the filter's text that its parse lost or read as a date part, which the checks
+    above therefore never saw. The filter runs as written (M222), so its engine reads every name in
+    it, and the checks read only the parse: sqlglot drops `secret` from `list_reverse_sort(xs,
+    secret)` and `decode(blob, secret)`, and reads it as a date part in `date_diff(secret, a, b)`,
+    where DuckDB reads a column the policy may not hold (Codex's review of #193).
+
+    Each name is accounted for where it stands, never across the filter: counted by word, a
+    keyword kept in one place stood in for a name dropped in another, `first.all` beside a `UNION
+    ALL` and a `NULLS FIRST` (Codex's tenth review of #193), and a word the reprint adds or repeats
+    could do the same (its twelfth). A word is accounted for by a name the parse holds at its own
+    offset (sqlglot records one on every Identifier it builds from the text). One without is
+    excused only by its own place: a word the engine reserves, not after a dot (`_reserved_apart`);
+    a place where a fresh name in its stead does not parse, which only a keyword fits; a struct
+    literal's field, a name the filter gives; or a place where the fresh name prints and one print
+    of the word goes, so the parse held the word there as a node of its own (`SYSDATE` as the
+    call). A quoted name is excused by none but the field. A place that holds the fresh name as a
+    date part, outside EXTRACT and an INTERVAL, which are keywords in every engine, excuses no
+    word: the engine reads a bare one there as a column. That too is decided where the word
+    stands: a quoted 'day' as the unit beside a column `day` the policy holds refused the filter
+    while the date parts were counted by word (Codex's fifteenth review of #193). A function's
+    name is left out: it reads no data."""
+    # A keyword the parser takes as an identifier is a name too: `comment` tokenizes as COMMENT,
+    # and DuckDB reads `date_diff(comment, a, b)` as the column (Codex's second review of #193).
+    # A type's name among them is left to `_keywords_dropped`, which probes it where it stands with
+    # every other keyword, and kept for the date-part check, which `date_diff(date, a, b)` would
+    # otherwise pass.
+    parser = sqlglot.Dialect.get_or_raise(dialect).parser_class
+    named = _NAME_TOKENS | parser.ID_VAR_TOKENS
+    counted = named - parser.TYPE_TOKENS
+    tree = _parsed(filt, dialect)
+
+    def names(text: str) -> list:
+        tokens = sqlglot.tokenize(text, read=dialect)
+        return [(i, t) for i, t in enumerate(tokens) if t.token_type in named
+                and not (i + 1 < len(tokens) and tokens[i + 1].token_type is TokenType.L_PAREN)]
+
+    tokens = sqlglot.tokenize(filt, read=dialect)
+    held = {node.meta["start"] for node in tree.find_all(exp.Identifier) if "start" in node.meta}
+    fresh = _fresh_name(filt)
+
+    def printed(expression: exp.Expression, word: str) -> int:
+        return sum(1 for _, t in names(expression.sql(dialect=dialect)) if t.text.casefold() == word)
+
+    lost = set()
+    for i, t in names(filt):
+        word = t.text.casefold()
+        if t.token_type not in counted or t.start in held:
+            continue
+        quoted = t.token_type is TokenType.IDENTIFIER  # a name wherever it stands
+        if not quoted and _reserved_apart(tokens, i, dialect):
+            continue
+        probe = _probe(filt, t, fresh, dialect)
+        if probe is None:
+            if not quoted:
+                continue  # a place only a keyword fits
+        elif _a_field_of(probe, fresh):
+            continue  # a struct literal's field, a name the filter gives, not reads
+        elif not quoted and fresh not in _date_parts(probe) and printed(probe, fresh) and (
+                printed(_raw(filt, dialect), word) > printed(probe, word)):
+            continue  # held as a node of its own here (`SYSDATE` as the call it is), printed in its place
+        lost.add(word)
+    return sorted(lost | set(_keywords_dropped(filt, dialect, counted)))
+
+
+def _date_parts(tree: exp.Expression) -> set[str]:
+    """The words the parse holds as date parts, outside EXTRACT and an INTERVAL. A date part holds
+    its text; a MAP key read as a lambda's parameter holds the parameter's Identifier
+    (`as_duckdb_reads`), a name the lambda declares. A collation's name is a Var too, in COLLATE's
+    place, and names no column (Codex's thirteenth review of #193)."""
+    return {v.name.casefold() for v in tree.find_all(exp.Var) if isinstance(v.this, str)
+            and not _in_extract_or_interval(v)
+            and not (isinstance(v.parent, exp.Collate) and v.arg_key == "expression")}
+
+
+def _raw(filt: str, dialect: str) -> exp.Expression:
+    """The filter's own parse, compared with a probe's, which is parsed the same way."""
+    return _where(filt, dialect)
+
+
+def _where(text: str, dialect: str) -> exp.Expression:
+    """`text` parsed as the WHERE it stands in, where a name cannot follow a predicate as its
+    alias: alone, `id mnemiq_name_probe` is `id` aliased, so ISNULL's place took a name and
+    `id ISNULL` refused its table's reads and writes (Codex's sixteenth review of #193)."""
+    return sqlglot.parse_one(f"SELECT 1 FROM {_SUBJECT} WHERE {text}", read=dialect)
+
+
+def _a_field_of(probe: exp.Expression, fresh: str) -> bool:
+    """Whether `fresh` stands in the probe as a struct literal's field: `{X: 1}`, whose field the
+    parse rebuilds without an offset and the reprint prints as a string."""
+    return any(isinstance(e, exp.PropertyEQ) and isinstance(e.this, exp.Identifier) and e.this.name == fresh
+               for struct in probe.find_all(exp.Struct) for e in struct.expressions)
+
+
+def _in_extract_or_interval(var: exp.Var) -> bool:
+    return (isinstance(var.parent, exp.Extract) and var.arg_key == "this") or isinstance(
+        var.parent, (exp.Interval, exp.IntervalSpan))
+
+
+def _fresh_name(filt: str) -> str:
+    fresh = "mnemiq_name_probe"
+    while fresh in filt.casefold():
+        fresh += "_"
+    return fresh
+
+
+def _probe(filt: str, token, fresh: str, dialect: str) -> exp.Expression | None:
+    """The filter parsed again with `fresh` in the token's place, or None where it does not parse:
+    a place only a keyword fits."""
+    try:
+        return _where(filt[:token.start] + fresh + filt[token.end + 1:], dialect)
+    except sqlglot.errors.ParseError:
+        return None
+
+
+def _reserved_apart(tokens, i: int, dialect: str) -> bool:
+    """Whether token `i` is a word its engine reserves, not after a dot: one the engine reads as a
+    keyword wherever it stands, so no name (`reserved_words`). After a dot Postgres and DuckDB read
+    it as a column label (`e.all`); before one it is no qualifier either grammar takes."""
+    after_a_dot = i > 0 and tokens[i - 1].token_type is TokenType.DOT
+    return not after_a_dot and reserved(tokens[i].text, dialect)
+
+
+def _keywords_dropped(filt: str, dialect: str, counted) -> list[str]:
+    """Each word in the filter's text the count leaves out, a type's name or any other keyword,
+    standing where its parse holds no name: sqlglot drops `date` from `decode(blob, date)` (Codex's
+    third review of #193) and `values` from `decode(blob, values)` (its fourth), where DuckDB reads
+    the column. Every keyword, not a list of them: `values` is neither a name nor a type to the
+    parser, and a list of the ones found is the next one missed.
+
+    Not counted against the reprint, which respells types in ways no count absorbs (`DECIMAL` as
+    `DECIMAL(18, 3)`, Oracle's `DATE '2020-01-01'` as TO_DATE): counted, 37 of the 286 casts
+    DuckDB accepts were refused. So the filter is parsed again with a fresh name in each one's
+    place. A place that drops a name drops that one too; a column's or a type's place keeps it;
+    and a place only the keyword fits, an operator's or a multi-word type's, does not parse. A
+    place that holds the fresh name as a date part reads no column either, though the name
+    prints: sqlglot holds `values` in `date_diff(values, a, b)` as one, and DuckDB reads the
+    column (Codex's fourteenth review of #193). A word
+    is read from the text where the token stands, so a string's contents are never one. A name
+    directly before a parenthesis, a brace or a string is a call, a type's parameters, a
+    constructor or a typed literal, never a column, and is left alone: a fresh name before the
+    brace of `MAP {1: x}` is dropped, which refused every map literal."""
+    fresh = _fresh_name(filt)
+    tokens = sqlglot.tokenize(filt, read=dialect)
+    dropped = []
+    for i, t in enumerate(tokens):
+        if t.token_type in counted or not _WORD.fullmatch(filt[t.start:t.end + 1]) or (
+                i + 1 < len(tokens) and tokens[i + 1].token_type in _NOT_A_COLUMN_AFTER) or (
+                _reserved_apart(tokens, i, dialect)):
+            continue
+        probe = _probe(filt, t, fresh, dialect)
+        if probe is None:
+            continue
+        if fresh not in probe.sql(dialect=dialect).casefold() or fresh in _date_parts(probe):
+            dropped.append(t.text.casefold())
+    return dropped
+
+
+def _lost_names(filt: str, table: str, dialect: str) -> Refusal | None:
+    """The refusal for a filter whose text names what its parse does not read (`_unaccounted_names`),
+    after the conversion check, whose advice is the more useful where both apply. The caller is
+    told only that the policy is not valid; the names go to the operator's log."""
+    lost = _unaccounted_names(filt, dialect)
+    if not lost:
+        return None
+    logger.warning("the row filter for %r names %s, which the parse does not read as a column or a "
+                   "table; write a date part or a constant quoted", table, lost)
+    return Refusal(
+        code=RefusalCode.INVALID_ROW_FILTER,
+        message=f"The row-access policy for {table!r} is not a valid predicate.",
+        subject=table,
+    )
+
+
+def _without_a_closing_semicolon(filt: str, dialect: str) -> str:
+    """The filter's text less a closing `;`, which its parse ignores and a parenthesised
+    predicate cannot hold. Any other `;` is a second statement, and the parse refused it."""
+    tokens = sqlglot.tokenize(filt, read=dialect)
+    if tokens and tokens[-1].token_type is TokenType.SEMICOLON:
+        return filt[: tokens[-1].start]
+    return filt
+
+
+def with_filters_held(tree: exp.Expression, registry: dict[str, str] | None = None,
+                      dialect: str = "duckdb") -> tuple[exp.Expression, dict[str, str]]:
+    """A copy of `tree` with each row filter the rewrite placed held out of it: the filter's parse
+    swapped for a placeholder column, and the text each placeholder stands for, which `as_written`
+    puts back once the copy is printed (M222). The placeholder survives the deciders' print and
+    re-read in every engine an adapter executes as, where a filter's parse does not. Fresh names
+    each call, so no statement can spell one in advance. A federation's `registry` expands the
+    text's tables as `expand_tables` expands the tree's (`_expanded`), in the filter's `dialect`."""
+    tree = tree.copy()
+    held = [node for node in tree.walk() if _AS_WRITTEN in node.meta]
+    texts: dict[str, str] = {}
+    for node in held:
+        name = f"mnemiq_row_filter_{secrets.token_hex(8)}"
+        texts[name] = _expanded(node.meta[_AS_WRITTEN], registry or {}, dialect)
+        node.replace(exp.column(name))
+    return tree, texts
+
+
+def _expanded(text: str, registry: dict[str, str], dialect: str) -> str:
+    """`text` with each `catalog.table` it reads written `catalog.schema.table`, as `expand_tables`
+    writes a federated statement's tree, so a filter's own subquery names what DuckDB can find. The
+    catalog is replaced where the parse found it, by what `expand_tables` would print there, and
+    the result is read back: it must parse to the expanded tree, or ValueError."""
+    tree = _parsed(text, dialect)
+    spans = []
+    for table in tree.find_all(exp.Table):
+        db = table.args.get("db")
+        if table.text("db") not in registry or table.args.get("catalog"):
+            continue
+        if "start" not in db.meta:
+            raise ValueError("a federated filter's catalog has no place in its text")
+        segment = exp.to_identifier(db.name).sql(dialect=dialect) + "." + exp.to_identifier(
+            registry[db.name]).sql(dialect=dialect)
+        spans.append((db.meta["start"], db.meta["end"] + 1, segment))
+    if not spans:
+        return text
+    out = text
+    for start, end, segment in sorted(spans, reverse=True):
+        out = out[:start] + segment + out[end:]
+    expected = tree.copy()
+    expand_tables(expected, registry)
+    if _parsed(out, dialect) != expected:
+        raise ValueError("a federated filter's tables did not expand as its statement's did")
+    return out
+
+
+def as_written(sql: str, texts: dict[str, str], dialect: str) -> str:
+    """`sql`, printed from a tree `with_filters_held`, with each placeholder replaced by its
+    filter's text as written: in parentheses, and closed on a new line so that a line comment in
+    the text ends there. Raises ValueError unless every placeholder printed exactly once, as a
+    condition of a WHERE joined to the rest by AND alone, which is where the rewrite puts a filter
+    and where parentheses give it the meaning the parse had. Anywhere else (under a NOT, an OR, a
+    comparison a printer added) the text would not mean what was validated."""
+    if not texts:
+        return sql
+    if sorted(_PLACEHOLDER.findall(sql)) != sorted(texts):
+        raise ValueError("a row filter did not print exactly once")
+    standing = [c.name for c in sqlglot.parse_one(sql, read=dialect).find_all(exp.Column)
+                if c.name in texts and not c.table and _a_where_conjunct(c)]
+    if sorted(standing) != sorted(texts):
+        raise ValueError("a row filter printed where it is not a condition of a WHERE")
+    return _PLACEHOLDER.sub(lambda m: f"({texts[m.group(0)]}\n)", sql)
+
+
+def _a_where_conjunct(node: exp.Expression) -> bool:
+    parent = node.parent
+    while isinstance(parent, (exp.Paren, exp.And)):
+        parent = parent.parent
+    return isinstance(parent, exp.Where)
 
 
 # Conversions that raise on a value they cannot read (M159). A row filter runs over every row of
@@ -2558,6 +2831,9 @@ def apply_row_and_mask(
                                          executes_as=executes_as)
             if raising is not None:
                 return _raising_refusal(raising, name, (executes_as or dialect).lower()), []
+            lost = _lost_names(policy.row_filter_for(name), name, dialect)
+            if lost is not None:
+                return lost, []
         derived = _derived_table(
             name, table_node.alias_or_name, visible[name],
             # `.lower()`: this dict is keyed folded and `name` is the QUERY's spelling.
@@ -2632,6 +2908,9 @@ def apply_row_filters_to_write(
     raising = raising_conversion(filt, name, dialect, policy, executes_as=executes_as)
     if raising is not None:
         return _raising_refusal(raising, name, (executes_as or dialect).lower()), []
+    lost = _lost_names(filt, name, dialect)
+    if lost is not None:
+        return lost, []
     if (executes_as or dialect).lower() in _FENCED:
         # The target is filtered by conjunction, and a conjunction is not a fence: the engine may
         # still evaluate the statement's own WHERE on rows the filter removes (M160, measured on
