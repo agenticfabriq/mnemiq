@@ -157,6 +157,8 @@ class AgentAnswer:
     # one, so the fact rides here from the moment the decider produces it.
     narrowed: list | None = None
     corrected: bool | None = None
+    # How many ranges the decider moved to end before the day after a bare date (`Approved.day_bounds`).
+    day_bounds_closed: int | None = None
     mode: str | None = None  # resolved mode name, stamped by the Runtime (the Agent IS a mode)
     preview: ResultPreview | None = None  # None on every deferral path -- never fabricated
     # The authorization boundary this answer was computed under. A client echoes it back
@@ -666,6 +668,7 @@ class Agent:
             # note, and a field added to AgentAnswer is silently dropped here unless copied.
             verify_confidence=base.verify_confidence,
             verify_layer=base.verify_layer,
+            day_bounds_closed=base.day_bounds_closed,
         )
 
     def _representative(self, packet: ContextPacket, members: list):
@@ -793,4 +796,5 @@ class Agent:
         return AgentAnswer(answer=answer, trace=trace, deferred=False, cached=cached,
                            narrowed=getattr(approved, "narrowed", None),
                            preview=result_preview(table, self.preview_rows, capped=cut is not None),
-                           attempts=attempts, corrected=approved.corrected)
+                           attempts=attempts, corrected=approved.corrected,
+                           day_bounds_closed=getattr(approved, "day_bounds", None))

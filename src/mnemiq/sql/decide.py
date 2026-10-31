@@ -21,6 +21,7 @@ from mnemiq.sql.authz_guard import (
     check_unmodelled_source,
 )
 from mnemiq.sql.cls import check_cls
+from mnemiq.sql.day_bounds import close_day_bounds
 from mnemiq.sql.fanout_check import KeyFacts, check_fanout
 from mnemiq.sql.guard import MAX_ROWS, check_shape, niladic_names
 from mnemiq.sql.lint import lint
@@ -96,9 +97,10 @@ def decide(
     permission error is not the control: by the time it fires, we have already confirmed to
     the model that the table exists.
 
-    `types` is each column's declared type by table (`schema.column_types`), read only to tell a
-    date compared with a date column from a text range (`ground_values`, M146); None reads every
-    such value as text, which declines more and never less.
+    `types` is each column's declared type by table (`schema.column_types`), read to tell a date
+    compared with a date column from a text range (`ground_values`, M146) and to find a range
+    ending on a bare date against a timestamp column (`close_day_bounds`); None reads every such
+    value as text, which declines more and never less, and moves no bound.
     """
     policy = policy or AccessPolicy()
     # M88: `visible` is the schema, and the shape check was guessing about the same names at
@@ -213,6 +215,21 @@ def decide(
         if inflated is not None:
             return inflated
 
+    # A range ending on a bare date against a timestamp column stops at that day's midnight and
+    # drops the rest of the day; it is moved to end before the next day (`close_day_bounds`).
+    # After every check that refuses the statement, and before the grounding reads its bounds and
+    # the row policy adds a predicate of its own: what runs, what the caller is shown and what a
+    # model call reads all carry the moved bound, and no literal of the policy's is ever moved.
+    # Placed on columns as the grounding places them, on the target's names. On a copy, adopted
+    # whole: a walk that raises moves nothing and costs no decision (None is "not evaluated").
+    moved = shaped.copy()
+    try:
+        day_bounds = close_day_bounds(moved, visible, types, dialect=target)
+        shaped = moved
+    except Exception:  # an improvement whose absence is the statement as written; logged
+        logger.warning("day bounds could not be read; the statement runs as written", exc_info=True)
+        day_bounds = None
+
     # M146: what an empty result rests on, read where `check_values` reads -- the statement as
     # asked, before the row policy's rewrite adds a predicate of its own, the same resolver, the
     # same masks and row-filtered tables -- so the value checked before the run and the one an
@@ -308,4 +325,5 @@ def decide(
 
     return Approved(plan_sql=plan_sql, target_sql=target_sql, tables=tables,
                     lineage=lineage, columns=columns, narrowed=narrowed, row_cap=row_cap,
-                    asked_sql=asked_sql, asked_plan=asked_plan, value_grounding=value_grounding)
+                    asked_sql=asked_sql, asked_plan=asked_plan, value_grounding=value_grounding,
+                    day_bounds=day_bounds)

@@ -77,6 +77,9 @@ def answer_payload(ans: AgentAnswer) -> dict:
         # indistinguishable on a question that succeeds first time -- which is most of them.
         "attempts": ans.attempts,
         "corrected": ans.corrected,
+        # The ranges the decider moved from a bare date's midnight to the next day, so a client can
+        # tell the SQL shown from the SQL the model wrote. None where no decision was made.
+        "day_bounds_closed": ans.day_bounds_closed,
         # M51: the statement as asked. The executed one carries a row policy's own predicate --
         # under an entitlements filter, a table and literals this caller is never granted -- and
         # stays in the audit trace. `narrowed`, below, says whether the policy changed anything.
