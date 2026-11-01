@@ -6,27 +6,34 @@ falls out, where the range a person means by "as of", "through" or "up to" the 9
 that turn on it, every such answer was wrong, and ending the range at the next day turned them
 right and turned no right answer wrong.
 
-Every comparison of the column with the day is read by day, as `CAST(col AS DATE) op D` reads it,
-so a statement's complementary predicates stay complementary (moving `<=` alone made `<= D` and
-`> D` buckets overlap and count a noon row twice, Codex's review):
+Every comparison of such a column with a bare day is read by day, as `CAST(col AS DATE) op D`
+reads it, the literal on either side and the column written first:
 
-    col <= D   ->  col < D+1               col > D    ->  col >= D+1
-    col = D    ->  (col >= D AND col < D+1)
-    col <> D   ->  NOT (col >= D AND col < D+1)
-    col BETWEEN x AND D  ->  (col >= x AND col < D+1)
+    col <= D   ->  col < D+1                 col > D    ->  col >= D+1
+    col = D    ->  (col >= D AND col < D+1)  col <> D   ->  NOT (col >= D AND col < D+1)
+    col IN (D1, D2)              ->  ((col >= D1 AND col < D1+1) OR (col >= D2 AND col < D2+1))
+    col IS NOT DISTINCT FROM D   ->  (col IS NOT NULL AND col >= D AND col < D+1)
+    col BETWEEN x AND D          ->  (col >= x AND col < D+1)
 
-each with the literal on either side, D+1 written in the literal's own spelling so the statement
-stays valid in its dialect. `col < D` and `col >= D` already mean the day's boundary and stay as
-written; so do IN and NOT IN, together, and BETWEEN SYMMETRIC.
+with NOT IN, IS DISTINCT FROM and NOT BETWEEN the negations, NULL kept as each form keeps it, and
+D+1 written in the literal's own spelling so the statement stays valid in its dialect. `col < D`
+and `col >= D` already mean the day's boundary and stay as written.
 
-D is a date-only ISO literal naming a real day, spelled plain, cast or typed (an allow-list: `_day`).
-`col` is a bare column bound directly to a base table of its own scope (no CTE, derived table, set
-operation or outer reference between them), placed by the values resolver's own-scope answer on a
-column declared a naive timestamp, or a DATE on Oracle, where a DATE holds a time of day. The
-resolver's wider readings are not used: past its own scope it can place a set operation's text
-column on a timestamp column of the same name (Codex's review). Nothing moves on a DATE elsewhere
-(whole days make both readings the same rows), a zone-aware timestamp (its midnight is the
-session's zone's), text, an expression, or a bound with a time of day, which says where it ends.
+One statement, one reading. A statement's predicates must keep meaning together what they meant
+together: moving `=` beside an unmoved `IS DISTINCT FROM`, or `<=` beside `>`, let a contradiction
+return rows and complementary buckets count a row twice (Codex's reviews). So the statement is left
+exactly as written wherever any bare day is compared with something this cannot read by day -- a
+column read through a CTE's output, a derived table, a set operation or an enclosing scope; an
+expression of no known type; a simple CASE's WHEN; BETWEEN SYMMETRIC; an IN list holding anything
+but bare days; a day reaching a comparison inside a function, an array or ANY. A bare day compared
+with a column declared DATE (whole days, where both readings are the same rows), text, a number or
+a zone-aware timestamp, or with a cast to such a type, is no obstacle and is not moved.
+
+D is a date-only ISO literal naming a real day, spelled plain, cast or typed (an allow-list:
+`_day`). The column is a bare column bound directly to a base table of its own scope, placed by the
+values resolver's own-scope answer on a column declared a naive timestamp, or a DATE on Oracle,
+where a DATE holds a time of day. The resolver's wider readings are not used: past its own scope it
+can place a set operation's text column on a timestamp column of the same name (Codex's review).
 """
 from __future__ import annotations
 
@@ -37,6 +44,13 @@ from sqlglot import exp
 from mnemiq.sql.values_check import _in_scope, _iso_date, _scopes, _temporal_kind
 
 _DAY_FORMATS = frozenset({"%Y-%m-%d"})  # a parse format naming the day alone (Oracle's TO_DATE 'YYYY-MM-DD')
+_WRAPPERS = (exp.Cast, exp.TryCast, exp.DateStrToDate, exp.StrToDate, exp.StrToTime)
+_BINARY = (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.NullSafeEQ, exp.NullSafeNEQ)
+# The comparison a day can reach through something other than a direct operand: any of these above
+# it, short of the query it sits in, means a value compared in a way this does not read.
+_COMPARING = (*_BINARY, exp.In, exp.Between, exp.Any, exp.All)
+# `bound op col` read as `col op' bound`.
+_MIRROR = {exp.LT: exp.GT, exp.GT: exp.LT, exp.LTE: exp.GTE, exp.GTE: exp.LTE}
 
 
 def _day(node: exp.Expression) -> exp.Literal | None:
@@ -79,72 +93,122 @@ def _the_day(column: exp.Expression, bound: exp.Expression) -> exp.Paren:
 
 def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
                      types: dict[str, dict[str, str]] | None, dialect: str | None) -> int:
-    """Rewrites every comparison described above, in place, and returns how many it rewrote.
+    """Reads the statement's bare-day comparisons by day, in place, as described above, and returns
+    how many comparisons it rewrote: 0, the statement untouched, wherever one cannot be read so.
 
     `visible` and `dialect` place a column as the values resolver's own scope places it; `types` is
-    each column's declared type by table, None reading every column as of unknown type (nothing
-    moves).
+    each column's declared type by table, None reading every column as of unknown type.
     """
     scopes = _scopes(ast)
     oracle = (dialect or "").lower() == "oracle"
 
-    def holds_times(node: exp.Expression) -> bool:
-        if not isinstance(node, exp.Column):
-            return False
+    def kind_of_column(node: exp.Column) -> str | None:
+        """The declared temporal kind of a column bound directly to a base table of its own scope
+        ("" for a declared column of no temporal kind), or None where it is not so bound or placed,
+        or its type is not declared."""
         scope = scopes.get(id(node))
         if scope is None:
-            return False
-        # Bound directly to a base table of its own scope: the qualifier's source, or, unqualified,
-        # every source of the scope. A CTE, a derived table or an enclosing scope's source is a
-        # Scope here, and its output column's type is not the base column's.
+            return None
+        # The qualifier's source, or, unqualified, every source of the scope, must be a base table:
+        # a CTE, a derived table or an enclosing scope's source is a Scope here, and its output
+        # column's type is not the base column's.
         sources = [scope.sources.get(node.table)] if node.table else list(scope.sources.values())
         if not sources or not all(isinstance(s, exp.Table) for s in sources):
-            return False
+            return None
         placed = _in_scope(node, scope, visible, dialect)
         if not isinstance(placed, tuple):
-            return False
+            return None
         declared = (types or {}).get(placed[0], {}).get(placed[1])
         if declared is None:
-            return False
-        kind = _temporal_kind(declared, dialect)
-        return kind == "timestamp" or (oracle and kind == "date")
+            return None
+        return _temporal_kind(declared, dialect) or ""
 
-    def operands(node: exp.Binary) -> tuple[exp.Expression, exp.Expression, bool] | None:
-        """(column, bound, the column on the left) where one side is a timestamp column and the
-        other a bare day."""
-        if holds_times(node.this) and _day(node.expression):
-            return node.this, node.expression, True
-        if holds_times(node.expression) and _day(node.this):
-            return node.expression, node.this, False
-        return None
+    def read(node: exp.Expression) -> str:
+        """"times" for a column whose bare-day comparisons are read by day; "settled" for an operand
+        whose comparison with a bare day means the same in both readings or is not this one's to
+        read; "unknown" for anything else, which leaves the statement as written."""
+        if isinstance(node, exp.Column):
+            kind = kind_of_column(node)
+            if kind is None:
+                return "unknown"
+            if kind == "timestamp" or (oracle and kind == "date"):
+                return "times"
+            return "settled"  # a DATE's whole days, text, a number, a zone-aware timestamp
+        if isinstance(node, (exp.Literal, exp.Null, exp.Boolean)):
+            return "settled"
+        if isinstance(node, (exp.Cast, exp.TryCast)):
+            kind = _temporal_kind(node.args.get("to"), dialect)
+            if kind is None or (kind == "date" and not oracle) or kind == "timestamptz":
+                return "settled"
+        return "unknown"
 
-    moved = 0
-    for node in list(ast.find_all(exp.LTE, exp.GTE, exp.GT, exp.LT, exp.EQ, exp.NEQ, exp.Between)):
-        if isinstance(node, exp.Between):
-            if node.args.get("symmetric") or not (holds_times(node.this) and _day(node.args["high"])):
-                continue
-            column = node.this
-            node.replace(exp.Paren(this=exp.And(
-                this=exp.GTE(this=column.copy(), expression=node.args["low"].copy()),
-                expression=exp.LT(this=column.copy(), expression=_next_day(node.args["high"])))))
-            moved += 1
+    rewrites: list[tuple[exp.Expression, exp.Expression]] = []
+    for literal in list(ast.find_all(exp.Literal)):
+        if not (literal.is_string and _iso_date(literal.this)):
             continue
-        found = operands(node)
-        if found is None:
-            continue
-        column, bound, left = found
-        # Normalized to `column op bound`: the literal on the left reverses the operator.
-        op = type(node) if left else {exp.LTE: exp.GTE, exp.GTE: exp.LTE, exp.GT: exp.LT,
-                                      exp.LT: exp.GT}.get(type(node), type(node))
-        if op is exp.LTE:
-            node.replace(exp.LT(this=column.copy(), expression=_next_day(bound)))
-        elif op is exp.GT:
-            node.replace(exp.GTE(this=column.copy(), expression=_next_day(bound)))
-        elif op is exp.EQ:
-            node.replace(_the_day(column, bound))
-        elif op is exp.NEQ:
-            node.replace(exp.Not(this=_the_day(column, bound)))
-        else:  # `<` and `>=` already mean the day's boundary
-            continue
-        moved += 1
-    return moved
+        bound = literal
+        if isinstance(literal.parent, _WRAPPERS) and _day(literal.parent) is literal:
+            bound = literal.parent
+        parent = bound.parent
+        if isinstance(parent, _BINARY):
+            left = parent.expression is bound
+            other = parent.this if left else parent.expression
+            seen = read(other)
+            if seen == "unknown":
+                return 0
+            if seen == "times":
+                op = type(parent) if left else _MIRROR.get(type(parent), type(parent))
+                if op is exp.LTE:
+                    rewrites.append((parent, exp.LT(this=other.copy(), expression=_next_day(bound))))
+                elif op is exp.GT:
+                    rewrites.append((parent, exp.GTE(this=other.copy(), expression=_next_day(bound))))
+                elif op is exp.EQ:
+                    rewrites.append((parent, _the_day(other, bound)))
+                elif op is exp.NEQ:
+                    rewrites.append((parent, exp.Not(this=_the_day(other, bound))))
+                elif op in (exp.NullSafeEQ, exp.NullSafeNEQ):
+                    held = exp.Paren(this=exp.And(this=exp.Not(this=exp.Is(this=other.copy(), expression=exp.Null())),
+                                                  expression=_the_day(other, bound).this))
+                    rewrites.append((parent, held if op is exp.NullSafeEQ else exp.Not(this=held)))
+                # `<` and `>=` already mean the day's boundary
+        elif isinstance(parent, exp.Between) and bound is not parent.this:
+            seen = read(parent.this)
+            if seen == "unknown" or (seen == "times" and parent.args.get("symmetric")):
+                return 0
+            if seen == "times" and bound is parent.args.get("high"):
+                column = parent.this
+                rewrites.append((parent, exp.Paren(this=exp.And(
+                    this=exp.GTE(this=column.copy(), expression=parent.args["low"].copy()),
+                    expression=exp.LT(this=column.copy(), expression=_next_day(bound))))))
+            # a day as the low end is the inclusive start, the day's own boundary
+        elif isinstance(parent, exp.In) and bound is not parent.this:
+            seen = read(parent.this)
+            if seen == "unknown":
+                return 0
+            if seen == "times":
+                items = list(parent.expressions)
+                if parent.args.get("query") or not items or not all(_day(i) for i in items):
+                    return 0
+                if items[0] is bound:  # the list rewritten once, by its first item
+                    days = [_the_day(parent.this, i) for i in items]
+                    either = days[0]
+                    for d in days[1:]:
+                        either = exp.Or(this=either, expression=d)
+                    rewrites.append((parent, exp.Paren(this=either) if len(days) > 1 else days[0]))
+        elif (isinstance(parent, exp.If) and isinstance(parent.parent, exp.Case)
+              and parent.parent.this is not None and parent.this is bound):
+            if read(parent.parent.this) != "settled":
+                return 0  # `CASE col WHEN D`: an equality this does not rewrite
+        elif any(isinstance(a, _COMPARING) for a in _up_to_query(bound)):
+            return 0  # compared, but not as a direct operand: a simple CASE, BETWEEN's subject, ANY
+    for node, replacement in rewrites:
+        node.replace(replacement)
+    return len(rewrites)
+
+
+def _up_to_query(node: exp.Expression):
+    """`node`'s ancestors, short of the query it sits in."""
+    node = node.parent
+    while node is not None and not isinstance(node, exp.Query):
+        yield node
+        node = node.parent

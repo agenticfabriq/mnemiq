@@ -70,6 +70,16 @@ def _closed(sql: str, dialect: str = "duckdb", types=TYPES) -> tuple[str, int]:
      "SELECT id FROM claim WHERE (ts >= '2024-03-09' AND ts < '2024-03-10')"),
     ("SELECT id FROM claim WHERE ts <> '2024-03-09'",
      "SELECT id FROM claim WHERE NOT (ts >= '2024-03-09' AND ts < '2024-03-10')"),
+    # In a list, on any of its days; NULL-safe, NULL is never on the day.
+    ("SELECT id FROM claim WHERE ts IN ('2024-03-09', '2024-03-10')",
+     "SELECT id FROM claim WHERE ((ts >= '2024-03-09' AND ts < '2024-03-10') OR "
+     "(ts >= '2024-03-10' AND ts < '2024-03-11'))"),
+    ("SELECT id FROM claim WHERE ts NOT IN ('2024-03-09')",
+     "SELECT id FROM claim WHERE NOT (ts >= '2024-03-09' AND ts < '2024-03-10')"),
+    ("SELECT id FROM claim WHERE ts IS NOT DISTINCT FROM '2024-03-09'",
+     "SELECT id FROM claim WHERE (NOT ts IS NULL AND ts >= '2024-03-09' AND ts < '2024-03-10')"),
+    ("SELECT id FROM claim WHERE ts IS DISTINCT FROM '2024-03-09'",
+     "SELECT id FROM claim WHERE NOT (NOT ts IS NULL AND ts >= '2024-03-09' AND ts < '2024-03-10')"),
     # A qualified column, through its alias.
     ("SELECT c.id FROM claim AS c WHERE c.ts <= '2024-03-09'",
      "SELECT c.id FROM claim AS c WHERE c.ts < '2024-03-10'"),
@@ -121,6 +131,60 @@ def test_every_such_bound_on_a_base_tables_column_moves_wherever_it_sits():
 ])
 def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
     assert _closed(asked)[1] == 0, asked
+
+
+@pytest.mark.parametrize("asked", [
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND CAST(ts AS TIMESTAMP) <= '2024-03-09'",
+    "SELECT id, CASE ts WHEN '2024-03-09' THEN 1 END AS d FROM claim WHERE ts <= '2024-03-09'",
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts = ANY(['2024-03-09'])",
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts IN ('2024-03-09', '2024-03-10 12:00:00')",
+    "WITH r AS (SELECT id, ts FROM claim) SELECT c.id FROM claim AS c JOIN r ON r.id = c.id "
+    "WHERE c.ts = '2024-03-09' AND r.ts <> '2024-03-09'",
+    "WITH r AS (SELECT id, ts FROM claim) SELECT c.id FROM claim AS c JOIN r ON r.id = c.id "
+    "WHERE c.ts <= '2024-03-09' AND r.ts BETWEEN '2024-03-01' AND '2024-03-09'",
+    "WITH r AS (SELECT id, ts FROM claim) SELECT c.id FROM claim AS c JOIN r ON r.id = c.id "
+    "WHERE c.ts <= '2024-03-09' AND r.ts IN ('2024-03-09')",
+])
+def test_one_comparison_that_cannot_be_read_by_day_leaves_the_whole_statement_as_written(asked):
+    """One statement, one reading: beside a day compared with something this cannot read by day (an
+    expression of no known type, a simple CASE, ANY, a mixed list, a CTE's output), the statement's
+    other comparisons are not moved either, so its predicates keep meaning together what they meant."""
+    sql, moved = _closed(asked)
+    assert moved == 0
+    assert sql == sqlglot.parse_one(asked, read="duckdb").sql(dialect="duckdb")
+
+
+def test_a_day_compared_with_whole_days_text_or_a_projection_does_not_stop_the_move():
+    assert _closed("SELECT id, '2024-03-09' AS asof FROM claim WHERE ts <= '2024-03-09' "
+                   "AND filed <= '2024-03-09' AND CAST(ts AS DATE) <= '2024-03-09' AND note <> '2024-03-09'") == (
+        "SELECT id, '2024-03-09' AS asof FROM claim WHERE ts < '2024-03-10' AND filed <= '2024-03-09' "
+        "AND CAST(ts AS DATE) <= '2024-03-09' AND note <> '2024-03-09'", 1)
+
+
+def test_contradictions_stay_contradictions_and_nulls_stay_null_on_the_engine():
+    """Codex's counterexamples: `=` moved beside an unmoved IS DISTINCT FROM or NOT IN let a noon
+    row satisfy `ts = D AND ts IS DISTINCT FROM D`. Read together by day, each still holds for no
+    row, and the NULL-safe pair partitions rows with a NULL among them."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-08 23:00'), (2, '2024-03-09 00:00'), "
+                "(3, '2024-03-09 12:00'), (4, '2024-03-10 00:00'), (5, NULL)")
+    for contradiction in ("ts = '2024-03-09' AND ts IS DISTINCT FROM '2024-03-09'",
+                          "ts = '2024-03-09' AND ts NOT IN ('2024-03-09')",
+                          "ts IN ('2024-03-09') AND ts <> '2024-03-09'",
+                          "ts IS NOT DISTINCT FROM '2024-03-09' AND ts > '2024-03-09'"):
+        verdict = decide(f"SELECT count(*) FROM claim WHERE {contradiction}", VISIBLE, dialect="duckdb",
+                         target="duckdb", types=TYPES)
+        assert isinstance(verdict, Approved) and verdict.day_bounds == 2, (contradiction, verdict)
+        assert con.execute(verdict.target_sql).fetchone()[0] == 0, (contradiction, verdict.target_sql)
+    pair = decide("SELECT SUM(CASE WHEN ts IS NOT DISTINCT FROM '2024-03-09' THEN 1 ELSE 0 END), "
+                  "SUM(CASE WHEN ts IS DISTINCT FROM '2024-03-09' THEN 1 ELSE 0 END) FROM claim",
+                  VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+    assert con.execute(pair.target_sql).fetchone() == (2, 3)  # rows 2 and 3; rows 1, 4 and the NULL
+    for null_kept in ("ts = '2024-03-09'", "ts <> '2024-03-09'", "ts NOT IN ('2024-03-09')"):
+        verdict = decide(f"SELECT {null_kept} FROM claim WHERE id = 5", VISIBLE, dialect="duckdb",
+                         target="duckdb", types=TYPES)
+        assert con.execute(verdict.target_sql).fetchone() == (None,), null_kept
 
 
 def test_the_unions_text_compares_as_written_on_the_engine():
@@ -180,9 +244,8 @@ def test_complementary_predicates_stay_complementary_on_the_engine():
     "SELECT id FROM claim WHERE ts < '2024-03-10'",
     "SELECT id FROM claim WHERE ts >= '2024-03-01'",
     "SELECT id FROM claim WHERE '2024-03-10' > ts",
-    # IN and NOT IN, left together as written.
-    "SELECT id FROM claim WHERE ts IN ('2024-03-09', '2024-03-10')",
-    "SELECT id FROM claim WHERE ts NOT IN ('2024-03-09')",
+    # A list holding anything but bare days.
+    "SELECT id FROM claim WHERE ts IN ('2024-03-09', '2024-03-10 12:00:00')",
     # A BETWEEN whose end has a time of day.
     "SELECT id FROM claim WHERE ts BETWEEN '2024-03-01' AND '2024-03-09 12:00:00'",
     # Text, in the mirrored and the BETWEEN spellings too.
