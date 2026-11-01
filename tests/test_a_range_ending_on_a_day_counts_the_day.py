@@ -167,6 +167,8 @@ def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
     # runs on SQLite below).
     "SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts = tz AND tz > '2024-03-09'",
     "SELECT id FROM claim WHERE ts <= '2024-03-09' AND epoch(ts) > 1709942400",
+    # `IS` with a value, SQLite's NULL-safe equality, written for another engine.
+    "SELECT id FROM claim WHERE ts = '2024-03-09' AND ts IS '2024-03-09'",
     # A day as the subject of an IN listing the timestamp (Codex's sixth review).
     "SELECT id FROM claim WHERE ts = '2024-03-09' AND '2024-03-09' NOT IN (ts)",
     "SELECT id FROM claim WHERE ts = '2024-03-09' AND '2024-03-09' IN (ts, ts)",
@@ -230,8 +232,8 @@ def test_the_third_reviews_contradictions_stay_contradictions_on_the_engine():
 def test_the_fourth_reviews_contradictions_stay_contradictions_on_the_engine():
     """Codex's fourth review: SQLite's `IS NOT`, a NULL-safe comparison the walk did not visit, and
     a text column's day against a timestamp expression, each read the noon row at midnight while
-    `=` moved. `IS` is now the NULL-safe pair, read by day with `=`; the text against an
-    expression leaves the statement as written. Each still returns nothing."""
+    `=` moved. Nothing moves on SQLite now, and the text against an expression leaves the statement
+    as written. Each still returns nothing."""
     import sqlite3
 
     lite = sqlite3.connect(":memory:")
@@ -239,12 +241,8 @@ def test_the_fourth_reviews_contradictions_stay_contradictions_on_the_engine():
     lite.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00:00'), (2, NULL)")
     asked = "SELECT count(*) FROM claim WHERE ts = '2024-03-09' AND ts IS NOT '2024-03-09'"
     verdict = decide(asked, VISIBLE, dialect="sqlite", target="sqlite", types=TYPES)
-    assert isinstance(verdict, Approved) and verdict.day_bounds == 2, verdict
+    assert isinstance(verdict, Approved) and verdict.day_bounds == 0, verdict  # never on SQLite
     assert lite.execute(verdict.target_sql).fetchone() == lite.execute(asked).fetchone() == (0,)
-    # `IS` the day holds for the noon row and not for the NULL one, as IS NOT DISTINCT FROM would.
-    on_the_day = decide("SELECT id FROM claim WHERE ts IS '2024-03-09' ORDER BY id", VISIBLE,
-                        dialect="sqlite", target="sqlite", types=TYPES)
-    assert lite.execute(on_the_day.target_sql).fetchall() == [(1,)]
 
     con = duckdb.connect()
     con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP, note VARCHAR)")
@@ -298,6 +296,25 @@ def test_a_day_as_an_in_subject_leaves_the_statement_as_written_on_both_engines(
         verdict = decide(asked, VISIBLE, dialect=dialect, target=dialect, types=TYPES)
         assert isinstance(verdict, Approved) and verdict.day_bounds == 0, (dialect, verdict)
         assert engine.execute(verdict.target_sql).fetchall() == engine.execute(asked).fetchall() == [], dialect
+
+
+def test_on_sqlite_nothing_moves():
+    """SQLite has no temporal type: `CAST('2024-03-09' AS TIMESTAMP)` is the integer 2024 there (Codex's
+    seventh review), and a column declared TIMESTAMP may hold ISO text, a number or a BLOB. No
+    reading of its bounds is proven, so nothing moves, a plain string included, and each statement
+    returns what it returns as written."""
+    import sqlite3
+
+    lite = sqlite3.connect(":memory:")
+    lite.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP)")
+    lite.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00:00')")
+    assert lite.execute("SELECT CAST('2024-03-09' AS TIMESTAMP)").fetchone() == (2024,)
+    for asked in ("SELECT id FROM claim WHERE ts = '2024-03-09' AND ts <> CAST('2024-03-09' AS TIMESTAMP)",
+                  "SELECT id FROM claim WHERE ts = CAST('2024-03-09' AS TIMESTAMP)",
+                  "SELECT id FROM claim WHERE ts <= '2024-03-09'"):
+        verdict = decide(asked, VISIBLE, dialect="sqlite", target="sqlite", types=TYPES)
+        assert isinstance(verdict, Approved) and verdict.day_bounds == 0, (asked, verdict)
+        assert lite.execute(verdict.target_sql).fetchall() == lite.execute(asked).fetchall(), asked
 
 
 def test_contradictions_stay_contradictions_and_nulls_stay_null_on_the_engine():

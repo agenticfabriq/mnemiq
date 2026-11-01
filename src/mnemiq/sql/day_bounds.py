@@ -36,8 +36,10 @@ literals (`_classify`, `_agree`), and
   anything but a literal (a cast to DATE, outside Oracle, is a DATE);
 - a simple CASE's WHEN, BETWEEN SYMMETRIC or a mixed IN list over a timestamp column, a day as the
   subject of a BETWEEN or of an IN listing one (Codex's sixth review), LIKE or a pattern match on
-  one, and a USING or NATURAL join (a comparison nothing here reads) are absent.
-  SQLite's `IS` and `IS NOT` are the NULL-safe pair.
+  one, `IS` with a value, and a USING or NATURAL join (a comparison nothing here reads) are absent.
+
+Never on SQLite, which has no temporal type: a column declared TIMESTAMP may hold ISO text, a number
+or anything, and a cast to TIMESTAMP is numeric affinity there (Codex's fourth and seventh reviews).
 
 Values then meet only directly, and a timestamp column only timestamp columns read the same way.
 Otherwise the statement is left exactly as written. The cost, accepted, and none on the saved runs
@@ -131,6 +133,11 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
     `visible` and `dialect` place a column as the values resolver's own scope places it; `types` is
     each column's declared type by table, None reading every column as of unknown type.
     """
+    if (dialect or "").lower() == "sqlite":
+        # No temporal type: a column declared TIMESTAMP may hold ISO text, a number or anything, and
+        # `CAST('2024-03-09' AS TIMESTAMP)` is the integer 2024 there (Codex's seventh review), so no
+        # reading of its bounds is proven.
+        return 0
     scopes = _scopes(ast)
     oracle = (dialect or "").lower() == "oracle"
 
@@ -242,10 +249,12 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
             rewrites.append((node, _the_day(column, bound)))
         elif op is exp.NEQ:
             rewrites.append((node, exp.Not(this=_the_day(column, bound))))
-        elif op in (exp.NullSafeEQ, exp.NullSafeNEQ, exp.Is):  # SQLite's `IS` is IS NOT DISTINCT FROM
+        elif op in (exp.NullSafeEQ, exp.NullSafeNEQ):
             held = exp.Paren(this=exp.And(this=exp.Not(this=exp.Is(this=column.copy(), expression=exp.Null())),
                                           expression=_the_day(column, bound).this))
             rewrites.append((node, exp.Not(this=held) if op is exp.NullSafeNEQ else held))
+        elif op is exp.Is:
+            return 0  # `IS` with a value: SQLite's NULL-safe equality, which no other engine has
         # `<` and `>=` already mean the day's boundary
 
     for node, replacement in rewrites:
