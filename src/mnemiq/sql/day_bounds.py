@@ -34,8 +34,9 @@ literals (`_classify`, `_agree`), and
 - nothing in any comparison is opaque: no expression, function, aggregate, subquery, column read
   through a CTE's output, a derived table, a set operation or an enclosing scope, or cast of
   anything but a literal (a cast to DATE, outside Oracle, is a DATE);
-- a simple CASE's WHEN, BETWEEN SYMMETRIC or a mixed IN list over a timestamp column, LIKE or a
-  pattern match on one, and a USING or NATURAL join (a comparison nothing here reads) are absent.
+- a simple CASE's WHEN, BETWEEN SYMMETRIC or a mixed IN list over a timestamp column, a day as the
+  subject of a BETWEEN or of an IN listing one (Codex's sixth review), LIKE or a pattern match on
+  one, and a USING or NATURAL join (a comparison nothing here reads) are absent.
   SQLite's `IS` and `IS NOT` are the NULL-safe pair.
 
 Values then meet only directly, and a timestamp column only timestamp columns read the same way.
@@ -214,6 +215,8 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
             classes = [_classify(i) for i in items]
             if not items or not all(_agree(subject, c) for c in classes):
                 return 0
+            if subject == DAY and TIMES in classes:
+                return 0  # a day as the subject, a timestamp in the list: a membership this does not rewrite
             if subject == TIMES and DAY in classes:
                 if not all(c == DAY for c in classes):
                     return 0  # a list mixing days and moments

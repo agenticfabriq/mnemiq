@@ -167,6 +167,9 @@ def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
     # runs on SQLite below).
     "SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts = tz AND tz > '2024-03-09'",
     "SELECT id FROM claim WHERE ts <= '2024-03-09' AND epoch(ts) > 1709942400",
+    # A day as the subject of an IN listing the timestamp (Codex's sixth review).
+    "SELECT id FROM claim WHERE ts = '2024-03-09' AND '2024-03-09' NOT IN (ts)",
+    "SELECT id FROM claim WHERE ts = '2024-03-09' AND '2024-03-09' IN (ts, ts)",
     # The same, met only inside a BETWEEN: a DATE column as its low end, an expression as its subject.
     "SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts BETWEEN filed AND '2024-03-20'",
     "SELECT id FROM claim WHERE ts <= '2024-03-09' AND upper(note) BETWEEN 'a' AND 'b'",
@@ -277,6 +280,24 @@ def test_the_fifth_reviews_contradictions_stay_contradictions_on_the_engine():
     verdict = decide(asked, VISIBLE, dialect="sqlite", target="sqlite", types=TYPES)
     assert isinstance(verdict, Approved) and verdict.day_bounds == 0, verdict
     assert lite.execute(verdict.target_sql).fetchone() == lite.execute(asked).fetchone() == (0,)
+
+
+def test_a_day_as_an_in_subject_leaves_the_statement_as_written_on_both_engines():
+    """Codex's sixth review: `'D' NOT IN (ts)` beside a moved `ts = 'D'` returned the noon row,
+    where read by day both cannot hold. Left as written, it returns nothing on DuckDB and SQLite."""
+    import sqlite3
+
+    asked = "SELECT id FROM claim WHERE ts = '2024-03-09' AND '2024-03-09' NOT IN (ts)"
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00:00')")
+    lite = sqlite3.connect(":memory:")
+    lite.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP)")
+    lite.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00:00')")
+    for engine, dialect in ((con, "duckdb"), (lite, "sqlite")):
+        verdict = decide(asked, VISIBLE, dialect=dialect, target=dialect, types=TYPES)
+        assert isinstance(verdict, Approved) and verdict.day_bounds == 0, (dialect, verdict)
+        assert engine.execute(verdict.target_sql).fetchall() == engine.execute(asked).fetchall() == [], dialect
 
 
 def test_contradictions_stay_contradictions_and_nulls_stay_null_on_the_engine():
