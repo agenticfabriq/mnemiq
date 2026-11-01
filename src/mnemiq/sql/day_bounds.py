@@ -26,16 +26,22 @@ every comparison in the statement, at any depth, is classified by its operands (
 the statement moves only where every one is read the same way in both readings or is one this
 rewrites:
 
-- a timestamp column meets only a bare day (rewritten), a constant (a value with its time of day
-  means that moment), or another timestamp column;
+- a timestamp column meets only a bare day (rewritten), a moment written with its time of day in
+  ISO form (which means that moment), NULL, or another timestamp column -- never text, a string in
+  any other form (an engine reads `'2024-3-9'` as that day's midnight too), a DATE, or an opaque
+  operand;
 - an opaque operand -- an expression, a function, a subquery, a column read through a CTE's output,
   a derived table, a set operation or an enclosing scope, a cast of anything but a literal to
-  anything but DATE -- meets only a constant or a column of no temporal type;
-- a simple CASE's WHEN, BETWEEN SYMMETRIC or a mixed IN list over a timestamp column, and a USING
-  or NATURAL join (a comparison nothing here reads), leave it as written too.
+  anything but DATE -- meets only a number, a boolean, NULL, or a column of a type neither temporal
+  nor text: an engine converts a string to a timestamp where an opaque timestamp meets one (Codex's
+  fourth review), and a number never carries a day;
+- a simple CASE's WHEN, BETWEEN SYMMETRIC or a mixed IN list over a timestamp column, LIKE or a
+  pattern match on one, and a USING or NATURAL join (a comparison nothing here reads), leave it as
+  written too. SQLite's `IS` and `IS NOT` are the NULL-safe pair.
 
 A bare day buried in an operand (a function's argument, an array, ANY, a subquery) makes that
-operand opaque, so it never meets a timestamp column or a bare day unread.
+operand opaque, so it never meets a timestamp column or a bare day unread. The cost, accepted: a
+statement comparing an expression with a string (`upper(region) = 'WEST'`) is left as written.
 
 Otherwise the statement is left exactly as written. A bare day compared with a column declared
 DATE (whole days, where both readings are the same rows), a zone-aware timestamp, text or a
@@ -52,15 +58,21 @@ from datetime import date, timedelta
 
 from sqlglot import exp
 
-from mnemiq.sql.values_check import _in_scope, _iso_date, _scopes, _temporal_kind
+from sqlglot.errors import SqlglotError
+
+from mnemiq.sql.values_check import _in_scope, _iso_date, _moment, _scopes, _temporal_kind
 
 _DAY_FORMATS = frozenset({"%Y-%m-%d"})  # a parse format naming the day alone (Oracle's TO_DATE 'YYYY-MM-DD')
 _WRAPPERS = (exp.Cast, exp.TryCast, exp.DateStrToDate, exp.StrToDate, exp.StrToTime)
-_BINARY = (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.NullSafeEQ, exp.NullSafeNEQ)
+_BINARY = (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.NullSafeEQ, exp.NullSafeNEQ, exp.Is)
+_PATTERNS = (exp.Like, exp.ILike, exp.Glob, exp.SimilarTo, exp.RegexpLike, exp.RegexpILike)
 _MIRROR = {exp.LT: exp.GT, exp.GT: exp.LT, exp.LTE: exp.GTE, exp.GTE: exp.LTE}  # `bound op col` as `col op' bound`
 
-# Operand classes (`_classify`).
-DAY, CONST, TIMES, DATE, ZONED, OTHER, OPAQUE = "day", "const", "times", "date", "zoned", "other", "opaque"
+# Operand classes (`_classify`): a bare day; a moment (an ISO timestamp string with its time of day);
+# a number, boolean or NULL; any other string; a typed column bound directly to a base table (a naive
+# timestamp, a DATE, a zone-aware timestamp, text, anything else); opaque.
+DAY, MOMENT, NUMBER, STRING = "day", "moment", "number", "string"
+TIMES, DATE, ZONED, TEXT, OTHER, OPAQUE = "times", "date", "zoned", "text", "other", "opaque"
 
 
 def _day(node: exp.Expression) -> exp.Literal | None:
@@ -101,14 +113,23 @@ def _the_day(column: exp.Expression, bound: exp.Expression) -> exp.Paren:
                                   expression=exp.LT(this=column.copy(), expression=_next_day(bound))))
 
 
+def _is_text(declared: str, dialect: str | None) -> bool:
+    """Whether a declared type is a string type; an unreadable one counts as text, the reading that
+    leaves more statements as written."""
+    try:
+        return exp.DataType.build(declared, dialect=dialect, udt=True).is_type(*exp.DataType.TEXT_TYPES)
+    except (SqlglotError, ValueError):
+        return True
+
+
 def _agree(a: str, b: str) -> bool:
     """Whether a comparison of operands of classes `a` and `b` reads the same in both readings, or
     is one this rewrites (a timestamp column and a bare day)."""
     pair = {a, b}
     if TIMES in pair:
-        return pair - {TIMES} <= {DAY, CONST, TIMES, ZONED}
+        return pair - {TIMES} <= {DAY, MOMENT, NUMBER, TIMES, ZONED}
     if OPAQUE in pair:
-        return len(pair) == 2 and pair - {OPAQUE} <= {CONST, OTHER}
+        return len(pair) == 2 and pair - {OPAQUE} <= {NUMBER, OTHER}
     return True
 
 
@@ -124,17 +145,24 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
     scopes = _scopes(ast)
     oracle = (dialect or "").lower() == "oracle"
 
+    def _literal(node: exp.Literal) -> str:
+        if not node.is_string:
+            return NUMBER
+        return MOMENT if _moment(node.this) == "timestamp" else STRING
+
     def _classify(node: exp.Expression) -> str:
         if _day(node):
             return DAY
-        if isinstance(node, (exp.Literal, exp.Null, exp.Boolean)):
-            return CONST
-        if isinstance(node, exp.Neg) and isinstance(node.this, exp.Literal):
-            return CONST
+        if isinstance(node, (exp.Null, exp.Boolean)):
+            return NUMBER
+        if isinstance(node, exp.Literal):
+            return _literal(node)
+        if isinstance(node, exp.Neg) and isinstance(node.this, exp.Literal) and not node.this.is_string:
+            return NUMBER
         if isinstance(node, _WRAPPERS) and isinstance(node.this, exp.Literal):
-            # A day in a spelling `_day` does not read (a cast to text, a format that is not the
-            # day alone) is a day this cannot move: opaque. Any other constant is a constant.
-            return OPAQUE if node.this.is_string and _iso_date(node.this.this) else CONST
+            # A constant keeps its literal's class: a day in a spelling `_day` does not read (a cast
+            # to text, a format that is not the day alone) is a string, which no timestamp meets.
+            return _literal(node.this)
         if isinstance(node, exp.Column):
             scope = scopes.get(id(node))
             if scope is None:
@@ -152,7 +180,9 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
             kind = _temporal_kind(declared, dialect)
             if kind == "timestamp" or (oracle and kind == "date"):
                 return TIMES
-            return {"date": DATE, "timestamptz": ZONED}.get(kind, OTHER)
+            if kind is not None:
+                return {"date": DATE, "timestamptz": ZONED}.get(kind, OPAQUE)  # a TIME: opaque
+            return TEXT if _is_text(declared, dialect) else OTHER
         if (isinstance(node, (exp.Cast, exp.TryCast)) and not oracle
                 and _temporal_kind(node.args.get("to"), dialect) == "date"):
             return DATE  # a cast to DATE already reads its value by day
@@ -162,6 +192,9 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
 
     for join in ast.find_all(exp.Join):
         if join.args.get("using") or str(join.args.get("method") or "").upper() == "NATURAL":
+            return 0
+    for match in ast.find_all(*_PATTERNS):
+        if TIMES in (_classify(match.this), _classify(match.expression)):
             return 0
     for node in list(ast.find_all(*_BINARY, exp.In, exp.Between, exp.Case)):
         if isinstance(node, exp.Case):
@@ -220,10 +253,10 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
             rewrites.append((node, _the_day(column, bound)))
         elif op is exp.NEQ:
             rewrites.append((node, exp.Not(this=_the_day(column, bound))))
-        elif op in (exp.NullSafeEQ, exp.NullSafeNEQ):
+        elif op in (exp.NullSafeEQ, exp.NullSafeNEQ, exp.Is):  # SQLite's `IS` is IS NOT DISTINCT FROM
             held = exp.Paren(this=exp.And(this=exp.Not(this=exp.Is(this=column.copy(), expression=exp.Null())),
                                           expression=_the_day(column, bound).this))
-            rewrites.append((node, held if op is exp.NullSafeEQ else exp.Not(this=held)))
+            rewrites.append((node, exp.Not(this=held) if op is exp.NullSafeNEQ else held))
         # `<` and `>=` already mean the day's boundary
 
     for node, replacement in rewrites:

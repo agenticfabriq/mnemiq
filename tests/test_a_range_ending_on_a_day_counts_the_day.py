@@ -158,6 +158,13 @@ def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
     "AND CAST(ts AS TIMESTAMPTZ) <> (SELECT CAST('2024-03-09' AS TIMESTAMPTZ))",
     # A comparison this does not read: a USING join's.
     "SELECT a.id FROM claim AS a JOIN claim AS b USING (id) WHERE a.ts <= '2024-03-09'",
+    # A string an engine reads as a day in another form; text against a timestamp expression
+    # (Codex's fourth review); a pattern match on the timestamp.
+    "SELECT id FROM claim WHERE ts = '2024-03-09' AND ts <> '2024-3-9'",
+    "SELECT id FROM claim WHERE ts = '2024-03-09' AND (ts + INTERVAL '0 seconds') <> note",
+    "SELECT id FROM claim WHERE ts = '2024-03-09' AND ts LIKE '2024-03-09%'",
+    # The cost, accepted: an expression compared with a string, which may be a timestamp met by a day.
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND upper(region) = 'WEST'",
 ])
 def test_one_comparison_that_cannot_be_read_by_day_leaves_the_whole_statement_as_written(asked):
     """One statement, one reading: beside a day compared with something this cannot read by day (an
@@ -208,6 +215,34 @@ def test_the_third_reviews_contradictions_stay_contradictions_on_the_engine():
         verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
         assert isinstance(verdict, Approved) and verdict.day_bounds == 0, (asked, verdict)
         assert con.execute(verdict.target_sql).fetchone() == con.execute(asked).fetchone() == (0,), asked
+
+
+def test_the_fourth_reviews_contradictions_stay_contradictions_on_the_engine():
+    """Codex's fourth review: SQLite's `IS NOT`, a NULL-safe comparison the walk did not visit, and
+    a text column's day against a timestamp expression, each read the noon row at midnight while
+    `=` moved. `IS` is now the NULL-safe pair, read by day with `=`; the text against an
+    expression leaves the statement as written. Each still returns nothing."""
+    import sqlite3
+
+    lite = sqlite3.connect(":memory:")
+    lite.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP)")
+    lite.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00:00'), (2, NULL)")
+    asked = "SELECT count(*) FROM claim WHERE ts = '2024-03-09' AND ts IS NOT '2024-03-09'"
+    verdict = decide(asked, VISIBLE, dialect="sqlite", target="sqlite", types=TYPES)
+    assert isinstance(verdict, Approved) and verdict.day_bounds == 2, verdict
+    assert lite.execute(verdict.target_sql).fetchone() == lite.execute(asked).fetchone() == (0,)
+    # `IS` the day holds for the noon row and not for the NULL one, as IS NOT DISTINCT FROM would.
+    on_the_day = decide("SELECT id FROM claim WHERE ts IS '2024-03-09' ORDER BY id", VISIBLE,
+                        dialect="sqlite", target="sqlite", types=TYPES)
+    assert lite.execute(on_the_day.target_sql).fetchall() == [(1,)]
+
+    con = duckdb.connect()
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP, note VARCHAR)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00', '2024-03-09')")
+    asked = "SELECT count(*) FROM claim WHERE ts = '2024-03-09' AND (ts + INTERVAL '0 seconds') <> note"
+    verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+    assert isinstance(verdict, Approved) and verdict.day_bounds == 0, verdict
+    assert con.execute(verdict.target_sql).fetchone() == con.execute(asked).fetchone() == (0,)
 
 
 def test_contradictions_stay_contradictions_and_nulls_stay_null_on_the_engine():
