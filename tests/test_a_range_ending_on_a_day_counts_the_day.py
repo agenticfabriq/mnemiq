@@ -176,6 +176,9 @@ def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
     # An aggregate carrying the timestamp into a function that compares it (Codex's eleventh review).
     "SELECT NULLIF(MIN(ts), TIMESTAMP '2024-03-09') AS m FROM claim WHERE ts <= '2024-03-09'",
     "SELECT GREATEST(MAX(ts), TIMESTAMP '2024-03-09') AS m FROM claim WHERE ts <= '2024-03-09'",
+    # A CTE's output, whose type is unknown, carried into a function that compares it.
+    "WITH r AS (SELECT ts AS t FROM claim) SELECT list_contains([r.t], TIMESTAMP '2024-03-09') AS f "
+    "FROM r, claim WHERE claim.ts <= '2024-03-09'",
     "SELECT id FROM claim WHERE ts = '2024-03-09' "
     "AND NOT list_contains([CAST(ts AS TIMESTAMPTZ)], TIMESTAMPTZ '2024-03-09 00:00:00+00')",
     # A day as the subject of an IN listing the timestamp (Codex's sixth review).
@@ -212,6 +215,9 @@ def test_a_day_compared_with_whole_days_text_or_a_projection_does_not_stop_the_m
      "WHERE ts <= '2024-03-09' GROUP BY ts ORDER BY ts",
      "SELECT ts, COUNT(DISTINCT ts) AS n, MAX(ts) AS last, CAST(ts AS DATE) AS d FROM claim "
      "WHERE ts < '2024-03-10' GROUP BY ts ORDER BY ts"),
+    # A count is never a time, wherever it goes.
+    ("SELECT NULLIF(COUNT(ts), 0) AS n FROM claim WHERE ts <= '2024-03-09'",
+     "SELECT NULLIF(COUNT(ts), 0) AS n FROM claim WHERE ts < '2024-03-10'"),
     # Columns and literals only: a moment with its time of day, a number, other columns, a timestamp
     # join condition.
     ("SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts > '2024-03-01 12:00:00' AND id > -1",

@@ -20,12 +20,14 @@ D+1 written in the literal's own spelling so the statement stays valid in its di
 and `col >= D` already mean the day's boundary and stay as written.
 
 One statement, one reading. Moving some of a statement's comparisons and not others let a
-contradiction return rows and complementary buckets count a row twice; five reviews by Codex each
+contradiction return rows and complementary buckets count a row twice; twelve reviews by Codex each
 found a path by which the same timestamp reached a midnight value unmoved -- `<=` beside `>`, `=`
-beside IS DISTINCT FROM, a day inside a subquery, a cast of the column, SQLite's IS, a text or
-BLOB column, a zone-aware copy, an epoch number. So the rule is closed by construction: the
-statement moves only when every comparison in it, at any depth, is between bare columns and
-literals (`_classify`, `_agree`), and
+beside IS DISTINCT FROM, a day inside a subquery, a cast of the column, SQLite's IS, a text or BLOB
+column, a zone-aware copy, an epoch number, a function comparing internally, an aggregate's result,
+a cast to DATE turned back into a timestamp. So the rule is closed by construction, on two parts.
+
+Comparisons (`_classify`, `_agree`). Every comparison in the statement, at any depth, is between
+bare columns and literals, and
 
 - a timestamp column meets only a bare day (rewritten), a moment written with its time of day in
   ISO form (which means that moment), NULL, a number, or another timestamp column -- never a DATE,
@@ -35,18 +37,24 @@ literals (`_classify`, `_agree`), and
   through a CTE's output, a derived table, a set operation or an enclosing scope, or cast of
   anything but a literal (a cast to DATE, outside Oracle, is a DATE);
 - a simple CASE's WHEN, BETWEEN SYMMETRIC or a mixed IN list over a timestamp column, a day as the
-  subject of a BETWEEN or of an IN listing one (Codex's sixth review), LIKE or a pattern match on
-  one, `IS` with a value, and a USING or NATURAL join (a comparison nothing here reads) are absent.
+  subject of a BETWEEN or of an IN listing one, `IS` with a value, a bound whose day or next day no
+  engine's timestamp holds, and a USING or NATURAL join (a comparison nothing here reads) are absent.
+
+Where a time goes (`_CONSUMES`, `_CARRIES_ON`). A value computed from a timestamp column or a column
+of unknown type ends only where the comparisons above read it, in what the statement shows or sorts,
+or in a container whose outputs are read again as columns, passing on through an alias, MIN, MAX, a
+cast to DATE or a subquery; COUNT, EXISTS and comparisons consume it. Anywhere else -- a function,
+arithmetic, a CASE, a pattern match -- it may be compared unread.
 
 Never on SQLite, which has no temporal type: a column declared TIMESTAMP may hold ISO text, a number
-or anything, and a cast to TIMESTAMP is numeric affinity there (Codex's fourth and seventh reviews).
+or anything, and a cast to TIMESTAMP is numeric affinity there.
 
-Values then meet only directly, and a timestamp column only timestamp columns read the same way.
 Otherwise the statement is left exactly as written. The cost, accepted, and none on the saved runs
-it was measured on: a statement with any expression in any comparison (`COUNT(*) > 5`, an IN over a
-subquery, `upper(region) = 'WEST'`) is not moved. A bare day compared with a column declared DATE
-(whole days, where both readings are the same rows), a zone-aware timestamp, text or a number, or
-with a cast to DATE, is not moved and stops nothing.
+it was measured on: a statement with any expression in a comparison (`COUNT(*) > 5`, an IN over a
+subquery, `upper(region) = 'WEST'`) or a timestamp inside a function or arithmetic (`ts + INTERVAL
+1 DAY` projected) is not moved. A bare day compared with a column declared DATE (whole days, where
+both readings are the same rows), a zone-aware timestamp, text or a number, or with a cast to DATE,
+is not moved and stops nothing.
 
 D is a date-only ISO literal naming a real day, spelled plain, cast or typed (an allow-list:
 `_day`). A timestamp column is a bare column bound directly to a base table of its own scope,
@@ -70,6 +78,15 @@ _BINARY = (exp.EQ, exp.NEQ, exp.LT, exp.LTE, exp.GT, exp.GTE, exp.NullSafeEQ, ex
 # (Codex's eighth). A day before the first, a next day after the last, or past the calendar
 # ('9999-12-31') leaves the statement as written.
 _FIRST_DAY, _LAST_DAY = date(1677, 9, 22), date(2262, 4, 11)
+# What consumes a time without passing it on: a comparison (read, or left as written, by the pair rules),
+# COUNT, EXISTS and the connectives over comparisons.
+_CONSUMES = (*_BINARY, exp.In, exp.Between, exp.Count, exp.Exists, exp.And, exp.Or, exp.Not)
+# Where a time may go, or pass on from (`close_day_bounds`): what a statement shows or sorts, what
+# carries it on to be checked again (an alias, MIN, MAX, a subquery), and the containers whose
+# outputs are read again as columns of unknown type.
+_CARRIES_ON = (exp.Select, exp.Alias, exp.Group, exp.Order, exp.Ordered, exp.Window, exp.Distinct,
+               exp.Count, exp.Min, exp.Max, exp.Subquery, exp.SetOperation, exp.CTE, exp.With,
+               exp.From, exp.Join, exp.Paren, exp.Exists)
 _MIRROR = {exp.LT: exp.GT, exp.GT: exp.LT, exp.LTE: exp.GTE, exp.GTE: exp.LTE}  # `bound op col` as `col op' bound`
 
 # Operand classes (`_classify`): a bare day; a moment (an ISO timestamp string with its time of day);
@@ -280,54 +297,35 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
             return 0  # `IS` with a value: SQLite's NULL-safe equality, which no other engine has
         # `<` and `>=` already mean the day's boundary
 
-    # A timestamp column, or one whose type is unknown, anywhere else -- inside a function or an
-    # expression -- may be compared there with a day unread (`list_contains([ts], TIMESTAMP D)`,
-    # NULLIF, GREATEST: Codex's tenth review), so it leaves the statement as written, unless it only
-    # passes through: projected bare, grouped, ordered, partitioned, counted, MIN or MAX, or cast to
-    # DATE, which is its day.
-    for column in ast.find_all(exp.Column):
-        if id(column) not in direct and not _passes_through(column, oracle) and _classify(column) in (TIMES, OPAQUE):
-            return 0
+    # Where a time goes. A value computed from a timestamp column or a column of unknown type --
+    # through anything but a comparison, COUNT or EXISTS, which consume it -- carries that time, and
+    # may end only where the classifier read it (a comparison's direct operand), in what the
+    # statement shows (a projection, GROUP BY, ORDER BY, a window's PARTITION BY or ORDER BY), or in
+    # a container whose outputs are read again as columns (a derived table, a CTE, a set operation),
+    # passing on through an alias, MIN or MAX, a cast to DATE outside Oracle, or a subquery. Reaching
+    # anything else -- a function, arithmetic, a CASE -- it may be compared there with a day unread
+    # (`list_contains([ts], TIMESTAMP D)`, `NULLIF(MIN(ts), TIMESTAMP D)`, `NULLIF(CAST(ts AS DATE) +
+    # INTERVAL '12 hours', TIMESTAMP D)`: Codex's tenth to twelfth reviews), and the statement is
+    # left as written.
+    carries: set[int] = set()
+    for node in reversed(list(ast.walk())):  # every node after its descendants
+        if isinstance(node, exp.Column):
+            if _classify(node) in (TIMES, OPAQUE):
+                carries.add(id(node))
+        elif not isinstance(node, _CONSUMES) and any(id(c) in carries for c in node.iter_expressions()):
+            carries.add(id(node))
+    for node in ast.walk():
+        if id(node) in carries and node.parent is not None and id(node) not in direct:
+            parent = node.parent
+            if not (isinstance(parent, _CARRIES_ON) or _day_cast(parent, oracle)):
+                return 0
 
     for node, replacement in rewrites:
         node.replace(replacement)
     return len(rewrites)
 
 
-def _passes_through(column: exp.Column, oracle: bool) -> bool:
-    """Whether `column` sits where it is compared with nothing but its own column's values: a bare
-    projection (aliased or not), a GROUP BY or ORDER BY item, a window's PARTITION BY or ORDER BY,
-    the sole argument of COUNT (DISTINCT included), or of a MIN or MAX that is itself projected bare
-    or ordered (consumed by anything else, its timestamp is compared there unread: NULLIF(MIN(ts),
-    TIMESTAMP D), Codex's eleventh review); or where it becomes its own day, a cast to DATE outside
-    Oracle (whose DATE keeps the time of day), whose every use depends on the day alone."""
-    parent = column.parent
-    if (isinstance(parent, (exp.Cast, exp.TryCast)) and not oracle
-            and _temporal_kind(parent.args.get("to"), None) == "date"):
-        return True
-    if isinstance(parent, exp.Alias) and isinstance(parent.parent, exp.Select):
-        column, parent = parent, parent.parent
-    if isinstance(parent, exp.Select):
-        return any(e is column for e in parent.expressions)
-    if isinstance(parent, (exp.Group, exp.Ordered)):
-        return True
-    if isinstance(parent, exp.Window):
-        return any(e is column for e in parent.args.get("partition_by") or [])
-    if isinstance(parent, exp.Distinct) and isinstance(parent.parent, exp.Count):
-        return True
-    if isinstance(parent, exp.Count):
-        return parent.this is column  # a count is never a time
-    if isinstance(parent, (exp.Min, exp.Max)) and parent.this is column:
-        return _projected(parent)
-    return False
-
-
-def _projected(node: exp.Expression) -> bool:
-    """Whether `node` is a bare projection (aliased or not) or an ORDER BY item: shown or sorted, and
-    compared with nothing."""
-    parent = node.parent
-    if isinstance(parent, exp.Alias) and isinstance(parent.parent, exp.Select):
-        node, parent = parent, parent.parent
-    if isinstance(parent, exp.Select):
-        return any(e is node for e in parent.expressions)
-    return isinstance(parent, exp.Ordered)
+def _day_cast(node: exp.Expression, oracle: bool) -> bool:
+    """A cast to DATE outside Oracle (whose DATE keeps the time of day): its value is its operand's day."""
+    return (isinstance(node, (exp.Cast, exp.TryCast)) and not oracle
+            and _temporal_kind(node.args.get("to"), None) == "date")
