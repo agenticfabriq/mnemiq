@@ -37,9 +37,9 @@ from mnemiq.sql.day_bounds import close_day_bounds
 from mnemiq.sql.decide import decide
 from mnemiq.sql.verdict import Approved
 
-VISIBLE = {"claim": {"id", "ts", "filed", "tz", "note", "region"}}
+VISIBLE = {"claim": {"id", "ts", "filed", "tz", "note", "region", "raw"}}
 TYPES = {"claim": {"id": "INTEGER", "ts": "TIMESTAMP", "filed": "DATE", "tz": "TIMESTAMPTZ",
-                   "note": "VARCHAR", "region": "VARCHAR"}}
+                   "note": "VARCHAR", "region": "VARCHAR", "raw": "BLOB"}}
 
 
 def _closed(sql: str, dialect: str = "duckdb", types=TYPES) -> tuple[str, int]:
@@ -163,8 +163,18 @@ def test_a_column_not_bound_directly_to_a_base_table_is_never_moved(asked):
     "SELECT id FROM claim WHERE ts = '2024-03-09' AND ts <> '2024-3-9'",
     "SELECT id FROM claim WHERE ts = '2024-03-09' AND (ts + INTERVAL '0 seconds') <> note",
     "SELECT id FROM claim WHERE ts = '2024-03-09' AND ts LIKE '2024-03-09%'",
-    # The cost, accepted: an expression compared with a string, which may be a timestamp met by a day.
+    # A zone-aware copy of the timestamp, an epoch number (Codex's fifth review; its SQLite BLOB case
+    # runs on SQLite below).
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts = tz AND tz > '2024-03-09'",
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND epoch(ts) > 1709942400",
+    # The same, met only inside a BETWEEN: a DATE column as its low end, an expression as its subject.
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts BETWEEN filed AND '2024-03-20'",
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND upper(note) BETWEEN 'a' AND 'b'",
+    # The cost, accepted: any expression in any comparison -- a function, an aggregate, an IN over a
+    # subquery -- leaves the statement as written.
     "SELECT id FROM claim WHERE ts <= '2024-03-09' AND upper(region) = 'WEST'",
+    "SELECT region, COUNT(*) AS n FROM claim WHERE ts <= '2024-03-09' GROUP BY region HAVING COUNT(*) > 5",
+    "SELECT id FROM claim WHERE ts <= '2024-03-09' AND id IN (SELECT id FROM claim WHERE region = 'west')",
 ])
 def test_one_comparison_that_cannot_be_read_by_day_leaves_the_whole_statement_as_written(asked):
     """One statement, one reading: beside a day compared with something this cannot read by day (an
@@ -183,11 +193,8 @@ def test_a_day_compared_with_whole_days_text_or_a_projection_does_not_stop_the_m
 
 
 @pytest.mark.parametrize("asked, closed", [
-    # A semi-join, a count, a moment with its time of day: none of them reads a day.
-    ("SELECT id FROM claim WHERE ts <= '2024-03-09' AND id IN (SELECT id FROM claim WHERE region = 'west')",
-     "SELECT id FROM claim WHERE ts < '2024-03-10' AND id IN (SELECT id FROM claim WHERE region = 'west')"),
-    ("SELECT region, COUNT(*) AS n FROM claim WHERE ts <= '2024-03-09' GROUP BY region HAVING COUNT(*) > 5",
-     "SELECT region, COUNT(*) AS n FROM claim WHERE ts < '2024-03-10' GROUP BY region HAVING COUNT(*) > 5"),
+    # Columns and literals only: a moment with its time of day, a number, other columns, a timestamp
+    # join condition.
     ("SELECT id FROM claim WHERE ts <= '2024-03-09' AND ts > '2024-03-01 12:00:00' AND id > -1",
      "SELECT id FROM claim WHERE ts < '2024-03-10' AND ts > '2024-03-01 12:00:00' AND id > -1"),
     ("SELECT a.id FROM claim AS a JOIN claim AS b ON a.id = b.id AND a.ts >= b.ts WHERE a.ts <= '2024-03-09'",
@@ -243,6 +250,33 @@ def test_the_fourth_reviews_contradictions_stay_contradictions_on_the_engine():
     verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
     assert isinstance(verdict, Approved) and verdict.day_bounds == 0, verdict
     assert con.execute(verdict.target_sql).fetchone() == con.execute(asked).fetchone() == (0,)
+
+
+def test_the_fifth_reviews_contradictions_stay_contradictions_on_the_engine():
+    """Codex's fifth review: a zone-aware copy of the timestamp (`ts = tz AND tz > D`), an epoch number
+    and, on SQLite, a BLOB holding the day each carried the same value to a midnight reading while
+    `<=` moved. Every comparison must now be between bare columns and literals, and a timestamp met
+    only by days, moments, numbers and timestamps: each statement is left as written and returns
+    nothing."""
+    import sqlite3
+
+    con = duckdb.connect()
+    con.execute("SET TimeZone = 'UTC'")
+    con.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP, filed DATE, tz TIMESTAMPTZ, note VARCHAR, "
+                "region VARCHAR, raw BLOB)")
+    con.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00', NULL, '2024-03-09 12:00:00+00', NULL, NULL, NULL)")
+    for asked in ("SELECT count(*) FROM claim WHERE ts <= '2024-03-09' AND ts = tz AND tz > '2024-03-09'",
+                  "SELECT count(*) FROM claim WHERE ts <= '2024-03-09' AND epoch(ts) > 1709985600"):
+        verdict = decide(asked, VISIBLE, dialect="duckdb", target="duckdb", types=TYPES)
+        assert isinstance(verdict, Approved) and verdict.day_bounds == 0, (asked, verdict)
+        assert con.execute(verdict.target_sql).fetchone() == con.execute(asked).fetchone() == (0,), asked
+    lite = sqlite3.connect(":memory:")
+    lite.execute("CREATE TABLE claim (id INTEGER, ts TIMESTAMP, raw BLOB)")
+    lite.execute("INSERT INTO claim VALUES (1, '2024-03-09 12:00:00', '2024-03-09')")
+    asked = "SELECT count(*) FROM claim WHERE ts <= '2024-03-09' AND datetime(ts) > raw AND raw = '2024-03-09'"
+    verdict = decide(asked, VISIBLE, dialect="sqlite", target="sqlite", types=TYPES)
+    assert isinstance(verdict, Approved) and verdict.day_bounds == 0, verdict
+    assert lite.execute(verdict.target_sql).fetchone() == lite.execute(asked).fetchone() == (0,)
 
 
 def test_contradictions_stay_contradictions_and_nulls_stay_null_on_the_engine():

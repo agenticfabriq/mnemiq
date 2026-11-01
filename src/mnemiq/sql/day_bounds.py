@@ -20,32 +20,30 @@ D+1 written in the literal's own spelling so the statement stays valid in its di
 and `col >= D` already mean the day's boundary and stay as written.
 
 One statement, one reading. Moving some of a statement's comparisons and not others let a
-contradiction return rows and complementary buckets count a row twice (Codex's reviews: `<=` moved
-beside `>`, `=` beside IS DISTINCT FROM, a day inside a subquery, a cast of the same column). So
-every comparison in the statement, at any depth, is classified by its operands (`_classify`), and
-the statement moves only where every one is read the same way in both readings or is one this
-rewrites:
+contradiction return rows and complementary buckets count a row twice; five reviews by Codex each
+found a path by which the same timestamp reached a midnight value unmoved -- `<=` beside `>`, `=`
+beside IS DISTINCT FROM, a day inside a subquery, a cast of the column, SQLite's IS, a text or
+BLOB column, a zone-aware copy, an epoch number. So the rule is closed by construction: the
+statement moves only when every comparison in it, at any depth, is between bare columns and
+literals (`_classify`, `_agree`), and
 
 - a timestamp column meets only a bare day (rewritten), a moment written with its time of day in
-  ISO form (which means that moment), NULL, or another timestamp column -- never text, a string in
-  any other form (an engine reads `'2024-3-9'` as that day's midnight too), a DATE, or an opaque
-  operand;
-- an opaque operand -- an expression, a function, a subquery, a column read through a CTE's output,
-  a derived table, a set operation or an enclosing scope, a cast of anything but a literal to
-  anything but DATE -- meets only a number, a boolean, NULL, or a column of a type neither temporal
-  nor text: an engine converts a string to a timestamp where an opaque timestamp meets one (Codex's
-  fourth review), and a number never carries a day;
+  ISO form (which means that moment), NULL, a number, or another timestamp column -- never a DATE,
+  text, a zone-aware timestamp, any other column, a string in any other form (an engine reads
+  `'2024-3-9'` as that day's midnight too), or anything opaque;
+- nothing in any comparison is opaque: no expression, function, aggregate, subquery, column read
+  through a CTE's output, a derived table, a set operation or an enclosing scope, or cast of
+  anything but a literal (a cast to DATE, outside Oracle, is a DATE);
 - a simple CASE's WHEN, BETWEEN SYMMETRIC or a mixed IN list over a timestamp column, LIKE or a
-  pattern match on one, and a USING or NATURAL join (a comparison nothing here reads), leave it as
-  written too. SQLite's `IS` and `IS NOT` are the NULL-safe pair.
+  pattern match on one, and a USING or NATURAL join (a comparison nothing here reads) are absent.
+  SQLite's `IS` and `IS NOT` are the NULL-safe pair.
 
-A bare day buried in an operand (a function's argument, an array, ANY, a subquery) makes that
-operand opaque, so it never meets a timestamp column or a bare day unread. The cost, accepted: a
-statement comparing an expression with a string (`upper(region) = 'WEST'`) is left as written.
-
-Otherwise the statement is left exactly as written. A bare day compared with a column declared
-DATE (whole days, where both readings are the same rows), a zone-aware timestamp, text or a
-number, or with a cast to DATE, is not moved and stops nothing.
+Values then meet only directly, and a timestamp column only timestamp columns read the same way.
+Otherwise the statement is left exactly as written. The cost, accepted, and none on the saved runs
+it was measured on: a statement with any expression in any comparison (`COUNT(*) > 5`, an IN over a
+subquery, `upper(region) = 'WEST'`) is not moved. A bare day compared with a column declared DATE
+(whole days, where both readings are the same rows), a zone-aware timestamp, text or a number, or
+with a cast to DATE, is not moved and stops nothing.
 
 D is a date-only ISO literal naming a real day, spelled plain, cast or typed (an allow-list:
 `_day`). A timestamp column is a bare column bound directly to a base table of its own scope,
@@ -58,8 +56,6 @@ from datetime import date, timedelta
 
 from sqlglot import exp
 
-from sqlglot.errors import SqlglotError
-
 from mnemiq.sql.values_check import _in_scope, _iso_date, _moment, _scopes, _temporal_kind
 
 _DAY_FORMATS = frozenset({"%Y-%m-%d"})  # a parse format naming the day alone (Oracle's TO_DATE 'YYYY-MM-DD')
@@ -69,10 +65,10 @@ _PATTERNS = (exp.Like, exp.ILike, exp.Glob, exp.SimilarTo, exp.RegexpLike, exp.R
 _MIRROR = {exp.LT: exp.GT, exp.GT: exp.LT, exp.LTE: exp.GTE, exp.GTE: exp.LTE}  # `bound op col` as `col op' bound`
 
 # Operand classes (`_classify`): a bare day; a moment (an ISO timestamp string with its time of day);
-# a number, boolean or NULL; any other string; a typed column bound directly to a base table (a naive
-# timestamp, a DATE, a zone-aware timestamp, text, anything else); opaque.
+# a number, boolean or NULL; any other string; a column bound directly to a base table and declared a
+# naive timestamp (or an Oracle DATE); any other such column, or a cast to DATE outside Oracle; opaque.
 DAY, MOMENT, NUMBER, STRING = "day", "moment", "number", "string"
-TIMES, DATE, ZONED, TEXT, OTHER, OPAQUE = "times", "date", "zoned", "text", "other", "opaque"
+TIMES, COLUMN, OPAQUE = "times", "column", "opaque"
 
 
 def _day(node: exp.Expression) -> exp.Literal | None:
@@ -113,23 +109,15 @@ def _the_day(column: exp.Expression, bound: exp.Expression) -> exp.Paren:
                                   expression=exp.LT(this=column.copy(), expression=_next_day(bound))))
 
 
-def _is_text(declared: str, dialect: str | None) -> bool:
-    """Whether a declared type is a string type; an unreadable one counts as text, the reading that
-    leaves more statements as written."""
-    try:
-        return exp.DataType.build(declared, dialect=dialect, udt=True).is_type(*exp.DataType.TEXT_TYPES)
-    except (SqlglotError, ValueError):
-        return True
-
-
 def _agree(a: str, b: str) -> bool:
-    """Whether a comparison of operands of classes `a` and `b` reads the same in both readings, or
-    is one this rewrites (a timestamp column and a bare day)."""
+    """Whether a comparison of operands of classes `a` and `b` is one of the two this allows: nothing
+    opaque, and a timestamp column met only by a bare day (rewritten), a moment, a number or NULL,
+    or another timestamp column."""
     pair = {a, b}
-    if TIMES in pair:
-        return pair - {TIMES} <= {DAY, MOMENT, NUMBER, TIMES, ZONED}
     if OPAQUE in pair:
-        return len(pair) == 2 and pair - {OPAQUE} <= {NUMBER, OTHER}
+        return False
+    if TIMES in pair:
+        return pair - {TIMES} <= {DAY, MOMENT, NUMBER, TIMES}
     return True
 
 
@@ -180,12 +168,10 @@ def close_day_bounds(ast: exp.Expression, visible: dict[str, set[str]],
             kind = _temporal_kind(declared, dialect)
             if kind == "timestamp" or (oracle and kind == "date"):
                 return TIMES
-            if kind is not None:
-                return {"date": DATE, "timestamptz": ZONED}.get(kind, OPAQUE)  # a TIME: opaque
-            return TEXT if _is_text(declared, dialect) else OTHER
+            return COLUMN
         if (isinstance(node, (exp.Cast, exp.TryCast)) and not oracle
                 and _temporal_kind(node.args.get("to"), dialect) == "date"):
-            return DATE  # a cast to DATE already reads its value by day
+            return COLUMN  # a cast to DATE already reads its value by day
         return OPAQUE
 
     rewrites: list[tuple[exp.Expression, exp.Expression]] = []
